@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use onyx_storage::buffer::entry::*;
 use onyx_storage::buffer::pool::WriteBufferPool;
 use onyx_storage::config::MetaConfig;
 use onyx_storage::io::device::RawDevice;
@@ -23,7 +22,7 @@ fn setup_worker(compression: CompressionAlgo) -> (ZoneWorker, Arc<MetaStore>) {
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
     let buf_tmp = NamedTempFile::new().unwrap();
-    let buf_size = BUFFER_SUPERBLOCK_SIZE + 100 * BUFFER_ENTRY_SIZE;
+    let buf_size = 4096 + 100 * 8192;
     buf_tmp.as_file().set_len(buf_size).unwrap();
     let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
     let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
@@ -51,7 +50,7 @@ fn setup_zone_manager(zone_count: u32) -> ZoneManager {
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
     let buf_tmp = NamedTempFile::new().unwrap();
-    let buf_size = BUFFER_SUPERBLOCK_SIZE + 1000 * BUFFER_ENTRY_SIZE;
+    let buf_size = 4096 + 1000 * 8192;
     buf_tmp.as_file().set_len(buf_size).unwrap();
     let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
     let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
@@ -82,7 +81,7 @@ fn setup_zone_manager(zone_count: u32) -> ZoneManager {
 fn write_appends_to_buffer() {
     let (worker, _meta) = setup_worker(CompressionAlgo::Lz4);
     let data = vec![0u8; 4096];
-    worker.handle_write("test-vol", Lba(0), &data).unwrap();
+    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
     assert_eq!(worker.buffer_pool.pending_count(), 1);
 }
 
@@ -105,7 +104,7 @@ fn concurrent_writes() {
 
     let data = vec![0u8; 4096];
     for i in 0..20u64 {
-        zm.submit_write("test-vol", Lba(i * 256), data.clone())
+        zm.submit_write("test-vol", Lba(i * 256), 1, data.clone())
             .unwrap();
     }
 
@@ -118,7 +117,7 @@ fn write_to_different_zones() {
 
     for zone in 0..4u64 {
         let lba = Lba(zone * 256);
-        zm.submit_write("test-vol", lba, vec![zone as u8; 4096])
+        zm.submit_write("test-vol", lba, 1, vec![zone as u8; 4096])
             .unwrap();
     }
 
@@ -134,7 +133,7 @@ fn read_after_write_before_flush() {
     let (worker, _meta) = setup_worker(CompressionAlgo::Lz4);
 
     let data = vec![0xAB; 4096];
-    worker.handle_write("test-vol", Lba(0), &data).unwrap();
+    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
 
     // Read immediately -- should see the data from the buffer, not from LV3
     let read_data = worker.handle_read("test-vol", Lba(0)).unwrap().unwrap();
@@ -158,8 +157,8 @@ fn read_after_overwrite() {
 
     let data1 = vec![0x11; 4096];
     let data2 = vec![0x22; 4096];
-    worker.handle_write("test-vol", Lba(5), &data1).unwrap();
-    worker.handle_write("test-vol", Lba(5), &data2).unwrap();
+    worker.handle_write("test-vol", Lba(5), 1, &data1).unwrap();
+    worker.handle_write("test-vol", Lba(5), 1, &data2).unwrap();
 
     let read_data = worker.handle_read("test-vol", Lba(5)).unwrap().unwrap();
     assert_eq!(read_data, data2);
@@ -171,7 +170,7 @@ fn read_after_write_zstd() {
     let (worker, _meta) = setup_worker(CompressionAlgo::Zstd { level: 3 });
 
     let data = vec![0x42; 4096]; // compressible
-    worker.handle_write("test-vol", Lba(10), &data).unwrap();
+    worker.handle_write("test-vol", Lba(10), 1, &data).unwrap();
 
     let read_data = worker.handle_read("test-vol", Lba(10)).unwrap().unwrap();
     assert_eq!(read_data, data);
@@ -183,7 +182,7 @@ fn read_after_write_no_compression() {
     let (worker, _meta) = setup_worker(CompressionAlgo::None);
 
     let data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
-    worker.handle_write("test-vol", Lba(20), &data).unwrap();
+    worker.handle_write("test-vol", Lba(20), 1, &data).unwrap();
 
     let read_data = worker.handle_read("test-vol", Lba(20)).unwrap().unwrap();
     assert_eq!(read_data, data);
@@ -196,7 +195,7 @@ fn multi_lba_write_read() {
 
     for i in 0..10u64 {
         let data = vec![i as u8; 4096];
-        worker.handle_write("test-vol", Lba(i), &data).unwrap();
+        worker.handle_write("test-vol", Lba(i), 1, &data).unwrap();
     }
 
     for i in 0..10u64 {
@@ -211,7 +210,7 @@ fn zone_manager_read_after_write() {
     let mut zm = setup_zone_manager(4);
 
     let data = vec![0xDE; 4096];
-    zm.submit_write("test-vol", Lba(0), data.clone()).unwrap();
+    zm.submit_write("test-vol", Lba(0), 1, data.clone()).unwrap();
 
     let read_data = zm.submit_read("test-vol", Lba(0)).unwrap().unwrap();
     assert_eq!(read_data, data);

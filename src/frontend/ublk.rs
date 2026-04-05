@@ -123,41 +123,51 @@ impl OnyxUblkTarget {
                 }
                 sys::UBLK_IO_OP_WRITE => {
                     let buf_addr = q.get_io_buf_addr(tag);
-                    let mut buf_offset = 0usize;
-                    let mut remaining = io_bytes;
-                    let mut cur_offset = offset_bytes;
 
-                    while remaining > 0 {
-                        let block_lba = Lba(cur_offset / block_size);
-                        let offset_in_block = (cur_offset % block_size) as usize;
-                        let avail_in_block = block_size as usize - offset_in_block;
-                        let write_len = (remaining as usize).min(avail_in_block);
-
-                        let block_data = if write_len == block_size as usize && offset_in_block == 0
+                    // Fast path: fully block-aligned write → single submit, no splitting
+                    if offset_bytes % block_size == 0 && io_bytes % block_size == 0 {
+                        let start_lba = Lba(offset_bytes / block_size);
+                        let lba_count = (io_bytes / block_size) as u32;
+                        let data = unsafe {
+                            std::slice::from_raw_parts(buf_addr, io_bytes as usize)
+                        }
+                        .to_vec();
+                        if let Err(e) =
+                            zm.submit_write(&vol_id, start_lba, lba_count, data)
                         {
-                            // Full block write — no RMW needed
-                            unsafe {
-                                std::slice::from_raw_parts(
-                                    buf_addr.add(buf_offset),
-                                    block_size as usize,
-                                )
-                                .to_vec()
-                            }
-                        } else {
-                            // Partial block write — read-modify-write
+                            tracing::error!(
+                                lba = start_lba.0,
+                                count = lba_count,
+                                error = %e,
+                                "write failed"
+                            );
+                            return -(libc::EIO as i32);
+                        }
+                    } else {
+                        // Slow path: non-aligned write → per-block RMW (rare)
+                        let mut buf_offset = 0usize;
+                        let mut remaining = io_bytes;
+                        let mut cur_offset = offset_bytes;
+
+                        while remaining > 0 {
+                            let block_lba = Lba(cur_offset / block_size);
+                            let offset_in_block = (cur_offset % block_size) as usize;
+                            let avail_in_block = block_size as usize - offset_in_block;
+                            let write_len = (remaining as usize).min(avail_in_block);
+
                             let mut block = match zm.submit_read(&vol_id, block_lba) {
                                 Ok(Some(data)) => {
                                     let mut b = data;
                                     b.resize(block_size as usize, 0);
                                     b
                                 }
-                                Ok(None) => {
-                                    // Unmapped — start from zeros
-                                    vec![0u8; block_size as usize]
-                                }
+                                Ok(None) => vec![0u8; block_size as usize],
                                 Err(e) => {
-                                    tracing::error!(lba = block_lba.0, error = %e,
-                                        "RMW read failed");
+                                    tracing::error!(
+                                        lba = block_lba.0,
+                                        error = %e,
+                                        "RMW read failed"
+                                    );
                                     return -(libc::EIO as i32);
                                 }
                             };
@@ -168,17 +178,22 @@ impl OnyxUblkTarget {
                                     write_len,
                                 );
                             }
-                            block
-                        };
 
-                        if let Err(e) = zm.submit_write(&vol_id, block_lba, block_data) {
-                            tracing::error!(lba = block_lba.0, error = %e, "write failed");
-                            return -(libc::EIO as i32);
+                            if let Err(e) =
+                                zm.submit_write(&vol_id, block_lba, 1, block)
+                            {
+                                tracing::error!(
+                                    lba = block_lba.0,
+                                    error = %e,
+                                    "write failed"
+                                );
+                                return -(libc::EIO as i32);
+                            }
+
+                            buf_offset += write_len;
+                            cur_offset += write_len as u64;
+                            remaining -= write_len as u64;
                         }
-
-                        buf_offset += write_len;
-                        cur_offset += write_len as u64;
-                        remaining -= write_len as u64;
                     }
 
                     io_bytes as i32

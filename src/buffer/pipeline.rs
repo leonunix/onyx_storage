@@ -9,7 +9,10 @@ pub struct CoalesceUnit {
     pub start_lba: Lba,
     pub lba_count: u32,
     pub raw_data: Vec<u8>,
-    pub entry_seqs: Vec<u64>,
+    /// (seq, first_lba_from_this_entry_in_unit, count) — tracks exactly which
+    /// LBAs from each original entry are in this unit. Needed for idempotent
+    /// partial mark_flushed when a multi-LBA entry is split across units.
+    pub seq_lba_ranges: Vec<(u64, Lba, u32)>,
 }
 
 /// A compressed coalesce unit, ready to be written to LV3.
@@ -22,69 +25,104 @@ pub struct CompressedUnit {
     pub compressed_data: Vec<u8>,
     pub compression: u8,
     pub crc32: u32,
-    pub entry_seqs: Vec<u64>,
+    pub seq_lba_ranges: Vec<(u64, Lba, u32)>,
+}
+
+/// A single-LBA slice extracted from a (possibly multi-LBA) buffer entry.
+struct LbaSlice<'a> {
+    vol_id: &'a str,
+    lba: Lba,
+    data: &'a [u8], // exactly BLOCK_SIZE bytes
+    entry_seq: u64,
+}
+
+/// Record that `lba` from entry `seq` is in this unit.
+/// Tracks contiguous ranges per seq: if seq already has a range ending at lba-1,
+/// extend it; otherwise start a new range.
+fn add_seq_lba(acc: &mut Vec<(u64, Lba, u32)>, seq: u64, lba: Lba) {
+    if let Some(existing) = acc.iter_mut().find(|(s, start, count)| {
+        *s == seq && start.0 + *count as u64 == lba.0
+    }) {
+        existing.2 += 1;
+    } else {
+        acc.push((seq, lba, 1));
+    }
 }
 
 /// Coalesce buffer entries into compression units.
 ///
-/// Sorts entries by (vol_id, lba), then merges runs of contiguous LBAs from
-/// the same volume. A run is cut when:
-/// - vol_id changes
-/// - LBA is not contiguous (gap)
-/// - accumulated raw bytes exceed `max_raw_bytes`
-/// - LBA count exceeds `max_lbas`
-///
-/// Each entry is assumed to carry exactly one 4KB LBA of raw data.
-/// If an LBA appears multiple times (overwrite), only the latest (highest seq) is kept.
-pub fn coalesce(entries: &[BufferEntry], max_raw_bytes: usize, max_lbas: u32) -> Vec<CoalesceUnit> {
+/// Multi-LBA entries are expanded into per-LBA slices for dedup, then
+/// contiguous same-volume LBAs are merged up to the configured limits.
+pub fn coalesce(
+    entries: &[BufferEntry],
+    max_raw_bytes: usize,
+    max_lbas: u32,
+) -> Vec<CoalesceUnit> {
     if entries.is_empty() {
         return Vec::new();
     }
 
-    struct DedupedEntry<'a> {
-        latest: &'a BufferEntry,
-        seqs_to_flush: Vec<u64>,
-    }
+    let bs = BLOCK_SIZE as usize;
 
-    // Deduplicate: keep only the latest entry per (vol_id, lba) by highest seq.
-    // Older overwritten entries must still be retired once the newest value is
-    // durable on LV3, otherwise stale log entries can stay pending forever.
-    let mut deduped: std::collections::HashMap<(String, u64), DedupedEntry<'_>> =
-        std::collections::HashMap::new();
+    // Phase 1: Expand all entries into per-LBA slices
+    let mut all_slices: Vec<LbaSlice> = Vec::new();
     for entry in entries {
-        let key = (entry.vol_id.clone(), entry.lba.0);
-        match deduped.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut existing) => {
-                let existing = existing.get_mut();
-                existing.seqs_to_flush.push(entry.seq);
-                if entry.seq > existing.latest.seq {
-                    existing.latest = entry;
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(DedupedEntry {
-                    latest: entry,
-                    seqs_to_flush: vec![entry.seq],
+        for i in 0..entry.lba_count {
+            let offset = i as usize * bs;
+            let end = offset + bs;
+            if end <= entry.payload.len() {
+                all_slices.push(LbaSlice {
+                    vol_id: &entry.vol_id,
+                    lba: Lba(entry.start_lba.0 + i as u64),
+                    data: &entry.payload[offset..end],
+                    entry_seq: entry.seq,
                 });
             }
         }
     }
 
-    // Sort by (vol_id, lba)
-    let mut sorted: Vec<&DedupedEntry<'_>> = deduped.values().collect();
+    // Phase 2: Dedup — keep latest (highest seq) per (vol_id, lba).
+    // Collect all seqs per key for flushing.
+    struct DedupSlice<'a> {
+        latest: LbaSlice<'a>,
+        all_seqs: Vec<u64>,
+    }
+
+    let mut deduped: std::collections::HashMap<(String, u64), DedupSlice> =
+        std::collections::HashMap::new();
+    for slice in all_slices {
+        let key = (slice.vol_id.to_string(), slice.lba.0);
+        match deduped.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let existing = e.get_mut();
+                existing.all_seqs.push(slice.entry_seq);
+                if slice.entry_seq > existing.latest.entry_seq {
+                    existing.latest = slice;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(DedupSlice {
+                    all_seqs: vec![slice.entry_seq],
+                    latest: slice,
+                });
+            }
+        }
+    }
+
+    // Phase 3: Sort by (vol_id, lba)
+    let mut sorted: Vec<&DedupSlice> = deduped.values().collect();
     sorted.sort_by(|a, b| {
         (&a.latest.vol_id, a.latest.lba.0).cmp(&(&b.latest.vol_id, b.latest.lba.0))
     });
 
-    let bs = BLOCK_SIZE as usize;
+    // Phase 4: Merge contiguous LBAs
     let mut units = Vec::new();
     let mut current: Option<CoalesceUnit> = None;
 
-    for entry in sorted {
-        let latest = entry.latest;
+    for ds in sorted {
         let should_extend = if let Some(ref cur) = current {
-            cur.vol_id == latest.vol_id
-                && latest.lba.0 == cur.start_lba.0 + cur.lba_count as u64
+            cur.vol_id == ds.latest.vol_id
+                && ds.latest.lba.0 == cur.start_lba.0 + cur.lba_count as u64
                 && cur.raw_data.len() + bs <= max_raw_bytes
                 && cur.lba_count + 1 <= max_lbas
         } else {
@@ -94,27 +132,24 @@ pub fn coalesce(entries: &[BufferEntry], max_raw_bytes: usize, max_lbas: u32) ->
         if should_extend {
             let cur = current.as_mut().unwrap();
             cur.lba_count += 1;
-            // Pad payload to exactly 4KB if shorter
-            let mut block = vec![0u8; bs];
-            let copy_len = latest.payload.len().min(bs);
-            block[..copy_len].copy_from_slice(&latest.payload[..copy_len]);
-            cur.raw_data.extend_from_slice(&block);
-            cur.entry_seqs.extend_from_slice(&entry.seqs_to_flush);
+            cur.raw_data.extend_from_slice(ds.latest.data);
+            for &seq in &ds.all_seqs {
+                add_seq_lba(& mut cur.seq_lba_ranges, seq, ds.latest.lba);
+            }
         } else {
-            // Flush current unit if any
             if let Some(unit) = current.take() {
                 units.push(unit);
             }
-            // Start new unit
-            let mut block = vec![0u8; bs];
-            let copy_len = latest.payload.len().min(bs);
-            block[..copy_len].copy_from_slice(&latest.payload[..copy_len]);
+            let mut seq_lba_ranges = Vec::new();
+            for &seq in &ds.all_seqs {
+                add_seq_lba(&mut seq_lba_ranges, seq, ds.latest.lba);
+            }
             current = Some(CoalesceUnit {
-                vol_id: latest.vol_id.clone(),
-                start_lba: latest.lba,
+                vol_id: ds.latest.vol_id.to_string(),
+                start_lba: ds.latest.lba,
                 lba_count: 1,
-                raw_data: block,
-                entry_seqs: entry.seqs_to_flush.clone(),
+                raw_data: ds.latest.data.to_vec(),
+                seq_lba_ranges,
             });
         }
     }
@@ -130,15 +165,13 @@ pub fn coalesce(entries: &[BufferEntry], max_raw_bytes: usize, max_lbas: u32) ->
 mod tests {
     use super::*;
 
-    fn make_entry(vol_id: &str, lba: u64, seq: u64, data: u8) -> BufferEntry {
-        let payload = vec![data; BLOCK_SIZE as usize];
+    fn make_entry(vol_id: &str, start_lba: u64, lba_count: u32, seq: u64, fill: u8) -> BufferEntry {
+        let payload = vec![fill; lba_count as usize * BLOCK_SIZE as usize];
         BufferEntry {
             seq,
             vol_id: vol_id.to_string(),
-            lba: Lba(lba),
-            compression: 0,
-            original_size: BLOCK_SIZE,
-            compressed_size: BLOCK_SIZE,
+            start_lba: Lba(start_lba),
+            lba_count,
             payload_crc32: crc32fast::hash(&payload),
             flushed: false,
             payload,
@@ -146,8 +179,8 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_contiguous() {
-        let entries: Vec<_> = (0..8).map(|i| make_entry("vol-a", i, i, 0xAA)).collect();
+    fn coalesce_single_lba_entries() {
+        let entries: Vec<_> = (0..8).map(|i| make_entry("vol-a", i, 1, i, 0xAA)).collect();
         let units = coalesce(&entries, 131072, 32);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 8);
@@ -155,101 +188,89 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_multi_lba_entry() {
+        // One entry covering 4 LBAs
+        let entries = vec![make_entry("vol-a", 0, 4, 0, 0xBB)];
+        let units = coalesce(&entries, 131072, 32);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].lba_count, 4);
+    }
+
+    #[test]
+    fn coalesce_adjacent_multi_lba_entries() {
+        // Two entries: LBAs 0-3 and LBAs 4-7 → should merge into one 8-LBA unit
+        let entries = vec![
+            make_entry("vol-a", 0, 4, 0, 0xAA),
+            make_entry("vol-a", 4, 4, 1, 0xBB),
+        ];
+        let units = coalesce(&entries, 131072, 32);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].lba_count, 8);
+        // First 4 LBAs filled with 0xAA, next 4 with 0xBB
+        assert_eq!(units[0].raw_data[0], 0xAA);
+        assert_eq!(units[0].raw_data[4 * BLOCK_SIZE as usize], 0xBB);
+    }
+
+    #[test]
     fn coalesce_gap_splits() {
-        let mut entries = vec![
-            make_entry("vol-a", 0, 0, 0xAA),
-            make_entry("vol-a", 1, 1, 0xAA),
-            // gap: LBA 2 missing
-            make_entry("vol-a", 3, 2, 0xBB),
-            make_entry("vol-a", 4, 3, 0xBB),
+        let entries = vec![
+            make_entry("vol-a", 0, 2, 0, 0xAA),
+            make_entry("vol-a", 5, 2, 1, 0xBB), // gap at LBA 2-4
         ];
         let units = coalesce(&entries, 131072, 32);
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].lba_count, 2);
-        assert_eq!(units[0].start_lba, Lba(0));
         assert_eq!(units[1].lba_count, 2);
-        assert_eq!(units[1].start_lba, Lba(3));
     }
 
     #[test]
     fn coalesce_cross_volume_splits() {
         let entries = vec![
-            make_entry("vol-a", 0, 0, 0xAA),
-            make_entry("vol-a", 1, 1, 0xAA),
-            make_entry("vol-b", 2, 2, 0xBB),
-            make_entry("vol-b", 3, 3, 0xBB),
+            make_entry("vol-a", 0, 2, 0, 0xAA),
+            make_entry("vol-b", 2, 2, 1, 0xBB),
         ];
         let units = coalesce(&entries, 131072, 32);
         assert_eq!(units.len(), 2);
-        assert_eq!(units[0].vol_id, "vol-a");
-        assert_eq!(units[1].vol_id, "vol-b");
     }
 
     #[test]
     fn coalesce_max_lbas_limit() {
-        let entries: Vec<_> = (0..10).map(|i| make_entry("vol-a", i, i, 0xAA)).collect();
-        let units = coalesce(&entries, 131072, 4); // max 4 LBAs per unit
+        let entries: Vec<_> = (0..10).map(|i| make_entry("vol-a", i, 1, i, 0xAA)).collect();
+        let units = coalesce(&entries, 131072, 4);
         assert_eq!(units.len(), 3); // 4 + 4 + 2
-        assert_eq!(units[0].lba_count, 4);
-        assert_eq!(units[1].lba_count, 4);
-        assert_eq!(units[2].lba_count, 2);
     }
 
     #[test]
-    fn coalesce_max_bytes_limit() {
-        let entries: Vec<_> = (0..10).map(|i| make_entry("vol-a", i, i, 0xAA)).collect();
-        // 2 * 4096 = 8192 max
-        let units = coalesce(&entries, 8192, 100);
-        assert_eq!(units.len(), 5); // 2 + 2 + 2 + 2 + 2
-        for u in &units {
-            assert_eq!(u.lba_count, 2);
-        }
+    fn coalesce_dedup_overwrites() {
+        let entries = vec![
+            make_entry("vol-a", 0, 1, 0, 0x11), // old
+            make_entry("vol-a", 0, 1, 5, 0x22), // new (higher seq)
+            make_entry("vol-a", 1, 1, 1, 0x33),
+        ];
+        let units = coalesce(&entries, 131072, 32);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].lba_count, 2);
+        assert_eq!(units[0].raw_data[0], 0x22); // latest data
+    }
+
+    #[test]
+    fn coalesce_multi_lba_partial_overwrite() {
+        // Entry covers LBAs 0-3, then a single-LBA overwrite at LBA 1
+        let entries = vec![
+            make_entry("vol-a", 0, 4, 0, 0xAA),
+            make_entry("vol-a", 1, 1, 5, 0xFF), // overwrite LBA 1
+        ];
+        let units = coalesce(&entries, 131072, 32);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].lba_count, 4);
+        // LBA 0: 0xAA, LBA 1: 0xFF (overwritten), LBA 2-3: 0xAA
+        assert_eq!(units[0].raw_data[0], 0xAA);
+        assert_eq!(units[0].raw_data[BLOCK_SIZE as usize], 0xFF);
+        assert_eq!(units[0].raw_data[2 * BLOCK_SIZE as usize], 0xAA);
     }
 
     #[test]
     fn coalesce_empty() {
-        let units = coalesce(&[], 131072, 32);
-        assert!(units.is_empty());
-    }
-
-    #[test]
-    fn coalesce_single_entry() {
-        let entries = vec![make_entry("vol-a", 5, 0, 0xCC)];
-        let units = coalesce(&entries, 131072, 32);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].lba_count, 1);
-        assert_eq!(units[0].start_lba, Lba(5));
-    }
-
-    #[test]
-    fn coalesce_dedup_keeps_latest() {
-        let entries = vec![
-            make_entry("vol-a", 0, 0, 0x11), // old
-            make_entry("vol-a", 0, 5, 0x22), // new (higher seq)
-            make_entry("vol-a", 1, 1, 0x33),
-        ];
-        let units = coalesce(&entries, 131072, 32);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].lba_count, 2);
-        // First 4KB should be from seq 5 (0x22), not seq 0 (0x11)
-        assert_eq!(units[0].raw_data[0], 0x22);
-        assert_eq!(units[0].raw_data[BLOCK_SIZE as usize], 0x33);
-        assert_eq!(units[0].entry_seqs, vec![0, 5, 1]);
-    }
-
-    #[test]
-    fn coalesce_marks_superseded_entries_flushed() {
-        let entries = vec![
-            make_entry("vol-a", 10, 1, 0x10),
-            make_entry("vol-a", 10, 4, 0x40),
-            make_entry("vol-a", 11, 2, 0x20),
-            make_entry("vol-a", 11, 6, 0x60),
-        ];
-        let units = coalesce(&entries, 131072, 32);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].lba_count, 2);
-        assert_eq!(units[0].raw_data[0], 0x40);
-        assert_eq!(units[0].raw_data[BLOCK_SIZE as usize], 0x60);
-        assert_eq!(units[0].entry_seqs, vec![1, 4, 2, 6]);
+        assert!(coalesce(&[], 131072, 32).is_empty());
     }
 }

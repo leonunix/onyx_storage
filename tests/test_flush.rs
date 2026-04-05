@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use onyx_storage::buffer::entry::*;
-use onyx_storage::buffer::flush::BufferFlusher;
+use onyx_storage::buffer::flush::{
+    clear_test_failpoint, install_test_failpoint, BufferFlusher, FlushFailStage,
+};
 use onyx_storage::buffer::pool::WriteBufferPool;
 use onyx_storage::config::{FlushConfig, MetaConfig};
 use onyx_storage::io::device::RawDevice;
@@ -28,7 +30,7 @@ fn setup_flush_env() -> (
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
     let buf_tmp = NamedTempFile::new().unwrap();
-    let buf_size = BUFFER_SUPERBLOCK_SIZE + 100 * BUFFER_ENTRY_SIZE;
+    let buf_size = 4096 + 100 * 8192;
     buf_tmp.as_file().set_len(buf_size).unwrap();
     let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
     let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
@@ -54,12 +56,28 @@ fn start_flusher(
     allocator: &Arc<SpaceAllocator>,
     io_engine: &Arc<IoEngine>,
 ) -> BufferFlusher {
+    start_flusher_with_compression(
+        pool,
+        meta,
+        allocator,
+        io_engine,
+        CompressionAlgo::Lz4,
+    )
+}
+
+fn start_flusher_with_compression(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+    compression: CompressionAlgo,
+) -> BufferFlusher {
     BufferFlusher::start(
         pool.clone(),
         meta.clone(),
         allocator.clone(),
         io_engine.clone(),
-        CompressionAlgo::Lz4,
+        compression,
         &FlushConfig::default(),
     )
 }
@@ -74,14 +92,59 @@ fn wait_flushed(pool: &WriteBufferPool, timeout_ms: u64) -> bool {
     false
 }
 
+fn wait_until<F>(timeout_ms: u64, condition: F) -> bool
+where
+    F: Fn() -> bool,
+{
+    for _ in 0..(timeout_ms / 10) {
+        if condition() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn next_test_volume(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    format!("{}-{}", prefix, COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+struct FailpointGuard {
+    vol_id: String,
+    start_lba: Lba,
+    stage: FlushFailStage,
+}
+
+impl FailpointGuard {
+    fn install(vol_id: &str, start_lba: Lba, stage: FlushFailStage, remaining_hits: Option<u32>) -> Self {
+        install_test_failpoint(vol_id, start_lba, stage, remaining_hits);
+        Self {
+            vol_id: vol_id.to_string(),
+            start_lba,
+            stage,
+        }
+    }
+
+    fn clear(&self) {
+        clear_test_failpoint(&self.vol_id, self.start_lba, self.stage);
+    }
+}
+
+impl Drop for FailpointGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 /// Flusher moves buffered entries to LV3 and updates metadata.
 #[test]
 fn flusher_flushes_entries_to_lv3() {
     let (pool, meta, allocator, io_engine) = setup_flush_env();
 
     let data = vec![0xAB; 4096];
-    pool.append("test-vol", Lba(0), &data).unwrap();
-    pool.append("test-vol", Lba(1), &data).unwrap();
+    pool.append("test-vol", Lba(0), 1, &data).unwrap();
+    pool.append("test-vol", Lba(1), 1, &data).unwrap();
 
     let mut flusher = start_flusher(&pool, &meta, &allocator, &io_engine);
     assert!(wait_flushed(&pool, 5000), "flush timeout");
@@ -104,14 +167,14 @@ fn flusher_handles_overwrite() {
     let (pool, meta, allocator, io_engine) = setup_flush_env();
     let initial_free = allocator.free_block_count();
 
-    pool.append("test-vol", Lba(5), &[0x11; 4096]).unwrap();
+    pool.append("test-vol", Lba(5), 1, &[0x11; 4096]).unwrap();
 
     let mut flusher = start_flusher(&pool, &meta, &allocator, &io_engine);
     assert!(wait_flushed(&pool, 5000));
     flusher.stop();
 
     // Overwrite
-    pool.append("test-vol", Lba(5), &[0x22; 4096]).unwrap();
+    pool.append("test-vol", Lba(5), 1, &[0x22; 4096]).unwrap();
 
     let mut flusher = start_flusher(&pool, &meta, &allocator, &io_engine);
     assert!(wait_flushed(&pool, 5000));
@@ -126,8 +189,8 @@ fn flusher_handles_overwrite() {
 fn flusher_coalesces_overwrites_before_flush() {
     let (pool, meta, allocator, io_engine) = setup_flush_env();
 
-    pool.append("test-vol", Lba(7), &[0x11; 4096]).unwrap();
-    pool.append("test-vol", Lba(7), &[0x22; 4096]).unwrap();
+    pool.append("test-vol", Lba(7), 1, &[0x11; 4096]).unwrap();
+    pool.append("test-vol", Lba(7), 1, &[0x22; 4096]).unwrap();
 
     let mut flusher = start_flusher(&pool, &meta, &allocator, &io_engine);
     assert!(wait_flushed(&pool, 5000), "flush timeout");
@@ -153,8 +216,8 @@ fn flusher_reclaims_full_extent_for_multi_block_units() {
 
     let first0 = (0..4096).map(|i| (i % 251) as u8).collect::<Vec<_>>();
     let first1 = (0..4096).map(|i| ((i * 7) % 251) as u8).collect::<Vec<_>>();
-    pool.append("test-vol", Lba(20), &first0).unwrap();
-    pool.append("test-vol", Lba(21), &first1).unwrap();
+    pool.append("test-vol", Lba(20), 1, &first0).unwrap();
+    pool.append("test-vol", Lba(21), 1, &first1).unwrap();
 
     let mut flusher = BufferFlusher::start(
         pool.clone(),
@@ -169,8 +232,8 @@ fn flusher_reclaims_full_extent_for_multi_block_units() {
 
     assert_eq!(allocator.free_block_count(), initial_free - 2);
 
-    pool.append("test-vol", Lba(20), &[0xAA; 4096]).unwrap();
-    pool.append("test-vol", Lba(21), &[0xBB; 4096]).unwrap();
+    pool.append("test-vol", Lba(20), 1, &[0xAA; 4096]).unwrap();
+    pool.append("test-vol", Lba(21), 1, &[0xBB; 4096]).unwrap();
 
     let mut flusher = BufferFlusher::start(
         pool.clone(),
@@ -208,4 +271,81 @@ fn flusher_drop_calls_stop() {
         thread::sleep(Duration::from_millis(50));
     }
     // Drop should not panic
+}
+
+#[test]
+fn flusher_retries_after_injected_lv3_write_failure() {
+    let (pool, meta, allocator, io_engine) = setup_flush_env();
+    let initial_free = allocator.free_block_count();
+    let vol_id = next_test_volume("fail-lv3");
+    let lba = Lba(40);
+    let _guard = FailpointGuard::install(&vol_id, lba, FlushFailStage::BeforeIoWrite, None);
+
+    pool.append(&vol_id, lba, 1, &[0xAB; 4096]).unwrap();
+
+    let mut flusher = start_flusher_with_compression(
+        &pool,
+        &meta,
+        &allocator,
+        &io_engine,
+        CompressionAlgo::None,
+    );
+
+    assert!(
+        wait_until(1000, || {
+            pool.pending_count() == 1
+                && meta.get_mapping(&VolumeId(vol_id.clone()), lba).unwrap().is_none()
+                && allocator.free_block_count() == initial_free
+        }),
+        "entry should remain pending and allocator must not leak while LV3 writes keep failing"
+    );
+
+    clear_test_failpoint(&vol_id, lba, FlushFailStage::BeforeIoWrite);
+
+    assert!(wait_flushed(&pool, 5000), "flush retry timeout after LV3 failure");
+    flusher.stop();
+
+    let mapping = meta.get_mapping(&VolumeId(vol_id.clone()), lba).unwrap();
+    assert!(mapping.is_some(), "mapping should appear after retry succeeds");
+    assert_eq!(allocator.free_block_count(), initial_free - 1);
+}
+
+#[test]
+fn flusher_retries_after_injected_metadata_failure() {
+    let (pool, meta, allocator, io_engine) = setup_flush_env();
+    let initial_free = allocator.free_block_count();
+    let vol_id = next_test_volume("fail-meta");
+    let lba = Lba(50);
+    let _guard = FailpointGuard::install(&vol_id, lba, FlushFailStage::BeforeMetaWrite, None);
+
+    pool.append(&vol_id, lba, 1, &[0xCD; 4096]).unwrap();
+
+    let mut flusher = start_flusher_with_compression(
+        &pool,
+        &meta,
+        &allocator,
+        &io_engine,
+        CompressionAlgo::None,
+    );
+
+    assert!(
+        wait_until(1000, || {
+            pool.pending_count() == 1
+                && meta.get_mapping(&VolumeId(vol_id.clone()), lba).unwrap().is_none()
+                && allocator.free_block_count() == initial_free
+        }),
+        "entry should remain pending and allocator must not leak while metadata writes keep failing"
+    );
+
+    clear_test_failpoint(&vol_id, lba, FlushFailStage::BeforeMetaWrite);
+
+    assert!(
+        wait_flushed(&pool, 5000),
+        "flush retry timeout after metadata failure"
+    );
+    flusher.stop();
+
+    let mapping = meta.get_mapping(&VolumeId(vol_id.clone()), lba).unwrap();
+    assert!(mapping.is_some(), "mapping should appear after retry succeeds");
+    assert_eq!(allocator.free_block_count(), initial_free - 1);
 }

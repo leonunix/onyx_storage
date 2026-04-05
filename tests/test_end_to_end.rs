@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use onyx_storage::buffer::entry::*;
 use onyx_storage::buffer::flush::BufferFlusher;
 use onyx_storage::buffer::pool::WriteBufferPool;
 use onyx_storage::config::MetaConfig;
@@ -31,7 +30,7 @@ fn setup_e2e() -> (
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
     let buf_tmp = NamedTempFile::new().unwrap();
-    let buf_size = BUFFER_SUPERBLOCK_SIZE + 100 * BUFFER_ENTRY_SIZE;
+    let buf_size = 4096 + 100 * 8192;
     buf_tmp.as_file().set_len(buf_size).unwrap();
     let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
     let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
@@ -76,7 +75,7 @@ fn write_flush_read_from_lv3_lz4() {
     let (worker, meta, allocator, pool, io_engine) = setup_e2e();
 
     let data = vec![0x55; 4096];
-    worker.handle_write("test-vol", Lba(0), &data).unwrap();
+    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
 
     // Start flusher and wait
     let mut flusher = BufferFlusher::start(
@@ -105,7 +104,7 @@ fn overwrite_after_flush() {
 
     // First write
     let data1 = vec![0x11; 4096];
-    worker.handle_write("test-vol", Lba(5), &data1).unwrap();
+    worker.handle_write("test-vol", Lba(5), 1, &data1).unwrap();
 
     let mut flusher = BufferFlusher::start(
         pool.clone(),
@@ -122,7 +121,7 @@ fn overwrite_after_flush() {
 
     // Overwrite
     let data2 = vec![0x22; 4096];
-    worker.handle_write("test-vol", Lba(5), &data2).unwrap();
+    worker.handle_write("test-vol", Lba(5), 1, &data2).unwrap();
 
     let mut flusher = BufferFlusher::start(
         pool.clone(),
@@ -150,7 +149,7 @@ fn bulk_write_flush_read() {
 
     for i in 0..20u64 {
         let data = vec![i as u8; 4096];
-        worker.handle_write("test-vol", Lba(i), &data).unwrap();
+        worker.handle_write("test-vol", Lba(i), 1, &data).unwrap();
     }
 
     let mut flusher = BufferFlusher::start(
@@ -182,7 +181,7 @@ fn write_flush_read_zstd() {
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
     let buf_tmp = NamedTempFile::new().unwrap();
-    let buf_size = BUFFER_SUPERBLOCK_SIZE + 100 * BUFFER_ENTRY_SIZE;
+    let buf_size = 4096 + 100 * 8192;
     buf_tmp.as_file().set_len(buf_size).unwrap();
     let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
     let pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
@@ -207,7 +206,7 @@ fn write_flush_read_zstd() {
     );
 
     let data = vec![0x77; 4096]; // compressible
-    worker.handle_write("test-vol", Lba(0), &data).unwrap();
+    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
 
     let mut flusher = BufferFlusher::start(
         pool.clone(),
@@ -237,7 +236,7 @@ fn write_flush_read_no_compression() {
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
     let buf_tmp = NamedTempFile::new().unwrap();
-    let buf_size = BUFFER_SUPERBLOCK_SIZE + 100 * BUFFER_ENTRY_SIZE;
+    let buf_size = 4096 + 100 * 8192;
     buf_tmp.as_file().set_len(buf_size).unwrap();
     let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
     let pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
@@ -263,7 +262,7 @@ fn write_flush_read_no_compression() {
 
     // Data small enough to fit in a block (no header overhead now, full 4096 available).
     let data = vec![0x42; 4096];
-    worker.handle_write("test-vol", Lba(0), &data).unwrap();
+    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
 
     // Read from buffer (before flush) works fine
     let read_data = worker.handle_read("test-vol", Lba(0)).unwrap().unwrap();

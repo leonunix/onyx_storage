@@ -14,7 +14,8 @@ use crate::zone::worker::ZoneWorker;
 pub enum ZoneIoRequest {
     Write {
         vol_id: String,
-        lba: Lba,
+        start_lba: Lba,
+        lba_count: u32,
         data: Vec<u8>,
         reply: crossbeam_channel::Sender<OnyxResult<()>>,
     },
@@ -87,11 +88,12 @@ impl ZoneManager {
             match request {
                 ZoneIoRequest::Write {
                     vol_id,
-                    lba,
+                    start_lba,
+                    lba_count,
                     data,
                     reply,
                 } => {
-                    let result = worker.handle_write(&vol_id, lba, &data);
+                    let result = worker.handle_write(&vol_id, start_lba, lba_count, &data);
                     let _ = reply.send(result);
                 }
                 ZoneIoRequest::Read { vol_id, lba, reply } => {
@@ -112,24 +114,51 @@ impl ZoneManager {
         ZoneId(zone_idx as u32)
     }
 
-    /// Submit a write IO. Blocks until the zone worker processes it.
-    pub fn submit_write(&self, vol_id: &str, lba: Lba, data: Vec<u8>) -> OnyxResult<()> {
-        let zone = self.zone_for_lba(lba);
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    /// Submit a write IO covering one or more contiguous LBAs.
+    /// Automatically splits at zone boundaries to preserve the "same zone = serial" invariant.
+    pub fn submit_write(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        data: Vec<u8>,
+    ) -> OnyxResult<()> {
+        let bs = crate::types::BLOCK_SIZE as usize;
+        let mut offset = 0u32;
 
-        self.handles[zone.0 as usize]
-            .sender
-            .send(ZoneIoRequest::Write {
-                vol_id: vol_id.to_string(),
-                lba,
-                data,
-                reply: reply_tx,
-            })
-            .map_err(|_| OnyxError::Ublk("zone worker channel closed".into()))?;
+        while offset < lba_count {
+            let cur_lba = Lba(start_lba.0 + offset as u64);
+            let cur_zone = self.zone_for_lba(cur_lba);
 
-        reply_rx
-            .recv()
-            .map_err(|_| OnyxError::Ublk("zone worker reply channel closed".into()))?
+            // How many LBAs until the next zone boundary?
+            let zone_start_lba = (cur_lba.0 / self.zone_size_blocks) * self.zone_size_blocks;
+            let zone_end_lba = zone_start_lba + self.zone_size_blocks;
+            let lbas_in_zone = (zone_end_lba - cur_lba.0).min((lba_count - offset) as u64) as u32;
+
+            let data_start = offset as usize * bs;
+            let data_end = (offset + lbas_in_zone) as usize * bs;
+            let chunk = data[data_start..data_end].to_vec();
+
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            self.handles[cur_zone.0 as usize]
+                .sender
+                .send(ZoneIoRequest::Write {
+                    vol_id: vol_id.to_string(),
+                    start_lba: cur_lba,
+                    lba_count: lbas_in_zone,
+                    data: chunk,
+                    reply: reply_tx,
+                })
+                .map_err(|_| OnyxError::Ublk("zone worker channel closed".into()))?;
+
+            reply_rx
+                .recv()
+                .map_err(|_| OnyxError::Ublk("zone worker reply channel closed".into()))??;
+
+            offset += lbas_in_zone;
+        }
+
+        Ok(())
     }
 
     /// Submit a read IO. Blocks until the zone worker processes it.
