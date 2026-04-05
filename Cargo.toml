@@ -3,6 +3,9 @@ name = "onyx-storage"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 # metadata
 rocksdb = { version = "0.24", features = ["lz4", "zstd"] }
@@ -40,6 +43,10 @@ crc32fast = "1"
 
 # concurrency
 crossbeam-channel = "0.5"
+
+# FFI
+libc = "0.2"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

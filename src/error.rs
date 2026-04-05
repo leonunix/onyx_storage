@@ -38,6 +38,9 @@ pub enum OnyxError {
 
     #[error("Ublk error: {0}")]
     Ublk(String),
+
+    #[error("IO out of bounds: offset={offset} + len={len} exceeds volume size {size}")]
+    OutOfBounds { offset: u64, len: u64, size: u64 },
 }
 
 pub type OnyxResult<T> = Result<T, OnyxError>;

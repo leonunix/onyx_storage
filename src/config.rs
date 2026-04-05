@@ -10,9 +10,12 @@ pub struct OnyxConfig {
     pub meta: MetaConfig,
     pub storage: StorageConfig,
     pub buffer: BufferConfig,
+    #[serde(default)]
     pub ublk: UblkConfig,
     #[serde(default)]
     pub flush: FlushConfig,
+    #[serde(default)]
+    pub engine: EngineConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +69,16 @@ pub struct UblkConfig {
     pub io_buf_bytes: u32,
 }
 
+impl Default for UblkConfig {
+    fn default() -> Self {
+        Self {
+            nr_queues: default_nr_queues(),
+            queue_depth: default_queue_depth(),
+            io_buf_bytes: default_io_buf_bytes(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FlushConfig {
     /// Number of parallel compression worker threads (default 2)
@@ -77,6 +90,25 @@ pub struct FlushConfig {
     /// Max number of LBAs to coalesce into one compression unit (default 32)
     #[serde(default = "default_coalesce_max_lbas")]
     pub coalesce_max_lbas: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngineConfig {
+    /// Number of zones (default 4)
+    #[serde(default = "default_zone_count")]
+    pub zone_count: u32,
+    /// Blocks per zone (default 256)
+    #[serde(default = "default_zone_size_blocks")]
+    pub zone_size_blocks: u64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            zone_count: default_zone_count(),
+            zone_size_blocks: default_zone_size_blocks(),
+        }
+    }
 }
 
 impl Default for FlushConfig {
@@ -97,6 +129,12 @@ fn default_coalesce_max_raw_bytes() -> usize {
 }
 fn default_coalesce_max_lbas() -> u32 {
     32
+}
+fn default_zone_count() -> u32 {
+    4
+}
+fn default_zone_size_blocks() -> u64 {
+    256
 }
 fn default_block_cache_mb() -> usize {
     256
