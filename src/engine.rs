@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
 use crate::config::OnyxConfig;
+use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::runner::GcRunner;
 use crate::io::device::RawDevice;
@@ -35,6 +36,7 @@ pub struct OnyxEngine {
     buffer_pool: Option<Arc<WriteBufferPool>>,
     flusher: Mutex<Option<BufferFlusher>>,
     gc_runner: Mutex<Option<GcRunner>>,
+    dedup_scanner: Mutex<Option<DedupScanner>>,
     zone_manager: Option<Arc<ZoneManager>>,
     /// Live volume handles: (vol_name, alive_flag).
     /// delete_volume sets all matching flags to false.
@@ -144,6 +146,7 @@ impl OnyxEngine {
             io_engine.clone(),
             &config.flush,
             hole_map.clone(),
+            &config.dedup,
         );
 
         // 8. Zone manager
@@ -155,7 +158,21 @@ impl OnyxEngine {
             io_engine.clone(),
         )?);
 
-        // 9. GC runner (after flusher; rewrites dead blocks back to buffer)
+        // 9. Dedup scanner (after flusher; re-processes skipped blocks)
+        let dedup_scanner = if config.dedup.enabled {
+            Some(DedupScanner::start(
+                meta.clone(),
+                io_engine.clone(),
+                allocator.clone(),
+                lifecycle.clone(),
+                buffer_pool.clone(),
+                config.dedup.clone(),
+            ))
+        } else {
+            None
+        };
+
+        // 10. GC runner (after flusher; rewrites dead blocks back to buffer)
         let gc_runner = if config.gc.enabled {
             Some(GcRunner::start(
                 meta.clone(),
@@ -177,6 +194,7 @@ impl OnyxEngine {
             buffer_pool: Some(buffer_pool),
             flusher: Mutex::new(Some(flusher)),
             gc_runner: Mutex::new(gc_runner),
+            dedup_scanner: Mutex::new(dedup_scanner),
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -204,6 +222,7 @@ impl OnyxEngine {
             buffer_pool: None,
             flusher: Mutex::new(None),
             gc_runner: Mutex::new(None),
+            dedup_scanner: Mutex::new(None),
             zone_manager: None,
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -335,7 +354,12 @@ impl OnyxEngine {
         }
         *done = true;
 
-        // Stop GC first (it injects into buffer pool)
+        // Stop dedup scanner first
+        if let Some(mut scanner) = self.dedup_scanner.lock().unwrap().take() {
+            scanner.stop();
+        }
+
+        // Stop GC (it injects into buffer pool)
         if let Some(mut gc) = self.gc_runner.lock().unwrap().take() {
             gc.stop();
         }

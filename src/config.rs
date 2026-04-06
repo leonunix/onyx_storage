@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::dedup::config::DedupConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::config::GcConfig;
 use crate::types::CompressionAlgo;
@@ -19,6 +20,8 @@ pub struct OnyxConfig {
     pub engine: EngineConfig,
     #[serde(default)]
     pub gc: GcConfig,
+    #[serde(default)]
+    pub dedup: DedupConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -66,6 +66,16 @@ fn setup_with_options(
     flush: FlushConfig,
     gc: GcConfig,
 ) -> TestEnv {
+    setup_with_all_options(data_bytes, buf_bytes, flush, gc, onyx_storage::dedup::config::DedupConfig::default())
+}
+
+fn setup_with_all_options(
+    data_bytes: u64,
+    buf_bytes: u64,
+    flush: FlushConfig,
+    gc: GcConfig,
+    dedup: onyx_storage::dedup::config::DedupConfig,
+) -> TestEnv {
     let meta_dir = tempdir().unwrap();
     let buf_file = NamedTempFile::new().unwrap();
     let data_file = NamedTempFile::new().unwrap();
@@ -97,6 +107,7 @@ fn setup_with_options(
             zone_size_blocks: 128,
         },
         gc,
+        dedup,
     };
 
     let engine = OnyxEngine::open(&config).unwrap();
@@ -1390,7 +1401,10 @@ fn prove_packed_metadata_failure_retries_without_leak() {
 // ===========================================================================
 #[test]
 fn prove_background_gc_runner_reclaims_old_units() {
-    let env = setup_with_options(
+    // Disable dedup for this test: GC rewrites live blocks back to buffer,
+    // and with dedup enabled the blocks map back to the same PBA (correct
+    // optimization but prevents the space reclamation this test checks).
+    let env = setup_with_all_options(
         4096 * 4096,
         4096 + 512 * 4096,
         FlushConfig {
@@ -1406,6 +1420,7 @@ fn prove_background_gc_runner_reclaims_old_units() {
             buffer_usage_resume_pct: 50,
             max_rewrite_per_cycle: 64,
         },
+        onyx_storage::dedup::config::DedupConfig { enabled: false, ..Default::default() },
     );
 
     let vol_size = 128 * 4096u64;

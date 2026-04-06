@@ -35,6 +35,38 @@ pub fn new_hole_map() -> HoleMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Insert a hole into the map and coalesce with adjacent entries at the same PBA.
+/// This is the only correct way to add holes — ensures the map stays merged.
+pub fn insert_hole_coalesced(map: &HoleMap, pba: Pba, offset: u16, size: u16) {
+    let mut holes = map.lock().unwrap();
+
+    let mut new_offset = offset;
+    let mut new_size = size;
+
+    // Try to merge with the hole immediately before: (pba, prev_offset) where prev_offset + prev_size == new_offset
+    // We need to scan for it since we don't have a reverse index.
+    let before_key = holes.iter().find_map(|(k, &s)| {
+        if k.pba == pba && k.offset + s == new_offset {
+            Some(*k)
+        } else {
+            None
+        }
+    });
+    if let Some(bk) = before_key {
+        let bs = holes.remove(&bk).unwrap();
+        new_offset = bk.offset;
+        new_size += bs;
+    }
+
+    // Try to merge with the hole immediately after: (pba, new_offset + new_size)
+    let after_key = HoleKey { pba, offset: new_offset + new_size };
+    if let Some(as_) = holes.remove(&after_key) {
+        new_size += as_;
+    }
+
+    holes.insert(HoleKey { pba, offset: new_offset }, new_size);
+}
+
 /// Describes filling a hole in an existing packed slot (read-modify-write).
 pub struct HoleFill {
     pub pba: Pba,
@@ -168,6 +200,7 @@ impl Packer {
         if holes.is_empty() {
             return None;
         }
+
         let mut best_key = None;
         let mut best_waste = u16::MAX;
         for (key, &size) in holes.iter() {

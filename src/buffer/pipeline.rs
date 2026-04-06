@@ -1,5 +1,44 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use crate::buffer::entry::BufferEntry;
+use crate::meta::schema::{BlockmapValue, ContentHash};
 use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
+
+/// Tracks completion of sub-units produced by dedup splitting.
+///
+/// When dedup splits a coalesced unit into N miss sub-units, it creates a
+/// DedupCompletion with `remaining = N` and the original unit's full seqs.
+/// Each sub-unit carries an `Arc<DedupCompletion>`. When the writer finishes
+/// a sub-unit, it calls `decrement()`. The last one to reach 0 gets back
+/// the seqs to send via done_tx.
+#[derive(Debug)]
+pub struct DedupCompletion {
+    remaining: AtomicU32,
+    /// All seqs from the original coalesced unit (for done_tx).
+    seqs: Vec<u64>,
+}
+
+impl DedupCompletion {
+    pub fn new(count: u32, seqs: Vec<u64>) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: AtomicU32::new(count),
+            seqs,
+        })
+    }
+
+    /// Decrement the counter. If this was the last sub-unit (counter reaches 0),
+    /// returns the seqs that should be sent to done_tx.
+    pub fn decrement(&self) -> Option<Vec<u64>> {
+        let prev = self.remaining.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            // We were the last one
+            Some(self.seqs.clone())
+        } else {
+            None
+        }
+    }
+}
 
 /// A group of contiguous LBAs from the same volume, merged from buffer entries.
 /// Ready to be compressed as a single unit.
@@ -17,6 +56,28 @@ pub struct CoalesceUnit {
     /// LBAs from each original entry are in this unit. Needed for idempotent
     /// partial mark_flushed when a multi-LBA entry is split across units.
     pub seq_lba_ranges: Vec<(u64, Lba, u32)>,
+    /// True if dedup was skipped under backpressure (buffer > threshold).
+    pub dedup_skipped: bool,
+    /// SHA-256 hashes per 4KB block, populated by dedup stage for miss blocks.
+    /// None if dedup not yet run or skipped.
+    pub block_hashes: Option<Vec<ContentHash>>,
+    /// When set, this sub-unit is part of a dedup split. The writer calls
+    /// `decrement()` on completion; the last sub-unit to finish triggers done_tx
+    /// with the original unit's full seqs. When None, the writer sends done_tx
+    /// directly using this unit's own seq_lba_ranges (normal non-dedup path).
+    pub dedup_completion: Option<Arc<DedupCompletion>>,
+}
+
+/// A dedup hit: this 4KB block matches an existing entry in the dedup index.
+/// Sent from dedup workers to the writer thread for metadata-only update.
+#[derive(Debug, Clone)]
+pub struct DedupHit {
+    pub vol_id: String,
+    pub lba: Lba,
+    pub content_hash: ContentHash,
+    pub existing_value: BlockmapValue,
+    pub vol_created_at: u64,
+    pub seq_lba_ranges: Vec<(u64, Lba, u32)>,
 }
 
 /// A compressed coalesce unit, ready to be written to LV3.
@@ -32,6 +93,13 @@ pub struct CompressedUnit {
     /// Volume generation epoch from the buffer entries.
     pub vol_created_at: u64,
     pub seq_lba_ranges: Vec<(u64, Lba, u32)>,
+    /// SHA-256 hashes per 4KB block (one per LBA), populated by dedup stage.
+    /// None if dedup was skipped under backpressure.
+    pub block_hashes: Option<Vec<ContentHash>>,
+    /// True if dedup was skipped under backpressure.
+    pub dedup_skipped: bool,
+    /// See CoalesceUnit::dedup_completion.
+    pub dedup_completion: Option<Arc<DedupCompletion>>,
 }
 
 /// A single-LBA slice extracted from a (possibly multi-LBA) buffer entry.
@@ -166,6 +234,9 @@ pub fn coalesce(
                 compression: vol_compression(ds.latest.vol_id),
                 vol_created_at: ds.latest.vol_created_at,
                 seq_lba_ranges,
+                dedup_skipped: false,
+                block_hashes: None,
+                dedup_completion: None,
             });
         }
     }

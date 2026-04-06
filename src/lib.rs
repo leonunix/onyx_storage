@@ -4,6 +4,7 @@ pub mod types;
 
 pub mod buffer;
 pub mod compress;
+pub mod dedup;
 pub mod frontend;
 pub mod gc;
 pub mod io;

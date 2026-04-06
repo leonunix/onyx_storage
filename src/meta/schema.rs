@@ -5,6 +5,11 @@ use crate::types::{Lba, Pba, VolumeId};
 pub const CF_VOLUMES: &str = "volumes";
 pub const CF_BLOCKMAP: &str = "blockmap";
 pub const CF_REFCOUNT: &str = "refcount";
+pub const CF_DEDUP_INDEX: &str = "dedup_index";
+pub const CF_DEDUP_REVERSE: &str = "dedup_reverse";
+
+/// BlockmapValue flags
+pub const FLAG_DEDUP_SKIPPED: u8 = 0x01;
 
 /// Maximum volume ID length in bytes. Enforced at volume creation time.
 /// The length byte in blockmap keys is u8, so the hard ceiling is 255.
@@ -27,6 +32,8 @@ pub struct BlockmapValue {
     /// Byte offset of this fragment within a shared 4KB physical slot (packer).
     /// 0 = fragment starts at beginning of slot (no packing, or first fragment).
     pub slot_offset: u16,
+    /// Flags: bit 0 = DEDUP_SKIPPED (block bypassed dedup under pressure).
+    pub flags: u8,
 }
 
 // --- Blockmap key: volume_id (length-prefixed) + lba ---
@@ -84,11 +91,11 @@ fn validate_vol_id_len(len: usize) -> Result<(), OnyxError> {
     }
 }
 
-/// Encode blockmap value (27 bytes):
+/// Encode blockmap value (28 bytes):
 /// pba(8B) + compression(1B) + unit_compressed_size(4B) + unit_original_size(4B)
-/// + unit_lba_count(2B) + offset_in_unit(2B) + crc32(4B) + slot_offset(2B)
-pub fn encode_blockmap_value(v: &BlockmapValue) -> [u8; 27] {
-    let mut val = [0u8; 27];
+/// + unit_lba_count(2B) + offset_in_unit(2B) + crc32(4B) + slot_offset(2B) + flags(1B)
+pub fn encode_blockmap_value(v: &BlockmapValue) -> [u8; 28] {
+    let mut val = [0u8; 28];
     val[0..8].copy_from_slice(&v.pba.0.to_be_bytes());
     val[8] = v.compression;
     val[9..13].copy_from_slice(&v.unit_compressed_size.to_be_bytes());
@@ -97,14 +104,29 @@ pub fn encode_blockmap_value(v: &BlockmapValue) -> [u8; 27] {
     val[19..21].copy_from_slice(&v.offset_in_unit.to_be_bytes());
     val[21..25].copy_from_slice(&v.crc32.to_be_bytes());
     val[25..27].copy_from_slice(&v.slot_offset.to_be_bytes());
+    val[27] = v.flags;
     val
 }
 
 /// Decode blockmap value. Supports:
-/// - 27-byte format (with slot_offset for packer)
-/// - 25-byte format (compression units, slot_offset=0)
-/// - 17-byte legacy format (single-LBA, migrated to unit_lba_count=1, slot_offset=0)
+/// - 28-byte format (with flags for dedup)
+/// - 27-byte format (with slot_offset for packer, flags=0)
+/// - 25-byte format (compression units, slot_offset=0, flags=0)
+/// - 17-byte legacy format (single-LBA, migrated to unit_lba_count=1, slot_offset=0, flags=0)
 pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
+    if val.len() == 28 {
+        return Some(BlockmapValue {
+            pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
+            compression: val[8],
+            unit_compressed_size: u32::from_be_bytes(val[9..13].try_into().unwrap()),
+            unit_original_size: u32::from_be_bytes(val[13..17].try_into().unwrap()),
+            unit_lba_count: u16::from_be_bytes(val[17..19].try_into().unwrap()),
+            offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
+            crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
+            slot_offset: u16::from_be_bytes(val[25..27].try_into().unwrap()),
+            flags: val[27],
+        });
+    }
     if val.len() == 27 {
         return Some(BlockmapValue {
             pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
@@ -115,6 +137,7 @@ pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
             offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
             crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
             slot_offset: u16::from_be_bytes(val[25..27].try_into().unwrap()),
+            flags: 0,
         });
     }
     if val.len() == 25 {
@@ -127,6 +150,7 @@ pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
             offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
             crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
             slot_offset: 0,
+            flags: 0,
         });
     }
     // Legacy 17-byte format: single-LBA block
@@ -142,9 +166,96 @@ pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
             offset_in_unit: 0,
             crc32: u32::from_be_bytes(val[13..17].try_into().unwrap()),
             slot_offset: 0,
+            flags: 0,
         });
     }
     None
+}
+
+/// Content hash type for dedup (SHA-256, 32 bytes)
+pub type ContentHash = [u8; 32];
+
+/// Dedup index value: physical location info for a deduplicated block.
+/// Stored in CF_DEDUP_INDEX with key = ContentHash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupEntry {
+    pub pba: Pba,
+    pub slot_offset: u16,
+    pub compression: u8,
+    pub unit_compressed_size: u32,
+    pub unit_original_size: u32,
+    pub unit_lba_count: u16,
+    pub offset_in_unit: u16,
+    pub crc32: u32,
+}
+
+impl DedupEntry {
+    /// Convert to a BlockmapValue (flags=0).
+    pub fn to_blockmap_value(&self) -> BlockmapValue {
+        BlockmapValue {
+            pba: self.pba,
+            compression: self.compression,
+            unit_compressed_size: self.unit_compressed_size,
+            unit_original_size: self.unit_original_size,
+            unit_lba_count: self.unit_lba_count,
+            offset_in_unit: self.offset_in_unit,
+            crc32: self.crc32,
+            slot_offset: self.slot_offset,
+            flags: 0,
+        }
+    }
+}
+
+/// Encode dedup index value (27 bytes):
+/// pba(8B) + slot_offset(2B) + compression(1B) + unit_compressed_size(4B)
+/// + unit_original_size(4B) + unit_lba_count(2B) + offset_in_unit(2B) + crc32(4B)
+pub fn encode_dedup_entry(e: &DedupEntry) -> [u8; 27] {
+    let mut val = [0u8; 27];
+    val[0..8].copy_from_slice(&e.pba.0.to_be_bytes());
+    val[8..10].copy_from_slice(&e.slot_offset.to_be_bytes());
+    val[10] = e.compression;
+    val[11..15].copy_from_slice(&e.unit_compressed_size.to_be_bytes());
+    val[15..19].copy_from_slice(&e.unit_original_size.to_be_bytes());
+    val[19..21].copy_from_slice(&e.unit_lba_count.to_be_bytes());
+    val[21..23].copy_from_slice(&e.offset_in_unit.to_be_bytes());
+    val[23..27].copy_from_slice(&e.crc32.to_be_bytes());
+    val
+}
+
+/// Decode dedup index value (27 bytes)
+pub fn decode_dedup_entry(val: &[u8]) -> Option<DedupEntry> {
+    if val.len() != 27 {
+        return None;
+    }
+    Some(DedupEntry {
+        pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
+        slot_offset: u16::from_be_bytes(val[8..10].try_into().unwrap()),
+        compression: val[10],
+        unit_compressed_size: u32::from_be_bytes(val[11..15].try_into().unwrap()),
+        unit_original_size: u32::from_be_bytes(val[15..19].try_into().unwrap()),
+        unit_lba_count: u16::from_be_bytes(val[19..21].try_into().unwrap()),
+        offset_in_unit: u16::from_be_bytes(val[21..23].try_into().unwrap()),
+        crc32: u32::from_be_bytes(val[23..27].try_into().unwrap()),
+    })
+}
+
+/// Encode dedup reverse key: pba(8B) + content_hash(32B) = 40B
+pub fn encode_dedup_reverse_key(pba: Pba, hash: &ContentHash) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[0..8].copy_from_slice(&pba.0.to_be_bytes());
+    key[8..40].copy_from_slice(hash);
+    key
+}
+
+/// Decode dedup reverse key (40B) → (pba, hash)
+pub fn decode_dedup_reverse_key(key: &[u8]) -> Option<(Pba, ContentHash)> {
+    if key.len() != 40 {
+        return None;
+    }
+    let pba = Pba(u64::from_be_bytes(key[0..8].try_into().unwrap()));
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&key[8..40]);
+    Some((pba, hash))
 }
 
 /// Encode refcount key: pba (8B BE)

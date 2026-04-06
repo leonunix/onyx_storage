@@ -226,6 +226,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
         offset_in_unit: 0,
         crc32: 0x1234_5678,
         slot_offset: 0,
+    flags: 0,
     };
     let value1 = onyx_storage::meta::schema::BlockmapValue {
         offset_in_unit: 1,

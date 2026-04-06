@@ -81,6 +81,7 @@ fn start_flusher(
         io_engine.clone(),
         &FlushConfig::default(),
         onyx_storage::packer::packer::new_hole_map(),
+        &onyx_storage::dedup::config::DedupConfig::default(),
     )
 }
 

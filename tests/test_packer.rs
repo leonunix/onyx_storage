@@ -17,6 +17,9 @@ fn make_unit(vol_id: &str, start_lba: u64, lba_count: u32, data_size: usize) -> 
         crc32: crc32fast::hash(&vec![0xAB; data_size]),
         vol_created_at: 1000,
         seq_lba_ranges: vec![(1, Lba(start_lba), lba_count)],
+        block_hashes: None,
+        dedup_skipped: false,
+        dedup_completion: None,
     }
 }
 
@@ -387,4 +390,135 @@ fn hole_preferred_over_open_slot_when_doesnt_fit() {
     let sealed = packer.flush_open_slot();
     assert!(sealed.is_some());
     assert_eq!(sealed.unwrap().fragments.len(), 1); // only unit1
+}
+
+#[test]
+fn hole_map_coalesces_adjacent_holes() {
+    use onyx_storage::packer::packer::insert_hole_coalesced;
+
+    let alloc = make_allocator(100);
+    let hole_map = new_hole_map();
+
+    // Two adjacent holes: [100..300) and [300..500) at the same PBA
+    // Neither alone fits a 350-byte fragment, but merged they do.
+    // Use insert_hole_coalesced which merges at insertion time.
+    insert_hole_coalesced(&hole_map, Pba(10), 100, 200);
+    insert_hole_coalesced(&hole_map, Pba(10), 300, 200);
+
+    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
+
+    // 350-byte fragment — needs the merged 400-byte hole
+    let unit = make_unit("vol-a", 0, 1, 350);
+    match packer.pack_or_passthrough(unit).unwrap() {
+        PackResult::FillHole(fill) => {
+            assert_eq!(fill.pba, Pba(10));
+            assert_eq!(fill.slot_offset, 100); // merged hole starts at 100
+            assert_eq!(fill.hole_size, 400);   // 200 + 200 merged
+        }
+        _ => panic!("expected FillHole after adjacent holes are coalesced"),
+    }
+
+    // Hole map should be empty (consumed; remainder injected by writer)
+    assert!(hole_map.lock().unwrap().is_empty());
+}
+
+#[test]
+fn hole_map_does_not_coalesce_non_adjacent() {
+    use onyx_storage::packer::packer::insert_hole_coalesced;
+
+    let alloc = make_allocator(100);
+    let hole_map = new_hole_map();
+
+    // Two non-adjacent holes: [100..200) and [300..400) — gap at [200..300)
+    insert_hole_coalesced(&hole_map, Pba(10), 100, 100);
+    insert_hole_coalesced(&hole_map, Pba(10), 300, 100);
+
+    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
+
+    // 150-byte fragment — neither hole (100 bytes each) fits
+    let unit = make_unit("vol-a", 0, 1, 150);
+    match packer.pack_or_passthrough(unit).unwrap() {
+        PackResult::Buffered => {} // Falls through to new slot
+        PackResult::FillHole(_) => panic!("should not fit in non-adjacent 100-byte holes"),
+        _ => {}
+    }
+
+    // Both holes should still be in the map
+    assert_eq!(hole_map.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn hole_map_coalesces_across_different_pbas_independently() {
+    use onyx_storage::packer::packer::{HoleKey, insert_hole_coalesced};
+
+    let alloc = make_allocator(100);
+    let hole_map = new_hole_map();
+
+    // Adjacent holes at PBA 10, and a separate hole at PBA 20
+    insert_hole_coalesced(&hole_map, Pba(10), 0, 100);
+    insert_hole_coalesced(&hole_map, Pba(10), 100, 100);
+    insert_hole_coalesced(&hole_map, Pba(20), 0, 50);
+
+    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
+
+    // 180-byte fragment — needs the merged 200-byte hole at PBA 10
+    let unit = make_unit("vol-a", 0, 1, 180);
+    match packer.pack_or_passthrough(unit).unwrap() {
+        PackResult::FillHole(fill) => {
+            assert_eq!(fill.pba, Pba(10));
+            assert_eq!(fill.hole_size, 200);
+        }
+        _ => panic!("expected FillHole from merged PBA 10 holes"),
+    }
+
+    // PBA 20's hole should still be there
+    let remaining = hole_map.lock().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining.contains_key(&HoleKey { pba: Pba(20), offset: 0 }));
+}
+
+#[test]
+fn hole_map_coalesces_three_segment_chain_when_bridge_inserted() {
+    use onyx_storage::packer::packer::{HoleKey, insert_hole_coalesced};
+
+    let alloc = make_allocator(100);
+    let hole_map = new_hole_map();
+
+    // Existing holes: [100..200) and [300..400), with a gap between them.
+    // Inserting the bridging hole [200..300) should merge all three into
+    // one contiguous hole [100..400).
+    insert_hole_coalesced(&hole_map, Pba(10), 100, 100);
+    insert_hole_coalesced(&hole_map, Pba(10), 300, 100);
+    insert_hole_coalesced(&hole_map, Pba(10), 200, 100);
+
+    {
+        let map = hole_map.lock().unwrap();
+        assert_eq!(map.len(), 1, "three chained holes should collapse into one");
+        assert_eq!(
+            map.get(&HoleKey {
+                pba: Pba(10),
+                offset: 100,
+            })
+            .copied(),
+            Some(300),
+            "merged chain should span [100..400)"
+        );
+    }
+
+    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
+
+    // A 250-byte fragment only fits if the three segments really merged.
+    let unit = make_unit("vol-a", 0, 1, 250);
+    match packer.pack_or_passthrough(unit).unwrap() {
+        PackResult::FillHole(fill) => {
+            assert_eq!(fill.pba, Pba(10));
+            assert_eq!(fill.slot_offset, 100);
+            assert_eq!(fill.hole_size, 300);
+        }
+        _ => panic!("expected FillHole from a three-segment merged chain"),
+    }
+
+    // The merged hole was consumed; any remainder is writer-owned and not
+    // reinserted here by the packer.
+    assert!(hole_map.lock().unwrap().is_empty());
 }

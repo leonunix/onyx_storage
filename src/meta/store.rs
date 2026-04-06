@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, Options, ReadOptions, WriteBatch, DB};
 
@@ -9,6 +10,12 @@ use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
 pub struct MetaStore {
     db: DB,
+    /// Mutex protecting ALL refcount read-modify-write operations.
+    /// Covers: atomic_dedup_hit(), atomic_batch_write(), atomic_batch_write_packed(),
+    /// atomic_remap(), delete_volume(). Without serialization, concurrent operations
+    /// on the same PBA's refcount lose updates (e.g., dedup hit +1 racing with
+    /// overwrite -1 on the same PBA).
+    refcount_lock: Mutex<()>,
 }
 
 impl MetaStore {
@@ -46,13 +53,30 @@ impl MetaStore {
         refcount_opts.set_block_based_table_factory(&refcount_block_opts);
         let cf_refcount = ColumnFamilyDescriptor::new(CF_REFCOUNT, refcount_opts);
 
+        // Dedup index CF: content_hash(32B) → DedupEntry(27B), high bloom FPR for mostly-miss workloads
+        let mut dedup_index_opts = Options::default();
+        let mut dedup_index_block_opts = BlockBasedOptions::default();
+        dedup_index_block_opts.set_bloom_filter(15.0, false);
+        dedup_index_opts.set_block_based_table_factory(&dedup_index_block_opts);
+        let cf_dedup_index = ColumnFamilyDescriptor::new(CF_DEDUP_INDEX, dedup_index_opts);
+
+        // Dedup reverse CF: pba(8B)+hash(32B) → empty, for eager cleanup on PBA free
+        let mut dedup_reverse_opts = Options::default();
+        let mut dedup_reverse_block_opts = BlockBasedOptions::default();
+        dedup_reverse_block_opts.set_bloom_filter(10.0, false);
+        dedup_reverse_opts.set_block_based_table_factory(&dedup_reverse_block_opts);
+        let cf_dedup_reverse = ColumnFamilyDescriptor::new(CF_DEDUP_REVERSE, dedup_reverse_opts);
+
         let db = DB::open_cf_descriptors(
             &db_opts,
             &config.rocksdb_path,
-            vec![cf_volumes, cf_blockmap, cf_refcount],
+            vec![cf_volumes, cf_blockmap, cf_refcount, cf_dedup_index, cf_dedup_reverse],
         )?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            refcount_lock: Mutex::new(()),
+        })
     }
 
     // --- Volume operations ---
@@ -99,6 +123,7 @@ impl MetaStore {
     /// is derived from `unit_compressed_size.div_ceil(BLOCK_SIZE)` so the
     /// caller can free the correct number of physical blocks.
     pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<(Pba, u32)>> {
+        let _guard = self.refcount_lock.lock().unwrap();
         let cf_volumes = self.db.cf_handle(CF_VOLUMES).unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
@@ -146,6 +171,8 @@ impl MetaStore {
             let rc_key = encode_refcount_key(*pba);
             if new_rc == 0 {
                 batch.delete_cf(&cf_refcount, &rc_key);
+                // Clean up dedup entries for freed PBA
+                self.cleanup_dedup_for_pba(*pba, &mut batch)?;
                 let block_count = pba_block_counts.get(pba).copied().unwrap_or(1);
                 freed_extents.push((*pba, block_count));
             } else {
@@ -296,6 +323,7 @@ impl MetaStore {
         lba: Lba,
         value: &BlockmapValue,
     ) -> OnyxResult<()> {
+        let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
@@ -319,6 +347,7 @@ impl MetaStore {
         old_pba: Option<Pba>,
         new_value: &BlockmapValue,
     ) -> OnyxResult<()> {
+        let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
@@ -359,6 +388,7 @@ impl MetaStore {
         new_refcount: u32,
         old_pba_decrements: &std::collections::HashMap<Pba, u32>,
     ) -> OnyxResult<()> {
+        let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
@@ -407,6 +437,7 @@ impl MetaStore {
         new_refcount: u32,
         old_pba_decrements: &std::collections::HashMap<Pba, u32>,
     ) -> OnyxResult<()> {
+        let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
@@ -527,6 +558,190 @@ impl MetaStore {
             }
         }
         Ok(results)
+    }
+
+    /// Atomically handle a dedup hit: write blockmap entry, increment existing PBA refcount,
+    /// and optionally decrement old PBA refcount.
+    ///
+    /// Protected by `refcount_lock` to serialize concurrent read-modify-write
+    /// on refcounts from multiple dedup workers / scanner.
+    pub fn atomic_dedup_hit(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        new_value: &BlockmapValue,
+        old_pba: Option<Pba>,
+    ) -> OnyxResult<()> {
+        let _guard = self.refcount_lock.lock().unwrap();
+
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        let mut batch = WriteBatch::default();
+
+        // Write blockmap entry
+        let bm_key = encode_blockmap_key(vol_id, lba)?;
+        let bm_val = encode_blockmap_value(new_value);
+        batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+
+        let same_pba = old_pba.map_or(false, |old| old == new_value.pba);
+
+        if !same_pba {
+            // Increment refcount for existing PBA (not set to 1!)
+            let current_rc = self.get_refcount(new_value.pba)?;
+            let new_rc = current_rc + 1;
+            let rc_key = encode_refcount_key(new_value.pba);
+            batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
+
+            // Decrement old PBA refcount
+            if let Some(old) = old_pba {
+                let old_count = self.get_refcount(old)?;
+                let old_new = old_count.saturating_sub(1);
+                let old_rc_key = encode_refcount_key(old);
+                if old_new == 0 {
+                    batch.delete_cf(&cf_refcount, &old_rc_key);
+                } else {
+                    batch.put_cf(&cf_refcount, &old_rc_key, &encode_refcount_value(old_new));
+                }
+            }
+        }
+        // If same PBA: blockmap is refreshed but refcount stays unchanged
+
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    // --- Dedup operations ---
+
+    /// Look up a content hash in the dedup index.
+    pub fn get_dedup_entry(&self, hash: &ContentHash) -> OnyxResult<Option<DedupEntry>> {
+        let cf = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();
+        match self.db.get_cf(&cf, hash)? {
+            Some(data) => Ok(decode_dedup_entry(&data)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert dedup index + reverse entries into an existing WriteBatch.
+    /// Called from the writer thread after a successful write to populate the dedup index.
+    pub fn put_dedup_entries_in_batch(
+        &self,
+        batch: &mut WriteBatch,
+        entries: &[(ContentHash, DedupEntry)],
+    ) {
+        let cf_index = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();
+        let cf_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
+        for (hash, entry) in entries {
+            let val = encode_dedup_entry(entry);
+            batch.put_cf(&cf_index, hash, &val);
+            let rev_key = encode_dedup_reverse_key(entry.pba, hash);
+            batch.put_cf(&cf_reverse, &rev_key, &[]);
+        }
+    }
+
+    /// Write dedup index + reverse entries atomically.
+    pub fn put_dedup_entries(&self, entries: &[(ContentHash, DedupEntry)]) -> OnyxResult<()> {
+        let mut batch = WriteBatch::default();
+        self.put_dedup_entries_in_batch(&mut batch, entries);
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Delete a single dedup index entry by hash (best-effort stale cleanup).
+    pub fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
+        let cf = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();
+        self.db.delete_cf(&cf, hash)?;
+        Ok(())
+    }
+
+    /// Clean up dedup index + reverse entries for a given PBA.
+    /// Called when refcount → 0 (PBA is freed).
+    /// Only deletes the forward index entry if it still points to this PBA —
+    /// the same hash may have been re-registered to a different PBA by a
+    /// concurrent write, and we must not delete that newer mapping.
+    /// Adds deletions to the provided WriteBatch for atomicity.
+    pub fn cleanup_dedup_for_pba(&self, pba: Pba, batch: &mut WriteBatch) -> OnyxResult<()> {
+        let cf_index = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();
+        let cf_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
+
+        // Prefix scan dedup_reverse for this PBA
+        let prefix = pba.0.to_be_bytes();
+        let mut iter = self.db.raw_iterator_cf(&cf_reverse);
+        iter.seek(&prefix);
+        while iter.valid() {
+            if let Some(key) = iter.key() {
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if let Some((_pba, hash)) = decode_dedup_reverse_key(key) {
+                    // Only delete forward index if it still points to THIS PBA.
+                    // A concurrent miss-write may have re-registered the same
+                    // hash → different PBA; deleting that would be wrong.
+                    if let Some(current_entry) = self.get_dedup_entry(&hash)? {
+                        if current_entry.pba == pba {
+                            batch.delete_cf(&cf_index, &hash);
+                        }
+                    }
+                    // Always delete the reverse entry for this PBA
+                    batch.delete_cf(&cf_reverse, key);
+                }
+            }
+            iter.next();
+        }
+        iter.status()?;
+        Ok(())
+    }
+
+    /// Standalone cleanup_dedup_for_pba that writes its own batch.
+    pub fn cleanup_dedup_for_pba_standalone(&self, pba: Pba) -> OnyxResult<()> {
+        let mut batch = WriteBatch::default();
+        self.cleanup_dedup_for_pba(pba, &mut batch)?;
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Scan blockmap for entries with DEDUP_SKIPPED flag set.
+    /// Returns (vol_id, lba, BlockmapValue) tuples, up to `limit`.
+    pub fn scan_dedup_skipped(&self, limit: usize) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let mut results = Vec::new();
+        let iter = self.db.iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                if bv.flags & FLAG_DEDUP_SKIPPED != 0 {
+                    if let Some((vol_id, lba)) = decode_blockmap_key(&key) {
+                        results.push((vol_id, lba, bv));
+                        if results.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Update a single blockmap entry's flags (e.g., clear DEDUP_SKIPPED).
+    pub fn update_blockmap_flags(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        new_flags: u8,
+    ) -> OnyxResult<()> {
+        let cf = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let key = encode_blockmap_key(vol_id, lba)?;
+        match self.db.get_cf(&cf, &key)? {
+            Some(data) => {
+                if let Some(mut bv) = decode_blockmap_value(&data) {
+                    bv.flags = new_flags;
+                    let val = encode_blockmap_value(&bv);
+                    self.db.put_cf(&cf, &key, &val)?;
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Iterate all allocated physical blocks. Compression units can span multiple
