@@ -132,7 +132,10 @@ impl OnyxEngine {
             );
         }
 
-        // 6. Background flusher
+        // 6. Shared hole map (GC → Packer)
+        let hole_map = crate::packer::packer::new_hole_map();
+
+        // 7. Background flusher (owns the Packer, which reads from hole_map)
         let flusher = BufferFlusher::start(
             buffer_pool.clone(),
             meta.clone(),
@@ -140,9 +143,10 @@ impl OnyxEngine {
             allocator.clone(),
             io_engine.clone(),
             &config.flush,
+            hole_map.clone(),
         );
 
-        // 7. Zone manager
+        // 8. Zone manager
         let zone_manager = Arc::new(ZoneManager::new(
             config.engine.zone_count,
             config.engine.zone_size_blocks,
@@ -151,7 +155,7 @@ impl OnyxEngine {
             io_engine.clone(),
         )?);
 
-        // 8. GC runner (after flusher, so flusher can drain GC-injected entries)
+        // 9. GC runner (after flusher; rewrites dead blocks back to buffer)
         let gc_runner = if config.gc.enabled {
             Some(GcRunner::start(
                 meta.clone(),

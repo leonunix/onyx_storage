@@ -90,7 +90,7 @@ impl GcRunner {
                 continue;
             }
 
-            // Scan for candidates
+            // Scan for GC rewrite candidates
             let candidates = match scan_gc_candidates(
                 meta,
                 config.dead_ratio_threshold,

@@ -436,6 +436,64 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Find all unique volume IDs that have blockmap entries pointing to a given PBA.
+    /// Used by write_hole_fill to acquire lifecycle locks on all volumes in a packed slot.
+    pub fn find_volume_ids_by_pba(&self, target_pba: Pba) -> OnyxResult<Vec<String>> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let mut vol_ids = std::collections::HashSet::new();
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                if bv.pba == target_pba {
+                    if let Some((vol_id_str, _)) = decode_blockmap_key(&key) {
+                        vol_ids.insert(vol_id_str);
+                    }
+                }
+            }
+        }
+        let mut result: Vec<String> = vol_ids.into_iter().collect();
+        result.sort();
+        Ok(result)
+    }
+
+    /// Check if any blockmap entry at `target_pba` has a fragment whose byte
+    /// range `[bv.slot_offset, bv.slot_offset + bv.unit_compressed_size)` overlaps
+    /// with `[fill_offset, fill_offset + fill_size)`.
+    ///
+    /// This prevents filling a hole that has been (partially) reclaimed by
+    /// another write or that overlaps with a live fragment starting at a
+    /// different offset.
+    pub fn has_overlap_at_pba(
+        &self,
+        target_pba: Pba,
+        fill_offset: u16,
+        fill_size: u16,
+    ) -> OnyxResult<bool> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let fill_start = fill_offset as u32;
+        let fill_end = fill_start + fill_size as u32;
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (_, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                if bv.pba == target_pba {
+                    let frag_start = bv.slot_offset as u32;
+                    let frag_end = frag_start + bv.unit_compressed_size;
+                    // Interval overlap: [a, b) ∩ [c, d) ≠ ∅  iff  a < d && c < b
+                    if fill_start < frag_end && frag_start < fill_end {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Scan all blockmap entries, calling the provided callback for each (key, value) pair.
     /// Used by GC scanner to identify compression units with dead blocks.
     pub fn scan_all_blockmap_entries(

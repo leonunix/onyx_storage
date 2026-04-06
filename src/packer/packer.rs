@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::buffer::pipeline::CompressedUnit;
 use crate::error::OnyxResult;
@@ -18,6 +19,30 @@ pub struct SealedSlot {
     pub fragments: Vec<SlotFragment>,
 }
 
+/// A hole in an existing packed slot, keyed by (pba, offset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HoleKey {
+    pub pba: Pba,
+    pub offset: u16,
+}
+
+/// Shared hole map between write path (producer) and Packer (consumer).
+/// Keyed by (pba, offset) → size. Dedup is automatic via HashMap.
+pub type HoleMap = Arc<Mutex<HashMap<HoleKey, u16>>>;
+
+/// Create a new empty shared hole map.
+pub fn new_hole_map() -> HoleMap {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Describes filling a hole in an existing packed slot (read-modify-write).
+pub struct HoleFill {
+    pub pba: Pba,
+    pub slot_offset: u16,
+    pub hole_size: u16,
+    pub unit: CompressedUnit,
+}
+
 /// Result of attempting to pack a compressed unit.
 pub enum PackResult {
     /// Unit is too large for packing (>= BLOCK_SIZE); write it directly.
@@ -31,6 +56,8 @@ pub enum PackResult {
     /// fragment failed. The sealed slot must still be written. The unit that
     /// could not be packed is returned for the caller to handle as Passthrough.
     SealedSlotAndPassthrough(SealedSlot, CompressedUnit),
+    /// Fill a hole in an existing packed slot (read-modify-write on LV3).
+    FillHole(HoleFill),
 }
 
 struct OpenSlot {
@@ -43,17 +70,26 @@ struct OpenSlot {
 /// Bin-packing of small compressed units into shared 4KB physical slots.
 ///
 /// Owned by the flusher writer thread (single-threaded, no synchronization needed).
+/// The hole_map is shared with the write path which pushes holes when fragments
+/// die; the packer drains fitting holes when packing new fragments.
 pub struct Packer {
     allocator: Arc<SpaceAllocator>,
     open_slot: Option<OpenSlot>,
+    hole_map: HoleMap,
 }
 
 impl Packer {
-    pub fn new(allocator: Arc<SpaceAllocator>) -> Self {
+    pub fn new(allocator: Arc<SpaceAllocator>, hole_map: HoleMap) -> Self {
         Self {
             allocator,
             open_slot: None,
+            hole_map,
         }
+    }
+
+    /// Access the shared hole map (for write path hole detection).
+    pub fn hole_map(&self) -> &HoleMap {
+        &self.hole_map
     }
 
     /// Try to pack a compressed unit into the current open slot.
@@ -67,10 +103,9 @@ impl Packer {
 
         let frag_size_u16 = frag_size as u16;
 
-        // Try to fit into open slot
+        // 1. Try to fit into open slot
         if let Some(ref slot) = self.open_slot {
             if slot.used + frag_size_u16 <= BLOCK_SIZE as u16 {
-                // Fits — append to open slot
                 let slot = self.open_slot.as_mut().unwrap();
                 let offset = slot.used;
                 slot.data[offset as usize..offset as usize + frag_size]
@@ -82,8 +117,23 @@ impl Packer {
                 });
                 return Ok(PackResult::Buffered);
             }
-            // Doesn't fit — seal current slot, try to open new one.
-            // Allocate FIRST before sealing, so we can recover if allocation fails.
+        }
+
+        // 2. Try hole map — find the smallest hole that fits (best-fit)
+        if let Some((key, hole_size)) = self.take_best_hole(frag_size_u16) {
+            // Don't inject remainder here — the writer will do it after
+            // confirming the fill succeeded. Otherwise a failed fill leaves
+            // a phantom sub-hole in the map.
+            return Ok(PackResult::FillHole(HoleFill {
+                pba: key.pba,
+                slot_offset: key.offset,
+                hole_size,
+                unit,
+            }));
+        }
+
+        // 3. Doesn't fit in open slot, no hole available — seal + allocate new
+        if self.open_slot.is_some() {
             match self.allocator.allocate_one() {
                 Ok(new_pba) => {
                     let sealed = self.seal_open_slot();
@@ -91,8 +141,6 @@ impl Packer {
                     Ok(PackResult::SealedSlot(sealed))
                 }
                 Err(_) => {
-                    // Allocation failed. Seal the old slot (must be written),
-                    // return the unit for the caller to handle as Passthrough.
                     let sealed = self.seal_open_slot();
                     Ok(PackResult::SealedSlotAndPassthrough(sealed, unit))
                 }
@@ -106,10 +154,34 @@ impl Packer {
     }
 
     /// Force-seal the open slot (e.g., on shutdown or flush).
-    /// Returns `None` if no open slot exists.
     pub fn flush_open_slot(&mut self) -> Option<SealedSlot> {
         if self.open_slot.is_some() {
             Some(self.seal_open_slot())
+        } else {
+            None
+        }
+    }
+
+    /// Find the smallest hole >= frag_size, remove it, return (key, full_hole_size).
+    fn take_best_hole(&self, frag_size: u16) -> Option<(HoleKey, u16)> {
+        let mut holes = self.hole_map.lock().unwrap();
+        if holes.is_empty() {
+            return None;
+        }
+        let mut best_key = None;
+        let mut best_waste = u16::MAX;
+        for (key, &size) in holes.iter() {
+            if size >= frag_size {
+                let waste = size - frag_size;
+                if waste < best_waste {
+                    best_waste = waste;
+                    best_key = Some(*key);
+                }
+            }
+        }
+        if let Some(key) = best_key {
+            let size = holes.remove(&key).unwrap();
+            Some((key, size))
         } else {
             None
         }

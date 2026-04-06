@@ -15,7 +15,7 @@ use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
-use crate::packer::packer::{PackResult, Packer, SealedSlot};
+use crate::packer::packer::{HoleFill, HoleMap, PackResult, Packer, SealedSlot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
@@ -230,6 +230,7 @@ impl BufferFlusher {
         allocator: Arc<SpaceAllocator>,
         io_engine: Arc<IoEngine>,
         config: &FlushConfig,
+        hole_map: HoleMap,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let workers = config.compress_workers.max(1);
@@ -286,7 +287,7 @@ impl BufferFlusher {
         let writer_handle = thread::Builder::new()
             .name("flusher-writer".into())
             .spawn(move || {
-                let mut packer = Packer::new(allocator_w);
+                let mut packer = Packer::new(allocator_w, hole_map);
                 Self::writer_loop(
                     &write_rx, &pool_w, &meta, &lifecycle, &allocator, &io_engine, &done_tx,
                     &running_w, &mut packer,
@@ -452,7 +453,7 @@ impl BufferFlusher {
                     match packer.pack_or_passthrough(unit) {
                         Ok(PackResult::Passthrough(unit)) => {
                             if let Err(e) =
-                                Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine)
+                                Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine, packer.hole_map())
                             {
                                 tracing::error!(
                                     vol = unit.vol_id,
@@ -473,7 +474,7 @@ impl BufferFlusher {
                         Ok(PackResult::SealedSlot(sealed)) => {
                             // Write the sealed slot
                             if let Err(e) = Self::write_packed_slot(
-                                &sealed, pool, meta, lifecycle, allocator, io_engine,
+                                &sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
                             ) {
                                 tracing::error!(
                                     pba = sealed.pba.0,
@@ -493,7 +494,7 @@ impl BufferFlusher {
                         Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
                             // Sealed slot must be written; unit falls back to direct write.
                             if let Err(e) = Self::write_packed_slot(
-                                &sealed, pool, meta, lifecycle, allocator, io_engine,
+                                &sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
                             ) {
                                 tracing::error!(
                                     pba = sealed.pba.0,
@@ -506,12 +507,26 @@ impl BufferFlusher {
 
                             // Write the unit directly (Passthrough path)
                             if let Err(e) =
-                                Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine)
+                                Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine, packer.hole_map())
                             {
                                 tracing::error!(
                                     vol = unit.vol_id,
                                     error = %e,
                                     "writer: failed to flush unit (alloc fallback)"
+                                );
+                            }
+                            let _ = done_tx.send(seqs);
+                        }
+                        Ok(PackResult::FillHole(fill)) => {
+                            // Read-modify-write an existing packed slot to fill a hole.
+                            if let Err(e) = Self::write_hole_fill(
+                                &fill, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
+                            ) {
+                                tracing::error!(
+                                    pba = fill.pba.0,
+                                    slot_offset = fill.slot_offset,
+                                    error = %e,
+                                    "writer: failed to fill hole"
                                 );
                             }
                             let _ = done_tx.send(seqs);
@@ -527,7 +542,7 @@ impl BufferFlusher {
                     // buffered fragments indefinitely.
                     if let Some(sealed) = packer.flush_open_slot() {
                         if let Err(e) = Self::write_packed_slot(
-                            &sealed, pool, meta, lifecycle, allocator, io_engine,
+                            &sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
                         ) {
                             tracing::error!(
                                 pba = sealed.pba.0,
@@ -548,7 +563,7 @@ impl BufferFlusher {
         // Flush any remaining open slot on shutdown
         if let Some(sealed) = packer.flush_open_slot() {
             if let Err(e) =
-                Self::write_packed_slot(&sealed, pool, meta, lifecycle, allocator, io_engine)
+                Self::write_packed_slot(&sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map())
             {
                 tracing::error!(
                     pba = sealed.pba.0,
@@ -569,6 +584,7 @@ impl BufferFlusher {
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
+        hole_map: &HoleMap,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
             // Hold the lifecycle read lock from generation validation through
@@ -629,6 +645,8 @@ impl BufferFlusher {
             }
 
             let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+            // Per-fragment tracking for hole detection: (pba, slot_offset) → (decrement, unit_lba_count, compressed_size)
+            let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
 
             let mut batch_values = Vec::with_capacity(unit.lba_count as usize);
             for i in 0..unit.lba_count {
@@ -638,6 +656,11 @@ impl BufferFlusher {
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
+                    // Track per-fragment for hole detection
+                    let frag = old_frag_meta
+                        .entry((old.pba, old.slot_offset))
+                        .or_insert((0, old.unit_lba_count, old.unit_compressed_size));
+                    frag.0 += 1;
                 }
                 batch_values.push((
                     lba,
@@ -686,6 +709,9 @@ impl BufferFlusher {
                 }
             }
 
+            // Detect holes: fully-dead fragments in still-live packed PBAs
+            Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map)?;
+
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
                 if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
                     tracing::warn!(seq, error = %e, "failed to mark entry flushed");
@@ -714,6 +740,7 @@ impl BufferFlusher {
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
+        hole_map: &HoleMap,
     ) -> OnyxResult<()> {
         // Collect unique volume IDs and acquire read locks on ALL of them
         // BEFORE doing any work. Sorted to prevent deadlock. Held until
@@ -738,6 +765,7 @@ impl BufferFlusher {
         // Build blockmap entries and collect old PBA decrements across all fragments
         let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
         let mut total_refcount: u32 = 0;
         let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
         let mut any_discarded = false;
@@ -772,6 +800,10 @@ impl BufferFlusher {
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
+                    let frag_entry = old_frag_meta
+                        .entry((old.pba, old.slot_offset))
+                        .or_insert((0, old.unit_lba_count, old.unit_compressed_size));
+                    frag_entry.0 += 1;
                 }
                 batch_values.push((
                     vol_id.clone(),
@@ -841,6 +873,9 @@ impl BufferFlusher {
         // Lifecycle read locks are still held here — metadata is committed,
         // so delete_volume cannot have interleaved.
 
+        // Detect holes in packed slots
+        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map)?;
+
         // Mark entries flushed
         for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
             if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
@@ -855,6 +890,233 @@ impl BufferFlusher {
             total_lbas = total_refcount,
             discarded = any_discarded,
             "flushed packed slot"
+        );
+
+        Ok(())
+    }
+
+    /// Detect holes created by overwrites: when ALL LBAs of a fragment in a
+    /// packed slot are overwritten in this batch, and the PBA still has other
+    /// live fragments (refcount > 0), the dead fragment's space is a hole.
+    ///
+    /// Called from write_unit and write_packed_slot after metadata commit.
+    fn detect_holes(
+        old_frag_meta: &HashMap<(Pba, u16), (u32, u16, u32)>,
+        _old_pba_meta: &HashMap<Pba, (u32, u32)>,
+        meta: &MetaStore,
+        hole_map: &HoleMap,
+    ) -> OnyxResult<()> {
+        for (&(old_pba, slot_offset), &(decrement, unit_lba_count, compressed_size)) in
+            old_frag_meta
+        {
+            // Only interested in packed fragments (unit_compressed_size < BLOCK_SIZE implies packed)
+            // and only if we overwrote ALL LBAs of this fragment in this batch
+            if decrement < unit_lba_count as u32 {
+                continue;
+            }
+
+            // Check PBA still has other live fragments (not entirely freed)
+            let remaining = meta.get_refcount(old_pba)?;
+            if remaining == 0 {
+                continue; // PBA is freed, no hole to track
+            }
+
+            // This fragment is fully dead but PBA is still live → hole
+            let key = crate::packer::packer::HoleKey {
+                pba: old_pba,
+                offset: slot_offset,
+            };
+            let size = compressed_size as u16;
+            hole_map.lock().unwrap().insert(key, size);
+
+            tracing::debug!(
+                pba = old_pba.0,
+                slot_offset,
+                size,
+                "detected hole in packed slot"
+            );
+        }
+        Ok(())
+    }
+
+    /// Fill a hole in an existing packed slot: read-modify-write.
+    ///
+    /// Locks ALL volumes in the packed slot (not just the new fragment's volume)
+    /// to prevent concurrent delete_volume from corrupting refcount.
+    /// Validates the hole is still free before writing.
+    fn write_hole_fill(
+        fill: &HoleFill,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
+        hole_map: &HoleMap,
+    ) -> OnyxResult<()> {
+        let unit = &fill.unit;
+        let vol_id = VolumeId(unit.vol_id.clone());
+
+        // Lock ALL volumes in this packed slot, not just the new fragment's volume.
+        // This prevents delete_volume(other_vol) from racing with our refcount update.
+        let mut all_vol_ids = meta.find_volume_ids_by_pba(fill.pba)?;
+        if !all_vol_ids.contains(&unit.vol_id) {
+            all_vol_ids.push(unit.vol_id.clone());
+        }
+        all_vol_ids.sort();
+        all_vol_ids.dedup();
+
+        let locks: Vec<_> = all_vol_ids
+            .iter()
+            .map(|vid| lifecycle.get_lock(vid))
+            .collect();
+        let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
+
+        // Generation check for the writing volume
+        let should_discard = match meta.get_volume(&vol_id)? {
+            None => true,
+            Some(vc)
+                if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if should_discard {
+            for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+            }
+            let _ = pool.advance_tail();
+            return Ok(());
+        }
+
+        // Validate the hole is still free: check that no existing fragment at this
+        // PBA overlaps with [slot_offset, slot_offset + compressed_data.len()).
+        let fill_size = unit.compressed_data.len() as u16;
+        if meta.has_overlap_at_pba(fill.pba, fill.slot_offset, fill_size)? {
+            tracing::debug!(
+                pba = fill.pba.0,
+                slot_offset = fill.slot_offset,
+                "hole fill: byte range overlaps with live fragment, skipping"
+            );
+            // Don't mark flushed — the unit stays in the buffer and will be
+            // re-dispatched by the coalescer on the next pass.
+            return Ok(());
+        }
+
+        // Read existing slot
+        let mut slot_data = io_engine.read_blocks(fill.pba, BLOCK_SIZE as usize)?;
+
+        // Overlay new fragment
+        let start = fill.slot_offset as usize;
+        let end = start + unit.compressed_data.len();
+        if end > slot_data.len() {
+            return Err(crate::error::OnyxError::Compress(format!(
+                "hole fill out of bounds: offset={} + size={} > {}",
+                start, unit.compressed_data.len(), slot_data.len()
+            )));
+        }
+        slot_data[start..end].copy_from_slice(&unit.compressed_data);
+
+        // Write back
+        io_engine.write_blocks(fill.pba, &slot_data)?;
+
+        // Collect old PBA decrements
+        let mut old_pba_decrements: HashMap<Pba, u32> = HashMap::new();
+        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
+
+        let mut batch_values = Vec::with_capacity(unit.lba_count as usize);
+        for i in 0..unit.lba_count {
+            let lba = Lba(unit.start_lba.0 + i as u64);
+            if let Some(old) = meta.get_mapping(&vol_id, lba)? {
+                let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
+                let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
+                entry.0 += 1;
+                entry.1 = entry.1.max(old_blocks);
+                let frag = old_frag_meta
+                    .entry((old.pba, old.slot_offset))
+                    .or_insert((0, old.unit_lba_count, old.unit_compressed_size));
+                frag.0 += 1;
+            }
+            batch_values.push((
+                lba,
+                BlockmapValue {
+                    pba: fill.pba,
+                    compression: unit.compression,
+                    unit_compressed_size: unit.compressed_data.len() as u32,
+                    unit_original_size: unit.original_size,
+                    unit_lba_count: unit.lba_count as u16,
+                    offset_in_unit: i as u16,
+                    crc32: unit.crc32,
+                    slot_offset: fill.slot_offset,
+                },
+            ));
+        }
+
+        // Separate self-referencing decrements (old_pba == fill.pba) from external.
+        // atomic_batch_write SETs the new PBA's refcount, then DECREMENTS old PBAs.
+        // If old_pba == fill.pba, both target the same key and the last write wins.
+        // Fix: fold self-decrements into the new_rc calculation.
+        let mut self_decrement: u32 = 0;
+        for (old_pba, (decrement, _)) in &old_pba_meta {
+            if *old_pba == fill.pba {
+                self_decrement += decrement;
+            } else {
+                old_pba_decrements.insert(*old_pba, *decrement);
+            }
+        }
+
+        let current_rc = meta.get_refcount(fill.pba)?;
+        let new_rc = current_rc + unit.lba_count - self_decrement;
+
+        meta.atomic_batch_write(
+            &vol_id,
+            &batch_values,
+            new_rc,
+            &old_pba_decrements,
+        )?;
+
+        // Free old PBAs whose refcount dropped to 0
+        for (old_pba, (_, old_blocks)) in &old_pba_meta {
+            let remaining = meta.get_refcount(*old_pba)?;
+            if remaining == 0 {
+                if *old_blocks == 1 {
+                    allocator.free_one(*old_pba)?;
+                } else {
+                    allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
+                }
+            }
+        }
+
+        // Detect any new holes from the old PBAs
+        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map)?;
+
+        // Mark flushed
+        for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+            if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                tracing::warn!(seq, error = %e, "failed to mark flushed (hole fill)");
+            }
+        }
+        pool.advance_tail()?;
+
+        // Inject remainder back into hole_map only after successful write.
+        let frag_size = unit.compressed_data.len() as u16;
+        let remainder = fill.hole_size.saturating_sub(frag_size);
+        if remainder > 0 {
+            let remainder_key = crate::packer::packer::HoleKey {
+                pba: fill.pba,
+                offset: fill.slot_offset + frag_size,
+            };
+            hole_map.lock().unwrap().insert(remainder_key, remainder);
+        }
+
+        tracing::debug!(
+            pba = fill.pba.0,
+            slot_offset = fill.slot_offset,
+            remainder,
+            vol = unit.vol_id,
+            lba_count = unit.lba_count,
+            "filled hole in packed slot"
         );
 
         Ok(())

@@ -42,6 +42,7 @@ fn start_flusher(
         allocator.clone(),
         io_engine.clone(),
         &FlushConfig::default(),
+        onyx_storage::packer::packer::new_hole_map(),
     )
 }
 
