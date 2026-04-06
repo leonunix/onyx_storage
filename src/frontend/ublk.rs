@@ -18,6 +18,7 @@ pub struct OnyxUblkTarget {
     zone_manager: Arc<ZoneManager>,
     vol_id: String,
     device_size_bytes: u64,
+    vol_created_at: u64,
 }
 
 impl OnyxUblkTarget {
@@ -31,6 +32,7 @@ impl OnyxUblkTarget {
             zone_manager,
             vol_id: vol.id.0.clone(),
             device_size_bytes: vol.size_bytes,
+            vol_created_at: vol.created_at,
         })
     }
 
@@ -41,6 +43,7 @@ impl OnyxUblkTarget {
         let io_buf_bytes = self.config.io_buf_bytes;
         let dev_size = self.device_size_bytes;
         let vol_id = self.vol_id.clone();
+        let vol_created_at = self.vol_created_at;
         let zm = self.zone_manager.clone();
 
         let sess = UblkCtrlBuilder::default()
@@ -128,12 +131,11 @@ impl OnyxUblkTarget {
                     if offset_bytes % block_size == 0 && io_bytes % block_size == 0 {
                         let start_lba = Lba(offset_bytes / block_size);
                         let lba_count = (io_bytes / block_size) as u32;
-                        let data = unsafe {
-                            std::slice::from_raw_parts(buf_addr, io_bytes as usize)
-                        }
-                        .to_vec();
+                        let data =
+                            unsafe { std::slice::from_raw_parts(buf_addr, io_bytes as usize) }
+                                .to_vec();
                         if let Err(e) =
-                            zm.submit_write(&vol_id, start_lba, lba_count, data)
+                            zm.submit_write(&vol_id, start_lba, lba_count, data, vol_created_at)
                         {
                             tracing::error!(
                                 lba = start_lba.0,
@@ -180,7 +182,7 @@ impl OnyxUblkTarget {
                             }
 
                             if let Err(e) =
-                                zm.submit_write(&vol_id, block_lba, 1, block)
+                                zm.submit_write(&vol_id, block_lba, 1, block, vol_created_at)
                             {
                                 tracing::error!(
                                     lba = block_lba.0,

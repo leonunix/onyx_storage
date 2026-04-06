@@ -93,16 +93,22 @@ impl MetaStore {
     /// Aggregates per-PBA decrement counts first, then reads current refcounts once
     /// and applies the total delta in a single WriteBatch. This is correct even when
     /// multiple LBAs in this volume map to the same PBA (dedup scenario).
-    pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<Pba>> {
+    /// Delete a volume and all its associated blockmap/refcount entries.
+    ///
+    /// Returns `Vec<(Pba, block_count)>` for freed extents. The block_count
+    /// is derived from `unit_compressed_size.div_ceil(BLOCK_SIZE)` so the
+    /// caller can free the correct number of physical blocks.
+    pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<(Pba, u32)>> {
         let cf_volumes = self.db.cf_handle(CF_VOLUMES).unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let prefix = blockmap_key_prefix(id)?;
 
-        // Phase 1: scan all blockmap entries, collect PBA decrement counts
-        // and blockmap keys to delete.
+        // Phase 1: scan all blockmap entries, collect PBA decrement counts,
+        // block counts per PBA, and blockmap keys to delete.
         let mut pba_decrements: HashMap<Pba, u32> = HashMap::new();
+        let mut pba_block_counts: HashMap<Pba, u32> = HashMap::new();
         let mut blockmap_keys_to_delete: Vec<Vec<u8>> = Vec::new();
 
         let mut iter = self.db.raw_iterator_cf(&cf_blockmap);
@@ -115,6 +121,13 @@ impl MetaStore {
                 if let Some(val) = iter.value() {
                     if let Some(bv) = decode_blockmap_value(val) {
                         *pba_decrements.entry(bv.pba).or_insert(0) += 1;
+                        let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                        // All LBAs in the same compression unit share the same
+                        // pba and unit_compressed_size, so max() is correct.
+                        pba_block_counts
+                            .entry(bv.pba)
+                            .and_modify(|b| *b = (*b).max(blocks))
+                            .or_insert(blocks);
                     }
                 }
                 blockmap_keys_to_delete.push(key.to_vec());
@@ -125,7 +138,7 @@ impl MetaStore {
 
         // Phase 2: read current refcounts once per PBA, compute final values
         let mut batch = WriteBatch::default();
-        let mut freed_pbas = Vec::new();
+        let mut freed_extents = Vec::new();
 
         for (pba, decrement) in &pba_decrements {
             let current_rc = self.get_refcount(*pba)?;
@@ -133,7 +146,8 @@ impl MetaStore {
             let rc_key = encode_refcount_key(*pba);
             if new_rc == 0 {
                 batch.delete_cf(&cf_refcount, &rc_key);
-                freed_pbas.push(*pba);
+                let block_count = pba_block_counts.get(pba).copied().unwrap_or(1);
+                freed_extents.push((*pba, block_count));
             } else {
                 batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
             }
@@ -151,11 +165,11 @@ impl MetaStore {
 
         tracing::info!(
             volume = %id,
-            freed_pbas = freed_pbas.len(),
+            freed_extents = freed_extents.len(),
             "volume deleted with blockmap/refcount cleanup"
         );
 
-        Ok(freed_pbas)
+        Ok(freed_extents)
     }
 
     pub fn list_volumes(&self) -> OnyxResult<Vec<VolumeConfig>> {

@@ -448,7 +448,7 @@ fn delete_volume_shared_pba_refcount() {
 
     // All 3 decrements aggregated: 3 - 3 = 0, PBA freed
     assert_eq!(freed.len(), 1);
-    assert_eq!(freed[0], shared_pba);
+    assert_eq!(freed[0].0, shared_pba);
     assert_eq!(store.get_refcount(shared_pba).unwrap(), 0);
 }
 

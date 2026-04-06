@@ -41,6 +41,9 @@ pub enum OnyxError {
 
     #[error("IO out of bounds: offset={offset} + len={len} exceeds volume size {size}")]
     OutOfBounds { offset: u64, len: u64, size: u64 },
+
+    #[error("Volume '{0}' has been deleted")]
+    VolumeDeleted(String),
 }
 
 pub type OnyxResult<T> = Result<T, OnyxError>;

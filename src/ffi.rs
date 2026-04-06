@@ -27,7 +27,8 @@ thread_local! {
 
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
-        *e.borrow_mut() = CString::new(msg).unwrap_or_else(|_| CString::new("unknown error").unwrap());
+        *e.borrow_mut() =
+            CString::new(msg).unwrap_or_else(|_| CString::new("unknown error").unwrap());
     });
 }
 
@@ -40,6 +41,7 @@ fn error_code(e: &OnyxError) -> c_int {
         OnyxError::Config(_) => ONYX_ERR_CONFIG,
         OnyxError::OutOfBounds { .. } => ONYX_ERR_INVALID,
         OnyxError::InvalidLba { .. } => ONYX_ERR_INVALID,
+        OnyxError::VolumeDeleted(_) => ONYX_ERR_NOTFOUND,
         _ => ONYX_ERR_INTERNAL,
     }
 }
@@ -63,12 +65,9 @@ fn compression_from_int(v: c_int) -> CompressionAlgo {
 /// Open the storage engine from a TOML config file.
 /// Returns NULL on error (call `onyx_strerror()` for details).
 ///
-/// `compression`: 0=None, 1=LZ4, 2=ZSTD
+/// Compression is per-volume (set at create_volume time), not engine-wide.
 #[no_mangle]
-pub extern "C" fn onyx_engine_open(
-    config_path: *const c_char,
-    compression: c_int,
-) -> *mut OnyxEngine {
+pub extern "C" fn onyx_engine_open(config_path: *const c_char) -> *mut OnyxEngine {
     if config_path.is_null() {
         set_last_error("config_path is null");
         return std::ptr::null_mut();
@@ -87,8 +86,7 @@ pub extern "C" fn onyx_engine_open(
             return std::ptr::null_mut();
         }
     };
-    let algo = compression_from_int(compression);
-    match OnyxEngine::open(&config, algo) {
+    match OnyxEngine::open(&config) {
         Ok(engine) => Box::into_raw(Box::new(engine)),
         Err(e) => {
             handle_error(e);
@@ -189,10 +187,7 @@ pub extern "C" fn onyx_delete_volume(engine: *mut OnyxEngine, name: *const c_cha
 
 /// List volumes as JSON. Caller must free `*out_json` with `onyx_free_string()`.
 #[no_mangle]
-pub extern "C" fn onyx_list_volumes(
-    engine: *mut OnyxEngine,
-    out_json: *mut *mut c_char,
-) -> c_int {
+pub extern "C" fn onyx_list_volumes(engine: *mut OnyxEngine, out_json: *mut *mut c_char) -> c_int {
     if engine.is_null() || out_json.is_null() {
         set_last_error("null pointer");
         return ONYX_ERR_NULL;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::buffer::pool::WriteBufferPool;
-use crate::compress::codec::{create_compressor, Compressor};
+use crate::compress::codec::create_compressor;
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::meta::store::MetaStore;
@@ -16,7 +16,6 @@ pub struct ZoneWorker {
     meta: Arc<MetaStore>,
     pub buffer_pool: Arc<WriteBufferPool>,
     io_engine: Arc<IoEngine>,
-    compression_algo: CompressionAlgo,
 }
 
 impl ZoneWorker {
@@ -25,14 +24,12 @@ impl ZoneWorker {
         meta: Arc<MetaStore>,
         buffer_pool: Arc<WriteBufferPool>,
         io_engine: Arc<IoEngine>,
-        compression_algo: CompressionAlgo,
     ) -> Self {
         Self {
             zone_id,
             meta,
             buffer_pool,
             io_engine,
-            compression_algo,
         }
     }
 
@@ -44,8 +41,10 @@ impl ZoneWorker {
         start_lba: Lba,
         lba_count: u32,
         data: &[u8],
+        vol_created_at: u64,
     ) -> OnyxResult<()> {
-        self.buffer_pool.append(vol_id, start_lba, lba_count, data)?;
+        self.buffer_pool
+            .append(vol_id, start_lba, lba_count, data, vol_created_at)?;
         Ok(())
     }
 

@@ -12,8 +12,10 @@ pub const MIN_ENTRY_SIZE: u32 = 4096;
 /// Maximum entry size: 40 + 255 + 256*4096 ~= 1MB+. Cap at 2MB for sanity.
 pub const MAX_ENTRY_SIZE: u32 = 2 * 1024 * 1024;
 
-/// Fixed header size in bytes.
-const FIXED_HEADER_SIZE: usize = 40;
+/// Fixed header size in bytes (v3: 48 bytes, v2 was 40).
+const FIXED_HEADER_SIZE: usize = 48;
+/// Legacy v2 header size (before vol_created_at was added).
+const V2_HEADER_SIZE: usize = 40;
 
 // ──────────────────────────── Superblock ────────────────────────────
 
@@ -115,7 +117,7 @@ impl BufferSuperblock {
 /// Variable-length buffer entry. Stores raw (uncompressed) data for one or more
 /// contiguous LBAs from the same volume.
 ///
-/// On-disk layout (4KB-aligned total size):
+/// On-disk layout v3 (4KB-aligned total size):
 ///   0.. 4: total_len (u32 LE, 4KB-aligned)
 ///   4.. 8: magic
 ///   8..16: seq (u64 LE)
@@ -123,12 +125,16 @@ impl BufferSuperblock {
 ///  24..28: lba_count (u32 LE)
 ///  28..30: vol_id_len (u16 LE)
 ///  30    : flushed flag
-///  31    : reserved
+///  31    : header_version (0 = v2/40-byte header, 1 = v3/48-byte header)
 ///  32..36: payload_crc32
 ///  36..40: entry_crc32 (covers 0..36 + 40..data_end, excludes 36..40)
-///  40 .. 40+vol_id_len              : vol_id
-///  40+vol_id_len .. +payload_len    : payload (lba_count * BLOCK_SIZE raw)
+///  40..48: vol_created_at (u64 LE) — volume generation epoch
+///  48 .. 48+vol_id_len              : vol_id
+///  48+vol_id_len .. +payload_len    : payload (lba_count * BLOCK_SIZE raw)
 ///  ... zero padding to 4KB alignment
+///
+/// V2 entries (header_version=0) have a 40-byte header and no vol_created_at.
+/// They are read as vol_created_at=0 (never matches any real volume).
 #[derive(Debug, Clone)]
 pub struct BufferEntry {
     pub seq: u64,
@@ -137,6 +143,9 @@ pub struct BufferEntry {
     pub lba_count: u32,
     pub payload_crc32: u32,
     pub flushed: bool,
+    /// Volume generation epoch (VolumeConfig.created_at at write time).
+    /// 0 for legacy v2 entries.
+    pub vol_created_at: u64,
     pub payload: Vec<u8>,
 }
 
@@ -161,7 +170,7 @@ impl BufferEntry {
         let total_len = self.disk_size();
         let mut buf = vec![0u8; total_len as usize];
 
-        // Fixed header
+        // Fixed header (v3: 48 bytes)
         buf[0..4].copy_from_slice(&total_len.to_le_bytes());
         buf[4..8].copy_from_slice(&BUFFER_ENTRY_MAGIC.to_le_bytes());
         buf[8..16].copy_from_slice(&self.seq.to_le_bytes());
@@ -169,9 +178,10 @@ impl BufferEntry {
         buf[24..28].copy_from_slice(&self.lba_count.to_le_bytes());
         buf[28..30].copy_from_slice(&(id_bytes.len() as u16).to_le_bytes());
         buf[30] = if self.flushed { 1 } else { 0 };
-        // 31: reserved
+        buf[31] = 1; // header_version = 1 (v3)
         buf[32..36].copy_from_slice(&self.payload_crc32.to_le_bytes());
         // 36..40: entry_crc32, filled below
+        buf[40..48].copy_from_slice(&self.vol_created_at.to_le_bytes());
 
         // Variable: vol_id
         let vid_start = FIXED_HEADER_SIZE;
@@ -194,13 +204,14 @@ impl BufferEntry {
 
     /// Deserialize from a byte slice. The slice must be at least `total_len` bytes.
     /// Returns None if magic, CRC, or UTF-8 checks fail.
+    /// Supports both v2 (40-byte header, no vol_created_at) and v3 (48-byte header).
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < FIXED_HEADER_SIZE {
+        if buf.len() < V2_HEADER_SIZE {
             return None;
         }
 
         let total_len = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        if (total_len as usize) < FIXED_HEADER_SIZE || total_len > MAX_ENTRY_SIZE {
+        if (total_len as usize) < V2_HEADER_SIZE || total_len > MAX_ENTRY_SIZE {
             return None;
         }
         if buf.len() < total_len as usize {
@@ -212,6 +223,18 @@ impl BufferEntry {
             return None;
         }
 
+        // Determine header version: byte 31 = 0 → v2, 1 → v3
+        let header_version = buf[31];
+        let header_size = if header_version >= 1 {
+            FIXED_HEADER_SIZE // v3: 48 bytes
+        } else {
+            V2_HEADER_SIZE // v2: 40 bytes
+        };
+
+        if buf.len() < header_size {
+            return None;
+        }
+
         let vol_id_len = u16::from_le_bytes(buf[28..30].try_into().unwrap()) as usize;
         if vol_id_len > MAX_VOLUME_ID_BYTES {
             return None;
@@ -219,12 +242,12 @@ impl BufferEntry {
 
         let lba_count = u32::from_le_bytes(buf[24..28].try_into().unwrap());
         let payload_len = lba_count as usize * BLOCK_SIZE as usize;
-        let data_end = FIXED_HEADER_SIZE + vol_id_len + payload_len;
+        let data_end = header_size + vol_id_len + payload_len;
         if data_end > total_len as usize {
             return None;
         }
 
-        // Verify entry CRC
+        // Verify entry CRC: covers 0..36 + 40..data_end (same formula for v2 and v3)
         let stored_crc = u32::from_le_bytes(buf[36..40].try_into().unwrap());
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&buf[0..36]);
@@ -234,8 +257,15 @@ impl BufferEntry {
             return None;
         }
 
+        // vol_created_at: present in v3, 0 for v2
+        let vol_created_at = if header_version >= 1 {
+            u64::from_le_bytes(buf[40..48].try_into().unwrap())
+        } else {
+            0
+        };
+
         // vol_id must be valid UTF-8
-        let vid_start = FIXED_HEADER_SIZE;
+        let vid_start = header_size;
         let vol_id = std::str::from_utf8(&buf[vid_start..vid_start + vol_id_len])
             .ok()?
             .to_string();
@@ -256,6 +286,7 @@ impl BufferEntry {
             lba_count,
             payload_crc32,
             flushed: buf[30] != 0,
+            vol_created_at,
             payload,
         })
     }

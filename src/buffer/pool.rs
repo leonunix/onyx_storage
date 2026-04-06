@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::buffer::entry::*;
 use crate::error::{OnyxError, OnyxResult};
@@ -49,6 +49,25 @@ pub struct WriteBufferPool {
     flush_progress: Mutex<HashMap<u64, HashSet<u16>>>, // seq → set of flushed offset_in_entry
 }
 
+static TEST_PURGE_FAIL_VOLUMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn test_purge_fail_volumes() -> &'static Mutex<HashSet<String>> {
+    TEST_PURGE_FAIL_VOLUMES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[doc(hidden)]
+pub fn install_purge_volume_failpoint(vol_id: &str) {
+    test_purge_fail_volumes()
+        .lock()
+        .unwrap()
+        .insert(vol_id.to_string());
+}
+
+#[doc(hidden)]
+pub fn clear_purge_volume_failpoint(vol_id: &str) {
+    test_purge_fail_volumes().lock().unwrap().remove(vol_id);
+}
+
 impl WriteBufferPool {
     /// Open the buffer pool. Rebuilds in-memory indices from the on-disk log.
     pub fn open(device: RawDevice) -> OnyxResult<Self> {
@@ -77,7 +96,10 @@ impl WriteBufferPool {
                 (sb, max_seq)
             }
             _ => {
-                tracing::info!(capacity = capacity_bytes, "initializing new v2 buffer superblock");
+                tracing::info!(
+                    capacity = capacity_bytes,
+                    "initializing new v2 buffer superblock"
+                );
                 let sb = BufferSuperblock::new(capacity_bytes);
                 device.write_at(&sb.to_bytes(), 0)?;
                 device.sync()?;
@@ -90,7 +112,10 @@ impl WriteBufferPool {
         let mut seq_index: HashMap<u64, (u64, u32)> = HashMap::new();
         Self::rebuild_indices(&device, &sb, &mut lba_index, &mut seq_index)?;
 
-        tracing::info!(pending_lbas = lba_index.len(), "buffer pool indices rebuilt");
+        tracing::info!(
+            pending_lbas = lba_index.len(),
+            "buffer pool indices rebuilt"
+        );
 
         Ok(Self {
             device,
@@ -176,7 +201,7 @@ impl WriteBufferPool {
                         lba_index.insert(key, pending.clone());
                     }
                 }
-                Some(_) => {} // flushed, skip
+                Some(_) => {}  // flushed, skip
                 None => break, // corrupt, stop
             }
 
@@ -197,6 +222,7 @@ impl WriteBufferPool {
         start_lba: Lba,
         lba_count: u32,
         payload: &[u8],
+        vol_created_at: u64,
     ) -> OnyxResult<u64> {
         if vol_id.is_empty() || vol_id.len() > MAX_VOLUME_ID_BYTES {
             return Err(OnyxError::Config(format!(
@@ -212,13 +238,16 @@ impl WriteBufferPool {
         if payload.len() != expected_len {
             return Err(OnyxError::Config(format!(
                 "payload must be {} bytes (lba_count={} * {}), got {}",
-                expected_len, lba_count, BLOCK_SIZE, payload.len()
+                expected_len,
+                lba_count,
+                BLOCK_SIZE,
+                payload.len()
             )));
         }
 
         // Check entry won't exceed MAX_ENTRY_SIZE (otherwise it's writable but unrecoverable)
         let estimated_size = round_up(
-            40 + vol_id.len() + payload.len(), // FIXED_HEADER + vol_id + payload
+            48 + vol_id.len() + payload.len(), // FIXED_HEADER(v3) + vol_id + payload
             BLOCK_SIZE as usize,
         );
         if estimated_size > MAX_ENTRY_SIZE as usize {
@@ -238,6 +267,7 @@ impl WriteBufferPool {
             lba_count,
             payload_crc32: payload_crc,
             flushed: false,
+            vol_created_at,
             payload: payload.to_vec(),
         };
 
@@ -499,6 +529,72 @@ impl WriteBufferPool {
     pub fn capacity(&self) -> u64 {
         let sb = self.superblock.lock().unwrap();
         sb.capacity_bytes
+    }
+
+    /// Purge all pending (unflushed) buffer entries for a specific volume.
+    ///
+    /// Removes entries from the in-memory LBA and seq indices, and marks them
+    /// as flushed on disk so the flusher won't pick them up. This prevents
+    /// deleted-volume data from being flushed back into metadata after deletion.
+    pub fn purge_volume(&self, vol_id: &str) -> OnyxResult<u64> {
+        if test_purge_fail_volumes().lock().unwrap().contains(vol_id) {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "injected purge failure for volume {vol_id}"
+            ))));
+        }
+
+        // Collect seqs belonging to this volume from the LBA index
+        let seqs_to_purge: Vec<u64> = {
+            let lba_idx = self.lba_index.lock().unwrap();
+            let mut seqs = std::collections::HashSet::new();
+            for (key, entry) in lba_idx.iter() {
+                if key.vol_id == vol_id {
+                    seqs.insert(entry.seq);
+                }
+            }
+            seqs.into_iter().collect()
+        };
+
+        if seqs_to_purge.is_empty() {
+            return Ok(0);
+        }
+
+        let count = seqs_to_purge.len() as u64;
+
+        // Remove from LBA index
+        {
+            let mut lba_idx = self.lba_index.lock().unwrap();
+            lba_idx.retain(|key, _| key.vol_id != vol_id);
+        }
+
+        // Mark as flushed on disk + remove from seq index
+        for seq in &seqs_to_purge {
+            let loc = {
+                let seq_idx = self.seq_index.lock().unwrap();
+                seq_idx.get(seq).copied()
+            };
+            if let Some((disk_offset, disk_len)) = loc {
+                // Read entry, set flushed flag, write back
+                let mut buf = vec![0u8; disk_len as usize];
+                self.device.read_at(&mut buf, disk_offset)?;
+                if let Some(mut entry) = crate::buffer::entry::BufferEntry::from_bytes(&buf) {
+                    if entry.seq == *seq && !entry.flushed {
+                        entry.flushed = true;
+                        let updated = entry.to_bytes()?;
+                        self.device.write_at(&updated, disk_offset)?;
+                    }
+                }
+            }
+            self.seq_index.lock().unwrap().remove(seq);
+            self.flush_progress.lock().unwrap().remove(seq);
+        }
+
+        tracing::info!(
+            vol_id,
+            purged_entries = count,
+            "buffer entries purged for volume"
+        );
+        Ok(count)
     }
 
     pub fn fill_percentage(&self) -> u8 {

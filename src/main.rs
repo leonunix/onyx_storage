@@ -28,9 +28,6 @@ enum Command {
         /// Volume name to serve
         #[arg(short, long)]
         volume: String,
-        /// Compression algorithm: none, lz4, zstd
-        #[arg(long, default_value = "lz4")]
-        compression: String,
     },
     /// Create a new volume
     CreateVolume {
@@ -77,14 +74,10 @@ fn main() -> anyhow::Result<()> {
     let config = OnyxConfig::load(&cli.config)?;
 
     match cli.command {
-        Command::Start {
-            volume,
-            compression,
-        } => {
+        Command::Start { volume } => {
             tracing::info!("starting onyx storage engine");
 
-            let algo = parse_compression(&compression);
-            let engine = OnyxEngine::open(&config, algo)?;
+            let engine = OnyxEngine::open(&config)?;
             let _vol = engine.open_volume(&volume)?;
 
             #[cfg(target_os = "linux")]
@@ -133,7 +126,10 @@ fn main() -> anyhow::Result<()> {
         Command::DeleteVolume { name } => {
             let engine = OnyxEngine::open_meta_only(&config)?;
             let freed = engine.delete_volume(&name)?;
-            println!("Volume '{}' deleted ({} physical blocks freed)", name, freed);
+            println!(
+                "Volume '{}' deleted ({} physical blocks freed)",
+                name, freed
+            );
         }
         Command::ListVolumes => {
             let engine = OnyxEngine::open_meta_only(&config)?;

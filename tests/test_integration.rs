@@ -33,11 +33,11 @@ struct TestEnv {
     data_file: NamedTempFile, // not underscore — we need to read raw LV3
 }
 
-fn setup(compression: CompressionAlgo) -> TestEnv {
-    setup_with_sizes(compression, 4096 * 2048, 4096 + 512 * 4096)
+fn setup() -> TestEnv {
+    setup_with_sizes(4096 * 2048, 4096 + 512 * 4096)
 }
 
-fn setup_with_sizes(compression: CompressionAlgo, data_bytes: u64, buf_bytes: u64) -> TestEnv {
+fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
     let meta_dir = tempdir().unwrap();
     let buf_file = NamedTempFile::new().unwrap();
     let data_file = NamedTempFile::new().unwrap();
@@ -55,7 +55,7 @@ fn setup_with_sizes(compression: CompressionAlgo, data_bytes: u64, buf_bytes: u6
             data_device: data_file.path().to_path_buf(),
             block_size: 4096,
             use_hugepages: false,
-            default_compression: compression,
+            default_compression: CompressionAlgo::Lz4,
         },
         buffer: BufferConfig {
             device: buf_file.path().to_path_buf(),
@@ -74,7 +74,7 @@ fn setup_with_sizes(compression: CompressionAlgo, data_bytes: u64, buf_bytes: u6
         },
     };
 
-    let engine = OnyxEngine::open(&config, compression).unwrap();
+    let engine = OnyxEngine::open(&config).unwrap();
     TestEnv {
         engine,
         _meta_dir: meta_dir,
@@ -130,7 +130,7 @@ fn read_raw_lv3(env: &TestEnv, pba: Pba, size: usize) -> Vec<u8> {
 // ===========================================================================
 #[test]
 fn prove_buffer_or_metadata_consistent() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 64 * 4096u64;
     env.engine
         .create_volume("vol-buf", vol_size, CompressionAlgo::Lz4)
@@ -156,10 +156,7 @@ fn prove_buffer_or_metadata_consistent() {
             "LBA {} must be in buffer or metadata (got neither)",
             lba
         );
-        eprintln!(
-            "  LBA {}: buffer={}, metadata={}",
-            lba, in_buffer, in_meta
-        );
+        eprintln!("  LBA {}: buffer={}, metadata={}", lba, in_buffer, in_meta);
     }
 
     // EVIDENCE: data readable regardless of where it lives
@@ -172,7 +169,7 @@ fn prove_buffer_or_metadata_consistent() {
 // ===========================================================================
 #[test]
 fn prove_flusher_drains_buffer_creates_metadata() {
-    let env = setup(CompressionAlgo::None);
+    let env = setup();
     let vol_size = 64 * 4096u64;
     env.engine
         .create_volume("vol-drain", vol_size, CompressionAlgo::None)
@@ -196,7 +193,11 @@ fn prove_flusher_drains_buffer_creates_metadata() {
     wait_for_flush(&env, Duration::from_secs(10));
 
     // EVIDENCE 1: buffer is empty
-    assert_eq!(pool.pending_count(), 0, "buffer should be empty after flush");
+    assert_eq!(
+        pool.pending_count(),
+        0,
+        "buffer should be empty after flush"
+    );
 
     // EVIDENCE 2: buffer lookup returns None (data evicted)
     let lookup = pool.lookup("vol-drain", Lba(0)).unwrap();
@@ -209,10 +210,7 @@ fn prove_flusher_drains_buffer_creates_metadata() {
     let mapping = meta
         .get_mapping(&VolumeId("vol-drain".into()), Lba(0))
         .unwrap();
-    assert!(
-        mapping.is_some(),
-        "blockmap should have entry after flush"
-    );
+    assert!(mapping.is_some(), "blockmap should have entry after flush");
     let bv = mapping.unwrap();
     assert!(bv.pba.0 > 0 || bv.pba.0 == 0, "PBA should be valid"); // any PBA is fine
     assert!(bv.crc32 != 0, "CRC should be non-zero");
@@ -231,7 +229,7 @@ fn prove_flusher_drains_buffer_creates_metadata() {
 // ===========================================================================
 #[test]
 fn prove_lz4_compression_ran() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 128 * 4096u64;
     env.engine
         .create_volume("vol-clz4", vol_size, CompressionAlgo::Lz4)
@@ -305,7 +303,7 @@ fn prove_lz4_compression_ran() {
 // ===========================================================================
 #[test]
 fn prove_zstd_compression_ran() {
-    let env = setup(CompressionAlgo::Zstd { level: 3 });
+    let env = setup();
     let vol_size = 128 * 4096u64;
     env.engine
         .create_volume("vol-czstd", vol_size, CompressionAlgo::Zstd { level: 3 })
@@ -362,7 +360,7 @@ fn prove_zstd_compression_ran() {
 // ===========================================================================
 #[test]
 fn prove_coalescer_merged_lbas() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 128 * 4096u64;
     env.engine
         .create_volume("vol-coal", vol_size, CompressionAlgo::Lz4)
@@ -427,8 +425,7 @@ fn prove_coalescer_merged_lbas() {
     // EVIDENCE 5: refcount = unit_lba_count (each LBA holds one ref)
     let rc = meta.get_refcount(shared_pba).unwrap();
     assert_eq!(
-        rc,
-        mappings[0].unit_lba_count as u32,
+        rc, mappings[0].unit_lba_count as u32,
         "refcount should equal unit_lba_count"
     );
 
@@ -454,7 +451,7 @@ fn prove_coalescer_merged_lbas() {
 // ===========================================================================
 #[test]
 fn prove_overwrite_frees_old_pba() {
-    let env = setup(CompressionAlgo::None);
+    let env = setup();
     let vol_size = 64 * 4096u64;
     env.engine
         .create_volume("vol-ofree", vol_size, CompressionAlgo::None)
@@ -480,7 +477,10 @@ fn prove_overwrite_frees_old_pba() {
 
     // EVIDENCE 1: old PBA refcount dropped to 0
     let old_rc_after = meta.get_refcount(old_pba).unwrap();
-    assert_eq!(old_rc_after, 0, "old PBA refcount should be 0 after overwrite");
+    assert_eq!(
+        old_rc_after, 0,
+        "old PBA refcount should be 0 after overwrite"
+    );
 
     // EVIDENCE 2: new mapping points to different PBA
     let new_bv = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap();
@@ -499,7 +499,7 @@ fn prove_overwrite_frees_old_pba() {
 // ===========================================================================
 #[test]
 fn prove_incompressible_fallback() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 64 * 4096u64;
     env.engine
         .create_volume("vol-incomp", vol_size, CompressionAlgo::Lz4)
@@ -554,7 +554,7 @@ fn prove_incompressible_fallback() {
 // ===========================================================================
 #[test]
 fn prove_multi_volume_isolation() {
-    let env = setup(CompressionAlgo::None);
+    let env = setup();
     let vol_size = 64 * 4096u64;
 
     env.engine
@@ -608,7 +608,7 @@ fn prove_multi_volume_isolation() {
 // ===========================================================================
 #[test]
 fn prove_sparse_then_written_reads_from_lv3() {
-    let env = setup(CompressionAlgo::None);
+    let env = setup();
     let vol_size = 64 * 4096u64;
     env.engine
         .create_volume("vol-sp2", vol_size, CompressionAlgo::None)
@@ -638,7 +638,7 @@ fn prove_sparse_then_written_reads_from_lv3() {
 // ===========================================================================
 #[test]
 fn prove_full_digest_roundtrip() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 512 * 4096u64;
     env.engine
         .create_volume("vol-1mb", vol_size, CompressionAlgo::Lz4)
@@ -705,7 +705,7 @@ fn prove_full_digest_roundtrip() {
 // ===========================================================================
 #[test]
 fn prove_large_write_pipeline() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 256 * 4096u64;
     env.engine
         .create_volume("vol-big", vol_size, CompressionAlgo::Lz4)
@@ -748,7 +748,11 @@ fn prove_large_write_pipeline() {
     let decompressor = create_compressor(CompressionAlgo::Lz4);
     let mut decompressed = vec![0u8; first_bv.unit_original_size as usize];
     decompressor
-        .decompress(&raw, &mut decompressed, first_bv.unit_original_size as usize)
+        .decompress(
+            &raw,
+            &mut decompressed,
+            first_bv.unit_original_size as usize,
+        )
         .unwrap();
     assert_eq!(decompressed, data, "manual decompress should match");
 
@@ -762,7 +766,7 @@ fn prove_large_write_pipeline() {
 // ===========================================================================
 #[test]
 fn prove_concurrent_pipeline() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 512 * 4096u64;
     env.engine
         .create_volume("vol-par", vol_size, CompressionAlgo::Lz4)
@@ -824,7 +828,7 @@ fn prove_concurrent_pipeline() {
 // ===========================================================================
 #[test]
 fn prove_delete_volume_cleanup() {
-    let env = setup(CompressionAlgo::None);
+    let env = setup();
     let vol_size = 64 * 4096u64;
     env.engine
         .create_volume("vol-del", vol_size, CompressionAlgo::None)
@@ -879,7 +883,7 @@ fn prove_delete_volume_cleanup() {
 // ===========================================================================
 #[test]
 fn prove_pipeline_status_report() {
-    let env = setup(CompressionAlgo::Lz4);
+    let env = setup();
     let vol_size = 256 * 4096u64;
     env.engine
         .create_volume("vol-status", vol_size, CompressionAlgo::Lz4)
@@ -922,7 +926,10 @@ fn prove_pipeline_status_report() {
 
     let pending_after_flush = pool.pending_count();
     eprintln!("\n--- After flush ---");
-    eprintln!("  buffer pending entries: {} (should be 0)", pending_after_flush);
+    eprintln!(
+        "  buffer pending entries: {} (should be 0)",
+        pending_after_flush
+    );
     assert_eq!(pending_after_flush, 0, "buffer should be drained");
 
     // --- Metadata inspection ---
@@ -953,9 +960,7 @@ fn prove_pipeline_status_report() {
         ));
     }
 
-    for (i, (pba_val, (pba, comp, comp_size, orig_size, lba_count))) in
-        units.iter().enumerate()
-    {
+    for (i, (pba_val, (pba, comp, comp_size, orig_size, lba_count))) in units.iter().enumerate() {
         let comp_name = match *comp {
             0 => "none",
             1 => "lz4",
@@ -977,11 +982,7 @@ fn prove_pipeline_status_report() {
         // Verify CRC of raw data on disk
         let raw = read_raw_lv3(&env, *pba, *comp_size as usize);
         let raw_crc = crc32fast::hash(&raw);
-        let meta_crc = meta
-            .get_mapping(&vol_id, Lba(0))
-            .unwrap()
-            .unwrap()
-            .crc32;
+        let meta_crc = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap().crc32;
         eprintln!(
             "    raw CRC: 0x{:08X}, refcount: {}",
             raw_crc,
@@ -996,8 +997,14 @@ fn prove_pipeline_status_report() {
     eprintln!("\n--- Summary ---");
     eprintln!("  total compression units:   {}", units.len());
     eprintln!("  total LBAs mapped:         40");
-    eprintln!("  original data:             {} KB", total_original_bytes / 1024);
-    eprintln!("  compressed data:           {} KB", total_compressed_bytes / 1024);
+    eprintln!(
+        "  original data:             {} KB",
+        total_original_bytes / 1024
+    );
+    eprintln!(
+        "  compressed data:           {} KB",
+        total_compressed_bytes / 1024
+    );
     eprintln!(
         "  overall compression ratio: {:.2}x",
         total_original_bytes as f64 / total_compressed_bytes as f64
@@ -1016,14 +1023,8 @@ fn prove_pipeline_status_report() {
 
     let comp_ok = read_comp == compressible;
     let incomp_ok = read_incomp == incompressible;
-    eprintln!(
-        "  compressible blocks (0..31):   hash_match={}",
-        comp_ok
-    );
-    eprintln!(
-        "  incompressible blocks (32..39): hash_match={}",
-        incomp_ok
-    );
+    eprintln!("  compressible blocks (0..31):   hash_match={}", comp_ok);
+    eprintln!("  incompressible blocks (32..39): hash_match={}", incomp_ok);
     assert!(comp_ok, "compressible data mismatch");
     assert!(incomp_ok, "incompressible data mismatch");
 
@@ -1052,7 +1053,11 @@ fn prove_pipeline_status_report() {
             );
         }
     }
-    eprintln!("  {}/{} blocks verified OK", ok_count, ok_count + fail_count);
+    eprintln!(
+        "  {}/{} blocks verified OK",
+        ok_count,
+        ok_count + fail_count
+    );
     assert_eq!(fail_count, 0, "all blocks should verify");
 
     eprintln!("\n========== END REPORT ==========\n");

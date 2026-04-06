@@ -7,7 +7,7 @@ use crate::buffer::pool::WriteBufferPool;
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::engine::IoEngine;
 use crate::meta::store::MetaStore;
-use crate::types::{CompressionAlgo, Lba, ZoneId};
+use crate::types::{Lba, ZoneId};
 use crate::zone::worker::ZoneWorker;
 
 /// IO request dispatched to a zone worker
@@ -17,6 +17,7 @@ pub enum ZoneIoRequest {
         start_lba: Lba,
         lba_count: u32,
         data: Vec<u8>,
+        vol_created_at: u64,
         reply: crossbeam_channel::Sender<OnyxResult<()>>,
     },
     Read {
@@ -46,7 +47,6 @@ impl ZoneManager {
         meta: Arc<MetaStore>,
         buffer_pool: Arc<WriteBufferPool>,
         io_engine: Arc<IoEngine>,
-        compression: CompressionAlgo,
     ) -> OnyxResult<Self> {
         let mut handles = Vec::with_capacity(zone_count as usize);
 
@@ -60,8 +60,7 @@ impl ZoneManager {
             let thread = thread::Builder::new()
                 .name(format!("zone-worker-{}", i))
                 .spawn(move || {
-                    let worker =
-                        ZoneWorker::new(zone_id, meta, buffer_pool, io_engine, compression);
+                    let worker = ZoneWorker::new(zone_id, meta, buffer_pool, io_engine);
                     Self::worker_loop(worker, receiver);
                 })
                 .map_err(|e| OnyxError::Config(format!("failed to spawn zone thread: {}", e)))?;
@@ -91,9 +90,11 @@ impl ZoneManager {
                     start_lba,
                     lba_count,
                     data,
+                    vol_created_at,
                     reply,
                 } => {
-                    let result = worker.handle_write(&vol_id, start_lba, lba_count, &data);
+                    let result =
+                        worker.handle_write(&vol_id, start_lba, lba_count, &data, vol_created_at);
                     let _ = reply.send(result);
                 }
                 ZoneIoRequest::Read { vol_id, lba, reply } => {
@@ -122,6 +123,7 @@ impl ZoneManager {
         start_lba: Lba,
         lba_count: u32,
         data: Vec<u8>,
+        vol_created_at: u64,
     ) -> OnyxResult<()> {
         let bs = crate::types::BLOCK_SIZE as usize;
         let mut offset = 0u32;
@@ -147,6 +149,7 @@ impl ZoneManager {
                     start_lba: cur_lba,
                     lba_count: lbas_in_zone,
                     data: chunk,
+                    vol_created_at,
                     reply: reply_tx,
                 })
                 .map_err(|_| OnyxError::Ublk("zone worker channel closed".into()))?;

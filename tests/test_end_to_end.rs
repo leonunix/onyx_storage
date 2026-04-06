@@ -5,18 +5,50 @@ use std::time::Duration;
 
 use onyx_storage::buffer::flush::BufferFlusher;
 use onyx_storage::buffer::pool::WriteBufferPool;
-use onyx_storage::config::MetaConfig;
+use onyx_storage::config::{FlushConfig, MetaConfig};
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::engine::IoEngine;
+use onyx_storage::lifecycle::VolumeLifecycleManager;
 use onyx_storage::meta::store::MetaStore;
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::types::*;
 use onyx_storage::zone::worker::ZoneWorker;
 use tempfile::{tempdir, NamedTempFile};
 
+/// Register a volume in MetaStore so the flusher picks up its compression algorithm.
+fn register_volume(meta: &MetaStore, name: &str, compression: CompressionAlgo) {
+    meta.put_volume(&VolumeConfig {
+        id: VolumeId(name.to_string()),
+        size_bytes: 4096 * 1000,
+        block_size: 4096,
+        compression,
+        created_at: 0,
+        zone_count: 1,
+    })
+    .unwrap();
+}
+
+fn start_flusher(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+) -> BufferFlusher {
+    BufferFlusher::start(
+        pool.clone(),
+        meta.clone(),
+        lifecycle.clone(),
+        allocator.clone(),
+        io_engine.clone(),
+        &FlushConfig::default(),
+    )
+}
+
 fn setup_e2e() -> (
     ZoneWorker,
     Arc<MetaStore>,
+    Arc<VolumeLifecycleManager>,
     Arc<SpaceAllocator>,
     Arc<WriteBufferPool>,
     Arc<IoEngine>,
@@ -41,21 +73,24 @@ fn setup_e2e() -> (
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
 
+    let lifecycle = Arc::new(VolumeLifecycleManager::default());
     let allocator = Arc::new(SpaceAllocator::new(data_size));
 
     std::mem::forget(meta_dir);
     std::mem::forget(buf_tmp);
     std::mem::forget(data_tmp);
 
+    // Register default test volume with LZ4 compression
+    register_volume(&meta, "test-vol", CompressionAlgo::Lz4);
+
     let worker = ZoneWorker::new(
         ZoneId(0),
         meta.clone(),
         buffer_pool.clone(),
         io_engine.clone(),
-        CompressionAlgo::Lz4,
     );
 
-    (worker, meta, allocator, buffer_pool, io_engine)
+    (worker, meta, lifecycle, allocator, buffer_pool, io_engine)
 }
 
 fn wait_for_flush(pool: &WriteBufferPool, timeout_ms: u64) -> bool {
@@ -72,20 +107,15 @@ fn wait_for_flush(pool: &WriteBufferPool, timeout_ms: u64) -> bool {
 /// Write -> flush to LV3 -> read from LV3 (buffer empty). Full path with LZ4 compression.
 #[test]
 fn write_flush_read_from_lv3_lz4() {
-    let (worker, meta, allocator, pool, io_engine) = setup_e2e();
+    let (worker, meta, lifecycle, allocator, pool, io_engine) = setup_e2e();
 
     let data = vec![0x55; 4096];
-    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
+    worker
+        .handle_write("test-vol", Lba(0), 1, &data, 0)
+        .unwrap();
 
     // Start flusher and wait
-    let mut flusher = BufferFlusher::start(
-        pool.clone(),
-        meta.clone(),
-        allocator.clone(),
-        io_engine.clone(),
-        onyx_storage::types::CompressionAlgo::Lz4,
-        &onyx_storage::config::FlushConfig::default(),
-    );
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_for_flush(&pool, 3000), "flush timeout");
     flusher.stop();
 
@@ -98,22 +128,17 @@ fn write_flush_read_from_lv3_lz4() {
 /// Write -> flush -> overwrite -> flush -> read. Verify latest data and old PBA freed.
 #[test]
 fn overwrite_after_flush() {
-    let (worker, meta, allocator, pool, io_engine) = setup_e2e();
+    let (worker, meta, lifecycle, allocator, pool, io_engine) = setup_e2e();
 
     let initial_free = allocator.free_block_count();
 
     // First write
     let data1 = vec![0x11; 4096];
-    worker.handle_write("test-vol", Lba(5), 1, &data1).unwrap();
+    worker
+        .handle_write("test-vol", Lba(5), 1, &data1, 0)
+        .unwrap();
 
-    let mut flusher = BufferFlusher::start(
-        pool.clone(),
-        meta.clone(),
-        allocator.clone(),
-        io_engine.clone(),
-        onyx_storage::types::CompressionAlgo::Lz4,
-        &onyx_storage::config::FlushConfig::default(),
-    );
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_for_flush(&pool, 3000));
     flusher.stop();
 
@@ -121,16 +146,11 @@ fn overwrite_after_flush() {
 
     // Overwrite
     let data2 = vec![0x22; 4096];
-    worker.handle_write("test-vol", Lba(5), 1, &data2).unwrap();
+    worker
+        .handle_write("test-vol", Lba(5), 1, &data2, 0)
+        .unwrap();
 
-    let mut flusher = BufferFlusher::start(
-        pool.clone(),
-        meta.clone(),
-        allocator.clone(),
-        io_engine.clone(),
-        onyx_storage::types::CompressionAlgo::Lz4,
-        &onyx_storage::config::FlushConfig::default(),
-    );
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_for_flush(&pool, 3000));
     flusher.stop();
 
@@ -145,21 +165,16 @@ fn overwrite_after_flush() {
 /// Write multiple LBAs -> flush -> read all back.
 #[test]
 fn bulk_write_flush_read() {
-    let (worker, meta, allocator, pool, io_engine) = setup_e2e();
+    let (worker, meta, lifecycle, allocator, pool, io_engine) = setup_e2e();
 
     for i in 0..20u64 {
         let data = vec![i as u8; 4096];
-        worker.handle_write("test-vol", Lba(i), 1, &data).unwrap();
+        worker
+            .handle_write("test-vol", Lba(i), 1, &data, 0)
+            .unwrap();
     }
 
-    let mut flusher = BufferFlusher::start(
-        pool.clone(),
-        meta.clone(),
-        allocator.clone(),
-        io_engine.clone(),
-        onyx_storage::types::CompressionAlgo::Lz4,
-        &onyx_storage::config::FlushConfig::default(),
-    );
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_for_flush(&pool, 5000));
     flusher.stop();
 
@@ -191,31 +206,24 @@ fn write_flush_read_zstd() {
     data_tmp.as_file().set_len(data_size).unwrap();
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
+    let lifecycle = Arc::new(VolumeLifecycleManager::default());
     let allocator = Arc::new(SpaceAllocator::new(data_size));
 
     std::mem::forget(meta_dir);
     std::mem::forget(buf_tmp);
     std::mem::forget(data_tmp);
 
-    let worker = ZoneWorker::new(
-        ZoneId(0),
-        meta.clone(),
-        pool.clone(),
-        io_engine.clone(),
-        CompressionAlgo::Zstd { level: 3 },
-    );
+    // Register volume with ZSTD compression
+    register_volume(&meta, "test-vol", CompressionAlgo::Zstd { level: 3 });
+
+    let worker = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone());
 
     let data = vec![0x77; 4096]; // compressible
-    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
+    worker
+        .handle_write("test-vol", Lba(0), 1, &data, 0)
+        .unwrap();
 
-    let mut flusher = BufferFlusher::start(
-        pool.clone(),
-        meta.clone(),
-        allocator.clone(),
-        io_engine.clone(),
-        onyx_storage::types::CompressionAlgo::Lz4,
-        &onyx_storage::config::FlushConfig::default(),
-    );
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_for_flush(&pool, 3000));
     flusher.stop();
 
@@ -246,37 +254,30 @@ fn write_flush_read_no_compression() {
     data_tmp.as_file().set_len(data_size).unwrap();
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
+    let lifecycle = Arc::new(VolumeLifecycleManager::default());
     let allocator = Arc::new(SpaceAllocator::new(data_size));
 
     std::mem::forget(meta_dir);
     std::mem::forget(buf_tmp);
     std::mem::forget(data_tmp);
 
-    let worker = ZoneWorker::new(
-        ZoneId(0),
-        meta.clone(),
-        pool.clone(),
-        io_engine.clone(),
-        CompressionAlgo::None,
-    );
+    // Register volume with no compression
+    register_volume(&meta, "test-vol", CompressionAlgo::None);
+
+    let worker = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone());
 
     // Data small enough to fit in a block (no header overhead now, full 4096 available).
     let data = vec![0x42; 4096];
-    worker.handle_write("test-vol", Lba(0), 1, &data).unwrap();
+    worker
+        .handle_write("test-vol", Lba(0), 1, &data, 0)
+        .unwrap();
 
     // Read from buffer (before flush) works fine
     let read_data = worker.handle_read("test-vol", Lba(0)).unwrap().unwrap();
     assert_eq!(read_data, data);
 
     // With no on-disk header, full 4096-byte payload fits in a block now.
-    let mut flusher = BufferFlusher::start(
-        pool.clone(),
-        meta.clone(),
-        allocator.clone(),
-        io_engine.clone(),
-        onyx_storage::types::CompressionAlgo::Lz4,
-        &onyx_storage::config::FlushConfig::default(),
-    );
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_for_flush(&pool, 3000));
     flusher.stop();
 

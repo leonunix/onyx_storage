@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::flush::BufferFlusher;
@@ -6,11 +7,18 @@ use crate::config::OnyxConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
+use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
 use crate::space::allocator::SpaceAllocator;
+use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, VolumeConfig, VolumeId};
 use crate::volume::OnyxVolume;
 use crate::zone::manager::ZoneManager;
+
+/// A per-handle "alive" flag. Set to false when the volume is deleted.
+/// Each OnyxVolume holds its own Arc to this flag. The engine keeps Weak
+/// references so it can invalidate all outstanding handles on delete.
+pub type VolumeAliveFlag = Arc<AtomicBool>;
 
 /// Top-level storage engine handle (librbd-style).
 ///
@@ -26,18 +34,79 @@ pub struct OnyxEngine {
     buffer_pool: Option<Arc<WriteBufferPool>>,
     flusher: Mutex<Option<BufferFlusher>>,
     zone_manager: Option<Arc<ZoneManager>>,
+    /// Live volume handles: (vol_name, alive_flag).
+    /// delete_volume sets all matching flags to false.
+    /// Entries with dropped handles (strong_count==1, only engine's copy) are
+    /// cleaned up lazily on subsequent open_volume/delete_volume calls.
+    live_handles: Mutex<Vec<(String, VolumeAliveFlag)>>,
+    lifecycle: Arc<VolumeLifecycleManager>,
+    generation_clock: AtomicU64,
     config: OnyxConfig,
     shutdown_done: Mutex<bool>,
 }
 
 impl OnyxEngine {
+    fn current_time_nanos() -> u64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        u64::try_from(nanos).unwrap_or(u64::MAX)
+    }
+
+    fn seed_generation_clock(meta: &MetaStore) -> OnyxResult<u64> {
+        let max_existing = meta
+            .list_volumes()?
+            .into_iter()
+            .map(|vol| vol.created_at)
+            .max()
+            .unwrap_or(0);
+        Ok(Self::current_time_nanos().max(max_existing))
+    }
+
+    fn next_volume_generation(&self) -> u64 {
+        let mut candidate = Self::current_time_nanos();
+        loop {
+            let observed = self.generation_clock.load(Ordering::Relaxed);
+            if candidate <= observed {
+                candidate = observed.saturating_add(1);
+            }
+            match self.generation_clock.compare_exchange(
+                observed,
+                candidate,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return candidate,
+                Err(new_observed) => {
+                    if candidate <= new_observed {
+                        candidate = new_observed.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn invalidate_live_handles(&self, name: &str) {
+        let mut handles = self.live_handles.lock().unwrap();
+        for (vol_name, flag) in handles.iter() {
+            if vol_name == name {
+                flag.store(false, Ordering::Release);
+            }
+        }
+        handles.retain(|(_, flag)| Arc::strong_count(flag) > 1);
+    }
+
     /// Open the engine with full IO capability (data device + buffer + flusher + zones).
     ///
-    /// The `compression` parameter sets the engine-wide compression algorithm used
-    /// by the flusher pipeline and zone workers.
-    pub fn open(config: &OnyxConfig, compression: CompressionAlgo) -> OnyxResult<Self> {
+    /// Compression is per-volume (stored in VolumeConfig metadata), not engine-wide.
+    pub fn open(config: &OnyxConfig) -> OnyxResult<Self> {
         // 1. MetaStore
         let meta = Arc::new(MetaStore::open(&config.meta)?);
+        let lifecycle = Arc::new(VolumeLifecycleManager::default());
+        let generation_clock = Self::seed_generation_clock(&meta)?;
+
+        // (no shared deletion state needed — per-handle alive flags are used)
 
         // 2. Data device + IO engine
         let data_dev = RawDevice::open(&config.storage.data_device)?;
@@ -55,16 +124,19 @@ impl OnyxEngine {
         // 5. Recover unflushed entries
         let unflushed = buffer_pool.recover()?;
         if !unflushed.is_empty() {
-            tracing::info!(count = unflushed.len(), "replaying unflushed buffer entries");
+            tracing::info!(
+                count = unflushed.len(),
+                "replaying unflushed buffer entries"
+            );
         }
 
         // 6. Background flusher
         let flusher = BufferFlusher::start(
             buffer_pool.clone(),
             meta.clone(),
+            lifecycle.clone(),
             allocator.clone(),
             io_engine.clone(),
-            compression,
             &config.flush,
         );
 
@@ -75,7 +147,6 @@ impl OnyxEngine {
             meta.clone(),
             buffer_pool.clone(),
             io_engine.clone(),
-            compression,
         )?);
 
         tracing::info!("onyx engine opened (full mode)");
@@ -87,6 +158,9 @@ impl OnyxEngine {
             buffer_pool: Some(buffer_pool),
             flusher: Mutex::new(Some(flusher)),
             zone_manager: Some(zone_manager),
+            live_handles: Mutex::new(Vec::new()),
+            lifecycle,
+            generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -98,6 +172,8 @@ impl OnyxEngine {
     /// Attempting to open_volume() will fail.
     pub fn open_meta_only(config: &OnyxConfig) -> OnyxResult<Self> {
         let meta = Arc::new(MetaStore::open(&config.meta)?);
+        let lifecycle = Arc::new(VolumeLifecycleManager::default());
+        let generation_clock = Self::seed_generation_clock(&meta)?;
 
         tracing::info!("onyx engine opened (meta-only mode)");
 
@@ -108,6 +184,9 @@ impl OnyxEngine {
             buffer_pool: None,
             flusher: Mutex::new(None),
             zone_manager: None,
+            live_handles: Mutex::new(Vec::new()),
+            lifecycle,
+            generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -120,28 +199,75 @@ impl OnyxEngine {
         size_bytes: u64,
         compression: CompressionAlgo,
     ) -> OnyxResult<()> {
-        let vol = VolumeConfig {
-            id: VolumeId(name.to_string()),
-            size_bytes,
-            block_size: 4096,
-            compression,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            zone_count: self.config.engine.zone_count,
-        };
-        self.meta.put_volume(&vol)?;
-        tracing::info!(name, size_bytes, "volume created");
-        Ok(())
+        self.lifecycle.with_write_lock(name, || {
+            let vol = VolumeConfig {
+                id: VolumeId(name.to_string()),
+                size_bytes,
+                block_size: 4096,
+                compression,
+                created_at: self.next_volume_generation(),
+                zone_count: self.config.engine.zone_count,
+            };
+            self.meta.put_volume(&vol)?;
+            tracing::info!(
+                name,
+                size_bytes,
+                generation = vol.created_at,
+                "volume created"
+            );
+            Ok(())
+        })
     }
 
-    /// Delete a volume and free its physical blocks.
+    /// Delete a volume, purge its buffer entries, and free its physical blocks.
+    ///
+    /// Steps:
+    /// 1. Take the per-volume lifecycle write lock.
+    /// 2. Purge pending buffer entries.
+    /// 3. Delete metadata (volume config + blockmap + refcounts) atomically.
+    /// 4. Return freed PBAs to the in-memory SpaceAllocator.
+    /// 5. Invalidate existing handles after delete succeeds.
     pub fn delete_volume(&self, name: &str) -> OnyxResult<usize> {
-        let freed = self.meta.delete_volume(&VolumeId(name.to_string()))?;
-        let count = freed.len();
-        tracing::info!(name, freed_pbas = count, "volume deleted");
-        Ok(count)
+        self.lifecycle.with_write_lock(name, || {
+            let vol_id = VolumeId(name.to_string());
+            if self.meta.get_volume(&vol_id)?.is_none() {
+                tracing::info!(name, "delete_volume: volume not found, nothing to do");
+                return Ok(0);
+            }
+
+            if let Some(pool) = &self.buffer_pool {
+                pool.purge_volume(name)?;
+            }
+
+            let freed = self.meta.delete_volume(&vol_id)?;
+            let freed_blocks: usize = freed.iter().map(|(_, blocks)| *blocks as usize).sum();
+
+            if let Some(allocator) = &self.allocator {
+                for (pba, block_count) in &freed {
+                    let result = if *block_count <= 1 {
+                        allocator.free_one(*pba)
+                    } else {
+                        allocator.free_extent(Extent::new(*pba, *block_count))
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            pba = pba.0, blocks = block_count,
+                            error = %e, "failed to free extent to allocator during volume delete"
+                        );
+                    }
+                }
+            }
+
+            self.invalidate_live_handles(name);
+
+            tracing::info!(
+                name,
+                freed_extents = freed.len(),
+                freed_blocks,
+                "volume deleted"
+            );
+            Ok(freed_blocks)
+        })
     }
 
     /// List all volumes.
@@ -151,21 +277,33 @@ impl OnyxEngine {
 
     /// Open a volume for IO. Requires full engine mode.
     pub fn open_volume(&self, name: &str) -> OnyxResult<OnyxVolume> {
-        let zm = self.zone_manager.as_ref().ok_or_else(|| {
-            OnyxError::Config("cannot open volume in meta-only mode".into())
-        })?;
+        self.lifecycle.with_read_lock(name, || {
+            let zm = self
+                .zone_manager
+                .as_ref()
+                .ok_or_else(|| OnyxError::Config("cannot open volume in meta-only mode".into()))?;
 
-        let vol_id = VolumeId(name.to_string());
-        let vol_config = self
-            .meta
-            .get_volume(&vol_id)?
-            .ok_or_else(|| OnyxError::VolumeNotFound(name.to_string()))?;
+            let vol_id = VolumeId(name.to_string());
+            let vol_config = self
+                .meta
+                .get_volume(&vol_id)?
+                .ok_or_else(|| OnyxError::VolumeNotFound(name.to_string()))?;
 
-        Ok(OnyxVolume::new(
-            name.to_string(),
-            vol_config.size_bytes,
-            zm.clone(),
-        ))
+            let alive = Arc::new(AtomicBool::new(true));
+            self.live_handles
+                .lock()
+                .unwrap()
+                .push((name.to_string(), alive.clone()));
+
+            Ok(OnyxVolume::new(
+                name.to_string(),
+                vol_config.size_bytes,
+                vol_config.created_at,
+                zm.clone(),
+                alive,
+                self.lifecycle.clone(),
+            ))
+        })
     }
 
     /// Graceful shutdown: stop flusher, then zone manager.

@@ -1,5 +1,5 @@
 use crate::buffer::entry::BufferEntry;
-use crate::types::{Lba, BLOCK_SIZE};
+use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
 
 /// A group of contiguous LBAs from the same volume, merged from buffer entries.
 /// Ready to be compressed as a single unit.
@@ -9,6 +9,10 @@ pub struct CoalesceUnit {
     pub start_lba: Lba,
     pub lba_count: u32,
     pub raw_data: Vec<u8>,
+    /// Per-volume compression algorithm (from VolumeConfig metadata).
+    pub compression: CompressionAlgo,
+    /// Volume generation epoch from the buffer entries.
+    pub vol_created_at: u64,
     /// (seq, first_lba_from_this_entry_in_unit, count) — tracks exactly which
     /// LBAs from each original entry are in this unit. Needed for idempotent
     /// partial mark_flushed when a multi-LBA entry is split across units.
@@ -25,6 +29,8 @@ pub struct CompressedUnit {
     pub compressed_data: Vec<u8>,
     pub compression: u8,
     pub crc32: u32,
+    /// Volume generation epoch from the buffer entries.
+    pub vol_created_at: u64,
     pub seq_lba_ranges: Vec<(u64, Lba, u32)>,
 }
 
@@ -34,15 +40,17 @@ struct LbaSlice<'a> {
     lba: Lba,
     data: &'a [u8], // exactly BLOCK_SIZE bytes
     entry_seq: u64,
+    vol_created_at: u64,
 }
 
 /// Record that `lba` from entry `seq` is in this unit.
 /// Tracks contiguous ranges per seq: if seq already has a range ending at lba-1,
 /// extend it; otherwise start a new range.
 fn add_seq_lba(acc: &mut Vec<(u64, Lba, u32)>, seq: u64, lba: Lba) {
-    if let Some(existing) = acc.iter_mut().find(|(s, start, count)| {
-        *s == seq && start.0 + *count as u64 == lba.0
-    }) {
+    if let Some(existing) = acc
+        .iter_mut()
+        .find(|(s, start, count)| *s == seq && start.0 + *count as u64 == lba.0)
+    {
         existing.2 += 1;
     } else {
         acc.push((seq, lba, 1));
@@ -53,10 +61,15 @@ fn add_seq_lba(acc: &mut Vec<(u64, Lba, u32)>, seq: u64, lba: Lba) {
 ///
 /// Multi-LBA entries are expanded into per-LBA slices for dedup, then
 /// contiguous same-volume LBAs are merged up to the configured limits.
+///
+/// `vol_compression` returns the compression algorithm for a given volume ID.
+/// If the volume is not found (e.g., deleted while entries were pending),
+/// `CompressionAlgo::None` is used as fallback.
 pub fn coalesce(
     entries: &[BufferEntry],
     max_raw_bytes: usize,
     max_lbas: u32,
+    vol_compression: &dyn Fn(&str) -> CompressionAlgo,
 ) -> Vec<CoalesceUnit> {
     if entries.is_empty() {
         return Vec::new();
@@ -76,6 +89,7 @@ pub fn coalesce(
                     lba: Lba(entry.start_lba.0 + i as u64),
                     data: &entry.payload[offset..end],
                     entry_seq: entry.seq,
+                    vol_created_at: entry.vol_created_at,
                 });
             }
         }
@@ -134,7 +148,7 @@ pub fn coalesce(
             cur.lba_count += 1;
             cur.raw_data.extend_from_slice(ds.latest.data);
             for &seq in &ds.all_seqs {
-                add_seq_lba(& mut cur.seq_lba_ranges, seq, ds.latest.lba);
+                add_seq_lba(&mut cur.seq_lba_ranges, seq, ds.latest.lba);
             }
         } else {
             if let Some(unit) = current.take() {
@@ -149,6 +163,8 @@ pub fn coalesce(
                 start_lba: ds.latest.lba,
                 lba_count: 1,
                 raw_data: ds.latest.data.to_vec(),
+                compression: vol_compression(ds.latest.vol_id),
+                vol_created_at: ds.latest.vol_created_at,
                 seq_lba_ranges,
             });
         }
@@ -174,6 +190,7 @@ mod tests {
             lba_count,
             payload_crc32: crc32fast::hash(&payload),
             flushed: false,
+            vol_created_at: 0,
             payload,
         }
     }
@@ -181,7 +198,7 @@ mod tests {
     #[test]
     fn coalesce_single_lba_entries() {
         let entries: Vec<_> = (0..8).map(|i| make_entry("vol-a", i, 1, i, 0xAA)).collect();
-        let units = coalesce(&entries, 131072, 32);
+        let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 8);
         assert_eq!(units[0].raw_data.len(), 8 * BLOCK_SIZE as usize);
@@ -191,7 +208,7 @@ mod tests {
     fn coalesce_multi_lba_entry() {
         // One entry covering 4 LBAs
         let entries = vec![make_entry("vol-a", 0, 4, 0, 0xBB)];
-        let units = coalesce(&entries, 131072, 32);
+        let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 4);
     }
@@ -203,7 +220,7 @@ mod tests {
             make_entry("vol-a", 0, 4, 0, 0xAA),
             make_entry("vol-a", 4, 4, 1, 0xBB),
         ];
-        let units = coalesce(&entries, 131072, 32);
+        let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 8);
         // First 4 LBAs filled with 0xAA, next 4 with 0xBB
@@ -217,7 +234,7 @@ mod tests {
             make_entry("vol-a", 0, 2, 0, 0xAA),
             make_entry("vol-a", 5, 2, 1, 0xBB), // gap at LBA 2-4
         ];
-        let units = coalesce(&entries, 131072, 32);
+        let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].lba_count, 2);
         assert_eq!(units[1].lba_count, 2);
@@ -229,14 +246,16 @@ mod tests {
             make_entry("vol-a", 0, 2, 0, 0xAA),
             make_entry("vol-b", 2, 2, 1, 0xBB),
         ];
-        let units = coalesce(&entries, 131072, 32);
+        let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 2);
     }
 
     #[test]
     fn coalesce_max_lbas_limit() {
-        let entries: Vec<_> = (0..10).map(|i| make_entry("vol-a", i, 1, i, 0xAA)).collect();
-        let units = coalesce(&entries, 131072, 4);
+        let entries: Vec<_> = (0..10)
+            .map(|i| make_entry("vol-a", i, 1, i, 0xAA))
+            .collect();
+        let units = coalesce(&entries, 131072, 4, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 3); // 4 + 4 + 2
     }
 
@@ -247,7 +266,7 @@ mod tests {
             make_entry("vol-a", 0, 1, 5, 0x22), // new (higher seq)
             make_entry("vol-a", 1, 1, 1, 0x33),
         ];
-        let units = coalesce(&entries, 131072, 32);
+        let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 2);
         assert_eq!(units[0].raw_data[0], 0x22); // latest data
@@ -260,7 +279,7 @@ mod tests {
             make_entry("vol-a", 0, 4, 0, 0xAA),
             make_entry("vol-a", 1, 1, 5, 0xFF), // overwrite LBA 1
         ];
-        let units = coalesce(&entries, 131072, 32);
+        let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 4);
         // LBA 0: 0xAA, LBA 1: 0xFF (overwritten), LBA 2-3: 0xAA
@@ -271,6 +290,6 @@ mod tests {
 
     #[test]
     fn coalesce_empty() {
-        assert!(coalesce(&[], 131072, 32).is_empty());
+        assert!(coalesce(&[], 131072, 32, &|_| CompressionAlgo::None).is_empty());
     }
 }

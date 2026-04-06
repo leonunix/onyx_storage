@@ -37,11 +37,11 @@ typedef struct OnyxVolume OnyxVolume;
 
 /**
  * Open the storage engine with full IO capability.
+ * Compression is per-volume (set at create_volume time).
  * @param config_path  Path to TOML config file.
- * @param compression  Compression algorithm (ONYX_COMPRESS_*).
  * @return Engine handle, or NULL on error (call onyx_strerror()).
  */
-OnyxEngine *onyx_engine_open(const char *config_path, int compression);
+OnyxEngine *onyx_engine_open(const char *config_path);
 
 /**
  * Open engine in metadata-only mode (no data device needed).

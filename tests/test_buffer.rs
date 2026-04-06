@@ -36,6 +36,7 @@ fn entry_roundtrip() {
         lba_count: 1,
         payload_crc32: payload_crc,
         flushed: false,
+        vol_created_at: 0,
         payload,
     };
 
@@ -60,6 +61,7 @@ fn entry_corrupt_detected() {
         lba_count: 1,
         payload_crc32: payload_crc,
         flushed: false,
+        vol_created_at: 0,
         payload,
     };
     let mut bytes = entry.to_bytes().unwrap();
@@ -83,7 +85,7 @@ fn basic_append_and_recover() {
     let (pool, _tmp) = create_test_pool(10);
 
     let data = vec![0xAB; 4096];
-    let seq = pool.append("test-vol", Lba(5), 1, &data).unwrap();
+    let seq = pool.append("test-vol", Lba(5), 1, &data, 0).unwrap();
     assert!(seq >= 1); // seq counter starts at 1 for a fresh pool
     assert_eq!(pool.pending_count(), 1);
 
@@ -99,7 +101,9 @@ fn flush_and_advance() {
 
     let mut seqs = Vec::new();
     for i in 0..5 {
-        let seq = pool.append("test-vol", Lba(i), 1, &vec![0xAB; 4096]).unwrap();
+        let seq = pool
+            .append("test-vol", Lba(i), 1, &vec![0xAB; 4096], 0)
+            .unwrap();
         seqs.push((seq, Lba(i)));
     }
     assert_eq!(pool.pending_count(), 5);
@@ -127,11 +131,12 @@ fn full_buffer_rejected() {
     let pool = WriteBufferPool::open(dev).unwrap();
 
     for _ in 0..2 {
-        pool.append("test-vol", Lba(0), 1, &vec![0; 4096]).unwrap();
+        pool.append("test-vol", Lba(0), 1, &vec![0; 4096], 0)
+            .unwrap();
     }
 
     // 3rd append should fail -- 4096 free < 8192 needed
-    let result = pool.append("test-vol", Lba(0), 1, &vec![0; 4096]);
+    let result = pool.append("test-vol", Lba(0), 1, &vec![0; 4096], 0);
     assert!(matches!(result, Err(OnyxError::BufferPoolFull(_))));
 }
 
@@ -144,8 +149,10 @@ fn persistence_across_reopen() {
     {
         let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
         let pool = WriteBufferPool::open(dev).unwrap();
-        pool.append("test-vol", Lba(42), 1, &vec![0xCD; 4096]).unwrap();
-        pool.append("test-vol", Lba(43), 1, &vec![0xEF; 4096]).unwrap();
+        pool.append("test-vol", Lba(42), 1, &vec![0xCD; 4096], 0)
+            .unwrap();
+        pool.append("test-vol", Lba(43), 1, &vec![0xEF; 4096], 0)
+            .unwrap();
     }
 
     {
@@ -164,7 +171,8 @@ fn fill_percentage() {
     assert_eq!(pool.fill_percentage(), 0);
 
     for _ in 0..5 {
-        pool.append("test-vol", Lba(0), 1, &vec![0; 4096]).unwrap();
+        pool.append("test-vol", Lba(0), 1, &vec![0; 4096], 0)
+            .unwrap();
     }
     assert!(pool.fill_percentage() > 0);
 }
@@ -176,8 +184,10 @@ fn fill_percentage() {
 fn buffer_pool_lookup() {
     let (pool, _tmp) = create_test_pool(10);
 
-    pool.append("test-vol", Lba(0), 1, &vec![0xAA; 4096]).unwrap();
-    pool.append("test-vol", Lba(1), 1, &vec![0xBB; 4096]).unwrap();
+    pool.append("test-vol", Lba(0), 1, &vec![0xAA; 4096], 0)
+        .unwrap();
+    pool.append("test-vol", Lba(1), 1, &vec![0xBB; 4096], 0)
+        .unwrap();
 
     let found = pool.lookup("test-vol", Lba(0)).unwrap();
     assert!(found.is_some());
@@ -196,8 +206,10 @@ fn buffer_pool_lookup() {
 fn buffer_pool_lookup_latest() {
     let (pool, _tmp) = create_test_pool(10);
 
-    pool.append("test-vol", Lba(5), 1, &vec![0x11; 4096]).unwrap();
-    pool.append("test-vol", Lba(5), 1, &vec![0x22; 4096]).unwrap();
+    pool.append("test-vol", Lba(5), 1, &vec![0x11; 4096], 0)
+        .unwrap();
+    pool.append("test-vol", Lba(5), 1, &vec![0x22; 4096], 0)
+        .unwrap();
 
     let found = pool.lookup("test-vol", Lba(5)).unwrap().unwrap();
     assert_eq!(found.payload, vec![0x22; 4096]);
@@ -231,6 +243,7 @@ fn entry_flushed_flag_roundtrip() {
         lba_count: 1,
         payload_crc32: payload_crc,
         flushed: true,
+        vol_created_at: 0,
         payload,
     };
     let bytes = entry.to_bytes().unwrap();
@@ -294,6 +307,7 @@ fn entry_long_vol_id_roundtrip() {
         lba_count: 1,
         payload_crc32: payload_crc,
         flushed: false,
+        vol_created_at: 0,
         payload,
     };
     let bytes = entry.to_bytes().unwrap();
@@ -307,7 +321,8 @@ fn entry_long_vol_id_roundtrip() {
 fn pool_long_vol_id_lookup() {
     let (pool, _tmp) = create_test_pool(10);
     let long_id = "x".repeat(255);
-    pool.append(&long_id, Lba(0), 1, &vec![0xEE; 4096]).unwrap();
+    pool.append(&long_id, Lba(0), 1, &vec![0xEE; 4096], 0)
+        .unwrap();
 
     let found = pool.lookup(&long_id, Lba(0)).unwrap();
     assert!(found.is_some());
@@ -326,6 +341,7 @@ fn entry_corrupt_vol_id_detected() {
         lba_count: 1,
         payload_crc32: payload_crc,
         flushed: false,
+        vol_created_at: 0,
         payload,
     };
     let mut bytes = entry.to_bytes().unwrap();
@@ -347,6 +363,7 @@ fn entry_corrupt_payload_detected() {
         lba_count: 1,
         payload_crc32: payload_crc,
         flushed: false,
+        vol_created_at: 0,
         payload,
     };
     let mut bytes = entry.to_bytes().unwrap();
@@ -368,6 +385,7 @@ fn entry_invalid_utf8_vol_id_rejected() {
         lba_count: 1,
         payload_crc32: payload_crc,
         flushed: false,
+        vol_created_at: 0,
         payload,
     };
     let mut bytes = entry.to_bytes().unwrap();
@@ -391,7 +409,13 @@ fn append_rejects_wrong_payload_size() {
     let (pool, _tmp) = create_test_pool(4);
     // payload must be exactly lba_count * 4096 = 4096 bytes for lba_count=1
     let err = pool
-        .append("test-vol", Lba(0), 1, &vec![0xAA; BLOCK_SIZE as usize + 1])
+        .append(
+            "test-vol",
+            Lba(0),
+            1,
+            &vec![0xAA; BLOCK_SIZE as usize + 1],
+            0,
+        )
         .unwrap_err();
     assert!(matches!(err, OnyxError::Config(_)));
 }
@@ -401,7 +425,7 @@ fn partial_mark_flushed_is_idempotent_for_multi_lba_entry() {
     let (pool, _tmp) = create_test_pool(8);
     let payload = vec![0x5A; 2 * BLOCK_SIZE as usize];
 
-    let seq = pool.append("test-vol", Lba(100), 2, &payload).unwrap();
+    let seq = pool.append("test-vol", Lba(100), 2, &payload, 0).unwrap();
     assert_eq!(pool.pending_count(), 1);
 
     pool.mark_flushed(seq, Lba(100), 1).unwrap();
