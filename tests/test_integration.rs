@@ -13,12 +13,19 @@
 //!   8. space: old PBAs freed on overwrite
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use onyx_storage::buffer::flush::{
+    clear_test_failpoint, clear_test_packed_pause_hook, install_test_failpoint,
+    install_test_packed_pause_hook, release_test_packed_pause_hook, wait_for_test_packed_pause_hit,
+    FlushFailStage,
+};
 use onyx_storage::compress::codec::create_compressor;
 use onyx_storage::config::*;
 use onyx_storage::engine::OnyxEngine;
+use onyx_storage::gc::config::GcConfig;
 use onyx_storage::types::*;
 use tempfile::{tempdir, NamedTempFile};
 
@@ -38,6 +45,27 @@ fn setup() -> TestEnv {
 }
 
 fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
+    setup_with_options(
+        data_bytes,
+        buf_bytes,
+        FlushConfig {
+            compress_workers: 2,
+            coalesce_max_raw_bytes: 131072,
+            coalesce_max_lbas: 32,
+        },
+        GcConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    )
+}
+
+fn setup_with_options(
+    data_bytes: u64,
+    buf_bytes: u64,
+    flush: FlushConfig,
+    gc: GcConfig,
+) -> TestEnv {
     let meta_dir = tempdir().unwrap();
     let buf_file = NamedTempFile::new().unwrap();
     let data_file = NamedTempFile::new().unwrap();
@@ -63,15 +91,12 @@ fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
             flush_watermark_pct: 80,
         },
         ublk: UblkConfig::default(),
-        flush: FlushConfig {
-            compress_workers: 2,
-            coalesce_max_raw_bytes: 131072,
-            coalesce_max_lbas: 32,
-        },
+        flush,
         engine: EngineConfig {
             zone_count: 2,
             zone_size_blocks: 128,
         },
+        gc,
     };
 
     let engine = OnyxEngine::open(&config).unwrap();
@@ -80,6 +105,53 @@ fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
         _meta_dir: meta_dir,
         _buf_file: buf_file,
         data_file,
+    }
+}
+
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+    let start = std::time::Instant::now();
+    loop {
+        if condition() {
+            return;
+        }
+        if start.elapsed() > timeout {
+            panic!("condition not met within {:?}", timeout);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct PackedPauseGuard {
+    state: Arc<(
+        std::sync::Mutex<onyx_storage::buffer::flush::PackedPauseState>,
+        std::sync::Condvar,
+    )>,
+}
+
+impl PackedPauseGuard {
+    fn install(vol_id: &str) -> Self {
+        Self {
+            state: install_test_packed_pause_hook(vol_id),
+        }
+    }
+
+    fn wait_hit(&self, timeout: Duration) {
+        assert!(
+            wait_for_test_packed_pause_hit(&self.state, timeout),
+            "packed pause hook was not hit within {:?}",
+            timeout
+        );
+    }
+
+    fn release(&self) {
+        release_test_packed_pause_hook(&self.state);
+    }
+}
+
+impl Drop for PackedPauseGuard {
+    fn drop(&mut self) {
+        self.release();
+        clear_test_packed_pause_hook();
     }
 }
 
@@ -1061,4 +1133,312 @@ fn prove_pipeline_status_report() {
     assert_eq!(fail_count, 0, "all blocks should verify");
 
     eprintln!("\n========== END REPORT ==========\n");
+}
+
+// ===========================================================================
+// Test 15: Prove packed read path handles non-zero slot_offset correctly
+// ===========================================================================
+#[test]
+fn prove_packed_slot_offset_read_path() {
+    let env = setup();
+    let vol_size = 16 * 4096u64;
+    env.engine
+        .create_volume("pack-read-a", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    env.engine
+        .create_volume("pack-read-b", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+
+    let vol_a = env.engine.open_volume("pack-read-a").unwrap();
+    let vol_b = env.engine.open_volume("pack-read-b").unwrap();
+
+    let data_a = vec![0x11u8; 4096];
+    let data_b = vec![0x22u8; 4096];
+    vol_a.write(0, &data_a).unwrap();
+    vol_b.write(0, &data_b).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    let meta = env.engine.meta();
+    let map_a = meta
+        .get_mapping(&VolumeId("pack-read-a".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    let map_b = meta
+        .get_mapping(&VolumeId("pack-read-b".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(map_a.pba, map_b.pba, "both fragments should share one packed slot");
+    assert_ne!(
+        map_a.slot_offset, map_b.slot_offset,
+        "packed fragments in one slot must have different offsets"
+    );
+    assert!(
+        map_a.slot_offset > 0 || map_b.slot_offset > 0,
+        "at least one fragment must use the non-zero slot_offset read path"
+    );
+
+    let slot_bytes = read_raw_lv3(&env, map_a.pba, 4096);
+    assert!(map_a.slot_offset as usize + map_a.unit_compressed_size as usize <= slot_bytes.len());
+    assert!(map_b.slot_offset as usize + map_b.unit_compressed_size as usize <= slot_bytes.len());
+
+    assert_eq!(vol_a.read(0, 4096).unwrap(), data_a);
+    assert_eq!(vol_b.read(0, 4096).unwrap(), data_b);
+}
+
+// ===========================================================================
+// Test 16: Prove delete_volume on one volume does not break another fragment
+// sharing the same packed slot
+// ===========================================================================
+#[test]
+fn prove_multi_volume_packed_slot_delete_isolation() {
+    let env = setup();
+    let vol_size = 16 * 4096u64;
+    env.engine
+        .create_volume("pack-del-a", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    env.engine
+        .create_volume("pack-del-b", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+
+    let vol_a = env.engine.open_volume("pack-del-a").unwrap();
+    let vol_b = env.engine.open_volume("pack-del-b").unwrap();
+
+    vol_a.write(0, &vec![0xA5; 4096]).unwrap();
+    vol_b.write(0, &vec![0x5A; 4096]).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    let meta = env.engine.meta();
+    let vol_a_id = VolumeId("pack-del-a".into());
+    let vol_b_id = VolumeId("pack-del-b".into());
+    let map_a = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
+    let map_b = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
+    assert_eq!(map_a.pba, map_b.pba, "initial fragments should share one packed slot");
+    assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 2);
+
+    drop(vol_a);
+    let _freed = env.engine.delete_volume("pack-del-a").unwrap();
+
+    assert!(meta.get_volume(&vol_a_id).unwrap().is_none());
+    assert!(meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_none());
+
+    let surviving = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
+    assert_eq!(surviving.pba, map_b.pba, "surviving fragment should stay on the same slot");
+    assert_eq!(meta.get_refcount(surviving.pba).unwrap(), 1);
+    assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x5A; 4096]);
+}
+
+// ===========================================================================
+// Test 17: Prove shared packed slot is only reclaimed after the last fragment
+// is overwritten
+// ===========================================================================
+#[test]
+fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
+    let env = setup();
+    let vol_size = 16 * 4096u64;
+    let initial_free = env.engine.allocator().unwrap().free_block_count();
+
+    env.engine
+        .create_volume("pack-over-a", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    env.engine
+        .create_volume("pack-over-b", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+
+    let vol_a = env.engine.open_volume("pack-over-a").unwrap();
+    let vol_b = env.engine.open_volume("pack-over-b").unwrap();
+
+    vol_a.write(0, &vec![0x31; 4096]).unwrap();
+    vol_b.write(0, &vec![0x32; 4096]).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    let meta = env.engine.meta();
+    let vol_a_id = VolumeId("pack-over-a".into());
+    let vol_b_id = VolumeId("pack-over-b".into());
+    let shared_pba = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap().pba;
+    assert_eq!(meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap().pba, shared_pba);
+    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 2);
+    assert_eq!(env.engine.allocator().unwrap().free_block_count(), initial_free - 1);
+
+    vol_a.write(0, &vec![0x41; 4096]).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+    let map_a_new = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
+    let map_b_old = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
+    assert_ne!(map_a_new.pba, shared_pba);
+    assert_eq!(map_b_old.pba, shared_pba);
+    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 1);
+    assert_eq!(env.engine.allocator().unwrap().free_block_count(), initial_free - 2);
+
+    vol_b.write(0, &vec![0x42; 4096]).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+    let map_b_new = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
+    assert_ne!(map_b_new.pba, shared_pba);
+    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 0);
+    assert_eq!(env.engine.allocator().unwrap().free_block_count(), initial_free - 2);
+
+    assert_eq!(vol_a.read(0, 4096).unwrap(), vec![0x41; 4096]);
+    assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x42; 4096]);
+}
+
+// ===========================================================================
+// Test 18: Prove packed flush holds lifecycle read lock long enough to block
+// delete_volume until commit completes
+// ===========================================================================
+#[test]
+fn prove_packed_flush_blocks_delete_until_commit() {
+    let env = setup();
+    let vol_size = 16 * 4096u64;
+    env.engine
+        .create_volume("pack-lock-a", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    env.engine
+        .create_volume("pack-lock-b", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+
+    let pause = PackedPauseGuard::install("pack-lock-a");
+
+    let vol_a = env.engine.open_volume("pack-lock-a").unwrap();
+    let vol_b = env.engine.open_volume("pack-lock-b").unwrap();
+    vol_a.write(0, &vec![0x61; 4096]).unwrap();
+    vol_b.write(0, &vec![0x62; 4096]).unwrap();
+
+    pause.wait_hit(Duration::from_secs(5));
+
+    let delete_done = Arc::new(AtomicBool::new(false));
+    thread::scope(|s| {
+        let done = delete_done.clone();
+        let engine = &env.engine;
+        s.spawn(move || {
+            engine.delete_volume("pack-lock-a").unwrap();
+            done.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !delete_done.load(Ordering::SeqCst),
+            "delete_volume should block while packed flush holds lifecycle read lock"
+        );
+
+        pause.release();
+    });
+
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    let meta = env.engine.meta();
+    let vol_a_id = VolumeId("pack-lock-a".into());
+    let vol_b_id = VolumeId("pack-lock-b".into());
+    assert!(meta.get_volume(&vol_a_id).unwrap().is_none());
+    assert!(meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_none());
+
+    let surviving = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
+    assert_eq!(meta.get_refcount(surviving.pba).unwrap(), 1);
+    assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x62; 4096]);
+}
+
+// ===========================================================================
+// Test 19: Prove packed metadata failure retries cleanly without leaking PBA
+// ===========================================================================
+#[test]
+fn prove_packed_metadata_failure_retries_without_leak() {
+    let env = setup();
+    let vol_size = 16 * 4096u64;
+    let initial_free = env.engine.allocator().unwrap().free_block_count();
+
+    env.engine
+        .create_volume("pack-fail-a", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    env.engine
+        .create_volume("pack-fail-b", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+
+    install_test_failpoint("pack-fail-a", Lba(0), FlushFailStage::BeforeMetaWrite, None);
+
+    let vol_a = env.engine.open_volume("pack-fail-a").unwrap();
+    let vol_b = env.engine.open_volume("pack-fail-b").unwrap();
+    vol_a.write(0, &vec![0x71; 4096]).unwrap();
+    vol_b.write(0, &vec![0x72; 4096]).unwrap();
+
+    let meta = env.engine.meta();
+    let vol_a_id = VolumeId("pack-fail-a".into());
+    let vol_b_id = VolumeId("pack-fail-b".into());
+    wait_until(Duration::from_secs(2), || {
+        meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_none()
+            && meta.get_mapping(&vol_b_id, Lba(0)).unwrap().is_none()
+            && env.engine.allocator().unwrap().free_block_count() == initial_free
+    });
+
+    clear_test_failpoint("pack-fail-a", Lba(0), FlushFailStage::BeforeMetaWrite);
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    let map_a = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
+    let map_b = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
+    assert_eq!(map_a.pba, map_b.pba, "retry should still produce one packed slot");
+    assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 2);
+    assert_eq!(env.engine.allocator().unwrap().free_block_count(), initial_free - 1);
+    assert_eq!(vol_a.read(0, 4096).unwrap(), vec![0x71; 4096]);
+    assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x72; 4096]);
+}
+
+// ===========================================================================
+// Test 20: Prove background GC runner rewrites and reclaims fragmented units
+// ===========================================================================
+#[test]
+fn prove_background_gc_runner_reclaims_old_units() {
+    let env = setup_with_options(
+        4096 * 4096,
+        4096 + 512 * 4096,
+        FlushConfig {
+            compress_workers: 2,
+            coalesce_max_raw_bytes: 131072,
+            coalesce_max_lbas: 32,
+        },
+        GcConfig {
+            enabled: true,
+            scan_interval_ms: 50,
+            dead_ratio_threshold: 0.25,
+            buffer_usage_max_pct: 90,
+            buffer_usage_resume_pct: 50,
+            max_rewrite_per_cycle: 64,
+        },
+    );
+
+    let vol_size = 128 * 4096u64;
+    env.engine
+        .create_volume("gc-bg", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    let vol = env.engine.open_volume("gc-bg").unwrap();
+
+    let mut initial = Vec::with_capacity(8 * 4096);
+    for i in 0u8..8 {
+        initial.extend_from_slice(&vec![i + 10; 4096]);
+    }
+    vol.write(0, &initial).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    let meta = env.engine.meta();
+    let vol_id = VolumeId("gc-bg".into());
+    let old_pba = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap().pba;
+
+    let mut overwrite = Vec::with_capacity(6 * 4096);
+    for i in 2u8..8 {
+        overwrite.extend_from_slice(&vec![i + 100; 4096]);
+    }
+    vol.write(2 * 4096, &overwrite).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    wait_until(Duration::from_secs(15), || meta.get_refcount(old_pba).unwrap() == 0);
+
+    let map0 = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap();
+    let map1 = meta.get_mapping(&vol_id, Lba(1)).unwrap().unwrap();
+    assert_ne!(map0.pba, old_pba, "GC should rewrite surviving live block");
+    assert_ne!(map1.pba, old_pba, "GC should rewrite surviving live block");
+
+    assert_eq!(vol.read(0, 4096).unwrap(), vec![10u8; 4096]);
+    assert_eq!(vol.read(4096, 4096).unwrap(), vec![11u8; 4096]);
+    for i in 2u8..8 {
+        assert_eq!(
+            vol.read(i as u64 * 4096, 4096).unwrap(),
+            vec![i + 100; 4096]
+        );
+    }
 }

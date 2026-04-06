@@ -67,9 +67,22 @@ impl ZoneWorker {
         };
 
         // 3. Read compression unit from LV3
-        let compressed_data = self
-            .io_engine
-            .read_blocks(mapping.pba, mapping.unit_compressed_size as usize)?;
+        //    If slot_offset > 0, the fragment is packed within a single 4KB slot.
+        let compressed_data = if mapping.slot_offset > 0 {
+            let slot_data = self.io_engine.read_blocks(mapping.pba, BLOCK_SIZE as usize)?;
+            let start = mapping.slot_offset as usize;
+            let end = start + mapping.unit_compressed_size as usize;
+            if end > slot_data.len() {
+                return Err(crate::error::OnyxError::Compress(format!(
+                    "packed fragment out of bounds: slot_offset={} + size={} > slot_len={}",
+                    start, mapping.unit_compressed_size, slot_data.len()
+                )));
+            }
+            slot_data[start..end].to_vec()
+        } else {
+            self.io_engine
+                .read_blocks(mapping.pba, mapping.unit_compressed_size as usize)?
+        };
 
         // 4. Verify CRC
         let actual_crc = crc32fast::hash(&compressed_data);

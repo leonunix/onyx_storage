@@ -43,6 +43,10 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             zone_count: 2,
             zone_size_blocks: 128,
         },
+        gc: onyx_storage::gc::config::GcConfig {
+            enabled: false,
+            ..Default::default()
+        },
     };
 
     (config, meta_dir, buf_tmp, data_tmp)

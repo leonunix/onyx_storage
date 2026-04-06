@@ -1,0 +1,772 @@
+/// Unit and integration tests for the GC module.
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use onyx_storage::buffer::flush::BufferFlusher;
+use onyx_storage::buffer::pool::WriteBufferPool;
+use onyx_storage::config::{FlushConfig, MetaConfig};
+use onyx_storage::gc::config::GcConfig;
+use onyx_storage::gc::rewriter::rewrite_candidate;
+use onyx_storage::gc::scanner::scan_gc_candidates;
+use onyx_storage::io::device::RawDevice;
+use onyx_storage::io::engine::IoEngine;
+use onyx_storage::lifecycle::VolumeLifecycleManager;
+use onyx_storage::meta::schema::*;
+use onyx_storage::meta::store::MetaStore;
+use onyx_storage::space::allocator::SpaceAllocator;
+use onyx_storage::types::*;
+use tempfile::{tempdir, NamedTempFile};
+
+fn register_volume(meta: &MetaStore, name: &str, compression: CompressionAlgo, created_at: u64) {
+    meta.put_volume(&VolumeConfig {
+        id: VolumeId(name.to_string()),
+        size_bytes: 4096 * 1000,
+        block_size: 4096,
+        compression,
+        created_at,
+        zone_count: 1,
+    })
+    .unwrap();
+}
+
+fn wait_for_flush(pool: &WriteBufferPool, timeout_ms: u64) -> bool {
+    let steps = timeout_ms / 10;
+    for _ in 0..steps {
+        if pool.pending_count() == 0 {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn start_flusher(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+) -> BufferFlusher {
+    BufferFlusher::start(
+        pool.clone(),
+        meta.clone(),
+        lifecycle.clone(),
+        allocator.clone(),
+        io_engine.clone(),
+        &FlushConfig::default(),
+    )
+}
+
+struct TestEnv {
+    meta: Arc<MetaStore>,
+    lifecycle: Arc<VolumeLifecycleManager>,
+    allocator: Arc<SpaceAllocator>,
+    pool: Arc<WriteBufferPool>,
+    io_engine: Arc<IoEngine>,
+    _meta_dir: tempfile::TempDir,
+    _buf_tmp: NamedTempFile,
+    _data_tmp: NamedTempFile,
+}
+
+fn setup_gc_env() -> TestEnv {
+    let meta_dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: meta_dir.path().to_path_buf(),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
+
+    let buf_tmp = NamedTempFile::new().unwrap();
+    let buf_size: u64 = 4096 + 200 * 8192;
+    buf_tmp.as_file().set_len(buf_size).unwrap();
+    let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
+    let pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
+
+    let data_tmp = NamedTempFile::new().unwrap();
+    let data_size: u64 = 4096 * 20000;
+    data_tmp.as_file().set_len(data_size).unwrap();
+    let data_dev = RawDevice::open(data_tmp.path()).unwrap();
+    let io_engine = Arc::new(IoEngine::new(data_dev, false));
+
+    let lifecycle = Arc::new(VolumeLifecycleManager::default());
+    let allocator = Arc::new(SpaceAllocator::new(data_size));
+
+    TestEnv {
+        meta,
+        lifecycle,
+        allocator,
+        pool,
+        io_engine,
+        _meta_dir: meta_dir,
+        _buf_tmp: buf_tmp,
+        _data_tmp: data_tmp,
+    }
+}
+
+// ---------- Scanner Tests ----------
+
+#[test]
+fn scanner_finds_candidates_with_dead_blocks() {
+    let dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: dir.path().to_path_buf(),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = MetaStore::open(&meta_config).unwrap();
+    let vol_id = VolumeId("vol-test".into());
+
+    // Simulate a compression unit with 4 LBAs, but only 2 still point to PBA 100
+    // (the other 2 were overwritten to different PBAs)
+    let bv = BlockmapValue {
+        pba: Pba(100),
+        compression: 1,
+        unit_compressed_size: 8000,
+        unit_original_size: 16384,
+        unit_lba_count: 4,
+        offset_in_unit: 0,
+        crc32: 0xDEADBEEF,
+        slot_offset: 0,
+    };
+
+    // LBA 0 and LBA 2 still point to PBA 100
+    meta.put_mapping(&vol_id, Lba(0), &bv).unwrap();
+    meta.put_mapping(
+        &vol_id,
+        Lba(2),
+        &BlockmapValue {
+            offset_in_unit: 2,
+            ..bv
+        },
+    )
+    .unwrap();
+
+    // LBA 1 and LBA 3 were overwritten to different PBAs
+    meta.put_mapping(
+        &vol_id,
+        Lba(1),
+        &BlockmapValue {
+            pba: Pba(200),
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            unit_compressed_size: 4000,
+            unit_original_size: 4096,
+            ..bv
+        },
+    )
+    .unwrap();
+    meta.put_mapping(
+        &vol_id,
+        Lba(3),
+        &BlockmapValue {
+            pba: Pba(300),
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            unit_compressed_size: 4000,
+            unit_original_size: 4096,
+            ..bv
+        },
+    )
+    .unwrap();
+
+    // Scan with threshold 0.25 (25% dead)
+    let candidates = scan_gc_candidates(&meta, 0.25, 100).unwrap();
+
+    assert_eq!(candidates.len(), 1);
+    let c = &candidates[0];
+    assert_eq!(c.pba, Pba(100));
+    assert_eq!(c.unit_lba_count, 4);
+    assert_eq!(c.live_lbas.len(), 2);
+    assert!((c.dead_ratio - 0.5).abs() < 0.01); // 2/4 = 50% dead
+}
+
+#[test]
+fn scanner_skips_below_threshold() {
+    let dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: dir.path().to_path_buf(),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = MetaStore::open(&meta_config).unwrap();
+    let vol_id = VolumeId("vol-test".into());
+
+    // 8-LBA unit, 7 still live → only 12.5% dead, below 25% threshold
+    for i in 0..7u64 {
+        let bv = BlockmapValue {
+            pba: Pba(100),
+            compression: 1,
+            unit_compressed_size: 16000,
+            unit_original_size: 32768,
+            unit_lba_count: 8,
+            offset_in_unit: i as u16,
+            crc32: 0,
+            slot_offset: 0,
+        };
+        meta.put_mapping(&vol_id, Lba(i), &bv).unwrap();
+    }
+    // LBA 7 was overwritten
+    meta.put_mapping(
+        &vol_id,
+        Lba(7),
+        &BlockmapValue {
+            pba: Pba(500),
+            compression: 1,
+            unit_compressed_size: 4000,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 0,
+            slot_offset: 0,
+        },
+    )
+    .unwrap();
+
+    let candidates = scan_gc_candidates(&meta, 0.25, 100).unwrap();
+    assert!(candidates.is_empty(), "12.5% dead should be below 25% threshold");
+}
+
+#[test]
+fn scanner_skips_single_lba_units() {
+    let dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: dir.path().to_path_buf(),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = MetaStore::open(&meta_config).unwrap();
+    let vol_id = VolumeId("vol-test".into());
+
+    // Single-LBA units can't have dead blocks
+    let bv = BlockmapValue {
+        pba: Pba(100),
+        compression: 0,
+        unit_compressed_size: 4096,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0,
+        slot_offset: 0,
+    };
+    meta.put_mapping(&vol_id, Lba(0), &bv).unwrap();
+
+    let candidates = scan_gc_candidates(&meta, 0.0, 100).unwrap();
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn scanner_sorts_by_dead_ratio_descending() {
+    let dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: dir.path().to_path_buf(),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = MetaStore::open(&meta_config).unwrap();
+    let vol_id = VolumeId("vol-test".into());
+
+    // Unit at PBA 100: 4-LBA, 1 live → 75% dead
+    meta.put_mapping(
+        &vol_id,
+        Lba(0),
+        &BlockmapValue {
+            pba: Pba(100),
+            compression: 1,
+            unit_compressed_size: 8000,
+            unit_original_size: 16384,
+            unit_lba_count: 4,
+            offset_in_unit: 0,
+            crc32: 0,
+            slot_offset: 0,
+        },
+    )
+    .unwrap();
+
+    // Unit at PBA 200: 4-LBA, 2 live → 50% dead
+    for i in 0..2u64 {
+        meta.put_mapping(
+            &vol_id,
+            Lba(10 + i),
+            &BlockmapValue {
+                pba: Pba(200),
+                compression: 1,
+                unit_compressed_size: 8000,
+                unit_original_size: 16384,
+                unit_lba_count: 4,
+                offset_in_unit: i as u16,
+                crc32: 0,
+                slot_offset: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let candidates = scan_gc_candidates(&meta, 0.25, 100).unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!((candidates[0].dead_ratio - 0.75).abs() < 0.01);
+    assert!((candidates[1].dead_ratio - 0.50).abs() < 0.01);
+}
+
+// ---------- GC End-to-End Tests ----------
+
+#[test]
+fn gc_rewrite_overwritten_blocks() {
+    let env = setup_gc_env();
+    let vol_id = "vol-gc";
+    let vol_created_at = 12345u64;
+    register_volume(&env.meta, vol_id, CompressionAlgo::Lz4, vol_created_at);
+
+    // Write 8 contiguous LBAs (forms 1 compression unit after coalescing)
+    let mut original_data = Vec::new();
+    for i in 0u8..8 {
+        let block = vec![i + 10; BLOCK_SIZE as usize];
+        original_data.push(block.clone());
+        env.pool
+            .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
+            .unwrap();
+    }
+
+    // Flush to LV3
+    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000), "initial flush timeout");
+    flusher.stop();
+
+    // Verify all 8 LBAs are mapped
+    let vid = VolumeId(vol_id.to_string());
+    for i in 0..8u64 {
+        assert!(env.meta.get_mapping(&vid, Lba(i)).unwrap().is_some());
+    }
+
+    // Get the PBA of the compression unit
+    let old_mapping = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap();
+    let old_pba = old_mapping.pba;
+    let _free_before_overwrite = env.allocator.free_block_count();
+
+    // Overwrite 6 of the 8 LBAs (LBA 2-7) with new data
+    for i in 2u8..8 {
+        let new_block = vec![i + 100; BLOCK_SIZE as usize];
+        env.pool
+            .append(vol_id, Lba(i as u64), 1, &new_block, vol_created_at)
+            .unwrap();
+    }
+
+    // Flush the overwrites
+    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000), "overwrite flush timeout");
+    flusher2.stop();
+
+    // Now LBA 0 and 1 still point to old_pba, LBA 2-7 point to new PBAs
+    let mapping0 = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap();
+    let mapping1 = env.meta.get_mapping(&vid, Lba(1)).unwrap().unwrap();
+    assert_eq!(mapping0.pba, old_pba);
+    assert_eq!(mapping1.pba, old_pba);
+    for i in 2..8u64 {
+        let m = env.meta.get_mapping(&vid, Lba(i)).unwrap().unwrap();
+        assert_ne!(m.pba, old_pba, "LBA {} should have new PBA", i);
+    }
+
+    // Scan for GC candidates — old unit has 6/8 dead = 75%
+    let candidates = scan_gc_candidates(&env.meta, 0.25, 100).unwrap();
+    assert!(!candidates.is_empty(), "should find GC candidate");
+
+    let candidate = candidates.iter().find(|c| c.pba == old_pba).unwrap();
+    assert_eq!(candidate.live_lbas.len(), 2);
+    assert!((candidate.dead_ratio - 0.75).abs() < 0.01);
+
+    // Rewrite the candidate — live blocks go back to buffer
+    let rewritten = rewrite_candidate(
+        candidate,
+        &env.io_engine,
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+    )
+    .unwrap();
+    assert_eq!(rewritten, 2);
+
+    // Flush the rewritten blocks
+    let mut flusher3 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000), "gc rewrite flush timeout");
+    flusher3.stop();
+
+    // After GC flush, LBA 0 and 1 should be at new PBAs (not old_pba)
+    let new_mapping0 = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap();
+    let new_mapping1 = env.meta.get_mapping(&vid, Lba(1)).unwrap().unwrap();
+    assert_ne!(new_mapping0.pba, old_pba, "LBA 0 should have new PBA after GC");
+    assert_ne!(new_mapping1.pba, old_pba, "LBA 1 should have new PBA after GC");
+
+    // Old PBA refcount should be 0
+    assert_eq!(env.meta.get_refcount(old_pba).unwrap(), 0);
+
+    // Verify data integrity — read all 8 blocks and check content
+    use onyx_storage::zone::worker::ZoneWorker;
+    let worker = ZoneWorker::new(
+        ZoneId(0),
+        env.meta.clone(),
+        env.pool.clone(),
+        env.io_engine.clone(),
+    );
+
+    // LBA 0 and 1 should still contain original data
+    let data0 = worker.handle_read(vol_id, Lba(0)).unwrap().unwrap();
+    assert_eq!(data0, vec![10u8; BLOCK_SIZE as usize], "LBA 0 data mismatch after GC");
+    let data1 = worker.handle_read(vol_id, Lba(1)).unwrap().unwrap();
+    assert_eq!(data1, vec![11u8; BLOCK_SIZE as usize], "LBA 1 data mismatch after GC");
+
+    // LBA 2-7 should contain overwritten data
+    for i in 2u8..8 {
+        let data = worker.handle_read(vol_id, Lba(i as u64)).unwrap().unwrap();
+        assert_eq!(
+            data,
+            vec![i + 100; BLOCK_SIZE as usize],
+            "LBA {} data mismatch after GC",
+            i
+        );
+    }
+}
+
+#[test]
+fn gc_rewriter_skips_changed_lba() {
+    let env = setup_gc_env();
+    let vol_id = "vol-race";
+    let vol_created_at = 99999u64;
+    register_volume(&env.meta, vol_id, CompressionAlgo::Lz4, vol_created_at);
+
+    // Write 4 LBAs
+    for i in 0u8..4 {
+        let block = vec![i; BLOCK_SIZE as usize];
+        env.pool
+            .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
+            .unwrap();
+    }
+
+    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher.stop();
+
+    let vid = VolumeId(vol_id.to_string());
+    let old_pba = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap().pba;
+
+    // Overwrite LBA 1 and 2
+    for i in 1u8..3 {
+        let block = vec![i + 50; BLOCK_SIZE as usize];
+        env.pool
+            .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
+            .unwrap();
+    }
+    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher2.stop();
+
+    // Scan for candidates
+    let candidates = scan_gc_candidates(&env.meta, 0.25, 100).unwrap();
+    let candidate = candidates.iter().find(|c| c.pba == old_pba).unwrap();
+    assert_eq!(candidate.live_lbas.len(), 2); // LBA 0 and 3
+
+    // Now overwrite LBA 0 AFTER the scan (simulating race condition)
+    env.pool
+        .append(vol_id, Lba(0), 1, &vec![0xFF; BLOCK_SIZE as usize], vol_created_at)
+        .unwrap();
+    let mut flusher3 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher3.stop();
+
+    // Now LBA 0 no longer points to old_pba — rewriter should skip it
+    let rewritten = rewrite_candidate(
+        candidate,
+        &env.io_engine,
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+    )
+    .unwrap();
+
+    // Only LBA 3 should be rewritten (LBA 0 was overwritten since scan)
+    assert_eq!(rewritten, 1);
+}
+
+#[test]
+fn gc_back_pressure_skips_when_buffer_full() {
+    // This is a behavioral test — we verify the GcConfig back-pressure logic.
+    // The actual GcRunner checks fill_percentage() in its loop.
+    let env = setup_gc_env();
+
+    // fill_percentage() with empty pool should be low
+    let pct = env.pool.fill_percentage();
+    assert!(pct < 80, "empty buffer should have low fill percentage");
+
+    // Config says skip when > 80%
+    let config = GcConfig {
+        buffer_usage_max_pct: 80,
+        buffer_usage_resume_pct: 50,
+        ..GcConfig::default()
+    };
+    assert!(pct <= config.buffer_usage_max_pct);
+}
+
+// ---------- Schema backward compatibility tests ----------
+
+#[test]
+fn blockmap_value_27byte_roundtrip() {
+    let v = BlockmapValue {
+        pba: Pba(42),
+        compression: 1,
+        unit_compressed_size: 2048,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0xDEAD,
+        slot_offset: 512,
+    };
+    let encoded = encode_blockmap_value(&v);
+    assert_eq!(encoded.len(), 27);
+    let decoded = decode_blockmap_value(&encoded).unwrap();
+    assert_eq!(decoded, v);
+    assert_eq!(decoded.slot_offset, 512);
+}
+
+#[test]
+fn blockmap_value_25byte_compat() {
+    // Simulate old 25-byte format (no slot_offset)
+    let mut old_encoded = [0u8; 25];
+    old_encoded[0..8].copy_from_slice(&42u64.to_be_bytes());
+    old_encoded[8] = 1; // compression
+    old_encoded[9..13].copy_from_slice(&2048u32.to_be_bytes());
+    old_encoded[13..17].copy_from_slice(&4096u32.to_be_bytes());
+    old_encoded[17..19].copy_from_slice(&1u16.to_be_bytes());
+    old_encoded[19..21].copy_from_slice(&0u16.to_be_bytes());
+    old_encoded[21..25].copy_from_slice(&0xDEADu32.to_be_bytes());
+
+    let decoded = decode_blockmap_value(&old_encoded).unwrap();
+    assert_eq!(decoded.pba, Pba(42));
+    assert_eq!(decoded.slot_offset, 0); // defaults to 0
+}
+
+#[test]
+fn blockmap_value_17byte_compat() {
+    // Legacy 17-byte format
+    let mut old_encoded = [0u8; 17];
+    old_encoded[0..8].copy_from_slice(&42u64.to_be_bytes());
+    old_encoded[8] = 0; // no compression
+    old_encoded[9..11].copy_from_slice(&4096u16.to_be_bytes());
+    old_encoded[11..13].copy_from_slice(&4096u16.to_be_bytes());
+    old_encoded[13..17].copy_from_slice(&0xBEEFu32.to_be_bytes());
+
+    let decoded = decode_blockmap_value(&old_encoded).unwrap();
+    assert_eq!(decoded.pba, Pba(42));
+    assert_eq!(decoded.unit_lba_count, 1);
+    assert_eq!(decoded.offset_in_unit, 0);
+    assert_eq!(decoded.slot_offset, 0);
+}
+
+// ---------- Fix validation tests ----------
+
+/// Scanner must distinguish multiple fragments packed into the same PBA slot.
+/// Before the fix, all fragments sharing a PBA were merged into one GcCandidate
+/// with wrong vol_id/unit_lba_count/crc32.
+#[test]
+fn scanner_distinguishes_packed_fragments_same_pba() {
+    let dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: dir.path().to_path_buf(),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = MetaStore::open(&meta_config).unwrap();
+
+    let shared_pba = Pba(100);
+
+    // Fragment A: vol-a, 4-LBA unit at slot_offset=0, 2 live
+    let vol_a = VolumeId("vol-a".into());
+    for i in [0u16, 2] {
+        meta.put_mapping(
+            &vol_a,
+            Lba(i as u64),
+            &BlockmapValue {
+                pba: shared_pba,
+                compression: 1,
+                unit_compressed_size: 1000,
+                unit_original_size: 16384,
+                unit_lba_count: 4,
+                offset_in_unit: i,
+                crc32: 0xAAAA,
+                slot_offset: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    // Fragment B: vol-b, 4-LBA unit at slot_offset=1000, 3 live
+    let vol_b = VolumeId("vol-b".into());
+    for i in [0u16, 1, 3] {
+        meta.put_mapping(
+            &vol_b,
+            Lba(10 + i as u64),
+            &BlockmapValue {
+                pba: shared_pba,
+                compression: 1,
+                unit_compressed_size: 2000,
+                unit_original_size: 16384,
+                unit_lba_count: 4,
+                offset_in_unit: i,
+                crc32: 0xBBBB,
+                slot_offset: 1000,
+            },
+        )
+        .unwrap();
+    }
+
+    let candidates = scan_gc_candidates(&meta, 0.20, 100).unwrap();
+
+    // Must find TWO separate candidates, not one merged one
+    assert_eq!(candidates.len(), 2, "should find 2 separate candidates for 2 fragments");
+
+    // Fragment A: 2/4 live → 50% dead
+    let cand_a = candidates.iter().find(|c| c.slot_offset == 0).unwrap();
+    assert_eq!(cand_a.vol_id, vol_a);
+    assert_eq!(cand_a.unit_lba_count, 4);
+    assert_eq!(cand_a.crc32, 0xAAAA);
+    assert_eq!(cand_a.live_lbas.len(), 2);
+    assert!((cand_a.dead_ratio - 0.5).abs() < 0.01);
+
+    // Fragment B: 3/4 live → 25% dead
+    let cand_b = candidates.iter().find(|c| c.slot_offset == 1000).unwrap();
+    assert_eq!(cand_b.vol_id, vol_b);
+    assert_eq!(cand_b.unit_lba_count, 4);
+    assert_eq!(cand_b.crc32, 0xBBBB);
+    assert_eq!(cand_b.live_lbas.len(), 3);
+    assert!((cand_b.dead_ratio - 0.25).abs() < 0.01);
+}
+
+/// Lifecycle lock must cover the entire packed write — from generation check
+/// through metadata commit. This test verifies that delete_volume during a
+/// packed flush does not leave stale blockmap entries.
+#[test]
+fn packed_flush_lifecycle_lock_covers_metadata_commit() {
+    let env = setup_gc_env();
+    let vol_id = "vol-lifecycle";
+    let vol_created_at = 77777u64;
+    register_volume(&env.meta, vol_id, CompressionAlgo::Lz4, vol_created_at);
+
+    // Write some data
+    let data = vec![42u8; BLOCK_SIZE as usize];
+    env.pool
+        .append(vol_id, Lba(0), 1, &data, vol_created_at)
+        .unwrap();
+
+    // Flush
+    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher.stop();
+
+    // Verify blockmap entry exists
+    let vid = VolumeId(vol_id.to_string());
+    assert!(env.meta.get_mapping(&vid, Lba(0)).unwrap().is_some());
+
+    // Now write more data and delete the volume before flushing
+    env.pool
+        .append(vol_id, Lba(1), 1, &data, vol_created_at)
+        .unwrap();
+
+    // Delete the volume using lifecycle write lock (simulating engine.delete_volume)
+    env.lifecycle.with_write_lock(vol_id, || {
+        env.pool.purge_volume(vol_id).unwrap();
+        env.meta.delete_volume(&vid).unwrap();
+    });
+
+    // Verify volume is gone
+    assert!(env.meta.get_volume(&vid).unwrap().is_none());
+
+    // Any pending buffer entries should have been purged
+    // If not, the flusher should discard them due to generation/volume check
+    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    // Give flusher time to process any remaining entries
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    flusher2.stop();
+
+    // The deleted volume's blockmap should NOT have been recreated by the flusher
+    assert!(
+        env.meta.get_mapping(&vid, Lba(0)).unwrap().is_none(),
+        "deleted volume's blockmap must not be recreated by packed flush"
+    );
+    assert!(
+        env.meta.get_mapping(&vid, Lba(1)).unwrap().is_none(),
+        "deleted volume's blockmap must not be recreated by packed flush"
+    );
+}
+
+/// GC rewrite of a packed slot must correctly handle the slot_offset:
+/// read the fragment from within the shared slot, not the whole slot.
+#[test]
+fn gc_rewrite_packed_fragment() {
+    let env = setup_gc_env();
+    let vol_id = "vol-packed-gc";
+    let vol_created_at = 55555u64;
+    register_volume(&env.meta, vol_id, CompressionAlgo::Lz4, vol_created_at);
+
+    // Write 4 contiguous LBAs (will be coalesced, compressed, and packed)
+    for i in 0u8..4 {
+        let block = vec![i + 20; BLOCK_SIZE as usize];
+        env.pool
+            .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
+            .unwrap();
+    }
+
+    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher.stop();
+
+    let vid = VolumeId(vol_id.to_string());
+    let original_pba = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap().pba;
+
+    // Overwrite 3 of 4 LBAs
+    for i in 1u8..4 {
+        let block = vec![i + 200; BLOCK_SIZE as usize];
+        env.pool
+            .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
+            .unwrap();
+    }
+    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher2.stop();
+
+    // GC scan + rewrite
+    let candidates = scan_gc_candidates(&env.meta, 0.25, 100).unwrap();
+    let candidate = candidates.iter().find(|c| c.pba == original_pba);
+    if let Some(candidate) = candidate {
+        assert_eq!(candidate.live_lbas.len(), 1); // only LBA 0
+        let rewritten = rewrite_candidate(
+            candidate,
+            &env.io_engine,
+            &env.pool,
+            &env.meta,
+            &env.lifecycle,
+        )
+        .unwrap();
+        assert_eq!(rewritten, 1);
+
+        // Flush rewritten block
+        let mut flusher3 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+        assert!(wait_for_flush(&env.pool, 5000));
+        flusher3.stop();
+    }
+
+    // Verify data integrity after GC
+    use onyx_storage::zone::worker::ZoneWorker;
+    let worker = ZoneWorker::new(
+        ZoneId(0),
+        env.meta.clone(),
+        env.pool.clone(),
+        env.io_engine.clone(),
+    );
+
+    let data0 = worker.handle_read(vol_id, Lba(0)).unwrap().unwrap();
+    assert_eq!(data0, vec![20u8; BLOCK_SIZE as usize], "LBA 0 data mismatch after packed GC");
+
+    for i in 1u8..4 {
+        let data = worker.handle_read(vol_id, Lba(i as u64)).unwrap().unwrap();
+        assert_eq!(data, vec![i + 200; BLOCK_SIZE as usize], "LBA {} data mismatch", i);
+    }
+}

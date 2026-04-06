@@ -24,6 +24,9 @@ pub struct BlockmapValue {
     pub unit_lba_count: u16,
     pub offset_in_unit: u16,
     pub crc32: u32,
+    /// Byte offset of this fragment within a shared 4KB physical slot (packer).
+    /// 0 = fragment starts at beginning of slot (no packing, or first fragment).
+    pub slot_offset: u16,
 }
 
 // --- Blockmap key: volume_id (length-prefixed) + lba ---
@@ -81,11 +84,11 @@ fn validate_vol_id_len(len: usize) -> Result<(), OnyxError> {
     }
 }
 
-/// Encode blockmap value (25 bytes):
+/// Encode blockmap value (27 bytes):
 /// pba(8B) + compression(1B) + unit_compressed_size(4B) + unit_original_size(4B)
-/// + unit_lba_count(2B) + offset_in_unit(2B) + crc32(4B)
-pub fn encode_blockmap_value(v: &BlockmapValue) -> [u8; 25] {
-    let mut val = [0u8; 25];
+/// + unit_lba_count(2B) + offset_in_unit(2B) + crc32(4B) + slot_offset(2B)
+pub fn encode_blockmap_value(v: &BlockmapValue) -> [u8; 27] {
+    let mut val = [0u8; 27];
     val[0..8].copy_from_slice(&v.pba.0.to_be_bytes());
     val[8] = v.compression;
     val[9..13].copy_from_slice(&v.unit_compressed_size.to_be_bytes());
@@ -93,13 +96,27 @@ pub fn encode_blockmap_value(v: &BlockmapValue) -> [u8; 25] {
     val[17..19].copy_from_slice(&v.unit_lba_count.to_be_bytes());
     val[19..21].copy_from_slice(&v.offset_in_unit.to_be_bytes());
     val[21..25].copy_from_slice(&v.crc32.to_be_bytes());
+    val[25..27].copy_from_slice(&v.slot_offset.to_be_bytes());
     val
 }
 
-/// Decode blockmap value. Supports both:
-/// - 25-byte new format (compression units)
-/// - 17-byte legacy format (single-LBA, migrated to unit_lba_count=1)
+/// Decode blockmap value. Supports:
+/// - 27-byte format (with slot_offset for packer)
+/// - 25-byte format (compression units, slot_offset=0)
+/// - 17-byte legacy format (single-LBA, migrated to unit_lba_count=1, slot_offset=0)
 pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
+    if val.len() == 27 {
+        return Some(BlockmapValue {
+            pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
+            compression: val[8],
+            unit_compressed_size: u32::from_be_bytes(val[9..13].try_into().unwrap()),
+            unit_original_size: u32::from_be_bytes(val[13..17].try_into().unwrap()),
+            unit_lba_count: u16::from_be_bytes(val[17..19].try_into().unwrap()),
+            offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
+            crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
+            slot_offset: u16::from_be_bytes(val[25..27].try_into().unwrap()),
+        });
+    }
     if val.len() == 25 {
         return Some(BlockmapValue {
             pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
@@ -109,6 +126,7 @@ pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
             unit_lba_count: u16::from_be_bytes(val[17..19].try_into().unwrap()),
             offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
             crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
+            slot_offset: 0,
         });
     }
     // Legacy 17-byte format: single-LBA block
@@ -123,6 +141,7 @@ pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
             unit_lba_count: 1,
             offset_in_unit: 0,
             crc32: u32::from_be_bytes(val[13..17].try_into().unwrap()),
+            slot_offset: 0,
         });
     }
     None

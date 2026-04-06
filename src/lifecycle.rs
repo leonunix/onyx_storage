@@ -28,4 +28,11 @@ impl VolumeLifecycleManager {
         let _guard = lock.write().unwrap();
         f()
     }
+
+    /// Get the underlying lock Arc for a volume, for callers that need
+    /// to hold multiple read locks simultaneously across an operation.
+    /// Caller must acquire the read guard and keep both the Arc and guard alive.
+    pub fn get_lock(&self, vol_id: &str) -> Arc<RwLock<()>> {
+        self.lock_for(vol_id)
+    }
 }

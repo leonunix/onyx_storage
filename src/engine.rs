@@ -5,6 +5,7 @@ use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
 use crate::config::OnyxConfig;
 use crate::error::{OnyxError, OnyxResult};
+use crate::gc::runner::GcRunner;
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
@@ -33,6 +34,7 @@ pub struct OnyxEngine {
     #[allow(dead_code)]
     buffer_pool: Option<Arc<WriteBufferPool>>,
     flusher: Mutex<Option<BufferFlusher>>,
+    gc_runner: Mutex<Option<GcRunner>>,
     zone_manager: Option<Arc<ZoneManager>>,
     /// Live volume handles: (vol_name, alive_flag).
     /// delete_volume sets all matching flags to false.
@@ -149,6 +151,19 @@ impl OnyxEngine {
             io_engine.clone(),
         )?);
 
+        // 8. GC runner (after flusher, so flusher can drain GC-injected entries)
+        let gc_runner = if config.gc.enabled {
+            Some(GcRunner::start(
+                meta.clone(),
+                io_engine.clone(),
+                buffer_pool.clone(),
+                lifecycle.clone(),
+                config.gc.clone(),
+            ))
+        } else {
+            None
+        };
+
         tracing::info!("onyx engine opened (full mode)");
 
         Ok(Self {
@@ -157,6 +172,7 @@ impl OnyxEngine {
             allocator: Some(allocator),
             buffer_pool: Some(buffer_pool),
             flusher: Mutex::new(Some(flusher)),
+            gc_runner: Mutex::new(gc_runner),
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -183,6 +199,7 @@ impl OnyxEngine {
             allocator: None,
             buffer_pool: None,
             flusher: Mutex::new(None),
+            gc_runner: Mutex::new(None),
             zone_manager: None,
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -314,7 +331,12 @@ impl OnyxEngine {
         }
         *done = true;
 
-        // Stop flusher first (drains pending flushes)
+        // Stop GC first (it injects into buffer pool)
+        if let Some(mut gc) = self.gc_runner.lock().unwrap().take() {
+            gc.stop();
+        }
+
+        // Then stop flusher (drains pending flushes)
         if let Some(mut flusher) = self.flusher.lock().unwrap().take() {
             flusher.stop();
         }

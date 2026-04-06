@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
+use crate::packer::packer::{PackResult, Packer, SealedSlot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
@@ -50,9 +51,25 @@ struct FlushFailRule {
 }
 
 static TEST_FAIL_RULES: OnceLock<Mutex<Vec<FlushFailRule>>> = OnceLock::new();
+#[doc(hidden)]
+pub struct PackedPauseState {
+    hit: bool,
+    released: bool,
+}
+
+struct PackedPauseHook {
+    vol_id: String,
+    state: Arc<(Mutex<PackedPauseState>, Condvar)>,
+}
+
+static TEST_PACKED_PAUSE_HOOK: OnceLock<Mutex<Option<PackedPauseHook>>> = OnceLock::new();
 
 fn test_fail_rules() -> &'static Mutex<Vec<FlushFailRule>> {
     TEST_FAIL_RULES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn test_packed_pause_hook() -> &'static Mutex<Option<PackedPauseHook>> {
+    TEST_PACKED_PAUSE_HOOK.get_or_init(|| Mutex::new(None))
 }
 
 fn maybe_inject_test_failure(
@@ -84,6 +101,40 @@ fn maybe_inject_test_failure(
     Ok(())
 }
 
+fn maybe_inject_test_failure_packed(
+    fragments: &[crate::packer::packer::SlotFragment],
+    stage: FlushFailStage,
+) -> OnyxResult<()> {
+    for frag in fragments {
+        maybe_inject_test_failure(&frag.unit.vol_id, frag.unit.start_lba, stage)?;
+    }
+    Ok(())
+}
+
+fn maybe_pause_before_packed_meta_write(
+    fragments: &[crate::packer::packer::SlotFragment],
+) -> OnyxResult<()> {
+    let state = {
+        let hook = test_packed_pause_hook().lock().unwrap();
+        let Some(hook) = hook.as_ref() else {
+            return Ok(());
+        };
+        if !fragments.iter().any(|f| f.unit.vol_id == hook.vol_id) {
+            return Ok(());
+        }
+        hook.state.clone()
+    };
+
+    let (lock, cv) = &*state;
+    let mut guard = lock.lock().unwrap();
+    guard.hit = true;
+    cv.notify_all();
+    while !guard.released {
+        guard = cv.wait(guard).unwrap();
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn install_test_failpoint(
     vol_id: &str,
@@ -106,6 +157,48 @@ pub fn clear_test_failpoint(vol_id: &str, start_lba: Lba, stage: FlushFailStage)
     rules.retain(|rule| {
         !(rule.vol_id == vol_id && rule.start_lba == start_lba && rule.stage == stage)
     });
+}
+
+#[doc(hidden)]
+pub fn install_test_packed_pause_hook(vol_id: &str) -> Arc<(Mutex<PackedPauseState>, Condvar)> {
+    let state = Arc::new((
+        Mutex::new(PackedPauseState {
+            hit: false,
+            released: false,
+        }),
+        Condvar::new(),
+    ));
+    let mut hook = test_packed_pause_hook().lock().unwrap();
+    *hook = Some(PackedPauseHook {
+        vol_id: vol_id.to_string(),
+        state: state.clone(),
+    });
+    state
+}
+
+#[doc(hidden)]
+pub fn clear_test_packed_pause_hook() {
+    let mut hook = test_packed_pause_hook().lock().unwrap();
+    *hook = None;
+}
+
+#[doc(hidden)]
+pub fn wait_for_test_packed_pause_hit(
+    state: &Arc<(Mutex<PackedPauseState>, Condvar)>,
+    timeout: Duration,
+) -> bool {
+    let (lock, cv) = &**state;
+    let guard = lock.lock().unwrap();
+    let (guard, _) = cv.wait_timeout_while(guard, timeout, |s| !s.hit).unwrap();
+    guard.hit
+}
+
+#[doc(hidden)]
+pub fn release_test_packed_pause_hook(state: &Arc<(Mutex<PackedPauseState>, Condvar)>) {
+    let (lock, cv) = &**state;
+    let mut guard = lock.lock().unwrap();
+    guard.released = true;
+    cv.notify_all();
 }
 
 enum Allocation {
@@ -186,15 +279,17 @@ impl BufferFlusher {
         drop(compress_rx);
         drop(write_tx);
 
-        // Stage 3: Writer
+        // Stage 3: Writer (owns the packer)
         let running_w = running.clone();
         let pool_w = pool.clone();
+        let allocator_w = allocator.clone();
         let writer_handle = thread::Builder::new()
             .name("flusher-writer".into())
             .spawn(move || {
+                let mut packer = Packer::new(allocator_w);
                 Self::writer_loop(
                     &write_rx, &pool_w, &meta, &lifecycle, &allocator, &io_engine, &done_tx,
-                    &running_w,
+                    &running_w, &mut packer,
                 );
             })
             .expect("failed to spawn writer thread");
@@ -344,34 +439,125 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
+        packer: &mut Packer,
     ) {
+        // Seqs buffered inside the packer's open slot, reported when the slot is sealed.
+        let mut buffered_seqs: Vec<u64> = Vec::new();
+
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => {
                     let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
 
-                    // Deleted-volume check is handled inside write_unit() via
-                    // persistent meta.get_volume() — no in-memory fast-path here
-                    // to avoid epoch/generation mismatches with recreated volumes.
+                    match packer.pack_or_passthrough(unit) {
+                        Ok(PackResult::Passthrough(unit)) => {
+                            if let Err(e) =
+                                Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine)
+                            {
+                                tracing::error!(
+                                    vol = unit.vol_id,
+                                    start_lba = unit.start_lba.0,
+                                    lba_count = unit.lba_count,
+                                    error = %e,
+                                    "writer: failed to flush unit"
+                                );
+                            }
+                            let _ = done_tx.send(seqs);
+                        }
+                        Ok(PackResult::Buffered) => {
+                            // Don't report seqs as done yet — entries must stay in-flight
+                            // until the packed slot is sealed and written. Otherwise the
+                            // coalescer will re-dispatch them.
+                            buffered_seqs.extend(&seqs);
+                        }
+                        Ok(PackResult::SealedSlot(sealed)) => {
+                            // Write the sealed slot
+                            if let Err(e) = Self::write_packed_slot(
+                                &sealed, pool, meta, lifecycle, allocator, io_engine,
+                            ) {
+                                tracing::error!(
+                                    pba = sealed.pba.0,
+                                    fragments = sealed.fragments.len(),
+                                    error = %e,
+                                    "writer: failed to flush packed slot"
+                                );
+                            }
+                            // Report all seqs from the sealed slot as done.
+                            // The new fragment that triggered the seal is now buffered
+                            // in the new open slot — its seqs stay in buffered_seqs.
+                            let sealed_seqs = std::mem::take(&mut buffered_seqs);
+                            let _ = done_tx.send(sealed_seqs);
+                            // Current unit's seqs go into buffered_seqs for the new slot
+                            buffered_seqs.extend(&seqs);
+                        }
+                        Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
+                            // Sealed slot must be written; unit falls back to direct write.
+                            if let Err(e) = Self::write_packed_slot(
+                                &sealed, pool, meta, lifecycle, allocator, io_engine,
+                            ) {
+                                tracing::error!(
+                                    pba = sealed.pba.0,
+                                    error = %e,
+                                    "writer: failed to flush packed slot (alloc fallback)"
+                                );
+                            }
+                            let sealed_seqs = std::mem::take(&mut buffered_seqs);
+                            let _ = done_tx.send(sealed_seqs);
 
-                    if let Err(e) =
-                        Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine)
-                    {
-                        tracing::error!(
-                            vol = unit.vol_id,
-                            start_lba = unit.start_lba.0,
-                            lba_count = unit.lba_count,
-                            error = %e,
-                            "writer: failed to flush unit"
-                        );
+                            // Write the unit directly (Passthrough path)
+                            if let Err(e) =
+                                Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine)
+                            {
+                                tracing::error!(
+                                    vol = unit.vol_id,
+                                    error = %e,
+                                    "writer: failed to flush unit (alloc fallback)"
+                                );
+                            }
+                            let _ = done_tx.send(seqs);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "writer: packer error");
+                            let _ = done_tx.send(seqs);
+                        }
                     }
-                    // Always report seqs as done (even on error) so they don't
-                    // stay in-flight forever. On error the entries remain unflushed
-                    // in the buffer and will be retried on the next coalesce pass.
-                    let _ = done_tx.send(seqs);
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Flush the packer's open slot on idle to avoid holding
+                    // buffered fragments indefinitely.
+                    if let Some(sealed) = packer.flush_open_slot() {
+                        if let Err(e) = Self::write_packed_slot(
+                            &sealed, pool, meta, lifecycle, allocator, io_engine,
+                        ) {
+                            tracing::error!(
+                                pba = sealed.pba.0,
+                                error = %e,
+                                "writer: failed to flush packed slot on idle"
+                            );
+                        }
+                        if !buffered_seqs.is_empty() {
+                            let _ = done_tx.send(std::mem::take(&mut buffered_seqs));
+                        }
+                    }
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        // Flush any remaining open slot on shutdown
+        if let Some(sealed) = packer.flush_open_slot() {
+            if let Err(e) =
+                Self::write_packed_slot(&sealed, pool, meta, lifecycle, allocator, io_engine)
+            {
+                tracing::error!(
+                    pba = sealed.pba.0,
+                    error = %e,
+                    "writer: failed to flush final packed slot on shutdown"
+                );
+            }
+            if !buffered_seqs.is_empty() {
+                let _ = done_tx.send(buffered_seqs);
             }
         }
     }
@@ -463,6 +649,7 @@ impl BufferFlusher {
                         unit_lba_count: unit.lba_count as u16,
                         offset_in_unit: i as u16,
                         crc32: unit.crc32,
+                        slot_offset: 0,
                     },
                 ));
             }
@@ -518,6 +705,159 @@ impl BufferFlusher {
 
             Ok(())
         })
+    }
+
+    fn write_packed_slot(
+        sealed: &SealedSlot,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
+    ) -> OnyxResult<()> {
+        // Collect unique volume IDs and acquire read locks on ALL of them
+        // BEFORE doing any work. Sorted to prevent deadlock. Held until
+        // metadata commit completes — mirrors write_unit()'s with_read_lock
+        // guarantee that delete/create cannot interleave with this flush.
+        let mut vol_ids: Vec<String> = sealed
+            .fragments
+            .iter()
+            .map(|f| f.unit.vol_id.clone())
+            .collect();
+        vol_ids.sort();
+        vol_ids.dedup();
+
+        let locks: Vec<_> = vol_ids
+            .iter()
+            .map(|vid| lifecycle.get_lock(vid))
+            .collect();
+        let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
+
+        // Under lifecycle read locks: check generation, build batch, IO, commit
+
+        // Build blockmap entries and collect old PBA decrements across all fragments
+        let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        let mut total_refcount: u32 = 0;
+        let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
+        let mut any_discarded = false;
+
+        for frag in &sealed.fragments {
+            let unit = &frag.unit;
+            let vol_id = VolumeId(unit.vol_id.clone());
+
+            // Lifecycle check: verify volume still exists and generation matches
+            let should_discard = match meta.get_volume(&vol_id)? {
+                None => true,
+                Some(vc)
+                    if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
+                {
+                    true
+                }
+                _ => false,
+            };
+
+            if should_discard {
+                any_discarded = true;
+                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                    let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                }
+                continue;
+            }
+
+            for i in 0..unit.lba_count {
+                let lba = Lba(unit.start_lba.0 + i as u64);
+                if let Some(old) = meta.get_mapping(&vol_id, lba)? {
+                    let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
+                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(old_blocks);
+                }
+                batch_values.push((
+                    vol_id.clone(),
+                    lba,
+                    BlockmapValue {
+                        pba: sealed.pba,
+                        compression: unit.compression,
+                        unit_compressed_size: unit.compressed_data.len() as u32,
+                        unit_original_size: unit.original_size,
+                        unit_lba_count: unit.lba_count as u16,
+                        offset_in_unit: i as u16,
+                        crc32: unit.crc32,
+                        slot_offset: frag.slot_offset,
+                    },
+                ));
+            }
+            total_refcount += unit.lba_count;
+            all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
+        }
+
+        // If all fragments were discarded, free the slot PBA
+        if batch_values.is_empty() {
+            allocator.free_one(sealed.pba)?;
+            let _ = pool.advance_tail();
+            return Ok(());
+        }
+
+        maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)?;
+
+        // Write the 4KB slot data to LV3
+        if let Err(e) = io_engine.write_blocks(sealed.pba, &sealed.data) {
+            allocator.free_one(sealed.pba)?;
+            return Err(e);
+        }
+
+        let old_pba_decrements: HashMap<Pba, u32> = old_pba_meta
+            .iter()
+            .map(|(old_pba, (decrement, _))| (*old_pba, *decrement))
+            .collect();
+
+        maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)?;
+        maybe_pause_before_packed_meta_write(&sealed.fragments)?;
+
+        // Metadata commit — if this fails, free the PBA to prevent orphaned block
+        if let Err(e) = meta.atomic_batch_write_packed(
+            &batch_values,
+            sealed.pba,
+            total_refcount,
+            &old_pba_decrements,
+        ) {
+            allocator.free_one(sealed.pba)?;
+            return Err(e);
+        }
+
+        // Free old PBAs whose refcount dropped to 0
+        for (old_pba, (_, old_blocks)) in &old_pba_meta {
+            let remaining = meta.get_refcount(*old_pba)?;
+            if remaining == 0 {
+                if *old_blocks == 1 {
+                    allocator.free_one(*old_pba)?;
+                } else {
+                    allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
+                }
+            }
+        }
+
+        // Lifecycle read locks are still held here — metadata is committed,
+        // so delete_volume cannot have interleaved.
+
+        // Mark entries flushed
+        for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
+            if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                tracing::warn!(seq, error = %e, "failed to mark entry flushed (packed)");
+            }
+        }
+        pool.advance_tail()?;
+
+        tracing::debug!(
+            pba = sealed.pba.0,
+            fragments = sealed.fragments.len(),
+            total_lbas = total_refcount,
+            discarded = any_discarded,
+            "flushed packed slot"
+        );
+
+        Ok(())
     }
 
     pub fn stop(&mut self) {

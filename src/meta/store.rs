@@ -393,6 +393,66 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Atomically write blockmap entries from multiple volumes sharing the same PBA
+    /// (packed slot). Sets the total refcount for the PBA and decrements old PBAs.
+    ///
+    /// `batch_values`: vec of (vol_id, lba, BlockmapValue) — each entry may belong to a different volume
+    /// `new_pba`: the shared PBA for the packed slot
+    /// `new_refcount`: total refcount for new_pba (sum of all lba_counts across fragments)
+    /// `old_pba_decrements`: aggregated decrements per old PBA
+    pub fn atomic_batch_write_packed(
+        &self,
+        batch_values: &[(VolumeId, Lba, BlockmapValue)],
+        new_pba: Pba,
+        new_refcount: u32,
+        old_pba_decrements: &std::collections::HashMap<Pba, u32>,
+    ) -> OnyxResult<()> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        let mut batch = WriteBatch::default();
+
+        for (vol_id, lba, value) in batch_values {
+            let bm_key = encode_blockmap_key(vol_id, *lba)?;
+            let bm_val = encode_blockmap_value(value);
+            batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+        }
+
+        let rc_key = encode_refcount_key(new_pba);
+        batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_refcount));
+
+        for (old_pba, decrement) in old_pba_decrements {
+            let current_rc = self.get_refcount(*old_pba)?;
+            let new_rc = current_rc.saturating_sub(*decrement);
+            let rc_key = encode_refcount_key(*old_pba);
+            if new_rc == 0 {
+                batch.delete_cf(&cf_refcount, &rc_key);
+            } else {
+                batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
+            }
+        }
+
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Scan all blockmap entries, calling the provided callback for each (key, value) pair.
+    /// Used by GC scanner to identify compression units with dead blocks.
+    pub fn scan_all_blockmap_entries(
+        &self,
+        callback: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> OnyxResult<()> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            callback(&key, &value);
+        }
+        Ok(())
+    }
+
     /// Iterate all refcount entries (for space allocator rebuild)
     pub fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
         let cf = self.db.cf_handle(CF_REFCOUNT).unwrap();
