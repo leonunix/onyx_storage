@@ -59,12 +59,21 @@ pub fn insert_hole_coalesced(map: &HoleMap, pba: Pba, offset: u16, size: u16) {
     }
 
     // Try to merge with the hole immediately after: (pba, new_offset + new_size)
-    let after_key = HoleKey { pba, offset: new_offset + new_size };
+    let after_key = HoleKey {
+        pba,
+        offset: new_offset + new_size,
+    };
     if let Some(as_) = holes.remove(&after_key) {
         new_size += as_;
     }
 
-    holes.insert(HoleKey { pba, offset: new_offset }, new_size);
+    holes.insert(
+        HoleKey {
+            pba,
+            offset: new_offset,
+        },
+        new_size,
+    );
 }
 
 /// Describes filling a hole in an existing packed slot (read-modify-write).

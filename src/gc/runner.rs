@@ -10,6 +10,7 @@ use crate::gc::scanner::scan_gc_candidates;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
+use crate::metrics::EngineMetrics;
 
 /// Background GC runner thread.
 pub struct GcRunner {
@@ -25,6 +26,24 @@ impl GcRunner {
         lifecycle: Arc<VolumeLifecycleManager>,
         config: GcConfig,
     ) -> Self {
+        Self::start_with_metrics(
+            Arc::new(EngineMetrics::default()),
+            meta,
+            io_engine,
+            buffer_pool,
+            lifecycle,
+            config,
+        )
+    }
+
+    pub fn start_with_metrics(
+        metrics: Arc<EngineMetrics>,
+        meta: Arc<MetaStore>,
+        io_engine: Arc<IoEngine>,
+        buffer_pool: Arc<WriteBufferPool>,
+        lifecycle: Arc<VolumeLifecycleManager>,
+        config: GcConfig,
+    ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
@@ -32,6 +51,7 @@ impl GcRunner {
             .name("gc-runner".into())
             .spawn(move || {
                 Self::gc_loop(
+                    &metrics,
                     &meta,
                     &io_engine,
                     &buffer_pool,
@@ -49,6 +69,7 @@ impl GcRunner {
     }
 
     fn gc_loop(
+        metrics: &EngineMetrics,
         meta: &MetaStore,
         io_engine: &IoEngine,
         buffer_pool: &WriteBufferPool,
@@ -65,9 +86,12 @@ impl GcRunner {
                 break;
             }
 
+            metrics.gc_cycles.fetch_add(1, Ordering::Relaxed);
+
             // Back-pressure: check buffer usage
             let fill_pct = buffer_pool.fill_percentage();
             if fill_pct > config.buffer_usage_max_pct {
+                metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
                 if !paused {
                     tracing::debug!(
                         fill_pct,
@@ -98,10 +122,15 @@ impl GcRunner {
             ) {
                 Ok(c) => c,
                 Err(e) => {
+                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, "gc: scan failed");
                     continue;
                 }
             };
+
+            metrics
+                .gc_candidates_found
+                .fetch_add(candidates.len() as u64, Ordering::Relaxed);
 
             if candidates.is_empty() {
                 continue;
@@ -119,20 +148,29 @@ impl GcRunner {
 
                 // Re-check back-pressure before each candidate
                 if buffer_pool.fill_percentage() > config.buffer_usage_max_pct {
+                    metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!("gc: pausing mid-cycle due to buffer pressure");
                     paused = true;
                     break;
                 }
 
-                if let Err(e) =
-                    rewrite_candidate(candidate, io_engine, buffer_pool, meta, lifecycle)
-                {
-                    tracing::warn!(
-                        pba = candidate.pba.0,
-                        vol = %candidate.vol_id,
-                        error = %e,
-                        "gc: failed to rewrite candidate"
-                    );
+                metrics.gc_rewrite_attempts.fetch_add(1, Ordering::Relaxed);
+
+                match rewrite_candidate(candidate, io_engine, buffer_pool, meta, lifecycle) {
+                    Ok(rewritten) => {
+                        metrics
+                            .gc_blocks_rewritten
+                            .fetch_add(rewritten as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            pba = candidate.pba.0,
+                            vol = %candidate.vol_id,
+                            error = %e,
+                            "gc: failed to rewrite candidate"
+                        );
+                    }
                 }
             }
         }

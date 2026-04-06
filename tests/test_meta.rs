@@ -39,7 +39,7 @@ fn blockmap_value_roundtrip() {
         offset_in_unit: 0,
         crc32: 0,
         slot_offset: 0,
-    flags: 0,
+        flags: 0,
     };
     let encoded = encode_blockmap_value(&v);
     let decoded = decode_blockmap_value(&encoded).unwrap();
@@ -113,7 +113,7 @@ fn blockmap_crud() {
         offset_in_unit: 0,
         crc32: 0,
         slot_offset: 0,
-    flags: 0,
+        flags: 0,
     };
 
     store.put_mapping(&vol_id, Lba(0), &val).unwrap();
@@ -144,7 +144,7 @@ fn blockmap_range_query() {
             offset_in_unit: 0,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         };
         store.put_mapping(&vol_id, Lba(i), &val).unwrap();
     }
@@ -193,7 +193,7 @@ fn atomic_write_mapping() {
         offset_in_unit: 0,
         crc32: 0,
         slot_offset: 0,
-    flags: 0,
+        flags: 0,
     };
 
     store.atomic_write_mapping(&vol_id, Lba(10), &val).unwrap();
@@ -220,7 +220,7 @@ fn atomic_remap() {
         offset_in_unit: 0,
         crc32: 0,
         slot_offset: 0,
-    flags: 0,
+        flags: 0,
     };
     store
         .atomic_write_mapping(&vol_id, Lba(5), &old_val)
@@ -237,7 +237,7 @@ fn atomic_remap() {
         offset_in_unit: 0,
         crc32: 0,
         slot_offset: 0,
-    flags: 0,
+        flags: 0,
     };
     store
         .atomic_remap(&vol_id, Lba(5), Some(Pba(100)), &new_val)
@@ -267,7 +267,7 @@ fn wal_recovery() {
             offset_in_unit: 0,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         };
         store.atomic_write_mapping(&vol_id, Lba(42), &val).unwrap();
     }
@@ -322,7 +322,7 @@ fn delete_volume_frees_blockmap_and_refcount() {
             offset_in_unit: 0,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         };
         store.atomic_write_mapping(vol_id, Lba(i), &val).unwrap();
     }
@@ -457,7 +457,7 @@ fn delete_volume_shared_pba_refcount() {
             offset_in_unit: 0,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         };
         store.put_mapping(vol_id, Lba(lba), &val).unwrap();
     }
@@ -496,7 +496,7 @@ fn delete_volume_shared_pba_partial_decrement() {
             offset_in_unit: 0,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         };
         store.put_mapping(vol_id, Lba(lba), &val).unwrap();
     }

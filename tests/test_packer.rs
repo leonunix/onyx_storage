@@ -1,8 +1,8 @@
 /// Unit tests for the Packer module (bin-packing of small compressed fragments).
 use std::sync::Arc;
 
-use onyx_storage::packer::packer::{new_hole_map, PackResult, Packer};
 use onyx_storage::buffer::pipeline::CompressedUnit;
+use onyx_storage::packer::packer::{new_hole_map, PackResult, Packer};
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::types::*;
 
@@ -235,7 +235,8 @@ fn alloc_failure_after_seal_returns_sealed_and_passthrough() {
                 PackResult::Passthrough(_) => "Passthrough",
                 PackResult::Buffered => "Buffered",
                 PackResult::SealedSlot(_) => "SealedSlot",
-                PackResult::SealedSlotAndPassthrough(_, _) | PackResult::FillHole(_) => unreachable!(),
+                PackResult::SealedSlotAndPassthrough(_, _) | PackResult::FillHole(_) =>
+                    unreachable!(),
             }
         ),
     }
@@ -277,7 +278,13 @@ fn hole_map_fills_hole_before_new_slot() {
     let hole_map = new_hole_map();
 
     // Pre-populate hole map with a hole at PBA 42, offset 500, size 800
-    hole_map.lock().unwrap().insert(HoleKey { pba: Pba(42), offset: 500 }, 800);
+    hole_map.lock().unwrap().insert(
+        HoleKey {
+            pba: Pba(42),
+            offset: 500,
+        },
+        800,
+    );
 
     let mut packer = Packer::new(alloc.clone(), hole_map.clone());
 
@@ -310,8 +317,20 @@ fn hole_map_best_fit_selection() {
     // Two holes: 2000 bytes and 500 bytes
     {
         let mut map = hole_map.lock().unwrap();
-        map.insert(HoleKey { pba: Pba(10), offset: 0 }, 2000);
-        map.insert(HoleKey { pba: Pba(20), offset: 100 }, 500);
+        map.insert(
+            HoleKey {
+                pba: Pba(10),
+                offset: 0,
+            },
+            2000,
+        );
+        map.insert(
+            HoleKey {
+                pba: Pba(20),
+                offset: 100,
+            },
+            500,
+        );
     }
 
     let mut packer = Packer::new(alloc.clone(), hole_map.clone());
@@ -330,7 +349,10 @@ fn hole_map_best_fit_selection() {
     // No remainder from the 500-byte hole yet (injected by writer on success).
     let remaining = hole_map.lock().unwrap();
     assert_eq!(remaining.len(), 1);
-    assert!(remaining.contains_key(&HoleKey { pba: Pba(10), offset: 0 }));
+    assert!(remaining.contains_key(&HoleKey {
+        pba: Pba(10),
+        offset: 0
+    }));
 }
 
 #[test]
@@ -341,7 +363,13 @@ fn hole_map_too_small_falls_through() {
     let hole_map = new_hole_map();
 
     // Hole of 100 bytes — too small for a 500-byte fragment
-    hole_map.lock().unwrap().insert(HoleKey { pba: Pba(42), offset: 0 }, 100);
+    hole_map.lock().unwrap().insert(
+        HoleKey {
+            pba: Pba(42),
+            offset: 0,
+        },
+        100,
+    );
 
     let mut packer = Packer::new(alloc.clone(), hole_map.clone());
 
@@ -374,7 +402,13 @@ fn hole_preferred_over_open_slot_when_doesnt_fit() {
     }
 
     // Add a hole that fits 1000 bytes
-    hole_map.lock().unwrap().insert(HoleKey { pba: Pba(99), offset: 200 }, 1000);
+    hole_map.lock().unwrap().insert(
+        HoleKey {
+            pba: Pba(99),
+            offset: 200,
+        },
+        1000,
+    );
 
     // 1000-byte fragment doesn't fit in open slot (3500 + 1000 > 4096)
     // but the hole fits → should FillHole
@@ -413,7 +447,7 @@ fn hole_map_coalesces_adjacent_holes() {
         PackResult::FillHole(fill) => {
             assert_eq!(fill.pba, Pba(10));
             assert_eq!(fill.slot_offset, 100); // merged hole starts at 100
-            assert_eq!(fill.hole_size, 400);   // 200 + 200 merged
+            assert_eq!(fill.hole_size, 400); // 200 + 200 merged
         }
         _ => panic!("expected FillHole after adjacent holes are coalesced"),
     }
@@ -449,7 +483,7 @@ fn hole_map_does_not_coalesce_non_adjacent() {
 
 #[test]
 fn hole_map_coalesces_across_different_pbas_independently() {
-    use onyx_storage::packer::packer::{HoleKey, insert_hole_coalesced};
+    use onyx_storage::packer::packer::{insert_hole_coalesced, HoleKey};
 
     let alloc = make_allocator(100);
     let hole_map = new_hole_map();
@@ -474,12 +508,15 @@ fn hole_map_coalesces_across_different_pbas_independently() {
     // PBA 20's hole should still be there
     let remaining = hole_map.lock().unwrap();
     assert_eq!(remaining.len(), 1);
-    assert!(remaining.contains_key(&HoleKey { pba: Pba(20), offset: 0 }));
+    assert!(remaining.contains_key(&HoleKey {
+        pba: Pba(20),
+        offset: 0
+    }));
 }
 
 #[test]
 fn hole_map_coalesces_three_segment_chain_when_bridge_inserted() {
-    use onyx_storage::packer::packer::{HoleKey, insert_hole_coalesced};
+    use onyx_storage::packer::packer::{insert_hole_coalesced, HoleKey};
 
     let alloc = make_allocator(100);
     let hole_map = new_hole_map();

@@ -18,6 +18,7 @@ use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
 use crate::meta::store::MetaStore;
+use crate::metrics::EngineMetrics;
 use crate::packer::packer::{HoleFill, HoleMap, PackResult, Packer, SealedSlot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
@@ -291,6 +292,30 @@ impl BufferFlusher {
         hole_map: HoleMap,
         dedup_config: &DedupConfig,
     ) -> Self {
+        Self::start_with_metrics(
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            io_engine,
+            config,
+            hole_map,
+            dedup_config,
+            Arc::new(EngineMetrics::default()),
+        )
+    }
+
+    pub fn start_with_metrics(
+        pool: Arc<WriteBufferPool>,
+        meta: Arc<MetaStore>,
+        lifecycle: Arc<VolumeLifecycleManager>,
+        allocator: Arc<SpaceAllocator>,
+        io_engine: Arc<IoEngine>,
+        config: &FlushConfig,
+        hole_map: HoleMap,
+        dedup_config: &DedupConfig,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let workers = config.compress_workers.max(1);
         let max_raw = config.coalesce_max_raw_bytes;
@@ -313,7 +338,12 @@ impl BufferFlusher {
         let running_c = running.clone();
         let pool_c = pool.clone();
         let meta_c = meta.clone();
-        let coalesce_out_tx = if dedup_enabled { dedup_tx.clone() } else { compress_tx.clone() };
+        let metrics_c = metrics.clone();
+        let coalesce_out_tx = if dedup_enabled {
+            dedup_tx.clone()
+        } else {
+            compress_tx.clone()
+        };
         let coalesce_handle = thread::Builder::new()
             .name("flusher-coalesce".into())
             .spawn(move || {
@@ -323,6 +353,7 @@ impl BufferFlusher {
                     &coalesce_out_tx,
                     &done_rx,
                     &running_c,
+                    &metrics_c,
                     max_raw,
                     max_lbas,
                 );
@@ -343,12 +374,21 @@ impl BufferFlusher {
                 let lifecycle_d = lifecycle.clone();
                 let allocator_d = allocator.clone();
                 let done_tx_d = done_tx.clone();
+                let metrics_d = metrics.clone();
                 let h = thread::Builder::new()
                     .name(format!("flusher-dedup-{}", i))
                     .spawn(move || {
                         Self::dedup_loop(
-                            &rx, &miss_tx, &meta_d, &pool_d, &lifecycle_d,
-                            &allocator_d, &done_tx_d, &running_d, dedup_skip_threshold,
+                            &rx,
+                            &miss_tx,
+                            &meta_d,
+                            &pool_d,
+                            &lifecycle_d,
+                            &allocator_d,
+                            &done_tx_d,
+                            &running_d,
+                            dedup_skip_threshold,
+                            &metrics_d,
                         );
                     })
                     .expect("failed to spawn dedup worker");
@@ -365,10 +405,11 @@ impl BufferFlusher {
             let rx = compress_rx.clone();
             let tx = write_tx.clone();
             let running_w = running.clone();
+            let metrics_w = metrics.clone();
             let h = thread::Builder::new()
                 .name(format!("flusher-compress-{}", i))
                 .spawn(move || {
-                    Self::compress_loop(&rx, &tx, &running_w);
+                    Self::compress_loop(&rx, &tx, &running_w, &metrics_w);
                 })
                 .expect("failed to spawn compress worker");
             compress_handles.push(h);
@@ -380,13 +421,22 @@ impl BufferFlusher {
         let running_w = running.clone();
         let pool_w = pool.clone();
         let allocator_w = allocator.clone();
+        let metrics_w = metrics.clone();
         let writer_handle = thread::Builder::new()
             .name("flusher-writer".into())
             .spawn(move || {
                 let mut packer = Packer::new(allocator_w, hole_map);
                 Self::writer_loop(
-                    &write_rx, &pool_w, &meta, &lifecycle, &allocator,
-                    &io_engine, &done_tx, &running_w, &mut packer,
+                    &write_rx,
+                    &pool_w,
+                    &meta,
+                    &lifecycle,
+                    &allocator,
+                    &io_engine,
+                    &done_tx,
+                    &running_w,
+                    &mut packer,
+                    &metrics_w,
                 );
             })
             .expect("failed to spawn writer thread");
@@ -406,6 +456,7 @@ impl BufferFlusher {
         tx: &Sender<CoalesceUnit>,
         done_rx: &Receiver<Vec<u64>>,
         running: &AtomicBool,
+        metrics: &EngineMetrics,
         max_raw: usize,
         max_lbas: u32,
     ) {
@@ -461,6 +512,20 @@ impl BufferFlusher {
                     let units = coalesce(&new_entries, max_raw, max_lbas, &|vid| {
                         cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None)
                     });
+                    if !units.is_empty() {
+                        metrics.coalesce_runs.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .coalesced_units
+                            .fetch_add(units.len() as u64, Ordering::Relaxed);
+                        metrics.coalesced_lbas.fetch_add(
+                            units.iter().map(|u| u.lba_count as u64).sum::<u64>(),
+                            Ordering::Relaxed,
+                        );
+                        metrics.coalesced_bytes.fetch_add(
+                            units.iter().map(|u| u.raw_data.len() as u64).sum::<u64>(),
+                            Ordering::Relaxed,
+                        );
+                    }
 
                     // Count how many units reference each seq
                     for unit in &units {
@@ -477,6 +542,7 @@ impl BufferFlusher {
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(10)),
                 Err(e) => {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, "coalescer: recover failed");
                     thread::sleep(Duration::from_millis(100));
                 }
@@ -488,6 +554,7 @@ impl BufferFlusher {
         rx: &Receiver<CoalesceUnit>,
         tx: &Sender<CompressedUnit>,
         running: &AtomicBool,
+        metrics: &EngineMetrics,
     ) {
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
@@ -503,6 +570,13 @@ impl BufferFlusher {
                             Some(size) => (algo.to_u8(), compressed_buf[..size].to_vec()),
                             None => (0u8, unit.raw_data.clone()),
                         };
+                    metrics.compress_units.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .compress_input_bytes
+                        .fetch_add(original_size as u64, Ordering::Relaxed);
+                    metrics
+                        .compress_output_bytes
+                        .fetch_add(compressed_data.len() as u64, Ordering::Relaxed);
 
                     let crc32 = crc32fast::hash(&compressed_data);
 
@@ -553,6 +627,7 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
         skip_threshold_pct: u8,
+        metrics: &EngineMetrics,
     ) {
         let bs = BLOCK_SIZE as usize;
         while running.load(Ordering::Relaxed) {
@@ -561,6 +636,7 @@ impl BufferFlusher {
                     // Backpressure: skip dedup if buffer is filling up
                     if pool.fill_percentage() > skip_threshold_pct as u8 {
                         unit.dedup_skipped = true;
+                        metrics.dedup_skipped_units.fetch_add(1, Ordering::Relaxed);
                         if miss_tx.send(unit).is_err() {
                             return;
                         }
@@ -587,17 +663,15 @@ impl BufferFlusher {
 
                         // Look up dedup index
                         match meta.get_dedup_entry(&hash) {
-                            Ok(Some(entry)) => {
-                                match meta.get_refcount(entry.pba) {
-                                    Ok(rc) if rc > 0 => {
-                                        is_hit[i] = true;
-                                        hit_infos.push((i, entry.to_blockmap_value()));
-                                    }
-                                    _ => {
-                                        let _ = meta.delete_dedup_index(&hash);
-                                    }
+                            Ok(Some(entry)) => match meta.get_refcount(entry.pba) {
+                                Ok(rc) if rc > 0 => {
+                                    is_hit[i] = true;
+                                    hit_infos.push((i, entry.to_blockmap_value()));
                                 }
-                            }
+                                _ => {
+                                    let _ = meta.delete_dedup_index(&hash);
+                                }
+                            },
                             _ => {}
                         }
                     }
@@ -614,8 +688,12 @@ impl BufferFlusher {
                             // Generation check
                             let should_discard = match meta.get_volume(&vol_id)? {
                                 None => true,
-                                Some(vc) if unit.vol_created_at != 0
-                                    && vc.created_at != unit.vol_created_at => true,
+                                Some(vc)
+                                    if unit.vol_created_at != 0
+                                        && vc.created_at != unit.vol_created_at =>
+                                {
+                                    true
+                                }
                                 _ => false,
                             };
                             if should_discard {
@@ -626,7 +704,9 @@ impl BufferFlusher {
 
                             let old_mapping = meta.get_mapping(&vol_id, lba)?;
                             meta.atomic_dedup_hit(
-                                &vol_id, lba, existing_value,
+                                &vol_id,
+                                lba,
+                                existing_value,
                                 old_mapping.as_ref().map(|m| m.pba),
                             )?;
 
@@ -640,9 +720,7 @@ impl BufferFlusher {
                                         if blocks <= 1 {
                                             allocator.free_one(old.pba)?;
                                         } else {
-                                            allocator.free_extent(
-                                                Extent::new(old.pba, blocks),
-                                            )?;
+                                            allocator.free_extent(Extent::new(old.pba, blocks))?;
                                         }
                                     }
                                 }
@@ -655,6 +733,7 @@ impl BufferFlusher {
                                 successful_hit_indices.push(*i);
                             }
                             Err(e) => {
+                                metrics.dedup_hit_failures.fetch_add(1, Ordering::Relaxed);
                                 // Hit failed — demote to miss so it goes through
                                 // the normal write path on next coalesce cycle.
                                 is_hit[*i] = false;
@@ -685,10 +764,17 @@ impl BufferFlusher {
 
                     // Recheck has_misses after potential demotions
                     let has_misses = is_hit.iter().any(|h| !h);
+                    metrics
+                        .dedup_hits
+                        .fetch_add(successful_hit_indices.len() as u64, Ordering::Relaxed);
+                    metrics.dedup_misses.fetch_add(
+                        is_hit.iter().filter(|hit| !**hit).count() as u64,
+                        Ordering::Relaxed,
+                    );
                     if !has_misses {
                         // All blocks were hits — send done_tx for the original unit's seqs
-                        let seqs: Vec<u64> = unit.seq_lba_ranges
-                            .iter().map(|(s, _, _)| *s).collect();
+                        let seqs: Vec<u64> =
+                            unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
                         let _ = done_tx.send(seqs);
                         continue;
                     }
@@ -713,8 +799,8 @@ impl BufferFlusher {
                     // Create shared countdown: all miss sub-units share this.
                     // The LAST sub-unit to complete sends done_tx with the
                     // original unit's full seq list.
-                    let all_seqs: Vec<u64> = unit.seq_lba_ranges
-                        .iter().map(|(s, _, _)| *s).collect();
+                    let all_seqs: Vec<u64> =
+                        unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
                     let completion = crate::buffer::pipeline::DedupCompletion::new(
                         miss_ranges.len() as u32,
                         all_seqs,
@@ -723,7 +809,10 @@ impl BufferFlusher {
                     let mut miss_units: Vec<CoalesceUnit> = Vec::new();
                     for (start, end) in &miss_ranges {
                         miss_units.push(Self::build_miss_unit(
-                            &unit, *start, *end, &all_hashes,
+                            &unit,
+                            *start,
+                            *end,
+                            &all_hashes,
                             Some(completion.clone()),
                         ));
                     }
@@ -754,7 +843,8 @@ impl BufferFlusher {
         let lba_count = (end_idx - start_idx) as u32;
         let data_start = start_idx * bs;
         let data_end = end_idx * bs;
-        let raw_data = original.raw_data[data_start..data_end.min(original.raw_data.len())].to_vec();
+        let raw_data =
+            original.raw_data[data_start..data_end.min(original.raw_data.len())].to_vec();
 
         // Build seq_lba_ranges for the sub-range
         let mut seq_lba_ranges = Vec::new();
@@ -763,12 +853,11 @@ impl BufferFlusher {
             for (seq, range_start, range_count) in &original.seq_lba_ranges {
                 if lba.0 >= range_start.0 && lba.0 < range_start.0 + *range_count as u64 {
                     // Use add_seq_lba logic: extend or start new range
-                    if let Some(existing) = seq_lba_ranges
-                        .iter_mut()
-                        .find(|(s, start, count): &&mut (u64, Lba, u32)| {
+                    if let Some(existing) = seq_lba_ranges.iter_mut().find(
+                        |(s, start, count): &&mut (u64, Lba, u32)| {
                             *s == *seq && start.0 + *count as u64 == lba.0
-                        })
-                    {
+                        },
+                    ) {
                         existing.2 += 1;
                     } else {
                         seq_lba_ranges.push((*seq, lba, 1));
@@ -804,26 +893,45 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
         packer: &mut Packer,
+        metrics: &EngineMetrics,
     ) {
         // Seqs buffered inside the packer's open slot, reported when the slot is sealed.
         let mut buffered_seqs: Vec<u64> = Vec::new();
         // DedupCompletion trackers for buffered units (decremented at seal time).
-        let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> = Vec::new();
+        let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
+            Vec::new();
 
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => {
                     Self::handle_compressed_unit(
-                        unit, pool, meta, lifecycle, allocator, io_engine,
-                        done_tx, packer, &mut buffered_seqs, &mut buffered_completions,
+                        unit,
+                        pool,
+                        meta,
+                        lifecycle,
+                        allocator,
+                        io_engine,
+                        done_tx,
+                        packer,
+                        &mut buffered_seqs,
+                        &mut buffered_completions,
+                        metrics,
                     );
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // Flush the packer's open slot on idle
                     if let Some(sealed) = packer.flush_open_slot() {
                         if let Err(e) = Self::write_packed_slot(
-                            &sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
+                            &sealed,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            io_engine,
+                            packer.hole_map(),
+                            metrics,
                         ) {
+                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(
                                 pba = sealed.pba.0,
                                 error = %e,
@@ -831,7 +939,9 @@ impl BufferFlusher {
                             );
                         }
                         Self::flush_buffered_done(
-                            &mut buffered_seqs, &mut buffered_completions, done_tx,
+                            &mut buffered_seqs,
+                            &mut buffered_completions,
+                            done_tx,
                         );
                     }
                     continue;
@@ -843,25 +953,40 @@ impl BufferFlusher {
         // Drain remaining messages
         while let Ok(unit) = rx.try_recv() {
             Self::handle_compressed_unit(
-                unit, pool, meta, lifecycle, allocator, io_engine,
-                done_tx, packer, &mut buffered_seqs, &mut buffered_completions,
+                unit,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                io_engine,
+                done_tx,
+                packer,
+                &mut buffered_seqs,
+                &mut buffered_completions,
+                metrics,
             );
         }
 
         // Flush any remaining open slot on shutdown
         if let Some(sealed) = packer.flush_open_slot() {
-            if let Err(e) =
-                Self::write_packed_slot(&sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map())
-            {
+            if let Err(e) = Self::write_packed_slot(
+                &sealed,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                io_engine,
+                packer.hole_map(),
+                metrics,
+            ) {
+                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     pba = sealed.pba.0,
                     error = %e,
                     "writer: failed to flush final packed slot on shutdown"
                 );
             }
-            Self::flush_buffered_done(
-                &mut buffered_seqs, &mut buffered_completions, done_tx,
-            );
+            Self::flush_buffered_done(&mut buffered_seqs, &mut buffered_completions, done_tx);
         }
     }
 
@@ -897,6 +1022,7 @@ impl BufferFlusher {
         packer: &mut Packer,
         buffered_seqs: &mut Vec<u64>,
         buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+        metrics: &EngineMetrics,
     ) {
         let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
         let completion = unit.dedup_completion.clone();
@@ -922,9 +1048,17 @@ impl BufferFlusher {
 
         match packer.pack_or_passthrough(unit) {
             Ok(PackResult::Passthrough(unit)) => {
-                if let Err(e) =
-                    Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine, packer.hole_map())
-                {
+                if let Err(e) = Self::write_unit(
+                    &unit,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    packer.hole_map(),
+                    metrics,
+                ) {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         vol = unit.vol_id,
                         start_lba = unit.start_lba.0,
@@ -935,16 +1069,22 @@ impl BufferFlusher {
                 }
                 signal_done!(seqs);
             }
-            Ok(PackResult::Buffered) => {
-                match &completion {
-                    None => buffered_seqs.extend(&seqs),
-                    Some(dc) => buffered_completions.push(dc.clone()),
-                }
-            }
+            Ok(PackResult::Buffered) => match &completion {
+                None => buffered_seqs.extend(&seqs),
+                Some(dc) => buffered_completions.push(dc.clone()),
+            },
             Ok(PackResult::SealedSlot(sealed)) => {
                 if let Err(e) = Self::write_packed_slot(
-                    &sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
+                    &sealed,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    packer.hole_map(),
+                    metrics,
                 ) {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         pba = sealed.pba.0,
                         fragments = sealed.fragments.len(),
@@ -962,8 +1102,16 @@ impl BufferFlusher {
             }
             Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
                 if let Err(e) = Self::write_packed_slot(
-                    &sealed, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
+                    &sealed,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    packer.hole_map(),
+                    metrics,
                 ) {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         pba = sealed.pba.0,
                         error = %e,
@@ -972,9 +1120,17 @@ impl BufferFlusher {
                 }
                 Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
 
-                if let Err(e) =
-                    Self::write_unit(&unit, pool, meta, lifecycle, allocator, io_engine, packer.hole_map())
-                {
+                if let Err(e) = Self::write_unit(
+                    &unit,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    packer.hole_map(),
+                    metrics,
+                ) {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         vol = unit.vol_id,
                         error = %e,
@@ -985,8 +1141,16 @@ impl BufferFlusher {
             }
             Ok(PackResult::FillHole(fill)) => {
                 if let Err(e) = Self::write_hole_fill(
-                    &fill, pool, meta, lifecycle, allocator, io_engine, packer.hole_map(),
+                    &fill,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    packer.hole_map(),
+                    metrics,
                 ) {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         pba = fill.pba.0,
                         slot_offset = fill.slot_offset,
@@ -997,12 +1161,12 @@ impl BufferFlusher {
                 signal_done!(seqs);
             }
             Err(e) => {
+                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(error = %e, "writer: packer error");
                 signal_done!(seqs);
             }
         }
     }
-
 
     fn write_unit(
         unit: &CompressedUnit,
@@ -1012,6 +1176,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         hole_map: &HoleMap,
+        metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
             // Hold the lifecycle read lock from generation validation through
@@ -1031,6 +1196,7 @@ impl BufferFlusher {
                 _ => false,
             };
             if should_discard {
+                metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     vol = unit.vol_id,
                     "write_unit: discarding unit (volume deleted or generation mismatch)"
@@ -1084,12 +1250,18 @@ impl BufferFlusher {
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
                     // Track per-fragment for hole detection
-                    let frag = old_frag_meta
-                        .entry((old.pba, old.slot_offset))
-                        .or_insert((0, old.unit_lba_count, old.unit_compressed_size));
+                    let frag = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
+                        0,
+                        old.unit_lba_count,
+                        old.unit_compressed_size,
+                    ));
                     frag.0 += 1;
                 }
-                let flags = if unit.dedup_skipped { FLAG_DEDUP_SKIPPED } else { 0 };
+                let flags = if unit.dedup_skipped {
+                    FLAG_DEDUP_SKIPPED
+                } else {
+                    0
+                };
                 batch_values.push((
                     lba,
                     BlockmapValue {
@@ -1147,16 +1319,19 @@ impl BufferFlusher {
                     if *hash == [0u8; 32] {
                         continue; // Skip empty hashes
                     }
-                    dedup_entries.push((*hash, DedupEntry {
-                        pba,
-                        slot_offset: 0,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: i as u16,
-                        crc32: unit.crc32,
-                    }));
+                    dedup_entries.push((
+                        *hash,
+                        DedupEntry {
+                            pba,
+                            slot_offset: 0,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: i as u16,
+                            crc32: unit.crc32,
+                        },
+                    ));
                 }
                 if !dedup_entries.is_empty() {
                     meta.put_dedup_entries(&dedup_entries)?;
@@ -1164,7 +1339,11 @@ impl BufferFlusher {
             }
 
             // Detect holes: fully-dead fragments in still-live packed PBAs
-            Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map)?;
+            Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+            metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .flush_unit_bytes
+                .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
 
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
                 if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
@@ -1195,6 +1374,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         hole_map: &HoleMap,
+        metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
         // Collect unique volume IDs and acquire read locks on ALL of them
         // BEFORE doing any work. Sorted to prevent deadlock. Held until
@@ -1208,10 +1388,7 @@ impl BufferFlusher {
         vol_ids.sort();
         vol_ids.dedup();
 
-        let locks: Vec<_> = vol_ids
-            .iter()
-            .map(|vid| lifecycle.get_lock(vid))
-            .collect();
+        let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
         // Under lifecycle read locks: check generation, build batch, IO, commit
@@ -1231,15 +1408,14 @@ impl BufferFlusher {
             // Lifecycle check: verify volume still exists and generation matches
             let should_discard = match meta.get_volume(&vol_id)? {
                 None => true,
-                Some(vc)
-                    if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
-                {
+                Some(vc) if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at => {
                     true
                 }
                 _ => false,
             };
 
             if should_discard {
+                metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
                 any_discarded = true;
                 for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
                     let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
@@ -1254,12 +1430,18 @@ impl BufferFlusher {
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
-                    let frag_entry = old_frag_meta
-                        .entry((old.pba, old.slot_offset))
-                        .or_insert((0, old.unit_lba_count, old.unit_compressed_size));
+                    let frag_entry = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
+                        0,
+                        old.unit_lba_count,
+                        old.unit_compressed_size,
+                    ));
                     frag_entry.0 += 1;
                 }
-                let flags = if unit.dedup_skipped { FLAG_DEDUP_SKIPPED } else { 0 };
+                let flags = if unit.dedup_skipped {
+                    FLAG_DEDUP_SKIPPED
+                } else {
+                    0
+                };
                 batch_values.push((
                     vol_id.clone(),
                     lba,
@@ -1335,16 +1517,19 @@ impl BufferFlusher {
                     if *hash == [0u8; 32] {
                         continue;
                     }
-                    dedup_entries.push((*hash, DedupEntry {
-                        pba: sealed.pba,
-                        slot_offset: frag.slot_offset,
-                        compression: frag.unit.compression,
-                        unit_compressed_size: frag.unit.compressed_data.len() as u32,
-                        unit_original_size: frag.unit.original_size,
-                        unit_lba_count: frag.unit.lba_count as u16,
-                        offset_in_unit: i as u16,
-                        crc32: frag.unit.crc32,
-                    }));
+                    dedup_entries.push((
+                        *hash,
+                        DedupEntry {
+                            pba: sealed.pba,
+                            slot_offset: frag.slot_offset,
+                            compression: frag.unit.compression,
+                            unit_compressed_size: frag.unit.compressed_data.len() as u32,
+                            unit_original_size: frag.unit.original_size,
+                            unit_lba_count: frag.unit.lba_count as u16,
+                            offset_in_unit: i as u16,
+                            crc32: frag.unit.crc32,
+                        },
+                    ));
                 }
                 if !dedup_entries.is_empty() {
                     meta.put_dedup_entries(&dedup_entries)?;
@@ -1353,7 +1538,16 @@ impl BufferFlusher {
         }
 
         // Detect holes in packed slots
-        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map)?;
+        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+        metrics
+            .flush_packed_slots_written
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_packed_fragments_written
+            .fetch_add(sealed.fragments.len() as u64, Ordering::Relaxed);
+        metrics
+            .flush_packed_bytes
+            .fetch_add(sealed.data.len() as u64, Ordering::Relaxed);
 
         // Mark entries flushed
         for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
@@ -1384,6 +1578,7 @@ impl BufferFlusher {
         _old_pba_meta: &HashMap<Pba, (u32, u32)>,
         meta: &MetaStore,
         hole_map: &HoleMap,
+        metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
         for (&(old_pba, slot_offset), &(decrement, unit_lba_count, compressed_size)) in
             old_frag_meta
@@ -1403,6 +1598,7 @@ impl BufferFlusher {
             // This fragment is fully dead but PBA is still live → hole
             let size = compressed_size as u16;
             crate::packer::packer::insert_hole_coalesced(hole_map, old_pba, slot_offset, size);
+            metrics.hole_detections.fetch_add(1, Ordering::Relaxed);
 
             tracing::debug!(
                 pba = old_pba.0,
@@ -1427,6 +1623,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         hole_map: &HoleMap,
+        metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
         let unit = &fill.unit;
         let vol_id = VolumeId(unit.vol_id.clone());
@@ -1449,14 +1646,11 @@ impl BufferFlusher {
         // Generation check for the writing volume
         let should_discard = match meta.get_volume(&vol_id)? {
             None => true,
-            Some(vc)
-                if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
-            {
-                true
-            }
+            Some(vc) if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at => true,
             _ => false,
         };
         if should_discard {
+            metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
                 let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
             }
@@ -1487,7 +1681,9 @@ impl BufferFlusher {
         if end > slot_data.len() {
             return Err(crate::error::OnyxError::Compress(format!(
                 "hole fill out of bounds: offset={} + size={} > {}",
-                start, unit.compressed_data.len(), slot_data.len()
+                start,
+                unit.compressed_data.len(),
+                slot_data.len()
             )));
         }
         slot_data[start..end].copy_from_slice(&unit.compressed_data);
@@ -1508,12 +1704,18 @@ impl BufferFlusher {
                 let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                 entry.0 += 1;
                 entry.1 = entry.1.max(old_blocks);
-                let frag = old_frag_meta
-                    .entry((old.pba, old.slot_offset))
-                    .or_insert((0, old.unit_lba_count, old.unit_compressed_size));
+                let frag = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
+                    0,
+                    old.unit_lba_count,
+                    old.unit_compressed_size,
+                ));
                 frag.0 += 1;
             }
-            let flags = if unit.dedup_skipped { FLAG_DEDUP_SKIPPED } else { 0 };
+            let flags = if unit.dedup_skipped {
+                FLAG_DEDUP_SKIPPED
+            } else {
+                0
+            };
             batch_values.push((
                 lba,
                 BlockmapValue {
@@ -1546,12 +1748,7 @@ impl BufferFlusher {
         let current_rc = meta.get_refcount(fill.pba)?;
         let new_rc = current_rc + unit.lba_count - self_decrement;
 
-        meta.atomic_batch_write(
-            &vol_id,
-            &batch_values,
-            new_rc,
-            &old_pba_decrements,
-        )?;
+        meta.atomic_batch_write(&vol_id, &batch_values, new_rc, &old_pba_decrements)?;
 
         // Free old PBAs whose refcount dropped to 0
         for (old_pba, (_, old_blocks)) in &old_pba_meta {
@@ -1573,16 +1770,19 @@ impl BufferFlusher {
                 if *hash == [0u8; 32] {
                     continue;
                 }
-                dedup_entries.push((*hash, DedupEntry {
-                    pba: fill.pba,
-                    slot_offset: fill.slot_offset,
-                    compression: unit.compression,
-                    unit_compressed_size: unit.compressed_data.len() as u32,
-                    unit_original_size: unit.original_size,
-                    unit_lba_count: unit.lba_count as u16,
-                    offset_in_unit: i as u16,
-                    crc32: unit.crc32,
-                }));
+                dedup_entries.push((
+                    *hash,
+                    DedupEntry {
+                        pba: fill.pba,
+                        slot_offset: fill.slot_offset,
+                        compression: unit.compression,
+                        unit_compressed_size: unit.compressed_data.len() as u32,
+                        unit_original_size: unit.original_size,
+                        unit_lba_count: unit.lba_count as u16,
+                        offset_in_unit: i as u16,
+                        crc32: unit.crc32,
+                    },
+                ));
             }
             if !dedup_entries.is_empty() {
                 meta.put_dedup_entries(&dedup_entries)?;
@@ -1590,7 +1790,11 @@ impl BufferFlusher {
         }
 
         // Detect any new holes from the old PBAs
-        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map)?;
+        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+        metrics.flush_hole_fills.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_hole_fill_bytes
+            .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
 
         // Mark flushed
         for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {

@@ -131,7 +131,7 @@ fn scanner_finds_candidates_with_dead_blocks() {
         offset_in_unit: 0,
         crc32: 0xDEADBEEF,
         slot_offset: 0,
-    flags: 0,
+        flags: 0,
     };
 
     // LBA 0 and LBA 2 still point to PBA 100
@@ -207,7 +207,7 @@ fn scanner_skips_below_threshold() {
             offset_in_unit: i as u16,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         };
         meta.put_mapping(&vol_id, Lba(i), &bv).unwrap();
     }
@@ -224,13 +224,16 @@ fn scanner_skips_below_threshold() {
             offset_in_unit: 0,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         },
     )
     .unwrap();
 
     let candidates = scan_gc_candidates(&meta, 0.25, 100).unwrap();
-    assert!(candidates.is_empty(), "12.5% dead should be below 25% threshold");
+    assert!(
+        candidates.is_empty(),
+        "12.5% dead should be below 25% threshold"
+    );
 }
 
 #[test]
@@ -254,7 +257,7 @@ fn scanner_skips_single_lba_units() {
         offset_in_unit: 0,
         crc32: 0,
         slot_offset: 0,
-    flags: 0,
+        flags: 0,
     };
     meta.put_mapping(&vol_id, Lba(0), &bv).unwrap();
 
@@ -286,7 +289,7 @@ fn scanner_sorts_by_dead_ratio_descending() {
             offset_in_unit: 0,
             crc32: 0,
             slot_offset: 0,
-        flags: 0,
+            flags: 0,
         },
     )
     .unwrap();
@@ -305,7 +308,7 @@ fn scanner_sorts_by_dead_ratio_descending() {
                 offset_in_unit: i as u16,
                 crc32: 0,
                 slot_offset: 0,
-            flags: 0,
+                flags: 0,
             },
         )
         .unwrap();
@@ -337,7 +340,13 @@ fn gc_rewrite_overwritten_blocks() {
     }
 
     // Flush to LV3
-    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000), "initial flush timeout");
     flusher.stop();
 
@@ -361,7 +370,13 @@ fn gc_rewrite_overwritten_blocks() {
     }
 
     // Flush the overwrites
-    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher2 = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000), "overwrite flush timeout");
     flusher2.stop();
 
@@ -395,7 +410,13 @@ fn gc_rewrite_overwritten_blocks() {
     assert_eq!(rewritten, 2);
 
     // Flush the rewritten blocks
-    let mut flusher3 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher3 = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000), "gc rewrite flush timeout");
     flusher3.stop();
 
@@ -428,9 +449,17 @@ fn gc_rewrite_overwritten_blocks() {
 
     // LBA 0 and 1 should still contain original data
     let data0 = worker.handle_read(vol_id, Lba(0)).unwrap().unwrap();
-    assert_eq!(data0, vec![10u8; BLOCK_SIZE as usize], "LBA 0 data mismatch after GC");
+    assert_eq!(
+        data0,
+        vec![10u8; BLOCK_SIZE as usize],
+        "LBA 0 data mismatch after GC"
+    );
     let data1 = worker.handle_read(vol_id, Lba(1)).unwrap().unwrap();
-    assert_eq!(data1, vec![11u8; BLOCK_SIZE as usize], "LBA 1 data mismatch after GC");
+    assert_eq!(
+        data1,
+        vec![11u8; BLOCK_SIZE as usize],
+        "LBA 1 data mismatch after GC"
+    );
 
     // LBA 2-7 should contain overwritten data
     for i in 2u8..8 {
@@ -459,7 +488,13 @@ fn gc_rewriter_skips_changed_lba() {
             .unwrap();
     }
 
-    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000));
     flusher.stop();
 
@@ -473,7 +508,13 @@ fn gc_rewriter_skips_changed_lba() {
             .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
             .unwrap();
     }
-    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher2 = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000));
     flusher2.stop();
 
@@ -484,9 +525,21 @@ fn gc_rewriter_skips_changed_lba() {
 
     // Now overwrite LBA 0 AFTER the scan (simulating race condition)
     env.pool
-        .append(vol_id, Lba(0), 1, &vec![0xFF; BLOCK_SIZE as usize], vol_created_at)
+        .append(
+            vol_id,
+            Lba(0),
+            1,
+            &vec![0xFF; BLOCK_SIZE as usize],
+            vol_created_at,
+        )
         .unwrap();
-    let mut flusher3 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher3 = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000));
     flusher3.stop();
 
@@ -611,7 +664,7 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
                 offset_in_unit: i,
                 crc32: 0xAAAA,
                 slot_offset: 0,
-            flags: 0,
+                flags: 0,
             },
         )
         .unwrap();
@@ -632,7 +685,7 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
                 offset_in_unit: i,
                 crc32: 0xBBBB,
                 slot_offset: 1000,
-            flags: 0,
+                flags: 0,
             },
         )
         .unwrap();
@@ -641,7 +694,11 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
     let candidates = scan_gc_candidates(&meta, 0.20, 100).unwrap();
 
     // Must find TWO separate candidates, not one merged one
-    assert_eq!(candidates.len(), 2, "should find 2 separate candidates for 2 fragments");
+    assert_eq!(
+        candidates.len(),
+        2,
+        "should find 2 separate candidates for 2 fragments"
+    );
 
     // Fragment A: 2/4 live → 50% dead
     let cand_a = candidates.iter().find(|c| c.slot_offset == 0).unwrap();
@@ -677,7 +734,13 @@ fn packed_flush_lifecycle_lock_covers_metadata_commit() {
         .unwrap();
 
     // Flush
-    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000));
     flusher.stop();
 
@@ -701,7 +764,13 @@ fn packed_flush_lifecycle_lock_covers_metadata_commit() {
 
     // Any pending buffer entries should have been purged
     // If not, the flusher should discard them due to generation/volume check
-    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher2 = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     // Give flusher time to process any remaining entries
     std::thread::sleep(std::time::Duration::from_millis(200));
     flusher2.stop();
@@ -734,7 +803,13 @@ fn gc_rewrite_packed_fragment() {
             .unwrap();
     }
 
-    let mut flusher = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000));
     flusher.stop();
 
@@ -748,7 +823,13 @@ fn gc_rewrite_packed_fragment() {
             .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
             .unwrap();
     }
-    let mut flusher2 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+    let mut flusher2 = start_flusher(
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+        &env.allocator,
+        &env.io_engine,
+    );
     assert!(wait_for_flush(&env.pool, 5000));
     flusher2.stop();
 
@@ -768,7 +849,13 @@ fn gc_rewrite_packed_fragment() {
         assert_eq!(rewritten, 1);
 
         // Flush rewritten block
-        let mut flusher3 = start_flusher(&env.pool, &env.meta, &env.lifecycle, &env.allocator, &env.io_engine);
+        let mut flusher3 = start_flusher(
+            &env.pool,
+            &env.meta,
+            &env.lifecycle,
+            &env.allocator,
+            &env.io_engine,
+        );
         assert!(wait_for_flush(&env.pool, 5000));
         flusher3.stop();
     }
@@ -783,11 +870,20 @@ fn gc_rewrite_packed_fragment() {
     );
 
     let data0 = worker.handle_read(vol_id, Lba(0)).unwrap().unwrap();
-    assert_eq!(data0, vec![20u8; BLOCK_SIZE as usize], "LBA 0 data mismatch after packed GC");
+    assert_eq!(
+        data0,
+        vec![20u8; BLOCK_SIZE as usize],
+        "LBA 0 data mismatch after packed GC"
+    );
 
     for i in 1u8..4 {
         let data = worker.handle_read(vol_id, Lba(i as u64)).unwrap().unwrap();
-        assert_eq!(data, vec![i + 200; BLOCK_SIZE as usize], "LBA {} data mismatch", i);
+        assert_eq!(
+            data,
+            vec![i + 200; BLOCK_SIZE as usize],
+            "LBA {} data mismatch",
+            i
+        );
     }
 }
 
@@ -877,7 +973,10 @@ fn write_path_detects_hole_when_fragment_fully_overwritten() {
         env.io_engine.clone(),
     );
     let read_b = worker.handle_read(vol_b, Lba(0)).unwrap().unwrap();
-    assert_eq!(read_b, data_b, "vol_b data must be intact after vol_a overwrite");
+    assert_eq!(
+        read_b, data_b,
+        "vol_b data must be intact after vol_a overwrite"
+    );
 }
 
 /// A stale hole entry that overlaps a live fragment must be rejected by the
@@ -907,8 +1006,13 @@ fn stale_hole_overlap_is_rejected_and_write_retries_elsewhere() {
     );
 
     let live_data = vec![0xA1; BLOCK_SIZE as usize];
-    env.pool.append(vol_live, Lba(0), 1, &live_data, 100).unwrap();
-    assert!(wait_for_flush(&env.pool, 5000), "live fragment flush timeout");
+    env.pool
+        .append(vol_live, Lba(0), 1, &live_data, 100)
+        .unwrap();
+    assert!(
+        wait_for_flush(&env.pool, 5000),
+        "live fragment flush timeout"
+    );
 
     let live_mapping = env
         .meta
@@ -989,7 +1093,9 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
     );
 
     let anchor_data = vec![0xC1; BLOCK_SIZE as usize];
-    env.pool.append(vol_anchor, Lba(0), 1, &anchor_data, 100).unwrap();
+    env.pool
+        .append(vol_anchor, Lba(0), 1, &anchor_data, 100)
+        .unwrap();
     assert!(wait_for_flush(&env.pool, 5000), "anchor flush timeout");
 
     let anchor_mapping = env
@@ -1000,7 +1106,8 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
     let packed_pba = anchor_mapping.pba;
 
     // Create an explicit free region after the live anchor fragment.
-    let manual_hole_offset = anchor_mapping.slot_offset + anchor_mapping.unit_compressed_size as u16;
+    let manual_hole_offset =
+        anchor_mapping.slot_offset + anchor_mapping.unit_compressed_size as u16;
     let manual_hole_size = 1024u16;
     assert!(
         manual_hole_offset + manual_hole_size <= BLOCK_SIZE as u16,
@@ -1015,7 +1122,9 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
     );
 
     let fill1_data = vec![0xD2; BLOCK_SIZE as usize];
-    env.pool.append(vol_fill1, Lba(0), 1, &fill1_data, 200).unwrap();
+    env.pool
+        .append(vol_fill1, Lba(0), 1, &fill1_data, 200)
+        .unwrap();
     assert!(wait_for_flush(&env.pool, 5000), "first hole fill timeout");
 
     let fill1_mapping = env
@@ -1023,7 +1132,10 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
         .get_mapping(&VolumeId(vol_fill1.to_string()), Lba(0))
         .unwrap()
         .unwrap();
-    assert_eq!(fill1_mapping.pba, packed_pba, "first write should reuse manual hole");
+    assert_eq!(
+        fill1_mapping.pba, packed_pba,
+        "first write should reuse manual hole"
+    );
     assert_eq!(
         fill1_mapping.slot_offset, manual_hole_offset,
         "first fill should start at the manual hole offset"
@@ -1049,7 +1161,9 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
     );
 
     let fill2_data = vec![0xE3; BLOCK_SIZE as usize];
-    env.pool.append(vol_fill2, Lba(0), 1, &fill2_data, 300).unwrap();
+    env.pool
+        .append(vol_fill2, Lba(0), 1, &fill2_data, 300)
+        .unwrap();
     assert!(wait_for_flush(&env.pool, 5000), "second hole fill timeout");
 
     let fill2_mapping = env
@@ -1057,7 +1171,10 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
         .get_mapping(&VolumeId(vol_fill2.to_string()), Lba(0))
         .unwrap()
         .unwrap();
-    assert_eq!(fill2_mapping.pba, packed_pba, "second write should reuse remainder");
+    assert_eq!(
+        fill2_mapping.pba, packed_pba,
+        "second write should reuse remainder"
+    );
     assert_eq!(
         fill2_mapping.slot_offset, expected_remainder_offset,
         "second write should consume the remainder published by the first fill"
@@ -1069,9 +1186,18 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
         env.pool.clone(),
         env.io_engine.clone(),
     );
-    assert_eq!(worker.handle_read(vol_anchor, Lba(0)).unwrap().unwrap(), anchor_data);
-    assert_eq!(worker.handle_read(vol_fill1, Lba(0)).unwrap().unwrap(), fill1_data);
-    assert_eq!(worker.handle_read(vol_fill2, Lba(0)).unwrap().unwrap(), fill2_data);
+    assert_eq!(
+        worker.handle_read(vol_anchor, Lba(0)).unwrap().unwrap(),
+        anchor_data
+    );
+    assert_eq!(
+        worker.handle_read(vol_fill1, Lba(0)).unwrap().unwrap(),
+        fill1_data
+    );
+    assert_eq!(
+        worker.handle_read(vol_fill2, Lba(0)).unwrap().unwrap(),
+        fill2_data
+    );
 
     flusher.stop();
 }

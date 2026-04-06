@@ -148,6 +148,18 @@ fn main() -> anyhow::Result<()> {
         Command::Status => {
             println!("onyx-storage v{}", env!("CARGO_PKG_VERSION"));
             println!("config: {:?}", cli.config);
+
+            match OnyxEngine::open(&config) {
+                Ok(engine) => {
+                    print!("{}", engine.status_report()?);
+                    engine.shutdown()?;
+                }
+                Err(full_err) => {
+                    eprintln!("full status unavailable: {}", full_err);
+                    let engine = OnyxEngine::open_meta_only(&config)?;
+                    print!("{}", engine.status_report()?);
+                }
+            }
         }
     }
 

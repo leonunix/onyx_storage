@@ -5,6 +5,7 @@ use crate::compress::codec::create_compressor;
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::meta::store::MetaStore;
+use crate::metrics::EngineMetrics;
 use crate::types::{CompressionAlgo, Lba, VolumeId, ZoneId, BLOCK_SIZE};
 
 /// Single-threaded zone worker.
@@ -16,6 +17,7 @@ pub struct ZoneWorker {
     meta: Arc<MetaStore>,
     pub buffer_pool: Arc<WriteBufferPool>,
     io_engine: Arc<IoEngine>,
+    metrics: Arc<EngineMetrics>,
 }
 
 impl ZoneWorker {
@@ -25,11 +27,28 @@ impl ZoneWorker {
         buffer_pool: Arc<WriteBufferPool>,
         io_engine: Arc<IoEngine>,
     ) -> Self {
+        Self::new_with_metrics(
+            zone_id,
+            meta,
+            buffer_pool,
+            io_engine,
+            Arc::new(EngineMetrics::default()),
+        )
+    }
+
+    pub fn new_with_metrics(
+        zone_id: ZoneId,
+        meta: Arc<MetaStore>,
+        buffer_pool: Arc<WriteBufferPool>,
+        io_engine: Arc<IoEngine>,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
         Self {
             zone_id,
             meta,
             buffer_pool,
             io_engine,
+            metrics,
         }
     }
 
@@ -55,6 +74,9 @@ impl ZoneWorker {
             let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
             let end = offset + BLOCK_SIZE as usize;
             if end <= pending.payload.len() {
+                self.metrics
+                    .read_buffer_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Some(pending.payload[offset..end].to_vec()));
             }
         }
@@ -63,19 +85,28 @@ impl ZoneWorker {
         let vid = VolumeId(vol_id.to_string());
         let mapping = match self.meta.get_mapping(&vid, lba)? {
             Some(m) => m,
-            None => return Ok(None),
+            None => {
+                self.metrics
+                    .read_unmapped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
         };
 
         // 3. Read compression unit from LV3
         //    If slot_offset > 0, the fragment is packed within a single 4KB slot.
         let compressed_data = if mapping.slot_offset > 0 {
-            let slot_data = self.io_engine.read_blocks(mapping.pba, BLOCK_SIZE as usize)?;
+            let slot_data = self
+                .io_engine
+                .read_blocks(mapping.pba, BLOCK_SIZE as usize)?;
             let start = mapping.slot_offset as usize;
             let end = start + mapping.unit_compressed_size as usize;
             if end > slot_data.len() {
                 return Err(crate::error::OnyxError::Compress(format!(
                     "packed fragment out of bounds: slot_offset={} + size={} > slot_len={}",
-                    start, mapping.unit_compressed_size, slot_data.len()
+                    start,
+                    mapping.unit_compressed_size,
+                    slot_data.len()
                 )));
             }
             slot_data[start..end].to_vec()
@@ -87,6 +118,9 @@ impl ZoneWorker {
         // 4. Verify CRC
         let actual_crc = crc32fast::hash(&compressed_data);
         if actual_crc != mapping.crc32 {
+            self.metrics
+                .read_crc_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(crate::error::OnyxError::CrcMismatch {
                 expected: mapping.crc32,
                 actual: actual_crc,
@@ -101,11 +135,16 @@ impl ZoneWorker {
                 CompressionAlgo::from_u8(mapping.compression).unwrap_or(CompressionAlgo::None);
             let decompressor = create_compressor(algo);
             let mut buf = vec![0u8; mapping.unit_original_size as usize];
-            decompressor.decompress(
+            if let Err(err) = decompressor.decompress(
                 &compressed_data,
                 &mut buf,
                 mapping.unit_original_size as usize,
-            )?;
+            ) {
+                self.metrics
+                    .read_decompress_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(err);
+            }
             buf
         };
 
@@ -121,6 +160,9 @@ impl ZoneWorker {
             )));
         }
 
+        self.metrics
+            .read_lv3_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(decompressed[start..end].to_vec()))
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::engine::VolumeAliveFlag;
 use crate::error::{OnyxError, OnyxResult};
 use crate::lifecycle::VolumeLifecycleManager;
+use crate::metrics::EngineMetrics;
 use crate::types::{Lba, BLOCK_SIZE};
 use crate::zone::manager::ZoneManager;
 
@@ -25,6 +26,7 @@ pub struct OnyxVolume {
     zone_manager: Arc<ZoneManager>,
     alive: VolumeAliveFlag,
     lifecycle: Arc<VolumeLifecycleManager>,
+    metrics: Arc<EngineMetrics>,
 }
 
 impl OnyxVolume {
@@ -35,6 +37,7 @@ impl OnyxVolume {
         zone_manager: Arc<ZoneManager>,
         alive: VolumeAliveFlag,
         lifecycle: Arc<VolumeLifecycleManager>,
+        metrics: Arc<EngineMetrics>,
     ) -> Self {
         Self {
             vol_id,
@@ -43,6 +46,7 @@ impl OnyxVolume {
             zone_manager,
             alive,
             lifecycle,
+            metrics,
         }
     }
 
@@ -99,14 +103,25 @@ impl OnyxVolume {
         if offset_bytes % bs == 0 && len % bs == 0 {
             let start_lba = Lba(offset_bytes / bs);
             let lba_count = (len / bs) as u32;
-            return self.zone_manager.submit_write(
+            self.zone_manager.submit_write(
                 &self.vol_id,
                 start_lba,
                 lba_count,
                 data.to_vec(),
                 self.created_at,
-            );
+            )?;
+            self.metrics
+                .volume_write_ops
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .volume_write_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            return Ok(());
         }
+
+        self.metrics
+            .volume_partial_write_ops
+            .fetch_add(1, Ordering::Relaxed);
 
         // Slow path: handle non-aligned head/tail with RMW
         let mut buf_offset = 0usize;
@@ -155,6 +170,13 @@ impl OnyxVolume {
             remaining -= write_len as u64;
         }
 
+        self.metrics
+            .volume_write_ops
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .volume_write_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -173,6 +195,11 @@ impl OnyxVolume {
         }
 
         let bs = BLOCK_SIZE as u64;
+        if offset_bytes % bs != 0 || len64 % bs != 0 {
+            self.metrics
+                .volume_partial_read_ops
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let mut result = vec![0u8; len];
         let mut buf_offset = 0usize;
         let mut remaining = len64;
@@ -203,6 +230,11 @@ impl OnyxVolume {
             cur_offset += copy_len as u64;
             remaining -= copy_len as u64;
         }
+
+        self.metrics.volume_read_ops.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .volume_read_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
 
         Ok(result)
     }

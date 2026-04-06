@@ -12,8 +12,8 @@
 //!   7. refcount: correct count in RocksDB
 //!   8. space: old PBAs freed on overwrite
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -66,7 +66,13 @@ fn setup_with_options(
     flush: FlushConfig,
     gc: GcConfig,
 ) -> TestEnv {
-    setup_with_all_options(data_bytes, buf_bytes, flush, gc, onyx_storage::dedup::config::DedupConfig::default())
+    setup_with_all_options(
+        data_bytes,
+        buf_bytes,
+        flush,
+        gc,
+        onyx_storage::dedup::config::DedupConfig::default(),
+    )
 }
 
 fn setup_with_all_options(
@@ -1179,7 +1185,10 @@ fn prove_packed_slot_offset_read_path() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(map_a.pba, map_b.pba, "both fragments should share one packed slot");
+    assert_eq!(
+        map_a.pba, map_b.pba,
+        "both fragments should share one packed slot"
+    );
     assert_ne!(
         map_a.slot_offset, map_b.slot_offset,
         "packed fragments in one slot must have different offsets"
@@ -1224,7 +1233,10 @@ fn prove_multi_volume_packed_slot_delete_isolation() {
     let vol_b_id = VolumeId("pack-del-b".into());
     let map_a = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
     let map_b = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
-    assert_eq!(map_a.pba, map_b.pba, "initial fragments should share one packed slot");
+    assert_eq!(
+        map_a.pba, map_b.pba,
+        "initial fragments should share one packed slot"
+    );
     assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 2);
 
     drop(vol_a);
@@ -1234,7 +1246,10 @@ fn prove_multi_volume_packed_slot_delete_isolation() {
     assert!(meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_none());
 
     let surviving = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
-    assert_eq!(surviving.pba, map_b.pba, "surviving fragment should stay on the same slot");
+    assert_eq!(
+        surviving.pba, map_b.pba,
+        "surviving fragment should stay on the same slot"
+    );
     assert_eq!(meta.get_refcount(surviving.pba).unwrap(), 1);
     assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x5A; 4096]);
 }
@@ -1267,9 +1282,15 @@ fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
     let vol_a_id = VolumeId("pack-over-a".into());
     let vol_b_id = VolumeId("pack-over-b".into());
     let shared_pba = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap().pba;
-    assert_eq!(meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap().pba, shared_pba);
+    assert_eq!(
+        meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap().pba,
+        shared_pba
+    );
     assert_eq!(meta.get_refcount(shared_pba).unwrap(), 2);
-    assert_eq!(env.engine.allocator().unwrap().free_block_count(), initial_free - 1);
+    assert_eq!(
+        env.engine.allocator().unwrap().free_block_count(),
+        initial_free - 1
+    );
 
     vol_a.write(0, &vec![0x41; 4096]).unwrap();
     wait_for_flush(&env, Duration::from_secs(10));
@@ -1278,7 +1299,10 @@ fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
     assert_ne!(map_a_new.pba, shared_pba);
     assert_eq!(map_b_old.pba, shared_pba);
     assert_eq!(meta.get_refcount(shared_pba).unwrap(), 1);
-    assert_eq!(env.engine.allocator().unwrap().free_block_count(), initial_free - 2);
+    assert_eq!(
+        env.engine.allocator().unwrap().free_block_count(),
+        initial_free - 2
+    );
 
     vol_b.write(0, &vec![0x42; 4096]).unwrap();
     wait_for_flush(&env, Duration::from_secs(10));
@@ -1389,9 +1413,15 @@ fn prove_packed_metadata_failure_retries_without_leak() {
 
     let map_a = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
     let map_b = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
-    assert_eq!(map_a.pba, map_b.pba, "retry should still produce one packed slot");
+    assert_eq!(
+        map_a.pba, map_b.pba,
+        "retry should still produce one packed slot"
+    );
     assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 2);
-    assert_eq!(env.engine.allocator().unwrap().free_block_count(), initial_free - 1);
+    assert_eq!(
+        env.engine.allocator().unwrap().free_block_count(),
+        initial_free - 1
+    );
     assert_eq!(vol_a.read(0, 4096).unwrap(), vec![0x71; 4096]);
     assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x72; 4096]);
 }
@@ -1420,7 +1450,10 @@ fn prove_background_gc_runner_reclaims_old_units() {
             buffer_usage_resume_pct: 50,
             max_rewrite_per_cycle: 64,
         },
-        onyx_storage::dedup::config::DedupConfig { enabled: false, ..Default::default() },
+        onyx_storage::dedup::config::DedupConfig {
+            enabled: false,
+            ..Default::default()
+        },
     );
 
     let vol_size = 128 * 4096u64;
@@ -1447,7 +1480,9 @@ fn prove_background_gc_runner_reclaims_old_units() {
     vol.write(2 * 4096, &overwrite).unwrap();
     wait_for_flush(&env, Duration::from_secs(10));
 
-    wait_until(Duration::from_secs(15), || meta.get_refcount(old_pba).unwrap() == 0);
+    wait_until(Duration::from_secs(15), || {
+        meta.get_refcount(old_pba).unwrap() == 0
+    });
 
     let map0 = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap();
     let map1 = meta.get_mapping(&vol_id, Lba(1)).unwrap().unwrap();

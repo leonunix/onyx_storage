@@ -7,6 +7,7 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::round_up;
 use crate::io::device::RawDevice;
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
+use crate::metrics::EngineMetrics;
 use crate::types::{Lba, BLOCK_SIZE};
 
 /// In-memory representation of a pending (unflushed) buffer entry.
@@ -47,6 +48,7 @@ pub struct WriteBufferPool {
     /// Uses a set of offsets (not a counter) so retrying the same LBAs is idempotent.
     /// Only when all offsets 0..lba_count are present do we mark the entry as flushed.
     flush_progress: Mutex<HashMap<u64, HashSet<u16>>>, // seq → set of flushed offset_in_entry
+    metrics: OnceLock<Arc<EngineMetrics>>,
 }
 
 static TEST_PURGE_FAIL_VOLUMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -124,7 +126,12 @@ impl WriteBufferPool {
             lba_index: Mutex::new(lba_index),
             seq_index: Mutex::new(seq_index),
             flush_progress: Mutex::new(HashMap::new()),
+            metrics: OnceLock::new(),
         })
+    }
+
+    pub fn attach_metrics(&self, metrics: Arc<EngineMetrics>) {
+        let _ = self.metrics.set(metrics);
     }
 
     fn scan_max_seq(device: &RawDevice, sb: &BufferSuperblock) -> OnyxResult<u64> {
@@ -332,6 +339,13 @@ impl WriteBufferPool {
             .unwrap()
             .insert(seq, (write_offset, entry_len as u32));
 
+        if let Some(metrics) = self.metrics.get() {
+            metrics.buffer_appends.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .buffer_append_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        }
+
         Ok(seq)
     }
 
@@ -343,7 +357,16 @@ impl WriteBufferPool {
             lba,
         };
         let idx = self.lba_index.lock().unwrap();
-        Ok(idx.get(&key).map(|arc| (**arc).clone()))
+        let result = idx.get(&key).map(|arc| (**arc).clone());
+        if let Some(metrics) = self.metrics.get() {
+            let counter = if result.is_some() {
+                &metrics.buffer_lookup_hits
+            } else {
+                &metrics.buffer_lookup_misses
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(result)
     }
 
     /// Mark specific LBA offsets within entry `seq` as flushed.

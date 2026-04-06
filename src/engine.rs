@@ -11,6 +11,7 @@ use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
+use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, EngineStatusSnapshot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, VolumeConfig, VolumeId};
@@ -44,6 +45,7 @@ pub struct OnyxEngine {
     /// cleaned up lazily on subsequent open_volume/delete_volume calls.
     live_handles: Mutex<Vec<(String, VolumeAliveFlag)>>,
     lifecycle: Arc<VolumeLifecycleManager>,
+    metrics: Arc<EngineMetrics>,
     generation_clock: AtomicU64,
     config: OnyxConfig,
     shutdown_done: Mutex<bool>,
@@ -108,6 +110,7 @@ impl OnyxEngine {
         // 1. MetaStore
         let meta = Arc::new(MetaStore::open(&config.meta)?);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
+        let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
 
         // (no shared deletion state needed — per-handle alive flags are used)
@@ -124,6 +127,7 @@ impl OnyxEngine {
         // 4. Write buffer pool
         let buf_dev = RawDevice::open(&config.buffer.device)?;
         let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev)?);
+        buffer_pool.attach_metrics(metrics.clone());
 
         // 5. Recover unflushed entries
         let unflushed = buffer_pool.recover()?;
@@ -138,7 +142,7 @@ impl OnyxEngine {
         let hole_map = crate::packer::packer::new_hole_map();
 
         // 7. Background flusher (owns the Packer, which reads from hole_map)
-        let flusher = BufferFlusher::start(
+        let flusher = BufferFlusher::start_with_metrics(
             buffer_pool.clone(),
             meta.clone(),
             lifecycle.clone(),
@@ -147,20 +151,23 @@ impl OnyxEngine {
             &config.flush,
             hole_map.clone(),
             &config.dedup,
+            metrics.clone(),
         );
 
         // 8. Zone manager
-        let zone_manager = Arc::new(ZoneManager::new(
+        let zone_manager = Arc::new(ZoneManager::new_with_metrics(
             config.engine.zone_count,
             config.engine.zone_size_blocks,
             meta.clone(),
             buffer_pool.clone(),
             io_engine.clone(),
+            metrics.clone(),
         )?);
 
         // 9. Dedup scanner (after flusher; re-processes skipped blocks)
         let dedup_scanner = if config.dedup.enabled {
-            Some(DedupScanner::start(
+            Some(DedupScanner::start_with_metrics(
+                metrics.clone(),
                 meta.clone(),
                 io_engine.clone(),
                 allocator.clone(),
@@ -174,7 +181,8 @@ impl OnyxEngine {
 
         // 10. GC runner (after flusher; rewrites dead blocks back to buffer)
         let gc_runner = if config.gc.enabled {
-            Some(GcRunner::start(
+            Some(GcRunner::start_with_metrics(
+                metrics.clone(),
                 meta.clone(),
                 io_engine.clone(),
                 buffer_pool.clone(),
@@ -198,6 +206,7 @@ impl OnyxEngine {
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
+            metrics,
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
@@ -211,6 +220,7 @@ impl OnyxEngine {
     pub fn open_meta_only(config: &OnyxConfig) -> OnyxResult<Self> {
         let meta = Arc::new(MetaStore::open(&config.meta)?);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
+        let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
 
         tracing::info!("onyx engine opened (meta-only mode)");
@@ -226,6 +236,7 @@ impl OnyxEngine {
             zone_manager: None,
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
+            metrics,
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
@@ -249,6 +260,9 @@ impl OnyxEngine {
                 zone_count: self.config.engine.zone_count,
             };
             self.meta.put_volume(&vol)?;
+            self.metrics
+                .volume_create_ops
+                .fetch_add(1, Ordering::Relaxed);
             tracing::info!(
                 name,
                 size_bytes,
@@ -299,6 +313,9 @@ impl OnyxEngine {
             }
 
             self.invalidate_live_handles(name);
+            self.metrics
+                .volume_delete_ops
+                .fetch_add(1, Ordering::Relaxed);
 
             tracing::info!(
                 name,
@@ -334,6 +351,7 @@ impl OnyxEngine {
                 .lock()
                 .unwrap()
                 .push((name.to_string(), alive.clone()));
+            self.metrics.volume_open_ops.fetch_add(1, Ordering::Relaxed);
 
             Ok(OnyxVolume::new(
                 name.to_string(),
@@ -342,6 +360,7 @@ impl OnyxEngine {
                 zm.clone(),
                 alive,
                 self.lifecycle.clone(),
+                self.metrics.clone(),
             ))
         })
     }
@@ -399,6 +418,40 @@ impl OnyxEngine {
     /// Access the SpaceAllocator (for testing / inspection).
     pub fn allocator(&self) -> Option<&Arc<SpaceAllocator>> {
         self.allocator.as_ref()
+    }
+
+    pub fn metrics_snapshot(&self) -> EngineMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {
+        Ok(EngineStatusSnapshot {
+            full_mode: self.zone_manager.is_some(),
+            volume_count: self.meta.list_volumes()?.len(),
+            live_handle_count: self
+                .live_handles
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, flag)| Arc::strong_count(flag) > 1)
+                .count(),
+            zone_count: self.zone_manager.as_ref().map(|zm| zm.zone_count()),
+            buffer_pending_entries: self.buffer_pool.as_ref().map(|pool| pool.pending_count()),
+            buffer_fill_pct: self.buffer_pool.as_ref().map(|pool| pool.fill_percentage()),
+            allocator_free_blocks: self
+                .allocator
+                .as_ref()
+                .map(|alloc| alloc.free_block_count()),
+            allocator_total_blocks: self
+                .allocator
+                .as_ref()
+                .map(|alloc| alloc.total_block_count()),
+            metrics: self.metrics.snapshot(),
+        })
+    }
+
+    pub fn status_report(&self) -> OnyxResult<String> {
+        Ok(self.status_snapshot()?.render_text())
     }
 }
 

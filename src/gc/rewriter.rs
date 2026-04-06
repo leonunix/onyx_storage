@@ -47,7 +47,9 @@ pub fn rewrite_candidate(
         if end > slot_data.len() {
             return Err(crate::error::OnyxError::Compress(format!(
                 "gc: packed fragment out of bounds: offset={} + size={} > {}",
-                start, candidate.unit_compressed_size, slot_data.len()
+                start,
+                candidate.unit_compressed_size,
+                slot_data.len()
             )));
         }
         slot_data[start..end].to_vec()
@@ -68,8 +70,7 @@ pub fn rewrite_candidate(
     let decompressed = if candidate.compression == 0 {
         compressed_data
     } else {
-        let algo =
-            CompressionAlgo::from_u8(candidate.compression).unwrap_or(CompressionAlgo::None);
+        let algo = CompressionAlgo::from_u8(candidate.compression).unwrap_or(CompressionAlgo::None);
         let compressor = create_compressor(algo);
         let mut buf = vec![0u8; candidate.unit_original_size as usize];
         compressor.decompress(
@@ -107,13 +108,7 @@ pub fn rewrite_candidate(
         let block_data = &decompressed[start..end];
 
         // Write back to buffer pool — reuses the normal write path
-        buffer_pool.append(
-            &candidate.vol_id.0,
-            *lba,
-            1,
-            block_data,
-            vol_created_at,
-        )?;
+        buffer_pool.append(&candidate.vol_id.0, *lba, 1, block_data, vol_created_at)?;
 
         rewritten += 1;
     }

@@ -365,7 +365,9 @@ fn dedup_cleanup_on_pba_free() {
     };
 
     // Insert two entries for same PBA
-    store.put_dedup_entries(&[(hash1, entry1), (hash2, entry2)]).unwrap();
+    store
+        .put_dedup_entries(&[(hash1, entry1), (hash2, entry2)])
+        .unwrap();
     assert!(store.get_dedup_entry(&hash1).unwrap().is_some());
     assert!(store.get_dedup_entry(&hash2).unwrap().is_some());
 
@@ -487,12 +489,18 @@ fn dedup_miss_populates_index() {
     flusher.stop();
 
     // Verify block was written
-    let mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     assert_eq!(mapping.flags, 0); // Not skipped
 
     // Verify dedup index was populated
     let dedup_entry = meta.get_dedup_entry(&hash).unwrap();
-    assert!(dedup_entry.is_some(), "dedup index should be populated for miss blocks");
+    assert!(
+        dedup_entry.is_some(),
+        "dedup index should be populated for miss blocks"
+    );
     assert_eq!(dedup_entry.unwrap().pba, mapping.pba);
 }
 
@@ -508,7 +516,10 @@ fn dedup_hit_reuses_pba() {
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_flushed(&pool, 10000), "flush timeout for first write");
 
-    let first_mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let first_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     let first_pba = first_mapping.pba;
 
     // Write same data to different LBA — should be dedup hit
@@ -516,7 +527,10 @@ fn dedup_hit_reuses_pba() {
     assert!(wait_flushed(&pool, 10000), "flush timeout for dedup write");
     flusher.stop();
 
-    let second_mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(1)).unwrap().unwrap();
+    let second_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+        .unwrap()
+        .unwrap();
 
     // Both LBAs should point to the same PBA (dedup hit)
     assert_eq!(second_mapping.pba, first_pba, "dedup hit should reuse PBA");
@@ -641,9 +655,16 @@ fn dedup_concurrent_hits_correct_refcount() {
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
-    assert!(wait_flushed(&pool, 10000), "flush timeout for initial write");
+    assert!(
+        wait_flushed(&pool, 10000),
+        "flush timeout for initial write"
+    );
 
-    let first_pba = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap().pba;
+    let first_pba = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap()
+        .pba;
     assert_eq!(meta.get_refcount(first_pba).unwrap(), 1);
 
     // Write same content to 4 different LBAs — all should be dedup hits
@@ -651,18 +672,31 @@ fn dedup_concurrent_hits_correct_refcount() {
     for lba in 1..5u64 {
         pool.append("test-vol", Lba(lba), 1, &data, 1000).unwrap();
     }
-    assert!(wait_flushed(&pool, 10000), "flush timeout for concurrent dedup writes");
+    assert!(
+        wait_flushed(&pool, 10000),
+        "flush timeout for concurrent dedup writes"
+    );
     flusher.stop();
 
     // All 5 LBAs should point to the same PBA
     for lba in 0..5u64 {
-        let mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(lba)).unwrap().unwrap();
-        assert_eq!(mapping.pba, first_pba, "LBA {} should point to dedup'd PBA", lba);
+        let mapping = meta
+            .get_mapping(&VolumeId("test-vol".into()), Lba(lba))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mapping.pba, first_pba,
+            "LBA {} should point to dedup'd PBA",
+            lba
+        );
     }
 
     // Refcount should be exactly 5 (no lost increments from concurrent hits)
     let rc = meta.get_refcount(first_pba).unwrap();
-    assert_eq!(rc, 5, "refcount should be 5 after 4 concurrent dedup hits + 1 original");
+    assert_eq!(
+        rc, 5,
+        "refcount should be 5 after 4 concurrent dedup hits + 1 original"
+    );
 }
 
 #[test]
@@ -673,10 +707,14 @@ fn dedup_interleaved_hit_miss_pattern() {
     // Write 4 unique blocks — all misses, populate dedup index
     for i in 0..4u8 {
         let data = vec![i + 0xA0; 4096];
-        pool.append("test-vol", Lba(i as u64), 1, &data, 1000).unwrap();
+        pool.append("test-vol", Lba(i as u64), 1, &data, 1000)
+            .unwrap();
     }
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
-    assert!(wait_flushed(&pool, 10000), "flush timeout for initial writes");
+    assert!(
+        wait_flushed(&pool, 10000),
+        "flush timeout for initial writes"
+    );
 
     // Write a mix of duplicate and new content to LBAs 10-17
     // hit, miss, hit, miss pattern
@@ -685,34 +723,68 @@ fn dedup_interleaved_hit_miss_pattern() {
     let hit_data_1 = vec![0xA1u8; 4096]; // same as LBA 1
     let miss_data_1 = vec![0xF1u8; 4096]; // new
 
-    pool.append("test-vol", Lba(10), 1, &hit_data_0, 1000).unwrap();
-    pool.append("test-vol", Lba(11), 1, &miss_data_0, 1000).unwrap();
-    pool.append("test-vol", Lba(12), 1, &hit_data_1, 1000).unwrap();
-    pool.append("test-vol", Lba(13), 1, &miss_data_1, 1000).unwrap();
+    pool.append("test-vol", Lba(10), 1, &hit_data_0, 1000)
+        .unwrap();
+    pool.append("test-vol", Lba(11), 1, &miss_data_0, 1000)
+        .unwrap();
+    pool.append("test-vol", Lba(12), 1, &hit_data_1, 1000)
+        .unwrap();
+    pool.append("test-vol", Lba(13), 1, &miss_data_1, 1000)
+        .unwrap();
 
-    assert!(wait_flushed(&pool, 10000), "flush timeout for mixed pattern");
+    assert!(
+        wait_flushed(&pool, 10000),
+        "flush timeout for mixed pattern"
+    );
     flusher.stop();
 
     // All 8 LBAs should be mapped
     for lba in [0, 1, 2, 3, 10, 11, 12, 13] {
         assert!(
-            meta.get_mapping(&VolumeId("test-vol".into()), Lba(lba)).unwrap().is_some(),
-            "LBA {} should be mapped", lba
+            meta.get_mapping(&VolumeId("test-vol".into()), Lba(lba))
+                .unwrap()
+                .is_some(),
+            "LBA {} should be mapped",
+            lba
         );
     }
 
     // Dedup hits: LBA 10 should share PBA with LBA 0, LBA 12 with LBA 1
-    let pba_0 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap().pba;
-    let pba_10 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(10)).unwrap().unwrap().pba;
+    let pba_0 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap()
+        .pba;
+    let pba_10 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(10))
+        .unwrap()
+        .unwrap()
+        .pba;
     assert_eq!(pba_0, pba_10, "LBA 10 should dedup to LBA 0's PBA");
 
-    let pba_1 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(1)).unwrap().unwrap().pba;
-    let pba_12 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(12)).unwrap().unwrap().pba;
+    let pba_1 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+        .unwrap()
+        .unwrap()
+        .pba;
+    let pba_12 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(12))
+        .unwrap()
+        .unwrap()
+        .pba;
     assert_eq!(pba_1, pba_12, "LBA 12 should dedup to LBA 1's PBA");
 
     // Miss LBAs should have their own PBAs
-    let pba_11 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(11)).unwrap().unwrap().pba;
-    let pba_13 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(13)).unwrap().unwrap().pba;
+    let pba_11 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(11))
+        .unwrap()
+        .unwrap()
+        .pba;
+    let pba_13 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(13))
+        .unwrap()
+        .unwrap()
+        .pba;
     assert_ne!(pba_11, pba_0, "LBA 11 should have its own PBA");
     assert_ne!(pba_13, pba_1, "LBA 13 should have its own PBA");
 }
@@ -732,46 +804,84 @@ fn dedup_multi_lba_entry_interleaved_hit_miss() {
         pool.append("test-vol", Lba(lba), 1, data, 1000).unwrap();
     }
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
-    assert!(wait_flushed(&pool, 10000), "flush timeout for initial unique blocks");
+    assert!(
+        wait_flushed(&pool, 10000),
+        "flush timeout for initial unique blocks"
+    );
 
     // Now write a multi-LBA entry: [hit, miss, hit, miss]
     // LBA 10=0xA0(dup), 11=0xC0(new), 12=0xB0(dup), 13=0xD0(new)
     let data_c = vec![0xC0u8; 4096];
     let data_d = vec![0xD0u8; 4096];
     let mut multi_block = Vec::with_capacity(4 * 4096);
-    multi_block.extend_from_slice(&data_a);  // LBA 10 — dedup hit
-    multi_block.extend_from_slice(&data_c);  // LBA 11 — miss
-    multi_block.extend_from_slice(&data_b);  // LBA 12 — dedup hit
-    multi_block.extend_from_slice(&data_d);  // LBA 13 — miss
-    pool.append("test-vol", Lba(10), 4, &multi_block, 1000).unwrap();
+    multi_block.extend_from_slice(&data_a); // LBA 10 — dedup hit
+    multi_block.extend_from_slice(&data_c); // LBA 11 — miss
+    multi_block.extend_from_slice(&data_b); // LBA 12 — dedup hit
+    multi_block.extend_from_slice(&data_d); // LBA 13 — miss
+    pool.append("test-vol", Lba(10), 4, &multi_block, 1000)
+        .unwrap();
 
-    assert!(wait_flushed(&pool, 10000), "flush timeout for multi-LBA interleaved entry");
+    assert!(
+        wait_flushed(&pool, 10000),
+        "flush timeout for multi-LBA interleaved entry"
+    );
     flusher.stop();
 
     // Verify all 4 LBAs are mapped
     for lba in 10..14u64 {
         assert!(
-            meta.get_mapping(&VolumeId("test-vol".into()), Lba(lba)).unwrap().is_some(),
-            "LBA {} should be mapped", lba
+            meta.get_mapping(&VolumeId("test-vol".into()), Lba(lba))
+                .unwrap()
+                .is_some(),
+            "LBA {} should be mapped",
+            lba
         );
     }
 
     // Verify dedup hits share PBAs with originals
-    let pba_0 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap().pba;
-    let pba_2 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(2)).unwrap().unwrap().pba;
-    let pba_10 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(10)).unwrap().unwrap().pba;
-    let pba_12 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(12)).unwrap().unwrap().pba;
+    let pba_0 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap()
+        .pba;
+    let pba_2 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(2))
+        .unwrap()
+        .unwrap()
+        .pba;
+    let pba_10 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(10))
+        .unwrap()
+        .unwrap()
+        .pba;
+    let pba_12 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(12))
+        .unwrap()
+        .unwrap()
+        .pba;
     assert_eq!(pba_0, pba_10, "LBA 10 should dedup to LBA 0's PBA");
     assert_eq!(pba_2, pba_12, "LBA 12 should dedup to LBA 2's PBA");
 
     // Verify misses have their own PBAs
-    let pba_11 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(11)).unwrap().unwrap().pba;
-    let pba_13 = meta.get_mapping(&VolumeId("test-vol".into()), Lba(13)).unwrap().unwrap().pba;
+    let pba_11 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(11))
+        .unwrap()
+        .unwrap()
+        .pba;
+    let pba_13 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(13))
+        .unwrap()
+        .unwrap()
+        .pba;
     assert_ne!(pba_11, pba_0);
     assert_ne!(pba_13, pba_0);
 
     // Verify no pending entries left (coalescer correctly tracked all seqs)
-    assert_eq!(pool.pending_count(), 0, "all entries should be fully flushed");
+    assert_eq!(
+        pool.pending_count(),
+        0,
+        "all entries should be fully flushed"
+    );
 }
 
 #[test]
@@ -787,8 +897,15 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
     assert!(wait_flushed(&pool, 10000), "initial flush timeout");
     flusher.stop();
 
-    let original_pba = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap().pba;
-    assert_eq!(meta.get_dedup_entry(&hash).unwrap().unwrap().pba, original_pba);
+    let original_pba = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap()
+        .pba;
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
+        original_pba
+    );
 
     let mut skip_flusher = start_flusher_custom(
         &pool,
@@ -803,8 +920,14 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
     assert!(wait_flushed(&pool, 10000), "skipped flush timeout");
     skip_flusher.stop();
 
-    let skipped_mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(1)).unwrap().unwrap();
-    assert_ne!(skipped_mapping.pba, original_pba, "skipped dedup write should land on a fresh PBA");
+    let skipped_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        skipped_mapping.pba, original_pba,
+        "skipped dedup write should land on a fresh PBA"
+    );
     assert_eq!(skipped_mapping.flags, FLAG_DEDUP_SKIPPED);
 
     let mut scanner = start_scanner(
@@ -818,7 +941,10 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
 
     assert!(
         wait_until(3000, || {
-            let mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(1)).unwrap().unwrap();
+            let mapping = meta
+                .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+                .unwrap()
+                .unwrap();
             mapping.flags == 0 && mapping.pba == original_pba
         }),
         "scanner should remap skipped duplicate to existing PBA"
@@ -826,7 +952,10 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
     scanner.stop();
 
     assert_eq!(meta.get_refcount(skipped_mapping.pba).unwrap(), 0);
-    assert_eq!(meta.get_dedup_entry(&hash).unwrap().unwrap().pba, original_pba);
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
+        original_pba
+    );
 }
 
 #[test]
@@ -850,7 +979,10 @@ fn scanner_miss_registers_index_and_clears_flag() {
     assert!(wait_flushed(&pool, 10000), "skipped flush timeout");
     flusher.stop();
 
-    let skipped_mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let skipped_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     assert_eq!(skipped_mapping.flags, FLAG_DEDUP_SKIPPED);
     assert!(meta.get_dedup_entry(&hash).unwrap().is_none());
 
@@ -864,7 +996,10 @@ fn scanner_miss_registers_index_and_clears_flag() {
     );
     assert!(
         wait_until(3000, || {
-            let mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+            let mapping = meta
+                .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+                .unwrap()
+                .unwrap();
             mapping.flags == 0
                 && meta
                     .get_dedup_entry(&hash)
@@ -894,11 +1029,15 @@ fn scanner_skips_under_pressure_then_resumes() {
         new_hole_map(),
         dedup_always_skip_config(),
     );
-    pool.append("test-vol", Lba(0), 1, &skipped_data, 1000).unwrap();
+    pool.append("test-vol", Lba(0), 1, &skipped_data, 1000)
+        .unwrap();
     assert!(wait_flushed(&pool, 10000), "skipped flush timeout");
     skip_flusher.stop();
 
-    let skipped_mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let skipped_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     assert_eq!(skipped_mapping.flags, FLAG_DEDUP_SKIPPED);
 
     let filler = vec![0xEE; 4096];
@@ -915,19 +1054,26 @@ fn scanner_skips_under_pressure_then_resumes() {
 
     thread::sleep(Duration::from_millis(150));
     assert_eq!(
-        meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap().flags,
+        meta.get_mapping(&VolumeId("test-vol".into()), Lba(0))
+            .unwrap()
+            .unwrap()
+            .flags,
         FLAG_DEDUP_SKIPPED,
         "scanner must skip rescans while buffer pressure is above threshold"
     );
     assert!(meta.get_dedup_entry(&skipped_hash).unwrap().is_none());
 
-    let mut drain_flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut drain_flusher =
+        start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
     assert!(wait_flushed(&pool, 10000), "filler drain timeout");
     drain_flusher.stop();
 
     assert!(
         wait_until(3000, || {
-            let mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+            let mapping = meta
+                .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+                .unwrap()
+                .unwrap();
             mapping.flags == 0 && meta.get_dedup_entry(&skipped_hash).unwrap().is_some()
         }),
         "scanner should resume once buffer pressure is relieved"
@@ -956,10 +1102,15 @@ fn scanner_crc_mismatch_leaves_block_skipped() {
     assert!(wait_flushed(&pool, 10000), "skipped flush timeout");
     flusher.stop();
 
-    let mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     assert_eq!(mapping.flags, FLAG_DEDUP_SKIPPED);
 
-    io_engine.write_blocks(mapping.pba, &vec![0xFF; 4096]).unwrap();
+    io_engine
+        .write_blocks(mapping.pba, &vec![0xFF; 4096])
+        .unwrap();
 
     let mut scanner = start_scanner(
         &pool,
@@ -972,7 +1123,10 @@ fn scanner_crc_mismatch_leaves_block_skipped() {
     thread::sleep(Duration::from_millis(150));
     scanner.stop();
 
-    let after = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let after = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     assert_eq!(after.flags, FLAG_DEDUP_SKIPPED);
     assert!(meta.get_dedup_entry(&hash).unwrap().is_none());
 }
@@ -997,7 +1151,10 @@ fn dedup_hole_fill_miss_populates_index() {
     let anchor_data = vec![0x11; 4096];
     pool.append("anchor", Lba(0), 1, &anchor_data, 100).unwrap();
     assert!(wait_flushed(&pool, 10000), "anchor flush timeout");
-    let anchor_mapping = meta.get_mapping(&VolumeId("anchor".into()), Lba(0)).unwrap().unwrap();
+    let anchor_mapping = meta
+        .get_mapping(&VolumeId("anchor".into()), Lba(0))
+        .unwrap()
+        .unwrap();
 
     let hole_offset = anchor_mapping.slot_offset + anchor_mapping.unit_compressed_size as u16;
     let hole_size = 1024u16;
@@ -1016,8 +1173,14 @@ fn dedup_hole_fill_miss_populates_index() {
     assert!(wait_flushed(&pool, 10000), "hole fill flush timeout");
     flusher.stop();
 
-    let fill_mapping = meta.get_mapping(&VolumeId("fill".into()), Lba(0)).unwrap().unwrap();
-    assert_eq!(fill_mapping.pba, anchor_mapping.pba, "write should reuse the manual hole");
+    let fill_mapping = meta
+        .get_mapping(&VolumeId("fill".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fill_mapping.pba, anchor_mapping.pba,
+        "write should reuse the manual hole"
+    );
     assert_eq!(fill_mapping.slot_offset, hole_offset);
     assert_eq!(fill_mapping.flags, 0);
 
@@ -1047,7 +1210,10 @@ fn dedup_skipped_hole_fill_is_rescanned() {
     assert!(wait_flushed(&pool, 10000), "anchor flush timeout");
     anchor_flusher.stop();
 
-    let anchor_mapping = meta.get_mapping(&VolumeId("anchor".into()), Lba(0)).unwrap().unwrap();
+    let anchor_mapping = meta
+        .get_mapping(&VolumeId("anchor".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     let hole_offset = anchor_mapping.slot_offset + anchor_mapping.unit_compressed_size as u16;
     let hole_size = 1024u16;
     assert!(hole_offset + hole_size <= BLOCK_SIZE as u16);
@@ -1074,7 +1240,10 @@ fn dedup_skipped_hole_fill_is_rescanned() {
     assert!(wait_flushed(&pool, 10000), "skipped hole fill timeout");
     skip_flusher.stop();
 
-    let skipped_mapping = meta.get_mapping(&VolumeId("fill".into()), Lba(0)).unwrap().unwrap();
+    let skipped_mapping = meta
+        .get_mapping(&VolumeId("fill".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     assert_eq!(skipped_mapping.pba, anchor_mapping.pba);
     assert_eq!(skipped_mapping.slot_offset, hole_offset);
     assert_eq!(skipped_mapping.flags, FLAG_DEDUP_SKIPPED);
@@ -1090,7 +1259,10 @@ fn dedup_skipped_hole_fill_is_rescanned() {
     );
     assert!(
         wait_until(3000, || {
-            let mapping = meta.get_mapping(&VolumeId("fill".into()), Lba(0)).unwrap().unwrap();
+            let mapping = meta
+                .get_mapping(&VolumeId("fill".into()), Lba(0))
+                .unwrap()
+                .unwrap();
             mapping.flags == 0
                 && meta
                     .get_dedup_entry(&fill_hash)
@@ -1121,10 +1293,16 @@ fn dedup_miss_before_meta_write_recovers_and_populates_index() {
     flusher.stop();
     clear_test_failpoint("test-vol", Lba(0), FlushFailStage::BeforeMetaWrite);
 
-    let mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
     assert_eq!(mapping.flags, 0);
     assert_eq!(meta.get_refcount(mapping.pba).unwrap(), 1);
-    assert_eq!(meta.get_dedup_entry(&hash).unwrap().unwrap().pba, mapping.pba);
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
+        mapping.pba
+    );
 }
 
 #[test]
@@ -1139,7 +1317,10 @@ fn dedup_hit_failure_demotes_to_miss() {
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
     assert!(wait_flushed(&pool, 10000), "initial flush timeout");
 
-    let original_mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(0)).unwrap().unwrap();
+    let original_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
 
     install_test_dedup_hit_failpoint("test-vol", Lba(1), Some(1));
     pool.append("test-vol", Lba(1), 1, &data, 1000).unwrap();
@@ -1147,12 +1328,18 @@ fn dedup_hit_failure_demotes_to_miss() {
     flusher.stop();
     clear_test_dedup_hit_failpoint("test-vol", Lba(1));
 
-    let second_mapping = meta.get_mapping(&VolumeId("test-vol".into()), Lba(1)).unwrap().unwrap();
+    let second_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+        .unwrap()
+        .unwrap();
     assert_ne!(
         second_mapping.pba, original_mapping.pba,
         "forced dedup-hit failure should demote the write to a fresh miss allocation"
     );
     assert_eq!(meta.get_refcount(original_mapping.pba).unwrap(), 1);
     assert_eq!(meta.get_refcount(second_mapping.pba).unwrap(), 1);
-    assert_eq!(meta.get_dedup_entry(&hash).unwrap().unwrap().pba, second_mapping.pba);
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
+        second_mapping.pba
+    );
 }

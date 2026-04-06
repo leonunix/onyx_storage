@@ -10,6 +10,7 @@ pub mod gc;
 pub mod io;
 pub mod lifecycle;
 pub mod meta;
+pub mod metrics;
 pub mod packer;
 pub mod space;
 pub mod zone;

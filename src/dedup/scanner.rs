@@ -13,6 +13,7 @@ use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::*;
 use crate::meta::store::MetaStore;
+use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{VolumeId, BLOCK_SIZE};
@@ -32,6 +33,26 @@ impl DedupScanner {
         buffer_pool: Arc<WriteBufferPool>,
         config: DedupConfig,
     ) -> Self {
+        Self::start_with_metrics(
+            Arc::new(EngineMetrics::default()),
+            meta,
+            io_engine,
+            allocator,
+            lifecycle,
+            buffer_pool,
+            config,
+        )
+    }
+
+    pub fn start_with_metrics(
+        metrics: Arc<EngineMetrics>,
+        meta: Arc<MetaStore>,
+        io_engine: Arc<IoEngine>,
+        allocator: Arc<SpaceAllocator>,
+        lifecycle: Arc<VolumeLifecycleManager>,
+        buffer_pool: Arc<WriteBufferPool>,
+        config: DedupConfig,
+    ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
@@ -39,6 +60,7 @@ impl DedupScanner {
             .name("dedup-scanner".into())
             .spawn(move || {
                 Self::scan_loop(
+                    &metrics,
                     &meta,
                     &io_engine,
                     &allocator,
@@ -57,6 +79,7 @@ impl DedupScanner {
     }
 
     fn scan_loop(
+        metrics: &EngineMetrics,
         meta: &MetaStore,
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
@@ -71,8 +94,13 @@ impl DedupScanner {
                 break;
             }
 
+            metrics.dedup_rescan_cycles.fetch_add(1, Ordering::Relaxed);
+
             // Skip if buffer is under pressure
             if buffer_pool.fill_percentage() > config.buffer_skip_threshold_pct as u8 {
+                metrics
+                    .dedup_rescan_skipped_cycles
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
@@ -83,12 +111,27 @@ impl DedupScanner {
                 lifecycle,
                 config.max_rescan_per_cycle,
             ) {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!(rescanned = count, "dedup scanner: re-processed skipped blocks");
+                Ok(stats) => {
+                    metrics
+                        .dedup_rescan_blocks
+                        .fetch_add(stats.rescanned as u64, Ordering::Relaxed);
+                    metrics
+                        .dedup_rescan_hits
+                        .fetch_add(stats.hits as u64, Ordering::Relaxed);
+                    metrics
+                        .dedup_rescan_misses
+                        .fetch_add(stats.misses as u64, Ordering::Relaxed);
+                    if stats.rescanned > 0 {
+                        tracing::info!(
+                            rescanned = stats.rescanned,
+                            hits = stats.hits,
+                            misses = stats.misses,
+                            "dedup scanner: re-processed skipped blocks"
+                        );
                     }
                 }
                 Err(e) => {
+                    metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, "dedup scanner: rescan failed");
                 }
             }
@@ -101,9 +144,9 @@ impl DedupScanner {
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         max_per_cycle: usize,
-    ) -> OnyxResult<usize> {
+    ) -> OnyxResult<RescanStats> {
         let skipped = meta.scan_dedup_skipped(max_per_cycle)?;
-        let mut count = 0;
+        let mut stats = RescanStats::default();
 
         for (vol_id_str, lba, bv) in &skipped {
             let vol_id = VolumeId(vol_id_str.clone());
@@ -153,7 +196,11 @@ impl DedupScanner {
                 let compressor = create_compressor(algo);
                 let mut decompressed = vec![0u8; current.unit_original_size as usize];
                 if current.compression != 0 {
-                    compressor.decompress(compressed, &mut decompressed, current.unit_original_size as usize)?;
+                    compressor.decompress(
+                        compressed,
+                        &mut decompressed,
+                        current.unit_original_size as usize,
+                    )?;
                 } else {
                     decompressed[..compressed.len()].copy_from_slice(compressed);
                 }
@@ -190,6 +237,7 @@ impl DedupScanner {
                                 allocator.free_extent(Extent::new(current.pba, blocks))?;
                             }
                         }
+                        stats.hits += 1;
                     }
                     _ => {
                         // Dedup miss: register in index and clear flag
@@ -205,6 +253,7 @@ impl DedupScanner {
                         };
                         meta.put_dedup_entries(&[(hash, entry)])?;
                         meta.update_blockmap_flags(&vol_id, *lba, 0)?;
+                        stats.misses += 1;
                     }
                 }
 
@@ -212,11 +261,11 @@ impl DedupScanner {
             })?;
 
             if result {
-                count += 1;
+                stats.rescanned += 1;
             }
         }
 
-        Ok(count)
+        Ok(stats)
     }
 
     pub fn stop(&mut self) {
@@ -231,4 +280,11 @@ impl Drop for DedupScanner {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RescanStats {
+    rescanned: usize,
+    hits: usize,
+    misses: usize,
 }

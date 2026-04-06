@@ -7,6 +7,7 @@ use crate::buffer::pool::WriteBufferPool;
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::engine::IoEngine;
 use crate::meta::store::MetaStore;
+use crate::metrics::EngineMetrics;
 use crate::types::{Lba, ZoneId};
 use crate::zone::worker::ZoneWorker;
 
@@ -38,6 +39,7 @@ pub struct ZoneManager {
     handles: Vec<ZoneHandle>,
     zone_size_blocks: u64,
     zone_count: u32,
+    metrics: Arc<EngineMetrics>,
 }
 
 impl ZoneManager {
@@ -48,6 +50,24 @@ impl ZoneManager {
         buffer_pool: Arc<WriteBufferPool>,
         io_engine: Arc<IoEngine>,
     ) -> OnyxResult<Self> {
+        Self::new_with_metrics(
+            zone_count,
+            zone_size_blocks,
+            meta,
+            buffer_pool,
+            io_engine,
+            Arc::new(EngineMetrics::default()),
+        )
+    }
+
+    pub fn new_with_metrics(
+        zone_count: u32,
+        zone_size_blocks: u64,
+        meta: Arc<MetaStore>,
+        buffer_pool: Arc<WriteBufferPool>,
+        io_engine: Arc<IoEngine>,
+        metrics: Arc<EngineMetrics>,
+    ) -> OnyxResult<Self> {
         let mut handles = Vec::with_capacity(zone_count as usize);
 
         for i in 0..zone_count {
@@ -56,11 +76,18 @@ impl ZoneManager {
             let meta = meta.clone();
             let buffer_pool = buffer_pool.clone();
             let io_engine = io_engine.clone();
+            let metrics = metrics.clone();
 
             let thread = thread::Builder::new()
                 .name(format!("zone-worker-{}", i))
                 .spawn(move || {
-                    let worker = ZoneWorker::new(zone_id, meta, buffer_pool, io_engine);
+                    let worker = ZoneWorker::new_with_metrics(
+                        zone_id,
+                        meta,
+                        buffer_pool,
+                        io_engine,
+                        metrics,
+                    );
                     Self::worker_loop(worker, receiver);
                 })
                 .map_err(|e| OnyxError::Config(format!("failed to spawn zone thread: {}", e)))?;
@@ -77,6 +104,7 @@ impl ZoneManager {
             handles,
             zone_size_blocks,
             zone_count,
+            metrics,
         })
     }
 
@@ -127,6 +155,7 @@ impl ZoneManager {
     ) -> OnyxResult<()> {
         let bs = crate::types::BLOCK_SIZE as usize;
         let mut offset = 0u32;
+        let mut chunks = 0u64;
 
         while offset < lba_count {
             let cur_lba = Lba(start_lba.0 + offset as u64);
@@ -159,6 +188,19 @@ impl ZoneManager {
                 .map_err(|_| OnyxError::Ublk("zone worker reply channel closed".into()))??;
 
             offset += lbas_in_zone;
+            chunks += 1;
+        }
+
+        self.metrics
+            .zone_write_dispatches
+            .fetch_add(chunks, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .zone_write_lbas
+            .fetch_add(lba_count as u64, std::sync::atomic::Ordering::Relaxed);
+        if chunks > 1 {
+            self.metrics
+                .zone_write_split_ops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(())
@@ -179,6 +221,10 @@ impl ZoneManager {
                 reply: reply_tx,
             })
             .map_err(|_| OnyxError::Ublk("zone worker channel closed".into()))?;
+
+        self.metrics
+            .zone_read_dispatches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         reply_rx
             .recv()

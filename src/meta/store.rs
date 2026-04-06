@@ -70,7 +70,13 @@ impl MetaStore {
         let db = DB::open_cf_descriptors(
             &db_opts,
             &config.rocksdb_path,
-            vec![cf_volumes, cf_blockmap, cf_refcount, cf_dedup_index, cf_dedup_reverse],
+            vec![
+                cf_volumes,
+                cf_blockmap,
+                cf_refcount,
+                cf_dedup_index,
+                cf_dedup_reverse,
+            ],
         )?;
 
         Ok(Self {
@@ -702,10 +708,15 @@ impl MetaStore {
 
     /// Scan blockmap for entries with DEDUP_SKIPPED flag set.
     /// Returns (vol_id, lba, BlockmapValue) tuples, up to `limit`.
-    pub fn scan_dedup_skipped(&self, limit: usize) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
+    pub fn scan_dedup_skipped(
+        &self,
+        limit: usize,
+    ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let mut results = Vec::new();
-        let iter = self.db.iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, value) = item?;
             if let Some(bv) = decode_blockmap_value(&value) {

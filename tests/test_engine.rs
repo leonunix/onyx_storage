@@ -53,6 +53,20 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
     (config, meta_dir, buf_tmp, data_tmp)
 }
 
+fn wait_for_buffer_drain(engine: &OnyxEngine, timeout_ms: u64) -> bool {
+    let Some(pool) = engine.buffer_pool() else {
+        return true;
+    };
+    let steps = timeout_ms / 10;
+    for _ in 0..steps {
+        if pool.pending_count() == 0 {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 // --- Meta-only mode ---
 
 #[test]
@@ -155,6 +169,61 @@ fn recreate_same_name_gets_new_generation() {
 
     assert_ne!(gen1, gen2, "recreated volume must get a fresh generation");
     assert!(gen2 > gen1, "generation should increase monotonically");
+}
+
+#[test]
+fn engine_metrics_snapshot_tracks_reads_writes_and_dedup() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-metrics", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-metrics").unwrap();
+    let payload = vec![0x5A; 4096];
+
+    vol.write(0, &payload).unwrap();
+    assert_eq!(vol.read(0, 4096).unwrap(), payload);
+    assert!(wait_for_buffer_drain(&engine, 5000), "first flush timeout");
+    assert_eq!(vol.read(0, 4096).unwrap(), payload);
+
+    vol.write(4096, &payload).unwrap();
+    assert!(wait_for_buffer_drain(&engine, 5000), "second flush timeout");
+
+    let snapshot = engine.metrics_snapshot();
+    assert_eq!(snapshot.volume_create_ops, 1);
+    assert_eq!(snapshot.volume_open_ops, 1);
+    assert_eq!(snapshot.volume_write_ops, 2);
+    assert_eq!(snapshot.volume_read_ops, 2);
+    assert!(snapshot.volume_write_bytes >= 8192);
+    assert!(snapshot.volume_read_bytes >= 8192);
+    assert!(snapshot.buffer_appends >= 2);
+    assert!(snapshot.read_buffer_hits >= 1);
+    assert!(snapshot.read_lv3_hits >= 1);
+    assert!(snapshot.flush_units_written >= 1 || snapshot.flush_packed_slots_written >= 1);
+    assert!(
+        snapshot.dedup_hits >= 1,
+        "expected second identical block to dedup"
+    );
+}
+
+#[test]
+fn engine_status_report_includes_metrics_sections() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-status", 16 * 4096, CompressionAlgo::None)
+        .unwrap();
+
+    let report = engine.status_report().unwrap();
+
+    assert!(report.contains("mode: full"));
+    assert!(report.contains("volumes: 1"));
+    assert!(report.contains("buffer_pending_entries:"));
+    assert!(report.contains("volume_ops:"));
+    assert!(report.contains("read_path:"));
+    assert!(report.contains("flush:"));
+    assert!(report.contains("dedup:"));
+    assert!(report.contains("gc:"));
 }
 
 // --- Volume IO ---
