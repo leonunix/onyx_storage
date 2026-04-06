@@ -189,67 +189,6 @@ impl EngineMetrics {
     }
 }
 
-macro_rules! snapshot_fields {
-    ($macro:ident) => {
-        $macro!(uptime_secs);
-        $macro!(volume_create_ops);
-        $macro!(volume_delete_ops);
-        $macro!(volume_open_ops);
-        $macro!(volume_read_ops);
-        $macro!(volume_read_bytes);
-        $macro!(volume_partial_read_ops);
-        $macro!(volume_write_ops);
-        $macro!(volume_write_bytes);
-        $macro!(volume_partial_write_ops);
-        $macro!(zone_write_dispatches);
-        $macro!(zone_write_split_ops);
-        $macro!(zone_write_lbas);
-        $macro!(zone_read_dispatches);
-        $macro!(buffer_appends);
-        $macro!(buffer_append_bytes);
-        $macro!(buffer_lookup_hits);
-        $macro!(buffer_lookup_misses);
-        $macro!(read_buffer_hits);
-        $macro!(read_lv3_hits);
-        $macro!(read_unmapped);
-        $macro!(read_crc_errors);
-        $macro!(read_decompress_errors);
-        $macro!(coalesce_runs);
-        $macro!(coalesced_units);
-        $macro!(coalesced_lbas);
-        $macro!(coalesced_bytes);
-        $macro!(compress_units);
-        $macro!(compress_input_bytes);
-        $macro!(compress_output_bytes);
-        $macro!(dedup_hits);
-        $macro!(dedup_misses);
-        $macro!(dedup_skipped_units);
-        $macro!(dedup_hit_failures);
-        $macro!(flush_units_written);
-        $macro!(flush_unit_bytes);
-        $macro!(flush_packed_slots_written);
-        $macro!(flush_packed_fragments_written);
-        $macro!(flush_packed_bytes);
-        $macro!(flush_hole_fills);
-        $macro!(flush_hole_fill_bytes);
-        $macro!(flush_stale_discards);
-        $macro!(flush_errors);
-        $macro!(hole_detections);
-        $macro!(gc_cycles);
-        $macro!(gc_paused_cycles);
-        $macro!(gc_candidates_found);
-        $macro!(gc_rewrite_attempts);
-        $macro!(gc_blocks_rewritten);
-        $macro!(gc_errors);
-        $macro!(dedup_rescan_cycles);
-        $macro!(dedup_rescan_skipped_cycles);
-        $macro!(dedup_rescan_blocks);
-        $macro!(dedup_rescan_hits);
-        $macro!(dedup_rescan_misses);
-        $macro!(dedup_rescan_errors);
-    };
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineMetricsSnapshot {
     pub uptime_secs: u64,
@@ -312,13 +251,74 @@ pub struct EngineMetricsSnapshot {
 
 impl EngineMetricsSnapshot {
     pub fn saturating_sub(&self, earlier: &Self) -> Self {
-        macro_rules! sub_field {
-            ($field:ident) => {
-                $field: self.$field.saturating_sub(earlier.$field),
+        macro_rules! build_sub {
+            ($($field:ident),+ $(,)?) => {
+                Self {
+                    $(
+                        $field: self.$field.saturating_sub(earlier.$field),
+                    )+
+                }
             };
         }
 
-        Self { snapshot_fields!(sub_field) }
+        build_sub! {
+            uptime_secs,
+            volume_create_ops,
+            volume_delete_ops,
+            volume_open_ops,
+            volume_read_ops,
+            volume_read_bytes,
+            volume_partial_read_ops,
+            volume_write_ops,
+            volume_write_bytes,
+            volume_partial_write_ops,
+            zone_write_dispatches,
+            zone_write_split_ops,
+            zone_write_lbas,
+            zone_read_dispatches,
+            buffer_appends,
+            buffer_append_bytes,
+            buffer_lookup_hits,
+            buffer_lookup_misses,
+            read_buffer_hits,
+            read_lv3_hits,
+            read_unmapped,
+            read_crc_errors,
+            read_decompress_errors,
+            coalesce_runs,
+            coalesced_units,
+            coalesced_lbas,
+            coalesced_bytes,
+            compress_units,
+            compress_input_bytes,
+            compress_output_bytes,
+            dedup_hits,
+            dedup_misses,
+            dedup_skipped_units,
+            dedup_hit_failures,
+            flush_units_written,
+            flush_unit_bytes,
+            flush_packed_slots_written,
+            flush_packed_fragments_written,
+            flush_packed_bytes,
+            flush_hole_fills,
+            flush_hole_fill_bytes,
+            flush_stale_discards,
+            flush_errors,
+            hole_detections,
+            gc_cycles,
+            gc_paused_cycles,
+            gc_candidates_found,
+            gc_rewrite_attempts,
+            gc_blocks_rewritten,
+            gc_errors,
+            dedup_rescan_cycles,
+            dedup_rescan_skipped_cycles,
+            dedup_rescan_blocks,
+            dedup_rescan_hits,
+            dedup_rescan_misses,
+            dedup_rescan_errors,
+        }
     }
 }
 
