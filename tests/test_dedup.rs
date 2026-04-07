@@ -1278,23 +1278,33 @@ fn dedup_skipped_hole_fill_is_rescanned() {
 #[test]
 fn dedup_miss_before_meta_write_recovers_and_populates_index() {
     let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
-    register_volume(&meta, "test-vol");
+    register_volume(&meta, "test-vol-meta-fail");
 
     let data = vec![0x91; 4096];
     let hash: ContentHash = Sha256::digest(&data).into();
-    install_test_failpoint("test-vol", Lba(0), FlushFailStage::BeforeMetaWrite, Some(1));
+    install_test_failpoint(
+        "test-vol-meta-fail",
+        Lba(0),
+        FlushFailStage::BeforeMetaWrite,
+        Some(1),
+    );
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
-    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    pool.append("test-vol-meta-fail", Lba(0), 1, &data, 1000)
+        .unwrap();
     assert!(
         wait_flushed(&pool, 10000),
         "write should retry and eventually flush after metadata failpoint"
     );
     flusher.stop();
-    clear_test_failpoint("test-vol", Lba(0), FlushFailStage::BeforeMetaWrite);
+    clear_test_failpoint(
+        "test-vol-meta-fail",
+        Lba(0),
+        FlushFailStage::BeforeMetaWrite,
+    );
 
     let mapping = meta
-        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .get_mapping(&VolumeId("test-vol-meta-fail".into()), Lba(0))
         .unwrap()
         .unwrap();
     assert_eq!(mapping.flags, 0);
@@ -1308,28 +1318,30 @@ fn dedup_miss_before_meta_write_recovers_and_populates_index() {
 #[test]
 fn dedup_hit_failure_demotes_to_miss() {
     let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
-    register_volume(&meta, "test-vol");
+    register_volume(&meta, "test-vol-hit-fail");
 
     let data = vec![0xA5; 4096];
     let hash: ContentHash = Sha256::digest(&data).into();
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
-    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    pool.append("test-vol-hit-fail", Lba(0), 1, &data, 1000)
+        .unwrap();
     assert!(wait_flushed(&pool, 10000), "initial flush timeout");
 
     let original_mapping = meta
-        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .get_mapping(&VolumeId("test-vol-hit-fail".into()), Lba(0))
         .unwrap()
         .unwrap();
 
-    install_test_dedup_hit_failpoint("test-vol", Lba(1), Some(1));
-    pool.append("test-vol", Lba(1), 1, &data, 1000).unwrap();
+    install_test_dedup_hit_failpoint("test-vol-hit-fail", Lba(1), Some(1));
+    pool.append("test-vol-hit-fail", Lba(1), 1, &data, 1000)
+        .unwrap();
     assert!(wait_flushed(&pool, 10000), "demoted miss flush timeout");
     flusher.stop();
-    clear_test_dedup_hit_failpoint("test-vol", Lba(1));
+    clear_test_dedup_hit_failpoint("test-vol-hit-fail", Lba(1));
 
     let second_mapping = meta
-        .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+        .get_mapping(&VolumeId("test-vol-hit-fail".into()), Lba(1))
         .unwrap()
         .unwrap();
     assert_ne!(

@@ -1469,7 +1469,12 @@ impl BufferFlusher {
             return Ok(());
         }
 
-        maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)?;
+        if let Err(e) =
+            maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)
+        {
+            allocator.free_one(sealed.pba)?;
+            return Err(e);
+        }
 
         // Write the 4KB slot data to LV3
         if let Err(e) = io_engine.write_blocks(sealed.pba, &sealed.data) {
@@ -1482,7 +1487,12 @@ impl BufferFlusher {
             .map(|(old_pba, (decrement, _))| (*old_pba, *decrement))
             .collect();
 
-        maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)?;
+        if let Err(e) =
+            maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)
+        {
+            allocator.free_one(sealed.pba)?;
+            return Err(e);
+        }
         maybe_pause_before_packed_meta_write(&sealed.fragments)?;
 
         // Metadata commit — if this fails, free the PBA to prevent orphaned block

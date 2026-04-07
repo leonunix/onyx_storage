@@ -653,6 +653,39 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Iterate all dedup index entries.
+    pub fn iter_dedup_entries(&self) -> OnyxResult<Vec<(ContentHash, DedupEntry)>> {
+        let cf = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();
+        let mut results = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if key.len() != 32 {
+                continue;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&key);
+            if let Some(entry) = decode_dedup_entry(&value) {
+                results.push((hash, entry));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Iterate all dedup reverse entries.
+    pub fn iter_dedup_reverse_entries(&self) -> OnyxResult<Vec<(Pba, ContentHash)>> {
+        let cf = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
+        let mut results = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item?;
+            if let Some((pba, hash)) = decode_dedup_reverse_key(&key) {
+                results.push((pba, hash));
+            }
+        }
+        Ok(results)
+    }
+
     /// Delete a single dedup index entry by hash (best-effort stale cleanup).
     pub fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
         let cf = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();

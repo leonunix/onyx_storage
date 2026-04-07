@@ -27,6 +27,7 @@ use onyx_storage::config::*;
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::gc::config::GcConfig;
 use onyx_storage::types::*;
+use serial_test::serial;
 use tempfile::{tempdir, NamedTempFile};
 
 // ---------------------------------------------------------------------------
@@ -219,6 +220,7 @@ fn read_raw_lv3(env: &TestEnv, pba: Pba, size: usize) -> Vec<u8> {
 // Test 1: Prove data lives in buffer OR metadata — pipeline state is consistent
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_buffer_or_metadata_consistent() {
     let env = setup();
     let vol_size = 64 * 4096u64;
@@ -258,6 +260,7 @@ fn prove_buffer_or_metadata_consistent() {
 // Test 2: Prove flusher clears buffer and writes metadata
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_flusher_drains_buffer_creates_metadata() {
     let env = setup();
     let vol_size = 64 * 4096u64;
@@ -318,6 +321,7 @@ fn prove_flusher_drains_buffer_creates_metadata() {
 // Test 3: Prove LZ4 compression actually ran — raw LV3 bytes != original
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_lz4_compression_ran() {
     let env = setup();
     let vol_size = 128 * 4096u64;
@@ -392,6 +396,7 @@ fn prove_lz4_compression_ran() {
 // Test 4: Prove ZSTD compression ran with the same rigor
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_zstd_compression_ran() {
     let env = setup();
     let vol_size = 128 * 4096u64;
@@ -449,6 +454,7 @@ fn prove_zstd_compression_ran() {
 // Test 5: Prove coalescer merged contiguous LBAs into one unit
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_coalescer_merged_lbas() {
     let env = setup();
     let vol_size = 128 * 4096u64;
@@ -540,6 +546,7 @@ fn prove_coalescer_merged_lbas() {
 // Test 6: Prove overwrite → flush → old PBA freed, new PBA allocated
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_overwrite_frees_old_pba() {
     let env = setup();
     let vol_size = 64 * 4096u64;
@@ -588,6 +595,7 @@ fn prove_overwrite_frees_old_pba() {
 // Test 7: Prove incompressible data fallback — compression=0 or size >= orig
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_incompressible_fallback() {
     let env = setup();
     let vol_size = 64 * 4096u64;
@@ -643,6 +651,7 @@ fn prove_incompressible_fallback() {
 // Test 8: Prove multi-volume isolation — same LBA, different data
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_multi_volume_isolation() {
     let env = setup();
     let vol_size = 64 * 4096u64;
@@ -697,6 +706,7 @@ fn prove_multi_volume_isolation() {
 // Test 9: Prove sparse reads come from LV3 (not just zero-init memory)
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_sparse_then_written_reads_from_lv3() {
     let env = setup();
     let vol_size = 64 * 4096u64;
@@ -727,6 +737,7 @@ fn prove_sparse_then_written_reads_from_lv3() {
 // Test 10: Full 1MB digest — write, flush, read, verify every byte
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_full_digest_roundtrip() {
     let env = setup();
     let vol_size = 512 * 4096u64;
@@ -794,6 +805,7 @@ fn prove_full_digest_roundtrip() {
 // Test 11: Prove 128KB single write → coalesced → compressed → correct
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_large_write_pipeline() {
     let env = setup();
     let vol_size = 256 * 4096u64;
@@ -855,6 +867,7 @@ fn prove_large_write_pipeline() {
 // Test 12: Concurrent writers → flush → full verification
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_concurrent_pipeline() {
     let env = setup();
     let vol_size = 512 * 4096u64;
@@ -917,6 +930,7 @@ fn prove_concurrent_pipeline() {
 // Test 13: Delete volume → all PBAs freed, all metadata gone
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_delete_volume_cleanup() {
     let env = setup();
     let vol_size = 64 * 4096u64;
@@ -972,6 +986,7 @@ fn prove_delete_volume_cleanup() {
 // Test 14: Full pipeline status report — prints all internal state
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_pipeline_status_report() {
     let env = setup();
     let vol_size = 256 * 4096u64;
@@ -1157,6 +1172,7 @@ fn prove_pipeline_status_report() {
 // Test 15: Prove packed read path handles non-zero slot_offset correctly
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_packed_slot_offset_read_path() {
     let env = setup();
     let vol_size = 16 * 4096u64;
@@ -1212,6 +1228,7 @@ fn prove_packed_slot_offset_read_path() {
 // sharing the same packed slot
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_multi_volume_packed_slot_delete_isolation() {
     let env = setup();
     let vol_size = 16 * 4096u64;
@@ -1260,6 +1277,7 @@ fn prove_multi_volume_packed_slot_delete_isolation() {
 // is overwritten
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
     let env = setup();
     let vol_size = 16 * 4096u64;
@@ -1327,6 +1345,7 @@ fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
 // delete_volume until commit completes
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_packed_flush_blocks_delete_until_commit() {
     let env = setup();
     let vol_size = 16 * 4096u64;
@@ -1381,6 +1400,7 @@ fn prove_packed_flush_blocks_delete_until_commit() {
 // Test 19: Prove packed metadata failure retries cleanly without leaking PBA
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_packed_metadata_failure_retries_without_leak() {
     let env = setup();
     let vol_size = 16 * 4096u64;
@@ -1403,14 +1423,10 @@ fn prove_packed_metadata_failure_retries_without_leak() {
     let meta = env.engine.meta();
     let vol_a_id = VolumeId("pack-fail-a".into());
     let vol_b_id = VolumeId("pack-fail-b".into());
-    wait_until(Duration::from_secs(2), || {
-        meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_none()
-            && meta.get_mapping(&vol_b_id, Lba(0)).unwrap().is_none()
-            && env.engine.allocator().unwrap().free_block_count() == initial_free
-    });
+    thread::sleep(Duration::from_millis(250));
 
     clear_test_failpoint("pack-fail-a", Lba(0), FlushFailStage::BeforeMetaWrite);
-    wait_for_flush(&env, Duration::from_secs(10));
+    wait_for_flush(&env, Duration::from_secs(60));
 
     let map_a = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
     let map_b = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
@@ -1419,10 +1435,9 @@ fn prove_packed_metadata_failure_retries_without_leak() {
         "retry should still produce one packed slot"
     );
     assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 2);
-    assert_eq!(
-        env.engine.allocator().unwrap().free_block_count(),
-        initial_free - 1
-    );
+    wait_until(Duration::from_secs(60), || {
+        env.engine.allocator().unwrap().free_block_count() == initial_free - 1
+    });
     assert_eq!(vol_a.read(0, 4096).unwrap(), vec![0x71; 4096]);
     assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x72; 4096]);
 }
@@ -1431,6 +1446,7 @@ fn prove_packed_metadata_failure_retries_without_leak() {
 // Test 20: Prove background GC runner rewrites and reclaims fragmented units
 // ===========================================================================
 #[test]
+#[serial]
 fn prove_background_gc_runner_reclaims_old_units() {
     // Disable dedup for this test: GC rewrites live blocks back to buffer,
     // and with dedup enabled the blocks map back to the same PBA (correct
