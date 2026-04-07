@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use crate::buffer::entry::*;
 use crate::error::{OnyxError, OnyxResult};
@@ -38,20 +40,22 @@ struct LbaKey {
 /// In-memory: per-LBA HashMap index pointing to Arc<PendingEntry> for O(1) lookup.
 pub struct WriteBufferPool {
     device: RawDevice,
-    superblock: Mutex<BufferSuperblock>,
+    superblock: parking_lot::Mutex<BufferSuperblock>,
     next_seq: AtomicU64,
     /// Per-LBA index: (vol_id, lba) → pending entry covering that LBA.
     /// A multi-LBA entry has lba_count keys all pointing to the same Arc.
-    lba_index: Mutex<HashMap<LbaKey, Arc<PendingEntry>>>,
+    /// DashMap uses sharded RwLocks internally — concurrent inserts to different
+    /// keys do not contend, eliminating the global Mutex bottleneck on append.
+    lba_index: DashMap<LbaKey, Arc<PendingEntry>>,
     /// Seq → disk location, for mark_flushed to find the entry on disk.
-    seq_index: Mutex<HashMap<u64, (u64, u32)>>, // seq → (disk_offset, disk_len)
+    seq_index: DashMap<u64, (u64, u32)>,
     /// Tracks which specific LBA offsets within each entry have been flushed.
     /// Uses a set of offsets (not a counter) so retrying the same LBAs is idempotent.
     /// Only when all offsets 0..lba_count are present do we mark the entry as flushed.
-    flush_progress: Mutex<HashMap<u64, HashSet<u16>>>, // seq → set of flushed offset_in_entry
+    flush_progress: DashMap<u64, HashSet<u16>>,
     metrics: OnceLock<Arc<EngineMetrics>>,
-    sync_state: Mutex<SyncState>,
-    sync_cv: Condvar,
+    sync_state: parking_lot::Mutex<SyncState>,
+    sync_cv: parking_lot::Condvar,
     next_durable_epoch: AtomicU64,
     group_commit_wait: Duration,
 }
@@ -148,9 +152,9 @@ impl WriteBufferPool {
         };
 
         // Rebuild in-memory indices
-        let mut lba_index: HashMap<LbaKey, Arc<PendingEntry>> = HashMap::new();
-        let mut seq_index: HashMap<u64, (u64, u32)> = HashMap::new();
-        Self::rebuild_indices(&device, &sb, &mut lba_index, &mut seq_index)?;
+        let lba_index: DashMap<LbaKey, Arc<PendingEntry>> = DashMap::new();
+        let seq_index: DashMap<u64, (u64, u32)> = DashMap::new();
+        Self::rebuild_indices(&device, &sb, &lba_index, &seq_index)?;
 
         tracing::info!(
             pending_lbas = lba_index.len(),
@@ -159,14 +163,14 @@ impl WriteBufferPool {
 
         Ok(Self {
             device,
-            superblock: Mutex::new(sb),
+            superblock: parking_lot::Mutex::new(sb),
             next_seq: AtomicU64::new(max_seq + 1),
-            lba_index: Mutex::new(lba_index),
-            seq_index: Mutex::new(seq_index),
-            flush_progress: Mutex::new(HashMap::new()),
+            lba_index,
+            seq_index,
+            flush_progress: DashMap::new(),
             metrics: OnceLock::new(),
-            sync_state: Mutex::new(SyncState::default()),
-            sync_cv: Condvar::new(),
+            sync_state: parking_lot::Mutex::new(SyncState::default()),
+            sync_cv: parking_lot::Condvar::new(),
             next_durable_epoch: AtomicU64::new(1),
             group_commit_wait,
         })
@@ -207,8 +211,8 @@ impl WriteBufferPool {
     fn rebuild_indices(
         device: &RawDevice,
         sb: &BufferSuperblock,
-        lba_index: &mut HashMap<LbaKey, Arc<PendingEntry>>,
-        seq_index: &mut HashMap<u64, (u64, u32)>,
+        lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,
+        seq_index: &DashMap<u64, (u64, u32)>,
     ) -> OnyxResult<()> {
         let mut offset = sb.tail_offset;
         while offset != sb.head_offset {
@@ -324,7 +328,7 @@ impl WriteBufferPool {
         let entry_len = entry_bytes.len() as u64;
         let epoch;
 
-        let mut sb = self.superblock.lock().unwrap();
+        let mut sb = self.superblock.lock();
 
         if !sb.has_room(entry_len) {
             return Err(OnyxError::BufferPoolFull(sb.used_bytes as usize));
@@ -369,19 +373,14 @@ impl WriteBufferPool {
             disk_len: entry_len as u32,
         });
 
-        {
-            let mut lba_idx = self.lba_index.lock().unwrap();
-            for i in 0..lba_count {
-                let key = LbaKey {
-                    vol_id: vol_id.to_string(),
-                    lba: Lba(start_lba.0 + i as u64),
-                };
-                lba_idx.insert(key, pending.clone());
-            }
+        for i in 0..lba_count {
+            let key = LbaKey {
+                vol_id: vol_id.to_string(),
+                lba: Lba(start_lba.0 + i as u64),
+            };
+            self.lba_index.insert(key, pending.clone());
         }
         self.seq_index
-            .lock()
-            .unwrap()
             .insert(seq, (write_offset, entry_len as u32));
 
         self.wait_until_durable(epoch)?;
@@ -398,21 +397,20 @@ impl WriteBufferPool {
 
     fn wait_until_durable(&self, epoch: u64) -> OnyxResult<()> {
         loop {
-            let mut state = self.sync_state.lock().unwrap();
+            let mut state = self.sync_state.lock();
             loop {
                 if state.durable_epoch >= epoch {
                     return Ok(());
                 }
                 if state.sync_in_progress {
-                    state = self.sync_cv.wait(state).unwrap();
+                    self.sync_cv.wait(&mut state);
                     continue;
                 }
                 if let Some(retry_after) = state.retry_after {
                     let now = Instant::now();
                     if retry_after > now {
                         let timeout = retry_after.duration_since(now);
-                        let (next_state, _) = self.sync_cv.wait_timeout(state, timeout).unwrap();
-                        state = next_state;
+                        self.sync_cv.wait_for(&mut state, timeout);
                         continue;
                     }
                 }
@@ -439,7 +437,7 @@ impl WriteBufferPool {
             .saturating_sub(1);
         let sync_result = self.sync_device();
 
-        let mut state = self.sync_state.lock().unwrap();
+        let mut state = self.sync_state.lock();
         match sync_result {
             Ok(()) => {
                 state.durable_epoch = state.durable_epoch.max(batch_end);
@@ -489,8 +487,7 @@ impl WriteBufferPool {
             vol_id: vol_id.to_string(),
             lba,
         };
-        let idx = self.lba_index.lock().unwrap();
-        let result = idx.get(&key).map(|arc| (**arc).clone());
+        let result = self.lba_index.get(&key).map(|r| (**r).clone());
         if let Some(metrics) = self.metrics.get() {
             let counter = if result.is_some() {
                 &metrics.buffer_lookup_hits
@@ -517,12 +514,9 @@ impl WriteBufferPool {
         flushed_lba_start: Lba,
         flushed_lba_count: u32,
     ) -> OnyxResult<()> {
-        let loc = {
-            let seq_idx = self.seq_index.lock().unwrap();
-            match seq_idx.get(&seq) {
-                Some(&loc) => loc,
-                None => return Ok(()),
-            }
+        let loc = match self.seq_index.get(&seq) {
+            Some(r) => *r,
+            None => return Ok(()),
         };
         let (disk_offset, disk_len) = loc;
 
@@ -537,8 +531,10 @@ impl WriteBufferPool {
         // Compute offsets within the entry
         let entry_start = entry.start_lba.0;
         let all_done = {
-            let mut progress = self.flush_progress.lock().unwrap();
-            let flushed_offsets = progress.entry(seq).or_insert_with(HashSet::new);
+            let mut flushed_offsets = self
+                .flush_progress
+                .entry(seq)
+                .or_insert_with(HashSet::new);
             for i in 0..flushed_lba_count {
                 let abs_lba = flushed_lba_start.0 + i as u64;
                 if abs_lba >= entry_start {
@@ -553,24 +549,18 @@ impl WriteBufferPool {
         }
 
         // All LBAs flushed — clean up
-        self.flush_progress.lock().unwrap().remove(&seq);
+        self.flush_progress.remove(&seq);
 
         // Remove from LBA index (only if still the latest for each LBA)
-        {
-            let mut lba_idx = self.lba_index.lock().unwrap();
-            for i in 0..entry.lba_count {
-                let key = LbaKey {
-                    vol_id: entry.vol_id.clone(),
-                    lba: Lba(entry.start_lba.0 + i as u64),
-                };
-                if let Some(existing) = lba_idx.get(&key) {
-                    if existing.seq == seq {
-                        lba_idx.remove(&key);
-                    }
-                }
-            }
+        for i in 0..entry.lba_count {
+            let key = LbaKey {
+                vol_id: entry.vol_id.clone(),
+                lba: Lba(entry.start_lba.0 + i as u64),
+            };
+            // DashMap::remove_if atomically checks and removes
+            self.lba_index.remove_if(&key, |_, v| v.seq == seq);
         }
-        self.seq_index.lock().unwrap().remove(&seq);
+        self.seq_index.remove(&seq);
 
         // Write flushed flag to disk
         let mut entry = entry;
@@ -583,7 +573,7 @@ impl WriteBufferPool {
 
     /// Advance tail past all contiguous flushed entries.
     pub fn advance_tail(&self) -> OnyxResult<u64> {
-        let mut sb = self.superblock.lock().unwrap();
+        let mut sb = self.superblock.lock();
         let mut advanced = 0u64;
 
         let mut offset = sb.tail_offset;
@@ -632,7 +622,7 @@ impl WriteBufferPool {
 
     /// Recover all unflushed entries from the on-disk log.
     pub fn recover(&self) -> OnyxResult<Vec<BufferEntry>> {
-        let sb = self.superblock.lock().unwrap();
+        let sb = self.superblock.lock();
         let mut unflushed = Vec::new();
 
         let mut offset = sb.tail_offset;
@@ -679,11 +669,11 @@ impl WriteBufferPool {
     /// Number of unflushed LBAs in the index.
     pub fn pending_count(&self) -> u64 {
         // Count unique seqs (not LBAs, since one entry can cover many LBAs)
-        self.seq_index.lock().unwrap().len() as u64
+        self.seq_index.len() as u64
     }
 
     pub fn capacity(&self) -> u64 {
-        let sb = self.superblock.lock().unwrap();
+        let sb = self.superblock.lock();
         sb.capacity_bytes
     }
 
@@ -701,11 +691,10 @@ impl WriteBufferPool {
 
         // Collect seqs belonging to this volume from the LBA index
         let seqs_to_purge: Vec<u64> = {
-            let lba_idx = self.lba_index.lock().unwrap();
             let mut seqs = std::collections::HashSet::new();
-            for (key, entry) in lba_idx.iter() {
-                if key.vol_id == vol_id {
-                    seqs.insert(entry.seq);
+            for entry in self.lba_index.iter() {
+                if entry.key().vol_id == vol_id {
+                    seqs.insert(entry.value().seq);
                 }
             }
             seqs.into_iter().collect()
@@ -718,17 +707,11 @@ impl WriteBufferPool {
         let count = seqs_to_purge.len() as u64;
 
         // Remove from LBA index
-        {
-            let mut lba_idx = self.lba_index.lock().unwrap();
-            lba_idx.retain(|key, _| key.vol_id != vol_id);
-        }
+        self.lba_index.retain(|key, _| key.vol_id != vol_id);
 
         // Mark as flushed on disk + remove from seq index
         for seq in &seqs_to_purge {
-            let loc = {
-                let seq_idx = self.seq_index.lock().unwrap();
-                seq_idx.get(seq).copied()
-            };
+            let loc = self.seq_index.get(seq).map(|r| *r);
             if let Some((disk_offset, disk_len)) = loc {
                 // Read entry, set flushed flag, write back
                 let mut buf = vec![0u8; disk_len as usize];
@@ -741,8 +724,8 @@ impl WriteBufferPool {
                     }
                 }
             }
-            self.seq_index.lock().unwrap().remove(seq);
-            self.flush_progress.lock().unwrap().remove(seq);
+            self.seq_index.remove(seq);
+            self.flush_progress.remove(seq);
         }
 
         tracing::info!(
@@ -754,7 +737,7 @@ impl WriteBufferPool {
     }
 
     pub fn fill_percentage(&self) -> u8 {
-        let sb = self.superblock.lock().unwrap();
+        let sb = self.superblock.lock();
         if sb.capacity_bytes == 0 {
             return 100;
         }
