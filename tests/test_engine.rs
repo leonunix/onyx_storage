@@ -36,6 +36,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             device: buf_tmp.path().to_path_buf(),
             capacity_mb: 1,
             flush_watermark_pct: 80,
+            group_commit_wait_us: 250,
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig::default(),

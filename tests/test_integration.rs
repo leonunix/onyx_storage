@@ -105,6 +105,7 @@ fn setup_with_all_options(
             device: buf_file.path().to_path_buf(),
             capacity_mb: 1,
             flush_watermark_pct: 80,
+            group_commit_wait_us: 250,
         },
         ublk: UblkConfig::default(),
         flush,

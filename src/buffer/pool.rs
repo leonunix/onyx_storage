@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::buffer::entry::*;
 use crate::error::{OnyxError, OnyxResult};
@@ -49,12 +50,30 @@ pub struct WriteBufferPool {
     /// Only when all offsets 0..lba_count are present do we mark the entry as flushed.
     flush_progress: Mutex<HashMap<u64, HashSet<u16>>>, // seq → set of flushed offset_in_entry
     metrics: OnceLock<Arc<EngineMetrics>>,
+    sync_state: Mutex<SyncState>,
+    sync_cv: Condvar,
+    next_durable_epoch: AtomicU64,
+    group_commit_wait: Duration,
+}
+
+#[derive(Debug, Default)]
+struct SyncState {
+    durable_epoch: u64,
+    sync_in_progress: bool,
+    consecutive_failures: u32,
+    retry_after: Option<Instant>,
+    last_error: Option<String>,
 }
 
 static TEST_PURGE_FAIL_VOLUMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static TEST_SYNC_FAIL_REMAINING: OnceLock<Mutex<u32>> = OnceLock::new();
 
 fn test_purge_fail_volumes() -> &'static Mutex<HashSet<String>> {
     TEST_PURGE_FAIL_VOLUMES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn test_sync_fail_remaining() -> &'static Mutex<u32> {
+    TEST_SYNC_FAIL_REMAINING.get_or_init(|| Mutex::new(0))
 }
 
 #[doc(hidden)]
@@ -70,9 +89,28 @@ pub fn clear_purge_volume_failpoint(vol_id: &str) {
     test_purge_fail_volumes().lock().unwrap().remove(vol_id);
 }
 
+#[doc(hidden)]
+pub fn install_buffer_sync_failpoint(remaining_hits: u32) {
+    *test_sync_fail_remaining().lock().unwrap() = remaining_hits;
+}
+
+#[doc(hidden)]
+pub fn clear_buffer_sync_failpoint() {
+    *test_sync_fail_remaining().lock().unwrap() = 0;
+}
+
 impl WriteBufferPool {
+    const MAX_SYNC_RETRY_BACKOFF_MS: u64 = 16;
+
     /// Open the buffer pool. Rebuilds in-memory indices from the on-disk log.
     pub fn open(device: RawDevice) -> OnyxResult<Self> {
+        Self::open_with_group_commit_wait(device, Duration::from_micros(250))
+    }
+
+    pub fn open_with_group_commit_wait(
+        device: RawDevice,
+        group_commit_wait: Duration,
+    ) -> OnyxResult<Self> {
         let device_size = device.size();
         let capacity_bytes = device_size.saturating_sub(BUFFER_SUPERBLOCK_SIZE);
 
@@ -127,6 +165,10 @@ impl WriteBufferPool {
             seq_index: Mutex::new(seq_index),
             flush_progress: Mutex::new(HashMap::new()),
             metrics: OnceLock::new(),
+            sync_state: Mutex::new(SyncState::default()),
+            sync_cv: Condvar::new(),
+            next_durable_epoch: AtomicU64::new(1),
+            group_commit_wait,
         })
     }
 
@@ -280,6 +322,7 @@ impl WriteBufferPool {
 
         let entry_bytes = entry.to_bytes()?;
         let entry_len = entry_bytes.len() as u64;
+        let epoch;
 
         let mut sb = self.superblock.lock().unwrap();
 
@@ -309,11 +352,13 @@ impl WriteBufferPool {
         sb.used_bytes += entry_len + wasted;
         sb.update_crc();
         self.device.write_at(&sb.to_bytes(), 0)?;
+        epoch = self.next_durable_epoch.fetch_add(1, Ordering::SeqCst);
+        drop(sb);
 
-        // Sync to disk before ack
-        self.device.sync()?;
-
-        // Update in-memory indices
+        // Publish the entry into the in-memory lookup index before the durable barrier.
+        // This intentionally provides read-after-write visibility from the buffer log while
+        // append waits for group commit. A sync failure does not roll back these indices;
+        // instead we keep the entry visible and retry sync until the epoch becomes durable.
         let pending = Arc::new(PendingEntry {
             seq,
             vol_id: vol_id.to_string(),
@@ -339,6 +384,8 @@ impl WriteBufferPool {
             .unwrap()
             .insert(seq, (write_offset, entry_len as u32));
 
+        self.wait_until_durable(epoch)?;
+
         if let Some(metrics) = self.metrics.get() {
             metrics.buffer_appends.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -347,6 +394,92 @@ impl WriteBufferPool {
         }
 
         Ok(seq)
+    }
+
+    fn wait_until_durable(&self, epoch: u64) -> OnyxResult<()> {
+        loop {
+            let mut state = self.sync_state.lock().unwrap();
+            loop {
+                if state.durable_epoch >= epoch {
+                    return Ok(());
+                }
+                if state.sync_in_progress {
+                    state = self.sync_cv.wait(state).unwrap();
+                    continue;
+                }
+                if let Some(retry_after) = state.retry_after {
+                    let now = Instant::now();
+                    if retry_after > now {
+                        let timeout = retry_after.duration_since(now);
+                        let (next_state, _) = self.sync_cv.wait_timeout(state, timeout).unwrap();
+                        state = next_state;
+                        continue;
+                    }
+                }
+                state.sync_in_progress = true;
+                break;
+            }
+            drop(state);
+            self.run_sync_batch();
+        }
+    }
+
+    fn run_sync_batch(&self) {
+        // Allow a short batching window so multiple appends can share one durable sync.
+        if !self.group_commit_wait.is_zero() {
+            std::thread::sleep(self.group_commit_wait);
+        }
+
+        // Batch membership is defined by the durable epoch snapshot. We intentionally do not
+        // hold the superblock lock across sync so new appends can continue writing the next batch
+        // while this flush is in flight.
+        let batch_end = self
+            .next_durable_epoch
+            .load(Ordering::Acquire)
+            .saturating_sub(1);
+        let sync_result = self.sync_device();
+
+        let mut state = self.sync_state.lock().unwrap();
+        match sync_result {
+            Ok(()) => {
+                state.durable_epoch = state.durable_epoch.max(batch_end);
+                state.consecutive_failures = 0;
+                state.retry_after = None;
+                state.last_error = None;
+                debug_assert!(state.durable_epoch >= batch_end);
+            }
+            Err(err) => {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                let backoff = Self::sync_retry_backoff(state.consecutive_failures);
+                state.retry_after = Some(Instant::now() + backoff);
+                state.last_error = Some(err.to_string());
+                tracing::warn!(
+                    error = %err,
+                    consecutive_failures = state.consecutive_failures,
+                    retry_backoff_ms = backoff.as_millis(),
+                    "buffer sync failed; keeping pending entries indexed and retrying"
+                );
+            }
+        }
+        state.sync_in_progress = false;
+        self.sync_cv.notify_all();
+    }
+
+    fn sync_device(&self) -> OnyxResult<()> {
+        let mut remaining_failures = test_sync_fail_remaining().lock().unwrap();
+        if *remaining_failures > 0 {
+            *remaining_failures -= 1;
+            return Err(OnyxError::Io(std::io::Error::other(
+                "injected buffer sync failure",
+            )));
+        }
+        drop(remaining_failures);
+        self.device.sync()
+    }
+
+    fn sync_retry_backoff(consecutive_failures: u32) -> Duration {
+        let shift = consecutive_failures.saturating_sub(1).min(4);
+        Duration::from_millis((1u64 << shift).min(Self::MAX_SYNC_RETRY_BACKOFF_MS))
     }
 
     /// Look up the 4KB data for a single LBA. Returns the payload slice if found.

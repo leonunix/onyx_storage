@@ -126,7 +126,10 @@ impl OnyxEngine {
 
         // 4. Write buffer pool
         let buf_dev = RawDevice::open(&config.buffer.device)?;
-        let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev)?);
+        let buffer_pool = Arc::new(WriteBufferPool::open_with_group_commit_wait(
+            buf_dev,
+            std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
+        )?);
         buffer_pool.attach_metrics(metrics.clone());
 
         // 5. Recover unflushed entries

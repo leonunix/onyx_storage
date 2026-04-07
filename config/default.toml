@@ -13,6 +13,7 @@ default_compression = "Lz4"
 device = "/dev/vg0/onyx-buffer"
 capacity_mb = 16384
 flush_watermark_pct = 80
+group_commit_wait_us = 250
 
 [ublk]
 nr_queues = 4

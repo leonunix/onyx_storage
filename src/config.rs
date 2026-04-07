@@ -60,6 +60,9 @@ pub struct BufferConfig {
     /// Flush watermark percentage (default 80)
     #[serde(default = "default_flush_watermark_pct")]
     pub flush_watermark_pct: u8,
+    /// Max time to wait for a batched durable sync before forcing a commit (default 250us)
+    #[serde(default = "default_group_commit_wait_us")]
+    pub group_commit_wait_us: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,6 +159,9 @@ fn default_buffer_capacity_mb() -> usize {
 }
 fn default_flush_watermark_pct() -> u8 {
     80
+}
+fn default_group_commit_wait_us() -> u64 {
+    250
 }
 fn default_nr_queues() -> u16 {
     4

@@ -1,8 +1,11 @@
 use onyx_storage::buffer::entry::*;
-use onyx_storage::buffer::pool::WriteBufferPool;
+use onyx_storage::buffer::pool::{
+    clear_buffer_sync_failpoint, install_buffer_sync_failpoint, WriteBufferPool,
+};
 use onyx_storage::error::OnyxError;
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::types::{Lba, BLOCK_SIZE};
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 // --- entry tests ---
@@ -447,4 +450,28 @@ fn partial_mark_flushed_is_idempotent_for_multi_lba_entry() {
 
     let advanced = pool.advance_tail().unwrap();
     assert_eq!(advanced, 1);
+}
+
+#[test]
+fn append_retries_transient_sync_failure_without_losing_pending_entry() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_group_commit_wait(dev, Duration::ZERO).unwrap();
+
+    install_buffer_sync_failpoint(2);
+    let data = vec![0x6C; 4096];
+    let seq = pool.append("test-vol", Lba(7), 1, &data, 0).unwrap();
+    clear_buffer_sync_failpoint();
+
+    assert!(seq >= 1);
+    assert_eq!(pool.pending_count(), 1);
+    let found = pool.lookup("test-vol", Lba(7)).unwrap().unwrap();
+    assert_eq!(found.payload, data);
+
+    let unflushed = pool.recover().unwrap();
+    assert_eq!(unflushed.len(), 1);
+    assert_eq!(unflushed[0].seq, seq);
+    assert_eq!(unflushed[0].payload, data);
 }

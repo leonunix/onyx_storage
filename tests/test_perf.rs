@@ -39,6 +39,7 @@ struct PerfConfig {
     pattern: Pattern,
     compression: CompressionAlgo,
     drain_timeout: Duration,
+    group_commit_wait_us: u64,
 }
 
 struct PerfEnv {
@@ -138,6 +139,10 @@ fn load_perf_config() -> PerfConfig {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(60);
+    let group_commit_wait_us = env::var("ONYX_PERF_GROUP_COMMIT_WAIT_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(250);
 
     assert!(
         volume_size >= total_size,
@@ -157,6 +162,7 @@ fn load_perf_config() -> PerfConfig {
         pattern,
         compression,
         drain_timeout: Duration::from_secs(drain_timeout_secs),
+        group_commit_wait_us,
     }
 }
 
@@ -187,6 +193,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             device: buf_file.path().to_path_buf(),
             capacity_mb: ((buf_bytes / 1024 / 1024).max(1)) as usize,
             flush_watermark_pct: 80,
+            group_commit_wait_us: cfg.group_commit_wait_us,
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig {
@@ -200,6 +207,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
         },
         gc: GcConfig {
             enabled: env::var("ONYX_PERF_GC").ok().as_deref() == Some("1"),
+            scan_interval_ms: 100,
             ..Default::default()
         },
         dedup: onyx_storage::dedup::config::DedupConfig {
@@ -207,6 +215,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
                 .ok()
                 .map(|v| v != "0")
                 .unwrap_or(true),
+            rescan_interval_ms: 100,
             ..Default::default()
         },
     };
@@ -361,6 +370,7 @@ fn print_perf_report(
         human_bytes(cfg.io_size),
         human_bytes(stats.bytes),
     );
+    eprintln!("group_commit_wait_us={}", cfg.group_commit_wait_us);
     eprintln!(
         "timed={:.3}s throughput={:.2} MiB/s iops={:.0} avg_latency={:.2} us/op",
         timed.as_secs_f64(),

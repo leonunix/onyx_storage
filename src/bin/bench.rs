@@ -46,6 +46,9 @@ struct Cli {
     #[arg(long, default_value_t = 60)]
     drain_timeout_secs: u64,
 
+    #[arg(long)]
+    group_commit_wait_us: Option<u64>,
+
     #[arg(long, default_value_t = false)]
     skip_prefill: bool,
 }
@@ -94,6 +97,7 @@ struct BenchConfig {
     io_size: u64,
     threads: usize,
     pattern: Pattern,
+    group_commit_wait_us: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,7 +120,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_args(&cli)?;
 
-    let config = OnyxConfig::load(&cli.config)?;
+    let mut config = OnyxConfig::load(&cli.config)?;
+    if let Some(wait_us) = cli.group_commit_wait_us {
+        config.buffer.group_commit_wait_us = wait_us;
+    }
     let engine = OnyxEngine::open(&config)?;
 
     engine
@@ -142,6 +149,7 @@ fn main() -> Result<()> {
                 io_size: cli.io_size,
                 threads: cli.threads,
                 pattern: cli.pattern,
+                group_commit_wait_us: config.buffer.group_commit_wait_us,
             },
             cli.drain_timeout_secs,
         )?;
@@ -154,6 +162,7 @@ fn main() -> Result<()> {
         io_size: cli.io_size,
         threads: cli.threads,
         pattern: cli.pattern,
+        group_commit_wait_us: config.buffer.group_commit_wait_us,
     };
 
     let result = run_benchmark(&engine, &bench, cli.drain_timeout_secs)?;
@@ -362,6 +371,7 @@ fn print_report(bench: &BenchConfig, result: &BenchResult) {
     println!("pattern:  {:?}", bench.pattern);
     println!("threads:  {}", bench.threads);
     println!("bs:       {}", human_bytes(bench.io_size));
+    println!("group commit wait: {} us", bench.group_commit_wait_us);
     println!("total:    {}", human_bytes(result.stats.bytes));
     println!("ops:      {}", result.stats.ops);
     println!("time:     {:.3}s", secs);
