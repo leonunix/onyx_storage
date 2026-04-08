@@ -242,6 +242,35 @@ impl MetaStore {
         }
     }
 
+    /// Batch-read multiple LBA mappings in one RocksDB multi_get_cf call.
+    /// Returns results in the same order as the input `lbas` slice.
+    pub fn multi_get_mappings(
+        &self,
+        vol_id: &VolumeId,
+        lbas: &[Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        if lbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let keys: Vec<Vec<u8>> = lbas
+            .iter()
+            .map(|lba| encode_blockmap_key(vol_id, *lba))
+            .collect::<OnyxResult<Vec<_>>>()?;
+        let results = self
+            .db
+            .multi_get_cf(keys.iter().map(|k| (&cf, k.as_slice())));
+        let mut out = Vec::with_capacity(lbas.len());
+        for result in results {
+            match result {
+                Ok(Some(data)) => out.push(decode_blockmap_value(&data)),
+                Ok(None) => out.push(None),
+                Err(e) => return Err(OnyxError::Meta(e)),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn delete_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<()> {
         let cf = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let key = encode_blockmap_key(vol_id, lba)?;
@@ -293,6 +322,27 @@ impl MetaStore {
             Some(data) => Ok(decode_refcount_value(&data).unwrap_or(0)),
             None => Ok(0),
         }
+    }
+
+    /// Batch-read refcounts for multiple PBAs in one RocksDB multi_get_cf call.
+    pub fn multi_get_refcounts(&self, pbas: &[Pba]) -> OnyxResult<Vec<u32>> {
+        if pbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.db.cf_handle(CF_REFCOUNT).unwrap();
+        let keys: Vec<[u8; 8]> = pbas.iter().map(|pba| encode_refcount_key(*pba)).collect();
+        let results = self
+            .db
+            .multi_get_cf(keys.iter().map(|k| (&cf, k.as_slice())));
+        let mut out = Vec::with_capacity(pbas.len());
+        for result in results {
+            match result {
+                Ok(Some(data)) => out.push(decode_refcount_value(&data).unwrap_or(0)),
+                Ok(None) => out.push(0),
+                Err(e) => return Err(OnyxError::Meta(e)),
+            }
+        }
+        Ok(out)
     }
 
     pub fn set_refcount(&self, pba: Pba, count: u32) -> OnyxResult<()> {
@@ -459,6 +509,68 @@ impl MetaStore {
         batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_refcount));
 
         for (old_pba, decrement) in old_pba_decrements {
+            let current_rc = self.get_refcount(*old_pba)?;
+            let new_rc = current_rc.saturating_sub(*decrement);
+            let rc_key = encode_refcount_key(*old_pba);
+            if new_rc == 0 {
+                batch.delete_cf(&cf_refcount, &rc_key);
+            } else {
+                batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
+            }
+        }
+
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Atomically write blockmap entries for multiple units, each with its own PBA.
+    /// Combines all units into a single RocksDB WriteBatch for one WAL sync.
+    ///
+    /// Each item in `units`: (vol_id, blockmap entries, new_pba refcount, old PBA decrements)
+    pub fn atomic_batch_write_multi(
+        &self,
+        units: &[(
+            &VolumeId,
+            &[(Lba, BlockmapValue)],
+            u32, // new_refcount
+            &HashMap<Pba, u32>, // old_pba_decrements
+        )],
+    ) -> OnyxResult<()> {
+        if units.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.refcount_lock.lock().unwrap();
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        let mut batch = WriteBatch::default();
+
+        // Aggregate all old_pba decrements across units to handle correctly
+        // when multiple units reference the same old PBA.
+        let mut aggregated_decrements: HashMap<Pba, u32> = HashMap::new();
+
+        for (vol_id, batch_values, new_refcount, old_pba_decrements) in units {
+            // Write blockmap entries
+            for (lba, value) in *batch_values {
+                let bm_key = encode_blockmap_key(vol_id, *lba)?;
+                let bm_val = encode_blockmap_value(value);
+                batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+            }
+
+            // Set new PBA refcount
+            if let Some((_, first_val)) = batch_values.first() {
+                let rc_key = encode_refcount_key(first_val.pba);
+                batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(*new_refcount));
+            }
+
+            // Aggregate old PBA decrements
+            for (old_pba, decrement) in *old_pba_decrements {
+                *aggregated_decrements.entry(*old_pba).or_insert(0) += decrement;
+            }
+        }
+
+        // Apply aggregated decrements
+        for (old_pba, decrement) in &aggregated_decrements {
             let current_rc = self.get_refcount(*old_pba)?;
             let new_rc = current_rc.saturating_sub(*decrement);
             let rc_key = encode_refcount_key(*old_pba);
@@ -735,7 +847,25 @@ impl MetaStore {
     pub fn cleanup_dedup_for_pba_standalone(&self, pba: Pba) -> OnyxResult<()> {
         let mut batch = WriteBatch::default();
         self.cleanup_dedup_for_pba(pba, &mut batch)?;
-        self.db.write(batch)?;
+        if !batch.is_empty() {
+            self.db.write(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Batch cleanup dedup index for multiple PBAs in one WriteBatch.
+    /// Much faster than calling cleanup_dedup_for_pba_standalone per PBA.
+    pub fn cleanup_dedup_for_pbas_batch(&self, pbas: &[Pba]) -> OnyxResult<()> {
+        if pbas.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for pba in pbas {
+            self.cleanup_dedup_for_pba(*pba, &mut batch)?;
+        }
+        if !batch.is_empty() {
+            self.db.write(batch)?;
+        }
         Ok(())
     }
 

@@ -697,18 +697,39 @@ impl BufferShard {
         self.pending_entries.contains_key(&seq)
     }
 
-    fn free_seq_allocation(&self, seq: u64, pending: &PendingEntry) -> OnyxResult<()> {
+    /// Memory-only: reclaim ring space, cancel write thread if needed.
+    /// No disk write — metadata commit to RocksDB is the durable record.
+    /// On crash recovery, stale "unflushed" entries are detected by
+    /// cross-checking against the blockmap.
+    fn free_seq_allocation(&self, seq: u64, pending: &PendingEntry) {
         let slot_count = pending.disk_len / BLOCK_SIZE;
+        self.lifecycle.lock().cancelled.insert(seq);
+        {
+            let mut ring = self.ring.lock();
+            debug_assert!(ring.log_order.iter().any(|record| record.seq == seq
+                && record.disk_offset == pending.disk_offset
+                && record.slot_count == slot_count));
+            ring.flushed_seqs.insert(seq);
+            let before = ring.used_bytes;
+            Self::reclaim_log_prefix(&mut ring);
+            if ring.used_bytes < before {
+                self.ring_space_cv.notify_all();
+            }
+        }
+        self.flush_progress.remove(&seq);
+    }
+
+    /// Durable mark: writes flushed header to disk. Only used by purge_volume
+    /// which needs disk-durable state before returning.
+    fn free_seq_allocation_durable(&self, seq: u64, pending: &PendingEntry) -> OnyxResult<()> {
         self.lifecycle.lock().cancelled.insert(seq);
         {
             let _guard = self.io_lock.lock();
             Self::mark_entry_flushed(&self.device, pending)?;
         }
         {
+            let slot_count = pending.disk_len / BLOCK_SIZE;
             let mut ring = self.ring.lock();
-            debug_assert!(ring.log_order.iter().any(|record| record.seq == seq
-                && record.disk_offset == pending.disk_offset
-                && record.slot_count == slot_count));
             ring.flushed_seqs.insert(seq);
             let before = ring.used_bytes;
             Self::reclaim_log_prefix(&mut ring);
@@ -747,7 +768,8 @@ impl BufferShard {
                 |_, value| value.seq == seq,
             );
             self.pending_entries.remove(&seq);
-            return self.free_seq_allocation(seq, &pending);
+            self.free_seq_allocation(seq, &pending);
+            return Ok(());
         }
 
         let all_done = {
@@ -775,7 +797,8 @@ impl BufferShard {
             );
         }
         self.pending_entries.remove(&seq);
-        self.free_seq_allocation(seq, &pending)
+        self.free_seq_allocation(seq, &pending);
+        Ok(())
     }
 
     fn advance_tail(&self) -> OnyxResult<u64> {
@@ -825,7 +848,7 @@ impl BufferShard {
 
         let seqs: Vec<u64> = to_purge.iter().map(|(seq, _)| *seq).collect();
         for (seq, pending) in &to_purge {
-            self.free_seq_allocation(*seq, pending)?;
+            self.free_seq_allocation_durable(*seq, pending)?;
         }
 
         Ok(seqs)

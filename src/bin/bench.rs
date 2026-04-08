@@ -536,6 +536,15 @@ fn print_report(bench: &BenchConfig, result: &BenchResult) {
     );
     println!("drain catch-up: {:.3}s", result.drain_phase.as_secs_f64());
 
+    let total_secs = (result.timed_phase + result.drain_phase).as_secs_f64();
+    let sustained_mbps =
+        (result.stats.bytes as f64 / 1024.0 / 1024.0) / total_secs.max(f64::MIN_POSITIVE);
+    let sustained_iops = result.stats.ops as f64 / total_secs.max(f64::MIN_POSITIVE);
+    println!(
+        "sustained (incl. drain): {:.2} MiB/s, {:.0} IOPS over {:.3}s",
+        sustained_mbps, sustained_iops, total_secs
+    );
+
     let m = &result.metrics_delta;
     println!();
     println!("== Metrics Delta ==");

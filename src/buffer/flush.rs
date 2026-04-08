@@ -943,6 +943,8 @@ impl BufferFlusher {
         }
     }
 
+    const WRITER_BATCH_SIZE: usize = 32;
+
     fn writer_loop(
         shard_idx: usize,
         rx: &Receiver<CompressedUnit>,
@@ -956,116 +958,193 @@ impl BufferFlusher {
         packer: &mut Packer,
         metrics: &EngineMetrics,
     ) {
-        // Seqs buffered inside the packer's open slot, reported when the slot is sealed.
         let mut buffered_seqs: Vec<u64> = Vec::new();
-        // DedupCompletion trackers for buffered units (decremented at seal time).
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
             Vec::new();
         let mut tail_dirty = false;
-        let mut units_since_tail_advance = 0u32;
 
-        while running.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(unit) => {
-                    Self::handle_compressed_unit(
-                        shard_idx,
-                        unit,
-                        pool,
-                        meta,
-                        lifecycle,
-                        allocator,
-                        io_engine,
-                        done_tx,
-                        packer,
-                        &mut buffered_seqs,
-                        &mut buffered_completions,
-                        metrics,
+        /// Helper: flush accumulated Passthrough units through write_units_batch.
+        macro_rules! flush_pt_batch {
+            ($batch:expr, $batch_seqs:expr, $batch_completions:expr) => {
+                if !$batch.is_empty() {
+                    let results = Self::write_units_batch(
+                        shard_idx, &$batch, pool, meta, lifecycle, allocator,
+                        io_engine, packer.hole_map(), metrics,
                     );
-                    tail_dirty = true;
-                    units_since_tail_advance += 1;
-                    if units_since_tail_advance >= 16 {
-                        let _ = pool.advance_tail_for_shard(shard_idx);
-                        tail_dirty = false;
-                        units_since_tail_advance = 0;
-                    }
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Flush the packer's open slot on idle
-                    if let Some(sealed) = packer.flush_open_slot() {
-                        if let Err(e) = Self::write_packed_slot(
-                            shard_idx,
-                            &sealed,
-                            pool,
-                            meta,
-                            lifecycle,
-                            allocator,
-                            io_engine,
-                            packer.hole_map(),
-                            metrics,
-                        ) {
+                    for (idx, result) in results.into_iter().enumerate() {
+                        if let Err(e) = result {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(
-                                pba = sealed.pba.0,
+                                vol = $batch[idx].vol_id,
+                                start_lba = $batch[idx].start_lba.0,
                                 error = %e,
-                                "writer: failed to flush packed slot on idle"
+                                "writer: failed to flush unit in batch"
                             );
                         }
+                        match &$batch_completions[idx] {
+                            None => { let _ = done_tx.send($batch_seqs[idx].clone()); }
+                            Some(dc) => {
+                                if let Some(original_seqs) = dc.decrement() {
+                                    let _ = done_tx.send(original_seqs);
+                                }
+                            }
+                        }
+                    }
+                    $batch.clear();
+                    $batch_seqs.clear();
+                    $batch_completions.clear();
+                    tail_dirty = true;
+                }
+            };
+        }
+
+        while running.load(Ordering::Relaxed) {
+            let first = match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(unit) => unit,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if let Some(sealed) = packer.flush_open_slot() {
+                        if let Err(e) = Self::write_packed_slot(
+                            shard_idx, &sealed, pool, meta, lifecycle,
+                            allocator, io_engine, packer.hole_map(), metrics,
+                        ) {
+                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(pba = sealed.pba.0, error = %e,
+                                "writer: failed to flush packed slot on idle");
+                        }
                         Self::flush_buffered_done(
-                            &mut buffered_seqs,
-                            &mut buffered_completions,
-                            done_tx,
+                            &mut buffered_seqs, &mut buffered_completions, done_tx,
                         );
                         tail_dirty = true;
                     }
                     if tail_dirty {
                         let _ = pool.advance_tail_for_shard(shard_idx);
                         tail_dirty = false;
-                        units_since_tail_advance = 0;
                     }
                     continue;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            };
+
+            // Drain up to WRITER_BATCH_SIZE units.
+            let mut incoming = vec![first];
+            while incoming.len() < Self::WRITER_BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(unit) => incoming.push(unit),
+                    Err(_) => break,
+                }
             }
+
+            // Run through packer, collect Passthrough units for batching.
+            let mut pt_batch: Vec<CompressedUnit> = Vec::new();
+            let mut pt_seqs: Vec<Vec<u64>> = Vec::new();
+            let mut pt_completions: Vec<Option<Arc<crate::buffer::pipeline::DedupCompletion>>> =
+                Vec::new();
+
+            for unit in incoming {
+                let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
+                let completion = unit.dedup_completion.clone();
+
+                match packer.pack_or_passthrough(unit) {
+                    Ok(PackResult::Passthrough(unit)) => {
+                        pt_batch.push(unit);
+                        pt_seqs.push(seqs);
+                        pt_completions.push(completion);
+                    }
+                    Ok(PackResult::Buffered) => {
+                        match &completion {
+                            None => buffered_seqs.extend(&seqs),
+                            Some(dc) => buffered_completions.push(dc.clone()),
+                        }
+                    }
+                    Ok(PackResult::SealedSlot(sealed)) => {
+                        flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
+                        if let Err(e) = Self::write_packed_slot(
+                            shard_idx, &sealed, pool, meta, lifecycle,
+                            allocator, io_engine, packer.hole_map(), metrics,
+                        ) {
+                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(pba = sealed.pba.0, error = %e,
+                                "writer: failed to flush packed slot");
+                        }
+                        Self::flush_buffered_done(
+                            &mut buffered_seqs, &mut buffered_completions, done_tx,
+                        );
+                        match &completion {
+                            None => buffered_seqs.extend(&seqs),
+                            Some(dc) => buffered_completions.push(dc.clone()),
+                        }
+                    }
+                    Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
+                        flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
+                        if let Err(e) = Self::write_packed_slot(
+                            shard_idx, &sealed, pool, meta, lifecycle,
+                            allocator, io_engine, packer.hole_map(), metrics,
+                        ) {
+                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(pba = sealed.pba.0, error = %e,
+                                "writer: failed to flush packed slot (passthrough fallback)");
+                        }
+                        Self::flush_buffered_done(
+                            &mut buffered_seqs, &mut buffered_completions, done_tx,
+                        );
+                        pt_batch.push(unit);
+                        pt_seqs.push(seqs);
+                        pt_completions.push(completion);
+                    }
+                    Ok(PackResult::FillHole(fill)) => {
+                        flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
+                        if let Err(e) = Self::write_hole_fill(
+                            shard_idx, &fill, pool, meta, lifecycle,
+                            allocator, io_engine, packer.hole_map(), metrics,
+                        ) {
+                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(error = %e, "writer: failed to fill hole");
+                        }
+                        match &completion {
+                            None => { let _ = done_tx.send(seqs); }
+                            Some(dc) => {
+                                if let Some(original_seqs) = dc.decrement() {
+                                    let _ = done_tx.send(original_seqs);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(error = %e, "writer: packer error");
+                        match &completion {
+                            None => { let _ = done_tx.send(seqs); }
+                            Some(dc) => {
+                                if let Some(original_seqs) = dc.decrement() {
+                                    let _ = done_tx.send(original_seqs);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
         }
 
-        // Drain remaining messages
+        // Drain remaining on shutdown (use per-unit path for simplicity).
         while let Ok(unit) = rx.try_recv() {
             Self::handle_compressed_unit(
-                shard_idx,
-                unit,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                io_engine,
-                done_tx,
-                packer,
-                &mut buffered_seqs,
-                &mut buffered_completions,
-                metrics,
+                shard_idx, unit, pool, meta, lifecycle, allocator,
+                io_engine, done_tx, packer,
+                &mut buffered_seqs, &mut buffered_completions, metrics,
             );
             tail_dirty = true;
         }
 
-        // Flush any remaining open slot on shutdown
         if let Some(sealed) = packer.flush_open_slot() {
             if let Err(e) = Self::write_packed_slot(
-                shard_idx,
-                &sealed,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                io_engine,
-                packer.hole_map(),
-                metrics,
+                shard_idx, &sealed, pool, meta, lifecycle,
+                allocator, io_engine, packer.hole_map(), metrics,
             ) {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    pba = sealed.pba.0,
-                    error = %e,
-                    "writer: failed to flush final packed slot on shutdown"
-                );
+                tracing::error!(pba = sealed.pba.0, error = %e,
+                    "writer: failed to flush final packed slot on shutdown");
             }
             Self::flush_buffered_done(&mut buffered_seqs, &mut buffered_completions, done_tx);
             tail_dirty = true;
@@ -1347,15 +1426,19 @@ impl BufferFlusher {
             // Per-fragment tracking for hole detection: (pba, slot_offset) → (decrement, unit_lba_count, compressed_size)
             let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
 
+            // Batch read old mappings via multi_get
+            let lbas: Vec<Lba> = (0..unit.lba_count)
+                .map(|i| Lba(unit.start_lba.0 + i as u64))
+                .collect();
+            let old_mappings = meta.multi_get_mappings(&vol_id, &lbas)?;
+
             let mut batch_values = Vec::with_capacity(unit.lba_count as usize);
-            for i in 0..unit.lba_count {
-                let lba = Lba(unit.start_lba.0 + i as u64);
-                if let Some(old) = meta.get_mapping(&vol_id, lba)? {
+            for (i, old) in old_mappings.into_iter().enumerate() {
+                if let Some(old) = old {
                     let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
-                    // Track per-fragment for hole detection
                     let frag = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
                         0,
                         old.unit_lba_count,
@@ -1369,7 +1452,7 @@ impl BufferFlusher {
                     0
                 };
                 batch_values.push((
-                    lba,
+                    lbas[i],
                     BlockmapValue {
                         pba,
                         compression: unit.compression,
@@ -1485,6 +1568,357 @@ impl BufferFlusher {
         })
     }
 
+    /// Batch-write multiple Passthrough units in one go:
+    /// 1. Acquire lifecycle read locks for all unique volumes (sorted, no deadlock)
+    /// 2. Validate generations, discard stale units
+    /// 3. Allocate PBAs for all units
+    /// 4. Batch IO writes
+    /// 5. Batch multi_get old mappings
+    /// 6. ONE RocksDB WriteBatch for all blockmap + refcount updates
+    /// 7. Batch cleanup + dedup index + mark_flushed
+    fn write_units_batch(
+        shard_idx: usize,
+        units: &[CompressedUnit],
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
+        hole_map: &HoleMap,
+        metrics: &EngineMetrics,
+    ) -> Vec<OnyxResult<()>> {
+        if units.is_empty() {
+            return Vec::new();
+        }
+        let total_start = Instant::now();
+
+        // Acquire lifecycle read locks for all unique volumes (sorted to prevent deadlock).
+        let mut vol_ids: Vec<String> = units.iter().map(|u| u.vol_id.clone()).collect();
+        vol_ids.sort();
+        vol_ids.dedup();
+        let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
+        let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
+
+        // Per-unit state tracking.
+        let n = units.len();
+        let mut results: Vec<OnyxResult<()>> = (0..n).map(|_| Ok(())).collect();
+        let mut skip = vec![false; n]; // true = discard (stale volume)
+        let mut pbas: Vec<Option<Pba>> = vec![None; n];
+        let mut alloc_blocks: Vec<u32> = vec![0; n];
+
+        // Phase 1: Validate generations.
+        for (i, unit) in units.iter().enumerate() {
+            let vol_id = VolumeId(unit.vol_id.clone());
+            let should_discard = match meta.get_volume(&vol_id) {
+                Ok(None) => true,
+                Ok(Some(vc))
+                    if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
+                {
+                    true
+                }
+                Ok(_) => false,
+                Err(e) => {
+                    results[i] = Err(e);
+                    skip[i] = true;
+                    continue;
+                }
+            };
+            if should_discard {
+                metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
+                skip[i] = true;
+                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                    let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                }
+            }
+        }
+
+        // Phase 2: Allocate PBAs for non-skipped units.
+        let alloc_start = Instant::now();
+        for (i, unit) in units.iter().enumerate() {
+            if skip[i] {
+                continue;
+            }
+            let bs = BLOCK_SIZE as usize;
+            let blocks_needed = (unit.compressed_data.len() + bs - 1) / bs;
+            alloc_blocks[i] = blocks_needed as u32;
+
+            let allocation = if blocks_needed == 1 {
+                allocator.allocate_one().map(|pba| (pba, 1u32))
+            } else {
+                allocator.allocate_extent(blocks_needed as u32).and_then(|ext| {
+                    if (ext.count as usize) < blocks_needed {
+                        allocator.free_extent(ext)?;
+                        Err(crate::error::OnyxError::SpaceExhausted)
+                    } else {
+                        Ok((ext.start, ext.count))
+                    }
+                })
+            };
+            match allocation {
+                Ok((pba, _)) => pbas[i] = Some(pba),
+                Err(e) => {
+                    results[i] = Err(e);
+                    skip[i] = true;
+                }
+            }
+        }
+        Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
+
+        // Phase 3: Batch IO writes.
+        let io_start = Instant::now();
+        for (i, unit) in units.iter().enumerate() {
+            if skip[i] {
+                continue;
+            }
+            let pba = pbas[i].unwrap();
+            if let Err(e) = io_engine.write_blocks(pba, &unit.compressed_data) {
+                // Rollback allocation.
+                if alloc_blocks[i] == 1 {
+                    let _ = allocator.free_one(pba);
+                } else {
+                    let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
+                }
+                results[i] = Err(e);
+                skip[i] = true;
+            }
+        }
+        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+
+        // Phase 4: Batch multi_get old mappings.
+        let meta_start = Instant::now();
+        // Per-unit: (batch_values, old_pba_meta, old_frag_meta)
+        struct UnitMeta {
+            batch_values: Vec<(Lba, BlockmapValue)>,
+            old_pba_meta: HashMap<Pba, (u32, u32)>,
+            old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)>,
+        }
+        let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
+
+        for (i, unit) in units.iter().enumerate() {
+            if skip[i] {
+                continue;
+            }
+            let pba = pbas[i].unwrap();
+            let vol_id = VolumeId(unit.vol_id.clone());
+            let lbas: Vec<Lba> = (0..unit.lba_count)
+                .map(|j| Lba(unit.start_lba.0 + j as u64))
+                .collect();
+            let old_mappings = match meta.multi_get_mappings(&vol_id, &lbas) {
+                Ok(m) => m,
+                Err(e) => {
+                    if alloc_blocks[i] == 1 {
+                        let _ = allocator.free_one(pba);
+                    } else {
+                        let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
+                    }
+                    results[i] = Err(e);
+                    skip[i] = true;
+                    continue;
+                }
+            };
+
+            let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+            let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
+            let mut batch_values = Vec::with_capacity(unit.lba_count as usize);
+
+            for (j, old) in old_mappings.into_iter().enumerate() {
+                if let Some(old) = old {
+                    let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
+                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(old_blocks);
+                    let frag = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
+                        0,
+                        old.unit_lba_count,
+                        old.unit_compressed_size,
+                    ));
+                    frag.0 += 1;
+                }
+                let flags = if unit.dedup_skipped {
+                    FLAG_DEDUP_SKIPPED
+                } else {
+                    0
+                };
+                batch_values.push((
+                    lbas[j],
+                    BlockmapValue {
+                        pba,
+                        compression: unit.compression,
+                        unit_compressed_size: unit.compressed_data.len() as u32,
+                        unit_original_size: unit.original_size,
+                        unit_lba_count: unit.lba_count as u16,
+                        offset_in_unit: j as u16,
+                        crc32: unit.crc32,
+                        slot_offset: 0,
+                        flags,
+                    },
+                ));
+            }
+            unit_metas[i] = Some(UnitMeta {
+                batch_values,
+                old_pba_meta,
+                old_frag_meta,
+            });
+        }
+
+        // Phase 5: ONE combined WriteBatch for all units.
+        let mut vol_ids_owned: Vec<VolumeId> = Vec::new();
+        let mut decrements_owned: Vec<HashMap<Pba, u32>> = Vec::new();
+        let mut meta_indices: Vec<usize> = Vec::new(); // which units go into the batch
+
+        for (i, unit) in units.iter().enumerate() {
+            if skip[i] || unit_metas[i].is_none() {
+                continue;
+            }
+            vol_ids_owned.push(VolumeId(unit.vol_id.clone()));
+            let um = unit_metas[i].as_ref().unwrap();
+            decrements_owned.push(
+                um.old_pba_meta
+                    .iter()
+                    .map(|(old_pba, (dec, _))| (*old_pba, *dec))
+                    .collect(),
+            );
+            meta_indices.push(i);
+        }
+
+        if !meta_indices.is_empty() {
+            let batch_args: Vec<(
+                &VolumeId,
+                &[(Lba, BlockmapValue)],
+                u32,
+                &HashMap<Pba, u32>,
+            )> = meta_indices
+                .iter()
+                .enumerate()
+                .map(|(batch_idx, &unit_idx)| {
+                    let um = unit_metas[unit_idx].as_ref().unwrap();
+                    (
+                        &vol_ids_owned[batch_idx],
+                        um.batch_values.as_slice(),
+                        units[unit_idx].lba_count,
+                        &decrements_owned[batch_idx],
+                    )
+                })
+                .collect();
+
+            if let Err(e) = meta.atomic_batch_write_multi(&batch_args) {
+                // Entire batch failed — rollback all allocations.
+                for &unit_idx in &meta_indices {
+                    let pba = pbas[unit_idx].unwrap();
+                    if alloc_blocks[unit_idx] == 1 {
+                        let _ = allocator.free_one(pba);
+                    } else {
+                        let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
+                    }
+                    results[unit_idx] = Err(crate::error::OnyxError::Io(
+                        std::io::Error::other(format!("batch write failed: {e}")),
+                    ));
+                    skip[unit_idx] = true;
+                }
+            }
+        }
+        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+
+        // Phase 6: Cleanup (free old PBAs) + dedup index + hole detection.
+        // Collect all old PBAs across units, batch-read refcounts, batch-cleanup dedup.
+        let cleanup_start = Instant::now();
+
+        // Collect all unique old PBAs with their block counts.
+        let mut all_old_pbas: Vec<(Pba, u32)> = Vec::new();
+        for &unit_idx in &meta_indices {
+            if skip[unit_idx] {
+                continue;
+            }
+            let um = unit_metas[unit_idx].as_ref().unwrap();
+            for (old_pba, (_, old_blocks)) in &um.old_pba_meta {
+                all_old_pbas.push((*old_pba, *old_blocks));
+            }
+        }
+
+        // Batch-read refcounts for all old PBAs.
+        let old_pba_keys: Vec<Pba> = all_old_pbas.iter().map(|(pba, _)| *pba).collect();
+        let refcounts = meta.multi_get_refcounts(&old_pba_keys).unwrap_or_default();
+        let mut dead_pbas: Vec<Pba> = Vec::new();
+        for (i, (old_pba, old_blocks)) in all_old_pbas.iter().enumerate() {
+            let remaining = refcounts.get(i).copied().unwrap_or(0);
+            if remaining == 0 {
+                dead_pbas.push(*old_pba);
+                if *old_blocks == 1 {
+                    let _ = allocator.free_one(*old_pba);
+                } else {
+                    let _ = allocator.free_extent(Extent::new(*old_pba, *old_blocks));
+                }
+            }
+        }
+
+        let mut all_dedup_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
+
+        for &unit_idx in &meta_indices {
+            if skip[unit_idx] {
+                continue;
+            }
+            let um = unit_metas[unit_idx].as_ref().unwrap();
+            let unit = &units[unit_idx];
+            let pba = pbas[unit_idx].unwrap();
+
+            // Collect dedup index entries for batch write
+            if let Some(ref hashes) = unit.block_hashes {
+                for (j, hash) in hashes.iter().enumerate() {
+                    if *hash == [0u8; 32] {
+                        continue;
+                    }
+                    all_dedup_entries.push((
+                        *hash,
+                        DedupEntry {
+                            pba,
+                            slot_offset: 0,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: j as u16,
+                            crc32: unit.crc32,
+                        },
+                    ));
+                }
+            }
+
+            // Hole detection
+            let _ = Self::detect_holes(&um.old_frag_meta, &um.old_pba_meta, meta, hole_map, metrics);
+
+            metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .flush_unit_bytes
+                .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
+        }
+
+        // One batch for all dead PBA dedup cleanup (was N standalone WriteBatch commits)
+        if !dead_pbas.is_empty() {
+            let _ = meta.cleanup_dedup_for_pbas_batch(&dead_pbas);
+        }
+        // One batch for all new dedup index entries
+        if !all_dedup_entries.is_empty() {
+            let _ = meta.put_dedup_entries(&all_dedup_entries);
+        }
+        Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
+
+        // Phase 7: Batch mark_flushed (memory-only, fast).
+        let mark_start = Instant::now();
+        for (i, unit) in units.iter().enumerate() {
+            if skip[i] {
+                continue;
+            }
+            for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+            }
+        }
+        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+        let _ = pool.advance_tail_for_shard(shard_idx);
+
+        Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+        results
+    }
+
     fn write_packed_slot(
         shard_idx: usize,
         sealed: &SealedSlot,
@@ -1544,9 +1978,14 @@ impl BufferFlusher {
                 continue;
             }
 
-            for i in 0..unit.lba_count {
-                let lba = Lba(unit.start_lba.0 + i as u64);
-                if let Some(old) = meta.get_mapping(&vol_id, lba)? {
+            // Batch read old mappings via multi_get
+            let frag_lbas: Vec<Lba> = (0..unit.lba_count)
+                .map(|i| Lba(unit.start_lba.0 + i as u64))
+                .collect();
+            let old_mappings = meta.multi_get_mappings(&vol_id, &frag_lbas)?;
+
+            for (i, old) in old_mappings.into_iter().enumerate() {
+                if let Some(old) = old {
                     let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
@@ -1565,7 +2004,7 @@ impl BufferFlusher {
                 };
                 batch_values.push((
                     vol_id.clone(),
-                    lba,
+                    frag_lbas[i],
                     BlockmapValue {
                         pba: sealed.pba,
                         compression: unit.compression,
