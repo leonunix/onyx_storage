@@ -1538,7 +1538,7 @@ impl BufferFlusher {
 
             // Detect holes: fully-dead fragments in still-live packed PBAs
             let hole_start = Instant::now();
-            Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+            Self::detect_holes(&old_frag_meta, meta, hole_map, metrics)?;
             Self::record_elapsed(&metrics.flush_writer_hole_detect_ns, hole_start);
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -1884,7 +1884,7 @@ impl BufferFlusher {
             }
 
             // Hole detection
-            let _ = Self::detect_holes(&um.old_frag_meta, &um.old_pba_meta, meta, hole_map, metrics);
+            let _ = Self::detect_holes(&um.old_frag_meta, meta, hole_map, metrics);
 
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -2126,7 +2126,7 @@ impl BufferFlusher {
 
         // Detect holes in packed slots
         let hole_start = Instant::now();
-        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+        Self::detect_holes(&old_frag_meta, meta, hole_map, metrics)?;
         Self::record_elapsed(&metrics.flush_writer_hole_detect_ns, hole_start);
         metrics
             .flush_packed_slots_written
@@ -2166,7 +2166,6 @@ impl BufferFlusher {
     /// Called from write_unit and write_packed_slot after metadata commit.
     fn detect_holes(
         old_frag_meta: &HashMap<(Pba, u16), (u32, u16, u32)>,
-        _old_pba_meta: &HashMap<Pba, (u32, u32)>,
         meta: &MetaStore,
         hole_map: &HoleMap,
         metrics: &EngineMetrics,
@@ -2396,7 +2395,7 @@ impl BufferFlusher {
 
         // Detect any new holes from the old PBAs
         let hole_start = Instant::now();
-        Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+        Self::detect_holes(&old_frag_meta, meta, hole_map, metrics)?;
         Self::record_elapsed(&metrics.flush_writer_hole_detect_ns, hole_start);
         metrics.flush_hole_fills.fetch_add(1, Ordering::Relaxed);
         metrics

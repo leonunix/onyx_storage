@@ -181,7 +181,6 @@ impl BufferEntry {
         vol_id: &str,
         start_lba: Lba,
         lba_count: u32,
-        _payload_crc32: u32,
         flushed: bool,
         vol_created_at: u64,
         payload: &[u8],

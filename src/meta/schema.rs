@@ -108,68 +108,22 @@ pub fn encode_blockmap_value(v: &BlockmapValue) -> [u8; 28] {
     val
 }
 
-/// Decode blockmap value. Supports:
-/// - 28-byte format (with flags for dedup)
-/// - 27-byte format (with slot_offset for packer, flags=0)
-/// - 25-byte format (compression units, slot_offset=0, flags=0)
-/// - 17-byte legacy format (single-LBA, migrated to unit_lba_count=1, slot_offset=0, flags=0)
+/// Decode blockmap value (28 bytes).
 pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
-    if val.len() == 28 {
-        return Some(BlockmapValue {
-            pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
-            compression: val[8],
-            unit_compressed_size: u32::from_be_bytes(val[9..13].try_into().unwrap()),
-            unit_original_size: u32::from_be_bytes(val[13..17].try_into().unwrap()),
-            unit_lba_count: u16::from_be_bytes(val[17..19].try_into().unwrap()),
-            offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
-            crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
-            slot_offset: u16::from_be_bytes(val[25..27].try_into().unwrap()),
-            flags: val[27],
-        });
+    if val.len() != 28 {
+        return None;
     }
-    if val.len() == 27 {
-        return Some(BlockmapValue {
-            pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
-            compression: val[8],
-            unit_compressed_size: u32::from_be_bytes(val[9..13].try_into().unwrap()),
-            unit_original_size: u32::from_be_bytes(val[13..17].try_into().unwrap()),
-            unit_lba_count: u16::from_be_bytes(val[17..19].try_into().unwrap()),
-            offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
-            crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
-            slot_offset: u16::from_be_bytes(val[25..27].try_into().unwrap()),
-            flags: 0,
-        });
-    }
-    if val.len() == 25 {
-        return Some(BlockmapValue {
-            pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
-            compression: val[8],
-            unit_compressed_size: u32::from_be_bytes(val[9..13].try_into().unwrap()),
-            unit_original_size: u32::from_be_bytes(val[13..17].try_into().unwrap()),
-            unit_lba_count: u16::from_be_bytes(val[17..19].try_into().unwrap()),
-            offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
-            crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
-            slot_offset: 0,
-            flags: 0,
-        });
-    }
-    // Legacy 17-byte format: single-LBA block
-    if val.len() == 17 {
-        let compressed_size = u16::from_be_bytes(val[9..11].try_into().unwrap());
-        let original_size = u16::from_be_bytes(val[11..13].try_into().unwrap());
-        return Some(BlockmapValue {
-            pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
-            compression: val[8],
-            unit_compressed_size: compressed_size as u32,
-            unit_original_size: original_size as u32,
-            unit_lba_count: 1,
-            offset_in_unit: 0,
-            crc32: u32::from_be_bytes(val[13..17].try_into().unwrap()),
-            slot_offset: 0,
-            flags: 0,
-        });
-    }
-    None
+    Some(BlockmapValue {
+        pba: Pba(u64::from_be_bytes(val[0..8].try_into().unwrap())),
+        compression: val[8],
+        unit_compressed_size: u32::from_be_bytes(val[9..13].try_into().unwrap()),
+        unit_original_size: u32::from_be_bytes(val[13..17].try_into().unwrap()),
+        unit_lba_count: u16::from_be_bytes(val[17..19].try_into().unwrap()),
+        offset_in_unit: u16::from_be_bytes(val[19..21].try_into().unwrap()),
+        crc32: u32::from_be_bytes(val[21..25].try_into().unwrap()),
+        slot_offset: u16::from_be_bytes(val[25..27].try_into().unwrap()),
+        flags: val[27],
+    })
 }
 
 /// Content hash type for dedup (SHA-256, 32 bytes)

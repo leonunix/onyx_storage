@@ -272,21 +272,8 @@ fn blockmap_value_28byte_with_flags() {
 }
 
 #[test]
-fn blockmap_value_27byte_compat_sets_flags_zero() {
-    // Simulate old 27-byte format (no flags byte)
-    let mut old_encoded = [0u8; 27];
-    old_encoded[0..8].copy_from_slice(&42u64.to_be_bytes());
-    old_encoded[8] = 1;
-    old_encoded[9..13].copy_from_slice(&2048u32.to_be_bytes());
-    old_encoded[13..17].copy_from_slice(&4096u32.to_be_bytes());
-    old_encoded[17..19].copy_from_slice(&1u16.to_be_bytes());
-    old_encoded[19..21].copy_from_slice(&0u16.to_be_bytes());
-    old_encoded[21..25].copy_from_slice(&0xDEADu32.to_be_bytes());
-    old_encoded[25..27].copy_from_slice(&512u16.to_be_bytes());
-
-    let decoded = decode_blockmap_value(&old_encoded).unwrap();
-    assert_eq!(decoded.flags, 0); // Old format defaults to 0
-    assert_eq!(decoded.slot_offset, 512);
+fn blockmap_value_rejects_27byte_format() {
+    assert!(decode_blockmap_value(&[0u8; 27]).is_none());
 }
 
 // --- MetaStore dedup operations ---

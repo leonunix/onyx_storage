@@ -17,6 +17,8 @@ Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses
 - **Fragment packing** &mdash; VDO-style bin-packing of sub-4KB compressed fragments into shared physical slots
 - **Garbage collection** &mdash; background dead-block scanner and rewriter with back-pressure control
 - **Crash consistency** &mdash; RocksDB WriteBatch atomic updates; write-buffer sync-before-ack
+- **High-performance write path** &mdash; staging channel + write thread batch (encode/CRC off hot path), jemalloc, DashMap 256-shard indices, per-shard backpressure
+- **Batched backend** &mdash; writer drains up to 32 units per batch: one RocksDB WriteBatch, multi_get for old mappings, batched dedup cleanup
 - **Zone-based parallelism** &mdash; LBA space partitioned into zones, each served by a dedicated worker thread
 - **ublk frontend** (Linux) &mdash; expose volumes as `/dev/ublkbN` block devices with 512B sector alignment
 
@@ -27,12 +29,12 @@ ublk (Linux) / stdin (macOS dev)
   |
 ZoneManager --> ZoneWorker x N  (per-zone single-thread, crossbeam channel)
   |
-WriteBufferPool  (O_DIRECT ring log on LV2, 8KB slots, sync-before-ack)
-  |  background BufferFlusher
+WriteBufferPool  (staging channel + write thread batch, ring log on LV2, jemalloc)
+  |  background BufferFlusher (per-shard lanes)
   v
-Dedup Workers --> Compress Workers --> Packer (bin-pack fragments)
+Dedup Workers --> Compress Workers --> Batch Writer (drain N units)
   |
-IoEngine (O_DIRECT --> LV3) + MetaStore (RocksDB WriteBatch)
+IoEngine (O_DIRECT --> LV3) + MetaStore (RocksDB multi_get + batch WriteBatch)
   |
 SpaceAllocator (BTreeSet free list, strip-aligned allocation)
   |
@@ -71,6 +73,11 @@ default_compression = "Lz4"
 device = "/dev/vg0/onyx-buffer"
 capacity_mb = 16384
 flush_watermark_pct = 80
+group_commit_wait_us = 500    # batching window for group commit
+shards = 4                   # ring shards (1 flush lane per shard)
+
+[flush]
+compress_workers = 2          # per flush lane
 
 [ublk]
 nr_queues = 4
@@ -98,11 +105,11 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 ### Write Path
 
 1. User I/O arrives at ZoneWorker
-2. Raw (uncompressed) data appended to WriteBufferPool &rarr; sync &rarr; **ack to user**
-3. Background flusher drains buffer: coalesce contiguous LBAs &rarr; dedup (4KB SHA-256) &rarr; compress merged unit &rarr; packer bin-pack &rarr; O_DIRECT write to LV3
-4. RocksDB WriteBatch atomically updates blockmap + refcount
+2. `append()`: ring reserve (~50ns) + DashMap inserts + staging channel send &rarr; **~3&micro;s total, zero disk I/O**
+3. Write thread: batch encode + CRC + pwrite + fdatasync &rarr; ack to user via ready channel
+4. Background flusher (per-shard lane): coalesce contiguous LBAs &rarr; dedup (4KB SHA-256) &rarr; compress merged unit &rarr; packer bin-pack &rarr; batch writer (drain up to 32 units &rarr; one WriteBatch)
 
-User-perceived latency = buffer write + sync. Compression and dedup are fully off the hot path.
+User-perceived latency = ring lock + memcpy + channel send. Encoding, CRC, disk I/O, compression, and dedup are fully off the hot path.
 
 ### Read Path
 
@@ -138,6 +145,7 @@ User-perceived latency = buffer write + sync. Compression and dedup are fully of
 - [x] MVP: ublk + RocksDB + compression + space management
 - [x] Packer + GC: fragment bin-packing, GC scanner/rewriter, back-pressure, hole-map reuse
 - [x] Dedup: worker pool, dedup_index/dedup_reverse, tiered skip strategy, background rescan
+- [x] Performance: staging buffer, write thread batch, jemalloc, batched backend writer, multi_get, batched dedup cleanup
 - [ ] RAID-aware: strip-aligned writes, strip-granularity allocation
 - [ ] Production hardening: iSCSI frontend, HA (active-standby dual controller), Prometheus metrics
 - [ ] High performance: NVMe-oF over RDMA

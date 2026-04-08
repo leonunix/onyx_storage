@@ -321,7 +321,6 @@ impl BufferShard {
                 &pending.vol_id,
                 pending.start_lba,
                 pending.lba_count,
-                pending.payload_crc32,
                 true,
                 pending.vol_created_at,
                 &pending.payload,

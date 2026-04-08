@@ -599,37 +599,10 @@ fn blockmap_value_28byte_roundtrip() {
 }
 
 #[test]
-fn blockmap_value_25byte_compat() {
-    // Simulate old 25-byte format (no slot_offset)
-    let mut old_encoded = [0u8; 25];
-    old_encoded[0..8].copy_from_slice(&42u64.to_be_bytes());
-    old_encoded[8] = 1; // compression
-    old_encoded[9..13].copy_from_slice(&2048u32.to_be_bytes());
-    old_encoded[13..17].copy_from_slice(&4096u32.to_be_bytes());
-    old_encoded[17..19].copy_from_slice(&1u16.to_be_bytes());
-    old_encoded[19..21].copy_from_slice(&0u16.to_be_bytes());
-    old_encoded[21..25].copy_from_slice(&0xDEADu32.to_be_bytes());
-
-    let decoded = decode_blockmap_value(&old_encoded).unwrap();
-    assert_eq!(decoded.pba, Pba(42));
-    assert_eq!(decoded.slot_offset, 0); // defaults to 0
-}
-
-#[test]
-fn blockmap_value_17byte_compat() {
-    // Legacy 17-byte format
-    let mut old_encoded = [0u8; 17];
-    old_encoded[0..8].copy_from_slice(&42u64.to_be_bytes());
-    old_encoded[8] = 0; // no compression
-    old_encoded[9..11].copy_from_slice(&4096u16.to_be_bytes());
-    old_encoded[11..13].copy_from_slice(&4096u16.to_be_bytes());
-    old_encoded[13..17].copy_from_slice(&0xBEEFu32.to_be_bytes());
-
-    let decoded = decode_blockmap_value(&old_encoded).unwrap();
-    assert_eq!(decoded.pba, Pba(42));
-    assert_eq!(decoded.unit_lba_count, 1);
-    assert_eq!(decoded.offset_in_unit, 0);
-    assert_eq!(decoded.slot_offset, 0);
+fn blockmap_value_rejects_wrong_length() {
+    assert!(decode_blockmap_value(&[0u8; 25]).is_none());
+    assert!(decode_blockmap_value(&[0u8; 17]).is_none());
+    assert!(decode_blockmap_value(&[0u8; 27]).is_none());
 }
 
 // ---------- Fix validation tests ----------
