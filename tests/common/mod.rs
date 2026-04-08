@@ -89,6 +89,7 @@ impl EngineHarness {
             },
             gc: options.gc,
             dedup: options.dedup,
+            service: Default::default(),
         };
 
         let engine = OnyxEngine::open(&config).unwrap();

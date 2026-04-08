@@ -18,7 +18,7 @@ device = "/dev/vg0/lv2"
     assert_eq!(config.meta.block_cache_mb, 256);
     assert_eq!(config.storage.block_size, 4096);
     assert_eq!(config.buffer.capacity_mb, 16384);
-    assert_eq!(config.buffer.group_commit_wait_us, 0);
+    assert_eq!(config.buffer.group_commit_wait_us, 500);
     assert_eq!(config.ublk.nr_queues, 4);
 }
 

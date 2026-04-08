@@ -81,6 +81,7 @@ fn write_and_abort(
             workers: 2,
             ..Default::default()
         },
+        service: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

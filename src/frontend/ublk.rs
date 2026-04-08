@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use libublk::ctrl::UblkCtrlBuilder;
+use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 
@@ -38,8 +38,19 @@ impl OnyxUblkTarget {
         })
     }
 
+    /// Kill a running ublk device by its kernel device ID.
+    /// Safe to call from any thread — creates a temporary control handle.
+    pub fn kill_device(dev_id: u32) -> OnyxResult<()> {
+        let ctrl = UblkCtrl::new_simple(dev_id as i32)
+            .map_err(|e| OnyxError::Ublk(format!("failed to open ublk ctrl {}: {:?}", dev_id, e)))?;
+        ctrl.kill_dev()
+            .map_err(|e| OnyxError::Ublk(format!("failed to kill ublk dev {}: {:?}", dev_id, e)))?;
+        Ok(())
+    }
+
     /// Start the ublk device. Blocks until the device is stopped.
-    pub fn run(&self) -> OnyxResult<()> {
+    /// Reports the kernel-assigned device ID via `dev_id_tx` before blocking.
+    pub fn run(&self, dev_id_tx: Option<std::sync::mpsc::Sender<u32>>) -> OnyxResult<()> {
         let nr_queues = self.config.nr_queues;
         let depth = self.config.queue_depth;
         let io_buf_bytes = self.config.io_buf_bytes;
@@ -47,9 +58,10 @@ impl OnyxUblkTarget {
         let vol_id = self.vol_id.clone();
         let vol_created_at = self.vol_created_at;
         let zm = self.zone_manager.clone();
+        let dev_name = format!("onyx-{}", self.vol_id);
 
         let sess = UblkCtrlBuilder::default()
-            .name("onyx")
+            .name(&dev_name)
             .nr_queues(nr_queues)
             .depth(depth)
             .io_buf_bytes(io_buf_bytes)
@@ -264,8 +276,12 @@ impl OnyxUblkTarget {
             queue.wait_and_handle_io(io_handler);
         };
 
-        let dev_handler = |_ctrl: &_| {
-            tracing::info!("ublk device ready");
+        let dev_handler = move |ctrl: &UblkCtrl| {
+            let id = ctrl.dev_info().dev_id;
+            tracing::info!(dev_id = id, "ublk device ready");
+            if let Some(tx) = dev_id_tx {
+                let _ = tx.send(id);
+            }
         };
 
         sess.run_target(tgt_init, q_handler, dev_handler)

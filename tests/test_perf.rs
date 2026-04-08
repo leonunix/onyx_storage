@@ -219,6 +219,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             rescan_interval_ms: 100,
             ..Default::default()
         },
+        service: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

@@ -22,6 +22,8 @@ pub struct OnyxConfig {
     pub gc: GcConfig,
     #[serde(default)]
     pub dedup: DedupConfig,
+    #[serde(default)]
+    pub service: ServiceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +172,25 @@ fn default_group_commit_wait_us() -> u64 {
 fn default_buffer_shards() -> usize {
     4
 }
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceConfig {
+    /// Unix socket path for IPC (stop command, status queries)
+    #[serde(default = "default_socket_path")]
+    pub socket_path: PathBuf,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: default_socket_path(),
+        }
+    }
+}
+
+fn default_socket_path() -> PathBuf {
+    PathBuf::from("/var/run/onyx-storage.sock")
+}
+
 fn default_nr_queues() -> u16 {
     4
 }

@@ -35,6 +35,7 @@ anyhow = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
 
 # memory alignment / hugepages
 nix = { version = "0.29", features = ["mman", "fs"] }

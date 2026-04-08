@@ -21,6 +21,7 @@ Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses
 - **Batched backend** &mdash; writer drains up to 32 units per batch: one RocksDB WriteBatch, multi_get for old mappings, batched dedup cleanup
 - **Zone-based parallelism** &mdash; LBA space partitioned into zones, each served by a dedicated worker thread
 - **ublk frontend** (Linux) &mdash; expose volumes as `/dev/ublkbN` block devices with 512B sector alignment
+- **Service mode** &mdash; multi-volume serving in a single process, Unix socket IPC for online management and graceful shutdown
 
 ## Architecture
 
@@ -82,6 +83,9 @@ compress_workers = 2          # per flush lane
 [ublk]
 nr_queues = 4
 queue_depth = 128
+
+[service]
+socket_path = "/var/run/onyx-storage.sock"  # IPC socket for stop/create/delete
 ```
 
 ### Usage
@@ -93,11 +97,19 @@ onyx-storage -c config/default.toml create-volume -n myvolume -s 1073741824 --co
 # List volumes
 onyx-storage -c config/default.toml list-volumes
 
-# Start serving a volume via ublk
-onyx-storage -c config/default.toml start -v myvolume
+# Start serving all volumes via ublk (each volume gets its own /dev/ublkbN)
+onyx-storage -c config/default.toml start
 
-# Delete a volume
-onyx-storage -c config/default.toml delete-volume -n myvolume
+# Start specific volumes only
+onyx-storage -c config/default.toml start -v vol1 -v vol2
+
+# While running: create/delete/list volumes via IPC (another terminal)
+onyx-storage -c config/default.toml create-volume -n newvol -s 1073741824 --compression lz4
+onyx-storage -c config/default.toml list-volumes
+onyx-storage -c config/default.toml delete-volume -n newvol
+
+# Graceful stop (via Unix socket, or Ctrl+C / SIGTERM)
+onyx-storage -c config/default.toml stop
 ```
 
 ## Design Highlights
@@ -146,6 +158,7 @@ User-perceived latency = ring lock + memcpy + channel send. Encoding, CRC, disk 
 - [x] Packer + GC: fragment bin-packing, GC scanner/rewriter, back-pressure, hole-map reuse
 - [x] Dedup: worker pool, dedup_index/dedup_reverse, tiered skip strategy, background rescan
 - [x] Performance: staging buffer, write thread batch, jemalloc, batched backend writer, multi_get, batched dedup cleanup
+- [x] Service mode: multi-volume start, Unix socket IPC (stop/create/delete/list), signal handling (SIGTERM/SIGINT)
 - [ ] RAID-aware: strip-aligned writes, strip-granularity allocation
 - [ ] Production hardening: iSCSI frontend, HA (active-standby dual controller), Prometheus metrics
 - [ ] High performance: NVMe-oF over RDMA

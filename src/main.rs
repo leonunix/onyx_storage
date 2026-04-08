@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::engine::OnyxEngine;
+use onyx_storage::service::{self, ServiceController};
 use onyx_storage::types::CompressionAlgo;
 
 #[derive(Parser)]
@@ -23,12 +25,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the storage engine daemon
+    /// Start the storage engine, serving one or more volumes via ublk
     Start {
-        /// Volume name to serve
+        /// Volume name(s) to serve. Can be specified multiple times.
+        /// If omitted, all existing volumes are started.
         #[arg(short, long)]
-        volume: String,
+        volume: Vec<String>,
     },
+    /// Stop a running storage engine (via Unix socket IPC)
+    Stop,
     /// Create a new volume
     CreateVolume {
         /// Volume name
@@ -77,70 +82,83 @@ fn main() -> anyhow::Result<()> {
         Command::Start { volume } => {
             tracing::info!("starting onyx storage engine");
 
-            let engine = OnyxEngine::open(&config)?;
-            let _vol = engine.open_volume(&volume)?;
+            let controller = ServiceController::new(config.clone())?;
+            let controller = Arc::new(controller);
 
-            #[cfg(target_os = "linux")]
-            {
-                let zm = engine.zone_manager().expect("engine has zone manager");
-                let vol_config = engine
-                    .meta()
-                    .get_volume(&onyx_storage::types::VolumeId(volume.clone()))?
-                    .expect("volume exists");
-                let target = onyx_storage::frontend::ublk::OnyxUblkTarget::new(
-                    &config.ublk,
-                    zm.clone(),
-                    &vol_config,
-                )?;
-                tracing::info!("starting ublk device for volume '{}'", volume);
-                target.run()?;
+            // Register signal handlers for graceful shutdown
+            let ctrl_for_signal = controller.clone();
+            ctrlc::set_handler(move || {
+                ctrl_for_signal.trigger_shutdown();
+            })
+            .expect("failed to set signal handler");
+
+            if volume.is_empty() {
+                tracing::info!("starting all volumes");
+            } else {
+                tracing::info!(volumes = ?volume, "starting specified volumes");
             }
 
-            #[cfg(not(target_os = "linux"))]
-            {
-                tracing::warn!("ublk is only available on Linux, engine will idle");
-                tracing::info!("volume '{}' ready via library API", volume);
-                let (tx, rx) = std::sync::mpsc::channel();
-                ctrlc_channel(&tx);
-                let _ = rx.recv();
-                tracing::info!("shutting down");
-                engine.shutdown()?;
-            }
-
+            controller.run(&volume)?;
             tracing::info!("engine stopped");
+        }
+        Command::Stop => {
+            service::send_stop_command(&config.service.socket_path)?;
+            println!("engine stopped");
         }
         Command::CreateVolume {
             name,
             size,
             compression,
         } => {
-            let engine = OnyxEngine::open_meta_only(&config)?;
-            let algo = parse_compression(&compression);
-            engine.create_volume(&name, size, algo)?;
+            let sock = &config.service.socket_path;
+            if sock.exists() {
+                service::send_create_volume(sock, &name, size, &compression)?;
+            } else {
+                let engine = OnyxEngine::open_meta_only(&config)?;
+                let algo = parse_compression(&compression);
+                engine.create_volume(&name, size, algo)?;
+            }
             println!(
                 "Volume '{}' created ({} bytes, compression={})",
                 name, size, compression
             );
         }
         Command::DeleteVolume { name } => {
-            let engine = OnyxEngine::open_meta_only(&config)?;
-            let freed = engine.delete_volume(&name)?;
+            let sock = &config.service.socket_path;
+            let freed = if sock.exists() {
+                service::send_delete_volume(sock, &name)?
+            } else {
+                let engine = OnyxEngine::open_meta_only(&config)?;
+                engine.delete_volume(&name)? as u64
+            };
             println!(
                 "Volume '{}' deleted ({} physical blocks freed)",
                 name, freed
             );
         }
         Command::ListVolumes => {
-            let engine = OnyxEngine::open_meta_only(&config)?;
-            let volumes = engine.list_volumes()?;
-            if volumes.is_empty() {
-                println!("No volumes");
+            let sock = &config.service.socket_path;
+            if sock.exists() {
+                let lines = service::send_list_volumes(sock)?;
+                if lines.is_empty() {
+                    println!("No volumes");
+                } else {
+                    for line in &lines {
+                        println!("  {}", line);
+                    }
+                }
             } else {
-                for vol in &volumes {
-                    println!(
-                        "  {} : {} bytes, zones={}, compression={:?}",
-                        vol.id, vol.size_bytes, vol.zone_count, vol.compression
-                    );
+                let engine = OnyxEngine::open_meta_only(&config)?;
+                let volumes = engine.list_volumes()?;
+                if volumes.is_empty() {
+                    println!("No volumes");
+                } else {
+                    for vol in &volumes {
+                        println!(
+                            "  {} : {} bytes, zones={}, compression={:?}",
+                            vol.id, vol.size_bytes, vol.zone_count, vol.compression
+                        );
+                    }
                 }
             }
         }
@@ -163,15 +181,4 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn ctrlc_channel(tx: &std::sync::mpsc::Sender<()>) {
-    let tx = tx.clone();
-    std::thread::spawn(move || {
-        let mut input = String::new();
-        println!("Press Enter to stop...");
-        let _ = std::io::stdin().read_line(&mut input);
-        let _ = tx.send(());
-    });
 }

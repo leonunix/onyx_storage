@@ -117,6 +117,7 @@ fn setup_with_all_options(
         },
         gc,
         dedup,
+        service: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();
