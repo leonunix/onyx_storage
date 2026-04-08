@@ -54,7 +54,7 @@ impl AlignedBuf {
 
     #[cfg(target_os = "linux")]
     fn alloc_hugepage(size: usize) -> OnyxResult<Self> {
-        use nix::sys::mman::{mmap_anonymous, munmap, MapFlags, ProtFlags};
+        use nix::sys::mman::{mmap_anonymous, MapFlags, ProtFlags};
         use std::num::NonZeroUsize;
 
         let nz_size = NonZeroUsize::new(size)

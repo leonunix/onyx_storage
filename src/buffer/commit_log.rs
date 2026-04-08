@@ -727,7 +727,7 @@ impl BufferShard {
             Self::mark_entry_flushed(&self.device, pending)?;
         }
         {
-            let slot_count = pending.disk_len / BLOCK_SIZE;
+            let _slot_count = pending.disk_len / BLOCK_SIZE;
             let mut ring = self.ring.lock();
             ring.flushed_seqs.insert(seq);
             let before = ring.used_bytes;
