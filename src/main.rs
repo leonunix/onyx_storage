@@ -82,7 +82,6 @@ fn main() -> anyhow::Result<()> {
 
             #[cfg(target_os = "linux")]
             {
-                use std::sync::Arc;
                 let zm = engine.zone_manager().expect("engine has zone manager");
                 let vol_config = engine
                     .meta()
