@@ -8,7 +8,7 @@
 
 Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses RocksDB for metadata management, O_DIRECT for data I/O, and exposes block devices via Linux ublk. Designed for NVMe SSD arrays behind dm-raid / LVM.
 
-> **Status: Technology Preview** &mdash; core functionality (compression, dedup, GC, packer) is implemented and tested. Not yet recommended for production workloads.
+> **WARNING: This is a learning/educational project. DO NOT use in production environments.** This codebase is built for studying storage engine internals (VDO-style compression, dedup, GC, packer) and is NOT production-ready. There is no warranty of data safety, reliability, or performance.
 
 ## Features
 
