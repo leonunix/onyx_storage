@@ -286,8 +286,10 @@ impl Allocation {
 }
 
 impl BufferFlusher {
-    fn per_lane_worker_count(configured: usize, lane_count: usize) -> usize {
-        configured.max(lane_count).div_ceil(lane_count.max(1))
+    /// compress_workers / dedup.workers are now **per-lane** counts.
+    /// No division — each lane gets the configured number of workers.
+    fn per_lane_worker_count(configured: usize, _lane_count: usize) -> usize {
+        configured.max(1)
     }
 
     fn elapsed_ns(start: Instant) -> u64 {
@@ -691,8 +693,8 @@ impl BufferFlusher {
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(mut unit) => {
-                    // Backpressure: skip dedup if buffer is filling up
-                    if pool.fill_percentage() > skip_threshold_pct as u8 {
+                    // Backpressure: skip dedup if this shard's buffer is filling up
+                    if pool.fill_percentage_for_shard(shard_idx) > skip_threshold_pct as u8 {
                         unit.dedup_skipped = true;
                         metrics.dedup_skipped_units.fetch_add(1, Ordering::Relaxed);
                         if miss_tx.send(unit).is_err() {

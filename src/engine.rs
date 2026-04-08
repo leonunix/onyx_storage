@@ -131,6 +131,7 @@ impl OnyxEngine {
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
             config.buffer.shards,
             config.engine.zone_size_blocks,
+            std::time::Duration::from_secs(30),
         )?);
         buffer_pool.attach_metrics(metrics.clone());
 

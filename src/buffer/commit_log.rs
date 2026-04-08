@@ -118,6 +118,10 @@ struct LifecycleState {
 struct BufferShard {
     device: RawDevice,
     ring: parking_lot::Mutex<RingState>,
+    /// Signaled when ring space is freed (reclaim_log_prefix).
+    ring_space_cv: parking_lot::Condvar,
+    /// How long append() waits when the shard ring is temporarily full.
+    backpressure_timeout: Duration,
     lba_index: DashMap<LbaKey, Arc<PendingEntry>>,
     pending_entries: DashMap<u64, Arc<PendingEntry>>,
     flush_progress: DashMap<u64, HashSet<u16>>,
@@ -477,6 +481,7 @@ impl BufferShard {
 
     fn open(
         device: RawDevice,
+        backpressure_timeout: Duration,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
     ) -> OnyxResult<(Self, u64)> {
         let capacity_bytes = device.size();
@@ -509,6 +514,8 @@ impl BufferShard {
                     log_order,
                     flushed_seqs: scan.flushed_seqs,
                 }),
+                ring_space_cv: parking_lot::Condvar::new(),
+                backpressure_timeout,
                 lba_index,
                 pending_entries,
                 flush_progress: DashMap::with_shard_amount(DASHMAP_SHARDS),
@@ -566,13 +573,30 @@ impl BufferShard {
             )));
         }
 
-        // ── Ring lock: reserve space (~50ns) ──
+        // ── Ring lock: reserve space, wait if shard is temporarily full ──
+        // The flush lane will drain entries and notify ring_space_cv.
         let write_offset = {
             let mut ring = self.ring.lock();
-            let Some(offset) = Self::reserve_log_space(&mut ring, seq, slot_count) else {
-                return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
-            };
-            offset
+            loop {
+                if let Some(offset) = Self::reserve_log_space(&mut ring, seq, slot_count) {
+                    break offset;
+                }
+                // Entry physically cannot fit even in empty ring → real error.
+                if Self::slot_bytes(slot_count) > ring.capacity_bytes {
+                    return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                }
+                // No backpressure configured (tests) → fail immediately.
+                if self.backpressure_timeout.is_zero() {
+                    return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                }
+                // Wait for flush lane to free space (condvar releases ring lock).
+                let wait = self
+                    .ring_space_cv
+                    .wait_for(&mut ring, self.backpressure_timeout);
+                if wait.timed_out() {
+                    return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                }
+            }
         };
 
         // Build PendingEntry — one String alloc (vol_id) + one Vec alloc (payload).
@@ -686,7 +710,11 @@ impl BufferShard {
                 && record.disk_offset == pending.disk_offset
                 && record.slot_count == slot_count));
             ring.flushed_seqs.insert(seq);
+            let before = ring.used_bytes;
             Self::reclaim_log_prefix(&mut ring);
+            if ring.used_bytes < before {
+                self.ring_space_cv.notify_all();
+            }
         }
         self.flush_progress.remove(&seq);
         Ok(())
@@ -1036,6 +1064,8 @@ impl WriteBufferPool {
         }
     }
 
+    /// Open with defaults. Backpressure timeout = 0 (immediate fail) — suitable
+    /// for tests or standalone usage without a flusher.
     pub fn open(device: RawDevice) -> OnyxResult<Self> {
         Self::open_with_group_commit_wait(device, Duration::ZERO)
     }
@@ -1044,7 +1074,7 @@ impl WriteBufferPool {
         device: RawDevice,
         group_commit_wait: Duration,
     ) -> OnyxResult<Self> {
-        Self::open_with_options(device, group_commit_wait, 1, 256)
+        Self::open_with_options(device, group_commit_wait, 1, 256, Duration::ZERO)
     }
 
     pub fn open_with_options(
@@ -1052,6 +1082,7 @@ impl WriteBufferPool {
         group_commit_wait: Duration,
         shard_count: usize,
         routing_zone_size_blocks: u64,
+        backpressure_timeout: Duration,
     ) -> OnyxResult<Self> {
         Self::validate_shard_count(shard_count)?;
         let routing_zone_size_blocks = routing_zone_size_blocks.max(1);
@@ -1106,7 +1137,7 @@ impl WriteBufferPool {
 
             let shard_device = device.slice(shard_offset, shard_bytes)?;
             let sync_device = device.slice(shard_offset, shard_bytes)?;
-            let (shard, shard_max_seq) = BufferShard::open(shard_device, metrics.clone())?;
+            let (shard, shard_max_seq) = BufferShard::open(shard_device, backpressure_timeout, metrics.clone())?;
             for seq in shard.pending_entries.iter().map(|entry| *entry.key()) {
                 let _ = ready_tx.send(seq);
                 let _ = shard_ready_txs[shard_idx].send(seq);
@@ -1361,6 +1392,19 @@ impl WriteBufferPool {
             .map(|shard| shard.shard.used_bytes())
             .sum();
         ((total_used * 100) / total_capacity) as u8
+    }
+
+    /// Per-shard fill percentage. Used by flush lane to make per-lane
+    /// backpressure decisions (e.g. dedup skip threshold).
+    pub fn fill_percentage_for_shard(&self, shard_idx: usize) -> u8 {
+        let Some(shard) = self.shards.get(shard_idx) else {
+            return 100;
+        };
+        let cap = shard.shard.capacity();
+        if cap == 0 {
+            return 100;
+        }
+        ((shard.shard.used_bytes() * 100) / cap) as u8
     }
 }
 

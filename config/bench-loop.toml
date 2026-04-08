@@ -12,8 +12,8 @@ default_compression = "None"
 device = "/dev/loop101"
 capacity_mb = 128
 flush_watermark_pct = 80
-group_commit_wait_us = 0
-shards = 16
+group_commit_wait_us = 500
+shards = 4
 
 [ublk]
 nr_queues = 4
@@ -21,7 +21,8 @@ queue_depth = 128
 io_buf_bytes = 1048576
 
 [flush]
-compress_workers = 4
+# per flush lane (1 lane per buffer shard). total = shards × compress_workers
+compress_workers = 2
 coalesce_max_raw_bytes = 131072
 coalesce_max_lbas = 32
 
@@ -33,5 +34,6 @@ zone_size_blocks = 256
 enabled = false
 
 [dedup]
-enabled = false
-workers = 4
+enabled = true
+# per flush lane
+workers = 2

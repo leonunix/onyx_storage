@@ -93,7 +93,8 @@ impl Default for UblkConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FlushConfig {
-    /// Number of parallel compression worker threads (default 2)
+    /// Number of compression worker threads **per flush lane** (default 2).
+    /// Each buffer shard has its own flush lane. Total compress threads = shards × compress_workers.
     #[serde(default = "default_compress_workers")]
     pub compress_workers: usize,
     /// Max raw bytes to coalesce before compressing (default 128KB)
@@ -134,7 +135,7 @@ impl Default for FlushConfig {
 }
 
 fn default_compress_workers() -> usize {
-    2
+    2 // per flush lane (1 lane per buffer shard)
 }
 fn default_coalesce_max_raw_bytes() -> usize {
     131072 // 128KB
@@ -164,10 +165,10 @@ fn default_flush_watermark_pct() -> u8 {
     80
 }
 fn default_group_commit_wait_us() -> u64 {
-    0
+    500 // 500µs batching window — good balance for group commit
 }
 fn default_buffer_shards() -> usize {
-    1
+    4
 }
 fn default_nr_queues() -> u16 {
     4
