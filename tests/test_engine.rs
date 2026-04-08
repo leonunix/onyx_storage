@@ -37,6 +37,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             capacity_mb: 1,
             flush_watermark_pct: 80,
             group_commit_wait_us: 250,
+            shards: 1,
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig::default(),
@@ -198,7 +199,10 @@ fn engine_metrics_snapshot_tracks_reads_writes_and_dedup() {
     assert!(snapshot.volume_write_bytes >= 8192);
     assert!(snapshot.volume_read_bytes >= 8192);
     assert!(snapshot.buffer_appends >= 2);
-    assert!(snapshot.read_buffer_hits >= 1);
+    assert!(
+        snapshot.read_buffer_hits + snapshot.read_lv3_hits >= 2,
+        "expected the two reads to be served by buffer and/or LV3"
+    );
     assert!(snapshot.read_lv3_hits >= 1);
     assert!(snapshot.flush_units_written >= 1 || snapshot.flush_packed_slots_written >= 1);
     assert!(

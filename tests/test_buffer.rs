@@ -54,6 +54,59 @@ fn entry_roundtrip() {
 }
 
 #[test]
+fn entry_aligned_encode_roundtrip() {
+    let payload = vec![0xCD; 4096];
+    let payload_crc = crc32fast::hash(&payload);
+
+    let bytes = BufferEntry::encode_aligned(
+        7,
+        "aligned-vol",
+        Lba(11),
+        1,
+        payload_crc,
+        false,
+        123,
+        &payload,
+    )
+    .unwrap();
+
+    assert_eq!((bytes.as_ptr() as usize) % BLOCK_SIZE as usize, 0);
+
+    let restored = BufferEntry::from_bytes(bytes.as_slice()).unwrap();
+    assert_eq!(restored.seq, 7);
+    assert_eq!(restored.vol_id, "aligned-vol");
+    assert_eq!(restored.start_lba, Lba(11));
+    assert_eq!(restored.payload, payload);
+    assert_eq!(restored.vol_created_at, 123);
+}
+
+#[test]
+fn entry_direct_compact_header_roundtrip() {
+    let payload = vec![0x5A; 4096];
+    let mut header = BufferEntry::encode_direct_compact_header(
+        9,
+        "direct-compact-vol",
+        Lba(21),
+        1,
+        false,
+        456,
+        payload.len(),
+    )
+    .unwrap();
+    let total_len = BufferEntry::direct_compact_total_len(payload.len()) as usize;
+    let mut bytes = vec![0u8; total_len];
+    bytes[..BLOCK_SIZE as usize].copy_from_slice(&header.as_mut_slice()[..BLOCK_SIZE as usize]);
+    bytes[BLOCK_SIZE as usize..].copy_from_slice(&payload);
+
+    let restored = BufferEntry::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.seq, 9);
+    assert_eq!(restored.vol_id, "direct-compact-vol");
+    assert_eq!(restored.start_lba, Lba(21));
+    assert_eq!(restored.payload, payload);
+    assert_eq!(restored.vol_created_at, 456);
+}
+
+#[test]
 fn entry_corrupt_detected() {
     let payload = vec![0; 4096];
     let payload_crc = crc32fast::hash(&payload);
@@ -474,4 +527,81 @@ fn append_retries_transient_sync_failure_without_losing_pending_entry() {
     assert_eq!(unflushed.len(), 1);
     assert_eq!(unflushed[0].seq, seq);
     assert_eq!(unflushed[0].payload, data);
+}
+
+#[test]
+fn append_is_visible_before_ready_publish() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool =
+        WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(50)).unwrap();
+
+    let data = vec![0x3C; 4096];
+    let seq = pool.append("test-vol", Lba(9), 1, &data, 0).unwrap();
+
+    let found = pool.lookup("test-vol", Lba(9)).unwrap().unwrap();
+    assert_eq!(found.payload, data);
+    assert!(matches!(
+        pool.try_recv_ready(),
+        Err(crossbeam_channel::TryRecvError::Empty)
+    ));
+
+    let ready = pool.recv_ready_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(ready, seq);
+}
+
+#[test]
+fn persistence_across_reopen_after_ring_wrap() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 3 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+
+    let keep = vec![0xA3; 4096];
+    let wrapped = vec![0xB4; 4096];
+    let (keep_seq, wrapped_seq) = {
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let pool = WriteBufferPool::open(dev).unwrap();
+
+        let seq0 = pool
+            .append("test-vol", Lba(0), 1, &vec![0x10; 4096], 0)
+            .unwrap();
+        let seq1 = pool
+            .append("test-vol", Lba(1), 1, &vec![0x11; 4096], 0)
+            .unwrap();
+        let keep_seq = pool.append("test-vol", Lba(2), 1, &keep, 0).unwrap();
+
+        pool.mark_flushed(seq0, Lba(0), 1).unwrap();
+        pool.mark_flushed(seq1, Lba(1), 1).unwrap();
+        assert_eq!(pool.advance_tail().unwrap(), 2);
+
+        let wrapped_seq = pool.append("test-vol", Lba(3), 1, &wrapped, 0).unwrap();
+        assert_eq!(
+            pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload,
+            keep
+        );
+        assert_eq!(
+            pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload,
+            wrapped
+        );
+        (keep_seq, wrapped_seq)
+    };
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open(dev).unwrap();
+    let recovered = pool.recover().unwrap();
+    let recovered_seqs = recovered.iter().map(|entry| entry.seq).collect::<Vec<_>>();
+    assert_eq!(recovered_seqs, vec![keep_seq, wrapped_seq]);
+    assert_eq!(pool.pending_count(), 2);
+    assert!(pool.lookup("test-vol", Lba(0)).unwrap().is_none());
+    assert!(pool.lookup("test-vol", Lba(1)).unwrap().is_none());
+    assert_eq!(
+        pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload,
+        keep
+    );
+    assert_eq!(
+        pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload,
+        wrapped
+    );
 }

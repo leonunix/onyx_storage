@@ -98,7 +98,7 @@ fn concurrent_writes() {
 
     let data = vec![0u8; 4096];
     for i in 0..20u64 {
-        zm.submit_write("test-vol", Lba(i * 256), 1, data.clone(), 0)
+        zm.submit_write("test-vol", Lba(i * 256), 1, &data, 0)
             .unwrap();
     }
 
@@ -111,8 +111,8 @@ fn write_to_different_zones() {
 
     for zone in 0..4u64 {
         let lba = Lba(zone * 256);
-        zm.submit_write("test-vol", lba, 1, vec![zone as u8; 4096], 0)
-            .unwrap();
+        let data = vec![zone as u8; 4096];
+        zm.submit_write("test-vol", lba, 1, &data, 0).unwrap();
     }
 
     zm.shutdown().unwrap();
@@ -216,8 +216,7 @@ fn zone_manager_read_after_write() {
     let mut zm = setup_zone_manager(4);
 
     let data = vec![0xDE; 4096];
-    zm.submit_write("test-vol", Lba(0), 1, data.clone(), 0)
-        .unwrap();
+    zm.submit_write("test-vol", Lba(0), 1, &data, 0).unwrap();
 
     let read_data = zm.submit_read("test-vol", Lba(0)).unwrap().unwrap();
     assert_eq!(read_data, data);

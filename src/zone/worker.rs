@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
@@ -21,6 +22,10 @@ pub struct ZoneWorker {
 }
 
 impl ZoneWorker {
+    fn elapsed_ns(start: Instant) -> u64 {
+        start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
     pub fn new(
         zone_id: ZoneId,
         meta: Arc<MetaStore>,
@@ -52,6 +57,13 @@ impl ZoneWorker {
         }
     }
 
+    pub(crate) fn record_write_ns(&self, start: Instant) {
+        self.metrics.zone_worker_write_ns.fetch_add(
+            Self::elapsed_ns(start),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Write raw data covering one or more contiguous LBAs.
     /// `data.len()` must equal `lba_count * BLOCK_SIZE`.
     pub fn handle_write(
@@ -67,17 +79,26 @@ impl ZoneWorker {
         Ok(())
     }
 
-    /// Read a single 4KB LBA.
-    pub fn handle_read(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<Vec<u8>>> {
+    pub fn handle_read_with_generation(
+        &self,
+        vol_id: &str,
+        lba: Lba,
+        vol_created_at: u64,
+    ) -> OnyxResult<Option<Vec<u8>>> {
         // 1. Check buffer — may be part of a multi-LBA entry
         if let Some(pending) = self.buffer_pool.lookup(vol_id, lba)? {
-            let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
-            let end = offset + BLOCK_SIZE as usize;
-            if end <= pending.payload.len() {
-                self.metrics
-                    .read_buffer_hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(Some(pending.payload[offset..end].to_vec()));
+            if vol_created_at == 0
+                || pending.vol_created_at == 0
+                || pending.vol_created_at == vol_created_at
+            {
+                let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
+                let end = offset + BLOCK_SIZE as usize;
+                if end <= pending.payload.len() {
+                    self.metrics
+                        .read_buffer_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Some(pending.payload[offset..end].to_vec()));
+                }
             }
         }
 
@@ -94,7 +115,6 @@ impl ZoneWorker {
         };
 
         // 3. Read compression unit from LV3
-        //    If slot_offset > 0, the fragment is packed within a single 4KB slot.
         let compressed_data = if mapping.slot_offset > 0 {
             let slot_data = self
                 .io_engine
@@ -164,5 +184,10 @@ impl ZoneWorker {
             .read_lv3_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(decompressed[start..end].to_vec()))
+    }
+
+    /// Read a single 4KB LBA.
+    pub fn handle_read(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<Vec<u8>>> {
+        self.handle_read_with_generation(vol_id, lba, 0)
     }
 }

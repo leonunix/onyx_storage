@@ -7,6 +7,7 @@ use clap::{Parser, ValueEnum};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::engine::OnyxEngine;
+use onyx_storage::io::aligned::AlignedBuf;
 use onyx_storage::metrics::EngineMetricsSnapshot;
 use onyx_storage::types::{CompressionAlgo, BLOCK_SIZE};
 
@@ -34,8 +35,11 @@ struct Cli {
     #[arg(long = "bs", default_value = "128k", value_parser = parse_size)]
     io_size: u64,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, visible_alias = "clients", default_value_t = 1)]
     threads: usize,
+
+    #[arg(long, default_value_t = 1)]
+    iodepth: usize,
 
     #[arg(long, value_enum, default_value_t = Pattern::Zero)]
     pattern: Pattern,
@@ -49,8 +53,26 @@ struct Cli {
     #[arg(long)]
     group_commit_wait_us: Option<u64>,
 
+    #[arg(long)]
+    compress_workers: Option<usize>,
+
+    #[arg(long)]
+    dedup_enabled: Option<bool>,
+
+    #[arg(long)]
+    dedup_workers: Option<usize>,
+
+    #[arg(long)]
+    zone_count: Option<u32>,
+
+    #[arg(long)]
+    buffer_shards: Option<usize>,
+
     #[arg(long, default_value_t = false)]
     skip_prefill: bool,
+
+    #[arg(long, default_value_t = false)]
+    aligned_write_buffers: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -96,14 +118,57 @@ struct BenchConfig {
     total_size: u64,
     io_size: u64,
     threads: usize,
+    iodepth: usize,
     pattern: Pattern,
     group_commit_wait_us: u64,
+    compress_workers: usize,
+    dedup_enabled: bool,
+    dedup_workers: usize,
+    zone_count: u32,
+    buffer_shards: usize,
+    aligned_write_buffers: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct WorkerStats {
     ops: u64,
     bytes: u64,
+}
+
+enum WorkerIoBuf {
+    Heap(Vec<u8>),
+    Aligned(AlignedBuf),
+}
+
+impl WorkerIoBuf {
+    fn new(size: usize, aligned: bool) -> Result<Self> {
+        if aligned {
+            Ok(Self::Aligned(AlignedBuf::new(size, false)?))
+        } else {
+            Ok(Self::Heap(vec![0u8; size]))
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Heap(buf) => buf,
+            Self::Aligned(buf) => buf.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Heap(buf) => buf,
+            Self::Aligned(buf) => buf.as_mut_slice(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Heap(buf) => buf.len(),
+            Self::Aligned(buf) => buf.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +188,21 @@ fn main() -> Result<()> {
     let mut config = OnyxConfig::load(&cli.config)?;
     if let Some(wait_us) = cli.group_commit_wait_us {
         config.buffer.group_commit_wait_us = wait_us;
+    }
+    if let Some(compress_workers) = cli.compress_workers {
+        config.flush.compress_workers = compress_workers.max(1);
+    }
+    if let Some(dedup_enabled) = cli.dedup_enabled {
+        config.dedup.enabled = dedup_enabled;
+    }
+    if let Some(dedup_workers) = cli.dedup_workers {
+        config.dedup.workers = dedup_workers.max(1);
+    }
+    if let Some(zone_count) = cli.zone_count {
+        config.engine.zone_count = zone_count.max(1);
+    }
+    if let Some(buffer_shards) = cli.buffer_shards {
+        config.buffer.shards = buffer_shards.max(1);
     }
     let engine = OnyxEngine::open(&config)?;
 
@@ -148,8 +228,15 @@ fn main() -> Result<()> {
                 total_size: cli.total_size,
                 io_size: cli.io_size,
                 threads: cli.threads,
+                iodepth: cli.iodepth,
                 pattern: cli.pattern,
                 group_commit_wait_us: config.buffer.group_commit_wait_us,
+                compress_workers: config.flush.compress_workers,
+                dedup_enabled: config.dedup.enabled,
+                dedup_workers: config.dedup.workers,
+                zone_count: config.engine.zone_count,
+                buffer_shards: config.buffer.shards,
+                aligned_write_buffers: cli.aligned_write_buffers,
             },
             cli.drain_timeout_secs,
         )?;
@@ -161,8 +248,15 @@ fn main() -> Result<()> {
         total_size: cli.total_size,
         io_size: cli.io_size,
         threads: cli.threads,
+        iodepth: cli.iodepth,
         pattern: cli.pattern,
         group_commit_wait_us: config.buffer.group_commit_wait_us,
+        compress_workers: config.flush.compress_workers,
+        dedup_enabled: config.dedup.enabled,
+        dedup_workers: config.dedup.workers,
+        zone_count: config.engine.zone_count,
+        buffer_shards: config.buffer.shards,
+        aligned_write_buffers: cli.aligned_write_buffers,
     };
 
     let result = run_benchmark(&engine, &bench, cli.drain_timeout_secs)?;
@@ -178,6 +272,29 @@ fn validate_args(cli: &Cli) -> Result<()> {
     }
     if cli.threads == 0 {
         return Err(anyhow!("threads must be > 0"));
+    }
+    if cli.iodepth == 0 {
+        return Err(anyhow!("--iodepth must be > 0"));
+    }
+    if let Some(compress_workers) = cli.compress_workers {
+        if compress_workers == 0 {
+            return Err(anyhow!("--compress-workers must be > 0"));
+        }
+    }
+    if let Some(dedup_workers) = cli.dedup_workers {
+        if dedup_workers == 0 {
+            return Err(anyhow!("--dedup-workers must be > 0"));
+        }
+    }
+    if let Some(zone_count) = cli.zone_count {
+        if zone_count == 0 {
+            return Err(anyhow!("--zone-count must be > 0"));
+        }
+    }
+    if let Some(buffer_shards) = cli.buffer_shards {
+        if buffer_shards == 0 {
+            return Err(anyhow!("--buffer-shards must be > 0"));
+        }
     }
     if cli.io_size % BLOCK_SIZE as u64 != 0 {
         return Err(anyhow!("--bs must be aligned to {} bytes", BLOCK_SIZE));
@@ -242,12 +359,19 @@ fn run_benchmark(
 }
 
 fn run_workload(engine: &OnyxEngine, bench: &BenchConfig) -> Result<WorkerStats> {
-    let barrier = Arc::new(Barrier::new(bench.threads + 1));
-    let mut handles = Vec::with_capacity(bench.threads);
-    let ops_per_thread = (bench.total_size / bench.io_size) / bench.threads as u64;
-    let extra_ops = (bench.total_size / bench.io_size) % bench.threads as u64;
+    let total_lanes = bench
+        .threads
+        .checked_mul(bench.iodepth)
+        .ok_or_else(|| anyhow!("threads * iodepth overflows usize"))?;
+    let barrier = Arc::new(Barrier::new(total_lanes + 1));
+    let mut handles = Vec::with_capacity(total_lanes);
+    let total_ops = bench.total_size / bench.io_size;
+    let ops_per_lane = total_ops / total_lanes as u64;
+    let extra_ops = total_ops % total_lanes as u64;
 
-    for tid in 0..bench.threads {
+    for lane_idx in 0..total_lanes {
+        let client_idx = lane_idx / bench.iodepth;
+        let depth_slot = lane_idx % bench.iodepth;
         let volume = engine
             .open_volume(&bench.volume)
             .with_context(|| format!("failed to open volume '{}'", bench.volume))?;
@@ -256,14 +380,21 @@ fn run_workload(engine: &OnyxEngine, bench: &BenchConfig) -> Result<WorkerStats>
         let pattern = bench.pattern;
         let io_size = bench.io_size;
         let volume_size = volume.size_bytes();
-        let ops = ops_per_thread + u64::from(tid < extra_ops as usize);
-        let start_ops = tid as u64 * ops_per_thread + (tid as u64).min(extra_ops);
+        let aligned_write_buffers = bench.aligned_write_buffers;
+        let ops = ops_per_lane + u64::from(lane_idx < extra_ops as usize);
+        let start_ops = lane_idx as u64 * ops_per_lane + (lane_idx as u64).min(extra_ops);
         let base_lba = (start_ops * io_size) / BLOCK_SIZE as u64;
 
         let handle = thread::spawn(move || -> Result<WorkerStats> {
-            let mut rng = XorShift64::seed(0x9E37_79B9_7F4A_7C15u64 ^ tid as u64);
-            let mut io_buf = vec![0u8; io_size as usize];
-            fill_buffer(pattern, &mut io_buf, &mut rng, tid, 0);
+            let seed = 0x9E37_79B9_7F4A_7C15u64 ^ ((client_idx as u64) << 32) ^ depth_slot as u64;
+            let mut rng = XorShift64::seed(seed);
+            let aligned_write_buffers = aligned_write_buffers
+                && matches!(
+                    scenario,
+                    Scenario::SeqWrite | Scenario::RandWrite | Scenario::Overwrite
+                );
+            let mut io_buf = WorkerIoBuf::new(io_size as usize, aligned_write_buffers)?;
+            fill_buffer(pattern, io_buf.as_mut_slice(), &mut rng, lane_idx, 0);
             barrier.wait();
 
             let mut stats = WorkerStats::default();
@@ -275,8 +406,8 @@ fn run_workload(engine: &OnyxEngine, bench: &BenchConfig) -> Result<WorkerStats>
                     scenario,
                     Scenario::SeqWrite | Scenario::RandWrite | Scenario::Overwrite
                 ) {
-                    fill_buffer(pattern, &mut io_buf, &mut rng, tid, op_idx);
-                    volume.write(offset, &io_buf)?;
+                    fill_buffer(pattern, io_buf.as_mut_slice(), &mut rng, lane_idx, op_idx);
+                    volume.write(offset, io_buf.as_slice())?;
                 } else {
                     let _ = volume.read(offset, io_buf.len())?;
                 }
@@ -369,7 +500,28 @@ fn print_report(bench: &BenchConfig, result: &BenchResult) {
     println!("== Onyx Benchmark ==");
     println!("scenario: {:?}", bench.scenario);
     println!("pattern:  {:?}", bench.pattern);
-    println!("threads:  {}", bench.threads);
+    println!("clients:  {}", bench.threads);
+    println!("iodepth:  {}", bench.iodepth);
+    println!(
+        "in-flight target: {}",
+        bench.threads.saturating_mul(bench.iodepth)
+    );
+    println!("zones:    {}", bench.zone_count);
+    println!("buffer shards: {}", bench.buffer_shards);
+    println!(
+        "aligned write buffers: {}",
+        if bench.aligned_write_buffers {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    println!("compress workers: {}", bench.compress_workers);
+    println!(
+        "dedup:    {} (workers={})",
+        if bench.dedup_enabled { "on" } else { "off" },
+        bench.dedup_workers
+    );
     println!("bs:       {}", human_bytes(bench.io_size));
     println!("group commit wait: {} us", bench.group_commit_wait_us);
     println!("total:    {}", human_bytes(result.stats.bytes));
@@ -416,6 +568,30 @@ fn print_report(bench: &BenchConfig, result: &BenchResult) {
         m.flush_packed_fragments_written,
         m.flush_hole_fills,
         m.flush_errors,
+    );
+    println!(
+        "front-write: zone_submit={} zone_worker={} append_total={} append_prepare={} append_log_write={} append_wait_durable={} sync_batches={} sync_batch={} sync_sleep={} sync_epochs={}",
+        human_duration_ns(m.zone_submit_write_ns),
+        human_duration_ns(m.zone_worker_write_ns),
+        human_duration_ns(m.buffer_append_total_ns),
+        human_duration_ns(m.buffer_append_prepare_ns),
+        human_duration_ns(m.buffer_append_log_write_ns),
+        human_duration_ns(m.buffer_append_wait_durable_ns),
+        m.buffer_sync_batches,
+        human_duration_ns(m.buffer_sync_batch_ns),
+        human_duration_ns(m.buffer_sync_sleep_ns),
+        m.buffer_sync_epochs_committed,
+    );
+    println!(
+        "writer-stage: total={} alloc={} io={} meta={} cleanup={} dedup_index={} hole_detect={} mark_flushed={}",
+        human_duration_ns(m.flush_writer_total_ns),
+        human_duration_ns(m.flush_writer_alloc_ns),
+        human_duration_ns(m.flush_writer_io_ns),
+        human_duration_ns(m.flush_writer_meta_ns),
+        human_duration_ns(m.flush_writer_cleanup_ns),
+        human_duration_ns(m.flush_writer_dedup_index_ns),
+        human_duration_ns(m.flush_writer_hole_detect_ns),
+        human_duration_ns(m.flush_writer_mark_flushed_ns),
     );
     println!(
         "dedup: hits={} misses={} skipped_units={} hit_failures={} rescanned_blocks={}",
@@ -511,6 +687,18 @@ fn bottleneck_hints(bench: &BenchConfig, result: &BenchResult) -> Vec<String> {
     }
 
     hints
+}
+
+fn human_duration_ns(ns: u64) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.3}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.3}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.3}us", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
+    }
 }
 
 fn parse_size(input: &str) -> Result<u64, String> {

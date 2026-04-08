@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -24,6 +25,7 @@ pub enum ZoneIoRequest {
     Read {
         vol_id: String,
         lba: Lba,
+        vol_created_at: u64,
         reply: crossbeam_channel::Sender<OnyxResult<Option<Vec<u8>>>>,
     },
     Shutdown,
@@ -34,11 +36,14 @@ struct ZoneHandle {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Routes IO requests to per-zone worker threads based on LBA.
+/// Routes read IO requests to per-zone worker threads based on LBA.
+/// Aligned writes bypass the worker threads and append directly into the
+/// durable write buffer to keep the foreground path thinner.
 pub struct ZoneManager {
     handles: Vec<ZoneHandle>,
     zone_size_blocks: u64,
     zone_count: u32,
+    buffer_pool: Arc<WriteBufferPool>,
     metrics: Arc<EngineMetrics>,
 }
 
@@ -104,6 +109,7 @@ impl ZoneManager {
             handles,
             zone_size_blocks,
             zone_count,
+            buffer_pool,
             metrics,
         })
     }
@@ -121,12 +127,19 @@ impl ZoneManager {
                     vol_created_at,
                     reply,
                 } => {
+                    let start = Instant::now();
                     let result =
                         worker.handle_write(&vol_id, start_lba, lba_count, &data, vol_created_at);
+                    worker.record_write_ns(start);
                     let _ = reply.send(result);
                 }
-                ZoneIoRequest::Read { vol_id, lba, reply } => {
-                    let result = worker.handle_read(&vol_id, lba);
+                ZoneIoRequest::Read {
+                    vol_id,
+                    lba,
+                    vol_created_at,
+                    reply,
+                } => {
+                    let result = worker.handle_read_with_generation(&vol_id, lba, vol_created_at);
                     let _ = reply.send(result);
                 }
                 ZoneIoRequest::Shutdown => {
@@ -150,66 +163,59 @@ impl ZoneManager {
         vol_id: &str,
         start_lba: Lba,
         lba_count: u32,
-        data: Vec<u8>,
+        data: &[u8],
         vol_created_at: u64,
     ) -> OnyxResult<()> {
-        let bs = crate::types::BLOCK_SIZE as usize;
-        let mut offset = 0u32;
-        let mut chunks = 0u64;
+        let total_start = Instant::now();
+        let result = (|| {
+            let chunks = if lba_count == 0 {
+                0
+            } else {
+                let first_zone = start_lba.0 / self.zone_size_blocks;
+                let last_lba = start_lba.0 + lba_count as u64 - 1;
+                let last_zone = last_lba / self.zone_size_blocks;
+                last_zone.saturating_sub(first_zone) + 1
+            };
 
-        while offset < lba_count {
-            let cur_lba = Lba(start_lba.0 + offset as u64);
-            let cur_zone = self.zone_for_lba(cur_lba);
+            self.buffer_pool
+                .append(vol_id, start_lba, lba_count, &data, vol_created_at)?;
 
-            // How many LBAs until the next zone boundary?
-            let zone_start_lba = (cur_lba.0 / self.zone_size_blocks) * self.zone_size_blocks;
-            let zone_end_lba = zone_start_lba + self.zone_size_blocks;
-            let lbas_in_zone = (zone_end_lba - cur_lba.0).min((lba_count - offset) as u64) as u32;
-
-            let data_start = offset as usize * bs;
-            let data_end = (offset + lbas_in_zone) as usize * bs;
-            let chunk = data[data_start..data_end].to_vec();
-
-            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-            self.handles[cur_zone.0 as usize]
-                .sender
-                .send(ZoneIoRequest::Write {
-                    vol_id: vol_id.to_string(),
-                    start_lba: cur_lba,
-                    lba_count: lbas_in_zone,
-                    data: chunk,
-                    vol_created_at,
-                    reply: reply_tx,
-                })
-                .map_err(|_| OnyxError::Ublk("zone worker channel closed".into()))?;
-
-            reply_rx
-                .recv()
-                .map_err(|_| OnyxError::Ublk("zone worker reply channel closed".into()))??;
-
-            offset += lbas_in_zone;
-            chunks += 1;
-        }
-
-        self.metrics
-            .zone_write_dispatches
-            .fetch_add(chunks, std::sync::atomic::Ordering::Relaxed);
-        self.metrics
-            .zone_write_lbas
-            .fetch_add(lba_count as u64, std::sync::atomic::Ordering::Relaxed);
-        if chunks > 1 {
             self.metrics
-                .zone_write_split_ops
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+                .zone_write_dispatches
+                .fetch_add(chunks, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .zone_write_lbas
+                .fetch_add(lba_count as u64, std::sync::atomic::Ordering::Relaxed);
+            if chunks > 1 {
+                self.metrics
+                    .zone_write_split_ops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
-        Ok(())
+            Ok(())
+        })();
+
+        self.metrics.zone_submit_write_ns.fetch_add(
+            total_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        result
     }
 
     /// Submit a read IO. Blocks until the zone worker processes it.
     ///
     /// Returns `Ok(Some(data))` if mapped, `Ok(None)` if unmapped, `Err` on failure.
     pub fn submit_read(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<Vec<u8>>> {
+        self.submit_read_with_generation(vol_id, lba, 0)
+    }
+
+    pub fn submit_read_with_generation(
+        &self,
+        vol_id: &str,
+        lba: Lba,
+        vol_created_at: u64,
+    ) -> OnyxResult<Option<Vec<u8>>> {
         let zone = self.zone_for_lba(lba);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
@@ -218,6 +224,7 @@ impl ZoneManager {
             .send(ZoneIoRequest::Read {
                 vol_id: vol_id.to_string(),
                 lba,
+                vol_created_at,
                 reply: reply_tx,
             })
             .map_err(|_| OnyxError::Ublk("zone worker channel closed".into()))?;

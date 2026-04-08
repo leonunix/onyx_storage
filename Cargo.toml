@@ -48,6 +48,9 @@ crossbeam-channel = "0.5"
 dashmap = "6"
 parking_lot = "0.12"
 
+# allocator
+tikv-jemallocator = { version = "0.6", optional = true }
+
 # FFI
 libc = "0.2"
 serde_json = "1"
@@ -56,6 +59,10 @@ serde_json = "1"
 tempfile = "3"
 rand = "0.8"
 serial_test = "3"
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk = "0.4"

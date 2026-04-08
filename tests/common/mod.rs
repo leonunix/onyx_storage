@@ -79,6 +79,7 @@ impl EngineHarness {
                 capacity_mb: ((options.buffer_bytes / 1024 / 1024).max(1)) as usize,
                 flush_watermark_pct: 80,
                 group_commit_wait_us: 250,
+                shards: 1,
             },
             ublk: UblkConfig::default(),
             flush: options.flush,

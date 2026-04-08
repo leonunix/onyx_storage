@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 use sha2::{Digest, Sha256};
 
@@ -25,7 +25,7 @@ use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 
 /// 3-stage flusher pipeline:
-///   Stage 1 (coalescer): drain buffer → filter in-flight → coalesce → dispatch
+///   Stage 1 (coalescer): drain ready queue → filter in-flight → coalesce → dispatch
 ///   Stage 2 (N compress workers): parallel compression
 ///   Stage 3 (writer): write LV3 → update metadata → report completed seqs
 ///
@@ -34,6 +34,10 @@ use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 /// twice when the coalescer loops faster than the writer commits.
 pub struct BufferFlusher {
     running: Arc<AtomicBool>,
+    lanes: Vec<FlusherLane>,
+}
+
+struct FlusherLane {
     coalesce_handle: Option<JoinHandle<()>>,
     dedup_handles: Vec<JoinHandle<()>>,
     compress_handles: Vec<JoinHandle<()>>,
@@ -282,6 +286,18 @@ impl Allocation {
 }
 
 impl BufferFlusher {
+    fn per_lane_worker_count(configured: usize, lane_count: usize) -> usize {
+        configured.max(lane_count).div_ceil(lane_count.max(1))
+    }
+
+    fn elapsed_ns(start: Instant) -> u64 {
+        start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    fn record_elapsed(counter: &std::sync::atomic::AtomicU64, start: Instant) {
+        counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
+    }
+
     pub fn start(
         pool: Arc<WriteBufferPool>,
         meta: Arc<MetaStore>,
@@ -317,140 +333,147 @@ impl BufferFlusher {
         metrics: Arc<EngineMetrics>,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
-        let workers = config.compress_workers.max(1);
+        let lane_count = pool.shard_count().max(1);
+        let compress_workers =
+            Self::per_lane_worker_count(config.compress_workers.max(1), lane_count);
         let max_raw = config.coalesce_max_raw_bytes;
         let max_lbas = config.coalesce_max_lbas;
         let dedup_enabled = dedup_config.enabled;
-        let dedup_workers = dedup_config.workers.max(1);
+        let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
+        let mut lanes = Vec::with_capacity(lane_count);
 
-        // Stage 1 → Stage 1.5 (dedup) or Stage 2 (compress)
-        let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(dedup_workers * 4);
-        // Stage 1.5 → Stage 2
-        let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(workers * 4);
-        // Stage 2 → Stage 3
-        let (write_tx, write_rx) = bounded::<CompressedUnit>(workers * 4);
-        // Stage 3 → Stage 1 (feedback: completed seqs)
-        // Dedup workers also send done_tx for hit seqs
-        let (done_tx, done_rx) = bounded::<Vec<u64>>((workers + dedup_workers) * 8);
+        for shard_idx in 0..lane_count {
+            // Stage 1 → Stage 1.5 (dedup) or Stage 2 (compress)
+            let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(dedup_workers * 4);
+            // Stage 1.5 → Stage 2
+            let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(compress_workers * 4);
+            // Stage 2 → Stage 3
+            let (write_tx, write_rx) = bounded::<CompressedUnit>(compress_workers * 4);
+            // Stage 3 → Stage 1 (feedback: completed seqs)
+            let (done_tx, done_rx) = unbounded::<Vec<u64>>();
 
-        // Stage 1: Coalescer — sends to dedup stage (or compress if dedup disabled)
-        let running_c = running.clone();
-        let pool_c = pool.clone();
-        let meta_c = meta.clone();
-        let metrics_c = metrics.clone();
-        let coalesce_out_tx = if dedup_enabled {
-            dedup_tx.clone()
-        } else {
-            compress_tx.clone()
-        };
-        let coalesce_handle = thread::Builder::new()
-            .name("flusher-coalesce".into())
-            .spawn(move || {
-                Self::coalesce_loop(
-                    &pool_c,
-                    &meta_c,
-                    &coalesce_out_tx,
-                    &done_rx,
-                    &running_c,
-                    &metrics_c,
-                    max_raw,
-                    max_lbas,
-                );
-            })
-            .expect("failed to spawn coalescer thread");
-
-        // Stage 1.5: Dedup workers (if enabled)
-        // Dedup workers handle hits directly (metadata update + mark_flushed + done_tx)
-        // and send misses to compress stage. This avoids seq refcount mismatch.
-        let mut dedup_handles = Vec::new();
-        if dedup_enabled {
-            for i in 0..dedup_workers {
-                let rx = dedup_rx.clone();
-                let miss_tx = compress_tx.clone();
-                let running_d = running.clone();
-                let meta_d = meta.clone();
-                let pool_d = pool.clone();
-                let lifecycle_d = lifecycle.clone();
-                let allocator_d = allocator.clone();
-                let done_tx_d = done_tx.clone();
-                let metrics_d = metrics.clone();
-                let h = thread::Builder::new()
-                    .name(format!("flusher-dedup-{}", i))
-                    .spawn(move || {
-                        Self::dedup_loop(
-                            &rx,
-                            &miss_tx,
-                            &meta_d,
-                            &pool_d,
-                            &lifecycle_d,
-                            &allocator_d,
-                            &done_tx_d,
-                            &running_d,
-                            dedup_skip_threshold,
-                            &metrics_d,
-                        );
-                    })
-                    .expect("failed to spawn dedup worker");
-                dedup_handles.push(h);
-            }
-        }
-        drop(dedup_rx);
-        drop(dedup_tx);
-        drop(compress_tx);
-
-        // Stage 2: Compress workers (use per-unit compression from CoalesceUnit)
-        let mut compress_handles = Vec::with_capacity(workers);
-        for i in 0..workers {
-            let rx = compress_rx.clone();
-            let tx = write_tx.clone();
-            let running_w = running.clone();
-            let metrics_w = metrics.clone();
-            let h = thread::Builder::new()
-                .name(format!("flusher-compress-{}", i))
+            let running_c = running.clone();
+            let pool_c = pool.clone();
+            let meta_c = meta.clone();
+            let metrics_c = metrics.clone();
+            let coalesce_out_tx = if dedup_enabled {
+                dedup_tx.clone()
+            } else {
+                compress_tx.clone()
+            };
+            let coalesce_handle = thread::Builder::new()
+                .name(format!("flusher-coalesce-{}", shard_idx))
                 .spawn(move || {
-                    Self::compress_loop(&rx, &tx, &running_w, &metrics_w);
+                    Self::coalesce_loop(
+                        shard_idx,
+                        &pool_c,
+                        &meta_c,
+                        &coalesce_out_tx,
+                        &done_rx,
+                        &running_c,
+                        &metrics_c,
+                        max_raw,
+                        max_lbas,
+                    );
                 })
-                .expect("failed to spawn compress worker");
-            compress_handles.push(h);
-        }
-        drop(compress_rx);
-        drop(write_tx);
+                .expect("failed to spawn coalescer thread");
 
-        // Stage 3: Writer (owns the packer)
-        let running_w = running.clone();
-        let pool_w = pool.clone();
-        let allocator_w = allocator.clone();
-        let metrics_w = metrics.clone();
-        let writer_handle = thread::Builder::new()
-            .name("flusher-writer".into())
-            .spawn(move || {
-                let mut packer = Packer::new(allocator_w, hole_map);
-                Self::writer_loop(
-                    &write_rx,
-                    &pool_w,
-                    &meta,
-                    &lifecycle,
-                    &allocator,
-                    &io_engine,
-                    &done_tx,
-                    &running_w,
-                    &mut packer,
-                    &metrics_w,
-                );
-            })
-            .expect("failed to spawn writer thread");
+            let mut dedup_handles = Vec::new();
+            if dedup_enabled {
+                for worker_idx in 0..dedup_workers {
+                    let rx = dedup_rx.clone();
+                    let miss_tx = compress_tx.clone();
+                    let running_d = running.clone();
+                    let meta_d = meta.clone();
+                    let pool_d = pool.clone();
+                    let lifecycle_d = lifecycle.clone();
+                    let allocator_d = allocator.clone();
+                    let done_tx_d = done_tx.clone();
+                    let metrics_d = metrics.clone();
+                    let h = thread::Builder::new()
+                        .name(format!("flusher-dedup-{}-{}", shard_idx, worker_idx))
+                        .spawn(move || {
+                            Self::dedup_loop(
+                                shard_idx,
+                                &rx,
+                                &miss_tx,
+                                &meta_d,
+                                &pool_d,
+                                &lifecycle_d,
+                                &allocator_d,
+                                &done_tx_d,
+                                &running_d,
+                                dedup_skip_threshold,
+                                &metrics_d,
+                            );
+                        })
+                        .expect("failed to spawn dedup worker");
+                    dedup_handles.push(h);
+                }
+            }
+            drop(dedup_rx);
+            drop(dedup_tx);
+            drop(compress_tx);
 
-        Self {
-            running,
-            coalesce_handle: Some(coalesce_handle),
-            dedup_handles,
-            compress_handles,
-            writer_handle: Some(writer_handle),
+            let mut compress_handles = Vec::with_capacity(compress_workers);
+            for worker_idx in 0..compress_workers {
+                let rx = compress_rx.clone();
+                let tx = write_tx.clone();
+                let running_w = running.clone();
+                let metrics_w = metrics.clone();
+                let h = thread::Builder::new()
+                    .name(format!("flusher-compress-{}-{}", shard_idx, worker_idx))
+                    .spawn(move || {
+                        Self::compress_loop(&rx, &tx, &running_w, &metrics_w);
+                    })
+                    .expect("failed to spawn compress worker");
+                compress_handles.push(h);
+            }
+            drop(compress_rx);
+            drop(write_tx);
+
+            let running_w = running.clone();
+            let pool_w = pool.clone();
+            let meta_w = meta.clone();
+            let lifecycle_w = lifecycle.clone();
+            let allocator_w = allocator.clone();
+            let io_engine_w = io_engine.clone();
+            let metrics_w = metrics.clone();
+            let hole_map_w = hole_map.clone();
+            let writer_handle = thread::Builder::new()
+                .name(format!("flusher-writer-{}", shard_idx))
+                .spawn(move || {
+                    let mut packer = Packer::new(allocator_w.clone(), hole_map_w);
+                    Self::writer_loop(
+                        shard_idx,
+                        &write_rx,
+                        &pool_w,
+                        &meta_w,
+                        &lifecycle_w,
+                        &allocator_w,
+                        &io_engine_w,
+                        &done_tx,
+                        &running_w,
+                        &mut packer,
+                        &metrics_w,
+                    );
+                })
+                .expect("failed to spawn writer thread");
+
+            lanes.push(FlusherLane {
+                coalesce_handle: Some(coalesce_handle),
+                dedup_handles,
+                compress_handles,
+                writer_handle: Some(writer_handle),
+            });
         }
+
+        Self { running, lanes }
     }
 
     fn coalesce_loop(
+        shard_idx: usize,
         pool: &WriteBufferPool,
         meta: &MetaStore,
         tx: &Sender<CoalesceUnit>,
@@ -475,6 +498,9 @@ impl BufferFlusher {
                 CompressionAlgo::None
             }
         };
+        let ready_timeout = Duration::from_millis(10);
+        let retry_snapshot_interval = Duration::from_millis(100);
+        let mut last_retry_snapshot = Instant::now();
 
         while running.load(Ordering::Relaxed) {
             // Drain completed seqs from writer feedback — decrement refcounts
@@ -489,62 +515,78 @@ impl BufferFlusher {
                 }
             }
 
-            match pool.recover() {
-                Ok(entries) if !entries.is_empty() => {
-                    // Filter out entries that still have any units in-flight
-                    let new_entries: Vec<_> = entries
-                        .into_iter()
-                        .filter(|e| !in_flight.contains_key(&e.seq))
-                        .collect();
+            let mut new_entries = Vec::new();
+            let mut seen = std::collections::HashSet::new();
 
-                    if new_entries.is_empty() {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-
-                    // Build per-volume compression lookup using cache
-                    for entry in &new_entries {
-                        vol_compression_cache
-                            .entry(entry.vol_id.clone())
-                            .or_insert_with(|| vol_compression(&entry.vol_id));
-                    }
-                    let cache_ref = &vol_compression_cache;
-                    let units = coalesce(&new_entries, max_raw, max_lbas, &|vid| {
-                        cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None)
-                    });
-                    if !units.is_empty() {
-                        metrics.coalesce_runs.fetch_add(1, Ordering::Relaxed);
-                        metrics
-                            .coalesced_units
-                            .fetch_add(units.len() as u64, Ordering::Relaxed);
-                        metrics.coalesced_lbas.fetch_add(
-                            units.iter().map(|u| u.lba_count as u64).sum::<u64>(),
-                            Ordering::Relaxed,
-                        );
-                        metrics.coalesced_bytes.fetch_add(
-                            units.iter().map(|u| u.raw_data.len() as u64).sum::<u64>(),
-                            Ordering::Relaxed,
-                        );
-                    }
-
-                    // Count how many units reference each seq
-                    for unit in &units {
-                        for (seq, _, _) in &unit.seq_lba_ranges {
-                            *in_flight.entry(*seq).or_insert(0) += 1;
+            match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
+                Ok(seq) => {
+                    if !in_flight.contains_key(&seq) && seen.insert(seq) {
+                        if let Some(entry) = pool.pending_entry(seq) {
+                            new_entries.push(entry);
                         }
                     }
-
-                    for unit in units {
-                        if tx.send(unit).is_err() {
-                            return;
+                    while let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) {
+                        if !in_flight.contains_key(&seq) && seen.insert(seq) {
+                            if let Some(entry) = pool.pending_entry(seq) {
+                                new_entries.push(entry);
+                            }
                         }
                     }
                 }
-                Ok(_) => thread::sleep(Duration::from_millis(10)),
-                Err(e) => {
-                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(error = %e, "coalescer: recover failed");
-                    thread::sleep(Duration::from_millis(100));
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            }
+
+            // Safety net for retried/failed units: periodically snapshot the in-memory
+            // pending set instead of rescanning the on-disk log on every loop.
+            if new_entries.is_empty() && last_retry_snapshot.elapsed() >= retry_snapshot_interval {
+                last_retry_snapshot = Instant::now();
+                for entry in pool.pending_entries_snapshot_for_shard(shard_idx) {
+                    if !in_flight.contains_key(&entry.seq) && seen.insert(entry.seq) {
+                        new_entries.push(entry);
+                    }
+                }
+            }
+
+            if new_entries.is_empty() {
+                continue;
+            }
+
+            // Build per-volume compression lookup using cache
+            for entry in &new_entries {
+                vol_compression_cache
+                    .entry(entry.vol_id.clone())
+                    .or_insert_with(|| vol_compression(&entry.vol_id));
+            }
+            let cache_ref = &vol_compression_cache;
+            let units = coalesce(&new_entries, max_raw, max_lbas, &|vid| {
+                cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None)
+            });
+            if !units.is_empty() {
+                metrics.coalesce_runs.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .coalesced_units
+                    .fetch_add(units.len() as u64, Ordering::Relaxed);
+                metrics.coalesced_lbas.fetch_add(
+                    units.iter().map(|u| u.lba_count as u64).sum::<u64>(),
+                    Ordering::Relaxed,
+                );
+                metrics.coalesced_bytes.fetch_add(
+                    units.iter().map(|u| u.raw_data.len() as u64).sum::<u64>(),
+                    Ordering::Relaxed,
+                );
+            }
+
+            // Count how many units reference each seq
+            for unit in &units {
+                for (seq, _, _) in &unit.seq_lba_ranges {
+                    *in_flight.entry(*seq).or_insert(0) += 1;
+                }
+            }
+
+            for unit in units {
+                if tx.send(unit).is_err() {
+                    return;
                 }
             }
         }
@@ -559,17 +601,32 @@ impl BufferFlusher {
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => {
-                    let algo = unit.compression;
-                    let compressor = create_compressor(algo);
-                    let original_size = unit.raw_data.len();
-                    let max_out = compressor.max_compressed_size(original_size);
-                    let mut compressed_buf = vec![0u8; max_out];
+                    let CoalesceUnit {
+                        vol_id,
+                        start_lba,
+                        lba_count,
+                        raw_data,
+                        compression: algo,
+                        vol_created_at,
+                        seq_lba_ranges,
+                        dedup_skipped,
+                        block_hashes,
+                        dedup_completion,
+                    } = unit;
 
-                    let (compression_byte, compressed_data) =
-                        match compressor.compress(&unit.raw_data, &mut compressed_buf) {
-                            Some(size) => (algo.to_u8(), compressed_buf[..size].to_vec()),
-                            None => (0u8, unit.raw_data.clone()),
-                        };
+                    let original_size = raw_data.len();
+                    let (compression_byte, compressed_data) = match algo {
+                        CompressionAlgo::None => (0u8, raw_data),
+                        _ => {
+                            let compressor = create_compressor(algo);
+                            let max_out = compressor.max_compressed_size(original_size);
+                            let mut compressed_buf = vec![0u8; max_out];
+                            match compressor.compress(&raw_data, &mut compressed_buf) {
+                                Some(size) => (algo.to_u8(), compressed_buf[..size].to_vec()),
+                                None => (0u8, raw_data),
+                            }
+                        }
+                    };
                     metrics.compress_units.fetch_add(1, Ordering::Relaxed);
                     metrics
                         .compress_input_bytes
@@ -581,18 +638,18 @@ impl BufferFlusher {
                     let crc32 = crc32fast::hash(&compressed_data);
 
                     let cu = CompressedUnit {
-                        vol_id: unit.vol_id,
-                        start_lba: unit.start_lba,
-                        lba_count: unit.lba_count,
+                        vol_id,
+                        start_lba,
+                        lba_count,
                         original_size: original_size as u32,
                         compressed_data,
                         compression: compression_byte,
                         crc32,
-                        vol_created_at: unit.vol_created_at,
-                        seq_lba_ranges: unit.seq_lba_ranges,
-                        block_hashes: unit.block_hashes,
-                        dedup_skipped: unit.dedup_skipped,
-                        dedup_completion: unit.dedup_completion,
+                        vol_created_at,
+                        seq_lba_ranges,
+                        block_hashes,
+                        dedup_skipped,
+                        dedup_completion,
                     };
 
                     if tx.send(cu).is_err() {
@@ -618,6 +675,7 @@ impl BufferFlusher {
     /// is sent to done_tx exactly once — either by the dedup worker (for hit-only seqs)
     /// or by the writer (for seqs that have miss blocks flowing through the pipeline).
     fn dedup_loop(
+        shard_idx: usize,
         rx: &Receiver<CoalesceUnit>,
         miss_tx: &Sender<CoalesceUnit>,
         meta: &MetaStore,
@@ -759,7 +817,7 @@ impl BufferFlusher {
                                 }
                             }
                         }
-                        let _ = pool.advance_tail();
+                        let _ = pool.advance_tail_for_shard(shard_idx);
                     }
 
                     // Recheck has_misses after potential demotions
@@ -884,6 +942,7 @@ impl BufferFlusher {
     }
 
     fn writer_loop(
+        shard_idx: usize,
         rx: &Receiver<CompressedUnit>,
         pool: &WriteBufferPool,
         meta: &MetaStore,
@@ -900,11 +959,14 @@ impl BufferFlusher {
         // DedupCompletion trackers for buffered units (decremented at seal time).
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
             Vec::new();
+        let mut tail_dirty = false;
+        let mut units_since_tail_advance = 0u32;
 
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => {
                     Self::handle_compressed_unit(
+                        shard_idx,
                         unit,
                         pool,
                         meta,
@@ -917,11 +979,19 @@ impl BufferFlusher {
                         &mut buffered_completions,
                         metrics,
                     );
+                    tail_dirty = true;
+                    units_since_tail_advance += 1;
+                    if units_since_tail_advance >= 16 {
+                        let _ = pool.advance_tail_for_shard(shard_idx);
+                        tail_dirty = false;
+                        units_since_tail_advance = 0;
+                    }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // Flush the packer's open slot on idle
                     if let Some(sealed) = packer.flush_open_slot() {
                         if let Err(e) = Self::write_packed_slot(
+                            shard_idx,
                             &sealed,
                             pool,
                             meta,
@@ -943,6 +1013,12 @@ impl BufferFlusher {
                             &mut buffered_completions,
                             done_tx,
                         );
+                        tail_dirty = true;
+                    }
+                    if tail_dirty {
+                        let _ = pool.advance_tail_for_shard(shard_idx);
+                        tail_dirty = false;
+                        units_since_tail_advance = 0;
                     }
                     continue;
                 }
@@ -953,6 +1029,7 @@ impl BufferFlusher {
         // Drain remaining messages
         while let Ok(unit) = rx.try_recv() {
             Self::handle_compressed_unit(
+                shard_idx,
                 unit,
                 pool,
                 meta,
@@ -965,11 +1042,13 @@ impl BufferFlusher {
                 &mut buffered_completions,
                 metrics,
             );
+            tail_dirty = true;
         }
 
         // Flush any remaining open slot on shutdown
         if let Some(sealed) = packer.flush_open_slot() {
             if let Err(e) = Self::write_packed_slot(
+                shard_idx,
                 &sealed,
                 pool,
                 meta,
@@ -987,6 +1066,11 @@ impl BufferFlusher {
                 );
             }
             Self::flush_buffered_done(&mut buffered_seqs, &mut buffered_completions, done_tx);
+            tail_dirty = true;
+        }
+
+        if tail_dirty {
+            let _ = pool.advance_tail_for_shard(shard_idx);
         }
     }
 
@@ -1012,6 +1096,7 @@ impl BufferFlusher {
 
     /// Handle a compressed unit in the writer thread.
     fn handle_compressed_unit(
+        shard_idx: usize,
         unit: CompressedUnit,
         pool: &WriteBufferPool,
         meta: &MetaStore,
@@ -1049,6 +1134,7 @@ impl BufferFlusher {
         match packer.pack_or_passthrough(unit) {
             Ok(PackResult::Passthrough(unit)) => {
                 if let Err(e) = Self::write_unit(
+                    shard_idx,
                     &unit,
                     pool,
                     meta,
@@ -1075,6 +1161,7 @@ impl BufferFlusher {
             },
             Ok(PackResult::SealedSlot(sealed)) => {
                 if let Err(e) = Self::write_packed_slot(
+                    shard_idx,
                     &sealed,
                     pool,
                     meta,
@@ -1102,6 +1189,7 @@ impl BufferFlusher {
             }
             Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
                 if let Err(e) = Self::write_packed_slot(
+                    shard_idx,
                     &sealed,
                     pool,
                     meta,
@@ -1121,6 +1209,7 @@ impl BufferFlusher {
                 Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
 
                 if let Err(e) = Self::write_unit(
+                    shard_idx,
                     &unit,
                     pool,
                     meta,
@@ -1141,6 +1230,7 @@ impl BufferFlusher {
             }
             Ok(PackResult::FillHole(fill)) => {
                 if let Err(e) = Self::write_hole_fill(
+                    shard_idx,
                     &fill,
                     pool,
                     meta,
@@ -1169,6 +1259,7 @@ impl BufferFlusher {
     }
 
     fn write_unit(
+        shard_idx: usize,
         unit: &CompressedUnit,
         pool: &WriteBufferPool,
         meta: &MetaStore,
@@ -1179,6 +1270,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
+            let total_start = Instant::now();
             // Hold the lifecycle read lock from generation validation through
             // metadata commit so delete/create cannot interleave with this flush.
             let vol_id = VolumeId(unit.vol_id.clone());
@@ -1204,11 +1296,13 @@ impl BufferFlusher {
                 for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
                     let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
                 }
-                let _ = pool.advance_tail();
+                let _ = pool.advance_tail_for_shard(shard_idx);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Ok(());
             }
 
             let bs = BLOCK_SIZE as usize;
+            let alloc_start = Instant::now();
             let blocks_needed = (unit.compressed_data.len() + bs - 1) / bs;
 
             let allocation = if blocks_needed == 1 {
@@ -1217,26 +1311,36 @@ impl BufferFlusher {
                 let extent = allocator.allocate_extent(blocks_needed as u32)?;
                 if (extent.count as usize) < blocks_needed {
                     allocator.free_extent(extent)?;
+                    Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
+                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                     return Err(crate::error::OnyxError::SpaceExhausted);
                 }
                 Allocation::Extent(extent)
             };
+            Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
             let pba = allocation.start_pba();
 
+            let io_start = Instant::now();
             if let Err(e) = maybe_inject_test_failure(
                 &unit.vol_id,
                 unit.start_lba,
                 FlushFailStage::BeforeIoWrite,
             ) {
                 allocation.free(allocator)?;
+                Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Err(e);
             }
 
             if let Err(e) = io_engine.write_blocks(pba, &unit.compressed_data) {
                 allocation.free(allocator)?;
+                Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Err(e);
             }
+            Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
+            let meta_start = Instant::now();
             let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
             // Per-fragment tracking for hole detection: (pba, slot_offset) → (decrement, unit_lba_count, compressed_size)
             let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
@@ -1289,6 +1393,8 @@ impl BufferFlusher {
                 FlushFailStage::BeforeMetaWrite,
             ) {
                 allocation.free(allocator)?;
+                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Err(e);
             }
 
@@ -1296,9 +1402,13 @@ impl BufferFlusher {
                 meta.atomic_batch_write(&vol_id, &batch_values, unit.lba_count, &old_pba_decrements)
             {
                 allocation.free(allocator)?;
+                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Err(e);
             }
+            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
+            let cleanup_start = Instant::now();
             for (old_pba, (_, old_blocks)) in &old_pba_meta {
                 let remaining = meta.get_refcount(*old_pba)?;
                 if remaining == 0 {
@@ -1311,8 +1421,10 @@ impl BufferFlusher {
                     }
                 }
             }
+            Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
             // Populate dedup index for newly written blocks
+            let dedup_start = Instant::now();
             if let Some(ref hashes) = unit.block_hashes {
                 let mut dedup_entries = Vec::new();
                 for (i, hash) in hashes.iter().enumerate() {
@@ -1337,20 +1449,24 @@ impl BufferFlusher {
                     meta.put_dedup_entries(&dedup_entries)?;
                 }
             }
+            Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 
             // Detect holes: fully-dead fragments in still-live packed PBAs
+            let hole_start = Instant::now();
             Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+            Self::record_elapsed(&metrics.flush_writer_hole_detect_ns, hole_start);
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
                 .flush_unit_bytes
                 .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
 
+            let mark_start = Instant::now();
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
                 if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
                     tracing::warn!(seq, error = %e, "failed to mark entry flushed");
                 }
             }
-            pool.advance_tail()?;
+            Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
 
             tracing::debug!(
                 vol = unit.vol_id,
@@ -1362,11 +1478,13 @@ impl BufferFlusher {
                 "flushed compression unit"
             );
 
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             Ok(())
         })
     }
 
     fn write_packed_slot(
+        shard_idx: usize,
         sealed: &SealedSlot,
         pool: &WriteBufferPool,
         meta: &MetaStore,
@@ -1376,6 +1494,7 @@ impl BufferFlusher {
         hole_map: &HoleMap,
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
+        let total_start = Instant::now();
         // Collect unique volume IDs and acquire read locks on ALL of them
         // BEFORE doing any work. Sorted to prevent deadlock. Held until
         // metadata commit completes — mirrors write_unit()'s with_read_lock
@@ -1465,23 +1584,31 @@ impl BufferFlusher {
         // If all fragments were discarded, free the slot PBA
         if batch_values.is_empty() {
             allocator.free_one(sealed.pba)?;
-            let _ = pool.advance_tail();
+            let _ = pool.advance_tail_for_shard(shard_idx);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Ok(());
         }
 
+        let io_start = Instant::now();
         if let Err(e) =
             maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)
         {
             allocator.free_one(sealed.pba)?;
+            Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Err(e);
         }
 
         // Write the 4KB slot data to LV3
         if let Err(e) = io_engine.write_blocks(sealed.pba, &sealed.data) {
             allocator.free_one(sealed.pba)?;
+            Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Err(e);
         }
+        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
+        let meta_start = Instant::now();
         let old_pba_decrements: HashMap<Pba, u32> = old_pba_meta
             .iter()
             .map(|(old_pba, (decrement, _))| (*old_pba, *decrement))
@@ -1491,6 +1618,8 @@ impl BufferFlusher {
             maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)
         {
             allocator.free_one(sealed.pba)?;
+            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Err(e);
         }
         maybe_pause_before_packed_meta_write(&sealed.fragments)?;
@@ -1503,10 +1632,14 @@ impl BufferFlusher {
             &old_pba_decrements,
         ) {
             allocator.free_one(sealed.pba)?;
+            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Err(e);
         }
+        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Free old PBAs whose refcount dropped to 0
+        let cleanup_start = Instant::now();
         for (old_pba, (_, old_blocks)) in &old_pba_meta {
             let remaining = meta.get_refcount(*old_pba)?;
             if remaining == 0 {
@@ -1518,8 +1651,10 @@ impl BufferFlusher {
                 }
             }
         }
+        Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
         // Populate dedup index for newly written fragments
+        let dedup_start = Instant::now();
         for frag in &sealed.fragments {
             if let Some(ref hashes) = frag.unit.block_hashes {
                 let mut dedup_entries = Vec::new();
@@ -1546,9 +1681,12 @@ impl BufferFlusher {
                 }
             }
         }
+        Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 
         // Detect holes in packed slots
+        let hole_start = Instant::now();
         Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+        Self::record_elapsed(&metrics.flush_writer_hole_detect_ns, hole_start);
         metrics
             .flush_packed_slots_written
             .fetch_add(1, Ordering::Relaxed);
@@ -1560,12 +1698,13 @@ impl BufferFlusher {
             .fetch_add(sealed.data.len() as u64, Ordering::Relaxed);
 
         // Mark entries flushed
+        let mark_start = Instant::now();
         for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
             if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
                 tracing::warn!(seq, error = %e, "failed to mark entry flushed (packed)");
             }
         }
-        pool.advance_tail()?;
+        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
 
         tracing::debug!(
             pba = sealed.pba.0,
@@ -1575,6 +1714,7 @@ impl BufferFlusher {
             "flushed packed slot"
         );
 
+        Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
         Ok(())
     }
 
@@ -1626,6 +1766,7 @@ impl BufferFlusher {
     /// to prevent concurrent delete_volume from corrupting refcount.
     /// Validates the hole is still free before writing.
     fn write_hole_fill(
+        shard_idx: usize,
         fill: &HoleFill,
         pool: &WriteBufferPool,
         meta: &MetaStore,
@@ -1635,6 +1776,7 @@ impl BufferFlusher {
         hole_map: &HoleMap,
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
+        let total_start = Instant::now();
         let unit = &fill.unit;
         let vol_id = VolumeId(unit.vol_id.clone());
 
@@ -1664,7 +1806,8 @@ impl BufferFlusher {
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
                 let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
             }
-            let _ = pool.advance_tail();
+            let _ = pool.advance_tail_for_shard(shard_idx);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Ok(());
         }
 
@@ -1679,9 +1822,11 @@ impl BufferFlusher {
             );
             // Don't mark flushed — the unit stays in the buffer and will be
             // re-dispatched by the coalescer on the next pass.
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Ok(());
         }
 
+        let io_start = Instant::now();
         // Read existing slot
         let mut slot_data = io_engine.read_blocks(fill.pba, BLOCK_SIZE as usize)?;
 
@@ -1689,6 +1834,8 @@ impl BufferFlusher {
         let start = fill.slot_offset as usize;
         let end = start + unit.compressed_data.len();
         if end > slot_data.len() {
+            Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Err(crate::error::OnyxError::Compress(format!(
                 "hole fill out of bounds: offset={} + size={} > {}",
                 start,
@@ -1700,8 +1847,10 @@ impl BufferFlusher {
 
         // Write back
         io_engine.write_blocks(fill.pba, &slot_data)?;
+        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
         // Collect old PBA decrements
+        let meta_start = Instant::now();
         let mut old_pba_decrements: HashMap<Pba, u32> = HashMap::new();
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
@@ -1759,8 +1908,10 @@ impl BufferFlusher {
         let new_rc = current_rc + unit.lba_count - self_decrement;
 
         meta.atomic_batch_write(&vol_id, &batch_values, new_rc, &old_pba_decrements)?;
+        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Free old PBAs whose refcount dropped to 0
+        let cleanup_start = Instant::now();
         for (old_pba, (_, old_blocks)) in &old_pba_meta {
             let remaining = meta.get_refcount(*old_pba)?;
             if remaining == 0 {
@@ -1772,8 +1923,10 @@ impl BufferFlusher {
                 }
             }
         }
+        Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
         // Populate dedup index for newly written blocks (same as write_unit path)
+        let dedup_start = Instant::now();
         if let Some(ref hashes) = unit.block_hashes {
             let mut dedup_entries = Vec::new();
             for (i, hash) in hashes.iter().enumerate() {
@@ -1798,21 +1951,25 @@ impl BufferFlusher {
                 meta.put_dedup_entries(&dedup_entries)?;
             }
         }
+        Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 
         // Detect any new holes from the old PBAs
+        let hole_start = Instant::now();
         Self::detect_holes(&old_frag_meta, &old_pba_meta, meta, hole_map, metrics)?;
+        Self::record_elapsed(&metrics.flush_writer_hole_detect_ns, hole_start);
         metrics.flush_hole_fills.fetch_add(1, Ordering::Relaxed);
         metrics
             .flush_hole_fill_bytes
             .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
 
         // Mark flushed
+        let mark_start = Instant::now();
         for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
             if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
                 tracing::warn!(seq, error = %e, "failed to mark flushed (hole fill)");
             }
         }
-        pool.advance_tail()?;
+        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
 
         // Inject remainder back into hole_map only after successful write.
         let frag_size = unit.compressed_data.len() as u16;
@@ -1835,22 +1992,25 @@ impl BufferFlusher {
             "filled hole in packed slot"
         );
 
+        Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
         Ok(())
     }
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(h) = self.coalesce_handle.take() {
-            let _ = h.join();
-        }
-        for h in self.dedup_handles.drain(..) {
-            let _ = h.join();
-        }
-        for h in self.compress_handles.drain(..) {
-            let _ = h.join();
-        }
-        if let Some(h) = self.writer_handle.take() {
-            let _ = h.join();
+        for lane in &mut self.lanes {
+            if let Some(h) = lane.coalesce_handle.take() {
+                let _ = h.join();
+            }
+            for h in lane.dedup_handles.drain(..) {
+                let _ = h.join();
+            }
+            for h in lane.compress_handles.drain(..) {
+                let _ = h.join();
+            }
+            if let Some(h) = lane.writer_handle.take() {
+                let _ = h.join();
+            }
         }
     }
 }

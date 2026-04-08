@@ -126,9 +126,11 @@ impl OnyxEngine {
 
         // 4. Write buffer pool
         let buf_dev = RawDevice::open(&config.buffer.device)?;
-        let buffer_pool = Arc::new(WriteBufferPool::open_with_group_commit_wait(
+        let buffer_pool = Arc::new(WriteBufferPool::open_with_options(
             buf_dev,
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
+            config.buffer.shards,
+            config.engine.zone_size_blocks,
         )?);
         buffer_pool.attach_metrics(metrics.clone());
 
@@ -356,13 +358,14 @@ impl OnyxEngine {
                 .push((name.to_string(), alive.clone()));
             self.metrics.volume_open_ops.fetch_add(1, Ordering::Relaxed);
 
+            let vol_lock = self.lifecycle.get_lock(name);
             Ok(OnyxVolume::new(
                 name.to_string(),
                 vol_config.size_bytes,
                 vol_config.created_at,
                 zm.clone(),
                 alive,
-                self.lifecycle.clone(),
+                vol_lock,
                 self.metrics.clone(),
             ))
         })

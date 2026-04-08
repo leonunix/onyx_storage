@@ -194,6 +194,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             capacity_mb: ((buf_bytes / 1024 / 1024).max(1)) as usize,
             flush_watermark_pct: 80,
             group_commit_wait_us: cfg.group_commit_wait_us,
+            shards: 1,
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig {
@@ -403,6 +404,17 @@ fn print_perf_report(
         human_bytes(delta.compress_input_bytes),
         human_bytes(delta.compress_output_bytes),
     );
+    eprintln!(
+        "writer-stage: total={} alloc={} io={} meta={} cleanup={} dedup_index={} hole_detect={} mark_flushed={}",
+        human_duration_ns(delta.flush_writer_total_ns),
+        human_duration_ns(delta.flush_writer_alloc_ns),
+        human_duration_ns(delta.flush_writer_io_ns),
+        human_duration_ns(delta.flush_writer_meta_ns),
+        human_duration_ns(delta.flush_writer_cleanup_ns),
+        human_duration_ns(delta.flush_writer_dedup_index_ns),
+        human_duration_ns(delta.flush_writer_hole_detect_ns),
+        human_duration_ns(delta.flush_writer_mark_flushed_ns),
+    );
 }
 
 fn parse_size(input: &str) -> u64 {
@@ -435,6 +447,18 @@ fn human_bytes(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[unit])
     } else {
         format!("{:.2} {}", value, UNITS[unit])
+    }
+}
+
+fn human_duration_ns(ns: u64) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.3}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.3}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.3}us", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
     }
 }
 

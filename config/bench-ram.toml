@@ -1,0 +1,37 @@
+[meta]
+rocksdb_path = "/Volumes/OnyxMetaRam/rocksdb"
+block_cache_mb = 64
+
+[storage]
+data_device = "/dev/disk7"
+block_size = 4096
+use_hugepages = false
+default_compression = "None"
+
+[buffer]
+device = "/dev/disk6"
+capacity_mb = 128
+flush_watermark_pct = 80
+group_commit_wait_us = 0
+shards = 8
+
+[ublk]
+nr_queues = 4
+queue_depth = 128
+io_buf_bytes = 1048576
+
+[flush]
+compress_workers = 4
+coalesce_max_raw_bytes = 131072
+coalesce_max_lbas = 32
+
+[engine]
+zone_count = 16
+zone_size_blocks = 256
+
+[gc]
+enabled = false
+
+[dedup]
+enabled = false
+workers = 4

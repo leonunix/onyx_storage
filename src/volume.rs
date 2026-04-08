@@ -1,9 +1,8 @@
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::engine::VolumeAliveFlag;
 use crate::error::{OnyxError, OnyxResult};
-use crate::lifecycle::VolumeLifecycleManager;
 use crate::metrics::EngineMetrics;
 use crate::types::{Lba, BLOCK_SIZE};
 use crate::zone::manager::ZoneManager;
@@ -11,7 +10,8 @@ use crate::zone::manager::ZoneManager;
 /// Per-volume IO handle (librbd-style).
 ///
 /// Thread-safe: multiple threads can call read/write concurrently.
-/// The ZoneManager's channel-based dispatch serializes per-zone.
+/// Reads are dispatched through the ZoneManager; aligned writes go directly to
+/// the durable write buffer fast path.
 ///
 /// Each handle has its own `alive` flag (Arc<AtomicBool>) which is set to
 /// false when delete_volume() is called. Once dead, the flag is never reset —
@@ -25,7 +25,8 @@ pub struct OnyxVolume {
     created_at: u64,
     zone_manager: Arc<ZoneManager>,
     alive: VolumeAliveFlag,
-    lifecycle: Arc<VolumeLifecycleManager>,
+    /// Cached per-volume lifecycle lock — avoids global Mutex<HashMap> lookup on every IO.
+    vol_lock: Arc<RwLock<()>>,
     metrics: Arc<EngineMetrics>,
 }
 
@@ -36,7 +37,7 @@ impl OnyxVolume {
         created_at: u64,
         zone_manager: Arc<ZoneManager>,
         alive: VolumeAliveFlag,
-        lifecycle: Arc<VolumeLifecycleManager>,
+        vol_lock: Arc<RwLock<()>>,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
         Self {
@@ -45,7 +46,7 @@ impl OnyxVolume {
             created_at,
             zone_manager,
             alive,
-            lifecycle,
+            vol_lock,
             metrics,
         }
     }
@@ -70,17 +71,50 @@ impl OnyxVolume {
 
     /// Write data at a byte offset. Handles alignment automatically.
     ///
-    /// - Block-aligned writes go directly to ZoneManager (fast path).
+    /// - Block-aligned writes go directly to the write buffer fast path.
     /// - Non-aligned writes perform read-modify-write on head/tail blocks.
     pub fn write(&self, offset_bytes: u64, data: &[u8]) -> OnyxResult<()> {
-        self.lifecycle
-            .with_read_lock(&self.vol_id, || self.write_locked(offset_bytes, data))
+        if data.is_empty() {
+            return Ok(());
+        }
+        let len = data.len() as u64;
+        if offset_bytes + len > self.size_bytes {
+            return Err(OnyxError::OutOfBounds {
+                offset: offset_bytes,
+                len,
+                size: self.size_bytes,
+            });
+        }
+
+        let bs = BLOCK_SIZE as u64;
+        if offset_bytes % bs == 0 && len % bs == 0 {
+            self.check_alive()?;
+            let start_lba = Lba(offset_bytes / bs);
+            let lba_count = (len / bs) as u32;
+            self.zone_manager.submit_write(
+                &self.vol_id,
+                start_lba,
+                lba_count,
+                data,
+                self.created_at,
+            )?;
+            self.metrics
+                .volume_write_ops
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .volume_write_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let _guard = self.vol_lock.read().unwrap();
+        self.write_locked(offset_bytes, data)
     }
 
     /// Read `len` bytes from a byte offset. Unmapped blocks return zeros.
     pub fn read(&self, offset_bytes: u64, len: usize) -> OnyxResult<Vec<u8>> {
-        self.lifecycle
-            .with_read_lock(&self.vol_id, || self.read_locked(offset_bytes, len))
+        let _guard = self.vol_lock.read().unwrap();
+        self.read_locked(offset_bytes, len)
     }
 
     fn write_locked(&self, offset_bytes: u64, data: &[u8]) -> OnyxResult<()> {
@@ -107,7 +141,7 @@ impl OnyxVolume {
                 &self.vol_id,
                 start_lba,
                 lba_count,
-                data.to_vec(),
+                data,
                 self.created_at,
             )?;
             self.metrics
@@ -136,17 +170,20 @@ impl OnyxVolume {
 
             if offset_in_block == 0 && write_len == BLOCK_SIZE as usize {
                 // Full block — no RMW needed
-                let chunk = data[buf_offset..buf_offset + write_len].to_vec();
                 self.zone_manager.submit_write(
                     &self.vol_id,
                     block_lba,
                     1,
-                    chunk,
+                    &data[buf_offset..buf_offset + write_len],
                     self.created_at,
                 )?;
             } else {
                 // Partial block — read-modify-write
-                let mut block = match self.zone_manager.submit_read(&self.vol_id, block_lba)? {
+                let mut block = match self.zone_manager.submit_read_with_generation(
+                    &self.vol_id,
+                    block_lba,
+                    self.created_at,
+                )? {
                     Some(d) => {
                         let mut b = d;
                         b.resize(BLOCK_SIZE as usize, 0);
@@ -160,7 +197,7 @@ impl OnyxVolume {
                     &self.vol_id,
                     block_lba,
                     1,
-                    block,
+                    &block,
                     self.created_at,
                 )?;
             }
@@ -211,7 +248,11 @@ impl OnyxVolume {
             let avail = BLOCK_SIZE as usize - offset_in_block;
             let copy_len = (remaining as usize).min(avail);
 
-            match self.zone_manager.submit_read(&self.vol_id, block_lba)? {
+            match self.zone_manager.submit_read_with_generation(
+                &self.vol_id,
+                block_lba,
+                self.created_at,
+            )? {
                 Some(data) => {
                     let src_end = (offset_in_block + copy_len).min(data.len());
                     let actual = src_end.saturating_sub(offset_in_block);

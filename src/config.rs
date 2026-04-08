@@ -63,6 +63,9 @@ pub struct BufferConfig {
     /// Max time to wait for a batched durable sync before forcing a commit (default 250us)
     #[serde(default = "default_group_commit_wait_us")]
     pub group_commit_wait_us: u64,
+    /// Number of internal journal shards inside the buffer device (default 1)
+    #[serde(default = "default_buffer_shards")]
+    pub shards: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,7 +164,10 @@ fn default_flush_watermark_pct() -> u8 {
     80
 }
 fn default_group_commit_wait_us() -> u64 {
-    250
+    0
+}
+fn default_buffer_shards() -> usize {
+    1
 }
 fn default_nr_queues() -> u16 {
     4
