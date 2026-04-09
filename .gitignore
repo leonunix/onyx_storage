@@ -5,3 +5,6 @@ Cargo.lock
 dashboard/frontend/node_modules
 dashboard/frontend/dist
 dashboard/backend/.env.local
+dashboard/backend/internal/ui/dist
+bin/
+.dev/
