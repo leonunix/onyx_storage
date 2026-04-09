@@ -9,8 +9,11 @@ use crate::types::CompressionAlgo;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OnyxConfig {
+    #[serde(default)]
     pub meta: MetaConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
     pub buffer: BufferConfig,
     #[serde(default)]
     pub ublk: UblkConfig,
@@ -26,10 +29,78 @@ pub struct OnyxConfig {
     pub service: ServiceConfig,
 }
 
+/// What the engine can do given the current configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfiguredMode {
+    /// Nothing configured — only IPC socket, no engine at all.
+    Bare,
+    /// RocksDB available but storage devices missing — metadata-only operations.
+    Standby,
+    /// Everything configured — full IO.
+    Active,
+}
+
+impl std::fmt::Display for ConfiguredMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfiguredMode::Bare => write!(f, "bare"),
+            ConfiguredMode::Standby => write!(f, "standby"),
+            ConfiguredMode::Active => write!(f, "active"),
+        }
+    }
+}
+
+impl OnyxConfig {
+    /// Detect what mode the engine should operate in, based on which
+    /// paths are configured and actually exist on disk.
+    pub fn detect_mode(&self) -> ConfiguredMode {
+        // Check RocksDB path
+        let meta_ok = self
+            .meta
+            .rocksdb_path
+            .as_ref()
+            .map(|p| !p.as_os_str().is_empty())
+            .unwrap_or(false);
+        if !meta_ok {
+            return ConfiguredMode::Bare;
+        }
+
+        // Check data + buffer devices
+        let data_ok = self
+            .storage
+            .data_device
+            .as_ref()
+            .map(|p| !p.as_os_str().is_empty() && p.exists())
+            .unwrap_or(false);
+        let buffer_ok = self
+            .buffer
+            .device
+            .as_ref()
+            .map(|p| !p.as_os_str().is_empty() && p.exists())
+            .unwrap_or(false);
+
+        if data_ok && buffer_ok {
+            ConfiguredMode::Active
+        } else {
+            ConfiguredMode::Standby
+        }
+    }
+
+    pub fn load(path: &std::path::Path) -> OnyxResult<Self> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            OnyxError::Config(format!("failed to read config file {:?}: {}", path, e))
+        })?;
+        toml::from_str(&content)
+            .map_err(|e| OnyxError::Config(format!("failed to parse config: {}", e)))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaConfig {
-    /// Path to RocksDB data directory (on LV1 / XFS)
-    pub rocksdb_path: PathBuf,
+    /// Path to RocksDB data directory (on LV1 / XFS).
+    /// None = bare mode (no metadata store, only IPC).
+    #[serde(default)]
+    pub rocksdb_path: Option<PathBuf>,
     /// Block cache size in MB (default 256)
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
@@ -37,10 +108,21 @@ pub struct MetaConfig {
     pub wal_dir: Option<PathBuf>,
 }
 
+impl Default for MetaConfig {
+    fn default() -> Self {
+        Self {
+            rocksdb_path: None,
+            block_cache_mb: default_block_cache_mb(),
+            wal_dir: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
-    /// Path to data device (LV3)
-    pub data_device: PathBuf,
+    /// Path to data device (LV3). None = standby mode (no IO).
+    #[serde(default)]
+    pub data_device: Option<PathBuf>,
     /// Block size in bytes (default 4096)
     #[serde(default = "default_block_size")]
     pub block_size: u32,
@@ -52,10 +134,22 @@ pub struct StorageConfig {
     pub default_compression: CompressionAlgo,
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            data_device: None,
+            block_size: default_block_size(),
+            use_hugepages: false,
+            default_compression: default_compression(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
-    /// Path to write buffer device (LV2)
-    pub device: PathBuf,
+    /// Path to write buffer device (LV2). None = standby mode (no IO).
+    #[serde(default)]
+    pub device: Option<PathBuf>,
     /// Buffer capacity in MB (default 16384 = 16GB)
     #[serde(default = "default_buffer_capacity_mb")]
     pub capacity_mb: usize,
@@ -68,6 +162,18 @@ pub struct BufferConfig {
     /// Number of internal journal shards inside the buffer device (default 1)
     #[serde(default = "default_buffer_shards")]
     pub shards: usize,
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        Self {
+            device: None,
+            capacity_mb: default_buffer_capacity_mb(),
+            flush_watermark_pct: default_flush_watermark_pct(),
+            group_commit_wait_us: default_group_commit_wait_us(),
+            shards: default_buffer_shards(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,12 +307,4 @@ fn default_io_buf_bytes() -> u32 {
     1024 * 1024
 }
 
-impl OnyxConfig {
-    pub fn load(path: &std::path::Path) -> OnyxResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            OnyxError::Config(format!("failed to read config file {:?}: {}", path, e))
-        })?;
-        toml::from_str(&content)
-            .map_err(|e| OnyxError::Config(format!("failed to parse config: {}", e)))
-    }
-}
+// OnyxConfig::load and should_standby are defined in the impl block above.

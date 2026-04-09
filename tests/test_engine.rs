@@ -22,18 +22,18 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: meta_dir.path().to_path_buf(),
+            rocksdb_path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             wal_dir: None,
         },
         storage: StorageConfig {
-            data_device: data_tmp.path().to_path_buf(),
+            data_device: Some(data_tmp.path().to_path_buf()),
             block_size: 4096,
             use_hugepages: false,
             default_compression: CompressionAlgo::None,
         },
         buffer: BufferConfig {
-            device: buf_tmp.path().to_path_buf(),
+            device: Some(buf_tmp.path().to_path_buf()),
             capacity_mb: 1,
             flush_watermark_pct: 80,
             group_commit_wait_us: 250,
@@ -222,7 +222,7 @@ fn engine_status_report_includes_metrics_sections() {
 
     let report = engine.status_report().unwrap();
 
-    assert!(report.contains("mode: full"));
+    assert!(report.contains("mode: active"));
     assert!(report.contains("volumes: 1"));
     assert!(report.contains("buffer_pending_entries:"));
     assert!(report.contains("volume_ops:"));

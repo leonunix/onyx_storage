@@ -64,18 +64,18 @@ impl EngineHarness {
 
         let config = OnyxConfig {
             meta: MetaConfig {
-                rocksdb_path: meta_dir.path().to_path_buf(),
+                rocksdb_path: Some(meta_dir.path().to_path_buf()),
                 block_cache_mb: 32,
                 wal_dir: None,
             },
             storage: StorageConfig {
-                data_device: data_file.path().to_path_buf(),
+                data_device: Some(data_file.path().to_path_buf()),
                 block_size: BLOCK_SIZE,
                 use_hugepages: false,
                 default_compression: CompressionAlgo::Lz4,
             },
             buffer: BufferConfig {
-                device: buffer_file.path().to_path_buf(),
+                device: Some(buffer_file.path().to_path_buf()),
                 capacity_mb: ((options.buffer_bytes / 1024 / 1024).max(1)) as usize,
                 flush_watermark_pct: 80,
                 group_commit_wait_us: 250,
@@ -123,11 +123,11 @@ impl EngineHarness {
     }
 
     pub fn buffer_path(&self) -> PathBuf {
-        self.config.buffer.device.clone()
+        self.config.buffer.device.clone().unwrap()
     }
 
     pub fn data_path(&self) -> PathBuf {
-        self.config.storage.data_device.clone()
+        self.config.storage.data_device.clone().unwrap()
     }
 
     pub fn wait_for_drain(&self, timeout: Duration) {

@@ -16,7 +16,7 @@ use onyx_storage::types::CompressionAlgo;
 )]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, default_value = "config/default.toml")]
+    #[arg(short, long, default_value = "/etc/onyx-storage/config.toml")]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -34,6 +34,8 @@ enum Command {
     },
     /// Stop a running storage engine (via Unix socket IPC)
     Stop,
+    /// Reload configuration (equivalent to SIGHUP)
+    Reload,
     /// Create a new volume
     CreateVolume {
         /// Volume name
@@ -82,10 +84,13 @@ fn main() -> anyhow::Result<()> {
         Command::Start { volume } => {
             tracing::info!("starting onyx storage engine");
 
-            let controller = ServiceController::new(config.clone())?;
+            let controller = ServiceController::new(config.clone(), cli.config.clone())?;
             let controller = Arc::new(controller);
 
-            // Register signal handlers for graceful shutdown
+            // Install SIGHUP handler for config reload
+            onyx_storage::signal::install_signal_handlers();
+
+            // Register Ctrl+C / SIGTERM handler for graceful shutdown
             let ctrl_for_signal = controller.clone();
             ctrlc::set_handler(move || {
                 ctrl_for_signal.trigger_shutdown();
@@ -104,6 +109,10 @@ fn main() -> anyhow::Result<()> {
         Command::Stop => {
             service::send_stop_command(&config.service.socket_path)?;
             println!("engine stopped");
+        }
+        Command::Reload => {
+            service::send_reload_command(&config.service.socket_path)?;
+            println!("reload requested");
         }
         Command::CreateVolume {
             name,
@@ -163,18 +172,34 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Status => {
+            let sock = &config.service.socket_path;
             println!("onyx-storage v{}", env!("CARGO_PKG_VERSION"));
             println!("config: {:?}", cli.config);
 
-            match OnyxEngine::open(&config) {
-                Ok(engine) => {
-                    print!("{}", engine.status_report()?);
-                    engine.shutdown()?;
+            if sock.exists() {
+                // Prefer IPC query to running service
+                match service::send_status_command(sock) {
+                    Ok(lines) => {
+                        for line in &lines {
+                            println!("{}", line);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("failed to query running service: {}", e);
+                    }
                 }
-                Err(full_err) => {
-                    eprintln!("full status unavailable: {}", full_err);
-                    let engine = OnyxEngine::open_meta_only(&config)?;
-                    print!("{}", engine.status_report()?);
+            } else {
+                // No running service, try direct engine access
+                match OnyxEngine::open(&config) {
+                    Ok(engine) => {
+                        print!("{}", engine.status_report()?);
+                        engine.shutdown()?;
+                    }
+                    Err(full_err) => {
+                        eprintln!("full status unavailable: {}", full_err);
+                        let engine = OnyxEngine::open_meta_only(&config)?;
+                        print!("{}", engine.status_report()?);
+                    }
                 }
             }
         }

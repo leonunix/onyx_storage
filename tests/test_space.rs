@@ -101,7 +101,7 @@ fn coalescing() {
 fn rebuild_from_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -170,7 +170,7 @@ fn total_block_count() {
 fn rebuild_empty_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -188,7 +188,7 @@ fn rebuild_empty_metadata() {
 fn rebuild_fully_allocated() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -210,7 +210,7 @@ fn rebuild_fully_allocated() {
 fn rebuild_from_blockmap_marks_multi_block_units() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };

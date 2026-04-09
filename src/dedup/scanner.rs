@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use sha2::{Digest, Sha256};
 
 use crate::buffer::pool::WriteBufferPool;
@@ -21,6 +22,7 @@ use crate::types::{VolumeId, BLOCK_SIZE};
 /// Background dedup scanner: re-processes blocks that skipped dedup under pressure.
 pub struct DedupScanner {
     running: Arc<AtomicBool>,
+    config: Arc<ArcSwap<DedupConfig>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -55,6 +57,8 @@ impl DedupScanner {
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let config_clone = config.clone();
 
         let handle = thread::Builder::new()
             .name("dedup-scanner".into())
@@ -66,7 +70,7 @@ impl DedupScanner {
                     &allocator,
                     &lifecycle,
                     &buffer_pool,
-                    &config,
+                    &config_clone,
                     &running_clone,
                 );
             })
@@ -74,8 +78,15 @@ impl DedupScanner {
 
         Self {
             running,
+            config,
             handle: Some(handle),
         }
+    }
+
+    /// Hot-reload dedup scanner configuration.
+    pub fn update_config(&self, new_config: DedupConfig) {
+        tracing::info!("dedup scanner: config updated");
+        self.config.store(Arc::new(new_config));
     }
 
     fn scan_loop(
@@ -85,11 +96,12 @@ impl DedupScanner {
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         buffer_pool: &WriteBufferPool,
-        config: &DedupConfig,
+        config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
         while running.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(config.rescan_interval_ms));
+            let cfg = config.load();
+            thread::sleep(Duration::from_millis(cfg.rescan_interval_ms));
             if !running.load(Ordering::Relaxed) {
                 break;
             }
@@ -97,7 +109,7 @@ impl DedupScanner {
             metrics.dedup_rescan_cycles.fetch_add(1, Ordering::Relaxed);
 
             // Skip if buffer is under pressure
-            if buffer_pool.fill_percentage() > config.buffer_skip_threshold_pct as u8 {
+            if buffer_pool.fill_percentage() > cfg.buffer_skip_threshold_pct as u8 {
                 metrics
                     .dedup_rescan_skipped_cycles
                     .fetch_add(1, Ordering::Relaxed);
@@ -109,7 +121,7 @@ impl DedupScanner {
                 io_engine,
                 allocator,
                 lifecycle,
-                config.max_rescan_per_cycle,
+                cfg.max_rescan_per_cycle,
             ) {
                 Ok(stats) => {
                     metrics

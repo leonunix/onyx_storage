@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use crate::buffer::pool::WriteBufferPool;
 use crate::gc::config::GcConfig;
 use crate::gc::rewriter::rewrite_candidate;
@@ -15,6 +17,7 @@ use crate::metrics::EngineMetrics;
 /// Background GC runner thread.
 pub struct GcRunner {
     running: Arc<AtomicBool>,
+    config: Arc<ArcSwap<GcConfig>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -46,6 +49,8 @@ impl GcRunner {
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let config_clone = config.clone();
 
         let handle = thread::Builder::new()
             .name("gc-runner".into())
@@ -56,7 +61,7 @@ impl GcRunner {
                     &io_engine,
                     &buffer_pool,
                     &lifecycle,
-                    &config,
+                    &config_clone,
                     &running_clone,
                 );
             })
@@ -64,8 +69,15 @@ impl GcRunner {
 
         Self {
             running,
+            config,
             handle: Some(handle),
         }
+    }
+
+    /// Hot-reload GC configuration.
+    pub fn update_config(&self, new_config: GcConfig) {
+        tracing::info!("gc: config updated");
+        self.config.store(Arc::new(new_config));
     }
 
     fn gc_loop(
@@ -74,13 +86,14 @@ impl GcRunner {
         io_engine: &IoEngine,
         buffer_pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
-        config: &GcConfig,
+        config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
     ) {
         let mut paused = false;
 
         while running.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(config.scan_interval_ms));
+            let cfg = config.load();
+            thread::sleep(Duration::from_millis(cfg.scan_interval_ms));
 
             if !running.load(Ordering::Relaxed) {
                 break;
@@ -90,22 +103,22 @@ impl GcRunner {
 
             // Back-pressure: check buffer usage
             let fill_pct = buffer_pool.fill_percentage();
-            if fill_pct > config.buffer_usage_max_pct {
+            if fill_pct > cfg.buffer_usage_max_pct {
                 metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
                 if !paused {
                     tracing::debug!(
                         fill_pct,
-                        max = config.buffer_usage_max_pct,
+                        max = cfg.buffer_usage_max_pct,
                         "gc: pausing due to high buffer usage"
                     );
                     paused = true;
                 }
                 continue;
             }
-            if paused && fill_pct <= config.buffer_usage_resume_pct {
+            if paused && fill_pct <= cfg.buffer_usage_resume_pct {
                 tracing::debug!(
                     fill_pct,
-                    resume = config.buffer_usage_resume_pct,
+                    resume = cfg.buffer_usage_resume_pct,
                     "gc: resuming"
                 );
                 paused = false;
@@ -117,8 +130,8 @@ impl GcRunner {
             // Scan for GC rewrite candidates
             let candidates = match scan_gc_candidates(
                 meta,
-                config.dead_ratio_threshold,
-                config.max_rewrite_per_cycle,
+                cfg.dead_ratio_threshold,
+                cfg.max_rewrite_per_cycle,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -146,8 +159,9 @@ impl GcRunner {
                     break;
                 }
 
-                // Re-check back-pressure before each candidate
-                if buffer_pool.fill_percentage() > config.buffer_usage_max_pct {
+                // Re-check back-pressure before each candidate (re-load config for latest thresholds)
+                let cfg = config.load();
+                if buffer_pool.fill_percentage() > cfg.buffer_usage_max_pct {
                     metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!("gc: pausing mid-cycle due to buffer pressure");
                     paused = true;

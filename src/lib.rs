@@ -22,4 +22,5 @@ pub mod zone;
 pub mod engine;
 pub mod ffi;
 pub mod service;
+pub mod signal;
 pub mod volume;

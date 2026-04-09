@@ -25,7 +25,7 @@ fn setup_flush_env() -> (
 ) {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: meta_dir.path().to_path_buf(),
+        rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };

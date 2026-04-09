@@ -45,18 +45,18 @@ fn write_and_abort(
 ) -> ! {
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: meta_dir,
+            rocksdb_path: Some(meta_dir),
             block_cache_mb: 32,
             wal_dir: None,
         },
         storage: StorageConfig {
-            data_device: data,
+            data_device: Some(data),
             block_size: BLOCK_SIZE,
             use_hugepages: false,
             default_compression: CompressionAlgo::Lz4,
         },
         buffer: BufferConfig {
-            device: buffer,
+            device: Some(buffer),
             capacity_mb: 4,
             flush_watermark_pct: 80,
             group_commit_wait_us: 250,

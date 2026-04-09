@@ -48,7 +48,7 @@ fn setup_dedup_env_with_sizes(
     data_tmp.as_file().set_len(data_bytes).unwrap();
 
     let meta_config = onyx_storage::config::MetaConfig {
-        rocksdb_path: meta_dir.path().to_path_buf(),
+        rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -282,7 +282,7 @@ fn blockmap_value_rejects_27byte_format() {
 fn dedup_index_crud() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -320,7 +320,7 @@ fn dedup_index_crud() {
 fn dedup_cleanup_on_pba_free() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -370,7 +370,7 @@ fn dedup_cleanup_on_pba_free() {
 fn scan_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -417,7 +417,7 @@ fn scan_dedup_skipped() {
 fn update_blockmap_flags_clears_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -531,7 +531,7 @@ fn dedup_hit_reuses_pba() {
 fn delete_volume_cleans_dedup_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -589,7 +589,7 @@ fn delete_volume_cleans_dedup_index() {
 fn cleanup_old_pba_preserves_newer_forward_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: dir.path().to_path_buf(),
+        rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };

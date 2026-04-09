@@ -1,0 +1,32 @@
+[Unit]
+Description=Onyx Storage Engine
+Documentation=https://github.com/anthropics/onyx-storage
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/onyx-storage --config /etc/onyx-storage/config.toml start
+ExecStop=/usr/local/bin/onyx-storage --config /etc/onyx-storage/config.toml stop
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+
+# ublk requires CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+
+# Logging — override with systemctl edit
+Environment=RUST_LOG=onyx_storage=info
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/var/lib/onyx-storage /var/run /etc/onyx-storage /dev
+PrivateTmp=yes
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

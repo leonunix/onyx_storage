@@ -179,18 +179,18 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: meta_dir.path().to_path_buf(),
+            rocksdb_path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 64,
             wal_dir: None,
         },
         storage: StorageConfig {
-            data_device: data_file.path().to_path_buf(),
+            data_device: Some(data_file.path().to_path_buf()),
             block_size: BLOCK_SIZE,
             use_hugepages: false,
             default_compression: cfg.compression,
         },
         buffer: BufferConfig {
-            device: buf_file.path().to_path_buf(),
+            device: Some(buf_file.path().to_path_buf()),
             capacity_mb: ((buf_bytes / 1024 / 1024).max(1)) as usize,
             flush_watermark_pct: 80,
             group_commit_wait_us: cfg.group_commit_wait_us,

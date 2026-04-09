@@ -92,18 +92,18 @@ fn setup_with_all_options(
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: meta_dir.path().to_path_buf(),
+            rocksdb_path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             wal_dir: None,
         },
         storage: StorageConfig {
-            data_device: data_file.path().to_path_buf(),
+            data_device: Some(data_file.path().to_path_buf()),
             block_size: 4096,
             use_hugepages: false,
             default_compression: CompressionAlgo::Lz4,
         },
         buffer: BufferConfig {
-            device: buf_file.path().to_path_buf(),
+            device: Some(buf_file.path().to_path_buf()),
             capacity_mb: 1,
             flush_watermark_pct: 80,
             group_commit_wait_us: 250,

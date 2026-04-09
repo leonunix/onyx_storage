@@ -414,7 +414,8 @@ impl EngineMetricsSnapshot {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineStatusSnapshot {
-    pub full_mode: bool,
+    /// "active", "standby", or "meta-only"
+    pub mode: String,
     pub volume_count: usize,
     pub live_handle_count: usize,
     pub zone_count: Option<u32>,
@@ -428,11 +429,7 @@ pub struct EngineStatusSnapshot {
 impl EngineStatusSnapshot {
     pub fn render_text(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(
-            out,
-            "mode: {}",
-            if self.full_mode { "full" } else { "meta-only" }
-        );
+        let _ = writeln!(out, "mode: {}", self.mode);
         let _ = writeln!(out, "uptime_secs: {}", self.metrics.uptime_secs);
         let _ = writeln!(out, "volumes: {}", self.volume_count);
         let _ = writeln!(out, "live_handles: {}", self.live_handle_count);

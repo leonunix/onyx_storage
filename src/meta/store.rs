@@ -67,9 +67,13 @@ impl MetaStore {
         dedup_reverse_opts.set_block_based_table_factory(&dedup_reverse_block_opts);
         let cf_dedup_reverse = ColumnFamilyDescriptor::new(CF_DEDUP_REVERSE, dedup_reverse_opts);
 
+        let rocksdb_path = config.rocksdb_path.as_ref().ok_or_else(|| {
+            OnyxError::Config("meta.rocksdb_path is required to open MetaStore".into())
+        })?;
+
         let db = DB::open_cf_descriptors(
             &db_opts,
-            &config.rocksdb_path,
+            rocksdb_path,
             vec![
                 cf_volumes,
                 cf_blockmap,

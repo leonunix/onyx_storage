@@ -1,5 +1,5 @@
-// Service controller: manages multi-volume ublk lifecycle and Unix socket IPC.
-// This module is only compiled on Linux (ublk is Linux-only).
+// Service controller: manages multi-volume ublk lifecycle, Unix socket IPC,
+// bare/standby/active mode transitions, and config reload.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -8,108 +8,170 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::config::OnyxConfig;
+use arc_swap::ArcSwap;
+
+use crate::config::{ConfiguredMode, OnyxConfig};
 use crate::engine::OnyxEngine;
 use crate::error::{OnyxError, OnyxResult};
 #[cfg(target_os = "linux")]
 use crate::frontend::ublk::OnyxUblkTarget;
 use crate::types::{CompressionAlgo, VolumeConfig};
 
+// ── Helpers for engine behind ArcSwap<Option<…>> ────────────────────────
+
+/// Convenience: load the current engine from the ArcSwap, return error if bare.
+/// Check that the engine is available; if bare mode, send error and `continue`.
+macro_rules! require_engine {
+    ($engine:expr, $stream:expr) => {{
+        let __guard = $engine.load();
+        let __opt: &Option<OnyxEngine> = &__guard;
+        if __opt.is_none() {
+            let _ = $stream.write_all(b"error: engine not initialised (bare mode) - configure and reload first\n");
+            let _ = $stream.flush();
+            continue;
+        }
+    }};
+}
+
 /// Manages the engine lifecycle: multiple ublk devices + Unix socket for IPC.
 pub struct ServiceController {
-    engine: Arc<OnyxEngine>,
-    config: OnyxConfig,
+    /// `None` = bare mode (no engine). `Some` = standby or active.
+    engine: Arc<ArcSwap<Option<OnyxEngine>>>,
+    config: parking_lot::RwLock<OnyxConfig>,
+    config_path: PathBuf,
     socket_path: PathBuf,
     shutdown: Arc<AtomicBool>,
-    /// Kernel device IDs of running ublk devices, protected by mutex for
-    /// concurrent access from device threads and socket listener.
+    reload_signal: Arc<AtomicBool>,
+    /// Kernel device IDs of running ublk devices.
     dev_ids: Arc<Mutex<Vec<u32>>>,
 }
 
 impl ServiceController {
-    /// Create a new service controller. Does NOT start anything yet.
-    pub fn new(config: OnyxConfig) -> OnyxResult<Self> {
-        let engine = Arc::new(OnyxEngine::open(&config)?);
+    /// Create a new service controller.
+    /// Auto-detects bare / standby / active mode from configuration.
+    pub fn new(config: OnyxConfig, config_path: PathBuf) -> OnyxResult<Self> {
+        let detected = config.detect_mode();
+
+        let engine: Option<OnyxEngine> = match detected {
+            ConfiguredMode::Bare => {
+                tracing::info!("no storage paths configured — starting in bare mode (IPC only)");
+                None
+            }
+            ConfiguredMode::Standby => {
+                tracing::info!("storage devices not configured — starting in standby mode (metadata only)");
+                Some(OnyxEngine::open_meta_only(&config)?)
+            }
+            ConfiguredMode::Active => {
+                Some(OnyxEngine::open(&config)?)
+            }
+        };
+
         let socket_path = config.service.socket_path.clone();
 
         Ok(Self {
-            engine,
-            config,
+            engine: Arc::new(ArcSwap::from_pointee(engine)),
+            config: parking_lot::RwLock::new(config),
+            config_path,
             socket_path,
             shutdown: Arc::new(AtomicBool::new(false)),
+            reload_signal: Arc::new(AtomicBool::new(false)),
             dev_ids: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
-    /// Start serving the given volumes (or all if empty).
-    /// Blocks until shutdown is triggered (via socket or signal).
+    /// Start serving volumes (or idle in bare/standby mode).
+    /// Blocks until shutdown is triggered (via socket, signal, or Ctrl+C).
     pub fn run(&self, volume_names: &[String]) -> OnyxResult<()> {
-        let volumes = self.resolve_volumes(volume_names)?;
-        if volumes.is_empty() {
-            return Err(OnyxError::Config("no volumes to start".into()));
-        }
-
-        for vol in &volumes {
-            tracing::info!(volume = %vol.id.0, "opening volume");
-            self.engine.open_volume(&vol.id.0)?;
-        }
-
         // Clean up stale socket file
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
 
-        // Start socket listener thread
+        // Start socket listener thread (always, even in bare/standby)
         let socket_handle = self.start_socket_listener()?;
 
-        // Start ublk devices on Linux
+        // In active mode, open volumes and start ublk devices
         #[cfg(target_os = "linux")]
-        let device_handles = self.start_ublk_devices(&volumes)?;
+        let mut device_handles: Vec<JoinHandle<OnyxResult<()>>> = Vec::new();
 
-        #[cfg(not(target_os = "linux"))]
-        let device_handles: Vec<JoinHandle<OnyxResult<()>>> = Vec::new();
-
-        #[cfg(not(target_os = "linux"))]
         {
-            tracing::warn!("ublk is only available on Linux, engine will idle");
-            // Wait for shutdown signal on non-Linux
-            while !self.shutdown.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+            let guard = self.engine.load();
+            let opt: &Option<OnyxEngine> = &guard;
+            match opt.as_ref() {
+                Some(eng) if eng.is_full_mode() => {
+                    let volumes = self.resolve_volumes(volume_names)?;
+                    if !volumes.is_empty() {
+                        for vol in &volumes {
+                            tracing::info!(volume = %vol.id.0, "opening volume");
+                            eng.open_volume(&vol.id.0)?;
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            device_handles = self.start_ublk_devices(&volumes)?;
+                        }
+                    }
+                }
+                Some(_) => {
+                    tracing::info!("standby mode -- waiting for config reload to activate");
+                }
+                None => {
+                    tracing::info!("bare mode -- waiting for config reload");
+                }
             }
         }
 
-        // Wait for all device threads to finish
-        for handle in device_handles {
-            if let Err(e) = handle.join() {
-                tracing::error!("ublk device thread panicked: {:?}", e);
+        // Main loop: poll shutdown and reload flags
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
             }
+
+            let needs_reload = self.reload_signal.swap(false, Ordering::SeqCst)
+                || crate::signal::take_reload_flag();
+            if needs_reload {
+                if let Err(e) = self.handle_reload() {
+                    tracing::error!(error = %e, "config reload failed");
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
-        // Graceful engine shutdown (flusher, GC, dedup, zones)
-        self.engine.shutdown()?;
+        // Graceful shutdown
+        {
+            let guard = self.engine.load();
+            let opt: &Option<OnyxEngine> = &guard;
+            if let Some(eng) = opt.as_ref() {
+                eng.shutdown()?;
+            }
+        }
 
         // Stop socket listener
-        self.shutdown.store(true, Ordering::Relaxed);
-        // Connect to unblock the listener's accept()
         let _ = UnixStream::connect(&self.socket_path);
         if let Err(e) = socket_handle.join() {
             tracing::error!("socket listener thread panicked: {:?}", e);
         }
         let _ = std::fs::remove_file(&self.socket_path);
 
+        // Wait for ublk device threads
+        #[cfg(target_os = "linux")]
+        for handle in device_handles {
+            if let Err(e) = handle.join() {
+                tracing::error!("ublk device thread panicked: {:?}", e);
+            }
+        }
+
         tracing::info!("service stopped");
         Ok(())
     }
 
-    /// Trigger graceful shutdown: kill all ublk devices, then engine shutdown
-    /// will happen when run() resumes.
+    /// Trigger graceful shutdown.
     pub fn trigger_shutdown(&self) {
         if self.shutdown.swap(true, Ordering::SeqCst) {
-            return; // Already shutting down
+            return;
         }
         tracing::info!("shutdown requested");
 
-        // Kill all ublk devices — this causes run_target() to return in each thread
         #[cfg(target_os = "linux")]
         {
             let dev_ids = self.dev_ids.lock().unwrap().clone();
@@ -122,14 +184,184 @@ impl ServiceController {
         }
     }
 
+    /// Trigger a config reload (from IPC).
+    pub fn trigger_reload(&self) {
+        self.reload_signal.store(true, Ordering::SeqCst);
+    }
+
+    // ── Reload logic ────────────────────────────────────────────────────
+
+    fn handle_reload(&self) -> OnyxResult<()> {
+        tracing::info!(path = %self.config_path.display(), "reloading configuration");
+
+        let new_config = OnyxConfig::load(&self.config_path)?;
+        let new_mode = new_config.detect_mode();
+        let guard = self.engine.load();
+        let engine_ref: &Option<OnyxEngine> = &guard;
+        let has_engine = engine_ref.is_some();
+        let is_active = engine_ref
+            .as_ref()
+            .map(|e| e.is_full_mode())
+            .unwrap_or(false);
+        drop(guard);
+
+        match (has_engine, is_active, new_mode) {
+            // bare → standby
+            (false, _, ConfiguredMode::Standby) => {
+                tracing::info!("bare → standby: opening metadata store");
+                let eng = OnyxEngine::open_meta_only(&new_config)?;
+                self.engine.store(Arc::new(Some(eng)));
+            }
+            // bare → active
+            (false, _, ConfiguredMode::Active) => {
+                tracing::info!("bare → active: opening full engine");
+                let eng = OnyxEngine::open(&new_config)?;
+                let eng = Arc::new(Some(eng));
+                self.engine.store(eng.clone());
+                self.activate_volumes(&new_config)?;
+            }
+            // standby → active
+            (true, false, ConfiguredMode::Active) => {
+                self.transition_to_active(&new_config)?;
+            }
+            // active → active: hot-reload params
+            (true, true, ConfiguredMode::Active) => {
+                self.hot_reload_params(&new_config);
+            }
+            // still bare
+            (false, _, ConfiguredMode::Bare) => {
+                tracing::info!("config reload: still in bare mode (nothing configured)");
+            }
+            // still standby
+            (true, false, ConfiguredMode::Standby) => {
+                tracing::info!("config reload: still in standby (devices not configured)");
+            }
+            // active → downgrade not supported
+            (true, true, ConfiguredMode::Standby | ConfiguredMode::Bare) => {
+                tracing::warn!("config reload: downgrade from active requires a restart");
+            }
+            // bare → bare (already covered above but for completeness)
+            _ => {}
+        }
+
+        *self.config.write() = new_config;
+        Ok(())
+    }
+
+    fn transition_to_active(&self, new_config: &OnyxConfig) -> OnyxResult<()> {
+        tracing::info!("transitioning from standby to active mode");
+
+        // Extract MetaStore from old engine (avoid RocksDB double-open)
+        let meta = {
+            let guard = self.engine.load();
+            let opt: &Option<OnyxEngine> = &guard;
+            let old_engine = opt.as_ref().ok_or_else(|| {
+                OnyxError::Config("expected standby engine but got bare".into())
+            })?;
+            let meta = old_engine.meta().clone();
+            old_engine.shutdown()?;
+            meta
+        };
+
+        // Build full engine reusing the existing MetaStore
+        let new_engine = OnyxEngine::upgrade_from_meta_only(meta, new_config)?;
+        self.engine.store(Arc::new(Some(new_engine)));
+
+        self.activate_volumes(new_config)?;
+        tracing::info!("engine activated successfully");
+        Ok(())
+    }
+
+    /// Open all volumes and start ublk devices for them.
+    fn activate_volumes(&self, _new_config: &OnyxConfig) -> OnyxResult<()> {
+        let guard = self.engine.load();
+        let opt: &Option<OnyxEngine> = &guard;
+        let engine = opt.as_ref().unwrap();
+        let volumes = engine.list_volumes()?;
+
+        for vol in &volumes {
+            tracing::info!(volume = %vol.id.0, "opening volume after activation");
+            engine.open_volume(&vol.id.0)?;
+        }
+
+        #[cfg(target_os = "linux")]
+        if !volumes.is_empty() {
+            let config = self.config.read();
+            let zm = engine
+                .zone_manager()
+                .ok_or_else(|| OnyxError::Config("no zone manager after activation".into()))?
+                .clone();
+
+            for vol in &volumes {
+                let target = OnyxUblkTarget::new(&config.ublk, zm.clone(), vol)?;
+                let dev_ids = self.dev_ids.clone();
+                let vol_name = vol.id.0.clone();
+
+                thread::Builder::new()
+                    .name(format!("ublk-{}", vol_name))
+                    .spawn(move || {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let dev_ids_inner = dev_ids.clone();
+                        let vol_name_inner = vol_name.clone();
+                        thread::spawn(move || {
+                            if let Ok(id) = rx.recv() {
+                                tracing::info!(volume = %vol_name_inner, dev_id = id, "ublk device registered");
+                                dev_ids_inner.lock().unwrap().push(id);
+                            }
+                        });
+                        if let Err(e) = target.run(Some(tx)) {
+                            tracing::error!(volume = %vol_name, error = %e, "ublk device failed");
+                        }
+                    })
+                    .map_err(|e| OnyxError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn hot_reload_params(&self, new_config: &OnyxConfig) {
+        let old_config = self.config.read();
+
+        if old_config.storage.data_device != new_config.storage.data_device {
+            tracing::warn!("storage.data_device changed — requires restart to take effect");
+        }
+        if old_config.buffer.device != new_config.buffer.device {
+            tracing::warn!("buffer.device changed — requires restart to take effect");
+        }
+        if old_config.meta.rocksdb_path != new_config.meta.rocksdb_path {
+            tracing::warn!("meta.rocksdb_path changed — requires restart to take effect");
+        }
+        if old_config.engine.zone_count != new_config.engine.zone_count {
+            tracing::warn!("engine.zone_count changed — requires restart to take effect");
+        }
+
+        {
+            let guard = self.engine.load();
+            let opt: &Option<OnyxEngine> = &guard;
+            if let Some(eng) = opt.as_ref() {
+                eng.update_gc_config(new_config.gc.clone());
+                eng.update_dedup_config(new_config.dedup.clone());
+            }
+        }
+
+        tracing::info!("configuration hot-reloaded (gc, dedup parameters updated)");
+    }
+
+    // ── Volume / device helpers ─────────────────────────────────────────
+
     fn resolve_volumes(&self, names: &[String]) -> OnyxResult<Vec<VolumeConfig>> {
+        let guard = self.engine.load();
+        let opt: &Option<OnyxEngine> = &guard;
+        let engine = opt.as_ref().ok_or_else(|| {
+            OnyxError::Config("engine not initialised".into())
+        })?;
         if names.is_empty() {
-            self.engine.list_volumes()
+            engine.list_volumes()
         } else {
             let mut volumes = Vec::with_capacity(names.len());
             for name in names {
-                let vol = self
-                    .engine
+                let vol = engine
                     .meta()
                     .get_volume(&crate::types::VolumeId(name.clone()))?
                     .ok_or_else(|| OnyxError::VolumeNotFound(name.clone()))?;
@@ -141,16 +373,21 @@ impl ServiceController {
 
     #[cfg(target_os = "linux")]
     fn start_ublk_devices(&self, volumes: &[VolumeConfig]) -> OnyxResult<Vec<JoinHandle<OnyxResult<()>>>> {
-        let zm = self
-            .engine
+        let guard = self.engine.load();
+        let opt: &Option<OnyxEngine> = &guard;
+        let engine = opt.as_ref().ok_or_else(|| {
+            OnyxError::Config("engine not initialised".into())
+        })?;
+        let zm = engine
             .zone_manager()
             .ok_or_else(|| OnyxError::Config("no zone manager in meta-only mode".into()))?
             .clone();
+        let config = self.config.read();
 
         let mut handles = Vec::with_capacity(volumes.len());
 
         for vol in volumes {
-            let target = OnyxUblkTarget::new(&self.config.ublk, zm.clone(), vol)?;
+            let target = OnyxUblkTarget::new(&config.ublk, zm.clone(), vol)?;
             let dev_ids = self.dev_ids.clone();
             let vol_name = vol.id.0.clone();
 
@@ -158,7 +395,6 @@ impl ServiceController {
                 .name(format!("ublk-{}", vol_name))
                 .spawn(move || {
                     let (tx, rx) = std::sync::mpsc::channel();
-                    // Spawn a helper to register the dev_id once it's ready
                     let dev_ids_inner = dev_ids.clone();
                     let vol_name_inner = vol_name.clone();
                     thread::spawn(move || {
@@ -179,8 +415,9 @@ impl ServiceController {
         Ok(handles)
     }
 
+    // ── IPC socket ──────────────────────────────────────────────────────
+
     fn start_socket_listener(&self) -> OnyxResult<JoinHandle<()>> {
-        // Ensure parent directory exists
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 OnyxError::Config(format!(
@@ -204,11 +441,12 @@ impl ServiceController {
         let dev_ids = self.dev_ids.clone();
         let socket_path = self.socket_path.clone();
         let engine = self.engine.clone();
+        let reload_signal = self.reload_signal.clone();
 
         let handle = thread::Builder::new()
             .name("ipc-listener".into())
             .spawn(move || {
-                Self::socket_loop(&listener, &shutdown, &dev_ids, &socket_path, &engine);
+                Self::socket_loop(&listener, &shutdown, &dev_ids, &socket_path, &engine, &reload_signal);
             })
             .map_err(|e| OnyxError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
@@ -221,7 +459,8 @@ impl ServiceController {
         shutdown: &AtomicBool,
         dev_ids: &Mutex<Vec<u32>>,
         _socket_path: &Path,
-        engine: &Arc<OnyxEngine>,
+        engine: &Arc<ArcSwap<Option<OnyxEngine>>>,
+        reload_signal: &AtomicBool,
     ) {
         for stream in listener.incoming() {
             if shutdown.load(Ordering::Relaxed) {
@@ -229,7 +468,7 @@ impl ServiceController {
             }
             match stream {
                 Ok(stream) => {
-                    Self::handle_client(stream, shutdown, dev_ids, engine);
+                    Self::handle_client(stream, shutdown, dev_ids, engine, reload_signal);
                 }
                 Err(e) => {
                     if shutdown.load(Ordering::Relaxed) {
@@ -245,7 +484,8 @@ impl ServiceController {
         mut stream: UnixStream,
         shutdown: &AtomicBool,
         dev_ids: &Mutex<Vec<u32>>,
-        engine: &Arc<OnyxEngine>,
+        engine: &Arc<ArcSwap<Option<OnyxEngine>>>,
+        reload_signal: &AtomicBool,
     ) {
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
 
@@ -262,6 +502,7 @@ impl ServiceController {
             let cmd = line.trim().to_string();
             let parts: Vec<&str> = cmd.splitn(4, ' ').collect();
             match parts[0] {
+                // ── Always-available commands ────────────────────────
                 "shutdown" | "stop" => {
                     tracing::info!("received shutdown command via socket");
                     shutdown.store(true, Ordering::SeqCst);
@@ -280,8 +521,59 @@ impl ServiceController {
                     let _ = stream.flush();
                     return;
                 }
+                "reload" => {
+                    tracing::info!("received reload command via socket");
+                    reload_signal.store(true, Ordering::SeqCst);
+                    let _ = stream.write_all(b"ok\n");
+                    let _ = stream.flush();
+                }
+                "ping" => {
+                    let _ = stream.write_all(b"pong\n");
+                    let _ = stream.flush();
+                }
+                "status" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let ids = dev_ids.lock().unwrap();
+                    match opt.as_ref() {
+                        None => {
+                            let msg = format!(
+                                "mode: bare, {} ublk device(s): {:?}\n",
+                                ids.len(), *ids
+                            );
+                            let _ = stream.write_all(msg.as_bytes());
+                        }
+                        Some(eng) => {
+                            let mode_str = if eng.is_full_mode() { "active" } else { "standby" };
+                            let msg = format!(
+                                "mode: {}, {} ublk device(s): {:?}\n",
+                                mode_str, ids.len(), *ids
+                            );
+                            let _ = stream.write_all(msg.as_bytes());
+                            if let Ok(report) = eng.status_report() {
+                                let _ = stream.write_all(report.as_bytes());
+                            }
+                        }
+                    }
+                    let _ = stream.write_all(b"ok\n");
+                    let _ = stream.flush();
+                }
+                "mode" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let mode_str = match opt.as_ref() {
+                        None => "bare",
+                        Some(eng) if eng.is_full_mode() => "active",
+                        Some(_) => "standby",
+                    };
+                    let msg = format!("{}\nok\n", mode_str);
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
+
+                // ── Commands that require an engine ─────────────────
                 "create-volume" => {
-                    // create-volume <name> <size> <compression>
+                    require_engine!(engine, stream);
                     if parts.len() < 4 {
                         let _ = stream.write_all(b"error: usage: create-volume <name> <size> <compression>\n");
                         let _ = stream.flush();
@@ -302,7 +594,10 @@ impl ServiceController {
                         "zstd" => CompressionAlgo::Zstd { level: 3 },
                         _ => CompressionAlgo::Lz4,
                     };
-                    match engine.create_volume(name, size, algo) {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.create_volume(name, size, algo) {
                         Ok(_) => {
                             let msg = format!("ok {}\n", name);
                             let _ = stream.write_all(msg.as_bytes());
@@ -315,14 +610,17 @@ impl ServiceController {
                     let _ = stream.flush();
                 }
                 "delete-volume" => {
-                    // delete-volume <name>
+                    require_engine!(engine, stream);
                     if parts.len() < 2 {
                         let _ = stream.write_all(b"error: usage: delete-volume <name>\n");
                         let _ = stream.flush();
                         continue;
                     }
                     let name = parts[1];
-                    match engine.delete_volume(name) {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.delete_volume(name) {
                         Ok(freed) => {
                             let msg = format!("ok {}\n", freed);
                             let _ = stream.write_all(msg.as_bytes());
@@ -335,7 +633,11 @@ impl ServiceController {
                     let _ = stream.flush();
                 }
                 "list-volumes" => {
-                    match engine.list_volumes() {
+                    require_engine!(engine, stream);
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.list_volumes() {
                         Ok(volumes) => {
                             for vol in &volumes {
                                 let msg = format!(
@@ -353,16 +655,6 @@ impl ServiceController {
                     }
                     let _ = stream.flush();
                 }
-                "status" => {
-                    let ids = dev_ids.lock().unwrap();
-                    let msg = format!("running, {} ublk device(s): {:?}\n", ids.len(), *ids);
-                    let _ = stream.write_all(msg.as_bytes());
-                    let _ = stream.flush();
-                }
-                "ping" => {
-                    let _ = stream.write_all(b"pong\n");
-                    let _ = stream.flush();
-                }
                 _ => {
                     let _ = stream.write_all(b"error: unknown command\n");
                     let _ = stream.flush();
@@ -372,8 +664,9 @@ impl ServiceController {
     }
 }
 
+// ── IPC client helpers ──────────────────────────────────────────────────
+
 /// Send a command to a running service via its Unix socket.
-/// Returns all response lines (without the trailing "ok" line).
 fn send_ipc_command(socket_path: &Path, command: &str) -> OnyxResult<Vec<String>> {
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         OnyxError::Config(format!(
@@ -407,13 +700,16 @@ fn send_ipc_command(socket_path: &Path, command: &str) -> OnyxResult<Vec<String>
     Ok(lines)
 }
 
-/// Send a stop command to a running service.
 pub fn send_stop_command(socket_path: &Path) -> OnyxResult<()> {
     send_ipc_command(socket_path, "shutdown")?;
     Ok(())
 }
 
-/// Create a volume on a running service via IPC.
+pub fn send_reload_command(socket_path: &Path) -> OnyxResult<()> {
+    send_ipc_command(socket_path, "reload")?;
+    Ok(())
+}
+
 pub fn send_create_volume(
     socket_path: &Path,
     name: &str,
@@ -425,10 +721,8 @@ pub fn send_create_volume(
     Ok(())
 }
 
-/// Delete a volume on a running service via IPC. Returns freed block count.
 pub fn send_delete_volume(socket_path: &Path, name: &str) -> OnyxResult<u64> {
     let lines = send_ipc_command(socket_path, &format!("delete-volume {}", name))?;
-    // Response: "ok <freed>"
     if let Some(line) = lines.first() {
         if let Some(freed_str) = line.strip_prefix("ok ") {
             return freed_str.parse().map_err(|_| {
@@ -439,9 +733,17 @@ pub fn send_delete_volume(socket_path: &Path, name: &str) -> OnyxResult<u64> {
     Ok(0)
 }
 
-/// List volumes on a running service via IPC.
 pub fn send_list_volumes(socket_path: &Path) -> OnyxResult<Vec<String>> {
     let lines = send_ipc_command(socket_path, "list-volumes")?;
-    // Filter out the trailing "ok"
     Ok(lines.into_iter().filter(|l| l != "ok").collect())
+}
+
+pub fn send_status_command(socket_path: &Path) -> OnyxResult<Vec<String>> {
+    let lines = send_ipc_command(socket_path, "status")?;
+    Ok(lines.into_iter().filter(|l| l != "ok").collect())
+}
+
+pub fn send_mode_command(socket_path: &Path) -> OnyxResult<String> {
+    let lines = send_ipc_command(socket_path, "mode")?;
+    Ok(lines.into_iter().find(|l| l != "ok").unwrap_or_default())
 }

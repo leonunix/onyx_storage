@@ -116,7 +116,10 @@ impl OnyxEngine {
         // (no shared deletion state needed — per-handle alive flags are used)
 
         // 2. Data device + IO engine
-        let data_dev = RawDevice::open(&config.storage.data_device)?;
+        let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
+            OnyxError::Config("storage.data_device is required for full mode".into())
+        })?;
+        let data_dev = RawDevice::open(data_path)?;
         let device_size = data_dev.size();
         let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
 
@@ -125,7 +128,10 @@ impl OnyxEngine {
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool
-        let buf_dev = RawDevice::open(&config.buffer.device)?;
+        let buf_path = config.buffer.device.as_ref().ok_or_else(|| {
+            OnyxError::Config("buffer.device is required for full mode".into())
+        })?;
+        let buf_dev = RawDevice::open(buf_path)?;
         let buffer_pool = Arc::new(WriteBufferPool::open_with_options(
             buf_dev,
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
@@ -402,6 +408,144 @@ impl OnyxEngine {
         Ok(())
     }
 
+    /// Upgrade from a meta-only engine to full mode, reusing the existing MetaStore.
+    ///
+    /// This avoids the RocksDB exclusive directory lock problem: the old engine's
+    /// MetaStore Arc is shared with the new engine rather than opening a second one.
+    pub fn upgrade_from_meta_only(
+        meta: Arc<MetaStore>,
+        config: &OnyxConfig,
+    ) -> OnyxResult<Self> {
+        let lifecycle = Arc::new(VolumeLifecycleManager::default());
+        let metrics = Arc::new(EngineMetrics::default());
+        let generation_clock = Self::seed_generation_clock(&meta)?;
+
+        // Data device + IO engine
+        let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
+            OnyxError::Config("storage.data_device is required for full mode".into())
+        })?;
+        let data_dev = RawDevice::open(data_path)?;
+        let device_size = data_dev.size();
+        let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
+
+        // Space allocator
+        let allocator = Arc::new(SpaceAllocator::new(device_size));
+        allocator.rebuild_from_metadata(&meta)?;
+
+        // Write buffer pool
+        let buf_path = config.buffer.device.as_ref().ok_or_else(|| {
+            OnyxError::Config("buffer.device is required for full mode".into())
+        })?;
+        let buf_dev = RawDevice::open(buf_path)?;
+        let buffer_pool = Arc::new(WriteBufferPool::open_with_options(
+            buf_dev,
+            std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
+            config.buffer.shards,
+            config.engine.zone_size_blocks,
+            std::time::Duration::from_secs(30),
+        )?);
+        buffer_pool.attach_metrics(metrics.clone());
+
+        // Recover unflushed entries
+        let unflushed = buffer_pool.recover()?;
+        if !unflushed.is_empty() {
+            tracing::info!(count = unflushed.len(), "replaying unflushed buffer entries");
+        }
+
+        // Shared hole map
+        let hole_map = crate::packer::packer::new_hole_map();
+
+        // Background flusher
+        let flusher = BufferFlusher::start_with_metrics(
+            buffer_pool.clone(),
+            meta.clone(),
+            lifecycle.clone(),
+            allocator.clone(),
+            io_engine.clone(),
+            &config.flush,
+            hole_map.clone(),
+            &config.dedup,
+            metrics.clone(),
+        );
+
+        // Zone manager
+        let zone_manager = Arc::new(ZoneManager::new_with_metrics(
+            config.engine.zone_count,
+            config.engine.zone_size_blocks,
+            meta.clone(),
+            buffer_pool.clone(),
+            io_engine.clone(),
+            metrics.clone(),
+        )?);
+
+        // Dedup scanner
+        let dedup_scanner = if config.dedup.enabled {
+            Some(DedupScanner::start_with_metrics(
+                metrics.clone(),
+                meta.clone(),
+                io_engine.clone(),
+                allocator.clone(),
+                lifecycle.clone(),
+                buffer_pool.clone(),
+                config.dedup.clone(),
+            ))
+        } else {
+            None
+        };
+
+        // GC runner
+        let gc_runner = if config.gc.enabled {
+            Some(GcRunner::start_with_metrics(
+                metrics.clone(),
+                meta.clone(),
+                io_engine.clone(),
+                buffer_pool.clone(),
+                lifecycle.clone(),
+                config.gc.clone(),
+            ))
+        } else {
+            None
+        };
+
+        tracing::info!("onyx engine upgraded to full mode");
+
+        Ok(Self {
+            meta,
+            io_engine: Some(io_engine),
+            allocator: Some(allocator),
+            buffer_pool: Some(buffer_pool),
+            flusher: Mutex::new(Some(flusher)),
+            gc_runner: Mutex::new(gc_runner),
+            dedup_scanner: Mutex::new(dedup_scanner),
+            zone_manager: Some(zone_manager),
+            live_handles: Mutex::new(Vec::new()),
+            lifecycle,
+            metrics,
+            generation_clock: AtomicU64::new(generation_clock),
+            config: config.clone(),
+            shutdown_done: Mutex::new(false),
+        })
+    }
+
+    /// Update GC config on a running engine (hot-reload).
+    pub fn update_gc_config(&self, config: crate::gc::config::GcConfig) {
+        if let Some(gc) = self.gc_runner.lock().unwrap().as_ref() {
+            gc.update_config(config);
+        }
+    }
+
+    /// Update dedup scanner config on a running engine (hot-reload).
+    pub fn update_dedup_config(&self, config: crate::dedup::config::DedupConfig) {
+        if let Some(scanner) = self.dedup_scanner.lock().unwrap().as_ref() {
+            scanner.update_config(config);
+        }
+    }
+
+    /// Whether the engine is in full IO mode (not meta-only / standby).
+    pub fn is_full_mode(&self) -> bool {
+        self.zone_manager.is_some()
+    }
+
     /// Access the MetaStore (for advanced use / testing).
     pub fn meta(&self) -> &Arc<MetaStore> {
         &self.meta
@@ -433,7 +577,11 @@ impl OnyxEngine {
 
     pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {
         Ok(EngineStatusSnapshot {
-            full_mode: self.zone_manager.is_some(),
+            mode: if self.zone_manager.is_some() {
+                "active".to_string()
+            } else {
+                "standby".to_string()
+            },
             volume_count: self.meta.list_volumes()?.len(),
             live_handle_count: self
                 .live_handles

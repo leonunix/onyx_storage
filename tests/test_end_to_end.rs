@@ -57,7 +57,7 @@ fn setup_e2e() -> (
 ) {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: meta_dir.path().to_path_buf(),
+        rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -191,7 +191,7 @@ fn bulk_write_flush_read() {
 fn write_flush_read_zstd() {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: meta_dir.path().to_path_buf(),
+        rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -239,7 +239,7 @@ fn write_flush_read_zstd() {
 fn write_flush_read_no_compression() {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: meta_dir.path().to_path_buf(),
+        rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         wal_dir: None,
     };
