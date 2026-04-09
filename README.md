@@ -42,6 +42,21 @@ SpaceAllocator (BTreeSet free list, strip-aligned allocation)
 dm-raid + LVM --> NVMe SSD x N
 ```
 
+## Repository Layout
+
+```text
+.
+├── src/           Rust storage engine
+├── config/        Engine configuration
+├── tests/         Rust integration / correctness tests
+└── dashboard/     Control plane subproject
+    ├── backend/   Go API, RBAC, audit, Onyx/dm/LVM adapters
+    ├── frontend/  Vue 3 + Bootstrap management UI
+    └── docs/      Architecture, RBAC, roadmap
+```
+
+`dashboard/` is tracked from this repository as a Git submodule. It is the control-plane subproject for Onyx, versioned independently but mounted inside the main repository workflow.
+
 ## Quick Start
 
 ### Prerequisites
@@ -54,6 +69,33 @@ dm-raid + LVM --> NVMe SSD x N
 
 ```bash
 cargo build --release
+```
+
+Or use the top-level helper targets:
+
+```bash
+make
+make all
+make engine-build
+make engine-test
+```
+
+`make` and `make all` build the Rust storage engine only. They do not build the dashboard submodule by default.
+
+Build dashboard only when you explicitly need it:
+
+```bash
+make dashboard-backend
+make dashboard-frontend
+make dashboard-backend-build
+make dashboard-frontend-build
+make dashboard-build
+```
+
+If you cloned the repository fresh, initialize the submodule first:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ### Configure
@@ -110,6 +152,31 @@ onyx-storage -c config/default.toml delete-volume -n newvol
 
 # Graceful stop (via Unix socket, or Ctrl+C / SIGTERM)
 onyx-storage -c config/default.toml stop
+```
+
+## Dashboard Subproject
+
+The dashboard subproject lives under [dashboard/README.md](dashboard/README.md) and covers:
+
+- device / dm / LVM topology discovery
+- Onyx volume lifecycle management
+- engine status and metrics views
+- RBAC, login, and audit log foundations
+
+Run it from the main repository:
+
+```bash
+make dashboard-backend
+make dashboard-frontend
+```
+
+The dashboard is optional and is not part of the default storage-engine build artifact.
+
+Or manually:
+
+```bash
+cd dashboard/backend && go run ./cmd/dashboardd
+cd dashboard/frontend && npm install && npm run dev
 ```
 
 ## Design Highlights

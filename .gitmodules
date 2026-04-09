@@ -1,0 +1,3 @@
+[submodule "dashboard"]
+	path = dashboard
+	url = git@github.com:leonunix/oynx_storage_dashboard.git
