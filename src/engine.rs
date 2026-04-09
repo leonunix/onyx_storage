@@ -93,6 +93,106 @@ impl OnyxEngine {
         }
     }
 
+    /// Open buffer pool, handling shard count migration at startup if needed.
+    fn open_buffer_pool(
+        config: &OnyxConfig,
+        meta: &Arc<MetaStore>,
+        lifecycle: &Arc<VolumeLifecycleManager>,
+        allocator: &Arc<SpaceAllocator>,
+        io_engine: &Arc<IoEngine>,
+        metrics: &Arc<EngineMetrics>,
+    ) -> OnyxResult<Arc<WriteBufferPool>> {
+        let buf_path = config.buffer.device.as_ref().ok_or_else(|| {
+            OnyxError::Config("buffer.device is required for full mode".into())
+        })?;
+
+        // Detect shard count change and migrate if needed
+        let probe_dev = RawDevice::open(buf_path)?;
+        let disk_shards = WriteBufferPool::read_disk_shard_count(&probe_dev)?;
+        drop(probe_dev);
+
+        if let Some(old_count) = disk_shards {
+            if old_count != config.buffer.shards {
+                tracing::info!(
+                    old_shards = old_count,
+                    new_shards = config.buffer.shards,
+                    "shard count changed — attempting online migration"
+                );
+                // Try direct open (auto-reinit if buffer already clean)
+                let try_dev = RawDevice::open(buf_path)?;
+                let direct = WriteBufferPool::open_with_options(
+                    try_dev,
+                    std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
+                    config.buffer.shards,
+                    config.engine.zone_size_blocks,
+                    std::time::Duration::from_secs(30),
+                );
+                match direct {
+                    Ok(pool) => drop(pool), // clean, will reopen below
+                    Err(_) => {
+                        // Drain unflushed entries with old shard layout
+                        tracing::info!(
+                            old_shards = old_count,
+                            "opening buffer with old shard count to drain"
+                        );
+                        let old_dev = RawDevice::open(buf_path)?;
+                        let old_pool = Arc::new(WriteBufferPool::open_with_options(
+                            old_dev,
+                            std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
+                            old_count,
+                            config.engine.zone_size_blocks,
+                            std::time::Duration::from_secs(30),
+                        )?);
+                        old_pool.attach_metrics(metrics.clone());
+                        let old_unflushed = old_pool.recover()?;
+                        if !old_unflushed.is_empty() {
+                            tracing::info!(
+                                count = old_unflushed.len(),
+                                "draining unflushed entries before shard migration"
+                            );
+                        }
+                        let temp_hole_map = crate::packer::packer::new_hole_map();
+                        let mut temp_flusher = BufferFlusher::start_with_metrics(
+                            old_pool.clone(),
+                            meta.clone(),
+                            lifecycle.clone(),
+                            allocator.clone(),
+                            io_engine.clone(),
+                            &config.flush,
+                            temp_hole_map,
+                            &config.dedup,
+                            metrics.clone(),
+                        );
+                        temp_flusher.drain_and_stop(&old_pool);
+                        drop(old_pool);
+                        tracing::info!(
+                            new_shards = config.buffer.shards,
+                            "buffer drained — reinitializing with new shard layout"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Open buffer pool (auto-reinit if drained above, or normal open)
+        let buf_dev = RawDevice::open(buf_path)?;
+        let pool = Arc::new(WriteBufferPool::open_with_options(
+            buf_dev,
+            std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
+            config.buffer.shards,
+            config.engine.zone_size_blocks,
+            std::time::Duration::from_secs(30),
+        )?);
+        pool.attach_metrics(metrics.clone());
+
+        let unflushed = pool.recover()?;
+        if !unflushed.is_empty() {
+            tracing::info!(count = unflushed.len(), "replaying unflushed buffer entries");
+        }
+
+        Ok(pool)
+    }
+
     fn invalidate_live_handles(&self, name: &str) {
         let mut handles = self.live_handles.lock().unwrap();
         for (vol_name, flag) in handles.iter() {
@@ -127,28 +227,10 @@ impl OnyxEngine {
         let allocator = Arc::new(SpaceAllocator::new(device_size));
         allocator.rebuild_from_metadata(&meta)?;
 
-        // 4. Write buffer pool
-        let buf_path = config.buffer.device.as_ref().ok_or_else(|| {
-            OnyxError::Config("buffer.device is required for full mode".into())
-        })?;
-        let buf_dev = RawDevice::open(buf_path)?;
-        let buffer_pool = Arc::new(WriteBufferPool::open_with_options(
-            buf_dev,
-            std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
-            config.buffer.shards,
-            config.engine.zone_size_blocks,
-            std::time::Duration::from_secs(30),
-        )?);
-        buffer_pool.attach_metrics(metrics.clone());
-
-        // 5. Recover unflushed entries
-        let unflushed = buffer_pool.recover()?;
-        if !unflushed.is_empty() {
-            tracing::info!(
-                count = unflushed.len(),
-                "replaying unflushed buffer entries"
-            );
-        }
+        // 4. Write buffer pool (with shard migration if needed)
+        let buffer_pool = Self::open_buffer_pool(
+            config, &meta, &lifecycle, &allocator, &io_engine, &metrics,
+        )?;
 
         // 6. Shared hole map (GC → Packer)
         let hole_map = crate::packer::packer::new_hole_map();
@@ -325,6 +407,7 @@ impl OnyxEngine {
             }
 
             self.invalidate_live_handles(name);
+            self.metrics.remove_volume_metrics(name);
             self.metrics
                 .volume_delete_ops
                 .fetch_add(1, Ordering::Relaxed);
@@ -432,25 +515,10 @@ impl OnyxEngine {
         let allocator = Arc::new(SpaceAllocator::new(device_size));
         allocator.rebuild_from_metadata(&meta)?;
 
-        // Write buffer pool
-        let buf_path = config.buffer.device.as_ref().ok_or_else(|| {
-            OnyxError::Config("buffer.device is required for full mode".into())
-        })?;
-        let buf_dev = RawDevice::open(buf_path)?;
-        let buffer_pool = Arc::new(WriteBufferPool::open_with_options(
-            buf_dev,
-            std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
-            config.buffer.shards,
-            config.engine.zone_size_blocks,
-            std::time::Duration::from_secs(30),
-        )?);
-        buffer_pool.attach_metrics(metrics.clone());
-
-        // Recover unflushed entries
-        let unflushed = buffer_pool.recover()?;
-        if !unflushed.is_empty() {
-            tracing::info!(count = unflushed.len(), "replaying unflushed buffer entries");
-        }
+        // Write buffer pool (with shard migration if needed)
+        let buffer_pool = Self::open_buffer_pool(
+            config, &meta, &lifecycle, &allocator, &io_engine, &metrics,
+        )?;
 
         // Shared hole map
         let hole_map = crate::packer::packer::new_hole_map();
@@ -575,6 +643,12 @@ impl OnyxEngine {
         self.metrics.snapshot()
     }
 
+    pub fn volume_metrics_snapshot(
+        &self,
+    ) -> Vec<(String, crate::metrics::VolumeMetricsSnapshot)> {
+        self.metrics.volume_metrics_snapshot()
+    }
+
     pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {
         Ok(EngineStatusSnapshot {
             mode: if self.zone_manager.is_some() {
@@ -593,6 +667,11 @@ impl OnyxEngine {
             zone_count: self.zone_manager.as_ref().map(|zm| zm.zone_count()),
             buffer_pending_entries: self.buffer_pool.as_ref().map(|pool| pool.pending_count()),
             buffer_fill_pct: self.buffer_pool.as_ref().map(|pool| pool.fill_percentage()),
+            buffer_shards: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.shard_snapshots())
+                .unwrap_or_default(),
             allocator_free_blocks: self
                 .allocator
                 .as_ref()

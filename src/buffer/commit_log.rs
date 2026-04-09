@@ -13,7 +13,7 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::{round_up, AlignedBuf};
 use crate::io::device::RawDevice;
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
-use crate::metrics::EngineMetrics;
+use crate::metrics::{BufferShardSnapshot, EngineMetrics};
 use crate::types::{Lba, BLOCK_SIZE};
 
 const COMMIT_LOG_MAGIC: u32 = 0x4F43_4C47; // "OCLG"
@@ -861,6 +861,14 @@ impl WriteBufferPool {
             .ok_or_else(|| OnyxError::Config("persistent slot device too small".into()))
     }
 
+    /// Read the on-disk shard count from the superblock. Returns None if the
+    /// device has no valid superblock (first use).
+    pub fn read_disk_shard_count(device: &RawDevice) -> OnyxResult<Option<usize>> {
+        let mut buf = [0u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize];
+        device.read_at(&mut buf, 0)?;
+        Ok(GlobalSuperblock::decode(&buf).map(|sb| sb.shard_count as usize))
+    }
+
     fn validate_shard_count(shard_count: usize) -> OnyxResult<()> {
         if shard_count == 0 || shard_count > MAX_SHARDS_ON_DISK {
             return Err(OnyxError::Config(format!(
@@ -869,6 +877,42 @@ impl WriteBufferPool {
             )));
         }
         Ok(())
+    }
+
+    /// Check whether the buffer device with an old shard layout has zero
+    /// unflushed entries, meaning it is safe to reinitialize with a different
+    /// shard count.
+    fn check_old_layout_empty(device: &RawDevice, sb: &GlobalSuperblock) -> OnyxResult<bool> {
+        let old_shards = sb.shard_count as usize;
+        let device_size = device.size();
+        let total_data_bytes = Self::total_data_bytes(device_size)?;
+        let bytes_per_shard = total_data_bytes / old_shards as u64;
+
+        let mut consumed = 0u64;
+        for i in 0..old_shards {
+            let shard_bytes = if i == old_shards - 1 {
+                total_data_bytes - consumed
+            } else {
+                bytes_per_shard
+            };
+            let shard_offset = COMMIT_LOG_SUPERBLOCK_SIZE + consumed;
+            consumed += shard_bytes;
+
+            let shard_dev = device.slice(shard_offset, shard_bytes)?;
+            let lba_index = DashMap::with_shard_amount(4);
+            let pending = DashMap::with_shard_amount(4);
+            BufferShard::rebuild_indices(&shard_dev, shard_bytes, &lba_index, &pending)?;
+
+            if !pending.is_empty() {
+                tracing::warn!(
+                    shard = i,
+                    pending = pending.len(),
+                    "buffer shard has unflushed entries — cannot reinit"
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn persist_superblock(&self, sync: bool) -> OnyxResult<()> {
@@ -1122,10 +1166,24 @@ impl WriteBufferPool {
         let superblock = match GlobalSuperblock::decode(&sb_buf) {
             Some(sb) if sb.shard_count as usize == shard_count => sb,
             Some(sb) => {
-                return Err(OnyxError::Config(format!(
-                    "persistent slot shard layout mismatch: disk has {} shards, config requests {}",
-                    sb.shard_count, shard_count
-                )));
+                // Check if the old layout is clean (no unflushed entries)
+                let is_clean = Self::check_old_layout_empty(&device, &sb)?;
+                if is_clean {
+                    tracing::info!(
+                        old_shards = sb.shard_count,
+                        new_shards = shard_count,
+                        "buffer is clean — reinitializing with new shard layout"
+                    );
+                    let new_sb = GlobalSuperblock::new(shard_count);
+                    device.write_at(&new_sb.encode(), 0)?;
+                    device.sync()?;
+                    new_sb
+                } else {
+                    return Err(OnyxError::Config(format!(
+                        "buffer shard mismatch: disk={} config={}; unflushed entries exist",
+                        sb.shard_count, shard_count
+                    )));
+                }
             }
             None => {
                 let sb = GlobalSuperblock::new(shard_count);
@@ -1427,6 +1485,40 @@ impl WriteBufferPool {
             return 100;
         }
         ((shard.shard.used_bytes() * 100) / cap) as u8
+    }
+
+    /// Snapshot per-shard buffer statistics for monitoring.
+    pub fn shard_snapshots(&self) -> Vec<BufferShardSnapshot> {
+        self.shards
+            .iter()
+            .enumerate()
+            .map(|(idx, handle)| {
+                let s = &handle.shard;
+                let (used, capacity, head, tail) = {
+                    let ring = s.ring.lock();
+                    (
+                        ring.used_bytes,
+                        ring.capacity_bytes,
+                        ring.head_offset,
+                        ring.tail_offset,
+                    )
+                };
+                let fill_pct = if capacity > 0 {
+                    ((used * 100) / capacity) as u8
+                } else {
+                    100
+                };
+                BufferShardSnapshot {
+                    shard_idx: idx,
+                    used_bytes: used,
+                    capacity_bytes: capacity,
+                    fill_pct,
+                    pending_entries: s.pending_count(),
+                    head_offset: head,
+                    tail_offset: tail,
+                }
+            })
+            .collect()
     }
 }
 

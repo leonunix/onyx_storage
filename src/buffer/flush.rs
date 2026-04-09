@@ -2438,6 +2438,35 @@ impl BufferFlusher {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        self.join_lanes();
+    }
+
+    /// Wait for all pending buffer entries to be flushed, then stop.
+    /// Used during graceful shutdown to ensure the buffer device is clean
+    /// (e.g. before a shard count change on next startup).
+    pub fn drain_and_stop(&mut self, pool: &crate::buffer::pool::WriteBufferPool) {
+        // Keep flusher running while there are pending entries
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let pending = pool.pending_count();
+            if pending == 0 {
+                tracing::info!("flusher drain complete — buffer is clean");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                tracing::warn!(
+                    pending,
+                    "flusher drain timeout after 60s — stopping with unflushed entries"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        self.running.store(false, Ordering::Relaxed);
+        self.join_lanes();
+    }
+
+    fn join_lanes(&mut self) {
         for lane in &mut self.lanes {
             if let Some(h) = lane.coalesce_handle.take() {
                 let _ = h.join();

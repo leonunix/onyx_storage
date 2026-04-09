@@ -335,6 +335,12 @@ impl ServiceController {
         if old_config.engine.zone_count != new_config.engine.zone_count {
             tracing::warn!("engine.zone_count changed — requires restart to take effect");
         }
+        if old_config.buffer.shards != new_config.buffer.shards {
+            tracing::warn!(
+                "buffer.shards changed — requires restart. \
+                 Will auto-reinit if buffer is fully drained, otherwise start with old shard count first to drain"
+            );
+        }
 
         {
             let guard = self.engine.load();
@@ -655,6 +661,82 @@ impl ServiceController {
                     }
                     let _ = stream.flush();
                 }
+                // ── JSON IPC commands (for dashboard) ────────────
+                "status-json" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let ids = dev_ids.lock().unwrap().clone();
+                    let mode_str = match opt.as_ref() {
+                        None => "bare",
+                        Some(eng) if eng.is_full_mode() => "active",
+                        Some(_) => "standby",
+                    };
+                    let status = opt.as_ref().and_then(|eng| eng.status_snapshot().ok());
+                    let payload = serde_json::json!({
+                        "mode": mode_str,
+                        "ublk_devices": ids,
+                        "status": status,
+                    });
+                    let _ = stream.write_all(payload.to_string().as_bytes());
+                    let _ = stream.write_all(b"\nok\n");
+                    let _ = stream.flush();
+                }
+                "volumes-json" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    match opt.as_ref() {
+                        None => {
+                            let _ = stream.write_all(b"[]\nok\n");
+                        }
+                        Some(eng) => match eng.list_volumes() {
+                            Ok(volumes) => {
+                                // Enrich each volume with per-volume IO metrics
+                                let vol_metrics = eng.metrics_snapshot();
+                                let per_vol = eng.volume_metrics_snapshot();
+                                let enriched: Vec<serde_json::Value> = volumes.iter().map(|v| {
+                                    let vm = per_vol.iter()
+                                        .find(|(name, _)| name == &v.id.0)
+                                        .map(|(_, s)| s.clone());
+                                    serde_json::json!({
+                                        "id": v.id.0,
+                                        "size_bytes": v.size_bytes,
+                                        "block_size": v.block_size,
+                                        "compression": v.compression,
+                                        "created_at": v.created_at,
+                                        "zone_count": v.zone_count,
+                                        "metrics": vm,
+                                    })
+                                }).collect();
+                                let _ = vol_metrics; // suppress unused warning
+                                let json = serde_json::to_string(&enriched).unwrap_or_else(|_| "[]".into());
+                                let _ = stream.write_all(json.as_bytes());
+                                let _ = stream.write_all(b"\nok\n");
+                            }
+                            Err(e) => {
+                                let msg = format!("error: {}\n", e);
+                                let _ = stream.write_all(msg.as_bytes());
+                            }
+                        },
+                    }
+                    let _ = stream.flush();
+                }
+                "metrics-json" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    match opt.as_ref() {
+                        None => {
+                            let _ = stream.write_all(b"{}\nok\n");
+                        }
+                        Some(eng) => {
+                            let snapshot = eng.metrics_snapshot();
+                            let json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+                            let _ = stream.write_all(json.as_bytes());
+                            let _ = stream.write_all(b"\nok\n");
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+
                 _ => {
                     let _ = stream.write_all(b"error: unknown command\n");
                     let _ = stream.flush();

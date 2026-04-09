@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::engine::VolumeAliveFlag;
 use crate::error::{OnyxError, OnyxResult};
-use crate::metrics::EngineMetrics;
+use crate::metrics::{EngineMetrics, VolumeMetrics};
 use crate::types::{Lba, BLOCK_SIZE};
 use crate::zone::manager::ZoneManager;
 
@@ -28,6 +28,7 @@ pub struct OnyxVolume {
     /// Cached per-volume lifecycle lock — avoids global Mutex<HashMap> lookup on every IO.
     vol_lock: Arc<RwLock<()>>,
     metrics: Arc<EngineMetrics>,
+    vol_metrics: Arc<VolumeMetrics>,
 }
 
 impl OnyxVolume {
@@ -40,6 +41,7 @@ impl OnyxVolume {
         vol_lock: Arc<RwLock<()>>,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
+        let vol_metrics = metrics.get_volume_metrics(&vol_id);
         Self {
             vol_id,
             size_bytes,
@@ -48,6 +50,7 @@ impl OnyxVolume {
             alive,
             vol_lock,
             metrics,
+            vol_metrics,
         }
     }
 
@@ -103,6 +106,10 @@ impl OnyxVolume {
                 .fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .volume_write_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.vol_metrics.write_ops.fetch_add(1, Ordering::Relaxed);
+            self.vol_metrics
+                .write_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             return Ok(());
         }
@@ -213,6 +220,10 @@ impl OnyxVolume {
         self.metrics
             .volume_write_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.vol_metrics.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.vol_metrics
+            .write_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -275,6 +286,10 @@ impl OnyxVolume {
         self.metrics.volume_read_ops.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .volume_read_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
+        self.vol_metrics.read_ops.fetch_add(1, Ordering::Relaxed);
+        self.vol_metrics
+            .read_bytes
             .fetch_add(len as u64, Ordering::Relaxed);
 
         Ok(result)

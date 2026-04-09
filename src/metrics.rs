@@ -1,10 +1,61 @@
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
+
+use dashmap::DashMap;
+use serde::Serialize;
+
+/// Per-volume IO counters.
+#[derive(Debug)]
+pub struct VolumeMetrics {
+    pub read_ops: AtomicU64,
+    pub read_bytes: AtomicU64,
+    pub write_ops: AtomicU64,
+    pub write_bytes: AtomicU64,
+    pub read_errors: AtomicU64,
+    pub write_errors: AtomicU64,
+}
+
+impl VolumeMetrics {
+    pub fn new() -> Self {
+        Self {
+            read_ops: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            write_ops: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+            read_errors: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> VolumeMetricsSnapshot {
+        VolumeMetricsSnapshot {
+            read_ops: self.read_ops.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            write_ops: self.write_ops.load(Ordering::Relaxed),
+            write_bytes: self.write_bytes.load(Ordering::Relaxed),
+            read_errors: self.read_errors.load(Ordering::Relaxed),
+            write_errors: self.write_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VolumeMetricsSnapshot {
+    pub read_ops: u64,
+    pub read_bytes: u64,
+    pub write_ops: u64,
+    pub write_bytes: u64,
+    pub read_errors: u64,
+    pub write_errors: u64,
+}
 
 #[derive(Debug)]
 pub struct EngineMetrics {
     started_at: Instant,
+    /// Per-volume counters keyed by volume name.
+    pub volume_metrics: DashMap<String, Arc<VolumeMetrics>>,
     pub volume_create_ops: AtomicU64,
     pub volume_delete_ops: AtomicU64,
     pub volume_open_ops: AtomicU64,
@@ -80,10 +131,34 @@ pub struct EngineMetrics {
     pub dedup_rescan_errors: AtomicU64,
 }
 
+impl EngineMetrics {
+    /// Get or create per-volume metrics counters.
+    pub fn get_volume_metrics(&self, vol_id: &str) -> Arc<VolumeMetrics> {
+        self.volume_metrics
+            .entry(vol_id.to_string())
+            .or_insert_with(|| Arc::new(VolumeMetrics::new()))
+            .clone()
+    }
+
+    /// Snapshot all per-volume metrics.
+    pub fn volume_metrics_snapshot(&self) -> Vec<(String, VolumeMetricsSnapshot)> {
+        self.volume_metrics
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().snapshot()))
+            .collect()
+    }
+
+    /// Remove per-volume metrics (called on volume delete).
+    pub fn remove_volume_metrics(&self, vol_id: &str) {
+        self.volume_metrics.remove(vol_id);
+    }
+}
+
 impl Default for EngineMetrics {
     fn default() -> Self {
         Self {
             started_at: Instant::now(),
+            volume_metrics: DashMap::new(),
             volume_create_ops: AtomicU64::new(0),
             volume_delete_ops: AtomicU64::new(0),
             volume_open_ops: AtomicU64::new(0),
@@ -243,7 +318,7 @@ impl EngineMetrics {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct EngineMetricsSnapshot {
     pub uptime_secs: u64,
     pub volume_create_ops: u64,
@@ -412,7 +487,19 @@ impl EngineMetricsSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Per-shard buffer ring statistics.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BufferShardSnapshot {
+    pub shard_idx: usize,
+    pub used_bytes: u64,
+    pub capacity_bytes: u64,
+    pub fill_pct: u8,
+    pub pending_entries: u64,
+    pub head_offset: u64,
+    pub tail_offset: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EngineStatusSnapshot {
     /// "active", "standby", or "meta-only"
     pub mode: String,
@@ -421,6 +508,7 @@ pub struct EngineStatusSnapshot {
     pub zone_count: Option<u32>,
     pub buffer_pending_entries: Option<u64>,
     pub buffer_fill_pct: Option<u8>,
+    pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
     pub allocator_total_blocks: Option<u64>,
     pub metrics: EngineMetricsSnapshot,
