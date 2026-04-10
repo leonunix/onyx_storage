@@ -36,6 +36,16 @@ pub struct PendingEntry {
     pub disk_len: u32,
 }
 
+/// Lightweight recovery metadata — no payload clone.
+#[derive(Debug, Clone)]
+pub struct RecoveredMeta {
+    pub seq: u64,
+    pub vol_id: String,
+    pub start_lba: Lba,
+    pub lba_count: u32,
+    pub vol_created_at: u64,
+}
+
 /// Compact LBA key using Arc<str> to avoid per-insert String clones.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LbaKey {
@@ -824,6 +834,23 @@ impl BufferShard {
         Ok(self.pending_entries_snapshot())
     }
 
+    fn recover_metadata(&self) -> Vec<RecoveredMeta> {
+        self.pending_entries
+            .iter()
+            .map(|entry| RecoveredMeta {
+                seq: entry.seq,
+                vol_id: entry.vol_id.clone(),
+                start_lba: entry.start_lba,
+                lba_count: entry.lba_count,
+                vol_created_at: entry.vol_created_at,
+            })
+            .collect()
+    }
+
+    fn get_pending_arc(&self, seq: u64) -> Option<Arc<PendingEntry>> {
+        self.pending_entries.get(&seq).map(|e| e.value().clone())
+    }
+
     fn pending_count(&self) -> u64 {
         self.pending_entries.len() as u64
     }
@@ -1473,6 +1500,22 @@ impl WriteBufferPool {
         }
         result.sort_by_key(|entry| entry.seq);
         Ok(result)
+    }
+
+    /// Return pending entry metadata without cloning payloads.
+    pub fn recover_metadata(&self) -> Vec<RecoveredMeta> {
+        let mut result = Vec::new();
+        for shard in &self.shards {
+            result.extend(shard.shard.recover_metadata());
+        }
+        result.sort_by_key(|m| m.seq);
+        result
+    }
+
+    /// Get a zero-copy Arc handle to a pending entry (for payload access without clone).
+    pub fn get_pending_arc(&self, seq: u64) -> Option<Arc<PendingEntry>> {
+        let shard_idx = self.shard_for_seq(seq)?;
+        self.shards[shard_idx].shard.get_pending_arc(seq)
     }
 
     pub fn pending_count(&self) -> u64 {

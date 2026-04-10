@@ -162,6 +162,7 @@ Defaults used by `dev.sh start test`:
 - volume size: `320g`
 - engine command: `target/release/onyx-storage`
 - workers: host CPU count
+- startup timeout: `15m`
 
 You can override them with environment variables:
 
@@ -169,9 +170,14 @@ You can override them with environment variables:
 ONYX_TEST_VOLUME=soak-48h \
 ONYX_TEST_VOLUME_SIZE=320g \
 ONYX_TEST_WORKERS=16 \
+ONYX_TEST_STARTUP_TIMEOUT=20m \
 ONYX_TEST_EXTRA_ARGS="--restart-interval 2h --sample-scrub-interval 60s" \
 ./dev.sh --config config/vdb-detailed.toml start test 48h
 ```
+
+If you see a failure like `timeout waiting for condition: [Errno 2] No such file or directory`,
+that usually means the harness timed out waiting for the Unix socket or `/dev/ublkbN` to become ready.
+On a large persistent buffer device, first startup recovery may simply need a longer timeout.
 
 Start the dashboard separately from the soak run:
 

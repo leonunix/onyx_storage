@@ -36,6 +36,7 @@ TEST_DEFAULT_DURATION="48h"
 TEST_DEFAULT_VOLUME="soak-volume"
 TEST_DEFAULT_VOLUME_SIZE="320g"
 TEST_DEFAULT_ENGINE_CMD="target/release/onyx-storage"
+TEST_DEFAULT_STARTUP_TIMEOUT="15m"
 TEST_DURATION="${ONYX_TEST_DURATION:-$TEST_DEFAULT_DURATION}"
 
 # ── helpers ────────────────────────────────────────────────────────
@@ -211,12 +212,13 @@ command_for() {
             printf '%s' "${CMD[$name]}"
             ;;
         test)
-            local run_dir volume volume_size workers engine_cmd extra_args qrun_dir qvolume qsize qworkers qengine qroot
+            local run_dir volume volume_size workers engine_cmd extra_args startup_timeout qrun_dir qvolume qsize qworkers qengine qroot qstartup
             run_dir="${ONYX_TEST_RUN_DIR:-$PROJ_ROOT/.dev/soak/$(date -u +%Y%m%dT%H%M%SZ)}"
             volume="${ONYX_TEST_VOLUME:-$TEST_DEFAULT_VOLUME}"
             volume_size="${ONYX_TEST_VOLUME_SIZE:-$TEST_DEFAULT_VOLUME_SIZE}"
             workers="${ONYX_TEST_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
             engine_cmd="${ONYX_TEST_ENGINE_CMD:-$TEST_DEFAULT_ENGINE_CMD}"
+            startup_timeout="${ONYX_TEST_STARTUP_TIMEOUT:-$TEST_DEFAULT_STARTUP_TIMEOUT}"
             extra_args="${ONYX_TEST_EXTRA_ARGS:-}"
             save_test_run_dir "$run_dir"
             mkdir -p "$run_dir"
@@ -226,8 +228,9 @@ command_for() {
             qworkers="$(quote_shell_arg "$workers")"
             qengine="$(quote_shell_arg "$engine_cmd")"
             qroot="$(quote_shell_arg "$PROJ_ROOT")"
-            printf 'python3 scripts/os_integrity_stress.py --repo-root %s --config %s --engine-cmd %s --run-dir %s --volume %s --volume-size %s --duration %s --workers %s %s' \
-                "$qroot" "$qcfg" "$qengine" "$qrun_dir" "$qvolume" "$qsize" "$(quote_shell_arg "$TEST_DURATION")" "$qworkers" "$extra_args"
+            qstartup="$(quote_shell_arg "$startup_timeout")"
+            printf 'python3 scripts/os_integrity_stress.py --repo-root %s --config %s --engine-cmd %s --run-dir %s --volume %s --volume-size %s --duration %s --workers %s --startup-timeout %s %s' \
+                "$qroot" "$qcfg" "$qengine" "$qrun_dir" "$qvolume" "$qsize" "$(quote_shell_arg "$TEST_DURATION")" "$qworkers" "$qstartup" "$extra_args"
             ;;
         *)
             echo "unknown component: $name" >&2
@@ -259,15 +262,10 @@ start_one() {
 }
 
 ensure_release_binary() {
-    local bin_path
-    bin_path="$PROJ_ROOT/target/release/onyx-storage"
-    if [[ -x "$bin_path" ]]; then
-        return
-    fi
     echo "Building release binary for soak test..."
     (
         cd "$PROJ_ROOT"
-        cargo build --release
+        cargo build --release --bin onyx-storage
     )
 }
 
@@ -407,6 +405,7 @@ usage() {
     echo "  ONYX_TEST_VOLUME_SIZE=${ONYX_TEST_VOLUME_SIZE:-$TEST_DEFAULT_VOLUME_SIZE}"
     echo "  ONYX_TEST_ENGINE_CMD=${ONYX_TEST_ENGINE_CMD:-$TEST_DEFAULT_ENGINE_CMD}"
     echo "  ONYX_TEST_WORKERS=${ONYX_TEST_WORKERS:-auto}"
+    echo "  ONYX_TEST_STARTUP_TIMEOUT=${ONYX_TEST_STARTUP_TIMEOUT:-$TEST_DEFAULT_STARTUP_TIMEOUT}"
     echo "  ONYX_TEST_EXTRA_ARGS=<extra soak args>"
 }
 

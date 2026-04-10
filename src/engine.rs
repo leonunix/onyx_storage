@@ -1,10 +1,8 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
-use crate::compress::codec::create_compressor;
 use crate::config::OnyxConfig;
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
@@ -13,12 +11,11 @@ use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::io::superblock::{self, HeartbeatWriter};
 use crate::lifecycle::VolumeLifecycleManager;
-use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
 use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, EngineStatusSnapshot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
-use crate::types::{CompressionAlgo, Lba, VolumeConfig, VolumeId, BLOCK_SIZE};
+use crate::types::{CompressionAlgo, VolumeConfig, VolumeId};
 use crate::volume::OnyxVolume;
 use crate::zone::manager::ZoneManager;
 
@@ -73,64 +70,6 @@ impl OnyxEngine {
             .max()
             .unwrap_or(0);
         Ok(Self::current_time_nanos().max(max_existing))
-    }
-
-    fn read_block_from_mapping(
-        io_engine: &IoEngine,
-        mapping: &BlockmapValue,
-    ) -> OnyxResult<Vec<u8>> {
-        let compressed_data = if mapping.slot_offset > 0 {
-            let slot_data = io_engine.read_blocks(mapping.pba, BLOCK_SIZE as usize)?;
-            let start = mapping.slot_offset as usize;
-            let end = start + mapping.unit_compressed_size as usize;
-            if end > slot_data.len() {
-                return Err(OnyxError::Compress(format!(
-                    "packed fragment out of bounds: slot_offset={} + size={} > slot_len={}",
-                    start,
-                    mapping.unit_compressed_size,
-                    slot_data.len()
-                )));
-            }
-            slot_data[start..end].to_vec()
-        } else {
-            io_engine.read_blocks(mapping.pba, mapping.unit_compressed_size as usize)?
-        };
-
-        let actual_crc = crc32fast::hash(&compressed_data);
-        if actual_crc != mapping.crc32 {
-            return Err(OnyxError::CrcMismatch {
-                expected: mapping.crc32,
-                actual: actual_crc,
-            });
-        }
-
-        let decompressed = if mapping.compression == 0 {
-            compressed_data
-        } else {
-            let algo =
-                CompressionAlgo::from_u8(mapping.compression).unwrap_or(CompressionAlgo::None);
-            let decompressor = create_compressor(algo);
-            let mut buf = vec![0u8; mapping.unit_original_size as usize];
-            decompressor.decompress(
-                &compressed_data,
-                &mut buf,
-                mapping.unit_original_size as usize,
-            )?;
-            buf
-        };
-
-        let start = mapping.offset_in_unit as usize * BLOCK_SIZE as usize;
-        let end = start + BLOCK_SIZE as usize;
-        if end > decompressed.len() {
-            return Err(OnyxError::Compress(format!(
-                "decompressed unit too small: {} bytes, need {}..{}",
-                decompressed.len(),
-                start,
-                end
-            )));
-        }
-
-        Ok(decompressed[start..end].to_vec())
     }
 
     fn next_volume_generation(&self) -> u64 {
@@ -208,10 +147,10 @@ impl OnyxEngine {
                             std::time::Duration::from_secs(30),
                         )?);
                         old_pool.attach_metrics(metrics.clone());
-                        let old_unflushed = old_pool.recover()?;
-                        if !old_unflushed.is_empty() {
+                        let old_pending = old_pool.pending_count();
+                        if old_pending > 0 {
                             tracing::info!(
-                                count = old_unflushed.len(),
+                                count = old_pending,
                                 "draining unflushed entries before shard migration"
                             );
                         }
@@ -249,56 +188,18 @@ impl OnyxEngine {
         )?);
         pool.attach_metrics(metrics.clone());
 
-        let recovered = pool.recover()?;
-        let block_size = BLOCK_SIZE as usize;
-        let mut latest_blocks: HashMap<(String, u64), (u64, u64, Vec<u8>)> = HashMap::new();
-        for entry in &recovered {
-            for i in 0..entry.lba_count {
-                let lba = entry.start_lba.0 + i as u64;
-                let start = i as usize * block_size;
-                let end = start + block_size;
-                let payload = entry.payload[start..end].to_vec();
-                latest_blocks
-                    .entry((entry.vol_id.clone(), lba))
-                    .and_modify(|(seq, generation, data)| {
-                        if entry.seq > *seq {
-                            *seq = entry.seq;
-                            *generation = entry.vol_created_at;
-                            *data = payload.clone();
-                        }
-                    })
-                    .or_insert((entry.seq, entry.vol_created_at, payload));
-            }
-        }
-
-        for entry in &recovered {
-            let _ = pool.discard_pending_seq_durable(entry.seq)?;
-        }
-
-        for ((vol_name, lba_raw), (_seq, vol_created_at, payload)) in latest_blocks {
-            let vol_id = VolumeId(vol_name.clone());
-            let Some(volume) = meta.get_volume(&vol_id)? else {
-                continue;
-            };
-            if vol_created_at != 0 && volume.created_at != vol_created_at {
-                continue;
-            }
-
-            let lba = Lba(lba_raw);
-            let needs_replay = match meta.get_mapping(&vol_id, lba)? {
-                Some(mapping) => Self::read_block_from_mapping(io_engine, &mapping)? != payload,
-                None => true,
-            };
-            if needs_replay {
-                pool.append(&vol_name, lba, 1, &payload, vol_created_at)?;
-            }
-        }
-
-        let unflushed = pool.recover()?;
-        if !unflushed.is_empty() {
+        // --- Fast recovery: zero per-block IO ---
+        // Pending entries are already in pending_entries + lba_index + ready_tx
+        // after open(). The flusher will pick them up automatically and handles:
+        //   - Same-LBA dedup via coalescer
+        //   - vol_created_at generation checks (discards stale entries)
+        //   - Idempotent re-flush of already-committed blocks
+        // No per-block LV3 reads, no payload clones, no re-append — instant startup.
+        let unflushed_count = pool.pending_count();
+        if unflushed_count > 0 {
             tracing::info!(
-                count = unflushed.len(),
-                "replaying unflushed buffer entries"
+                count = unflushed_count,
+                "pending buffer entries will be flushed in background"
             );
         }
 

@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::engine::OnyxEngine;
+use onyx_storage::error::OnyxError;
 use onyx_storage::service::{self, ServiceController};
 use onyx_storage::types::CompressionAlgo;
 
@@ -69,6 +70,10 @@ fn parse_compression(s: &str) -> CompressionAlgo {
     }
 }
 
+fn is_stale_socket_error(err: &OnyxError) -> bool {
+    matches!(err, OnyxError::Config(msg) if msg.contains("cannot connect to"))
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -120,9 +125,23 @@ fn main() -> anyhow::Result<()> {
             compression,
         } => {
             let sock = &config.service.socket_path;
-            if sock.exists() {
-                service::send_create_volume(sock, &name, size, &compression)?;
+            let use_meta_only = if sock.exists() {
+                match service::send_create_volume(sock, &name, size, &compression) {
+                    Ok(()) => false,
+                    Err(err) if is_stale_socket_error(&err) => {
+                        eprintln!(
+                            "stale socket {:?} detected, falling back to metadata-only create",
+                            sock
+                        );
+                        true
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             } else {
+                true
+            };
+
+            if use_meta_only {
                 let engine = OnyxEngine::open_meta_only(&config)?;
                 let algo = parse_compression(&compression);
                 engine.create_volume(&name, size, algo)?;
@@ -135,7 +154,18 @@ fn main() -> anyhow::Result<()> {
         Command::DeleteVolume { name } => {
             let sock = &config.service.socket_path;
             let freed = if sock.exists() {
-                service::send_delete_volume(sock, &name)?
+                match service::send_delete_volume(sock, &name) {
+                    Ok(freed) => freed,
+                    Err(err) if is_stale_socket_error(&err) => {
+                        eprintln!(
+                            "stale socket {:?} detected, falling back to metadata-only delete",
+                            sock
+                        );
+                        let engine = OnyxEngine::open_meta_only(&config)?;
+                        engine.delete_volume(&name)? as u64
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             } else {
                 let engine = OnyxEngine::open_meta_only(&config)?;
                 engine.delete_volume(&name)? as u64
@@ -148,13 +178,35 @@ fn main() -> anyhow::Result<()> {
         Command::ListVolumes => {
             let sock = &config.service.socket_path;
             if sock.exists() {
-                let lines = service::send_list_volumes(sock)?;
-                if lines.is_empty() {
-                    println!("No volumes");
-                } else {
-                    for line in &lines {
-                        println!("  {}", line);
+                match service::send_list_volumes(sock) {
+                    Ok(lines) => {
+                        if lines.is_empty() {
+                            println!("No volumes");
+                        } else {
+                            for line in &lines {
+                                println!("  {}", line);
+                            }
+                        }
                     }
+                    Err(err) if is_stale_socket_error(&err) => {
+                        eprintln!(
+                            "stale socket {:?} detected, falling back to metadata-only list",
+                            sock
+                        );
+                        let engine = OnyxEngine::open_meta_only(&config)?;
+                        let volumes = engine.list_volumes()?;
+                        if volumes.is_empty() {
+                            println!("No volumes");
+                        } else {
+                            for vol in &volumes {
+                                println!(
+                                    "  {} : {} bytes, zones={}, compression={:?}",
+                                    vol.id, vol.size_bytes, vol.zone_count, vol.compression
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => return Err(err.into()),
                 }
             } else {
                 let engine = OnyxEngine::open_meta_only(&config)?;
@@ -182,6 +234,23 @@ fn main() -> anyhow::Result<()> {
                     Ok(lines) => {
                         for line in &lines {
                             println!("{}", line);
+                        }
+                    }
+                    Err(err) if is_stale_socket_error(&err) => {
+                        eprintln!(
+                            "stale socket {:?} detected, falling back to direct status",
+                            sock
+                        );
+                        match OnyxEngine::open(&config) {
+                            Ok(engine) => {
+                                print!("{}", engine.status_report()?);
+                                engine.shutdown()?;
+                            }
+                            Err(full_err) => {
+                                eprintln!("full status unavailable: {}", full_err);
+                                let engine = OnyxEngine::open_meta_only(&config)?;
+                                print!("{}", engine.status_report()?);
+                            }
                         }
                     }
                     Err(e) => {

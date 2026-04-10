@@ -357,6 +357,35 @@ impl BufferFlusher {
         counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
     }
 
+    fn latest_seq_for_lba(seq_lba_ranges: &[(u64, Lba, u32)], lba: Lba) -> u64 {
+        seq_lba_ranges
+            .iter()
+            .filter_map(|(seq, start, count)| {
+                (lba.0 >= start.0 && lba.0 < start.0 + *count as u64).then_some(*seq)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn live_positions_for_unit(
+        unit: &CompressedUnit,
+        pool: &WriteBufferPool,
+    ) -> OnyxResult<Vec<usize>> {
+        let mut live = Vec::with_capacity(unit.lba_count as usize);
+        for idx in 0..unit.lba_count as usize {
+            let lba = Lba(unit.start_lba.0 + idx as u64);
+            let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
+            let newer_pending = pool
+                .lookup(&unit.vol_id, lba)?
+                .map(|pending| pending.seq > latest_seq)
+                .unwrap_or(false);
+            if !newer_pending {
+                live.push(idx);
+            }
+        }
+        Ok(live)
+    }
+
     pub fn start(
         pool: Arc<WriteBufferPool>,
         meta: Arc<MetaStore>,
@@ -1544,17 +1573,33 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
             let meta_start = Instant::now();
+            let live_positions = Self::live_positions_for_unit(unit, pool)?;
+            if live_positions.is_empty() {
+                allocation.free(allocator)?;
+                let mark_start = Instant::now();
+                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                        tracing::warn!(seq, error = %e, "failed to mark stale entry flushed");
+                    }
+                }
+                Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+                let _ = pool.advance_tail_for_shard(shard_idx);
+                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                return Ok(());
+            }
             let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
             // Per-fragment tracking for hole detection: (pba, slot_offset) → (decrement, unit_lba_count, compressed_size)
             let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
 
             // Batch read old mappings via multi_get
-            let lbas: Vec<Lba> = (0..unit.lba_count)
-                .map(|i| Lba(unit.start_lba.0 + i as u64))
+            let lbas: Vec<Lba> = live_positions
+                .iter()
+                .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
                 .collect();
             let old_mappings = meta.multi_get_mappings(&vol_id, &lbas)?;
 
-            let mut batch_values = Vec::with_capacity(unit.lba_count as usize);
+            let mut batch_values = Vec::with_capacity(live_positions.len());
             for (i, old) in old_mappings.into_iter().enumerate() {
                 if let Some(old) = old {
                     let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
@@ -1581,7 +1626,7 @@ impl BufferFlusher {
                         unit_compressed_size: unit.compressed_data.len() as u32,
                         unit_original_size: unit.original_size,
                         unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: i as u16,
+                        offset_in_unit: live_positions[i] as u16,
                         crc32: unit.crc32,
                         slot_offset: 0,
                         flags,
@@ -1606,7 +1651,12 @@ impl BufferFlusher {
             }
 
             if let Err(e) =
-                meta.atomic_batch_write(&vol_id, &batch_values, unit.lba_count, &old_pba_decrements)
+                meta.atomic_batch_write(
+                    &vol_id,
+                    &batch_values,
+                    live_positions.len() as u32,
+                    &old_pba_decrements,
+                )
             {
                 allocation.free(allocator)?;
                 Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
@@ -1634,12 +1684,13 @@ impl BufferFlusher {
             let dedup_start = Instant::now();
             if let Some(ref hashes) = unit.block_hashes {
                 let mut dedup_entries = Vec::new();
-                for (i, hash) in hashes.iter().enumerate() {
-                    if *hash == [0u8; 32] {
+                for &pos in &live_positions {
+                    let hash = hashes[pos];
+                    if hash == [0u8; 32] {
                         continue; // Skip empty hashes
                     }
                     dedup_entries.push((
-                        *hash,
+                        hash,
                         DedupEntry {
                             pba,
                             slot_offset: 0,
@@ -1647,7 +1698,7 @@ impl BufferFlusher {
                             unit_compressed_size: unit.compressed_data.len() as u32,
                             unit_original_size: unit.original_size,
                             unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: i as u16,
+                            offset_in_unit: pos as u16,
                             crc32: unit.crc32,
                         },
                     ));
@@ -1847,6 +1898,7 @@ impl BufferFlusher {
             batch_values: Vec<(Lba, BlockmapValue)>,
             old_pba_meta: HashMap<Pba, (u32, u32)>,
             old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)>,
+            live_positions: Vec<usize>,
         }
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
 
@@ -1856,8 +1908,33 @@ impl BufferFlusher {
             }
             let pba = pbas[i].unwrap();
             let vol_id = VolumeId(unit.vol_id.clone());
-            let lbas: Vec<Lba> = (0..unit.lba_count)
-                .map(|j| Lba(unit.start_lba.0 + j as u64))
+            let live_positions = match Self::live_positions_for_unit(unit, pool) {
+                Ok(positions) => positions,
+                Err(e) => {
+                    if alloc_blocks[i] == 1 {
+                        let _ = allocator.free_one(pba);
+                    } else {
+                        let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
+                    }
+                    results[i] = Err(e);
+                    skip[i] = true;
+                    continue;
+                }
+            };
+
+            if live_positions.is_empty() {
+                unit_metas[i] = Some(UnitMeta {
+                    batch_values: Vec::new(),
+                    old_pba_meta: HashMap::new(),
+                    old_frag_meta: HashMap::new(),
+                    live_positions,
+                });
+                continue;
+            }
+
+            let lbas: Vec<Lba> = live_positions
+                .iter()
+                .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
                 .collect();
             let old_mappings = match meta.multi_get_mappings(&vol_id, &lbas) {
                 Ok(m) => m,
@@ -1875,7 +1952,7 @@ impl BufferFlusher {
 
             let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
             let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
-            let mut batch_values = Vec::with_capacity(unit.lba_count as usize);
+            let mut batch_values = Vec::with_capacity(live_positions.len());
 
             for (j, old) in old_mappings.into_iter().enumerate() {
                 if let Some(old) = old {
@@ -1903,7 +1980,7 @@ impl BufferFlusher {
                         unit_compressed_size: unit.compressed_data.len() as u32,
                         unit_original_size: unit.original_size,
                         unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: j as u16,
+                        offset_in_unit: live_positions[j] as u16,
                         crc32: unit.crc32,
                         slot_offset: 0,
                         flags,
@@ -1914,6 +1991,7 @@ impl BufferFlusher {
                 batch_values,
                 old_pba_meta,
                 old_frag_meta,
+                live_positions,
             });
         }
 
@@ -1947,7 +2025,7 @@ impl BufferFlusher {
                         (
                             &vol_ids_owned[batch_idx],
                             um.batch_values.as_slice(),
-                            units[unit_idx].lba_count,
+                            um.live_positions.len() as u32,
                             &decrements_owned[batch_idx],
                         )
                     })
@@ -2012,15 +2090,24 @@ impl BufferFlusher {
             let um = unit_metas[unit_idx].as_ref().unwrap();
             let unit = &units[unit_idx];
             let pba = pbas[unit_idx].unwrap();
+            if um.live_positions.is_empty() {
+                if alloc_blocks[unit_idx] == 1 {
+                    let _ = allocator.free_one(pba);
+                } else {
+                    let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
+                }
+                continue;
+            }
 
             // Collect dedup index entries for batch write
             if let Some(ref hashes) = unit.block_hashes {
-                for (j, hash) in hashes.iter().enumerate() {
-                    if *hash == [0u8; 32] {
+                for &pos in &um.live_positions {
+                    let hash = hashes[pos];
+                    if hash == [0u8; 32] {
                         continue;
                     }
                     all_dedup_entries.push((
-                        *hash,
+                        hash,
                         DedupEntry {
                             pba,
                             slot_offset: 0,
@@ -2028,7 +2115,7 @@ impl BufferFlusher {
                             unit_compressed_size: unit.compressed_data.len() as u32,
                             unit_original_size: unit.original_size,
                             unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: j as u16,
+                            offset_in_unit: pos as u16,
                             crc32: unit.crc32,
                         },
                     ));
@@ -2130,9 +2217,19 @@ impl BufferFlusher {
                 continue;
             }
 
+            let live_positions = Self::live_positions_for_unit(unit, pool)?;
+            if live_positions.is_empty() {
+                any_discarded = true;
+                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                    let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                }
+                continue;
+            }
+
             // Batch read old mappings via multi_get
-            let frag_lbas: Vec<Lba> = (0..unit.lba_count)
-                .map(|i| Lba(unit.start_lba.0 + i as u64))
+            let frag_lbas: Vec<Lba> = live_positions
+                .iter()
+                .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
                 .collect();
             let old_mappings = meta.multi_get_mappings(&vol_id, &frag_lbas)?;
 
@@ -2163,14 +2260,14 @@ impl BufferFlusher {
                         unit_compressed_size: unit.compressed_data.len() as u32,
                         unit_original_size: unit.original_size,
                         unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: i as u16,
+                        offset_in_unit: live_positions[i] as u16,
                         crc32: unit.crc32,
                         slot_offset: frag.slot_offset,
                         flags,
                     },
                 ));
             }
-            total_refcount += unit.lba_count;
+            total_refcount += live_positions.len() as u32;
             all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
         }
 
@@ -2250,13 +2347,15 @@ impl BufferFlusher {
         let dedup_start = Instant::now();
         for frag in &sealed.fragments {
             if let Some(ref hashes) = frag.unit.block_hashes {
+                let live_positions = Self::live_positions_for_unit(&frag.unit, pool)?;
                 let mut dedup_entries = Vec::new();
-                for (i, hash) in hashes.iter().enumerate() {
-                    if *hash == [0u8; 32] {
+                for &pos in &live_positions {
+                    let hash = hashes[pos];
+                    if hash == [0u8; 32] {
                         continue;
                     }
                     dedup_entries.push((
-                        *hash,
+                        hash,
                         DedupEntry {
                             pba: sealed.pba,
                             slot_offset: frag.slot_offset,
@@ -2264,7 +2363,7 @@ impl BufferFlusher {
                             unit_compressed_size: frag.unit.compressed_data.len() as u32,
                             unit_original_size: frag.unit.original_size,
                             unit_lba_count: frag.unit.lba_count as u16,
-                            offset_in_unit: i as u16,
+                            offset_in_unit: pos as u16,
                             crc32: frag.unit.crc32,
                         },
                     ));
@@ -2447,9 +2546,24 @@ impl BufferFlusher {
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
 
-        let mut batch_values = Vec::with_capacity(unit.lba_count as usize);
-        for i in 0..unit.lba_count {
-            let lba = Lba(unit.start_lba.0 + i as u64);
+        let live_positions = Self::live_positions_for_unit(unit, pool)?;
+        if live_positions.is_empty() {
+            let mark_start = Instant::now();
+            for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                    tracing::warn!(seq, error = %e, "failed to mark stale hole-fill entry flushed");
+                }
+            }
+            Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+            let _ = pool.advance_tail_for_shard(shard_idx);
+            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+            return Ok(());
+        }
+
+        let mut batch_values = Vec::with_capacity(live_positions.len());
+        for &pos in &live_positions {
+            let lba = Lba(unit.start_lba.0 + pos as u64);
             if let Some(old) = meta.get_mapping(&vol_id, lba)? {
                 let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
                 let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
@@ -2475,7 +2589,7 @@ impl BufferFlusher {
                     unit_compressed_size: unit.compressed_data.len() as u32,
                     unit_original_size: unit.original_size,
                     unit_lba_count: unit.lba_count as u16,
-                    offset_in_unit: i as u16,
+                    offset_in_unit: pos as u16,
                     crc32: unit.crc32,
                     slot_offset: fill.slot_offset,
                     flags,
@@ -2496,7 +2610,7 @@ impl BufferFlusher {
             }
         }
 
-        let net_increment = unit.lba_count - self_decrement;
+        let net_increment = live_positions.len() as u32 - self_decrement;
         meta.atomic_batch_write_hole_fill(&vol_id, &batch_values, fill.pba, net_increment, &old_pba_decrements)?;
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
@@ -2519,12 +2633,13 @@ impl BufferFlusher {
         let dedup_start = Instant::now();
         if let Some(ref hashes) = unit.block_hashes {
             let mut dedup_entries = Vec::new();
-            for (i, hash) in hashes.iter().enumerate() {
-                if *hash == [0u8; 32] {
+            for &pos in &live_positions {
+                let hash = hashes[pos];
+                if hash == [0u8; 32] {
                     continue;
                 }
                 dedup_entries.push((
-                    *hash,
+                    hash,
                     DedupEntry {
                         pba: fill.pba,
                         slot_offset: fill.slot_offset,
@@ -2532,7 +2647,7 @@ impl BufferFlusher {
                         unit_compressed_size: unit.compressed_data.len() as u32,
                         unit_original_size: unit.original_size,
                         unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: i as u16,
+                        offset_in_unit: pos as u16,
                         crc32: unit.crc32,
                     },
                 ));

@@ -386,6 +386,7 @@ class ServiceManager:
         env: dict[str, str],
         log_path: pathlib.Path,
         event_log: EventLog,
+        startup_timeout_secs: int,
     ) -> None:
         self.repo_root = repo_root
         self.engine_cmd = engine_cmd
@@ -395,6 +396,7 @@ class ServiceManager:
         self.env = env
         self.log_path = log_path
         self.event_log = event_log
+        self.startup_timeout_secs = startup_timeout_secs
         self.proc: Optional[subprocess.Popen[bytes]] = None
         self._log_fh = None
 
@@ -406,14 +408,21 @@ class ServiceManager:
             sock.settimeout(2.0)
             sock.connect(str(self.socket_path))
             sock.sendall((cmd + "\n").encode("utf-8"))
-            chunks = []
+            fileobj = sock.makefile("r", encoding="utf-8", newline="\n")
+            lines: list[str] = []
             while True:
-                data = sock.recv(65536)
-                if not data:
+                line = fileobj.readline()
+                if line == "":
                     break
-                chunks.append(data)
-        text = b"".join(chunks).decode("utf-8", errors="replace")
-        return [line for line in text.splitlines() if line and line != "ok"]
+                line = line.strip()
+                if not line:
+                    continue
+                if line == "ok" or line.startswith("ok "):
+                    break
+                if line.startswith("error:"):
+                    raise HarnessError(line.removeprefix("error:").strip())
+                lines.append(line)
+        return lines
 
     def best_effort_stop(self) -> None:
         try:
@@ -484,7 +493,7 @@ class ServiceManager:
             dev_ids = payload.get("ublk_devices") or []
             return bool(dev_ids)
 
-        wait_for(ready, timeout_secs=60, interval_secs=1.0)
+        wait_for(ready, timeout_secs=self.startup_timeout_secs, interval_secs=1.0)
         path = self.resolve_device_path()
         self.event_log.append({"event": "device-ready", "device": str(path), "ts": time.time()})
         return path
@@ -584,6 +593,7 @@ class IntegrityHarness:
             env=self.env,
             log_path=self.run_dir / "engine.log",
             event_log=self.event_log,
+            startup_timeout_secs=args.startup_timeout_secs,
         )
 
     def _make_hot_windows(self) -> list[tuple[int, int]]:
@@ -1121,6 +1131,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Restart once more and scrub again after the soak",
     )
     parser.add_argument(
+        "--startup-timeout",
+        type=parse_duration,
+        default="15m",
+        dest="startup_timeout_secs",
+        help="How long to wait for the engine socket and ublk device to become ready",
+    )
+    parser.add_argument(
         "--operation-log-stride",
         type=int,
         default=1024,
@@ -1138,6 +1155,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--hot-windows must be > 0")
     if args.operation_log_stride < 0:
         parser.error("--operation-log-stride must be >= 0")
+    if args.startup_timeout_secs <= 0:
+        parser.error("--startup-timeout must be > 0")
     if args.hotset_ratio <= 0 or args.hotset_ratio > 1.0:
         parser.error("--hotset-ratio must be in (0, 1]")
     if args.hotset_probability < 0 or args.hotset_probability > 1.0:
