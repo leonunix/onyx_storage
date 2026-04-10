@@ -403,6 +403,17 @@ class ServiceManager:
     def cli(self, *args: str) -> list[str]:
         return [*self.engine_cmd, "-c", str(self.config_path), *args]
 
+    def cleanup_ublk_devices(self) -> None:
+        try:
+            run_cmd(
+                self.cli("cleanup-ublk"),
+                cwd=self.repo_root,
+                env=self.env,
+                check=False,
+            )
+        except Exception:
+            pass
+
     def _send_socket_cmd(self, cmd: str) -> list[str]:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(2.0)
@@ -439,12 +450,13 @@ class ServiceManager:
         deadline = time.time() + 30
         while time.time() < deadline:
             if not self.socket_path.exists():
-                return
+                break
             try:
                 self._send_socket_cmd("ping")
             except Exception:
-                return
+                break
             time.sleep(0.5)
+        self.cleanup_ublk_devices()
 
     def recreate_volume(self, size_bytes: int, compression: str) -> None:
         run_cmd(self.cli("delete-volume", "-n", self.volume), cwd=self.repo_root, env=self.env, check=False)
@@ -921,6 +933,7 @@ class IntegrityHarness:
 
     def setup(self) -> None:
         self.service.best_effort_stop()
+        self.service.cleanup_ublk_devices()
         self.service.recreate_volume(self.args.volume_size, self.args.compression)
         device_path = self.service.start()
         self.device.replace(device_path)

@@ -1,11 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::{fs, path::Path};
 
 use clap::{Parser, Subcommand};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::error::OnyxError;
+#[cfg(target_os = "linux")]
+use onyx_storage::frontend::ublk::OnyxUblkTarget;
 use onyx_storage::service::{self, ServiceController};
 use onyx_storage::types::CompressionAlgo;
 
@@ -59,6 +63,8 @@ enum Command {
     ListVolumes,
     /// Show engine status
     Status,
+    /// Kill stale Linux ublk devices left behind after abnormal exit
+    CleanupUblk,
 }
 
 fn parse_compression(s: &str) -> CompressionAlgo {
@@ -72,6 +78,33 @@ fn parse_compression(s: &str) -> CompressionAlgo {
 
 fn is_stale_socket_error(err: &OnyxError) -> bool {
     matches!(err, OnyxError::Config(msg) if msg.contains("cannot connect to"))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_ublk_devices() -> anyhow::Result<usize> {
+    fn parse_dev_id(path: &Path) -> Option<u32> {
+        let name = path.file_name()?.to_str()?;
+        name.strip_prefix("ublkc")?.parse().ok()
+    }
+
+    let mut cleaned = 0usize;
+    for entry in fs::read_dir("/dev")? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(dev_id) = parse_dev_id(&path) else {
+            continue;
+        };
+        match OnyxUblkTarget::kill_device(dev_id) {
+            Ok(()) => {
+                cleaned += 1;
+                eprintln!("cleaned stale ublk device id {}", dev_id);
+            }
+            Err(err) => {
+                eprintln!("failed to clean ublk device id {}: {}", dev_id, err);
+            }
+        }
+    }
+    Ok(cleaned)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -270,6 +303,17 @@ fn main() -> anyhow::Result<()> {
                         print!("{}", engine.status_report()?);
                     }
                 }
+            }
+        }
+        Command::CleanupUblk => {
+            #[cfg(target_os = "linux")]
+            {
+                let cleaned = cleanup_stale_ublk_devices()?;
+                println!("cleaned {} stale ublk device(s)", cleaned);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                println!("cleanup-ublk is only supported on Linux");
             }
         }
     }

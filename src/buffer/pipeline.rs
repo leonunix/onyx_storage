@@ -254,15 +254,16 @@ mod tests {
 
     fn make_entry(vol_id: &str, start_lba: u64, lba_count: u32, seq: u64, fill: u8) -> BufferEntry {
         let payload = vec![fill; lba_count as usize * BLOCK_SIZE as usize];
+        let payload_crc32 = crc32fast::hash(&payload);
         BufferEntry {
             seq,
             vol_id: vol_id.to_string(),
             start_lba: Lba(start_lba),
             lba_count,
-            payload_crc32: crc32fast::hash(&payload),
+            payload_crc32,
             flushed: false,
             vol_created_at: 0,
-            payload,
+            payload: Arc::from(payload),
         }
     }
 

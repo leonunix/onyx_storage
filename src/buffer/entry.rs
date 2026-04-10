@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::{round_up, AlignedBuf};
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
@@ -172,7 +174,7 @@ pub struct BufferEntry {
     pub flushed: bool,
     /// Volume generation epoch (VolumeConfig.created_at at write time).
     pub vol_created_at: u64,
-    pub payload: Vec<u8>,
+    pub payload: Arc<[u8]>,
 }
 
 impl BufferEntry {
@@ -601,7 +603,7 @@ impl BufferEntry {
             .ok()?
             .to_string();
 
-        let payload = buf[payload_start..payload_start + payload_len].to_vec();
+        let payload: Arc<[u8]> = Arc::from(&buf[payload_start..payload_start + payload_len]);
 
         let payload_crc32 = u32::from_le_bytes(buf[32..36].try_into().unwrap());
         if header_version == FULL_CRC_HEADER_VERSION && crc32fast::hash(&payload) != payload_crc32 {

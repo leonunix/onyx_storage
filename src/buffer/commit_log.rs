@@ -17,11 +17,19 @@ use crate::metrics::{BufferShardSnapshot, EngineMetrics};
 use crate::types::{Lba, BLOCK_SIZE};
 
 const COMMIT_LOG_MAGIC: u32 = 0x4F43_4C47; // "OCLG"
-const COMMIT_LOG_VERSION: u32 = 2;
+const COMMIT_LOG_VERSION: u32 = 3;
+const COMMIT_LOG_VERSION_V2: u32 = 2;
 const COMMIT_LOG_SUPERBLOCK_SIZE: u64 = 4096;
 const MAX_SHARDS_ON_DISK: usize = 64;
 /// DashMap internal shard count — high value reduces contention under many writers.
 const DASHMAP_SHARDS: usize = 256;
+
+const SHARD_CHECKPOINT_MAGIC: u32 = 0x5348_434B; // "SHCK"
+const SHARD_CHECKPOINT_VERSION: u32 = 1;
+const SHARD_CHECKPOINT_SIZE: u64 = 4096;
+/// How many extra slots to scan beyond the checkpoint head on recovery,
+/// to catch entries written after the last checkpoint persist.
+const CHECKPOINT_FORWARD_SCAN_SLOTS: u64 = 1024;
 
 #[derive(Debug, Clone)]
 pub struct PendingEntry {
@@ -31,7 +39,7 @@ pub struct PendingEntry {
     pub lba_count: u32,
     pub payload_crc32: u32,
     pub vol_created_at: u64,
-    pub payload: Vec<u8>,
+    pub payload: Arc<[u8]>,
     pub disk_offset: u64,
     pub disk_len: u32,
 }
@@ -63,19 +71,25 @@ struct LogRecord {
 #[derive(Debug, Clone, Copy)]
 struct GlobalSuperblock {
     shard_count: u32,
+    version: u32,
 }
 
 impl GlobalSuperblock {
     fn new(shard_count: usize) -> Self {
         Self {
             shard_count: shard_count as u32,
+            version: COMMIT_LOG_VERSION,
         }
+    }
+
+    fn is_v3(&self) -> bool {
+        self.version >= COMMIT_LOG_VERSION
     }
 
     fn encode(&self) -> [u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize] {
         let mut buf = [0u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize];
         buf[0..4].copy_from_slice(&COMMIT_LOG_MAGIC.to_le_bytes());
-        buf[4..8].copy_from_slice(&COMMIT_LOG_VERSION.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.version.to_le_bytes());
         buf[8..12].copy_from_slice(&self.shard_count.to_le_bytes());
         let crc = crc32fast::hash(&buf[16..]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -88,7 +102,7 @@ impl GlobalSuperblock {
             return None;
         }
         let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-        if version != COMMIT_LOG_VERSION {
+        if version != COMMIT_LOG_VERSION && version != COMMIT_LOG_VERSION_V2 {
             return None;
         }
         let expected_crc = u32::from_le_bytes(buf[12..16].try_into().ok()?);
@@ -100,7 +114,57 @@ impl GlobalSuperblock {
         if shard_count == 0 || shard_count as usize > MAX_SHARDS_ON_DISK {
             return None;
         }
-        Some(Self { shard_count })
+        Some(Self {
+            shard_count,
+            version,
+        })
+    }
+}
+
+// ── Per-shard checkpoint (recovery hint) ───────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+struct ShardCheckpoint {
+    head_offset: u64,
+    tail_offset: u64,
+    max_seq: u64,
+    used_bytes: u64,
+}
+
+impl ShardCheckpoint {
+    fn encode(&self) -> [u8; SHARD_CHECKPOINT_SIZE as usize] {
+        let mut buf = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+        buf[0..4].copy_from_slice(&SHARD_CHECKPOINT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&SHARD_CHECKPOINT_VERSION.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.head_offset.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.tail_offset.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.max_seq.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.used_bytes.to_le_bytes());
+        let crc = crc32fast::hash(&buf[0..40]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    fn decode(buf: &[u8; SHARD_CHECKPOINT_SIZE as usize]) -> Option<Self> {
+        let magic = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+        if magic != SHARD_CHECKPOINT_MAGIC {
+            return None;
+        }
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        if version != SHARD_CHECKPOINT_VERSION {
+            return None;
+        }
+        let expected_crc = u32::from_le_bytes(buf[40..44].try_into().ok()?);
+        let actual_crc = crc32fast::hash(&buf[0..40]);
+        if expected_crc != actual_crc {
+            return None;
+        }
+        Some(Self {
+            head_offset: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+            tail_offset: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+            max_seq: u64::from_le_bytes(buf[24..32].try_into().ok()?),
+            used_bytes: u64::from_le_bytes(buf[32..40].try_into().ok()?),
+        })
     }
 }
 
@@ -143,6 +207,9 @@ struct BufferShard {
     /// Avoids per-insert Arc::from() allocation for LbaKey.
     vol_id_cache: RwLock<Vec<Arc<str>>>,
     metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
+    /// V3 checkpoint device — covers the 4KB checkpoint block preceding this
+    /// shard's data area. None for v2 layout (no checkpoint).
+    checkpoint_device: Option<RawDevice>,
 }
 
 pub struct WriteBufferPool {
@@ -488,10 +555,202 @@ impl BufferShard {
         })
     }
 
+    /// Guided recovery: scan only the occupied region [checkpoint.tail, checkpoint.head)
+    /// plus a forward margin to catch entries written after the last checkpoint persist.
+    /// Falls back to full scan if no entries are found in the guided region.
+    fn rebuild_indices_guided(
+        device: &RawDevice,
+        capacity_bytes: u64,
+        checkpoint: &ShardCheckpoint,
+        lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,
+        pending_entries: &DashMap<u64, Arc<PendingEntry>>,
+    ) -> OnyxResult<ScanResult> {
+        #[derive(Debug)]
+        struct ScannedRecord {
+            seq: u64,
+            disk_offset: u64,
+            slot_count: u32,
+            flushed: bool,
+            pending: Option<Arc<PendingEntry>>,
+        }
+
+        // Validate checkpoint offsets are within bounds and block-aligned.
+        let slot_sz = Self::slot_size();
+        if checkpoint.tail_offset % slot_sz != 0
+            || checkpoint.head_offset % slot_sz != 0
+            || checkpoint.tail_offset >= capacity_bytes
+            || checkpoint.head_offset >= capacity_bytes
+        {
+            tracing::warn!("shard checkpoint offsets invalid, falling back to full scan");
+            return Self::rebuild_indices(device, capacity_bytes, lba_index, pending_entries);
+        }
+
+        let mut scanned = Vec::new();
+        let mut max_seq = 0u64;
+
+        // Scan the occupied region, handling wrap-around.
+        // Phase 1: scan [tail, head) (the known occupied region from checkpoint)
+        // Phase 2: forward scan beyond head for entries missed by stale checkpoint
+        let forward_limit = CHECKPOINT_FORWARD_SCAN_SLOTS * slot_sz;
+        let scan_head = if checkpoint.used_bytes == 0 {
+            // Empty buffer: only do forward scan from head
+            checkpoint.head_offset
+        } else {
+            checkpoint.head_offset
+        };
+        // End of forward scan region (may wrap)
+        let forward_end = (scan_head + forward_limit) % capacity_bytes;
+
+        // Build the list of (start, end) byte ranges to scan (non-wrapping segments).
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        if checkpoint.used_bytes == 0 && checkpoint.head_offset == checkpoint.tail_offset {
+            // Checkpoint says empty. Only do forward scan.
+            if forward_end > scan_head {
+                ranges.push((scan_head, forward_end));
+            } else {
+                ranges.push((scan_head, capacity_bytes));
+                ranges.push((0, forward_end));
+            }
+        } else if scan_head >= checkpoint.tail_offset {
+            // No wrap in occupied region: [tail, head)
+            ranges.push((checkpoint.tail_offset, scan_head));
+            // Forward scan: [head, head + forward_limit)
+            if forward_end > scan_head {
+                ranges.push((scan_head, forward_end));
+            } else {
+                ranges.push((scan_head, capacity_bytes));
+                ranges.push((0, forward_end));
+            }
+        } else {
+            // Wrap-around: [tail, capacity) + [0, head)
+            ranges.push((checkpoint.tail_offset, capacity_bytes));
+            ranges.push((0, scan_head));
+            // Forward scan beyond head
+            if forward_end > scan_head {
+                ranges.push((scan_head, forward_end));
+            } else {
+                ranges.push((scan_head, capacity_bytes));
+                ranges.push((0, forward_end));
+            }
+        }
+
+        // Merge overlapping/adjacent ranges and deduplicate
+        ranges.sort_by_key(|r| r.0);
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut() {
+                if range.0 <= last.1 {
+                    last.1 = last.1.max(range.1);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+
+        // Scan each range
+        for (range_start, range_end) in &merged {
+            let mut offset = *range_start;
+            while offset < *range_end {
+                match Self::scan_entry(device, offset, capacity_bytes)? {
+                    Some((entry, slot_count)) => {
+                        let disk_len = Self::slot_bytes(slot_count) as u32;
+                        max_seq = max_seq.max(entry.seq);
+                        let pending = (!entry.flushed).then(|| {
+                            Arc::new(PendingEntry {
+                                seq: entry.seq,
+                                vol_id: entry.vol_id.clone(),
+                                start_lba: entry.start_lba,
+                                lba_count: entry.lba_count,
+                                payload_crc32: entry.payload_crc32,
+                                vol_created_at: entry.vol_created_at,
+                                payload: entry.payload,
+                                disk_offset: offset,
+                                disk_len,
+                            })
+                        });
+                        scanned.push(ScannedRecord {
+                            seq: entry.seq,
+                            disk_offset: offset,
+                            slot_count,
+                            flushed: entry.flushed,
+                            pending,
+                        });
+                        offset += Self::slot_bytes(slot_count);
+                    }
+                    None => {
+                        offset += slot_sz;
+                    }
+                }
+            }
+        }
+
+        scanned.sort_by_key(|record| record.seq);
+
+        for record in &scanned {
+            let Some(pending) = record.pending.as_ref() else {
+                continue;
+            };
+            let vid: Arc<str> = Arc::from(pending.vol_id.as_str());
+            pending_entries.insert(pending.seq, pending.clone());
+            for i in 0..pending.lba_count {
+                lba_index.insert(
+                    LbaKey {
+                        vol_id: vid.clone(),
+                        lba: Lba(pending.start_lba.0 + i as u64),
+                    },
+                    pending.clone(),
+                );
+            }
+        }
+
+        let first_unreclaimed = scanned.iter().position(|record| !record.flushed);
+        let mut log_order = VecDeque::new();
+        let mut flushed_seqs = HashSet::new();
+        let mut used_bytes = 0u64;
+
+        if let Some(idx) = first_unreclaimed {
+            for record in &scanned[idx..] {
+                log_order.push_back(LogRecord {
+                    seq: record.seq,
+                    disk_offset: record.disk_offset,
+                    slot_count: record.slot_count,
+                });
+                used_bytes += Self::slot_bytes(record.slot_count);
+                if record.flushed {
+                    flushed_seqs.insert(record.seq);
+                }
+            }
+        }
+
+        let head_offset = if let Some(last) = log_order.back() {
+            (last.disk_offset + Self::slot_bytes(last.slot_count)) % capacity_bytes
+        } else {
+            scanned
+                .last()
+                .map(|last| (last.disk_offset + Self::slot_bytes(last.slot_count)) % capacity_bytes)
+                .unwrap_or(checkpoint.head_offset)
+        };
+        let tail_offset = log_order
+            .front()
+            .map(|first| first.disk_offset)
+            .unwrap_or(head_offset);
+
+        Ok(ScanResult {
+            max_seq,
+            used_bytes,
+            head_offset,
+            tail_offset,
+            log_order,
+            flushed_seqs,
+        })
+    }
+
     fn open(
         device: RawDevice,
         backpressure_timeout: Duration,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
+        checkpoint: Option<ShardCheckpoint>,
+        checkpoint_device: Option<RawDevice>,
     ) -> OnyxResult<(Self, u64)> {
         let capacity_bytes = device.size();
         if capacity_bytes < Self::slot_size() {
@@ -502,7 +761,11 @@ impl BufferShard {
 
         let lba_index = DashMap::with_shard_amount(DASHMAP_SHARDS);
         let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
-        let scan = Self::rebuild_indices(&device, capacity_bytes, &lba_index, &pending_entries)?;
+        let scan = if let Some(ref ckpt) = checkpoint {
+            Self::rebuild_indices_guided(&device, capacity_bytes, ckpt, &lba_index, &pending_entries)?
+        } else {
+            Self::rebuild_indices(&device, capacity_bytes, &lba_index, &pending_entries)?
+        };
 
         let (staging_tx, staging_rx) = unbounded();
         // Pre-size ring collections to avoid allocs inside the lock.
@@ -536,9 +799,33 @@ impl BufferShard {
                 io_lock: parking_lot::Mutex::new(()),
                 vol_id_cache: RwLock::new(Vec::with_capacity(16)),
                 metrics,
+                checkpoint_device,
             },
             scan.max_seq,
         ))
+    }
+
+    /// Snapshot current ring state into a checkpoint structure.
+    fn snapshot_checkpoint(&self) -> ShardCheckpoint {
+        let ring = self.ring.lock();
+        ShardCheckpoint {
+            head_offset: ring.head_offset,
+            tail_offset: ring.tail_offset,
+            max_seq: 0, // updated by caller with global max_seq
+            used_bytes: ring.used_bytes,
+        }
+    }
+
+    /// Write the current checkpoint to disk (no sync — this is a hint).
+    fn write_checkpoint(&self, max_seq: u64) {
+        let Some(ref ckpt_dev) = self.checkpoint_device else {
+            return;
+        };
+        let mut ckpt = self.snapshot_checkpoint();
+        ckpt.max_seq = max_seq;
+        if let Err(e) = ckpt_dev.write_at(&ckpt.encode(), 0) {
+            tracing::debug!(error = %e, "failed to persist shard checkpoint (non-fatal)");
+        }
     }
 
     /// Hot-path append. No disk I/O, no CRC, no encoding.
@@ -618,7 +905,7 @@ impl BufferShard {
             lba_count,
             payload_crc32: 0,
             vol_created_at,
-            payload: payload.to_vec(),
+            payload: Arc::from(payload),
             disk_offset: write_offset,
             disk_len,
         });
@@ -769,7 +1056,7 @@ impl BufferShard {
         flushed_lba_start: Lba,
         flushed_lba_count: u32,
     ) -> OnyxResult<()> {
-        let Some(pending) = self.pending_entries.get(&seq).map(|e| (*e).clone()) else {
+        let Some(pending) = self.pending_entries.get(&seq).map(|e| Arc::clone(e.value())) else {
             return Ok(());
         };
 
@@ -915,10 +1202,25 @@ impl BufferShard {
 }
 
 impl WriteBufferPool {
+    /// V2 data bytes: device - superblock.
     fn total_data_bytes(device_size: u64) -> OnyxResult<u64> {
         device_size
             .checked_sub(COMMIT_LOG_SUPERBLOCK_SIZE)
             .ok_or_else(|| OnyxError::Config("persistent slot device too small".into()))
+    }
+
+    /// V3 data bytes: device - superblock - per-shard checkpoint blocks.
+    fn total_data_bytes_v3(device_size: u64, shard_count: usize) -> OnyxResult<u64> {
+        let overhead =
+            COMMIT_LOG_SUPERBLOCK_SIZE + shard_count as u64 * SHARD_CHECKPOINT_SIZE;
+        device_size
+            .checked_sub(overhead)
+            .ok_or_else(|| OnyxError::Config("persistent slot device too small".into()))
+    }
+
+    /// Offset where shard data areas begin in v3 layout.
+    fn v3_data_area_start(shard_count: usize) -> u64 {
+        COMMIT_LOG_SUPERBLOCK_SIZE + shard_count as u64 * SHARD_CHECKPOINT_SIZE
     }
 
     /// Read the on-disk shard count from the superblock. Returns None if the
@@ -939,23 +1241,53 @@ impl WriteBufferPool {
         Ok(())
     }
 
+    /// Read shard checkpoint from disk. Returns None if invalid.
+    fn read_shard_checkpoint(
+        device: &RawDevice,
+        shard_idx: usize,
+    ) -> OnyxResult<Option<ShardCheckpoint>> {
+        let offset = COMMIT_LOG_SUPERBLOCK_SIZE + shard_idx as u64 * SHARD_CHECKPOINT_SIZE;
+        let mut buf = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+        device.read_at(&mut buf, offset)?;
+        Ok(ShardCheckpoint::decode(&buf))
+    }
+
+    /// Initialize checkpoint blocks to zero (used during v2→v3 migration).
+    fn init_checkpoint_blocks(device: &RawDevice, shard_count: usize) -> OnyxResult<()> {
+        let zero = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+        for i in 0..shard_count {
+            let offset = COMMIT_LOG_SUPERBLOCK_SIZE + i as u64 * SHARD_CHECKPOINT_SIZE;
+            device.write_at(&zero, offset)?;
+        }
+        Ok(())
+    }
+
     /// Check whether the buffer device with an old shard layout has zero
     /// unflushed entries, meaning it is safe to reinitialize with a different
-    /// shard count.
+    /// shard count (or migrate to v3).
     fn check_old_layout_empty(device: &RawDevice, sb: &GlobalSuperblock) -> OnyxResult<bool> {
         let old_shards = sb.shard_count as usize;
         let device_size = device.size();
-        let total_data_bytes = Self::total_data_bytes(device_size)?;
-        let bytes_per_shard = total_data_bytes / old_shards as u64;
+        let total_data = if sb.is_v3() {
+            Self::total_data_bytes_v3(device_size, old_shards)?
+        } else {
+            Self::total_data_bytes(device_size)?
+        };
+        let bytes_per_shard = total_data / old_shards as u64;
+        let data_area_start = if sb.is_v3() {
+            Self::v3_data_area_start(old_shards)
+        } else {
+            COMMIT_LOG_SUPERBLOCK_SIZE
+        };
 
         let mut consumed = 0u64;
         for i in 0..old_shards {
             let shard_bytes = if i == old_shards - 1 {
-                total_data_bytes - consumed
+                total_data - consumed
             } else {
                 bytes_per_shard
             };
-            let shard_offset = COMMIT_LOG_SUPERBLOCK_SIZE + consumed;
+            let shard_offset = data_area_start + consumed;
             consumed += shard_bytes;
 
             let shard_dev = device.slice(shard_offset, shard_bytes)?;
@@ -1152,6 +1484,9 @@ impl WriteBufferPool {
                 Ok(()) => {
                     consecutive_failures = 0;
                     retry_after = None;
+                    // Persist checkpoint hint (best-effort, no sync).
+                    let batch_max_seq = inflight.iter().map(|p| p.seq).max().unwrap_or(0);
+                    shard.write_checkpoint(batch_max_seq);
                     {
                         let mut lc = shard.lifecycle.lock();
                         for pending in &inflight {
@@ -1213,31 +1548,49 @@ impl WriteBufferPool {
         Self::validate_shard_count(shard_count)?;
         let routing_zone_size_blocks = routing_zone_size_blocks.max(1);
         let device_size = device.size();
-        let total_data_bytes = Self::total_data_bytes(device_size)?;
-        if total_data_bytes < shard_count as u64 * BLOCK_SIZE as u64 {
-            return Err(OnyxError::Config(format!(
-                "persistent slot device too small for {} shards",
-                shard_count
-            )));
-        }
 
+        // ── Read or initialize superblock ────────────────────────────
         let mut sb_buf = [0u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize];
         device.read_at(&mut sb_buf, 0)?;
-        let superblock = match GlobalSuperblock::decode(&sb_buf) {
-            Some(sb) if sb.shard_count as usize == shard_count => sb,
+
+        // Determine if we're using v3 layout (with per-shard checkpoints).
+        let (use_v3, superblock) = match GlobalSuperblock::decode(&sb_buf) {
+            Some(sb) if sb.shard_count as usize == shard_count && sb.is_v3() => {
+                // Happy path: v3 with matching shard count.
+                (true, sb)
+            }
+            Some(sb) if sb.shard_count as usize == shard_count && !sb.is_v3() => {
+                // V2 with matching shard count — try to migrate.
+                let is_clean = Self::check_old_layout_empty(&device, &sb)?;
+                if is_clean {
+                    tracing::info!("buffer is clean — upgrading v2 → v3 layout");
+                    let new_sb = GlobalSuperblock::new(shard_count);
+                    Self::init_checkpoint_blocks(&device, shard_count)?;
+                    device.write_at(&new_sb.encode(), 0)?;
+                    device.sync()?;
+                    (true, new_sb)
+                } else {
+                    tracing::info!(
+                        "buffer has unflushed entries — using v2 layout (full scan); \
+                         will upgrade to v3 on next clean restart"
+                    );
+                    (false, sb)
+                }
+            }
             Some(sb) => {
-                // Check if the old layout is clean (no unflushed entries)
+                // Shard count mismatch — check if clean for reinit.
                 let is_clean = Self::check_old_layout_empty(&device, &sb)?;
                 if is_clean {
                     tracing::info!(
                         old_shards = sb.shard_count,
                         new_shards = shard_count,
-                        "buffer is clean — reinitializing with new shard layout"
+                        "buffer is clean — reinitializing with new shard layout (v3)"
                     );
                     let new_sb = GlobalSuperblock::new(shard_count);
+                    Self::init_checkpoint_blocks(&device, shard_count)?;
                     device.write_at(&new_sb.encode(), 0)?;
                     device.sync()?;
-                    new_sb
+                    (true, new_sb)
                 } else {
                     return Err(OnyxError::Config(format!(
                         "buffer shard mismatch: disk={} config={}; unflushed entries exist",
@@ -1246,45 +1599,137 @@ impl WriteBufferPool {
                 }
             }
             None => {
+                // Fresh device — initialize as v3.
                 let sb = GlobalSuperblock::new(shard_count);
+                Self::init_checkpoint_blocks(&device, shard_count)?;
                 device.write_at(&sb.encode(), 0)?;
                 device.sync()?;
-                sb
+                (true, sb)
             }
         };
 
+        // ── Compute shard layout ─────────────────────────────────────
+        let total_data_bytes = if use_v3 {
+            Self::total_data_bytes_v3(device_size, shard_count)?
+        } else {
+            Self::total_data_bytes(device_size)?
+        };
+        if total_data_bytes < shard_count as u64 * BLOCK_SIZE as u64 {
+            return Err(OnyxError::Config(format!(
+                "persistent slot device too small for {} shards",
+                shard_count
+            )));
+        }
+        let data_area_start = if use_v3 {
+            Self::v3_data_area_start(shard_count)
+        } else {
+            COMMIT_LOG_SUPERBLOCK_SIZE
+        };
         let bytes_per_shard = total_data_bytes / shard_count as u64;
+
+        // Build per-shard config for parallel open.
+        struct ShardOpenConfig {
+            data_device: RawDevice,
+            checkpoint: Option<ShardCheckpoint>,
+            checkpoint_device: Option<RawDevice>,
+        }
+
+        let mut shard_configs = Vec::with_capacity(shard_count);
         let mut consumed = 0u64;
+        for shard_idx in 0..shard_count {
+            let shard_bytes = if shard_idx + 1 == shard_count {
+                total_data_bytes.saturating_sub(consumed)
+            } else {
+                bytes_per_shard
+            };
+            let shard_offset = data_area_start + consumed;
+            consumed += shard_bytes;
+
+            let data_device = device.slice(shard_offset, shard_bytes)?;
+            let (checkpoint, checkpoint_device) = if use_v3 {
+                let ckpt = Self::read_shard_checkpoint(&device, shard_idx)?;
+                let ckpt_offset =
+                    COMMIT_LOG_SUPERBLOCK_SIZE + shard_idx as u64 * SHARD_CHECKPOINT_SIZE;
+                let ckpt_dev = device.slice(ckpt_offset, SHARD_CHECKPOINT_SIZE)?;
+                (ckpt, Some(ckpt_dev))
+            } else {
+                (None, None)
+            };
+            shard_configs.push(ShardOpenConfig {
+                data_device,
+                checkpoint,
+                checkpoint_device,
+            });
+        }
+
+        // ── Parallel shard recovery ──────────────────────────────────
         let metrics = Arc::new(OnceLock::new());
+        let shard_results: Vec<OnyxResult<(BufferShard, u64)>> = if shard_count > 1 {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = shard_configs
+                    .into_iter()
+                    .map(|cfg| {
+                        let m = metrics.clone();
+                        s.spawn(move || {
+                            BufferShard::open(
+                                cfg.data_device,
+                                backpressure_timeout,
+                                m,
+                                cfg.checkpoint,
+                                cfg.checkpoint_device,
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("shard open thread panicked"))
+                    .collect()
+            })
+        } else {
+            // Single shard — no need for thread overhead.
+            shard_configs
+                .into_iter()
+                .map(|cfg| {
+                    BufferShard::open(
+                        cfg.data_device,
+                        backpressure_timeout,
+                        metrics.clone(),
+                        cfg.checkpoint,
+                        cfg.checkpoint_device,
+                    )
+                })
+                .collect()
+        };
+
+        // ── Sequential setup: channels + sync threads ────────────────
         let (ready_tx, ready_rx) = unbounded();
         let mut shard_ready_txs = Vec::with_capacity(shard_count);
         let mut shard_ready_rxs = Vec::with_capacity(shard_count);
         let mut shards = Vec::with_capacity(shard_count);
         let mut max_seq = 0u64;
 
-        for shard_idx in 0..shard_count {
+        // Recompute consumed for sync device slices.
+        consumed = 0u64;
+        for (shard_idx, result) in shard_results.into_iter().enumerate() {
+            let (shard, shard_max_seq) = result?;
+
             let (shard_ready_tx, shard_ready_rx) = unbounded();
-            shard_ready_txs.push(shard_ready_tx);
-            shard_ready_rxs.push(shard_ready_rx);
+            for seq in shard.pending_entries.iter().map(|entry| *entry.key()) {
+                let _ = ready_tx.send(seq);
+                let _ = shard_ready_tx.send(seq);
+            }
+            max_seq = max_seq.max(shard_max_seq);
 
             let shard_bytes = if shard_idx + 1 == shard_count {
                 total_data_bytes.saturating_sub(consumed)
             } else {
                 bytes_per_shard
             };
-            let shard_offset = COMMIT_LOG_SUPERBLOCK_SIZE + consumed;
+            let shard_offset = data_area_start + consumed;
             consumed += shard_bytes;
 
-            let shard_device = device.slice(shard_offset, shard_bytes)?;
             let sync_device = device.slice(shard_offset, shard_bytes)?;
-            let (shard, shard_max_seq) =
-                BufferShard::open(shard_device, backpressure_timeout, metrics.clone())?;
-            for seq in shard.pending_entries.iter().map(|entry| *entry.key()) {
-                let _ = ready_tx.send(seq);
-                let _ = shard_ready_txs[shard_idx].send(seq);
-            }
-            max_seq = max_seq.max(shard_max_seq);
-
             let shard = Arc::new(shard);
             let (sync_wake_tx, sync_wake_rx) = unbounded();
             let sync_shutdown = Arc::new(AtomicBool::new(false));
@@ -1295,7 +1740,7 @@ impl WriteBufferPool {
                     let shard = shard.clone();
                     let shutdown = sync_shutdown.clone();
                     let ready_tx = ready_tx.clone();
-                    let shard_ready_tx = shard_ready_txs[shard_idx].clone();
+                    let shard_ready_tx = shard_ready_tx.clone();
                     move || {
                         Self::sync_loop(
                             sync_device,
@@ -1316,6 +1761,8 @@ impl WriteBufferPool {
                     ))
                 })?;
 
+            shard_ready_txs.push(shard_ready_tx);
+            shard_ready_rxs.push(shard_ready_rx);
             shards.push(BufferShardHandle {
                 shard,
                 sync_wake_tx,
@@ -1626,6 +2073,11 @@ impl Drop for WriteBufferPool {
             if let Some(handle) = shard.sync_thread.take() {
                 let _ = handle.join();
             }
+        }
+        // Persist final checkpoint for each shard so recovery is fast.
+        let global_max_seq = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
+        for shard in &self.shards {
+            shard.shard.write_checkpoint(global_max_seq);
         }
         let _ = self.persist_superblock(true);
     }
