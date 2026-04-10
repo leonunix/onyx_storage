@@ -282,6 +282,117 @@ impl MetaStore {
         Ok(freed_extents)
     }
 
+    /// Delete blockmap entries for an LBA range and decrement refcounts.
+    ///
+    /// Follows the same three-phase pattern as `delete_volume`:
+    /// 1. Scan blockmap range, collect PBA decrements
+    /// 2. Atomic WriteBatch: delete blockmap + merge-decrement refcounts
+    /// 3. Read back refcounts, cleanup dedup for zeroed PBAs
+    ///
+    /// Returns `Vec<(Pba, block_count)>` for freed extents.
+    pub fn delete_blockmap_range(
+        &self,
+        vol_id: &VolumeId,
+        start_lba: Lba,
+        end_lba: Lba,
+    ) -> OnyxResult<Vec<(Pba, u32)>> {
+        let _guard = self.refcount_lock.lock().unwrap();
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        // Phase 1: scan blockmap range with raw iterator, collect raw keys
+        // (avoids re-encoding keys that the iterator already yields)
+        let start_key = encode_blockmap_key(vol_id, start_lba)?;
+        let end_key = encode_blockmap_key(vol_id, end_lba)?;
+        let prefix = blockmap_key_prefix(vol_id)?;
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_upper_bound(end_key);
+
+        let mut pba_decrements: HashMap<Pba, u32> = HashMap::new();
+        let mut pba_block_counts: HashMap<Pba, u32> = HashMap::new();
+        let mut blockmap_keys: Vec<Vec<u8>> = Vec::new();
+
+        let mut iter = self.db.raw_iterator_cf_opt(&cf_blockmap, read_opts);
+        iter.seek(&start_key);
+        while iter.valid() {
+            if let (Some(key), Some(val)) = (iter.key(), iter.value()) {
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if let Some(bv) = decode_blockmap_value(val) {
+                    *pba_decrements.entry(bv.pba).or_insert(0) += 1;
+                    let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                    pba_block_counts
+                        .entry(bv.pba)
+                        .and_modify(|b| *b = (*b).max(blocks))
+                        .or_insert(blocks);
+                }
+                blockmap_keys.push(key.to_vec());
+            }
+            iter.next();
+        }
+        iter.status()?;
+
+        if blockmap_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: atomic WriteBatch — delete blockmap entries + merge-decrement refcounts
+        let mut batch = WriteBatch::default();
+
+        for (pba, decrement) in &pba_decrements {
+            let rc_key = encode_refcount_key(*pba);
+            batch.merge_cf(&cf_refcount, &rc_key, encode_refcount_delta(-(*decrement as i32)));
+        }
+
+        for key in &blockmap_keys {
+            batch.delete_cf(&cf_blockmap, key);
+        }
+
+        self.db.write(batch)?;
+
+        // Phase 3: read back refcounts, cleanup dedup for zeroed PBAs, collect freed extents
+        let mut freed_extents = Vec::new();
+        let pba_keys: Vec<Pba> = pba_decrements.keys().copied().collect();
+        match self.multi_get_refcounts(&pba_keys) {
+            Ok(refcounts) => {
+                let mut cleanup_batch = WriteBatch::default();
+                let mut need_cleanup = false;
+                for (i, pba) in pba_keys.iter().enumerate() {
+                    let rc = refcounts.get(i).copied().unwrap_or(0);
+                    if rc == 0 {
+                        let rc_key = encode_refcount_key(*pba);
+                        cleanup_batch.delete_cf(&cf_refcount, &rc_key);
+                        let _ = self.cleanup_dedup_for_pba(*pba, &mut cleanup_batch);
+                        let block_count = pba_block_counts.get(pba).copied().unwrap_or(1);
+                        freed_extents.push((*pba, block_count));
+                        need_cleanup = true;
+                    }
+                }
+                if need_cleanup {
+                    if let Err(e) = self.db.write(cleanup_batch) {
+                        tracing::warn!(error = %e, "delete_blockmap_range: cleanup batch failed (non-fatal)");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "delete_blockmap_range: refcount readback failed (non-fatal)");
+            }
+        }
+
+        tracing::debug!(
+            volume = %vol_id,
+            start_lba = start_lba.0,
+            end_lba = end_lba.0,
+            deleted_keys = blockmap_keys.len(),
+            freed_extents = freed_extents.len(),
+            "blockmap range deleted"
+        );
+
+        Ok(freed_extents)
+    }
+
     pub fn list_volumes(&self) -> OnyxResult<Vec<VolumeConfig>> {
         let cf = self.db.cf_handle(CF_VOLUMES).unwrap();
         let mut volumes = Vec::new();

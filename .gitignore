@@ -8,3 +8,4 @@ dashboard/backend/.env.local
 dashboard/backend/internal/ui/dist
 bin/
 .dev/
+*.pyc

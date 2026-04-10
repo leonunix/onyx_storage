@@ -71,7 +71,30 @@ impl OnyxUblkTarget {
             .map_err(|e| OnyxError::Ublk(format!("failed to create ublk ctrl: {:?}", e)))?;
 
         let tgt_init = move |dev: &mut UblkDev| {
-            dev.set_default_params(dev_size);
+            let info = dev.dev_info;
+            dev.tgt.dev_size = dev_size;
+            dev.tgt.params = sys::ublk_params {
+                types: sys::UBLK_PARAM_TYPE_BASIC | sys::UBLK_PARAM_TYPE_DISCARD,
+                basic: sys::ublk_param_basic {
+                    attrs: sys::UBLK_ATTR_VOLATILE_CACHE,
+                    logical_bs_shift: 9,
+                    physical_bs_shift: 12,
+                    io_opt_shift: 12,
+                    io_min_shift: 12,
+                    max_sectors: info.max_io_buf_bytes >> 9,
+                    dev_sectors: dev_size >> 9,
+                    ..Default::default()
+                },
+                discard: sys::ublk_param_discard {
+                    discard_alignment: BLOCK_SIZE as u32,
+                    discard_granularity: BLOCK_SIZE as u32,
+                    max_discard_sectors: (2 * 1024 * 1024 / SECTOR_SIZE) as u32, // 2MB
+                    max_write_zeroes_sectors: 0,
+                    max_discard_segments: 1,
+                    reserved0: 0,
+                },
+                ..Default::default()
+            };
             Ok::<(), UblkError>(())
         };
 
@@ -245,7 +268,30 @@ impl OnyxUblkTarget {
                                 }
                             }
                             sys::UBLK_IO_OP_FLUSH => 0,
-                            sys::UBLK_IO_OP_DISCARD => 0,
+                            sys::UBLK_IO_OP_DISCARD => {
+                                let start_lba = Lba(offset_bytes / block_size);
+                                let lba_count = (io_bytes / block_size) as u32;
+                                if lba_count == 0 {
+                                    0
+                                } else {
+                                    match zm.submit_discard(
+                                        &vol_id,
+                                        start_lba,
+                                        lba_count,
+                                    ) {
+                                        Ok(()) => io_bytes as i32,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                lba = start_lba.0,
+                                                count = lba_count,
+                                                error = %e,
+                                                "discard failed"
+                                            );
+                                            -(libc::EIO as i32)
+                                        }
+                                    }
+                                }
+                            }
                             _ => -(libc::ENOTSUP as i32),
                         }
                     }

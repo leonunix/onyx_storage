@@ -72,6 +72,48 @@ impl OnyxVolume {
         self.size_bytes
     }
 
+    /// Discard (TRIM) a byte range. Unmaps the LBAs and frees physical space.
+    ///
+    /// Only full 4KB blocks within the range are discarded. Sub-block
+    /// head/tail bytes are ignored (partial-block DISCARD is a no-op).
+    pub fn discard(&self, offset_bytes: u64, len: u64) -> OnyxResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if offset_bytes + len > self.size_bytes {
+            return Err(OnyxError::OutOfBounds {
+                offset: offset_bytes,
+                len,
+                size: self.size_bytes,
+            });
+        }
+
+        let _guard = self.vol_lock.read().unwrap();
+        self.check_alive()?;
+
+        let bs = BLOCK_SIZE as u64;
+        // Round start up to next block boundary, round end down
+        let start_lba = Lba(offset_bytes.div_ceil(bs));
+        let end_lba = Lba((offset_bytes + len) / bs);
+
+        if end_lba.0 <= start_lba.0 {
+            // Range doesn't cover any full block
+            return Ok(());
+        }
+
+        let lba_count = (end_lba.0 - start_lba.0) as u32;
+        self.zone_manager.submit_discard(&self.vol_id, start_lba, lba_count)?;
+
+        self.metrics
+            .volume_discard_ops
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .volume_discard_lbas
+            .fetch_add(lba_count as u64, Ordering::Relaxed);
+
+        Ok(())
+    }
+
     /// Write data at a byte offset. Handles alignment automatically.
     ///
     /// - Block-aligned writes go directly to the write buffer fast path.

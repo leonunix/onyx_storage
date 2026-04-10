@@ -668,6 +668,17 @@ impl BufferShard {
             .map(|entry| (**entry).clone())
     }
 
+    /// Remove LBA index entries for a range so reads see unmapped immediately.
+    /// Does not remove pending_entries (flusher handles stale entries gracefully).
+    fn invalidate_lba_range(&self, vol_id: &str, start_lba: Lba, lba_count: u32) {
+        let vid = self.intern_vol_id(vol_id);
+        let mut key = LbaKey { vol_id: vid, lba: start_lba };
+        for i in 0..lba_count as u64 {
+            key.lba = Lba(start_lba.0 + i);
+            self.lba_index.remove(&key);
+        }
+    }
+
     fn pending_to_buffer_entry(pending: &PendingEntry) -> BufferEntry {
         BufferEntry {
             seq: pending.seq,
@@ -1482,6 +1493,14 @@ impl WriteBufferPool {
             total += purged.len() as u64;
         }
         Ok(total)
+    }
+
+    /// Invalidate buffer index entries for an LBA range across all shards.
+    /// After this call, reads to these LBAs will no longer find buffered data.
+    pub fn invalidate_lba_range(&self, vol_id: &str, start_lba: Lba, lba_count: u32) {
+        for shard in self.shards.iter() {
+            shard.shard.invalidate_lba_range(vol_id, start_lba, lba_count);
+        }
     }
 
     pub fn discard_pending_seq_durable(&self, seq: u64) -> OnyxResult<bool> {

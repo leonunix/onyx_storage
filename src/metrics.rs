@@ -129,6 +129,9 @@ pub struct EngineMetrics {
     pub dedup_rescan_hits: AtomicU64,
     pub dedup_rescan_misses: AtomicU64,
     pub dedup_rescan_errors: AtomicU64,
+    pub volume_discard_ops: AtomicU64,
+    pub volume_discard_lbas: AtomicU64,
+    pub discard_blocks_freed: AtomicU64,
 }
 
 impl EngineMetrics {
@@ -232,6 +235,9 @@ impl Default for EngineMetrics {
             dedup_rescan_hits: AtomicU64::new(0),
             dedup_rescan_misses: AtomicU64::new(0),
             dedup_rescan_errors: AtomicU64::new(0),
+            volume_discard_ops: AtomicU64::new(0),
+            volume_discard_lbas: AtomicU64::new(0),
+            discard_blocks_freed: AtomicU64::new(0),
         }
     }
 }
@@ -314,6 +320,9 @@ impl EngineMetrics {
             dedup_rescan_hits: load(&self.dedup_rescan_hits),
             dedup_rescan_misses: load(&self.dedup_rescan_misses),
             dedup_rescan_errors: load(&self.dedup_rescan_errors),
+            volume_discard_ops: load(&self.volume_discard_ops),
+            volume_discard_lbas: load(&self.volume_discard_lbas),
+            discard_blocks_freed: load(&self.discard_blocks_freed),
         }
     }
 }
@@ -394,6 +403,9 @@ pub struct EngineMetricsSnapshot {
     pub dedup_rescan_hits: u64,
     pub dedup_rescan_misses: u64,
     pub dedup_rescan_errors: u64,
+    pub volume_discard_ops: u64,
+    pub volume_discard_lbas: u64,
+    pub discard_blocks_freed: u64,
 }
 
 impl EngineMetricsSnapshot {
@@ -483,6 +495,9 @@ impl EngineMetricsSnapshot {
             dedup_rescan_hits,
             dedup_rescan_misses,
             dedup_rescan_errors,
+            volume_discard_ops,
+            volume_discard_lbas,
+            discard_blocks_freed,
         }
     }
 }
@@ -536,12 +551,13 @@ impl EngineStatusSnapshot {
         }
         let _ = writeln!(
             out,
-            "volume_ops: create={} delete={} open={} read={} write={}",
+            "volume_ops: create={} delete={} open={} read={} write={} discard={}",
             self.metrics.volume_create_ops,
             self.metrics.volume_delete_ops,
             self.metrics.volume_open_ops,
             self.metrics.volume_read_ops,
-            self.metrics.volume_write_ops
+            self.metrics.volume_write_ops,
+            self.metrics.volume_discard_ops
         );
         let _ = writeln!(
             out,
@@ -643,6 +659,13 @@ impl EngineStatusSnapshot {
             self.metrics.gc_rewrite_attempts,
             self.metrics.gc_blocks_rewritten,
             self.metrics.gc_errors
+        );
+        let _ = writeln!(
+            out,
+            "discard: ops={} lbas={} blocks_freed={}",
+            self.metrics.volume_discard_ops,
+            self.metrics.volume_discard_lbas,
+            self.metrics.discard_blocks_freed
         );
         out
     }

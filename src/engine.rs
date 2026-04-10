@@ -399,6 +399,7 @@ impl OnyxEngine {
             buffer_pool.clone(),
             io_engine.clone(),
             metrics.clone(),
+            Some(allocator.clone()),
         )?);
 
         // 9. Dedup scanner (after flusher; re-processes skipped blocks)
@@ -784,6 +785,7 @@ impl OnyxEngine {
             buffer_pool.clone(),
             io_engine.clone(),
             metrics.clone(),
+            Some(allocator.clone()),
         )?);
 
         // Dedup scanner

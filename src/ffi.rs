@@ -296,6 +296,21 @@ pub extern "C" fn onyx_volume_read(
     }
 }
 
+/// Discard (TRIM) a byte range on a volume.
+/// Only full 4KB blocks within the range are discarded.
+#[no_mangle]
+pub extern "C" fn onyx_volume_discard(vol: *mut OnyxVolume, offset: u64, len: u64) -> c_int {
+    if vol.is_null() {
+        set_last_error("null pointer");
+        return ONYX_ERR_NULL;
+    }
+    let vol = unsafe { &*vol };
+    match vol.discard(offset, len) {
+        Ok(()) => ONYX_OK,
+        Err(e) => handle_error(e),
+    }
+}
+
 /// Close a volume handle.
 #[no_mangle]
 pub extern "C" fn onyx_volume_close(vol: *mut OnyxVolume) {

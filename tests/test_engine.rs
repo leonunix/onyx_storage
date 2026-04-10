@@ -638,3 +638,155 @@ fn old_generation_buffer_entry_not_flushed_into_new_volume() {
         );
     }
 }
+
+// --- DISCARD/TRIM tests ---
+
+#[test]
+fn discard_basic_unmap() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-discard", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-discard").unwrap();
+
+    // Write 4 blocks (LBA 0..3)
+    let payload = vec![0xAA; 4 * 4096];
+    vol.write(0, &payload).unwrap();
+
+    // Verify written
+    let read = vol.read(0, 4 * 4096).unwrap();
+    assert_eq!(read, payload, "data should be readable before discard");
+
+    // Discard LBA 1..2 (offset 4096, len 8192)
+    vol.discard(4096, 8192).unwrap();
+
+    // LBA 0 still readable (not discarded)
+    let lba0 = vol.read(0, 4096).unwrap();
+    assert_eq!(lba0, vec![0xAA; 4096], "LBA 0 should still be mapped");
+
+    // LBA 1 and 2 should read as zeros (unmapped)
+    let lba1 = vol.read(4096, 4096).unwrap();
+    assert_eq!(lba1, vec![0u8; 4096], "LBA 1 should be zeros after discard");
+    let lba2 = vol.read(8192, 4096).unwrap();
+    assert_eq!(lba2, vec![0u8; 4096], "LBA 2 should be zeros after discard");
+
+    // LBA 3 still readable
+    let lba3 = vol.read(12288, 4096).unwrap();
+    assert_eq!(lba3, vec![0xAA; 4096], "LBA 3 should still be mapped");
+
+    // Metrics should reflect discard
+    let snap = engine.metrics_snapshot();
+    assert!(snap.volume_discard_ops >= 1);
+    assert!(snap.volume_discard_lbas >= 2);
+}
+
+#[test]
+fn discard_with_flush_frees_space() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-discard-space", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-discard-space").unwrap();
+
+    // Write and flush to LV3
+    let payload = vec![0xBB; 8 * 4096];
+    vol.write(0, &payload).unwrap();
+    assert!(wait_for_buffer_drain(&engine, 5000), "flush timeout");
+
+    // Record free blocks before discard
+    let free_before = engine
+        .allocator()
+        .map(|a| a.free_block_count())
+        .unwrap_or(0);
+
+    // Discard all 8 blocks
+    vol.discard(0, 8 * 4096).unwrap();
+
+    // Free blocks should increase (space reclaimed)
+    let free_after = engine
+        .allocator()
+        .map(|a| a.free_block_count())
+        .unwrap_or(0);
+    assert!(
+        free_after > free_before,
+        "free blocks should increase after discard: before={}, after={}",
+        free_before,
+        free_after
+    );
+
+    // All blocks should read as zeros
+    for lba in 0..8u64 {
+        let data = vol.read(lba * 4096, 4096).unwrap();
+        assert_eq!(
+            data,
+            vec![0u8; 4096],
+            "LBA {} should be zeros after discard",
+            lba
+        );
+    }
+
+    // Blockmap should be empty for these LBAs
+    let vol_id = VolumeId("vol-discard-space".to_string());
+    let mappings = engine
+        .meta()
+        .get_mappings_range(&vol_id, Lba(0), Lba(8))
+        .unwrap();
+    assert!(
+        mappings.is_empty(),
+        "blockmap should have no entries after discard"
+    );
+}
+
+#[test]
+fn discard_empty_range_is_noop() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-discard-noop", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-discard-noop").unwrap();
+
+    // Zero-length discard
+    vol.discard(0, 0).unwrap();
+
+    // Sub-block discard (doesn't cover any full block)
+    vol.discard(100, 200).unwrap();
+
+    // Out-of-bounds discard should fail
+    let result = vol.discard(0, 65 * 4096);
+    assert!(result.is_err(), "discard beyond volume size should fail");
+}
+
+#[test]
+fn discard_partial_block_alignment() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-discard-align", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-discard-align").unwrap();
+
+    // Write 4 blocks
+    let payload = vec![0xCC; 4 * 4096];
+    vol.write(0, &payload).unwrap();
+
+    // Discard with unaligned start: offset=100, len=3*4096
+    // This should only discard LBA 1 and 2 (start rounds up, end rounds down)
+    vol.discard(100, 3 * 4096).unwrap();
+
+    // LBA 0 should still be readable (start rounded up past it)
+    let lba0 = vol.read(0, 4096).unwrap();
+    assert_eq!(lba0, vec![0xCC; 4096], "LBA 0 should survive partial discard");
+
+    // LBA 1 and 2 should be discarded
+    let lba1 = vol.read(4096, 4096).unwrap();
+    assert_eq!(lba1, vec![0u8; 4096], "LBA 1 should be zeros");
+    let lba2 = vol.read(8192, 4096).unwrap();
+    assert_eq!(lba2, vec![0u8; 4096], "LBA 2 should be zeros");
+
+    // LBA 3 should still be readable (end rounded down before it)
+    let lba3 = vol.read(12288, 4096).unwrap();
+    assert_eq!(lba3, vec![0xCC; 4096], "LBA 3 should survive partial discard");
+}

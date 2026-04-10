@@ -9,7 +9,9 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::io::engine::IoEngine;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
-use crate::types::{Lba, ZoneId};
+use crate::space::allocator::SpaceAllocator;
+use crate::space::extent::Extent;
+use crate::types::{Lba, VolumeId, ZoneId};
 use crate::zone::worker::ZoneWorker;
 
 /// IO request dispatched to a zone worker
@@ -44,6 +46,8 @@ pub struct ZoneManager {
     zone_size_blocks: u64,
     zone_count: u32,
     buffer_pool: Arc<WriteBufferPool>,
+    meta: Arc<MetaStore>,
+    allocator: Option<Arc<SpaceAllocator>>,
     metrics: Arc<EngineMetrics>,
 }
 
@@ -62,6 +66,7 @@ impl ZoneManager {
             buffer_pool,
             io_engine,
             Arc::new(EngineMetrics::default()),
+            None,
         )
     }
 
@@ -72,6 +77,7 @@ impl ZoneManager {
         buffer_pool: Arc<WriteBufferPool>,
         io_engine: Arc<IoEngine>,
         metrics: Arc<EngineMetrics>,
+        allocator: Option<Arc<SpaceAllocator>>,
     ) -> OnyxResult<Self> {
         let mut handles = Vec::with_capacity(zone_count as usize);
 
@@ -110,6 +116,8 @@ impl ZoneManager {
             zone_size_blocks,
             zone_count,
             buffer_pool,
+            meta,
+            allocator,
             metrics,
         })
     }
@@ -236,6 +244,55 @@ impl ZoneManager {
         reply_rx
             .recv()
             .map_err(|_| OnyxError::Ublk("zone worker reply channel closed".into()))?
+    }
+
+    /// Submit a DISCARD (TRIM) request for a range of LBAs.
+    ///
+    /// Invalidates buffer index entries, deletes blockmap mappings,
+    /// decrements refcounts, and frees PBAs with zero refcount.
+    /// No LV3 IO is performed — this is purely a metadata operation.
+    pub fn submit_discard(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+    ) -> OnyxResult<()> {
+        if lba_count == 0 {
+            return Ok(());
+        }
+
+        // Step 1: invalidate buffer index so reads see unmapped immediately
+        self.buffer_pool.invalidate_lba_range(vol_id, start_lba, lba_count);
+
+        // Step 2: delete blockmap entries + decrement refcounts atomically
+        let vol_id_obj = VolumeId(vol_id.to_string());
+        let end_lba = Lba(start_lba.0 + lba_count as u64);
+        let freed = self.meta.delete_blockmap_range(&vol_id_obj, start_lba, end_lba)?;
+
+        // Step 3: return freed PBAs to allocator
+        if let Some(allocator) = &self.allocator {
+            let mut blocks_freed = 0u64;
+            for (pba, block_count) in &freed {
+                let result = if *block_count <= 1 {
+                    allocator.free_one(*pba)
+                } else {
+                    allocator.free_extent(Extent::new(*pba, *block_count))
+                };
+                match result {
+                    Ok(()) => blocks_freed += *block_count as u64,
+                    Err(e) => {
+                        tracing::warn!(pba = pba.0, error = %e, "discard: failed to free extent");
+                    }
+                }
+            }
+            if blocks_freed > 0 {
+                self.metrics
+                    .discard_blocks_freed
+                    .fetch_add(blocks_freed, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        Ok(())
     }
 
     /// Graceful shutdown: send shutdown to all workers and wait.
