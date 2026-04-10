@@ -93,7 +93,7 @@ fn setup_gc_env() -> TestEnv {
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
 
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
-    let allocator = Arc::new(SpaceAllocator::new(data_size));
+    let allocator = Arc::new(SpaceAllocator::new(data_size, 0));
 
     TestEnv {
         meta,

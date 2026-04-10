@@ -115,6 +115,7 @@ struct OpenSlot {
 /// die; the packer drains fitting holes when packing new fragments.
 pub struct Packer {
     allocator: Arc<SpaceAllocator>,
+    lane_id: usize,
     open_slot: Option<OpenSlot>,
     hole_map: HoleMap,
 }
@@ -123,6 +124,16 @@ impl Packer {
     pub fn new(allocator: Arc<SpaceAllocator>, hole_map: HoleMap) -> Self {
         Self {
             allocator,
+            lane_id: 0,
+            open_slot: None,
+            hole_map,
+        }
+    }
+
+    pub fn new_with_lane(allocator: Arc<SpaceAllocator>, hole_map: HoleMap, lane_id: usize) -> Self {
+        Self {
+            allocator,
+            lane_id,
             open_slot: None,
             hole_map,
         }
@@ -175,7 +186,7 @@ impl Packer {
 
         // 3. Doesn't fit in open slot, no hole available — seal + allocate new
         if self.open_slot.is_some() {
-            match self.allocator.allocate_one() {
+            match self.allocator.allocate_one_for_lane(self.lane_id) {
                 Ok(new_pba) => {
                     let sealed = self.seal_open_slot();
                     self.place_into_new_slot(unit, new_pba);
@@ -188,7 +199,7 @@ impl Packer {
             }
         } else {
             // No open slot — start a new one
-            let pba = self.allocator.allocate_one()?;
+            let pba = self.allocator.allocate_one_for_lane(self.lane_id)?;
             self.place_into_new_slot(unit, pba);
             Ok(PackResult::Buffered)
         }

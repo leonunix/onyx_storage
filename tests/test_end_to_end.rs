@@ -76,7 +76,7 @@ fn setup_e2e() -> (
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
 
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
-    let allocator = Arc::new(SpaceAllocator::new(data_size));
+    let allocator = Arc::new(SpaceAllocator::new(data_size, 0));
 
     std::mem::forget(meta_dir);
     std::mem::forget(buf_tmp);
@@ -209,7 +209,7 @@ fn write_flush_read_zstd() {
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
-    let allocator = Arc::new(SpaceAllocator::new(data_size));
+    let allocator = Arc::new(SpaceAllocator::new(data_size, 0));
 
     std::mem::forget(meta_dir);
     std::mem::forget(buf_tmp);
@@ -257,7 +257,7 @@ fn write_flush_read_no_compression() {
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
-    let allocator = Arc::new(SpaceAllocator::new(data_size));
+    let allocator = Arc::new(SpaceAllocator::new(data_size, 0));
 
     std::mem::forget(meta_dir);
     std::mem::forget(buf_tmp);

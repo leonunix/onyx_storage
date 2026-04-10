@@ -1,12 +1,59 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, Options, ReadOptions, WriteBatch, DB};
+use rocksdb::{
+    BlockBasedOptions, ColumnFamilyDescriptor, MergeOperands, Options, ReadOptions, WriteBatch, DB,
+};
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::schema::*;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
+
+/// Full merge for CF_REFCOUNT: applies all pending i32 deltas to the base u32 value.
+///
+/// Base value: 4-byte BE u32 (existing refcount, or absent = 0).
+/// Operand: 4-byte BE i32 (delta: positive = increment, negative = decrement).
+/// Result: max(base + sum(deltas), 0) as u32, encoded as 4-byte BE u32.
+fn refcount_full_merge(
+    _key: &[u8],
+    existing_val: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let base: i64 = match existing_val {
+        Some(v) if v.len() == 4 => u32::from_be_bytes(v[0..4].try_into().unwrap()) as i64,
+        Some(_) => return None,
+        None => 0,
+    };
+    let mut total_delta: i64 = 0;
+    for op in operands {
+        if op.len() == 4 {
+            total_delta += i32::from_be_bytes(op[0..4].try_into().unwrap()) as i64;
+        } else {
+            return None;
+        }
+    }
+    let result = (base + total_delta).max(0) as u32;
+    Some(result.to_be_bytes().to_vec())
+}
+
+/// Partial merge for CF_REFCOUNT: combines multiple i32 deltas into one.
+/// Returns i32 (NOT clamped to 0) so negative deltas are preserved for full_merge.
+fn refcount_partial_merge(
+    _key: &[u8],
+    _existing_val: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut total: i32 = 0;
+    for op in operands {
+        if op.len() == 4 {
+            total = total.saturating_add(i32::from_be_bytes(op[0..4].try_into().unwrap()));
+        } else {
+            return None;
+        }
+    }
+    Some(total.to_be_bytes().to_vec())
+}
 
 pub struct MetaStore {
     db: DB,
@@ -24,6 +71,7 @@ impl MetaStore {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         db_opts.set_keep_log_file_num(5);
+        db_opts.set_enable_pipelined_write(true);
 
         if let Some(ref wal_dir) = config.wal_dir {
             db_opts.set_wal_dir(wal_dir);
@@ -46,11 +94,16 @@ impl MetaStore {
         blockmap_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         let cf_blockmap = ColumnFamilyDescriptor::new(CF_BLOCKMAP, blockmap_opts);
 
-        // Refcount CF: bloom filter
+        // Refcount CF: bloom filter + merge operator for lock-free increment/decrement
         let mut refcount_opts = Options::default();
         let mut refcount_block_opts = BlockBasedOptions::default();
         refcount_block_opts.set_bloom_filter(10.0, false);
         refcount_opts.set_block_based_table_factory(&refcount_block_opts);
+        refcount_opts.set_merge_operator(
+            "refcount_sum",
+            refcount_full_merge,
+            refcount_partial_merge,
+        );
         let cf_refcount = ColumnFamilyDescriptor::new(CF_REFCOUNT, refcount_opts);
 
         // Dedup index CF: content_hash(32B) → DedupEntry(27B), high bloom FPR for mostly-miss workloads
@@ -171,26 +224,14 @@ impl MetaStore {
         }
         iter.status()?;
 
-        // Phase 2: read current refcounts once per PBA, compute final values
+        // Phase 2: merge-decrement refcounts + delete blockmap + volume in one WriteBatch
         let mut batch = WriteBatch::default();
-        let mut freed_extents = Vec::new();
 
         for (pba, decrement) in &pba_decrements {
-            let current_rc = self.get_refcount(*pba)?;
-            let new_rc = current_rc.saturating_sub(*decrement);
             let rc_key = encode_refcount_key(*pba);
-            if new_rc == 0 {
-                batch.delete_cf(&cf_refcount, &rc_key);
-                // Clean up dedup entries for freed PBA
-                self.cleanup_dedup_for_pba(*pba, &mut batch)?;
-                let block_count = pba_block_counts.get(pba).copied().unwrap_or(1);
-                freed_extents.push((*pba, block_count));
-            } else {
-                batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
-            }
+            batch.merge_cf(&cf_refcount, &rc_key, encode_refcount_delta(-(*decrement as i32)));
         }
 
-        // Phase 3: delete all blockmap entries + volume record in one batch
         for key in &blockmap_keys_to_delete {
             batch.delete_cf(&cf_blockmap, key);
         }
@@ -199,6 +240,38 @@ impl MetaStore {
         batch.delete_cf(&cf_volumes, &vol_key);
 
         self.db.write(batch)?;
+
+        // Phase 3: read back refcounts to find zeroed PBAs, cleanup dedup + collect freed extents.
+        // This is best-effort: the volume is already deleted after Phase 2 committed.
+        // If cleanup fails, orphaned refcount/dedup entries are harmless and will be
+        // cleaned up by cleanup_orphaned_refcounts on next startup.
+        let mut freed_extents = Vec::new();
+        let pba_keys: Vec<Pba> = pba_decrements.keys().copied().collect();
+        match self.multi_get_refcounts(&pba_keys) {
+            Ok(refcounts) => {
+                let mut cleanup_batch = WriteBatch::default();
+                let mut need_cleanup = false;
+                for (i, pba) in pba_keys.iter().enumerate() {
+                    let rc = refcounts.get(i).copied().unwrap_or(0);
+                    if rc == 0 {
+                        let rc_key = encode_refcount_key(*pba);
+                        cleanup_batch.delete_cf(&cf_refcount, &rc_key);
+                        let _ = self.cleanup_dedup_for_pba(*pba, &mut cleanup_batch);
+                        let block_count = pba_block_counts.get(pba).copied().unwrap_or(1);
+                        freed_extents.push((*pba, block_count));
+                        need_cleanup = true;
+                    }
+                }
+                if need_cleanup {
+                    if let Err(e) = self.db.write(cleanup_batch) {
+                        tracing::warn!(error = %e, "delete_volume: cleanup batch failed (non-fatal)");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "delete_volume: refcount readback failed (non-fatal)");
+            }
+        }
 
         tracing::info!(
             volume = %id,
@@ -467,7 +540,7 @@ impl MetaStore {
             batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_refcount));
         }
 
-        // Decrement old PBA refcounts
+        // Decrement old PBA refcounts (read + put/delete inside lock)
         for (old_pba, decrement) in old_pba_decrements {
             let current_rc = self.get_refcount(*old_pba)?;
             let new_rc = current_rc.saturating_sub(*decrement);
@@ -476,6 +549,50 @@ impl MetaStore {
                 batch.delete_cf(&cf_refcount, &rc_key);
             } else {
                 batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
+            }
+        }
+
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Atomically write blockmap entries for a hole fill, incrementing the existing
+    /// PBA refcount by `increment` and decrementing old PBA refcounts.
+    pub fn atomic_batch_write_hole_fill(
+        &self,
+        vol_id: &VolumeId,
+        batch_values: &[(Lba, BlockmapValue)],
+        pba: Pba,
+        increment: u32,
+        old_pba_decrements: &std::collections::HashMap<Pba, u32>,
+    ) -> OnyxResult<()> {
+        let _guard = self.refcount_lock.lock().unwrap();
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        let mut batch = WriteBatch::default();
+
+        for (lba, value) in batch_values {
+            let bm_key = encode_blockmap_key(vol_id, *lba)?;
+            let bm_val = encode_blockmap_value(value);
+            batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+        }
+
+        // Increment existing PBA refcount (read + put inside lock)
+        let current_rc = self.get_refcount(pba)?;
+        let new_rc = current_rc + increment;
+        let rc_key = encode_refcount_key(pba);
+        batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
+
+        // Decrement old PBA refcounts (read + put/delete inside lock)
+        for (old_pba, decrement) in old_pba_decrements {
+            let old_rc = self.get_refcount(*old_pba)?;
+            let old_new = old_rc.saturating_sub(*decrement);
+            let old_rc_key = encode_refcount_key(*old_pba);
+            if old_new == 0 {
+                batch.delete_cf(&cf_refcount, &old_rc_key);
+            } else {
+                batch.put_cf(&cf_refcount, &old_rc_key, &encode_refcount_value(old_new));
             }
         }
 
@@ -782,13 +899,13 @@ impl MetaStore {
         let same_pba = old_pba.map_or(false, |old| old == new_value.pba);
 
         if !same_pba {
-            // Increment refcount for existing PBA (not set to 1!)
+            // Increment refcount for existing PBA (read + put inside lock)
             let current_rc = self.get_refcount(new_value.pba)?;
             let new_rc = current_rc + 1;
             let rc_key = encode_refcount_key(new_value.pba);
             batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
 
-            // Decrement old PBA refcount
+            // Decrement old PBA refcount (read + put/delete inside lock)
             if let Some(old) = old_pba {
                 let old_count = self.get_refcount(old)?;
                 let old_new = old_count.saturating_sub(1);

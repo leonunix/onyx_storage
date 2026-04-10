@@ -506,7 +506,7 @@ impl BufferFlusher {
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
-                    let mut packer = Packer::new(allocator_w.clone(), hole_map_w);
+                    let mut packer = Packer::new_with_lane(allocator_w.clone(), hole_map_w, shard_idx);
                     Self::writer_loop(
                         shard_idx,
                         &write_rx,
@@ -1509,7 +1509,7 @@ impl BufferFlusher {
             let blocks_needed = (unit.compressed_data.len() + bs - 1) / bs;
 
             let allocation = if blocks_needed == 1 {
-                Allocation::Single(allocator.allocate_one()?)
+                Allocation::Single(allocator.allocate_one_for_lane(shard_idx)?)
             } else {
                 let extent = allocator.allocate_extent(blocks_needed as u32)?;
                 if (extent.count as usize) < blocks_needed {
@@ -1765,7 +1765,7 @@ impl BufferFlusher {
             alloc_blocks[i] = blocks_needed as u32;
 
             let allocation = if blocks_needed == 1 {
-                allocator.allocate_one().map(|pba| (pba, 1u32))
+                allocator.allocate_one_for_lane(shard_idx).map(|pba| (pba, 1u32))
             } else {
                 allocator
                     .allocate_extent(blocks_needed as u32)
@@ -1788,22 +1788,54 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
-        // Phase 3: Batch IO writes.
+        // Phase 3: Parallel IO writes (one scoped thread per unit for NVMe QD > 1).
         let io_start = Instant::now();
-        for (i, unit) in units.iter().enumerate() {
-            if skip[i] {
-                continue;
-            }
-            let pba = pbas[i].unwrap();
-            if let Err(e) = io_engine.write_blocks(pba, &unit.compressed_data) {
-                // Rollback allocation.
-                if alloc_blocks[i] == 1 {
-                    let _ = allocator.free_one(pba);
-                } else {
-                    let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
+        {
+            let io_errors: Vec<Option<crate::error::OnyxError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..n)
+                    .filter(|i| !skip[*i])
+                    .map(|i| {
+                        let pba = pbas[i].unwrap();
+                        let data = &units[i].compressed_data;
+                        let blk = alloc_blocks[i];
+                        (i, blk, s.spawn(move || io_engine.write_blocks(pba, data)))
+                    })
+                    .collect();
+                let mut errs: Vec<Option<crate::error::OnyxError>> = (0..n).map(|_| None).collect();
+                for (i, blk, handle) in handles {
+                    match handle.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let pba = pbas[i].unwrap();
+                            if blk == 1 {
+                                let _ = allocator.free_one(pba);
+                            } else {
+                                let _ = allocator.free_extent(Extent::new(pba, blk));
+                            }
+                            errs[i] = Some(e);
+                        }
+                        Err(_) => {
+                            let pba = pbas[i].unwrap();
+                            if blk == 1 {
+                                let _ = allocator.free_one(pba);
+                            } else {
+                                let _ = allocator.free_extent(Extent::new(pba, blk));
+                            }
+                            errs[i] = Some(crate::error::OnyxError::Io(std::io::Error::other(
+                                "IO thread panicked",
+                            )));
+                        }
+                    }
                 }
-                results[i] = Err(e);
-                skip[i] = true;
+                errs
+            });
+            for (i, err) in io_errors.into_iter().enumerate() {
+                if let Some(e) = err {
+                    results[i] = Err(crate::error::OnyxError::Io(std::io::Error::other(
+                        format!("IO write failed: {e}"),
+                    )));
+                    skip[i] = true;
+                }
             }
         }
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
@@ -2464,10 +2496,8 @@ impl BufferFlusher {
             }
         }
 
-        let current_rc = meta.get_refcount(fill.pba)?;
-        let new_rc = current_rc + unit.lba_count - self_decrement;
-
-        meta.atomic_batch_write(&vol_id, &batch_values, new_rc, &old_pba_decrements)?;
+        let net_increment = unit.lba_count - self_decrement;
+        meta.atomic_batch_write_hole_fill(&vol_id, &batch_values, fill.pba, net_increment, &old_pba_decrements)?;
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Free old PBAs whose refcount dropped to 0

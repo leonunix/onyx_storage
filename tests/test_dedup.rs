@@ -59,7 +59,7 @@ fn setup_dedup_env_with_sizes(
 
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
-    let allocator = Arc::new(SpaceAllocator::new(16 * 1024 * 1024));
+    let allocator = Arc::new(SpaceAllocator::new(16 * 1024 * 1024, 0));
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
 
     // Keep temp files alive by leaking them

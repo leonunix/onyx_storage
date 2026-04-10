@@ -44,7 +44,7 @@ fn setup_flush_env() -> (
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
 
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
-    let allocator = Arc::new(SpaceAllocator::new(data_size as u64));
+    let allocator = Arc::new(SpaceAllocator::new(data_size as u64, 0));
 
     std::mem::forget(meta_dir);
     std::mem::forget(buf_tmp);

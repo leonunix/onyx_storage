@@ -27,7 +27,7 @@ fn extent_ordering() {
 
 #[test]
 fn basic_allocate_free() {
-    let alloc = SpaceAllocator::new(4096 * 100);
+    let alloc = SpaceAllocator::new(4096 * 100, 0);
     let usable = 100 - RESERVED_BLOCKS;
     assert_eq!(alloc.free_block_count(), usable);
     assert_eq!(alloc.allocated_block_count(), 0);
@@ -49,7 +49,7 @@ fn basic_allocate_free() {
 #[test]
 fn no_double_allocation() {
     // 18 total blocks = 10 usable (18 - 8 reserved)
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     let mut allocated = Vec::new();
     for _ in 0..10 {
         allocated.push(alloc.allocate_one().unwrap());
@@ -63,7 +63,7 @@ fn no_double_allocation() {
 #[test]
 fn exhaustion() {
     // 10 total = 2 usable (10 - 8 reserved)
-    let alloc = SpaceAllocator::new(4096 * 10);
+    let alloc = SpaceAllocator::new(4096 * 10, 0);
     alloc.allocate_one().unwrap();
     alloc.allocate_one().unwrap();
     assert!(alloc.allocate_one().is_err());
@@ -71,7 +71,7 @@ fn exhaustion() {
 
 #[test]
 fn extent_allocation() {
-    let alloc = SpaceAllocator::new(4096 * 100);
+    let alloc = SpaceAllocator::new(4096 * 100, 0);
     let usable = 100 - RESERVED_BLOCKS;
 
     let ext = alloc.allocate_extent(10).unwrap();
@@ -85,7 +85,7 @@ fn extent_allocation() {
 #[test]
 fn coalescing() {
     // 18 total = 10 usable
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
 
     let mut pbas = Vec::new();
     for _ in 0..10 {
@@ -119,7 +119,7 @@ fn rebuild_from_metadata() {
     meta.set_refcount(Pba(17), 1).unwrap();
 
     // 18 total blocks = 10 usable (18 - 8)
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     alloc.rebuild_from_metadata(&meta).unwrap();
 
     assert_eq!(alloc.allocated_block_count(), 4);
@@ -132,7 +132,7 @@ fn rebuild_from_metadata() {
 /// Allocate 0 blocks → error.
 #[test]
 fn allocate_zero_blocks() {
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     assert!(alloc.allocate_extent(0).is_err());
 }
 
@@ -140,7 +140,7 @@ fn allocate_zero_blocks() {
 #[test]
 fn allocate_extent_partial() {
     // 18 total = 10 usable
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     // Allocate 7, leaving 3
     let _ = alloc.allocate_extent(7).unwrap();
     // Request 5 but only 3 are available → returns 3
@@ -152,7 +152,7 @@ fn allocate_extent_partial() {
 #[test]
 fn allocate_extent_exhausted() {
     // 13 total = 5 usable
-    let alloc = SpaceAllocator::new(4096 * 13);
+    let alloc = SpaceAllocator::new(4096 * 13, 0);
     let _ = alloc.allocate_extent(5).unwrap();
     assert!(alloc.allocate_extent(1).is_err());
 }
@@ -160,7 +160,7 @@ fn allocate_extent_exhausted() {
 /// Free extent reclaims all blocks.
 #[test]
 fn free_extent_reclaims() {
-    let alloc = SpaceAllocator::new(4096 * 100);
+    let alloc = SpaceAllocator::new(4096 * 100, 0);
     let usable = 100 - RESERVED_BLOCKS;
     let ext = alloc.allocate_extent(20).unwrap();
     assert_eq!(alloc.free_block_count(), usable - 20);
@@ -171,7 +171,7 @@ fn free_extent_reclaims() {
 /// total_block_count returns correct value.
 #[test]
 fn total_block_count() {
-    let alloc = SpaceAllocator::new(4096 * 50);
+    let alloc = SpaceAllocator::new(4096 * 50, 0);
     assert_eq!(alloc.total_block_count(), 50);
 }
 
@@ -186,7 +186,7 @@ fn rebuild_empty_metadata() {
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
-    let alloc = SpaceAllocator::new(4096 * 100);
+    let alloc = SpaceAllocator::new(4096 * 100, 0);
     alloc.rebuild_from_metadata(&meta).unwrap();
 
     let usable = 100 - RESERVED_BLOCKS;
@@ -210,7 +210,7 @@ fn rebuild_fully_allocated() {
         meta.set_refcount(Pba(i), 1).unwrap();
     }
 
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     alloc.rebuild_from_metadata(&meta).unwrap();
 
     assert_eq!(alloc.allocated_block_count(), 10);
@@ -251,7 +251,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
     meta.set_refcount(Pba(12), 2).unwrap();
 
     // 18 total = 10 usable
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     alloc.rebuild_from_metadata(&meta).unwrap();
 
     assert_eq!(alloc.allocated_block_count(), 2);
@@ -264,7 +264,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
 /// Free a PBA beyond total_blocks → error.
 #[test]
 fn free_one_out_of_bounds() {
-    let alloc = SpaceAllocator::new(4096 * 18); // 18 blocks: 0..17, usable 8..17
+    let alloc = SpaceAllocator::new(4096 * 18, 0); // 18 blocks: 0..17, usable 8..17
     assert!(alloc.free_one(Pba(18)).is_err());
     assert!(alloc.free_one(Pba(100)).is_err());
 }
@@ -272,7 +272,7 @@ fn free_one_out_of_bounds() {
 /// Double-free the same PBA → error on second free.
 #[test]
 fn free_one_double_free() {
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     let pba = alloc.allocate_one().unwrap();
     alloc.free_one(pba).unwrap();
     assert!(alloc.free_one(pba).is_err()); // already free
@@ -281,7 +281,7 @@ fn free_one_double_free() {
 /// Free a PBA that was never allocated (initially all free) → error.
 #[test]
 fn free_one_never_allocated() {
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     // PBA 13 is in the initial free extent, never allocated
     assert!(alloc.free_one(Pba(13)).is_err());
 }
@@ -290,7 +290,7 @@ fn free_one_never_allocated() {
 #[test]
 fn free_extent_out_of_bounds() {
     // 18 total = 10 usable
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     let _ = alloc.allocate_extent(10).unwrap();
     // Try to free extent that goes beyond total blocks
     assert!(alloc.free_extent(Extent::new(Pba(16), 5)).is_err()); // 16+5=21 > 18
@@ -299,7 +299,7 @@ fn free_extent_out_of_bounds() {
 /// Free extent of 0 blocks → error.
 #[test]
 fn free_extent_zero_blocks() {
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     assert!(alloc
         .free_extent(Extent::new(Pba(RESERVED_BLOCKS), 0))
         .is_err());
@@ -309,7 +309,7 @@ fn free_extent_zero_blocks() {
 #[test]
 fn free_extent_overlap() {
     // 18 total = 10 usable (PBA 8..17)
-    let alloc = SpaceAllocator::new(4096 * 18);
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
     let _ = alloc.allocate_extent(5).unwrap(); // allocates 8..12
     let ext2 = alloc.allocate_extent(5).unwrap(); // allocates 13..17
     alloc.free_extent(ext2).unwrap(); // 13..17 now free
@@ -322,7 +322,7 @@ fn free_extent_overlap() {
 #[test]
 fn free_extent_underflow() {
     // 12 total = 4 usable (PBA 8..11)
-    let alloc2 = SpaceAllocator::new(4096 * 12);
+    let alloc2 = SpaceAllocator::new(4096 * 12, 0);
     let _ = alloc2.allocate_extent(4).unwrap(); // 4 allocated, 0 free
     alloc2
         .free_extent(Extent::new(Pba(RESERVED_BLOCKS), 2))

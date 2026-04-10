@@ -368,7 +368,7 @@ impl OnyxEngine {
         let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
 
         // 3. Space allocator
-        let allocator = Arc::new(SpaceAllocator::new(device_size));
+        let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool (with shard migration if needed)
@@ -692,6 +692,11 @@ impl OnyxEngine {
             flusher.stop();
         }
 
+        // Drain per-lane allocator caches back to the global free list
+        if let Some(ref allocator) = self.allocator {
+            allocator.drain_lane_caches();
+        }
+
         // Zone manager shutdown is handled by Drop (it sends Shutdown to all workers)
         // We can't call shutdown(&mut self) through Arc, but Drop handles it.
 
@@ -748,7 +753,7 @@ impl OnyxEngine {
         let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
 
         // Space allocator
-        let allocator = Arc::new(SpaceAllocator::new(device_size));
+        let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
         allocator.rebuild_from_metadata(&meta)?;
 
         // Write buffer pool (with shard migration if needed)

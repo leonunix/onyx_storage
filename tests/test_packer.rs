@@ -27,6 +27,7 @@ fn make_allocator(usable_blocks: u64) -> Arc<SpaceAllocator> {
     // Add RESERVED_BLOCKS so the allocator has the requested number of usable blocks.
     Arc::new(SpaceAllocator::new(
         (usable_blocks + onyx_storage::types::RESERVED_BLOCKS) * BLOCK_SIZE as u64,
+        0,
     ))
 }
 
@@ -188,7 +189,7 @@ fn exact_fit_fragment() {
 #[test]
 fn space_exhaustion_on_first_slot() {
     // No blocks available at all
-    let alloc = Arc::new(SpaceAllocator::new(0));
+    let alloc = Arc::new(SpaceAllocator::new(0, 0));
     let mut packer = Packer::new(alloc, new_hole_map());
 
     let unit = make_unit("vol-a", 0, 1, 500);

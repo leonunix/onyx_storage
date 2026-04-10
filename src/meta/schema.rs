@@ -238,6 +238,12 @@ pub fn decode_refcount_value(val: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(val[0..4].try_into().unwrap()))
 }
 
+/// Encode a refcount delta for the MergeOperator (4B BE i32).
+/// Positive = increment, negative = decrement.
+pub fn encode_refcount_delta(delta: i32) -> [u8; 4] {
+    delta.to_be_bytes()
+}
+
 /// Encode volumes CF key: "vol-{id}"
 pub fn encode_volume_key(vol_id: &str) -> Vec<u8> {
     format!("vol-{}", vol_id).into_bytes()
