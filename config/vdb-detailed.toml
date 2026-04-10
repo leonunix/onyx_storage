@@ -1,0 +1,75 @@
+# Detailed single-disk test profile for a dedicated `/dev/vdb`.
+#
+# Expected layout on this host:
+#   /dev/vdb1 -> filesystem for RocksDB metadata
+#   /dev/vdb2 -> raw buffer device
+#   /dev/vdb3 -> raw data device
+#
+# Suggested partitioning on the current 500 GiB disk:
+#   vdb1: 32 GiB
+#   vdb2: 64 GiB
+#   vdb3: remaining capacity
+#
+# Mount vdb1 at:
+#   /mnt/onyx-vdb-meta
+#
+# Note:
+#   `buffer.capacity_mb` is currently not enforced by the engine. The real
+#   usable buffer capacity comes from the size of `buffer.device`.
+
+[meta]
+rocksdb_path = "/mnt/onyx-vdb-meta/rocksdb"
+block_cache_mb = 1024
+wal_dir = "/mnt/onyx-vdb-meta/wal"
+
+[storage]
+data_device = "/dev/vdb3"
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+
+[buffer]
+device = "/dev/vdb2"
+capacity_mb = 65536
+flush_watermark_pct = 80
+group_commit_wait_us = 250
+shards = 4
+
+[ublk]
+nr_queues = 4
+queue_depth = 128
+io_buf_bytes = 1048576
+
+[flush]
+# per flush lane; total compress workers = shards × compress_workers
+compress_workers = 2
+coalesce_max_raw_bytes = 131072
+coalesce_max_lbas = 32
+
+[engine]
+zone_count = 16
+zone_size_blocks = 256
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 64
+
+[dedup]
+enabled = true
+workers = 2
+buffer_skip_threshold_pct = 90
+rescan_interval_ms = 30000
+max_rescan_per_cycle = 256
+
+[service]
+socket_path = "/tmp/onyx-storage-vdb.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30

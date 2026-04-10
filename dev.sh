@@ -4,17 +4,22 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "$0")" && pwd)"
 PID_DIR="$PROJ_ROOT/.dev"
 LOG_DIR="$PROJ_ROOT/.dev/logs"
+CONFIG_STATE_FILE="$PID_DIR/selected-config"
 
-# Dev config — override with: ONYX_CONFIG=config/default.toml ./dev.sh start
-ONYX_CONFIG="${ONYX_CONFIG:-config/bench-loop.toml}"
+# Dev config precedence:
+#   1. --config <path>
+#   2. ONYX_CONFIG env
+#   3. last saved selection in .dev/selected-config
+#   4. interactive picker from config/*.toml
+#   5. fallback: config/bench-loop.toml
+DEFAULT_CONFIG="config/bench-loop.toml"
+ONYX_CONFIG="${ONYX_CONFIG:-}"
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
 # ── component definitions ──────────────────────────────────────────
 
 declare -A CMD
-CMD[engine]="cargo run --bin onyx-storage -- -c $ONYX_CONFIG start"
-CMD[backend]="cd dashboard/backend && ONYX_STORAGE_CONFIG=$ONYX_CONFIG ONYX_DASHBOARD_ADDR=:8010 go run ./cmd/dashboardd"
 CMD[frontend]="cd dashboard/frontend && npm run dev"
 
 declare -A DESC
@@ -28,6 +33,163 @@ ALL_COMPONENTS="engine backend frontend"
 
 pid_file()  { echo "$PID_DIR/$1.pid"; }
 log_file()  { echo "$LOG_DIR/$1.log"; }
+selected_config_file() { echo "$CONFIG_STATE_FILE"; }
+
+quote_shell_arg() {
+    printf "%q" "$1"
+}
+
+list_configs() {
+    (
+        cd "$PROJ_ROOT"
+        shopt -s nullglob
+        local files=(config/*.toml)
+        printf '%s\n' "${files[@]}"
+    )
+}
+
+saved_config() {
+    local sf
+    sf="$(selected_config_file)"
+    if [[ -f "$sf" ]]; then
+        head -n 1 "$sf"
+    fi
+}
+
+save_config() {
+    printf '%s\n' "$1" > "$(selected_config_file)"
+}
+
+config_exists() {
+    local path="${1:-}"
+    [[ -n "$path" ]] || return 1
+    [[ -f "$(normalize_config_path "$path")" ]]
+}
+
+normalize_config_path() {
+    local path="${1:-}"
+    local dir
+    local base
+
+    if [[ -z "$path" ]]; then
+        return 1
+    fi
+
+    if [[ "$path" = /* ]]; then
+        if [[ -f "$path" ]]; then
+            dir="$(cd "$(dirname "$path")" && pwd -P)"
+            base="$(basename "$path")"
+            printf '%s/%s\n' "$dir" "$base"
+        else
+            printf '%s\n' "$path"
+        fi
+        return
+    fi
+
+    if [[ -f "$path" ]]; then
+        dir="$(cd "$(dirname "$path")" && pwd -P)"
+        base="$(basename "$path")"
+        printf '%s/%s\n' "$dir" "$base"
+        return
+    fi
+
+    if [[ -f "$PROJ_ROOT/$path" ]]; then
+        dir="$(cd "$PROJ_ROOT/$(dirname "$path")" && pwd -P)"
+        base="$(basename "$path")"
+        printf '%s/%s\n' "$dir" "$base"
+        return
+    fi
+
+    printf '%s\n' "$path"
+}
+
+pick_config_interactive() {
+    local configs=()
+    local i choice
+    mapfile -t configs < <(list_configs)
+
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        echo "$DEFAULT_CONFIG"
+        return
+    fi
+
+    echo "Available configs:" >&2
+    for i in "${!configs[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "${configs[$i]}" >&2
+    done
+
+    while true; do
+        printf 'Select config [1-%d]: ' "${#configs[@]}" >&2
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#configs[@]} )); then
+            echo "${configs[$((choice - 1))]}"
+            return
+        fi
+        echo "Invalid selection: $choice" >&2
+    done
+}
+
+resolve_config() {
+    local explicit="${1:-}"
+    local saved=""
+
+    if [[ -n "$explicit" ]]; then
+        echo "$explicit"
+        return
+    fi
+
+    if [[ -n "$ONYX_CONFIG" ]]; then
+        echo "$ONYX_CONFIG"
+        return
+    fi
+
+    saved="$(saved_config || true)"
+    if config_exists "$saved"; then
+        echo "$saved"
+        return
+    fi
+
+    if [[ -t 0 ]]; then
+        pick_config_interactive
+        return
+    fi
+
+    echo "$DEFAULT_CONFIG"
+}
+
+ensure_config() {
+    local requested="${1:-}"
+    local resolved
+    resolved="$(resolve_config "$requested")"
+    resolved="$(normalize_config_path "$resolved")"
+    if [[ ! -f "$resolved" ]]; then
+        echo "Config not found: $resolved" >&2
+        exit 1
+    fi
+    ONYX_CONFIG="$resolved"
+    save_config "$ONYX_CONFIG"
+}
+
+command_for() {
+    local name="$1"
+    local qcfg
+    qcfg="$(quote_shell_arg "$ONYX_CONFIG")"
+    case "$name" in
+        engine)
+            printf 'cargo run --bin onyx-storage -- -c %s start' "$qcfg"
+            ;;
+        backend)
+            printf 'cd dashboard/backend && ONYX_STORAGE_CONFIG=%s ONYX_DASHBOARD_ADDR=:8010 go run ./cmd/dashboardd' "$qcfg"
+            ;;
+        frontend)
+            printf '%s' "${CMD[$name]}"
+            ;;
+        *)
+            echo "unknown component: $name" >&2
+            exit 1
+            ;;
+    esac
+}
 
 is_running() {
     local pf
@@ -44,7 +206,7 @@ start_one() {
 
     local lf
     lf="$(log_file "$name")"
-    bash -c "cd $PROJ_ROOT && ${CMD[$name]}" > "$lf" 2>&1 &
+    bash -c "cd $(quote_shell_arg "$PROJ_ROOT") && $(command_for "$name")" > "$lf" 2>&1 &
     local pid=$!
     echo "$pid" > "$(pid_file "$name")"
     echo "  $name  started (pid $pid) → ${DESC[$name]}"
@@ -73,7 +235,10 @@ stop_one() {
 
 cmd_start() {
     local targets="${1:-$ALL_COMPONENTS}"
+    local requested_config="${2:-}"
+    ensure_config "$requested_config"
     echo "Starting..."
+    echo "Config: $ONYX_CONFIG"
     for c in $targets; do start_one "$c"; done
     echo ""
     echo "Logs:  tail -f .dev/logs/*.log"
@@ -88,12 +253,21 @@ cmd_stop() {
 
 cmd_restart() {
     local targets="${1:-$ALL_COMPONENTS}"
+    local requested_config="${2:-}"
+    ensure_config "$requested_config"
     cmd_stop "$targets"
     sleep 1
-    cmd_start "$targets"
+    cmd_start "$targets" "$ONYX_CONFIG"
 }
 
 cmd_status() {
+    local current_config
+    current_config="$(saved_config || true)"
+    if config_exists "$current_config"; then
+        echo "Config: $current_config"
+    else
+        echo "Config: (not selected yet)"
+    fi
     for c in $ALL_COMPONENTS; do
         if is_running "$c"; then
             echo "  $c  running (pid $(cat "$(pid_file "$c")"))"
@@ -112,23 +286,46 @@ cmd_logs() {
     fi
 }
 
+cmd_config() {
+    local requested_config="${1:-}"
+    ensure_config "$requested_config"
+    echo "Selected config: $ONYX_CONFIG"
+}
+
 # ── main ───────────────────────────────────────────────────────────
 
 usage() {
-    echo "Usage: $0 {start|stop|restart|status|logs} [engine|backend|frontend]"
+    echo "Usage: $0 [--config path] {start|stop|restart|status|logs|config} [engine|backend|frontend]"
     echo ""
     echo "  start   [component]   Start all or one component"
     echo "  stop    [component]   Stop all or one component"
     echo "  restart [component]   Restart all or one component"
     echo "  status                Show running state"
     echo "  logs    [component]   Tail logs (all or one)"
+    echo "  config  [path]        Select and save the config used by dev.sh"
+    echo ""
+    echo "Examples:"
+    echo "  ./dev.sh start"
+    echo "  ./dev.sh --config config/vdb-detailed.toml start engine"
+    echo "  ONYX_CONFIG=config/bench-loop.toml ./dev.sh restart"
 }
 
+REQUESTED_CONFIG=""
+if [[ "${1:-}" == "--config" ]]; then
+    REQUESTED_CONFIG="${2:-}"
+    if [[ -z "$REQUESTED_CONFIG" ]]; then
+        echo "--config requires a path" >&2
+        exit 1
+    fi
+    shift 2
+fi
+
 case "${1:-}" in
-    start)   cmd_start "${2:-}" ;;
+    start)   cmd_start "${2:-}" "$REQUESTED_CONFIG" ;;
     stop)    cmd_stop "${2:-}" ;;
-    restart) cmd_restart "${2:-}" ;;
+    restart) cmd_restart "${2:-}" "$REQUESTED_CONFIG" ;;
     status)  cmd_status ;;
     logs)    cmd_logs "${2:-}" ;;
+    config)  cmd_config "${2:-$REQUESTED_CONFIG}" ;;
     *)       usage ;;
 esac
