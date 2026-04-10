@@ -1,20 +1,24 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
+use crate::compress::codec::create_compressor;
 use crate::config::OnyxConfig;
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::runner::GcRunner;
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
+use crate::io::superblock::{self, HeartbeatWriter};
 use crate::lifecycle::VolumeLifecycleManager;
+use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
 use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, EngineStatusSnapshot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
-use crate::types::{CompressionAlgo, VolumeConfig, VolumeId};
+use crate::types::{CompressionAlgo, Lba, VolumeConfig, VolumeId, BLOCK_SIZE};
 use crate::volume::OnyxVolume;
 use crate::zone::manager::ZoneManager;
 
@@ -38,6 +42,7 @@ pub struct OnyxEngine {
     flusher: Mutex<Option<BufferFlusher>>,
     gc_runner: Mutex<Option<GcRunner>>,
     dedup_scanner: Mutex<Option<DedupScanner>>,
+    heartbeat_writer: Mutex<Option<HeartbeatWriter>>,
     zone_manager: Option<Arc<ZoneManager>>,
     /// Live volume handles: (vol_name, alive_flag).
     /// delete_volume sets all matching flags to false.
@@ -68,6 +73,64 @@ impl OnyxEngine {
             .max()
             .unwrap_or(0);
         Ok(Self::current_time_nanos().max(max_existing))
+    }
+
+    fn read_block_from_mapping(
+        io_engine: &IoEngine,
+        mapping: &BlockmapValue,
+    ) -> OnyxResult<Vec<u8>> {
+        let compressed_data = if mapping.slot_offset > 0 {
+            let slot_data = io_engine.read_blocks(mapping.pba, BLOCK_SIZE as usize)?;
+            let start = mapping.slot_offset as usize;
+            let end = start + mapping.unit_compressed_size as usize;
+            if end > slot_data.len() {
+                return Err(OnyxError::Compress(format!(
+                    "packed fragment out of bounds: slot_offset={} + size={} > slot_len={}",
+                    start,
+                    mapping.unit_compressed_size,
+                    slot_data.len()
+                )));
+            }
+            slot_data[start..end].to_vec()
+        } else {
+            io_engine.read_blocks(mapping.pba, mapping.unit_compressed_size as usize)?
+        };
+
+        let actual_crc = crc32fast::hash(&compressed_data);
+        if actual_crc != mapping.crc32 {
+            return Err(OnyxError::CrcMismatch {
+                expected: mapping.crc32,
+                actual: actual_crc,
+            });
+        }
+
+        let decompressed = if mapping.compression == 0 {
+            compressed_data
+        } else {
+            let algo =
+                CompressionAlgo::from_u8(mapping.compression).unwrap_or(CompressionAlgo::None);
+            let decompressor = create_compressor(algo);
+            let mut buf = vec![0u8; mapping.unit_original_size as usize];
+            decompressor.decompress(
+                &compressed_data,
+                &mut buf,
+                mapping.unit_original_size as usize,
+            )?;
+            buf
+        };
+
+        let start = mapping.offset_in_unit as usize * BLOCK_SIZE as usize;
+        let end = start + BLOCK_SIZE as usize;
+        if end > decompressed.len() {
+            return Err(OnyxError::Compress(format!(
+                "decompressed unit too small: {} bytes, need {}..{}",
+                decompressed.len(),
+                start,
+                end
+            )));
+        }
+
+        Ok(decompressed[start..end].to_vec())
     }
 
     fn next_volume_generation(&self) -> u64 {
@@ -102,9 +165,10 @@ impl OnyxEngine {
         io_engine: &Arc<IoEngine>,
         metrics: &Arc<EngineMetrics>,
     ) -> OnyxResult<Arc<WriteBufferPool>> {
-        let buf_path = config.buffer.device.as_ref().ok_or_else(|| {
-            OnyxError::Config("buffer.device is required for full mode".into())
-        })?;
+        let buf_path =
+            config.buffer.device.as_ref().ok_or_else(|| {
+                OnyxError::Config("buffer.device is required for full mode".into())
+            })?;
 
         // Detect shard count change and migrate if needed
         let probe_dev = RawDevice::open(buf_path)?;
@@ -185,9 +249,57 @@ impl OnyxEngine {
         )?);
         pool.attach_metrics(metrics.clone());
 
+        let recovered = pool.recover()?;
+        let block_size = BLOCK_SIZE as usize;
+        let mut latest_blocks: HashMap<(String, u64), (u64, u64, Vec<u8>)> = HashMap::new();
+        for entry in &recovered {
+            for i in 0..entry.lba_count {
+                let lba = entry.start_lba.0 + i as u64;
+                let start = i as usize * block_size;
+                let end = start + block_size;
+                let payload = entry.payload[start..end].to_vec();
+                latest_blocks
+                    .entry((entry.vol_id.clone(), lba))
+                    .and_modify(|(seq, generation, data)| {
+                        if entry.seq > *seq {
+                            *seq = entry.seq;
+                            *generation = entry.vol_created_at;
+                            *data = payload.clone();
+                        }
+                    })
+                    .or_insert((entry.seq, entry.vol_created_at, payload));
+            }
+        }
+
+        for entry in &recovered {
+            let _ = pool.discard_pending_seq_durable(entry.seq)?;
+        }
+
+        for ((vol_name, lba_raw), (_seq, vol_created_at, payload)) in latest_blocks {
+            let vol_id = VolumeId(vol_name.clone());
+            let Some(volume) = meta.get_volume(&vol_id)? else {
+                continue;
+            };
+            if vol_created_at != 0 && volume.created_at != vol_created_at {
+                continue;
+            }
+
+            let lba = Lba(lba_raw);
+            let needs_replay = match meta.get_mapping(&vol_id, lba)? {
+                Some(mapping) => Self::read_block_from_mapping(io_engine, &mapping)? != payload,
+                None => true,
+            };
+            if needs_replay {
+                pool.append(&vol_name, lba, 1, &payload, vol_created_at)?;
+            }
+        }
+
         let unflushed = pool.recover()?;
         if !unflushed.is_empty() {
-            tracing::info!(count = unflushed.len(), "replaying unflushed buffer entries");
+            tracing::info!(
+                count = unflushed.len(),
+                "replaying unflushed buffer entries"
+            );
         }
 
         Ok(pool)
@@ -221,6 +333,38 @@ impl OnyxEngine {
         })?;
         let data_dev = RawDevice::open(data_path)?;
         let device_size = data_dev.size();
+
+        // 2a. Validate / format LV3 superblock
+        match superblock::read_superblock(&data_dev)? {
+            Some(sb) => {
+                if sb.device_size_bytes != device_size {
+                    return Err(OnyxError::Config(format!(
+                        "LV3 superblock device_size {} != actual {}",
+                        sb.device_size_bytes, device_size
+                    )));
+                }
+                tracing::info!(
+                    uuid = sb.uuid_string(),
+                    version = sb.version,
+                    "LV3 superblock validated"
+                );
+            }
+            None => {
+                // Check if the device is fresh (all zeros in block 0)
+                let mut block0 = [0u8; 4096];
+                data_dev.read_at(&mut block0, 0)?;
+                if block0.iter().all(|&b| b == 0) {
+                    tracing::info!("fresh LV3 device — formatting");
+                    superblock::format_device(&data_dev)?;
+                } else {
+                    return Err(OnyxError::Config(
+                        "LV3 block 0 has data but invalid superblock (magic/CRC/version failed)"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
         let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
 
         // 3. Space allocator
@@ -228,9 +372,8 @@ impl OnyxEngine {
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool (with shard migration if needed)
-        let buffer_pool = Self::open_buffer_pool(
-            config, &meta, &lifecycle, &allocator, &io_engine, &metrics,
-        )?;
+        let buffer_pool =
+            Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
 
         // 6. Shared hole map (GC → Packer)
         let hole_map = crate::packer::packer::new_hole_map();
@@ -287,6 +430,18 @@ impl OnyxEngine {
             None
         };
 
+        // 11. Heartbeat writer (after all other subsystems)
+        let heartbeat_writer = if config.ha.enabled {
+            let hb_dev = RawDevice::open(data_path)?;
+            Some(HeartbeatWriter::start(
+                hb_dev,
+                config.ha.node_id,
+                std::time::Duration::from_millis(config.ha.heartbeat_interval_ms),
+            ))
+        } else {
+            None
+        };
+
         tracing::info!("onyx engine opened (full mode)");
 
         Ok(Self {
@@ -297,6 +452,7 @@ impl OnyxEngine {
             flusher: Mutex::new(Some(flusher)),
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
+            heartbeat_writer: Mutex::new(heartbeat_writer),
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -327,6 +483,7 @@ impl OnyxEngine {
             flusher: Mutex::new(None),
             gc_runner: Mutex::new(None),
             dedup_scanner: Mutex::new(None),
+            heartbeat_writer: Mutex::new(None),
             zone_manager: None,
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -374,14 +531,18 @@ impl OnyxEngine {
     /// 2. Purge pending buffer entries.
     /// 3. Delete metadata (volume config + blockmap + refcounts) atomically.
     /// 4. Return freed PBAs to the in-memory SpaceAllocator.
-    /// 5. Invalidate existing handles after delete succeeds.
+    /// 5. Wait for old-generation flusher work to retire, then clean orphaned refcounts.
+    /// 6. Invalidate existing handles after delete succeeds.
     pub fn delete_volume(&self, name: &str) -> OnyxResult<usize> {
-        self.lifecycle.with_write_lock(name, || {
+        let deleted = self
+            .lifecycle
+            .with_write_lock(name, || -> OnyxResult<Option<(usize, u64)>> {
             let vol_id = VolumeId(name.to_string());
-            if self.meta.get_volume(&vol_id)?.is_none() {
+            let Some(volume) = self.meta.get_volume(&vol_id)? else {
                 tracing::info!(name, "delete_volume: volume not found, nothing to do");
-                return Ok(0);
-            }
+                return Ok(None);
+            };
+            let deleted_generation = volume.created_at;
 
             if let Some(pool) = &self.buffer_pool {
                 pool.purge_volume(name)?;
@@ -414,12 +575,54 @@ impl OnyxEngine {
 
             tracing::info!(
                 name,
+                generation = deleted_generation,
                 freed_extents = freed.len(),
                 freed_blocks,
                 "volume deleted"
             );
-            Ok(freed_blocks)
-        })
+            Ok(Some((freed_blocks, deleted_generation)))
+        })?;
+
+        let Some((freed_blocks, deleted_generation)) = deleted else {
+            return Ok(0);
+        };
+
+        if let Some(flusher) = self.flusher.lock().unwrap().as_ref() {
+            let timeout = std::time::Duration::from_secs(60);
+            if !flusher.wait_volume_generation_idle(name, deleted_generation, timeout) {
+                tracing::warn!(
+                    name,
+                    generation = deleted_generation,
+                    timeout_secs = timeout.as_secs(),
+                    "timed out waiting for old-generation flusher work to retire"
+                );
+            }
+        }
+
+        let orphaned = self.meta.cleanup_orphaned_refcounts()?;
+        if let Some(allocator) = &self.allocator {
+            for (pba, _refcount) in &orphaned {
+                if let Err(e) = allocator.free_one(*pba) {
+                    tracing::warn!(
+                        name,
+                        generation = deleted_generation,
+                        pba = pba.0,
+                        error = %e,
+                        "failed to free orphaned packed-slot PBA after volume delete"
+                    );
+                }
+            }
+        }
+        if !orphaned.is_empty() {
+            tracing::warn!(
+                name,
+                generation = deleted_generation,
+                orphaned_pbas = orphaned.len(),
+                "cleaned orphaned refcounts after volume delete"
+            );
+        }
+
+        Ok(freed_blocks)
     }
 
     /// List all volumes.
@@ -469,7 +672,12 @@ impl OnyxEngine {
         }
         *done = true;
 
-        // Stop dedup scanner first
+        // Stop heartbeat writer first
+        if let Some(mut hb) = self.heartbeat_writer.lock().unwrap().take() {
+            hb.stop();
+        }
+
+        // Stop dedup scanner
         if let Some(mut scanner) = self.dedup_scanner.lock().unwrap().take() {
             scanner.stop();
         }
@@ -495,10 +703,7 @@ impl OnyxEngine {
     ///
     /// This avoids the RocksDB exclusive directory lock problem: the old engine's
     /// MetaStore Arc is shared with the new engine rather than opening a second one.
-    pub fn upgrade_from_meta_only(
-        meta: Arc<MetaStore>,
-        config: &OnyxConfig,
-    ) -> OnyxResult<Self> {
+    pub fn upgrade_from_meta_only(meta: Arc<MetaStore>, config: &OnyxConfig) -> OnyxResult<Self> {
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
@@ -509,6 +714,37 @@ impl OnyxEngine {
         })?;
         let data_dev = RawDevice::open(data_path)?;
         let device_size = data_dev.size();
+
+        // Validate / format LV3 superblock
+        match superblock::read_superblock(&data_dev)? {
+            Some(sb) => {
+                if sb.device_size_bytes != device_size {
+                    return Err(OnyxError::Config(format!(
+                        "LV3 superblock device_size {} != actual {}",
+                        sb.device_size_bytes, device_size
+                    )));
+                }
+                tracing::info!(
+                    uuid = sb.uuid_string(),
+                    version = sb.version,
+                    "LV3 superblock validated (upgrade)"
+                );
+            }
+            None => {
+                let mut block0 = [0u8; 4096];
+                data_dev.read_at(&mut block0, 0)?;
+                if block0.iter().all(|&b| b == 0) {
+                    tracing::info!("fresh LV3 device — formatting (upgrade)");
+                    superblock::format_device(&data_dev)?;
+                } else {
+                    return Err(OnyxError::Config(
+                        "LV3 block 0 has data but invalid superblock (magic/CRC/version failed)"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
         let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
 
         // Space allocator
@@ -516,9 +752,8 @@ impl OnyxEngine {
         allocator.rebuild_from_metadata(&meta)?;
 
         // Write buffer pool (with shard migration if needed)
-        let buffer_pool = Self::open_buffer_pool(
-            config, &meta, &lifecycle, &allocator, &io_engine, &metrics,
-        )?;
+        let buffer_pool =
+            Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
 
         // Shared hole map
         let hole_map = crate::packer::packer::new_hole_map();
@@ -575,6 +810,18 @@ impl OnyxEngine {
             None
         };
 
+        // Heartbeat writer
+        let heartbeat_writer = if config.ha.enabled {
+            let hb_dev = RawDevice::open(data_path)?;
+            Some(HeartbeatWriter::start(
+                hb_dev,
+                config.ha.node_id,
+                std::time::Duration::from_millis(config.ha.heartbeat_interval_ms),
+            ))
+        } else {
+            None
+        };
+
         tracing::info!("onyx engine upgraded to full mode");
 
         Ok(Self {
@@ -585,6 +832,7 @@ impl OnyxEngine {
             flusher: Mutex::new(Some(flusher)),
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
+            heartbeat_writer: Mutex::new(heartbeat_writer),
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -643,9 +891,7 @@ impl OnyxEngine {
         self.metrics.snapshot()
     }
 
-    pub fn volume_metrics_snapshot(
-        &self,
-    ) -> Vec<(String, crate::metrics::VolumeMetricsSnapshot)> {
+    pub fn volume_metrics_snapshot(&self) -> Vec<(String, crate::metrics::VolumeMetricsSnapshot)> {
         self.metrics.volume_metrics_snapshot()
     }
 

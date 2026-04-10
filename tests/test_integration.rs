@@ -118,6 +118,7 @@ fn setup_with_all_options(
         gc,
         dedup,
         service: Default::default(),
+        ha: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();
@@ -209,10 +210,12 @@ fn wait_for_flush(env: &TestEnv, timeout: Duration) {
 }
 
 /// Read raw bytes from the data file (LV3) at a PBA offset.
+/// Accounts for RESERVED_BLOCKS offset (PBA 0 from allocator starts at block 8 on device).
 fn read_raw_lv3(env: &TestEnv, pba: Pba, size: usize) -> Vec<u8> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(env.data_file.path()).unwrap();
-    f.seek(SeekFrom::Start(pba.0 * 4096)).unwrap();
+    f.seek(SeekFrom::Start((pba.0 + RESERVED_BLOCKS) * 4096))
+        .unwrap();
     let mut buf = vec![0u8; size];
     f.read_exact(&mut buf).unwrap();
     buf
@@ -1445,7 +1448,47 @@ fn prove_packed_metadata_failure_retries_without_leak() {
 }
 
 // ===========================================================================
-// Test 20: Prove background GC runner rewrites and reclaims fragmented units
+// Test 20: Prove delete_volume cleans orphaned packed-slot refcounts and
+// returns the leaked 4KB PBA to the allocator
+// ===========================================================================
+#[test]
+#[serial]
+fn prove_delete_volume_cleans_orphaned_refcount_leak() {
+    let env = setup();
+    let vol_size = 16 * 4096u64;
+    let allocator = env.engine.allocator().unwrap().clone();
+    let meta = env.engine.meta().clone();
+
+    env.engine
+        .create_volume("pack-orphan", vol_size, CompressionAlgo::None)
+        .unwrap();
+
+    let baseline_free = allocator.free_block_count();
+    let leaked_pba = allocator.allocate_one().unwrap();
+    meta.set_refcount(leaked_pba, 1).unwrap();
+    assert_eq!(
+        allocator.free_block_count(),
+        baseline_free - 1,
+        "test setup must reserve one leaked packed-slot block"
+    );
+    assert_eq!(meta.get_refcount(leaked_pba).unwrap(), 1);
+
+    env.engine.delete_volume("pack-orphan").unwrap();
+
+    assert_eq!(
+        meta.get_refcount(leaked_pba).unwrap(),
+        0,
+        "delete_volume must scrub orphaned refcount entries"
+    );
+    assert_eq!(
+        allocator.free_block_count(),
+        baseline_free,
+        "delete_volume must return the orphaned 4KB slot to the allocator"
+    );
+}
+
+// ===========================================================================
+// Test 21: Prove background GC runner rewrites and reclaims fragmented units
 // ===========================================================================
 #[test]
 #[serial]

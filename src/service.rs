@@ -26,7 +26,9 @@ macro_rules! require_engine {
         let __guard = $engine.load();
         let __opt: &Option<OnyxEngine> = &__guard;
         if __opt.is_none() {
-            let _ = $stream.write_all(b"error: engine not initialised (bare mode) - configure and reload first\n");
+            let _ = $stream.write_all(
+                b"error: engine not initialised (bare mode) - configure and reload first\n",
+            );
             let _ = $stream.flush();
             continue;
         }
@@ -58,12 +60,12 @@ impl ServiceController {
                 None
             }
             ConfiguredMode::Standby => {
-                tracing::info!("storage devices not configured — starting in standby mode (metadata only)");
+                tracing::info!(
+                    "storage devices not configured — starting in standby mode (metadata only)"
+                );
                 Some(OnyxEngine::open_meta_only(&config)?)
             }
-            ConfiguredMode::Active => {
-                Some(OnyxEngine::open(&config)?)
-            }
+            ConfiguredMode::Active => Some(OnyxEngine::open(&config)?),
         };
 
         let socket_path = config.service.socket_path.clone();
@@ -255,9 +257,9 @@ impl ServiceController {
         let meta = {
             let guard = self.engine.load();
             let opt: &Option<OnyxEngine> = &guard;
-            let old_engine = opt.as_ref().ok_or_else(|| {
-                OnyxError::Config("expected standby engine but got bare".into())
-            })?;
+            let old_engine = opt
+                .as_ref()
+                .ok_or_else(|| OnyxError::Config("expected standby engine but got bare".into()))?;
             let meta = old_engine.meta().clone();
             old_engine.shutdown()?;
             meta
@@ -359,9 +361,9 @@ impl ServiceController {
     fn resolve_volumes(&self, names: &[String]) -> OnyxResult<Vec<VolumeConfig>> {
         let guard = self.engine.load();
         let opt: &Option<OnyxEngine> = &guard;
-        let engine = opt.as_ref().ok_or_else(|| {
-            OnyxError::Config("engine not initialised".into())
-        })?;
+        let engine = opt
+            .as_ref()
+            .ok_or_else(|| OnyxError::Config("engine not initialised".into()))?;
         if names.is_empty() {
             engine.list_volumes()
         } else {
@@ -378,12 +380,15 @@ impl ServiceController {
     }
 
     #[cfg(target_os = "linux")]
-    fn start_ublk_devices(&self, volumes: &[VolumeConfig]) -> OnyxResult<Vec<JoinHandle<OnyxResult<()>>>> {
+    fn start_ublk_devices(
+        &self,
+        volumes: &[VolumeConfig],
+    ) -> OnyxResult<Vec<JoinHandle<OnyxResult<()>>>> {
         let guard = self.engine.load();
         let opt: &Option<OnyxEngine> = &guard;
-        let engine = opt.as_ref().ok_or_else(|| {
-            OnyxError::Config("engine not initialised".into())
-        })?;
+        let engine = opt
+            .as_ref()
+            .ok_or_else(|| OnyxError::Config("engine not initialised".into()))?;
         let zm = engine
             .zone_manager()
             .ok_or_else(|| OnyxError::Config("no zone manager in meta-only mode".into()))?
@@ -452,7 +457,14 @@ impl ServiceController {
         let handle = thread::Builder::new()
             .name("ipc-listener".into())
             .spawn(move || {
-                Self::socket_loop(&listener, &shutdown, &dev_ids, &socket_path, &engine, &reload_signal);
+                Self::socket_loop(
+                    &listener,
+                    &shutdown,
+                    &dev_ids,
+                    &socket_path,
+                    &engine,
+                    &reload_signal,
+                );
             })
             .map_err(|e| OnyxError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
@@ -543,17 +555,21 @@ impl ServiceController {
                     let ids = dev_ids.lock().unwrap();
                     match opt.as_ref() {
                         None => {
-                            let msg = format!(
-                                "mode: bare, {} ublk device(s): {:?}\n",
-                                ids.len(), *ids
-                            );
+                            let msg =
+                                format!("mode: bare, {} ublk device(s): {:?}\n", ids.len(), *ids);
                             let _ = stream.write_all(msg.as_bytes());
                         }
                         Some(eng) => {
-                            let mode_str = if eng.is_full_mode() { "active" } else { "standby" };
+                            let mode_str = if eng.is_full_mode() {
+                                "active"
+                            } else {
+                                "standby"
+                            };
                             let msg = format!(
                                 "mode: {}, {} ublk device(s): {:?}\n",
-                                mode_str, ids.len(), *ids
+                                mode_str,
+                                ids.len(),
+                                *ids
                             );
                             let _ = stream.write_all(msg.as_bytes());
                             if let Ok(report) = eng.status_report() {
@@ -581,7 +597,9 @@ impl ServiceController {
                 "create-volume" => {
                     require_engine!(engine, stream);
                     if parts.len() < 4 {
-                        let _ = stream.write_all(b"error: usage: create-volume <name> <size> <compression>\n");
+                        let _ = stream.write_all(
+                            b"error: usage: create-volume <name> <size> <compression>\n",
+                        );
                         let _ = stream.flush();
                         continue;
                     }
@@ -693,22 +711,27 @@ impl ServiceController {
                                 // Enrich each volume with per-volume IO metrics
                                 let vol_metrics = eng.metrics_snapshot();
                                 let per_vol = eng.volume_metrics_snapshot();
-                                let enriched: Vec<serde_json::Value> = volumes.iter().map(|v| {
-                                    let vm = per_vol.iter()
-                                        .find(|(name, _)| name == &v.id.0)
-                                        .map(|(_, s)| s.clone());
-                                    serde_json::json!({
-                                        "id": v.id.0,
-                                        "size_bytes": v.size_bytes,
-                                        "block_size": v.block_size,
-                                        "compression": v.compression,
-                                        "created_at": v.created_at,
-                                        "zone_count": v.zone_count,
-                                        "metrics": vm,
+                                let enriched: Vec<serde_json::Value> = volumes
+                                    .iter()
+                                    .map(|v| {
+                                        let vm = per_vol
+                                            .iter()
+                                            .find(|(name, _)| name == &v.id.0)
+                                            .map(|(_, s)| s.clone());
+                                        serde_json::json!({
+                                            "id": v.id.0,
+                                            "size_bytes": v.size_bytes,
+                                            "block_size": v.block_size,
+                                            "compression": v.compression,
+                                            "created_at": v.created_at,
+                                            "zone_count": v.zone_count,
+                                            "metrics": vm,
+                                        })
                                     })
-                                }).collect();
+                                    .collect();
                                 let _ = vol_metrics; // suppress unused warning
-                                let json = serde_json::to_string(&enriched).unwrap_or_else(|_| "[]".into());
+                                let json = serde_json::to_string(&enriched)
+                                    .unwrap_or_else(|_| "[]".into());
                                 let _ = stream.write_all(json.as_bytes());
                                 let _ = stream.write_all(b"\nok\n");
                             }
@@ -729,7 +752,8 @@ impl ServiceController {
                         }
                         Some(eng) => {
                             let snapshot = eng.metrics_snapshot();
-                            let json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+                            let json =
+                                serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
                             let _ = stream.write_all(json.as_bytes());
                             let _ = stream.write_all(b"\nok\n");
                         }
@@ -771,7 +795,9 @@ fn send_ipc_command(socket_path: &Path, command: &str) -> OnyxResult<Vec<String>
         let line = line.map_err(OnyxError::Io)?;
         let trimmed = line.trim().to_string();
         if trimmed.starts_with("error:") {
-            return Err(OnyxError::Config(trimmed["error:".len()..].trim().to_string()));
+            return Err(OnyxError::Config(
+                trimmed["error:".len()..].trim().to_string(),
+            ));
         }
         if trimmed == "ok" || trimmed.starts_with("ok ") {
             lines.push(trimmed);
@@ -807,9 +833,9 @@ pub fn send_delete_volume(socket_path: &Path, name: &str) -> OnyxResult<u64> {
     let lines = send_ipc_command(socket_path, &format!("delete-volume {}", name))?;
     if let Some(line) = lines.first() {
         if let Some(freed_str) = line.strip_prefix("ok ") {
-            return freed_str.parse().map_err(|_| {
-                OnyxError::Config(format!("invalid freed count: {}", freed_str))
-            });
+            return freed_str
+                .parse()
+                .map_err(|_| OnyxError::Config(format!("invalid freed count: {}", freed_str)));
         }
     }
     Ok(0)

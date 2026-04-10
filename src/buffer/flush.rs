@@ -35,6 +35,7 @@ use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 pub struct BufferFlusher {
     running: Arc<AtomicBool>,
     lanes: Vec<FlusherLane>,
+    in_flight: Arc<FlusherInFlightTracker>,
 }
 
 struct FlusherLane {
@@ -42,6 +43,62 @@ struct FlusherLane {
     dedup_handles: Vec<JoinHandle<()>>,
     compress_handles: Vec<JoinHandle<()>>,
     writer_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSeq {
+    vol_id: String,
+    vol_created_at: u64,
+}
+
+#[derive(Default)]
+struct FlusherInFlightTracker {
+    active: Mutex<HashMap<u64, ActiveSeq>>,
+    cv: Condvar,
+}
+
+impl FlusherInFlightTracker {
+    fn track_seq_start(&self, seq: u64, vol_id: &str, vol_created_at: u64) {
+        let mut active = self.active.lock().unwrap();
+        active.entry(seq).or_insert_with(|| ActiveSeq {
+            vol_id: vol_id.to_string(),
+            vol_created_at,
+        });
+    }
+
+    fn track_seq_done(&self, seq: u64) {
+        let mut active = self.active.lock().unwrap();
+        if active.remove(&seq).is_some() {
+            self.cv.notify_all();
+        }
+    }
+
+    fn wait_volume_generation_idle(
+        &self,
+        vol_id: &str,
+        vol_created_at: u64,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut active = self.active.lock().unwrap();
+        loop {
+            let still_active = active
+                .values()
+                .any(|seq| seq.vol_id == vol_id && seq.vol_created_at == vol_created_at);
+            if !still_active {
+                return true;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+
+            let wait = deadline.saturating_duration_since(now);
+            let (guard, _) = self.cv.wait_timeout(active, wait).unwrap();
+            active = guard;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +392,7 @@ impl BufferFlusher {
         metrics: Arc<EngineMetrics>,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(FlusherInFlightTracker::default());
         let lane_count = pool.shard_count().max(1);
         let compress_workers =
             Self::per_lane_worker_count(config.compress_workers.max(1), lane_count);
@@ -359,6 +417,7 @@ impl BufferFlusher {
             let pool_c = pool.clone();
             let meta_c = meta.clone();
             let metrics_c = metrics.clone();
+            let in_flight_c = in_flight.clone();
             let coalesce_out_tx = if dedup_enabled {
                 dedup_tx.clone()
             } else {
@@ -374,6 +433,7 @@ impl BufferFlusher {
                         &coalesce_out_tx,
                         &done_rx,
                         &running_c,
+                        &in_flight_c,
                         &metrics_c,
                         max_raw,
                         max_lbas,
@@ -471,7 +531,11 @@ impl BufferFlusher {
             });
         }
 
-        Self { running, lanes }
+        Self {
+            running,
+            lanes,
+            in_flight,
+        }
     }
 
     fn coalesce_loop(
@@ -481,6 +545,7 @@ impl BufferFlusher {
         tx: &Sender<CoalesceUnit>,
         done_rx: &Receiver<Vec<u64>>,
         running: &AtomicBool,
+        in_flight_tracker: &FlusherInFlightTracker,
         metrics: &EngineMetrics,
         max_raw: usize,
         max_lbas: u32,
@@ -512,6 +577,7 @@ impl BufferFlusher {
                         *count -= 1;
                         if *count == 0 {
                             in_flight.remove(&seq);
+                            in_flight_tracker.track_seq_done(seq);
                         }
                     }
                 }
@@ -582,7 +648,11 @@ impl BufferFlusher {
             // Count how many units reference each seq
             for unit in &units {
                 for (seq, _, _) in &unit.seq_lba_ranges {
-                    *in_flight.entry(*seq).or_insert(0) += 1;
+                    let count = in_flight.entry(*seq).or_insert(0);
+                    if *count == 0 {
+                        in_flight_tracker.track_seq_start(*seq, &unit.vol_id, unit.vol_created_at);
+                    }
+                    *count += 1;
                 }
             }
 
@@ -1004,15 +1074,24 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if let Some(sealed) = packer.flush_open_slot() {
                         if let Err(e) = Self::write_packed_slot(
-                            shard_idx, &sealed, pool, meta, lifecycle,
-                            allocator, io_engine, packer.hole_map(), metrics,
+                            shard_idx,
+                            &sealed,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            io_engine,
+                            packer.hole_map(),
+                            metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(pba = sealed.pba.0, error = %e,
                                 "writer: failed to flush packed slot on idle");
                         }
                         Self::flush_buffered_done(
-                            &mut buffered_seqs, &mut buffered_completions, done_tx,
+                            &mut buffered_seqs,
+                            &mut buffered_completions,
+                            done_tx,
                         );
                         tail_dirty = true;
                     }
@@ -1050,24 +1129,31 @@ impl BufferFlusher {
                         pt_seqs.push(seqs);
                         pt_completions.push(completion);
                     }
-                    Ok(PackResult::Buffered) => {
-                        match &completion {
-                            None => buffered_seqs.extend(&seqs),
-                            Some(dc) => buffered_completions.push(dc.clone()),
-                        }
-                    }
+                    Ok(PackResult::Buffered) => match &completion {
+                        None => buffered_seqs.extend(&seqs),
+                        Some(dc) => buffered_completions.push(dc.clone()),
+                    },
                     Ok(PackResult::SealedSlot(sealed)) => {
                         flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
                         if let Err(e) = Self::write_packed_slot(
-                            shard_idx, &sealed, pool, meta, lifecycle,
-                            allocator, io_engine, packer.hole_map(), metrics,
+                            shard_idx,
+                            &sealed,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            io_engine,
+                            packer.hole_map(),
+                            metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(pba = sealed.pba.0, error = %e,
                                 "writer: failed to flush packed slot");
                         }
                         Self::flush_buffered_done(
-                            &mut buffered_seqs, &mut buffered_completions, done_tx,
+                            &mut buffered_seqs,
+                            &mut buffered_completions,
+                            done_tx,
                         );
                         match &completion {
                             None => buffered_seqs.extend(&seqs),
@@ -1077,15 +1163,24 @@ impl BufferFlusher {
                     Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
                         flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
                         if let Err(e) = Self::write_packed_slot(
-                            shard_idx, &sealed, pool, meta, lifecycle,
-                            allocator, io_engine, packer.hole_map(), metrics,
+                            shard_idx,
+                            &sealed,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            io_engine,
+                            packer.hole_map(),
+                            metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(pba = sealed.pba.0, error = %e,
                                 "writer: failed to flush packed slot (passthrough fallback)");
                         }
                         Self::flush_buffered_done(
-                            &mut buffered_seqs, &mut buffered_completions, done_tx,
+                            &mut buffered_seqs,
+                            &mut buffered_completions,
+                            done_tx,
                         );
                         pt_batch.push(unit);
                         pt_seqs.push(seqs);
@@ -1094,14 +1189,23 @@ impl BufferFlusher {
                     Ok(PackResult::FillHole(fill)) => {
                         flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
                         if let Err(e) = Self::write_hole_fill(
-                            shard_idx, &fill, pool, meta, lifecycle,
-                            allocator, io_engine, packer.hole_map(), metrics,
+                            shard_idx,
+                            &fill,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            io_engine,
+                            packer.hole_map(),
+                            metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(error = %e, "writer: failed to fill hole");
                         }
                         match &completion {
-                            None => { let _ = done_tx.send(seqs); }
+                            None => {
+                                let _ = done_tx.send(seqs);
+                            }
                             Some(dc) => {
                                 if let Some(original_seqs) = dc.decrement() {
                                     let _ = done_tx.send(original_seqs);
@@ -1113,7 +1217,9 @@ impl BufferFlusher {
                         metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                         tracing::error!(error = %e, "writer: packer error");
                         match &completion {
-                            None => { let _ = done_tx.send(seqs); }
+                            None => {
+                                let _ = done_tx.send(seqs);
+                            }
                             Some(dc) => {
                                 if let Some(original_seqs) = dc.decrement() {
                                     let _ = done_tx.send(original_seqs);
@@ -1130,17 +1236,33 @@ impl BufferFlusher {
         // Drain remaining on shutdown (use per-unit path for simplicity).
         while let Ok(unit) = rx.try_recv() {
             Self::handle_compressed_unit(
-                shard_idx, unit, pool, meta, lifecycle, allocator,
-                io_engine, done_tx, packer,
-                &mut buffered_seqs, &mut buffered_completions, metrics,
+                shard_idx,
+                unit,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                io_engine,
+                done_tx,
+                packer,
+                &mut buffered_seqs,
+                &mut buffered_completions,
+                metrics,
             );
             tail_dirty = true;
         }
 
         if let Some(sealed) = packer.flush_open_slot() {
             if let Err(e) = Self::write_packed_slot(
-                shard_idx, &sealed, pool, meta, lifecycle,
-                allocator, io_engine, packer.hole_map(), metrics,
+                shard_idx,
+                &sealed,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                io_engine,
+                packer.hole_map(),
+                metrics,
             ) {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(pba = sealed.pba.0, error = %e,
@@ -1645,14 +1767,16 @@ impl BufferFlusher {
             let allocation = if blocks_needed == 1 {
                 allocator.allocate_one().map(|pba| (pba, 1u32))
             } else {
-                allocator.allocate_extent(blocks_needed as u32).and_then(|ext| {
-                    if (ext.count as usize) < blocks_needed {
-                        allocator.free_extent(ext)?;
-                        Err(crate::error::OnyxError::SpaceExhausted)
-                    } else {
-                        Ok((ext.start, ext.count))
-                    }
-                })
+                allocator
+                    .allocate_extent(blocks_needed as u32)
+                    .and_then(|ext| {
+                        if (ext.count as usize) < blocks_needed {
+                            allocator.free_extent(ext)?;
+                            Err(crate::error::OnyxError::SpaceExhausted)
+                        } else {
+                            Ok((ext.start, ext.count))
+                        }
+                    })
             };
             match allocation {
                 Ok((pba, _)) => pbas[i] = Some(pba),
@@ -1782,24 +1906,20 @@ impl BufferFlusher {
         }
 
         if !meta_indices.is_empty() {
-            let batch_args: Vec<(
-                &VolumeId,
-                &[(Lba, BlockmapValue)],
-                u32,
-                &HashMap<Pba, u32>,
-            )> = meta_indices
-                .iter()
-                .enumerate()
-                .map(|(batch_idx, &unit_idx)| {
-                    let um = unit_metas[unit_idx].as_ref().unwrap();
-                    (
-                        &vol_ids_owned[batch_idx],
-                        um.batch_values.as_slice(),
-                        units[unit_idx].lba_count,
-                        &decrements_owned[batch_idx],
-                    )
-                })
-                .collect();
+            let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32, &HashMap<Pba, u32>)> =
+                meta_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(batch_idx, &unit_idx)| {
+                        let um = unit_metas[unit_idx].as_ref().unwrap();
+                        (
+                            &vol_ids_owned[batch_idx],
+                            um.batch_values.as_slice(),
+                            units[unit_idx].lba_count,
+                            &decrements_owned[batch_idx],
+                        )
+                    })
+                    .collect();
 
             if let Err(e) = meta.atomic_batch_write_multi(&batch_args) {
                 // Entire batch failed — rollback all allocations.
@@ -1810,9 +1930,9 @@ impl BufferFlusher {
                     } else {
                         let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
                     }
-                    results[unit_idx] = Err(crate::error::OnyxError::Io(
-                        std::io::Error::other(format!("batch write failed: {e}")),
-                    ));
+                    results[unit_idx] = Err(crate::error::OnyxError::Io(std::io::Error::other(
+                        format!("batch write failed: {e}"),
+                    )));
                     skip[unit_idx] = true;
                 }
             }
@@ -2439,6 +2559,16 @@ impl BufferFlusher {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         self.join_lanes();
+    }
+
+    pub(crate) fn wait_volume_generation_idle(
+        &self,
+        vol_id: &str,
+        vol_created_at: u64,
+        timeout: Duration,
+    ) -> bool {
+        self.in_flight
+            .wait_volume_generation_idle(vol_id, vol_created_at, timeout)
     }
 
     /// Wait for all pending buffer entries to be flushed, then stop.

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::store::MetaStore;
 use crate::space::extent::Extent;
-use crate::types::{Pba, BLOCK_SIZE};
+use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
 pub struct SpaceAllocator {
     total_blocks: u64,
@@ -16,36 +16,43 @@ pub struct SpaceAllocator {
 
 impl SpaceAllocator {
     /// Create a new allocator for a device of the given size.
-    /// Initially all blocks are free.
+    /// Blocks 0..RESERVED_BLOCKS are reserved for superblock/heartbeat/HA lock.
+    /// Allocatable space starts at PBA RESERVED_BLOCKS.
     pub fn new(device_size_bytes: u64) -> Self {
         let total_blocks = device_size_bytes / BLOCK_SIZE as u64;
+        let usable_blocks = total_blocks.saturating_sub(RESERVED_BLOCKS);
         let mut free_extents = BTreeSet::new();
-        if total_blocks > 0 {
-            free_extents.insert(Extent::new(Pba(0), total_blocks as u32));
+        if usable_blocks > 0 {
+            free_extents.insert(Extent::new(
+                Pba(RESERVED_BLOCKS),
+                usable_blocks.min(u32::MAX as u64) as u32,
+            ));
         }
         Self {
             total_blocks,
             free_extents: Mutex::new(free_extents),
             allocated_blocks: AtomicU64::new(0),
-            free_blocks: AtomicU64::new(total_blocks),
+            free_blocks: AtomicU64::new(usable_blocks),
         }
     }
 
     /// Rebuild the free list from MetaStore metadata.
     /// Blockmap is the source of truth so multi-block compression units reserve
     /// all occupied PBAs, not just the starting block.
+    /// PBAs below RESERVED_BLOCKS are excluded (reserved for superblock/HA).
     pub fn rebuild_from_metadata(&self, meta: &MetaStore) -> OnyxResult<()> {
-        // Collect all allocated PBAs into a sorted vec
+        // Collect all allocated PBAs into a sorted vec, filtering out reserved region
         let mut allocated: Vec<u64> = meta
             .iter_allocated_blocks()?
             .into_iter()
             .map(|pba| pba.0)
+            .filter(|&pba| pba >= RESERVED_BLOCKS)
             .collect();
         allocated.sort_unstable();
 
-        // Build free extents from gaps
+        // Build free extents from gaps (starting at RESERVED_BLOCKS)
         let mut free = BTreeSet::new();
-        let mut pos: u64 = 0;
+        let mut pos: u64 = RESERVED_BLOCKS;
 
         for &alloc_pba in &allocated {
             if alloc_pba > pos {
@@ -76,8 +83,9 @@ impl SpaceAllocator {
             }
         }
 
+        let usable_blocks = self.total_blocks.saturating_sub(RESERVED_BLOCKS);
         let alloc_count = allocated.len() as u64;
-        let free_count = self.total_blocks - alloc_count;
+        let free_count = usable_blocks - alloc_count;
 
         *self.free_extents.lock().unwrap() = free;
         self.allocated_blocks.store(alloc_count, Ordering::Relaxed);

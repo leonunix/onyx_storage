@@ -1,25 +1,44 @@
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
 use crate::io::device::RawDevice;
-use crate::types::{Pba, BLOCK_SIZE};
+use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
 /// IO engine for reading/writing raw data blocks on LV3.
 ///
 /// LV3 slots are pure payload — no on-disk header. All metadata (compression,
 /// crc32, original_size) lives in RocksDB BlockmapValue, which is crash-consistent
 /// via WriteBatch. This allows a full 4096-byte payload per slot.
+///
+/// PBA addresses are translated by `pba_offset` (default `RESERVED_BLOCKS`)
+/// so that PBA 0 from the allocator maps to device offset `pba_offset * BLOCK_SIZE`.
+/// Blocks 0..pba_offset are reserved for superblock, heartbeat, and HA lock.
 pub struct IoEngine {
     data_device: RawDevice,
     use_hugepages: bool,
     block_size: u32,
+    pba_offset: u64,
 }
 
 impl IoEngine {
+    /// Create an IoEngine with standard PBA offset (RESERVED_BLOCKS).
+    /// PBA 0 maps to device offset `RESERVED_BLOCKS * BLOCK_SIZE`.
     pub fn new(data_device: RawDevice, use_hugepages: bool) -> Self {
         Self {
             data_device,
             use_hugepages,
             block_size: BLOCK_SIZE,
+            pba_offset: RESERVED_BLOCKS,
+        }
+    }
+
+    /// Create an IoEngine without PBA offset (PBA 0 = device offset 0).
+    /// For testing only — production code should use `new()`.
+    pub fn new_raw(data_device: RawDevice, use_hugepages: bool) -> Self {
+        Self {
+            data_device,
+            use_hugepages,
+            block_size: BLOCK_SIZE,
+            pba_offset: 0,
         }
     }
 
@@ -34,7 +53,7 @@ impl IoEngine {
             )));
         }
 
-        let offset = pba.0 * self.block_size as u64;
+        let offset = (pba.0 + self.pba_offset) * self.block_size as u64;
         let mut buf = AlignedBuf::new(self.block_size as usize, self.use_hugepages)?;
         let slice = buf.as_mut_slice();
         slice[..payload.len()].copy_from_slice(payload);
@@ -54,7 +73,7 @@ impl IoEngine {
             )));
         }
 
-        let offset = pba.0 * self.block_size as u64;
+        let offset = (pba.0 + self.pba_offset) * self.block_size as u64;
         let mut buf = AlignedBuf::new(self.block_size as usize, self.use_hugepages)?;
         self.data_device.read_at(buf.as_mut_slice(), offset)?;
 
@@ -69,7 +88,7 @@ impl IoEngine {
         }
         let bs = self.block_size as usize;
         let total_size = ((payload.len() + bs - 1) / bs) * bs; // round up
-        let offset = pba.0 * self.block_size as u64;
+        let offset = (pba.0 + self.pba_offset) * self.block_size as u64;
 
         let mut buf = AlignedBuf::new(total_size, self.use_hugepages)?;
         let slice = buf.as_mut_slice();
@@ -87,7 +106,7 @@ impl IoEngine {
         }
         let bs = self.block_size as usize;
         let read_size = ((size + bs - 1) / bs) * bs; // round up to block boundary
-        let offset = pba.0 * self.block_size as u64;
+        let offset = (pba.0 + self.pba_offset) * self.block_size as u64;
 
         let mut buf = AlignedBuf::new(read_size, self.use_hugepages)?;
         self.data_device.read_at(buf.as_mut_slice(), offset)?;
@@ -100,7 +119,7 @@ impl IoEngine {
     }
 
     pub fn total_blocks(&self) -> u64 {
-        self.data_device.size() / self.block_size as u64
+        self.data_device.size() / self.block_size as u64 - self.pba_offset
     }
 
     pub fn sync(&self) -> OnyxResult<()> {

@@ -82,6 +82,7 @@ fn write_and_abort(
             ..Default::default()
         },
         service: Default::default(),
+        ha: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

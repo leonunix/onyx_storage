@@ -23,8 +23,11 @@ fn make_unit(vol_id: &str, start_lba: u64, lba_count: u32, data_size: usize) -> 
     }
 }
 
-fn make_allocator(blocks: u64) -> Arc<SpaceAllocator> {
-    Arc::new(SpaceAllocator::new(blocks * BLOCK_SIZE as u64))
+fn make_allocator(usable_blocks: u64) -> Arc<SpaceAllocator> {
+    // Add RESERVED_BLOCKS so the allocator has the requested number of usable blocks.
+    Arc::new(SpaceAllocator::new(
+        (usable_blocks + onyx_storage::types::RESERVED_BLOCKS) * BLOCK_SIZE as u64,
+    ))
 }
 
 #[test]

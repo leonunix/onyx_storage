@@ -220,6 +220,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             ..Default::default()
         },
         service: Default::default(),
+        ha: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

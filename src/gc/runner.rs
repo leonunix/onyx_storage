@@ -128,18 +128,16 @@ impl GcRunner {
             }
 
             // Scan for GC rewrite candidates
-            let candidates = match scan_gc_candidates(
-                meta,
-                cfg.dead_ratio_threshold,
-                cfg.max_rewrite_per_cycle,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(error = %e, "gc: scan failed");
-                    continue;
-                }
-            };
+            let candidates =
+                match scan_gc_candidates(meta, cfg.dead_ratio_threshold, cfg.max_rewrite_per_cycle)
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(error = %e, "gc: scan failed");
+                        continue;
+                    }
+                };
 
             metrics
                 .gc_candidates_found

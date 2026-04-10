@@ -27,6 +27,8 @@ pub struct OnyxConfig {
     pub dedup: DedupConfig,
     #[serde(default)]
     pub service: ServiceConfig,
+    #[serde(default)]
+    pub ha: HaConfig,
 }
 
 /// What the engine can do given the current configuration.
@@ -295,6 +297,40 @@ impl Default for ServiceConfig {
 
 fn default_socket_path() -> PathBuf {
     PathBuf::from("/var/run/onyx-storage.sock")
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HaConfig {
+    /// Whether HA heartbeat is enabled (default false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Node identifier for this engine instance (default 0).
+    #[serde(default)]
+    pub node_id: u64,
+    /// Heartbeat write interval in milliseconds (default 3000).
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    /// Lease duration in seconds for HA lock (default 30).
+    #[serde(default = "default_lease_duration_secs")]
+    pub lease_duration_secs: u64,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: 0,
+            heartbeat_interval_ms: default_heartbeat_interval_ms(),
+            lease_duration_secs: default_lease_duration_secs(),
+        }
+    }
+}
+
+fn default_heartbeat_interval_ms() -> u64 {
+    3000
+}
+fn default_lease_duration_secs() -> u64 {
+    30
 }
 
 fn default_nr_queues() -> u16 {

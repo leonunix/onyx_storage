@@ -492,8 +492,7 @@ impl BufferShard {
 
         let lba_index = DashMap::with_shard_amount(DASHMAP_SHARDS);
         let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
-        let scan =
-            Self::rebuild_indices(&device, capacity_bytes, &lba_index, &pending_entries)?;
+        let scan = Self::rebuild_indices(&device, capacity_bytes, &lba_index, &pending_entries)?;
 
         let (staging_tx, staging_rx) = unbounded();
         // Pre-size ring collections to avoid allocs inside the lock.
@@ -558,7 +557,10 @@ impl BufferShard {
         if payload.len() != expected_len {
             return Err(OnyxError::Config(format!(
                 "payload must be {} bytes (lba_count={} * {}), got {}",
-                expected_len, lba_count, BLOCK_SIZE, payload.len()
+                expected_len,
+                lba_count,
+                BLOCK_SIZE,
+                payload.len()
             )));
         }
 
@@ -838,8 +840,7 @@ impl BufferShard {
             return Ok(Vec::new());
         }
 
-        self.lba_index
-            .retain(|key, _| &*key.vol_id != vol_id);
+        self.lba_index.retain(|key, _| &*key.vol_id != vol_id);
         for (seq, _) in &to_purge {
             self.pending_entries.remove(seq);
             self.flush_progress.remove(seq);
@@ -851,6 +852,27 @@ impl BufferShard {
         }
 
         Ok(seqs)
+    }
+
+    fn discard_pending_seq_durable(&self, seq: u64) -> OnyxResult<bool> {
+        let Some(pending) = self.pending_entries.get(&seq).map(|e| (*e).clone()) else {
+            return Ok(false);
+        };
+
+        let vid = self.intern_vol_id(&pending.vol_id);
+        for i in 0..pending.lba_count {
+            self.lba_index.remove_if(
+                &LbaKey {
+                    vol_id: vid.clone(),
+                    lba: Lba(pending.start_lba.0 + i as u64),
+                },
+                |_, value| value.seq == seq,
+            );
+        }
+        self.pending_entries.remove(&seq);
+        self.flush_progress.remove(&seq);
+        self.free_seq_allocation_durable(seq, &pending)?;
+        Ok(true)
     }
 }
 
@@ -1217,7 +1239,8 @@ impl WriteBufferPool {
 
             let shard_device = device.slice(shard_offset, shard_bytes)?;
             let sync_device = device.slice(shard_offset, shard_bytes)?;
-            let (shard, shard_max_seq) = BufferShard::open(shard_device, backpressure_timeout, metrics.clone())?;
+            let (shard, shard_max_seq) =
+                BufferShard::open(shard_device, backpressure_timeout, metrics.clone())?;
             for seq in shard.pending_entries.iter().map(|entry| *entry.key()) {
                 let _ = ready_tx.send(seq);
                 let _ = shard_ready_txs[shard_idx].send(seq);
@@ -1459,6 +1482,15 @@ impl WriteBufferPool {
             total += purged.len() as u64;
         }
         Ok(total)
+    }
+
+    pub fn discard_pending_seq_durable(&self, seq: u64) -> OnyxResult<bool> {
+        let Some(shard_idx) = self.shard_for_seq(seq) else {
+            return Ok(false);
+        };
+        self.shards[shard_idx]
+            .shard
+            .discard_pending_seq_durable(seq)
     }
 
     pub fn fill_percentage(&self) -> u8 {

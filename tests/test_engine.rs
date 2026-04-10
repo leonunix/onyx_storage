@@ -51,6 +51,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
         },
         dedup: onyx_storage::dedup::config::DedupConfig::default(),
         service: Default::default(),
+        ha: Default::default(),
     };
 
     (config, meta_dir, buf_tmp, data_tmp)

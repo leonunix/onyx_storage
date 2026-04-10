@@ -41,8 +41,9 @@ impl OnyxUblkTarget {
     /// Kill a running ublk device by its kernel device ID.
     /// Safe to call from any thread — creates a temporary control handle.
     pub fn kill_device(dev_id: u32) -> OnyxResult<()> {
-        let ctrl = UblkCtrl::new_simple(dev_id as i32)
-            .map_err(|e| OnyxError::Ublk(format!("failed to open ublk ctrl {}: {:?}", dev_id, e)))?;
+        let ctrl = UblkCtrl::new_simple(dev_id as i32).map_err(|e| {
+            OnyxError::Ublk(format!("failed to open ublk ctrl {}: {:?}", dev_id, e))
+        })?;
         ctrl.kill_dev()
             .map_err(|e| OnyxError::Ublk(format!("failed to kill ublk dev {}: {:?}", dev_id, e)))?;
         Ok(())

@@ -77,7 +77,8 @@ fn device_read_write_offset() {
 
 fn test_engine() -> (IoEngine, NamedTempFile) {
     let tmp = NamedTempFile::new().unwrap();
-    tmp.as_file().set_len(4096 * 100).unwrap();
+    // RESERVED_BLOCKS (8) + 100 usable blocks = 108 total
+    tmp.as_file().set_len(4096 * 108).unwrap();
     let dev = RawDevice::open(tmp.path()).unwrap();
     let engine = IoEngine::new(dev, false);
     (engine, tmp)
@@ -190,8 +191,8 @@ fn device_properties() {
 #[test]
 fn engine_metadata() {
     let (engine, _tmp) = test_engine();
-    assert_eq!(engine.device_size(), 4096 * 100);
-    assert_eq!(engine.total_blocks(), 100);
+    assert_eq!(engine.device_size(), 4096 * 108);
+    assert_eq!(engine.total_blocks(), 100); // 108 - 8 reserved
 }
 
 /// IoEngine sync.

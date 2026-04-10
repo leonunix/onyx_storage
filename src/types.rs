@@ -26,6 +26,10 @@ pub const BLOCK_SIZE: u32 = 4096;
 pub const SECTOR_SIZE: u32 = 512;
 pub const SECTORS_PER_BLOCK: u32 = BLOCK_SIZE / SECTOR_SIZE;
 
+/// Number of blocks reserved at the start of the LV3 data device
+/// for superblock, heartbeat, HA lock, and future expansion.
+pub const RESERVED_BLOCKS: u64 = 8;
+
 /// Compression algorithm selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionAlgo {

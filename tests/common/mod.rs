@@ -90,6 +90,7 @@ impl EngineHarness {
             gc: options.gc,
             dedup: options.dedup,
             service: Default::default(),
+            ha: Default::default(),
         };
 
         let engine = OnyxEngine::open(&config).unwrap();
@@ -119,7 +120,7 @@ impl EngineHarness {
     }
 
     pub fn meta_path(&self) -> PathBuf {
-        self.config.meta.rocksdb_path.clone()
+        self.config.meta.rocksdb_path.clone().unwrap()
     }
 
     pub fn buffer_path(&self) -> PathBuf {
@@ -320,8 +321,8 @@ impl EngineHarness {
             );
             assert_eq!(
                 allocator.free_block_count() + allocator.allocated_block_count(),
-                allocator.total_block_count(),
-                "allocator free + allocated must equal total"
+                allocator.total_block_count() - onyx_storage::types::RESERVED_BLOCKS,
+                "allocator free + allocated must equal usable blocks (total - reserved)"
             );
         }
 

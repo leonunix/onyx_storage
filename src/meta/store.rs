@@ -536,7 +536,7 @@ impl MetaStore {
         units: &[(
             &VolumeId,
             &[(Lba, BlockmapValue)],
-            u32, // new_refcount
+            u32,                // new_refcount
             &HashMap<Pba, u32>, // old_pba_decrements
         )],
     ) -> OnyxResult<()> {
@@ -549,8 +549,10 @@ impl MetaStore {
 
         let mut batch = WriteBatch::default();
 
-        // Aggregate all old_pba decrements across units to handle correctly
-        // when multiple units reference the same old PBA.
+        // Aggregate all refcount deltas so a PBA that appears as both a newly
+        // written target and an old overwritten source still gets one final,
+        // correct value in the batch.
+        let mut new_refcounts: HashMap<Pba, u32> = HashMap::new();
         let mut aggregated_decrements: HashMap<Pba, u32> = HashMap::new();
 
         for (vol_id, batch_values, new_refcount, old_pba_decrements) in units {
@@ -563,8 +565,7 @@ impl MetaStore {
 
             // Set new PBA refcount
             if let Some((_, first_val)) = batch_values.first() {
-                let rc_key = encode_refcount_key(first_val.pba);
-                batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(*new_refcount));
+                *new_refcounts.entry(first_val.pba).or_insert(0) += *new_refcount;
             }
 
             // Aggregate old PBA decrements
@@ -573,15 +574,22 @@ impl MetaStore {
             }
         }
 
-        // Apply aggregated decrements
-        for (old_pba, decrement) in &aggregated_decrements {
-            let current_rc = self.get_refcount(*old_pba)?;
-            let new_rc = current_rc.saturating_sub(*decrement);
-            let rc_key = encode_refcount_key(*old_pba);
-            if new_rc == 0 {
+        let mut touched_pbas = std::collections::HashSet::new();
+        touched_pbas.extend(new_refcounts.keys().copied());
+        touched_pbas.extend(aggregated_decrements.keys().copied());
+
+        for pba in touched_pbas {
+            let current_rc = self.get_refcount(pba)?;
+            let increments = new_refcounts.get(&pba).copied().unwrap_or(0);
+            let decrements = aggregated_decrements.get(&pba).copied().unwrap_or(0);
+            let final_rc = current_rc
+                .saturating_add(increments)
+                .saturating_sub(decrements);
+            let rc_key = encode_refcount_key(pba);
+            if final_rc == 0 {
                 batch.delete_cf(&cf_refcount, &rc_key);
             } else {
-                batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
+                batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(final_rc));
             }
         }
 
@@ -610,6 +618,71 @@ impl MetaStore {
         let mut result: Vec<String> = vol_ids.into_iter().collect();
         result.sort();
         Ok(result)
+    }
+
+    /// Check if any blockmap entry across all volumes references the given PBA.
+    pub fn has_any_blockmap_ref(&self, target_pba: Pba) -> OnyxResult<bool> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (_, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                if bv.pba == target_pba {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Scan for and remove orphaned refcount entries — PBAs with refcount > 0
+    /// but no blockmap entries referencing them. Returns the PBAs that were cleaned up.
+    pub fn cleanup_orphaned_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
+        let _guard = self.refcount_lock.lock().unwrap();
+        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+
+        // Collect all PBAs referenced by blockmap entries
+        let mut referenced_pbas = std::collections::HashSet::new();
+        let bm_iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        for item in bm_iter {
+            let (_, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                referenced_pbas.insert(bv.pba);
+            }
+        }
+
+        // Scan refcount CF, find entries not in referenced set
+        let mut orphans = Vec::new();
+        let mut batch = WriteBatch::default();
+        let rc_iter = self
+            .db
+            .iterator_cf(&cf_refcount, rocksdb::IteratorMode::Start);
+        for item in rc_iter {
+            let (key, value) = item?;
+            if key.len() == 8 && value.len() == 4 {
+                let pba = Pba(u64::from_be_bytes(key[..8].try_into().unwrap()));
+                let rc = u32::from_be_bytes(value[..4].try_into().unwrap());
+                if !referenced_pbas.contains(&pba) {
+                    orphans.push((pba, rc));
+                    batch.delete_cf(&cf_refcount, &key);
+                }
+            }
+        }
+
+        if !orphans.is_empty() {
+            self.db.write(batch)?;
+            tracing::warn!(
+                count = orphans.len(),
+                "cleaned up orphaned refcount entries"
+            );
+        }
+
+        Ok(orphans)
     }
 
     /// Check if any blockmap entry at `target_pba` has a fragment whose byte
