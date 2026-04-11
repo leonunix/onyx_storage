@@ -922,16 +922,26 @@ impl BufferFlusher {
 
                         // Look up dedup index
                         match meta.get_dedup_entry(&hash) {
-                            Ok(Some(entry)) => match meta.get_refcount(entry.pba) {
-                                Ok(rc) if rc > 0 => {
+                            Ok(Some(entry)) => match meta.dedup_entry_is_live(&entry) {
+                                Ok(true) => {
                                     is_hit[i] = true;
                                     hit_infos.push((i, entry.to_blockmap_value()));
                                 }
-                                _ => {
+                                Ok(false) => {
                                     let _ = meta.delete_dedup_index(&hash);
                                 }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        pba = entry.pba.0,
+                                        "dedup worker: failed to validate dedup entry liveness"
+                                    );
+                                }
                             },
-                            _ => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "dedup worker: failed to read dedup entry");
+                            }
+                            Ok(None) => {}
                         }
                     }
 
@@ -2184,32 +2194,30 @@ impl BufferFlusher {
         let cleanup_start = Instant::now();
 
         // Collect all unique old PBAs with their block counts.
-        let mut all_old_pbas: Vec<(Pba, u32)> = Vec::new();
+        let mut all_old_pbas: HashMap<Pba, u32> = HashMap::new();
         for &unit_idx in &meta_indices {
             if skip[unit_idx] {
                 continue;
             }
             let um = unit_metas[unit_idx].as_ref().unwrap();
             for (old_pba, (_, old_blocks)) in &um.old_pba_meta {
-                all_old_pbas.push((*old_pba, *old_blocks));
+                all_old_pbas
+                    .entry(*old_pba)
+                    .and_modify(|blocks| *blocks = (*blocks).max(*old_blocks))
+                    .or_insert(*old_blocks);
             }
         }
 
         // Batch-read refcounts for all old PBAs.
-        let old_pba_keys: Vec<Pba> = all_old_pbas.iter().map(|(pba, _)| *pba).collect();
+        let old_pba_keys: Vec<Pba> = all_old_pbas.keys().copied().collect();
         let refcounts = meta.multi_get_refcounts(&old_pba_keys).unwrap_or_default();
         let mut dead_pbas: Vec<Pba> = Vec::new();
-        for (i, (old_pba, old_blocks)) in all_old_pbas.iter().enumerate() {
+        let mut dead_allocations: Vec<(Pba, u32)> = Vec::new();
+        for (i, old_pba) in old_pba_keys.iter().enumerate() {
             let remaining = refcounts.get(i).copied().unwrap_or(0);
             if remaining == 0 {
                 dead_pbas.push(*old_pba);
-                if *old_blocks == 1 {
-                    Self::purge_holes_for_pba(hole_map, *old_pba);
-                    let _ = allocator.free_one(*old_pba);
-                } else {
-                    Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
-                    let _ = allocator.free_extent(Extent::new(*old_pba, *old_blocks));
-                }
+                dead_allocations.push((*old_pba, *all_old_pbas.get(old_pba).unwrap()));
             }
         }
 
@@ -2263,9 +2271,30 @@ impl BufferFlusher {
                 .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
         }
 
-        // One batch for all dead PBA dedup cleanup (was N standalone WriteBatch commits)
+        // Remove stale dedup entries before handing dead PBAs back to the allocator.
+        // Otherwise a concurrent dedup hit could see refcount(new owner) > 0 after
+        // reuse and incorrectly accept an old dedup entry for the recycled PBA.
         if !dead_pbas.is_empty() {
-            let _ = meta.cleanup_dedup_for_pbas_batch(&dead_pbas);
+            match meta.cleanup_dedup_for_pbas_batch(&dead_pbas) {
+                Ok(()) => {
+                    for (old_pba, old_blocks) in dead_allocations {
+                        if old_blocks == 1 {
+                            Self::purge_holes_for_pba(hole_map, old_pba);
+                            let _ = allocator.free_one(old_pba);
+                        } else {
+                            Self::purge_holes_for_extent(hole_map, old_pba, old_blocks);
+                            let _ = allocator.free_extent(Extent::new(old_pba, old_blocks));
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        count = dead_pbas.len(),
+                        "writer: failed to cleanup dedup metadata for dead PBAs; keeping allocator reservations"
+                    );
+                }
+            }
         }
         // One batch for all new dedup index entries
         if !all_dedup_entries.is_empty() {

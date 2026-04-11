@@ -1359,12 +1359,7 @@ fn dedup_live_reference_prevents_hole_publication_and_reuse() {
         "hole fill must not reuse bytes still referenced through dedup"
     );
 
-    let worker = ZoneWorker::new(
-        ZoneId(0),
-        meta.clone(),
-        pool.clone(),
-        io_engine.clone(),
-    );
+    let worker = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone());
     assert_eq!(
         worker.handle_read("anchor", Lba(0)).unwrap().unwrap(),
         anchor_new
@@ -1376,6 +1371,84 @@ fn dedup_live_reference_prevents_hole_publication_and_reuse() {
     assert_eq!(
         worker.handle_read("dup", Lba(0)).unwrap().unwrap(),
         anchor_data
+    );
+
+    flusher.stop();
+}
+
+#[test]
+fn dedup_worker_ignores_stale_entry_for_reused_pba() {
+    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
+    register_volume(&meta, "live");
+    register_volume(&meta, "dup");
+
+    let stale_block = vec![0xA5; BLOCK_SIZE as usize];
+    let live_block = vec![0x5A; BLOCK_SIZE as usize];
+    let stale_hash: ContentHash = *blake3::hash(&stale_block).as_bytes();
+
+    let reused_pba = allocator.allocate_one().unwrap();
+    io_engine.write_blocks(reused_pba, &live_block).unwrap();
+
+    let live_mapping = BlockmapValue {
+        pba: reused_pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&live_block),
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.atomic_write_mapping(&VolumeId("live".into()), Lba(0), &live_mapping)
+        .unwrap();
+
+    let stale_entry = DedupEntry {
+        pba: reused_pba,
+        slot_offset: 0,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&stale_block),
+    };
+    meta.put_dedup_entries(&[(stale_hash, stale_entry)])
+        .unwrap();
+    assert!(
+        !meta
+            .has_live_fragment_ref(&stale_entry.to_blockmap_value())
+            .unwrap(),
+        "test fixture must use a stale dedup entry"
+    );
+
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    pool.append("dup", Lba(0), 1, &stale_block, 1000).unwrap();
+    assert!(
+        wait_flushed(&pool, 10000),
+        "flush timeout for stale dedup entry workload"
+    );
+
+    let worker = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone());
+    assert_eq!(
+        worker.handle_read("dup", Lba(0)).unwrap().unwrap(),
+        stale_block,
+        "stale dedup entries on reused PBAs must be rejected and rewritten"
+    );
+
+    let dup_mapping = meta
+        .get_mapping(&VolumeId("dup".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        dup_mapping.pba, reused_pba,
+        "stale dedup entry must not be used as a hit target"
+    );
+
+    let current_entry = meta.get_dedup_entry(&stale_hash).unwrap().unwrap();
+    assert_eq!(
+        current_entry.pba, dup_mapping.pba,
+        "dedup index should be refreshed to the newly written live fragment"
     );
 
     flusher.stop();

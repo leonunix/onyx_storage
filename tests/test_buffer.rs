@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::thread;
 
 use onyx_storage::buffer::entry::*;
 use onyx_storage::buffer::pool::{
@@ -201,6 +202,50 @@ fn full_buffer_rejected() {
 }
 
 #[test]
+fn backpressure_wait_forever_blocks_until_memory_is_reclaimed() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = Arc::new(
+        WriteBufferPool::open_with_options_and_memory_limit(
+            dev,
+            Duration::ZERO,
+            1,
+            256,
+            Duration::MAX,
+            BLOCK_SIZE as u64,
+        )
+        .unwrap(),
+    );
+
+    let seq1 = pool
+        .append("test-vol", Lba(0), 1, &vec![0x11; 4096], 0)
+        .unwrap();
+
+    let pool_for_thread = pool.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(pool_for_thread.append("test-vol", Lba(1), 1, &vec![0x22; 4096], 0));
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "append should block under infinite backpressure instead of failing immediately"
+    );
+
+    pool.mark_flushed(seq1, Lba(0), 1).unwrap();
+    let result = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("append should resume after memory is reclaimed");
+    assert!(
+        result.is_ok(),
+        "append should succeed once backpressure clears"
+    );
+    assert_eq!(pool.pending_count(), 1);
+}
+
+#[test]
 fn persistence_across_reopen() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 10 * 8192;
@@ -251,11 +296,17 @@ fn buffer_pool_lookup() {
 
     let found = pool.lookup("test-vol", Lba(0)).unwrap();
     assert!(found.is_some());
-    assert_eq!(&**found.unwrap().payload.as_ref().unwrap(), &vec![0xAA; 4096][..]);
+    assert_eq!(
+        &**found.unwrap().payload.as_ref().unwrap(),
+        &vec![0xAA; 4096][..]
+    );
 
     let found = pool.lookup("test-vol", Lba(1)).unwrap();
     assert!(found.is_some());
-    assert_eq!(&**found.unwrap().payload.as_ref().unwrap(), &vec![0xBB; 4096][..]);
+    assert_eq!(
+        &**found.unwrap().payload.as_ref().unwrap(),
+        &vec![0xBB; 4096][..]
+    );
 
     let found = pool.lookup("test-vol", Lba(999)).unwrap();
     assert!(found.is_none());
@@ -557,6 +608,44 @@ fn append_is_visible_before_ready_publish() {
 }
 
 #[test]
+fn durable_overwrite_retires_superseded_pending_entry() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_group_commit_wait(dev, Duration::ZERO).unwrap();
+
+    let seq_old = pool
+        .append("test-vol", Lba(7), 1, &vec![0x11; 4096], 0)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq_old
+    );
+    assert_eq!(pool.pending_count(), 1);
+
+    let new_payload = vec![0x22; 4096];
+    let seq_new = pool.append("test-vol", Lba(7), 1, &new_payload, 0).unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq_new
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while pool.pending_count() != 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(pool.pending_count(), 1);
+    let recovered = pool.recover().unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].seq, seq_new);
+    assert_eq!(recovered[0].start_lba, Lba(7));
+    let found = pool.lookup("test-vol", Lba(7)).unwrap().unwrap();
+    assert_eq!(&**found.payload.as_ref().unwrap(), &*new_payload);
+}
+
+#[test]
 fn persistence_across_reopen_after_ring_wrap() {
     let tmp = NamedTempFile::new().unwrap();
     // superblock(4KB) + checkpoint(4KB) + 3 entry slots
@@ -583,11 +672,23 @@ fn persistence_across_reopen_after_ring_wrap() {
 
         let wrapped_seq = pool.append("test-vol", Lba(3), 1, &wrapped, 0).unwrap();
         assert_eq!(
-            &**pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload.as_ref().unwrap(),
+            &**pool
+                .lookup("test-vol", Lba(2))
+                .unwrap()
+                .unwrap()
+                .payload
+                .as_ref()
+                .unwrap(),
             &*keep
         );
         assert_eq!(
-            &**pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload.as_ref().unwrap(),
+            &**pool
+                .lookup("test-vol", Lba(3))
+                .unwrap()
+                .unwrap()
+                .payload
+                .as_ref()
+                .unwrap(),
             &*wrapped
         );
         (keep_seq, wrapped_seq)
@@ -603,11 +704,23 @@ fn persistence_across_reopen_after_ring_wrap() {
     assert!(pool.lookup("test-vol", Lba(1)).unwrap().is_none());
     // After reopen, payloads are lazily hydrated from disk on lookup.
     assert_eq!(
-        &**pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &**pool
+            .lookup("test-vol", Lba(2))
+            .unwrap()
+            .unwrap()
+            .payload
+            .as_ref()
+            .unwrap(),
         &*keep
     );
     assert_eq!(
-        &**pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &**pool
+            .lookup("test-vol", Lba(3))
+            .unwrap()
+            .unwrap()
+            .payload
+            .as_ref()
+            .unwrap(),
         &*wrapped
     );
 }
@@ -643,11 +756,23 @@ fn checkpoint_guided_recovery_finds_all_entries() {
     let seqs: Vec<u64> = recovered.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![seq_a, seq_b]);
     assert_eq!(
-        &**pool.lookup("vol", Lba(0)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &**pool
+            .lookup("vol", Lba(0))
+            .unwrap()
+            .unwrap()
+            .payload
+            .as_ref()
+            .unwrap(),
         &*data_a
     );
     assert_eq!(
-        &**pool.lookup("vol", Lba(1)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &**pool
+            .lookup("vol", Lba(1))
+            .unwrap()
+            .unwrap()
+            .payload
+            .as_ref()
+            .unwrap(),
         &*data_b
     );
 }
@@ -660,11 +785,10 @@ fn corrupt_checkpoint_falls_back_to_full_scan() {
     tmp.as_file().set_len(size).unwrap();
 
     let data = vec![0xCC; 4096];
-    let seq;
     {
         let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
         let pool = WriteBufferPool::open(dev).unwrap();
-        seq = pool.append("vol", Lba(5), 1, &data, 0).unwrap();
+        let _ = pool.append("vol", Lba(5), 1, &data, 0).unwrap();
     }
 
     // Corrupt the checkpoint block (second 4KB block on device).
@@ -734,6 +858,136 @@ fn stale_checkpoint_forward_scan_catches_late_entries() {
     let recovered = pool.recover().unwrap();
     let seqs: Vec<u64> = recovered.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![seq_early, seq_late]);
+}
+
+#[test]
+fn stale_checkpoint_forward_scan_recovers_large_post_checkpoint_batch() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let tmp = NamedTempFile::new().unwrap();
+    let late_entries = 1400u64;
+    let size = 4096 + 4096 + (late_entries + 32) * 8192;
+    tmp.as_file().set_len(size).unwrap();
+
+    let data_early = vec![0xE1; 4096];
+    let data_final = vec![0x7A; 4096];
+    let seq_early;
+    let seq_final;
+
+    {
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let pool = WriteBufferPool::open(dev).unwrap();
+        seq_early = pool.append("vol", Lba(0), 1, &data_early, 0).unwrap();
+    }
+
+    let mut stale_checkpoint = [0u8; 4096];
+    {
+        let mut file = std::fs::File::open(tmp.path()).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.read_exact(&mut stale_checkpoint).unwrap();
+    }
+
+    {
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let pool = WriteBufferPool::open(dev).unwrap();
+        let mut last_seq = 0u64;
+        for idx in 0..late_entries {
+            let lba = Lba(1 + idx);
+            let fill = ((idx % 251) as u8).wrapping_add(1);
+            let payload = if idx + 1 == late_entries {
+                data_final.clone()
+            } else {
+                vec![fill; 4096]
+            };
+            last_seq = pool.append("vol", lba, 1, &payload, 0).unwrap();
+        }
+        seq_final = last_seq;
+    }
+
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(&stale_checkpoint).unwrap();
+        file.flush().unwrap();
+    }
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open(dev).unwrap();
+
+    assert_eq!(pool.pending_count(), late_entries + 1);
+    let recovered = pool.recover().unwrap();
+    assert_eq!(recovered.len() as u64, late_entries + 1);
+    assert_eq!(recovered.first().unwrap().seq, seq_early);
+    assert_eq!(recovered.last().unwrap().seq, seq_final);
+
+    let final_entry = pool.lookup("vol", Lba(late_entries)).unwrap().unwrap();
+    assert_eq!(&**final_entry.payload.as_ref().unwrap(), &*data_final);
+}
+
+#[test]
+fn recovery_compacts_superseded_entry_before_requeue() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+
+    let old_payload = vec![0x3A; 4096];
+    let old_seq;
+    {
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let pool = WriteBufferPool::open(dev).unwrap();
+        old_seq = pool.append("vol", Lba(0), 1, &old_payload, 0).unwrap();
+        assert_eq!(
+            pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+            old_seq
+        );
+    }
+
+    let new_payload: Arc<[u8]> = Arc::from(vec![0x4B; 4096]);
+    let new_entry = BufferEntry {
+        seq: old_seq + 1,
+        vol_id: "vol".to_string(),
+        start_lba: Lba(0),
+        lba_count: 1,
+        payload_crc32: crc32fast::hash(&new_payload),
+        flushed: false,
+        vol_created_at: 0,
+        payload: new_payload.clone(),
+    };
+    let new_bytes = new_entry.to_bytes().unwrap();
+
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        let second_entry_offset = 4096 + 4096 + 8192;
+        file.seek(SeekFrom::Start(second_entry_offset)).unwrap();
+        file.write_all(&new_bytes).unwrap();
+        file.flush().unwrap();
+    }
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open(dev).unwrap();
+
+    assert_eq!(pool.pending_count(), 1);
+    let recovered = pool.recover().unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].seq, old_seq + 1);
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        old_seq + 1
+    );
+    assert!(matches!(
+        pool.try_recv_ready(),
+        Err(crossbeam_channel::TryRecvError::Empty)
+    ));
+    let found = pool.lookup("vol", Lba(0)).unwrap().unwrap();
+    assert_eq!(&**found.payload.as_ref().unwrap(), &*new_payload);
 }
 
 #[test]

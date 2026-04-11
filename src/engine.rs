@@ -54,6 +54,10 @@ pub struct OnyxEngine {
 }
 
 impl OnyxEngine {
+    fn buffer_backpressure_timeout() -> std::time::Duration {
+        std::time::Duration::MAX
+    }
+
     /// Auto-detect maximum buffer payload memory: 20% of system memory, capped at 8 GiB.
     fn auto_detect_max_payload_memory() -> u64 {
         let sys_mem = std::fs::read_to_string("/proc/meminfo")
@@ -151,7 +155,7 @@ impl OnyxEngine {
                     std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
                     config.buffer.shards,
                     config.engine.zone_size_blocks,
-                    std::time::Duration::from_secs(30),
+                    Self::buffer_backpressure_timeout(),
                 );
                 match direct {
                     Ok(pool) => drop(pool), // clean, will reopen below
@@ -167,7 +171,7 @@ impl OnyxEngine {
                             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
                             old_count,
                             config.engine.zone_size_blocks,
-                            std::time::Duration::from_secs(30),
+                            Self::buffer_backpressure_timeout(),
                         )?);
                         old_pool.attach_metrics(metrics.clone());
                         let old_pending = old_pool.pending_count();
@@ -212,7 +216,7 @@ impl OnyxEngine {
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
             config.buffer.shards,
             config.engine.zone_size_blocks,
-            std::time::Duration::from_secs(30),
+            Self::buffer_backpressure_timeout(),
             max_payload_memory,
         )?);
         pool.attach_metrics(metrics.clone());

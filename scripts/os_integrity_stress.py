@@ -397,6 +397,7 @@ class ServiceManager:
         log_path: pathlib.Path,
         event_log: EventLog,
         startup_timeout_secs: int,
+        startup_drain_timeout_secs: int,
     ) -> None:
         self.repo_root = repo_root
         self.engine_cmd = engine_cmd
@@ -407,6 +408,7 @@ class ServiceManager:
         self.log_path = log_path
         self.event_log = event_log
         self.startup_timeout_secs = startup_timeout_secs
+        self.startup_drain_timeout_secs = startup_drain_timeout_secs
         self.proc: Optional[subprocess.Popen[bytes]] = None
         self._log_fh = None
 
@@ -444,6 +446,53 @@ class ServiceManager:
                     raise HarnessError(line.removeprefix("error:").strip())
                 lines.append(line)
         return lines
+
+    def status_json(self) -> dict[str, object]:
+        lines = self._send_socket_cmd("status-json")
+        if not lines:
+            raise HarnessError("empty status-json response")
+        return json.loads(lines[0])
+
+    def wait_for_recovered_buffer_drain(self) -> None:
+        if self.startup_drain_timeout_secs <= 0:
+            return
+        payload = self.status_json()
+        status = payload.get("status") or {}
+        pending = int(status.get("buffer_pending_entries") or 0)
+        if pending <= 0:
+            return
+
+        started = time.time()
+        self.event_log.append(
+            {
+                "event": "startup-drain-begin",
+                "pending_entries": pending,
+                "ts": started,
+            }
+        )
+
+        def drained() -> bool:
+            if self.proc is not None and self.proc.poll() is not None:
+                raise HarnessError(f"engine exited early with code {self.proc.returncode}")
+            status = (self.status_json().get("status") or {})
+            return int(status.get("buffer_pending_entries") or 0) == 0
+
+        wait_for(
+            drained,
+            timeout_secs=self.startup_drain_timeout_secs,
+            interval_secs=1.0,
+        )
+        final_pending = int(
+            (self.status_json().get("status") or {}).get("buffer_pending_entries") or 0
+        )
+        self.event_log.append(
+            {
+                "event": "startup-drain-end",
+                "pending_entries": final_pending,
+                "elapsed_secs": time.time() - started,
+                "ts": time.time(),
+            }
+        )
 
     def best_effort_stop(self) -> None:
         try:
@@ -508,23 +557,18 @@ class ServiceManager:
         def ready() -> bool:
             if self.proc is not None and self.proc.poll() is not None:
                 raise HarnessError(f"engine exited early with code {self.proc.returncode}")
-            lines = self._send_socket_cmd("status-json")
-            if not lines:
-                return False
-            payload = json.loads(lines[0])
+            payload = self.status_json()
             dev_ids = payload.get("ublk_devices") or []
             return bool(dev_ids)
 
         wait_for(ready, timeout_secs=self.startup_timeout_secs, interval_secs=1.0)
         path = self.resolve_device_path()
         self.event_log.append({"event": "device-ready", "device": str(path), "ts": time.time()})
+        self.wait_for_recovered_buffer_drain()
         return path
 
     def resolve_device_path(self) -> pathlib.Path:
-        lines = self._send_socket_cmd("status-json")
-        if not lines:
-            raise HarnessError("empty status-json response")
-        payload = json.loads(lines[0])
+        payload = self.status_json()
         dev_ids = payload.get("ublk_devices") or []
         if len(dev_ids) != 1:
             raise HarnessError(f"expected exactly one ublk device, got {dev_ids}")
@@ -616,6 +660,7 @@ class IntegrityHarness:
             log_path=self.run_dir / "engine.log",
             event_log=self.event_log,
             startup_timeout_secs=args.startup_timeout_secs,
+            startup_drain_timeout_secs=args.startup_drain_timeout_secs,
         )
 
     def _make_hot_windows(self) -> list[tuple[int, int]]:
@@ -1200,6 +1245,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="How long to wait for the engine socket and ublk device to become ready",
     )
     parser.add_argument(
+        "--startup-drain-timeout",
+        type=parse_duration,
+        default="30m",
+        dest="startup_drain_timeout_secs",
+        help="How long to wait for recovered pending buffer entries to drain before starting workload; use 0 to disable",
+    )
+    parser.add_argument(
         "--operation-log-stride",
         type=int,
         default=1024,
@@ -1219,6 +1271,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--operation-log-stride must be >= 0")
     if args.startup_timeout_secs <= 0:
         parser.error("--startup-timeout must be > 0")
+    if args.startup_drain_timeout_secs < 0:
+        parser.error("--startup-drain-timeout must be >= 0")
     if args.hotset_ratio <= 0 or args.hotset_ratio > 1.0:
         parser.error("--hotset-ratio must be in (0, 1]")
     if args.hotset_probability < 0 or args.hotset_probability > 1.0:

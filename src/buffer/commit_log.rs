@@ -27,10 +27,7 @@ const DASHMAP_SHARDS: usize = 256;
 const SHARD_CHECKPOINT_MAGIC: u32 = 0x5348_434B; // "SHCK"
 const SHARD_CHECKPOINT_VERSION: u32 = 1;
 const SHARD_CHECKPOINT_SIZE: u64 = 4096;
-/// How many extra slots to scan beyond the checkpoint head on recovery,
-/// to catch entries written after the last checkpoint persist.
-const CHECKPOINT_FORWARD_SCAN_SLOTS: u64 = 1024;
-
+const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone)]
 pub struct PendingEntry {
     pub seq: u64,
@@ -44,6 +41,11 @@ pub struct PendingEntry {
     pub payload: Option<Arc<[u8]>>,
     pub disk_offset: u64,
     pub disk_len: u32,
+    /// Older buffered ranges overwritten by this entry at append time.
+    /// Once this entry is durable in the commit log, these ranges can be
+    /// retired immediately instead of waiting for the flusher to rediscover
+    /// that they are stale.
+    pub superseded_ranges: Vec<(u64, Lba, u32)>,
 }
 
 /// Lightweight recovery metadata — no payload clone.
@@ -298,6 +300,16 @@ impl BufferShard {
         BLOCK_SIZE as u64
     }
 
+    fn add_seq_lba_range(acc: &mut Vec<(u64, Lba, u32)>, seq: u64, lba: Lba) {
+        if let Some((last_seq, last_start, last_count)) = acc.last_mut() {
+            if *last_seq == seq && last_start.0 + *last_count as u64 == lba.0 {
+                *last_count += 1;
+                return;
+            }
+        }
+        acc.push((seq, lba, 1));
+    }
+
     fn total_slots(capacity_bytes: u64) -> u64 {
         capacity_bytes / Self::slot_size()
     }
@@ -495,6 +507,7 @@ impl BufferShard {
                             payload: None, // lazy: hydrated from disk on demand
                             disk_offset: offset,
                             disk_len,
+                            superseded_ranges: Vec::new(),
                         })
                     });
                     scanned.push(ScannedRecord {
@@ -631,6 +644,7 @@ impl BufferShard {
                         payload: None, // lazy: hydrated from disk on demand
                         disk_offset: offset,
                         disk_len,
+                        superseded_ranges: Vec::new(),
                     })
                 });
                 scanned.push(ScannedRecord {
@@ -679,18 +693,22 @@ impl BufferShard {
 
         // Scan forward from the checkpoint head to catch entries appended after
         // the last checkpoint write. These entries must be contiguous from the
-        // old head *and* must have a seq newer than the checkpoint's max_seq.
-        // Once we hit the first gap or an older seq, the rest of the ring
-        // contains stale reclaimed bytes from older epochs.
-        let max_forward_bytes = (CHECKPOINT_FORWARD_SCAN_SLOTS * slot_sz).min(capacity_bytes);
+        // old head and must keep increasing in seq beyond checkpoint.max_seq.
+        //
+        // A fixed forward-scan window is not safe here: a single committed
+        // batch can easily exceed 1024 slots under heavy load, and truncating
+        // recovery there loses still-live entries while rebuilding a too-small
+        // ring that later reuses live buffer space.
         let mut forward_offset = checkpoint.head_offset;
         let mut forward_scanned_bytes = 0u64;
-        while forward_scanned_bytes < max_forward_bytes {
+        let mut last_forward_seq = checkpoint.max_seq;
+        while forward_scanned_bytes < capacity_bytes {
             match Self::scan_entry(device, forward_offset, capacity_bytes)? {
                 Some((entry, slot_count)) => {
-                    if entry.seq <= checkpoint.max_seq {
+                    if entry.seq <= last_forward_seq {
                         break;
                     }
+                    last_forward_seq = entry.seq;
                     record_scanned(forward_offset, entry, slot_count, &mut scanned);
                     let step = Self::slot_bytes(slot_count);
                     forward_offset = (forward_offset + step) % capacity_bytes;
@@ -886,6 +904,9 @@ impl BufferShard {
             return;
         }
         for pending in committed {
+            if !self.pending_entries.contains_key(&pending.seq) {
+                continue;
+            }
             if let Some(ref p) = pending.payload {
                 let payload_len = p.len() as u64;
                 // Build an evicted copy (same metadata, payload=None).
@@ -899,6 +920,7 @@ impl BufferShard {
                     payload: None,
                     disk_offset: pending.disk_offset,
                     disk_len: pending.disk_len,
+                    superseded_ranges: pending.superseded_ranges.clone(),
                 });
                 // Replace in pending_entries.
                 self.pending_entries.insert(pending.seq, evicted.clone());
@@ -928,6 +950,58 @@ impl BufferShard {
 
     fn max_payload_memory(&self) -> u64 {
         self.max_payload_memory_bytes
+    }
+
+    fn backpressure_waits_forever(&self) -> bool {
+        self.backpressure_timeout == Duration::MAX
+    }
+
+    fn retire_superseded_by_durable_entries(&self, committed: &[Arc<PendingEntry>]) {
+        for pending in committed {
+            for (old_seq, lba_start, lba_count) in &pending.superseded_ranges {
+                if let Err(e) = self.mark_flushed(*old_seq, *lba_start, *lba_count) {
+                    tracing::warn!(
+                        new_seq = pending.seq,
+                        old_seq,
+                        start_lba = lba_start.0,
+                        lba_count,
+                        error = %e,
+                        "failed to retire superseded buffered range"
+                    );
+                }
+            }
+        }
+    }
+
+    fn compact_recovered_stale_ranges(&self) {
+        let mut entries: Vec<Arc<PendingEntry>> = self
+            .pending_entries
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        entries.sort_by_key(|entry| entry.seq);
+
+        for entry in entries {
+            let mut stale_ranges = Vec::new();
+            for i in 0..entry.lba_count {
+                let lba = Lba(entry.start_lba.0 + i as u64);
+                if !self.is_latest_lba_seq(&entry.vol_id, lba, entry.seq, entry.vol_created_at) {
+                    Self::add_seq_lba_range(&mut stale_ranges, entry.seq, lba);
+                }
+            }
+
+            for (seq, lba_start, lba_count) in stale_ranges {
+                if let Err(e) = self.mark_flushed(seq, lba_start, lba_count) {
+                    tracing::warn!(
+                        seq,
+                        start_lba = lba_start.0,
+                        lba_count,
+                        error = %e,
+                        "failed to compact recovered stale buffered range"
+                    );
+                }
+            }
+        }
     }
 
     /// Hot-path append. No disk I/O, no CRC, no encoding.
@@ -979,7 +1053,12 @@ impl BufferShard {
         let mem_limit = self.max_payload_memory();
         if mem_limit > 0 {
             let payload_size = payload.len() as u64;
-            let deadline = Instant::now() + self.backpressure_timeout;
+            let deadline =
+                if self.backpressure_timeout.is_zero() || self.backpressure_waits_forever() {
+                    None
+                } else {
+                    Instant::now().checked_add(self.backpressure_timeout)
+                };
             loop {
                 let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
                 if current + payload_size <= mem_limit {
@@ -988,21 +1067,25 @@ impl BufferShard {
                 if self.backpressure_timeout.is_zero() {
                     return Err(OnyxError::BufferPoolFull(current as usize));
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    tracing::warn!(
-                        current_mb = current / (1024 * 1024),
-                        limit_mb = mem_limit / (1024 * 1024),
-                        "append rejected: payload memory limit exceeded"
-                    );
-                    return Err(OnyxError::BufferPoolFull(current as usize));
-                }
+                let wait_for = match deadline {
+                    Some(deadline) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            tracing::warn!(
+                                current_mb = current / (1024 * 1024),
+                                limit_mb = mem_limit / (1024 * 1024),
+                                "append rejected: payload memory limit exceeded"
+                            );
+                            return Err(OnyxError::BufferPoolFull(current as usize));
+                        }
+                        remaining.min(BACKPRESSURE_POLL_INTERVAL)
+                    }
+                    None => BACKPRESSURE_POLL_INTERVAL,
+                };
                 // Wait for flusher to free memory (reuse ring_space_cv; flusher
                 // notifies it when mark_flushed reclaims ring + payload space).
                 let mut ring = self.ring.lock();
-                let _ = self
-                    .ring_space_cv
-                    .wait_for(&mut ring, remaining.min(Duration::from_millis(50)));
+                let _ = self.ring_space_cv.wait_for(&mut ring, wait_for);
             }
         }
 
@@ -1022,6 +1105,12 @@ impl BufferShard {
                 if self.backpressure_timeout.is_zero() {
                     return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
                 }
+                if self.backpressure_waits_forever() {
+                    let _ = self
+                        .ring_space_cv
+                        .wait_for(&mut ring, BACKPRESSURE_POLL_INTERVAL);
+                    continue;
+                }
                 // Wait for flush lane to free space (condvar releases ring lock).
                 let wait = self
                     .ring_space_cv
@@ -1036,6 +1125,23 @@ impl BufferShard {
         self.payload_bytes_in_memory
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
 
+        let vid = self.intern_vol_id(vol_id);
+        let mut keys = Vec::with_capacity(lba_count as usize);
+        let mut superseded_ranges = Vec::new();
+        for i in 0..lba_count {
+            let lba = Lba(start_lba.0 + i as u64);
+            let key = LbaKey {
+                vol_id: vid.clone(),
+                lba,
+            };
+            if let Some(existing) = self.lba_index.get(&key) {
+                if existing.seq != seq {
+                    Self::add_seq_lba_range(&mut superseded_ranges, existing.seq, lba);
+                }
+            }
+            keys.push(key);
+        }
+
         // Build PendingEntry — one String alloc (vol_id) + one Vec alloc (payload).
         let pending = Arc::new(PendingEntry {
             seq,
@@ -1047,16 +1153,12 @@ impl BufferShard {
             payload: Some(Arc::from(payload)),
             disk_offset: write_offset,
             disk_len,
+            superseded_ranges,
         });
 
         // ── DashMap inserts (concurrent sharded locks) ──
         // Interned Arc<str>: read-lock fast path, no alloc after first encounter.
-        let vid = self.intern_vol_id(vol_id);
-        for i in 0..lba_count {
-            let key = LbaKey {
-                vol_id: vid.clone(),
-                lba: Lba(start_lba.0 + i as u64),
-            };
+        for key in keys {
             self.lba_index.insert(key.clone(), pending.clone());
             self.latest_lba_seq.insert(key, (seq, vol_created_at));
         }
@@ -1804,6 +1906,7 @@ impl WriteBufferPool {
                 Ok(()) => {
                     consecutive_failures = 0;
                     retry_after = None;
+                    shard.retire_superseded_by_durable_entries(&inflight);
                     // Persist checkpoint hint (best-effort, no sync).
                     let batch_max_seq = inflight.iter().map(|p| p.seq).max().unwrap_or(0);
                     shard.write_checkpoint(batch_max_seq);
@@ -2061,9 +2164,16 @@ impl WriteBufferPool {
         consumed = 0u64;
         for (shard_idx, result) in shard_results.into_iter().enumerate() {
             let (shard, shard_max_seq) = result?;
+            shard.compact_recovered_stale_ranges();
 
             let (shard_ready_tx, shard_ready_rx) = unbounded();
-            for seq in shard.pending_entries.iter().map(|entry| *entry.key()) {
+            let mut recovered_seqs: Vec<u64> = shard
+                .pending_entries
+                .iter()
+                .map(|entry| *entry.key())
+                .collect();
+            recovered_seqs.sort_unstable();
+            for seq in recovered_seqs {
                 let _ = ready_tx.send(seq);
                 let _ = shard_ready_tx.send(seq);
             }

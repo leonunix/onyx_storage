@@ -24,7 +24,7 @@ pub enum OnyxError {
         max_lba: u64,
     },
 
-    #[error("Buffer pool full: {0} pending entries")]
+    #[error("Buffer pool full: {0} bytes in use")]
     BufferPoolFull(usize),
 
     #[error("CRC mismatch: expected {expected:#x}, got {actual:#x}")]

@@ -240,7 +240,7 @@ impl DedupScanner {
 
                 // Look up dedup index
                 match meta.get_dedup_entry(&hash)? {
-                    Some(existing) if meta.get_refcount(existing.pba)? > 0 => {
+                    Some(existing) if meta.dedup_entry_is_live(&existing)? => {
                         // Dedup hit! Remap this LBA to existing PBA
                         let new_bv = BlockmapValue {
                             flags: 0, // Clear DEDUP_SKIPPED
@@ -261,6 +261,23 @@ impl DedupScanner {
                             }
                         }
                         stats.hits += 1;
+                    }
+                    Some(_) => {
+                        meta.delete_dedup_index(&hash)?;
+                        // Dedup miss: register in index and clear flag
+                        let entry = DedupEntry {
+                            pba: current.pba,
+                            slot_offset: current.slot_offset,
+                            compression: current.compression,
+                            unit_compressed_size: current.unit_compressed_size,
+                            unit_original_size: current.unit_original_size,
+                            unit_lba_count: current.unit_lba_count,
+                            offset_in_unit: current.offset_in_unit,
+                            crc32: current.crc32,
+                        };
+                        meta.put_dedup_entries(&[(hash, entry)])?;
+                        meta.update_blockmap_flags(&vol_id, *lba, 0)?;
+                        stats.misses += 1;
                     }
                     _ => {
                         // Dedup miss: register in index and clear flag

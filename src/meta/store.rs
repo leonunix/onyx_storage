@@ -1139,11 +1139,31 @@ impl MetaStore {
         Ok(results)
     }
 
-    /// Delete a single dedup index entry by hash (best-effort stale cleanup).
+    /// Delete a single dedup index entry by hash, including its reverse entry.
+    /// Best-effort stale cleanup for hit paths that discover an index entry no
+    /// longer points at a live physical fragment.
     pub fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
-        let cf = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();
-        self.db.delete_cf(&cf, hash)?;
+        let cf_index = self.db.cf_handle(CF_DEDUP_INDEX).unwrap();
+        let cf_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
+        let mut batch = WriteBatch::default();
+        if let Some(raw) = self.db.get_cf(&cf_index, hash)? {
+            if let Some(entry) = decode_dedup_entry(&raw) {
+                let reverse_key = encode_dedup_reverse_key(entry.pba, hash);
+                batch.delete_cf(&cf_reverse, &reverse_key);
+            }
+        }
+        batch.delete_cf(&cf_index, hash);
+        self.db.write(batch)?;
         Ok(())
+    }
+
+    /// A dedup entry is safe to use only if the owning PBA is still referenced
+    /// and the exact fragment identity is still present in the live blockmap.
+    pub fn dedup_entry_is_live(&self, entry: &DedupEntry) -> OnyxResult<bool> {
+        if self.get_refcount(entry.pba)? == 0 {
+            return Ok(false);
+        }
+        self.has_live_fragment_ref(&entry.to_blockmap_value())
     }
 
     /// Clean up dedup index + reverse entries for a given PBA.

@@ -404,7 +404,10 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
     let data_tmp = NamedTempFile::new().unwrap();
     let data_size = 4096 * 20000;
     data_tmp.as_file().set_len(data_size as u64).unwrap();
-    let io_engine = Arc::new(IoEngine::new(RawDevice::open(data_tmp.path()).unwrap(), false));
+    let io_engine = Arc::new(IoEngine::new(
+        RawDevice::open(data_tmp.path()).unwrap(),
+        false,
+    ));
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
     let allocator = Arc::new(SpaceAllocator::new(data_size as u64, 1));
     let mut flusher = BufferFlusher::start(
