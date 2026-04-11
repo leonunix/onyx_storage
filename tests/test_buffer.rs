@@ -251,11 +251,11 @@ fn buffer_pool_lookup() {
 
     let found = pool.lookup("test-vol", Lba(0)).unwrap();
     assert!(found.is_some());
-    assert_eq!(*found.unwrap().payload, vec![0xAA; 4096][..]);
+    assert_eq!(&**found.unwrap().payload.as_ref().unwrap(), &vec![0xAA; 4096][..]);
 
     let found = pool.lookup("test-vol", Lba(1)).unwrap();
     assert!(found.is_some());
-    assert_eq!(*found.unwrap().payload, vec![0xBB; 4096][..]);
+    assert_eq!(&**found.unwrap().payload.as_ref().unwrap(), &vec![0xBB; 4096][..]);
 
     let found = pool.lookup("test-vol", Lba(999)).unwrap();
     assert!(found.is_none());
@@ -272,7 +272,7 @@ fn buffer_pool_lookup_latest() {
         .unwrap();
 
     let found = pool.lookup("test-vol", Lba(5)).unwrap().unwrap();
-    assert_eq!(*found.payload, vec![0x22; 4096][..]);
+    assert_eq!(&**found.payload.as_ref().unwrap(), &vec![0x22; 4096][..]);
 }
 
 /// Lookup on an empty pool returns None.
@@ -525,7 +525,7 @@ fn append_retries_transient_sync_failure_without_losing_pending_entry() {
     assert!(seq >= 1);
     assert_eq!(pool.pending_count(), 1);
     let found = pool.lookup("test-vol", Lba(7)).unwrap().unwrap();
-    assert_eq!(*found.payload, *data);
+    assert_eq!(&**found.payload.as_ref().unwrap(), &*data);
 
     let unflushed = pool.recover().unwrap();
     assert_eq!(unflushed.len(), 1);
@@ -546,7 +546,7 @@ fn append_is_visible_before_ready_publish() {
     let seq = pool.append("test-vol", Lba(9), 1, &data, 0).unwrap();
 
     let found = pool.lookup("test-vol", Lba(9)).unwrap().unwrap();
-    assert_eq!(*found.payload, *data);
+    assert_eq!(&**found.payload.as_ref().unwrap(), &*data);
     assert!(matches!(
         pool.try_recv_ready(),
         Err(crossbeam_channel::TryRecvError::Empty)
@@ -583,12 +583,12 @@ fn persistence_across_reopen_after_ring_wrap() {
 
         let wrapped_seq = pool.append("test-vol", Lba(3), 1, &wrapped, 0).unwrap();
         assert_eq!(
-            *pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload,
-            *keep
+            &**pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload.as_ref().unwrap(),
+            &*keep
         );
         assert_eq!(
-            *pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload,
-            *wrapped
+            &**pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload.as_ref().unwrap(),
+            &*wrapped
         );
         (keep_seq, wrapped_seq)
     };
@@ -601,13 +601,14 @@ fn persistence_across_reopen_after_ring_wrap() {
     assert_eq!(pool.pending_count(), 2);
     assert!(pool.lookup("test-vol", Lba(0)).unwrap().is_none());
     assert!(pool.lookup("test-vol", Lba(1)).unwrap().is_none());
+    // After reopen, payloads are lazily hydrated from disk on lookup.
     assert_eq!(
-        *pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload,
-        *keep
+        &**pool.lookup("test-vol", Lba(2)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &*keep
     );
     assert_eq!(
-        *pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload,
-        *wrapped
+        &**pool.lookup("test-vol", Lba(3)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &*wrapped
     );
 }
 
@@ -642,12 +643,12 @@ fn checkpoint_guided_recovery_finds_all_entries() {
     let seqs: Vec<u64> = recovered.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![seq_a, seq_b]);
     assert_eq!(
-        *pool.lookup("vol", Lba(0)).unwrap().unwrap().payload,
-        *data_a
+        &**pool.lookup("vol", Lba(0)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &*data_a
     );
     assert_eq!(
-        *pool.lookup("vol", Lba(1)).unwrap().unwrap().payload,
-        *data_b
+        &**pool.lookup("vol", Lba(1)).unwrap().unwrap().payload.as_ref().unwrap(),
+        &*data_b
     );
 }
 
@@ -683,9 +684,10 @@ fn corrupt_checkpoint_falls_back_to_full_scan() {
     let pool = WriteBufferPool::open(dev).unwrap();
 
     assert_eq!(pool.pending_count(), 1);
-    let recovered = pool.recover().unwrap();
-    assert_eq!(recovered[0].seq, seq);
-    assert_eq!(*recovered[0].payload, *data);
+    // Payload is lazy-loaded (not in memory after recovery).
+    // Verify via lookup which hydrates from disk.
+    let found = pool.lookup("vol", Lba(5)).unwrap().unwrap();
+    assert_eq!(&**found.payload.as_ref().unwrap(), &*data);
 }
 
 /// Stale checkpoint: entries written after the last checkpoint persist are

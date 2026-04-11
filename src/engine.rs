@@ -54,6 +54,29 @@ pub struct OnyxEngine {
 }
 
 impl OnyxEngine {
+    /// Auto-detect maximum buffer payload memory: 20% of system memory, capped at 8 GiB.
+    fn auto_detect_max_payload_memory() -> u64 {
+        let sys_mem = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("MemTotal:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|kb| kb.parse::<u64>().ok())
+                    .map(|kb| kb * 1024) // kB → bytes
+            })
+            .unwrap_or(8 * 1024 * 1024 * 1024); // fallback 8 GiB
+        let twenty_pct = sys_mem / 5;
+        let cap = 8u64 * 1024 * 1024 * 1024; // 8 GiB
+        let limit = twenty_pct.min(cap);
+        tracing::info!(
+            system_memory_mb = sys_mem / (1024 * 1024),
+            buffer_memory_limit_mb = limit / (1024 * 1024),
+            "buffer payload memory limit (20% of system memory, max 8 GiB)"
+        );
+        limit
+    }
+
     fn current_time_nanos() -> u64 {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -179,12 +202,18 @@ impl OnyxEngine {
 
         // Open buffer pool (auto-reinit if drained above, or normal open)
         let buf_dev = RawDevice::open(buf_path)?;
-        let pool = Arc::new(WriteBufferPool::open_with_options(
+        let max_payload_memory = if config.buffer.max_memory_mb > 0 {
+            config.buffer.max_memory_mb as u64 * 1024 * 1024
+        } else {
+            Self::auto_detect_max_payload_memory()
+        };
+        let pool = Arc::new(WriteBufferPool::open_with_options_and_memory_limit(
             buf_dev,
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
             config.buffer.shards,
             config.engine.zone_size_blocks,
             std::time::Duration::from_secs(30),
+            max_payload_memory,
         )?);
         pool.attach_metrics(metrics.clone());
 

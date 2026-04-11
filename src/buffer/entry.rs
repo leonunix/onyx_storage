@@ -621,4 +621,80 @@ impl BufferEntry {
             payload,
         })
     }
+
+    /// Parse only metadata from the first 4KB header block, without reading
+    /// the payload. Returns `(entry_without_payload, slot_count)`.
+    /// CRC is validated for compact/direct-compact formats (header-only CRC).
+    /// For full-CRC v1 entries, payload CRC is deferred to hydration time.
+    pub fn from_header_block(buf: &[u8]) -> Option<(Self, u32)> {
+        if buf.len() < FIXED_HEADER_SIZE {
+            return None;
+        }
+
+        let total_len = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        if (total_len as usize) < FIXED_HEADER_SIZE || total_len > MAX_ENTRY_SIZE {
+            return None;
+        }
+
+        let magic = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        if magic != BUFFER_ENTRY_MAGIC {
+            return None;
+        }
+
+        let header_version = buf[31];
+        if header_version != FULL_CRC_HEADER_VERSION
+            && header_version != COMPACT_HEADER_VERSION
+            && header_version != DIRECT_COMPACT_HEADER_VERSION
+        {
+            return None;
+        }
+
+        let vol_id_len = u16::from_le_bytes(buf[28..30].try_into().unwrap()) as usize;
+        if vol_id_len > MAX_VOLUME_ID_BYTES {
+            return None;
+        }
+
+        let header_end = FIXED_HEADER_SIZE + vol_id_len;
+        if header_end > buf.len() {
+            return None;
+        }
+
+        // Verify header CRC. For compact formats, CRC covers only header bytes
+        // which fit in the first 4KB block. For full-CRC v1, we can only validate
+        // the header portion — payload CRC is deferred.
+        let stored_crc = u32::from_le_bytes(buf[36..40].try_into().unwrap());
+        if header_version >= COMPACT_HEADER_VERSION {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&buf[0..36]);
+            hasher.update(&buf[40..header_end]);
+            if stored_crc != hasher.finalize() {
+                return None;
+            }
+        }
+        // For FULL_CRC_HEADER_VERSION: CRC covers header + payload.
+        // We can't validate it without the payload, so we skip CRC here and
+        // rely on payload_crc32 validation at hydration time.
+
+        let lba_count = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+        let slot_count =
+            round_up(total_len as usize, BLOCK_SIZE as usize) as u32 / BLOCK_SIZE;
+
+        let vol_id = std::str::from_utf8(&buf[FIXED_HEADER_SIZE..header_end])
+            .ok()?
+            .to_string();
+
+        Some((
+            Self {
+                seq: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+                vol_id,
+                start_lba: Lba(u64::from_le_bytes(buf[16..24].try_into().unwrap())),
+                lba_count,
+                payload_crc32: u32::from_le_bytes(buf[32..36].try_into().unwrap()),
+                flushed: buf[30] != 0,
+                vol_created_at: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+                payload: Arc::from(Vec::new()),
+            },
+            slot_count,
+        ))
+    }
 }

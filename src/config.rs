@@ -164,6 +164,10 @@ pub struct BufferConfig {
     /// Number of internal journal shards inside the buffer device (default 1)
     #[serde(default = "default_buffer_shards")]
     pub shards: usize,
+    /// Maximum in-memory payload bytes before append backpressure kicks in.
+    /// Default 0 = auto (50% of system memory, capped at 8 GiB).
+    #[serde(default)]
+    pub max_memory_mb: usize,
 }
 
 impl Default for BufferConfig {
@@ -174,6 +178,7 @@ impl Default for BufferConfig {
             flush_watermark_pct: default_flush_watermark_pct(),
             group_commit_wait_us: default_group_commit_wait_us(),
             shards: default_buffer_shards(),
+            max_memory_mb: 0,
         }
     }
 }

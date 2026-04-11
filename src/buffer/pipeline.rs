@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use crate::buffer::commit_log::PendingEntry;
 use crate::buffer::entry::BufferEntry;
 use crate::meta::schema::{BlockmapValue, ContentHash};
 use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
@@ -139,13 +140,8 @@ pub fn coalesce(
     max_lbas: u32,
     vol_compression: &dyn Fn(&str) -> CompressionAlgo,
 ) -> Vec<CoalesceUnit> {
-    if entries.is_empty() {
-        return Vec::new();
-    }
-
     let bs = BLOCK_SIZE as usize;
 
-    // Phase 1: Expand all entries into per-LBA slices
     let mut all_slices: Vec<LbaSlice> = Vec::new();
     for entry in entries {
         for i in 0..entry.lba_count {
@@ -162,6 +158,49 @@ pub fn coalesce(
             }
         }
     }
+    coalesce_slices(all_slices, max_raw_bytes, max_lbas, vol_compression)
+}
+
+pub fn coalesce_pending(
+    entries: &[Arc<PendingEntry>],
+    max_raw_bytes: usize,
+    max_lbas: u32,
+    vol_compression: &dyn Fn(&str) -> CompressionAlgo,
+) -> Vec<CoalesceUnit> {
+    let bs = BLOCK_SIZE as usize;
+
+    let mut all_slices: Vec<LbaSlice> = Vec::new();
+    for entry in entries {
+        let Some(ref payload) = entry.payload else {
+            continue;
+        };
+        for i in 0..entry.lba_count {
+            let offset = i as usize * bs;
+            let end = offset + bs;
+            if end <= payload.len() {
+                all_slices.push(LbaSlice {
+                    vol_id: &entry.vol_id,
+                    lba: Lba(entry.start_lba.0 + i as u64),
+                    data: &payload[offset..end],
+                    entry_seq: entry.seq,
+                    vol_created_at: entry.vol_created_at,
+                });
+            }
+        }
+    }
+    coalesce_slices(all_slices, max_raw_bytes, max_lbas, vol_compression)
+}
+
+fn coalesce_slices(
+    all_slices: Vec<LbaSlice<'_>>,
+    max_raw_bytes: usize,
+    max_lbas: u32,
+    vol_compression: &dyn Fn(&str) -> CompressionAlgo,
+) -> Vec<CoalesceUnit> {
+    if all_slices.is_empty() {
+        return Vec::new();
+    }
+    let bs = BLOCK_SIZE as usize;
 
     // Phase 2: Dedup — keep latest (highest seq) per (vol_id, lba).
     // Collect all seqs per key for flushing.

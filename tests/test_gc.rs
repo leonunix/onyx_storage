@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use onyx_storage::buffer::flush::BufferFlusher;
 use onyx_storage::buffer::pool::WriteBufferPool;
+use onyx_storage::compress::codec::create_compressor;
 use onyx_storage::config::{FlushConfig, MetaConfig};
 use onyx_storage::gc::config::GcConfig;
 use onyx_storage::gc::rewriter::rewrite_candidate;
-use onyx_storage::gc::scanner::scan_gc_candidates;
+use onyx_storage::gc::scanner::{scan_gc_candidates, GcCandidate};
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::engine::IoEngine;
 use onyx_storage::lifecycle::VolumeLifecycleManager;
@@ -688,6 +689,127 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
     assert_eq!(cand_b.crc32, 0xBBBB);
     assert_eq!(cand_b.live_lbas.len(), 3);
     assert!((cand_b.dead_ratio - 0.25).abs() < 0.01);
+}
+
+/// GC rewriter must verify the FULL fragment identity, not just PBA.
+/// If a live LBA was remapped to a different fragment in the same packed slot
+/// (same PBA, different slot_offset / metadata), rewriting from the old
+/// candidate would corrupt data.
+#[test]
+fn gc_rewriter_skips_lba_when_fragment_identity_changed_with_same_pba() {
+    let env = setup_gc_env();
+
+    let shared_pba = Pba(777);
+    let vol_a = VolumeId("vol-a".into());
+    let vol_b = VolumeId("vol-b".into());
+    register_volume(&env.meta, &vol_a.0, CompressionAlgo::Lz4, 100);
+    register_volume(&env.meta, &vol_b.0, CompressionAlgo::Lz4, 200);
+
+    let old_plain = vec![0x11; 2 * BLOCK_SIZE as usize];
+    let new_plain = vec![0x22; 2 * BLOCK_SIZE as usize];
+    let compressor = create_compressor(CompressionAlgo::Lz4);
+
+    let mut old_buf = vec![0u8; compressor.max_compressed_size(old_plain.len())];
+    let old_size = compressor.compress(&old_plain, &mut old_buf).unwrap();
+    let old_compressed = old_buf[..old_size].to_vec();
+    let old_crc = crc32fast::hash(&old_compressed);
+
+    let mut new_buf = vec![0u8; compressor.max_compressed_size(new_plain.len())];
+    let new_size = compressor.compress(&new_plain, &mut new_buf).unwrap();
+    let new_compressed = new_buf[..new_size].to_vec();
+    let new_crc = crc32fast::hash(&new_compressed);
+
+    let new_slot_offset = 1024u16;
+    let mut slot = vec![0u8; BLOCK_SIZE as usize];
+    slot[..old_compressed.len()].copy_from_slice(&old_compressed);
+    slot[new_slot_offset as usize..new_slot_offset as usize + new_compressed.len()]
+        .copy_from_slice(&new_compressed);
+    env.io_engine.write_blocks(shared_pba, &slot).unwrap();
+
+    // Old fragment A at slot_offset=0, 2 LBAs, with only LBA 0 still live.
+    env.meta
+        .put_mapping(
+            &vol_a,
+            Lba(0),
+            &BlockmapValue {
+                pba: shared_pba,
+                compression: 1,
+                unit_compressed_size: old_compressed.len() as u32,
+                unit_original_size: 8192,
+                unit_lba_count: 2,
+                offset_in_unit: 0,
+                crc32: old_crc,
+                slot_offset: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+
+    // Different fragment B in the same slot.
+    env.meta
+        .put_mapping(
+            &vol_b,
+            Lba(10),
+            &BlockmapValue {
+                pba: shared_pba,
+                compression: 1,
+                unit_compressed_size: new_compressed.len() as u32,
+                unit_original_size: 8192,
+                unit_lba_count: 2,
+                offset_in_unit: 0,
+                crc32: new_crc,
+                slot_offset: new_slot_offset,
+                flags: 0,
+            },
+        )
+        .unwrap();
+
+    let candidate = GcCandidate {
+        pba: shared_pba,
+        vol_id: vol_a.clone(),
+        compression: 1,
+        unit_compressed_size: old_compressed.len() as u32,
+        unit_original_size: 8192,
+        unit_lba_count: 2,
+        crc32: old_crc,
+        slot_offset: 0,
+        live_lbas: vec![(Lba(0), 0)],
+        dead_ratio: 0.5,
+    };
+
+    // Simulate a race after scan: LBA 0 is remapped to a DIFFERENT fragment in
+    // the same packed slot (same PBA, different slot_offset/metadata).
+    env.meta
+        .put_mapping(
+            &vol_a,
+            Lba(0),
+            &BlockmapValue {
+                pba: shared_pba,
+                compression: 1,
+                unit_compressed_size: new_compressed.len() as u32,
+                unit_original_size: 8192,
+                unit_lba_count: 2,
+                offset_in_unit: 1,
+                crc32: new_crc,
+                slot_offset: new_slot_offset,
+                flags: 0,
+            },
+        )
+        .unwrap();
+
+    // The old candidate no longer owns LBA 0 and must be skipped.
+    let rewritten = rewrite_candidate(
+        &candidate,
+        &env.io_engine,
+        &env.pool,
+        &env.meta,
+        &env.lifecycle,
+    )
+    .unwrap();
+    assert_eq!(
+        rewritten, 0,
+        "GC must skip LBA when fragment identity changed within same PBA"
+    );
 }
 
 /// Lifecycle lock must cover the entire packed write — from generation check

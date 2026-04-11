@@ -168,7 +168,19 @@ impl DedupScanner {
                 // Re-read the mapping to ensure it's still the same
                 let current = meta.get_mapping(&vol_id, *lba)?;
                 let current = match current {
-                    Some(c) if c.pba == bv.pba && c.flags & FLAG_DEDUP_SKIPPED != 0 => c,
+                    Some(c)
+                        if c.pba == bv.pba
+                            && c.slot_offset == bv.slot_offset
+                            && c.unit_compressed_size == bv.unit_compressed_size
+                            && c.unit_original_size == bv.unit_original_size
+                            && c.unit_lba_count == bv.unit_lba_count
+                            && c.offset_in_unit == bv.offset_in_unit
+                            && c.compression == bv.compression
+                            && c.crc32 == bv.crc32
+                            && c.flags & FLAG_DEDUP_SKIPPED != 0 =>
+                    {
+                        c
+                    }
                     _ => return Ok(false), // Changed or flag already cleared
                 };
 

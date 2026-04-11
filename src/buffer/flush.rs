@@ -8,7 +8,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 use sha2::{Digest, Sha256};
 
-use crate::buffer::pipeline::{coalesce, CoalesceUnit, CompressedUnit};
+use crate::buffer::pipeline::{coalesce_pending, CoalesceUnit, CompressedUnit};
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
 use crate::config::FlushConfig;
@@ -375,11 +375,7 @@ impl BufferFlusher {
         for idx in 0..unit.lba_count as usize {
             let lba = Lba(unit.start_lba.0 + idx as u64);
             let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
-            let newer_pending = pool
-                .lookup(&unit.vol_id, lba)?
-                .map(|pending| pending.seq > latest_seq)
-                .unwrap_or(false);
-            if !newer_pending {
+            if pool.is_latest_lba_seq(&unit.vol_id, lba, latest_seq, unit.vol_created_at) {
                 live.push(idx);
             }
         }
@@ -618,13 +614,13 @@ impl BufferFlusher {
             match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
                 Ok(seq) => {
                     if !in_flight.contains_key(&seq) && seen.insert(seq) {
-                        if let Some(entry) = pool.pending_entry(seq) {
+                        if let Some(entry) = pool.pending_entry_arc(seq) {
                             new_entries.push(entry);
                         }
                     }
                     while let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) {
                         if !in_flight.contains_key(&seq) && seen.insert(seq) {
-                            if let Some(entry) = pool.pending_entry(seq) {
+                            if let Some(entry) = pool.pending_entry_arc(seq) {
                                 new_entries.push(entry);
                             }
                         }
@@ -638,7 +634,7 @@ impl BufferFlusher {
             // pending set instead of rescanning the on-disk log on every loop.
             if new_entries.is_empty() && last_retry_snapshot.elapsed() >= retry_snapshot_interval {
                 last_retry_snapshot = Instant::now();
-                for entry in pool.pending_entries_snapshot_for_shard(shard_idx) {
+                for entry in pool.pending_entries_arc_snapshot_for_shard(shard_idx) {
                     if !in_flight.contains_key(&entry.seq) && seen.insert(entry.seq) {
                         new_entries.push(entry);
                     }
@@ -656,7 +652,7 @@ impl BufferFlusher {
                     .or_insert_with(|| vol_compression(&entry.vol_id));
             }
             let cache_ref = &vol_compression_cache;
-            let units = coalesce(&new_entries, max_raw, max_lbas, &|vid| {
+            let units = coalesce_pending(&new_entries, max_raw, max_lbas, &|vid| {
                 cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None)
             });
             if !units.is_empty() {
@@ -2762,5 +2758,142 @@ impl BufferFlusher {
 impl Drop for BufferFlusher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MetaConfig;
+    use crate::io::device::RawDevice;
+    use crate::meta::store::MetaStore;
+    use crate::types::{VolumeConfig, ZoneId};
+    use crate::zone::worker::ZoneWorker;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn setup_flush_test_env() -> (
+        Arc<MetaStore>,
+        Arc<WriteBufferPool>,
+        Arc<VolumeLifecycleManager>,
+        Arc<SpaceAllocator>,
+        Arc<IoEngine>,
+        Arc<EngineMetrics>,
+        tempfile::TempDir,
+        NamedTempFile,
+        NamedTempFile,
+    ) {
+        let meta_dir = tempdir().unwrap();
+        let meta = Arc::new(
+            MetaStore::open(&MetaConfig {
+                rocksdb_path: Some(meta_dir.path().to_path_buf()),
+                block_cache_mb: 8,
+                wal_dir: None,
+            })
+            .unwrap(),
+        );
+
+        let buf_tmp = NamedTempFile::new().unwrap();
+        let buf_size: u64 = 4096 + 4096 + 256 * 8192;
+        buf_tmp.as_file().set_len(buf_size).unwrap();
+        let pool = Arc::new(WriteBufferPool::open(RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap()).unwrap());
+
+        let data_tmp = NamedTempFile::new().unwrap();
+        let data_size: u64 = 4096 * 20000;
+        data_tmp.as_file().set_len(data_size).unwrap();
+        let io_engine = Arc::new(IoEngine::new(RawDevice::open(data_tmp.path()).unwrap(), false));
+
+        let allocator = Arc::new(SpaceAllocator::new(data_size, 1));
+        let lifecycle = Arc::new(VolumeLifecycleManager::default());
+        let metrics = Arc::new(EngineMetrics::default());
+
+        meta.put_volume(&VolumeConfig {
+            id: VolumeId("flush-race".into()),
+            size_bytes: 4096 * 1024,
+            block_size: 4096,
+            compression: CompressionAlgo::None,
+            created_at: 1,
+            zone_count: 1,
+        })
+        .unwrap();
+
+        (
+            meta,
+            pool,
+            lifecycle,
+            allocator,
+            io_engine,
+            metrics,
+            meta_dir,
+            buf_tmp,
+            data_tmp,
+        )
+    }
+
+    fn make_unit(fill: u8, seq: u64) -> CompressedUnit {
+        let data = vec![fill; BLOCK_SIZE as usize];
+        CompressedUnit {
+            vol_id: "flush-race".into(),
+            start_lba: Lba(0),
+            lba_count: 1,
+            original_size: BLOCK_SIZE,
+            compressed_data: data.clone(),
+            compression: 0,
+            crc32: crc32fast::hash(&data),
+            vol_created_at: 1,
+            seq_lba_ranges: vec![(seq, Lba(0), 1)],
+            block_hashes: None,
+            dedup_skipped: false,
+            dedup_completion: None,
+        }
+    }
+
+    #[test]
+    fn old_write_unit_can_overwrite_newer_committed_mapping() {
+        let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+            setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+
+        let newer = make_unit(0x33, 2);
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(0), 2, 1);
+        BufferFlusher::write_unit(
+            0,
+            &newer,
+            &pool,
+            &meta,
+            &lifecycle,
+            &allocator,
+            &io_engine,
+            &hole_map,
+            &metrics,
+        )
+        .unwrap();
+
+        let older = make_unit(0x11, 1);
+        BufferFlusher::write_unit(
+            0,
+            &older,
+            &pool,
+            &meta,
+            &lifecycle,
+            &allocator,
+            &io_engine,
+            &hole_map,
+            &metrics,
+        )
+        .unwrap();
+
+        let worker = ZoneWorker::new(
+            ZoneId(0),
+            meta.clone(),
+            pool.clone(),
+            io_engine.clone(),
+        );
+        let actual = worker.handle_read("flush-race", Lba(0)).unwrap().unwrap();
+
+        assert_eq!(
+            actual,
+            vec![0x33; BLOCK_SIZE as usize],
+            "older write committed after newer write must not win",
+        );
     }
 }

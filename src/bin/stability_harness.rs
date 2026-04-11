@@ -61,6 +61,7 @@ fn write_and_abort(
             flush_watermark_pct: 80,
             group_commit_wait_us: 250,
             shards: 1,
+            max_memory_mb: 0,
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig {

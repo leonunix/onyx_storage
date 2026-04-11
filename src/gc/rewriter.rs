@@ -4,8 +4,24 @@ use crate::error::OnyxResult;
 use crate::gc::scanner::GcCandidate;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
+use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
 use crate::types::{CompressionAlgo, BLOCK_SIZE};
+
+fn candidate_matches_mapping(
+    candidate: &GcCandidate,
+    offset_in_unit: u16,
+    bv: &BlockmapValue,
+) -> bool {
+    bv.pba == candidate.pba
+        && bv.slot_offset == candidate.slot_offset
+        && bv.unit_compressed_size == candidate.unit_compressed_size
+        && bv.unit_original_size == candidate.unit_original_size
+        && bv.unit_lba_count == candidate.unit_lba_count
+        && bv.compression == candidate.compression
+        && bv.crc32 == candidate.crc32
+        && bv.offset_in_unit == offset_in_unit
+}
 
 /// Rewrite live blocks from a GC candidate back into the buffer pool.
 ///
@@ -88,7 +104,7 @@ pub fn rewrite_candidate(
         // (it may have been overwritten since the scan)
         let current = meta.get_mapping(&candidate.vol_id, *lba)?;
         match current {
-            Some(bv) if bv.pba == candidate.pba => {}
+            Some(bv) if candidate_matches_mapping(candidate, *offset_in_unit, &bv) => {}
             _ => continue, // LBA was overwritten or deleted since scan, skip
         }
 

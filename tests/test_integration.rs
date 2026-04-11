@@ -108,6 +108,7 @@ fn setup_with_all_options(
             flush_watermark_pct: 80,
             group_commit_wait_us: 250,
             shards: 1,
+            max_memory_mb: 0,
         },
         ublk: UblkConfig::default(),
         flush,
@@ -221,6 +222,32 @@ fn read_raw_lv3(env: &TestEnv, pba: Pba, size: usize) -> Vec<u8> {
     buf
 }
 
+fn decode_repeat_b_stamp(seed: u64, lba: u64, block: &[u8]) -> Option<u64> {
+    if block.len() < 64 {
+        return None;
+    }
+    let vals: [u64; 8] = [
+        u64::from_le_bytes(block[0..8].try_into().ok()?),
+        u64::from_le_bytes(block[8..16].try_into().ok()?),
+        u64::from_le_bytes(block[16..24].try_into().ok()?),
+        u64::from_le_bytes(block[24..32].try_into().ok()?),
+        u64::from_le_bytes(block[32..40].try_into().ok()?),
+        u64::from_le_bytes(block[40..48].try_into().ok()?),
+        u64::from_le_bytes(block[48..56].try_into().ok()?),
+        u64::from_le_bytes(block[56..64].try_into().ok()?),
+    ];
+    let word2 = vals[1] ^ 0xAAAAAAAAAAAAAAAA;
+    let word1 = vals[2] ^ 0x5555555555555555;
+    let word0 = vals[3] ^ 0x3333333333333333;
+    let word3 = vals[0];
+    if word0 != seed || word2 != lba {
+        return None;
+    }
+    let calc =
+        (seed ^ word1 ^ ((lba * 0x9E3779B185EBCA87) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF;
+    (word3 == calc).then_some(word1)
+}
+
 // ===========================================================================
 // Test 1: Prove data lives in buffer OR metadata — pipeline state is consistent
 // ===========================================================================
@@ -259,6 +286,63 @@ fn prove_buffer_or_metadata_consistent() {
     // EVIDENCE: data readable regardless of where it lives
     let result = vol.read(0, 4096).unwrap();
     assert_eq!(result, expected);
+}
+
+#[test]
+#[serial]
+fn prove_latest_overwrite_wins_for_single_lba_under_flush_pressure() {
+    let env = setup_with_sizes(4096 * 32768, 4096 + 4096 + 4096 * 8192);
+    let vol_size = 128 * 1024 * 1024u64;
+    env.engine
+        .create_volume("vol-overwrite", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    let vol = env.engine.open_volume("vol-overwrite").unwrap();
+
+    let seed = 0x69D9_2C59u64;
+    let target_lba = 12_345u64;
+    let offset = target_lba * 4096;
+
+    // Keep the test deterministic and close to the soak symptom:
+    // same LBA written repeatedly with different repeat-b stamps while the
+    // background flusher is active.
+    let mut expected_last = Vec::new();
+    let mut last_stamp = 0u64;
+    for stamp in 1u64..=256 {
+        let mut block = vec![0u8; 4096];
+        let word0 = seed;
+        let word1 = stamp;
+        let word2 = target_lba;
+        let word3 = seed ^ stamp ^ target_lba.wrapping_mul(0x9E3779B185EBCA87);
+        let pattern = [
+            word3,
+            word2 ^ 0xAAAAAAAAAAAAAAAA,
+            word1 ^ 0x5555555555555555,
+            word0 ^ 0x3333333333333333,
+            word0.wrapping_add(word2),
+            word1.wrapping_add(word3),
+            word0.wrapping_sub(word1),
+            word2.wrapping_sub(word3),
+        ];
+        for chunk in block.chunks_exact_mut(64) {
+            for (idx, word) in pattern.iter().enumerate() {
+                chunk[idx * 8..(idx + 1) * 8].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        vol.write(offset, &block).unwrap();
+        expected_last = block;
+        last_stamp = stamp;
+    }
+
+    wait_for_flush(&env, Duration::from_secs(20));
+
+    let actual = vol.read(offset, 4096).unwrap();
+    assert_eq!(
+        actual, expected_last,
+        "latest overwrite must win for LBA {} (expected stamp {}, actual stamp {:?})",
+        target_lba,
+        last_stamp,
+        decode_repeat_b_stamp(seed, target_lba, &actual),
+    );
 }
 
 // ===========================================================================
@@ -1445,6 +1529,65 @@ fn prove_packed_metadata_failure_retries_without_leak() {
     });
     assert_eq!(vol_a.read(0, 4096).unwrap(), vec![0x71; 4096]);
     assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x72; 4096]);
+}
+
+#[test]
+#[serial]
+fn prove_packed_old_write_cannot_overwrite_newer_committed_write() {
+    let env = setup();
+    let vol_size = 16 * 4096u64;
+    env.engine
+        .create_volume("pack-race-a", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    env.engine
+        .create_volume("pack-race-b", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+
+    let vol_a = env.engine.open_volume("pack-race-a").unwrap();
+    let vol_b = env.engine.open_volume("pack-race-b").unwrap();
+    let pool = env.engine.buffer_pool().unwrap();
+    let meta = env.engine.meta();
+    let vol_a_id = VolumeId("pack-race-a".into());
+
+    let old_data = vec![0x11; 4096];
+    let filler_old = vec![0x22; 4096];
+    let new_data = vec![0x33; 4096];
+    let filler_new = vec![0x44; 4096];
+
+    // Force the first packed metadata commit to fail, leaving the old entry
+    // pending for retry while still allowing the writer lane to make progress.
+    install_test_failpoint("pack-race-b", Lba(0), FlushFailStage::BeforeMetaWrite, None);
+
+    vol_a.write(0, &old_data).unwrap();
+    vol_b.write(0, &filler_old).unwrap();
+    thread::sleep(Duration::from_millis(250));
+
+    // Old write should not have committed yet.
+    let old_lookup = pool.lookup("pack-race-a", Lba(0)).unwrap();
+    assert!(old_lookup.is_some(), "old write should still be pending after forced meta failure");
+
+    // Newer overwrite to the same LBA while the old packed write is pending retry.
+    vol_a.write(0, &new_data).unwrap();
+    vol_b.write(4096, &filler_new).unwrap();
+
+    wait_until(Duration::from_secs(10), || {
+        meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_some()
+    });
+
+    // At this point the newer write should be committed.
+    assert_eq!(vol_a.read(0, 4096).unwrap(), new_data);
+
+    // Allow the old failed packed write to retry.
+    clear_test_failpoint("pack-race-b", Lba(0), FlushFailStage::BeforeMetaWrite);
+
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    // Final state must still be the newer data.
+    assert_eq!(
+        vol_a.read(0, 4096).unwrap(),
+        new_data,
+        "older packed write must not clobber newer committed overwrite"
+    );
 }
 
 // ===========================================================================

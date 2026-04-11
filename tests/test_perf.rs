@@ -195,6 +195,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             flush_watermark_pct: 80,
             group_commit_wait_us: cfg.group_commit_wait_us,
             shards: 1,
+            max_memory_mb: 0,
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig {

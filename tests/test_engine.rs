@@ -38,6 +38,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             flush_watermark_pct: 80,
             group_commit_wait_us: 250,
             shards: 1,
+            max_memory_mb: 0,
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig::default(),
@@ -54,6 +55,14 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
         ha: Default::default(),
     };
 
+    (config, meta_dir, buf_tmp, data_tmp)
+}
+
+fn make_config_with_buffer_shards(
+    shards: usize,
+) -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile) {
+    let (mut config, meta_dir, buf_tmp, data_tmp) = make_config();
+    config.buffer.shards = shards;
     (config, meta_dir, buf_tmp, data_tmp)
 }
 
@@ -135,6 +144,37 @@ fn full_engine_create_and_open_volume() {
     let vol = engine.open_volume("vol-test").unwrap();
     assert_eq!(vol.name(), "vol-test");
     assert_eq!(vol.size_bytes(), 256 * 4096);
+}
+
+#[test]
+fn cross_zone_overwrite_must_not_return_stale_buffer_data() {
+    let (config, _md, _bf, _df) = make_config_with_buffer_shards(2);
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-cross-zone-stale", 512 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-cross-zone-stale").unwrap();
+
+    let old = vec![0x11; 4096];
+    let new_prev = vec![0x22; 4096];
+    let new_target = vec![0x33; 4096];
+
+    // Old single-block write at LBA 128 lands on shard for zone 1.
+    vol.write(128 * 4096, &old).unwrap();
+
+    // Newer two-block write starts at LBA 127 and crosses the zone boundary.
+    // Correct behavior requires splitting so LBA 128 is routed with its own zone.
+    let mut cross = Vec::with_capacity(8192);
+    cross.extend_from_slice(&new_prev);
+    cross.extend_from_slice(&new_target);
+    vol.write(127 * 4096, &cross).unwrap();
+
+    // Immediate read should see the newest value for LBA 128.
+    let actual = vol.read(128 * 4096, 4096).unwrap();
+    assert_eq!(
+        actual, new_target,
+        "LBA 128 must return the latest overwrite, not the stale older shard copy"
+    );
 }
 
 #[test]

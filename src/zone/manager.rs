@@ -11,7 +11,7 @@ use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
-use crate::types::{Lba, VolumeId, ZoneId};
+use crate::types::{Lba, VolumeId, ZoneId, BLOCK_SIZE};
 use crate::zone::worker::ZoneWorker;
 
 /// IO request dispatched to a zone worker
@@ -176,6 +176,10 @@ impl ZoneManager {
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
         let result = (|| {
+            if lba_count == 0 {
+                return Ok(());
+            }
+
             let chunks = if lba_count == 0 {
                 0
             } else {
@@ -185,8 +189,28 @@ impl ZoneManager {
                 last_zone.saturating_sub(first_zone) + 1
             };
 
-            self.buffer_pool
-                .append(vol_id, start_lba, lba_count, &data, vol_created_at)?;
+            let block_size = BLOCK_SIZE as usize;
+            let mut remaining_lbas = lba_count as u64;
+            let mut current_lba = start_lba.0;
+            let mut data_offset = 0usize;
+
+            while remaining_lbas > 0 {
+                let zone_end_lba =
+                    ((current_lba / self.zone_size_blocks) + 1) * self.zone_size_blocks;
+                let lbas_in_this_zone = remaining_lbas.min(zone_end_lba.saturating_sub(current_lba));
+                let byte_len = lbas_in_this_zone as usize * block_size;
+                let end = data_offset + byte_len;
+                self.buffer_pool.append(
+                    vol_id,
+                    Lba(current_lba),
+                    lbas_in_this_zone as u32,
+                    &data[data_offset..end],
+                    vol_created_at,
+                )?;
+                current_lba += lbas_in_this_zone;
+                remaining_lbas -= lbas_in_this_zone;
+                data_offset = end;
+            }
 
             self.metrics
                 .zone_write_dispatches

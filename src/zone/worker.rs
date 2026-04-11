@@ -91,13 +91,15 @@ impl ZoneWorker {
                 || pending.vol_created_at == 0
                 || pending.vol_created_at == vol_created_at
             {
-                let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
-                let end = offset + BLOCK_SIZE as usize;
-                if end <= pending.payload.len() {
-                    self.metrics
-                        .read_buffer_hits
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(Some(pending.payload[offset..end].to_vec()));
+                if let Some(ref payload) = pending.payload {
+                    let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
+                    let end = offset + BLOCK_SIZE as usize;
+                    if end <= payload.len() {
+                        self.metrics
+                            .read_buffer_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(Some(payload[offset..end].to_vec()));
+                    }
                 }
             }
         }

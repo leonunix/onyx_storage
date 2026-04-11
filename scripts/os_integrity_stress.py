@@ -104,6 +104,16 @@ def hexdump_prefix(data: bytes, width: int = 64) -> str:
     return data[:width].hex()
 
 
+def first_mismatch(expected: bytes, actual: bytes) -> Optional[int]:
+    limit = min(len(expected), len(actual))
+    for idx in range(limit):
+        if expected[idx] != actual[idx]:
+            return idx
+    if len(expected) != len(actual):
+        return limit
+    return None
+
+
 def load_socket_path(config_path: pathlib.Path, explicit: Optional[str]) -> pathlib.Path:
     if explicit:
         return pathlib.Path(explicit)
@@ -732,11 +742,24 @@ class IntegrityHarness:
             raise HarnessError(f"short read: expected {length}, got {len(actual)}")
         if actual != expected:
             self.stats.add(mismatches=1)
+            mismatch_at = first_mismatch(expected, actual)
+            block_idx = (mismatch_at // BLOCK_SIZE) if mismatch_at is not None else 0
+            block_base = block_idx * BLOCK_SIZE
+            block_lba = start_block + block_idx
             detail = {
                 "offset": offset,
                 "length": length,
                 "expected_prefix": hexdump_prefix(expected),
                 "actual_prefix": hexdump_prefix(actual),
+                "first_mismatch_byte": mismatch_at,
+                "first_bad_block_index": block_idx,
+                "first_bad_block_lba": block_lba,
+                "expected_block_prefix": hexdump_prefix(
+                    expected[block_base : block_base + BLOCK_SIZE]
+                ),
+                "actual_block_prefix": hexdump_prefix(
+                    actual[block_base : block_base + BLOCK_SIZE]
+                ),
                 "worker": worker_id,
             }
             self._record_failure("read mismatch", detail)
@@ -800,6 +823,10 @@ class IntegrityHarness:
 
         if actual != expected:
             self.stats.add(mismatches=1)
+            mismatch_at = first_mismatch(expected, actual)
+            block_idx = (mismatch_at // BLOCK_SIZE) if mismatch_at is not None else 0
+            block_base = block_idx * BLOCK_SIZE
+            block_lba = start_block + block_idx
             self._record_failure(
                 "scrub mismatch",
                 {
@@ -807,6 +834,15 @@ class IntegrityHarness:
                     "length": length,
                     "expected_prefix": hexdump_prefix(expected),
                     "actual_prefix": hexdump_prefix(actual),
+                    "first_mismatch_byte": mismatch_at,
+                    "first_bad_block_index": block_idx,
+                    "first_bad_block_lba": block_lba,
+                    "expected_block_prefix": hexdump_prefix(
+                        expected[block_base : block_base + BLOCK_SIZE]
+                    ),
+                    "actual_block_prefix": hexdump_prefix(
+                        actual[block_base : block_base + BLOCK_SIZE]
+                    ),
                     "worker": worker_id,
                 },
             )
@@ -873,6 +909,10 @@ class IntegrityHarness:
                     actual = self.device.read(offset, length)
                 if actual != expected:
                     self.stats.add(mismatches=1)
+                    mismatch_at = first_mismatch(expected, actual)
+                    block_idx = (mismatch_at // BLOCK_SIZE) if mismatch_at is not None else 0
+                    block_base = block_idx * BLOCK_SIZE
+                    block_lba = start_block + block_idx
                     self._record_failure(
                         "full scrub mismatch",
                         {
@@ -880,6 +920,15 @@ class IntegrityHarness:
                             "length": length,
                             "expected_prefix": hexdump_prefix(expected),
                             "actual_prefix": hexdump_prefix(actual),
+                            "first_mismatch_byte": mismatch_at,
+                            "first_bad_block_index": block_idx,
+                            "first_bad_block_lba": block_lba,
+                            "expected_block_prefix": hexdump_prefix(
+                                expected[block_base : block_base + BLOCK_SIZE]
+                            ),
+                            "actual_block_prefix": hexdump_prefix(
+                                actual[block_base : block_base + BLOCK_SIZE]
+                            ),
                         },
                     )
                     return
