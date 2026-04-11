@@ -337,7 +337,8 @@ fn prove_latest_overwrite_wins_for_single_lba_under_flush_pressure() {
 
     let actual = vol.read(offset, 4096).unwrap();
     assert_eq!(
-        actual, expected_last,
+        actual,
+        expected_last,
         "latest overwrite must win for LBA {} (expected stamp {}, actual stamp {:?})",
         target_lba,
         last_stamp,
@@ -1154,7 +1155,7 @@ fn prove_pipeline_status_report() {
         ));
     }
 
-    for (i, (pba_val, (pba, comp, comp_size, orig_size, lba_count))) in units.iter().enumerate() {
+    for (i, (_pba_val, (pba, comp, comp_size, orig_size, lba_count))) in units.iter().enumerate() {
         let comp_name = match *comp {
             0 => "none",
             1 => "lz4",
@@ -1176,7 +1177,6 @@ fn prove_pipeline_status_report() {
         // Verify CRC of raw data on disk
         let raw = read_raw_lv3(&env, *pba, *comp_size as usize);
         let raw_crc = crc32fast::hash(&raw);
-        let meta_crc = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap().crc32;
         eprintln!(
             "    raw CRC: 0x{:08X}, refcount: {}",
             raw_crc,
@@ -1564,7 +1564,10 @@ fn prove_packed_old_write_cannot_overwrite_newer_committed_write() {
 
     // Old write should not have committed yet.
     let old_lookup = pool.lookup("pack-race-a", Lba(0)).unwrap();
-    assert!(old_lookup.is_some(), "old write should still be pending after forced meta failure");
+    assert!(
+        old_lookup.is_some(),
+        "old write should still be pending after forced meta failure"
+    );
 
     // Newer overwrite to the same LBA while the old packed write is pending retry.
     vol_a.write(0, &new_data).unwrap();

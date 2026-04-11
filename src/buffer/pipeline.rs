@@ -39,6 +39,10 @@ impl DedupCompletion {
             None
         }
     }
+
+    pub fn seqs(&self) -> &[u64] {
+        &self.seqs
+    }
 }
 
 /// A group of contiguous LBAs from the same volume, merged from buffer entries.

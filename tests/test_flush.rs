@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -354,4 +354,101 @@ fn flusher_retries_after_injected_metadata_failure() {
         "mapping should appear after retry succeeds"
     );
     assert_eq!(allocator.free_block_count(), initial_free - 1);
+}
+
+#[test]
+fn flusher_retries_recovered_entries_during_sustained_new_writes() {
+    let meta_dir = tempdir().unwrap();
+    let meta = Arc::new(
+        MetaStore::open(&MetaConfig {
+            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            wal_dir: None,
+        })
+        .unwrap(),
+    );
+    register_volume(&meta, "retry-recovered");
+
+    let buf_tmp = NamedTempFile::new().unwrap();
+    let buf_size = 4096 + 4096 + 1024 * 8192;
+    buf_tmp.as_file().set_len(buf_size).unwrap();
+
+    {
+        let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
+        let pool = WriteBufferPool::open(buf_dev).unwrap();
+        for idx in 0..8u64 {
+            let payload = vec![idx as u8; 32 * BLOCK_SIZE as usize];
+            pool.append("retry-recovered", Lba(idx * 32), 32, &payload, 0)
+                .unwrap();
+        }
+    }
+
+    let recovered_pool = Arc::new(
+        WriteBufferPool::open_with_options_and_memory_limit(
+            RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap(),
+            Duration::from_millis(1),
+            1,
+            256,
+            Duration::from_secs(1),
+            32 * BLOCK_SIZE as u64,
+        )
+        .unwrap(),
+    );
+    assert_eq!(recovered_pool.payload_memory_bytes(), 0);
+    assert_eq!(
+        recovered_pool.payload_memory_limit_bytes(),
+        32 * BLOCK_SIZE as u64
+    );
+    assert_eq!(recovered_pool.pending_count(), 8);
+
+    let data_tmp = NamedTempFile::new().unwrap();
+    let data_size = 4096 * 20000;
+    data_tmp.as_file().set_len(data_size as u64).unwrap();
+    let io_engine = Arc::new(IoEngine::new(RawDevice::open(data_tmp.path()).unwrap(), false));
+    let lifecycle = Arc::new(VolumeLifecycleManager::default());
+    let allocator = Arc::new(SpaceAllocator::new(data_size as u64, 1));
+    let mut flusher = BufferFlusher::start(
+        recovered_pool.clone(),
+        meta.clone(),
+        lifecycle,
+        allocator,
+        io_engine,
+        &FlushConfig::default(),
+        onyx_storage::packer::packer::new_hole_map(),
+        &onyx_storage::dedup::config::DedupConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+
+    let keep_writing = Arc::new(AtomicBool::new(true));
+    let writer_flag = keep_writing.clone();
+    let writer_pool = recovered_pool.clone();
+    let writer = thread::spawn(move || {
+        let mut i = 0u64;
+        while writer_flag.load(Ordering::Relaxed) {
+            let lba = Lba(4096 + (i % 64));
+            let payload = vec![(i & 0xFF) as u8; BLOCK_SIZE as usize];
+            let _ = writer_pool.append("retry-recovered", lba, 1, &payload, 0);
+            i = i.wrapping_add(1);
+        }
+    });
+
+    let old_vol = VolumeId("retry-recovered".into());
+    let recovered_old_entries = wait_until(3000, || {
+        (0..8u64).all(|idx| meta.get_mapping(&old_vol, Lba(idx * 32)).unwrap().is_some())
+    });
+
+    keep_writing.store(false, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        recovered_old_entries,
+        "recovered pending entries should keep retrying even while new writes keep arriving"
+    );
+
+    assert!(
+        wait_flushed(&recovered_pool, 5000),
+        "all pending entries should eventually drain"
+    );
+    flusher.stop();
 }

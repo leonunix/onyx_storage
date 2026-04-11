@@ -274,11 +274,7 @@ impl OnyxUblkTarget {
                                 if lba_count == 0 {
                                     0
                                 } else {
-                                    match zm.submit_discard(
-                                        &vol_id,
-                                        start_lba,
-                                        lba_count,
-                                    ) {
+                                    match zm.submit_discard(&vol_id, start_lba, lba_count) {
                                         Ok(()) => io_bytes as i32,
                                         Err(e) => {
                                             tracing::error!(

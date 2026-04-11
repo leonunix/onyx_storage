@@ -1,11 +1,13 @@
 use std::thread;
 use std::time::Duration;
 
+use onyx_storage::buffer::flush::{clear_test_failpoint, install_test_failpoint, FlushFailStage};
 use onyx_storage::buffer::pool::{clear_purge_volume_failpoint, install_purge_volume_failpoint};
 use onyx_storage::config::*;
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::error::OnyxError;
 use onyx_storage::types::{CompressionAlgo, Lba, VolumeId};
+use serial_test::serial;
 use tempfile::{tempdir, NamedTempFile};
 
 fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile) {
@@ -132,6 +134,59 @@ fn full_engine_open_shutdown() {
     engine.shutdown().unwrap();
     // Double shutdown is safe
     engine.shutdown().unwrap();
+}
+
+#[test]
+#[serial]
+fn shutdown_drains_pending_flush_retries_before_exit() {
+    let (mut config, _md, _bf, _df) = make_config();
+    config.dedup.enabled = false;
+
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-shutdown-drain", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-shutdown-drain").unwrap();
+    let data = vec![0xA5; 4096];
+
+    install_test_failpoint(
+        "vol-shutdown-drain",
+        Lba(0),
+        FlushFailStage::BeforeMetaWrite,
+        None,
+    );
+    vol.write(0, &data).unwrap();
+    drop(vol);
+
+    let pool = engine.buffer_pool().unwrap();
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if pool.pending_count() > 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        pool.pending_count() > 0,
+        "metadata failpoint should leave at least one pending buffer entry"
+    );
+
+    clear_test_failpoint(
+        "vol-shutdown-drain",
+        Lba(0),
+        FlushFailStage::BeforeMetaWrite,
+    );
+    engine.shutdown().unwrap();
+    drop(engine);
+
+    let reopened = OnyxEngine::open(&config).unwrap();
+    assert_eq!(
+        reopened.buffer_pool().unwrap().pending_count(),
+        0,
+        "graceful shutdown must drain pending buffer entries before exit"
+    );
+    let reopened_vol = reopened.open_volume("vol-shutdown-drain").unwrap();
+    assert_eq!(reopened_vol.read(0, 4096).unwrap(), data);
 }
 
 #[test]
@@ -818,7 +873,11 @@ fn discard_partial_block_alignment() {
 
     // LBA 0 should still be readable (start rounded up past it)
     let lba0 = vol.read(0, 4096).unwrap();
-    assert_eq!(lba0, vec![0xCC; 4096], "LBA 0 should survive partial discard");
+    assert_eq!(
+        lba0,
+        vec![0xCC; 4096],
+        "LBA 0 should survive partial discard"
+    );
 
     // LBA 1 and 2 should be discarded
     let lba1 = vol.read(4096, 4096).unwrap();
@@ -828,5 +887,9 @@ fn discard_partial_block_alignment() {
 
     // LBA 3 should still be readable (end rounded down before it)
     let lba3 = vol.read(12288, 4096).unwrap();
-    assert_eq!(lba3, vec![0xCC; 4096], "LBA 3 should survive partial discard");
+    assert_eq!(
+        lba3,
+        vec![0xCC; 4096],
+        "LBA 3 should survive partial discard"
+    );
 }

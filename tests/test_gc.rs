@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use rand::{rngs::StdRng, RngCore, SeedableRng};
+
 use onyx_storage::buffer::flush::BufferFlusher;
 use onyx_storage::buffer::pool::WriteBufferPool;
 use onyx_storage::compress::codec::create_compressor;
@@ -500,7 +502,7 @@ fn gc_rewriter_skips_changed_lba() {
     flusher.stop();
 
     let vid = VolumeId(vol_id.to_string());
-    let old_pba = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap().pba;
+    let old_mapping = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap();
 
     // Overwrite LBA 1 and 2
     for i in 1u8..3 {
@@ -521,7 +523,17 @@ fn gc_rewriter_skips_changed_lba() {
 
     // Scan for candidates
     let candidates = scan_gc_candidates(&env.meta, 0.25, 100).unwrap();
-    let candidate = candidates.iter().find(|c| c.pba == old_pba).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|c| {
+            c.pba == old_mapping.pba
+                && c.slot_offset == old_mapping.slot_offset
+                && c.unit_compressed_size == old_mapping.unit_compressed_size
+                && c.unit_lba_count == old_mapping.unit_lba_count
+                && c.compression == old_mapping.compression
+                && c.crc32 == old_mapping.crc32
+        })
+        .unwrap();
     assert_eq!(candidate.live_lbas.len(), 2); // LBA 0 and 3
 
     // Now overwrite LBA 0 AFTER the scan (simulating race condition)
@@ -1072,6 +1084,104 @@ fn write_path_detects_hole_when_fragment_fully_overwritten() {
         read_b, data_b,
         "vol_b data must be intact after vol_a overwrite"
     );
+}
+
+#[test]
+fn fully_freed_packed_pba_purges_hole_entries() {
+    let env = setup_gc_env();
+    let hole_map = onyx_storage::packer::packer::new_hole_map();
+
+    let vol_a = "purge-hole-a";
+    let vol_b = "purge-hole-b";
+    register_volume(&env.meta, vol_a, CompressionAlgo::Lz4, 100);
+    register_volume(&env.meta, vol_b, CompressionAlgo::Lz4, 200);
+
+    let mut flusher = BufferFlusher::start(
+        env.pool.clone(),
+        env.meta.clone(),
+        env.lifecycle.clone(),
+        env.allocator.clone(),
+        env.io_engine.clone(),
+        &FlushConfig::default(),
+        hole_map.clone(),
+        &onyx_storage::dedup::config::DedupConfig::default(),
+    );
+
+    env.pool
+        .append(vol_a, Lba(0), 1, &vec![0xA3; BLOCK_SIZE as usize], 100)
+        .unwrap();
+    env.pool
+        .append(vol_b, Lba(0), 1, &vec![0xB4; BLOCK_SIZE as usize], 200)
+        .unwrap();
+    assert!(
+        wait_for_flush(&env.pool, 5000),
+        "initial packed flush timeout"
+    );
+
+    let vol_a_id = VolumeId(vol_a.to_string());
+    let vol_b_id = VolumeId(vol_b.to_string());
+    let shared_pba = env
+        .meta
+        .get_mapping(&vol_a_id, Lba(0))
+        .unwrap()
+        .unwrap()
+        .pba;
+    assert_eq!(
+        env.meta
+            .get_mapping(&vol_b_id, Lba(0))
+            .unwrap()
+            .unwrap()
+            .pba,
+        shared_pba,
+        "initial writes should share one packed slot"
+    );
+
+    let mut rng = StdRng::seed_from_u64(0x5EED_BAAD);
+    let mut overwrite_a = vec![0u8; BLOCK_SIZE as usize];
+    rng.fill_bytes(&mut overwrite_a);
+    let mut overwrite_b = vec![0u8; BLOCK_SIZE as usize];
+    rng.fill_bytes(&mut overwrite_b);
+
+    env.pool
+        .append(vol_a, Lba(0), 1, &overwrite_a, 100)
+        .unwrap();
+    assert!(
+        wait_for_flush(&env.pool, 5000),
+        "first overwrite flush timeout"
+    );
+    let map_a_new = env.meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
+    assert_ne!(
+        map_a_new.pba, shared_pba,
+        "incompressible overwrite should move vol_a off the old packed slot"
+    );
+    assert!(
+        hole_map.lock().unwrap().keys().any(|k| k.pba == shared_pba),
+        "first overwrite should leave at least one tracked hole on the shared packed slot"
+    );
+
+    env.pool
+        .append(vol_b, Lba(0), 1, &overwrite_b, 200)
+        .unwrap();
+    assert!(
+        wait_for_flush(&env.pool, 5000),
+        "second overwrite flush timeout"
+    );
+    let map_b_new = env.meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
+    assert_ne!(
+        map_b_new.pba, shared_pba,
+        "second incompressible overwrite should also leave the old packed slot"
+    );
+    assert_eq!(
+        env.meta.get_refcount(shared_pba).unwrap(),
+        0,
+        "old packed slot should be fully released after the last fragment dies"
+    );
+    assert!(
+        hole_map.lock().unwrap().keys().all(|k| k.pba != shared_pba),
+        "freeing the packed slot must purge stale hole entries for that PBA"
+    );
+
+    flusher.stop();
 }
 
 /// A stale hole entry that overlaps a live fragment must be rejected by the

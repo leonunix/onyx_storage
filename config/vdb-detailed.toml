@@ -60,7 +60,7 @@ max_rewrite_per_cycle = 64
 
 [dedup]
 enabled = true
-workers = 2
+workers = 4
 buffer_skip_threshold_pct = 90
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 256

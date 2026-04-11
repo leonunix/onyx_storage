@@ -6,8 +6,6 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
-use sha2::{Digest, Sha256};
-
 use crate::buffer::pipeline::{coalesce_pending, CoalesceUnit, CompressedUnit};
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
@@ -45,6 +43,12 @@ struct FlusherLane {
     writer_handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OldFragmentRef {
+    decrement: u32,
+    mapping: BlockmapValue,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveSeq {
     vol_id: String,
@@ -54,6 +58,7 @@ struct ActiveSeq {
 #[derive(Default)]
 struct FlusherInFlightTracker {
     active: Mutex<HashMap<u64, ActiveSeq>>,
+    retry_after: Mutex<HashMap<u64, Instant>>,
     cv: Condvar,
 }
 
@@ -70,6 +75,29 @@ impl FlusherInFlightTracker {
         let mut active = self.active.lock().unwrap();
         if active.remove(&seq).is_some() {
             self.cv.notify_all();
+        }
+    }
+
+    fn defer_retry(&self, seqs: &[u64], delay: Duration) {
+        if seqs.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + delay;
+        let mut retry_after = self.retry_after.lock().unwrap();
+        for seq in seqs {
+            retry_after.insert(*seq, deadline);
+        }
+    }
+
+    fn retry_ready(&self, seq: u64) -> bool {
+        let mut retry_after = self.retry_after.lock().unwrap();
+        match retry_after.get(&seq).copied() {
+            Some(deadline) if deadline > Instant::now() => false,
+            Some(_) => {
+                retry_after.remove(&seq);
+                true
+            }
+            None => true,
         }
     }
 
@@ -101,6 +129,33 @@ impl FlusherInFlightTracker {
     }
 }
 
+fn same_fragment_identity(lhs: &BlockmapValue, rhs: &BlockmapValue) -> bool {
+    lhs.pba == rhs.pba
+        && lhs.slot_offset == rhs.slot_offset
+        && lhs.unit_compressed_size == rhs.unit_compressed_size
+        && lhs.unit_original_size == rhs.unit_original_size
+        && lhs.unit_lba_count == rhs.unit_lba_count
+        && lhs.compression == rhs.compression
+        && lhs.crc32 == rhs.crc32
+}
+
+fn record_old_fragment_ref(
+    old_frag_meta: &mut HashMap<(Pba, u16), OldFragmentRef>,
+    old: BlockmapValue,
+) {
+    let frag = old_frag_meta
+        .entry((old.pba, old.slot_offset))
+        .or_insert(OldFragmentRef {
+            decrement: 0,
+            mapping: old,
+        });
+    debug_assert!(
+        same_fragment_identity(&frag.mapping, &old),
+        "fragment identity changed within one packed-slot fragment bucket"
+    );
+    frag.decrement += 1;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum FlushFailStage {
@@ -118,6 +173,7 @@ struct FlushFailRule {
 
 static TEST_FAIL_RULES: OnceLock<Mutex<Vec<FlushFailRule>>> = OnceLock::new();
 static TEST_DEDUP_HIT_FAIL_RULES: OnceLock<Mutex<Vec<DedupHitFailRule>>> = OnceLock::new();
+static HOLE_FILL_LOCKS: OnceLock<Mutex<HashMap<Pba, Arc<Mutex<()>>>>> = OnceLock::new();
 #[doc(hidden)]
 pub struct PackedPauseState {
     hit: bool,
@@ -148,6 +204,10 @@ fn test_dedup_hit_fail_rules() -> &'static Mutex<Vec<DedupHitFailRule>> {
 
 fn test_packed_pause_hook() -> &'static Mutex<Option<PackedPauseHook>> {
     TEST_PACKED_PAUSE_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+fn hole_fill_locks() -> &'static Mutex<HashMap<Pba, Arc<Mutex<()>>>> {
+    HOLE_FILL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn maybe_inject_test_failure(
@@ -357,6 +417,22 @@ impl BufferFlusher {
         counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
     }
 
+    fn purge_holes_for_pba(hole_map: &HoleMap, pba: Pba) {
+        crate::packer::packer::remove_holes_for_pba(hole_map, pba);
+    }
+
+    fn purge_holes_for_extent(hole_map: &HoleMap, start: Pba, count: u32) {
+        crate::packer::packer::remove_holes_for_extent(hole_map, start, count);
+    }
+
+    fn hole_fill_lock(pba: Pba) -> Arc<Mutex<()>> {
+        let mut locks = hole_fill_locks().lock().unwrap();
+        locks
+            .entry(pba)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     fn latest_seq_for_lba(seq_lba_ranges: &[(u64, Lba, u32)], lba: Lba) -> u64 {
         seq_lba_ranges
             .iter()
@@ -476,6 +552,7 @@ impl BufferFlusher {
                     let pool_d = pool.clone();
                     let lifecycle_d = lifecycle.clone();
                     let allocator_d = allocator.clone();
+                    let hole_map_d = hole_map.clone();
                     let done_tx_d = done_tx.clone();
                     let metrics_d = metrics.clone();
                     let h = thread::Builder::new()
@@ -489,6 +566,7 @@ impl BufferFlusher {
                                 &pool_d,
                                 &lifecycle_d,
                                 &allocator_d,
+                                &hole_map_d,
                                 &done_tx_d,
                                 &running_d,
                                 dedup_skip_threshold,
@@ -528,10 +606,12 @@ impl BufferFlusher {
             let io_engine_w = io_engine.clone();
             let metrics_w = metrics.clone();
             let hole_map_w = hole_map.clone();
+            let in_flight_w = in_flight.clone();
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
-                    let mut packer = Packer::new_with_lane(allocator_w.clone(), hole_map_w, shard_idx);
+                    let mut packer =
+                        Packer::new_with_lane(allocator_w.clone(), hole_map_w, shard_idx);
                     Self::writer_loop(
                         shard_idx,
                         &write_rx,
@@ -542,6 +622,7 @@ impl BufferFlusher {
                         &io_engine_w,
                         &done_tx,
                         &running_w,
+                        &in_flight_w,
                         &mut packer,
                         &metrics_w,
                     );
@@ -592,6 +673,7 @@ impl BufferFlusher {
         };
         let ready_timeout = Duration::from_millis(10);
         let retry_snapshot_interval = Duration::from_millis(100);
+        let retry_snapshot_topup_limit = 64usize;
         let mut last_retry_snapshot = Instant::now();
 
         while running.load(Ordering::Relaxed) {
@@ -613,13 +695,19 @@ impl BufferFlusher {
 
             match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
                 Ok(seq) => {
-                    if !in_flight.contains_key(&seq) && seen.insert(seq) {
+                    if !in_flight.contains_key(&seq)
+                        && in_flight_tracker.retry_ready(seq)
+                        && seen.insert(seq)
+                    {
                         if let Some(entry) = pool.pending_entry_arc(seq) {
                             new_entries.push(entry);
                         }
                     }
                     while let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) {
-                        if !in_flight.contains_key(&seq) && seen.insert(seq) {
+                        if !in_flight.contains_key(&seq)
+                            && in_flight_tracker.retry_ready(seq)
+                            && seen.insert(seq)
+                        {
                             if let Some(entry) = pool.pending_entry_arc(seq) {
                                 new_entries.push(entry);
                             }
@@ -630,13 +718,28 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             }
 
-            // Safety net for retried/failed units: periodically snapshot the in-memory
-            // pending set instead of rescanning the on-disk log on every loop.
-            if new_entries.is_empty() && last_retry_snapshot.elapsed() >= retry_snapshot_interval {
+            // Safety net for recovered / retried entries: periodically snapshot the
+            // in-memory pending set instead of rescanning the on-disk log on every
+            // loop. This must run even while foreground writes keep producing new
+            // ready seqs, otherwise payload-less recovered entries that were skipped
+            // once under memory pressure can starve indefinitely.
+            if last_retry_snapshot.elapsed() >= retry_snapshot_interval {
                 last_retry_snapshot = Instant::now();
+                let mut topped_up = 0usize;
                 for entry in pool.pending_entries_arc_snapshot_for_shard(shard_idx) {
-                    if !in_flight.contains_key(&entry.seq) && seen.insert(entry.seq) {
-                        new_entries.push(entry);
+                    if topped_up >= retry_snapshot_topup_limit {
+                        break;
+                    }
+                    if !in_flight.contains_key(&entry.seq)
+                        && in_flight_tracker.retry_ready(entry.seq)
+                        && seen.insert(entry.seq)
+                    {
+                        // Retry via seq lookup so recovered payload-less entries
+                        // get a chance to hydrate once memory is available.
+                        if let Some(hydrated) = pool.pending_entry_arc(entry.seq) {
+                            new_entries.push(hydrated);
+                            topped_up += 1;
+                        }
                     }
                 }
             }
@@ -779,6 +882,7 @@ impl BufferFlusher {
         pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
+        hole_map: &HoleMap,
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
         skip_threshold_pct: u8,
@@ -813,7 +917,7 @@ impl BufferFlusher {
                             continue;
                         }
                         let block_data = &unit.raw_data[offset..end];
-                        let hash: ContentHash = Sha256::digest(block_data).into();
+                        let hash: ContentHash = *blake3::hash(block_data).as_bytes();
                         all_hashes.push(hash);
 
                         // Look up dedup index
@@ -873,8 +977,10 @@ impl BufferFlusher {
                                         meta.cleanup_dedup_for_pba_standalone(old.pba)?;
                                         let blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE);
                                         if blocks <= 1 {
+                                            Self::purge_holes_for_pba(hole_map, old.pba);
                                             allocator.free_one(old.pba)?;
                                         } else {
+                                            Self::purge_holes_for_extent(hole_map, old.pba, blocks);
                                             allocator.free_extent(Extent::new(old.pba, blocks))?;
                                         }
                                     }
@@ -1039,6 +1145,7 @@ impl BufferFlusher {
     }
 
     const WRITER_BATCH_SIZE: usize = 32;
+    const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
     fn writer_loop(
         shard_idx: usize,
@@ -1050,6 +1157,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
+        in_flight_tracker: &FlusherInFlightTracker,
         packer: &mut Packer,
         metrics: &EngineMetrics,
     ) {
@@ -1069,6 +1177,16 @@ impl BufferFlusher {
                     for (idx, result) in results.into_iter().enumerate() {
                         if let Err(e) = result {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            match &$batch_completions[idx] {
+                                None => {
+                                    in_flight_tracker
+                                        .defer_retry(&$batch_seqs[idx], Self::RETRY_BACKOFF);
+                                }
+                                Some(dc) => {
+                                    in_flight_tracker
+                                        .defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
+                                }
+                            }
                             tracing::error!(
                                 vol = $batch[idx].vol_id,
                                 start_lba = $batch[idx].start_lba.0,
@@ -1110,6 +1228,10 @@ impl BufferFlusher {
                             metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
+                            for dc in &buffered_completions {
+                                in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
+                            }
                             tracing::error!(pba = sealed.pba.0, error = %e,
                                 "writer: failed to flush packed slot on idle");
                         }
@@ -1172,6 +1294,10 @@ impl BufferFlusher {
                             metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
+                            for dc in &buffered_completions {
+                                in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
+                            }
                             tracing::error!(pba = sealed.pba.0, error = %e,
                                 "writer: failed to flush packed slot");
                         }
@@ -1199,6 +1325,10 @@ impl BufferFlusher {
                             metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
+                            for dc in &buffered_completions {
+                                in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
+                            }
                             tracing::error!(pba = sealed.pba.0, error = %e,
                                 "writer: failed to flush packed slot (passthrough fallback)");
                         }
@@ -1225,6 +1355,12 @@ impl BufferFlusher {
                             metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            match &completion {
+                                None => in_flight_tracker.defer_retry(&seqs, Self::RETRY_BACKOFF),
+                                Some(dc) => {
+                                    in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF)
+                                }
+                            }
                             tracing::error!(error = %e, "writer: failed to fill hole");
                         }
                         match &completion {
@@ -1240,6 +1376,12 @@ impl BufferFlusher {
                     }
                     Err(e) => {
                         metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                        match &completion {
+                            None => in_flight_tracker.defer_retry(&seqs, Self::RETRY_BACKOFF),
+                            Some(dc) => {
+                                in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF)
+                            }
+                        }
                         tracing::error!(error = %e, "writer: packer error");
                         match &completion {
                             None => {
@@ -1586,7 +1728,7 @@ impl BufferFlusher {
             }
             let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
             // Per-fragment tracking for hole detection: (pba, slot_offset) → (decrement, unit_lba_count, compressed_size)
-            let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
+            let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
 
             // Batch read old mappings via multi_get
             let lbas: Vec<Lba> = live_positions
@@ -1602,12 +1744,7 @@ impl BufferFlusher {
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
-                    let frag = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
-                        0,
-                        old.unit_lba_count,
-                        old.unit_compressed_size,
-                    ));
-                    frag.0 += 1;
+                    record_old_fragment_ref(&mut old_frag_meta, old);
                 }
                 let flags = if unit.dedup_skipped {
                     FLAG_DEDUP_SKIPPED
@@ -1646,14 +1783,12 @@ impl BufferFlusher {
                 return Err(e);
             }
 
-            if let Err(e) =
-                meta.atomic_batch_write(
-                    &vol_id,
-                    &batch_values,
-                    live_positions.len() as u32,
-                    &old_pba_decrements,
-                )
-            {
+            if let Err(e) = meta.atomic_batch_write(
+                &vol_id,
+                &batch_values,
+                live_positions.len() as u32,
+                &old_pba_decrements,
+            ) {
                 allocation.free(allocator)?;
                 Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
@@ -1668,8 +1803,10 @@ impl BufferFlusher {
                     // Clean up dedup index entries for freed PBA
                     meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
                     if *old_blocks == 1 {
+                        Self::purge_holes_for_pba(hole_map, *old_pba);
                         allocator.free_one(*old_pba)?;
                     } else {
+                        Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
                         allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
                     }
                 }
@@ -1812,7 +1949,9 @@ impl BufferFlusher {
             alloc_blocks[i] = blocks_needed as u32;
 
             let allocation = if blocks_needed == 1 {
-                allocator.allocate_one_for_lane(shard_idx).map(|pba| (pba, 1u32))
+                allocator
+                    .allocate_one_for_lane(shard_idx)
+                    .map(|pba| (pba, 1u32))
             } else {
                 allocator
                     .allocate_extent(blocks_needed as u32)
@@ -1878,9 +2017,9 @@ impl BufferFlusher {
             });
             for (i, err) in io_errors.into_iter().enumerate() {
                 if let Some(e) = err {
-                    results[i] = Err(crate::error::OnyxError::Io(std::io::Error::other(
-                        format!("IO write failed: {e}"),
-                    )));
+                    results[i] = Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
+                        "IO write failed: {e}"
+                    ))));
                     skip[i] = true;
                 }
             }
@@ -1893,7 +2032,7 @@ impl BufferFlusher {
         struct UnitMeta {
             batch_values: Vec<(Lba, BlockmapValue)>,
             old_pba_meta: HashMap<Pba, (u32, u32)>,
-            old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)>,
+            old_frag_meta: HashMap<(Pba, u16), OldFragmentRef>,
             live_positions: Vec<usize>,
         }
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
@@ -1947,7 +2086,7 @@ impl BufferFlusher {
             };
 
             let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
-            let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
+            let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
             let mut batch_values = Vec::with_capacity(live_positions.len());
 
             for (j, old) in old_mappings.into_iter().enumerate() {
@@ -1956,12 +2095,7 @@ impl BufferFlusher {
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
-                    let frag = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
-                        0,
-                        old.unit_lba_count,
-                        old.unit_compressed_size,
-                    ));
-                    frag.0 += 1;
+                    record_old_fragment_ref(&mut old_frag_meta, old);
                 }
                 let flags = if unit.dedup_skipped {
                     FLAG_DEDUP_SKIPPED
@@ -2070,8 +2204,10 @@ impl BufferFlusher {
             if remaining == 0 {
                 dead_pbas.push(*old_pba);
                 if *old_blocks == 1 {
+                    Self::purge_holes_for_pba(hole_map, *old_pba);
                     let _ = allocator.free_one(*old_pba);
                 } else {
+                    Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
                     let _ = allocator.free_extent(Extent::new(*old_pba, *old_blocks));
                 }
             }
@@ -2186,7 +2322,7 @@ impl BufferFlusher {
         // Build blockmap entries and collect old PBA decrements across all fragments
         let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
-        let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
+        let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
         let mut total_refcount: u32 = 0;
         let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
         let mut any_discarded = false;
@@ -2235,12 +2371,7 @@ impl BufferFlusher {
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
-                    let frag_entry = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
-                        0,
-                        old.unit_lba_count,
-                        old.unit_compressed_size,
-                    ));
-                    frag_entry.0 += 1;
+                    record_old_fragment_ref(&mut old_frag_meta, old);
                 }
                 let flags = if unit.dedup_skipped {
                     FLAG_DEDUP_SKIPPED
@@ -2331,8 +2462,10 @@ impl BufferFlusher {
             if remaining == 0 {
                 meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
                 if *old_blocks == 1 {
+                    Self::purge_holes_for_pba(hole_map, *old_pba);
                     allocator.free_one(*old_pba)?;
                 } else {
+                    Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
                     allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
                 }
             }
@@ -2412,17 +2545,15 @@ impl BufferFlusher {
     ///
     /// Called from write_unit and write_packed_slot after metadata commit.
     fn detect_holes(
-        old_frag_meta: &HashMap<(Pba, u16), (u32, u16, u32)>,
+        old_frag_meta: &HashMap<(Pba, u16), OldFragmentRef>,
         meta: &MetaStore,
         hole_map: &HoleMap,
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
-        for (&(old_pba, slot_offset), &(decrement, unit_lba_count, compressed_size)) in
-            old_frag_meta
-        {
+        for (&(old_pba, slot_offset), frag) in old_frag_meta {
             // Only interested in packed fragments (unit_compressed_size < BLOCK_SIZE implies packed)
             // and only if we overwrote ALL LBAs of this fragment in this batch
-            if decrement < unit_lba_count as u32 {
+            if frag.decrement < frag.mapping.unit_lba_count as u32 {
                 continue;
             }
 
@@ -2432,8 +2563,21 @@ impl BufferFlusher {
                 continue; // PBA is freed, no hole to track
             }
 
+            // Dedup hits can add extra blockmap references to the same fragment
+            // without changing unit_lba_count. Publishing a hole here would let a
+            // later hole fill overwrite bytes that are still live.
+            if meta.has_live_fragment_ref(&frag.mapping)? {
+                tracing::debug!(
+                    pba = old_pba.0,
+                    slot_offset,
+                    remaining,
+                    "skipping hole publication for fragment that still has live refs"
+                );
+                continue;
+            }
+
             // This fragment is fully dead but PBA is still live → hole
-            let size = compressed_size as u16;
+            let size = frag.mapping.unit_compressed_size as u16;
             crate::packer::packer::insert_hole_coalesced(hole_map, old_pba, slot_offset, size);
             metrics.hole_detections.fetch_add(1, Ordering::Relaxed);
 
@@ -2481,6 +2625,8 @@ impl BufferFlusher {
             .map(|vid| lifecycle.get_lock(vid))
             .collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
+        let pba_lock = Self::hole_fill_lock(fill.pba);
+        let _pba_guard = pba_lock.lock().unwrap();
 
         // Generation check for the writing volume
         let should_discard = match meta.get_volume(&vol_id)? {
@@ -2540,7 +2686,7 @@ impl BufferFlusher {
         let meta_start = Instant::now();
         let mut old_pba_decrements: HashMap<Pba, u32> = HashMap::new();
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
-        let mut old_frag_meta: HashMap<(Pba, u16), (u32, u16, u32)> = HashMap::new();
+        let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
 
         let live_positions = Self::live_positions_for_unit(unit, pool)?;
         if live_positions.is_empty() {
@@ -2565,12 +2711,7 @@ impl BufferFlusher {
                 let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                 entry.0 += 1;
                 entry.1 = entry.1.max(old_blocks);
-                let frag = old_frag_meta.entry((old.pba, old.slot_offset)).or_insert((
-                    0,
-                    old.unit_lba_count,
-                    old.unit_compressed_size,
-                ));
-                frag.0 += 1;
+                record_old_fragment_ref(&mut old_frag_meta, old);
             }
             let flags = if unit.dedup_skipped {
                 FLAG_DEDUP_SKIPPED
@@ -2607,7 +2748,13 @@ impl BufferFlusher {
         }
 
         let net_increment = live_positions.len() as u32 - self_decrement;
-        meta.atomic_batch_write_hole_fill(&vol_id, &batch_values, fill.pba, net_increment, &old_pba_decrements)?;
+        meta.atomic_batch_write_hole_fill(
+            &vol_id,
+            &batch_values,
+            fill.pba,
+            net_increment,
+            &old_pba_decrements,
+        )?;
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Free old PBAs whose refcount dropped to 0
@@ -2617,8 +2764,10 @@ impl BufferFlusher {
             if remaining == 0 {
                 meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
                 if *old_blocks == 1 {
+                    Self::purge_holes_for_pba(hole_map, *old_pba);
                     allocator.free_one(*old_pba)?;
                 } else {
+                    Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
                     allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
                 }
             }
@@ -2795,12 +2944,18 @@ mod tests {
         let buf_tmp = NamedTempFile::new().unwrap();
         let buf_size: u64 = 4096 + 4096 + 256 * 8192;
         buf_tmp.as_file().set_len(buf_size).unwrap();
-        let pool = Arc::new(WriteBufferPool::open(RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap()).unwrap());
+        let pool = Arc::new(
+            WriteBufferPool::open(RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap())
+                .unwrap(),
+        );
 
         let data_tmp = NamedTempFile::new().unwrap();
         let data_size: u64 = 4096 * 20000;
         data_tmp.as_file().set_len(data_size).unwrap();
-        let io_engine = Arc::new(IoEngine::new(RawDevice::open(data_tmp.path()).unwrap(), false));
+        let io_engine = Arc::new(IoEngine::new(
+            RawDevice::open(data_tmp.path()).unwrap(),
+            false,
+        ));
 
         let allocator = Arc::new(SpaceAllocator::new(data_size, 1));
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
@@ -2817,15 +2972,7 @@ mod tests {
         .unwrap();
 
         (
-            meta,
-            pool,
-            lifecycle,
-            allocator,
-            io_engine,
-            metrics,
-            meta_dir,
-            buf_tmp,
-            data_tmp,
+            meta, pool, lifecycle, allocator, io_engine, metrics, meta_dir, buf_tmp, data_tmp,
         )
     }
 
@@ -2856,38 +3003,17 @@ mod tests {
         let newer = make_unit(0x33, 2);
         pool.note_latest_lba_seq_for_test("flush-race", Lba(0), 2, 1);
         BufferFlusher::write_unit(
-            0,
-            &newer,
-            &pool,
-            &meta,
-            &lifecycle,
-            &allocator,
-            &io_engine,
-            &hole_map,
-            &metrics,
+            0, &newer, &pool, &meta, &lifecycle, &allocator, &io_engine, &hole_map, &metrics,
         )
         .unwrap();
 
         let older = make_unit(0x11, 1);
         BufferFlusher::write_unit(
-            0,
-            &older,
-            &pool,
-            &meta,
-            &lifecycle,
-            &allocator,
-            &io_engine,
-            &hole_map,
-            &metrics,
+            0, &older, &pool, &meta, &lifecycle, &allocator, &io_engine, &hole_map, &metrics,
         )
         .unwrap();
 
-        let worker = ZoneWorker::new(
-            ZoneId(0),
-            meta.clone(),
-            pool.clone(),
-            io_engine.clone(),
-        );
+        let worker = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone());
         let actual = worker.handle_read("flush-race", Lba(0)).unwrap().unwrap();
 
         assert_eq!(

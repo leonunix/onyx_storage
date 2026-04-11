@@ -102,7 +102,8 @@ impl OnyxVolume {
         }
 
         let lba_count = (end_lba.0 - start_lba.0) as u32;
-        self.zone_manager.submit_discard(&self.vol_id, start_lba, lba_count)?;
+        self.zone_manager
+            .submit_discard(&self.vol_id, start_lba, lba_count)?;
 
         self.metrics
             .volume_discard_ops

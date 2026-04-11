@@ -108,6 +108,18 @@ pub fn rewrite_candidate(
             _ => continue, // LBA was overwritten or deleted since scan, skip
         }
 
+        // If this LBA already has a pending newer value in the write buffer,
+        // let the normal flusher path drain it instead of re-injecting the
+        // same block every GC cycle and starving the commit from reaching LV3.
+        if let Some(pending) = buffer_pool.lookup(&candidate.vol_id.0, *lba)? {
+            if pending.vol_created_at == 0
+                || vol_created_at == 0
+                || pending.vol_created_at == vol_created_at
+            {
+                continue;
+            }
+        }
+
         // Extract the 4KB block from the decompressed unit
         let start = *offset_in_unit as usize * BLOCK_SIZE as usize;
         let end = start + BLOCK_SIZE as usize;

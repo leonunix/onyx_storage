@@ -676,8 +676,7 @@ impl BufferEntry {
         // rely on payload_crc32 validation at hydration time.
 
         let lba_count = u32::from_le_bytes(buf[24..28].try_into().unwrap());
-        let slot_count =
-            round_up(total_len as usize, BLOCK_SIZE as usize) as u32 / BLOCK_SIZE;
+        let slot_count = round_up(total_len as usize, BLOCK_SIZE as usize) as u32 / BLOCK_SIZE;
 
         let vol_id = std::str::from_utf8(&buf[FIXED_HEADER_SIZE..header_end])
             .ok()?

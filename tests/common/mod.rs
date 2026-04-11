@@ -15,7 +15,6 @@ use onyx_storage::meta::schema::{
 use onyx_storage::types::{CompressionAlgo, Lba, Pba, BLOCK_SIZE};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sha2::{Digest, Sha256};
 use tempfile::{tempdir, NamedTempFile, TempDir};
 
 #[derive(Debug, Clone)]
@@ -300,15 +299,6 @@ impl EngineHarness {
             );
         }
 
-        let refcount_actual: HashMap<Pba, u32> = self
-            .engine()
-            .meta()
-            .iter_refcounts()
-            .unwrap()
-            .into_iter()
-            .collect();
- 
-
         if let Some(allocator) = self.engine().allocator() {
             let allocated = self.engine().meta().iter_allocated_blocks().unwrap();
             let allocated_set = allocated.iter().copied().collect::<HashSet<_>>();
@@ -348,9 +338,9 @@ impl EngineHarness {
             let block = handle
                 .read(lba.0 * BLOCK_SIZE as u64, BLOCK_SIZE as usize)
                 .unwrap();
-            let actual_hash = Sha256::digest(&block);
+            let actual_hash = blake3::hash(&block);
             assert_eq!(
-                actual_hash.as_slice(),
+                actual_hash.as_bytes().as_slice(),
                 hash.as_slice(),
                 "dedup index hash does not match logical block content"
             );

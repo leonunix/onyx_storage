@@ -618,9 +618,14 @@ impl OnyxEngine {
             gc.stop();
         }
 
-        // Then stop flusher (drains pending flushes)
+        // Then stop flusher and give graceful shutdown a chance to drain the
+        // buffer so recovered pending entries do not accumulate across restarts.
         if let Some(mut flusher) = self.flusher.lock().unwrap().take() {
-            flusher.stop();
+            if let Some(pool) = self.buffer_pool.as_ref() {
+                flusher.drain_and_stop(pool);
+            } else {
+                flusher.stop();
+            }
         }
 
         // Drain per-lane allocator caches back to the global free list

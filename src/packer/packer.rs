@@ -76,6 +76,19 @@ pub fn insert_hole_coalesced(map: &HoleMap, pba: Pba, offset: u16, size: u16) {
     );
 }
 
+/// Drop all tracked holes for a specific PBA.
+pub fn remove_holes_for_pba(map: &HoleMap, pba: Pba) {
+    let mut holes = map.lock().unwrap();
+    holes.retain(|key, _| key.pba != pba);
+}
+
+/// Drop all tracked holes for every PBA in a contiguous extent.
+pub fn remove_holes_for_extent(map: &HoleMap, pba: Pba, count: u32) {
+    let end = pba.0 + count as u64;
+    let mut holes = map.lock().unwrap();
+    holes.retain(|key, _| key.pba.0 < pba.0 || key.pba.0 >= end);
+}
+
 /// Describes filling a hole in an existing packed slot (read-modify-write).
 pub struct HoleFill {
     pub pba: Pba,
@@ -130,7 +143,11 @@ impl Packer {
         }
     }
 
-    pub fn new_with_lane(allocator: Arc<SpaceAllocator>, hole_map: HoleMap, lane_id: usize) -> Self {
+    pub fn new_with_lane(
+        allocator: Arc<SpaceAllocator>,
+        hole_map: HoleMap,
+        lane_id: usize,
+    ) -> Self {
         Self {
             allocator,
             lane_id,

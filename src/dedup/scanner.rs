@@ -4,7 +4,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use sha2::{Digest, Sha256};
 
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
@@ -237,7 +236,7 @@ impl DedupScanner {
                 let block = &decompressed[offset..offset + bs];
 
                 // Hash the block
-                let hash: ContentHash = Sha256::digest(block).into();
+                let hash: ContentHash = *blake3::hash(block).as_bytes();
 
                 // Look up dedup index
                 match meta.get_dedup_entry(&hash)? {

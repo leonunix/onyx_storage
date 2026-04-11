@@ -197,7 +197,8 @@ impl ZoneManager {
             while remaining_lbas > 0 {
                 let zone_end_lba =
                     ((current_lba / self.zone_size_blocks) + 1) * self.zone_size_blocks;
-                let lbas_in_this_zone = remaining_lbas.min(zone_end_lba.saturating_sub(current_lba));
+                let lbas_in_this_zone =
+                    remaining_lbas.min(zone_end_lba.saturating_sub(current_lba));
                 let byte_len = lbas_in_this_zone as usize * block_size;
                 let end = data_offset + byte_len;
                 self.buffer_pool.append(
@@ -275,23 +276,21 @@ impl ZoneManager {
     /// Invalidates buffer index entries, deletes blockmap mappings,
     /// decrements refcounts, and frees PBAs with zero refcount.
     /// No LV3 IO is performed — this is purely a metadata operation.
-    pub fn submit_discard(
-        &self,
-        vol_id: &str,
-        start_lba: Lba,
-        lba_count: u32,
-    ) -> OnyxResult<()> {
+    pub fn submit_discard(&self, vol_id: &str, start_lba: Lba, lba_count: u32) -> OnyxResult<()> {
         if lba_count == 0 {
             return Ok(());
         }
 
         // Step 1: invalidate buffer index so reads see unmapped immediately
-        self.buffer_pool.invalidate_lba_range(vol_id, start_lba, lba_count);
+        self.buffer_pool
+            .invalidate_lba_range(vol_id, start_lba, lba_count);
 
         // Step 2: delete blockmap entries + decrement refcounts atomically
         let vol_id_obj = VolumeId(vol_id.to_string());
         let end_lba = Lba(start_lba.0 + lba_count as u64);
-        let freed = self.meta.delete_blockmap_range(&vol_id_obj, start_lba, end_lba)?;
+        let freed = self
+            .meta
+            .delete_blockmap_range(&vol_id_obj, start_lba, end_lba)?;
 
         // Step 3: return freed PBAs to allocator
         if let Some(allocator) = &self.allocator {

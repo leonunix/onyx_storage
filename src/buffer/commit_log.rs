@@ -679,14 +679,18 @@ impl BufferShard {
 
         // Scan forward from the checkpoint head to catch entries appended after
         // the last checkpoint write. These entries must be contiguous from the
-        // old head; once we hit the first gap, the rest of the ring contains
-        // stale reclaimed bytes from older epochs.
+        // old head *and* must have a seq newer than the checkpoint's max_seq.
+        // Once we hit the first gap or an older seq, the rest of the ring
+        // contains stale reclaimed bytes from older epochs.
         let max_forward_bytes = (CHECKPOINT_FORWARD_SCAN_SLOTS * slot_sz).min(capacity_bytes);
         let mut forward_offset = checkpoint.head_offset;
         let mut forward_scanned_bytes = 0u64;
         while forward_scanned_bytes < max_forward_bytes {
             match Self::scan_entry(device, forward_offset, capacity_bytes)? {
                 Some((entry, slot_count)) => {
+                    if entry.seq <= checkpoint.max_seq {
+                        break;
+                    }
                     record_scanned(forward_offset, entry, slot_count, &mut scanned);
                     let step = Self::slot_bytes(slot_count);
                     forward_offset = (forward_offset + step) % capacity_bytes;
@@ -996,7 +1000,9 @@ impl BufferShard {
                 // Wait for flusher to free memory (reuse ring_space_cv; flusher
                 // notifies it when mark_flushed reclaims ring + payload space).
                 let mut ring = self.ring.lock();
-                let _ = self.ring_space_cv.wait_for(&mut ring, remaining.min(Duration::from_millis(50)));
+                let _ = self
+                    .ring_space_cv
+                    .wait_for(&mut ring, remaining.min(Duration::from_millis(50)));
             }
         }
 
@@ -1052,8 +1058,7 @@ impl BufferShard {
                 lba: Lba(start_lba.0 + i as u64),
             };
             self.lba_index.insert(key.clone(), pending.clone());
-            self.latest_lba_seq
-                .insert(key, (seq, vol_created_at));
+            self.latest_lba_seq.insert(key, (seq, vol_created_at));
         }
         self.pending_entries.insert(seq, pending.clone());
 
@@ -1140,20 +1145,17 @@ impl BufferShard {
     /// Does not remove pending_entries (flusher handles stale entries gracefully).
     fn invalidate_lba_range(&self, vol_id: &str, start_lba: Lba, lba_count: u32) {
         let vid = self.intern_vol_id(vol_id);
-        let mut key = LbaKey { vol_id: vid, lba: start_lba };
+        let mut key = LbaKey {
+            vol_id: vid,
+            lba: start_lba,
+        };
         for i in 0..lba_count as u64 {
             key.lba = Lba(start_lba.0 + i);
             self.lba_index.remove(&key);
         }
     }
 
-    fn is_latest_lba_seq(
-        &self,
-        vol_id: &str,
-        lba: Lba,
-        seq: u64,
-        vol_created_at: u64,
-    ) -> bool {
+    fn is_latest_lba_seq(&self, vol_id: &str, lba: Lba, seq: u64, vol_created_at: u64) -> bool {
         let vid = self.intern_vol_id(vol_id);
         self.latest_lba_seq
             .get(&LbaKey { vol_id: vid, lba })
@@ -1190,7 +1192,9 @@ impl BufferShard {
     }
 
     fn pending_entry_arc(&self, seq: u64) -> Option<Arc<PendingEntry>> {
-        self.pending_entries.get(&seq).map(|entry| entry.value().clone())
+        self.pending_entries
+            .get(&seq)
+            .map(|entry| entry.value().clone())
     }
 
     /// Evict a corrupt/unreadable pending entry: remove from all indices
@@ -1207,8 +1211,7 @@ impl BufferShard {
                 lba: Lba(pending.start_lba.0 + i as u64),
             };
             self.lba_index.remove_if(&key, |_, value| value.seq == seq);
-            self.latest_lba_seq
-                .remove_if(&key, |_, &(s, _)| s == seq);
+            self.latest_lba_seq.remove_if(&key, |_, &(s, _)| s == seq);
         }
         if let Some(ref p) = pending.payload {
             self.payload_bytes_in_memory
@@ -1340,7 +1343,11 @@ impl BufferShard {
         flushed_lba_start: Lba,
         flushed_lba_count: u32,
     ) -> OnyxResult<()> {
-        let Some(pending) = self.pending_entries.get(&seq).map(|e| Arc::clone(e.value())) else {
+        let Some(pending) = self
+            .pending_entries
+            .get(&seq)
+            .map(|e| Arc::clone(e.value()))
+        else {
             return Ok(());
         };
 
@@ -1504,8 +1511,7 @@ impl WriteBufferPool {
 
     /// V3 data bytes: device - superblock - per-shard checkpoint blocks.
     fn total_data_bytes_v3(device_size: u64, shard_count: usize) -> OnyxResult<u64> {
-        let overhead =
-            COMMIT_LOG_SUPERBLOCK_SIZE + shard_count as u64 * SHARD_CHECKPOINT_SIZE;
+        let overhead = COMMIT_LOG_SUPERBLOCK_SIZE + shard_count as u64 * SHARD_CHECKPOINT_SIZE;
         device_size
             .checked_sub(overhead)
             .ok_or_else(|| OnyxError::Config("persistent slot device too small".into()))
@@ -2113,7 +2119,11 @@ impl WriteBufferPool {
             });
         }
 
-        let disk_version = if use_v3 { COMMIT_LOG_VERSION } else { COMMIT_LOG_VERSION_V2 };
+        let disk_version = if use_v3 {
+            COMMIT_LOG_VERSION
+        } else {
+            COMMIT_LOG_VERSION_V2
+        };
         let pool = Self {
             root_device: device,
             shards,
@@ -2227,13 +2237,7 @@ impl WriteBufferPool {
             .and_then(|idx| self.shards[idx].shard.pending_entry_arc_hydrated(seq))
     }
 
-    pub fn is_latest_lba_seq(
-        &self,
-        vol_id: &str,
-        lba: Lba,
-        seq: u64,
-        vol_created_at: u64,
-    ) -> bool {
+    pub fn is_latest_lba_seq(&self, vol_id: &str, lba: Lba, seq: u64, vol_created_at: u64) -> bool {
         let shard_idx = self.shard_for_lba(lba);
         self.shards[shard_idx]
             .shard
@@ -2264,7 +2268,10 @@ impl WriteBufferPool {
             .unwrap_or_default()
     }
 
-    pub fn pending_entries_arc_snapshot_for_shard(&self, shard_idx: usize) -> Vec<Arc<PendingEntry>> {
+    pub fn pending_entries_arc_snapshot_for_shard(
+        &self,
+        shard_idx: usize,
+    ) -> Vec<Arc<PendingEntry>> {
         self.shards
             .get(shard_idx)
             .map(|shard| {
@@ -2396,7 +2403,9 @@ impl WriteBufferPool {
     /// After this call, reads to these LBAs will no longer find buffered data.
     pub fn invalidate_lba_range(&self, vol_id: &str, start_lba: Lba, lba_count: u32) {
         for shard in self.shards.iter() {
-            shard.shard.invalidate_lba_range(vol_id, start_lba, lba_count);
+            shard
+                .shard
+                .invalidate_lba_range(vol_id, start_lba, lba_count);
         }
     }
 
@@ -2433,6 +2442,16 @@ impl WriteBufferPool {
             return 100;
         }
         ((shard.shard.used_bytes() * 100) / cap) as u8
+    }
+
+    /// Total payload bytes currently kept resident in memory across all shards.
+    pub fn payload_memory_bytes(&self) -> u64 {
+        self.payload_bytes_in_memory.load(Ordering::Relaxed)
+    }
+
+    /// Configured in-memory payload ceiling. 0 means "no limit".
+    pub fn payload_memory_limit_bytes(&self) -> u64 {
+        self.max_payload_memory
     }
 
     /// Snapshot per-shard buffer statistics for monitoring.

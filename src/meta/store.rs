@@ -229,7 +229,11 @@ impl MetaStore {
 
         for (pba, decrement) in &pba_decrements {
             let rc_key = encode_refcount_key(*pba);
-            batch.merge_cf(&cf_refcount, &rc_key, encode_refcount_delta(-(*decrement as i32)));
+            batch.merge_cf(
+                &cf_refcount,
+                &rc_key,
+                encode_refcount_delta(-(*decrement as i32)),
+            );
         }
 
         for key in &blockmap_keys_to_delete {
@@ -343,7 +347,11 @@ impl MetaStore {
 
         for (pba, decrement) in &pba_decrements {
             let rc_key = encode_refcount_key(*pba);
-            batch.merge_cf(&cf_refcount, &rc_key, encode_refcount_delta(-(*decrement as i32)));
+            batch.merge_cf(
+                &cf_refcount,
+                &rc_key,
+                encode_refcount_delta(-(*decrement as i32)),
+            );
         }
 
         for key in &blockmap_keys {
@@ -858,6 +866,34 @@ impl MetaStore {
             let (_, value) = item?;
             if let Some(bv) = decode_blockmap_value(&value) {
                 if bv.pba == target_pba {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Check whether the exact packed fragment described by `target` still has
+    /// any live blockmap reference.
+    ///
+    /// Ignores `offset_in_unit` because any surviving block in the compression
+    /// unit keeps the fragment's byte range live.
+    pub fn has_live_fragment_ref(&self, target: &BlockmapValue) -> OnyxResult<bool> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (_, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                if bv.pba == target.pba
+                    && bv.slot_offset == target.slot_offset
+                    && bv.unit_compressed_size == target.unit_compressed_size
+                    && bv.unit_original_size == target.unit_original_size
+                    && bv.unit_lba_count == target.unit_lba_count
+                    && bv.compression == target.compression
+                    && bv.crc32 == target.crc32
+                {
                     return Ok(true);
                 }
             }

@@ -42,7 +42,7 @@ nix = { version = "0.29", features = ["mman", "fs", "signal"] }
 
 # integrity
 crc32fast = "1"
-sha2 = "0.10"
+blake3 = "1"
 
 # lock-free atomic Arc swap (for engine hot-reload)
 arc-swap = "1"

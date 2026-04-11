@@ -18,7 +18,7 @@ use onyx_storage::meta::store::MetaStore;
 use onyx_storage::packer::packer::{new_hole_map, HoleKey, HoleMap};
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::types::*;
-use sha2::{Digest, Sha256};
+use onyx_storage::zone::worker::ZoneWorker;
 use tempfile::{tempdir, NamedTempFile};
 
 fn setup_dedup_env() -> (
@@ -288,7 +288,7 @@ fn dedup_index_crud() {
     };
     let store = MetaStore::open(&config).unwrap();
 
-    let hash: ContentHash = Sha256::digest(b"hello world").into();
+    let hash: ContentHash = *blake3::hash(b"hello world").as_bytes();
     let entry = DedupEntry {
         pba: Pba(100),
         slot_offset: 0,
@@ -468,7 +468,7 @@ fn dedup_miss_populates_index() {
 
     // Write a unique block
     let data = vec![0xAA; 4096];
-    let hash: ContentHash = Sha256::digest(&data).into();
+    let hash: ContentHash = *blake3::hash(&data).as_bytes();
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
@@ -877,7 +877,7 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
     register_volume(&meta, "test-vol");
 
     let data = vec![0x5A; 4096];
-    let hash: ContentHash = Sha256::digest(&data).into();
+    let hash: ContentHash = *blake3::hash(&data).as_bytes();
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
@@ -951,7 +951,7 @@ fn scanner_miss_registers_index_and_clears_flag() {
     register_volume(&meta, "test-vol");
 
     let data = vec![0x6B; 4096];
-    let hash: ContentHash = Sha256::digest(&data).into();
+    let hash: ContentHash = *blake3::hash(&data).as_bytes();
 
     let mut flusher = start_flusher_custom(
         &pool,
@@ -1005,7 +1005,7 @@ fn scanner_skips_under_pressure_then_resumes() {
     register_volume(&meta, "test-vol");
 
     let skipped_data = vec![0x7C; 4096];
-    let skipped_hash: ContentHash = Sha256::digest(&skipped_data).into();
+    let skipped_hash: ContentHash = *blake3::hash(&skipped_data).as_bytes();
 
     let mut skip_flusher = start_flusher_custom(
         &pool,
@@ -1074,7 +1074,7 @@ fn scanner_crc_mismatch_leaves_block_skipped() {
     register_volume(&meta, "test-vol");
 
     let data = vec![0x8D; 4096];
-    let hash: ContentHash = Sha256::digest(&data).into();
+    let hash: ContentHash = *blake3::hash(&data).as_bytes();
 
     let mut flusher = start_flusher_custom(
         &pool,
@@ -1155,7 +1155,7 @@ fn dedup_hole_fill_miss_populates_index() {
     );
 
     let fill_data = vec![0x22; 4096];
-    let fill_hash: ContentHash = Sha256::digest(&fill_data).into();
+    let fill_hash: ContentHash = *blake3::hash(&fill_data).as_bytes();
     pool.append("fill", Lba(0), 1, &fill_data, 200).unwrap();
     assert!(wait_flushed(&pool, 10000), "hole fill flush timeout");
     flusher.stop();
@@ -1213,7 +1213,7 @@ fn dedup_skipped_hole_fill_is_rescanned() {
     );
 
     let fill_data = vec![0x44; 4096];
-    let fill_hash: ContentHash = Sha256::digest(&fill_data).into();
+    let fill_hash: ContentHash = *blake3::hash(&fill_data).as_bytes();
     let mut skip_flusher = start_flusher_custom(
         &pool,
         &meta,
@@ -1263,12 +1263,131 @@ fn dedup_skipped_hole_fill_is_rescanned() {
 }
 
 #[test]
+fn dedup_live_reference_prevents_hole_publication_and_reuse() {
+    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
+    let hole_map = new_hole_map();
+    register_volume_with(&meta, "anchor", CompressionAlgo::Lz4, 100);
+    register_volume_with(&meta, "peer", CompressionAlgo::Lz4, 200);
+    register_volume_with(&meta, "dup", CompressionAlgo::Lz4, 300);
+    register_volume_with(&meta, "fill", CompressionAlgo::Lz4, 400);
+
+    let mut flusher = start_flusher_custom(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        hole_map.clone(),
+        dedup_test_config(),
+    );
+
+    let anchor_data = vec![0x31; BLOCK_SIZE as usize];
+    let peer_data = vec![0x52; BLOCK_SIZE as usize];
+    let anchor_new = vec![0x73; BLOCK_SIZE as usize];
+    let fill_data = vec![0x94; BLOCK_SIZE as usize];
+
+    pool.append("anchor", Lba(0), 1, &anchor_data, 100).unwrap();
+    pool.append("peer", Lba(0), 1, &peer_data, 200).unwrap();
+    assert!(wait_flushed(&pool, 10000), "initial packed flush timeout");
+
+    let anchor_mapping = meta
+        .get_mapping(&VolumeId("anchor".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    let peer_mapping = meta
+        .get_mapping(&VolumeId("peer".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        anchor_mapping.pba, peer_mapping.pba,
+        "anchor and peer should share a packed slot"
+    );
+    assert_ne!(
+        anchor_mapping.slot_offset, peer_mapping.slot_offset,
+        "packed fragments must occupy different byte ranges"
+    );
+    let shared_pba = anchor_mapping.pba;
+    let anchor_hole = HoleKey {
+        pba: shared_pba,
+        offset: anchor_mapping.slot_offset,
+    };
+
+    pool.append("dup", Lba(0), 1, &anchor_data, 300).unwrap();
+    assert!(wait_flushed(&pool, 10000), "dedup-hit flush timeout");
+
+    let dup_mapping = meta
+        .get_mapping(&VolumeId("dup".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(dup_mapping.pba, shared_pba);
+    assert_eq!(dup_mapping.slot_offset, anchor_mapping.slot_offset);
+    assert_eq!(dup_mapping.crc32, anchor_mapping.crc32);
+
+    pool.append("anchor", Lba(0), 1, &anchor_new, 100).unwrap();
+    assert!(wait_flushed(&pool, 10000), "anchor overwrite flush timeout");
+
+    let anchor_new_mapping = meta
+        .get_mapping(&VolumeId("anchor".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        anchor_new_mapping.pba, shared_pba,
+        "overwrite should move anchor to a new location"
+    );
+    assert_eq!(
+        meta.get_mapping(&VolumeId("dup".into()), Lba(0))
+            .unwrap()
+            .unwrap()
+            .pba,
+        shared_pba,
+        "dedup reference must still point at the original fragment"
+    );
+    assert!(
+        !hole_map.lock().unwrap().contains_key(&anchor_hole),
+        "live dedup refs must prevent publishing a hole for the old fragment"
+    );
+
+    pool.append("fill", Lba(0), 1, &fill_data, 400).unwrap();
+    assert!(wait_flushed(&pool, 10000), "fill flush timeout");
+
+    let fill_mapping = meta
+        .get_mapping(&VolumeId("fill".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert!(
+        fill_mapping.pba != shared_pba || fill_mapping.slot_offset != anchor_mapping.slot_offset,
+        "hole fill must not reuse bytes still referenced through dedup"
+    );
+
+    let worker = ZoneWorker::new(
+        ZoneId(0),
+        meta.clone(),
+        pool.clone(),
+        io_engine.clone(),
+    );
+    assert_eq!(
+        worker.handle_read("anchor", Lba(0)).unwrap().unwrap(),
+        anchor_new
+    );
+    assert_eq!(
+        worker.handle_read("peer", Lba(0)).unwrap().unwrap(),
+        peer_data
+    );
+    assert_eq!(
+        worker.handle_read("dup", Lba(0)).unwrap().unwrap(),
+        anchor_data
+    );
+
+    flusher.stop();
+}
+
+#[test]
 fn dedup_miss_before_meta_write_recovers_and_populates_index() {
     let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
     register_volume(&meta, "test-vol-meta-fail");
 
     let data = vec![0x91; 4096];
-    let hash: ContentHash = Sha256::digest(&data).into();
+    let hash: ContentHash = *blake3::hash(&data).as_bytes();
     install_test_failpoint(
         "test-vol-meta-fail",
         Lba(0),
@@ -1308,7 +1427,7 @@ fn dedup_hit_failure_demotes_to_miss() {
     register_volume(&meta, "test-vol-hit-fail");
 
     let data = vec![0xA5; 4096];
-    let hash: ContentHash = Sha256::digest(&data).into();
+    let hash: ContentHash = *blake3::hash(&data).as_bytes();
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
     pool.append("test-vol-hit-fail", Lba(0), 1, &data, 1000)
