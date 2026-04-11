@@ -735,3 +735,64 @@ fn stale_checkpoint_forward_scan_catches_late_entries() {
     let seqs: Vec<u64> = recovered.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![seq_early, seq_late]);
 }
+
+#[test]
+fn guided_recovery_forward_scan_stops_at_first_gap() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 6 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+
+    let live_data = vec![0xAB; 4096];
+    let live_seq;
+    {
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let pool = WriteBufferPool::open(dev).unwrap();
+        live_seq = pool.append("vol", Lba(0), 1, &live_data, 0).unwrap();
+        // Drop persists a checkpoint whose head stops immediately after seq_live.
+    }
+
+    // Inject a stale but otherwise valid entry *after* a gap beyond the
+    // checkpoint head. Forward recovery must stop at the first gap and ignore
+    // this reclaimed-history record.
+    let stale_payload: Arc<[u8]> = Arc::from(vec![0xCD; 4096]);
+    let stale_entry = BufferEntry {
+        seq: live_seq + 1000,
+        vol_id: "vol".to_string(),
+        start_lba: Lba(99),
+        lba_count: 1,
+        payload_crc32: crc32fast::hash(&stale_payload),
+        flushed: false,
+        vol_created_at: 0,
+        payload: stale_payload,
+    };
+    let stale_bytes = stale_entry.to_bytes().unwrap();
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let data_area_start = 4096 + 4096;
+        let live_entry_len = 8192;
+        let gap_len = 8192;
+        let stale_offset = data_area_start + live_entry_len + gap_len;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        file.seek(SeekFrom::Start(stale_offset)).unwrap();
+        file.write_all(&stale_bytes).unwrap();
+        file.flush().unwrap();
+    }
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open(dev).unwrap();
+
+    assert_eq!(pool.pending_count(), 1);
+    let recovered = pool.recover().unwrap();
+    let seqs: Vec<u64> = recovered.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![live_seq]);
+    assert!(
+        pool.lookup("vol", Lba(99)).unwrap().is_none(),
+        "forward scan must stop at the first gap after checkpoint head"
+    );
+}

@@ -457,7 +457,6 @@ impl BufferShard {
         Ok(Some((entry, slot_count)))
     }
 
-
     fn rebuild_indices(
         device: &RawDevice,
         capacity_bytes: u64,
@@ -612,100 +611,88 @@ impl BufferShard {
 
         let mut scanned = Vec::new();
         let mut max_seq = 0u64;
+        let mut seen_offsets = HashSet::new();
+
+        let mut record_scanned =
+            |offset: u64, entry: BufferEntry, slot_count: u32, scanned: &mut Vec<ScannedRecord>| {
+                if !seen_offsets.insert(offset) {
+                    return;
+                }
+                let disk_len = Self::slot_bytes(slot_count) as u32;
+                max_seq = max_seq.max(entry.seq);
+                let pending = (!entry.flushed).then(|| {
+                    Arc::new(PendingEntry {
+                        seq: entry.seq,
+                        vol_id: entry.vol_id.clone(),
+                        start_lba: entry.start_lba,
+                        lba_count: entry.lba_count,
+                        payload_crc32: entry.payload_crc32,
+                        vol_created_at: entry.vol_created_at,
+                        payload: None, // lazy: hydrated from disk on demand
+                        disk_offset: offset,
+                        disk_len,
+                    })
+                });
+                scanned.push(ScannedRecord {
+                    seq: entry.seq,
+                    disk_offset: offset,
+                    slot_count,
+                    flushed: entry.flushed,
+                    pending,
+                });
+            };
 
         // Scan the occupied region, handling wrap-around.
-        // Phase 1: scan [tail, head) (the known occupied region from checkpoint)
-        // Phase 2: forward scan beyond head for entries missed by stale checkpoint
-        let forward_limit = CHECKPOINT_FORWARD_SCAN_SLOTS * slot_sz;
-        let scan_head = if checkpoint.used_bytes == 0 {
-            // Empty buffer: only do forward scan from head
-            checkpoint.head_offset
-        } else {
-            checkpoint.head_offset
-        };
-        // End of forward scan region (may wrap)
-        let forward_end = (scan_head + forward_limit) % capacity_bytes;
-
-        // Build the list of (start, end) byte ranges to scan (non-wrapping segments).
-        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        // Phase 1: scan [tail, head) (the known occupied region from checkpoint).
+        // Phase 2: scan forward from checkpoint.head, but only while entries are
+        // physically contiguous. Once we hit the first gap, later "valid-looking"
+        // bytes are stale reclaimed history and must not be recovered.
+        let mut occupied_ranges: Vec<(u64, u64)> = Vec::new();
         if checkpoint.used_bytes == 0 && checkpoint.head_offset == checkpoint.tail_offset {
-            // Checkpoint says empty. Only do forward scan.
-            if forward_end > scan_head {
-                ranges.push((scan_head, forward_end));
-            } else {
-                ranges.push((scan_head, capacity_bytes));
-                ranges.push((0, forward_end));
-            }
-        } else if scan_head >= checkpoint.tail_offset {
+            // Checkpoint says empty. Only do the contiguous forward scan below.
+        } else if checkpoint.head_offset >= checkpoint.tail_offset {
             // No wrap in occupied region: [tail, head)
-            ranges.push((checkpoint.tail_offset, scan_head));
-            // Forward scan: [head, head + forward_limit)
-            if forward_end > scan_head {
-                ranges.push((scan_head, forward_end));
-            } else {
-                ranges.push((scan_head, capacity_bytes));
-                ranges.push((0, forward_end));
-            }
+            occupied_ranges.push((checkpoint.tail_offset, checkpoint.head_offset));
         } else {
             // Wrap-around: [tail, capacity) + [0, head)
-            ranges.push((checkpoint.tail_offset, capacity_bytes));
-            ranges.push((0, scan_head));
-            // Forward scan beyond head
-            if forward_end > scan_head {
-                ranges.push((scan_head, forward_end));
-            } else {
-                ranges.push((scan_head, capacity_bytes));
-                ranges.push((0, forward_end));
-            }
+            occupied_ranges.push((checkpoint.tail_offset, capacity_bytes));
+            occupied_ranges.push((0, checkpoint.head_offset));
         }
 
-        // Merge overlapping/adjacent ranges and deduplicate
-        ranges.sort_by_key(|r| r.0);
-        let mut merged: Vec<(u64, u64)> = Vec::new();
-        for range in ranges {
-            if let Some(last) = merged.last_mut() {
-                if range.0 <= last.1 {
-                    last.1 = last.1.max(range.1);
-                    continue;
-                }
-            }
-            merged.push(range);
-        }
-
-        // Scan each range with full CRC validation but discard payload to save memory.
-        for (range_start, range_end) in &merged {
+        // Scan the checkpoint-declared occupied region. Here we can tolerate
+        // gaps and continue scanning slot-by-slot because corruption should not
+        // hide later still-live entries inside the known used range.
+        for (range_start, range_end) in &occupied_ranges {
             let mut offset = *range_start;
             while offset < *range_end {
                 match Self::scan_entry(device, offset, capacity_bytes)? {
                     Some((entry, slot_count)) => {
-                        let disk_len = Self::slot_bytes(slot_count) as u32;
-                        max_seq = max_seq.max(entry.seq);
-                        let pending = (!entry.flushed).then(|| {
-                            Arc::new(PendingEntry {
-                                seq: entry.seq,
-                                vol_id: entry.vol_id.clone(),
-                                start_lba: entry.start_lba,
-                                lba_count: entry.lba_count,
-                                payload_crc32: entry.payload_crc32,
-                                vol_created_at: entry.vol_created_at,
-                                payload: None, // lazy: hydrated from disk on demand
-                                disk_offset: offset,
-                                disk_len,
-                            })
-                        });
-                        scanned.push(ScannedRecord {
-                            seq: entry.seq,
-                            disk_offset: offset,
-                            slot_count,
-                            flushed: entry.flushed,
-                            pending,
-                        });
+                        record_scanned(offset, entry, slot_count, &mut scanned);
                         offset += Self::slot_bytes(slot_count);
                     }
                     None => {
                         offset += slot_sz;
                     }
                 }
+            }
+        }
+
+        // Scan forward from the checkpoint head to catch entries appended after
+        // the last checkpoint write. These entries must be contiguous from the
+        // old head; once we hit the first gap, the rest of the ring contains
+        // stale reclaimed bytes from older epochs.
+        let max_forward_bytes = (CHECKPOINT_FORWARD_SCAN_SLOTS * slot_sz).min(capacity_bytes);
+        let mut forward_offset = checkpoint.head_offset;
+        let mut forward_scanned_bytes = 0u64;
+        while forward_scanned_bytes < max_forward_bytes {
+            match Self::scan_entry(device, forward_offset, capacity_bytes)? {
+                Some((entry, slot_count)) => {
+                    record_scanned(forward_offset, entry, slot_count, &mut scanned);
+                    let step = Self::slot_bytes(slot_count);
+                    forward_offset = (forward_offset + step) % capacity_bytes;
+                    forward_scanned_bytes = forward_scanned_bytes.saturating_add(step);
+                }
+                None => break,
             }
         }
 
