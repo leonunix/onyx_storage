@@ -345,6 +345,7 @@ impl OnyxEngine {
                 allocator.clone(),
                 lifecycle.clone(),
                 buffer_pool.clone(),
+                hole_map.clone(),
                 config.dedup.clone(),
             ))
         } else {
@@ -736,6 +737,7 @@ impl OnyxEngine {
                 allocator.clone(),
                 lifecycle.clone(),
                 buffer_pool.clone(),
+                hole_map.clone(),
                 config.dedup.clone(),
             ))
         } else {

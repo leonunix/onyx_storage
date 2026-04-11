@@ -630,19 +630,36 @@ impl MetaStore {
     /// Atomically write multiple blockmap entries sharing the same PBA (compression unit),
     /// set new PBA refcount, and decrement old PBA refcounts.
     ///
-    /// `batch_values`: vec of (lba, BlockmapValue) — each LBA gets its own entry
-    /// `new_refcount`: refcount to set for the new PBA (typically = lba_count)
-    /// `old_pba_decrements`: aggregated decrements per old PBA (from HashMap)
+    /// Old mappings are re-read **inside** the refcount lock to prevent stale-read races
+    /// (another thread remapping an LBA between the caller's read and this write would
+    /// cause the wrong old PBA to be decremented, leading to refcount drift).
+    ///
+    /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were decremented,
+    /// so the caller can check refcounts and free dead PBAs.
     pub fn atomic_batch_write(
         &self,
         vol_id: &VolumeId,
         batch_values: &[(Lba, BlockmapValue)],
         new_refcount: u32,
-        old_pba_decrements: &std::collections::HashMap<Pba, u32>,
-    ) -> OnyxResult<()> {
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
         let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        let new_pba = batch_values.first().map(|(_, v)| v.pba);
+
+        // Re-read current mappings inside the lock to get accurate old PBA info.
+        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        for (lba, _new_value) in batch_values {
+            if let Some(old) = self.get_mapping(vol_id, *lba)? {
+                if Some(old.pba) != new_pba {
+                    let old_blocks = old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(old_blocks);
+                }
+            }
+        }
 
         let mut batch = WriteBatch::default();
 
@@ -659,8 +676,8 @@ impl MetaStore {
             batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_refcount));
         }
 
-        // Decrement old PBA refcounts (read + put/delete inside lock)
-        for (old_pba, decrement) in old_pba_decrements {
+        // Decrement old PBA refcounts using fresh data
+        for (old_pba, (decrement, _)) in &old_pba_meta {
             let current_rc = self.get_refcount(*old_pba)?;
             let new_rc = current_rc.saturating_sub(*decrement);
             let rc_key = encode_refcount_key(*old_pba);
@@ -672,22 +689,46 @@ impl MetaStore {
         }
 
         self.db.write(batch)?;
-        Ok(())
+        Ok(old_pba_meta)
     }
 
     /// Atomically write blockmap entries for a hole fill, incrementing the existing
-    /// PBA refcount by `increment` and decrementing old PBA refcounts.
+    /// PBA refcount and decrementing old PBA refcounts.
+    ///
+    /// Old mappings are re-read inside the lock (same rationale as `atomic_batch_write`).
+    /// `total_new_refs` is the number of LBAs being written (used to compute net increment).
+    ///
+    /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were decremented
+    /// (excludes self-referencing decrements where old PBA == fill PBA).
     pub fn atomic_batch_write_hole_fill(
         &self,
         vol_id: &VolumeId,
         batch_values: &[(Lba, BlockmapValue)],
         pba: Pba,
-        increment: u32,
-        old_pba_decrements: &std::collections::HashMap<Pba, u32>,
-    ) -> OnyxResult<()> {
+        total_new_refs: u32,
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
         let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        // Re-read current mappings inside the lock.
+        let mut self_decrement: u32 = 0;
+        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        for (lba, _new_value) in batch_values {
+            if let Some(old) = self.get_mapping(vol_id, *lba)? {
+                if old.pba == pba {
+                    // Self-referencing: old mapping already points to this slot
+                    self_decrement += 1;
+                } else {
+                    let old_blocks = old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(old_blocks);
+                }
+            }
+        }
+
+        let net_increment = total_new_refs - self_decrement;
 
         let mut batch = WriteBatch::default();
 
@@ -697,14 +738,14 @@ impl MetaStore {
             batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
         }
 
-        // Increment existing PBA refcount (read + put inside lock)
+        // Increment existing PBA refcount by net amount
         let current_rc = self.get_refcount(pba)?;
-        let new_rc = current_rc + increment;
+        let new_rc = current_rc + net_increment;
         let rc_key = encode_refcount_key(pba);
         batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
 
-        // Decrement old PBA refcounts (read + put/delete inside lock)
-        for (old_pba, decrement) in old_pba_decrements {
+        // Decrement old PBA refcounts using fresh data
+        for (old_pba, (decrement, _)) in &old_pba_meta {
             let old_rc = self.get_refcount(*old_pba)?;
             let old_new = old_rc.saturating_sub(*decrement);
             let old_rc_key = encode_refcount_key(*old_pba);
@@ -716,26 +757,37 @@ impl MetaStore {
         }
 
         self.db.write(batch)?;
-        Ok(())
+        Ok(old_pba_meta)
     }
 
     /// Atomically write blockmap entries from multiple volumes sharing the same PBA
     /// (packed slot). Sets the total refcount for the PBA and decrements old PBAs.
     ///
-    /// `batch_values`: vec of (vol_id, lba, BlockmapValue) — each entry may belong to a different volume
-    /// `new_pba`: the shared PBA for the packed slot
-    /// `new_refcount`: total refcount for new_pba (sum of all lba_counts across fragments)
-    /// `old_pba_decrements`: aggregated decrements per old PBA
+    /// Old mappings are re-read inside the lock (same rationale as `atomic_batch_write`).
+    ///
+    /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were decremented.
     pub fn atomic_batch_write_packed(
         &self,
         batch_values: &[(VolumeId, Lba, BlockmapValue)],
         new_pba: Pba,
         new_refcount: u32,
-        old_pba_decrements: &std::collections::HashMap<Pba, u32>,
-    ) -> OnyxResult<()> {
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
         let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        // Re-read current mappings inside the lock.
+        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        for (vol_id, lba, _new_value) in batch_values {
+            if let Some(old) = self.get_mapping(vol_id, *lba)? {
+                if old.pba != new_pba {
+                    let old_blocks = old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(old_blocks);
+                }
+            }
+        }
 
         let mut batch = WriteBatch::default();
 
@@ -748,7 +800,7 @@ impl MetaStore {
         let rc_key = encode_refcount_key(new_pba);
         batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_refcount));
 
-        for (old_pba, decrement) in old_pba_decrements {
+        for (old_pba, (decrement, _)) in &old_pba_meta {
             let current_rc = self.get_refcount(*old_pba)?;
             let new_rc = current_rc.saturating_sub(*decrement);
             let rc_key = encode_refcount_key(*old_pba);
@@ -760,24 +812,26 @@ impl MetaStore {
         }
 
         self.db.write(batch)?;
-        Ok(())
+        Ok(old_pba_meta)
     }
 
     /// Atomically write blockmap entries for multiple units, each with its own PBA.
     /// Combines all units into a single RocksDB WriteBatch for one WAL sync.
     ///
-    /// Each item in `units`: (vol_id, blockmap entries, new_pba refcount, old PBA decrements)
+    /// Old mappings are re-read inside the lock (same rationale as `atomic_batch_write`).
+    ///
+    /// Each item in `units`: (vol_id, blockmap entries, new_pba refcount)
+    /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were decremented.
     pub fn atomic_batch_write_multi(
         &self,
         units: &[(
             &VolumeId,
             &[(Lba, BlockmapValue)],
-            u32,                // new_refcount
-            &HashMap<Pba, u32>, // old_pba_decrements
+            u32, // new_refcount
         )],
-    ) -> OnyxResult<()> {
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
         if units.is_empty() {
-            return Ok(());
+            return Ok(HashMap::new());
         }
         let _guard = self.refcount_lock.lock().unwrap();
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
@@ -789,9 +843,26 @@ impl MetaStore {
         // written target and an old overwritten source still gets one final,
         // correct value in the batch.
         let mut new_refcounts: HashMap<Pba, u32> = HashMap::new();
-        let mut aggregated_decrements: HashMap<Pba, u32> = HashMap::new();
+        let mut aggregated_decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
 
-        for (vol_id, batch_values, new_refcount, old_pba_decrements) in units {
+        for (vol_id, batch_values, new_refcount) in units {
+            // Collect new PBA for this unit to exclude self-references
+            let new_pba = batch_values.first().map(|(_, v)| v.pba);
+
+            // Re-read current mappings inside the lock for accurate decrements.
+            for (lba, _new_value) in *batch_values {
+                if let Some(old) = self.get_mapping(vol_id, *lba)? {
+                    if Some(old.pba) != new_pba {
+                        let old_blocks =
+                            old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                        let entry =
+                            aggregated_decrements.entry(old.pba).or_insert((0, old_blocks));
+                        entry.0 += 1;
+                        entry.1 = entry.1.max(old_blocks);
+                    }
+                }
+            }
+
             // Write blockmap entries
             for (lba, value) in *batch_values {
                 let bm_key = encode_blockmap_key(vol_id, *lba)?;
@@ -803,21 +874,16 @@ impl MetaStore {
             if let Some((_, first_val)) = batch_values.first() {
                 *new_refcounts.entry(first_val.pba).or_insert(0) += *new_refcount;
             }
-
-            // Aggregate old PBA decrements
-            for (old_pba, decrement) in *old_pba_decrements {
-                *aggregated_decrements.entry(*old_pba).or_insert(0) += decrement;
-            }
         }
 
         let mut touched_pbas = std::collections::HashSet::new();
         touched_pbas.extend(new_refcounts.keys().copied());
-        touched_pbas.extend(aggregated_decrements.keys().copied());
+        touched_pbas.extend(aggregated_decrements.keys().map(|p| *p));
 
         for pba in touched_pbas {
             let current_rc = self.get_refcount(pba)?;
             let increments = new_refcounts.get(&pba).copied().unwrap_or(0);
-            let decrements = aggregated_decrements.get(&pba).copied().unwrap_or(0);
+            let decrements = aggregated_decrements.get(&pba).map(|(d, _)| *d).unwrap_or(0);
             let final_rc = current_rc
                 .saturating_add(increments)
                 .saturating_sub(decrements);
@@ -830,7 +896,7 @@ impl MetaStore {
         }
 
         self.db.write(batch)?;
-        Ok(())
+        Ok(aggregated_decrements)
     }
 
     /// Find all unique volume IDs that have blockmap entries pointing to a given PBA.
@@ -871,6 +937,143 @@ impl MetaStore {
             }
         }
         Ok(false)
+    }
+
+    fn count_blockmap_refs_for_pba_inner(&self, target_pba: Pba) -> OnyxResult<u32> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        let mut refs = 0u32;
+        for item in iter {
+            let (_, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                if bv.pba == target_pba {
+                    refs = refs.saturating_add(1);
+                }
+            }
+        }
+        Ok(refs)
+    }
+
+    // TEMP(soak-debug): full blockmap scan used to diagnose allocator/PBA reuse
+    // corruption. Remove or gate after the root cause is fixed and soak proves
+    // stable without the extra protection.
+    /// Count live blockmap references that currently point at `target_pba`.
+    pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {
+        self.count_blockmap_refs_for_pba_inner(target_pba)
+    }
+
+    fn unique_fragments_for_pba_inner(
+        &self,
+        target_pba: Pba,
+        limit: Option<usize>,
+    ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
+        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let iter = self
+            .db
+            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
+        let mut seen = std::collections::HashSet::new();
+        let mut fragments = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            let Some(bv) = decode_blockmap_value(&value) else {
+                continue;
+            };
+            if bv.pba != target_pba {
+                continue;
+            }
+            let frag_key = (
+                bv.slot_offset,
+                bv.unit_compressed_size,
+                bv.unit_original_size,
+                bv.unit_lba_count,
+                bv.compression,
+                bv.crc32,
+                bv.flags,
+            );
+            if !seen.insert(frag_key) {
+                continue;
+            }
+            let Some((vol_id, lba)) = decode_blockmap_key(&key) else {
+                continue;
+            };
+            fragments.push((vol_id, lba, bv));
+            if limit.is_some_and(|max| fragments.len() >= max) {
+                break;
+            }
+        }
+        Ok(fragments)
+    }
+
+    // TEMP(soak-debug): exemplar collection for corruption logs. Full scan;
+    // remove or gate once the root cause is fixed.
+    /// Return exemplar live fragment mappings for a PBA.
+    pub fn unique_fragments_for_pba(
+        &self,
+        target_pba: Pba,
+        limit: usize,
+    ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
+        self.unique_fragments_for_pba_inner(target_pba, Some(limit))
+    }
+
+    // TEMP(soak-debug): shared-slot overlap detector for early corruption
+    // fail-fast. Remove or gate after root cause is fixed.
+    /// Return the first pair of distinct live fragments at a PBA whose byte
+    /// ranges overlap inside the shared 4KB slot.
+    pub fn first_fragment_overlap_at_pba(
+        &self,
+        target_pba: Pba,
+    ) -> OnyxResult<Option<((String, Lba, BlockmapValue), (String, Lba, BlockmapValue))>> {
+        let fragments = self.unique_fragments_for_pba_inner(target_pba, None)?;
+        for i in 0..fragments.len() {
+            let lhs = &fragments[i];
+            let lhs_start = lhs.2.slot_offset as u32;
+            let lhs_end = lhs_start + lhs.2.unit_compressed_size;
+            for rhs in &fragments[i + 1..] {
+                let rhs_start = rhs.2.slot_offset as u32;
+                let rhs_end = rhs_start + rhs.2.unit_compressed_size;
+                if lhs_start < rhs_end && rhs_start < lhs_end {
+                    return Ok(Some((lhs.clone(), rhs.clone())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    // TEMP(soak-debug): heavy refcount reconciliation used to keep soak runs
+    // alive while we locate the real bug. Remove or gate after the allocator /
+    // hole-map issue is fixed and verified.
+    /// Repair a single PBA's refcount from the live blockmap if it drifted.
+    ///
+    /// This is intentionally slow and only used on suspicious paths such as
+    /// "refcount says zero, but freeing this PBA would be dangerous". The
+    /// returned value is the exact live refcount observed in blockmap.
+    pub fn reconcile_refcount_for_pba(&self, pba: Pba) -> OnyxResult<u32> {
+        let _guard = self.refcount_lock.lock().unwrap();
+        let current = self.get_refcount(pba)?;
+        let actual = self.count_blockmap_refs_for_pba_inner(pba)?;
+        if current == actual {
+            return Ok(actual);
+        }
+
+        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+        let key = encode_refcount_key(pba);
+        if actual == 0 {
+            self.db.delete_cf(&cf_refcount, &key)?;
+        } else {
+            self.db
+                .put_cf(&cf_refcount, &key, &encode_refcount_value(actual))?;
+        }
+
+        tracing::error!(
+            pba = pba.0,
+            recorded_refcount = current,
+            actual_refcount = actual,
+            "reconciled refcount from live blockmap references"
+        );
+
+        Ok(actual)
     }
 
     /// Check whether the exact packed fragment described by `target` still has
@@ -1020,21 +1223,27 @@ impl MetaStore {
     }
 
     /// Atomically handle a dedup hit: write blockmap entry, increment existing PBA refcount,
-    /// and optionally decrement old PBA refcount.
+    /// and decrement old PBA refcount if applicable.
     ///
-    /// Protected by `refcount_lock` to serialize concurrent read-modify-write
-    /// on refcounts from multiple dedup workers / scanner.
+    /// The old mapping is re-read **inside** the lock to prevent stale-read races
+    /// (the caller's pre-read old_pba may have been changed by another thread).
+    ///
+    /// Returns `Some((old_pba, block_count))` if an old PBA was decremented, for cleanup.
     pub fn atomic_dedup_hit(
         &self,
         vol_id: &VolumeId,
         lba: Lba,
         new_value: &BlockmapValue,
-        old_pba: Option<Pba>,
-    ) -> OnyxResult<()> {
+    ) -> OnyxResult<Option<(Pba, u32)>> {
         let _guard = self.refcount_lock.lock().unwrap();
 
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
+
+        // Re-read current mapping inside the lock for accuracy.
+        let old_mapping = self.get_mapping(vol_id, lba)?;
+        let old_pba = old_mapping.as_ref().map(|m| m.pba);
+        let same_pba = old_pba.map_or(false, |old| old == new_value.pba);
 
         let mut batch = WriteBatch::default();
 
@@ -1043,7 +1252,7 @@ impl MetaStore {
         let bm_val = encode_blockmap_value(new_value);
         batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
 
-        let same_pba = old_pba.map_or(false, |old| old == new_value.pba);
+        let mut decremented_old: Option<(Pba, u32)> = None;
 
         if !same_pba {
             // Increment refcount for existing PBA (read + put inside lock)
@@ -1053,21 +1262,23 @@ impl MetaStore {
             batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
 
             // Decrement old PBA refcount (read + put/delete inside lock)
-            if let Some(old) = old_pba {
-                let old_count = self.get_refcount(old)?;
+            if let Some(old) = &old_mapping {
+                let old_count = self.get_refcount(old.pba)?;
                 let old_new = old_count.saturating_sub(1);
-                let old_rc_key = encode_refcount_key(old);
+                let old_rc_key = encode_refcount_key(old.pba);
                 if old_new == 0 {
                     batch.delete_cf(&cf_refcount, &old_rc_key);
                 } else {
                     batch.put_cf(&cf_refcount, &old_rc_key, &encode_refcount_value(old_new));
                 }
+                let old_blocks = old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                decremented_old = Some((old.pba, old_blocks));
             }
         }
         // If same PBA: blockmap is refreshed but refcount stays unchanged
 
         self.db.write(batch)?;
-        Ok(())
+        Ok(decremented_old)
     }
 
     // --- Dedup operations ---

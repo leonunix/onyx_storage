@@ -204,6 +204,57 @@ fn atomic_write_mapping() {
 }
 
 #[test]
+fn reconcile_refcount_repairs_blockmap_undercount() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol_id = VolumeId("test-vol".into());
+    let pba = Pba(77);
+
+    let batch_values = vec![
+        (
+            Lba(0),
+            BlockmapValue {
+                pba,
+                compression: 1,
+                unit_compressed_size: 2000,
+                unit_original_size: 8192,
+                unit_lba_count: 2,
+                offset_in_unit: 0,
+                crc32: 0x1111_2222,
+                slot_offset: 0,
+                flags: 0,
+            },
+        ),
+        (
+            Lba(1),
+            BlockmapValue {
+                pba,
+                compression: 1,
+                unit_compressed_size: 2000,
+                unit_original_size: 8192,
+                unit_lba_count: 2,
+                offset_in_unit: 1,
+                crc32: 0x1111_2222,
+                slot_offset: 0,
+                flags: 0,
+            },
+        ),
+    ];
+
+    store
+        .atomic_batch_write(&vol_id, &batch_values, 2)
+        .unwrap();
+    assert_eq!(store.get_refcount(pba).unwrap(), 2);
+
+    store.set_refcount(pba, 1).unwrap();
+    assert_eq!(store.count_blockmap_refs_for_pba(pba).unwrap(), 2);
+
+    let repaired = store.reconcile_refcount_for_pba(pba).unwrap();
+    assert_eq!(repaired, 2);
+    assert_eq!(store.get_refcount(pba).unwrap(), 2);
+}
+
+#[test]
 fn atomic_remap() {
     let dir = tempdir().unwrap();
     let store = MetaStore::open(&test_config(dir.path())).unwrap();
@@ -676,8 +727,7 @@ fn atomic_batch_write_multi_single_unit() {
             },
         ),
     ];
-    let decrements = std::collections::HashMap::new();
-    let units = vec![(&vol_id, batch_values.as_slice(), 2u32, &decrements)];
+    let units = vec![(&vol_id, batch_values.as_slice(), 2u32)];
 
     store.atomic_batch_write_multi(&units).unwrap();
 
@@ -724,11 +774,9 @@ fn atomic_batch_write_multi_two_units_different_pbas() {
             flags: 0,
         },
     )];
-    let empty_dec = std::collections::HashMap::new();
-
     let units = vec![
-        (&vol_a, batch_a.as_slice(), 1u32, &empty_dec),
-        (&vol_b, batch_b.as_slice(), 1u32, &empty_dec),
+        (&vol_a, batch_a.as_slice(), 1u32),
+        (&vol_b, batch_b.as_slice(), 1u32),
     ];
     store.atomic_batch_write_multi(&units).unwrap();
 
@@ -765,13 +813,13 @@ fn atomic_batch_write_multi_with_decrements() {
             flags: 0,
         },
     )];
-    let empty_dec = std::collections::HashMap::new();
     store
-        .atomic_batch_write(&vol_id, &initial, 3, &empty_dec)
+        .atomic_batch_write(&vol_id, &initial, 3)
         .unwrap();
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
 
-    // Overwrite with new PBA 60, decrementing old PBA 50 by 1
+    // Overwrite Lba(0) with new PBA 60; function internally reads old mapping (PBA 50)
+    // and decrements it by 1
     let new_batch = vec![(
         Lba(0),
         BlockmapValue {
@@ -786,10 +834,8 @@ fn atomic_batch_write_multi_with_decrements() {
             flags: 0,
         },
     )];
-    let mut decrements = std::collections::HashMap::new();
-    decrements.insert(Pba(50), 1u32);
 
-    let units = vec![(&vol_id, new_batch.as_slice(), 1u32, &decrements)];
+    let units = vec![(&vol_id, new_batch.as_slice(), 1u32)];
     store.atomic_batch_write_multi(&units).unwrap();
 
     assert_eq!(
@@ -806,27 +852,27 @@ fn atomic_batch_write_multi_aggregates_decrements_across_units() {
     let store = MetaStore::open(&test_config(dir.path())).unwrap();
     let vol_id = VolumeId("test-vol".into());
 
-    // Set up: PBA 50 has refcount 5
-    let initial = vec![(
-        Lba(0),
-        BlockmapValue {
-            pba: Pba(50),
-            compression: 0,
-            unit_compressed_size: 4096,
-            unit_original_size: 4096,
-            unit_lba_count: 1,
-            offset_in_unit: 0,
-            crc32: 0,
-            slot_offset: 0,
-            flags: 0,
-        },
-    )];
-    let empty = std::collections::HashMap::new();
+    // Set up: Lba(0), Lba(10), Lba(20) all map to PBA 50 with refcount 3
+    let bv50 = BlockmapValue {
+        pba: Pba(50),
+        compression: 0,
+        unit_compressed_size: 4096,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0,
+        slot_offset: 0,
+        flags: 0,
+    };
+    let initial = vec![(Lba(0), bv50), (Lba(10), bv50), (Lba(20), bv50)];
     store
-        .atomic_batch_write(&vol_id, &initial, 5, &empty)
+        .atomic_batch_write(&vol_id, &initial, 3)
         .unwrap();
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
 
-    // Two units both decrement PBA 50: unit A by 2, unit B by 1 → total -3
+    // Two units overwrite Lba(10) and Lba(20) to new PBAs.
+    // The function internally reads old mappings (PBA 50) for each LBA
+    // and decrements PBA 50 by 1 per LBA → total -2
     let batch_a = vec![(
         Lba(10),
         BlockmapValue {
@@ -855,18 +901,14 @@ fn atomic_batch_write_multi_aggregates_decrements_across_units() {
             flags: 0,
         },
     )];
-    let mut dec_a = std::collections::HashMap::new();
-    dec_a.insert(Pba(50), 2u32);
-    let mut dec_b = std::collections::HashMap::new();
-    dec_b.insert(Pba(50), 1u32);
 
     let units = vec![
-        (&vol_id, batch_a.as_slice(), 1u32, &dec_a),
-        (&vol_id, batch_b.as_slice(), 1u32, &dec_b),
+        (&vol_id, batch_a.as_slice(), 1u32),
+        (&vol_id, batch_b.as_slice(), 1u32),
     ];
     store.atomic_batch_write_multi(&units).unwrap();
 
-    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 2); // 5 - 2 - 1 = 2
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 1); // 3 - 1 - 1 = 1
     assert_eq!(store.get_refcount(Pba(70)).unwrap(), 1);
     assert_eq!(store.get_refcount(Pba(80)).unwrap(), 1);
 }

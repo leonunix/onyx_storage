@@ -7,6 +7,7 @@ use onyx_storage::buffer::flush::{
     install_test_failpoint, BufferFlusher, FlushFailStage,
 };
 use onyx_storage::buffer::pool::WriteBufferPool;
+use onyx_storage::compress::codec::create_compressor;
 use onyx_storage::config::FlushConfig;
 use onyx_storage::dedup::config::DedupConfig;
 use onyx_storage::dedup::scanner::DedupScanner;
@@ -179,6 +180,27 @@ fn start_scanner(
         allocator.clone(),
         lifecycle.clone(),
         pool.clone(),
+        config,
+    )
+}
+
+fn start_scanner_with_hole_map(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+    hole_map: HoleMap,
+    config: DedupConfig,
+) -> DedupScanner {
+    DedupScanner::start_with_metrics(
+        Arc::new(onyx_storage::metrics::EngineMetrics::default()),
+        meta.clone(),
+        io_engine.clone(),
+        allocator.clone(),
+        lifecycle.clone(),
+        pool.clone(),
+        hole_map,
         config,
     )
 }
@@ -1260,6 +1282,114 @@ fn dedup_skipped_hole_fill_is_rescanned() {
         "scanner should rescan skipped hole-fill writes and register dedup metadata"
     );
     scanner.stop();
+}
+
+#[test]
+fn dedup_scanner_free_purges_holes_for_released_pba() {
+    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
+    let hole_map = new_hole_map();
+    register_volume_with(&meta, "live", CompressionAlgo::None, 100);
+    register_volume_with(&meta, "skip", CompressionAlgo::Lz4, 200);
+
+    let block = vec![0x5A; BLOCK_SIZE as usize];
+    let hash: ContentHash = *blake3::hash(&block).as_bytes();
+
+    let live_pba = allocator.allocate_one().unwrap();
+    io_engine.write_blocks(live_pba, &block).unwrap();
+    let live_mapping = BlockmapValue {
+        pba: live_pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&block),
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.atomic_write_mapping(&VolumeId("live".into()), Lba(0), &live_mapping)
+        .unwrap();
+    meta.put_dedup_entries(&[(
+        hash,
+        DedupEntry {
+            pba: live_pba,
+            slot_offset: 0,
+            compression: 0,
+            unit_compressed_size: BLOCK_SIZE,
+            unit_original_size: BLOCK_SIZE,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: live_mapping.crc32,
+        },
+    )])
+    .unwrap();
+
+    let old_pba = allocator.allocate_one().unwrap();
+    let compressor = create_compressor(CompressionAlgo::Lz4);
+    let mut buf = vec![0u8; compressor.max_compressed_size(block.len())];
+    let compressed_len = compressor.compress(&block, &mut buf).unwrap();
+    let compressed = buf[..compressed_len].to_vec();
+    let crc = crc32fast::hash(&compressed);
+    let slot_offset = 512u16;
+    let mut slot = vec![0u8; BLOCK_SIZE as usize];
+    slot[slot_offset as usize..slot_offset as usize + compressed.len()]
+        .copy_from_slice(&compressed);
+    io_engine.write_blocks(old_pba, &slot).unwrap();
+    meta.put_mapping(
+        &VolumeId("skip".into()),
+        Lba(0),
+        &BlockmapValue {
+            pba: old_pba,
+            compression: 1,
+            unit_compressed_size: compressed.len() as u32,
+            unit_original_size: BLOCK_SIZE,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: crc,
+            slot_offset,
+            flags: FLAG_DEDUP_SKIPPED,
+        },
+    )
+    .unwrap();
+    meta.set_refcount(old_pba, 1).unwrap();
+
+    hole_map.lock().unwrap().insert(
+        HoleKey {
+            pba: old_pba,
+            offset: 0,
+        },
+        slot_offset,
+    );
+    assert!(
+        hole_map.lock().unwrap().keys().any(|k| k.pba == old_pba),
+        "fixture must install a stale hole for the soon-to-be-freed PBA"
+    );
+
+    let mut scanner = start_scanner_with_hole_map(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        hole_map.clone(),
+        dedup_scanner_config(90),
+    );
+    assert!(
+        wait_until(3000, || {
+            meta.get_mapping(&VolumeId("skip".into()), Lba(0))
+                .unwrap()
+                .map(|m| m.pba == live_pba && m.flags == 0)
+                .unwrap_or(false)
+        }),
+        "scanner should remap skipped block to existing live dedup target"
+    );
+    scanner.stop();
+
+    assert_eq!(meta.get_refcount(old_pba).unwrap(), 0);
+    assert!(
+        !hole_map.lock().unwrap().keys().any(|k| k.pba == old_pba),
+        "scanner cleanup must purge stale holes for a fully freed PBA"
+    );
 }
 
 #[test]

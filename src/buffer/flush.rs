@@ -425,6 +425,88 @@ impl BufferFlusher {
         crate::packer::packer::remove_holes_for_extent(hole_map, start, count);
     }
 
+    // TEMP(soak-debug): heavy protective guard. It rescans metadata only when a
+    // refcount says zero. Remove or gate after the underlying PBA reuse bug is
+    // fixed and soak remains stable.
+    fn live_refcount_with_reconcile(
+        meta: &MetaStore,
+        pba: Pba,
+        context: &'static str,
+    ) -> OnyxResult<u32> {
+        let remaining = meta.get_refcount(pba)?;
+        if remaining != 0 {
+            return Ok(remaining);
+        }
+        let reconciled = meta.reconcile_refcount_for_pba(pba)?;
+        if reconciled != 0 {
+            tracing::error!(
+                pba = pba.0,
+                reconciled_refcount = reconciled,
+                context,
+                "detected refcount drift while preparing to free or inspect a PBA"
+            );
+        }
+        Ok(reconciled)
+    }
+
+    // TEMP(soak-debug): early fail-fast for "allocator handed out a live PBA".
+    // This is for root-cause capture, not a permanent hot-path check.
+    fn fail_if_fresh_pba_is_live(
+        meta: &MetaStore,
+        pba: Pba,
+        context: &'static str,
+    ) -> OnyxResult<()> {
+        let live_refs = meta.count_blockmap_refs_for_pba(pba)?;
+        if live_refs == 0 {
+            return Ok(());
+        }
+        let fragments = meta.unique_fragments_for_pba(pba, 4)?;
+        tracing::error!(
+            pba = pba.0,
+            live_refs,
+            samples = ?fragments
+                .iter()
+                .map(|(vol, lba, bv)| format!(
+                    "{}:{}@off{} size{} crc={:#x}",
+                    vol, lba.0, bv.slot_offset, bv.unit_compressed_size, bv.crc32
+                ))
+                .collect::<Vec<_>>(),
+            context,
+            "allocator returned a PBA that still has live blockmap references"
+        );
+        Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
+            "fresh pba {pba:?} is still live in metadata ({context})"
+        ))))
+    }
+
+    // TEMP(soak-debug): early fail-fast for overlapping live fragments inside a
+    // shared packed slot. Remove or gate after the root cause is fixed.
+    fn fail_if_pba_has_fragment_overlap(
+        meta: &MetaStore,
+        pba: Pba,
+        context: &'static str,
+    ) -> OnyxResult<()> {
+        let Some((lhs, rhs)) = meta.first_fragment_overlap_at_pba(pba)? else {
+            return Ok(());
+        };
+        tracing::error!(
+            pba = pba.0,
+            lhs = ?format!(
+                "{}:{} off{} size{} crc={:#x}",
+                lhs.0, lhs.1.0, lhs.2.slot_offset, lhs.2.unit_compressed_size, lhs.2.crc32
+            ),
+            rhs = ?format!(
+                "{}:{} off{} size{} crc={:#x}",
+                rhs.0, rhs.1.0, rhs.2.slot_offset, rhs.2.unit_compressed_size, rhs.2.crc32
+            ),
+            context,
+            "detected overlapping live fragments at a shared PBA"
+        );
+        Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
+            "overlapping live fragments detected at {pba:?} ({context})"
+        ))))
+    }
+
     fn hole_fill_lock(pba: Pba) -> Arc<Mutex<()>> {
         let mut locks = hole_fill_locks().lock().unwrap();
         locks
@@ -971,28 +1053,28 @@ impl BufferFlusher {
 
                             maybe_inject_dedup_hit_failure(vol_id_str, lba)?;
 
-                            let old_mapping = meta.get_mapping(&vol_id, lba)?;
-                            meta.atomic_dedup_hit(
+                            // atomic_dedup_hit re-reads old mapping inside the lock
+                            let decremented = meta.atomic_dedup_hit(
                                 &vol_id,
                                 lba,
                                 existing_value,
-                                old_mapping.as_ref().map(|m| m.pba),
                             )?;
 
                             // Free old PBA if refcount dropped to 0
-                            if let Some(old) = old_mapping {
-                                if old.pba != existing_value.pba {
-                                    let remaining = meta.get_refcount(old.pba)?;
-                                    if remaining == 0 {
-                                        meta.cleanup_dedup_for_pba_standalone(old.pba)?;
-                                        let blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE);
-                                        if blocks <= 1 {
-                                            Self::purge_holes_for_pba(hole_map, old.pba);
-                                            allocator.free_one(old.pba)?;
-                                        } else {
-                                            Self::purge_holes_for_extent(hole_map, old.pba, blocks);
-                                            allocator.free_extent(Extent::new(old.pba, blocks))?;
-                                        }
+                            if let Some((old_pba, old_blocks)) = decremented {
+                                let remaining = Self::live_refcount_with_reconcile(
+                                    meta,
+                                    old_pba,
+                                    "dedup_worker_hit_cleanup",
+                                )?;
+                                if remaining == 0 {
+                                    meta.cleanup_dedup_for_pba_standalone(old_pba)?;
+                                    if old_blocks <= 1 {
+                                        Self::purge_holes_for_pba(hole_map, old_pba);
+                                        allocator.free_one(old_pba)?;
+                                    } else {
+                                        Self::purge_holes_for_extent(hole_map, old_pba, old_blocks);
+                                        allocator.free_extent(Extent::new(old_pba, old_blocks))?;
                                     }
                                 }
                             }
@@ -1699,6 +1781,11 @@ impl BufferFlusher {
             };
             Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
             let pba = allocation.start_pba();
+            if let Err(e) = Self::fail_if_fresh_pba_is_live(meta, pba, "write_unit_pre_io") {
+                allocation.free(allocator)?;
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                return Err(e);
+            }
 
             let io_start = Instant::now();
             if let Err(e) = maybe_inject_test_failure(
@@ -1736,11 +1823,11 @@ impl BufferFlusher {
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Ok(());
             }
-            let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
             // Per-fragment tracking for hole detection: (pba, slot_offset) → (decrement, unit_lba_count, compressed_size)
             let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
 
-            // Batch read old mappings via multi_get
+            // Batch read old mappings for hole detection (stale reads are safe here;
+            // refcount decrements are re-computed inside the lock by atomic_batch_write).
             let lbas: Vec<Lba> = live_positions
                 .iter()
                 .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
@@ -1750,10 +1837,6 @@ impl BufferFlusher {
             let mut batch_values = Vec::with_capacity(live_positions.len());
             for (i, old) in old_mappings.into_iter().enumerate() {
                 if let Some(old) = old {
-                    let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
-                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
-                    entry.0 += 1;
-                    entry.1 = entry.1.max(old_blocks);
                     record_old_fragment_ref(&mut old_frag_meta, old);
                 }
                 let flags = if unit.dedup_skipped {
@@ -1777,11 +1860,6 @@ impl BufferFlusher {
                 ));
             }
 
-            let old_pba_decrements: HashMap<Pba, u32> = old_pba_meta
-                .iter()
-                .map(|(old_pba, (decrement, _))| (*old_pba, *decrement))
-                .collect();
-
             if let Err(e) = maybe_inject_test_failure(
                 &unit.vol_id,
                 unit.start_lba,
@@ -1793,22 +1871,25 @@ impl BufferFlusher {
                 return Err(e);
             }
 
-            if let Err(e) = meta.atomic_batch_write(
+            let actual_old_pba_meta = match meta.atomic_batch_write(
                 &vol_id,
                 &batch_values,
                 live_positions.len() as u32,
-                &old_pba_decrements,
             ) {
-                allocation.free(allocator)?;
-                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                return Err(e);
-            }
+                Ok(m) => m,
+                Err(e) => {
+                    allocation.free(allocator)?;
+                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                    return Err(e);
+                }
+            };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
             let cleanup_start = Instant::now();
-            for (old_pba, (_, old_blocks)) in &old_pba_meta {
-                let remaining = meta.get_refcount(*old_pba)?;
+            for (old_pba, (_, old_blocks)) in &actual_old_pba_meta {
+                let remaining =
+                    Self::live_refcount_with_reconcile(meta, *old_pba, "write_unit_cleanup")?;
                 if remaining == 0 {
                     // Clean up dedup index entries for freed PBA
                     meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
@@ -1984,6 +2065,22 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
+        for i in 0..n {
+            if skip[i] {
+                continue;
+            }
+            let pba = pbas[i].unwrap();
+            if let Err(e) = Self::fail_if_fresh_pba_is_live(meta, pba, "write_units_batch_pre_io") {
+                if alloc_blocks[i] == 1 {
+                    let _ = allocator.free_one(pba);
+                } else {
+                    let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
+                }
+                results[i] = Err(e);
+                skip[i] = true;
+            }
+        }
+
         // Phase 3: Parallel IO writes (one scoped thread per unit for NVMe QD > 1).
         let io_start = Instant::now();
         {
@@ -2036,12 +2133,11 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
-        // Phase 4: Batch multi_get old mappings.
+        // Phase 4: Batch multi_get old mappings (for hole detection only;
+        // refcount decrements are re-computed inside the lock by atomic_batch_write_multi).
         let meta_start = Instant::now();
-        // Per-unit: (batch_values, old_pba_meta, old_frag_meta)
         struct UnitMeta {
             batch_values: Vec<(Lba, BlockmapValue)>,
-            old_pba_meta: HashMap<Pba, (u32, u32)>,
             old_frag_meta: HashMap<(Pba, u16), OldFragmentRef>,
             live_positions: Vec<usize>,
         }
@@ -2070,7 +2166,6 @@ impl BufferFlusher {
             if live_positions.is_empty() {
                 unit_metas[i] = Some(UnitMeta {
                     batch_values: Vec::new(),
-                    old_pba_meta: HashMap::new(),
                     old_frag_meta: HashMap::new(),
                     live_positions,
                 });
@@ -2095,16 +2190,11 @@ impl BufferFlusher {
                 }
             };
 
-            let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
             let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
             let mut batch_values = Vec::with_capacity(live_positions.len());
 
             for (j, old) in old_mappings.into_iter().enumerate() {
                 if let Some(old) = old {
-                    let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
-                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
-                    entry.0 += 1;
-                    entry.1 = entry.1.max(old_blocks);
                     record_old_fragment_ref(&mut old_frag_meta, old);
                 }
                 let flags = if unit.dedup_skipped {
@@ -2129,95 +2219,109 @@ impl BufferFlusher {
             }
             unit_metas[i] = Some(UnitMeta {
                 batch_values,
-                old_pba_meta,
                 old_frag_meta,
                 live_positions,
             });
         }
 
         // Phase 5: ONE combined WriteBatch for all units.
+        // old PBA decrements are computed inside the lock by atomic_batch_write_multi.
         let mut vol_ids_owned: Vec<VolumeId> = Vec::new();
-        let mut decrements_owned: Vec<HashMap<Pba, u32>> = Vec::new();
-        let mut meta_indices: Vec<usize> = Vec::new(); // which units go into the batch
+        let mut meta_indices: Vec<usize> = Vec::new();
 
         for (i, unit) in units.iter().enumerate() {
             if skip[i] || unit_metas[i].is_none() {
                 continue;
             }
             vol_ids_owned.push(VolumeId(unit.vol_id.clone()));
-            let um = unit_metas[i].as_ref().unwrap();
-            decrements_owned.push(
-                um.old_pba_meta
-                    .iter()
-                    .map(|(old_pba, (dec, _))| (*old_pba, *dec))
-                    .collect(),
-            );
             meta_indices.push(i);
         }
 
-        if !meta_indices.is_empty() {
-            let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32, &HashMap<Pba, u32>)> =
-                meta_indices
-                    .iter()
-                    .enumerate()
-                    .map(|(batch_idx, &unit_idx)| {
-                        let um = unit_metas[unit_idx].as_ref().unwrap();
-                        (
-                            &vol_ids_owned[batch_idx],
-                            um.batch_values.as_slice(),
-                            um.live_positions.len() as u32,
-                            &decrements_owned[batch_idx],
-                        )
-                    })
-                    .collect();
+        // actual_old_pba_meta: returned by atomic_batch_write_multi with accurate data
+        let mut actual_old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
 
-            if let Err(e) = meta.atomic_batch_write_multi(&batch_args) {
-                // Entire batch failed — rollback all allocations.
-                for &unit_idx in &meta_indices {
-                    let pba = pbas[unit_idx].unwrap();
-                    if alloc_blocks[unit_idx] == 1 {
-                        let _ = allocator.free_one(pba);
-                    } else {
-                        let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
+        if !meta_indices.is_empty() {
+            let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = meta_indices
+                .iter()
+                .enumerate()
+                .map(|(batch_idx, &unit_idx)| {
+                    let um = unit_metas[unit_idx].as_ref().unwrap();
+                    (
+                        &vol_ids_owned[batch_idx],
+                        um.batch_values.as_slice(),
+                        um.live_positions.len() as u32,
+                    )
+                })
+                .collect();
+
+            match meta.atomic_batch_write_multi(&batch_args) {
+                Ok(returned) => {
+                    actual_old_pba_meta = returned;
+                }
+                Err(e) => {
+                    // Entire batch failed — rollback all allocations.
+                    for &unit_idx in &meta_indices {
+                        let pba = pbas[unit_idx].unwrap();
+                        if alloc_blocks[unit_idx] == 1 {
+                            let _ = allocator.free_one(pba);
+                        } else {
+                            let _ =
+                                allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
+                        }
+                        results[unit_idx] =
+                            Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
+                                "batch write failed: {e}",
+                            ))));
+                        skip[unit_idx] = true;
                     }
-                    results[unit_idx] = Err(crate::error::OnyxError::Io(std::io::Error::other(
-                        format!("batch write failed: {e}"),
-                    )));
-                    skip[unit_idx] = true;
                 }
             }
         }
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Phase 6: Cleanup (free old PBAs) + dedup index + hole detection.
-        // Collect all old PBAs across units, batch-read refcounts, batch-cleanup dedup.
+        // Use actual_old_pba_meta returned by atomic_batch_write_multi (fresh data).
         let cleanup_start = Instant::now();
 
-        // Collect all unique old PBAs with their block counts.
-        let mut all_old_pbas: HashMap<Pba, u32> = HashMap::new();
-        for &unit_idx in &meta_indices {
-            if skip[unit_idx] {
-                continue;
-            }
-            let um = unit_metas[unit_idx].as_ref().unwrap();
-            for (old_pba, (_, old_blocks)) in &um.old_pba_meta {
-                all_old_pbas
-                    .entry(*old_pba)
-                    .and_modify(|blocks| *blocks = (*blocks).max(*old_blocks))
-                    .or_insert(*old_blocks);
-            }
-        }
-
-        // Batch-read refcounts for all old PBAs.
-        let old_pba_keys: Vec<Pba> = all_old_pbas.keys().copied().collect();
+        // Batch-read refcounts for old PBAs returned by atomic_batch_write_multi.
+        let old_pba_keys: Vec<Pba> = actual_old_pba_meta.keys().copied().collect();
         let refcounts = meta.multi_get_refcounts(&old_pba_keys).unwrap_or_default();
         let mut dead_pbas: Vec<Pba> = Vec::new();
         let mut dead_allocations: Vec<(Pba, u32)> = Vec::new();
         for (i, old_pba) in old_pba_keys.iter().enumerate() {
             let remaining = refcounts.get(i).copied().unwrap_or(0);
-            if remaining == 0 {
+            let confirmed = if remaining == 0 {
+                match meta.reconcile_refcount_for_pba(*old_pba) {
+                    Ok(actual) => {
+                        if actual != 0 {
+                            tracing::error!(
+                                pba = old_pba.0,
+                                reconciled_refcount = actual,
+                                context = "write_units_batch_cleanup",
+                                "detected refcount drift while preparing batched free"
+                            );
+                        }
+                        actual
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            pba = old_pba.0,
+                            "writer: failed to reconcile zero refcount before free"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                remaining
+            };
+            if confirmed == 0 {
+                let block_count = actual_old_pba_meta
+                    .get(old_pba)
+                    .map(|(_, bc)| *bc)
+                    .unwrap_or(1);
                 dead_pbas.push(*old_pba);
-                dead_allocations.push((*old_pba, *all_old_pbas.get(old_pba).unwrap()));
+                dead_allocations.push((*old_pba, block_count));
             }
         }
 
@@ -2348,9 +2452,9 @@ impl BufferFlusher {
 
         // Under lifecycle read locks: check generation, build batch, IO, commit
 
-        // Build blockmap entries and collect old PBA decrements across all fragments
+        // Build blockmap entries; old mapping reads are for hole detection only
+        // (refcount decrements are re-computed inside the lock by atomic_batch_write_packed).
         let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
-        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
         let mut total_refcount: u32 = 0;
         let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
@@ -2387,7 +2491,7 @@ impl BufferFlusher {
                 continue;
             }
 
-            // Batch read old mappings via multi_get
+            // Batch read old mappings for hole detection (stale reads safe here)
             let frag_lbas: Vec<Lba> = live_positions
                 .iter()
                 .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
@@ -2396,10 +2500,6 @@ impl BufferFlusher {
 
             for (i, old) in old_mappings.into_iter().enumerate() {
                 if let Some(old) = old {
-                    let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
-                    let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
-                    entry.0 += 1;
-                    entry.1 = entry.1.max(old_blocks);
                     record_old_fragment_ref(&mut old_frag_meta, old);
                 }
                 let flags = if unit.dedup_skipped {
@@ -2434,6 +2534,7 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Ok(());
         }
+        Self::fail_if_fresh_pba_is_live(meta, sealed.pba, "write_packed_slot_pre_io")?;
 
         let io_start = Instant::now();
         if let Err(e) =
@@ -2455,10 +2556,6 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
         let meta_start = Instant::now();
-        let old_pba_decrements: HashMap<Pba, u32> = old_pba_meta
-            .iter()
-            .map(|(old_pba, (decrement, _))| (*old_pba, *decrement))
-            .collect();
 
         if let Err(e) =
             maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)
@@ -2470,24 +2567,27 @@ impl BufferFlusher {
         }
         maybe_pause_before_packed_meta_write(&sealed.fragments)?;
 
-        // Metadata commit — if this fails, free the PBA to prevent orphaned block
-        if let Err(e) = meta.atomic_batch_write_packed(
+        // Metadata commit — old PBA decrements re-computed inside the lock
+        let actual_old_pba_meta = match meta.atomic_batch_write_packed(
             &batch_values,
             sealed.pba,
             total_refcount,
-            &old_pba_decrements,
         ) {
-            allocator.free_one(sealed.pba)?;
-            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-            return Err(e);
-        }
+            Ok(m) => m,
+            Err(e) => {
+                allocator.free_one(sealed.pba)?;
+                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                return Err(e);
+            }
+        };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
-        // Free old PBAs whose refcount dropped to 0
+        // Free old PBAs whose refcount dropped to 0 (using fresh data from lock)
         let cleanup_start = Instant::now();
-        for (old_pba, (_, old_blocks)) in &old_pba_meta {
-            let remaining = meta.get_refcount(*old_pba)?;
+        for (old_pba, (_, old_blocks)) in &actual_old_pba_meta {
+            let remaining =
+                Self::live_refcount_with_reconcile(meta, *old_pba, "write_packed_slot_cleanup")?;
             if remaining == 0 {
                 meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
                 if *old_blocks == 1 {
@@ -2587,7 +2687,7 @@ impl BufferFlusher {
             }
 
             // Check PBA still has other live fragments (not entirely freed)
-            let remaining = meta.get_refcount(old_pba)?;
+            let remaining = Self::live_refcount_with_reconcile(meta, old_pba, "detect_holes")?;
             if remaining == 0 {
                 continue; // PBA is freed, no hole to track
             }
@@ -2656,6 +2756,7 @@ impl BufferFlusher {
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
         let pba_lock = Self::hole_fill_lock(fill.pba);
         let _pba_guard = pba_lock.lock().unwrap();
+        Self::fail_if_pba_has_fragment_overlap(meta, fill.pba, "write_hole_fill_precheck")?;
 
         // Generation check for the writing volume
         let should_discard = match meta.get_volume(&vol_id)? {
@@ -2711,10 +2812,9 @@ impl BufferFlusher {
         io_engine.write_blocks(fill.pba, &slot_data)?;
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
-        // Collect old PBA decrements
+        // Read old mappings for hole detection (stale reads safe here;
+        // refcount decrements are re-computed inside the lock by atomic_batch_write_hole_fill).
         let meta_start = Instant::now();
-        let mut old_pba_decrements: HashMap<Pba, u32> = HashMap::new();
-        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut old_frag_meta: HashMap<(Pba, u16), OldFragmentRef> = HashMap::new();
 
         let live_positions = Self::live_positions_for_unit(unit, pool)?;
@@ -2736,10 +2836,6 @@ impl BufferFlusher {
         for &pos in &live_positions {
             let lba = Lba(unit.start_lba.0 + pos as u64);
             if let Some(old) = meta.get_mapping(&vol_id, lba)? {
-                let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE) as u32;
-                let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
-                entry.0 += 1;
-                entry.1 = entry.1.max(old_blocks);
                 record_old_fragment_ref(&mut old_frag_meta, old);
             }
             let flags = if unit.dedup_skipped {
@@ -2763,33 +2859,21 @@ impl BufferFlusher {
             ));
         }
 
-        // Separate self-referencing decrements (old_pba == fill.pba) from external.
-        // atomic_batch_write SETs the new PBA's refcount, then DECREMENTS old PBAs.
-        // If old_pba == fill.pba, both target the same key and the last write wins.
-        // Fix: fold self-decrements into the new_rc calculation.
-        let mut self_decrement: u32 = 0;
-        for (old_pba, (decrement, _)) in &old_pba_meta {
-            if *old_pba == fill.pba {
-                self_decrement += decrement;
-            } else {
-                old_pba_decrements.insert(*old_pba, *decrement);
-            }
-        }
-
-        let net_increment = live_positions.len() as u32 - self_decrement;
-        meta.atomic_batch_write_hole_fill(
+        // Self-referencing decrements (old_pba == fill.pba) and external decrements
+        // are now computed inside the lock by atomic_batch_write_hole_fill.
+        let actual_old_pba_meta = meta.atomic_batch_write_hole_fill(
             &vol_id,
             &batch_values,
             fill.pba,
-            net_increment,
-            &old_pba_decrements,
+            live_positions.len() as u32,
         )?;
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
-        // Free old PBAs whose refcount dropped to 0
+        // Free old PBAs whose refcount dropped to 0 (using fresh data from lock)
         let cleanup_start = Instant::now();
-        for (old_pba, (_, old_blocks)) in &old_pba_meta {
-            let remaining = meta.get_refcount(*old_pba)?;
+        for (old_pba, (_, old_blocks)) in &actual_old_pba_meta {
+            let remaining =
+                Self::live_refcount_with_reconcile(meta, *old_pba, "write_hole_fill_cleanup")?;
             if remaining == 0 {
                 meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
                 if *old_blocks == 1 {

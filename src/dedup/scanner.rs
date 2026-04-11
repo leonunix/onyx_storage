@@ -14,6 +14,7 @@ use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::*;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
+use crate::packer::packer::HoleMap;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{VolumeId, BLOCK_SIZE};
@@ -41,10 +42,15 @@ impl DedupScanner {
             allocator,
             lifecycle,
             buffer_pool,
+            crate::packer::packer::new_hole_map(),
             config,
         )
     }
 
+    // TEMP(soak-debug/root-cause-fix): scanner now shares the writer's hole map
+    // so freeing a packed-slot PBA also purges stale holes. Keep this behavior,
+    // but once the bug is fully understood we can re-evaluate whether any extra
+    // logging around this path should be removed.
     pub fn start_with_metrics(
         metrics: Arc<EngineMetrics>,
         meta: Arc<MetaStore>,
@@ -52,6 +58,7 @@ impl DedupScanner {
         allocator: Arc<SpaceAllocator>,
         lifecycle: Arc<VolumeLifecycleManager>,
         buffer_pool: Arc<WriteBufferPool>,
+        hole_map: HoleMap,
         config: DedupConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -69,6 +76,7 @@ impl DedupScanner {
                     &allocator,
                     &lifecycle,
                     &buffer_pool,
+                    &hole_map,
                     &config_clone,
                     &running_clone,
                 );
@@ -95,6 +103,7 @@ impl DedupScanner {
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         buffer_pool: &WriteBufferPool,
+        hole_map: &HoleMap,
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
@@ -120,6 +129,7 @@ impl DedupScanner {
                 io_engine,
                 allocator,
                 lifecycle,
+                hole_map,
                 cfg.max_rescan_per_cycle,
             ) {
                 Ok(stats) => {
@@ -154,6 +164,7 @@ impl DedupScanner {
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
+        hole_map: &HoleMap,
         max_per_cycle: usize,
     ) -> OnyxResult<RescanStats> {
         let skipped = meta.scan_dedup_skipped(max_per_cycle)?;
@@ -246,18 +257,39 @@ impl DedupScanner {
                             flags: 0, // Clear DEDUP_SKIPPED
                             ..existing.to_blockmap_value()
                         };
-                        meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, Some(current.pba))?;
+                        // atomic_dedup_hit re-reads old mapping inside the lock
+                        let decremented = meta.atomic_dedup_hit(&vol_id, *lba, &new_bv)?;
 
-                        // Check if old PBA refcount dropped to 0
-                        let remaining = meta.get_refcount(current.pba)?;
-                        if remaining == 0 {
-                            // Clean up dedup entries for old PBA
-                            meta.cleanup_dedup_for_pba_standalone(current.pba)?;
-                            let blocks = current.unit_compressed_size.div_ceil(BLOCK_SIZE);
-                            if blocks <= 1 {
-                                allocator.free_one(current.pba)?;
+                        // Free old PBA if refcount dropped to 0
+                        if let Some((old_pba, old_blocks)) = decremented {
+                            let current_refcount = meta.get_refcount(old_pba)?;
+                            let remaining = if current_refcount == 0 {
+                                let reconciled = meta.reconcile_refcount_for_pba(old_pba)?;
+                                if reconciled != 0 {
+                                    tracing::error!(
+                                        pba = old_pba.0,
+                                        reconciled_refcount = reconciled,
+                                        context = "dedup_scanner_cleanup",
+                                        "detected refcount drift while dedup scanner prepared to free a PBA"
+                                    );
+                                }
+                                reconciled
                             } else {
-                                allocator.free_extent(Extent::new(current.pba, blocks))?;
+                                current_refcount
+                            };
+                            if remaining == 0 {
+                                meta.cleanup_dedup_for_pba_standalone(old_pba)?;
+                                if old_blocks <= 1 {
+                                    crate::packer::packer::remove_holes_for_pba(hole_map, old_pba);
+                                    allocator.free_one(old_pba)?;
+                                } else {
+                                    crate::packer::packer::remove_holes_for_extent(
+                                        hole_map,
+                                        old_pba,
+                                        old_blocks,
+                                    );
+                                    allocator.free_extent(Extent::new(old_pba, old_blocks))?;
+                                }
                             }
                         }
                         stats.hits += 1;
