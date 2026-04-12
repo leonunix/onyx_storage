@@ -394,6 +394,13 @@ impl Allocation {
         }
     }
 
+    fn block_count(&self) -> u32 {
+        match self {
+            Self::Single(_) => 1,
+            Self::Extent(extent) => extent.count,
+        }
+    }
+
     fn free(&self, allocator: &SpaceAllocator) -> OnyxResult<()> {
         match self {
             Self::Single(pba) => allocator.free_one(*pba),
@@ -479,6 +486,11 @@ impl BufferFlusher {
 
     fn hole_fill_lock(pba: Pba) -> Arc<Mutex<()>> {
         let mut locks = hole_fill_locks().lock().unwrap();
+        // Prune stale entries where the map is the sole holder (strong_count == 1).
+        // Amortised: only prune when the map exceeds a reasonable threshold.
+        if locks.len() > 4096 {
+            locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+        }
         locks
             .entry(pba)
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -1782,6 +1794,21 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
             let pba = allocation.start_pba();
 
+            // Serialize with concurrent hole fills targeting any PBA in this
+            // allocation (each block may be recycled from a previous packed slot).
+            let alloc_count = allocation.block_count();
+            let pba_locks: Vec<_> = (0..alloc_count)
+                .map(|i| Self::hole_fill_lock(Pba(pba.0 + i as u64)))
+                .collect();
+            let _pba_guards: Vec<_> =
+                pba_locks.iter().map(|l| l.lock().unwrap()).collect();
+            for i in 0..alloc_count {
+                crate::packer::packer::remove_holes_for_pba(
+                    hole_map,
+                    Pba(pba.0 + i as u64),
+                );
+            }
+
             let io_start = Instant::now();
             if let Err(e) = maybe_inject_test_failure(
                 &unit.vol_id,
@@ -2060,10 +2087,27 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
+        // Serialize with concurrent hole fills on any recycled PBA.
+        // Expand each unit's extent into individual PBAs, sorted to prevent deadlock.
+        let mut all_pba_list: Vec<Pba> = Vec::new();
         for i in 0..n {
-            if skip[i] {
+            if skip[i] || pbas[i].is_none() {
                 continue;
             }
+            let start = pbas[i].unwrap();
+            for b in 0..alloc_blocks[i] {
+                all_pba_list.push(Pba(start.0 + b as u64));
+            }
+        }
+        all_pba_list.sort_by_key(|p| p.0);
+        all_pba_list.dedup();
+        let pba_locks: Vec<_> = all_pba_list
+            .iter()
+            .map(|p| Self::hole_fill_lock(*p))
+            .collect();
+        let _pba_guards: Vec<_> = pba_locks.iter().map(|l| l.lock().unwrap()).collect();
+        for p in &all_pba_list {
+            crate::packer::packer::remove_holes_for_pba(hole_map, *p);
         }
 
         // Phase 3: Parallel IO writes (one scoped thread per unit for NVMe QD > 1).

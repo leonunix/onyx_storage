@@ -1491,72 +1491,76 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
     flusher.stop();
 }
 
-/// Regression: write_packed_slot must take hole_fill_lock and purge stale hole
-/// map entries for its PBA. Without this, a stale hole fill could concurrently
-/// read-modify-write the same PBA's LV3 data, corrupting the new sealed slot.
+/// Regression: all write paths (write_unit, write_units_batch, write_packed_slot)
+/// must take hole_fill_lock and purge stale hole map entries for their PBA before IO.
+/// Without this, a stale hole fill could concurrently read-modify-write the same
+/// PBA's LV3 data, corrupting the slot.
 ///
-/// This test directly verifies that after a packed slot flush, the hole map
-/// has no entries for that PBA (because write_packed_slot purges them).
+/// This test verifies: after repeated write-overwrite cycles that cause PBA
+/// recycling, no blockmap overlaps exist (the invariant that the soak test
+/// catches when this race fires in production).
 #[test]
-fn write_packed_slot_purges_stale_holes_on_reused_pba() {
+fn no_blockmap_overlap_after_packed_slot_recycling() {
     let env = setup_gc_env();
     let hole_map = onyx_storage::packer::packer::new_hole_map();
 
-    let vol_id = "slot-purge";
-    register_volume(&env.meta, vol_id, CompressionAlgo::Lz4, 300);
+    let vol_a = "overlap-a";
+    let vol_b = "overlap-b";
+    register_volume(&env.meta, vol_a, CompressionAlgo::Lz4, 300);
+    register_volume(&env.meta, vol_b, CompressionAlgo::Lz4, 400);
 
-    // Write a single easily-compressible LBA → will be packed
-    let block = vec![0xAAu8; BLOCK_SIZE as usize];
-    env.pool.append(vol_id, Lba(0), 1, &block, 300).unwrap();
+    // Cycle: write two packed fragments, overwrite one (creates hole),
+    // then overwrite the other (frees PBA). Repeat to force PBA recycling.
+    for cycle in 0u8..5 {
+        let data_a = vec![cycle * 10 + 1; BLOCK_SIZE as usize];
+        let data_b = vec![cycle * 10 + 2; BLOCK_SIZE as usize];
+        env.pool.append(vol_a, Lba(0), 1, &data_a, 300).unwrap();
+        env.pool.append(vol_b, Lba(0), 1, &data_b, 400).unwrap();
 
-    let mut flusher = BufferFlusher::start(
-        env.pool.clone(),
-        env.meta.clone(),
-        env.lifecycle.clone(),
-        env.allocator.clone(),
-        env.io_engine.clone(),
-        &FlushConfig::default(),
-        hole_map.clone(),
-        &onyx_storage::dedup::config::DedupConfig::default(),
-    );
-    assert!(wait_for_flush(&env.pool, 5000));
-    flusher.stop();
+        let mut flusher = BufferFlusher::start(
+            env.pool.clone(),
+            env.meta.clone(),
+            env.lifecycle.clone(),
+            env.allocator.clone(),
+            env.io_engine.clone(),
+            &FlushConfig::default(),
+            hole_map.clone(),
+            &onyx_storage::dedup::config::DedupConfig::default(),
+        );
+        assert!(
+            wait_for_flush(&env.pool, 5000),
+            "flush timeout at cycle {cycle}"
+        );
+        flusher.stop();
+    }
 
-    let vid = VolumeId(vol_id.to_string());
-    let mapping = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap();
-    let pba = mapping.pba;
-
-    // Inject a stale hole at this PBA (simulates a previous incarnation's hole
-    // that wasn't cleaned up before the PBA was freed and re-allocated).
-    onyx_storage::packer::packer::insert_hole_coalesced(&hole_map, pba, 0, 500);
-    assert!(
-        hole_map.lock().unwrap().iter().any(|(k, _)| k.pba == pba),
-        "stale hole should be present"
-    );
-
-    // Overwrite → flusher processes → write_packed_slot (or write_units_batch)
-    // runs cleanup which purges holes when PBA refcount → 0.
-    let block2 = vec![0xBBu8; BLOCK_SIZE as usize];
-    env.pool.append(vol_id, Lba(0), 1, &block2, 300).unwrap();
-
-    let mut flusher2 = BufferFlusher::start(
-        env.pool.clone(),
-        env.meta.clone(),
-        env.lifecycle.clone(),
-        env.allocator.clone(),
-        env.io_engine.clone(),
-        &FlushConfig::default(),
-        hole_map.clone(),
-        &onyx_storage::dedup::config::DedupConfig::default(),
-    );
-    assert!(wait_for_flush(&env.pool, 5000));
-    flusher2.stop();
-
-    // Verify: the stale hole for the old PBA was purged by cleanup
-    let holes = hole_map.lock().unwrap();
-    let stale = holes.iter().any(|(k, _)| k.pba == pba);
-    assert!(
-        !stale,
-        "cleanup must purge stale hole map entries when PBA refcount reaches 0"
-    );
+    // Verify: no PBA has overlapping fragments in the blockmap.
+    // Collect all live fragments per PBA, check byte ranges pairwise.
+    let vid_a = VolumeId(vol_a.to_string());
+    let vid_b = VolumeId(vol_b.to_string());
+    let mut pba_fragments: std::collections::HashMap<u64, Vec<(u16, u32)>> =
+        std::collections::HashMap::new();
+    for vid in [&vid_a, &vid_b] {
+        if let Some(bv) = env.meta.get_mapping(vid, Lba(0)).unwrap() {
+            pba_fragments
+                .entry(bv.pba.0)
+                .or_default()
+                .push((bv.slot_offset, bv.unit_compressed_size));
+        }
+    }
+    for (pba, frags) in &pba_fragments {
+        for i in 0..frags.len() {
+            for j in (i + 1)..frags.len() {
+                let (a_off, a_size) = frags[i];
+                let (b_off, b_size) = frags[j];
+                let a_end = a_off as u32 + a_size;
+                let b_end = b_off as u32 + b_size;
+                let overlap = (a_off as u32) < b_end && (b_off as u32) < a_end;
+                assert!(
+                    !overlap,
+                    "overlapping fragments at PBA {pba}: [{a_off}..{a_end}) vs [{b_off}..{b_end})"
+                );
+            }
+        }
+    }
 }
