@@ -2518,6 +2518,18 @@ impl BufferFlusher {
             return Ok(());
         }
 
+        // Serialize with concurrent hole fills targeting this PBA.
+        // Without this, a stale hole fill (targeting this PBA from a previous
+        // incarnation) could read-modify-write LV3 data concurrently with our
+        // write, corrupting the slot. The lock ensures: either the hole fill
+        // finishes first (and its metadata guard rejects it when refcount=0),
+        // or we finish first (and the hole fill sees our new refcount > 0 but
+        // the overlap check in atomic_batch_write_hole_fill rejects it).
+        let pba_lock = Self::hole_fill_lock(sealed.pba);
+        let _pba_guard = pba_lock.lock().unwrap();
+        // Purge any stale hole map entries from a previous incarnation of this PBA.
+        crate::packer::packer::remove_holes_for_pba(hole_map, sealed.pba);
+
         let io_start = Instant::now();
         if let Err(e) =
             maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)

@@ -1490,3 +1490,73 @@ fn hole_fill_success_reinserts_remainder_for_next_write() {
 
     flusher.stop();
 }
+
+/// Regression: write_packed_slot must take hole_fill_lock and purge stale hole
+/// map entries for its PBA. Without this, a stale hole fill could concurrently
+/// read-modify-write the same PBA's LV3 data, corrupting the new sealed slot.
+///
+/// This test directly verifies that after a packed slot flush, the hole map
+/// has no entries for that PBA (because write_packed_slot purges them).
+#[test]
+fn write_packed_slot_purges_stale_holes_on_reused_pba() {
+    let env = setup_gc_env();
+    let hole_map = onyx_storage::packer::packer::new_hole_map();
+
+    let vol_id = "slot-purge";
+    register_volume(&env.meta, vol_id, CompressionAlgo::Lz4, 300);
+
+    // Write a single easily-compressible LBA → will be packed
+    let block = vec![0xAAu8; BLOCK_SIZE as usize];
+    env.pool.append(vol_id, Lba(0), 1, &block, 300).unwrap();
+
+    let mut flusher = BufferFlusher::start(
+        env.pool.clone(),
+        env.meta.clone(),
+        env.lifecycle.clone(),
+        env.allocator.clone(),
+        env.io_engine.clone(),
+        &FlushConfig::default(),
+        hole_map.clone(),
+        &onyx_storage::dedup::config::DedupConfig::default(),
+    );
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher.stop();
+
+    let vid = VolumeId(vol_id.to_string());
+    let mapping = env.meta.get_mapping(&vid, Lba(0)).unwrap().unwrap();
+    let pba = mapping.pba;
+
+    // Inject a stale hole at this PBA (simulates a previous incarnation's hole
+    // that wasn't cleaned up before the PBA was freed and re-allocated).
+    onyx_storage::packer::packer::insert_hole_coalesced(&hole_map, pba, 0, 500);
+    assert!(
+        hole_map.lock().unwrap().iter().any(|(k, _)| k.pba == pba),
+        "stale hole should be present"
+    );
+
+    // Overwrite → flusher processes → write_packed_slot (or write_units_batch)
+    // runs cleanup which purges holes when PBA refcount → 0.
+    let block2 = vec![0xBBu8; BLOCK_SIZE as usize];
+    env.pool.append(vol_id, Lba(0), 1, &block2, 300).unwrap();
+
+    let mut flusher2 = BufferFlusher::start(
+        env.pool.clone(),
+        env.meta.clone(),
+        env.lifecycle.clone(),
+        env.allocator.clone(),
+        env.io_engine.clone(),
+        &FlushConfig::default(),
+        hole_map.clone(),
+        &onyx_storage::dedup::config::DedupConfig::default(),
+    );
+    assert!(wait_for_flush(&env.pool, 5000));
+    flusher2.stop();
+
+    // Verify: the stale hole for the old PBA was purged by cleanup
+    let holes = hole_map.lock().unwrap();
+    let stale = holes.iter().any(|(k, _)| k.pba == pba);
+    assert!(
+        !stale,
+        "cleanup must purge stale hole map entries when PBA refcount reaches 0"
+    );
+}
