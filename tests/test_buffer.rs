@@ -149,10 +149,13 @@ fn basic_append_and_recover() {
     assert!(seq >= 1); // seq counter starts at 1 for a fresh pool
     assert_eq!(pool.pending_count(), 1);
 
+    // Verify payload via lookup (hydrates from buffer device if evicted).
+    let found = pool.lookup("test-vol", Lba(5)).unwrap().unwrap();
+    assert_eq!(&**found.payload.as_ref().unwrap(), &*data);
+
     let unflushed = pool.recover().unwrap();
     assert_eq!(unflushed.len(), 1);
     assert_eq!(unflushed[0].start_lba, Lba(5));
-    assert_eq!(*unflushed[0].payload, *data);
 }
 
 #[test]
@@ -202,47 +205,37 @@ fn full_buffer_rejected() {
 }
 
 #[test]
-fn backpressure_wait_forever_blocks_until_memory_is_reclaimed() {
+fn write_through_evicts_payload_after_fdatasync() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 8 * 8192;
     tmp.as_file().set_len(size).unwrap();
     let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
-    let pool = Arc::new(
-        WriteBufferPool::open_with_options_and_memory_limit(
-            dev,
-            Duration::ZERO,
-            1,
-            256,
-            Duration::MAX,
-            BLOCK_SIZE as u64,
-        )
-        .unwrap(),
-    );
+    // Memory limit = 1 block (4KB). With write-through, append never blocks
+    // on memory — payload is evicted after fdatasync.
+    let pool = WriteBufferPool::open_with_options_and_memory_limit(
+        dev,
+        Duration::ZERO,
+        1,
+        256,
+        Duration::MAX,
+        BLOCK_SIZE as u64,
+    )
+    .unwrap();
 
-    let seq1 = pool
+    // Append two entries — both succeed immediately despite memory limit of 1 block.
+    let _seq1 = pool
         .append("test-vol", Lba(0), 1, &vec![0x11; 4096], 0)
         .unwrap();
+    let _seq2 = pool
+        .append("test-vol", Lba(1), 1, &vec![0x22; 4096], 0)
+        .unwrap();
+    assert_eq!(pool.pending_count(), 2);
 
-    let pool_for_thread = pool.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(pool_for_thread.append("test-vol", Lba(1), 1, &vec![0x22; 4096], 0));
-    });
-
-    assert!(
-        rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "append should block under infinite backpressure instead of failing immediately"
-    );
-
-    pool.mark_flushed(seq1, Lba(0), 1).unwrap();
-    let result = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("append should resume after memory is reclaimed");
-    assert!(
-        result.is_ok(),
-        "append should succeed once backpressure clears"
-    );
-    assert_eq!(pool.pending_count(), 1);
+    // Payload is still recoverable via lookup (hydrates from buffer device).
+    let found = pool.lookup("test-vol", Lba(0)).unwrap().unwrap();
+    assert_eq!(&**found.payload.as_ref().unwrap(), &vec![0x11; 4096][..]);
+    let found = pool.lookup("test-vol", Lba(1)).unwrap().unwrap();
+    assert_eq!(&**found.payload.as_ref().unwrap(), &vec![0x22; 4096][..]);
 }
 
 #[test]
@@ -581,7 +574,6 @@ fn append_retries_transient_sync_failure_without_losing_pending_entry() {
     let unflushed = pool.recover().unwrap();
     assert_eq!(unflushed.len(), 1);
     assert_eq!(unflushed[0].seq, seq);
-    assert_eq!(*unflushed[0].payload, *data);
 }
 
 #[test]

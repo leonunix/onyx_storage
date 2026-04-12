@@ -822,6 +822,14 @@ impl BufferFlusher {
             let units = coalesce_pending(&new_entries, max_raw, max_lbas, &|vid| {
                 cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None)
             });
+
+            // Payload data has been copied into CoalesceUnit.raw_data — evict
+            // the hydrated payloads from the DashMap immediately so the flusher
+            // memory budget is freed without waiting for mark_flushed.
+            let consumed_seqs: Vec<u64> = new_entries.iter().map(|e| e.seq).collect();
+            drop(new_entries);
+            pool.evict_hydrated_payloads_for_shard(shard_idx, &consumed_seqs);
+
             if !units.is_empty() {
                 metrics.coalesce_runs.fetch_add(1, Ordering::Relaxed);
                 metrics
@@ -1046,6 +1054,26 @@ impl BufferFlusher {
                         let lba = Lba(unit.start_lba.0 + *i as u64);
                         let vol_id_str = &unit.vol_id;
                         let vol_id = VolumeId(vol_id_str.clone());
+
+                        // Staleness guard: if a newer write superseded this LBA
+                        // in the buffer, skip the dedup hit to avoid overwriting
+                        // the newer blockmap entry.  This mirrors the
+                        // live_positions_for_unit check that write_unit uses for
+                        // miss blocks.
+                        let latest_seq =
+                            Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
+                        if !pool.is_latest_lba_seq(
+                            vol_id_str,
+                            lba,
+                            latest_seq,
+                            unit.vol_created_at,
+                        ) {
+                            // Treat as "successfully handled" so mark_flushed
+                            // cleans up the buffer entry, but don't touch the
+                            // blockmap or refcounts.
+                            successful_hit_indices.push(*i);
+                            continue;
+                        }
 
                         metrics.dedup_hit_commit_ops.fetch_add(1, Ordering::Relaxed);
                         let hit_commit_start = Instant::now();

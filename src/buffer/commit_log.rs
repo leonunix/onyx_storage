@@ -894,15 +894,11 @@ impl BufferShard {
         }
     }
 
-    /// After fdatasync, evict in-memory payloads if memory pressure is high.
-    /// Entries remain in pending_entries with payload=None; reads/flusher
-    /// will hydrate from the buffer device on demand.
-    fn maybe_evict_payloads(&self, committed: &[Arc<PendingEntry>]) {
-        let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
-        let limit = self.max_payload_memory();
-        if limit == 0 || current <= limit {
-            return;
-        }
+    /// After fdatasync, unconditionally evict all in-memory payloads from
+    /// committed entries (write-through policy). Entries remain in
+    /// pending_entries with payload=None; reads hydrate from the buffer
+    /// device on demand, flusher hydrates via pending_entry_arc_hydrated().
+    fn evict_committed_payloads(&self, committed: &[Arc<PendingEntry>]) {
         for pending in committed {
             if !self.pending_entries.contains_key(&pending.seq) {
                 continue;
@@ -941,9 +937,49 @@ impl BufferShard {
                     }
                 }
             }
-            // Stop evicting once below limit.
-            if self.payload_bytes_in_memory.load(Ordering::Relaxed) <= limit {
-                break;
+        }
+    }
+
+    /// After the coalescer has copied payload data into CoalesceUnits, evict
+    /// the hydrated payloads from pending_entries so the memory budget is freed
+    /// immediately — without waiting for mark_flushed at the end of the pipeline.
+    fn evict_hydrated_payloads(&self, seqs: &[u64]) {
+        for &seq in seqs {
+            let pending = match self.pending_entries.get(&seq) {
+                Some(entry_ref) => Arc::clone(entry_ref.value()),
+                None => continue,
+            };
+            let Some(ref p) = pending.payload else {
+                continue;
+            };
+            let payload_len = p.len() as u64;
+            let evicted = Arc::new(PendingEntry {
+                seq: pending.seq,
+                vol_id: pending.vol_id.clone(),
+                start_lba: pending.start_lba,
+                lba_count: pending.lba_count,
+                payload_crc32: pending.payload_crc32,
+                vol_created_at: pending.vol_created_at,
+                payload: None,
+                disk_offset: pending.disk_offset,
+                disk_len: pending.disk_len,
+                superseded_ranges: pending.superseded_ranges.clone(),
+            });
+            self.pending_entries.insert(seq, evicted.clone());
+            self.payload_bytes_in_memory
+                .fetch_sub(payload_len, Ordering::Relaxed);
+            let vid = self.intern_vol_id(&pending.vol_id);
+            for i in 0..pending.lba_count {
+                let key = LbaKey {
+                    vol_id: vid.clone(),
+                    lba: Lba(pending.start_lba.0 + i as u64),
+                };
+                if let Some(existing) = self.lba_index.get(&key) {
+                    if existing.seq == seq {
+                        drop(existing);
+                        self.lba_index.insert(key, evicted.clone());
+                    }
+                }
             }
         }
     }
@@ -1045,75 +1081,6 @@ impl BufferShard {
                 "entry too large: {} bytes (max {}). Reduce lba_count.",
                 disk_len, MAX_ENTRY_SIZE
             )));
-        }
-
-        // ── Payload memory backpressure ──
-        // If in-memory payload bytes exceed the limit, wait for flusher to drain
-        // before accepting new writes. This prevents OOM when flusher is slow.
-        let mem_limit = self.max_payload_memory();
-        if mem_limit > 0 {
-            let payload_size = payload.len() as u64;
-            let deadline =
-                if self.backpressure_timeout.is_zero() || self.backpressure_waits_forever() {
-                    None
-                } else {
-                    Instant::now().checked_add(self.backpressure_timeout)
-                };
-            let mut backpressure_start: Option<Instant> = None;
-            loop {
-                let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
-                if current + payload_size <= mem_limit {
-                    if let (Some(start), Some(metrics)) =
-                        (backpressure_start.take(), self.metrics.get())
-                    {
-                        BufferShard::record_metric(&metrics.buffer_backpressure_wait_ns, start);
-                    }
-                    break;
-                }
-                if backpressure_start.is_none() {
-                    backpressure_start = Some(Instant::now());
-                    if let Some(metrics) = self.metrics.get() {
-                        metrics
-                            .buffer_backpressure_events
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                if self.backpressure_timeout.is_zero() {
-                    if let (Some(start), Some(metrics)) =
-                        (backpressure_start.take(), self.metrics.get())
-                    {
-                        BufferShard::record_metric(&metrics.buffer_backpressure_wait_ns, start);
-                    }
-                    return Err(OnyxError::BufferPoolFull(current as usize));
-                }
-                let wait_for = match deadline {
-                    Some(deadline) => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            tracing::warn!(
-                                current_mb = current / (1024 * 1024),
-                                limit_mb = mem_limit / (1024 * 1024),
-                                "append rejected: payload memory limit exceeded"
-                            );
-                            if let (Some(start), Some(metrics)) =
-                                (backpressure_start.take(), self.metrics.get())
-                            {
-                                BufferShard::record_metric(
-                                    &metrics.buffer_backpressure_wait_ns,
-                                    start,
-                                );
-                            }
-                            return Err(OnyxError::BufferPoolFull(current as usize));
-                        }
-                        remaining.min(BACKPRESSURE_POLL_INTERVAL)
-                    }
-                    None => BACKPRESSURE_POLL_INTERVAL,
-                };
-                // Wait for flusher to free memory (reuse ring_space_cv; flusher
-                // notifies it when mark_flushed reclaims ring + payload space).
-                let mut ring = self.ring.lock();
-                let _ = self.ring_space_cv.wait_for(&mut ring, wait_for);
-            }
         }
 
         // ── Ring lock: reserve space, wait if shard is temporarily full ──
@@ -1360,7 +1327,10 @@ impl BufferShard {
         );
     }
 
-    /// Return Arc<PendingEntry> with payload hydrated from disk if needed.
+    /// Return Arc<PendingEntry> with payload hydrated from the buffer device.
+    /// With write-through append, committed entries always have payload=None,
+    /// so this function is the primary hydration path for the flusher.
+    /// max_payload_memory exclusively governs flusher hydration rate.
     /// Returns None if payload memory limit is exceeded (flusher will retry later).
     fn pending_entry_arc_hydrated(&self, seq: u64) -> Option<Arc<PendingEntry>> {
         let entry_ref = self.pending_entries.get(&seq)?;
@@ -1368,17 +1338,16 @@ impl BufferShard {
         if entry.payload.is_some() {
             return Some(entry.clone());
         }
-        // Memory guard: refuse to hydrate if payload memory is already over limit.
+        // Memory guard: refuse to hydrate if flusher memory budget is exhausted.
         // The flusher's retry-snapshot mechanism will pick this entry up later
         // once in-flight entries have been drained and memory is freed.
         //
         // EXCEPTION: always allow hydration for the entry at the front of log_order.
-        // That entry blocks reclaim_log_prefix (tail advancement). Under sustained
-        // write load, maybe_evict_payloads evicts payloads faster than the flusher
-        // can process them, and the memory limit prevents re-hydration — a deadlock
-        // where the tail never advances. Exempting the single head-of-queue entry
-        // (at most one 128 KB payload over the limit) breaks the cycle and lets the
-        // ring reclaim space.
+        // That entry blocks reclaim_log_prefix (tail advancement). With write-through
+        // append, all committed payloads are evicted; the flusher hydrates on demand.
+        // If the memory limit prevents re-hydration, the tail never advances.
+        // Exempting the single head-of-queue entry (at most one 128 KB payload over
+        // the limit) breaks the cycle and lets the ring reclaim space.
         let limit = self.max_payload_memory();
         if limit > 0 {
             let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
@@ -1627,7 +1596,11 @@ impl BufferShard {
 
         self.lba_index.retain(|key, _| &*key.vol_id != vol_id);
         self.latest_lba_seq.retain(|key, _| &*key.vol_id != vol_id);
-        for (seq, _) in &to_purge {
+        for (seq, pending) in &to_purge {
+            if let Some(ref p) = pending.payload {
+                self.payload_bytes_in_memory
+                    .fetch_sub(p.len() as u64, Ordering::Relaxed);
+            }
             self.pending_entries.remove(seq);
             self.flush_progress.remove(seq);
         }
@@ -1654,6 +1627,10 @@ impl BufferShard {
                 },
                 |_, value| value.seq == seq,
             );
+        }
+        if let Some(ref p) = pending.payload {
+            self.payload_bytes_in_memory
+                .fetch_sub(p.len() as u64, Ordering::Relaxed);
         }
         self.pending_entries.remove(&seq);
         self.flush_progress.remove(&seq);
@@ -1980,8 +1957,8 @@ impl WriteBufferPool {
                             let _ = shard_ready_tx.send(pending.seq);
                         }
                     }
-                    // Memory pressure: evict payloads that are now durable on disk.
-                    shard.maybe_evict_payloads(&inflight);
+                    // Write-through: unconditionally evict payloads now durable on disk.
+                    shard.evict_committed_payloads(&inflight);
                     if let Some(metrics) = metrics.get() {
                         metrics.buffer_sync_batches.fetch_add(1, Ordering::Relaxed);
                         metrics
@@ -2611,6 +2588,16 @@ impl WriteBufferPool {
             return 100;
         }
         ((shard.shard.used_bytes() * 100) / cap) as u8
+    }
+
+    /// Evict hydrated payloads from pending_entries for the given shard.
+    /// Called by the coalescer after payload data has been copied into
+    /// CoalesceUnits, so the memory budget is freed without waiting for
+    /// mark_flushed at the end of the pipeline.
+    pub fn evict_hydrated_payloads_for_shard(&self, shard_idx: usize, seqs: &[u64]) {
+        if let Some(shard) = self.shards.get(shard_idx) {
+            shard.shard.evict_hydrated_payloads(seqs);
+        }
     }
 
     /// Total payload bytes currently kept resident in memory across all shards.
