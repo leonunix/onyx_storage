@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use onyx_storage::buffer::entry::*;
@@ -551,6 +551,48 @@ fn partial_mark_flushed_is_idempotent_for_multi_lba_entry() {
 
     let advanced = pool.advance_tail().unwrap();
     assert_eq!(advanced, 1);
+}
+
+#[test]
+fn concurrent_duplicate_mark_flushed_does_not_underflow_payload_memory() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 32 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = Arc::new(
+        WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(200)).unwrap(),
+    );
+
+    for lba in 0..64u64 {
+        let seq = pool
+            .append("test-vol", Lba(lba), 1, &vec![0xA5; BLOCK_SIZE as usize], 0)
+            .unwrap();
+        assert_eq!(pool.payload_memory_bytes(), BLOCK_SIZE as u64);
+
+        let barrier = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                pool.mark_flushed(seq, Lba(lba), 1).unwrap();
+            }));
+        }
+
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(
+            pool.payload_memory_bytes(),
+            0,
+            "duplicate mark_flushed calls must not underflow payload accounting"
+        );
+        assert_eq!(pool.pending_count(), 0);
+        let _ = pool.advance_tail().unwrap();
+    }
 }
 
 #[test]

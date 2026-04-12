@@ -296,6 +296,27 @@ impl BufferShard {
         counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
     }
 
+    fn release_payload_bytes(counter: &AtomicU64, bytes: u64) {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    if current < bytes {
+                        tracing::warn!(
+                            current_payload_bytes = current,
+                            release_bytes = bytes,
+                            "prevented payload memory accounting underflow"
+                        );
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     fn slot_size() -> u64 {
         BLOCK_SIZE as u64
     }
@@ -900,41 +921,12 @@ impl BufferShard {
     /// device on demand, flusher hydrates via pending_entry_arc_hydrated().
     fn evict_committed_payloads(&self, committed: &[Arc<PendingEntry>]) {
         for pending in committed {
-            if !self.pending_entries.contains_key(&pending.seq) {
-                continue;
-            }
             if let Some(ref p) = pending.payload {
                 let payload_len = p.len() as u64;
-                // Build an evicted copy (same metadata, payload=None).
-                let evicted = Arc::new(PendingEntry {
-                    seq: pending.seq,
-                    vol_id: pending.vol_id.clone(),
-                    start_lba: pending.start_lba,
-                    lba_count: pending.lba_count,
-                    payload_crc32: pending.payload_crc32,
-                    vol_created_at: pending.vol_created_at,
-                    payload: None,
-                    disk_offset: pending.disk_offset,
-                    disk_len: pending.disk_len,
-                    superseded_ranges: pending.superseded_ranges.clone(),
-                });
-                // Replace in pending_entries.
-                self.pending_entries.insert(pending.seq, evicted.clone());
-                self.payload_bytes_in_memory
-                    .fetch_sub(payload_len, Ordering::Relaxed);
-                // Replace in lba_index entries.
-                let vid = self.intern_vol_id(&pending.vol_id);
-                for i in 0..pending.lba_count {
-                    let key = LbaKey {
-                        vol_id: vid.clone(),
-                        lba: Lba(pending.start_lba.0 + i as u64),
-                    };
-                    if let Some(existing) = self.lba_index.get(&key) {
-                        if existing.seq == pending.seq {
-                            drop(existing);
-                            self.lba_index.insert(key, evicted.clone());
-                        }
-                    }
+                let evicted = Self::evicted_pending_entry(pending.as_ref());
+                if self.replace_pending_entry_if_current(pending, evicted.clone()) {
+                    Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), payload_len);
+                    self.replace_lba_index_if_current(pending, &evicted);
                 }
             }
         }
@@ -953,33 +945,10 @@ impl BufferShard {
                 continue;
             };
             let payload_len = p.len() as u64;
-            let evicted = Arc::new(PendingEntry {
-                seq: pending.seq,
-                vol_id: pending.vol_id.clone(),
-                start_lba: pending.start_lba,
-                lba_count: pending.lba_count,
-                payload_crc32: pending.payload_crc32,
-                vol_created_at: pending.vol_created_at,
-                payload: None,
-                disk_offset: pending.disk_offset,
-                disk_len: pending.disk_len,
-                superseded_ranges: pending.superseded_ranges.clone(),
-            });
-            self.pending_entries.insert(seq, evicted.clone());
-            self.payload_bytes_in_memory
-                .fetch_sub(payload_len, Ordering::Relaxed);
-            let vid = self.intern_vol_id(&pending.vol_id);
-            for i in 0..pending.lba_count {
-                let key = LbaKey {
-                    vol_id: vid.clone(),
-                    lba: Lba(pending.start_lba.0 + i as u64),
-                };
-                if let Some(existing) = self.lba_index.get(&key) {
-                    if existing.seq == seq {
-                        drop(existing);
-                        self.lba_index.insert(key, evicted.clone());
-                    }
-                }
+            let evicted = Self::evicted_pending_entry(pending.as_ref());
+            if self.replace_pending_entry_if_current(&pending, evicted.clone()) {
+                Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), payload_len);
+                self.replace_lba_index_if_current(&pending, &evicted);
             }
         }
     }
@@ -1297,6 +1266,55 @@ impl BufferShard {
             .map(|entry| entry.value().clone())
     }
 
+    fn evicted_pending_entry(pending: &PendingEntry) -> Arc<PendingEntry> {
+        Arc::new(PendingEntry {
+            seq: pending.seq,
+            vol_id: pending.vol_id.clone(),
+            start_lba: pending.start_lba,
+            lba_count: pending.lba_count,
+            payload_crc32: pending.payload_crc32,
+            vol_created_at: pending.vol_created_at,
+            payload: None,
+            disk_offset: pending.disk_offset,
+            disk_len: pending.disk_len,
+            superseded_ranges: pending.superseded_ranges.clone(),
+        })
+    }
+
+    fn replace_pending_entry_if_current(
+        &self,
+        expected: &Arc<PendingEntry>,
+        replacement: Arc<PendingEntry>,
+    ) -> bool {
+        let Some(mut current) = self.pending_entries.get_mut(&expected.seq) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&*current, expected) {
+            return false;
+        }
+        *current = replacement;
+        true
+    }
+
+    fn replace_lba_index_if_current(
+        &self,
+        expected: &Arc<PendingEntry>,
+        replacement: &Arc<PendingEntry>,
+    ) {
+        let vid = self.intern_vol_id(&expected.vol_id);
+        for i in 0..expected.lba_count {
+            let key = LbaKey {
+                vol_id: vid.clone(),
+                lba: Lba(expected.start_lba.0 + i as u64),
+            };
+            if let Some(mut current) = self.lba_index.get_mut(&key) {
+                if Arc::ptr_eq(&*current, expected) {
+                    *current = replacement.clone();
+                }
+            }
+        }
+    }
+
     /// Evict a corrupt/unreadable pending entry: remove from all indices
     /// and reclaim ring space. Called when hydration fails (e.g. the disk
     /// region was overwritten by ring wrap-around or a partial write on crash).
@@ -1314,8 +1332,7 @@ impl BufferShard {
             self.latest_lba_seq.remove_if(&key, |_, &(s, _)| s == seq);
         }
         if let Some(ref p) = pending.payload {
-            self.payload_bytes_in_memory
-                .fetch_sub(p.len() as u64, Ordering::Relaxed);
+            Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }
         self.free_seq_allocation(seq, &pending);
         tracing::info!(
@@ -1334,10 +1351,11 @@ impl BufferShard {
     /// Returns None if payload memory limit is exceeded (flusher will retry later).
     fn pending_entry_arc_hydrated(&self, seq: u64) -> Option<Arc<PendingEntry>> {
         let entry_ref = self.pending_entries.get(&seq)?;
-        let entry = entry_ref.value();
+        let entry = entry_ref.value().clone();
         if entry.payload.is_some() {
-            return Some(entry.clone());
+            return Some(entry);
         }
+        drop(entry_ref);
         // Memory guard: refuse to hydrate if flusher memory budget is exhausted.
         // The flusher's retry-snapshot mechanism will pick this entry up later
         // once in-flight entries have been drained and memory is freed.
@@ -1381,23 +1399,25 @@ impl BufferShard {
             }
         }
         // Lazy hydration: read payload from disk.
-        match self.read_payload_from_disk(entry) {
+        match self.read_payload_from_disk(entry.as_ref()) {
             Ok(payload) => {
                 let payload_len = payload.len() as u64;
-                let mut hydrated = (**entry).clone();
+                let mut hydrated = (*entry).clone();
                 hydrated.payload = Some(payload);
                 let hydrated = Arc::new(hydrated);
-                // Track memory for hydrated payload.
-                self.payload_bytes_in_memory
-                    .fetch_add(payload_len, Ordering::Relaxed);
-                // Update the DashMap entry so future accesses don't re-read.
-                drop(entry_ref);
-                self.pending_entries.insert(seq, hydrated.clone());
-                Some(hydrated)
+                if self.replace_pending_entry_if_current(&entry, hydrated.clone()) {
+                    self.payload_bytes_in_memory
+                        .fetch_add(payload_len, Ordering::Relaxed);
+                    self.replace_lba_index_if_current(&entry, &hydrated);
+                    Some(hydrated)
+                } else {
+                    self.pending_entries.get(&seq).and_then(|current| {
+                        current.payload.is_some().then(|| current.value().clone())
+                    })
+                }
             }
             Err(e) => {
                 tracing::warn!(seq, error = %e, "failed to hydrate pending entry payload, evicting corrupt entry");
-                drop(entry_ref);
                 self.evict_corrupt_entry(seq);
                 None
             }
@@ -1497,12 +1517,13 @@ impl BufferShard {
                 },
                 |_, value| value.seq == seq,
             );
-            self.pending_entries.remove(&seq);
-            if let Some(ref p) = pending.payload {
-                self.payload_bytes_in_memory
-                    .fetch_sub(p.len() as u64, Ordering::Relaxed);
+            let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
+                return Ok(());
+            };
+            if let Some(ref p) = removed_pending.payload {
+                Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
             }
-            self.free_seq_allocation(seq, &pending);
+            self.free_seq_allocation(seq, &removed_pending);
             return Ok(());
         }
 
@@ -1530,12 +1551,13 @@ impl BufferShard {
                 |_, value| value.seq == seq,
             );
         }
-        self.pending_entries.remove(&seq);
-        if let Some(ref p) = pending.payload {
-            self.payload_bytes_in_memory
-                .fetch_sub(p.len() as u64, Ordering::Relaxed);
+        let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
+            return Ok(());
+        };
+        if let Some(ref p) = removed_pending.payload {
+            Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }
-        self.free_seq_allocation(seq, &pending);
+        self.free_seq_allocation(seq, &removed_pending);
         Ok(())
     }
 
@@ -1596,17 +1618,22 @@ impl BufferShard {
 
         self.lba_index.retain(|key, _| &*key.vol_id != vol_id);
         self.latest_lba_seq.retain(|key, _| &*key.vol_id != vol_id);
-        for (seq, pending) in &to_purge {
-            if let Some(ref p) = pending.payload {
-                self.payload_bytes_in_memory
-                    .fetch_sub(p.len() as u64, Ordering::Relaxed);
+        let mut removed_entries = Vec::with_capacity(to_purge.len());
+        for (seq, _) in &to_purge {
+            if let Some((_, pending)) = self.pending_entries.remove(seq) {
+                if let Some(ref p) = pending.payload {
+                    Self::release_payload_bytes(
+                        self.payload_bytes_in_memory.as_ref(),
+                        p.len() as u64,
+                    );
+                }
+                removed_entries.push((*seq, pending));
             }
-            self.pending_entries.remove(seq);
             self.flush_progress.remove(seq);
         }
 
-        let seqs: Vec<u64> = to_purge.iter().map(|(seq, _)| *seq).collect();
-        for (seq, pending) in &to_purge {
+        let seqs: Vec<u64> = removed_entries.iter().map(|(seq, _)| *seq).collect();
+        for (seq, pending) in &removed_entries {
             self.free_seq_allocation_durable(*seq, pending)?;
         }
 
@@ -1628,13 +1655,14 @@ impl BufferShard {
                 |_, value| value.seq == seq,
             );
         }
-        if let Some(ref p) = pending.payload {
-            self.payload_bytes_in_memory
-                .fetch_sub(p.len() as u64, Ordering::Relaxed);
+        let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
+            return Ok(false);
+        };
+        if let Some(ref p) = removed_pending.payload {
+            Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }
-        self.pending_entries.remove(&seq);
         self.flush_progress.remove(&seq);
-        self.free_seq_allocation_durable(seq, &pending)?;
+        self.free_seq_allocation_durable(seq, &removed_pending)?;
         Ok(true)
     }
 }
@@ -2662,5 +2690,87 @@ impl Drop for WriteBufferPool {
             shard.shard.write_checkpoint(global_max_seq);
         }
         let _ = self.persist_superblock(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn create_pool(size: u64, group_commit_wait: Duration) -> (WriteBufferPool, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(size).unwrap();
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        (
+            WriteBufferPool::open_with_group_commit_wait(dev, group_commit_wait).unwrap(),
+            tmp,
+        )
+    }
+
+    #[test]
+    fn flushed_entry_cannot_be_reinstalled_by_stale_eviction_state() {
+        let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::ZERO);
+        let shard = &pool.shards[0].shard;
+
+        let seq = pool
+            .append("test-vol", Lba(7), 1, &vec![0xA5; BLOCK_SIZE as usize], 0)
+            .unwrap();
+        let pending = shard.pending_entry_arc(seq).unwrap();
+        assert!(pending.payload.is_some());
+
+        shard.mark_flushed(seq, Lba(7), 1).unwrap();
+        assert_eq!(pool.payload_memory_bytes(), 0);
+
+        let evicted = BufferShard::evicted_pending_entry(pending.as_ref());
+        assert!(
+            !shard.replace_pending_entry_if_current(&pending, evicted),
+            "stale payload eviction state must not resurrect a flushed seq"
+        );
+        assert!(shard.pending_entry_arc(seq).is_none());
+        assert!(pool.lookup("test-vol", Lba(7)).unwrap().is_none());
+        assert_eq!(pool.payload_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn hydrated_payload_is_not_reinstalled_after_flush_race() {
+        let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+        let shard = &pool.shards[0].shard;
+
+        let seq = pool
+            .append("test-vol", Lba(11), 1, &vec![0x5C; BLOCK_SIZE as usize], 0)
+            .unwrap();
+        assert_eq!(
+            pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+            seq
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pending = loop {
+            let pending = shard.pending_entry_arc(seq).unwrap();
+            if pending.payload.is_none() {
+                break pending;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sync loop did not evict committed payload in time"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let payload = shard.read_payload_from_disk(pending.as_ref()).unwrap();
+        shard.mark_flushed(seq, Lba(11), 1).unwrap();
+        assert_eq!(pool.payload_memory_bytes(), 0);
+
+        let mut hydrated = pending.as_ref().clone();
+        hydrated.payload = Some(payload);
+        let hydrated = Arc::new(hydrated);
+        assert!(
+            !shard.replace_pending_entry_if_current(&pending, hydrated),
+            "hydration must not reinstall a seq that was already flushed"
+        );
+        assert!(shard.pending_entry_arc(seq).is_none());
+        assert_eq!(pool.payload_memory_bytes(), 0);
     }
 }

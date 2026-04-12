@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import errno
 import json
 import mmap
 import os
@@ -385,6 +386,9 @@ class DeviceHandle:
 
 
 class ServiceManager:
+    DEVICE_REMOVAL_WAIT_SECS = 20.0
+    CLEANUP_UBLK_TIMEOUT_SECS = 5.0
+
     def __init__(
         self,
         *,
@@ -416,15 +420,83 @@ class ServiceManager:
         return [*self.engine_cmd, "-c", str(self.config_path), *args]
 
     def cleanup_ublk_devices(self) -> None:
+        proc = None
         try:
-            run_cmd(
+            proc = subprocess.Popen(
                 self.cli("cleanup-ublk"),
-                cwd=self.repo_root,
+                cwd=str(self.repo_root),
                 env=self.env,
-                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            proc.wait(timeout=self.CLEANUP_UBLK_TIMEOUT_SECS)
+            self.event_log.append(
+                {
+                    "event": "cleanup-ublk-finished",
+                    "returncode": proc.returncode,
+                    "ts": time.time(),
+                }
+            )
+        except subprocess.TimeoutExpired:
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self.event_log.append(
+                        {
+                            "event": "cleanup-ublk-timeout",
+                            "pid": proc.pid,
+                            "timeout_secs": self.CLEANUP_UBLK_TIMEOUT_SECS,
+                            "ts": time.time(),
+                        }
+                    )
+                    return
+            self.event_log.append(
+                {
+                    "event": "cleanup-ublk-timeout",
+                    "timeout_secs": self.CLEANUP_UBLK_TIMEOUT_SECS,
+                    "ts": time.time(),
+                }
             )
         except Exception:
-            pass
+            self.event_log.append(
+                {
+                    "event": "cleanup-ublk-error",
+                    "ts": time.time(),
+                }
+            )
+
+    def _status_json_or_none(self) -> Optional[dict[str, object]]:
+        try:
+            return self.status_json()
+        except Exception:
+            return None
+
+    def _tracked_ublk_nodes(self) -> list[pathlib.Path]:
+        payload = self._status_json_or_none() or {}
+        dev_ids = payload.get("ublk_devices") or []
+        nodes: list[pathlib.Path] = []
+        for raw_dev_id in dev_ids:
+            try:
+                dev_id = int(raw_dev_id)
+            except (TypeError, ValueError):
+                continue
+            nodes.append(pathlib.Path(f"/dev/ublkb{dev_id}"))
+            nodes.append(pathlib.Path(f"/dev/ublkc{dev_id}"))
+        return nodes
+
+    def _wait_for_ublk_nodes_removed(self, nodes: list[pathlib.Path]) -> bool:
+        if not nodes:
+            return True
+        deadline = time.time() + self.DEVICE_REMOVAL_WAIT_SECS
+        while time.time() < deadline:
+            if all(not node.exists() for node in nodes):
+                return True
+            time.sleep(0.5)
+        return all(not node.exists() for node in nodes)
 
     def _send_socket_cmd(self, cmd: str) -> list[str]:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -495,6 +567,7 @@ class ServiceManager:
         )
 
     def best_effort_stop(self) -> None:
+        tracked_nodes = self._tracked_ublk_nodes()
         try:
             run_cmd(self.cli("stop"), cwd=self.repo_root, env=self.env, check=False)
         except Exception:
@@ -515,7 +588,15 @@ class ServiceManager:
             except Exception:
                 break
             time.sleep(0.5)
-        self.cleanup_ublk_devices()
+        if tracked_nodes and not self._wait_for_ublk_nodes_removed(tracked_nodes):
+            self.event_log.append(
+                {
+                    "event": "ublk-nodes-still-present-after-stop",
+                    "nodes": [str(node) for node in tracked_nodes if node.exists()],
+                    "wait_secs": self.DEVICE_REMOVAL_WAIT_SECS,
+                    "ts": time.time(),
+                }
+            )
 
     def recreate_volume(self, size_bytes: int, compression: str) -> None:
         run_cmd(self.cli("delete-volume", "-n", self.volume), cwd=self.repo_root, env=self.env, check=False)
@@ -638,6 +719,8 @@ class IntegrityHarness:
         self.pause_gate = PauseGate()
         self.device = DeviceHandle()
         self.stop_event = threading.Event()
+        self.normal_stop_requested = threading.Event()
+        self.teardown_started = threading.Event()
         self.failure: Optional[str] = None
         self.failure_lock = threading.Lock()
         self.stats = StatsTracker()
@@ -662,6 +745,39 @@ class IntegrityHarness:
             startup_timeout_secs=args.startup_timeout_secs,
             startup_drain_timeout_secs=args.startup_drain_timeout_secs,
         )
+
+    def _should_ignore_io_exception(self, exc: Exception) -> bool:
+        if not (self.normal_stop_requested.is_set() or self.teardown_started.is_set()):
+            return False
+        if isinstance(exc, HarnessError):
+            text = str(exc)
+            return (
+                text == "device not open"
+                or text.startswith("short read: expected ")
+                or text.startswith("short write: expected ")
+            )
+        if isinstance(exc, OSError):
+            return exc.errno in {
+                errno.EBADF,
+                errno.ENODEV,
+                errno.ENXIO,
+                errno.EIO,
+            }
+        return False
+
+    def _handle_thread_exception(self, context: str, exc: Exception) -> None:
+        if self._should_ignore_io_exception(exc):
+            self.event_log.remember(
+                {
+                    "event": "ignored-shutdown-io-error",
+                    "context": context,
+                    "message": str(exc),
+                    "ts": time.time(),
+                }
+            )
+            return
+        self.stats.add(io_errors=1)
+        self._record_failure(f"{context}: {exc}")
 
     def _make_hot_windows(self) -> list[tuple[int, int]]:
         rng = random.Random(self.seed ^ 0x5EEDFACE)
@@ -851,8 +967,7 @@ class IntegrityHarness:
                 else:
                     self._flush_once(worker_id)
             except Exception as exc:
-                self.stats.add(io_errors=1)
-                self._record_failure(f"worker-{worker_id}: {exc}")
+                self._handle_thread_exception(f"worker-{worker_id}", exc)
                 return
 
     def scrub_sample_once(self, worker_id: int = -1) -> None:
@@ -911,8 +1026,7 @@ class IntegrityHarness:
             try:
                 self.scrub_sample_once()
             except Exception as exc:
-                self.stats.add(io_errors=1)
-                self._record_failure(f"sample-scrubber: {exc}")
+                self._handle_thread_exception("sample-scrubber", exc)
                 return
 
     def reporter_loop(self, start_time: float) -> None:
@@ -931,8 +1045,7 @@ class IntegrityHarness:
                 self.device.replace(path)
                 self.stats.add(restarts=1)
             except Exception as exc:
-                self.stats.add(io_errors=1)
-                self._record_failure(f"restarter: {exc}")
+                self._handle_thread_exception("restarter", exc)
                 return
             finally:
                 self.pause_gate.resume()
@@ -1051,6 +1164,7 @@ class IntegrityHarness:
         )
 
     def teardown(self) -> None:
+        self.teardown_started.set()
         self.device.close()
         self.state_map.flush()
         self.state_map.close()
@@ -1080,6 +1194,8 @@ class IntegrityHarness:
         while time.time() < end_time and not self.stop_event.wait(1.0):
             pass
 
+        if self.failure is None:
+            self.normal_stop_requested.set()
         self.stop_event.set()
         for thread in threads:
             thread.join(timeout=10)
