@@ -449,36 +449,6 @@ impl BufferFlusher {
         Ok(reconciled)
     }
 
-    // TEMP(soak-debug): early fail-fast for "allocator handed out a live PBA".
-    // This is for root-cause capture, not a permanent hot-path check.
-    fn fail_if_fresh_pba_is_live(
-        meta: &MetaStore,
-        pba: Pba,
-        context: &'static str,
-    ) -> OnyxResult<()> {
-        let live_refs = meta.count_blockmap_refs_for_pba(pba)?;
-        if live_refs == 0 {
-            return Ok(());
-        }
-        let fragments = meta.unique_fragments_for_pba(pba, 4)?;
-        tracing::error!(
-            pba = pba.0,
-            live_refs,
-            samples = ?fragments
-                .iter()
-                .map(|(vol, lba, bv)| format!(
-                    "{}:{}@off{} size{} crc={:#x}",
-                    vol, lba.0, bv.slot_offset, bv.unit_compressed_size, bv.crc32
-                ))
-                .collect::<Vec<_>>(),
-            context,
-            "allocator returned a PBA that still has live blockmap references"
-        );
-        Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
-            "fresh pba {pba:?} is still live in metadata ({context})"
-        ))))
-    }
-
     // TEMP(soak-debug): early fail-fast for overlapping live fragments inside a
     // shared packed slot. Remove or gate after the root cause is fixed.
     fn fail_if_pba_has_fragment_overlap(
@@ -1003,27 +973,57 @@ impl BufferFlusher {
                         all_hashes.push(hash);
 
                         // Look up dedup index
+                        metrics.dedup_lookup_ops.fetch_add(1, Ordering::Relaxed);
+                        let lookup_start = Instant::now();
                         match meta.get_dedup_entry(&hash) {
-                            Ok(Some(entry)) => match meta.dedup_entry_is_live(&entry) {
-                                Ok(true) => {
-                                    is_hit[i] = true;
-                                    hit_infos.push((i, entry.to_blockmap_value()));
+                            Ok(Some(entry)) => {
+                                Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
+                                metrics.dedup_live_check_ops.fetch_add(1, Ordering::Relaxed);
+                                let live_check_start = Instant::now();
+                                match meta.dedup_entry_is_live(&entry) {
+                                    Ok(true) => {
+                                        Self::record_elapsed(
+                                            &metrics.dedup_live_check_ns,
+                                            live_check_start,
+                                        );
+                                        is_hit[i] = true;
+                                        hit_infos.push((i, entry.to_blockmap_value()));
+                                    }
+                                    Ok(false) => {
+                                        Self::record_elapsed(
+                                            &metrics.dedup_live_check_ns,
+                                            live_check_start,
+                                        );
+                                        metrics
+                                            .dedup_stale_index_entries
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let stale_delete_start = Instant::now();
+                                        let _ = meta.delete_dedup_index(&hash);
+                                        Self::record_elapsed(
+                                            &metrics.dedup_stale_delete_ns,
+                                            stale_delete_start,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        Self::record_elapsed(
+                                            &metrics.dedup_live_check_ns,
+                                            live_check_start,
+                                        );
+                                        tracing::warn!(
+                                            error = %e,
+                                            pba = entry.pba.0,
+                                            "dedup worker: failed to validate dedup entry liveness"
+                                        );
+                                    }
                                 }
-                                Ok(false) => {
-                                    let _ = meta.delete_dedup_index(&hash);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        pba = entry.pba.0,
-                                        "dedup worker: failed to validate dedup entry liveness"
-                                    );
-                                }
-                            },
+                            }
                             Err(e) => {
+                                Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
                                 tracing::warn!(error = %e, "dedup worker: failed to read dedup entry");
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
+                            }
                         }
                     }
 
@@ -1035,6 +1035,8 @@ impl BufferFlusher {
                         let vol_id_str = &unit.vol_id;
                         let vol_id = VolumeId(vol_id_str.clone());
 
+                        metrics.dedup_hit_commit_ops.fetch_add(1, Ordering::Relaxed);
+                        let hit_commit_start = Instant::now();
                         let result = lifecycle.with_read_lock(vol_id_str, || -> OnyxResult<()> {
                             // Generation check
                             let should_discard = match meta.get_volume(&vol_id)? {
@@ -1054,11 +1056,8 @@ impl BufferFlusher {
                             maybe_inject_dedup_hit_failure(vol_id_str, lba)?;
 
                             // atomic_dedup_hit re-reads old mapping inside the lock
-                            let decremented = meta.atomic_dedup_hit(
-                                &vol_id,
-                                lba,
-                                existing_value,
-                            )?;
+                            let decremented =
+                                meta.atomic_dedup_hit(&vol_id, lba, existing_value)?;
 
                             // Free old PBA if refcount dropped to 0
                             if let Some((old_pba, old_blocks)) = decremented {
@@ -1080,6 +1079,7 @@ impl BufferFlusher {
                             }
                             Ok(())
                         });
+                        Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
 
                         match result {
                             Ok(()) => {
@@ -1453,7 +1453,7 @@ impl BufferFlusher {
                                     in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF)
                                 }
                             }
-                            tracing::error!(error = %e, "writer: failed to fill hole");
+                            tracing::warn!(error = %e, "writer: hole fill rejected (will retry via normal path)");
                         }
                         match &completion {
                             None => {
@@ -1703,11 +1703,11 @@ impl BufferFlusher {
                     metrics,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
+                    tracing::warn!(
                         pba = fill.pba.0,
                         slot_offset = fill.slot_offset,
                         error = %e,
-                        "writer: failed to fill hole"
+                        "writer: hole fill rejected (will retry via normal path)"
                     );
                 }
                 signal_done!(seqs);
@@ -1781,11 +1781,6 @@ impl BufferFlusher {
             };
             Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
             let pba = allocation.start_pba();
-            if let Err(e) = Self::fail_if_fresh_pba_is_live(meta, pba, "write_unit_pre_io") {
-                allocation.free(allocator)?;
-                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                return Err(e);
-            }
 
             let io_start = Instant::now();
             if let Err(e) = maybe_inject_test_failure(
@@ -2069,16 +2064,6 @@ impl BufferFlusher {
             if skip[i] {
                 continue;
             }
-            let pba = pbas[i].unwrap();
-            if let Err(e) = Self::fail_if_fresh_pba_is_live(meta, pba, "write_units_batch_pre_io") {
-                if alloc_blocks[i] == 1 {
-                    let _ = allocator.free_one(pba);
-                } else {
-                    let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
-                }
-                results[i] = Err(e);
-                skip[i] = true;
-            }
         }
 
         // Phase 3: Parallel IO writes (one scoped thread per unit for NVMe QD > 1).
@@ -2265,13 +2250,11 @@ impl BufferFlusher {
                         if alloc_blocks[unit_idx] == 1 {
                             let _ = allocator.free_one(pba);
                         } else {
-                            let _ =
-                                allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
+                            let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
                         }
-                        results[unit_idx] =
-                            Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
-                                "batch write failed: {e}",
-                            ))));
+                        results[unit_idx] = Err(crate::error::OnyxError::Io(
+                            std::io::Error::other(format!("batch write failed: {e}",)),
+                        ));
                         skip[unit_idx] = true;
                     }
                 }
@@ -2534,7 +2517,6 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             return Ok(());
         }
-        Self::fail_if_fresh_pba_is_live(meta, sealed.pba, "write_packed_slot_pre_io")?;
 
         let io_start = Instant::now();
         if let Err(e) =
@@ -2568,19 +2550,16 @@ impl BufferFlusher {
         maybe_pause_before_packed_meta_write(&sealed.fragments)?;
 
         // Metadata commit — old PBA decrements re-computed inside the lock
-        let actual_old_pba_meta = match meta.atomic_batch_write_packed(
-            &batch_values,
-            sealed.pba,
-            total_refcount,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                allocator.free_one(sealed.pba)?;
-                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                return Err(e);
-            }
-        };
+        let actual_old_pba_meta =
+            match meta.atomic_batch_write_packed(&batch_values, sealed.pba, total_refcount) {
+                Ok(m) => m,
+                Err(e) => {
+                    allocator.free_one(sealed.pba)?;
+                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                    return Err(e);
+                }
+            };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Free old PBAs whose refcount dropped to 0 (using fresh data from lock)
@@ -2705,8 +2684,22 @@ impl BufferFlusher {
                 continue;
             }
 
-            // This fragment is fully dead but PBA is still live → hole
+            // This fragment is fully dead but PBA is still live → hole.
+            // Validate against current metadata before publishing: old_frag_meta
+            // is built from a stale read, so the actual byte layout may differ
+            // if a concurrent hole fill already placed a new fragment here.
+            // TODO(perf): has_overlap_at_pba is a full blockmap scan O(N).
+            // Replace with a PBA-prefix scan once blockmap key layout supports it.
             let size = frag.mapping.unit_compressed_size as u16;
+            if meta.has_overlap_at_pba(old_pba, slot_offset, size)? {
+                tracing::debug!(
+                    pba = old_pba.0,
+                    slot_offset,
+                    size,
+                    "skipping hole publication: byte range overlaps with live fragment in current metadata"
+                );
+                continue;
+            }
             crate::packer::packer::insert_hole_coalesced(hole_map, old_pba, slot_offset, size);
             metrics.hole_detections.fetch_add(1, Ordering::Relaxed);
 
@@ -2739,6 +2732,15 @@ impl BufferFlusher {
         let total_start = Instant::now();
         let unit = &fill.unit;
         let vol_id = VolumeId(unit.vol_id.clone());
+
+        // Early bail-out: if the slot PBA is already dead, skip the entire
+        // read-modify-write cycle. This is a best-effort check outside the
+        // lock — the definitive guard is inside atomic_batch_write_hole_fill.
+        if meta.get_refcount(fill.pba)? == 0 {
+            crate::packer::packer::remove_holes_for_pba(hole_map, fill.pba);
+            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+            return Ok(());
+        }
 
         // Lock ALL volumes in this packed slot, not just the new fragment's volume.
         // This prevents delete_volume(other_vol) from racing with our refcount update.

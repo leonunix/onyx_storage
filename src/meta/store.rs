@@ -711,6 +711,19 @@ impl MetaStore {
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
+        // Guard: reject if target PBA refcount is 0 (slot was freed).
+        // Between the caller's hole detection and this point, another thread may
+        // have decremented the slot's refcount to 0 and freed it to the allocator.
+        // Writing new entries to a freed PBA would create live blockmap references
+        // for a PBA the allocator considers free.
+        let current_rc = self.get_refcount(pba)?;
+        if current_rc == 0 {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "hole fill rejected: target PBA {:?} refcount is 0 (slot freed between hole detection and fill)",
+                pba,
+            ))));
+        }
+
         // Re-read current mappings inside the lock.
         let mut self_decrement: u32 = 0;
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
@@ -739,7 +752,6 @@ impl MetaStore {
         }
 
         // Increment existing PBA refcount by net amount
-        let current_rc = self.get_refcount(pba)?;
         let new_rc = current_rc + net_increment;
         let rc_key = encode_refcount_key(pba);
         batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
@@ -855,8 +867,9 @@ impl MetaStore {
                     if Some(old.pba) != new_pba {
                         let old_blocks =
                             old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
-                        let entry =
-                            aggregated_decrements.entry(old.pba).or_insert((0, old_blocks));
+                        let entry = aggregated_decrements
+                            .entry(old.pba)
+                            .or_insert((0, old_blocks));
                         entry.0 += 1;
                         entry.1 = entry.1.max(old_blocks);
                     }
@@ -883,7 +896,10 @@ impl MetaStore {
         for pba in touched_pbas {
             let current_rc = self.get_refcount(pba)?;
             let increments = new_refcounts.get(&pba).copied().unwrap_or(0);
-            let decrements = aggregated_decrements.get(&pba).map(|(d, _)| *d).unwrap_or(0);
+            let decrements = aggregated_decrements
+                .get(&pba)
+                .map(|(d, _)| *d)
+                .unwrap_or(0);
             let final_rc = current_rc
                 .saturating_add(increments)
                 .saturating_sub(decrements);
@@ -1255,11 +1271,27 @@ impl MetaStore {
         let mut decremented_old: Option<(Pba, u32)> = None;
 
         if !same_pba {
-            // Increment refcount for existing PBA (read + put inside lock)
+            // Guard: reject the hit if the dedup target PBA was freed.
+            // Between the caller's dedup_entry_is_live() check (outside lock) and
+            // this point, another thread may have decremented the target PBA's
+            // refcount to 0 and freed it to the allocator. Incrementing a freed
+            // PBA's refcount would create a live blockmap reference to a PBA that
+            // the allocator considers free.
             let current_rc = self.get_refcount(new_value.pba)?;
-            let new_rc = current_rc + 1;
+            if current_rc == 0 {
+                return Err(OnyxError::Io(std::io::Error::other(format!(
+                    "dedup hit rejected: target PBA {:?} refcount is 0 (freed between liveness check and hit)",
+                    new_value.pba,
+                ))));
+            }
+
+            // Increment refcount for existing PBA (reuse current_rc, no second read)
             let rc_key = encode_refcount_key(new_value.pba);
-            batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
+            batch.put_cf(
+                &cf_refcount,
+                &rc_key,
+                &encode_refcount_value(current_rc + 1),
+            );
 
             // Decrement old PBA refcount (read + put/delete inside lock)
             if let Some(old) = &old_mapping {

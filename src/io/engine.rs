@@ -1,6 +1,10 @@
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
 use crate::io::device::RawDevice;
+use crate::metrics::EngineMetrics;
 use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
 /// IO engine for reading/writing raw data blocks on LV3.
@@ -17,28 +21,61 @@ pub struct IoEngine {
     use_hugepages: bool,
     block_size: u32,
     pba_offset: u64,
+    metrics: Option<Arc<EngineMetrics>>,
 }
 
 impl IoEngine {
-    /// Create an IoEngine with standard PBA offset (RESERVED_BLOCKS).
-    /// PBA 0 maps to device offset `RESERVED_BLOCKS * BLOCK_SIZE`.
-    pub fn new(data_device: RawDevice, use_hugepages: bool) -> Self {
+    fn with_options(
+        data_device: RawDevice,
+        use_hugepages: bool,
+        pba_offset: u64,
+        metrics: Option<Arc<EngineMetrics>>,
+    ) -> Self {
         Self {
             data_device,
             use_hugepages,
             block_size: BLOCK_SIZE,
-            pba_offset: RESERVED_BLOCKS,
+            pba_offset,
+            metrics,
         }
+    }
+
+    /// Create an IoEngine with standard PBA offset (RESERVED_BLOCKS).
+    /// PBA 0 maps to device offset `RESERVED_BLOCKS * BLOCK_SIZE`.
+    pub fn new(data_device: RawDevice, use_hugepages: bool) -> Self {
+        Self::with_options(data_device, use_hugepages, RESERVED_BLOCKS, None)
+    }
+
+    /// Create an IoEngine with metrics attached.
+    pub fn new_with_metrics(
+        data_device: RawDevice,
+        use_hugepages: bool,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
+        Self::with_options(data_device, use_hugepages, RESERVED_BLOCKS, Some(metrics))
     }
 
     /// Create an IoEngine without PBA offset (PBA 0 = device offset 0).
     /// For testing only — production code should use `new()`.
     pub fn new_raw(data_device: RawDevice, use_hugepages: bool) -> Self {
-        Self {
-            data_device,
-            use_hugepages,
-            block_size: BLOCK_SIZE,
-            pba_offset: 0,
+        Self::with_options(data_device, use_hugepages, 0, None)
+    }
+
+    fn record_lv3_read(&self, bytes: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.lv3_read_ops.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .lv3_read_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_lv3_write(&self, bytes: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.lv3_write_ops.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .lv3_write_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
         }
     }
 
@@ -60,6 +97,7 @@ impl IoEngine {
         // Rest is already zero (AlignedBuf is zeroed)
 
         self.data_device.write_at(buf.as_slice(), offset)?;
+        self.record_lv3_write(buf.as_slice().len());
         Ok(())
     }
 
@@ -76,6 +114,7 @@ impl IoEngine {
         let offset = (pba.0 + self.pba_offset) * self.block_size as u64;
         let mut buf = AlignedBuf::new(self.block_size as usize, self.use_hugepages)?;
         self.data_device.read_at(buf.as_mut_slice(), offset)?;
+        self.record_lv3_read(buf.as_slice().len());
 
         Ok(buf.as_slice()[..size].to_vec())
     }
@@ -96,6 +135,7 @@ impl IoEngine {
         // Padding is already zero
 
         self.data_device.write_at(buf.as_slice(), offset)?;
+        self.record_lv3_write(total_size);
         Ok(())
     }
 
@@ -110,6 +150,7 @@ impl IoEngine {
 
         let mut buf = AlignedBuf::new(read_size, self.use_hugepages)?;
         self.data_device.read_at(buf.as_mut_slice(), offset)?;
+        self.record_lv3_read(read_size);
 
         Ok(buf.as_slice()[..size].to_vec())
     }

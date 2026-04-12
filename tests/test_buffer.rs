@@ -1050,3 +1050,62 @@ fn guided_recovery_forward_scan_stops_at_first_gap() {
         "forward scan must stop at the first gap after checkpoint head"
     );
 }
+
+/// Regression test: under memory pressure the head-of-queue entry must still be
+/// hydratable so reclaim_log_prefix can advance the tail.  Without the fix in
+/// pending_entry_arc_hydrated, the head entry's payload eviction + memory limit
+/// creates a deadlock where the tail never moves.
+#[test]
+fn head_of_queue_hydration_bypasses_memory_limit() {
+    // Create a pool with a 1-block memory limit. After appending one entry the
+    // limit is reached; sync_loop will evict its payload. A second append pushes
+    // us over the limit. The first (head-of-queue) entry must still be
+    // hydratable so the flusher can process it.
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_options_and_memory_limit(
+        dev,
+        Duration::ZERO,
+        1,   // 1 shard
+        256, // zone size
+        Duration::ZERO,
+        BLOCK_SIZE as u64, // max_payload_memory = 1 block (4 KB)
+    )
+    .unwrap();
+
+    // Append entry 1 — uses the entire memory budget.
+    let seq1 = pool.append("vol", Lba(0), 1, &vec![0xAA; 4096], 0).unwrap();
+
+    // Wait for the sync thread to publish seq1 and evict its payload.
+    thread::sleep(Duration::from_millis(50));
+
+    // Manually mark_flushed to reclaim memory so we can append a second entry.
+    pool.mark_flushed(seq1, Lba(0), 1).unwrap();
+
+    let seq2 = pool.append("vol", Lba(1), 1, &vec![0xBB; 4096], 0).unwrap();
+
+    // Wait for sync thread to publish and evict seq2's payload.
+    thread::sleep(Duration::from_millis(50));
+
+    // seq1 was mark_flushed above and removed from pending — it's gone.
+    // seq2 should be the head-of-queue entry with payload evicted.
+    // Even though memory is at the limit, pending_entry_arc must succeed
+    // for the head-of-queue entry.
+    let hydrated = pool.pending_entry_arc(seq2);
+    assert!(
+        hydrated.is_some(),
+        "head-of-queue entry must be hydratable even under memory pressure"
+    );
+    let entry = hydrated.unwrap();
+    assert!(
+        entry.payload.is_some(),
+        "hydrated entry must have its payload restored from disk"
+    );
+    assert_eq!(
+        &**entry.payload.as_ref().unwrap(),
+        &vec![0xBB; 4096][..],
+        "hydrated payload must match original data"
+    );
+}

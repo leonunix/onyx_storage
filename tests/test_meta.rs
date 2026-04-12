@@ -241,9 +241,7 @@ fn reconcile_refcount_repairs_blockmap_undercount() {
         ),
     ];
 
-    store
-        .atomic_batch_write(&vol_id, &batch_values, 2)
-        .unwrap();
+    store.atomic_batch_write(&vol_id, &batch_values, 2).unwrap();
     assert_eq!(store.get_refcount(pba).unwrap(), 2);
 
     store.set_refcount(pba, 1).unwrap();
@@ -813,9 +811,7 @@ fn atomic_batch_write_multi_with_decrements() {
             flags: 0,
         },
     )];
-    store
-        .atomic_batch_write(&vol_id, &initial, 3)
-        .unwrap();
+    store.atomic_batch_write(&vol_id, &initial, 3).unwrap();
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
 
     // Overwrite Lba(0) with new PBA 60; function internally reads old mapping (PBA 50)
@@ -865,9 +861,7 @@ fn atomic_batch_write_multi_aggregates_decrements_across_units() {
         flags: 0,
     };
     let initial = vec![(Lba(0), bv50), (Lba(10), bv50), (Lba(20), bv50)];
-    store
-        .atomic_batch_write(&vol_id, &initial, 3)
-        .unwrap();
+    store.atomic_batch_write(&vol_id, &initial, 3).unwrap();
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
 
     // Two units overwrite Lba(10) and Lba(20) to new PBAs.

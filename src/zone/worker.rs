@@ -98,6 +98,12 @@ impl ZoneWorker {
                         self.metrics
                             .read_buffer_hits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.metrics
+                            .buffer_read_ops
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.metrics
+                            .buffer_read_bytes
+                            .fetch_add(BLOCK_SIZE as u64, std::sync::atomic::Ordering::Relaxed);
                         return Ok(Some(payload[offset..end].to_vec()));
                     }
                 }

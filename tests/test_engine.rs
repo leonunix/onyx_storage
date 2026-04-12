@@ -296,11 +296,19 @@ fn engine_metrics_snapshot_tracks_reads_writes_and_dedup() {
     assert!(snapshot.volume_write_bytes >= 8192);
     assert!(snapshot.volume_read_bytes >= 8192);
     assert!(snapshot.buffer_appends >= 2);
+    assert!(snapshot.buffer_write_ops >= 2);
+    assert!(snapshot.buffer_write_bytes >= 8192);
     assert!(
         snapshot.read_buffer_hits + snapshot.read_lv3_hits >= 2,
         "expected the two reads to be served by buffer and/or LV3"
     );
+    assert!(snapshot.buffer_read_ops >= 1);
+    assert!(snapshot.buffer_read_bytes >= 4096);
     assert!(snapshot.read_lv3_hits >= 1);
+    assert!(snapshot.lv3_read_ops >= 1);
+    assert!(snapshot.lv3_read_bytes >= 4096);
+    assert!(snapshot.lv3_write_ops >= 1);
+    assert!(snapshot.lv3_write_bytes >= 4096);
     assert!(snapshot.flush_units_written >= 1 || snapshot.flush_packed_slots_written >= 1);
     assert!(
         snapshot.dedup_hits >= 1,
@@ -323,6 +331,7 @@ fn engine_status_report_includes_metrics_sections() {
     assert!(report.contains("buffer_pending_entries:"));
     assert!(report.contains("volume_ops:"));
     assert!(report.contains("read_path:"));
+    assert!(report.contains("lv3_io:"));
     assert!(report.contains("flush:"));
     assert!(report.contains("dedup:"));
     assert!(report.contains("gc:"));

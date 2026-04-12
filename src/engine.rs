@@ -299,7 +299,11 @@ impl OnyxEngine {
             }
         }
 
-        let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
+        let io_engine = Arc::new(IoEngine::new_with_metrics(
+            data_dev,
+            config.storage.use_hugepages,
+            metrics.clone(),
+        ));
 
         // 3. Space allocator
         let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
@@ -691,7 +695,11 @@ impl OnyxEngine {
             }
         }
 
-        let io_engine = Arc::new(IoEngine::new(data_dev, config.storage.use_hugepages));
+        let io_engine = Arc::new(IoEngine::new_with_metrics(
+            data_dev,
+            config.storage.use_hugepages,
+            metrics.clone(),
+        ));
 
         // Space allocator
         let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
@@ -861,6 +869,14 @@ impl OnyxEngine {
             zone_count: self.zone_manager.as_ref().map(|zm| zm.zone_count()),
             buffer_pending_entries: self.buffer_pool.as_ref().map(|pool| pool.pending_count()),
             buffer_fill_pct: self.buffer_pool.as_ref().map(|pool| pool.fill_percentage()),
+            buffer_payload_memory_bytes: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.payload_memory_bytes()),
+            buffer_payload_memory_limit_bytes: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.payload_memory_limit_bytes()),
             buffer_shards: self
                 .buffer_pool
                 .as_ref()

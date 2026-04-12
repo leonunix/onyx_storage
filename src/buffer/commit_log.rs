@@ -1059,12 +1059,31 @@ impl BufferShard {
                 } else {
                     Instant::now().checked_add(self.backpressure_timeout)
                 };
+            let mut backpressure_start: Option<Instant> = None;
             loop {
                 let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
                 if current + payload_size <= mem_limit {
+                    if let (Some(start), Some(metrics)) =
+                        (backpressure_start.take(), self.metrics.get())
+                    {
+                        BufferShard::record_metric(&metrics.buffer_backpressure_wait_ns, start);
+                    }
                     break;
                 }
+                if backpressure_start.is_none() {
+                    backpressure_start = Some(Instant::now());
+                    if let Some(metrics) = self.metrics.get() {
+                        metrics
+                            .buffer_backpressure_events
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 if self.backpressure_timeout.is_zero() {
+                    if let (Some(start), Some(metrics)) =
+                        (backpressure_start.take(), self.metrics.get())
+                    {
+                        BufferShard::record_metric(&metrics.buffer_backpressure_wait_ns, start);
+                    }
                     return Err(OnyxError::BufferPoolFull(current as usize));
                 }
                 let wait_for = match deadline {
@@ -1076,6 +1095,14 @@ impl BufferShard {
                                 limit_mb = mem_limit / (1024 * 1024),
                                 "append rejected: payload memory limit exceeded"
                             );
+                            if let (Some(start), Some(metrics)) =
+                                (backpressure_start.take(), self.metrics.get())
+                            {
+                                BufferShard::record_metric(
+                                    &metrics.buffer_backpressure_wait_ns,
+                                    start,
+                                );
+                            }
                             return Err(OnyxError::BufferPoolFull(current as usize));
                         }
                         remaining.min(BACKPRESSURE_POLL_INTERVAL)
@@ -1171,6 +1198,10 @@ impl BufferShard {
             metrics.buffer_appends.fetch_add(1, Ordering::Relaxed);
             metrics
                 .buffer_append_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            metrics.buffer_write_ops.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .buffer_write_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
         }
         Ok(())
@@ -1340,17 +1371,44 @@ impl BufferShard {
         // Memory guard: refuse to hydrate if payload memory is already over limit.
         // The flusher's retry-snapshot mechanism will pick this entry up later
         // once in-flight entries have been drained and memory is freed.
+        //
+        // EXCEPTION: always allow hydration for the entry at the front of log_order.
+        // That entry blocks reclaim_log_prefix (tail advancement). Under sustained
+        // write load, maybe_evict_payloads evicts payloads faster than the flusher
+        // can process them, and the memory limit prevents re-hydration — a deadlock
+        // where the tail never advances. Exempting the single head-of-queue entry
+        // (at most one 128 KB payload over the limit) breaks the cycle and lets the
+        // ring reclaim space.
         let limit = self.max_payload_memory();
         if limit > 0 {
             let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
             if current >= limit {
+                let is_head = self.ring.lock().log_order.front().map(|f| f.seq) == Some(seq);
+                if !is_head {
+                    if let Some(metrics) = self.metrics.get() {
+                        metrics
+                            .buffer_hydration_skipped_due_to_mem_limit
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::debug!(
+                        seq,
+                        current_mb = current / (1024 * 1024),
+                        limit_mb = limit / (1024 * 1024),
+                        "skipping hydration: payload memory limit reached"
+                    );
+                    return None;
+                }
+                if let Some(metrics) = self.metrics.get() {
+                    metrics
+                        .buffer_hydration_head_bypass_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 tracing::debug!(
                     seq,
                     current_mb = current / (1024 * 1024),
                     limit_mb = limit / (1024 * 1024),
-                    "skipping hydration: payload memory limit reached"
+                    "head-of-queue entry: bypassing memory limit to unblock tail"
                 );
-                return None;
             }
         }
         // Lazy hydration: read payload from disk.
@@ -1399,15 +1457,15 @@ impl BufferShard {
     /// No disk write — metadata commit to RocksDB is the durable record.
     /// On crash recovery, stale "unflushed" entries are detected by
     /// cross-checking against the blockmap.
-    fn free_seq_allocation(&self, seq: u64, pending: &PendingEntry) {
-        let slot_count = pending.disk_len / BLOCK_SIZE;
+    fn free_seq_allocation(&self, seq: u64, _pending: &PendingEntry) {
         self.lifecycle.lock().cancelled.insert(seq);
         {
             let mut ring = self.ring.lock();
-            debug_assert!(ring.log_order.iter().any(|record| record.seq == seq
-                && record.disk_offset == pending.disk_offset
-                && record.slot_count == slot_count));
-            ring.flushed_seqs.insert(seq);
+            if !ring.flushed_seqs.insert(seq) {
+                // Already freed by a concurrent purge_volume / free_seq_allocation_durable.
+                // The ring space was already reclaimed — nothing left to do.
+                return;
+            }
             let before = ring.used_bytes;
             Self::reclaim_log_prefix(&mut ring);
             if ring.used_bytes < before {
@@ -1426,9 +1484,10 @@ impl BufferShard {
             Self::mark_entry_flushed(&self.device, pending)?;
         }
         {
-            let _slot_count = pending.disk_len / BLOCK_SIZE;
             let mut ring = self.ring.lock();
-            ring.flushed_seqs.insert(seq);
+            if !ring.flushed_seqs.insert(seq) {
+                return Ok(());
+            }
             let before = ring.used_bytes;
             Self::reclaim_log_prefix(&mut ring);
             if ring.used_bytes < before {
