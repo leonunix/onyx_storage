@@ -567,7 +567,7 @@ fn concurrent_duplicate_mark_flushed_does_not_underflow_payload_memory() {
         let seq = pool
             .append("test-vol", Lba(lba), 1, &vec![0xA5; BLOCK_SIZE as usize], 0)
             .unwrap();
-        assert_eq!(pool.payload_memory_bytes(), BLOCK_SIZE as u64);
+        assert_eq!(pool.payload_memory_bytes(), 0);
 
         let barrier = Arc::new(Barrier::new(9));
         let mut workers = Vec::new();

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use rocksdb::{
     BlockBasedOptions, ColumnFamilyDescriptor, MergeOperands, Options, ReadOptions, WriteBatch, DB,
@@ -63,6 +63,24 @@ pub struct MetaStore {
     /// on the same PBA's refcount lose updates (e.g., dedup hit +1 racing with
     /// overwrite -1 on the same PBA).
     refcount_lock: Mutex<()>,
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn soak_debug_guards_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONYX_ENABLE_SOAK_DEBUG_GUARDS")
+            .ok()
+            .and_then(|value| parse_env_bool(&value))
+            .unwrap_or(cfg!(debug_assertions))
+    })
 }
 
 impl MetaStore {
@@ -1401,10 +1419,27 @@ impl MetaStore {
     }
 
     /// A dedup entry is safe to use only if the owning PBA is still referenced
-    /// and the exact fragment identity is still present in the live blockmap.
-    pub fn dedup_entry_is_live(&self, entry: &DedupEntry) -> OnyxResult<bool> {
+    /// and the hash is still registered to that PBA in dedup_reverse.
+    ///
+    /// In debug builds (or when `ONYX_ENABLE_SOAK_DEBUG_GUARDS=1`) we also
+    /// verify the exact fragment identity against the live blockmap. That last
+    /// check is a full blockmap scan and is intentionally skipped by default in
+    /// release builds to keep dedup on the hot path.
+    pub fn dedup_entry_is_live(
+        &self,
+        hash: &ContentHash,
+        entry: &DedupEntry,
+    ) -> OnyxResult<bool> {
         if self.get_refcount(entry.pba)? == 0 {
             return Ok(false);
+        }
+        let cf_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
+        let reverse_key = encode_dedup_reverse_key(entry.pba, hash);
+        if self.db.get_cf(&cf_reverse, &reverse_key)?.is_none() {
+            return Ok(false);
+        }
+        if !soak_debug_guards_enabled() {
+            return Ok(true);
         }
         self.has_live_fragment_ref(&entry.to_blockmap_value())
     }

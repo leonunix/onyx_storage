@@ -251,7 +251,7 @@ impl DedupScanner {
 
                 // Look up dedup index
                 match meta.get_dedup_entry(&hash)? {
-                    Some(existing) if meta.dedup_entry_is_live(&existing)? => {
+                    Some(existing) if meta.dedup_entry_is_live(&hash, &existing)? => {
                         // Dedup hit! Remap this LBA to existing PBA
                         let new_bv = BlockmapValue {
                             flags: 0, // Clear DEDUP_SKIPPED

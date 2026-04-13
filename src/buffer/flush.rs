@@ -210,6 +210,24 @@ fn hole_fill_locks() -> &'static Mutex<HashMap<Pba, Arc<Mutex<()>>>> {
     HOLE_FILL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn soak_debug_guards_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONYX_ENABLE_SOAK_DEBUG_GUARDS")
+            .ok()
+            .and_then(|value| parse_env_bool(&value))
+            .unwrap_or(cfg!(debug_assertions))
+    })
+}
+
 fn maybe_inject_test_failure(
     vol_id: &str,
     start_lba: Lba,
@@ -1000,7 +1018,7 @@ impl BufferFlusher {
                                 Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
                                 metrics.dedup_live_check_ops.fetch_add(1, Ordering::Relaxed);
                                 let live_check_start = Instant::now();
-                                match meta.dedup_entry_is_live(&entry) {
+                                match meta.dedup_entry_is_live(&hash, &entry) {
                                     Ok(true) => {
                                         Self::record_elapsed(
                                             &metrics.dedup_live_check_ns,
@@ -2742,6 +2760,17 @@ impl BufferFlusher {
         hole_map: &HoleMap,
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
+        // Hole publication currently depends on full-blockmap validation to
+        // avoid reviving stale packed-slot bytes. Keep that expensive path in
+        // debug builds, but skip it by default in release so the writer does
+        // not spend multiple CPU-seconds per status window on O(N) scans.
+        //
+        // Hole reuse remains available for investigation by setting
+        // ONYX_ENABLE_SOAK_DEBUG_GUARDS=1.
+        if !soak_debug_guards_enabled() {
+            let _ = (old_frag_meta, meta, hole_map, metrics);
+            return Ok(());
+        }
         for (&(old_pba, slot_offset), frag) in old_frag_meta {
             // Only interested in packed fragments (unit_compressed_size < BLOCK_SIZE implies packed)
             // and only if we overwrote ALL LBAs of this fragment in this batch

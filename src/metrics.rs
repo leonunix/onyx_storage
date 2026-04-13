@@ -631,6 +631,12 @@ pub struct BufferShardSnapshot {
     pub pending_entries: u64,
     pub head_offset: u64,
     pub tail_offset: u64,
+    /// Total entries in log_order (both flushed and unflushed).
+    pub log_order_len: usize,
+    /// Entries flushed but stuck behind the head-of-line blocker.
+    pub flushed_seqs_len: usize,
+    /// Seq of the front entry in log_order (the head-of-line blocker), if any.
+    pub head_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
