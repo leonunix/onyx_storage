@@ -41,6 +41,8 @@ pub struct PendingEntry {
     pub payload: Option<Arc<[u8]>>,
     pub disk_offset: u64,
     pub disk_len: u32,
+    /// In-memory residency start used for starvation diagnostics.
+    pub enqueued_at: Instant,
     /// Older buffered ranges overwritten by this entry at append time.
     /// Once this entry is durable in the commit log, these ranges can be
     /// retired immediately instead of waiting for the flusher to rediscover
@@ -182,6 +184,7 @@ struct RingState {
     tail_offset: u64,
     log_order: VecDeque<LogRecord>,
     flushed_seqs: HashSet<u64>,
+    head_became_at: Option<Instant>,
 }
 
 // ── Lifecycle: inflight/cancelled tracking ──────────────────────────
@@ -395,6 +398,7 @@ impl BufferShard {
             return None;
         };
 
+        let was_empty = ring.log_order.is_empty();
         ring.head_offset = (offset + len_bytes) % capacity;
         ring.used_bytes += len_bytes;
         ring.log_order.push_back(LogRecord {
@@ -402,6 +406,9 @@ impl BufferShard {
             disk_offset: offset,
             slot_count,
         });
+        if was_empty {
+            ring.head_became_at = Some(Instant::now());
+        }
         Some(offset)
     }
 
@@ -409,6 +416,7 @@ impl BufferShard {
         loop {
             let Some(front) = ring.log_order.front().copied() else {
                 ring.tail_offset = ring.head_offset;
+                ring.head_became_at = None;
                 break;
             };
             if !ring.flushed_seqs.contains(&front.seq) {
@@ -427,6 +435,7 @@ impl BufferShard {
                 .front()
                 .map(|next| next.disk_offset)
                 .unwrap_or(ring.head_offset);
+            ring.head_became_at = ring.log_order.front().map(|_| Instant::now());
         }
     }
 
@@ -535,6 +544,7 @@ impl BufferShard {
                             payload: None, // lazy: hydrated from disk on demand
                             disk_offset: offset,
                             disk_len,
+                            enqueued_at: Instant::now(),
                             superseded_ranges: Vec::new(),
                         })
                     });
@@ -672,6 +682,7 @@ impl BufferShard {
                         payload: None, // lazy: hydrated from disk on demand
                         disk_offset: offset,
                         disk_len,
+                        enqueued_at: Instant::now(),
                         superseded_ranges: Vec::new(),
                     })
                 });
@@ -861,6 +872,7 @@ impl BufferShard {
         };
 
         let (staging_tx, staging_rx) = unbounded();
+        let had_head = !scan.log_order.is_empty();
         let mut log_order = VecDeque::with_capacity(scan.log_order.len());
         log_order.extend(scan.log_order);
 
@@ -875,6 +887,7 @@ impl BufferShard {
                     tail_offset: scan.tail_offset,
                     log_order,
                     flushed_seqs: scan.flushed_seqs,
+                    head_became_at: had_head.then(Instant::now),
                 }),
                 ring_space_cv: parking_lot::Condvar::new(),
                 backpressure_timeout,
@@ -1125,6 +1138,7 @@ impl BufferShard {
             payload: None,
             disk_offset: write_offset,
             disk_len,
+            enqueued_at: Instant::now(),
             superseded_ranges,
         });
 
@@ -1322,6 +1336,7 @@ impl BufferShard {
             payload: None,
             disk_offset: pending.disk_offset,
             disk_len: pending.disk_len,
+            enqueued_at: pending.enqueued_at,
             superseded_ranges: pending.superseded_ranges.clone(),
         })
     }
@@ -1493,6 +1508,66 @@ impl BufferShard {
             .iter()
             .map(|entry| entry.value().clone())
             .collect()
+    }
+
+    fn is_seq_ready_for_flush(&self, seq: u64) -> bool {
+        !self.lifecycle.lock().inflight.contains(&seq)
+    }
+
+    fn head_pending_entry_arc_hydrated_if_stuck(
+        &self,
+        min_age: Duration,
+    ) -> Option<Arc<PendingEntry>> {
+        let head_seq = self
+            .ring
+            .lock()
+            .log_order
+            .front()
+            .map(|record| record.seq)?;
+        if !self.is_seq_ready_for_flush(head_seq) {
+            return None;
+        }
+        let pending = self.pending_entries.get(&head_seq)?;
+        let has_partial_progress = self.flush_progress.contains_key(&head_seq);
+        let old_enough = pending.enqueued_at.elapsed() >= min_age;
+        drop(pending);
+        if !has_partial_progress && !old_enough {
+            return None;
+        }
+        self.pending_entry_arc_hydrated(head_seq)
+    }
+
+    fn head_seq_debug_state(
+        &self,
+        head_seq: Option<u64>,
+        head_became_at: Option<Instant>,
+    ) -> (Option<u32>, Option<u64>, Option<u64>) {
+        let Some(seq) = head_seq else {
+            return (None, None, None);
+        };
+        let Some(pending) = self.pending_entries.get(&seq) else {
+            return (None, None, None);
+        };
+        let flushed = self
+            .flush_progress
+            .get(&seq)
+            .map(|offsets| offsets.len() as u32)
+            .unwrap_or(0);
+        let remaining = pending
+            .lba_count
+            .saturating_sub(flushed.min(pending.lba_count));
+        let age_ms = pending
+            .enqueued_at
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let residency_ms =
+            head_became_at.map(|ts| ts.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        (Some(remaining), Some(age_ms), residency_ms)
+    }
+
+    fn flushed_offsets_snapshot(&self, seq: u64) -> Option<HashSet<u16>> {
+        self.flush_progress.get(&seq).map(|s| s.clone())
     }
 
     fn has_seq(&self, seq: u64) -> bool {
@@ -2074,21 +2149,28 @@ impl WriteBufferPool {
                     inflight.clear();
                     writes_applied = false;
 
-                    // Safety-net: purge stale entries from cancelled that
-                    // outlived their corresponding inflight seq. After the
-                    // batch above, inflight is empty so any remaining
-                    // cancelled entry is a leftover that will never be
-                    // consumed. Retain only seqs still tracked as inflight.
+                    // Safety-net: periodically purge stale entries from
+                    // cancelled that outlived their corresponding inflight
+                    // seq. Use pending_entries as ground truth: if a seq is
+                    // no longer pending, it has been fully flushed and the
+                    // cancelled entry is stale.  Only sweep when cancelled
+                    // grows past a threshold to amortise the DashMap lookups.
                     {
                         let lc = shard.lifecycle.lock();
-                        if !lc.cancelled.is_empty() {
-                            let keep: HashSet<u64> = lc
+                        if lc.cancelled.len() > 256 {
+                            let stale: Vec<u64> = lc
                                 .cancelled
-                                .intersection(&lc.inflight)
+                                .iter()
+                                .filter(|seq| !shard.pending_entries.contains_key(seq))
                                 .copied()
                                 .collect();
                             drop(lc);
-                            shard.lifecycle.lock().cancelled = keep;
+                            if !stale.is_empty() {
+                                let mut lc = shard.lifecycle.lock();
+                                for seq in &stale {
+                                    lc.cancelled.remove(seq);
+                                }
+                            }
                         }
                     }
                 }
@@ -2552,6 +2634,43 @@ impl WriteBufferPool {
             .unwrap_or_default()
     }
 
+    pub fn ready_pending_entries_arc_snapshot_for_shard(
+        &self,
+        shard_idx: usize,
+    ) -> Vec<Arc<PendingEntry>> {
+        self.shards
+            .get(shard_idx)
+            .map(|shard| {
+                let mut entries: Vec<_> = shard
+                    .shard
+                    .pending_entries_arc_snapshot()
+                    .into_iter()
+                    .filter(|entry| shard.shard.is_seq_ready_for_flush(entry.seq))
+                    .collect();
+                entries.sort_by_key(|entry| entry.seq);
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn head_stuck_pending_entry_arc_for_shard(
+        &self,
+        shard_idx: usize,
+        min_age: Duration,
+    ) -> Option<Arc<PendingEntry>> {
+        self.shards.get(shard_idx).and_then(|shard| {
+            shard
+                .shard
+                .head_pending_entry_arc_hydrated_if_stuck(min_age)
+        })
+    }
+
+    pub fn flushed_offsets_for_shard(&self, shard_idx: usize, seq: u64) -> Option<HashSet<u16>> {
+        self.shards
+            .get(shard_idx)
+            .and_then(|shard| shard.shard.flushed_offsets_snapshot(seq))
+    }
+
     pub fn recv_ready_timeout(&self, timeout: Duration) -> Result<u64, RecvTimeoutError> {
         self.ready_rx.recv_timeout(timeout)
     }
@@ -2741,7 +2860,16 @@ impl WriteBufferPool {
             .enumerate()
             .map(|(idx, handle)| {
                 let s = &handle.shard;
-                let (used, capacity, head, tail, log_order_len, flushed_seqs_len, head_seq) = {
+                let (
+                    used,
+                    capacity,
+                    head,
+                    tail,
+                    log_order_len,
+                    flushed_seqs_len,
+                    head_seq,
+                    head_became_at,
+                ) = {
                     let ring = s.ring.lock();
                     (
                         ring.used_bytes,
@@ -2751,8 +2879,11 @@ impl WriteBufferPool {
                         ring.log_order.len(),
                         ring.flushed_seqs.len(),
                         ring.log_order.front().map(|r| r.seq),
+                        ring.head_became_at,
                     )
                 };
+                let (head_remaining_lbas, head_age_ms, head_residency_ms) =
+                    s.head_seq_debug_state(head_seq, head_became_at);
                 let fill_pct = if capacity > 0 {
                     ((used * 100) / capacity) as u8
                 } else {
@@ -2769,6 +2900,9 @@ impl WriteBufferPool {
                     log_order_len,
                     flushed_seqs_len,
                     head_seq,
+                    head_remaining_lbas,
+                    head_age_ms,
+                    head_residency_ms,
                 }
             })
             .collect()
@@ -2882,5 +3016,80 @@ mod tests {
         );
         assert!(shard.pending_entry_arc(seq).is_none());
         assert_eq!(pool.payload_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn shard_snapshot_reports_head_remaining_lbas_and_age() {
+        let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+
+        let seq = pool
+            .append(
+                "test-vol",
+                Lba(32),
+                3,
+                &vec![0xAB; 3 * BLOCK_SIZE as usize],
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+            seq
+        );
+        thread::sleep(Duration::from_millis(2));
+
+        let snap = &pool.shard_snapshots()[0];
+        assert_eq!(snap.head_seq, Some(seq));
+        assert_eq!(snap.head_remaining_lbas, Some(3));
+        assert!(snap.head_age_ms.is_some());
+        assert!(snap.head_residency_ms.is_some());
+
+        pool.mark_flushed(seq, Lba(32), 1).unwrap();
+        let snap = &pool.shard_snapshots()[0];
+        assert_eq!(snap.head_seq, Some(seq));
+        assert_eq!(snap.head_remaining_lbas, Some(2));
+    }
+
+    #[test]
+    fn flushed_offsets_tracks_partial_progress() {
+        let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+
+        let seq = pool
+            .append(
+                "test-vol",
+                Lba(100),
+                4,
+                &vec![0xCD; 4 * BLOCK_SIZE as usize],
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+            seq
+        );
+
+        // No flush progress yet.
+        assert!(pool.flushed_offsets_for_shard(0, seq).is_none());
+
+        // Partial flush: LBA 100 and 102 (offsets 0 and 2).
+        pool.mark_flushed(seq, Lba(100), 1).unwrap();
+        pool.mark_flushed(seq, Lba(102), 1).unwrap();
+
+        let offsets = pool.flushed_offsets_for_shard(0, seq).unwrap();
+        assert!(offsets.contains(&0));
+        assert!(!offsets.contains(&1));
+        assert!(offsets.contains(&2));
+        assert!(!offsets.contains(&3));
+        assert_eq!(offsets.len(), 2);
+
+        // Entry still exists (not fully flushed).
+        assert!(pool.pending_entry_arc(seq).is_some());
+
+        // Flush remaining LBAs 101 and 103.
+        pool.mark_flushed(seq, Lba(101), 1).unwrap();
+        pool.mark_flushed(seq, Lba(103), 1).unwrap();
+
+        // Entry removed; flush_progress cleaned up.
+        assert!(pool.flushed_offsets_for_shard(0, seq).is_none());
+        assert!(pool.pending_entry_arc(seq).is_none());
     }
 }

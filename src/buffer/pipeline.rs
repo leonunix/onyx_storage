@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -170,6 +171,7 @@ pub fn coalesce_pending(
     max_raw_bytes: usize,
     max_lbas: u32,
     vol_compression: &dyn Fn(&str) -> CompressionAlgo,
+    skip_offsets: &HashMap<u64, HashSet<u16>>,
 ) -> Vec<CoalesceUnit> {
     let bs = BLOCK_SIZE as usize;
 
@@ -178,7 +180,13 @@ pub fn coalesce_pending(
         let Some(ref payload) = entry.payload else {
             continue;
         };
+        let skip = skip_offsets.get(&entry.seq);
         for i in 0..entry.lba_count {
+            if let Some(flushed) = skip {
+                if flushed.contains(&(i as u16)) {
+                    continue;
+                }
+            }
             let offset = i as usize * bs;
             let end = offset + bs;
             if end <= payload.len() {

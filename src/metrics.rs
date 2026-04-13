@@ -637,6 +637,12 @@ pub struct BufferShardSnapshot {
     pub flushed_seqs_len: usize,
     /// Seq of the front entry in log_order (the head-of-line blocker), if any.
     pub head_seq: Option<u64>,
+    /// Remaining unflushed 4KB blocks for the head-of-line seq, if known.
+    pub head_remaining_lbas: Option<u32>,
+    /// Age of the head-of-line seq in milliseconds, if known.
+    pub head_age_ms: Option<u64>,
+    /// How long the current seq has continuously remained at the head/front.
+    pub head_residency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

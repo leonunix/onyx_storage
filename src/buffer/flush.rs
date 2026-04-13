@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -53,6 +53,13 @@ struct OldFragmentRef {
 struct ActiveSeq {
     vol_id: String,
     vol_created_at: u64,
+}
+
+struct PackedSlotRetry {
+    sealed: SealedSlot,
+    buffered_seqs: Vec<u64>,
+    buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+    retry_at: Instant,
 }
 
 #[derive(Default)]
@@ -428,6 +435,8 @@ impl Allocation {
 }
 
 impl BufferFlusher {
+    const HEAD_RETRY_AGE_THRESHOLD: Duration = Duration::from_millis(500);
+
     /// compress_workers / dedup.workers are now **per-lane** counts.
     /// No division — each lane gets the configured number of workers.
     fn per_lane_worker_count(configured: usize, _lane_count: usize) -> usize {
@@ -448,6 +457,64 @@ impl BufferFlusher {
 
     fn purge_holes_for_extent(hole_map: &HoleMap, start: Pba, count: u32) {
         crate::packer::packer::remove_holes_for_extent(hole_map, start, count);
+    }
+
+    /// Once blockmap/refcount metadata has committed, reclaiming the old PBA is
+    /// strictly best-effort. Failing this cleanup must not turn the flush into a
+    /// retry loop, or the buffer head will stay pinned behind work that already
+    /// committed successfully.
+    fn cleanup_dead_pba_post_commit(
+        meta: &MetaStore,
+        allocator: &SpaceAllocator,
+        hole_map: &HoleMap,
+        old_pba: Pba,
+        old_blocks: u32,
+        context: &'static str,
+    ) {
+        let remaining = match Self::live_refcount_with_reconcile(meta, old_pba, context) {
+            Ok(remaining) => remaining,
+            Err(e) => {
+                tracing::error!(
+                    pba = old_pba.0,
+                    old_blocks,
+                    error = %e,
+                    context,
+                    "post-commit cleanup: failed to confirm dead PBA; leaving allocator reservation"
+                );
+                return;
+            }
+        };
+        if remaining != 0 {
+            return;
+        }
+
+        if let Err(e) = meta.cleanup_dedup_for_pba_standalone(old_pba) {
+            tracing::error!(
+                pba = old_pba.0,
+                old_blocks,
+                error = %e,
+                context,
+                "post-commit cleanup: failed to cleanup dedup metadata; leaving allocator reservation"
+            );
+            return;
+        }
+
+        let free_result = if old_blocks <= 1 {
+            Self::purge_holes_for_pba(hole_map, old_pba);
+            allocator.free_one(old_pba)
+        } else {
+            Self::purge_holes_for_extent(hole_map, old_pba, old_blocks);
+            allocator.free_extent(Extent::new(old_pba, old_blocks))
+        };
+        if let Err(e) = free_result {
+            tracing::error!(
+                pba = old_pba.0,
+                old_blocks,
+                error = %e,
+                context,
+                "post-commit cleanup: allocator free failed after metadata commit; continuing without retry"
+            );
+        }
     }
 
     // TEMP(soak-debug): heavy protective guard. It rescans metadata only when a
@@ -523,6 +590,21 @@ impl BufferFlusher {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    fn try_enqueue_pending_seq(
+        seq: u64,
+        pool: &WriteBufferPool,
+        in_flight: &HashMap<u64, u32>,
+        in_flight_tracker: &FlusherInFlightTracker,
+        seen: &mut std::collections::HashSet<u64>,
+        new_entries: &mut Vec<Arc<crate::buffer::commit_log::PendingEntry>>,
+    ) {
+        if !in_flight.contains_key(&seq) && in_flight_tracker.retry_ready(seq) && seen.insert(seq) {
+            if let Some(entry) = pool.pending_entry_arc(seq) {
+                new_entries.push(entry);
+            }
+        }
     }
 
     fn live_positions_for_unit(
@@ -775,29 +857,47 @@ impl BufferFlusher {
             let mut new_entries = Vec::new();
             let mut seen = std::collections::HashSet::new();
 
-            match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
-                Ok(seq) => {
-                    if !in_flight.contains_key(&seq)
-                        && in_flight_tracker.retry_ready(seq)
-                        && seen.insert(seq)
-                    {
-                        if let Some(entry) = pool.pending_entry_arc(seq) {
-                            new_entries.push(entry);
-                        }
-                    }
-                    while let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) {
-                        if !in_flight.contains_key(&seq)
-                            && in_flight_tracker.retry_ready(seq)
-                            && seen.insert(seq)
-                        {
-                            if let Some(entry) = pool.pending_entry_arc(seq) {
-                                new_entries.push(entry);
-                            }
-                        }
-                    }
+            // Always give the front of log_order a retry chance first. A single
+            // partially flushed seq can otherwise starve behind newer ready work
+            // and pin tail reclamation for minutes.
+            if let Some(entry) = pool
+                .head_stuck_pending_entry_arc_for_shard(shard_idx, Self::HEAD_RETRY_AGE_THRESHOLD)
+            {
+                let seq = entry.seq;
+                if !in_flight.contains_key(&seq)
+                    && in_flight_tracker.retry_ready(seq)
+                    && seen.insert(seq)
+                {
+                    new_entries.push(entry);
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            }
+
+            if new_entries.is_empty() {
+                match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
+                    Ok(seq) => {
+                        Self::try_enqueue_pending_seq(
+                            seq,
+                            pool,
+                            &in_flight,
+                            in_flight_tracker,
+                            &mut seen,
+                            &mut new_entries,
+                        );
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+
+            while let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) {
+                Self::try_enqueue_pending_seq(
+                    seq,
+                    pool,
+                    &in_flight,
+                    in_flight_tracker,
+                    &mut seen,
+                    &mut new_entries,
+                );
             }
 
             // Safety net for recovered / retried entries: periodically snapshot the
@@ -808,7 +908,7 @@ impl BufferFlusher {
             if last_retry_snapshot.elapsed() >= retry_snapshot_interval {
                 last_retry_snapshot = Instant::now();
                 let mut topped_up = 0usize;
-                for entry in pool.pending_entries_arc_snapshot_for_shard(shard_idx) {
+                for entry in pool.ready_pending_entries_arc_snapshot_for_shard(shard_idx) {
                     if topped_up >= retry_snapshot_topup_limit {
                         break;
                     }
@@ -836,10 +936,26 @@ impl BufferFlusher {
                     .entry(entry.vol_id.clone())
                     .or_insert_with(|| vol_compression(&entry.vol_id));
             }
+            // Build skip map: already-flushed LBA offsets that the coalescer
+            // should not re-include.  Prevents the head-of-line starvation bug
+            // where a partially-flushed entry keeps re-coalescing done LBAs.
+            let mut skip_offsets: HashMap<u64, std::collections::HashSet<u16>> = HashMap::new();
+            for entry in &new_entries {
+                if let Some(flushed) = pool.flushed_offsets_for_shard(shard_idx, entry.seq) {
+                    if !flushed.is_empty() {
+                        skip_offsets.insert(entry.seq, flushed);
+                    }
+                }
+            }
+
             let cache_ref = &vol_compression_cache;
-            let units = coalesce_pending(&new_entries, max_raw, max_lbas, &|vid| {
-                cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None)
-            });
+            let units = coalesce_pending(
+                &new_entries,
+                max_raw,
+                max_lbas,
+                &|vid| cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None),
+                &skip_offsets,
+            );
 
             // Payload data has been copied into CoalesceUnit.raw_data — evict
             // the hydrated payloads from the DashMap immediately so the flusher
@@ -1078,14 +1194,9 @@ impl BufferFlusher {
                         // the newer blockmap entry.  This mirrors the
                         // live_positions_for_unit check that write_unit uses for
                         // miss blocks.
-                        let latest_seq =
-                            Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
-                        if !pool.is_latest_lba_seq(
-                            vol_id_str,
-                            lba,
-                            latest_seq,
-                            unit.vol_created_at,
-                        ) {
+                        let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
+                        if !pool.is_latest_lba_seq(vol_id_str, lba, latest_seq, unit.vol_created_at)
+                        {
                             // Treat as "successfully handled" so mark_flushed
                             // cleans up the buffer entry, but don't touch the
                             // blockmap or refcounts.
@@ -1119,21 +1230,14 @@ impl BufferFlusher {
 
                             // Free old PBA if refcount dropped to 0
                             if let Some((old_pba, old_blocks)) = decremented {
-                                let remaining = Self::live_refcount_with_reconcile(
+                                Self::cleanup_dead_pba_post_commit(
                                     meta,
+                                    allocator,
+                                    hole_map,
                                     old_pba,
+                                    old_blocks,
                                     "dedup_worker_hit_cleanup",
-                                )?;
-                                if remaining == 0 {
-                                    meta.cleanup_dedup_for_pba_standalone(old_pba)?;
-                                    if old_blocks <= 1 {
-                                        Self::purge_holes_for_pba(hole_map, old_pba);
-                                        allocator.free_one(old_pba)?;
-                                    } else {
-                                        Self::purge_holes_for_extent(hole_map, old_pba, old_blocks);
-                                        allocator.free_extent(Extent::new(old_pba, old_blocks))?;
-                                    }
-                                }
+                                );
                             }
                             Ok(())
                         });
@@ -1314,6 +1418,7 @@ impl BufferFlusher {
         let mut buffered_seqs: Vec<u64> = Vec::new();
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
             Vec::new();
+        let mut packed_retries: VecDeque<PackedSlotRetry> = VecDeque::new();
         let mut tail_dirty = false;
 
         /// Helper: flush accumulated Passthrough units through write_units_batch.
@@ -1362,6 +1467,21 @@ impl BufferFlusher {
         }
 
         while running.load(Ordering::Relaxed) {
+            if Self::retry_one_packed_slot(
+                shard_idx,
+                &mut packed_retries,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                io_engine,
+                done_tx,
+                packer.hole_map(),
+                metrics,
+            ) {
+                tail_dirty = true;
+            }
+
             let first = match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => unit,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1378,19 +1498,26 @@ impl BufferFlusher {
                             metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
-                            for dc in &buffered_completions {
-                                in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
-                            }
-                            tracing::error!(pba = sealed.pba.0, error = %e,
-                                "writer: failed to flush packed slot on idle");
+                            let failed_pba = sealed.pba;
+                            Self::queue_packed_slot_retry(
+                                &mut packed_retries,
+                                sealed,
+                                &mut buffered_seqs,
+                                &mut buffered_completions,
+                            );
+                            tracing::error!(
+                                pba = failed_pba.0,
+                                error = %e,
+                                "writer: failed to flush packed slot on idle; queued whole-slot retry"
+                            );
+                        } else {
+                            Self::flush_buffered_done(
+                                &mut buffered_seqs,
+                                &mut buffered_completions,
+                                done_tx,
+                            );
+                            tail_dirty = true;
                         }
-                        Self::flush_buffered_done(
-                            &mut buffered_seqs,
-                            &mut buffered_completions,
-                            done_tx,
-                        );
-                        tail_dirty = true;
                     }
                     if tail_dirty {
                         let _ = pool.advance_tail_for_shard(shard_idx);
@@ -1444,18 +1571,26 @@ impl BufferFlusher {
                             metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
-                            for dc in &buffered_completions {
-                                in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
-                            }
-                            tracing::error!(pba = sealed.pba.0, error = %e,
-                                "writer: failed to flush packed slot");
+                            let failed_pba = sealed.pba;
+                            Self::queue_packed_slot_retry(
+                                &mut packed_retries,
+                                sealed,
+                                &mut buffered_seqs,
+                                &mut buffered_completions,
+                            );
+                            tracing::error!(
+                                pba = failed_pba.0,
+                                error = %e,
+                                "writer: failed to flush packed slot; queued whole-slot retry"
+                            );
+                        } else {
+                            Self::flush_buffered_done(
+                                &mut buffered_seqs,
+                                &mut buffered_completions,
+                                done_tx,
+                            );
+                            tail_dirty = true;
                         }
-                        Self::flush_buffered_done(
-                            &mut buffered_seqs,
-                            &mut buffered_completions,
-                            done_tx,
-                        );
                         match &completion {
                             None => buffered_seqs.extend(&seqs),
                             Some(dc) => buffered_completions.push(dc.clone()),
@@ -1475,18 +1610,26 @@ impl BufferFlusher {
                             metrics,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
-                            for dc in &buffered_completions {
-                                in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
-                            }
-                            tracing::error!(pba = sealed.pba.0, error = %e,
-                                "writer: failed to flush packed slot (passthrough fallback)");
+                            let failed_pba = sealed.pba;
+                            Self::queue_packed_slot_retry(
+                                &mut packed_retries,
+                                sealed,
+                                &mut buffered_seqs,
+                                &mut buffered_completions,
+                            );
+                            tracing::error!(
+                                pba = failed_pba.0,
+                                error = %e,
+                                "writer: failed to flush packed slot (passthrough fallback); queued whole-slot retry"
+                            );
+                        } else {
+                            Self::flush_buffered_done(
+                                &mut buffered_seqs,
+                                &mut buffered_completions,
+                                done_tx,
+                            );
+                            tail_dirty = true;
                         }
-                        Self::flush_buffered_done(
-                            &mut buffered_seqs,
-                            &mut buffered_completions,
-                            done_tx,
-                        );
                         pt_batch.push(unit);
                         pt_seqs.push(seqs);
                         pt_completions.push(completion);
@@ -1569,6 +1712,21 @@ impl BufferFlusher {
             tail_dirty = true;
         }
 
+        while Self::retry_one_packed_slot(
+            shard_idx,
+            &mut packed_retries,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            io_engine,
+            done_tx,
+            packer.hole_map(),
+            metrics,
+        ) {
+            tail_dirty = true;
+        }
+
         if let Some(sealed) = packer.flush_open_slot() {
             if let Err(e) = Self::write_packed_slot(
                 shard_idx,
@@ -1610,6 +1768,88 @@ impl BufferFlusher {
         for dc in buffered_completions.drain(..) {
             if let Some(original_seqs) = dc.decrement() {
                 let _ = done_tx.send(original_seqs);
+            }
+        }
+    }
+
+    fn queue_packed_slot_retry(
+        retries: &mut VecDeque<PackedSlotRetry>,
+        sealed: SealedSlot,
+        buffered_seqs: &mut Vec<u64>,
+        buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+    ) {
+        retries.push_back(PackedSlotRetry {
+            sealed,
+            buffered_seqs: std::mem::take(buffered_seqs),
+            buffered_completions: std::mem::take(buffered_completions),
+            retry_at: Instant::now() + Self::RETRY_BACKOFF,
+        });
+    }
+
+    fn retry_one_packed_slot(
+        shard_idx: usize,
+        retries: &mut VecDeque<PackedSlotRetry>,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
+        done_tx: &Sender<Vec<u64>>,
+        hole_map: &HoleMap,
+        metrics: &EngineMetrics,
+    ) -> bool {
+        let Some(retry_at) = retries.front().map(|retry| retry.retry_at) else {
+            return false;
+        };
+        if retry_at > Instant::now() {
+            return false;
+        }
+
+        let mut retry = retries.pop_front().expect("front checked above");
+        let new_pba = match allocator.allocate_one_for_lane(shard_idx) {
+            Ok(pba) => pba,
+            Err(e) => {
+                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                retry.retry_at = Instant::now() + Self::RETRY_BACKOFF;
+                retries.push_back(retry);
+                tracing::warn!(
+                    lane = shard_idx,
+                    error = %e,
+                    "writer: failed to allocate PBA for packed-slot retry"
+                );
+                return false;
+            }
+        };
+        retry.sealed.pba = new_pba;
+
+        match Self::write_packed_slot(
+            shard_idx,
+            &retry.sealed,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            io_engine,
+            hole_map,
+            metrics,
+        ) {
+            Ok(()) => {
+                let mut buffered_seqs = retry.buffered_seqs;
+                let mut buffered_completions = retry.buffered_completions;
+                Self::flush_buffered_done(&mut buffered_seqs, &mut buffered_completions, done_tx);
+                true
+            }
+            Err(e) => {
+                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                retry.retry_at = Instant::now() + Self::RETRY_BACKOFF;
+                retries.push_back(retry);
+                tracing::error!(
+                    lane = shard_idx,
+                    pba = new_pba.0,
+                    error = %e,
+                    "writer: packed-slot retry failed; will retry whole slot again"
+                );
+                false
             }
         }
     }
@@ -1846,13 +2086,9 @@ impl BufferFlusher {
             let pba_locks: Vec<_> = (0..alloc_count)
                 .map(|i| Self::hole_fill_lock(Pba(pba.0 + i as u64)))
                 .collect();
-            let _pba_guards: Vec<_> =
-                pba_locks.iter().map(|l| l.lock().unwrap()).collect();
+            let _pba_guards: Vec<_> = pba_locks.iter().map(|l| l.lock().unwrap()).collect();
             for i in 0..alloc_count {
-                crate::packer::packer::remove_holes_for_pba(
-                    hole_map,
-                    Pba(pba.0 + i as u64),
-                );
+                crate::packer::packer::remove_holes_for_pba(hole_map, Pba(pba.0 + i as u64));
             }
 
             let io_start = Instant::now();
@@ -1956,19 +2192,14 @@ impl BufferFlusher {
 
             let cleanup_start = Instant::now();
             for (old_pba, (_, old_blocks)) in &actual_old_pba_meta {
-                let remaining =
-                    Self::live_refcount_with_reconcile(meta, *old_pba, "write_unit_cleanup")?;
-                if remaining == 0 {
-                    // Clean up dedup index entries for freed PBA
-                    meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
-                    if *old_blocks == 1 {
-                        Self::purge_holes_for_pba(hole_map, *old_pba);
-                        allocator.free_one(*old_pba)?;
-                    } else {
-                        Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
-                        allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
-                    }
-                }
+                Self::cleanup_dead_pba_post_commit(
+                    meta,
+                    allocator,
+                    hole_map,
+                    *old_pba,
+                    *old_blocks,
+                    "write_unit_cleanup",
+                );
             }
             Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
@@ -2667,18 +2898,14 @@ impl BufferFlusher {
         // Free old PBAs whose refcount dropped to 0 (using fresh data from lock)
         let cleanup_start = Instant::now();
         for (old_pba, (_, old_blocks)) in &actual_old_pba_meta {
-            let remaining =
-                Self::live_refcount_with_reconcile(meta, *old_pba, "write_packed_slot_cleanup")?;
-            if remaining == 0 {
-                meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
-                if *old_blocks == 1 {
-                    Self::purge_holes_for_pba(hole_map, *old_pba);
-                    allocator.free_one(*old_pba)?;
-                } else {
-                    Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
-                    allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
-                }
-            }
+            Self::cleanup_dead_pba_post_commit(
+                meta,
+                allocator,
+                hole_map,
+                *old_pba,
+                *old_blocks,
+                "write_packed_slot_cleanup",
+            );
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
@@ -2987,18 +3214,14 @@ impl BufferFlusher {
         // Free old PBAs whose refcount dropped to 0 (using fresh data from lock)
         let cleanup_start = Instant::now();
         for (old_pba, (_, old_blocks)) in &actual_old_pba_meta {
-            let remaining =
-                Self::live_refcount_with_reconcile(meta, *old_pba, "write_hole_fill_cleanup")?;
-            if remaining == 0 {
-                meta.cleanup_dedup_for_pba_standalone(*old_pba)?;
-                if *old_blocks == 1 {
-                    Self::purge_holes_for_pba(hole_map, *old_pba);
-                    allocator.free_one(*old_pba)?;
-                } else {
-                    Self::purge_holes_for_extent(hole_map, *old_pba, *old_blocks);
-                    allocator.free_extent(Extent::new(*old_pba, *old_blocks))?;
-                }
-            }
+            Self::cleanup_dead_pba_post_commit(
+                meta,
+                allocator,
+                hole_map,
+                *old_pba,
+                *old_blocks,
+                "write_hole_fill_cleanup",
+            );
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
@@ -3222,6 +3445,24 @@ mod tests {
         }
     }
 
+    fn make_packed_unit(fill: u8, seq: u64) -> CompressedUnit {
+        let data = vec![fill; 512];
+        CompressedUnit {
+            vol_id: "flush-race".into(),
+            start_lba: Lba(0),
+            lba_count: 1,
+            original_size: BLOCK_SIZE,
+            compressed_data: data.clone(),
+            compression: 0,
+            crc32: crc32fast::hash(&data),
+            vol_created_at: 1,
+            seq_lba_ranges: vec![(seq, Lba(0), 1)],
+            block_hashes: None,
+            dedup_skipped: false,
+            dedup_completion: None,
+        }
+    }
+
     #[test]
     fn old_write_unit_can_overwrite_newer_committed_mapping() {
         let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
@@ -3248,6 +3489,64 @@ mod tests {
             actual,
             vec![0x33; BLOCK_SIZE as usize],
             "older write committed after newer write must not win",
+        );
+    }
+
+    #[test]
+    fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
+        let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+            setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+
+        let seq = pool
+            .append("flush-race", Lba(0), 1, &vec![0x44; BLOCK_SIZE as usize], 1)
+            .unwrap();
+
+        let old_pba = allocator.allocate_one_for_lane(0).unwrap();
+        let new_pba = allocator.allocate_one_for_lane(0).unwrap();
+        let old_value = BlockmapValue {
+            pba: old_pba,
+            compression: 0,
+            unit_compressed_size: 512,
+            unit_original_size: BLOCK_SIZE,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: crc32fast::hash(&[0x22; 512]),
+            slot_offset: 0,
+            flags: 0,
+        };
+        meta.put_mapping(&VolumeId("flush-race".into()), Lba(0), &old_value)
+            .unwrap();
+        meta.set_refcount(old_pba, 1).unwrap();
+
+        // Simulate the allocator drift we observed in soak: metadata still
+        // points at old_pba, but the allocator already handed it back.
+        allocator.free_one(old_pba).unwrap();
+
+        let sealed = SealedSlot {
+            pba: new_pba,
+            data: vec![0xAB; BLOCK_SIZE as usize],
+            fragments: vec![crate::packer::packer::SlotFragment {
+                unit: make_packed_unit(0x11, seq),
+                slot_offset: 0,
+            }],
+        };
+
+        BufferFlusher::write_packed_slot(
+            0, &sealed, &pool, &meta, &lifecycle, &allocator, &io_engine, &hole_map, &metrics,
+        )
+        .unwrap();
+
+        let mapping = meta
+            .get_mapping(&VolumeId("flush-race".into()), Lba(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.pba, new_pba);
+        assert_eq!(meta.get_refcount(new_pba).unwrap(), 1);
+        assert_eq!(meta.get_refcount(old_pba).unwrap(), 0);
+        assert!(
+            pool.pending_entry_arc(seq).is_none(),
+            "post-commit cleanup drift must not leave the seq stuck in the buffer"
         );
     }
 }

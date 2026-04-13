@@ -1425,11 +1425,7 @@ impl MetaStore {
     /// verify the exact fragment identity against the live blockmap. That last
     /// check is a full blockmap scan and is intentionally skipped by default in
     /// release builds to keep dedup on the hot path.
-    pub fn dedup_entry_is_live(
-        &self,
-        hash: &ContentHash,
-        entry: &DedupEntry,
-    ) -> OnyxResult<bool> {
+    pub fn dedup_entry_is_live(&self, hash: &ContentHash, entry: &DedupEntry) -> OnyxResult<bool> {
         if self.get_refcount(entry.pba)? == 0 {
             return Ok(false);
         }
