@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::buffer::pipeline::CompressedUnit;
 use crate::error::OnyxResult;
@@ -119,6 +120,9 @@ struct OpenSlot {
     data: Vec<u8>,
     used: u16,
     fragments: Vec<SlotFragment>,
+    // Keep the first-fragment timestamp stable so sustained traffic cannot
+    // perpetually reset the open-slot age and strand buffered seqs forever.
+    opened_at: Instant,
 }
 
 /// Bin-packing of small compressed units into shared 4KB physical slots.
@@ -231,6 +235,21 @@ impl Packer {
         }
     }
 
+    /// Seal the current open slot once it has been kept open longer than
+    /// `max_age`, even if the writer lane never goes idle.
+    pub fn flush_open_slot_if_older_than(&mut self, max_age: Duration) -> Option<SealedSlot> {
+        let should_flush = self
+            .open_slot
+            .as_ref()
+            .map(|slot| slot.opened_at.elapsed() >= max_age)
+            .unwrap_or(false);
+        if should_flush {
+            Some(self.seal_open_slot())
+        } else {
+            None
+        }
+    }
+
     /// Find the smallest hole >= frag_size, remove it, return (key, full_hole_size).
     fn take_best_hole(&self, frag_size: u16) -> Option<(HoleKey, u16)> {
         let mut holes = self.hole_map.lock().unwrap();
@@ -280,6 +299,7 @@ impl Packer {
                 unit,
                 slot_offset: 0,
             }],
+            opened_at: Instant::now(),
         });
     }
 }

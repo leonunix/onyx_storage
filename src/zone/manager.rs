@@ -158,6 +158,11 @@ impl ZoneManager {
         }
     }
 
+    /// Access the shared engine metrics.
+    pub fn metrics(&self) -> &Arc<EngineMetrics> {
+        &self.metrics
+    }
+
     /// Determine which zone handles a given LBA
     pub fn zone_for_lba(&self, lba: Lba) -> ZoneId {
         let zone_idx = (lba.0 / self.zone_size_blocks) % self.zone_count as u64;

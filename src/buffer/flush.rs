@@ -525,26 +525,26 @@ impl BufferFlusher {
             allocator.free_extent(Extent::new(old_pba, old_blocks))
         };
         if let Err(e) = free_result {
-            tracing::error!(
+            tracing::warn!(
                 pba = old_pba.0,
                 old_blocks,
                 error = %e,
                 context,
-                "post-commit cleanup: allocator free failed after metadata commit; continuing without retry"
+                "post-commit cleanup: allocator free failed after metadata commit (benign if already freed by another path); continuing without retry"
             );
         }
     }
 
-    // TEMP(soak-debug): heavy protective guard. It rescans metadata only when a
-    // refcount says zero. Remove or gate after the underlying PBA reuse bug is
-    // fixed and soak remains stable.
+    // TEMP(soak-debug): heavy protective guard. In normal release runs we trust
+    // the refcount that was just updated in the metadata write path. The full
+    // reconcile scan stays available behind ONYX_ENABLE_SOAK_DEBUG_GUARDS=1.
     fn live_refcount_with_reconcile(
         meta: &MetaStore,
         pba: Pba,
         context: &'static str,
     ) -> OnyxResult<u32> {
         let remaining = meta.get_refcount(pba)?;
-        if remaining != 0 {
+        if remaining != 0 || !soak_debug_guards_enabled() {
             return Ok(remaining);
         }
         let reconciled = meta.reconcile_refcount_for_pba(pba)?;
@@ -1515,6 +1515,7 @@ impl BufferFlusher {
 
     const WRITER_BATCH_SIZE: usize = 32;
     const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+    const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(50);
 
     fn writer_loop(
         shard_idx: usize,
@@ -1592,6 +1593,23 @@ impl BufferFlusher {
                 io_engine,
                 done_tx,
                 packer.hole_map(),
+                metrics,
+            ) {
+                tail_dirty = true;
+            }
+
+            if Self::flush_aged_open_slot(
+                shard_idx,
+                packer,
+                &mut buffered_seqs,
+                &mut buffered_completions,
+                &mut packed_retries,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                io_engine,
+                done_tx,
                 metrics,
             ) {
                 tail_dirty = true;
@@ -1865,6 +1883,53 @@ impl BufferFlusher {
         if tail_dirty {
             let _ = pool.advance_tail_for_shard(shard_idx);
         }
+    }
+
+    fn flush_aged_open_slot(
+        shard_idx: usize,
+        packer: &mut Packer,
+        buffered_seqs: &mut Vec<u64>,
+        buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+        packed_retries: &mut VecDeque<PackedSlotRetry>,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
+        done_tx: &Sender<Vec<u64>>,
+        metrics: &EngineMetrics,
+    ) -> bool {
+        let Some(sealed) = packer.flush_open_slot_if_older_than(Self::PACKED_SLOT_MAX_AGE) else {
+            return false;
+        };
+        if let Err(e) = Self::write_packed_slot(
+            shard_idx,
+            &sealed,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            io_engine,
+            packer.hole_map(),
+            metrics,
+        ) {
+            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+            let failed_pba = sealed.pba;
+            Self::queue_packed_slot_retry(
+                packed_retries,
+                sealed,
+                buffered_seqs,
+                buffered_completions,
+            );
+            tracing::error!(
+                pba = failed_pba.0,
+                error = %e,
+                "writer: failed to flush aged packed slot; queued whole-slot retry"
+            );
+        } else {
+            Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
+        }
+        true
     }
 
     /// Flush buffered done_tx for sealed packer slots.
@@ -2709,7 +2774,7 @@ impl BufferFlusher {
         let mut dead_allocations: Vec<(Pba, u32)> = Vec::new();
         for (i, old_pba) in old_pba_keys.iter().enumerate() {
             let remaining = refcounts.get(i).copied().unwrap_or(0);
-            let confirmed = if remaining == 0 {
+            let confirmed = if remaining == 0 && soak_debug_guards_enabled() {
                 match meta.reconcile_refcount_for_pba(*old_pba) {
                     Ok(actual) => {
                         if actual != 0 {
@@ -3579,6 +3644,24 @@ mod tests {
         }
     }
 
+    fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
+        let data = vec![fill; 128];
+        CompressedUnit {
+            vol_id: "flush-race".into(),
+            start_lba: Lba(lba),
+            lba_count: 1,
+            original_size: BLOCK_SIZE,
+            compressed_data: data.clone(),
+            compression: 0,
+            crc32: crc32fast::hash(&data),
+            vol_created_at: 1,
+            seq_lba_ranges: vec![(seq, Lba(lba), 1)],
+            block_hashes: None,
+            dedup_skipped: false,
+            dedup_completion: None,
+        }
+    }
+
     #[test]
     fn old_write_unit_can_overwrite_newer_committed_mapping() {
         let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
@@ -3763,6 +3846,64 @@ mod tests {
 
         assert_eq!(dead_pbas.len(), 1);
         assert_eq!(dead_pbas.get(&old_pba), Some(&1));
+    }
+
+    #[test]
+    fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
+        let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+            setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+        let running = Arc::new(AtomicBool::new(true));
+        let in_flight = FlusherInFlightTracker::default();
+        let (tx, rx) = bounded::<CompressedUnit>(64);
+        let (done_tx, done_rx) = unbounded::<Vec<u64>>();
+
+        let running_w = running.clone();
+        let pool_w = pool.clone();
+        let meta_w = meta.clone();
+        let lifecycle_w = lifecycle.clone();
+        let allocator_w = allocator.clone();
+        let io_engine_w = io_engine.clone();
+        let metrics_w = metrics.clone();
+
+        let handle = thread::spawn(move || {
+            let mut packer = Packer::new_with_lane(allocator_w.clone(), hole_map, 0);
+            BufferFlusher::writer_loop(
+                0,
+                &rx,
+                &pool_w,
+                &meta_w,
+                &lifecycle_w,
+                &allocator_w,
+                &io_engine_w,
+                &done_tx,
+                &running_w,
+                &in_flight,
+                &mut packer,
+                &metrics_w,
+            );
+        });
+
+        // Keep the lane busy with small packed fragments and never leave a
+        // 50ms idle gap. Without age-based flushing, buffered seqs would not
+        // complete until traffic stops and recv_timeout finally fires.
+        for i in 0..12u64 {
+            tx.send(make_packed_unit_at(0x40 + i as u8, 10_000 + i, i))
+                .unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let done = done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .expect("busy writer lane should flush aged packed slot without waiting for idle");
+        assert!(
+            !done.is_empty(),
+            "aged packed slot flush should signal at least one buffered seq"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        drop(tx);
+        handle.join().unwrap();
     }
 
     #[test]

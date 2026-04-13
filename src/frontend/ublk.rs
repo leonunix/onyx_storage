@@ -9,6 +9,8 @@ use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 
+use std::sync::atomic::Ordering;
+
 use crate::config::UblkConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::types::{Lba, VolumeConfig, BLOCK_SIZE, SECTOR_SIZE};
@@ -113,6 +115,7 @@ impl OnyxUblkTarget {
                 let io_bytes = nr_sectors * sector_size;
                 let io_len = io_bytes as usize;
 
+                let metrics = zm.metrics();
                 let res = {
                     let mut bufs = io_bufs.borrow_mut();
                     let io_buf = &mut bufs[tag as usize];
@@ -184,6 +187,7 @@ impl OnyxUblkTarget {
                             }
                             sys::UBLK_IO_OP_WRITE => {
                                 let req = &io_slice[..io_len];
+                                #[allow(clippy::collapsible_if)]
                                 if offset_bytes % block_size == 0 && io_bytes % block_size == 0 {
                                     let start_lba = Lba(offset_bytes / block_size);
                                     let lba_count = (io_bytes / block_size) as u32;
@@ -292,6 +296,26 @@ impl OnyxUblkTarget {
                         }
                     }
                 };
+
+                // Record volume-level IO metrics for successful operations.
+                if res > 0 {
+                    let bytes = res as u64;
+                    match op {
+                        sys::UBLK_IO_OP_READ => {
+                            metrics.volume_read_ops.fetch_add(1, Ordering::Relaxed);
+                            metrics
+                                .volume_read_bytes
+                                .fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        sys::UBLK_IO_OP_WRITE => {
+                            metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
+                            metrics
+                                .volume_write_bytes
+                                .fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
 
                 let bufs = io_bufs.borrow();
                 if let Err(err) = q.complete_io_cmd_unified(
