@@ -15,7 +15,7 @@ use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
-use crate::meta::store::MetaStore;
+use crate::meta::store::{DedupHitResult, MetaStore};
 use crate::metrics::EngineMetrics;
 use crate::packer::packer::{HoleFill, HoleMap, PackResult, Packer, SealedSlot};
 use crate::space::allocator::SpaceAllocator;
@@ -168,6 +168,16 @@ fn record_old_fragment_ref(
         "fragment identity changed within one packed-slot fragment bucket"
     );
     frag.decrement += 1;
+}
+
+fn record_dead_pba_cleanup(dead_pbas: &mut HashMap<Pba, u32>, decremented: Option<(Pba, u32)>) {
+    let Some((old_pba, old_blocks)) = decremented else {
+        return;
+    };
+    dead_pbas
+        .entry(old_pba)
+        .and_modify(|blocks| *blocks = (*blocks).max(old_blocks))
+        .or_insert(old_blocks);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1232,82 +1242,140 @@ impl BufferFlusher {
                         }
                     }
 
-                    // Process hits directly in this thread.
-                    // Track which hits succeeded so we only mark_flushed for those.
+                    // Process hits in a single batch for this CoalesceUnit.
+                    // Phase A: pre-filter stale hits (outside lock).
                     let mut successful_hit_indices: Vec<usize> = Vec::new();
+                    let mut valid_hits: Vec<(usize, BlockmapValue)> = Vec::new();
                     for (i, existing_value) in &hit_infos {
                         let lba = Lba(unit.start_lba.0 + *i as u64);
                         let vol_id_str = &unit.vol_id;
-                        let vol_id = VolumeId(vol_id_str.clone());
 
                         // Staleness guard: if a newer write superseded this LBA
                         // in the buffer, skip the dedup hit to avoid overwriting
-                        // the newer blockmap entry.  This mirrors the
-                        // live_positions_for_unit check that write_unit uses for
-                        // miss blocks.
+                        // the newer blockmap entry.
                         let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
                         if !pool.is_latest_lba_seq(vol_id_str, lba, latest_seq, unit.vol_created_at)
                         {
-                            // Treat as "successfully handled" so mark_flushed
-                            // cleans up the buffer entry, but don't touch the
-                            // blockmap or refcounts.
                             successful_hit_indices.push(*i);
                             continue;
                         }
+                        valid_hits.push((*i, *existing_value));
+                    }
 
-                        metrics.dedup_hit_commit_ops.fetch_add(1, Ordering::Relaxed);
+                    // Phase B: batch commit all valid hits under one lifecycle
+                    // read lock + one refcount_lock acquisition.
+                    if !valid_hits.is_empty() {
+                        let vol_id_str = &unit.vol_id;
+                        let vol_id = VolumeId(vol_id_str.clone());
+
+                        metrics
+                            .dedup_hit_commit_ops
+                            .fetch_add(valid_hits.len() as u64, Ordering::Relaxed);
                         let hit_commit_start = Instant::now();
-                        let result = lifecycle.with_read_lock(vol_id_str, || -> OnyxResult<()> {
-                            // Generation check
-                            let should_discard = match meta.get_volume(&vol_id)? {
-                                None => true,
-                                Some(vc)
-                                    if unit.vol_created_at != 0
-                                        && vc.created_at != unit.vol_created_at =>
-                                {
-                                    true
+
+                        let batch_result = lifecycle.with_read_lock(
+                            vol_id_str,
+                            || -> OnyxResult<Vec<(usize, DedupHitResult)>> {
+                                // Generation check (one call for entire batch)
+                                let should_discard = match meta.get_volume(&vol_id)? {
+                                    None => true,
+                                    Some(vc)
+                                        if unit.vol_created_at != 0
+                                            && vc.created_at != unit.vol_created_at =>
+                                    {
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                if should_discard {
+                                    // Treat all as discarded (successfully handled)
+                                    return Ok(valid_hits
+                                        .iter()
+                                        .map(|(i, _)| (*i, DedupHitResult::Accepted(None)))
+                                        .collect());
                                 }
-                                _ => false,
-                            };
-                            if should_discard {
-                                return Ok(());
-                            }
 
-                            maybe_inject_dedup_hit_failure(vol_id_str, lba)?;
+                                // Build batch input, filtering out test-injected failures.
+                                let mut batch_input: Vec<(Lba, BlockmapValue)> =
+                                    Vec::with_capacity(valid_hits.len());
+                                let mut input_map: Vec<usize> =
+                                    Vec::with_capacity(valid_hits.len());
+                                for &(i, ref existing_value) in &valid_hits {
+                                    let lba = Lba(unit.start_lba.0 + i as u64);
+                                    if maybe_inject_dedup_hit_failure(vol_id_str, lba).is_ok() {
+                                        batch_input.push((lba, *existing_value));
+                                        input_map.push(i);
+                                    }
+                                }
 
-                            // atomic_dedup_hit re-reads old mapping inside the lock
-                            let decremented =
-                                meta.atomic_dedup_hit(&vol_id, lba, existing_value)?;
+                                let batch_results =
+                                    meta.atomic_batch_dedup_hits(&vol_id, &batch_input)?;
 
-                            // Free old PBA if refcount dropped to 0
-                            if let Some((old_pba, old_blocks)) = decremented {
-                                Self::cleanup_dead_pba_post_commit(
-                                    meta,
-                                    allocator,
-                                    hole_map,
-                                    old_pba,
-                                    old_blocks,
-                                    "dedup_worker_hit_cleanup",
-                                );
-                            }
-                            Ok(())
-                        });
+                                let mut combined: Vec<(usize, DedupHitResult)> =
+                                    Vec::with_capacity(valid_hits.len());
+                                for (j, result) in batch_results.into_iter().enumerate() {
+                                    combined.push((input_map[j], result));
+                                }
+                                // Injection-failed hits: demote to Rejected so they
+                                // get is_hit[i]=false and go through the write path.
+                                for &(i, _) in &valid_hits {
+                                    if !input_map.contains(&i) {
+                                        combined.push((i, DedupHitResult::Rejected));
+                                    }
+                                }
+                                Ok(combined)
+                            },
+                        );
                         Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
 
-                        match result {
-                            Ok(()) => {
-                                successful_hit_indices.push(*i);
+                        // Phase C: process results
+                        match batch_result {
+                            Ok(results) => {
+                                let mut dead_pbas: HashMap<Pba, u32> = HashMap::new();
+                                for (i, result) in &results {
+                                    match result {
+                                        DedupHitResult::Accepted(decremented) => {
+                                            successful_hit_indices.push(*i);
+                                            record_dead_pba_cleanup(&mut dead_pbas, *decremented);
+                                        }
+                                        DedupHitResult::Rejected => {
+                                            metrics
+                                                .dedup_hit_failures
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            is_hit[*i] = false;
+                                            tracing::warn!(
+                                                vol = unit.vol_id,
+                                                lba = unit.start_lba.0 + *i as u64,
+                                                "dedup worker: hit rejected (target PBA freed), demoting to miss"
+                                            );
+                                        }
+                                    }
+                                }
+                                // Phase D: cleanup dead PBAs outside the lock
+                                for (old_pba, old_blocks) in dead_pbas {
+                                    Self::cleanup_dead_pba_post_commit(
+                                        meta,
+                                        allocator,
+                                        hole_map,
+                                        old_pba,
+                                        old_blocks,
+                                        "dedup_worker_hit_cleanup",
+                                    );
+                                }
                             }
                             Err(e) => {
-                                metrics.dedup_hit_failures.fetch_add(1, Ordering::Relaxed);
-                                // Hit failed — demote to miss so it goes through
-                                // the normal write path on next coalesce cycle.
-                                is_hit[*i] = false;
+                                // Entire batch failed — demote all valid_hits to misses.
+                                metrics
+                                    .dedup_hit_failures
+                                    .fetch_add(valid_hits.len() as u64, Ordering::Relaxed);
+                                for (i, _) in &valid_hits {
+                                    is_hit[*i] = false;
+                                }
                                 tracing::error!(
                                     vol = unit.vol_id,
-                                    lba = lba.0,
+                                    count = valid_hits.len(),
                                     error = %e,
-                                    "dedup worker: hit failed, demoting to miss"
+                                    "dedup worker: batch hit failed, demoting all to miss"
                                 );
                             }
                         }
@@ -3596,6 +3664,105 @@ mod tests {
             pool.pending_entry_arc(seq).is_none(),
             "post-commit cleanup drift must not leave the seq stuck in the buffer"
         );
+    }
+
+    #[test]
+    fn dedup_hit_cleanup_deduplicates_repeated_old_pbas() {
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            _allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+        let vol = VolumeId("flush-race".into());
+        let old_pba = Pba(100);
+        let new_pba = Pba(200);
+
+        for lba in 0..3u64 {
+            meta.put_mapping(
+                &vol,
+                Lba(lba),
+                &BlockmapValue {
+                    pba: old_pba,
+                    compression: 0,
+                    unit_compressed_size: BLOCK_SIZE,
+                    unit_original_size: BLOCK_SIZE,
+                    unit_lba_count: 1,
+                    offset_in_unit: 0,
+                    crc32: 0,
+                    slot_offset: 0,
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        }
+        meta.set_refcount(old_pba, 3).unwrap();
+        meta.set_refcount(new_pba, 8).unwrap();
+
+        let results = meta
+            .atomic_batch_dedup_hits(
+                &vol,
+                &[
+                    (
+                        Lba(0),
+                        BlockmapValue {
+                            pba: new_pba,
+                            compression: 0,
+                            unit_compressed_size: BLOCK_SIZE,
+                            unit_original_size: BLOCK_SIZE,
+                            unit_lba_count: 1,
+                            offset_in_unit: 0,
+                            crc32: 0,
+                            slot_offset: 0,
+                            flags: 0,
+                        },
+                    ),
+                    (
+                        Lba(1),
+                        BlockmapValue {
+                            pba: new_pba,
+                            compression: 0,
+                            unit_compressed_size: BLOCK_SIZE,
+                            unit_original_size: BLOCK_SIZE,
+                            unit_lba_count: 1,
+                            offset_in_unit: 0,
+                            crc32: 0,
+                            slot_offset: 0,
+                            flags: 0,
+                        },
+                    ),
+                    (
+                        Lba(2),
+                        BlockmapValue {
+                            pba: new_pba,
+                            compression: 0,
+                            unit_compressed_size: BLOCK_SIZE,
+                            unit_original_size: BLOCK_SIZE,
+                            unit_lba_count: 1,
+                            offset_in_unit: 0,
+                            crc32: 0,
+                            slot_offset: 0,
+                            flags: 0,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let mut dead_pbas = HashMap::new();
+        for result in results {
+            if let DedupHitResult::Accepted(decremented) = result {
+                record_dead_pba_cleanup(&mut dead_pbas, decremented);
+            }
+        }
+
+        assert_eq!(dead_pbas.len(), 1);
+        assert_eq!(dead_pbas.get(&old_pba), Some(&1));
     }
 
     #[test]

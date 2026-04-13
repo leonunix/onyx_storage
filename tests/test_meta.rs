@@ -1,6 +1,6 @@
 use onyx_storage::config::MetaConfig;
 use onyx_storage::meta::schema::*;
-use onyx_storage::meta::store::MetaStore;
+use onyx_storage::meta::store::{DedupHitResult, MetaStore};
 use onyx_storage::types::*;
 use tempfile::tempdir;
 
@@ -913,4 +913,312 @@ fn atomic_batch_write_multi_empty() {
     let store = MetaStore::open(&test_config(dir.path())).unwrap();
     // Empty batch should be a no-op
     store.atomic_batch_write_multi(&[]).unwrap();
+}
+
+// --- atomic_batch_dedup_hits tests ---
+
+fn make_bv(pba: u64, compressed: u32, lba_count: u16, offset: u16) -> BlockmapValue {
+    BlockmapValue {
+        pba: Pba(pba),
+        compression: 0,
+        unit_compressed_size: compressed,
+        unit_original_size: 4096 * lba_count as u32,
+        unit_lba_count: lba_count,
+        offset_in_unit: offset,
+        crc32: 0,
+        slot_offset: 0,
+        flags: 0,
+    }
+}
+
+#[test]
+fn batch_dedup_hits_basic() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // Set up target PBA 100 with refcount 5
+    store.set_refcount(Pba(100), 5).unwrap();
+
+    // Three hits, no old mapping, all targeting PBA 100
+    let hits = vec![
+        (Lba(0), make_bv(100, 4096, 1, 0)),
+        (Lba(1), make_bv(100, 4096, 1, 0)),
+        (Lba(2), make_bv(100, 4096, 1, 0)),
+    ];
+    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    assert_eq!(results.len(), 3);
+    for r in &results {
+        match r {
+            DedupHitResult::Accepted(None) => {}
+            _ => panic!("expected Ok(None) for hit with no old mapping"),
+        }
+    }
+    // Refcount should be 5 + 3 = 8
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 8);
+    // Blockmap entries should be written
+    assert!(store.get_mapping(&vol, Lba(0)).unwrap().is_some());
+    assert!(store.get_mapping(&vol, Lba(1)).unwrap().is_some());
+    assert!(store.get_mapping(&vol, Lba(2)).unwrap().is_some());
+}
+
+#[test]
+fn batch_dedup_hits_rejected_target_freed() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // PBA 100 alive, PBA 200 freed (refcount 0)
+    store.set_refcount(Pba(100), 2).unwrap();
+    // PBA 200 has no refcount entry → 0
+
+    let hits = vec![
+        (Lba(0), make_bv(100, 4096, 1, 0)),
+        (Lba(1), make_bv(200, 4096, 1, 0)),
+    ];
+    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    assert_eq!(results.len(), 2);
+    match results[0] {
+        DedupHitResult::Accepted(None) => {}
+        _ => panic!("expected Ok(None) for PBA 100 hit"),
+    }
+    match results[1] {
+        DedupHitResult::Rejected => {}
+        _ => panic!("expected Rejected for freed PBA 200"),
+    }
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 3);
+    // PBA 200 should remain 0
+    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 0);
+    // Only LBA 0 should have blockmap entry
+    assert!(store.get_mapping(&vol, Lba(0)).unwrap().is_some());
+    assert!(store.get_mapping(&vol, Lba(1)).unwrap().is_none());
+}
+
+#[test]
+fn batch_dedup_hits_same_pba_refresh() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // LBA 5 already maps to PBA 100
+    let existing = make_bv(100, 4096, 1, 0);
+    store.atomic_write_mapping(&vol, Lba(5), &existing).unwrap();
+    let rc_before = store.get_refcount(Pba(100)).unwrap();
+
+    // Dedup hit targets the same PBA 100 → blockmap refresh, no refcount change
+    let hits = vec![(Lba(5), make_bv(100, 4096, 1, 0))];
+    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    match results[0] {
+        DedupHitResult::Accepted(None) => {}
+        _ => panic!("expected Accepted(None) for same-PBA hit"),
+    }
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), rc_before);
+}
+
+#[test]
+fn batch_dedup_hits_old_pba_decrement() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // LBA 5 maps to PBA 100 (refcount 3)
+    let existing = make_bv(100, 4096, 1, 0);
+    store.atomic_write_mapping(&vol, Lba(5), &existing).unwrap();
+    store.set_refcount(Pba(100), 3).unwrap();
+    // Target PBA 200 with refcount 5
+    store.set_refcount(Pba(200), 5).unwrap();
+
+    let hits = vec![(Lba(5), make_bv(200, 4096, 1, 0))];
+    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    match results[0] {
+        DedupHitResult::Accepted(Some((old_pba, _))) => {
+            assert_eq!(old_pba, Pba(100));
+        }
+        _ => panic!("expected Ok(Some) with old PBA 100"),
+    }
+    // PBA 200 should be 5 + 1 = 6
+    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 6);
+    // PBA 100 should be decremented (merge-based, read back to check)
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 2);
+    // Blockmap should point to PBA 200 now
+    let m = store.get_mapping(&vol, Lba(5)).unwrap().unwrap();
+    assert_eq!(m.pba, Pba(200));
+}
+
+#[test]
+fn batch_dedup_hits_multiple_same_target() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // All target PBA 100 with refcount 5, no old mappings
+    store.set_refcount(Pba(100), 5).unwrap();
+    let hits = vec![
+        (Lba(10), make_bv(100, 4096, 1, 0)),
+        (Lba(11), make_bv(100, 4096, 1, 0)),
+        (Lba(12), make_bv(100, 4096, 1, 0)),
+    ];
+    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 8);
+}
+
+#[test]
+fn batch_dedup_hits_multiple_decrement_same_old() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // 3 LBAs all map to PBA 100 (refcount 5)
+    store.set_refcount(Pba(100), 5).unwrap();
+    for i in 0..3 {
+        let bv = make_bv(100, 4096, 1, 0);
+        store.atomic_write_mapping(&vol, Lba(i), &bv).unwrap();
+    }
+    // Re-set refcount to 5 after atomic_write_mapping set it to 1 each time
+    store.set_refcount(Pba(100), 5).unwrap();
+    // Target PBA 200 with refcount 10
+    store.set_refcount(Pba(200), 10).unwrap();
+
+    let hits = vec![
+        (Lba(0), make_bv(200, 4096, 1, 0)),
+        (Lba(1), make_bv(200, 4096, 1, 0)),
+        (Lba(2), make_bv(200, 4096, 1, 0)),
+    ];
+    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    for r in &results {
+        match r {
+            DedupHitResult::Accepted(Some((old_pba, _))) => assert_eq!(*old_pba, Pba(100)),
+            _ => panic!("expected Ok(Some) for overwrite hit"),
+        }
+    }
+    // PBA 200: 10 + 3 = 13
+    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 13);
+    // PBA 100: 5 - 3 = 2 (merge-based)
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 2);
+}
+
+#[test]
+fn batch_dedup_hits_pba_is_both_target_and_old() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // LBA 5 maps to PBA 100 (refcount 3)
+    store.set_refcount(Pba(100), 3).unwrap();
+    store
+        .atomic_write_mapping(&vol, Lba(5), &make_bv(100, 4096, 1, 0))
+        .unwrap();
+    store.set_refcount(Pba(100), 3).unwrap();
+
+    // PBA 200 with refcount 5
+    store.set_refcount(Pba(200), 5).unwrap();
+
+    // Hit 1: LBA 5 maps 100→200 (decrement 100, increment 200)
+    // Hit 2: LBA 6 (no old mapping) targets 100 (increment 100)
+    let hits = vec![
+        (Lba(5), make_bv(200, 4096, 1, 0)),
+        (Lba(6), make_bv(100, 4096, 1, 0)),
+    ];
+    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    assert_eq!(results.len(), 2);
+    // PBA 100: base=3, +1 (hit 2 targets it), -1 (hit 1 old) = 3
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 3);
+    // PBA 200: base=5, +1 (hit 1 targets it) = 6
+    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 6);
+}
+
+#[test]
+fn batch_dedup_hits_empty() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+    let results = store.atomic_batch_dedup_hits(&vol, &[]).unwrap();
+    assert!(results.is_empty());
+}
+
+// --- merge-based decrement tests for atomic_batch_write_packed ---
+
+#[test]
+fn batch_write_packed_merge_decrement() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // Pre-existing: LBA 0,1 map to PBA 50 with refcount 5
+    store.set_refcount(Pba(50), 5).unwrap();
+    for i in 0..2 {
+        store
+            .atomic_write_mapping(&vol, Lba(i), &make_bv(50, 4096, 1, 0))
+            .unwrap();
+    }
+    store.set_refcount(Pba(50), 5).unwrap();
+
+    // Write packed slot with PBA 300 containing LBA 0,1
+    let batch = vec![
+        (vol.clone(), Lba(0), make_bv(300, 2000, 2, 0)),
+        (vol.clone(), Lba(1), make_bv(300, 2000, 2, 1)),
+    ];
+    let old_meta = store
+        .atomic_batch_write_packed(&batch, Pba(300), 2)
+        .unwrap();
+
+    // PBA 50 should be decremented by 2 → 3 (merge-based)
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
+    // PBA 300 refcount = 2
+    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 2);
+    // old_meta should report PBA 50 was decremented
+    assert!(old_meta.contains_key(&Pba(50)));
+    assert_eq!(old_meta[&Pba(50)].0, 2); // decrement count
+}
+
+#[test]
+fn batch_write_packed_merge_decrement_to_zero() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // PBA 50 with refcount 1, LBA 0 maps to it
+    store.set_refcount(Pba(50), 1).unwrap();
+    store
+        .atomic_write_mapping(&vol, Lba(0), &make_bv(50, 4096, 1, 0))
+        .unwrap();
+    store.set_refcount(Pba(50), 1).unwrap();
+
+    // Overwrite with PBA 300
+    let batch = vec![(vol.clone(), Lba(0), make_bv(300, 2000, 1, 0))];
+    store
+        .atomic_batch_write_packed(&batch, Pba(300), 1)
+        .unwrap();
+
+    // PBA 50: 1 - 1 = 0 (merge clamps to 0, key still exists with value 0)
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 0);
+    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 1);
+}
+
+// --- merge-based decrement tests for atomic_batch_write_multi ---
+
+#[test]
+fn batch_write_multi_merge_decrement_only() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol = VolumeId("test-vol".into());
+
+    // Pre-existing: LBA 0 maps to PBA 50 (refcount 3)
+    store.set_refcount(Pba(50), 3).unwrap();
+    store
+        .atomic_write_mapping(&vol, Lba(0), &make_bv(50, 4096, 1, 0))
+        .unwrap();
+    store.set_refcount(Pba(50), 3).unwrap();
+
+    // Overwrite LBA 0 with PBA 400. PBA 50 is decrement-only (not a target).
+    let batch_values = vec![(Lba(0), make_bv(400, 4096, 1, 0))];
+    let units = vec![(&vol, batch_values.as_slice(), 1u32)];
+    let old_meta = store.atomic_batch_write_multi(&units).unwrap();
+
+    assert!(old_meta.contains_key(&Pba(50)));
+    // PBA 50: 3 - 1 = 2 (merge path)
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 2);
+    // PBA 400: 0 + 1 = 1 (new path)
+    assert_eq!(store.get_refcount(Pba(400)).unwrap(), 1);
 }
