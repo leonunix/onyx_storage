@@ -53,7 +53,7 @@ pub struct CoalesceUnit {
     pub vol_id: String,
     pub start_lba: Lba,
     pub lba_count: u32,
-    pub raw_data: Vec<u8>,
+    pub(crate) raw_blocks: Vec<RawBlockRef>,
     /// Per-volume compression algorithm (from VolumeConfig metadata).
     pub compression: CompressionAlgo,
     /// Volume generation epoch from the buffer entries.
@@ -72,6 +72,33 @@ pub struct CoalesceUnit {
     /// with the original unit's full seqs. When None, the writer sends done_tx
     /// directly using this unit's own seq_lba_ranges (normal non-dedup path).
     pub dedup_completion: Option<Arc<DedupCompletion>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RawBlockRef {
+    pub payload: Arc<[u8]>,
+    pub offset: usize,
+}
+
+impl RawBlockRef {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        let bs = BLOCK_SIZE as usize;
+        &self.payload[self.offset..self.offset + bs]
+    }
+}
+
+impl CoalesceUnit {
+    pub fn raw_len(&self) -> usize {
+        self.raw_blocks.len() * BLOCK_SIZE as usize
+    }
+
+    pub fn materialize_raw_data(&self) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(self.raw_len());
+        for block in &self.raw_blocks {
+            raw.extend_from_slice(block.bytes());
+        }
+        raw
+    }
 }
 
 /// A dedup hit: this 4KB block matches an existing entry in the dedup index.
@@ -112,7 +139,8 @@ pub struct CompressedUnit {
 struct LbaSlice<'a> {
     vol_id: &'a str,
     lba: Lba,
-    data: &'a [u8], // exactly BLOCK_SIZE bytes
+    payload: Arc<[u8]>,
+    offset: usize,
     entry_seq: u64,
     vol_created_at: u64,
 }
@@ -156,7 +184,8 @@ pub fn coalesce(
                 all_slices.push(LbaSlice {
                     vol_id: &entry.vol_id,
                     lba: Lba(entry.start_lba.0 + i as u64),
-                    data: &entry.payload[offset..end],
+                    payload: Arc::clone(&entry.payload),
+                    offset,
                     entry_seq: entry.seq,
                     vol_created_at: entry.vol_created_at,
                 });
@@ -193,7 +222,8 @@ pub fn coalesce_pending(
                 all_slices.push(LbaSlice {
                     vol_id: &entry.vol_id,
                     lba: Lba(entry.start_lba.0 + i as u64),
-                    data: &payload[offset..end],
+                    payload: Arc::clone(payload),
+                    offset,
                     entry_seq: entry.seq,
                     vol_created_at: entry.vol_created_at,
                 });
@@ -256,7 +286,7 @@ fn coalesce_slices(
         let should_extend = if let Some(ref cur) = current {
             cur.vol_id == ds.latest.vol_id
                 && ds.latest.lba.0 == cur.start_lba.0 + cur.lba_count as u64
-                && cur.raw_data.len() + bs <= max_raw_bytes
+                && cur.raw_len() + bs <= max_raw_bytes
                 && cur.lba_count + 1 <= max_lbas
         } else {
             false
@@ -265,7 +295,10 @@ fn coalesce_slices(
         if should_extend {
             let cur = current.as_mut().unwrap();
             cur.lba_count += 1;
-            cur.raw_data.extend_from_slice(ds.latest.data);
+            cur.raw_blocks.push(RawBlockRef {
+                payload: Arc::clone(&ds.latest.payload),
+                offset: ds.latest.offset,
+            });
             for &seq in &ds.all_seqs {
                 add_seq_lba(&mut cur.seq_lba_ranges, seq, ds.latest.lba);
             }
@@ -281,7 +314,10 @@ fn coalesce_slices(
                 vol_id: ds.latest.vol_id.to_string(),
                 start_lba: ds.latest.lba,
                 lba_count: 1,
-                raw_data: ds.latest.data.to_vec(),
+                raw_blocks: vec![RawBlockRef {
+                    payload: Arc::clone(&ds.latest.payload),
+                    offset: ds.latest.offset,
+                }],
                 compression: vol_compression(ds.latest.vol_id),
                 vol_created_at: ds.latest.vol_created_at,
                 seq_lba_ranges,
@@ -324,7 +360,7 @@ mod tests {
         let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 8);
-        assert_eq!(units[0].raw_data.len(), 8 * BLOCK_SIZE as usize);
+        assert_eq!(units[0].raw_len(), 8 * BLOCK_SIZE as usize);
     }
 
     #[test]
@@ -346,9 +382,10 @@ mod tests {
         let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 8);
+        let raw = units[0].materialize_raw_data();
         // First 4 LBAs filled with 0xAA, next 4 with 0xBB
-        assert_eq!(units[0].raw_data[0], 0xAA);
-        assert_eq!(units[0].raw_data[4 * BLOCK_SIZE as usize], 0xBB);
+        assert_eq!(raw[0], 0xAA);
+        assert_eq!(raw[4 * BLOCK_SIZE as usize], 0xBB);
     }
 
     #[test]
@@ -392,7 +429,7 @@ mod tests {
         let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 2);
-        assert_eq!(units[0].raw_data[0], 0x22); // latest data
+        assert_eq!(units[0].materialize_raw_data()[0], 0x22); // latest data
     }
 
     #[test]
@@ -405,10 +442,11 @@ mod tests {
         let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 4);
+        let raw = units[0].materialize_raw_data();
         // LBA 0: 0xAA, LBA 1: 0xFF (overwritten), LBA 2-3: 0xAA
-        assert_eq!(units[0].raw_data[0], 0xAA);
-        assert_eq!(units[0].raw_data[BLOCK_SIZE as usize], 0xFF);
-        assert_eq!(units[0].raw_data[2 * BLOCK_SIZE as usize], 0xAA);
+        assert_eq!(raw[0], 0xAA);
+        assert_eq!(raw[BLOCK_SIZE as usize], 0xFF);
+        assert_eq!(raw[2 * BLOCK_SIZE as usize], 0xAA);
     }
 
     #[test]

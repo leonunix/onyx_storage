@@ -62,6 +62,13 @@ struct PackedSlotRetry {
     retry_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueuePendingSeq {
+    Queued,
+    Skipped,
+    WindowFull,
+}
+
 #[derive(Default)]
 struct FlusherInFlightTracker {
     active: Mutex<HashMap<u64, ActiveSeq>>,
@@ -436,6 +443,7 @@ impl Allocation {
 
 impl BufferFlusher {
     const HEAD_RETRY_AGE_THRESHOLD: Duration = Duration::from_millis(500);
+    const COALESCE_READY_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
     /// compress_workers / dedup.workers are now **per-lane** counts.
     /// No division — each lane gets the configured number of workers.
@@ -592,18 +600,40 @@ impl BufferFlusher {
             .unwrap_or(0)
     }
 
+    fn pending_entry_bytes(entry: &crate::buffer::commit_log::PendingEntry) -> usize {
+        entry.lba_count as usize * BLOCK_SIZE as usize
+    }
+
     fn try_enqueue_pending_seq(
         seq: u64,
         pool: &WriteBufferPool,
         in_flight: &HashMap<u64, u32>,
         in_flight_tracker: &FlusherInFlightTracker,
         seen: &mut std::collections::HashSet<u64>,
+        queued_bytes: &mut usize,
         new_entries: &mut Vec<Arc<crate::buffer::commit_log::PendingEntry>>,
-    ) {
-        if !in_flight.contains_key(&seq) && in_flight_tracker.retry_ready(seq) && seen.insert(seq) {
-            if let Some(entry) = pool.pending_entry_arc(seq) {
-                new_entries.push(entry);
-            }
+    ) -> EnqueuePendingSeq {
+        if in_flight.contains_key(&seq) || !in_flight_tracker.retry_ready(seq) || !seen.insert(seq)
+        {
+            return EnqueuePendingSeq::Skipped;
+        }
+
+        let Some(meta) = pool.get_pending_arc(seq) else {
+            return EnqueuePendingSeq::Skipped;
+        };
+        let estimated_bytes = Self::pending_entry_bytes(meta.as_ref());
+        if !new_entries.is_empty()
+            && queued_bytes.saturating_add(estimated_bytes) > Self::COALESCE_READY_WINDOW_BYTES
+        {
+            return EnqueuePendingSeq::WindowFull;
+        }
+
+        if let Some(entry) = pool.pending_entry_arc(seq) {
+            *queued_bytes = queued_bytes.saturating_add(Self::pending_entry_bytes(entry.as_ref()));
+            new_entries.push(entry);
+            EnqueuePendingSeq::Queued
+        } else {
+            EnqueuePendingSeq::Skipped
         }
     }
 
@@ -856,6 +886,7 @@ impl BufferFlusher {
 
             let mut new_entries = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            let mut queued_bytes = 0usize;
 
             // Always give the front of log_order a retry chance first. A single
             // partially flushed seq can otherwise starve behind newer ready work
@@ -868,6 +899,8 @@ impl BufferFlusher {
                     && in_flight_tracker.retry_ready(seq)
                     && seen.insert(seq)
                 {
+                    queued_bytes =
+                        queued_bytes.saturating_add(Self::pending_entry_bytes(entry.as_ref()));
                     new_entries.push(entry);
                 }
             }
@@ -875,12 +908,13 @@ impl BufferFlusher {
             if new_entries.is_empty() {
                 match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
                     Ok(seq) => {
-                        Self::try_enqueue_pending_seq(
+                        let _ = Self::try_enqueue_pending_seq(
                             seq,
                             pool,
                             &in_flight,
                             in_flight_tracker,
                             &mut seen,
+                            &mut queued_bytes,
                             &mut new_entries,
                         );
                     }
@@ -889,15 +923,24 @@ impl BufferFlusher {
                 }
             }
 
-            while let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) {
-                Self::try_enqueue_pending_seq(
-                    seq,
-                    pool,
-                    &in_flight,
-                    in_flight_tracker,
-                    &mut seen,
-                    &mut new_entries,
-                );
+            while queued_bytes < Self::COALESCE_READY_WINDOW_BYTES {
+                let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) else {
+                    break;
+                };
+                if matches!(
+                    Self::try_enqueue_pending_seq(
+                        seq,
+                        pool,
+                        &in_flight,
+                        in_flight_tracker,
+                        &mut seen,
+                        &mut queued_bytes,
+                        &mut new_entries,
+                    ),
+                    EnqueuePendingSeq::WindowFull
+                ) {
+                    break;
+                }
             }
 
             // Safety net for recovered / retried entries: periodically snapshot the
@@ -905,23 +948,30 @@ impl BufferFlusher {
             // loop. This must run even while foreground writes keep producing new
             // ready seqs, otherwise payload-less recovered entries that were skipped
             // once under memory pressure can starve indefinitely.
-            if last_retry_snapshot.elapsed() >= retry_snapshot_interval {
+            if last_retry_snapshot.elapsed() >= retry_snapshot_interval
+                && queued_bytes < Self::COALESCE_READY_WINDOW_BYTES
+            {
                 last_retry_snapshot = Instant::now();
                 let mut topped_up = 0usize;
                 for entry in pool.ready_pending_entries_arc_snapshot_for_shard(shard_idx) {
-                    if topped_up >= retry_snapshot_topup_limit {
+                    if topped_up >= retry_snapshot_topup_limit
+                        || queued_bytes >= Self::COALESCE_READY_WINDOW_BYTES
+                    {
                         break;
                     }
-                    if !in_flight.contains_key(&entry.seq)
-                        && in_flight_tracker.retry_ready(entry.seq)
-                        && seen.insert(entry.seq)
-                    {
-                        // Retry via seq lookup so recovered payload-less entries
-                        // get a chance to hydrate once memory is available.
-                        if let Some(hydrated) = pool.pending_entry_arc(entry.seq) {
-                            new_entries.push(hydrated);
-                            topped_up += 1;
-                        }
+                    if matches!(
+                        Self::try_enqueue_pending_seq(
+                            entry.seq,
+                            pool,
+                            &in_flight,
+                            in_flight_tracker,
+                            &mut seen,
+                            &mut queued_bytes,
+                            &mut new_entries,
+                        ),
+                        EnqueuePendingSeq::Queued
+                    ) {
+                        topped_up += 1;
                     }
                 }
             }
@@ -957,9 +1007,9 @@ impl BufferFlusher {
                 &skip_offsets,
             );
 
-            // Payload data has been copied into CoalesceUnit.raw_data — evict
-            // the hydrated payloads from the DashMap immediately so the flusher
-            // memory budget is freed without waiting for mark_flushed.
+            // Payload ownership has been moved into Arc-backed block refs inside
+            // the coalesced units, so the pending-entry copy can be evicted
+            // immediately without losing the bytes needed by dedup/compress.
             let consumed_seqs: Vec<u64> = new_entries.iter().map(|e| e.seq).collect();
             drop(new_entries);
             pool.evict_hydrated_payloads_for_shard(shard_idx, &consumed_seqs);
@@ -974,7 +1024,7 @@ impl BufferFlusher {
                     Ordering::Relaxed,
                 );
                 metrics.coalesced_bytes.fetch_add(
-                    units.iter().map(|u| u.raw_data.len() as u64).sum::<u64>(),
+                    units.iter().map(|u| u.raw_len() as u64).sum::<u64>(),
                     Ordering::Relaxed,
                 );
             }
@@ -1011,7 +1061,7 @@ impl BufferFlusher {
                         vol_id,
                         start_lba,
                         lba_count,
-                        raw_data,
+                        raw_blocks,
                         compression: algo,
                         vol_created_at,
                         seq_lba_ranges,
@@ -1020,7 +1070,11 @@ impl BufferFlusher {
                         dedup_completion,
                     } = unit;
 
-                    let original_size = raw_data.len();
+                    let original_size = raw_blocks.len() * BLOCK_SIZE as usize;
+                    let mut raw_data = Vec::with_capacity(original_size);
+                    for block in &raw_blocks {
+                        raw_data.extend_from_slice(block.bytes());
+                    }
                     let (compression_byte, compressed_data) = match algo {
                         CompressionAlgo::None => (0u8, raw_data),
                         _ => {
@@ -1094,7 +1148,6 @@ impl BufferFlusher {
         skip_threshold_pct: u8,
         metrics: &EngineMetrics,
     ) {
-        let bs = BLOCK_SIZE as usize;
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(mut unit) => {
@@ -1116,13 +1169,11 @@ impl BufferFlusher {
                     let mut hit_infos: Vec<(usize, BlockmapValue)> = Vec::new();
 
                     for i in 0..lba_count {
-                        let offset = i * bs;
-                        let end = offset + bs;
-                        if end > unit.raw_data.len() {
+                        let Some(block) = unit.raw_blocks.get(i) else {
                             all_hashes.push([0u8; 32]);
                             continue;
-                        }
-                        let block_data = &unit.raw_data[offset..end];
+                        };
+                        let block_data = block.bytes();
                         let hash: ContentHash = *blake3::hash(block_data).as_bytes();
                         all_hashes.push(hash);
 
@@ -1353,13 +1404,9 @@ impl BufferFlusher {
         hashes: &[ContentHash],
         dedup_completion: Option<Arc<crate::buffer::pipeline::DedupCompletion>>,
     ) -> CoalesceUnit {
-        let bs = BLOCK_SIZE as usize;
         let start_lba = Lba(original.start_lba.0 + start_idx as u64);
         let lba_count = (end_idx - start_idx) as u32;
-        let data_start = start_idx * bs;
-        let data_end = end_idx * bs;
-        let raw_data =
-            original.raw_data[data_start..data_end.min(original.raw_data.len())].to_vec();
+        let raw_blocks = original.raw_blocks[start_idx..end_idx].to_vec();
 
         // Build seq_lba_ranges for the sub-range
         let mut seq_lba_ranges = Vec::new();
@@ -1388,7 +1435,7 @@ impl BufferFlusher {
             vol_id: original.vol_id.clone(),
             start_lba,
             lba_count,
-            raw_data,
+            raw_blocks,
             compression: original.compression,
             vol_created_at: original.vol_created_at,
             seq_lba_ranges,
@@ -3369,6 +3416,7 @@ mod tests {
     use crate::meta::store::MetaStore;
     use crate::types::{VolumeConfig, ZoneId};
     use crate::zone::worker::ZoneWorker;
+    use std::collections::{HashMap, HashSet};
     use tempfile::{tempdir, NamedTempFile};
 
     fn setup_flush_test_env() -> (
@@ -3548,5 +3596,55 @@ mod tests {
             pool.pending_entry_arc(seq).is_none(),
             "post-commit cleanup drift must not leave the seq stuck in the buffer"
         );
+    }
+
+    #[test]
+    fn coalesce_enqueue_caps_ready_window_bytes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let size = 4096 + 4096 + 96 * 1024 * 1024;
+        tmp.as_file().set_len(size).unwrap();
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let pool = WriteBufferPool::open(dev).unwrap();
+
+        let payload = vec![0x5A; 256 * BLOCK_SIZE as usize];
+        let mut seqs = Vec::new();
+        for i in 0..20u64 {
+            seqs.push(
+                pool.append("window-vol", Lba(i * 256), 256, &payload, 0)
+                    .unwrap(),
+            );
+        }
+
+        let tracker = FlusherInFlightTracker::default();
+        let in_flight = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut queued_bytes = 0usize;
+        let mut new_entries = Vec::new();
+        let mut window_full = false;
+
+        for seq in seqs {
+            if matches!(
+                BufferFlusher::try_enqueue_pending_seq(
+                    seq,
+                    &pool,
+                    &in_flight,
+                    &tracker,
+                    &mut seen,
+                    &mut queued_bytes,
+                    &mut new_entries,
+                ),
+                EnqueuePendingSeq::WindowFull
+            ) {
+                window_full = true;
+                break;
+            }
+        }
+
+        assert!(
+            window_full,
+            "coalescer should stop once the ready window is full"
+        );
+        assert_eq!(queued_bytes, BufferFlusher::COALESCE_READY_WINDOW_BYTES);
+        assert_eq!(new_entries.len(), 16);
     }
 }
