@@ -2,10 +2,12 @@ use std::thread;
 use std::time::Duration;
 
 use onyx_storage::buffer::flush::{clear_test_failpoint, install_test_failpoint, FlushFailStage};
+use onyx_storage::buffer::pool::WriteBufferPool;
 use onyx_storage::buffer::pool::{clear_purge_volume_failpoint, install_purge_volume_failpoint};
 use onyx_storage::config::*;
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::error::OnyxError;
+use onyx_storage::io::device::RawDevice;
 use onyx_storage::types::{CompressionAlgo, Lba, VolumeId};
 use serial_test::serial;
 use tempfile::{tempdir, NamedTempFile};
@@ -738,6 +740,153 @@ fn old_generation_buffer_entry_not_flushed_into_new_volume() {
             result,
             vec![0u8; 4096],
             "LBA {} should read as zeros (unmapped in gen-2)",
+            lba
+        );
+    }
+}
+
+/// Prove that stale buffer entries recovered after a restart are discarded
+/// when the same volume name was deleted and recreated with a new generation.
+///
+/// This models the path seen in soak:
+///   1. Gen-1 volume exists
+///   2. Pending buffer entries for gen-1 survive on the buffer device
+///   3. Volume is deleted and recreated with the same name (gen-2)
+///   4. A fresh engine process opens and recovers those pending entries
+///   5. The flusher must discard them, not flush them into gen-2
+#[test]
+fn recovered_old_generation_entries_not_flushed_into_recreated_volume_after_restart() {
+    let (config, _md, _bf, _df) = make_config();
+    let vol_size = 32 * 4096u64;
+    let vol_name = "vol-restart-gen";
+    let vol_id = VolumeId(vol_name.to_string());
+
+    let meta_only = OnyxEngine::open_meta_only(&config).unwrap();
+    meta_only
+        .create_volume(vol_name, vol_size, CompressionAlgo::None)
+        .unwrap();
+    let gen1 = meta_only
+        .meta()
+        .get_volume(&vol_id)
+        .unwrap()
+        .unwrap()
+        .created_at;
+
+    let buffer_dev = RawDevice::open(config.buffer.device.as_ref().unwrap()).unwrap();
+    let pool = WriteBufferPool::open(buffer_dev).unwrap();
+    let stale = vec![0xAA; 4096];
+    for lba in 0..4u64 {
+        pool.append(vol_name, Lba(lba), 1, &stale, gen1).unwrap();
+    }
+    assert_eq!(
+        pool.pending_count(),
+        4,
+        "fixture must persist stale entries"
+    );
+    drop(pool);
+
+    meta_only.delete_volume(vol_name).unwrap();
+    meta_only
+        .create_volume(vol_name, vol_size, CompressionAlgo::None)
+        .unwrap();
+    let gen2 = meta_only
+        .meta()
+        .get_volume(&vol_id)
+        .unwrap()
+        .unwrap()
+        .created_at;
+    assert_ne!(gen1, gen2, "recreated volume must get a fresh generation");
+    drop(meta_only);
+
+    let engine = OnyxEngine::open(&config).unwrap();
+    assert!(
+        wait_for_buffer_drain(&engine, 5000),
+        "recovered stale buffer entries should be drained or discarded quickly"
+    );
+
+    let vol = engine.open_volume(vol_name).unwrap();
+    for lba in 0..4u64 {
+        assert_eq!(
+            vol.read(lba * 4096, 4096).unwrap(),
+            vec![0u8; 4096],
+            "recovered gen-1 entry for LBA {} must not appear in gen-2",
+            lba
+        );
+        assert!(
+            engine
+                .meta()
+                .get_mapping(&vol_id, Lba(lba))
+                .unwrap()
+                .is_none(),
+            "recovered stale entry for LBA {} must not create a blockmap mapping",
+            lba
+        );
+    }
+
+    let snapshot = engine.metrics_snapshot();
+    assert!(
+        snapshot.flush_stale_discards >= 1,
+        "expected at least one recovered stale unit to be discarded, got {}",
+        snapshot.flush_stale_discards
+    );
+}
+
+/// Recovered buffer entries with vol_created_at=0 are especially dangerous:
+/// zero is treated as a wildcard generation in the read/flush path. If such
+/// entries survive on disk across delete+recreate of the same volume name,
+/// they must still NOT be flushed into the new generation.
+#[test]
+fn recovered_zero_generation_entries_not_flushed_into_recreated_volume_after_restart() {
+    let (config, _md, _bf, _df) = make_config();
+    let vol_size = 32 * 4096u64;
+    let vol_name = "vol-restart-zero-gen";
+    let vol_id = VolumeId(vol_name.to_string());
+
+    let meta_only = OnyxEngine::open_meta_only(&config).unwrap();
+    meta_only
+        .create_volume(vol_name, vol_size, CompressionAlgo::None)
+        .unwrap();
+
+    let buffer_dev = RawDevice::open(config.buffer.device.as_ref().unwrap()).unwrap();
+    let pool = WriteBufferPool::open(buffer_dev).unwrap();
+    let stale = vec![0xCC; 4096];
+    for lba in 0..4u64 {
+        pool.append(vol_name, Lba(lba), 1, &stale, 0).unwrap();
+    }
+    assert_eq!(
+        pool.pending_count(),
+        4,
+        "fixture must persist zero-generation stale entries"
+    );
+    drop(pool);
+
+    meta_only.delete_volume(vol_name).unwrap();
+    meta_only
+        .create_volume(vol_name, vol_size, CompressionAlgo::None)
+        .unwrap();
+    drop(meta_only);
+
+    let engine = OnyxEngine::open(&config).unwrap();
+    assert!(
+        wait_for_buffer_drain(&engine, 5000),
+        "recovered zero-generation entries should be drained quickly"
+    );
+
+    let vol = engine.open_volume(vol_name).unwrap();
+    for lba in 0..4u64 {
+        assert_eq!(
+            vol.read(lba * 4096, 4096).unwrap(),
+            vec![0u8; 4096],
+            "zero-generation recovered entry for LBA {} must not appear after recreate",
+            lba
+        );
+        assert!(
+            engine
+                .meta()
+                .get_mapping(&vol_id, Lba(lba))
+                .unwrap()
+                .is_none(),
+            "zero-generation recovered entry for LBA {} must not create a blockmap mapping",
             lba
         );
     }

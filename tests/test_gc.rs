@@ -703,6 +703,72 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
     assert!((cand_b.dead_ratio - 0.25).abs() < 0.01);
 }
 
+#[test]
+fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_identity() {
+    let dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: Some(dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = MetaStore::open(&meta_config).unwrap();
+
+    let shared_pba = Pba(4242);
+    let vol_a = VolumeId("vol-a".into());
+    let vol_b = VolumeId("vol-b".into());
+
+    for i in [0u16, 2] {
+        meta.put_mapping(
+            &vol_a,
+            Lba(i as u64),
+            &BlockmapValue {
+                pba: shared_pba,
+                compression: 1,
+                unit_compressed_size: 1000,
+                unit_original_size: 16384,
+                unit_lba_count: 4,
+                offset_in_unit: i,
+                crc32: 0xAAAA,
+                slot_offset: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    for i in [0u16, 1] {
+        meta.put_mapping(
+            &vol_b,
+            Lba(10 + i as u64),
+            &BlockmapValue {
+                pba: shared_pba,
+                compression: 1,
+                unit_compressed_size: 1000,
+                unit_original_size: 8192,
+                unit_lba_count: 2,
+                offset_in_unit: i,
+                crc32: 0xBBBB,
+                slot_offset: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let candidates = scan_gc_candidates(&meta, 0.0, 100).unwrap();
+    assert_eq!(
+        candidates.len(),
+        2,
+        "scanner must keep distinct fragment identities separate even when pba/offset/size match"
+    );
+    assert!(candidates
+        .iter()
+        .any(|c| c.vol_id == vol_a && c.crc32 == 0xAAAA));
+    assert!(candidates
+        .iter()
+        .any(|c| c.vol_id == vol_b && c.crc32 == 0xBBBB));
+}
+
 /// GC rewriter must verify the FULL fragment identity, not just PBA.
 /// If a live LBA was remapped to a different fragment in the same packed slot
 /// (same PBA, different slot_offset / metadata), rewriting from the old

@@ -389,6 +389,70 @@ fn dedup_cleanup_on_pba_free() {
 }
 
 #[test]
+fn dedup_entry_liveness_requires_exact_fragment_identity() {
+    let dir = tempdir().unwrap();
+    let config = onyx_storage::config::MetaConfig {
+        rocksdb_path: Some(dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let store = MetaStore::open(&config).unwrap();
+    let vol_id = VolumeId("dedup-live-check".into());
+    let pba = Pba(321);
+
+    let live_block = vec![0x5A; BLOCK_SIZE as usize];
+    let stale_block = vec![0xA5; BLOCK_SIZE as usize];
+    let live_hash: ContentHash = *blake3::hash(&live_block).as_bytes();
+    let stale_hash: ContentHash = *blake3::hash(&stale_block).as_bytes();
+
+    let live_mapping = BlockmapValue {
+        pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&live_block),
+        slot_offset: 0,
+        flags: 0,
+    };
+    store.put_mapping(&vol_id, Lba(0), &live_mapping).unwrap();
+    store.set_refcount(pba, 1).unwrap();
+
+    let live_entry = DedupEntry {
+        pba,
+        slot_offset: 0,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: live_mapping.crc32,
+    };
+    let stale_entry = DedupEntry {
+        pba,
+        slot_offset: 0,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&stale_block),
+    };
+    store
+        .put_dedup_entries(&[(live_hash, live_entry), (stale_hash, stale_entry)])
+        .unwrap();
+
+    assert!(store.dedup_entry_is_live(&live_hash, &live_entry).unwrap());
+    assert!(
+        !store
+            .dedup_entry_is_live(&stale_hash, &stale_entry)
+            .unwrap(),
+        "a reused PBA must not keep an old fragment-looking dedup entry live"
+    );
+}
+
+#[test]
 fn scan_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {

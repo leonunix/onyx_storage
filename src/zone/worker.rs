@@ -87,10 +87,7 @@ impl ZoneWorker {
     ) -> OnyxResult<Option<Vec<u8>>> {
         // 1. Check buffer — may be part of a multi-LBA entry
         if let Some(pending) = self.buffer_pool.lookup(vol_id, lba)? {
-            if vol_created_at == 0
-                || pending.vol_created_at == 0
-                || pending.vol_created_at == vol_created_at
-            {
+            if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
                 if let Some(ref payload) = pending.payload {
                     let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
                     let end = offset + BLOCK_SIZE as usize;

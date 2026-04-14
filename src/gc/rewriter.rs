@@ -55,6 +55,35 @@ pub fn rewrite_candidate(
         }
     };
 
+    // Pre-validate: check if ANY LBA still maps to this candidate's PBA before
+    // doing disk IO.  Between scan and rewrite the flusher may have remapped
+    // every LBA, freed the PBA, and the allocator may have recycled it for new
+    // data.  Reading from a recycled PBA would yield a CRC mismatch against the
+    // stale candidate metadata — an expected race, not a data-integrity issue.
+    // By validating first we avoid the unnecessary IO and the spurious error.
+    //
+    // Safety: if at least one LBA still maps here, refcount > 0, so the PBA has
+    // NOT been freed and the on-disk data is intact.
+    let mut valid_lbas: Vec<(crate::types::Lba, u16)> = Vec::new();
+    for (lba, offset_in_unit) in &candidate.live_lbas {
+        let current = meta.get_mapping(&candidate.vol_id, *lba)?;
+        match current {
+            Some(bv) if candidate_matches_mapping(candidate, *offset_in_unit, &bv) => {
+                valid_lbas.push((*lba, *offset_in_unit));
+            }
+            _ => {} // LBA remapped since scan
+        }
+    }
+
+    if valid_lbas.is_empty() {
+        tracing::debug!(
+            pba = candidate.pba.0,
+            vol = %candidate.vol_id,
+            "gc: all LBAs remapped since scan, skipping candidate"
+        );
+        return Ok(0);
+    }
+
     // Read the compressed unit from LV3
     let compressed_data = if candidate.slot_offset > 0 {
         let slot_data = io_engine.read_blocks(candidate.pba, BLOCK_SIZE as usize)?;
@@ -76,6 +105,28 @@ pub fn rewrite_candidate(
     // Verify CRC
     let actual_crc = crc32fast::hash(&compressed_data);
     if actual_crc != candidate.crc32 {
+        // CRC mismatch after pre-validation found valid LBAs.  This means the
+        // PBA was freed and reallocated in the tiny window between our mapping
+        // check and the disk read.  Re-validate: if all LBAs have now been
+        // remapped, this is a benign race — the flusher committed new mappings
+        // and recycled the PBA concurrently.  If some LBAs still point here,
+        // this is a genuine data-integrity concern.
+        let still_valid = valid_lbas.iter().any(|(lba, off)| {
+            meta.get_mapping(&candidate.vol_id, *lba)
+                .ok()
+                .flatten()
+                .is_some_and(|bv| candidate_matches_mapping(candidate, *off, &bv))
+        });
+        if !still_valid {
+            tracing::debug!(
+                pba = candidate.pba.0,
+                vol = %candidate.vol_id,
+                expected = format!("0x{:08x}", candidate.crc32),
+                actual = format!("0x{actual_crc:08x}"),
+                "gc: PBA recycled between pre-check and disk read, skipping"
+            );
+            return Ok(0);
+        }
         return Err(crate::error::OnyxError::CrcMismatch {
             expected: candidate.crc32,
             actual: actual_crc,
@@ -99,13 +150,13 @@ pub fn rewrite_candidate(
 
     let mut rewritten = 0u32;
 
-    for (lba, offset_in_unit) in &candidate.live_lbas {
-        // Re-verify that this LBA still points to the candidate PBA
-        // (it may have been overwritten since the scan)
+    // Use the pre-validated set, but re-verify each LBA one more time right
+    // before writing — mappings could have shifted during the disk read.
+    for (lba, offset_in_unit) in &valid_lbas {
         let current = meta.get_mapping(&candidate.vol_id, *lba)?;
         match current {
             Some(bv) if candidate_matches_mapping(candidate, *offset_in_unit, &bv) => {}
-            _ => continue, // LBA was overwritten or deleted since scan, skip
+            _ => continue,
         }
 
         // If this LBA already has a pending newer value in the write buffer,
@@ -144,7 +195,7 @@ pub fn rewrite_candidate(
     tracing::debug!(
         pba = candidate.pba.0,
         vol = %candidate.vol_id,
-        live = candidate.live_lbas.len(),
+        live = valid_lbas.len(),
         rewritten,
         dead_ratio = candidate.dead_ratio,
         "gc: rewrote candidate"

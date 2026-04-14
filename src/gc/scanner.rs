@@ -23,12 +23,17 @@ pub struct GcCandidate {
 }
 
 /// Composite key to distinguish fragments within a packed slot.
-/// Two fragments sharing the same PBA are differentiated by (slot_offset, unit_compressed_size).
+/// Two fragments sharing the same PBA must be differentiated by their full
+/// fragment identity, not just byte range size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FragmentKey {
     pba: Pba,
     slot_offset: u16,
+    compression: u8,
     unit_compressed_size: u32,
+    unit_original_size: u32,
+    unit_lba_count: u16,
+    crc32: u32,
 }
 
 /// Info collected per fragment during scanning.
@@ -77,7 +82,11 @@ pub fn scan_gc_candidates(
         let fkey = FragmentKey {
             pba: bv.pba,
             slot_offset: bv.slot_offset,
+            compression: bv.compression,
             unit_compressed_size: bv.unit_compressed_size,
+            unit_original_size: bv.unit_original_size,
+            unit_lba_count: bv.unit_lba_count,
+            crc32: bv.crc32,
         };
 
         let info = frag_map.entry(fkey).or_insert_with(|| FragmentInfo {

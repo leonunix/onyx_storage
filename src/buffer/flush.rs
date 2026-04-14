@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -198,6 +200,8 @@ struct FlushFailRule {
 static TEST_FAIL_RULES: OnceLock<Mutex<Vec<FlushFailRule>>> = OnceLock::new();
 static TEST_DEDUP_HIT_FAIL_RULES: OnceLock<Mutex<Vec<DedupHitFailRule>>> = OnceLock::new();
 static HOLE_FILL_LOCKS: OnceLock<Mutex<HashMap<Pba, Arc<Mutex<()>>>>> = OnceLock::new();
+#[cfg(test)]
+static CLEANUP_FREE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 #[doc(hidden)]
 pub struct PackedPauseState {
     hit: bool,
@@ -481,7 +485,7 @@ impl BufferFlusher {
     /// strictly best-effort. Failing this cleanup must not turn the flush into a
     /// retry loop, or the buffer head will stay pinned behind work that already
     /// committed successfully.
-    fn cleanup_dead_pba_post_commit(
+    pub(crate) fn cleanup_dead_pba_post_commit(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
         hole_map: &HoleMap,
@@ -489,6 +493,9 @@ impl BufferFlusher {
         old_blocks: u32,
         context: &'static str,
     ) {
+        let cleanup_lock = Self::cleanup_lock(old_pba);
+        let _cleanup_guard = cleanup_lock.lock().unwrap();
+
         let remaining = match Self::live_refcount_with_reconcile(meta, old_pba, context) {
             Ok(remaining) => remaining,
             Err(e) => {
@@ -516,6 +523,23 @@ impl BufferFlusher {
             );
             return;
         }
+
+        let already_free = if old_blocks <= 1 {
+            allocator.is_free(old_pba)
+        } else {
+            allocator.is_extent_free(Extent::new(old_pba, old_blocks))
+        };
+        if already_free {
+            if old_blocks <= 1 {
+                Self::purge_holes_for_pba(hole_map, old_pba);
+            } else {
+                Self::purge_holes_for_extent(hole_map, old_pba, old_blocks);
+            }
+            return;
+        }
+
+        #[cfg(test)]
+        CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
 
         let free_result = if old_blocks <= 1 {
             Self::purge_holes_for_pba(hole_map, old_pba);
@@ -598,6 +622,10 @@ impl BufferFlusher {
             .entry(pba)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    pub(crate) fn cleanup_lock(pba: Pba) -> Arc<Mutex<()>> {
+        Self::hole_fill_lock(pba)
     }
 
     fn latest_seq_for_lba(seq_lba_ranges: &[(u64, Lba, u32)], lba: Lba) -> u64 {
@@ -1279,12 +1307,7 @@ impl BufferFlusher {
                                 // Generation check (one call for entire batch)
                                 let should_discard = match meta.get_volume(&vol_id)? {
                                     None => true,
-                                    Some(vc)
-                                        if unit.vol_created_at != 0
-                                            && vc.created_at != unit.vol_created_at =>
-                                    {
-                                        true
-                                    }
+                                    Some(vc) if vc.created_at != unit.vol_created_at => true,
                                     _ => false,
                                 };
                                 if should_discard {
@@ -2216,7 +2239,7 @@ impl BufferFlusher {
             let vol_id = VolumeId(unit.vol_id.clone());
             let should_discard = match meta.get_volume(&vol_id)? {
                 None => true,
-                Some(vc) if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at => {
+                Some(vc) if vc.created_at != unit.vol_created_at => {
                     tracing::debug!(
                         vol = unit.vol_id,
                         entry_gen = unit.vol_created_at,
@@ -2487,11 +2510,7 @@ impl BufferFlusher {
             let vol_id = VolumeId(unit.vol_id.clone());
             let should_discard = match meta.get_volume(&vol_id) {
                 Ok(None) => true,
-                Ok(Some(vc))
-                    if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
-                {
-                    true
-                }
+                Ok(Some(vc)) if vc.created_at != unit.vol_created_at => true,
                 Ok(_) => false,
                 Err(e) => {
                     results[i] = Err(e);
@@ -2859,29 +2878,19 @@ impl BufferFlusher {
                 .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
         }
 
-        // Remove stale dedup entries before handing dead PBAs back to the allocator.
-        // Otherwise a concurrent dedup hit could see refcount(new owner) > 0 after
-        // reuse and incorrectly accept an old dedup entry for the recycled PBA.
+        // Reclaim old PBAs through the shared cleanup helper so every path
+        // (dedup worker/scanner, writer, GC-adjacent rewrites) serializes the
+        // "refcount==0 -> dedup cleanup -> allocator free" transition per PBA.
         if !dead_pbas.is_empty() {
-            match meta.cleanup_dedup_for_pbas_batch(&dead_pbas) {
-                Ok(()) => {
-                    for (old_pba, old_blocks) in dead_allocations {
-                        if old_blocks == 1 {
-                            Self::purge_holes_for_pba(hole_map, old_pba);
-                            let _ = allocator.free_one(old_pba);
-                        } else {
-                            Self::purge_holes_for_extent(hole_map, old_pba, old_blocks);
-                            let _ = allocator.free_extent(Extent::new(old_pba, old_blocks));
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        count = dead_pbas.len(),
-                        "writer: failed to cleanup dedup metadata for dead PBAs; keeping allocator reservations"
-                    );
-                }
+            for (old_pba, old_blocks) in dead_allocations {
+                Self::cleanup_dead_pba_post_commit(
+                    meta,
+                    allocator,
+                    hole_map,
+                    old_pba,
+                    old_blocks,
+                    "write_units_batch_cleanup",
+                );
             }
         }
         // One batch for all new dedup index entries
@@ -3283,7 +3292,7 @@ impl BufferFlusher {
         // Generation check for the writing volume
         let should_discard = match meta.get_volume(&vol_id)? {
             None => true,
-            Some(vc) if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at => true,
+            Some(vc) if vc.created_at != unit.vol_created_at => true,
             _ => false,
         };
         if should_discard {
@@ -3846,6 +3855,128 @@ mod tests {
 
         assert_eq!(dead_pbas.len(), 1);
         assert_eq!(dead_pbas.get(&old_pba), Some(&1));
+    }
+
+    #[test]
+    fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+
+        let pba = allocator.allocate_one_for_lane(0).unwrap();
+        let hash: ContentHash = [0xAB; 32];
+        meta.put_dedup_entries(&[(
+            hash,
+            DedupEntry {
+                pba,
+                slot_offset: 0,
+                compression: 0,
+                unit_compressed_size: BLOCK_SIZE,
+                unit_original_size: BLOCK_SIZE,
+                unit_lba_count: 1,
+                offset_in_unit: 0,
+                crc32: 0xDEAD_BEEF,
+            },
+        )])
+        .unwrap();
+        assert_eq!(meta.get_refcount(pba).unwrap(), 0);
+
+        let meta_scanner = meta.clone();
+        let allocator_scanner = allocator.clone();
+        let (ready_tx, ready_rx) = bounded::<()>(1);
+        let (resume_tx, resume_rx) = bounded::<()>(1);
+
+        CLEANUP_FREE_ATTEMPTS.store(0, Ordering::SeqCst);
+
+        let scanner = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            BufferFlusher::cleanup_dead_pba_post_commit(
+                &meta_scanner,
+                &allocator_scanner,
+                &crate::packer::packer::new_hole_map(),
+                pba,
+                1,
+                "dedup_scanner_cleanup",
+            );
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scanner-style cleanup should reach allocator handoff");
+
+        BufferFlusher::cleanup_dead_pba_post_commit(
+            &meta,
+            &allocator,
+            &hole_map,
+            pba,
+            1,
+            "dedup_worker_hit_cleanup",
+        );
+
+        resume_tx.send(()).unwrap();
+        scanner.join().unwrap();
+        assert_eq!(
+            CLEANUP_FREE_ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "shared cleanup helper should perform allocator free at most once"
+        );
+        assert!(meta.get_dedup_entry(&hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_dead_pba_cleanup_callers_without_shared_lock_double_free() {
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+
+        let pba = allocator.allocate_one_for_lane(0).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let run_cleanup = |meta: Arc<MetaStore>,
+                           allocator: Arc<SpaceAllocator>,
+                           barrier: Arc<std::sync::Barrier>| {
+            thread::spawn(move || {
+                assert_eq!(meta.get_refcount(pba).unwrap(), 0);
+                barrier.wait();
+                allocator.free_one(pba)
+            })
+        };
+
+        let t1 = run_cleanup(meta.clone(), allocator.clone(), barrier.clone());
+        let t2 = run_cleanup(meta.clone(), allocator.clone(), barrier.clone());
+        barrier.wait();
+
+        let results = [t1.join().unwrap(), t2.join().unwrap()];
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        let already_free = results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .filter(|e| e.to_string().contains("already free"))
+            .count();
+
+        assert_eq!(ok, 1, "exactly one cleanup caller should win the free");
+        assert_eq!(
+            already_free, 1,
+            "the second cleanup caller should hit allocator already-free"
+        );
     }
 
     #[test]

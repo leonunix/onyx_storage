@@ -208,13 +208,25 @@ impl SpaceAllocator {
 
     /// Free a single block.
     ///
-    /// Returns error if the PBA is out of bounds, already free, or would underflow counters.
+    /// Returns error if the PBA is out of bounds, already free (in the global
+    /// free list **or** a lane cache), or would underflow counters.
     pub fn free_one(&self, pba: Pba) -> OnyxResult<()> {
         if pba.0 >= self.total_blocks {
             return Err(OnyxError::Config(format!(
                 "free_one: PBA {} out of bounds (total {})",
                 pba.0, self.total_blocks
             )));
+        }
+
+        // Check lane caches first (no global lock needed)
+        for (lane_idx, cache_mutex) in self.lane_caches.iter().enumerate() {
+            let cache = cache_mutex.lock().unwrap();
+            if cache.contains(&pba) {
+                return Err(OnyxError::Config(format!(
+                    "free_one: PBA {} is already free (in lane cache {})",
+                    pba.0, lane_idx
+                )));
+            }
         }
 
         let mut free = self.free_extents.lock().unwrap();
@@ -240,6 +252,24 @@ impl SpaceAllocator {
         self.allocated_blocks.fetch_sub(1, Ordering::Relaxed);
         self.free_blocks.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Return true if the single block is free — either in the global free list
+    /// or sitting in a lane cache (allocated from the free list but not yet
+    /// handed out to a caller).
+    pub fn is_free(&self, pba: Pba) -> bool {
+        let free = self.free_extents.lock().unwrap();
+        if free.iter().any(|extent| extent.contains(pba)) {
+            return true;
+        }
+        drop(free);
+        for cache_mutex in &self.lane_caches {
+            let cache = cache_mutex.lock().unwrap();
+            if cache.contains(&pba) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Allocate up to `count` contiguous blocks. Returns the extent actually allocated
@@ -336,6 +366,25 @@ impl SpaceAllocator {
         self.free_blocks
             .fetch_add(extent.count as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Return true if the whole extent is already covered by a free extent
+    /// or all its blocks are sitting in lane caches.
+    pub fn is_extent_free(&self, extent: Extent) -> bool {
+        let free = self.free_extents.lock().unwrap();
+        if free.iter().any(|existing| {
+            extent.start.0 >= existing.start.0 && extent.end_pba().0 <= existing.end_pba().0
+        }) {
+            return true;
+        }
+        drop(free);
+        // Fallback: check if every block in the extent is in a lane cache.
+        (0..extent.count).all(|i| {
+            let pba = Pba(extent.start.0 + i as u64);
+            self.lane_caches
+                .iter()
+                .any(|c| c.lock().unwrap().contains(&pba))
+        })
     }
 
     pub fn free_block_count(&self) -> u64 {

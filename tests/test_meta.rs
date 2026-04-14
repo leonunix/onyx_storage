@@ -56,6 +56,23 @@ fn refcount_roundtrip() {
     assert_eq!(decode_refcount_value(&val), Some(7));
 }
 
+#[test]
+fn fragment_ref_key_roundtrip() {
+    let key = FragmentRefKey {
+        pba: Pba(77),
+        slot_offset: 512,
+        compression: 1,
+        unit_compressed_size: 1024,
+        unit_original_size: 4096,
+        unit_lba_count: 2,
+        crc32: 0x1234_5678,
+    };
+    let encoded = encode_fragment_ref_key(&key);
+    let decoded = decode_fragment_ref_key(&encoded).unwrap();
+    assert_eq!(decoded, key);
+    assert_eq!(fragment_ref_prefix(key.pba), key.pba.0.to_be_bytes());
+}
+
 // --- store tests ---
 
 fn test_config(dir: &std::path::Path) -> MetaConfig {
@@ -124,6 +141,51 @@ fn blockmap_crud() {
 
     store.delete_mapping(&vol_id, Lba(0)).unwrap();
     assert!(store.get_mapping(&vol_id, Lba(0)).unwrap().is_none());
+}
+
+#[test]
+fn fragment_ref_index_tracks_liveness_and_overlap() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol_id = VolumeId("frag-vol".into());
+
+    let old = BlockmapValue {
+        pba: Pba(100),
+        compression: 1,
+        unit_compressed_size: 512,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0xAAAA_BBBB,
+        slot_offset: 0,
+        flags: 0,
+    };
+    let new = BlockmapValue {
+        pba: Pba(100),
+        compression: 1,
+        unit_compressed_size: 512,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0xCCCC_DDDD,
+        slot_offset: 1024,
+        flags: 0,
+    };
+
+    store.put_mapping(&vol_id, Lba(0), &old).unwrap();
+    assert!(store.has_live_fragment_ref(&old).unwrap());
+    assert!(store.has_overlap_at_pba(old.pba, 0, 128).unwrap());
+    assert!(!store.has_overlap_at_pba(old.pba, 700, 100).unwrap());
+
+    store.put_mapping(&vol_id, Lba(0), &new).unwrap();
+    assert!(!store.has_live_fragment_ref(&old).unwrap());
+    assert!(store.has_live_fragment_ref(&new).unwrap());
+    assert!(!store.has_overlap_at_pba(old.pba, 0, 128).unwrap());
+    assert!(store.has_overlap_at_pba(new.pba, 1100, 64).unwrap());
+
+    store.delete_mapping(&vol_id, Lba(0)).unwrap();
+    assert!(!store.has_live_fragment_ref(&new).unwrap());
+    assert!(!store.has_overlap_at_pba(new.pba, 1100, 64).unwrap());
 }
 
 #[test]

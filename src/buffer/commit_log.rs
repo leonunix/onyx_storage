@@ -1271,10 +1271,7 @@ impl BufferShard {
             .get(&LbaKey { vol_id: vid, lba })
             .map(|entry| {
                 let (latest_seq, latest_created_at) = *entry;
-                latest_seq == seq
-                    && (latest_created_at == 0
-                        || vol_created_at == 0
-                        || latest_created_at == vol_created_at)
+                latest_seq == seq && latest_created_at == vol_created_at
             })
             .unwrap_or(true)
     }
@@ -2113,6 +2110,17 @@ impl WriteBufferPool {
                 }
             }
 
+            // Persist the checkpoint hint before fdatasync so the same sync
+            // makes both the batch payload and the updated recovery head/tail
+            // durable. This keeps crash-restart recovery on the fast guided
+            // path without adding an extra sync to the hot path.
+            let batch_max_seq = inflight
+                .iter()
+                .map(|entry| entry.pending.seq)
+                .max()
+                .unwrap_or(0);
+            shard.write_checkpoint(batch_max_seq);
+
             match Self::sync_device_impl(&device) {
                 Ok(()) => {
                     consecutive_failures = 0;
@@ -2120,13 +2128,6 @@ impl WriteBufferPool {
                     let inflight_pending: Vec<Arc<PendingEntry>> =
                         inflight.iter().map(|entry| entry.pending.clone()).collect();
                     shard.retire_superseded_by_durable_entries(&inflight_pending);
-                    // Persist checkpoint hint (best-effort, no sync).
-                    let batch_max_seq = inflight
-                        .iter()
-                        .map(|entry| entry.pending.seq)
-                        .max()
-                        .unwrap_or(0);
-                    shard.write_checkpoint(batch_max_seq);
                     {
                         let mut lc = shard.lifecycle.lock();
                         for entry in &inflight {

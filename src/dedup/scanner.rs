@@ -1,10 +1,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
+use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
 use crate::dedup::config::DedupConfig;
@@ -16,26 +17,7 @@ use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::packer::packer::HoleMap;
 use crate::space::allocator::SpaceAllocator;
-use crate::space::extent::Extent;
 use crate::types::{VolumeId, BLOCK_SIZE};
-
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn soak_debug_guards_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ONYX_ENABLE_SOAK_DEBUG_GUARDS")
-            .ok()
-            .and_then(|value| parse_env_bool(&value))
-            .unwrap_or(cfg!(debug_assertions))
-    })
-}
 
 /// Background dedup scanner: re-processes blocks that skipped dedup under pressure.
 pub struct DedupScanner {
@@ -280,36 +262,14 @@ impl DedupScanner {
 
                         // Free old PBA if refcount dropped to 0
                         if let Some((old_pba, old_blocks)) = decremented {
-                            let current_refcount = meta.get_refcount(old_pba)?;
-                            let remaining = if current_refcount == 0 && soak_debug_guards_enabled()
-                            {
-                                let reconciled = meta.reconcile_refcount_for_pba(old_pba)?;
-                                if reconciled != 0 {
-                                    tracing::error!(
-                                        pba = old_pba.0,
-                                        reconciled_refcount = reconciled,
-                                        context = "dedup_scanner_cleanup",
-                                        "detected refcount drift while dedup scanner prepared to free a PBA"
-                                    );
-                                }
-                                reconciled
-                            } else {
-                                current_refcount
-                            };
-                            if remaining == 0 {
-                                meta.cleanup_dedup_for_pba_standalone(old_pba)?;
-                                if old_blocks <= 1 {
-                                    crate::packer::packer::remove_holes_for_pba(hole_map, old_pba);
-                                    allocator.free_one(old_pba)?;
-                                } else {
-                                    crate::packer::packer::remove_holes_for_extent(
-                                        hole_map,
-                                        old_pba,
-                                        old_blocks,
-                                    );
-                                    allocator.free_extent(Extent::new(old_pba, old_blocks))?;
-                                }
-                            }
+                            BufferFlusher::cleanup_dead_pba_post_commit(
+                                meta,
+                                allocator,
+                                hole_map,
+                                old_pba,
+                                old_blocks,
+                                "dedup_scanner_cleanup",
+                            );
                         }
                         stats.hits += 1;
                     }
