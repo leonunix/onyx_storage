@@ -381,33 +381,43 @@ impl BufferShard {
         let tail = ring.tail_offset;
         let capacity = ring.capacity_bytes;
 
-        let offset = if ring.used_bytes == 0 {
+        // When wrapping to offset 0, the space from head to the end of the
+        // ring becomes a dead gap.  Track it in `gap` so used_bytes stays
+        // accurate (prevents head==tail with used<capacity from being
+        // misinterpreted as "has space").
+        let (offset, gap) = if ring.used_bytes == 0 {
             // Ring is empty — the entire capacity is available, but we must
             // still check whether the entry fits between head and the end of
             // the device.  If it doesn't, wrap to offset 0.
             if len_bytes <= capacity - head {
-                head
+                (head, 0)
             } else {
-                0
+                (0, capacity - head)
             }
-        } else if head >= tail {
+        } else if head > tail {
             let bytes_to_end = capacity - head;
             if len_bytes <= bytes_to_end {
-                head
+                (head, 0)
             } else if len_bytes <= tail {
-                0
+                (0, bytes_to_end)
             } else {
                 return None;
             }
-        } else if len_bytes <= tail - head {
-            head
+        } else if head < tail {
+            if len_bytes <= tail - head {
+                (head, 0)
+            } else {
+                return None;
+            }
         } else {
+            // head == tail && used_bytes > 0 → ring is full (entries + gap
+            // fill the entire capacity).
             return None;
         };
 
         let was_empty = ring.log_order.is_empty();
         ring.head_offset = (offset + len_bytes) % capacity;
-        ring.used_bytes += len_bytes;
+        ring.used_bytes += len_bytes + gap;
         ring.log_order.push_back(LogRecord {
             seq,
             disk_offset: offset,
@@ -424,6 +434,8 @@ impl BufferShard {
             let Some(front) = ring.log_order.front().copied() else {
                 ring.tail_offset = ring.head_offset;
                 ring.head_became_at = None;
+                // All entries reclaimed — any orphaned wrap gap is also gone.
+                ring.used_bytes = 0;
                 break;
             };
             if !ring.flushed_seqs.contains(&front.seq) {
@@ -433,9 +445,26 @@ impl BufferShard {
 
             ring.log_order.pop_front();
             ring.flushed_seqs.remove(&front.seq);
-            ring.used_bytes = ring
-                .used_bytes
-                .saturating_sub(Self::slot_bytes(front.slot_count));
+
+            let entry_bytes = Self::slot_bytes(front.slot_count);
+            let entry_end = front.disk_offset + entry_bytes;
+
+            // Detect wrap gap: if this entry ends before the ring boundary
+            // but the next entry (or head) is at a lower offset, there is a
+            // dead gap at [entry_end, capacity) that was added to used_bytes
+            // when the ring wrapped.  Free it together with the entry.
+            let next_offset = ring
+                .log_order
+                .front()
+                .map(|next| next.disk_offset)
+                .unwrap_or(ring.head_offset);
+            let gap = if entry_end < ring.capacity_bytes && next_offset < entry_end {
+                ring.capacity_bytes - entry_end
+            } else {
+                0
+            };
+
+            ring.used_bytes = ring.used_bytes.saturating_sub(entry_bytes + gap);
             ring.reclaim_ready += 1;
             ring.tail_offset = ring
                 .log_order
@@ -3099,5 +3128,145 @@ mod tests {
         // Entry removed; flush_progress cleaned up.
         assert!(pool.flushed_offsets_for_shard(0, seq).is_none());
         assert!(pool.pending_entry_arc(seq).is_none());
+    }
+
+    // ── Unit tests for ring allocator gap accounting ─────────────────
+
+    fn make_ring(capacity_slots: u32) -> RingState {
+        RingState {
+            used_bytes: 0,
+            capacity_bytes: BufferShard::slot_bytes(capacity_slots),
+            reclaim_ready: 0,
+            head_offset: 0,
+            tail_offset: 0,
+            log_order: VecDeque::new(),
+            flushed_seqs: HashSet::new(),
+            head_became_at: None,
+        }
+    }
+
+    #[test]
+    fn ring_wrap_gap_prevents_overlap() {
+        // Reproduce the scenario that caused overlapping offsets:
+        // 1. Fill [tail, head) with entries
+        // 2. Wrap an entry to offset 0, creating a gap at [head, capacity)
+        // 3. Fill remaining free space [entry_end, tail)
+        // 4. At this point head == tail; the ring MUST reject further allocations.
+        let slot = BufferShard::slot_size();
+        let mut ring = make_ring(10); // 10 slots = 40KB
+
+        // Fill slots [0, 7) — 7 slots used.
+        let o = BufferShard::reserve_log_space(&mut ring, 1, 7);
+        assert_eq!(o, Some(0));
+        assert_eq!(ring.head_offset, 7 * slot);
+        assert_eq!(ring.used_bytes, 7 * slot);
+
+        // Reclaim entry 1 so that tail advances.
+        ring.flushed_seqs.insert(1);
+        BufferShard::reclaim_log_prefix(&mut ring);
+        assert_eq!(ring.used_bytes, 0);
+        // head=7*slot, tail=7*slot (ring empty).
+
+        // Fill slots [7, 9) — 2 slots.
+        let o = BufferShard::reserve_log_space(&mut ring, 2, 2);
+        assert_eq!(o, Some(7 * slot));
+        assert_eq!(ring.head_offset, 9 * slot);
+        assert_eq!(ring.used_bytes, 2 * slot);
+
+        // Wrap: allocate 3 slots starting at offset 0 (doesn't fit at end).
+        // Creates a 1-slot gap at [9*slot, 10*slot).
+        let o = BufferShard::reserve_log_space(&mut ring, 3, 3);
+        assert_eq!(o, Some(0));
+        assert_eq!(ring.head_offset, 3 * slot);
+        // used_bytes includes the gap: 2 (entry 2) + 1 (gap) + 3 (entry 3) = 6 slots.
+        assert_eq!(ring.used_bytes, 6 * slot);
+
+        // Fill remaining free space [3*slot, 7*slot) — 4 slots.
+        let o = BufferShard::reserve_log_space(&mut ring, 4, 4);
+        assert_eq!(o, Some(3 * slot));
+        assert_eq!(ring.head_offset, 7 * slot); // head == tail
+
+        // Ring is now full: entries [7,9) + gap [9,10) + entries [0,3) + entries [3,7).
+        // used_bytes = 2 + 1 + 3 + 4 = 10 slots = capacity.
+        assert_eq!(ring.used_bytes, 10 * slot);
+
+        // Any further allocation MUST fail — the ring is full.
+        assert!(BufferShard::reserve_log_space(&mut ring, 5, 1).is_none());
+    }
+
+    #[test]
+    fn ring_gap_freed_on_reclaim_past_wrap() {
+        let slot = BufferShard::slot_size();
+        let mut ring = make_ring(10);
+
+        // Entry 1 at [0, 8*slot).
+        BufferShard::reserve_log_space(&mut ring, 1, 8);
+        // Entry 2 wraps to offset 0, gap at [8*slot, 10*slot).
+        // (need to move head first)
+        // Actually entry 1 is at [0, 8*slot), head=8*slot, tail=0.
+        // Entry 2 at [8*slot, 10*slot) — fits at end.
+        BufferShard::reserve_log_space(&mut ring, 2, 2);
+        // head=0, tail=0, used=10*slot. Ring full, no gap.
+
+        // Reset — use a scenario where gap is created.
+        let mut ring = make_ring(10);
+
+        // Entry 1: 7 slots at [0, 7*slot).
+        BufferShard::reserve_log_space(&mut ring, 1, 7);
+        // Reclaim entry 1.
+        ring.flushed_seqs.insert(1);
+        BufferShard::reclaim_log_prefix(&mut ring);
+        // head=7*slot, tail=7*slot, used=0.
+
+        // Entry 2: 2 slots at [7*slot, 9*slot).
+        BufferShard::reserve_log_space(&mut ring, 2, 2);
+        // Entry 3: 3 slots — wraps to [0, 3*slot). Gap at [9*slot, 10*slot).
+        BufferShard::reserve_log_space(&mut ring, 3, 3);
+        assert_eq!(ring.used_bytes, 6 * slot); // 2 + 1(gap) + 3 = 6
+
+        // Reclaim entry 2 — should also free the gap.
+        ring.flushed_seqs.insert(2);
+        BufferShard::reclaim_log_prefix(&mut ring);
+        // Entry 2 was 2 slots, gap was 1 slot. Total freed = 3 slots.
+        assert_eq!(ring.used_bytes, 3 * slot); // only entry 3 remains
+        assert_eq!(ring.tail_offset, 0); // tail advanced past gap to entry 3
+
+        // Reclaim entry 3.
+        ring.flushed_seqs.insert(3);
+        BufferShard::reclaim_log_prefix(&mut ring);
+        assert_eq!(ring.used_bytes, 0);
+    }
+
+    #[test]
+    fn ring_empty_wrap_tracks_gap() {
+        let slot = BufferShard::slot_size();
+        let mut ring = make_ring(10);
+
+        // Simulate head at 9*slot (from prior usage).
+        ring.head_offset = 9 * slot;
+        ring.tail_offset = 9 * slot;
+
+        // Allocate 3 slots: doesn't fit at end (only 1 slot left), wraps to 0.
+        let o = BufferShard::reserve_log_space(&mut ring, 1, 3);
+        assert_eq!(o, Some(0));
+        // Gap = 1 slot at [9*slot, 10*slot).
+        assert_eq!(ring.used_bytes, 4 * slot); // 3 (entry) + 1 (gap)
+
+        // Reclaim — gap should be freed along with the entry.
+        ring.flushed_seqs.insert(1);
+        BufferShard::reclaim_log_prefix(&mut ring);
+        assert_eq!(ring.used_bytes, 0);
+    }
+
+    #[test]
+    fn ring_head_eq_tail_used_zero_still_allocates() {
+        let slot = BufferShard::slot_size();
+        let mut ring = make_ring(10);
+        ring.head_offset = 5 * slot;
+        ring.tail_offset = 5 * slot;
+        // Ring is empty. Should allocate normally.
+        let o = BufferShard::reserve_log_space(&mut ring, 1, 3);
+        assert_eq!(o, Some(5 * slot));
+        assert_eq!(ring.used_bytes, 3 * slot);
     }
 }

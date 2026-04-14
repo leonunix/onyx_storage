@@ -143,6 +143,23 @@ def main() -> int:
     print(f"final:   {summary.get('final', False)}")
     print(f"failure: {summary.get('failure', '-')}")
     print(
+        "bw:      "
+        f"write_avg={summary.get('write_bw_avg', summary.get('write_bw', '-'))} "
+        f"read_avg={summary.get('read_bw_avg', summary.get('read_bw', '-'))}"
+    )
+    if "write_bw_recent" in summary or "read_bw_recent" in summary:
+        window_secs = summary.get("recent_window_secs")
+        if isinstance(window_secs, (int, float)):
+            window_text = f"{window_secs:.1f}s"
+        else:
+            window_text = "-"
+        print(
+            "recent:  "
+            f"window={window_text} "
+            f"write={summary.get('write_bw_recent', '-')} "
+            f"read={summary.get('read_bw_recent', '-')}"
+        )
+    print(
         "ops:     "
         f"writes={summary.get('write_ops', 0)} reads={summary.get('read_ops', 0)} "
         f"scrubs={summary.get('scrub_checks', 0)} mismatches={summary.get('mismatches', 0)} "

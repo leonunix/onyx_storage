@@ -685,6 +685,12 @@ class Stats:
     io_errors: int = 0
 
 
+@dataclass
+class SummaryCursor:
+    timestamp: float
+    stats: Stats
+
+
 class StatsTracker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -724,6 +730,8 @@ class IntegrityHarness:
         self.failure: Optional[str] = None
         self.failure_lock = threading.Lock()
         self.stats = StatsTracker()
+        self.summary_cursor_lock = threading.Lock()
+        self.summary_cursor: Optional[SummaryCursor] = None
         self.next_stamp = 1
         self.next_stamp_lock = threading.Lock()
         self.op_trace_counter = 0
@@ -1102,11 +1110,40 @@ class IntegrityHarness:
         finally:
             self.pause_gate.resume()
 
-    def write_summary(self, start_time: float, final: bool) -> None:
+    def _build_summary(self, start_time: float, now: Optional[float] = None) -> dict[str, object]:
+        now = time.time() if now is None else now
         stats = self.stats.snapshot()
-        elapsed = max(1.0, time.time() - start_time)
+        elapsed = max(1.0, now - start_time)
+        avg_write_bw = format_bytes(stats.write_bytes / elapsed) + "/s"
+        avg_read_bw = format_bytes(stats.read_bytes / elapsed) + "/s"
+
+        with self.summary_cursor_lock:
+            previous = self.summary_cursor
+            if previous is None or now < previous.timestamp:
+                recent_window_secs = elapsed
+                recent_write_ops = stats.write_ops
+                recent_read_ops = stats.read_ops
+                recent_flush_ops = stats.flush_ops
+                recent_restarts = stats.restarts
+                recent_scrub_checks = stats.scrub_checks
+                recent_mismatches = stats.mismatches
+                recent_io_errors = stats.io_errors
+                recent_write_bytes = stats.write_bytes
+                recent_read_bytes = stats.read_bytes
+            else:
+                recent_window_secs = max(1.0, now - previous.timestamp)
+                recent_write_ops = max(0, stats.write_ops - previous.stats.write_ops)
+                recent_read_ops = max(0, stats.read_ops - previous.stats.read_ops)
+                recent_flush_ops = max(0, stats.flush_ops - previous.stats.flush_ops)
+                recent_restarts = max(0, stats.restarts - previous.stats.restarts)
+                recent_scrub_checks = max(0, stats.scrub_checks - previous.stats.scrub_checks)
+                recent_mismatches = max(0, stats.mismatches - previous.stats.mismatches)
+                recent_io_errors = max(0, stats.io_errors - previous.stats.io_errors)
+                recent_write_bytes = max(0, stats.write_bytes - previous.stats.write_bytes)
+                recent_read_bytes = max(0, stats.read_bytes - previous.stats.read_bytes)
+            self.summary_cursor = SummaryCursor(timestamp=now, stats=stats)
+
         summary = {
-            "final": final,
             "seed": self.seed,
             "elapsed_secs": elapsed,
             "elapsed_human": format_duration(elapsed),
@@ -1119,11 +1156,30 @@ class IntegrityHarness:
             "io_errors": stats.io_errors,
             "write_bytes": stats.write_bytes,
             "read_bytes": stats.read_bytes,
-            "write_bw": format_bytes(stats.write_bytes / elapsed) + "/s",
-            "read_bw": format_bytes(stats.read_bytes / elapsed) + "/s",
+            "write_bw": avg_write_bw,
+            "read_bw": avg_read_bw,
+            "write_bw_avg": avg_write_bw,
+            "read_bw_avg": avg_read_bw,
+            "recent_window_secs": recent_window_secs,
+            "recent_write_ops": recent_write_ops,
+            "recent_read_ops": recent_read_ops,
+            "recent_flush_ops": recent_flush_ops,
+            "recent_restarts": recent_restarts,
+            "recent_scrub_checks": recent_scrub_checks,
+            "recent_mismatches": recent_mismatches,
+            "recent_io_errors": recent_io_errors,
+            "recent_write_bytes": recent_write_bytes,
+            "recent_read_bytes": recent_read_bytes,
+            "write_bw_recent": format_bytes(recent_write_bytes / recent_window_secs) + "/s",
+            "read_bw_recent": format_bytes(recent_read_bytes / recent_window_secs) + "/s",
             "failure": self.failure,
             "device": str(self.device.path) if self.device.path else None,
         }
+        return summary
+
+    def write_summary(self, start_time: float, final: bool) -> None:
+        summary = self._build_summary(start_time)
+        summary["final"] = final
         (self.run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -1131,10 +1187,11 @@ class IntegrityHarness:
         status = "FINAL" if final else "STAT"
         print(
             f"[{status}] elapsed={summary['elapsed_human']} "
-            f"write_ops={stats.write_ops} read_ops={stats.read_ops} "
-            f"write_bw={summary['write_bw']} read_bw={summary['read_bw']} "
-            f"restarts={stats.restarts} scrubs={stats.scrub_checks} "
-            f"errors={stats.io_errors} mismatches={stats.mismatches}",
+            f"write_ops={summary['write_ops']} read_ops={summary['read_ops']} "
+            f"write_bw_avg={summary['write_bw_avg']} write_bw_recent={summary['write_bw_recent']} "
+            f"read_bw_avg={summary['read_bw_avg']} read_bw_recent={summary['read_bw_recent']} "
+            f"restarts={summary['restarts']} scrubs={summary['scrub_checks']} "
+            f"errors={summary['io_errors']} mismatches={summary['mismatches']}",
             flush=True,
         )
 

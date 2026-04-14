@@ -91,6 +91,7 @@ The harness writes everything into `--run-dir`:
 - `engine.log`: engine stdout/stderr
 - `events.jsonl`: operation timeline and lifecycle events
 - `summary.json`: rolling stats and final result
+  `write_bw` / `read_bw` are cumulative averages across the whole run; `write_bw_recent` / `read_bw_recent` capture the latest reporting window.
 - `recent-events.json`: last events before failure
 - `shadow-state.bin`: compact logical-image metadata used for verification
 

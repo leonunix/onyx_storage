@@ -1,4 +1,5 @@
 import argparse
+import json
 import pathlib
 import tempfile
 import unittest
@@ -101,6 +102,58 @@ class OsIntegrityStressTests(unittest.TestCase):
             harness._handle_thread_exception("worker-2", HarnessError("device not open"))
             self.assertIsNone(harness.failure)
             self.assertEqual(harness.stats.snapshot().io_errors, 0)
+        finally:
+            harness.teardown()
+
+    def test_summary_reports_average_and_recent_bandwidth(self) -> None:
+        harness = self.make_harness()
+        try:
+            start_time = 100.0
+            harness.stats.add(
+                write_ops=4,
+                read_ops=2,
+                flush_ops=1,
+                write_bytes=4 * BLOCK_SIZE,
+                read_bytes=2 * BLOCK_SIZE,
+            )
+            first = harness._build_summary(start_time, now=110.0)
+            self.assertEqual(first["write_bw"], first["write_bw_avg"])
+            self.assertEqual(first["recent_window_secs"], 10.0)
+            self.assertEqual(first["recent_write_ops"], 4)
+            self.assertEqual(first["recent_read_ops"], 2)
+            self.assertEqual(first["recent_write_bytes"], 4 * BLOCK_SIZE)
+            self.assertEqual(first["recent_read_bytes"], 2 * BLOCK_SIZE)
+
+            harness.stats.add(
+                write_ops=3,
+                read_ops=1,
+                flush_ops=2,
+                write_bytes=3 * BLOCK_SIZE,
+                read_bytes=BLOCK_SIZE,
+            )
+            second = harness._build_summary(start_time, now=115.0)
+            self.assertEqual(second["recent_window_secs"], 5.0)
+            self.assertEqual(second["recent_write_ops"], 3)
+            self.assertEqual(second["recent_read_ops"], 1)
+            self.assertEqual(second["recent_flush_ops"], 2)
+            self.assertEqual(second["recent_write_bytes"], 3 * BLOCK_SIZE)
+            self.assertEqual(second["recent_read_bytes"], BLOCK_SIZE)
+            self.assertIn("write_bw_recent", second)
+            self.assertIn("read_bw_recent", second)
+        finally:
+            harness.teardown()
+
+    def test_write_summary_persists_recent_bandwidth_fields(self) -> None:
+        harness = self.make_harness()
+        try:
+            harness.stats.add(write_ops=1, write_bytes=BLOCK_SIZE)
+            harness.write_summary(start_time=0.0, final=False)
+            summary_path = pathlib.Path(harness.run_dir) / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertIn("write_bw_avg", summary)
+            self.assertIn("write_bw_recent", summary)
+            self.assertIn("recent_window_secs", summary)
+            self.assertFalse(summary["final"])
         finally:
             harness.teardown()
 

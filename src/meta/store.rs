@@ -32,6 +32,18 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     mix_u64(hash)
 }
 
+fn lexicographic_successor(key: &[u8]) -> Option<Vec<u8>> {
+    let mut next = key.to_vec();
+    for idx in (0..next.len()).rev() {
+        if next[idx] != u8::MAX {
+            next[idx] += 1;
+            next.truncate(idx + 1);
+            return Some(next);
+        }
+    }
+    None
+}
+
 /// Full merge for CF_REFCOUNT: applies all pending i32 deltas to the base u32 value.
 ///
 /// Base value: 4-byte BE u32 (existing refcount, or absent = 0).
@@ -401,13 +413,13 @@ impl MetaStore {
         let cf_fragment_refs = self.db.cf_handle(CF_FRAGMENT_REFS).unwrap();
 
         let prefix = blockmap_key_prefix(id)?;
+        let prefix_end = lexicographic_successor(&prefix);
 
         // Phase 1: scan all blockmap entries, collect PBA decrement counts,
-        // block counts per PBA, and blockmap keys to delete.
-        let mut pba_decrements: HashMap<Pba, u32> = HashMap::new();
-        let mut pba_block_counts: HashMap<Pba, u32> = HashMap::new();
+        // block counts per PBA, and fragment ref decrements.
+        let mut pba_decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut fragment_decrements: HashMap<FragmentRefKey, u32> = HashMap::new();
-        let mut blockmap_keys_to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut deleted_entries = 0usize;
 
         let mut iter = self.db.raw_iterator_cf(&cf_blockmap);
         iter.seek(&prefix);
@@ -418,31 +430,31 @@ impl MetaStore {
                 }
                 if let Some(val) = iter.value() {
                     if let Some(bv) = decode_blockmap_value(val) {
-                        *pba_decrements.entry(bv.pba).or_insert(0) += 1;
+                        let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                        let entry = pba_decrements.entry(bv.pba).or_insert((0, blocks));
+                        entry.0 += 1;
+                        entry.1 = entry.1.max(blocks);
                         *fragment_decrements
                             .entry(FragmentRefKey::from(&bv))
                             .or_insert(0) += 1;
-                        let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
-                        // All LBAs in the same compression unit share the same
-                        // pba and unit_compressed_size, so max() is correct.
-                        pba_block_counts
-                            .entry(bv.pba)
-                            .and_modify(|b| *b = (*b).max(blocks))
-                            .or_insert(blocks);
                     }
                 }
-                blockmap_keys_to_delete.push(key.to_vec());
+                deleted_entries += 1;
             }
             iter.next();
         }
         iter.status()?;
+
+        if deleted_entries == 0 {
+            return Ok(Vec::new());
+        }
 
         let _refcount_guards = self.lock_refcount_pbas(pba_decrements.keys().copied());
 
         // Phase 2: merge-decrement refcounts + delete blockmap + volume in one WriteBatch
         let mut batch = WriteBatch::default();
 
-        for (pba, decrement) in &pba_decrements {
+        for (pba, (decrement, _)) in &pba_decrements {
             let rc_key = encode_refcount_key(*pba);
             batch.merge_cf(
                 &cf_refcount,
@@ -460,8 +472,22 @@ impl MetaStore {
             );
         }
 
-        for key in &blockmap_keys_to_delete {
-            batch.delete_cf(&cf_blockmap, key);
+        if let Some(end) = prefix_end.as_ref() {
+            batch.delete_range_cf(&cf_blockmap, &prefix, end);
+        } else {
+            let mut iter = self.db.raw_iterator_cf(&cf_blockmap);
+            iter.seek(&prefix);
+            while iter.valid() {
+                let Some(key) = iter.key() else {
+                    break;
+                };
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                batch.delete_cf(&cf_blockmap, key);
+                iter.next();
+            }
+            iter.status()?;
         }
 
         let vol_key = encode_volume_key(&id.0);
@@ -485,7 +511,10 @@ impl MetaStore {
                         let rc_key = encode_refcount_key(*pba);
                         cleanup_batch.delete_cf(&cf_refcount, &rc_key);
                         let _ = self.cleanup_dedup_for_pba(*pba, &mut cleanup_batch);
-                        let block_count = pba_block_counts.get(pba).copied().unwrap_or(1);
+                        let block_count = pba_decrements
+                            .get(pba)
+                            .map(|(_, blocks)| *blocks)
+                            .unwrap_or(1);
                         freed_extents.push((*pba, block_count));
                         need_cleanup = true;
                     }
@@ -503,6 +532,7 @@ impl MetaStore {
 
         tracing::info!(
             volume = %id,
+            deleted_entries,
             freed_extents = freed_extents.len(),
             "volume deleted with blockmap/refcount cleanup"
         );
@@ -536,12 +566,11 @@ impl MetaStore {
         let prefix = blockmap_key_prefix(vol_id)?;
 
         let mut read_opts = ReadOptions::default();
-        read_opts.set_iterate_upper_bound(end_key);
+        read_opts.set_iterate_upper_bound(end_key.clone());
 
-        let mut pba_decrements: HashMap<Pba, u32> = HashMap::new();
-        let mut pba_block_counts: HashMap<Pba, u32> = HashMap::new();
+        let mut pba_decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut fragment_decrements: HashMap<FragmentRefKey, u32> = HashMap::new();
-        let mut blockmap_keys: Vec<Vec<u8>> = Vec::new();
+        let mut deleted_entries = 0usize;
 
         let mut iter = self.db.raw_iterator_cf_opt(&cf_blockmap, read_opts);
         iter.seek(&start_key);
@@ -551,23 +580,21 @@ impl MetaStore {
                     break;
                 }
                 if let Some(bv) = decode_blockmap_value(val) {
-                    *pba_decrements.entry(bv.pba).or_insert(0) += 1;
+                    let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                    let entry = pba_decrements.entry(bv.pba).or_insert((0, blocks));
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(blocks);
                     *fragment_decrements
                         .entry(FragmentRefKey::from(&bv))
                         .or_insert(0) += 1;
-                    let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
-                    pba_block_counts
-                        .entry(bv.pba)
-                        .and_modify(|b| *b = (*b).max(blocks))
-                        .or_insert(blocks);
                 }
-                blockmap_keys.push(key.to_vec());
+                deleted_entries += 1;
             }
             iter.next();
         }
         iter.status()?;
 
-        if blockmap_keys.is_empty() {
+        if deleted_entries == 0 {
             return Ok(Vec::new());
         }
 
@@ -576,7 +603,7 @@ impl MetaStore {
         // Phase 2: atomic WriteBatch — delete blockmap entries + merge-decrement refcounts
         let mut batch = WriteBatch::default();
 
-        for (pba, decrement) in &pba_decrements {
+        for (pba, (decrement, _)) in &pba_decrements {
             let rc_key = encode_refcount_key(*pba);
             batch.merge_cf(
                 &cf_refcount,
@@ -594,9 +621,7 @@ impl MetaStore {
             );
         }
 
-        for key in &blockmap_keys {
-            batch.delete_cf(&cf_blockmap, key);
-        }
+        batch.delete_range_cf(&cf_blockmap, &start_key, &end_key);
 
         self.db.write(batch)?;
 
@@ -613,7 +638,10 @@ impl MetaStore {
                         let rc_key = encode_refcount_key(*pba);
                         cleanup_batch.delete_cf(&cf_refcount, &rc_key);
                         let _ = self.cleanup_dedup_for_pba(*pba, &mut cleanup_batch);
-                        let block_count = pba_block_counts.get(pba).copied().unwrap_or(1);
+                        let block_count = pba_decrements
+                            .get(pba)
+                            .map(|(_, blocks)| *blocks)
+                            .unwrap_or(1);
                         freed_extents.push((*pba, block_count));
                         need_cleanup = true;
                     }
@@ -633,7 +661,7 @@ impl MetaStore {
             volume = %vol_id,
             start_lba = start_lba.0,
             end_lba = end_lba.0,
-            deleted_keys = blockmap_keys.len(),
+            deleted_keys = deleted_entries,
             freed_extents = freed_extents.len(),
             "blockmap range deleted"
         );
@@ -1119,11 +1147,14 @@ impl MetaStore {
 
         let mut old_mappings = Vec::with_capacity(batch_values.len());
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        let mut self_decrement: u32 = 0;
         for (vol_id, lba, _new_value) in batch_values {
             let old_mapping = self.get_mapping(vol_id, *lba)?;
             old_mappings.push(old_mapping);
             if let Some(old) = old_mapping {
-                if old.pba != new_pba {
+                if old.pba == new_pba {
+                    self_decrement += 1;
+                } else {
                     let old_blocks = old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
                     let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
                     entry.0 += 1;
@@ -1153,8 +1184,14 @@ impl MetaStore {
             );
         }
 
+        // Read current refcount and compute net increment, instead of blind PUT.
+        // A blind PUT would overwrite any refs added by concurrent dedup hits or
+        // other paths, causing refcount drift → premature PBA free → CRC mismatch.
+        let current_rc = self.get_refcount(new_pba)?;
+        let net_increment = new_refcount - self_decrement;
+        let new_rc = current_rc + net_increment;
         let rc_key = encode_refcount_key(new_pba);
-        batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_refcount));
+        batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
 
         for (old_pba, (decrement, _)) in &old_pba_meta {
             let current_rc = old_refcounts.get(old_pba).copied().unwrap_or(0);
