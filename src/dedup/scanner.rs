@@ -258,7 +258,7 @@ impl DedupScanner {
                             ..existing.to_blockmap_value()
                         };
                         // atomic_dedup_hit re-reads old mapping inside the lock
-                        let decremented = meta.atomic_dedup_hit(&vol_id, *lba, &new_bv)?;
+                        let decremented = meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash)?;
 
                         // Free old PBA if refcount dropped to 0
                         if let Some((old_pba, old_blocks)) = decremented {

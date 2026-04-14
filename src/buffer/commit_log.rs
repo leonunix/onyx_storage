@@ -382,7 +382,14 @@ impl BufferShard {
         let capacity = ring.capacity_bytes;
 
         let offset = if ring.used_bytes == 0 {
-            head
+            // Ring is empty — the entire capacity is available, but we must
+            // still check whether the entry fits between head and the end of
+            // the device.  If it doesn't, wrap to offset 0.
+            if len_bytes <= capacity - head {
+                head
+            } else {
+                0
+            }
         } else if head >= tail {
             let bytes_to_end = capacity - head;
             if len_bytes <= bytes_to_end {

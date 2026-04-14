@@ -1204,7 +1204,7 @@ impl BufferFlusher {
                     let mut is_hit: Vec<bool> = vec![false; lba_count];
                     let mut all_hashes: Vec<ContentHash> = Vec::with_capacity(lba_count);
                     // Collect hit info for processing
-                    let mut hit_infos: Vec<(usize, BlockmapValue)> = Vec::new();
+                    let mut hit_infos: Vec<(usize, BlockmapValue, ContentHash)> = Vec::new();
 
                     for i in 0..lba_count {
                         let Some(block) = unit.raw_blocks.get(i) else {
@@ -1230,7 +1230,7 @@ impl BufferFlusher {
                                             live_check_start,
                                         );
                                         is_hit[i] = true;
-                                        hit_infos.push((i, entry.to_blockmap_value()));
+                                        hit_infos.push((i, entry.to_blockmap_value(), hash));
                                     }
                                     Ok(false) => {
                                         Self::record_elapsed(
@@ -1273,8 +1273,8 @@ impl BufferFlusher {
                     // Process hits in a single batch for this CoalesceUnit.
                     // Phase A: pre-filter stale hits (outside lock).
                     let mut successful_hit_indices: Vec<usize> = Vec::new();
-                    let mut valid_hits: Vec<(usize, BlockmapValue)> = Vec::new();
-                    for (i, existing_value) in &hit_infos {
+                    let mut valid_hits: Vec<(usize, BlockmapValue, ContentHash)> = Vec::new();
+                    for (i, existing_value, hash) in &hit_infos {
                         let lba = Lba(unit.start_lba.0 + *i as u64);
                         let vol_id_str = &unit.vol_id;
 
@@ -1287,7 +1287,7 @@ impl BufferFlusher {
                             successful_hit_indices.push(*i);
                             continue;
                         }
-                        valid_hits.push((*i, *existing_value));
+                        valid_hits.push((*i, *existing_value, *hash));
                     }
 
                     // Phase B: batch commit all valid hits under one lifecycle
@@ -1314,19 +1314,19 @@ impl BufferFlusher {
                                     // Treat all as discarded (successfully handled)
                                     return Ok(valid_hits
                                         .iter()
-                                        .map(|(i, _)| (*i, DedupHitResult::Accepted(None)))
+                                        .map(|(i, _, _)| (*i, DedupHitResult::Accepted(None)))
                                         .collect());
                                 }
 
                                 // Build batch input, filtering out test-injected failures.
-                                let mut batch_input: Vec<(Lba, BlockmapValue)> =
+                                let mut batch_input: Vec<(Lba, BlockmapValue, ContentHash)> =
                                     Vec::with_capacity(valid_hits.len());
                                 let mut input_map: Vec<usize> =
                                     Vec::with_capacity(valid_hits.len());
-                                for &(i, ref existing_value) in &valid_hits {
+                                for &(i, ref existing_value, ref hash) in &valid_hits {
                                     let lba = Lba(unit.start_lba.0 + i as u64);
                                     if maybe_inject_dedup_hit_failure(vol_id_str, lba).is_ok() {
-                                        batch_input.push((lba, *existing_value));
+                                        batch_input.push((lba, *existing_value, *hash));
                                         input_map.push(i);
                                     }
                                 }
@@ -1341,7 +1341,7 @@ impl BufferFlusher {
                                 }
                                 // Injection-failed hits: demote to Rejected so they
                                 // get is_hit[i]=false and go through the write path.
-                                for &(i, _) in &valid_hits {
+                                for &(i, _, _) in &valid_hits {
                                     if !input_map.contains(&i) {
                                         combined.push((i, DedupHitResult::Rejected));
                                     }
@@ -1391,7 +1391,7 @@ impl BufferFlusher {
                                 metrics
                                     .dedup_hit_failures
                                     .fetch_add(valid_hits.len() as u64, Ordering::Relaxed);
-                                for (i, _) in &valid_hits {
+                                for (i, _, _) in &valid_hits {
                                     is_hit[*i] = false;
                                 }
                                 tracing::error!(
@@ -3796,6 +3796,16 @@ mod tests {
         meta.set_refcount(old_pba, 3).unwrap();
         meta.set_refcount(new_pba, 8).unwrap();
 
+        // Each LBA needs a dedup_reverse entry for the guard to accept the hit.
+        let hash_0: ContentHash = [0x01; 32];
+        let hash_1: ContentHash = [0x02; 32];
+        let hash_2: ContentHash = [0x03; 32];
+        meta.put_dedup_entries(&[
+            (hash_0, DedupEntry { pba: new_pba, slot_offset: 0, compression: 0, unit_compressed_size: BLOCK_SIZE, unit_original_size: BLOCK_SIZE, unit_lba_count: 1, offset_in_unit: 0, crc32: 0 }),
+            (hash_1, DedupEntry { pba: new_pba, slot_offset: 0, compression: 0, unit_compressed_size: BLOCK_SIZE, unit_original_size: BLOCK_SIZE, unit_lba_count: 1, offset_in_unit: 0, crc32: 0 }),
+            (hash_2, DedupEntry { pba: new_pba, slot_offset: 0, compression: 0, unit_compressed_size: BLOCK_SIZE, unit_original_size: BLOCK_SIZE, unit_lba_count: 1, offset_in_unit: 0, crc32: 0 }),
+        ]).unwrap();
+
         let results = meta
             .atomic_batch_dedup_hits(
                 &vol,
@@ -3813,6 +3823,7 @@ mod tests {
                             slot_offset: 0,
                             flags: 0,
                         },
+                        hash_0,
                     ),
                     (
                         Lba(1),
@@ -3827,6 +3838,7 @@ mod tests {
                             slot_offset: 0,
                             flags: 0,
                         },
+                        hash_1,
                     ),
                     (
                         Lba(2),
@@ -3841,6 +3853,7 @@ mod tests {
                             slot_offset: 0,
                             flags: 0,
                         },
+                        hash_2,
                     ),
                 ],
             )

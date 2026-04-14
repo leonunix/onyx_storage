@@ -993,6 +993,35 @@ fn make_bv(pba: u64, compressed: u32, lba_count: u16, offset: u16) -> BlockmapVa
     }
 }
 
+/// Create a unique ContentHash from a u8 seed.
+fn test_hash(seed: u8) -> ContentHash {
+    [seed; 32]
+}
+
+/// Register dedup_reverse entries so the dedup_reverse guard in
+/// atomic_batch_dedup_hits accepts the hits.
+fn register_dedup_reverse(store: &MetaStore, pba: u64, hashes: &[ContentHash]) {
+    let entries: Vec<(ContentHash, DedupEntry)> = hashes
+        .iter()
+        .map(|h| {
+            (
+                *h,
+                DedupEntry {
+                    pba: Pba(pba),
+                    slot_offset: 0,
+                    compression: 0,
+                    unit_compressed_size: 4096,
+                    unit_original_size: 4096,
+                    unit_lba_count: 1,
+                    offset_in_unit: 0,
+                    crc32: 0,
+                },
+            )
+        })
+        .collect();
+    store.put_dedup_entries(&entries).unwrap();
+}
+
 #[test]
 fn batch_dedup_hits_basic() {
     let dir = tempdir().unwrap();
@@ -1001,12 +1030,14 @@ fn batch_dedup_hits_basic() {
 
     // Set up target PBA 100 with refcount 5
     store.set_refcount(Pba(100), 5).unwrap();
+    let h = [test_hash(1), test_hash(2), test_hash(3)];
+    register_dedup_reverse(&store, 100, &h);
 
     // Three hits, no old mapping, all targeting PBA 100
     let hits = vec![
-        (Lba(0), make_bv(100, 4096, 1, 0)),
-        (Lba(1), make_bv(100, 4096, 1, 0)),
-        (Lba(2), make_bv(100, 4096, 1, 0)),
+        (Lba(0), make_bv(100, 4096, 1, 0), h[0]),
+        (Lba(1), make_bv(100, 4096, 1, 0), h[1]),
+        (Lba(2), make_bv(100, 4096, 1, 0), h[2]),
     ];
     let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 3);
@@ -1033,10 +1064,14 @@ fn batch_dedup_hits_rejected_target_freed() {
     // PBA 100 alive, PBA 200 freed (refcount 0)
     store.set_refcount(Pba(100), 2).unwrap();
     // PBA 200 has no refcount entry → 0
+    let h0 = test_hash(1);
+    let h1 = test_hash(2);
+    register_dedup_reverse(&store, 100, &[h0]);
+    // No dedup_reverse for PBA 200 → rejected by dedup_reverse guard
 
     let hits = vec![
-        (Lba(0), make_bv(100, 4096, 1, 0)),
-        (Lba(1), make_bv(200, 4096, 1, 0)),
+        (Lba(0), make_bv(100, 4096, 1, 0), h0),
+        (Lba(1), make_bv(200, 4096, 1, 0), h1),
     ];
     let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 2);
@@ -1068,7 +1103,9 @@ fn batch_dedup_hits_same_pba_refresh() {
     let rc_before = store.get_refcount(Pba(100)).unwrap();
 
     // Dedup hit targets the same PBA 100 → blockmap refresh, no refcount change
-    let hits = vec![(Lba(5), make_bv(100, 4096, 1, 0))];
+    let h = test_hash(1);
+    register_dedup_reverse(&store, 100, &[h]);
+    let hits = vec![(Lba(5), make_bv(100, 4096, 1, 0), h)];
     let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     match results[0] {
         DedupHitResult::Accepted(None) => {}
@@ -1089,8 +1126,10 @@ fn batch_dedup_hits_old_pba_decrement() {
     store.set_refcount(Pba(100), 3).unwrap();
     // Target PBA 200 with refcount 5
     store.set_refcount(Pba(200), 5).unwrap();
+    let h = test_hash(1);
+    register_dedup_reverse(&store, 200, &[h]);
 
-    let hits = vec![(Lba(5), make_bv(200, 4096, 1, 0))];
+    let hits = vec![(Lba(5), make_bv(200, 4096, 1, 0), h)];
     let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     match results[0] {
         DedupHitResult::Accepted(Some((old_pba, _))) => {
@@ -1115,10 +1154,12 @@ fn batch_dedup_hits_multiple_same_target() {
 
     // All target PBA 100 with refcount 5, no old mappings
     store.set_refcount(Pba(100), 5).unwrap();
+    let h = [test_hash(1), test_hash(2), test_hash(3)];
+    register_dedup_reverse(&store, 100, &h);
     let hits = vec![
-        (Lba(10), make_bv(100, 4096, 1, 0)),
-        (Lba(11), make_bv(100, 4096, 1, 0)),
-        (Lba(12), make_bv(100, 4096, 1, 0)),
+        (Lba(10), make_bv(100, 4096, 1, 0), h[0]),
+        (Lba(11), make_bv(100, 4096, 1, 0), h[1]),
+        (Lba(12), make_bv(100, 4096, 1, 0), h[2]),
     ];
     let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 3);
@@ -1141,11 +1182,13 @@ fn batch_dedup_hits_multiple_decrement_same_old() {
     store.set_refcount(Pba(100), 5).unwrap();
     // Target PBA 200 with refcount 10
     store.set_refcount(Pba(200), 10).unwrap();
+    let h = [test_hash(1), test_hash(2), test_hash(3)];
+    register_dedup_reverse(&store, 200, &h);
 
     let hits = vec![
-        (Lba(0), make_bv(200, 4096, 1, 0)),
-        (Lba(1), make_bv(200, 4096, 1, 0)),
-        (Lba(2), make_bv(200, 4096, 1, 0)),
+        (Lba(0), make_bv(200, 4096, 1, 0), h[0]),
+        (Lba(1), make_bv(200, 4096, 1, 0), h[1]),
+        (Lba(2), make_bv(200, 4096, 1, 0), h[2]),
     ];
     let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     for r in &results {
@@ -1178,9 +1221,13 @@ fn batch_dedup_hits_pba_is_both_target_and_old() {
 
     // Hit 1: LBA 5 maps 100→200 (decrement 100, increment 200)
     // Hit 2: LBA 6 (no old mapping) targets 100 (increment 100)
+    let h0 = test_hash(1);
+    let h1 = test_hash(2);
+    register_dedup_reverse(&store, 200, &[h0]);
+    register_dedup_reverse(&store, 100, &[h1]);
     let hits = vec![
-        (Lba(5), make_bv(200, 4096, 1, 0)),
-        (Lba(6), make_bv(100, 4096, 1, 0)),
+        (Lba(5), make_bv(200, 4096, 1, 0), h0),
+        (Lba(6), make_bv(100, 4096, 1, 0), h1),
     ];
     let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 2);

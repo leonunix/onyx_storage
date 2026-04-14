@@ -1618,10 +1618,12 @@ impl MetaStore {
         vol_id: &VolumeId,
         lba: Lba,
         new_value: &BlockmapValue,
+        hash: &ContentHash,
     ) -> OnyxResult<Option<(Pba, u32)>> {
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
         let cf_fragment_refs = self.db.cf_handle(CF_FRAGMENT_REFS).unwrap();
+        let cf_dedup_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
 
         let bm_key = encode_blockmap_key(vol_id, lba)?;
         let _blockmap_guards = self.lock_blockmap_keys([bm_key.as_slice()]);
@@ -1634,6 +1636,18 @@ impl MetaStore {
             touched_pbas.push(old);
         }
         let _refcount_guards = self.lock_refcount_pbas(touched_pbas);
+
+        // Guard: re-verify the dedup_reverse entry still exists.
+        // Between the caller's dedup_entry_is_live() check and this point,
+        // cleanup_dead_pba_post_commit may have deleted the dedup_reverse
+        // entry, freed the PBA, and another write may have reused it.
+        let reverse_key = encode_dedup_reverse_key(new_value.pba, hash);
+        if self.db.get_cf(&cf_dedup_reverse, &reverse_key)?.is_none() {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "dedup hit rejected: dedup_reverse entry for PBA {:?} was cleaned up (PBA freed between liveness check and hit)",
+                new_value.pba,
+            ))));
+        }
 
         let mut batch = WriteBatch::default();
 
@@ -1650,11 +1664,6 @@ impl MetaStore {
 
         if !same_pba {
             // Guard: reject the hit if the dedup target PBA was freed.
-            // Between the caller's dedup_entry_is_live() check (outside lock) and
-            // this point, another thread may have decremented the target PBA's
-            // refcount to 0 and freed it to the allocator. Incrementing a freed
-            // PBA's refcount would create a live blockmap reference to a PBA that
-            // the allocator considers free.
             let current_rc = self.get_refcount(new_value.pba)?;
             if current_rc == 0 {
                 return Err(OnyxError::Io(std::io::Error::other(format!(
@@ -1705,7 +1714,7 @@ impl MetaStore {
     pub fn atomic_batch_dedup_hits(
         &self,
         vol_id: &VolumeId,
-        hits: &[(Lba, BlockmapValue)],
+        hits: &[(Lba, BlockmapValue, ContentHash)],
     ) -> OnyxResult<Vec<DedupHitResult>> {
         if hits.is_empty() {
             return Ok(Vec::new());
@@ -1714,8 +1723,9 @@ impl MetaStore {
         let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
         let cf_fragment_refs = self.db.cf_handle(CF_FRAGMENT_REFS).unwrap();
+        let cf_dedup_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
 
-        let lbas: Vec<Lba> = hits.iter().map(|(lba, _)| *lba).collect();
+        let lbas: Vec<Lba> = hits.iter().map(|(lba, _, _)| *lba).collect();
         let bm_keys: Vec<Vec<u8>> = lbas
             .iter()
             .map(|lba| encode_blockmap_key(vol_id, *lba))
@@ -1724,7 +1734,7 @@ impl MetaStore {
         let old_mappings = self.multi_get_mappings(vol_id, &lbas)?;
 
         let mut touched_pbas = Vec::with_capacity(hits.len() * 2);
-        for (idx, (_, new_val)) in hits.iter().enumerate() {
+        for (idx, (_, new_val, _)) in hits.iter().enumerate() {
             touched_pbas.push(new_val.pba);
             if let Some(old) = old_mappings[idx] {
                 touched_pbas.push(old.pba);
@@ -1737,7 +1747,7 @@ impl MetaStore {
         let mut pba_index: HashMap<Pba, usize> = HashMap::new();
         let mut pbas_to_read: Vec<Pba> = Vec::new();
 
-        for (idx, (_, new_val)) in hits.iter().enumerate() {
+        for (idx, (_, new_val, _)) in hits.iter().enumerate() {
             let same_pba = old_mappings[idx]
                 .as_ref()
                 .map_or(false, |old| old.pba == new_val.pba);
@@ -1758,11 +1768,23 @@ impl MetaStore {
         let mut target_increments: HashMap<Pba, u32> = HashMap::new();
         let mut old_decrements: HashMap<Pba, u32> = HashMap::new();
 
-        for (idx, (_lba, new_val)) in hits.iter().enumerate() {
+        for (idx, (_lba, new_val, hash)) in hits.iter().enumerate() {
             let old_mapping = &old_mappings[idx];
             let same_pba = old_mapping
                 .as_ref()
                 .map_or(false, |old| old.pba == new_val.pba);
+
+            // Guard: re-verify the dedup_reverse entry still exists.
+            // Between the caller's dedup_entry_is_live() check and this point,
+            // cleanup_dead_pba_post_commit may have deleted the dedup_reverse
+            // entry, freed the PBA, and another write may have reused it.
+            // The refcount-only guard below would pass (reused PBA has rc > 0),
+            // but the data no longer matches this dedup entry.
+            let reverse_key = encode_dedup_reverse_key(new_val.pba, hash);
+            if self.db.get_cf(&cf_dedup_reverse, &reverse_key)?.is_none() {
+                results.push(DedupHitResult::Rejected);
+                continue;
+            }
 
             if same_pba {
                 // Refresh blockmap only — no refcount change.
