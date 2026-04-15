@@ -3093,14 +3093,21 @@ impl BufferFlusher {
     /// live fragments (refcount > 0), the dead fragment's space is a hole.
     ///
     /// Called from write_unit and write_packed_slot after metadata commit.
+    #[allow(unreachable_code)]
     fn detect_holes(
         old_frag_meta: &HashMap<(Pba, u16), OldFragmentRef>,
         meta: &MetaStore,
         hole_map: &HoleMap,
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
-        // Hole detection: when all LBAs of a packed fragment are overwritten,
-        // publish the freed slot region to hole_map so the packer can reuse it.
+        // Hole detection disabled in release until cleanup batch optimization
+        // lands — the per-PBA WriteBatch in cleanup_dead_pba_post_commit makes
+        // the writer too slow, causing buffer backlog.
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (old_frag_meta, meta, hole_map, metrics);
+            return Ok(());
+        }
         for (&(old_pba, slot_offset), frag) in old_frag_meta {
             // Only interested in packed fragments (unit_compressed_size < BLOCK_SIZE implies packed)
             // and only if we overwrote ALL LBAs of this fragment in this batch
