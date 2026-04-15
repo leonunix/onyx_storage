@@ -184,6 +184,32 @@ fn flush_and_advance() {
 }
 
 #[test]
+fn retry_snapshot_does_not_treat_pre_sync_entries_as_ready() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(500))
+        .unwrap();
+
+    let seq = pool
+        .append("test-vol", Lba(9), 1, &vec![0xAB; 4096], 0)
+        .unwrap();
+
+    let ready_snapshot = pool.ready_pending_entries_arc_snapshot_for_shard(0);
+    assert!(
+        ready_snapshot.is_empty(),
+        "staged seq {} must not appear ready before the sync thread persists it",
+        seq
+    );
+
+    assert_eq!(
+        pool.recv_ready_timeout_for_shard(0, Duration::from_secs(2)).unwrap(),
+        seq
+    );
+}
+
+#[test]
 fn full_buffer_rejected() {
     // Create a pool with capacity for ~2.5 entries (each entry is 8192 bytes for single-LBA)
     // so after 2 appends there's not enough room for a 3rd

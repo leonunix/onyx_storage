@@ -18,6 +18,19 @@ pub struct RawDevice {
 }
 
 impl RawDevice {
+    #[cfg(not(target_os = "macos"))]
+    fn log_direct_fallback(&self, op: &str, offset: u64, len: usize, reason: &str) {
+        tracing::warn!(
+            op,
+            path = %self.path.display(),
+            base_offset = self.base_offset,
+            global_offset = offset,
+            len,
+            reason,
+            "direct-io device falling back to buffered io"
+        );
+    }
+
     /// Open a device or file for O_DIRECT read/write.
     /// Falls back to buffered IO if O_DIRECT is not supported (e.g., regular files on macOS).
     pub fn open(path: &Path) -> OnyxResult<Self> {
@@ -217,6 +230,12 @@ impl RawDevice {
                 if !Self::is_direct_io_offset_aligned(offset)
                     || !Self::is_direct_io_len_aligned(buf.len())
                 {
+                    self.log_direct_fallback(
+                        "read",
+                        offset,
+                        buf.len(),
+                        "unaligned offset or length",
+                    );
                     return self.buffered_read_at(buf, offset);
                 }
                 if !Self::is_direct_io_ptr_aligned(buf.as_ptr()) {
@@ -296,6 +315,12 @@ impl RawDevice {
                 if !Self::is_direct_io_offset_aligned(offset)
                     || !Self::is_direct_io_len_aligned(buf.len())
                 {
+                    self.log_direct_fallback(
+                        "write",
+                        offset,
+                        buf.len(),
+                        "unaligned offset or length",
+                    );
                     return self.buffered_write_at(buf, offset);
                 }
                 if !Self::is_direct_io_ptr_aligned(buf.as_ptr()) {
@@ -399,6 +424,31 @@ impl RawDevice {
             })
     }
 
+    #[cfg(target_os = "linux")]
+    fn reopen_with_same_mode(&self) -> OnyxResult<File> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        if self.direct_io {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        opts.open(&self.path).map_err(|e| OnyxError::Device {
+            path: self.path.clone(),
+            reason: e.to_string(),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reopen_with_same_mode(&self) -> OnyxResult<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| OnyxError::Device {
+                path: self.path.clone(),
+                reason: e.to_string(),
+            })
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn buffered_read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
         self.read_exact_file(self.buffered_handle()?, buf, offset)
@@ -474,10 +524,7 @@ impl RawDevice {
         }
 
         Ok(Self {
-            file: self.file.try_clone().map_err(|e| OnyxError::Device {
-                path: self.path.clone(),
-                reason: format!("slice clone failed: {}", e),
-            })?,
+            file: self.reopen_with_same_mode()?,
             size_bytes,
             base_offset: self.base_offset + base_offset,
             path: self.path.clone(),
@@ -491,6 +538,10 @@ impl RawDevice {
 
     pub fn is_direct_io(&self) -> bool {
         self.direct_io
+    }
+
+    pub fn base_offset(&self) -> u64 {
+        self.base_offset
     }
 
     fn translate_offset(&self, offset: u64, len: usize) -> OnyxResult<u64> {

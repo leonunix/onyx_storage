@@ -73,6 +73,30 @@ fn device_read_write_offset() {
     assert!(buf.iter().all(|&b| b == 0));
 }
 
+#[test]
+fn device_slice_offsets_are_translated() {
+    let tmp = NamedTempFile::new().unwrap();
+    tmp.as_file().set_len(4096 * 6).unwrap();
+
+    let dev = RawDevice::open(tmp.path()).unwrap();
+    let slice = dev.slice(4096, 4096 * 2).unwrap();
+
+    let data = vec![0x5Au8; 4096];
+    slice.write_at(&data, 0).unwrap();
+
+    let mut root_buf = vec![0u8; 4096];
+    dev.read_at(&mut root_buf, 4096).unwrap();
+    assert_eq!(root_buf, data);
+
+    let mut before = vec![0u8; 4096];
+    dev.read_at(&mut before, 0).unwrap();
+    assert!(before.iter().all(|&b| b == 0));
+
+    let mut after = vec![0u8; 4096];
+    dev.read_at(&mut after, 4096 * 2).unwrap();
+    assert!(after.iter().all(|&b| b == 0));
+}
+
 // --- io engine tests ---
 
 fn test_engine() -> (IoEngine, NamedTempFile) {
