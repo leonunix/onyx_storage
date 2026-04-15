@@ -646,6 +646,26 @@ pub struct BufferShardSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct RocksDbMemorySnapshot {
+    pub block_cache_capacity_bytes: Option<u64>,
+    pub block_cache_usage_bytes: Option<u64>,
+    pub block_cache_pinned_usage_bytes: Option<u64>,
+    pub cur_size_all_mem_tables_bytes: u64,
+    pub size_all_mem_tables_bytes: u64,
+    pub estimate_table_readers_mem_bytes: u64,
+}
+
+impl RocksDbMemorySnapshot {
+    pub fn total_estimate_bytes(&self) -> Option<u64> {
+        self.block_cache_usage_bytes.map(|block_cache| {
+            block_cache
+                .saturating_add(self.size_all_mem_tables_bytes)
+                .saturating_add(self.estimate_table_readers_mem_bytes)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EngineStatusSnapshot {
     /// "active", "standby", or "meta-only"
     pub mode: String,
@@ -656,6 +676,7 @@ pub struct EngineStatusSnapshot {
     pub buffer_fill_pct: Option<u8>,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
+    pub rocksdb_memory: Option<RocksDbMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
     pub allocator_total_blocks: Option<u64>,
@@ -685,6 +706,25 @@ impl EngineStatusSnapshot {
                 "buffer_payload_memory_bytes: {}/{}",
                 payload_bytes, limit
             );
+        }
+        if let Some(rocksdb) = &self.rocksdb_memory {
+            let _ = writeln!(
+                out,
+                "rocksdb_block_cache_bytes: usage={} pinned={} capacity={}",
+                rocksdb.block_cache_usage_bytes.unwrap_or(0),
+                rocksdb.block_cache_pinned_usage_bytes.unwrap_or(0),
+                rocksdb.block_cache_capacity_bytes.unwrap_or(0)
+            );
+            let _ = writeln!(
+                out,
+                "rocksdb_meta_bytes: memtables_current={} memtables_total={} table_readers={}",
+                rocksdb.cur_size_all_mem_tables_bytes,
+                rocksdb.size_all_mem_tables_bytes,
+                rocksdb.estimate_table_readers_mem_bytes
+            );
+            if let Some(total) = rocksdb.total_estimate_bytes() {
+                let _ = writeln!(out, "rocksdb_total_estimate_bytes: {}", total);
+            }
         }
         if let (Some(free), Some(total)) = (self.allocator_free_blocks, self.allocator_total_blocks)
         {

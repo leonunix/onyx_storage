@@ -210,6 +210,11 @@ impl Packer {
             match self.allocator.allocate_one_for_lane(self.lane_id) {
                 Ok(new_pba) => {
                     let sealed = self.seal_open_slot();
+                    tracing::debug!(
+                        pba = new_pba.0,
+                        lane = self.lane_id,
+                        "packer: allocated PBA for new open slot (seal+new)"
+                    );
                     self.place_into_new_slot(unit, new_pba);
                     Ok(PackResult::SealedSlot(sealed))
                 }
@@ -221,6 +226,11 @@ impl Packer {
         } else {
             // No open slot — start a new one
             let pba = self.allocator.allocate_one_for_lane(self.lane_id)?;
+            tracing::debug!(
+                pba = pba.0,
+                lane = self.lane_id,
+                "packer: allocated PBA for first open slot"
+            );
             self.place_into_new_slot(unit, pba);
             Ok(PackResult::Buffered)
         }

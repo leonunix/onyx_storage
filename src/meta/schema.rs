@@ -5,7 +5,6 @@ use crate::types::{Lba, Pba, VolumeId};
 pub const CF_VOLUMES: &str = "volumes";
 pub const CF_BLOCKMAP: &str = "blockmap";
 pub const CF_REFCOUNT: &str = "refcount";
-pub const CF_FRAGMENT_REFS: &str = "fragment_refs";
 pub const CF_DEDUP_INDEX: &str = "dedup_index";
 pub const CF_DEDUP_REVERSE: &str = "dedup_reverse";
 
@@ -35,37 +34,6 @@ pub struct BlockmapValue {
     pub slot_offset: u16,
     /// Flags: bit 0 = DEDUP_SKIPPED (block bypassed dedup under pressure).
     pub flags: u8,
-}
-
-/// Fragment identity tracked independently from per-LBA blockmap entries.
-///
-/// This intentionally ignores `offset_in_unit` and `flags`:
-/// - `offset_in_unit` differs per LBA but all LBAs in the same compressed
-///   fragment share the same physical bytes.
-/// - `flags` affect policy (e.g. DEDUP_SKIPPED), not physical identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FragmentRefKey {
-    pub pba: Pba,
-    pub slot_offset: u16,
-    pub compression: u8,
-    pub unit_compressed_size: u32,
-    pub unit_original_size: u32,
-    pub unit_lba_count: u16,
-    pub crc32: u32,
-}
-
-impl From<&BlockmapValue> for FragmentRefKey {
-    fn from(value: &BlockmapValue) -> Self {
-        Self {
-            pba: value.pba,
-            slot_offset: value.slot_offset,
-            compression: value.compression,
-            unit_compressed_size: value.unit_compressed_size,
-            unit_original_size: value.unit_original_size,
-            unit_lba_count: value.unit_lba_count,
-            crc32: value.crc32,
-        }
-    }
 }
 
 // --- Blockmap key: volume_id (length-prefixed) + lba ---
@@ -156,42 +124,6 @@ pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
         slot_offset: u16::from_be_bytes(val[25..27].try_into().unwrap()),
         flags: val[27],
     })
-}
-
-/// Encode fragment ref key (25 bytes):
-/// pba(8B) + slot_offset(2B) + compression(1B) + unit_compressed_size(4B)
-/// + unit_original_size(4B) + unit_lba_count(2B) + crc32(4B)
-pub fn encode_fragment_ref_key(key: &FragmentRefKey) -> [u8; 25] {
-    let mut out = [0u8; 25];
-    out[0..8].copy_from_slice(&key.pba.0.to_be_bytes());
-    out[8..10].copy_from_slice(&key.slot_offset.to_be_bytes());
-    out[10] = key.compression;
-    out[11..15].copy_from_slice(&key.unit_compressed_size.to_be_bytes());
-    out[15..19].copy_from_slice(&key.unit_original_size.to_be_bytes());
-    out[19..21].copy_from_slice(&key.unit_lba_count.to_be_bytes());
-    out[21..25].copy_from_slice(&key.crc32.to_be_bytes());
-    out
-}
-
-/// Decode fragment ref key (25 bytes).
-pub fn decode_fragment_ref_key(raw: &[u8]) -> Option<FragmentRefKey> {
-    if raw.len() != 25 {
-        return None;
-    }
-    Some(FragmentRefKey {
-        pba: Pba(u64::from_be_bytes(raw[0..8].try_into().unwrap())),
-        slot_offset: u16::from_be_bytes(raw[8..10].try_into().unwrap()),
-        compression: raw[10],
-        unit_compressed_size: u32::from_be_bytes(raw[11..15].try_into().unwrap()),
-        unit_original_size: u32::from_be_bytes(raw[15..19].try_into().unwrap()),
-        unit_lba_count: u16::from_be_bytes(raw[19..21].try_into().unwrap()),
-        crc32: u32::from_be_bytes(raw[21..25].try_into().unwrap()),
-    })
-}
-
-/// Prefix for fragment-ref scans by PBA.
-pub fn fragment_ref_prefix(pba: Pba) -> [u8; 8] {
-    pba.0.to_be_bytes()
 }
 
 /// Content hash type for dedup (SHA-256, 32 bytes)

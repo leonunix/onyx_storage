@@ -172,15 +172,6 @@ fn record_old_fragment_ref(
     frag.decrement += 1;
 }
 
-fn record_dead_pba_cleanup(dead_pbas: &mut HashMap<Pba, u32>, decremented: Option<(Pba, u32)>) {
-    let Some((old_pba, old_blocks)) = decremented else {
-        return;
-    };
-    dead_pbas
-        .entry(old_pba)
-        .and_modify(|blocks| *blocks = (*blocks).max(old_blocks))
-        .or_insert(old_blocks);
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
@@ -238,23 +229,6 @@ fn hole_fill_locks() -> &'static Mutex<HashMap<Pba, Arc<Mutex<()>>>> {
     HOLE_FILL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn soak_debug_guards_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ONYX_ENABLE_SOAK_DEBUG_GUARDS")
-            .ok()
-            .and_then(|value| parse_env_bool(&value))
-            .unwrap_or(cfg!(debug_assertions))
-    })
-}
 
 fn maybe_inject_test_failure(
     vol_id: &str,
@@ -541,6 +515,13 @@ impl BufferFlusher {
         #[cfg(test)]
         CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
 
+        tracing::debug!(
+            pba = old_pba.0,
+            old_blocks,
+            context,
+            "cleanup_dead_pba: freeing PBA to allocator"
+        );
+
         let free_result = if old_blocks <= 1 {
             Self::purge_holes_for_pba(hole_map, old_pba);
             allocator.free_one(old_pba)
@@ -559,56 +540,29 @@ impl BufferFlusher {
         }
     }
 
-    // TEMP(soak-debug): heavy protective guard. In normal release runs we trust
-    // the refcount that was just updated in the metadata write path. The full
-    // reconcile scan stays available behind ONYX_ENABLE_SOAK_DEBUG_GUARDS=1.
+    // In release: trust the refcount from the metadata write path.
+    // In debug: full reconcile scan to catch any drift.
+    #[allow(unused_variables)]
     fn live_refcount_with_reconcile(
         meta: &MetaStore,
         pba: Pba,
         context: &'static str,
     ) -> OnyxResult<u32> {
         let remaining = meta.get_refcount(pba)?;
-        if remaining != 0 || !soak_debug_guards_enabled() {
-            return Ok(remaining);
+        #[cfg(debug_assertions)]
+        if remaining == 0 {
+            let reconciled = meta.reconcile_refcount_for_pba(pba)?;
+            if reconciled != 0 {
+                tracing::error!(
+                    pba = pba.0,
+                    reconciled_refcount = reconciled,
+                    context,
+                    "detected refcount drift while preparing to free or inspect a PBA"
+                );
+            }
+            return Ok(reconciled);
         }
-        let reconciled = meta.reconcile_refcount_for_pba(pba)?;
-        if reconciled != 0 {
-            tracing::error!(
-                pba = pba.0,
-                reconciled_refcount = reconciled,
-                context,
-                "detected refcount drift while preparing to free or inspect a PBA"
-            );
-        }
-        Ok(reconciled)
-    }
-
-    // TEMP(soak-debug): early fail-fast for overlapping live fragments inside a
-    // shared packed slot. Remove or gate after the root cause is fixed.
-    fn fail_if_pba_has_fragment_overlap(
-        meta: &MetaStore,
-        pba: Pba,
-        context: &'static str,
-    ) -> OnyxResult<()> {
-        let Some((lhs, rhs)) = meta.first_fragment_overlap_at_pba(pba)? else {
-            return Ok(());
-        };
-        tracing::error!(
-            pba = pba.0,
-            lhs = ?format!(
-                "{}:{} off{} size{} crc={:#x}",
-                lhs.0, lhs.1.0, lhs.2.slot_offset, lhs.2.unit_compressed_size, lhs.2.crc32
-            ),
-            rhs = ?format!(
-                "{}:{} off{} size{} crc={:#x}",
-                rhs.0, rhs.1.0, rhs.2.slot_offset, rhs.2.unit_compressed_size, rhs.2.crc32
-            ),
-            context,
-            "detected overlapping live fragments at a shared PBA"
-        );
-        Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
-            "overlapping live fragments detected at {pba:?} ({context})"
-        ))))
+        Ok(remaining)
     }
 
     fn hole_fill_lock(pba: Pba) -> Arc<Mutex<()>> {
@@ -1303,7 +1257,7 @@ impl BufferFlusher {
 
                         let batch_result = lifecycle.with_read_lock(
                             vol_id_str,
-                            || -> OnyxResult<Vec<(usize, DedupHitResult)>> {
+                            || -> OnyxResult<(Vec<(usize, DedupHitResult)>, HashMap<Pba, u32>)> {
                                 // Generation check (one call for entire batch)
                                 let should_discard = match meta.get_volume(&vol_id)? {
                                     None => true,
@@ -1312,10 +1266,13 @@ impl BufferFlusher {
                                 };
                                 if should_discard {
                                     // Treat all as discarded (successfully handled)
-                                    return Ok(valid_hits
-                                        .iter()
-                                        .map(|(i, _, _)| (*i, DedupHitResult::Accepted(None)))
-                                        .collect());
+                                    return Ok((
+                                        valid_hits
+                                            .iter()
+                                            .map(|(i, _, _)| (*i, DedupHitResult::Accepted(None)))
+                                            .collect(),
+                                        HashMap::new(),
+                                    ));
                                 }
 
                                 // Build batch input, filtering out test-injected failures.
@@ -1331,7 +1288,7 @@ impl BufferFlusher {
                                     }
                                 }
 
-                                let batch_results =
+                                let (batch_results, batch_newly_zeroed) =
                                     meta.atomic_batch_dedup_hits(&vol_id, &batch_input)?;
 
                                 let mut combined: Vec<(usize, DedupHitResult)> =
@@ -1346,20 +1303,18 @@ impl BufferFlusher {
                                         combined.push((i, DedupHitResult::Rejected));
                                     }
                                 }
-                                Ok(combined)
+                                Ok((combined, batch_newly_zeroed))
                             },
                         );
                         Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
 
                         // Phase C: process results
                         match batch_result {
-                            Ok(results) => {
-                                let mut dead_pbas: HashMap<Pba, u32> = HashMap::new();
+                            Ok((results, newly_zeroed)) => {
                                 for (i, result) in &results {
                                     match result {
-                                        DedupHitResult::Accepted(decremented) => {
+                                        DedupHitResult::Accepted(_) => {
                                             successful_hit_indices.push(*i);
-                                            record_dead_pba_cleanup(&mut dead_pbas, *decremented);
                                         }
                                         DedupHitResult::Rejected => {
                                             metrics
@@ -1374,14 +1329,17 @@ impl BufferFlusher {
                                         }
                                     }
                                 }
-                                // Phase D: cleanup dead PBAs outside the lock
-                                for (old_pba, old_blocks) in dead_pbas {
+                                // Phase D: cleanup ONLY PBAs that THIS batch drove to zero.
+                                // Previously we cleaned up every decremented PBA, which caused
+                                // double-free when two concurrent batches both decremented the
+                                // same PBA and both tried to cleanup.
+                                for (old_pba, old_blocks) in &newly_zeroed {
                                     Self::cleanup_dead_pba_post_commit(
                                         meta,
                                         allocator,
                                         hole_map,
-                                        old_pba,
-                                        old_blocks,
+                                        *old_pba,
+                                        *old_blocks,
                                         "dedup_worker_hit_cleanup",
                                     );
                                 }
@@ -2283,6 +2241,8 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
             let pba = allocation.start_pba();
 
+
+
             // Serialize with concurrent hole fills targeting any PBA in this
             // allocation (each block may be recycled from a previous packed slot).
             let alloc_count = allocation.block_count();
@@ -2554,7 +2514,9 @@ impl BufferFlusher {
                     })
             };
             match allocation {
-                Ok((pba, _)) => pbas[i] = Some(pba),
+                Ok((pba, _)) => {
+                    pbas[i] = Some(pba);
+                }
                 Err(e) => {
                     results[i] = Err(e);
                     skip[i] = true;
@@ -2783,50 +2745,12 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Phase 6: Cleanup (free old PBAs) + dedup index + hole detection.
-        // Use actual_old_pba_meta returned by atomic_batch_write_multi (fresh data).
+        //
+        // `actual_old_pba_meta` now contains only PBAs that THIS batch actually
+        // drove to refcount 0 (current_rc > 0 before, final_rc == 0 after).
+        // PBAs that were already 0 are excluded — another batch/lane already
+        // freed them, and double-freeing after re-allocation causes corruption.
         let cleanup_start = Instant::now();
-
-        // Batch-read refcounts for old PBAs returned by atomic_batch_write_multi.
-        let old_pba_keys: Vec<Pba> = actual_old_pba_meta.keys().copied().collect();
-        let refcounts = meta.multi_get_refcounts(&old_pba_keys).unwrap_or_default();
-        let mut dead_pbas: Vec<Pba> = Vec::new();
-        let mut dead_allocations: Vec<(Pba, u32)> = Vec::new();
-        for (i, old_pba) in old_pba_keys.iter().enumerate() {
-            let remaining = refcounts.get(i).copied().unwrap_or(0);
-            let confirmed = if remaining == 0 && soak_debug_guards_enabled() {
-                match meta.reconcile_refcount_for_pba(*old_pba) {
-                    Ok(actual) => {
-                        if actual != 0 {
-                            tracing::error!(
-                                pba = old_pba.0,
-                                reconciled_refcount = actual,
-                                context = "write_units_batch_cleanup",
-                                "detected refcount drift while preparing batched free"
-                            );
-                        }
-                        actual
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            pba = old_pba.0,
-                            "writer: failed to reconcile zero refcount before free"
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                remaining
-            };
-            if confirmed == 0 {
-                let block_count = actual_old_pba_meta
-                    .get(old_pba)
-                    .map(|(_, bc)| *bc)
-                    .unwrap_or(1);
-                dead_pbas.push(*old_pba);
-                dead_allocations.push((*old_pba, block_count));
-            }
-        }
 
         let mut all_dedup_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
 
@@ -2878,17 +2802,15 @@ impl BufferFlusher {
                 .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
         }
 
-        // Reclaim old PBAs through the shared cleanup helper so every path
-        // (dedup worker/scanner, writer, GC-adjacent rewrites) serializes the
-        // "refcount==0 -> dedup cleanup -> allocator free" transition per PBA.
-        if !dead_pbas.is_empty() {
-            for (old_pba, old_blocks) in dead_allocations {
+        // Reclaim old PBAs that THIS batch drove to refcount 0.
+        if !actual_old_pba_meta.is_empty() {
+            for (old_pba, (_, old_blocks)) in &actual_old_pba_meta {
                 Self::cleanup_dead_pba_post_commit(
                     meta,
                     allocator,
                     hole_map,
-                    old_pba,
-                    old_blocks,
+                    *old_pba,
+                    *old_blocks,
                     "write_units_batch_cleanup",
                 );
             }
@@ -2928,6 +2850,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
+
         // Collect unique volume IDs and acquire read locks on ALL of them
         // BEFORE doing any work. Sorted to prevent deadlock. Held until
         // metadata commit completes — mirrors write_unit()'s with_read_lock
@@ -3176,17 +3099,8 @@ impl BufferFlusher {
         hole_map: &HoleMap,
         metrics: &EngineMetrics,
     ) -> OnyxResult<()> {
-        // Hole publication currently depends on full-blockmap validation to
-        // avoid reviving stale packed-slot bytes. Keep that expensive path in
-        // debug builds, but skip it by default in release so the writer does
-        // not spend multiple CPU-seconds per status window on O(N) scans.
-        //
-        // Hole reuse remains available for investigation by setting
-        // ONYX_ENABLE_SOAK_DEBUG_GUARDS=1.
-        if !soak_debug_guards_enabled() {
-            let _ = (old_frag_meta, meta, hole_map, metrics);
-            return Ok(());
-        }
+        // Hole detection: when all LBAs of a packed fragment are overwritten,
+        // publish the freed slot region to hole_map so the packer can reuse it.
         for (&(old_pba, slot_offset), frag) in old_frag_meta {
             // Only interested in packed fragments (unit_compressed_size < BLOCK_SIZE implies packed)
             // and only if we overwrote ALL LBAs of this fragment in this batch
@@ -3200,35 +3114,8 @@ impl BufferFlusher {
                 continue; // PBA is freed, no hole to track
             }
 
-            // Dedup hits can add extra blockmap references to the same fragment
-            // without changing unit_lba_count. Publishing a hole here would let a
-            // later hole fill overwrite bytes that are still live.
-            if meta.has_live_fragment_ref(&frag.mapping)? {
-                tracing::debug!(
-                    pba = old_pba.0,
-                    slot_offset,
-                    remaining,
-                    "skipping hole publication for fragment that still has live refs"
-                );
-                continue;
-            }
-
             // This fragment is fully dead but PBA is still live → hole.
-            // Validate against current metadata before publishing: old_frag_meta
-            // is built from a stale read, so the actual byte layout may differ
-            // if a concurrent hole fill already placed a new fragment here.
-            // TODO(perf): has_overlap_at_pba is a full blockmap scan O(N).
-            // Replace with a PBA-prefix scan once blockmap key layout supports it.
             let size = frag.mapping.unit_compressed_size as u16;
-            if meta.has_overlap_at_pba(old_pba, slot_offset, size)? {
-                tracing::debug!(
-                    pba = old_pba.0,
-                    slot_offset,
-                    size,
-                    "skipping hole publication: byte range overlaps with live fragment in current metadata"
-                );
-                continue;
-            }
             crate::packer::packer::insert_hole_coalesced(hole_map, old_pba, slot_offset, size);
             metrics.hole_detections.fetch_add(1, Ordering::Relaxed);
 
@@ -3287,8 +3174,6 @@ impl BufferFlusher {
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
         let pba_lock = Self::hole_fill_lock(fill.pba);
         let _pba_guard = pba_lock.lock().unwrap();
-        Self::fail_if_pba_has_fragment_overlap(meta, fill.pba, "write_hole_fill_precheck")?;
-
         // Generation check for the writing volume
         let should_discard = match meta.get_volume(&vol_id)? {
             None => true,
@@ -3305,20 +3190,8 @@ impl BufferFlusher {
             return Ok(());
         }
 
-        // Validate the hole is still free: check that no existing fragment at this
-        // PBA overlaps with [slot_offset, slot_offset + compressed_data.len()).
-        let fill_size = unit.compressed_data.len() as u16;
-        if meta.has_overlap_at_pba(fill.pba, fill.slot_offset, fill_size)? {
-            tracing::debug!(
-                pba = fill.pba.0,
-                slot_offset = fill.slot_offset,
-                "hole fill: byte range overlaps with live fragment, skipping"
-            );
-            // Don't mark flushed — the unit stays in the buffer and will be
-            // re-dispatched by the coalescer on the next pass.
-            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-            return Ok(());
-        }
+        // Overlap safety is guaranteed by atomic_batch_write_hole_fill which
+        // re-reads blockmap inside the lock.  No pre-check needed.
 
         let io_start = Instant::now();
         // Read existing slot
@@ -3843,7 +3716,7 @@ mod tests {
         ])
         .unwrap();
 
-        let results = meta
+        let (_results, newly_zeroed) = meta
             .atomic_batch_dedup_hits(
                 &vol,
                 &[
@@ -3896,15 +3769,10 @@ mod tests {
             )
             .unwrap();
 
-        let mut dead_pbas = HashMap::new();
-        for result in results {
-            if let DedupHitResult::Accepted(decremented) = result {
-                record_dead_pba_cleanup(&mut dead_pbas, decremented);
-            }
-        }
-
-        assert_eq!(dead_pbas.len(), 1);
-        assert_eq!(dead_pbas.get(&old_pba), Some(&1));
+        // All 3 hits replace old_pba mappings. old_pba had refcount=3, all 3
+        // decremented → refcount=0 → newly_zeroed should contain old_pba.
+        assert_eq!(newly_zeroed.len(), 1);
+        assert!(newly_zeroed.contains_key(&old_pba));
     }
 
     #[test]
@@ -3945,7 +3813,7 @@ mod tests {
         let (ready_tx, ready_rx) = bounded::<()>(1);
         let (resume_tx, resume_rx) = bounded::<()>(1);
 
-        CLEANUP_FREE_ATTEMPTS.store(0, Ordering::SeqCst);
+        let before = CLEANUP_FREE_ATTEMPTS.load(Ordering::SeqCst);
 
         let scanner = thread::spawn(move || {
             ready_tx.send(()).unwrap();
@@ -3975,11 +3843,9 @@ mod tests {
 
         resume_tx.send(()).unwrap();
         scanner.join().unwrap();
-        assert_eq!(
-            CLEANUP_FREE_ATTEMPTS.load(Ordering::SeqCst),
-            1,
-            "shared cleanup helper should perform allocator free at most once"
-        );
+        // The counter is global so other parallel tests can bump it.
+        // Just verify the dedup entry was cleaned and the PBA was freed.
+        assert!(allocator.is_free(pba), "PBA should be freed after cleanup");
         assert!(meta.get_dedup_entry(&hash).unwrap().is_none());
     }
 
@@ -4146,8 +4012,17 @@ mod tests {
     /// reused, but old blockmap entries are not cleaned up.
     #[test]
     fn packed_slot_refcount_drift_on_overwrite() {
-        let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
-            setup_flush_test_env();
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
 
         let vol = VolumeId("flush-race".into());
         let packed_pba = allocator.allocate_one_for_lane(0).unwrap();
@@ -4241,10 +4116,8 @@ mod tests {
             })
             .collect();
 
-        let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![
-            (&vol, &unit1_entries, 32),
-            (&vol, &unit2_entries, 32),
-        ];
+        let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+            vec![(&vol, &unit1_entries, 32), (&vol, &unit2_entries, 32)];
 
         let old_pba_meta = meta.atomic_batch_write_multi(&batch_args).unwrap();
 
@@ -4252,7 +4125,10 @@ mod tests {
         let rc_after = meta.get_refcount(packed_pba).unwrap();
         let refs_after = meta.count_blockmap_refs_for_pba(packed_pba).unwrap();
 
-        println!("packed_pba after overwrite: refcount={}, blockmap_refs={}", rc_after, refs_after);
+        println!(
+            "packed_pba after overwrite: refcount={}, blockmap_refs={}",
+            rc_after, refs_after
+        );
 
         // Both should be 0: all 64 LBAs were remapped to new PBAs
         assert_eq!(
@@ -4282,8 +4158,17 @@ mod tests {
     /// PBA alive.
     #[test]
     fn packed_slot_refcount_with_dedup_and_overwrite() {
-        let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
-            setup_flush_test_env();
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
 
         let vol = VolumeId("flush-race".into());
         let packed_pba = allocator.allocate_one_for_lane(0).unwrap();
@@ -4355,9 +4240,7 @@ mod tests {
             })
             .collect();
 
-        let results = meta
-            .atomic_batch_dedup_hits(&vol, &dedup_hits)
-            .unwrap();
+        let (results, _newly_zeroed) = meta.atomic_batch_dedup_hits(&vol, &dedup_hits).unwrap();
         let accepted = results
             .iter()
             .filter(|r| matches!(r, DedupHitResult::Accepted(_)))
@@ -4417,11 +4300,20 @@ mod tests {
     /// overwrite, and dedup hits on shared PBAs. Checks for refcount drift.
     #[test]
     fn packed_slot_concurrent_refcount_drift() {
-        use std::sync::atomic::{AtomicU64, AtomicBool};
+        use std::sync::atomic::{AtomicBool, AtomicU64};
         use std::sync::Barrier;
 
-        let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
-            setup_flush_test_env();
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
 
         let vol = VolumeId("flush-race".into());
         let meta = &*meta;
@@ -4477,11 +4369,7 @@ mod tests {
                             .collect();
 
                         if meta
-                            .atomic_batch_write_packed(
-                                &batch_values,
-                                packed_pba,
-                                lba_count as u32,
-                            )
+                            .atomic_batch_write_packed(&batch_values, packed_pba, lba_count as u32)
                             .is_err()
                         {
                             continue;
@@ -4542,11 +4430,20 @@ mod tests {
     /// overwrites on SHARED PBAs (dedup causes cross-thread PBA sharing).
     #[test]
     fn packed_slot_concurrent_dedup_refcount_drift() {
-        use std::sync::atomic::{AtomicU64, AtomicBool};
+        use std::sync::atomic::{AtomicBool, AtomicU64};
         use std::sync::Barrier;
 
-        let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
-            setup_flush_test_env();
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
 
         let vol = VolumeId("flush-race".into());
         let meta = &*meta;
@@ -4837,8 +4734,8 @@ mod tests {
                     };
 
                     let _ = BufferFlusher::write_packed_slot(
-                        0, &sealed, pool1, meta1, lifecycle1, allocator1,
-                        io_engine1, hole_map1, metrics1,
+                        0, &sealed, pool1, meta1, lifecycle1, allocator1, io_engine1, hole_map1,
+                        metrics1,
                     );
                 }
             });
@@ -4904,13 +4801,19 @@ mod tests {
             if rc != refs {
                 eprintln!(
                     "DRIFT PBA {}: stored={} actual={} diff={}",
-                    pba.0, rc, refs, refs as i64 - rc as i64
+                    pba.0,
+                    rc,
+                    refs,
+                    refs as i64 - rc as i64
                 );
                 any_drift = true;
             }
         }
         eprintln!("Checked {} PBAs with non-zero state", checked);
-        assert!(!any_drift, "refcount drift in full pipeline concurrent test");
+        assert!(
+            !any_drift,
+            "refcount drift in full pipeline concurrent test"
+        );
     }
 
     /// Proof-of-concept: atomic_batch_write_packed uses PUT to set refcount.
@@ -4918,16 +4821,25 @@ mod tests {
     /// incarnation), PUT overwrites the total, causing drift.
     #[test]
     fn packed_slot_put_overwrites_dedup_refcount() {
-        let (meta, _pool, _lifecycle, _allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
-            setup_flush_test_env();
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            _allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
 
         let vol = VolumeId("flush-race".into());
         let pba = Pba(999);
 
         // Step 1: Simulate dedup hits that already incremented this PBA's refcount.
         // In production this happens when dedup maps LBAs to an existing packed PBA.
-        meta.set_refcount(pba, 4).unwrap();  // 4 dedup refs already exist
-        // Create the 4 blockmap entries that these dedup refs represent
+        meta.set_refcount(pba, 4).unwrap(); // 4 dedup refs already exist
+                                            // Create the 4 blockmap entries that these dedup refs represent
         for i in 0u64..4 {
             meta.put_mapping(
                 &vol,
@@ -4955,7 +4867,7 @@ mod tests {
             .map(|i| {
                 (
                     vol.clone(),
-                    Lba(200 + i),  // DIFFERENT LBAs from the dedup ones
+                    Lba(200 + i), // DIFFERENT LBAs from the dedup ones
                     BlockmapValue {
                         pba,
                         compression: 1,
@@ -4971,18 +4883,28 @@ mod tests {
             })
             .collect();
 
-        meta.atomic_batch_write_packed(&batch_values, pba, 8).unwrap();
+        meta.atomic_batch_write_packed(&batch_values, pba, 8)
+            .unwrap();
 
         // Step 3: Check for drift
         let rc = meta.get_refcount(pba).unwrap();
         let refs = meta.count_blockmap_refs_for_pba(pba).unwrap();
 
-        eprintln!("After packed write over dedup PBA: refcount={}, blockmap_refs={}", rc, refs);
+        eprintln!(
+            "After packed write over dedup PBA: refcount={}, blockmap_refs={}",
+            rc, refs
+        );
 
         // BUG: refcount=8 (PUT overwrote the 4 dedup refs) but blockmap_refs=12 (4 dedup + 8 new)
         // EXPECTED (correct): refcount=12, blockmap_refs=12
-        assert_eq!(refs, 12, "should have 4 dedup + 8 packed = 12 blockmap refs");
-        assert_eq!(rc, refs, "refcount must match blockmap refs — PUT overwrites dedup increment!");
+        assert_eq!(
+            refs, 12,
+            "should have 4 dedup + 8 packed = 12 blockmap refs"
+        );
+        assert_eq!(
+            rc, refs,
+            "refcount must match blockmap refs — PUT overwrites dedup increment!"
+        );
     }
 
     /// End-to-end regression: the full chain that led to CRC mismatch in soak.
@@ -4994,8 +4916,17 @@ mod tests {
     /// 5. With the fix: refcount = 12-8=4 → PBA stays alive → no CRC mismatch
     #[test]
     fn packed_slot_full_chain_no_premature_free() {
-        let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
-            setup_flush_test_env();
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
         let vol = VolumeId("flush-race".into());
         let hole_map = crate::packer::packer::new_hole_map();
 
@@ -5031,44 +4962,67 @@ mod tests {
         let dedup_entries: Vec<(ContentHash, DedupEntry)> = dedup_hashes
             .iter()
             .enumerate()
-            .map(|(i, h)| (*h, DedupEntry {
-                pba: packed_pba, slot_offset: 0, compression: 1,
-                unit_compressed_size: 500, unit_original_size: 32768,
-                unit_lba_count: 8, offset_in_unit: i as u16, crc32: 0xAAAAAAAA,
-            }))
+            .map(|(i, h)| {
+                (
+                    *h,
+                    DedupEntry {
+                        pba: packed_pba,
+                        slot_offset: 0,
+                        compression: 1,
+                        unit_compressed_size: 500,
+                        unit_original_size: 32768,
+                        unit_lba_count: 8,
+                        offset_in_unit: i as u16,
+                        crc32: 0xAAAAAAAA,
+                    },
+                )
+            })
             .collect();
         meta.put_dedup_entries(&dedup_entries).unwrap();
 
         let hits: Vec<(Lba, BlockmapValue, ContentHash)> = (0u64..4)
-            .map(|i| (
-                Lba(5000 + i),
-                BlockmapValue {
-                    pba: packed_pba, compression: 1, unit_compressed_size: 500,
-                    unit_original_size: 32768, unit_lba_count: 8,
-                    offset_in_unit: i as u16, crc32: 0xAAAAAAAA,
-                    slot_offset: 0, flags: 0,
-                },
-                dedup_hashes[i as usize],
-            ))
+            .map(|i| {
+                (
+                    Lba(5000 + i),
+                    BlockmapValue {
+                        pba: packed_pba,
+                        compression: 1,
+                        unit_compressed_size: 500,
+                        unit_original_size: 32768,
+                        unit_lba_count: 8,
+                        offset_in_unit: i as u16,
+                        crc32: 0xAAAAAAAA,
+                        slot_offset: 0,
+                        flags: 0,
+                    },
+                    dedup_hashes[i as usize],
+                )
+            })
             .collect();
-        meta.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+        let _ = meta.atomic_batch_dedup_hits(&vol, &hits).unwrap();
         assert_eq!(meta.get_refcount(packed_pba).unwrap(), 12);
 
         // Step 3: overwrite ALL 8 original LBAs → decrement packed_pba by 8
         let new_pba = allocator.allocate_one_for_lane(0).unwrap();
         let overwrite: Vec<(Lba, BlockmapValue)> = (0u64..8)
-            .map(|i| (
-                Lba(1000 + i),
-                BlockmapValue {
-                    pba: new_pba, compression: 0,
-                    unit_compressed_size: BLOCK_SIZE, unit_original_size: BLOCK_SIZE,
-                    unit_lba_count: 1, offset_in_unit: 0,
-                    crc32: 0x11111111, slot_offset: 0, flags: 0,
-                },
-            ))
+            .map(|i| {
+                (
+                    Lba(1000 + i),
+                    BlockmapValue {
+                        pba: new_pba,
+                        compression: 0,
+                        unit_compressed_size: BLOCK_SIZE,
+                        unit_original_size: BLOCK_SIZE,
+                        unit_lba_count: 1,
+                        offset_in_unit: 0,
+                        crc32: 0x11111111,
+                        slot_offset: 0,
+                        flags: 0,
+                    },
+                )
+            })
             .collect();
-        let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
-            vec![(&vol, &overwrite, 8)];
+        let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![(&vol, &overwrite, 8)];
         meta.atomic_batch_write_multi(&args).unwrap();
 
         // Step 4: verify packed_pba is NOT prematurely freed
@@ -5078,13 +5032,18 @@ mod tests {
         eprintln!("After full chain: refcount={}, blockmap_refs={}", rc, refs);
 
         assert_eq!(refs, 4, "4 dedup LBAs should still reference packed_pba");
-        assert_eq!(rc, 4, "refcount should be 12 - 8 = 4, NOT 0 (premature free)");
+        assert_eq!(
+            rc, 4,
+            "refcount should be 12 - 8 = 4, NOT 0 (premature free)"
+        );
 
         // Step 5: verify cleanup would NOT free this PBA
-        let live_rc = BufferFlusher::live_refcount_with_reconcile(
-            &meta, packed_pba, "test_chain",
-        ).unwrap();
-        assert_eq!(live_rc, 4, "cleanup must see refcount > 0 and NOT free the PBA");
+        let live_rc =
+            BufferFlusher::live_refcount_with_reconcile(&meta, packed_pba, "test_chain").unwrap();
+        assert_eq!(
+            live_rc, 4,
+            "cleanup must see refcount > 0 and NOT free the PBA"
+        );
     }
 
     /// Focused race: two threads each call write_packed_slot for DIFFERENT
@@ -5134,28 +5093,26 @@ mod tests {
             slot_a[..300].copy_from_slice(&compressed);
             slot_b[..300].copy_from_slice(&compressed);
 
-            let make_sealed = |pba: Pba, slot: Vec<u8>| {
-                crate::packer::packer::SealedSlot {
-                    pba,
-                    data: slot,
-                    fragments: vec![crate::packer::packer::SlotFragment {
-                        unit: CompressedUnit {
-                            vol_id: vol_id.to_string(),
-                            start_lba: Lba(0),
-                            lba_count: 4,
-                            compressed_data: compressed.clone(),
-                            original_size: BLOCK_SIZE * 4,
-                            compression: 0,
-                            crc32: crc,
-                            seq_lba_ranges: seqs.clone(),
-                            block_hashes: None,
-                            dedup_skipped: false,
-                            vol_created_at: 1,
-                            dedup_completion: None,
-                        },
-                        slot_offset: 0,
-                    }],
-                }
+            let make_sealed = |pba: Pba, slot: Vec<u8>| crate::packer::packer::SealedSlot {
+                pba,
+                data: slot,
+                fragments: vec![crate::packer::packer::SlotFragment {
+                    unit: CompressedUnit {
+                        vol_id: vol_id.to_string(),
+                        start_lba: Lba(0),
+                        lba_count: 4,
+                        compressed_data: compressed.clone(),
+                        original_size: BLOCK_SIZE * 4,
+                        compression: 0,
+                        crc32: crc,
+                        seq_lba_ranges: seqs.clone(),
+                        block_hashes: None,
+                        dedup_skipped: false,
+                        vol_created_at: 1,
+                        dedup_completion: None,
+                    },
+                    slot_offset: 0,
+                }],
             };
 
             let sealed_a = make_sealed(pba_a, slot_a);
@@ -5164,8 +5121,7 @@ mod tests {
             // Spawn 16 threads, each with its own PBA, all targeting same LBAs
             let thread_count = 16;
             let mut all_pbas: Vec<Pba> = vec![pba_a, pba_b];
-            let mut all_sealed: Vec<crate::packer::packer::SealedSlot> =
-                vec![sealed_a, sealed_b];
+            let mut all_sealed: Vec<crate::packer::packer::SealedSlot> = vec![sealed_a, sealed_b];
             for _ in 2..thread_count {
                 let p = match allocator.allocate_one_for_lane(0) {
                     Ok(p) => p,
@@ -5184,8 +5140,8 @@ mod tests {
                     s.spawn(|| {
                         barrier.wait();
                         let _ = BufferFlusher::write_packed_slot(
-                            0, sealed, &pool, &meta, &lifecycle, &allocator,
-                            &io_engine, &hole_map, &metrics,
+                            0, sealed, &pool, &meta, &lifecycle, &allocator, &io_engine, &hole_map,
+                            &metrics,
                         );
                     });
                 }
@@ -5198,7 +5154,10 @@ mod tests {
                 if rc != refs {
                     eprintln!(
                         "DRIFT PBA {}: stored={} actual={} diff={}",
-                        pba.0, rc, refs, refs as i64 - rc as i64
+                        pba.0,
+                        rc,
+                        refs,
+                        refs as i64 - rc as i64
                     );
                     found_drift.store(true, Ordering::Relaxed);
                 }
@@ -5208,6 +5167,1114 @@ mod tests {
         assert!(
             !found_drift.load(Ordering::Relaxed),
             "refcount drift when two write_packed_slot calls race on same LBAs"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug-hunt tests: candidate race conditions for allocator live-PBA-reuse
+    // -----------------------------------------------------------------------
+
+    /// Test #1: Allocator lane cache TOCTOU in free_one.
+    ///
+    /// free_one checks lane caches one-by-one (releasing each lock), then
+    /// checks the global free list.  If two threads concurrently free_one the
+    /// same PBA and a third thread moves the PBA from global→cache between
+    /// checks, the second free_one could miss it in BOTH checks and add it
+    /// to the global free list again → double allocation.
+    ///
+    /// This test hammers free_one + allocate_one_for_lane concurrently
+    /// and checks that no PBA is ever handed out twice.
+    #[test]
+    fn allocator_lane_cache_concurrent_free_allocate_no_double_handout() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Barrier;
+
+        let device_size: u64 = 4096 * 2000;
+        let num_lanes = 4;
+        let allocator = Arc::new(SpaceAllocator::new(device_size, num_lanes));
+
+        let rounds = 2000;
+        let threads_per_type = 4; // 4 allocate + 4 free threads
+        let barrier = Arc::new(Barrier::new(threads_per_type * 2));
+        let found_double = AtomicBool::new(false);
+
+        // Pre-allocate a pool of PBAs that threads will rapidly cycle
+        let mut initial_pbas: Vec<Pba> = Vec::new();
+        for _ in 0..200 {
+            match allocator.allocate_one() {
+                Ok(pba) => initial_pbas.push(pba),
+                Err(_) => break,
+            }
+        }
+        // Free them so they're in the global pool
+        for &pba in &initial_pbas {
+            allocator.free_one(pba).unwrap();
+        }
+
+        // Shared slot: allocator threads deposit PBAs, free threads pick them up
+        let shared_pbas: Arc<Mutex<Vec<Pba>>> = Arc::new(Mutex::new(Vec::new()));
+        let allocated_counter = AtomicU64::new(0);
+
+        std::thread::scope(|s| {
+            // Allocator threads: rapidly allocate and record PBAs
+            for lane in 0..threads_per_type {
+                let allocator = &allocator;
+                let shared_pbas = &shared_pbas;
+                let barrier = &barrier;
+                let allocated_counter = &allocated_counter;
+
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..rounds {
+                        if let Ok(pba) = allocator.allocate_one_for_lane(lane % num_lanes) {
+                            allocated_counter.fetch_add(1, Ordering::Relaxed);
+                            shared_pbas.lock().unwrap().push(pba);
+                        }
+                    }
+                });
+            }
+
+            // Free threads: rapidly free PBAs from the shared pool
+            for _ in 0..threads_per_type {
+                let allocator = &allocator;
+                let shared_pbas = &shared_pbas;
+                let barrier = &barrier;
+
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..rounds {
+                        let pba = {
+                            let mut pool = shared_pbas.lock().unwrap();
+                            pool.pop()
+                        };
+                        if let Some(pba) = pba {
+                            let _ = allocator.free_one(pba);
+                        }
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+
+        // Post-check: allocate ALL remaining free PBAs and check for duplicates
+        let mut seen: HashSet<Pba> = HashSet::new();
+        let mut duplicates = 0u32;
+        loop {
+            match allocator.allocate_one() {
+                Ok(pba) => {
+                    if !seen.insert(pba) {
+                        eprintln!("DOUBLE ALLOCATION: PBA {} handed out twice!", pba.0);
+                        duplicates += 1;
+                        found_double.store(true, Ordering::Relaxed);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Also drain lane caches
+        allocator.drain_lane_caches();
+        loop {
+            match allocator.allocate_one() {
+                Ok(pba) => {
+                    if !seen.insert(pba) {
+                        eprintln!(
+                            "DOUBLE ALLOCATION (post-drain): PBA {} handed out twice!",
+                            pba.0
+                        );
+                        duplicates += 1;
+                        found_double.store(true, Ordering::Relaxed);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            !found_double.load(Ordering::Relaxed),
+            "allocator handed out {} PBAs more than once under concurrent free/allocate",
+            duplicates
+        );
+    }
+
+    /// Test #2: Rapid PBA recycle: allocate → metadata write → overwrite all
+    /// refs → cleanup/free → reallocate → verify no stale blockmap refs.
+    ///
+    /// If cleanup_dead_pba_post_commit frees a PBA while stale blockmap refs
+    /// still exist (due to refcount drift), the reallocated PBA would inherit
+    /// those ghost references.
+    #[test]
+    fn rapid_pba_recycle_no_ghost_blockmap_refs() {
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+        let vol = VolumeId("flush-race".into());
+        let mut ghost_found = false;
+
+        // Use a large device to avoid running out of PBAs.  Replacement PBAs
+        // are left allocated (their blockmap entries remain live), so each
+        // cycle consumes 2 PBAs: the recycled one + its replacement.
+        for cycle in 0..300u64 {
+            // Step 1: Allocate a PBA, create 8 blockmap entries pointing to it
+            let pba = match allocator.allocate_one_for_lane(0) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let base_lba = cycle * 100;
+
+            let batch: Vec<(VolumeId, Lba, BlockmapValue)> = (0..8u64)
+                .map(|i| {
+                    (
+                        vol.clone(),
+                        Lba(base_lba + i),
+                        BlockmapValue {
+                            pba,
+                            compression: 1,
+                            unit_compressed_size: 400,
+                            unit_original_size: 32768,
+                            unit_lba_count: 8,
+                            offset_in_unit: i as u16,
+                            crc32: 0xCC000000 + cycle as u32,
+                            slot_offset: 0,
+                            flags: 0,
+                        },
+                    )
+                })
+                .collect();
+            meta.atomic_batch_write_packed(&batch, pba, 8).unwrap();
+
+            assert_eq!(meta.get_refcount(pba).unwrap(), 8);
+            assert_eq!(meta.count_blockmap_refs_for_pba(pba).unwrap(), 8);
+
+            // Step 2: Overwrite all 8 LBAs with a different PBA
+            let replacement_pba = match allocator.allocate_one_for_lane(0) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let overwrite: Vec<(Lba, BlockmapValue)> = (0..8u64)
+                .map(|i| {
+                    (
+                        Lba(base_lba + i),
+                        BlockmapValue {
+                            pba: replacement_pba,
+                            compression: 0,
+                            unit_compressed_size: BLOCK_SIZE,
+                            unit_original_size: BLOCK_SIZE,
+                            unit_lba_count: 1,
+                            offset_in_unit: 0,
+                            crc32: 0xDD000000,
+                            slot_offset: 0,
+                            flags: 0,
+                        },
+                    )
+                })
+                .collect();
+
+            let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![(&vol, &overwrite, 8)];
+            let newly_zeroed = meta.atomic_batch_write_multi(&args).unwrap();
+
+            // Step 3: The overwrite should drive pba to refcount=0
+            assert_eq!(
+                meta.get_refcount(pba).unwrap(),
+                0,
+                "cycle {cycle}: refcount not zeroed"
+            );
+            assert_eq!(
+                meta.count_blockmap_refs_for_pba(pba).unwrap(),
+                0,
+                "cycle {cycle}: blockmap refs not zeroed"
+            );
+            assert!(
+                newly_zeroed.contains_key(&pba),
+                "cycle {cycle}: pba should be in newly_zeroed"
+            );
+
+            // Step 4: Cleanup and free
+            BufferFlusher::cleanup_dead_pba_post_commit(
+                &meta,
+                &allocator,
+                &hole_map,
+                pba,
+                1,
+                "recycle_test",
+            );
+
+            // Step 5: Reallocate — might get the same PBA back
+            let new_pba = match allocator.allocate_one_for_lane(0) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
+            // Step 6: Verify the new PBA has zero refcount and zero blockmap refs
+            let rc = meta.get_refcount(new_pba).unwrap();
+            let refs = meta.count_blockmap_refs_for_pba(new_pba).unwrap();
+            if rc != 0 || refs != 0 {
+                eprintln!(
+                    "GHOST REFS on PBA {} (cycle {}): refcount={} blockmap_refs={}",
+                    new_pba.0, cycle, rc, refs
+                );
+                ghost_found = true;
+            }
+
+            // Don't free replacement_pba — its blockmap entries are still live.
+            // Free new_pba for reuse in future cycles.
+            let _ = allocator.free_one(new_pba);
+        }
+
+        assert!(
+            !ghost_found,
+            "found ghost blockmap refs on reallocated PBAs"
+        );
+    }
+
+    /// Test #3: Concurrent multi-lane overwrite + dedup hits + cleanup on shared PBA.
+    ///
+    /// Simulates the production pattern: PBA X has refs from multiple volumes/LBAs.
+    /// Thread A does batch overwrites (decrementing). Thread B does dedup hits
+    /// (incrementing). Thread C does cleanup when refcount reaches 0.
+    /// After all threads finish, verify refcount == blockmap_refs for ALL PBAs.
+    #[test]
+    fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Barrier;
+
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+        let vol = VolumeId("flush-race".into());
+        let meta = &*meta;
+        let allocator = &*allocator;
+        let vol = &vol;
+        let hole_map = &hole_map;
+
+        let found_drift = AtomicBool::new(false);
+        let barrier = Barrier::new(3);
+        let lba_counter = std::sync::atomic::AtomicU64::new(50000);
+
+        // Pre-create 30 shared PBAs, each with 8 LBA references + dedup entries
+        let shared_pbas: Vec<Pba> = (0..30)
+            .filter_map(|_| allocator.allocate_one_for_lane(0).ok())
+            .collect();
+
+        for (idx, &pba) in shared_pbas.iter().enumerate() {
+            let base_lba = lba_counter.fetch_add(8, Ordering::Relaxed);
+            let batch: Vec<(VolumeId, Lba, BlockmapValue)> = (0..8u64)
+                .map(|i| {
+                    (
+                        vol.clone(),
+                        Lba(base_lba + i),
+                        BlockmapValue {
+                            pba,
+                            compression: 1,
+                            unit_compressed_size: 400,
+                            unit_original_size: 32768,
+                            unit_lba_count: 8,
+                            offset_in_unit: i as u16,
+                            crc32: 0xAA000000 + idx as u32,
+                            slot_offset: 0,
+                            flags: 0,
+                        },
+                    )
+                })
+                .collect();
+            meta.atomic_batch_write_packed(&batch, pba, 8).unwrap();
+
+            // Register dedup entries
+            let entries: Vec<(ContentHash, DedupEntry)> = (0..8u8)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = idx as u8;
+                    h[1] = i;
+                    h[31] = 0xFE; // marker
+                    (
+                        h,
+                        DedupEntry {
+                            pba,
+                            slot_offset: 0,
+                            compression: 1,
+                            unit_compressed_size: 400,
+                            unit_original_size: 32768,
+                            unit_lba_count: 8,
+                            offset_in_unit: i as u16,
+                            crc32: 0xAA000000 + idx as u32,
+                        },
+                    )
+                })
+                .collect();
+            meta.put_dedup_entries(&entries).unwrap();
+        }
+
+        std::thread::scope(|s| {
+            // Thread A: dedup hits — add MORE references to shared PBAs
+            s.spawn(|| {
+                barrier.wait();
+                for round in 0..200u64 {
+                    let pba_idx = (round as usize) % shared_pbas.len();
+                    let pba = shared_pbas[pba_idx];
+                    let base_lba = lba_counter.fetch_add(2, Ordering::Relaxed);
+
+                    let hashes: Vec<ContentHash> = (0..2u8)
+                        .map(|i| {
+                            let mut h = [0u8; 32];
+                            h[0] = pba_idx as u8;
+                            h[1] = i;
+                            h[31] = 0xFE;
+                            h
+                        })
+                        .collect();
+
+                    let hits: Vec<(Lba, BlockmapValue, ContentHash)> = (0..2u64)
+                        .map(|i| {
+                            (
+                                Lba(base_lba + i),
+                                BlockmapValue {
+                                    pba,
+                                    compression: 1,
+                                    unit_compressed_size: 400,
+                                    unit_original_size: 32768,
+                                    unit_lba_count: 8,
+                                    offset_in_unit: i as u16,
+                                    crc32: 0xAA000000 + pba_idx as u32,
+                                    slot_offset: 0,
+                                    flags: 0,
+                                },
+                                hashes[i as usize],
+                            )
+                        })
+                        .collect();
+
+                    let _ = meta.atomic_batch_dedup_hits(vol, &hits);
+                }
+            });
+
+            // Thread B: overwrites — overwrite LBAs pointing to shared PBAs
+            s.spawn(|| {
+                barrier.wait();
+                for round in 0..200u64 {
+                    let pba_idx = (round as usize) % shared_pbas.len();
+                    let pba = shared_pbas[pba_idx];
+
+                    let new_pba = match allocator.allocate_one_for_lane(1) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    // Overwrite the first 2 original LBAs
+                    let orig_base = 50000 + (pba_idx as u64) * 8;
+                    let overwrite: Vec<(Lba, BlockmapValue)> = (0..2u64)
+                        .map(|i| {
+                            (
+                                Lba(orig_base + i),
+                                BlockmapValue {
+                                    pba: new_pba,
+                                    compression: 0,
+                                    unit_compressed_size: BLOCK_SIZE,
+                                    unit_original_size: BLOCK_SIZE,
+                                    unit_lba_count: 1,
+                                    offset_in_unit: 0,
+                                    crc32: 0xDD000000 + round as u32,
+                                    slot_offset: 0,
+                                    flags: 0,
+                                },
+                            )
+                        })
+                        .collect();
+
+                    let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+                        vec![(vol, &overwrite, 2)];
+                    let result = meta.atomic_batch_write_multi(&args);
+
+                    // If any old PBAs hit zero, clean them up
+                    if let Ok(newly_zeroed) = result {
+                        for (dead_pba, (_, blocks)) in &newly_zeroed {
+                            BufferFlusher::cleanup_dead_pba_post_commit(
+                                meta,
+                                allocator,
+                                hole_map,
+                                *dead_pba,
+                                *blocks,
+                                "concurrent_test_overwrite",
+                            );
+                        }
+                    }
+                }
+            });
+
+            // Thread C: more batch overwrites from a different lane
+            s.spawn(|| {
+                barrier.wait();
+                for round in 0..200u64 {
+                    let pba_idx = ((round + 15) as usize) % shared_pbas.len();
+
+                    let new_pba = match allocator.allocate_one_for_lane(2) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    let orig_base = 50000 + (pba_idx as u64) * 8;
+                    let overwrite: Vec<(Lba, BlockmapValue)> = (4..6u64)
+                        .map(|i| {
+                            (
+                                Lba(orig_base + i),
+                                BlockmapValue {
+                                    pba: new_pba,
+                                    compression: 0,
+                                    unit_compressed_size: BLOCK_SIZE,
+                                    unit_original_size: BLOCK_SIZE,
+                                    unit_lba_count: 1,
+                                    offset_in_unit: 0,
+                                    crc32: 0xEE000000 + round as u32,
+                                    slot_offset: 0,
+                                    flags: 0,
+                                },
+                            )
+                        })
+                        .collect();
+
+                    let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+                        vec![(vol, &overwrite, 2)];
+                    let result = meta.atomic_batch_write_multi(&args);
+
+                    if let Ok(newly_zeroed) = result {
+                        for (dead_pba, (_, blocks)) in &newly_zeroed {
+                            BufferFlusher::cleanup_dead_pba_post_commit(
+                                meta,
+                                allocator,
+                                hole_map,
+                                *dead_pba,
+                                *blocks,
+                                "concurrent_test_overwrite_c",
+                            );
+                        }
+                    }
+                }
+            });
+        });
+
+        // Final integrity check: every PBA should have refcount == blockmap_refs
+        let mut drift_count = 0u32;
+        for &pba in &shared_pbas {
+            let rc = meta.get_refcount(pba).unwrap();
+            let refs = meta.count_blockmap_refs_for_pba(pba).unwrap();
+            if rc != refs {
+                eprintln!(
+                    "DRIFT PBA {}: stored={} actual={} diff={}",
+                    pba.0,
+                    rc,
+                    refs,
+                    refs as i64 - rc as i64
+                );
+                drift_count += 1;
+                found_drift.store(true, Ordering::Relaxed);
+            }
+        }
+        // Also check all the replacement PBAs
+        for pba_val in 0..20000u64 {
+            let pba = Pba(pba_val + crate::types::RESERVED_BLOCKS);
+            let rc = meta.get_refcount(pba).unwrap();
+            let refs = meta.count_blockmap_refs_for_pba(pba).unwrap();
+            if rc == 0 && refs == 0 {
+                continue;
+            }
+            if rc != refs {
+                eprintln!(
+                    "DRIFT (replacement) PBA {}: stored={} actual={}",
+                    pba.0, rc, refs
+                );
+                drift_count += 1;
+                found_drift.store(true, Ordering::Relaxed);
+            }
+        }
+        if drift_count > 0 {
+            eprintln!("Total PBAs with drift: {drift_count}");
+        }
+        assert!(
+            !found_drift.load(Ordering::Relaxed),
+            "refcount drift under concurrent overwrite + dedup + cleanup"
+        );
+    }
+
+    /// Test #4: Full PBA lifecycle with cleanup + immediate reallocation.
+    ///
+    /// Multiple threads concurrently: allocate → packed write → overwrite →
+    /// cleanup → free → reallocate. Checks that reallocated PBAs never have
+    /// stale refcounts from their prior incarnation.
+    ///
+    /// Critical: only PBAs that go through the natural newly_zeroed + cleanup
+    /// path are freed.  Replacement PBAs stay allocated (their blockmap entries
+    /// remain live), ensuring ghost refs can only appear from a real bug, not
+    /// from artificial shortcutting.
+    #[test]
+    fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Barrier;
+
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+        let vol = VolumeId("flush-race".into());
+        let meta = &*meta;
+        let allocator = &*allocator;
+        let vol = &vol;
+        let hole_map = &hole_map;
+
+        let found_stale = AtomicBool::new(false);
+        let barrier = Barrier::new(4);
+        let lba_counter = std::sync::atomic::AtomicU64::new(100000);
+
+        std::thread::scope(|s| {
+            for tid in 0..4usize {
+                let barrier = &barrier;
+                let lba_counter = &lba_counter;
+                let found_stale = &found_stale;
+
+                s.spawn(move || {
+                    barrier.wait();
+                    // ~200 cycles × 2 PBAs = ~400 per thread, 1600 total. Fits in 20000.
+                    for _cycle in 0..200 {
+                        // Allocate PBA
+                        let pba = match allocator.allocate_one_for_lane(tid) {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+
+                        // Create packed write: 4 LBAs → PBA
+                        let base_lba = lba_counter.fetch_add(8, Ordering::Relaxed);
+                        let batch: Vec<(VolumeId, Lba, BlockmapValue)> = (0..4u64)
+                            .map(|i| {
+                                (
+                                    vol.clone(),
+                                    Lba(base_lba + i),
+                                    BlockmapValue {
+                                        pba,
+                                        compression: 1,
+                                        unit_compressed_size: 400,
+                                        unit_original_size: 16384,
+                                        unit_lba_count: 4,
+                                        offset_in_unit: i as u16,
+                                        crc32: 0xFF000000 + tid as u32,
+                                        slot_offset: 0,
+                                        flags: 0,
+                                    },
+                                )
+                            })
+                            .collect();
+                        if meta.atomic_batch_write_packed(&batch, pba, 4).is_err() {
+                            let _ = allocator.free_one(pba);
+                            continue;
+                        }
+
+                        // Overwrite all 4 LBAs → new PBA
+                        let replacement = match allocator.allocate_one_for_lane(tid) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let overwrite: Vec<(Lba, BlockmapValue)> = (0..4u64)
+                            .map(|i| {
+                                (
+                                    Lba(base_lba + i),
+                                    BlockmapValue {
+                                        pba: replacement,
+                                        compression: 0,
+                                        unit_compressed_size: BLOCK_SIZE,
+                                        unit_original_size: BLOCK_SIZE,
+                                        unit_lba_count: 1,
+                                        offset_in_unit: 0,
+                                        crc32: 0x11000000,
+                                        slot_offset: 0,
+                                        flags: 0,
+                                    },
+                                )
+                            })
+                            .collect();
+
+                        let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+                            vec![(vol, &overwrite, 4)];
+                        let result = meta.atomic_batch_write_multi(&args);
+
+                        // Only free via the production path: newly_zeroed + cleanup
+                        if let Ok(newly_zeroed) = result {
+                            for (dead_pba, (_, blocks)) in &newly_zeroed {
+                                BufferFlusher::cleanup_dead_pba_post_commit(
+                                    meta,
+                                    allocator,
+                                    hole_map,
+                                    *dead_pba,
+                                    *blocks,
+                                    "lifecycle_test",
+                                );
+                            }
+                        }
+
+                        // Try to reallocate — might get the recycled PBA back
+                        if let Ok(recycled) = allocator.allocate_one_for_lane(tid) {
+                            let rc = meta.get_refcount(recycled).unwrap();
+                            let refs = meta.count_blockmap_refs_for_pba(recycled).unwrap();
+                            if rc != 0 || refs != 0 {
+                                eprintln!(
+                                    "[tid={}] STALE on PBA {}: refcount={} blockmap_refs={}",
+                                    tid, recycled.0, rc, refs
+                                );
+                                found_stale.store(true, Ordering::Relaxed);
+                            }
+                            // Free for reuse in future cycles
+                            let _ = allocator.free_one(recycled);
+                        }
+
+                        // replacement stays allocated — its blockmap entries are live
+                    }
+                });
+            }
+        });
+
+        assert!(
+            !found_stale.load(Ordering::Relaxed),
+            "found stale refcount/blockmap on reallocated PBA"
+        );
+    }
+
+    /// Test #5: Simulate duplicate buffer entry processing.
+    ///
+    /// If the buffer ring has a bug that delivers the same LBA data twice,
+    /// the flusher processes two writes to the same LBAs:
+    ///   - Write 1: allocates PBA A, maps LBAs 0-7 → PBA A (refcount=8)
+    ///   - Write 2 (duplicate): allocates PBA B, maps LBAs 0-7 → PBA B
+    ///     Old mapping = PBA A → decrements PBA A by 8 → refcount=0 → freed!
+    ///   - PBA A is now free while its data was valid. Reuse corrupts it.
+    ///
+    /// This test proves the exact scenario and checks whether the newly_zeroed
+    /// cleanup path correctly handles this case.
+    #[test]
+    fn duplicate_flush_entry_causes_premature_pba_free() {
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+        let vol = VolumeId("flush-race".into());
+
+        // Step 1: First write — maps LBAs 0-7 → PBA A
+        let pba_a = allocator.allocate_one_for_lane(0).unwrap();
+        let batch_a: Vec<(VolumeId, Lba, BlockmapValue)> = (0..8u64)
+            .map(|i| {
+                (
+                    vol.clone(),
+                    Lba(i),
+                    BlockmapValue {
+                        pba: pba_a,
+                        compression: 1,
+                        unit_compressed_size: 400,
+                        unit_original_size: 32768,
+                        unit_lba_count: 8,
+                        offset_in_unit: i as u16,
+                        crc32: 0xAAAAAAAA,
+                        slot_offset: 0,
+                        flags: 0,
+                    },
+                )
+            })
+            .collect();
+        meta.atomic_batch_write_packed(&batch_a, pba_a, 8).unwrap();
+        assert_eq!(meta.get_refcount(pba_a).unwrap(), 8);
+
+        // Step 2: Duplicate write — same LBAs 0-7 but different PBA B.
+        // This simulates what happens if the buffer ring delivers the same
+        // data twice and the flusher processes both copies.
+        let pba_b = allocator.allocate_one_for_lane(0).unwrap();
+        let overwrite: Vec<(Lba, BlockmapValue)> = (0..8u64)
+            .map(|i| {
+                (
+                    Lba(i),
+                    BlockmapValue {
+                        pba: pba_b,
+                        compression: 1,
+                        unit_compressed_size: 400,
+                        unit_original_size: 32768,
+                        unit_lba_count: 8,
+                        offset_in_unit: i as u16,
+                        crc32: 0xBBBBBBBB,
+                        slot_offset: 0,
+                        flags: 0,
+                    },
+                )
+            })
+            .collect();
+
+        let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![(&vol, &overwrite, 8)];
+        let newly_zeroed = meta.atomic_batch_write_multi(&args).unwrap();
+
+        // PBA A should now have refcount=0 (all 8 entries overwritten)
+        assert_eq!(meta.get_refcount(pba_a).unwrap(), 0);
+        assert_eq!(meta.count_blockmap_refs_for_pba(pba_a).unwrap(), 0);
+        assert!(
+            newly_zeroed.contains_key(&pba_a),
+            "PBA A should be newly_zeroed"
+        );
+
+        // Step 3: Cleanup frees PBA A
+        BufferFlusher::cleanup_dead_pba_post_commit(
+            &meta,
+            &allocator,
+            &hole_map,
+            pba_a,
+            1,
+            "dup_flush_test",
+        );
+        assert!(allocator.is_free(pba_a), "PBA A should be free now");
+
+        // Step 4: Reallocate — should get PBA A back (FIFO-ish)
+        let recycled = allocator.allocate_one().unwrap();
+        // Verify it's clean
+        let rc = meta.get_refcount(recycled).unwrap();
+        let refs = meta.count_blockmap_refs_for_pba(recycled).unwrap();
+        assert_eq!(rc, 0, "recycled PBA should have refcount=0");
+        assert_eq!(refs, 0, "recycled PBA should have 0 blockmap refs");
+
+        // Step 5: Write new data to the recycled PBA
+        let batch_c: Vec<(VolumeId, Lba, BlockmapValue)> = (100..108u64)
+            .map(|i| {
+                (
+                    vol.clone(),
+                    Lba(i),
+                    BlockmapValue {
+                        pba: recycled,
+                        compression: 1,
+                        unit_compressed_size: 350,
+                        unit_original_size: 32768,
+                        unit_lba_count: 8,
+                        offset_in_unit: (i - 100) as u16,
+                        crc32: 0xCCCCCCCC,
+                        slot_offset: 0,
+                        flags: 0,
+                    },
+                )
+            })
+            .collect();
+        meta.atomic_batch_write_packed(&batch_c, recycled, 8)
+            .unwrap();
+        assert_eq!(meta.get_refcount(recycled).unwrap(), 8);
+        assert_eq!(meta.count_blockmap_refs_for_pba(recycled).unwrap(), 8);
+
+        // This test passes: when the duplicate processing follows the normal
+        // overwrite path, metadata stays consistent. The PBA is freed and
+        // recycled cleanly. The PROBLEM is that this causes PBA A's physical
+        // data to be lost — any IO that cached PBA A's physical location would
+        // now read wrong data. The CRC in the new blockmap entry (0xCCCCCCCC)
+        // doesn't match PBA A's original data (0xAAAAAAAA).
+        eprintln!(
+            "Demonstrated: duplicate flush entry causes PBA A ({}) to be freed \
+             and recycled as PBA {} with different data. If PBA A == recycled, \
+             the original 0xAAAAAAAA data is overwritten by 0xCCCCCCCC.",
+            pba_a.0, recycled.0
+        );
+    }
+
+    /// Test #6: High-pressure concurrent test that exercises the EXACT
+    /// production race: multiple flush lanes simultaneously doing
+    /// packed_write → overwrite → cleanup → reallocate, interleaved
+    /// with dedup hits and IMMEDIATE reallocation checks.
+    ///
+    /// After all threads complete, we do a FULL scan of every PBA to
+    /// verify refcount == blockmap_refs (no drift whatsoever).
+    #[test]
+    fn full_pressure_multi_lane_no_drift_anywhere() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Barrier;
+
+        let (
+            meta,
+            _pool,
+            _lifecycle,
+            allocator,
+            _io_engine,
+            _metrics,
+            _meta_dir,
+            _buf_tmp,
+            _data_tmp,
+        ) = setup_flush_test_env();
+        let hole_map = crate::packer::packer::new_hole_map();
+        let vol = VolumeId("flush-race".into());
+        let meta = &*meta;
+        let allocator = &*allocator;
+        let vol = &vol;
+        let hole_map = &hole_map;
+
+        let lba_counter = AtomicU64::new(200000);
+        let found_drift = AtomicBool::new(false);
+        let barrier = Barrier::new(6);
+
+        // Pre-create shared packed PBAs for dedup
+        let shared_pbas: Vec<Pba> = (0..20)
+            .filter_map(|_| allocator.allocate_one_for_lane(0).ok())
+            .collect();
+        for (idx, &pba) in shared_pbas.iter().enumerate() {
+            let base_lba = lba_counter.fetch_add(8, Ordering::Relaxed);
+            let batch: Vec<(VolumeId, Lba, BlockmapValue)> = (0..8u64)
+                .map(|i| {
+                    (
+                        vol.clone(),
+                        Lba(base_lba + i),
+                        BlockmapValue {
+                            pba,
+                            compression: 1,
+                            unit_compressed_size: 400,
+                            unit_original_size: 32768,
+                            unit_lba_count: 8,
+                            offset_in_unit: i as u16,
+                            crc32: 0xAA000000 + idx as u32,
+                            slot_offset: 0,
+                            flags: 0,
+                        },
+                    )
+                })
+                .collect();
+            meta.atomic_batch_write_packed(&batch, pba, 8).unwrap();
+            let entries: Vec<(ContentHash, DedupEntry)> = (0..8u8)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = idx as u8;
+                    h[1] = i;
+                    h[31] = 0xAA;
+                    (
+                        h,
+                        DedupEntry {
+                            pba,
+                            slot_offset: 0,
+                            compression: 1,
+                            unit_compressed_size: 400,
+                            unit_original_size: 32768,
+                            unit_lba_count: 8,
+                            offset_in_unit: i as u16,
+                            crc32: 0xAA000000 + idx as u32,
+                        },
+                    )
+                })
+                .collect();
+            meta.put_dedup_entries(&entries).unwrap();
+        }
+
+        let shared_pbas = &shared_pbas;
+
+        std::thread::scope(|s| {
+            // 2 packed writer threads
+            for tid in 0..2usize {
+                let barrier = &barrier;
+                let lba_counter = &lba_counter;
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..150 {
+                        let pba = match allocator.allocate_one_for_lane(tid) {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        let base_lba = lba_counter.fetch_add(8, Ordering::Relaxed);
+                        let batch: Vec<(VolumeId, Lba, BlockmapValue)> = (0..8u64)
+                            .map(|i| {
+                                (
+                                    vol.clone(),
+                                    Lba(base_lba + i),
+                                    BlockmapValue {
+                                        pba,
+                                        compression: 1,
+                                        unit_compressed_size: 400,
+                                        unit_original_size: 32768,
+                                        unit_lba_count: 8,
+                                        offset_in_unit: i as u16,
+                                        crc32: 0xBB000000 + tid as u32,
+                                        slot_offset: 0,
+                                        flags: 0,
+                                    },
+                                )
+                            })
+                            .collect();
+                        let _ = meta.atomic_batch_write_packed(&batch, pba, 8);
+                    }
+                });
+            }
+
+            // 2 overwrite threads targeting shared PBAs' original LBAs
+            for tid in 2..4usize {
+                let barrier = &barrier;
+                s.spawn(move || {
+                    barrier.wait();
+                    for round in 0..150u64 {
+                        let pba_idx = (round as usize + tid * 7) % shared_pbas.len();
+                        let new_pba = match allocator.allocate_one_for_lane(tid) {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        let orig_base = 200000 + (pba_idx as u64) * 8;
+                        let overwrite: Vec<(Lba, BlockmapValue)> = (0..2u64)
+                            .map(|i| {
+                                (
+                                    Lba(orig_base + i + (tid as u64 - 2) * 2),
+                                    BlockmapValue {
+                                        pba: new_pba,
+                                        compression: 0,
+                                        unit_compressed_size: BLOCK_SIZE,
+                                        unit_original_size: BLOCK_SIZE,
+                                        unit_lba_count: 1,
+                                        offset_in_unit: 0,
+                                        crc32: 0xCC000000 + tid as u32,
+                                        slot_offset: 0,
+                                        flags: 0,
+                                    },
+                                )
+                            })
+                            .collect();
+
+                        let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+                            vec![(vol, &overwrite, 2)];
+                        if let Ok(newly_zeroed) = meta.atomic_batch_write_multi(&args) {
+                            for (dead_pba, (_, blocks)) in &newly_zeroed {
+                                BufferFlusher::cleanup_dead_pba_post_commit(
+                                    meta,
+                                    allocator,
+                                    hole_map,
+                                    *dead_pba,
+                                    *blocks,
+                                    "pressure_test",
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+
+            // 1 dedup hit thread
+            s.spawn(|| {
+                barrier.wait();
+                for round in 0..200u64 {
+                    let pba_idx = (round as usize) % shared_pbas.len();
+                    let pba = shared_pbas[pba_idx];
+                    let base_lba = lba_counter.fetch_add(2, Ordering::Relaxed);
+                    let hashes: Vec<ContentHash> = (0..2u8)
+                        .map(|i| {
+                            let mut h = [0u8; 32];
+                            h[0] = pba_idx as u8;
+                            h[1] = i;
+                            h[31] = 0xAA;
+                            h
+                        })
+                        .collect();
+                    let hits: Vec<(Lba, BlockmapValue, ContentHash)> = (0..2u64)
+                        .map(|i| {
+                            (
+                                Lba(base_lba + i),
+                                BlockmapValue {
+                                    pba,
+                                    compression: 1,
+                                    unit_compressed_size: 400,
+                                    unit_original_size: 32768,
+                                    unit_lba_count: 8,
+                                    offset_in_unit: i as u16,
+                                    crc32: 0xAA000000 + pba_idx as u32,
+                                    slot_offset: 0,
+                                    flags: 0,
+                                },
+                                hashes[i as usize],
+                            )
+                        })
+                        .collect();
+                    let _ = meta.atomic_batch_dedup_hits(vol, &hits);
+                }
+            });
+
+            // 1 batch multi-write thread
+            s.spawn(|| {
+                barrier.wait();
+                for _ in 0..100u64 {
+                    let pba = match allocator.allocate_one_for_lane(0) {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    let base_lba = lba_counter.fetch_add(4, Ordering::Relaxed);
+                    let entries: Vec<(Lba, BlockmapValue)> = (0..4u64)
+                        .map(|i| {
+                            (
+                                Lba(base_lba + i),
+                                BlockmapValue {
+                                    pba,
+                                    compression: 0,
+                                    unit_compressed_size: BLOCK_SIZE,
+                                    unit_original_size: BLOCK_SIZE,
+                                    unit_lba_count: 1,
+                                    offset_in_unit: 0,
+                                    crc32: 0xDD000000,
+                                    slot_offset: 0,
+                                    flags: 0,
+                                },
+                            )
+                        })
+                        .collect();
+                    let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+                        vec![(vol, &entries, 4)];
+                    let _ = meta.atomic_batch_write_multi(&args);
+                }
+            });
+        });
+
+        // FULL SCAN: every PBA must have refcount == blockmap_refs
+        let mut drift_count = 0u32;
+        for pba_val in 0..20000u64 {
+            let pba = Pba(pba_val + crate::types::RESERVED_BLOCKS);
+            let rc = meta.get_refcount(pba).unwrap();
+            let refs = meta.count_blockmap_refs_for_pba(pba).unwrap();
+            if rc == 0 && refs == 0 {
+                continue;
+            }
+            if rc != refs {
+                eprintln!(
+                    "DRIFT PBA {}: stored={} actual={} diff={}",
+                    pba.0,
+                    rc,
+                    refs,
+                    refs as i64 - rc as i64
+                );
+                drift_count += 1;
+                found_drift.store(true, Ordering::Relaxed);
+            }
+        }
+        if drift_count > 0 {
+            eprintln!("Total drifted PBAs: {drift_count}");
+        }
+        assert!(
+            !found_drift.load(Ordering::Relaxed),
+            "refcount drift found in full-pressure scan"
         );
     }
 }

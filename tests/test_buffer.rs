@@ -189,8 +189,8 @@ fn retry_snapshot_does_not_treat_pre_sync_entries_as_ready() {
     let size = 4096 + 4096 + 8 * 8192;
     tmp.as_file().set_len(size).unwrap();
     let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
-    let pool = WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(500))
-        .unwrap();
+    let pool =
+        WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(500)).unwrap();
 
     let seq = pool
         .append("test-vol", Lba(9), 1, &vec![0xAB; 4096], 0)
@@ -204,7 +204,8 @@ fn retry_snapshot_does_not_treat_pre_sync_entries_as_ready() {
     );
 
     assert_eq!(
-        pool.recv_ready_timeout_for_shard(0, Duration::from_secs(2)).unwrap(),
+        pool.recv_ready_timeout_for_shard(0, Duration::from_secs(2))
+            .unwrap(),
         seq
     );
 }

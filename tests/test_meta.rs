@@ -56,23 +56,6 @@ fn refcount_roundtrip() {
     assert_eq!(decode_refcount_value(&val), Some(7));
 }
 
-#[test]
-fn fragment_ref_key_roundtrip() {
-    let key = FragmentRefKey {
-        pba: Pba(77),
-        slot_offset: 512,
-        compression: 1,
-        unit_compressed_size: 1024,
-        unit_original_size: 4096,
-        unit_lba_count: 2,
-        crc32: 0x1234_5678,
-    };
-    let encoded = encode_fragment_ref_key(&key);
-    let decoded = decode_fragment_ref_key(&encoded).unwrap();
-    assert_eq!(decoded, key);
-    assert_eq!(fragment_ref_prefix(key.pba), key.pba.0.to_be_bytes());
-}
-
 // --- store tests ---
 
 fn test_config(dir: &std::path::Path) -> MetaConfig {
@@ -141,51 +124,6 @@ fn blockmap_crud() {
 
     store.delete_mapping(&vol_id, Lba(0)).unwrap();
     assert!(store.get_mapping(&vol_id, Lba(0)).unwrap().is_none());
-}
-
-#[test]
-fn fragment_ref_index_tracks_liveness_and_overlap() {
-    let dir = tempdir().unwrap();
-    let store = MetaStore::open(&test_config(dir.path())).unwrap();
-    let vol_id = VolumeId("frag-vol".into());
-
-    let old = BlockmapValue {
-        pba: Pba(100),
-        compression: 1,
-        unit_compressed_size: 512,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0xAAAA_BBBB,
-        slot_offset: 0,
-        flags: 0,
-    };
-    let new = BlockmapValue {
-        pba: Pba(100),
-        compression: 1,
-        unit_compressed_size: 512,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0xCCCC_DDDD,
-        slot_offset: 1024,
-        flags: 0,
-    };
-
-    store.put_mapping(&vol_id, Lba(0), &old).unwrap();
-    assert!(store.has_live_fragment_ref(&old).unwrap());
-    assert!(store.has_overlap_at_pba(old.pba, 0, 128).unwrap());
-    assert!(!store.has_overlap_at_pba(old.pba, 700, 100).unwrap());
-
-    store.put_mapping(&vol_id, Lba(0), &new).unwrap();
-    assert!(!store.has_live_fragment_ref(&old).unwrap());
-    assert!(store.has_live_fragment_ref(&new).unwrap());
-    assert!(!store.has_overlap_at_pba(old.pba, 0, 128).unwrap());
-    assert!(store.has_overlap_at_pba(new.pba, 1100, 64).unwrap());
-
-    store.delete_mapping(&vol_id, Lba(0)).unwrap();
-    assert!(!store.has_live_fragment_ref(&new).unwrap());
-    assert!(!store.has_overlap_at_pba(new.pba, 1100, 64).unwrap());
 }
 
 #[test]
@@ -1039,7 +977,7 @@ fn batch_dedup_hits_basic() {
         (Lba(1), make_bv(100, 4096, 1, 0), h[1]),
         (Lba(2), make_bv(100, 4096, 1, 0), h[2]),
     ];
-    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 3);
     for r in &results {
         match r {
@@ -1073,7 +1011,7 @@ fn batch_dedup_hits_rejected_target_freed() {
         (Lba(0), make_bv(100, 4096, 1, 0), h0),
         (Lba(1), make_bv(200, 4096, 1, 0), h1),
     ];
-    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 2);
     match results[0] {
         DedupHitResult::Accepted(None) => {}
@@ -1106,7 +1044,7 @@ fn batch_dedup_hits_same_pba_refresh() {
     let h = test_hash(1);
     register_dedup_reverse(&store, 100, &[h]);
     let hits = vec![(Lba(5), make_bv(100, 4096, 1, 0), h)];
-    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     match results[0] {
         DedupHitResult::Accepted(None) => {}
         _ => panic!("expected Accepted(None) for same-PBA hit"),
@@ -1130,7 +1068,7 @@ fn batch_dedup_hits_old_pba_decrement() {
     register_dedup_reverse(&store, 200, &[h]);
 
     let hits = vec![(Lba(5), make_bv(200, 4096, 1, 0), h)];
-    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     match results[0] {
         DedupHitResult::Accepted(Some((old_pba, _))) => {
             assert_eq!(old_pba, Pba(100));
@@ -1161,7 +1099,7 @@ fn batch_dedup_hits_multiple_same_target() {
         (Lba(11), make_bv(100, 4096, 1, 0), h[1]),
         (Lba(12), make_bv(100, 4096, 1, 0), h[2]),
     ];
-    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 3);
     assert_eq!(store.get_refcount(Pba(100)).unwrap(), 8);
 }
@@ -1190,7 +1128,7 @@ fn batch_dedup_hits_multiple_decrement_same_old() {
         (Lba(1), make_bv(200, 4096, 1, 0), h[1]),
         (Lba(2), make_bv(200, 4096, 1, 0), h[2]),
     ];
-    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     for r in &results {
         match r {
             DedupHitResult::Accepted(Some((old_pba, _))) => assert_eq!(*old_pba, Pba(100)),
@@ -1229,7 +1167,7 @@ fn batch_dedup_hits_pba_is_both_target_and_old() {
         (Lba(5), make_bv(200, 4096, 1, 0), h0),
         (Lba(6), make_bv(100, 4096, 1, 0), h1),
     ];
-    let results = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
+    let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 2);
     // PBA 100: base=3, +1 (hit 2 targets it), -1 (hit 1 old) = 3
     assert_eq!(store.get_refcount(Pba(100)).unwrap(), 3);
@@ -1242,8 +1180,9 @@ fn batch_dedup_hits_empty() {
     let dir = tempdir().unwrap();
     let store = MetaStore::open(&test_config(dir.path())).unwrap();
     let vol = VolumeId("test-vol".into());
-    let results = store.atomic_batch_dedup_hits(&vol, &[]).unwrap();
+    let (results, newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &[]).unwrap();
     assert!(results.is_empty());
+    assert!(newly_zeroed.is_empty());
 }
 
 // --- merge-based decrement tests for atomic_batch_write_packed ---

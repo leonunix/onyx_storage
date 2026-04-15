@@ -877,6 +877,7 @@ impl OnyxEngine {
                 .buffer_pool
                 .as_ref()
                 .map(|pool| pool.payload_memory_limit_bytes()),
+            rocksdb_memory: self.meta.memory_stats().ok(),
             buffer_shards: self
                 .buffer_pool
                 .as_ref()

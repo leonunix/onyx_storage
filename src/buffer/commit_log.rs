@@ -1178,6 +1178,18 @@ impl BufferShard {
             superseded_ranges,
         });
 
+        // ── Mark inflight BEFORE any index insert ──────────────────
+        // The flusher's retry-snapshot scans pending_entries and treats
+        // entries with !inflight as ready.  If pending_entries is visible
+        // before inflight is set, the flusher can race in and hydrate an
+        // entry that hasn't been written to disk yet.  Setting inflight
+        // first closes this window: by the time pending_entries.insert
+        // makes the entry visible, inflight already contains the seq.
+        {
+            let mut lc = self.lifecycle.lock();
+            lc.inflight.insert(seq);
+        }
+
         // ── DashMap inserts (concurrent sharded locks) ──
         // Interned Arc<str>: read-lock fast path, no alloc after first encounter.
         for key in keys {
@@ -1186,13 +1198,6 @@ impl BufferShard {
         }
         self.pending_entries.insert(seq, pending.clone());
         self.volatile_payloads.insert(seq, payload.clone());
-        {
-            // Mark the seq as in-flight immediately at append time so the
-            // flusher's retry snapshots never treat staged-but-not-yet-synced
-            // entries as ready work.
-            let mut lc = self.lifecycle.lock();
-            lc.inflight.insert(seq);
-        }
 
         // ── Channel send (lock-free MPSC, ~30ns) ──
         let _ = self.staging_tx.send(StagedEntry { pending, payload });
@@ -2549,8 +2554,7 @@ impl WriteBufferPool {
         // offsets and silently fall back to buffered IO, which on the same
         // block device as shard 0's O_DIRECT causes page-cache coherency
         // corruption (mixed O_DIRECT + buffered IO on one file).
-        let bytes_per_shard =
-            (total_data_bytes / shard_count as u64) & !(BLOCK_SIZE as u64 - 1);
+        let bytes_per_shard = (total_data_bytes / shard_count as u64) & !(BLOCK_SIZE as u64 - 1);
 
         // Build per-shard config for parallel open.
         struct ShardOpenConfig {
