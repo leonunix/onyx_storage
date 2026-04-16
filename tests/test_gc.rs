@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-
 use onyx_storage::buffer::flush::BufferFlusher;
 use onyx_storage::buffer::pool::WriteBufferPool;
 use onyx_storage::compress::codec::create_compressor;
@@ -1067,7 +1066,6 @@ fn gc_rewrite_packed_fragment() {
         );
     }
 }
-
 
 #[test]
 fn zero_refcount_is_reconciled_before_freeing_live_pba() {

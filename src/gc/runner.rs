@@ -97,11 +97,11 @@ impl GcRunner {
         let free_pct = (allocator.free_block_count() * 100) / total;
 
         if free_pct > 50 {
-            0.70  // Plentiful — only GC very dead slots
+            0.70 // Plentiful — only GC very dead slots
         } else if free_pct > 30 {
-            0.50  // Moderate pressure
+            0.50 // Moderate pressure
         } else if free_pct > 10 {
-            0.30  // Getting tight
+            0.30 // Getting tight
         } else {
             cfg.dead_ratio_threshold // Critical — use configured minimum (default 0.25)
         }
@@ -160,16 +160,14 @@ impl GcRunner {
             let threshold = Self::dynamic_threshold(&cfg, allocator);
 
             // Scan for GC rewrite candidates
-            let candidates =
-                match scan_gc_candidates(meta, threshold, cfg.max_rewrite_per_cycle)
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(error = %e, "gc: scan failed");
-                        continue;
-                    }
-                };
+            let candidates = match scan_gc_candidates(meta, threshold, cfg.max_rewrite_per_cycle) {
+                Ok(c) => c,
+                Err(e) => {
+                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(error = %e, "gc: scan failed");
+                    continue;
+                }
+            };
 
             metrics
                 .gc_candidates_found

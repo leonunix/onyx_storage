@@ -272,4 +272,3 @@ fn sealed_slot_data_integrity() {
     assert_eq!(&sealed.data[100..300], &[0x22; 200]);
     assert!(sealed.data[300..].iter().all(|&b| b == 0));
 }
-
