@@ -181,7 +181,6 @@ impl OnyxEngine {
                                 "draining unflushed entries before shard migration"
                             );
                         }
-                        let temp_hole_map = crate::packer::packer::new_hole_map();
                         let mut temp_flusher = BufferFlusher::start_with_metrics(
                             old_pool.clone(),
                             meta.clone(),
@@ -189,7 +188,6 @@ impl OnyxEngine {
                             allocator.clone(),
                             io_engine.clone(),
                             &config.flush,
-                            temp_hole_map,
                             &config.dedup,
                             metrics.clone(),
                         );
@@ -313,10 +311,7 @@ impl OnyxEngine {
         let buffer_pool =
             Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
 
-        // 6. Shared hole map (GC → Packer)
-        let hole_map = crate::packer::packer::new_hole_map();
-
-        // 7. Background flusher (owns the Packer, which reads from hole_map)
+        // 6. Background flusher
         let flusher = BufferFlusher::start_with_metrics(
             buffer_pool.clone(),
             meta.clone(),
@@ -324,7 +319,6 @@ impl OnyxEngine {
             allocator.clone(),
             io_engine.clone(),
             &config.flush,
-            hole_map.clone(),
             &config.dedup,
             metrics.clone(),
         );
@@ -349,7 +343,6 @@ impl OnyxEngine {
                 allocator.clone(),
                 lifecycle.clone(),
                 buffer_pool.clone(),
-                hole_map.clone(),
                 config.dedup.clone(),
             ))
         } else {
@@ -709,9 +702,6 @@ impl OnyxEngine {
         let buffer_pool =
             Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
 
-        // Shared hole map
-        let hole_map = crate::packer::packer::new_hole_map();
-
         // Background flusher
         let flusher = BufferFlusher::start_with_metrics(
             buffer_pool.clone(),
@@ -720,7 +710,6 @@ impl OnyxEngine {
             allocator.clone(),
             io_engine.clone(),
             &config.flush,
-            hole_map.clone(),
             &config.dedup,
             metrics.clone(),
         );
@@ -745,7 +734,6 @@ impl OnyxEngine {
                 allocator.clone(),
                 lifecycle.clone(),
                 buffer_pool.clone(),
-                hole_map.clone(),
                 config.dedup.clone(),
             ))
         } else {

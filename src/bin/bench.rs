@@ -566,7 +566,7 @@ fn print_report(bench: &BenchConfig, result: &BenchResult) {
         m.read_decompress_errors,
     );
     println!(
-        "flush: coalesce_runs={} units={} lbas={} raw_bytes={} compress_in={} compress_out={} packed_slots={} packed_frags={} hole_fills={} errors={}",
+        "flush: coalesce_runs={} units={} lbas={} raw_bytes={} compress_in={} compress_out={} packed_slots={} packed_frags={} errors={}",
         m.coalesce_runs,
         m.flush_units_written,
         m.coalesced_lbas,
@@ -575,7 +575,6 @@ fn print_report(bench: &BenchConfig, result: &BenchResult) {
         human_bytes(m.compress_output_bytes),
         m.flush_packed_slots_written,
         m.flush_packed_fragments_written,
-        m.flush_hole_fills,
         m.flush_errors,
     );
     println!(
@@ -592,14 +591,13 @@ fn print_report(bench: &BenchConfig, result: &BenchResult) {
         m.buffer_sync_epochs_committed,
     );
     println!(
-        "writer-stage: total={} alloc={} io={} meta={} cleanup={} dedup_index={} hole_detect={} mark_flushed={}",
+        "writer-stage: total={} alloc={} io={} meta={} cleanup={} dedup_index={} mark_flushed={}",
         human_duration_ns(m.flush_writer_total_ns),
         human_duration_ns(m.flush_writer_alloc_ns),
         human_duration_ns(m.flush_writer_io_ns),
         human_duration_ns(m.flush_writer_meta_ns),
         human_duration_ns(m.flush_writer_cleanup_ns),
         human_duration_ns(m.flush_writer_dedup_index_ns),
-        human_duration_ns(m.flush_writer_hole_detect_ns),
         human_duration_ns(m.flush_writer_mark_flushed_ns),
     );
     println!(
@@ -675,7 +673,7 @@ fn bottleneck_hints(bench: &BenchConfig, result: &BenchResult) -> Vec<String> {
 
     if m.flush_packed_slots_written > 0 {
         hints.push(
-            "packer was exercised; if CPU is high and throughput is low on small-block workloads, inspect packed slot write amplification and hole-fill frequency".to_string(),
+            "packer was exercised; if CPU is high and throughput is low on small-block workloads, inspect packed slot write amplification".to_string(),
         );
     }
 

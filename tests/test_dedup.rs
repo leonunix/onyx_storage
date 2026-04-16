@@ -7,7 +7,6 @@ use onyx_storage::buffer::flush::{
     install_test_failpoint, BufferFlusher, FlushFailStage,
 };
 use onyx_storage::buffer::pool::WriteBufferPool;
-use onyx_storage::compress::codec::create_compressor;
 use onyx_storage::config::FlushConfig;
 use onyx_storage::dedup::config::DedupConfig;
 use onyx_storage::dedup::scanner::DedupScanner;
@@ -16,10 +15,8 @@ use onyx_storage::io::engine::IoEngine;
 use onyx_storage::lifecycle::VolumeLifecycleManager;
 use onyx_storage::meta::schema::*;
 use onyx_storage::meta::store::MetaStore;
-use onyx_storage::packer::packer::{new_hole_map, HoleKey, HoleMap};
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::types::*;
-use onyx_storage::zone::worker::ZoneWorker;
 use tempfile::{tempdir, NamedTempFile};
 
 fn setup_dedup_env() -> (
@@ -140,7 +137,6 @@ fn start_flusher_with_dedup(
         lifecycle,
         allocator,
         io_engine,
-        new_hole_map(),
         dedup_test_config(),
     )
 }
@@ -151,7 +147,6 @@ fn start_flusher_custom(
     lifecycle: &Arc<VolumeLifecycleManager>,
     allocator: &Arc<SpaceAllocator>,
     io_engine: &Arc<IoEngine>,
-    hole_map: HoleMap,
     dedup_config: DedupConfig,
 ) -> BufferFlusher {
     BufferFlusher::start(
@@ -161,7 +156,6 @@ fn start_flusher_custom(
         allocator.clone(),
         io_engine.clone(),
         &FlushConfig::default(),
-        hole_map,
         &dedup_config,
     )
 }
@@ -180,27 +174,6 @@ fn start_scanner(
         allocator.clone(),
         lifecycle.clone(),
         pool.clone(),
-        config,
-    )
-}
-
-fn start_scanner_with_hole_map(
-    pool: &Arc<WriteBufferPool>,
-    meta: &Arc<MetaStore>,
-    lifecycle: &Arc<VolumeLifecycleManager>,
-    allocator: &Arc<SpaceAllocator>,
-    io_engine: &Arc<IoEngine>,
-    hole_map: HoleMap,
-    config: DedupConfig,
-) -> DedupScanner {
-    DedupScanner::start_with_metrics(
-        Arc::new(onyx_storage::metrics::EngineMetrics::default()),
-        meta.clone(),
-        io_engine.clone(),
-        allocator.clone(),
-        lifecycle.clone(),
-        pool.clone(),
-        hole_map,
         config,
     )
 }
@@ -924,7 +897,6 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
         &lifecycle,
         &allocator,
         &io_engine,
-        new_hole_map(),
         dedup_always_skip_config(),
     );
     pool.append("test-vol", Lba(1), 1, &data, 1000).unwrap();
@@ -983,7 +955,6 @@ fn scanner_miss_registers_index_and_clears_flag() {
         &lifecycle,
         &allocator,
         &io_engine,
-        new_hole_map(),
         dedup_always_skip_config(),
     );
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
@@ -1037,7 +1008,6 @@ fn scanner_skips_under_pressure_then_resumes() {
         &lifecycle,
         &allocator,
         &io_engine,
-        new_hole_map(),
         dedup_always_skip_config(),
     );
     pool.append("test-vol", Lba(0), 1, &skipped_data, 1000)
@@ -1106,7 +1076,6 @@ fn scanner_crc_mismatch_leaves_block_skipped() {
         &lifecycle,
         &allocator,
         &io_engine,
-        new_hole_map(),
         dedup_always_skip_config(),
     );
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
@@ -1140,258 +1109,6 @@ fn scanner_crc_mismatch_leaves_block_skipped() {
         .unwrap();
     assert_eq!(after.flags, FLAG_DEDUP_SKIPPED);
     assert!(meta.get_dedup_entry(&hash).unwrap().is_none());
-}
-
-#[test]
-fn dedup_hole_fill_miss_populates_index() {
-    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
-    let hole_map = new_hole_map();
-    register_volume_with(&meta, "anchor", CompressionAlgo::Lz4, 100);
-    register_volume_with(&meta, "fill", CompressionAlgo::Lz4, 200);
-
-    let mut flusher = start_flusher_custom(
-        &pool,
-        &meta,
-        &lifecycle,
-        &allocator,
-        &io_engine,
-        hole_map.clone(),
-        dedup_test_config(),
-    );
-
-    let anchor_data = vec![0x11; 4096];
-    pool.append("anchor", Lba(0), 1, &anchor_data, 100).unwrap();
-    assert!(wait_flushed(&pool, 10000), "anchor flush timeout");
-    let anchor_mapping = meta
-        .get_mapping(&VolumeId("anchor".into()), Lba(0))
-        .unwrap()
-        .unwrap();
-
-    let hole_offset = anchor_mapping.slot_offset + anchor_mapping.unit_compressed_size as u16;
-    let hole_size = 1024u16;
-    assert!(hole_offset + hole_size <= BLOCK_SIZE as u16);
-    hole_map.lock().unwrap().insert(
-        HoleKey {
-            pba: anchor_mapping.pba,
-            offset: hole_offset,
-        },
-        hole_size,
-    );
-
-    let fill_data = vec![0x22; 4096];
-    let fill_hash: ContentHash = *blake3::hash(&fill_data).as_bytes();
-    pool.append("fill", Lba(0), 1, &fill_data, 200).unwrap();
-    assert!(wait_flushed(&pool, 10000), "hole fill flush timeout");
-    flusher.stop();
-
-    let fill_mapping = meta
-        .get_mapping(&VolumeId("fill".into()), Lba(0))
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        fill_mapping.pba, anchor_mapping.pba,
-        "write should reuse the manual hole"
-    );
-    assert_eq!(fill_mapping.slot_offset, hole_offset);
-    assert_eq!(fill_mapping.flags, 0);
-
-    let entry = meta.get_dedup_entry(&fill_hash).unwrap().unwrap();
-    assert_eq!(entry.pba, fill_mapping.pba);
-    assert_eq!(entry.slot_offset, fill_mapping.slot_offset);
-}
-
-#[test]
-fn dedup_skipped_hole_fill_is_rescanned() {
-    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env_small_buffer();
-    let hole_map = new_hole_map();
-    register_volume_with(&meta, "anchor", CompressionAlgo::Lz4, 100);
-    register_volume_with(&meta, "fill", CompressionAlgo::Lz4, 200);
-
-    let mut anchor_flusher = start_flusher_custom(
-        &pool,
-        &meta,
-        &lifecycle,
-        &allocator,
-        &io_engine,
-        hole_map.clone(),
-        dedup_test_config(),
-    );
-    let anchor_data = vec![0x33; 4096];
-    pool.append("anchor", Lba(0), 1, &anchor_data, 100).unwrap();
-    assert!(wait_flushed(&pool, 10000), "anchor flush timeout");
-    anchor_flusher.stop();
-
-    let anchor_mapping = meta
-        .get_mapping(&VolumeId("anchor".into()), Lba(0))
-        .unwrap()
-        .unwrap();
-    let hole_offset = anchor_mapping.slot_offset + anchor_mapping.unit_compressed_size as u16;
-    let hole_size = 1024u16;
-    assert!(hole_offset + hole_size <= BLOCK_SIZE as u16);
-    hole_map.lock().unwrap().insert(
-        HoleKey {
-            pba: anchor_mapping.pba,
-            offset: hole_offset,
-        },
-        hole_size,
-    );
-
-    let fill_data = vec![0x44; 4096];
-    let fill_hash: ContentHash = *blake3::hash(&fill_data).as_bytes();
-    let mut skip_flusher = start_flusher_custom(
-        &pool,
-        &meta,
-        &lifecycle,
-        &allocator,
-        &io_engine,
-        hole_map.clone(),
-        dedup_always_skip_config(),
-    );
-    pool.append("fill", Lba(0), 1, &fill_data, 200).unwrap();
-    assert!(wait_flushed(&pool, 10000), "skipped hole fill timeout");
-    skip_flusher.stop();
-
-    let skipped_mapping = meta
-        .get_mapping(&VolumeId("fill".into()), Lba(0))
-        .unwrap()
-        .unwrap();
-    assert_eq!(skipped_mapping.pba, anchor_mapping.pba);
-    assert_eq!(skipped_mapping.slot_offset, hole_offset);
-    assert_eq!(skipped_mapping.flags, FLAG_DEDUP_SKIPPED);
-    assert!(meta.get_dedup_entry(&fill_hash).unwrap().is_none());
-
-    let mut scanner = start_scanner(
-        &pool,
-        &meta,
-        &lifecycle,
-        &allocator,
-        &io_engine,
-        dedup_scanner_config(90),
-    );
-    assert!(
-        wait_until(3000, || {
-            let mapping = meta
-                .get_mapping(&VolumeId("fill".into()), Lba(0))
-                .unwrap()
-                .unwrap();
-            mapping.flags == 0
-                && meta
-                    .get_dedup_entry(&fill_hash)
-                    .unwrap()
-                    .map(|e| e.pba == mapping.pba && e.slot_offset == mapping.slot_offset)
-                    .unwrap_or(false)
-        }),
-        "scanner should rescan skipped hole-fill writes and register dedup metadata"
-    );
-    scanner.stop();
-}
-
-#[test]
-fn dedup_scanner_free_purges_holes_for_released_pba() {
-    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
-    let hole_map = new_hole_map();
-    register_volume_with(&meta, "live", CompressionAlgo::None, 100);
-    register_volume_with(&meta, "skip", CompressionAlgo::Lz4, 200);
-
-    let block = vec![0x5A; BLOCK_SIZE as usize];
-    let hash: ContentHash = *blake3::hash(&block).as_bytes();
-
-    let live_pba = allocator.allocate_one().unwrap();
-    io_engine.write_blocks(live_pba, &block).unwrap();
-    let live_mapping = BlockmapValue {
-        pba: live_pba,
-        compression: 0,
-        unit_compressed_size: BLOCK_SIZE,
-        unit_original_size: BLOCK_SIZE,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: crc32fast::hash(&block),
-        slot_offset: 0,
-        flags: 0,
-    };
-    meta.atomic_write_mapping(&VolumeId("live".into()), Lba(0), &live_mapping)
-        .unwrap();
-    meta.put_dedup_entries(&[(
-        hash,
-        DedupEntry {
-            pba: live_pba,
-            slot_offset: 0,
-            compression: 0,
-            unit_compressed_size: BLOCK_SIZE,
-            unit_original_size: BLOCK_SIZE,
-            unit_lba_count: 1,
-            offset_in_unit: 0,
-            crc32: live_mapping.crc32,
-        },
-    )])
-    .unwrap();
-
-    let old_pba = allocator.allocate_one().unwrap();
-    let compressor = create_compressor(CompressionAlgo::Lz4);
-    let mut buf = vec![0u8; compressor.max_compressed_size(block.len())];
-    let compressed_len = compressor.compress(&block, &mut buf).unwrap();
-    let compressed = buf[..compressed_len].to_vec();
-    let crc = crc32fast::hash(&compressed);
-    let slot_offset = 512u16;
-    let mut slot = vec![0u8; BLOCK_SIZE as usize];
-    slot[slot_offset as usize..slot_offset as usize + compressed.len()]
-        .copy_from_slice(&compressed);
-    io_engine.write_blocks(old_pba, &slot).unwrap();
-    meta.put_mapping(
-        &VolumeId("skip".into()),
-        Lba(0),
-        &BlockmapValue {
-            pba: old_pba,
-            compression: 1,
-            unit_compressed_size: compressed.len() as u32,
-            unit_original_size: BLOCK_SIZE,
-            unit_lba_count: 1,
-            offset_in_unit: 0,
-            crc32: crc,
-            slot_offset,
-            flags: FLAG_DEDUP_SKIPPED,
-        },
-    )
-    .unwrap();
-    meta.set_refcount(old_pba, 1).unwrap();
-
-    hole_map.lock().unwrap().insert(
-        HoleKey {
-            pba: old_pba,
-            offset: 0,
-        },
-        slot_offset,
-    );
-    assert!(
-        hole_map.lock().unwrap().keys().any(|k| k.pba == old_pba),
-        "fixture must install a stale hole for the soon-to-be-freed PBA"
-    );
-
-    let mut scanner = start_scanner_with_hole_map(
-        &pool,
-        &meta,
-        &lifecycle,
-        &allocator,
-        &io_engine,
-        hole_map.clone(),
-        dedup_scanner_config(90),
-    );
-    assert!(
-        wait_until(3000, || {
-            meta.get_mapping(&VolumeId("skip".into()), Lba(0))
-                .unwrap()
-                .map(|m| m.pba == live_pba && m.flags == 0)
-                .unwrap_or(false)
-        }),
-        "scanner should remap skipped block to existing live dedup target"
-    );
-    scanner.stop();
-
-    assert_eq!(meta.get_refcount(old_pba).unwrap(), 0);
-    assert!(
-        !hole_map.lock().unwrap().keys().any(|k| k.pba == old_pba),
-        "scanner cleanup must purge stale holes for a fully freed PBA"
-    );
 }
 
 #[test]

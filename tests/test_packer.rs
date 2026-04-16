@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use onyx_storage::buffer::pipeline::CompressedUnit;
-use onyx_storage::packer::packer::{new_hole_map, PackResult, Packer};
+use onyx_storage::packer::packer::{PackResult, Packer};
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::types::*;
 
@@ -34,7 +34,7 @@ fn make_allocator(usable_blocks: u64) -> Arc<SpaceAllocator> {
 #[test]
 fn passthrough_large_fragment() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     // Fragment >= BLOCK_SIZE should be passed through
     let unit = make_unit("vol-a", 0, 1, BLOCK_SIZE as usize);
@@ -53,7 +53,7 @@ fn passthrough_large_fragment() {
 #[test]
 fn buffer_small_fragment() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     // Small fragment should be buffered
     let unit = make_unit("vol-a", 0, 1, 500);
@@ -74,7 +74,7 @@ fn buffer_small_fragment() {
 #[test]
 fn two_fragments_share_slot() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     let unit1 = make_unit("vol-a", 0, 1, 1000);
     let unit2 = make_unit("vol-a", 1, 1, 1500);
@@ -100,7 +100,7 @@ fn two_fragments_share_slot() {
 #[test]
 fn fragment_doesnt_fit_seals_slot() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     // Fill slot almost to capacity
     let unit1 = make_unit("vol-a", 0, 1, 3000);
@@ -133,14 +133,14 @@ fn fragment_doesnt_fit_seals_slot() {
 #[test]
 fn flush_empty_returns_none() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
     assert!(packer.flush_open_slot().is_none());
 }
 
 #[test]
 fn multi_volume_packing() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     // Fragments from different volumes can share a slot
     let unit1 = make_unit("vol-a", 0, 1, 1000);
@@ -166,7 +166,7 @@ fn multi_volume_packing() {
 #[test]
 fn exact_fit_fragment() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     // Fragment that exactly fills the remaining space
     let unit1 = make_unit("vol-a", 0, 1, 2048);
@@ -190,7 +190,7 @@ fn exact_fit_fragment() {
 fn space_exhaustion_on_first_slot() {
     // No blocks available at all
     let alloc = Arc::new(SpaceAllocator::new(0, 0));
-    let mut packer = Packer::new(alloc, new_hole_map());
+    let mut packer = Packer::new(alloc);
 
     let unit = make_unit("vol-a", 0, 1, 500);
     assert!(packer.pack_or_passthrough(unit).is_err());
@@ -202,7 +202,7 @@ fn space_exhaustion_on_first_slot() {
 fn alloc_failure_after_seal_returns_sealed_and_passthrough() {
     // Allocator with exactly 2 blocks
     let alloc = make_allocator(2);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     // First fragment opens a slot (allocates 1 block)
     let unit1 = make_unit("vol-a", 0, 1, 500);
@@ -239,8 +239,7 @@ fn alloc_failure_after_seal_returns_sealed_and_passthrough() {
                 PackResult::Passthrough(_) => "Passthrough",
                 PackResult::Buffered => "Buffered",
                 PackResult::SealedSlot(_) => "SealedSlot",
-                PackResult::SealedSlotAndPassthrough(_, _) | PackResult::FillHole(_) =>
-                    unreachable!(),
+                PackResult::SealedSlotAndPassthrough(_, _) => unreachable!(),
             }
         ),
     }
@@ -252,7 +251,7 @@ fn alloc_failure_after_seal_returns_sealed_and_passthrough() {
 #[test]
 fn sealed_slot_data_integrity() {
     let alloc = make_allocator(100);
-    let mut packer = Packer::new(alloc.clone(), new_hole_map());
+    let mut packer = Packer::new(alloc.clone());
 
     // Use distinct data patterns to verify correct placement
     let mut unit1 = make_unit("vol-a", 0, 1, 100);
@@ -274,292 +273,3 @@ fn sealed_slot_data_integrity() {
     assert!(sealed.data[300..].iter().all(|&b| b == 0));
 }
 
-#[test]
-fn hole_map_fills_hole_before_new_slot() {
-    use onyx_storage::packer::packer::HoleKey;
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    // Pre-populate hole map with a hole at PBA 42, offset 500, size 800
-    hole_map.lock().unwrap().insert(
-        HoleKey {
-            pba: Pba(42),
-            offset: 500,
-        },
-        800,
-    );
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // Fragment of 600 bytes — should fill the hole (800 >= 600)
-    let unit = make_unit("vol-a", 0, 1, 600);
-    match packer.pack_or_passthrough(unit).unwrap() {
-        PackResult::FillHole(fill) => {
-            assert_eq!(fill.pba, Pba(42));
-            assert_eq!(fill.slot_offset, 500);
-            assert_eq!(fill.unit.compressed_data.len(), 600);
-        }
-        _ => panic!("expected FillHole when hole map has a fitting hole"),
-    }
-
-    // Hole consumed from map. Remainder is NOT injected here —
-    // it will be injected by the writer after confirming the fill succeeded.
-    assert!(hole_map.lock().unwrap().is_empty());
-
-    // Verify hole_size is carried for the writer to compute remainder
-    // (already checked via fill.slot_offset and fill.unit above)
-}
-
-#[test]
-fn hole_map_best_fit_selection() {
-    use onyx_storage::packer::packer::HoleKey;
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    // Two holes: 2000 bytes and 500 bytes
-    {
-        let mut map = hole_map.lock().unwrap();
-        map.insert(
-            HoleKey {
-                pba: Pba(10),
-                offset: 0,
-            },
-            2000,
-        );
-        map.insert(
-            HoleKey {
-                pba: Pba(20),
-                offset: 100,
-            },
-            500,
-        );
-    }
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // 400-byte fragment should pick the 500-byte hole (best fit, least waste)
-    let unit = make_unit("vol-a", 0, 1, 400);
-    match packer.pack_or_passthrough(unit).unwrap() {
-        PackResult::FillHole(fill) => {
-            assert_eq!(fill.pba, Pba(20), "should pick smaller hole (best fit)");
-            assert_eq!(fill.slot_offset, 100);
-        }
-        _ => panic!("expected FillHole"),
-    }
-
-    // The 2000-byte hole should still be in the map.
-    // No remainder from the 500-byte hole yet (injected by writer on success).
-    let remaining = hole_map.lock().unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert!(remaining.contains_key(&HoleKey {
-        pba: Pba(10),
-        offset: 0
-    }));
-}
-
-#[test]
-fn hole_map_too_small_falls_through() {
-    use onyx_storage::packer::packer::HoleKey;
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    // Hole of 100 bytes — too small for a 500-byte fragment
-    hole_map.lock().unwrap().insert(
-        HoleKey {
-            pba: Pba(42),
-            offset: 0,
-        },
-        100,
-    );
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // 500-byte fragment can't fit in 100-byte hole → should open new slot (Buffered)
-    let unit = make_unit("vol-a", 0, 1, 500);
-    match packer.pack_or_passthrough(unit).unwrap() {
-        PackResult::Buffered => {}
-        PackResult::FillHole(_) => panic!("should not fill hole that's too small"),
-        _ => panic!("expected Buffered"),
-    }
-
-    // Hole should still be in the map (not consumed)
-    assert_eq!(hole_map.lock().unwrap().len(), 1);
-}
-
-#[test]
-fn hole_preferred_over_open_slot_when_doesnt_fit() {
-    use onyx_storage::packer::packer::HoleKey;
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // Fill open slot to 3500 bytes
-    let unit1 = make_unit("vol-a", 0, 1, 3500);
-    match packer.pack_or_passthrough(unit1).unwrap() {
-        PackResult::Buffered => {}
-        _ => panic!("expected Buffered"),
-    }
-
-    // Add a hole that fits 1000 bytes
-    hole_map.lock().unwrap().insert(
-        HoleKey {
-            pba: Pba(99),
-            offset: 200,
-        },
-        1000,
-    );
-
-    // 1000-byte fragment doesn't fit in open slot (3500 + 1000 > 4096)
-    // but the hole fits → should FillHole
-    let unit2 = make_unit("vol-a", 1, 1, 1000);
-    match packer.pack_or_passthrough(unit2).unwrap() {
-        PackResult::FillHole(fill) => {
-            assert_eq!(fill.pba, Pba(99));
-        }
-        _ => panic!("expected FillHole when open slot is full but hole is available"),
-    }
-
-    // Open slot should still exist (not sealed)
-    let sealed = packer.flush_open_slot();
-    assert!(sealed.is_some());
-    assert_eq!(sealed.unwrap().fragments.len(), 1); // only unit1
-}
-
-#[test]
-fn hole_map_coalesces_adjacent_holes() {
-    use onyx_storage::packer::packer::insert_hole_coalesced;
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    // Two adjacent holes: [100..300) and [300..500) at the same PBA
-    // Neither alone fits a 350-byte fragment, but merged they do.
-    // Use insert_hole_coalesced which merges at insertion time.
-    insert_hole_coalesced(&hole_map, Pba(10), 100, 200);
-    insert_hole_coalesced(&hole_map, Pba(10), 300, 200);
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // 350-byte fragment — needs the merged 400-byte hole
-    let unit = make_unit("vol-a", 0, 1, 350);
-    match packer.pack_or_passthrough(unit).unwrap() {
-        PackResult::FillHole(fill) => {
-            assert_eq!(fill.pba, Pba(10));
-            assert_eq!(fill.slot_offset, 100); // merged hole starts at 100
-            assert_eq!(fill.hole_size, 400); // 200 + 200 merged
-        }
-        _ => panic!("expected FillHole after adjacent holes are coalesced"),
-    }
-
-    // Hole map should be empty (consumed; remainder injected by writer)
-    assert!(hole_map.lock().unwrap().is_empty());
-}
-
-#[test]
-fn hole_map_does_not_coalesce_non_adjacent() {
-    use onyx_storage::packer::packer::insert_hole_coalesced;
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    // Two non-adjacent holes: [100..200) and [300..400) — gap at [200..300)
-    insert_hole_coalesced(&hole_map, Pba(10), 100, 100);
-    insert_hole_coalesced(&hole_map, Pba(10), 300, 100);
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // 150-byte fragment — neither hole (100 bytes each) fits
-    let unit = make_unit("vol-a", 0, 1, 150);
-    match packer.pack_or_passthrough(unit).unwrap() {
-        PackResult::Buffered => {} // Falls through to new slot
-        PackResult::FillHole(_) => panic!("should not fit in non-adjacent 100-byte holes"),
-        _ => {}
-    }
-
-    // Both holes should still be in the map
-    assert_eq!(hole_map.lock().unwrap().len(), 2);
-}
-
-#[test]
-fn hole_map_coalesces_across_different_pbas_independently() {
-    use onyx_storage::packer::packer::{insert_hole_coalesced, HoleKey};
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    // Adjacent holes at PBA 10, and a separate hole at PBA 20
-    insert_hole_coalesced(&hole_map, Pba(10), 0, 100);
-    insert_hole_coalesced(&hole_map, Pba(10), 100, 100);
-    insert_hole_coalesced(&hole_map, Pba(20), 0, 50);
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // 180-byte fragment — needs the merged 200-byte hole at PBA 10
-    let unit = make_unit("vol-a", 0, 1, 180);
-    match packer.pack_or_passthrough(unit).unwrap() {
-        PackResult::FillHole(fill) => {
-            assert_eq!(fill.pba, Pba(10));
-            assert_eq!(fill.hole_size, 200);
-        }
-        _ => panic!("expected FillHole from merged PBA 10 holes"),
-    }
-
-    // PBA 20's hole should still be there
-    let remaining = hole_map.lock().unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert!(remaining.contains_key(&HoleKey {
-        pba: Pba(20),
-        offset: 0
-    }));
-}
-
-#[test]
-fn hole_map_coalesces_three_segment_chain_when_bridge_inserted() {
-    use onyx_storage::packer::packer::{insert_hole_coalesced, HoleKey};
-
-    let alloc = make_allocator(100);
-    let hole_map = new_hole_map();
-
-    // Existing holes: [100..200) and [300..400), with a gap between them.
-    // Inserting the bridging hole [200..300) should merge all three into
-    // one contiguous hole [100..400).
-    insert_hole_coalesced(&hole_map, Pba(10), 100, 100);
-    insert_hole_coalesced(&hole_map, Pba(10), 300, 100);
-    insert_hole_coalesced(&hole_map, Pba(10), 200, 100);
-
-    {
-        let map = hole_map.lock().unwrap();
-        assert_eq!(map.len(), 1, "three chained holes should collapse into one");
-        assert_eq!(
-            map.get(&HoleKey {
-                pba: Pba(10),
-                offset: 100,
-            })
-            .copied(),
-            Some(300),
-            "merged chain should span [100..400)"
-        );
-    }
-
-    let mut packer = Packer::new(alloc.clone(), hole_map.clone());
-
-    // A 250-byte fragment only fits if the three segments really merged.
-    let unit = make_unit("vol-a", 0, 1, 250);
-    match packer.pack_or_passthrough(unit).unwrap() {
-        PackResult::FillHole(fill) => {
-            assert_eq!(fill.pba, Pba(10));
-            assert_eq!(fill.slot_offset, 100);
-            assert_eq!(fill.hole_size, 300);
-        }
-        _ => panic!("expected FillHole from a three-segment merged chain"),
-    }
-
-    // The merged hole was consumed; any remainder is writer-owned and not
-    // reinserted here by the packer.
-    assert!(hole_map.lock().unwrap().is_empty());
-}

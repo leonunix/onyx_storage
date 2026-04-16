@@ -15,7 +15,6 @@ use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::*;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
-use crate::packer::packer::HoleMap;
 use crate::space::allocator::SpaceAllocator;
 use crate::types::{VolumeId, BLOCK_SIZE};
 
@@ -42,15 +41,10 @@ impl DedupScanner {
             allocator,
             lifecycle,
             buffer_pool,
-            crate::packer::packer::new_hole_map(),
             config,
         )
     }
 
-    // TEMP(soak-debug/root-cause-fix): scanner now shares the writer's hole map
-    // so freeing a packed-slot PBA also purges stale holes. Keep this behavior,
-    // but once the bug is fully understood we can re-evaluate whether any extra
-    // logging around this path should be removed.
     pub fn start_with_metrics(
         metrics: Arc<EngineMetrics>,
         meta: Arc<MetaStore>,
@@ -58,7 +52,6 @@ impl DedupScanner {
         allocator: Arc<SpaceAllocator>,
         lifecycle: Arc<VolumeLifecycleManager>,
         buffer_pool: Arc<WriteBufferPool>,
-        hole_map: HoleMap,
         config: DedupConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -76,7 +69,6 @@ impl DedupScanner {
                     &allocator,
                     &lifecycle,
                     &buffer_pool,
-                    &hole_map,
                     &config_clone,
                     &running_clone,
                 );
@@ -103,7 +95,6 @@ impl DedupScanner {
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         buffer_pool: &WriteBufferPool,
-        hole_map: &HoleMap,
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
@@ -129,7 +120,6 @@ impl DedupScanner {
                 io_engine,
                 allocator,
                 lifecycle,
-                hole_map,
                 cfg.max_rescan_per_cycle,
             ) {
                 Ok(stats) => {
@@ -164,7 +154,6 @@ impl DedupScanner {
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
-        hole_map: &HoleMap,
         max_per_cycle: usize,
     ) -> OnyxResult<RescanStats> {
         let skipped = meta.scan_dedup_skipped(max_per_cycle)?;
@@ -265,7 +254,6 @@ impl DedupScanner {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
                                 allocator,
-                                hole_map,
                                 old_pba,
                                 old_blocks,
                                 "dedup_scanner_cleanup",

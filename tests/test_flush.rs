@@ -80,7 +80,6 @@ fn start_flusher(
         allocator.clone(),
         io_engine.clone(),
         &FlushConfig::default(),
-        onyx_storage::packer::packer::new_hole_map(),
         &onyx_storage::dedup::config::DedupConfig::default(),
     )
 }
@@ -417,7 +416,6 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
         allocator,
         io_engine,
         &FlushConfig::default(),
-        onyx_storage::packer::packer::new_hole_map(),
         &onyx_storage::dedup::config::DedupConfig {
             enabled: false,
             ..Default::default()

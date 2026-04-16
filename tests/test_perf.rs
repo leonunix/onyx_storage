@@ -408,14 +408,13 @@ fn print_perf_report(
         human_bytes(delta.compress_output_bytes),
     );
     eprintln!(
-        "writer-stage: total={} alloc={} io={} meta={} cleanup={} dedup_index={} hole_detect={} mark_flushed={}",
+        "writer-stage: total={} alloc={} io={} meta={} cleanup={} dedup_index={} mark_flushed={}",
         human_duration_ns(delta.flush_writer_total_ns),
         human_duration_ns(delta.flush_writer_alloc_ns),
         human_duration_ns(delta.flush_writer_io_ns),
         human_duration_ns(delta.flush_writer_meta_ns),
         human_duration_ns(delta.flush_writer_cleanup_ns),
         human_duration_ns(delta.flush_writer_dedup_index_ns),
-        human_duration_ns(delta.flush_writer_hole_detect_ns),
         human_duration_ns(delta.flush_writer_mark_flushed_ns),
     );
 }

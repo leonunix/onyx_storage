@@ -1020,94 +1020,6 @@ impl MetaStore {
         Ok(newly_zeroed)
     }
 
-    /// Atomically write blockmap entries for a hole fill, incrementing the existing
-    /// PBA refcount and decrementing old PBA refcounts.
-    ///
-    /// Old mappings are re-read inside the lock (same rationale as `atomic_batch_write`).
-    /// `total_new_refs` is the number of LBAs being written (used to compute net increment).
-    ///
-    /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were decremented
-    /// (excludes self-referencing decrements where old PBA == fill PBA).
-    pub fn atomic_batch_write_hole_fill(
-        &self,
-        vol_id: &VolumeId,
-        batch_values: &[(Lba, BlockmapValue)],
-        pba: Pba,
-        total_new_refs: u32,
-    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
-        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
-        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
-
-        let lbas: Vec<Lba> = batch_values.iter().map(|(lba, _)| *lba).collect();
-        let bm_keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
-        let _blockmap_guards = self.lock_blockmap_keys(&bm_keys);
-        let old_mappings = self.multi_get_mappings(vol_id, &lbas)?;
-
-        let mut self_decrement: u32 = 0;
-        let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
-        for old in old_mappings.iter().flatten() {
-            if old.pba == pba {
-                self_decrement += 1;
-            } else {
-                let old_blocks = old.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
-                let entry = old_pba_meta.entry(old.pba).or_insert((0, old_blocks));
-                entry.0 += 1;
-                entry.1 = entry.1.max(old_blocks);
-            }
-        }
-
-        let mut touched_pbas: Vec<Pba> = old_pba_meta.keys().copied().collect();
-        touched_pbas.push(pba);
-        let _refcount_guards = self.lock_refcount_pbas(touched_pbas);
-
-        // Guard: reject if target PBA refcount is 0 (slot was freed).
-        // Between the caller's hole detection and this point, another thread may
-        // have decremented the slot's refcount to 0 and freed it to the allocator.
-        // Writing new entries to a freed PBA would create live blockmap references
-        // for a PBA the allocator considers free.
-        let current_rc = self.get_refcount(pba)?;
-        if current_rc == 0 {
-            return Err(OnyxError::Io(std::io::Error::other(format!(
-                "hole fill rejected: target PBA {:?} refcount is 0 (slot freed between hole detection and fill)",
-                pba,
-            ))));
-        }
-
-        let net_increment = total_new_refs - self_decrement;
-        let old_pbas: Vec<Pba> = old_pba_meta.keys().copied().collect();
-        let old_refcounts = self.refcounts_by_pba(&old_pbas)?;
-
-        let mut batch = WriteBatch::default();
-
-        for ((_, value), bm_key) in batch_values.iter().zip(bm_keys.iter()) {
-            let bm_val = encode_blockmap_value(value);
-            batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
-        }
-
-        // Increment existing PBA refcount by net amount
-        let new_rc = current_rc + net_increment;
-        let rc_key = encode_refcount_key(pba);
-        batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(new_rc));
-
-        let mut newly_zeroed: HashMap<Pba, (u32, u32)> = HashMap::new();
-        for (old_pba, (decrement, blocks)) in &old_pba_meta {
-            let old_rc = old_refcounts.get(old_pba).copied().unwrap_or(0);
-            let old_new = old_rc.saturating_sub(*decrement);
-            let old_rc_key = encode_refcount_key(*old_pba);
-            if old_new == 0 {
-                batch.delete_cf(&cf_refcount, &old_rc_key);
-                if old_rc > 0 {
-                    newly_zeroed.insert(*old_pba, (*decrement, *blocks));
-                }
-            } else {
-                batch.put_cf(&cf_refcount, &old_rc_key, &encode_refcount_value(old_new));
-            }
-        }
-
-        self.db.write_opt(batch, &self.hot_write_opts)?;
-        Ok(newly_zeroed)
-    }
-
     /// Atomically write blockmap entries from multiple volumes sharing the same PBA
     /// (packed slot). Sets the total refcount for the PBA and decrements old PBAs.
     ///
@@ -1292,35 +1204,6 @@ impl MetaStore {
 
         self.db.write_opt(batch, &self.hot_write_opts)?;
         Ok(newly_zeroed)
-    }
-
-    /// Find all unique volume IDs that have blockmap entries pointing to a given PBA.
-    /// Used by write_hole_fill to acquire lifecycle locks on all volumes in a packed slot.
-    /// Find all unique volume IDs that have blockmap entries pointing to a given PBA.
-    /// Scans all per-volume blockmap CFs.
-    pub fn find_volume_ids_by_pba(&self, target_pba: Pba) -> OnyxResult<Vec<String>> {
-        let mut vol_ids = std::collections::HashSet::new();
-        for cf_name in self.all_blockmap_cf_names() {
-            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            if let Some(cf) = self.db.cf_handle(&cf_name) {
-                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-                for item in iter {
-                    let (_, value) = item?;
-                    if let Some(bv) = decode_blockmap_value(&value) {
-                        if bv.pba == target_pba {
-                            vol_ids.insert(vol_id.clone());
-                            break; // Found in this volume, move to next
-                        }
-                    }
-                }
-            }
-        }
-        let mut result: Vec<String> = vol_ids.into_iter().collect();
-        result.sort();
-        Ok(result)
     }
 
     /// Check if any blockmap entry across all volumes references the given PBA.
