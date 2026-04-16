@@ -232,8 +232,9 @@ impl EngineHarness {
 
         self.engine()
             .meta()
-            .scan_all_blockmap_entries(&mut |key, value| {
-                let (vol_id, lba) = decode_blockmap_key(key).expect("valid blockmap key");
+            .scan_all_blockmap_entries(&mut |vol_id_str, key, value| {
+                let vol_id = vol_id_str.to_string();
+                let lba = decode_blockmap_key(key).expect("valid blockmap key");
                 let mapping = decode_blockmap_value(value).expect("valid blockmap value");
                 let volume = volumes
                     .get(&vol_id)

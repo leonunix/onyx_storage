@@ -3,10 +3,25 @@ use crate::types::{Lba, Pba, VolumeId};
 
 /// Column family names
 pub const CF_VOLUMES: &str = "volumes";
-pub const CF_BLOCKMAP: &str = "blockmap";
+/// Legacy single blockmap CF — only used during migration to per-volume CFs.
+pub const CF_BLOCKMAP_LEGACY: &str = "blockmap";
 pub const CF_REFCOUNT: &str = "refcount";
 pub const CF_DEDUP_INDEX: &str = "dedup_index";
 pub const CF_DEDUP_REVERSE: &str = "dedup_reverse";
+
+/// Prefix for per-volume blockmap column families: "blockmap:{vol_id}"
+pub const BLOCKMAP_CF_PREFIX: &str = "blockmap:";
+
+/// Build the CF name for a volume's blockmap: `"blockmap:{vol_id}"`.
+pub fn blockmap_cf_name(vol_id: &str) -> String {
+    format!("{}{}", BLOCKMAP_CF_PREFIX, vol_id)
+}
+
+/// Extract the volume ID from a per-volume blockmap CF name.
+/// Returns `None` if the name doesn't start with `BLOCKMAP_CF_PREFIX`.
+pub fn vol_id_from_blockmap_cf(cf_name: &str) -> Option<&str> {
+    cf_name.strip_prefix(BLOCKMAP_CF_PREFIX)
+}
 
 /// BlockmapValue flags
 pub const FLAG_DEDUP_SKIPPED: u8 = 0x01;
@@ -36,14 +51,27 @@ pub struct BlockmapValue {
     pub flags: u8,
 }
 
-// --- Blockmap key: volume_id (length-prefixed) + lba ---
-// Format: 1-byte vol_id_len + vol_id bytes + 8-byte lba (BE)
-// This eliminates hash collision risk entirely.
+// --- Per-volume blockmap key: just lba (8B BE) ---
+// Each volume has its own CF, so vol_id is implicit in the CF name.
 
-/// Encode blockmap key: vol_id_len(1B) + vol_id + lba(8B BE)
-///
-/// Returns error if vol_id exceeds MAX_VOLUME_ID_BYTES or is empty.
-pub fn encode_blockmap_key(vol_id: &VolumeId, lba: Lba) -> Result<Vec<u8>, OnyxError> {
+/// Encode blockmap key for per-volume CF: lba(8B BE).
+pub fn encode_blockmap_key(lba: Lba) -> [u8; 8] {
+    lba.0.to_be_bytes()
+}
+
+/// Decode blockmap key from per-volume CF: lba(8B BE).
+pub fn decode_blockmap_key(key: &[u8]) -> Option<Lba> {
+    if key.len() != 8 {
+        return None;
+    }
+    Some(Lba(u64::from_be_bytes(key[..8].try_into().unwrap())))
+}
+
+// --- Legacy blockmap key (for migration): vol_id_len(1B) + vol_id + lba(8B BE) ---
+
+/// Encode legacy blockmap key: vol_id_len(1B) + vol_id + lba(8B BE).
+/// Used only during migration from the old single CF_BLOCKMAP.
+pub fn encode_blockmap_key_legacy(vol_id: &VolumeId, lba: Lba) -> Result<Vec<u8>, OnyxError> {
     let id_bytes = vol_id.0.as_bytes();
     validate_vol_id_len(id_bytes.len())?;
     let id_len = id_bytes.len() as u8;
@@ -54,8 +82,9 @@ pub fn encode_blockmap_key(vol_id: &VolumeId, lba: Lba) -> Result<Vec<u8>, OnyxE
     Ok(key)
 }
 
-/// Decode blockmap key back to (vol_id_str, lba)
-pub fn decode_blockmap_key(key: &[u8]) -> Option<(String, Lba)> {
+/// Decode legacy blockmap key back to (vol_id_str, lba).
+/// Used only during migration from the old single CF_BLOCKMAP.
+pub fn decode_blockmap_key_legacy(key: &[u8]) -> Option<(String, Lba)> {
     if key.len() < 1 + 8 {
         return None;
     }
@@ -67,17 +96,6 @@ pub fn decode_blockmap_key(key: &[u8]) -> Option<(String, Lba)> {
     let lba_bytes: [u8; 8] = key[1 + id_len..].try_into().ok()?;
     let lba = u64::from_be_bytes(lba_bytes);
     Some((vol_id, Lba(lba)))
-}
-
-/// Build the key prefix for a volume (for iteration / delete_volume scans)
-pub fn blockmap_key_prefix(vol_id: &VolumeId) -> Result<Vec<u8>, OnyxError> {
-    let id_bytes = vol_id.0.as_bytes();
-    validate_vol_id_len(id_bytes.len())?;
-    let id_len = id_bytes.len() as u8;
-    let mut prefix = Vec::with_capacity(1 + id_len as usize);
-    prefix.push(id_len);
-    prefix.extend_from_slice(id_bytes);
-    Ok(prefix)
 }
 
 fn validate_vol_id_len(len: usize) -> Result<(), OnyxError> {

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rocksdb::{
-    properties, BlockBasedOptions, ColumnFamilyDescriptor, MergeOperands, Options, ReadOptions,
-    WriteBatch, WriteOptions, DB,
+    properties, BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode,
+    MergeOperands, MultiThreaded, Options, ReadOptions, WriteBatch, WriteOptions,
 };
 
 use crate::config::MetaConfig;
@@ -31,18 +31,6 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     mix_u64(hash)
-}
-
-fn lexicographic_successor(key: &[u8]) -> Option<Vec<u8>> {
-    let mut next = key.to_vec();
-    for idx in (0..next.len()).rev() {
-        if next[idx] != u8::MAX {
-            next[idx] += 1;
-            next.truncate(idx + 1);
-            return Some(next);
-        }
-    }
-    None
 }
 
 /// Full merge for CF_REFCOUNT: applies all pending i32 deltas to the base u32 value.
@@ -101,7 +89,7 @@ pub enum DedupHitResult {
 }
 
 pub struct MetaStore {
-    db: DB,
+    db: DBWithThreadMode<MultiThreaded>,
     /// Striped locks for blockmap key updates.
     ///
     /// Any operation that re-reads + rewrites a blockmap entry must hold the
@@ -122,16 +110,33 @@ pub struct MetaStore {
     /// Cold-path operations (create/delete volume, reconciliation) keep
     /// sync = true via the default `db.write(batch)`.
     hot_write_opts: WriteOptions,
+    /// Block cache size from config — reused when creating new per-volume CFs.
+    block_cache_mb: usize,
 }
 
 impl MetaStore {
-    const ALL_CFS: [&'static str; 5] = [
+    /// Global (non-blockmap) column families that always exist.
+    const GLOBAL_CFS: [&'static str; 4] = [
         CF_VOLUMES,
-        CF_BLOCKMAP,
         CF_REFCOUNT,
         CF_DEDUP_INDEX,
         CF_DEDUP_REVERSE,
     ];
+
+    /// Build the Options for a per-volume blockmap CF (bloom + LZ4 + cache).
+    fn blockmap_cf_opts(block_cache_mb: usize) -> Options {
+        let mut opts = Options::default();
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_bloom_filter(10.0, false);
+        block_opts.set_block_size(4096);
+        if block_cache_mb > 0 {
+            let cache = rocksdb::Cache::new_lru_cache(block_cache_mb * 1024 * 1024);
+            block_opts.set_block_cache(&cache);
+        }
+        opts.set_block_based_table_factory(&block_opts);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts
+    }
 
     pub fn open(config: &MetaConfig) -> OnyxResult<Self> {
         let mut db_opts = Options::default();
@@ -144,22 +149,23 @@ impl MetaStore {
             db_opts.set_wal_dir(wal_dir);
         }
 
-        // Volumes CF: small, default options
-        let cf_volumes = ColumnFamilyDescriptor::new(CF_VOLUMES, Options::default());
+        let rocksdb_path = config.rocksdb_path.as_ref().ok_or_else(|| {
+            OnyxError::Config("meta.rocksdb_path is required to open MetaStore".into())
+        })?;
 
-        // Blockmap CF: hot path, bloom filter + LZ4
-        // Keys are length-prefixed volume ID + LBA, no fixed prefix size.
-        let mut blockmap_opts = Options::default();
-        let mut blockmap_block_opts = BlockBasedOptions::default();
-        blockmap_block_opts.set_bloom_filter(10.0, false);
-        blockmap_block_opts.set_block_size(4096);
-        if config.block_cache_mb > 0 {
-            let cache = rocksdb::Cache::new_lru_cache(config.block_cache_mb * 1024 * 1024);
-            blockmap_block_opts.set_block_cache(&cache);
-        }
-        blockmap_opts.set_block_based_table_factory(&blockmap_block_opts);
-        blockmap_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        let cf_blockmap = ColumnFamilyDescriptor::new(CF_BLOCKMAP, blockmap_opts);
+        // Discover existing CFs so we don't lose per-volume blockmap CFs on reopen.
+        let existing_cfs: Vec<String> = if rocksdb_path.exists() {
+            DBWithThreadMode::<MultiThreaded>::list_cf(&db_opts, rocksdb_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // --- Build CF descriptors ---
+
+        let mut descriptors: Vec<ColumnFamilyDescriptor> = Vec::new();
+
+        // Volumes CF: small, default options
+        descriptors.push(ColumnFamilyDescriptor::new(CF_VOLUMES, Options::default()));
 
         // Refcount CF: bloom filter + merge operator for lock-free increment/decrement
         let mut refcount_opts = Options::default();
@@ -171,71 +177,206 @@ impl MetaStore {
             refcount_full_merge,
             refcount_partial_merge,
         );
-        let cf_refcount = ColumnFamilyDescriptor::new(CF_REFCOUNT, refcount_opts);
+        descriptors.push(ColumnFamilyDescriptor::new(CF_REFCOUNT, refcount_opts));
 
-        // Dedup index CF: content_hash(32B) → DedupEntry(27B), high bloom FPR for mostly-miss workloads
+        // Dedup index CF: content_hash(32B) → DedupEntry(27B)
         let mut dedup_index_opts = Options::default();
         let mut dedup_index_block_opts = BlockBasedOptions::default();
         dedup_index_block_opts.set_bloom_filter(15.0, false);
         dedup_index_opts.set_block_based_table_factory(&dedup_index_block_opts);
-        let cf_dedup_index = ColumnFamilyDescriptor::new(CF_DEDUP_INDEX, dedup_index_opts);
+        descriptors.push(ColumnFamilyDescriptor::new(CF_DEDUP_INDEX, dedup_index_opts));
 
-        // Dedup reverse CF: pba(8B)+hash(32B) → empty, for eager cleanup on PBA free
+        // Dedup reverse CF: pba(8B)+hash(32B) → empty
         let mut dedup_reverse_opts = Options::default();
         let mut dedup_reverse_block_opts = BlockBasedOptions::default();
         dedup_reverse_block_opts.set_bloom_filter(10.0, false);
         dedup_reverse_opts.set_block_based_table_factory(&dedup_reverse_block_opts);
-        let cf_dedup_reverse = ColumnFamilyDescriptor::new(CF_DEDUP_REVERSE, dedup_reverse_opts);
+        descriptors.push(ColumnFamilyDescriptor::new(CF_DEDUP_REVERSE, dedup_reverse_opts));
 
-        let rocksdb_path = config.rocksdb_path.as_ref().ok_or_else(|| {
-            OnyxError::Config("meta.rocksdb_path is required to open MetaStore".into())
-        })?;
+        // Per-volume blockmap CFs discovered from existing DB
+        let has_legacy_blockmap = existing_cfs.iter().any(|n| n == CF_BLOCKMAP_LEGACY);
+        for cf_name in &existing_cfs {
+            if vol_id_from_blockmap_cf(cf_name).is_some() {
+                descriptors.push(ColumnFamilyDescriptor::new(
+                    cf_name.as_str(),
+                    Self::blockmap_cf_opts(config.block_cache_mb),
+                ));
+            }
+        }
 
-        let db = DB::open_cf_descriptors(
+        // Legacy CF_BLOCKMAP — keep it open for migration, will drop after
+        if has_legacy_blockmap {
+            descriptors.push(ColumnFamilyDescriptor::new(
+                CF_BLOCKMAP_LEGACY,
+                Self::blockmap_cf_opts(config.block_cache_mb),
+            ));
+        }
+
+        let db = DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(
             &db_opts,
             rocksdb_path,
-            vec![
-                cf_volumes,
-                cf_blockmap,
-                cf_refcount,
-                cf_dedup_index,
-                cf_dedup_reverse,
-            ],
+            descriptors,
         )?;
 
         let mut hot_write_opts = WriteOptions::default();
         hot_write_opts.set_sync(false);
 
-        Ok(Self {
+        let store = Self {
             db,
             blockmap_locks: (0..BLOCKMAP_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             refcount_locks: (0..REFCOUNT_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             hot_write_opts,
+            block_cache_mb: config.block_cache_mb,
+        };
+
+        // Run migration if legacy CF_BLOCKMAP exists
+        if has_legacy_blockmap {
+            store.migrate_legacy_blockmap()?;
+        }
+
+        Ok(store)
+    }
+
+    /// Create a per-volume blockmap CF. Called when a new volume is created.
+    pub fn create_blockmap_cf(&self, vol_id: &str) -> OnyxResult<()> {
+        let cf_name = blockmap_cf_name(vol_id);
+        if self.db.cf_handle(&cf_name).is_some() {
+            return Ok(()); // Already exists (e.g. reopened)
+        }
+        let opts = Self::blockmap_cf_opts(self.block_cache_mb);
+        self.db.create_cf(&cf_name, &opts)?;
+        tracing::info!(volume = vol_id, cf = %cf_name, "created per-volume blockmap CF");
+        Ok(())
+    }
+
+    /// Drop a per-volume blockmap CF. Called when a volume is deleted.
+    pub fn drop_blockmap_cf(&self, vol_id: &str) -> OnyxResult<()> {
+        let cf_name = blockmap_cf_name(vol_id);
+        if self.db.cf_handle(&cf_name).is_none() {
+            return Ok(()); // Already gone
+        }
+        self.db.drop_cf(&cf_name)?;
+        tracing::info!(volume = vol_id, cf = %cf_name, "dropped per-volume blockmap CF");
+        Ok(())
+    }
+
+    /// Get the CF handle for a volume's blockmap. Returns None if the CF doesn't exist.
+    fn blockmap_cf(&self, vol_id: &str) -> Option<Arc<BoundColumnFamily<'_>>> {
+        let cf_name = blockmap_cf_name(vol_id);
+        self.db.cf_handle(&cf_name)
+    }
+
+    /// Get the CF handle for a volume's blockmap, returning an error if missing.
+    fn require_blockmap_cf(&self, vol_id: &str) -> OnyxResult<Arc<BoundColumnFamily<'_>>> {
+        self.blockmap_cf(vol_id).ok_or_else(|| {
+            OnyxError::Config(format!(
+                "blockmap CF not found for volume '{}' — was it created?",
+                vol_id
+            ))
         })
     }
 
+    /// Collect all per-volume blockmap CF names currently in the DB.
+    fn all_blockmap_cf_names(&self) -> Vec<String> {
+        // RocksDB doesn't expose a list-cf-handles API on an open DB,
+        // so we re-list from the filesystem path.  This is only called
+        // on cold paths (GC scan, orphan cleanup, migration).
+        let path = self.db.path();
+        let opts = Options::default();
+        DBWithThreadMode::<MultiThreaded>::list_cf(&opts, path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| vol_id_from_blockmap_cf(n).is_some())
+            .collect()
+    }
+
+    /// Migrate legacy single CF_BLOCKMAP to per-volume CFs.
+    fn migrate_legacy_blockmap(&self) -> OnyxResult<()> {
+        let legacy_cf = match self.db.cf_handle(CF_BLOCKMAP_LEGACY) {
+            Some(cf) => cf,
+            None => return Ok(()),
+        };
+
+        tracing::info!("starting migration from legacy CF_BLOCKMAP to per-volume CFs");
+
+        // Scan all entries, group by vol_id
+        let mut entries_by_vol: HashMap<String, Vec<(Lba, Vec<u8>)>> = HashMap::new();
+        let iter = self.db.iterator_cf(&legacy_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if let Some((vol_id, lba)) = decode_blockmap_key_legacy(&key) {
+                entries_by_vol
+                    .entry(vol_id)
+                    .or_default()
+                    .push((lba, value.to_vec()));
+            }
+        }
+
+        let total_entries: usize = entries_by_vol.values().map(|v| v.len()).sum();
+        tracing::info!(
+            volumes = entries_by_vol.len(),
+            total_entries,
+            "scanned legacy blockmap for migration"
+        );
+
+        // Create per-volume CFs and write entries
+        for (vol_id, entries) in &entries_by_vol {
+            self.create_blockmap_cf(vol_id)?;
+            let cf = self.require_blockmap_cf(vol_id)?;
+            let mut batch = WriteBatch::default();
+            for (lba, value) in entries {
+                let key = encode_blockmap_key(*lba);
+                batch.put_cf(&cf, &key, value);
+            }
+            self.db.write(batch)?;
+            tracing::info!(
+                volume = vol_id,
+                entries = entries.len(),
+                "migrated blockmap entries to per-volume CF"
+            );
+        }
+
+        // Drop legacy CF
+        self.db.drop_cf(CF_BLOCKMAP_LEGACY)?;
+        tracing::info!("dropped legacy CF_BLOCKMAP after migration");
+
+        Ok(())
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<RocksDbMemorySnapshot> {
+        // Collect all CF names (global + per-volume blockmap)
+        let mut all_cf_names: Vec<String> = Self::GLOBAL_CFS.iter().map(|s| s.to_string()).collect();
+        all_cf_names.extend(self.all_blockmap_cf_names());
+
         let sum_cf_property = |prop| -> OnyxResult<u64> {
             let mut total = 0u64;
-            for cf_name in Self::ALL_CFS {
-                let cf = self.db.cf_handle(cf_name).unwrap();
-                total =
-                    total.saturating_add(self.db.property_int_value_cf(&cf, prop)?.unwrap_or(0));
+            for cf_name in &all_cf_names {
+                if let Some(cf) = self.db.cf_handle(cf_name) {
+                    total = total
+                        .saturating_add(self.db.property_int_value_cf(&cf, prop)?.unwrap_or(0));
+                }
             }
             Ok(total)
         };
 
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        // Use the first per-volume blockmap CF (or refcount CF) for block cache stats
+        let cache_cf_name = self
+            .all_blockmap_cf_names()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| CF_REFCOUNT.to_string());
+        let cache_cf = self.db.cf_handle(&cache_cf_name).unwrap();
+
         Ok(RocksDbMemorySnapshot {
             block_cache_capacity_bytes: self
                 .db
-                .property_int_value_cf(&cf_blockmap, properties::BLOCK_CACHE_CAPACITY)?,
+                .property_int_value_cf(&cache_cf, properties::BLOCK_CACHE_CAPACITY)?,
             block_cache_usage_bytes: self
                 .db
-                .property_int_value_cf(&cf_blockmap, properties::BLOCK_CACHE_USAGE)?,
+                .property_int_value_cf(&cache_cf, properties::BLOCK_CACHE_USAGE)?,
             block_cache_pinned_usage_bytes: self
                 .db
-                .property_int_value_cf(&cf_blockmap, properties::BLOCK_CACHE_PINNED_USAGE)?,
+                .property_int_value_cf(&cache_cf, properties::BLOCK_CACHE_PINNED_USAGE)?,
             cur_size_all_mem_tables_bytes: sum_cf_property(properties::CUR_SIZE_ALL_MEM_TABLES)?,
             size_all_mem_tables_bytes: sum_cf_property(properties::SIZE_ALL_MEM_TABLES)?,
             estimate_table_readers_mem_bytes: sum_cf_property(
@@ -314,6 +455,9 @@ impl MetaStore {
             )));
         }
 
+        // Ensure per-volume blockmap CF exists
+        self.create_blockmap_cf(&config.id.0)?;
+
         let cf = self.db.cf_handle(CF_VOLUMES).unwrap();
         let key = encode_volume_key(&config.id.0);
         let value = bincode::serialize(config).map_err(|e| OnyxError::Config(e.to_string()))?;
@@ -348,45 +492,38 @@ impl MetaStore {
     /// caller can free the correct number of physical blocks.
     pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<(Pba, u32)>> {
         let cf_volumes = self.db.cf_handle(CF_VOLUMES).unwrap();
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
-        let prefix = blockmap_key_prefix(id)?;
-        let prefix_end = lexicographic_successor(&prefix);
+        // Phase 1: scan volume's blockmap CF to collect PBA decrement counts.
+        let bm_cf = match self.blockmap_cf(&id.0) {
+            Some(cf) => cf,
+            None => {
+                // No blockmap CF — just delete the volume entry
+                let vol_key = encode_volume_key(&id.0);
+                self.db.delete_cf(&cf_volumes, &vol_key)?;
+                return Ok(Vec::new());
+            }
+        };
 
-        // Phase 1: scan all blockmap entries, collect PBA decrement counts
-        // and block counts per PBA.
         let mut pba_decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut deleted_entries = 0usize;
 
-        let mut iter = self.db.raw_iterator_cf(&cf_blockmap);
-        iter.seek(&prefix);
-        while iter.valid() {
-            if let Some(key) = iter.key() {
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                if let Some(val) = iter.value() {
-                    if let Some(bv) = decode_blockmap_value(val) {
-                        let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
-                        let entry = pba_decrements.entry(bv.pba).or_insert((0, blocks));
-                        entry.0 += 1;
-                        entry.1 = entry.1.max(blocks);
-                    }
-                }
-                deleted_entries += 1;
+        let iter = self.db.iterator_cf(&bm_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (_, value) = item?;
+            if let Some(bv) = decode_blockmap_value(&value) {
+                let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                let entry = pba_decrements.entry(bv.pba).or_insert((0, blocks));
+                entry.0 += 1;
+                entry.1 = entry.1.max(blocks);
             }
-            iter.next();
-        }
-        iter.status()?;
-
-        if deleted_entries == 0 {
-            return Ok(Vec::new());
+            deleted_entries += 1;
         }
 
         let _refcount_guards = self.lock_refcount_pbas(pba_decrements.keys().copied());
 
-        // Phase 2: merge-decrement refcounts + delete blockmap + volume in one WriteBatch
+        // Phase 2: merge-decrement refcounts + delete volume in one WriteBatch,
+        //          then drop the entire blockmap CF (O(1), no per-key deletion).
         let mut batch = WriteBatch::default();
 
         for (pba, (decrement, _)) in &pba_decrements {
@@ -398,33 +535,15 @@ impl MetaStore {
             );
         }
 
-        if let Some(end) = prefix_end.as_ref() {
-            batch.delete_range_cf(&cf_blockmap, &prefix, end);
-        } else {
-            let mut iter = self.db.raw_iterator_cf(&cf_blockmap);
-            iter.seek(&prefix);
-            while iter.valid() {
-                let Some(key) = iter.key() else {
-                    break;
-                };
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                batch.delete_cf(&cf_blockmap, key);
-                iter.next();
-            }
-            iter.status()?;
-        }
-
         let vol_key = encode_volume_key(&id.0);
         batch.delete_cf(&cf_volumes, &vol_key);
 
         self.db.write(batch)?;
 
+        // Drop the per-volume blockmap CF — instant, no key-by-key deletion.
+        self.drop_blockmap_cf(&id.0)?;
+
         // Phase 3: read back refcounts to find zeroed PBAs, cleanup dedup + collect freed extents.
-        // This is best-effort: the volume is already deleted after Phase 2 committed.
-        // If cleanup fails, orphaned refcount/dedup entries are harmless and will be
-        // cleaned up by cleanup_orphaned_refcounts on next startup.
         let mut freed_extents = Vec::new();
         let pba_keys: Vec<Pba> = pba_decrements.keys().copied().collect();
         match self.multi_get_refcounts(&pba_keys) {
@@ -481,17 +600,14 @@ impl MetaStore {
         end_lba: Lba,
     ) -> OnyxResult<Vec<(Pba, u32)>> {
         let _blockmap_guards = self.lock_all_blockmap_stripes();
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
-        // Phase 1: scan blockmap range with raw iterator, collect raw keys
-        // (avoids re-encoding keys that the iterator already yields)
-        let start_key = encode_blockmap_key(vol_id, start_lba)?;
-        let end_key = encode_blockmap_key(vol_id, end_lba)?;
-        let prefix = blockmap_key_prefix(vol_id)?;
+        let start_key = encode_blockmap_key(start_lba);
+        let end_key = encode_blockmap_key(end_lba);
 
         let mut read_opts = ReadOptions::default();
-        read_opts.set_iterate_upper_bound(end_key.clone());
+        read_opts.set_iterate_upper_bound(end_key.to_vec());
 
         let mut pba_decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut deleted_entries = 0usize;
@@ -499,10 +615,7 @@ impl MetaStore {
         let mut iter = self.db.raw_iterator_cf_opt(&cf_blockmap, read_opts);
         iter.seek(&start_key);
         while iter.valid() {
-            if let (Some(key), Some(val)) = (iter.key(), iter.value()) {
-                if !key.starts_with(&prefix) {
-                    break;
-                }
+            if let (Some(_key), Some(val)) = (iter.key(), iter.value()) {
                 if let Some(bv) = decode_blockmap_value(val) {
                     let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
                     let entry = pba_decrements.entry(bv.pba).or_insert((0, blocks));
@@ -521,7 +634,7 @@ impl MetaStore {
 
         let _refcount_guards = self.lock_refcount_pbas(pba_decrements.keys().copied());
 
-        // Phase 2: atomic WriteBatch — delete blockmap entries + merge-decrement refcounts
+        // Phase 2: atomic WriteBatch — delete blockmap range + merge-decrement refcounts
         let mut batch = WriteBatch::default();
 
         for (pba, (decrement, _)) in &pba_decrements {
@@ -602,8 +715,8 @@ impl MetaStore {
         lba: Lba,
         value: &BlockmapValue,
     ) -> OnyxResult<()> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let key = encode_blockmap_key(vol_id, lba)?;
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
+        let key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([key.as_slice()]);
         let val = encode_blockmap_value(value);
         let mut batch = WriteBatch::default();
@@ -613,8 +726,11 @@ impl MetaStore {
     }
 
     pub fn get_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<Option<BlockmapValue>> {
-        let cf = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let key = encode_blockmap_key(vol_id, lba)?;
+        let cf = match self.blockmap_cf(&vol_id.0) {
+            Some(cf) => cf,
+            None => return Ok(None), // Volume CF doesn't exist (not created or deleted)
+        };
+        let key = encode_blockmap_key(lba);
         match self.db.get_cf(&cf, &key)? {
             Some(data) => Ok(decode_blockmap_value(&data)),
             None => Ok(None),
@@ -631,11 +747,11 @@ impl MetaStore {
         if lbas.is_empty() {
             return Ok(Vec::new());
         }
-        let cf = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let keys: Vec<Vec<u8>> = lbas
-            .iter()
-            .map(|lba| encode_blockmap_key(vol_id, *lba))
-            .collect::<OnyxResult<Vec<_>>>()?;
+        let cf = match self.blockmap_cf(&vol_id.0) {
+            Some(cf) => cf,
+            None => return Ok(vec![None; lbas.len()]),
+        };
+        let keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
         let results = self
             .db
             .multi_get_cf(keys.iter().map(|k| (&cf, k.as_slice())));
@@ -651,8 +767,8 @@ impl MetaStore {
     }
 
     pub fn delete_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<()> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let key = encode_blockmap_key(vol_id, lba)?;
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
+        let key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([key.as_slice()]);
         let mut batch = WriteBatch::default();
         batch.delete_cf(&cf_blockmap, &key);
@@ -666,13 +782,15 @@ impl MetaStore {
         start: Lba,
         end: Lba,
     ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
-        let cf = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let start_key = encode_blockmap_key(vol_id, start)?;
-        let end_key = encode_blockmap_key(vol_id, end)?;
-        let prefix = blockmap_key_prefix(vol_id)?;
+        let cf = match self.blockmap_cf(&vol_id.0) {
+            Some(cf) => cf,
+            None => return Ok(Vec::new()),
+        };
+        let start_key = encode_blockmap_key(start);
+        let end_key = encode_blockmap_key(end);
 
         let mut read_opts = ReadOptions::default();
-        read_opts.set_iterate_upper_bound(end_key);
+        read_opts.set_iterate_upper_bound(end_key.to_vec());
 
         let mut results = Vec::new();
         let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
@@ -680,10 +798,7 @@ impl MetaStore {
 
         while iter.valid() {
             if let (Some(key), Some(val)) = (iter.key(), iter.value()) {
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                if let Some((_, lba)) = decode_blockmap_key(key) {
+                if let Some(lba) = decode_blockmap_key(key) {
                     if let Some(bv) = decode_blockmap_value(val) {
                         results.push((lba, bv));
                     }
@@ -768,10 +883,10 @@ impl MetaStore {
         lba: Lba,
         value: &BlockmapValue,
     ) -> OnyxResult<()> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
-        let bm_key = encode_blockmap_key(vol_id, lba)?;
+        let bm_key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([bm_key.as_slice()]);
         let _refcount_guards = self.lock_refcount_pbas([value.pba]);
         let bm_val = encode_blockmap_value(value);
@@ -793,10 +908,10 @@ impl MetaStore {
         old_pba: Option<Pba>,
         new_value: &BlockmapValue,
     ) -> OnyxResult<()> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
-        let bm_key = encode_blockmap_key(vol_id, lba)?;
+        let bm_key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([bm_key.as_slice()]);
         let current_old_mapping = self.get_mapping(vol_id, lba)?;
         let current_old_pba = current_old_mapping.as_ref().map(|mapping| mapping.pba);
@@ -845,14 +960,11 @@ impl MetaStore {
         batch_values: &[(Lba, BlockmapValue)],
         new_refcount: u32,
     ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let lbas: Vec<Lba> = batch_values.iter().map(|(lba, _)| *lba).collect();
-        let bm_keys: Vec<Vec<u8>> = lbas
-            .iter()
-            .map(|lba| encode_blockmap_key(vol_id, *lba))
-            .collect::<OnyxResult<Vec<_>>>()?;
+        let bm_keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
         let _blockmap_guards = self.lock_blockmap_keys(&bm_keys);
 
         let new_pba = batch_values.first().map(|(_, v)| v.pba);
@@ -923,14 +1035,11 @@ impl MetaStore {
         pba: Pba,
         total_new_refs: u32,
     ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let lbas: Vec<Lba> = batch_values.iter().map(|(lba, _)| *lba).collect();
-        let bm_keys: Vec<Vec<u8>> = lbas
-            .iter()
-            .map(|lba| encode_blockmap_key(vol_id, *lba))
-            .collect::<OnyxResult<Vec<_>>>()?;
+        let bm_keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
         let _blockmap_guards = self.lock_blockmap_keys(&bm_keys);
         let old_mappings = self.multi_get_mappings(vol_id, &lbas)?;
 
@@ -1011,13 +1120,12 @@ impl MetaStore {
         new_pba: Pba,
         new_refcount: u32,
     ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
-        let bm_keys: Vec<Vec<u8>> = batch_values
+        let bm_keys: Vec<[u8; 8]> = batch_values
             .iter()
-            .map(|(vol_id, lba, _)| encode_blockmap_key(vol_id, *lba))
-            .collect::<OnyxResult<Vec<_>>>()?;
+            .map(|(_, lba, _)| encode_blockmap_key(*lba))
+            .collect();
         let _blockmap_guards = self.lock_blockmap_keys(&bm_keys);
 
         let mut old_mappings = Vec::with_capacity(batch_values.len());
@@ -1046,9 +1154,10 @@ impl MetaStore {
 
         let mut batch = WriteBatch::default();
 
-        for ((_, _, value), bm_key) in batch_values.iter().zip(bm_keys.iter()) {
+        for ((vol_id, _, value), bm_key) in batch_values.iter().zip(bm_keys.iter()) {
+            let vol_cf = self.require_blockmap_cf(&vol_id.0)?;
             let bm_val = encode_blockmap_value(value);
-            batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+            batch.put_cf(&vol_cf, bm_key, &bm_val);
         }
         // Read current refcount and compute net increment, instead of blind PUT.
         // A blind PUT would overwrite any refs added by concurrent dedup hits or
@@ -1096,17 +1205,13 @@ impl MetaStore {
         if units.is_empty() {
             return Ok(HashMap::new());
         }
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let mut unit_lbas: Vec<Vec<Lba>> = Vec::with_capacity(units.len());
-        let mut unit_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(units.len());
-        for (vol_id, batch_values, _) in units {
+        let mut unit_keys: Vec<Vec<[u8; 8]>> = Vec::with_capacity(units.len());
+        for (_vol_id, batch_values, _) in units {
             let lbas: Vec<Lba> = batch_values.iter().map(|(lba, _)| *lba).collect();
-            let keys: Vec<Vec<u8>> = lbas
-                .iter()
-                .map(|lba| encode_blockmap_key(vol_id, *lba))
-                .collect::<OnyxResult<Vec<_>>>()?;
+            let keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
             unit_lbas.push(lbas);
             unit_keys.push(keys);
         }
@@ -1137,9 +1242,10 @@ impl MetaStore {
                 }
             }
 
+            let vol_cf = self.require_blockmap_cf(&vol_id.0)?;
             for ((_, value), bm_key) in batch_values.iter().zip(unit_keys[unit_idx].iter()) {
                 let bm_val = encode_blockmap_value(value);
-                batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+                batch.put_cf(&vol_cf, bm_key, &bm_val);
             }
 
             // Set new PBA refcount
@@ -1190,18 +1296,24 @@ impl MetaStore {
 
     /// Find all unique volume IDs that have blockmap entries pointing to a given PBA.
     /// Used by write_hole_fill to acquire lifecycle locks on all volumes in a packed slot.
+    /// Find all unique volume IDs that have blockmap entries pointing to a given PBA.
+    /// Scans all per-volume blockmap CFs.
     pub fn find_volume_ids_by_pba(&self, target_pba: Pba) -> OnyxResult<Vec<String>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let mut vol_ids = std::collections::HashSet::new();
-        let iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, value) = item?;
-            if let Some(bv) = decode_blockmap_value(&value) {
-                if bv.pba == target_pba {
-                    if let Some((vol_id_str, _)) = decode_blockmap_key(&key) {
-                        vol_ids.insert(vol_id_str);
+        for cf_name in self.all_blockmap_cf_names() {
+            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
+                Some(v) => v.to_string(),
+                None => continue,
+            };
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        if bv.pba == target_pba {
+                            vol_ids.insert(vol_id.clone());
+                            break; // Found in this volume, move to next
+                        }
                     }
                 }
             }
@@ -1213,15 +1325,16 @@ impl MetaStore {
 
     /// Check if any blockmap entry across all volumes references the given PBA.
     pub fn has_any_blockmap_ref(&self, target_pba: Pba) -> OnyxResult<bool> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (_, value) = item?;
-            if let Some(bv) = decode_blockmap_value(&value) {
-                if bv.pba == target_pba {
-                    return Ok(true);
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        if bv.pba == target_pba {
+                            return Ok(true);
+                        }
+                    }
                 }
             }
         }
@@ -1229,16 +1342,17 @@ impl MetaStore {
     }
 
     fn count_blockmap_refs_for_pba_inner(&self, target_pba: Pba) -> OnyxResult<u32> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
         let mut refs = 0u32;
-        for item in iter {
-            let (_, value) = item?;
-            if let Some(bv) = decode_blockmap_value(&value) {
-                if bv.pba == target_pba {
-                    refs = refs.saturating_add(1);
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        if bv.pba == target_pba {
+                            refs = refs.saturating_add(1);
+                        }
+                    }
                 }
             }
         }
@@ -1258,38 +1372,44 @@ impl MetaStore {
         target_pba: Pba,
         limit: Option<usize>,
     ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
         let mut seen = std::collections::HashSet::new();
         let mut fragments = Vec::new();
-        for item in iter {
-            let (key, value) = item?;
-            let Some(bv) = decode_blockmap_value(&value) else {
+        for cf_name in self.all_blockmap_cf_names() {
+            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
+                Some(v) => v.to_string(),
+                None => continue,
+            };
+            let Some(cf) = self.db.cf_handle(&cf_name) else {
                 continue;
             };
-            if bv.pba != target_pba {
-                continue;
-            }
-            let frag_key = (
-                bv.slot_offset,
-                bv.unit_compressed_size,
-                bv.unit_original_size,
-                bv.unit_lba_count,
-                bv.compression,
-                bv.crc32,
-                bv.flags,
-            );
-            if !seen.insert(frag_key) {
-                continue;
-            }
-            let Some((vol_id, lba)) = decode_blockmap_key(&key) else {
-                continue;
-            };
-            fragments.push((vol_id, lba, bv));
-            if limit.is_some_and(|max| fragments.len() >= max) {
-                break;
+            let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (key, value) = item?;
+                let Some(bv) = decode_blockmap_value(&value) else {
+                    continue;
+                };
+                if bv.pba != target_pba {
+                    continue;
+                }
+                let frag_key = (
+                    bv.slot_offset,
+                    bv.unit_compressed_size,
+                    bv.unit_original_size,
+                    bv.unit_lba_count,
+                    bv.compression,
+                    bv.crc32,
+                    bv.flags,
+                );
+                if !seen.insert(frag_key) {
+                    continue;
+                }
+                let Some(lba) = decode_blockmap_key(&key) else {
+                    continue;
+                };
+                fragments.push((vol_id.clone(), lba, bv));
+                if limit.is_some_and(|max| fragments.len() >= max) {
+                    return Ok(fragments);
+                }
             }
         }
         Ok(fragments)
@@ -1310,10 +1430,6 @@ impl MetaStore {
     // alive while we locate the real bug. Remove or gate after the allocator /
     // hole-map issue is fixed and verified.
     /// Repair a single PBA's refcount from the live blockmap if it drifted.
-    ///
-    /// This is intentionally slow and only used on suspicious paths such as
-    /// "refcount says zero, but freeing this PBA would be dangerous". The
-    /// returned value is the exact live refcount observed in blockmap.
     pub fn reconcile_refcount_for_pba(&self, pba: Pba) -> OnyxResult<u32> {
         let _refcount_guards = self.lock_refcount_pbas([pba]);
         let current = self.get_refcount(pba)?;
@@ -1347,17 +1463,18 @@ impl MetaStore {
         let _blockmap_guards = self.lock_all_blockmap_stripes();
         let _refcount_guards = self.lock_all_refcount_stripes();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
 
-        // Collect all PBAs referenced by blockmap entries
+        // Collect all PBAs referenced by blockmap entries across all volume CFs
         let mut referenced_pbas = std::collections::HashSet::new();
-        let bm_iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
-        for item in bm_iter {
-            let (_, value) = item?;
-            if let Some(bv) = decode_blockmap_value(&value) {
-                referenced_pbas.insert(bv.pba);
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let bm_iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in bm_iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        referenced_pbas.insert(bv.pba);
+                    }
+                }
             }
         }
 
@@ -1390,19 +1507,26 @@ impl MetaStore {
         Ok(orphans)
     }
 
-    /// Scan all blockmap entries, calling the provided callback for each (key, value) pair.
+    /// Scan all blockmap entries across all volume CFs.
+    /// Callback receives (vol_id, key, value) for each entry.
     /// Used by GC scanner to identify compression units with dead blocks.
     pub fn scan_all_blockmap_entries(
         &self,
-        callback: &mut dyn FnMut(&[u8], &[u8]),
+        callback: &mut dyn FnMut(&str, &[u8], &[u8]),
     ) -> OnyxResult<()> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, value) = item?;
-            callback(&key, &value);
+        for cf_name in self.all_blockmap_cf_names() {
+            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
+                Some(v) => v,
+                None => continue,
+            };
+            let Some(cf) = self.db.cf_handle(&cf_name) else {
+                continue;
+            };
+            let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (key, value) = item?;
+                callback(vol_id, &key, &value);
+            }
         }
         Ok(())
     }
@@ -1440,11 +1564,11 @@ impl MetaStore {
         new_value: &BlockmapValue,
         hash: &ContentHash,
     ) -> OnyxResult<Option<(Pba, u32)>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
         let cf_dedup_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
 
-        let bm_key = encode_blockmap_key(vol_id, lba)?;
+        let bm_key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([bm_key.as_slice()]);
 
         let old_mapping = self.get_mapping(vol_id, lba)?;
@@ -1545,15 +1669,12 @@ impl MetaStore {
             return Ok((Vec::new(), HashMap::new()));
         }
 
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
         let cf_dedup_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
 
         let lbas: Vec<Lba> = hits.iter().map(|(lba, _, _)| *lba).collect();
-        let bm_keys: Vec<Vec<u8>> = lbas
-            .iter()
-            .map(|lba| encode_blockmap_key(vol_id, *lba))
-            .collect::<OnyxResult<Vec<_>>>()?;
+        let bm_keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
         let _blockmap_guards = self.lock_blockmap_keys(&bm_keys);
         let old_mappings = self.multi_get_mappings(vol_id, &lbas)?;
 
@@ -1876,19 +1997,25 @@ impl MetaStore {
         &self,
         limit: usize,
     ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let mut results = Vec::new();
-        let iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, value) = item?;
-            if let Some(bv) = decode_blockmap_value(&value) {
-                if bv.flags & FLAG_DEDUP_SKIPPED != 0 {
-                    if let Some((vol_id, lba)) = decode_blockmap_key(&key) {
-                        results.push((vol_id, lba, bv));
-                        if results.len() >= limit {
-                            break;
+        for cf_name in self.all_blockmap_cf_names() {
+            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
+                Some(v) => v.to_string(),
+                None => continue,
+            };
+            let Some(cf) = self.db.cf_handle(&cf_name) else {
+                continue;
+            };
+            let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (key, value) = item?;
+                if let Some(bv) = decode_blockmap_value(&value) {
+                    if bv.flags & FLAG_DEDUP_SKIPPED != 0 {
+                        if let Some(lba) = decode_blockmap_key(&key) {
+                            results.push((vol_id.clone(), lba, bv));
+                            if results.len() >= limit {
+                                return Ok(results);
+                            }
                         }
                     }
                 }
@@ -1904,8 +2031,8 @@ impl MetaStore {
         lba: Lba,
         new_flags: u8,
     ) -> OnyxResult<()> {
-        let cf = self.db.cf_handle(CF_BLOCKMAP).unwrap();
-        let key = encode_blockmap_key(vol_id, lba)?;
+        let cf = self.require_blockmap_cf(&vol_id.0)?;
+        let key = encode_blockmap_key(lba);
         match self.db.get_cf(&cf, &key)? {
             Some(data) => {
                 if let Some(mut bv) = decode_blockmap_value(&data) {
@@ -1919,22 +2046,21 @@ impl MetaStore {
         }
     }
 
-    /// Iterate all allocated physical blocks. Compression units can span multiple
-    /// 4KB slots, so blockmap is the source of truth for allocator rebuild.
-    /// Refcount keys are unioned in as a fallback for older single-slot metadata.
+    /// Iterate all allocated physical blocks across all volume CFs.
     pub fn iter_allocated_blocks(&self) -> OnyxResult<Vec<Pba>> {
-        let cf_blockmap = self.db.cf_handle(CF_BLOCKMAP).unwrap();
         let mut allocated = std::collections::BTreeSet::new();
 
-        let iter = self
-            .db
-            .iterator_cf(&cf_blockmap, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (_, value) = item?;
-            if let Some(bv) = decode_blockmap_value(&value) {
-                let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
-                for block in 0..blocks {
-                    allocated.insert(Pba(bv.pba.0 + block as u64));
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        let blocks = bv.unit_compressed_size.div_ceil(crate::types::BLOCK_SIZE);
+                        for block in 0..blocks {
+                            allocated.insert(Pba(bv.pba.0 + block as u64));
+                        }
+                    }
                 }
             }
         }

@@ -211,13 +211,22 @@ User-perceived latency = ring lock + memcpy + channel send. Encoding, CRC, disk 
 
 ## RocksDB Column Families
 
-| CF              | Key                              | Value               | Purpose                        |
-|-----------------|----------------------------------|----------------------|--------------------------------|
-| `volumes`       | `vol-{id}`                       | bincode VolumeConfig | Volume registry                |
-| `blockmap`      | `vol_id_len + vol_id + lba(BE)`  | 28B BlockmapValue    | LBA &rarr; PBA mapping         |
-| `refcount`      | `pba(BE)`                        | `count(BE)`          | Physical block reference counts|
-| `dedup_index`   | `sha256(32B)`                    | DedupEntry(27B)      | Content hash &rarr; PBA        |
-| `dedup_reverse` | `pba(BE) + sha256(32B)`          | empty                | Reverse lookup for cleanup     |
+Global CFs (fixed):
+
+| CF              | Key                     | Value               | Purpose                        |
+|-----------------|-------------------------|----------------------|--------------------------------|
+| `volumes`       | `vol-{id}`              | bincode VolumeConfig | Volume registry                |
+| `refcount`      | `pba(BE)`               | `count(BE)`          | Physical block reference counts|
+| `dedup_index`   | `sha256(32B)`           | DedupEntry(27B)      | Content hash &rarr; PBA        |
+| `dedup_reverse` | `pba(BE) + sha256(32B)` | empty                | Reverse lookup for cleanup     |
+
+Per-volume blockmap CF (one per volume, created/dropped dynamically):
+
+| CF                       | Key        | Value            | Purpose                |
+|--------------------------|------------|------------------|------------------------|
+| `blockmap:{volume_id}`   | `lba(BE)`  | 28B BlockmapValue| LBA &rarr; PBA mapping |
+
+Each volume gets its own LSM tree with independent bloom filter, compaction, and block cache. Volume deletion drops the entire CF in O(1). Legacy single-CF blockmap is auto-migrated on first open.
 
 ## Roadmap
 

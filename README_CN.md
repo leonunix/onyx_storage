@@ -125,13 +125,22 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 
 ## RocksDB Column Families
 
-| CF              | Key                              | Value               | 用途                    |
-|-----------------|----------------------------------|----------------------|-------------------------|
-| `volumes`       | `vol-{id}`                       | bincode VolumeConfig | 卷注册表                |
-| `blockmap`      | `vol_id_len + vol_id + lba(BE)`  | 28B BlockmapValue    | LBA &rarr; PBA 映射     |
-| `refcount`      | `pba(BE)`                        | `count(BE)`          | 物理块引用计数          |
-| `dedup_index`   | `sha256(32B)`                    | DedupEntry(27B)      | 内容哈希 &rarr; PBA     |
-| `dedup_reverse` | `pba(BE) + sha256(32B)`          | empty                | 反向查找用于清理        |
+全局 CF（固定）：
+
+| CF              | Key                     | Value               | 用途                    |
+|-----------------|-------------------------|----------------------|-------------------------|
+| `volumes`       | `vol-{id}`              | bincode VolumeConfig | 卷注册表                |
+| `refcount`      | `pba(BE)`               | `count(BE)`          | 物理块引用计数          |
+| `dedup_index`   | `sha256(32B)`           | DedupEntry(27B)      | 内容哈希 &rarr; PBA     |
+| `dedup_reverse` | `pba(BE) + sha256(32B)` | empty                | 反向查找用于清理        |
+
+Per-volume blockmap CF（每个 volume 一个，动态创建/销毁）：
+
+| CF                     | Key       | Value            | 用途                  |
+|------------------------|-----------|------------------|-----------------------|
+| `blockmap:{volume_id}` | `lba(BE)` | 28B BlockmapValue| LBA &rarr; PBA 映射   |
+
+每个 volume 独立 LSM tree，独立 bloom filter、compaction 和 block cache。删卷时 `drop_cf` O(1) 删除整个 CF。旧的单 CF blockmap 在首次打开时自动迁移。
 
 ## 演进路线
 

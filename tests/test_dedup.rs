@@ -397,6 +397,7 @@ fn scan_dedup_skipped() {
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
+    store.create_blockmap_cf("test-vol").unwrap();
     let vol_id = VolumeId("test-vol".into());
 
     // Write entry with DEDUP_SKIPPED flag
@@ -444,6 +445,7 @@ fn update_blockmap_flags_clears_dedup_skipped() {
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
+    store.create_blockmap_cf("test-vol").unwrap();
     let vol_id = VolumeId("test-vol".into());
 
     let val = BlockmapValue {

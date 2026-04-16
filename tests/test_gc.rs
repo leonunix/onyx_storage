@@ -122,6 +122,7 @@ fn scanner_finds_candidates_with_dead_blocks() {
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
+    meta.create_blockmap_cf("vol-test").unwrap();
 
     // Simulate a compression unit with 4 LBAs, but only 2 still point to PBA 100
     // (the other 2 were overwritten to different PBAs)
@@ -198,6 +199,7 @@ fn scanner_skips_below_threshold() {
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
+    meta.create_blockmap_cf("vol-test").unwrap();
 
     // 8-LBA unit, 7 still live → only 12.5% dead, below 25% threshold
     for i in 0..7u64 {
@@ -249,6 +251,7 @@ fn scanner_skips_single_lba_units() {
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
+    meta.create_blockmap_cf("vol-test").unwrap();
 
     // Single-LBA units can't have dead blocks
     let bv = BlockmapValue {
@@ -278,6 +281,7 @@ fn scanner_sorts_by_dead_ratio_descending() {
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
+    meta.create_blockmap_cf("vol-test").unwrap();
 
     // Unit at PBA 100: 4-LBA, 1 live → 75% dead
     meta.put_mapping(
@@ -637,6 +641,7 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
 
     // Fragment A: vol-a, 4-LBA unit at slot_offset=0, 2 live
     let vol_a = VolumeId("vol-a".into());
+    meta.create_blockmap_cf("vol-a").unwrap();
     for i in [0u16, 2] {
         meta.put_mapping(
             &vol_a,
@@ -658,6 +663,7 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
 
     // Fragment B: vol-b, 4-LBA unit at slot_offset=1000, 3 live
     let vol_b = VolumeId("vol-b".into());
+    meta.create_blockmap_cf("vol-b").unwrap();
     for i in [0u16, 1, 3] {
         meta.put_mapping(
             &vol_b,
@@ -715,7 +721,9 @@ fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_
 
     let shared_pba = Pba(4242);
     let vol_a = VolumeId("vol-a".into());
+    meta.create_blockmap_cf("vol-a").unwrap();
     let vol_b = VolumeId("vol-b".into());
+    meta.create_blockmap_cf("vol-b").unwrap();
 
     for i in [0u16, 2] {
         meta.put_mapping(
@@ -779,7 +787,9 @@ fn gc_rewriter_skips_lba_when_fragment_identity_changed_with_same_pba() {
 
     let shared_pba = Pba(777);
     let vol_a = VolumeId("vol-a".into());
+    env.meta.create_blockmap_cf("vol-a").unwrap();
     let vol_b = VolumeId("vol-b".into());
+    env.meta.create_blockmap_cf("vol-b").unwrap();
     register_volume(&env.meta, &vol_a.0, CompressionAlgo::Lz4, 100);
     register_volume(&env.meta, &vol_b.0, CompressionAlgo::Lz4, 200);
 

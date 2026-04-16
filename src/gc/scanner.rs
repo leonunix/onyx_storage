@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::OnyxResult;
-use crate::meta::schema::{decode_blockmap_key, decode_blockmap_value};
+use crate::meta::schema::{decode_blockmap_key, decode_blockmap_value}; // decode_blockmap_key now returns Option<Lba>
 use crate::meta::store::MetaStore;
 use crate::types::{Lba, Pba, VolumeId};
 
@@ -63,9 +63,9 @@ pub fn scan_gc_candidates(
 ) -> OnyxResult<Vec<GcCandidate>> {
     let mut frag_map: HashMap<FragmentKey, FragmentInfo> = HashMap::new();
 
-    // Iterate all blockmap entries
-    meta.scan_all_blockmap_entries(&mut |key: &[u8], val: &[u8]| {
-        let (vol_id_str, lba) = match decode_blockmap_key(key) {
+    // Iterate all blockmap entries across all volume CFs
+    meta.scan_all_blockmap_entries(&mut |vol_id_str: &str, key: &[u8], val: &[u8]| {
+        let lba = match decode_blockmap_key(key) {
             Some(v) => v,
             None => return,
         };
@@ -90,7 +90,7 @@ pub fn scan_gc_candidates(
         };
 
         let info = frag_map.entry(fkey).or_insert_with(|| FragmentInfo {
-            vol_id: vol_id_str.clone(),
+            vol_id: vol_id_str.to_string(),
             unit_lba_count: bv.unit_lba_count,
             compression: bv.compression,
             unit_compressed_size: bv.unit_compressed_size,
