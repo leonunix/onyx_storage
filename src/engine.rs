@@ -357,6 +357,7 @@ impl OnyxEngine {
                 io_engine.clone(),
                 buffer_pool.clone(),
                 lifecycle.clone(),
+                allocator.clone(),
                 config.gc.clone(),
             ))
         } else {
@@ -748,6 +749,7 @@ impl OnyxEngine {
                 io_engine.clone(),
                 buffer_pool.clone(),
                 lifecycle.clone(),
+                allocator.clone(),
                 config.gc.clone(),
             ))
         } else {

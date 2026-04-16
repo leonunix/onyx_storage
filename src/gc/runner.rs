@@ -13,6 +13,7 @@ use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
+use crate::space::allocator::SpaceAllocator;
 
 /// Background GC runner thread.
 pub struct GcRunner {
@@ -27,6 +28,7 @@ impl GcRunner {
         io_engine: Arc<IoEngine>,
         buffer_pool: Arc<WriteBufferPool>,
         lifecycle: Arc<VolumeLifecycleManager>,
+        allocator: Arc<SpaceAllocator>,
         config: GcConfig,
     ) -> Self {
         Self::start_with_metrics(
@@ -35,6 +37,7 @@ impl GcRunner {
             io_engine,
             buffer_pool,
             lifecycle,
+            allocator,
             config,
         )
     }
@@ -45,6 +48,7 @@ impl GcRunner {
         io_engine: Arc<IoEngine>,
         buffer_pool: Arc<WriteBufferPool>,
         lifecycle: Arc<VolumeLifecycleManager>,
+        allocator: Arc<SpaceAllocator>,
         config: GcConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -61,6 +65,7 @@ impl GcRunner {
                     &io_engine,
                     &buffer_pool,
                     &lifecycle,
+                    &allocator,
                     &config_clone,
                     &running_clone,
                 );
@@ -80,12 +85,35 @@ impl GcRunner {
         self.config.store(Arc::new(new_config));
     }
 
+    /// Compute dynamic dead_ratio_threshold based on space pressure.
+    ///
+    /// When space is plentiful, only reclaim heavily fragmented slots.
+    /// As space gets tighter, lower the threshold to reclaim more aggressively.
+    fn dynamic_threshold(cfg: &GcConfig, allocator: &SpaceAllocator) -> f64 {
+        let total = allocator.total_block_count();
+        if total == 0 {
+            return cfg.dead_ratio_threshold;
+        }
+        let free_pct = (allocator.free_block_count() * 100) / total;
+
+        if free_pct > 50 {
+            0.70  // Plentiful — only GC very dead slots
+        } else if free_pct > 30 {
+            0.50  // Moderate pressure
+        } else if free_pct > 10 {
+            0.30  // Getting tight
+        } else {
+            cfg.dead_ratio_threshold // Critical — use configured minimum (default 0.25)
+        }
+    }
+
     fn gc_loop(
         metrics: &EngineMetrics,
         meta: &MetaStore,
         io_engine: &IoEngine,
         buffer_pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
         config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
     ) {
@@ -127,9 +155,13 @@ impl GcRunner {
                 continue;
             }
 
+            // Smart GC: dynamic dead_ratio_threshold based on space pressure.
+            // More aggressive reclamation when space is tight.
+            let threshold = Self::dynamic_threshold(&cfg, allocator);
+
             // Scan for GC rewrite candidates
             let candidates =
-                match scan_gc_candidates(meta, cfg.dead_ratio_threshold, cfg.max_rewrite_per_cycle)
+                match scan_gc_candidates(meta, threshold, cfg.max_rewrite_per_cycle)
                 {
                     Ok(c) => c,
                     Err(e) => {
