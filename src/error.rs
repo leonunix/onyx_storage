@@ -5,6 +5,9 @@ pub enum OnyxError {
     #[error("RocksDB error: {0}")]
     Meta(#[from] rocksdb::Error),
 
+    #[error("redb error: {0}")]
+    Redb(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
