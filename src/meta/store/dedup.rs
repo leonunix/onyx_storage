@@ -24,14 +24,13 @@ impl MetaStore {
         new_value: &BlockmapValue,
         hash: &ContentHash,
     ) -> OnyxResult<Option<(Pba, u32)>> {
-        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
         let cf_dedup_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
 
         let bm_key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([bm_key.as_slice()]);
 
-        let old_mapping = self.get_mapping(vol_id, lba)?;
+        let old_mapping = self.redb.get_mapping(&vol_id.0, lba)?;
         let old_pba = old_mapping.as_ref().map(|m| m.pba);
         let same_pba = old_pba.is_some_and(|old| old == new_value.pba);
         let mut touched_pbas = vec![new_value.pba];
@@ -52,10 +51,6 @@ impl MetaStore {
         }
 
         let mut batch = WriteBatch::default();
-
-        let bm_val = encode_blockmap_value(new_value);
-        batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
-
         let mut decremented_old: Option<(Pba, u32)> = None;
 
         if !same_pba {
@@ -91,6 +86,11 @@ impl MetaStore {
         }
 
         self.db.write_opt(batch, &self.hot_write_opts)?;
+
+        // Commit blockmap change to redb. If same_pba and no refcount change,
+        // still refresh the blockmap entry (e.g., LBA may need updated flags).
+        self.redb.put_mapping(&vol_id.0, lba, *new_value)?;
+
         Ok(decremented_old)
     }
 
@@ -121,14 +121,13 @@ impl MetaStore {
             return Ok((Vec::new(), HashMap::new()));
         }
 
-        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
         let cf_dedup_reverse = self.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
 
         let lbas: Vec<Lba> = hits.iter().map(|(lba, _, _)| *lba).collect();
         let bm_keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
         let _blockmap_guards = self.lock_blockmap_keys(&bm_keys);
-        let old_mappings = self.multi_get_mappings(vol_id, &lbas)?;
+        let old_mappings = self.redb.batch_get_mappings(&vol_id.0, &lbas)?;
 
         let mut touched_pbas = Vec::with_capacity(hits.len() * 2);
         for (idx, (_, new_val, _)) in hits.iter().enumerate() {
@@ -162,6 +161,8 @@ impl MetaStore {
         let mut results: Vec<DedupHitResult> = Vec::with_capacity(hits.len());
         let mut target_increments: HashMap<Pba, u32> = HashMap::new();
         let mut old_decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
+        // Records which hit indices actually need a blockmap write in redb.
+        let mut accepted_idxs: Vec<usize> = Vec::new();
 
         for (idx, (_lba, new_val, hash)) in hits.iter().enumerate() {
             let old_mapping = &old_mappings[idx];
@@ -179,7 +180,9 @@ impl MetaStore {
             }
 
             if same_pba {
-                batch.put_cf(&cf_blockmap, &bm_keys[idx], &encode_blockmap_value(new_val));
+                // LBA already points to the target PBA. Still refresh the
+                // blockmap entry in redb (flags may have changed).
+                accepted_idxs.push(idx);
                 results.push(DedupHitResult::Accepted(None));
                 continue;
             }
@@ -194,7 +197,7 @@ impl MetaStore {
                 continue;
             }
 
-            batch.put_cf(&cf_blockmap, &bm_keys[idx], &encode_blockmap_value(new_val));
+            accepted_idxs.push(idx);
             *target_increments.entry(new_val.pba).or_insert(0) += 1;
 
             if let Some(old) = old_mapping {
@@ -260,6 +263,16 @@ impl MetaStore {
         }
 
         self.db.write_opt(batch, &self.hot_write_opts)?;
+
+        // Commit blockmap updates for every accepted hit.
+        if !accepted_idxs.is_empty() {
+            let redb_entries: Vec<(&str, Lba, BlockmapValue)> = accepted_idxs
+                .iter()
+                .map(|&idx| (vol_id.0.as_str(), hits[idx].0, hits[idx].1))
+                .collect();
+            self.redb.batch_put_mappings(&redb_entries)?;
+        }
+
         Ok((results, newly_zeroed))
     }
 
@@ -421,58 +434,42 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Scan blockmap for entries with DEDUP_SKIPPED flag set.
+    /// Scan all blockmap entries for DEDUP_SKIPPED flag. Uses redb paged scan.
     /// Returns (vol_id, lba, BlockmapValue) tuples, up to `limit`.
     pub fn scan_dedup_skipped(
         &self,
         limit: usize,
     ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
-        let mut results = Vec::new();
-        for cf_name in self.all_blockmap_cf_names() {
-            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            let Some(cf) = self.db.cf_handle(&cf_name) else {
-                continue;
-            };
-            let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-            for item in iter {
-                let (key, value) = item?;
-                if let Some(bv) = decode_blockmap_value(&value) {
-                    if bv.flags & FLAG_DEDUP_SKIPPED != 0 {
-                        if let Some(lba) = decode_blockmap_key(&key) {
-                            results.push((vol_id.clone(), lba, bv));
-                            if results.len() >= limit {
-                                return Ok(results);
-                            }
-                        }
-                    }
-                }
+        let mut results: Vec<(String, Lba, BlockmapValue)> = Vec::new();
+        // Use a manual iteration so we can stop early when `limit` is reached.
+        // `scan_all_mappings` does not support early termination, so we run it
+        // to completion but short-circuit the callback.
+        self.redb.scan_all_mappings(|vol_id, lba, bv| {
+            if results.len() >= limit {
+                return;
             }
-        }
+            if bv.flags & FLAG_DEDUP_SKIPPED != 0 {
+                results.push((vol_id.to_string(), lba, bv));
+            }
+        })?;
         Ok(results)
     }
 
     /// Update a single blockmap entry's flags (e.g., clear DEDUP_SKIPPED).
+    /// Read-modify-write on the redb blockmap; no refcount involvement.
     pub fn update_blockmap_flags(
         &self,
         vol_id: &VolumeId,
         lba: Lba,
         new_flags: u8,
     ) -> OnyxResult<()> {
-        let cf = self.require_blockmap_cf(&vol_id.0)?;
         let key = encode_blockmap_key(lba);
-        match self.db.get_cf(&cf, &key)? {
-            Some(data) => {
-                if let Some(mut bv) = decode_blockmap_value(&data) {
-                    bv.flags = new_flags;
-                    let val = encode_blockmap_value(&bv);
-                    self.db.put_cf(&cf, &key, &val)?;
-                }
-                Ok(())
-            }
-            None => Ok(()),
-        }
+        let _blockmap_guards = self.lock_blockmap_keys([key.as_slice()]);
+        let Some(mut bv) = self.redb.get_mapping(&vol_id.0, lba)? else {
+            return Ok(());
+        };
+        bv.flags = new_flags;
+        self.redb.put_mapping(&vol_id.0, lba, bv)?;
+        Ok(())
     }
 }

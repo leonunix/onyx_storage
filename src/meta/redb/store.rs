@@ -185,6 +185,212 @@ impl RedbStore {
         Ok(old)
     }
 
+    /// Batch-read mappings for multiple LBAs in a single redb read transaction.
+    /// Results preserve the order of `lbas`. Caches decoded L2 pages so queries
+    /// hitting the same page only pay decode cost once.
+    pub fn batch_get_mappings(
+        &self,
+        vol_id: &str,
+        lbas: &[Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        if lbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let read = self.db.begin_read().map_err(to_onyx)?;
+        let t_l1 = read.open_table(T_L1).map_err(to_onyx)?;
+        let t_pages = read.open_table(T_L2_PAGES).map_err(to_onyx)?;
+
+        let mut out = Vec::with_capacity(lbas.len());
+        let mut page_cache: std::collections::HashMap<u64, L2Page> =
+            std::collections::HashMap::new();
+        for lba in lbas {
+            let l1_idx = lba.0 / LBAS_PER_PAGE as u64;
+            let l2_off = (lba.0 % LBAS_PER_PAGE as u64) as usize;
+            let l1_guard = t_l1.get((vol_id, l1_idx)).map_err(to_onyx)?;
+            let Some(l1_raw) = l1_guard else {
+                out.push(None);
+                continue;
+            };
+            let l1_entry = L1Entry::decode(&l1_raw.value())
+                .expect("L1 entry encoded by this module must roundtrip");
+            drop(l1_raw);
+
+            if !page_cache.contains_key(&l1_entry.page_id) {
+                let page_guard = t_pages
+                    .get(l1_entry.page_id)
+                    .map_err(to_onyx)?
+                    .unwrap_or_else(|| panic!("L1 references missing page {}", l1_entry.page_id));
+                let page = L2Page::decode(page_guard.value())
+                    .unwrap_or_else(|| panic!("L2 page {} failed to decode", l1_entry.page_id));
+                page_cache.insert(l1_entry.page_id, page);
+            }
+            out.push(page_cache.get(&l1_entry.page_id).unwrap().get(l2_off));
+        }
+        Ok(out)
+    }
+
+    /// Batch-write mappings from possibly multiple volumes in a single redb
+    /// write transaction. Each entry fully overwrites any existing value at
+    /// `(vol_id, lba)`.
+    ///
+    /// Returns the old mappings that were replaced, in the same order as the
+    /// input `entries`. `None` means no prior mapping existed.
+    pub fn batch_put_mappings(
+        &self,
+        entries: &[(&str, Lba, BlockmapValue)],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let write = self.db.begin_write().map_err(to_onyx)?;
+        let mut olds = Vec::with_capacity(entries.len());
+        for (vol_id, lba, value) in entries {
+            let l1_idx = lba.0 / LBAS_PER_PAGE as u64;
+            let l2_off = (lba.0 % LBAS_PER_PAGE as u64) as usize;
+            let old = Self::update_lba_in_txn(&write, vol_id, l1_idx, l2_off, Some(*value))?;
+            olds.push(old);
+        }
+        write.commit().map_err(to_onyx)?;
+        Ok(olds)
+    }
+
+    /// Range scan over `[start, end)` for a single volume. Returns mappings in
+    /// ascending LBA order.
+    pub fn get_mappings_range(
+        &self,
+        vol_id: &str,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        if start.0 >= end.0 {
+            return Ok(Vec::new());
+        }
+        let start_l1 = start.0 / LBAS_PER_PAGE as u64;
+        let end_l1 = (end.0 - 1) / LBAS_PER_PAGE as u64;
+
+        let read = self.db.begin_read().map_err(to_onyx)?;
+        let t_l1 = read.open_table(T_L1).map_err(to_onyx)?;
+        let t_pages = read.open_table(T_L2_PAGES).map_err(to_onyx)?;
+
+        let mut out = Vec::new();
+        let range = t_l1
+            .range((vol_id, start_l1)..=(vol_id, end_l1))
+            .map_err(to_onyx)?;
+        for item in range {
+            let (key, val) = item.map_err(to_onyx)?;
+            let (_, l1_idx) = key.value();
+            let l1_entry = L1Entry::decode(&val.value())
+                .expect("L1 entry encoded by this module must roundtrip");
+            let page_guard = t_pages
+                .get(l1_entry.page_id)
+                .map_err(to_onyx)?
+                .unwrap_or_else(|| panic!("L1 references missing page {}", l1_entry.page_id));
+            let page = L2Page::decode(page_guard.value())
+                .unwrap_or_else(|| panic!("L2 page {} failed to decode", l1_entry.page_id));
+            for (slot, bv) in page.iter() {
+                let lba = Lba(l1_idx * LBAS_PER_PAGE as u64 + slot as u64);
+                if lba.0 >= start.0 && lba.0 < end.0 {
+                    out.push((lba, bv));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Enumerate every mapping for a single volume. Used by delete_volume /
+    /// delete_blockmap_range to aggregate PBA decrements before dropping the
+    /// volume's L1 entries.
+    pub fn list_volume_mappings(
+        &self,
+        vol_id: &str,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        let read = self.db.begin_read().map_err(to_onyx)?;
+        let t_l1 = read.open_table(T_L1).map_err(to_onyx)?;
+        let t_pages = read.open_table(T_L2_PAGES).map_err(to_onyx)?;
+
+        let start = (vol_id, 0u64);
+        let end = (vol_id, u64::MAX);
+        let mut out = Vec::new();
+        let range = t_l1.range(start..=end).map_err(to_onyx)?;
+        for item in range {
+            let (key, val) = item.map_err(to_onyx)?;
+            let (_, l1_idx) = key.value();
+            let l1_entry = L1Entry::decode(&val.value())
+                .expect("L1 entry encoded by this module must roundtrip");
+            let page_guard = t_pages
+                .get(l1_entry.page_id)
+                .map_err(to_onyx)?
+                .unwrap_or_else(|| panic!("L1 references missing page {}", l1_entry.page_id));
+            let page = L2Page::decode(page_guard.value())
+                .unwrap_or_else(|| panic!("L2 page {} failed to decode", l1_entry.page_id));
+            for (slot, bv) in page.iter() {
+                let lba = Lba(l1_idx * LBAS_PER_PAGE as u64 + slot as u64);
+                out.push((lba, bv));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete all mappings in `[start, end)` for a volume. Caller is expected
+    /// to have enumerated the entries first via `list_volume_mappings` or
+    /// `get_mappings_range` for refcount accounting.
+    pub fn delete_mappings_range(
+        &self,
+        vol_id: &str,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<()> {
+        if start.0 >= end.0 {
+            return Ok(());
+        }
+        let start_l1 = start.0 / LBAS_PER_PAGE as u64;
+        let end_l1 = (end.0 - 1) / LBAS_PER_PAGE as u64;
+
+        let write = self.db.begin_write().map_err(to_onyx)?;
+        for l1_idx in start_l1..=end_l1 {
+            let page_start = l1_idx * LBAS_PER_PAGE as u64;
+            let page_end = page_start + LBAS_PER_PAGE as u64;
+            let lo = start.0.max(page_start);
+            let hi = end.0.min(page_end);
+            for lba_val in lo..hi {
+                let l2_off = (lba_val % LBAS_PER_PAGE as u64) as usize;
+                Self::update_lba_in_txn(&write, vol_id, l1_idx, l2_off, None)?;
+            }
+        }
+        write.commit().map_err(to_onyx)?;
+        Ok(())
+    }
+
+    /// Iterate all live (vol_id, lba, BlockmapValue) triples across every
+    /// volume. Used by `scan_all_blockmap_entries` in GC / dedup rescan.
+    pub fn scan_all_mappings<F>(&self, mut callback: F) -> OnyxResult<()>
+    where
+        F: FnMut(&str, Lba, BlockmapValue),
+    {
+        let read = self.db.begin_read().map_err(to_onyx)?;
+        let t_l1 = read.open_table(T_L1).map_err(to_onyx)?;
+        let t_pages = read.open_table(T_L2_PAGES).map_err(to_onyx)?;
+
+        let iter = t_l1.iter().map_err(to_onyx)?;
+        for item in iter {
+            let (key, val) = item.map_err(to_onyx)?;
+            let (vol_id, l1_idx) = key.value();
+            let l1_entry = L1Entry::decode(&val.value())
+                .expect("L1 entry encoded by this module must roundtrip");
+            let page_guard = t_pages
+                .get(l1_entry.page_id)
+                .map_err(to_onyx)?
+                .unwrap_or_else(|| panic!("L1 references missing page {}", l1_entry.page_id));
+            let page = L2Page::decode(page_guard.value())
+                .unwrap_or_else(|| panic!("L2 page {} failed to decode", l1_entry.page_id));
+            for (slot, bv) in page.iter() {
+                let lba = Lba(l1_idx * LBAS_PER_PAGE as u64 + slot as u64);
+                callback(vol_id, lba, bv);
+            }
+        }
+        Ok(())
+    }
+
     // ---- internal helpers ---------------------------------------------------
 
     /// Core page-COW logic. Shared by put / delete / future batch APIs.
