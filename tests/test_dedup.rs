@@ -47,6 +47,7 @@ fn setup_dedup_env_with_sizes(
 
     let meta_config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -278,6 +279,7 @@ fn dedup_index_crud() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
+        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -316,6 +318,7 @@ fn dedup_cleanup_on_pba_free() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
+        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -366,11 +369,12 @@ fn scan_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
+        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
-    store.create_blockmap_cf("test-vol").unwrap();
+    // removed: store.create_blockmap_cf("test-vol").unwrap();
     let vol_id = VolumeId("test-vol".into());
 
     // Write entry with DEDUP_SKIPPED flag
@@ -414,11 +418,12 @@ fn update_blockmap_flags_clears_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
+        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
-    store.create_blockmap_cf("test-vol").unwrap();
+    // removed: store.create_blockmap_cf("test-vol").unwrap();
     let vol_id = VolumeId("test-vol".into());
 
     let val = BlockmapValue {
@@ -529,6 +534,7 @@ fn delete_volume_cleans_dedup_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
+        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -587,6 +593,7 @@ fn cleanup_old_pba_preserves_newer_forward_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
+        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };

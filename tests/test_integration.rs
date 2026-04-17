@@ -93,6 +93,7 @@ fn setup_with_all_options(
     let config = OnyxConfig {
         meta: MetaConfig {
             rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            redb_path: None,
             block_cache_mb: 8,
             wal_dir: None,
         },

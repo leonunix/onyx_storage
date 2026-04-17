@@ -180,6 +180,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
     let config = OnyxConfig {
         meta: MetaConfig {
             rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            redb_path: None,
             block_cache_mb: 64,
             wal_dir: None,
         },
