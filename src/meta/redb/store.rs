@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable};
 
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::redb::page::{L2Page, LBAS_PER_PAGE};
@@ -27,6 +27,19 @@ const PAGE_NEXT_ID_KEY: &str = "";
 #[derive(Clone)]
 pub struct RedbStore {
     db: Arc<Database>,
+}
+
+/// Begin a write transaction configured with the hot-path durability. redb's
+/// `Durability::None` skips fsync on commit; the page changes stay queryable
+/// by subsequent read transactions (logical commit) but are not persistent
+/// until a later [`RedbStore::sync`] call. The buffer commit log is the
+/// persistence anchor for any unsynced blockmap updates — on crash, recovery
+/// replays from buffer and the partial redb state is discarded in the
+/// reconcile step.
+fn begin_hot_write(db: &Database) -> OnyxResult<redb::WriteTransaction> {
+    let mut write = db.begin_write().map_err(to_onyx)?;
+    write.set_durability(Durability::None).map_err(to_onyx)?;
+    Ok(write)
 }
 
 impl RedbStore {
@@ -47,12 +60,22 @@ impl RedbStore {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Force all prior `Durability::None` writes to disk by issuing an empty
+    /// `Durability::Immediate` commit. Called from engine shutdown so the
+    /// clean-shutdown superblock marker is only written after all blockmap
+    /// state is physically persistent.
+    pub fn sync(&self) -> OnyxResult<()> {
+        let write = self.db.begin_write().map_err(to_onyx)?;
+        write.commit().map_err(to_onyx)?;
+        Ok(())
+    }
+
     // ---- volume CRUD --------------------------------------------------------
 
     pub fn put_volume(&self, vol_id: &str, root: VolumeRoot) -> OnyxResult<()> {
         let encoded = bincode::serialize(&root)
             .map_err(|e| OnyxError::Config(format!("volume root serialize: {e}")))?;
-        let write = self.db.begin_write().map_err(to_onyx)?;
+        let write = begin_hot_write(&self.db)?;
         {
             let mut table = write.open_table(T_VOLUMES).map_err(to_onyx)?;
             table
@@ -79,7 +102,7 @@ impl RedbStore {
     /// Pages shared with snapshots (refcount > 1) just have their refcount
     /// decremented; orphaned pages go to the freelist.
     pub fn delete_volume(&self, vol_id: &str) -> OnyxResult<()> {
-        let write = self.db.begin_write().map_err(to_onyx)?;
+        let write = begin_hot_write(&self.db)?;
         {
             // Collect all page_ids to decrement before mutating tables.
             let l1_entries = {
@@ -162,7 +185,7 @@ impl RedbStore {
     ) -> OnyxResult<Option<BlockmapValue>> {
         let l1_idx = lba.0 / LBAS_PER_PAGE as u64;
         let l2_off = (lba.0 % LBAS_PER_PAGE as u64) as usize;
-        let write = self.db.begin_write().map_err(to_onyx)?;
+        let write = begin_hot_write(&self.db)?;
         let old = Self::update_lba_in_txn(&write, vol_id, l1_idx, l2_off, Some(value))?;
         write.commit().map_err(to_onyx)?;
         Ok(old)
@@ -179,7 +202,7 @@ impl RedbStore {
     ) -> OnyxResult<Option<BlockmapValue>> {
         let l1_idx = lba.0 / LBAS_PER_PAGE as u64;
         let l2_off = (lba.0 % LBAS_PER_PAGE as u64) as usize;
-        let write = self.db.begin_write().map_err(to_onyx)?;
+        let write = begin_hot_write(&self.db)?;
         let old = Self::update_lba_in_txn(&write, vol_id, l1_idx, l2_off, None)?;
         write.commit().map_err(to_onyx)?;
         Ok(old)
@@ -242,7 +265,7 @@ impl RedbStore {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let write = self.db.begin_write().map_err(to_onyx)?;
+        let write = begin_hot_write(&self.db)?;
         let mut olds = Vec::with_capacity(entries.len());
         for (vol_id, lba, value) in entries {
             let l1_idx = lba.0 / LBAS_PER_PAGE as u64;
@@ -346,7 +369,7 @@ impl RedbStore {
         let start_l1 = start.0 / LBAS_PER_PAGE as u64;
         let end_l1 = (end.0 - 1) / LBAS_PER_PAGE as u64;
 
-        let write = self.db.begin_write().map_err(to_onyx)?;
+        let write = begin_hot_write(&self.db)?;
         for l1_idx in start_l1..=end_l1 {
             let page_start = l1_idx * LBAS_PER_PAGE as u64;
             let page_end = page_start + LBAS_PER_PAGE as u64;
@@ -560,7 +583,7 @@ impl RedbStore {
     #[cfg(test)]
     pub fn _test_bump_page_refcount(&self, vol_id: &str, lba: Lba) -> OnyxResult<u64> {
         let l1_idx = lba.0 / LBAS_PER_PAGE as u64;
-        let write = self.db.begin_write().map_err(to_onyx)?;
+        let write = begin_hot_write(&self.db)?;
         let page_id = {
             let t_l1 = write.open_table(T_L1).map_err(to_onyx)?;
             let entry_raw = t_l1

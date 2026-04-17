@@ -135,6 +135,12 @@ impl MetaStore {
         opts
     }
 
+    /// Force any in-memory redb commits to disk. Called at engine shutdown
+    /// before the clean-shutdown superblock marker is written.
+    pub fn sync_redb(&self) -> OnyxResult<()> {
+        self.redb.sync()
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<RocksDbMemorySnapshot> {
         let cf_names: Vec<&str> = Self::GLOBAL_CFS.to_vec();
 

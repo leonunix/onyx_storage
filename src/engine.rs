@@ -752,6 +752,18 @@ impl OnyxEngine {
         // Zone manager shutdown is handled by Drop (it sends Shutdown to all workers)
         // We can't call shutdown(&mut self) through Arc, but Drop handles it.
 
+        // Flush redb: hot-path writes run with Durability::None and need an
+        // explicit Immediate commit to hit disk. MUST precede the clean
+        // shutdown marker; otherwise a crash between the marker and the
+        // physical sync would boot into fast path with unsynced blockmap.
+        if let Err(e) = self.meta.sync_redb() {
+            tracing::error!(
+                error = %e,
+                "failed to sync redb at shutdown — forcing dirty recovery on next boot"
+            );
+            return Ok(());
+        }
+
         // Stamp the LV3 superblock with FLAG_CLEAN_SHUTDOWN so the next boot
         // can skip dirty recovery. This is the last persistent act of the
         // engine — by this point flusher has drained, cleanup_tx is idle, and
