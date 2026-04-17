@@ -256,6 +256,11 @@ impl RedbStore {
     /// write transaction. Each entry fully overwrites any existing value at
     /// `(vol_id, lba)`.
     ///
+    /// Entries are grouped by their L1 page before applying updates so each
+    /// L2 page is decoded/encoded once per batch rather than once per LBA.
+    /// This is the dominant CPU cost when many LBAs in a batch share the same
+    /// compression-unit locality (the common case from the flusher).
+    ///
     /// Returns the old mappings that were replaced, in the same order as the
     /// input `entries`. `None` means no prior mapping existed.
     pub fn batch_put_mappings(
@@ -265,16 +270,131 @@ impl RedbStore {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let write = begin_hot_write(&self.db)?;
-        let mut olds = Vec::with_capacity(entries.len());
-        for (vol_id, lba, value) in entries {
+
+        type GroupKey = (String, u64);
+        let mut groups: std::collections::HashMap<GroupKey, Vec<(usize, usize, BlockmapValue)>> =
+            std::collections::HashMap::new();
+        for (idx, (vol_id, lba, value)) in entries.iter().enumerate() {
             let l1_idx = lba.0 / LBAS_PER_PAGE as u64;
             let l2_off = (lba.0 % LBAS_PER_PAGE as u64) as usize;
-            let old = Self::update_lba_in_txn(&write, vol_id, l1_idx, l2_off, Some(*value))?;
-            olds.push(old);
+            groups
+                .entry(((*vol_id).to_string(), l1_idx))
+                .or_default()
+                .push((idx, l2_off, *value));
+        }
+
+        let mut olds: Vec<Option<BlockmapValue>> = vec![None; entries.len()];
+        let write = begin_hot_write(&self.db)?;
+        for ((vol_id, l1_idx), updates) in &groups {
+            Self::apply_page_updates_in_txn(&write, vol_id, *l1_idx, updates, &mut olds)?;
         }
         write.commit().map_err(to_onyx)?;
         Ok(olds)
+    }
+
+    /// Apply several slot updates to the L2 page that backs `(vol_id, l1_idx)`
+    /// in a single decode/encode pair. Writes the resulting old values back
+    /// into the caller-supplied `olds` slice, indexed by each update's
+    /// original batch position.
+    fn apply_page_updates_in_txn(
+        write: &redb::WriteTransaction,
+        vol_id: &str,
+        l1_idx: u64,
+        updates: &[(usize, usize, BlockmapValue)],
+        olds: &mut [Option<BlockmapValue>],
+    ) -> OnyxResult<()> {
+        let current = {
+            let t_l1 = write.open_table(T_L1).map_err(to_onyx)?;
+            let guard = t_l1.get((vol_id, l1_idx)).map_err(to_onyx)?;
+            guard.map(|g| {
+                L1Entry::decode(&g.value())
+                    .expect("L1 entry encoded by this module must roundtrip")
+            })
+        };
+
+        match current {
+            None => {
+                let mut page = L2Page::empty();
+                for &(batch_idx, l2_off, value) in updates {
+                    olds[batch_idx] = None;
+                    page.set(l2_off, value);
+                }
+                let page_id = Self::alloc_page_id(write)?;
+                {
+                    let mut t_pages = write.open_table(T_L2_PAGES).map_err(to_onyx)?;
+                    t_pages
+                        .insert(page_id, page.encode().as_slice())
+                        .map_err(to_onyx)?;
+                }
+                {
+                    let mut t_refs = write.open_table(T_PAGE_REFS).map_err(to_onyx)?;
+                    t_refs.insert(page_id, 1u32).map_err(to_onyx)?;
+                }
+                {
+                    let mut t_l1 = write.open_table(T_L1).map_err(to_onyx)?;
+                    let entry = L1Entry { page_id, gen: 0 };
+                    t_l1.insert((vol_id, l1_idx), entry.encode())
+                        .map_err(to_onyx)?;
+                }
+            }
+            Some(current) => {
+                let mut page = {
+                    let t_pages = write.open_table(T_L2_PAGES).map_err(to_onyx)?;
+                    let raw = t_pages
+                        .get(current.page_id)
+                        .map_err(to_onyx)?
+                        .unwrap_or_else(|| {
+                            panic!("L1 references missing page {}", current.page_id)
+                        });
+                    L2Page::decode(raw.value())
+                        .unwrap_or_else(|| panic!("L2 page {} failed to decode", current.page_id))
+                };
+                let refs = {
+                    let t_refs = write.open_table(T_PAGE_REFS).map_err(to_onyx)?;
+                    let guard = t_refs.get(current.page_id).map_err(to_onyx)?;
+                    guard
+                        .map(|g| g.value())
+                        .unwrap_or_else(|| panic!("page {} missing refs row", current.page_id))
+                };
+
+                for &(batch_idx, l2_off, value) in updates {
+                    olds[batch_idx] = page.get(l2_off);
+                    page.set(l2_off, value);
+                }
+
+                if refs == 1 {
+                    let mut t_pages = write.open_table(T_L2_PAGES).map_err(to_onyx)?;
+                    t_pages
+                        .insert(current.page_id, page.encode().as_slice())
+                        .map_err(to_onyx)?;
+                } else {
+                    let new_page_id = Self::alloc_page_id(write)?;
+                    {
+                        let mut t_pages = write.open_table(T_L2_PAGES).map_err(to_onyx)?;
+                        t_pages
+                            .insert(new_page_id, page.encode().as_slice())
+                            .map_err(to_onyx)?;
+                    }
+                    {
+                        let mut t_refs = write.open_table(T_PAGE_REFS).map_err(to_onyx)?;
+                        t_refs.insert(new_page_id, 1u32).map_err(to_onyx)?;
+                        t_refs
+                            .insert(current.page_id, refs - 1)
+                            .map_err(to_onyx)?;
+                    }
+                    {
+                        let mut t_l1 = write.open_table(T_L1).map_err(to_onyx)?;
+                        let entry = L1Entry {
+                            page_id: new_page_id,
+                            gen: current.gen.wrapping_add(1),
+                        };
+                        t_l1.insert((vol_id, l1_idx), entry.encode())
+                            .map_err(to_onyx)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Range scan over `[start, end)` for a single volume. Returns mappings in
