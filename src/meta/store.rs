@@ -5,10 +5,11 @@ mod refcount;
 mod scan;
 mod volume;
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rocksdb::{DBWithThreadMode, MergeOperands, MultiThreaded, WriteOptions};
 
+use crate::meta::redb::RedbStore;
 use crate::types::Pba;
 
 const BLOCKMAP_LOCK_STRIPES: usize = 1024;
@@ -111,6 +112,13 @@ pub struct MetaStore {
     hot_write_opts: WriteOptions,
     /// Block cache size from config — reused when creating new per-volume CFs.
     block_cache_mb: usize,
+    /// Paged blockmap backend (redb). Holds `T_L1` / `T_L2_PAGES` /
+    /// `T_PAGE_REFS` / `T_PAGE_FREE` / `T_PAGE_NEXT_ID` / `T_VOLUMES`.
+    ///
+    /// Phase 3: field is present and opened, but the current atomic_* paths
+    /// still go through RocksDB per-volume CFs. Rewiring happens in
+    /// subsequent commits.
+    pub(super) redb: Arc<RedbStore>,
 }
 
 impl MetaStore {

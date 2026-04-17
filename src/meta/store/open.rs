@@ -8,6 +8,7 @@ use rocksdb::{
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
+use crate::meta::redb::RedbStore;
 use crate::meta::schema::*;
 use crate::metrics::RocksDbMemorySnapshot;
 use crate::types::Lba;
@@ -114,12 +115,25 @@ impl MetaStore {
         let mut hot_write_opts = WriteOptions::default();
         hot_write_opts.set_sync(false);
 
+        // Open the paged blockmap backend (redb). Path defaults to
+        // `{rocksdb_path}/blockmap.redb` if the config did not set one.
+        let redb_path = config.resolved_redb_path().ok_or_else(|| {
+            OnyxError::Config("meta.redb_path or meta.rocksdb_path must be set".into())
+        })?;
+        if let Some(parent) = redb_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(OnyxError::Io)?;
+            }
+        }
+        let redb = Arc::new(RedbStore::open(&redb_path)?);
+
         let store = Self {
             db,
             blockmap_locks: (0..BLOCKMAP_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             refcount_locks: (0..REFCOUNT_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             hot_write_opts,
             block_cache_mb: config.block_cache_mb,
+            redb,
         };
 
         if has_legacy_blockmap {
