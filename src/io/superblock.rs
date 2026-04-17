@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
 use crate::io::device::RawDevice;
+use crate::io::uring::{IoUringSession, UringOp};
 use crate::types::{BLOCK_SIZE, RESERVED_BLOCKS};
 
 // ──────────────────────────── Constants ────────────────────────────
@@ -438,14 +439,34 @@ pub struct HeartbeatWriter {
 }
 
 impl HeartbeatWriter {
+    /// Start a heartbeat writer that uses classic pwrite + fsync.
     pub fn start(device: RawDevice, node_id: u64, interval: Duration) -> Self {
+        Self::start_inner(device, node_id, interval, None)
+    }
+
+    /// Start a heartbeat writer that submits write+fdatasync as one io_uring batch.
+    pub fn start_uring(
+        device: RawDevice,
+        node_id: u64,
+        interval: Duration,
+        session: Arc<IoUringSession>,
+    ) -> Self {
+        Self::start_inner(device, node_id, interval, Some(session))
+    }
+
+    fn start_inner(
+        device: RawDevice,
+        node_id: u64,
+        interval: Duration,
+        session: Option<Arc<IoUringSession>>,
+    ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
         let handle = thread::Builder::new()
             .name("heartbeat-writer".into())
             .spawn(move || {
-                Self::heartbeat_loop(&device, node_id, interval, &running_clone);
+                Self::heartbeat_loop(&device, node_id, interval, &running_clone, session.as_ref());
             })
             .expect("failed to spawn heartbeat writer thread");
 
@@ -455,7 +476,13 @@ impl HeartbeatWriter {
         }
     }
 
-    fn heartbeat_loop(device: &RawDevice, node_id: u64, interval: Duration, running: &AtomicBool) {
+    fn heartbeat_loop(
+        device: &RawDevice,
+        node_id: u64,
+        interval: Duration,
+        running: &AtomicBool,
+        session: Option<&Arc<IoUringSession>>,
+    ) {
         let sequence = AtomicU64::new(1);
 
         // Pre-allocate aligned buffer for the heartbeat block
@@ -471,9 +498,38 @@ impl HeartbeatWriter {
             let seq = sequence.fetch_add(1, Ordering::Relaxed);
             let hb = HeartbeatBlock::new(node_id, seq);
             let bytes = hb.to_bytes();
-
             aligned.as_mut_slice().copy_from_slice(&bytes);
-            if let Err(e) = device.write_at(aligned.as_slice(), BLOCK_SIZE as u64) {
+
+            if let Some(session) = session {
+                let fd = device.as_raw_fd();
+                let offset = device.base_offset() + BLOCK_SIZE as u64;
+                let ops = [
+                    UringOp::Write {
+                        fd,
+                        ptr: aligned.as_ptr(),
+                        len: BLOCK_SIZE,
+                        offset,
+                    },
+                    UringOp::FsyncDataBarrier { fd },
+                ];
+                match unsafe { session.submit_batch(&ops) } {
+                    Ok(results) => {
+                        let write_ok = results[0].bytes() == Some(BLOCK_SIZE);
+                        if !write_ok {
+                            tracing::warn!(
+                                errno = ?results[0].errno(),
+                                bytes = ?results[0].bytes(),
+                                "heartbeat: io_uring write failed"
+                            );
+                        } else if let Some(errno) = results[1].errno() {
+                            tracing::warn!(errno, "heartbeat: io_uring fdatasync failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "heartbeat: io_uring submit failed");
+                    }
+                }
+            } else if let Err(e) = device.write_at(aligned.as_slice(), BLOCK_SIZE as u64) {
                 tracing::warn!(error = %e, "heartbeat: write failed");
             } else if let Err(e) = device.sync() {
                 tracing::warn!(error = %e, "heartbeat: sync failed");

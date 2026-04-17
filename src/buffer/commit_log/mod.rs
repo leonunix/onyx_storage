@@ -12,6 +12,7 @@ use crate::buffer::entry::{BufferEntry, BUFFER_ENTRY_MAGIC, MAX_ENTRY_SIZE, MIN_
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::{round_up, AlignedBuf};
 use crate::io::device::RawDevice;
+use crate::io::uring::{IoUringSession, UringOp};
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
 use crate::metrics::{BufferShardSnapshot, EngineMetrics};
 use crate::types::{Lba, BLOCK_SIZE};

@@ -19,14 +19,13 @@ unsafe impl Sync for AlignedBuf {}
 impl AlignedBuf {
     /// Allocate an aligned buffer of the given size.
     /// Size will be rounded up to a multiple of BLOCK_SIZE.
-    pub fn new(size: usize, _use_hugepages: bool) -> OnyxResult<Self> {
+    pub fn new(size: usize, use_hugepages: bool) -> OnyxResult<Self> {
         let aligned_size = round_up(size, BLOCK_SIZE as usize);
         if aligned_size == 0 {
             return Err(OnyxError::Config("cannot allocate zero-size buffer".into()));
         }
 
-        #[cfg(target_os = "linux")]
-        if _use_hugepages {
+        if use_hugepages {
             return Self::alloc_hugepage(aligned_size);
         }
 
@@ -52,7 +51,6 @@ impl AlignedBuf {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn alloc_hugepage(size: usize) -> OnyxResult<Self> {
         use nix::sys::mman::{mmap_anonymous, MapFlags, ProtFlags};
         use std::num::NonZeroUsize;
@@ -111,7 +109,6 @@ impl AlignedBuf {
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
         if self.is_hugepage {
-            #[cfg(target_os = "linux")]
             unsafe {
                 let _ = nix::sys::mman::munmap(
                     std::ptr::NonNull::new(self.ptr as *mut _).unwrap(),

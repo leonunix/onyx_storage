@@ -70,3 +70,4 @@ jemalloc = ["tikv-jemallocator"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk = "0.4"
+io-uring = "0.7"

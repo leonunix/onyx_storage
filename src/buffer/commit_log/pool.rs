@@ -132,6 +132,14 @@ impl WriteBufferPool {
     }
 
     fn sync_device_impl(device: &RawDevice) -> OnyxResult<()> {
+        Self::consume_test_sync_failpoint()?;
+        device.sync()
+    }
+
+    /// Pull one hit off the failpoint counter; returns Err if it was armed.
+    /// Both the syscall and io_uring sync paths funnel through here so test
+    /// failure injection still drives both.
+    fn consume_test_sync_failpoint() -> OnyxResult<()> {
         let mut remaining_failures = test_sync_fail_remaining().lock().unwrap();
         if *remaining_failures > 0 {
             *remaining_failures -= 1;
@@ -139,8 +147,7 @@ impl WriteBufferPool {
                 "injected persistent slot sync failure",
             )));
         }
-        drop(remaining_failures);
-        device.sync()
+        Ok(())
     }
 
     fn sync_retry_backoff(consecutive_failures: u32) -> Duration {
@@ -248,6 +255,197 @@ impl WriteBufferPool {
         Ok(())
     }
 
+    /// io_uring variant of `write_batch` that also includes the checkpoint
+    /// write and a barrier-fdatasync in the same `submit_batch` call. On
+    /// success, both data and checkpoint are persisted with one
+    /// `io_uring_enter` + one `wait_for_completions(N+2)`.
+    ///
+    /// The failpoint-driven test injection from `sync_device_impl` is checked
+    /// after CQE harvest so existing recovery tests still cover this path.
+    fn write_batch_and_sync_uring(
+        device: &RawDevice,
+        shard: &BufferShard,
+        ring: &Arc<IoUringSession>,
+        io_lock: &parking_lot::Mutex<()>,
+        entries: &[StagedEntry],
+        batch_max_seq: u64,
+        metrics: &Arc<OnceLock<Arc<EngineMetrics>>>,
+    ) -> OnyxResult<()> {
+        if entries.is_empty() {
+            // No entries → nothing to fsync either; mirrors syscall fast-path.
+            return Ok(());
+        }
+
+        // 1. Encode entries (identical to write_batch).
+        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let pending = &entry.pending;
+            let payload = &entry.payload;
+            let payload_crc = crc32fast::hash(payload);
+            let data = BufferEntry::encode(
+                pending.seq,
+                &pending.vol_id,
+                pending.start_lba,
+                pending.lba_count,
+                payload_crc,
+                false,
+                pending.vol_created_at,
+                payload,
+            )?;
+            encoded.push((pending.disk_offset, data));
+        }
+
+        // 2. Coalesce contiguous entries into one AlignedBuf each, ready for
+        //    a single SQE per coalesced span.
+        struct CoalescedSpan {
+            buf: AlignedBuf,
+            offset: u64,
+            len: u32,
+        }
+        let mut spans: Vec<CoalescedSpan> = Vec::new();
+        let mut start = 0usize;
+        while start < encoded.len() {
+            let mut end = start + 1;
+            let mut next_offset = encoded[start].0 + encoded[start].1.len() as u64;
+            while end < encoded.len() && encoded[end].0 == next_offset {
+                next_offset += encoded[end].1.len() as u64;
+                end += 1;
+            }
+            let span = &encoded[start..end];
+            let total_len: usize = span.iter().map(|(_, data)| data.len()).sum();
+            let mut batch = AlignedBuf::new(total_len, false)?;
+            let mut cursor = 0;
+            for (_, data) in span {
+                batch.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
+                cursor += data.len();
+            }
+            spans.push(CoalescedSpan {
+                buf: batch,
+                offset: span[0].0,
+                len: total_len as u32,
+            });
+            start = end;
+        }
+
+        // 3. Optional checkpoint payload (only when the shard has a checkpoint
+        //    device — same condition as `write_checkpoint`).
+        let checkpoint_payload = shard.encode_checkpoint_for_uring(batch_max_seq);
+        let checkpoint_target = shard.checkpoint_target();
+        let mut ckpt_aligned: Option<AlignedBuf> = None;
+        if let (Some(payload), Some(_)) = (&checkpoint_payload, checkpoint_target) {
+            let mut buf = AlignedBuf::new(BLOCK_SIZE as usize, false)?;
+            buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
+            ckpt_aligned = Some(buf);
+        }
+
+        let data_fd = device.as_raw_fd();
+        let data_base = device.base_offset();
+
+        // 4. Build the SQE batch: writes → checkpoint → barrier fsync.
+        let mut ops: Vec<UringOp> = Vec::with_capacity(spans.len() + 2);
+        for span in &spans {
+            ops.push(UringOp::Write {
+                fd: data_fd,
+                ptr: span.buf.as_ptr(),
+                len: span.len,
+                offset: data_base + span.offset,
+            });
+        }
+        if let (Some(buf), Some((ckpt_fd, ckpt_base))) = (ckpt_aligned.as_ref(), checkpoint_target)
+        {
+            ops.push(UringOp::Write {
+                fd: ckpt_fd,
+                ptr: buf.as_ptr(),
+                len: BLOCK_SIZE,
+                offset: ckpt_base,
+            });
+        }
+        ops.push(UringOp::FsyncDataBarrier { fd: data_fd });
+
+        // 5. Submit + wait under the same io_lock that the syscall path uses,
+        //    so concurrent writers see consistent ordering.
+        let write_start = Instant::now();
+        let _guard = io_lock.lock();
+        let results = unsafe { ring.submit_batch(&ops)? };
+
+        // 6. Validate per-op CQE results.
+        let span_count = spans.len();
+        for (i, span) in spans.iter().enumerate() {
+            let r = &results[i];
+            if let Some(errno) = r.errno() {
+                return Err(OnyxError::Io(std::io::Error::other(format!(
+                    "io_uring entry write failed at offset={} errno={}",
+                    span.offset, errno
+                ))));
+            }
+            let bytes = r.bytes().unwrap_or(0);
+            if bytes != span.len {
+                return Err(OnyxError::Io(std::io::Error::other(format!(
+                    "io_uring short entry write at offset={}: got {} of {}",
+                    span.offset, bytes, span.len
+                ))));
+            }
+        }
+        let mut next_idx = span_count;
+        if ckpt_aligned.is_some() {
+            let r = &results[next_idx];
+            next_idx += 1;
+            if let Some(errno) = r.errno() {
+                tracing::debug!(errno, "io_uring checkpoint write failed (non-fatal)");
+            }
+        }
+        // Final SQE is the fsync barrier.
+        let fsync_r = &results[next_idx];
+        if let Some(errno) = fsync_r.errno() {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "io_uring fdatasync failed: errno={errno}"
+            ))));
+        }
+
+        if let Some(metrics) = metrics.get() {
+            BufferShard::record_metric(&metrics.buffer_append_log_write_ns, write_start);
+        }
+
+        // 7. Honour the test failpoint AFTER successful CQE harvest so existing
+        //    recovery tests cover the io_uring path too.
+        Self::consume_test_sync_failpoint()?;
+
+        // 8. Post-write verification — same magic check as `write_batch`. Done
+        //    via syscall reads to keep the io_uring submit path tight.
+        {
+            use crate::buffer::entry::BUFFER_ENTRY_MAGIC;
+            let mut verify_buf = vec![0u8; BLOCK_SIZE as usize];
+            for (offset, data) in &encoded {
+                if data.len() < 8 {
+                    continue;
+                }
+                if let Err(e) = device.read_at(&mut verify_buf, *offset) {
+                    tracing::error!(
+                        offset,
+                        error = %e,
+                        "io_uring post-write read-back failed"
+                    );
+                    continue;
+                }
+                let magic = u32::from_le_bytes(verify_buf[4..8].try_into().unwrap());
+                if magic != BUFFER_ENTRY_MAGIC {
+                    let expected_magic_bytes = &data[4..8];
+                    tracing::error!(
+                        offset,
+                        data_len = data.len(),
+                        disk_magic = magic,
+                        expected_magic = u32::from_le_bytes(
+                            expected_magic_bytes.try_into().unwrap()
+                        ),
+                        "POST-WRITE VERIFICATION FAILED (io_uring path): entry not on disk"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn sync_loop(
         device: RawDevice,
         shard: Arc<BufferShard>,
@@ -257,6 +455,7 @@ impl WriteBufferPool {
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
         ready_tx: Sender<u64>,
         shard_ready_tx: Sender<u64>,
+        uring: Option<Arc<IoUringSession>>,
     ) {
         let mut consecutive_failures = 0u32;
         let mut retry_after: Option<Instant> = None;
@@ -338,7 +537,29 @@ impl WriteBufferPool {
                         "sync batch has cancelled entries — these will NOT be written to disk"
                     );
                 }
-                match Self::write_batch(&device, &shard.io_lock, &writes_to_persist, &metrics) {
+                let batch_max_seq_pre = writes_to_persist
+                    .iter()
+                    .map(|e| e.pending.seq)
+                    .max()
+                    .unwrap_or(0);
+
+                let result = if let Some(ref ring) = uring {
+                    // Batched io_uring path: N entry writes + 1 checkpoint write
+                    // + 1 DRAIN-flagged fdatasync — all in one submit.
+                    Self::write_batch_and_sync_uring(
+                        &device,
+                        &shard,
+                        ring,
+                        &shard.io_lock,
+                        &writes_to_persist,
+                        batch_max_seq_pre,
+                        &metrics,
+                    )
+                } else {
+                    Self::write_batch(&device, &shard.io_lock, &writes_to_persist, &metrics)
+                };
+
+                match result {
                     Ok(()) => {
                         writes_applied = true;
                     }
@@ -365,9 +586,17 @@ impl WriteBufferPool {
                 .map(|entry| entry.pending.seq)
                 .max()
                 .unwrap_or(0);
-            shard.write_checkpoint(batch_max_seq);
 
-            match Self::sync_device_impl(&device) {
+            // The uring path already checkpointed + fsynced inside
+            // write_batch_and_sync_uring. The syscall path still needs both.
+            let sync_result = if uring.is_some() {
+                Ok(())
+            } else {
+                shard.write_checkpoint(batch_max_seq);
+                Self::sync_device_impl(&device)
+            };
+
+            match sync_result {
                 Ok(()) => {
                     consecutive_failures = 0;
                     retry_after = None;
@@ -476,6 +705,30 @@ impl WriteBufferPool {
         routing_zone_size_blocks: u64,
         backpressure_timeout: Duration,
         max_payload_memory: u64,
+    ) -> OnyxResult<Self> {
+        Self::open_with_options_full(
+            device,
+            group_commit_wait,
+            shard_count,
+            routing_zone_size_blocks,
+            backpressure_timeout,
+            max_payload_memory,
+            None,
+        )
+    }
+
+    /// Variant that lets the caller request io_uring-backed sync threads.
+    /// `uring_sq_entries=Some(n)` creates one io_uring session per shard with
+    /// SQ depth `n`; `None` keeps the classic syscall (pread/pwrite + fsync)
+    /// sync path.
+    pub fn open_with_options_full(
+        device: RawDevice,
+        group_commit_wait: Duration,
+        shard_count: usize,
+        routing_zone_size_blocks: u64,
+        backpressure_timeout: Duration,
+        max_payload_memory: u64,
+        uring_sq_entries: Option<u32>,
     ) -> OnyxResult<Self> {
         Self::validate_shard_count(shard_count)?;
         let routing_zone_size_blocks = routing_zone_size_blocks.max(1);
@@ -685,6 +938,12 @@ impl WriteBufferPool {
             let shard = Arc::new(shard);
             let (sync_wake_tx, sync_wake_rx) = unbounded();
             let sync_shutdown = Arc::new(AtomicBool::new(false));
+            // Per-shard io_uring session (one ring per sync thread, no
+            // contention). Skipped when uring_sq_entries is None.
+            let shard_uring = match uring_sq_entries {
+                Some(entries) => Some(Arc::new(IoUringSession::new(entries)?)),
+                None => None,
+            };
             let sync_thread = thread::Builder::new()
                 .name(format!("persistent-slot-sync-{}", shard_idx))
                 .spawn({
@@ -693,6 +952,7 @@ impl WriteBufferPool {
                     let shutdown = sync_shutdown.clone();
                     let ready_tx = ready_tx.clone();
                     let shard_ready_tx = shard_ready_tx.clone();
+                    let uring = shard_uring.clone();
                     move || {
                         Self::sync_loop(
                             sync_device,
@@ -703,6 +963,7 @@ impl WriteBufferPool {
                             metrics,
                             ready_tx,
                             shard_ready_tx,
+                            uring,
                         );
                     }
                 })

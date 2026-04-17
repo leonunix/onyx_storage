@@ -209,56 +209,6 @@ fn atomic_write_mapping() {
 }
 
 #[test]
-fn reconcile_refcount_repairs_blockmap_undercount() {
-    let dir = tempdir().unwrap();
-    let store = MetaStore::open(&test_config(dir.path())).unwrap();
-    let vol_id = VolumeId("test-vol".into());
-    ensure_blockmap_cf(&store, "test-vol");
-    let pba = Pba(77);
-
-    let batch_values = vec![
-        (
-            Lba(0),
-            BlockmapValue {
-                pba,
-                compression: 1,
-                unit_compressed_size: 2000,
-                unit_original_size: 8192,
-                unit_lba_count: 2,
-                offset_in_unit: 0,
-                crc32: 0x1111_2222,
-                slot_offset: 0,
-                flags: 0,
-            },
-        ),
-        (
-            Lba(1),
-            BlockmapValue {
-                pba,
-                compression: 1,
-                unit_compressed_size: 2000,
-                unit_original_size: 8192,
-                unit_lba_count: 2,
-                offset_in_unit: 1,
-                crc32: 0x1111_2222,
-                slot_offset: 0,
-                flags: 0,
-            },
-        ),
-    ];
-
-    store.atomic_batch_write(&vol_id, &batch_values, 2).unwrap();
-    assert_eq!(store.get_refcount(pba).unwrap(), 2);
-
-    store.set_refcount(pba, 1).unwrap();
-    assert_eq!(store.count_blockmap_refs_for_pba(pba).unwrap(), 2);
-
-    let repaired = store.reconcile_refcount_for_pba(pba).unwrap();
-    assert_eq!(repaired, 2);
-    assert_eq!(store.get_refcount(pba).unwrap(), 2);
-}
-
-#[test]
 fn atomic_remap() {
     let dir = tempdir().unwrap();
     let store = MetaStore::open(&test_config(dir.path())).unwrap();

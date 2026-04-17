@@ -1,12 +1,11 @@
 use std::fs::{File, OpenOptions};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
 use crate::types::BLOCK_SIZE;
-
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
 
 /// Raw device/file handle for O_DIRECT IO
 pub struct RawDevice {
@@ -18,7 +17,6 @@ pub struct RawDevice {
 }
 
 impl RawDevice {
-    #[cfg(not(target_os = "macos"))]
     fn log_direct_fallback(&self, op: &str, offset: u64, len: usize, reason: &str) {
         tracing::warn!(
             op,
@@ -32,7 +30,7 @@ impl RawDevice {
     }
 
     /// Open a device or file for O_DIRECT read/write.
-    /// Falls back to buffered IO if O_DIRECT is not supported (e.g., regular files on macOS).
+    /// Falls back to buffered IO if O_DIRECT is not supported (e.g., regular files in tests).
     pub fn open(path: &Path) -> OnyxResult<Self> {
         let (file, direct_io) = Self::open_direct(path)?;
         let size_bytes = Self::get_size(&file, path)?;
@@ -71,7 +69,6 @@ impl RawDevice {
         })
     }
 
-    #[cfg(target_os = "linux")]
     fn open_direct(path: &Path) -> OnyxResult<(File, bool)> {
         let metadata = std::fs::metadata(path).map_err(|e| OnyxError::Device {
             path: path.to_path_buf(),
@@ -79,30 +76,16 @@ impl RawDevice {
         })?;
 
         if !metadata.file_type().is_file() {
-            match OpenOptions::new()
+            if let Ok(f) = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_DIRECT)
                 .open(path)
             {
-                Ok(f) => return Ok((f, true)),
-                Err(_) => {}
+                return Ok((f, true));
             }
         }
 
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| OnyxError::Device {
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            })?;
-        Ok((f, false))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn open_direct(path: &Path) -> OnyxResult<(File, bool)> {
         let f = OpenOptions::new()
             .read(true)
             .write(true)
@@ -123,59 +106,17 @@ impl RawDevice {
         if metadata.file_type().is_file() {
             Ok(metadata.len())
         } else {
-            #[cfg(target_os = "macos")]
-            {
-                use std::os::fd::AsRawFd;
-
-                const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x4004_6418;
-                const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x4008_6419;
-
-                let fd = file.as_raw_fd();
-                let mut block_size: u32 = 0;
-                let mut block_count: u64 = 0;
-
-                let block_size_rc = unsafe { libc::ioctl(fd, DKIOCGETBLOCKSIZE, &mut block_size) };
-                if block_size_rc != 0 {
-                    return Err(OnyxError::Device {
-                        path: path.to_path_buf(),
-                        reason: format!(
-                            "ioctl(DKIOCGETBLOCKSIZE) failed: {}",
-                            std::io::Error::last_os_error()
-                        ),
-                    });
-                }
-
-                let block_count_rc =
-                    unsafe { libc::ioctl(fd, DKIOCGETBLOCKCOUNT, &mut block_count) };
-                if block_count_rc != 0 {
-                    return Err(OnyxError::Device {
-                        path: path.to_path_buf(),
-                        reason: format!(
-                            "ioctl(DKIOCGETBLOCKCOUNT) failed: {}",
-                            std::io::Error::last_os_error()
-                        ),
-                    });
-                }
-
-                Ok(u64::from(block_size).saturating_mul(block_count))
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                // Block device — use seek to end
-                use std::io::Seek;
-                let mut f = file.try_clone().map_err(|e| OnyxError::Device {
+            // Block device — use seek to end
+            use std::io::Seek;
+            let mut f = file.try_clone().map_err(|e| OnyxError::Device {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+            f.seek(std::io::SeekFrom::End(0))
+                .map_err(|e| OnyxError::Device {
                     path: path.to_path_buf(),
                     reason: e.to_string(),
-                })?;
-                let size = f
-                    .seek(std::io::SeekFrom::End(0))
-                    .map_err(|e| OnyxError::Device {
-                        path: path.to_path_buf(),
-                        reason: e.to_string(),
-                    })?;
-                Ok(size)
-            }
+                })
         }
     }
 
@@ -183,22 +124,78 @@ impl RawDevice {
     /// Loops on short reads to guarantee the full buffer is filled.
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
         let offset = self.translate_offset(offset, buf.len())?;
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::fd::AsRawFd;
+        if self.direct_io {
+            if !Self::is_direct_io_offset_aligned(offset)
+                || !Self::is_direct_io_len_aligned(buf.len())
+            {
+                self.log_direct_fallback("read", offset, buf.len(), "unaligned offset or length");
+                return self.buffered_read_at(buf, offset);
+            }
+            if !Self::is_direct_io_ptr_aligned(buf.as_ptr()) {
+                let mut aligned = AlignedBuf::new(buf.len(), false)?;
+                self.read_exact_file(
+                    self.file.try_clone().map_err(|e| OnyxError::Device {
+                        path: self.path.clone(),
+                        reason: format!("clone failed: {}", e),
+                    })?,
+                    aligned.as_mut_slice(),
+                    offset,
+                )?;
+                buf.copy_from_slice(&aligned.as_slice()[..buf.len()]);
+                return Ok(());
+            }
+        }
 
-            let fd = self.file.as_raw_fd();
-            let mut done = 0usize;
-            while done < buf.len() {
-                let rc = unsafe {
-                    libc::pread(
-                        fd,
-                        buf[done..].as_mut_ptr().cast(),
-                        buf.len() - done,
-                        (offset + done as u64) as libc::off_t,
-                    )
-                };
-                if rc == 0 {
+        self.read_exact_file(
+            self.file.try_clone().map_err(|e| OnyxError::Device {
+                path: self.path.clone(),
+                reason: format!("clone failed: {}", e),
+            })?,
+            buf,
+            offset,
+        )
+    }
+
+    /// Write exactly `buf.len()` bytes at the given offset.
+    /// Loops on short writes to guarantee the full buffer is written.
+    pub fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
+        let offset = self.translate_offset(offset, buf.len())?;
+        if self.direct_io {
+            if !Self::is_direct_io_offset_aligned(offset)
+                || !Self::is_direct_io_len_aligned(buf.len())
+            {
+                self.log_direct_fallback("write", offset, buf.len(), "unaligned offset or length");
+                return self.buffered_write_at(buf, offset);
+            }
+            if !Self::is_direct_io_ptr_aligned(buf.as_ptr()) {
+                let mut aligned = AlignedBuf::new(buf.len(), false)?;
+                aligned.as_mut_slice()[..buf.len()].copy_from_slice(buf);
+                return self.write_exact_file(
+                    self.file.try_clone().map_err(|e| OnyxError::Device {
+                        path: self.path.clone(),
+                        reason: format!("clone failed: {}", e),
+                    })?,
+                    aligned.as_slice(),
+                    offset,
+                );
+            }
+        }
+
+        self.write_exact_file(
+            self.file.try_clone().map_err(|e| OnyxError::Device {
+                path: self.path.clone(),
+                reason: format!("clone failed: {}", e),
+            })?,
+            buf,
+            offset,
+        )
+    }
+
+    fn read_exact_file(&self, file: File, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            match file.read_at(&mut buf[done..], offset + done as u64) {
+                Ok(0) => {
                     return Err(OnyxError::Device {
                         path: self.path.clone(),
                         reason: format!(
@@ -209,81 +206,24 @@ impl RawDevice {
                         ),
                     });
                 }
-                if rc < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
+                Ok(n) => done += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
                     return Err(OnyxError::Device {
                         path: self.path.clone(),
-                        reason: format!("read_at offset={}: {}", offset, err),
+                        reason: format!("read_at offset={}: {}", offset, e),
                     });
                 }
-                done += rc as usize;
             }
-            Ok(())
         }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            if self.direct_io {
-                if !Self::is_direct_io_offset_aligned(offset)
-                    || !Self::is_direct_io_len_aligned(buf.len())
-                {
-                    self.log_direct_fallback(
-                        "read",
-                        offset,
-                        buf.len(),
-                        "unaligned offset or length",
-                    );
-                    return self.buffered_read_at(buf, offset);
-                }
-                if !Self::is_direct_io_ptr_aligned(buf.as_ptr()) {
-                    let mut aligned = AlignedBuf::new(buf.len(), false)?;
-                    self.read_exact_file(
-                        self.file.try_clone().map_err(|e| OnyxError::Device {
-                            path: self.path.clone(),
-                            reason: format!("clone failed: {}", e),
-                        })?,
-                        aligned.as_mut_slice(),
-                        offset,
-                    )?;
-                    buf.copy_from_slice(&aligned.as_slice()[..buf.len()]);
-                    return Ok(());
-                }
-            }
-
-            self.read_exact_file(
-                self.file.try_clone().map_err(|e| OnyxError::Device {
-                    path: self.path.clone(),
-                    reason: format!("clone failed: {}", e),
-                })?,
-                buf,
-                offset,
-            )
-        }
+        Ok(())
     }
 
-    /// Write exactly `buf.len()` bytes at the given offset.
-    /// Loops on short writes to guarantee the full buffer is written.
-    pub fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
-        let offset = self.translate_offset(offset, buf.len())?;
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::fd::AsRawFd;
-
-            let fd = self.file.as_raw_fd();
-            let mut done = 0usize;
-            while done < buf.len() {
-                let rc = unsafe {
-                    libc::pwrite(
-                        fd,
-                        buf[done..].as_ptr().cast(),
-                        buf.len() - done,
-                        (offset + done as u64) as libc::off_t,
-                    )
-                };
-                if rc == 0 {
+    fn write_exact_file(&self, file: File, buf: &[u8], offset: u64) -> OnyxResult<()> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            match file.write_at(&buf[done..], offset + done as u64) {
+                Ok(0) => {
                     return Err(OnyxError::Device {
                         path: self.path.clone(),
                         reason: format!(
@@ -294,125 +234,19 @@ impl RawDevice {
                         ),
                     });
                 }
-                if rc < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
+                Ok(n) => done += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
                     return Err(OnyxError::Device {
                         path: self.path.clone(),
-                        reason: format!("write_at offset={}: {}", offset, err),
+                        reason: format!("write_at offset={}: {}", offset, e),
                     });
                 }
-                done += rc as usize;
             }
-            Ok(())
         }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            if self.direct_io {
-                if !Self::is_direct_io_offset_aligned(offset)
-                    || !Self::is_direct_io_len_aligned(buf.len())
-                {
-                    self.log_direct_fallback(
-                        "write",
-                        offset,
-                        buf.len(),
-                        "unaligned offset or length",
-                    );
-                    return self.buffered_write_at(buf, offset);
-                }
-                if !Self::is_direct_io_ptr_aligned(buf.as_ptr()) {
-                    let mut aligned = AlignedBuf::new(buf.len(), false)?;
-                    aligned.as_mut_slice()[..buf.len()].copy_from_slice(buf);
-                    return self.write_exact_file(
-                        self.file.try_clone().map_err(|e| OnyxError::Device {
-                            path: self.path.clone(),
-                            reason: format!("clone failed: {}", e),
-                        })?,
-                        aligned.as_slice(),
-                        offset,
-                    );
-                }
-            }
-
-            self.write_exact_file(
-                self.file.try_clone().map_err(|e| OnyxError::Device {
-                    path: self.path.clone(),
-                    reason: format!("clone failed: {}", e),
-                })?,
-                buf,
-                offset,
-            )
-        }
+        Ok(())
     }
 
-    fn read_exact_file(&self, file: File, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            use std::os::unix::fs::FileExt;
-            let mut done = 0usize;
-            while done < buf.len() {
-                match file.read_at(&mut buf[done..], offset + done as u64) {
-                    Ok(0) => {
-                        return Err(OnyxError::Device {
-                            path: self.path.clone(),
-                            reason: format!(
-                                "read_at offset={}: unexpected EOF after {} of {} bytes",
-                                offset,
-                                done,
-                                buf.len()
-                            ),
-                        });
-                    }
-                    Ok(n) => done += n,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        return Err(OnyxError::Device {
-                            path: self.path.clone(),
-                            reason: format!("read_at offset={}: {}", offset, e),
-                        });
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-
-    fn write_exact_file(&self, file: File, buf: &[u8], offset: u64) -> OnyxResult<()> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            use std::os::unix::fs::FileExt;
-            let mut done = 0usize;
-            while done < buf.len() {
-                match file.write_at(&buf[done..], offset + done as u64) {
-                    Ok(0) => {
-                        return Err(OnyxError::Device {
-                            path: self.path.clone(),
-                            reason: format!(
-                                "write_at offset={}: zero-length write after {} of {} bytes",
-                                offset,
-                                done,
-                                buf.len()
-                            ),
-                        });
-                    }
-                    Ok(n) => done += n,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        return Err(OnyxError::Device {
-                            path: self.path.clone(),
-                            reason: format!("write_at offset={}: {}", offset, e),
-                        });
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
     fn buffered_handle(&self) -> OnyxResult<File> {
         OpenOptions::new()
             .read(true)
@@ -424,7 +258,6 @@ impl RawDevice {
             })
     }
 
-    #[cfg(target_os = "linux")]
     fn reopen_with_same_mode(&self) -> OnyxResult<File> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
@@ -437,66 +270,31 @@ impl RawDevice {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn reopen_with_same_mode(&self) -> OnyxResult<File> {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .map_err(|e| OnyxError::Device {
-                path: self.path.clone(),
-                reason: e.to_string(),
-            })
-    }
-
-    #[cfg(not(target_os = "macos"))]
     fn buffered_read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
         self.read_exact_file(self.buffered_handle()?, buf, offset)
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn buffered_write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
         self.write_exact_file(self.buffered_handle()?, buf, offset)
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn is_direct_io_offset_aligned(offset: u64) -> bool {
         offset % BLOCK_SIZE as u64 == 0
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn is_direct_io_len_aligned(len: usize) -> bool {
         len % BLOCK_SIZE as usize == 0
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn is_direct_io_ptr_aligned(ptr: *const u8) -> bool {
         (ptr as usize) % BLOCK_SIZE as usize == 0
     }
 
     pub fn sync(&self) -> OnyxResult<()> {
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::fd::AsRawFd;
-
-            let rc = unsafe { libc::fsync(self.file.as_raw_fd()) };
-            if rc == 0 {
-                return Ok(());
-            }
-
-            return Err(OnyxError::Device {
-                path: self.path.clone(),
-                reason: format!("sync: {}", std::io::Error::last_os_error()),
-            });
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.file.sync_all().map_err(|e| OnyxError::Device {
-                path: self.path.clone(),
-                reason: format!("sync: {}", e),
-            })
-        }
+        self.file.sync_all().map_err(|e| OnyxError::Device {
+            path: self.path.clone(),
+            reason: format!("sync: {}", e),
+        })
     }
 
     pub fn size(&self) -> u64 {
@@ -542,6 +340,11 @@ impl RawDevice {
 
     pub fn base_offset(&self) -> u64 {
         self.base_offset
+    }
+
+    /// Raw file descriptor for io_uring SQE construction.
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 
     fn translate_offset(&self, offset: u64, len: usize) -> OnyxResult<u64> {

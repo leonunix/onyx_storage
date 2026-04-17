@@ -1170,3 +1170,98 @@ fn head_of_queue_hydration_bypasses_memory_limit() {
         "hydrated payload must match original data"
     );
 }
+
+#[test]
+fn uring_sync_loop_persists_and_recovers() {
+    use std::time::Duration;
+
+    // 4KB superblock + 1 shard checkpoint + plenty of data slots.
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 32 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full(
+        dev,
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::ZERO,
+        0,
+        Some(32), // io_uring backend, SQ depth 32
+    )
+    .unwrap();
+
+    let mut seqs = Vec::new();
+    for lba in 0..16u64 {
+        let mut data = vec![0u8; 4096];
+        data[0] = lba as u8;
+        let seq = pool.append("uring-vol", Lba(lba), 1, &data, 0).unwrap();
+        seqs.push((seq, Lba(lba), data));
+    }
+
+    // Wait until each seq is durable (ready_tx fires after fsync CQE).
+    for &(seq, _, _) in &seqs {
+        let got = pool
+            .recv_ready_timeout(Duration::from_secs(3))
+            .expect("uring sync loop should publish each seq once durable");
+        assert_eq!(got, seq, "ready_tx must publish in submission order");
+    }
+
+    // Reopen with the same uring backend and verify the recovered payload
+    // matches what we wrote.
+    drop(pool);
+    let dev2 = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool2 = WriteBufferPool::open_with_options_full(
+        dev2,
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::ZERO,
+        0,
+        Some(32),
+    )
+    .unwrap();
+    let recovered = pool2.recover().unwrap();
+    assert_eq!(recovered.len(), 16, "all entries must survive restart");
+    for (_, lba, expected) in &seqs {
+        let entry = pool2.lookup("uring-vol", *lba).unwrap().expect("lba must map");
+        assert_eq!(entry.start_lba, *lba);
+        assert_eq!(entry.lba_count, 1);
+        let payload = entry.payload.as_ref().expect("payload should hydrate");
+        assert_eq!(&**payload, expected.as_slice());
+    }
+}
+
+#[test]
+fn uring_sync_loop_honors_failpoint_then_recovers() {
+    use std::time::Duration;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full(
+        dev,
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::ZERO,
+        0,
+        Some(8),
+    )
+    .unwrap();
+
+    // Inject 2 sync failures — sync_loop should retry and eventually publish.
+    install_buffer_sync_failpoint(2);
+
+    let seq = pool
+        .append("uring-fp", Lba(3), 1, &vec![0xC3; 4096], 0)
+        .unwrap();
+
+    let got = pool
+        .recv_ready_timeout(Duration::from_secs(5))
+        .expect("sync_loop should retry past injected failpoint hits");
+    assert_eq!(got, seq);
+
+    clear_buffer_sync_failpoint();
+}

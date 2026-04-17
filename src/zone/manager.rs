@@ -1,54 +1,41 @@
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-
 use crate::buffer::pool::WriteBufferPool;
-use crate::error::{OnyxError, OnyxResult};
+use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
+use crate::io::read_pool::ReadPool;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, ZoneId, BLOCK_SIZE};
-use crate::zone::worker::ZoneWorker;
+use crate::zone::read;
 
-/// IO request dispatched to a zone worker
-pub enum ZoneIoRequest {
-    Write {
-        vol_id: String,
-        start_lba: Lba,
-        lba_count: u32,
-        data: Vec<u8>,
-        vol_created_at: u64,
-        reply: crossbeam_channel::Sender<OnyxResult<()>>,
-    },
-    Read {
-        vol_id: String,
-        lba: Lba,
-        vol_created_at: u64,
-        reply: crossbeam_channel::Sender<OnyxResult<Option<Vec<u8>>>>,
-    },
-    Shutdown,
-}
-
-struct ZoneHandle {
-    sender: Sender<ZoneIoRequest>,
-    thread: Option<JoinHandle<()>>,
-}
-
-/// Routes read IO requests to per-zone worker threads based on LBA.
-/// Aligned writes bypass the worker threads and append directly into the
-/// durable write buffer to keep the foreground path thinner.
+/// Routes IO across LBAs.
+///
+/// Both reads and writes execute inline on the caller thread:
+/// * Writes go straight into `WriteBufferPool::append` — same-zone ordering is
+///   preserved by the per-shard append lock inside the pool.
+/// * Reads run via `crate::zone::read::execute_read` — the buffer DashMap is
+///   lock-free and `MetaStore::get_mapping` is a RocksDB point-get, so no
+///   external serialization is needed.
+///
+/// `zone_count` / `zone_size_blocks` are kept for write-splitting at zone
+/// boundaries (so a wide write doesn't span shards on disk) and for metric
+/// labelling, but no per-zone worker threads are spawned anymore.
 pub struct ZoneManager {
-    handles: Vec<ZoneHandle>,
     zone_size_blocks: u64,
     zone_count: u32,
+    io_engine: Arc<IoEngine>,
     buffer_pool: Arc<WriteBufferPool>,
     meta: Arc<MetaStore>,
     allocator: Option<Arc<SpaceAllocator>>,
     metrics: Arc<EngineMetrics>,
+    /// Optional LV3 read pool. When present, mapped reads dispatch here for
+    /// batched io_uring submission + parallel decompression. When absent,
+    /// reads fall back to inline `IoEngine::read_blocks` on the caller thread.
+    read_pool: Option<Arc<ReadPool>>,
 }
 
 impl ZoneManager {
@@ -79,83 +66,49 @@ impl ZoneManager {
         metrics: Arc<EngineMetrics>,
         allocator: Option<Arc<SpaceAllocator>>,
     ) -> OnyxResult<Self> {
-        let mut handles = Vec::with_capacity(zone_count as usize);
+        Self::new_full(
+            zone_count,
+            zone_size_blocks,
+            meta,
+            buffer_pool,
+            io_engine,
+            metrics,
+            allocator,
+            None,
+        )
+    }
 
-        for i in 0..zone_count {
-            let (sender, receiver) = bounded::<ZoneIoRequest>(256);
-            let zone_id = ZoneId(i);
-            let meta = meta.clone();
-            let buffer_pool = buffer_pool.clone();
-            let io_engine = io_engine.clone();
-            let metrics = metrics.clone();
-
-            let thread = thread::Builder::new()
-                .name(format!("zone-worker-{}", i))
-                .spawn(move || {
-                    let worker = ZoneWorker::new_with_metrics(
-                        zone_id,
-                        meta,
-                        buffer_pool,
-                        io_engine,
-                        metrics,
-                    );
-                    Self::worker_loop(worker, receiver);
-                })
-                .map_err(|e| OnyxError::Config(format!("failed to spawn zone thread: {}", e)))?;
-
-            handles.push(ZoneHandle {
-                sender,
-                thread: Some(thread),
-            });
-        }
-
-        tracing::info!(zone_count, zone_size_blocks, "zone manager started");
+    /// Full constructor that additionally takes a shared LV3 `ReadPool`. Pass
+    /// `Some(pool)` in production (built from `config.storage.read_pool_workers`)
+    /// so mapped reads enjoy batched io_uring + parallel decompress; pass
+    /// `None` to keep the legacy inline LV3 path.
+    pub fn new_full(
+        zone_count: u32,
+        zone_size_blocks: u64,
+        meta: Arc<MetaStore>,
+        buffer_pool: Arc<WriteBufferPool>,
+        io_engine: Arc<IoEngine>,
+        metrics: Arc<EngineMetrics>,
+        allocator: Option<Arc<SpaceAllocator>>,
+        read_pool: Option<Arc<ReadPool>>,
+    ) -> OnyxResult<Self> {
+        tracing::info!(
+            zone_count,
+            zone_size_blocks,
+            read_pool_workers = read_pool.as_ref().map(|p| p.worker_count()).unwrap_or(0),
+            "zone manager initialised (inline read/write — no zone worker threads)"
+        );
 
         Ok(Self {
-            handles,
             zone_size_blocks,
             zone_count,
+            io_engine,
             buffer_pool,
             meta,
             allocator,
             metrics,
+            read_pool,
         })
-    }
-
-    fn worker_loop(worker: ZoneWorker, receiver: Receiver<ZoneIoRequest>) {
-        tracing::debug!(zone = worker.zone_id.0, "zone worker started");
-
-        for request in receiver {
-            match request {
-                ZoneIoRequest::Write {
-                    vol_id,
-                    start_lba,
-                    lba_count,
-                    data,
-                    vol_created_at,
-                    reply,
-                } => {
-                    let start = Instant::now();
-                    let result =
-                        worker.handle_write(&vol_id, start_lba, lba_count, &data, vol_created_at);
-                    worker.record_write_ns(start);
-                    let _ = reply.send(result);
-                }
-                ZoneIoRequest::Read {
-                    vol_id,
-                    lba,
-                    vol_created_at,
-                    reply,
-                } => {
-                    let result = worker.handle_read_with_generation(&vol_id, lba, vol_created_at);
-                    let _ = reply.send(result);
-                }
-                ZoneIoRequest::Shutdown => {
-                    tracing::debug!(zone = worker.zone_id.0, "zone worker shutting down");
-                    break;
-                }
-            }
-        }
     }
 
     /// Access the shared engine metrics.
@@ -241,9 +194,9 @@ impl ZoneManager {
         result
     }
 
-    /// Submit a read IO. Blocks until the zone worker processes it.
-    ///
-    /// Returns `Ok(Some(data))` if mapped, `Ok(None)` if unmapped, `Err` on failure.
+    /// Submit a read IO. Executes inline on the caller thread — no zone-worker
+    /// channel hop, no per-zone serialization. Returns `Ok(Some(data))` if
+    /// mapped, `Ok(None)` if unmapped, `Err` on failure.
     pub fn submit_read(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<Vec<u8>>> {
         self.submit_read_with_generation(vol_id, lba, 0)
     }
@@ -254,26 +207,19 @@ impl ZoneManager {
         lba: Lba,
         vol_created_at: u64,
     ) -> OnyxResult<Option<Vec<u8>>> {
-        let zone = self.zone_for_lba(lba);
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-
-        self.handles[zone.0 as usize]
-            .sender
-            .send(ZoneIoRequest::Read {
-                vol_id: vol_id.to_string(),
-                lba,
-                vol_created_at,
-                reply: reply_tx,
-            })
-            .map_err(|_| OnyxError::Ublk("zone worker channel closed".into()))?;
-
         self.metrics
             .zone_read_dispatches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        reply_rx
-            .recv()
-            .map_err(|_| OnyxError::Ublk("zone worker reply channel closed".into()))?
+        read::execute_read(
+            &self.meta,
+            &self.buffer_pool,
+            &self.io_engine,
+            &self.metrics,
+            self.read_pool.as_deref(),
+            vol_id,
+            lba,
+            vol_created_at,
+        )
     }
 
     /// Submit a DISCARD (TRIM) request for a range of LBAs.
@@ -323,16 +269,10 @@ impl ZoneManager {
         Ok(())
     }
 
-    /// Graceful shutdown: send shutdown to all workers and wait.
+    /// Graceful shutdown — currently a no-op since reads/writes run inline.
+    /// Kept on the API surface for callers (engine.rs) that expect to be able
+    /// to call it.
     pub fn shutdown(&mut self) -> OnyxResult<()> {
-        for handle in &self.handles {
-            let _ = handle.sender.send(ZoneIoRequest::Shutdown);
-        }
-        for handle in &mut self.handles {
-            if let Some(thread) = handle.thread.take() {
-                let _ = thread.join();
-            }
-        }
         tracing::info!("zone manager stopped");
         Ok(())
     }

@@ -11,7 +11,7 @@ impl BufferFlusher {
         let cleanup_lock = Self::cleanup_lock(old_pba);
         let _cleanup_guard = cleanup_lock.lock().unwrap();
 
-        let remaining = match Self::live_refcount_with_reconcile(meta, old_pba, context) {
+        let remaining = match meta.get_refcount(old_pba) {
             Ok(remaining) => remaining,
             Err(e) => {
                 tracing::error!(
@@ -92,7 +92,7 @@ impl BufferFlusher {
             let cleanup_lock = Self::cleanup_lock(pba);
             let _cleanup_guard = cleanup_lock.lock().unwrap();
 
-            let remaining = match Self::live_refcount_with_reconcile(meta, pba, context) {
+            let remaining = match meta.get_refcount(pba) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(
@@ -213,31 +213,6 @@ impl BufferFlusher {
         if !remaining.is_empty() {
             Self::cleanup_dead_pbas_batch(meta, allocator, &remaining, "cleanup_thread_drain");
         }
-    }
-
-    // In release: trust the refcount from the metadata write path.
-    // In debug: full reconcile scan to catch any drift.
-    #[allow(unused_variables)]
-    pub(super) fn live_refcount_with_reconcile(
-        meta: &MetaStore,
-        pba: Pba,
-        context: &'static str,
-    ) -> OnyxResult<u32> {
-        let remaining = meta.get_refcount(pba)?;
-        #[cfg(debug_assertions)]
-        if remaining == 0 {
-            let reconciled = meta.reconcile_refcount_for_pba(pba)?;
-            if reconciled != 0 {
-                tracing::error!(
-                    pba = pba.0,
-                    reconciled_refcount = reconciled,
-                    context,
-                    "detected refcount drift while preparing to free or inspect a PBA"
-                );
-            }
-            return Ok(reconciled);
-        }
-        Ok(remaining)
     }
 
     pub(super) fn pba_lock(pba: Pba) -> Arc<Mutex<()>> {

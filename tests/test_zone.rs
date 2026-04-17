@@ -234,3 +234,255 @@ fn zone_manager_read_unmapped() {
 
     zm.shutdown().unwrap();
 }
+
+#[test]
+fn zone_manager_concurrent_reads_inline_no_serialization() {
+    use std::thread;
+    use std::time::Duration;
+    use onyx_storage::io::uring::IoUringSession;
+
+    // Build a zone manager that uses the io_uring backend so the inline
+    // read path also exercises the new code in this configuration.
+    let meta_dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
+
+    let buf_tmp = NamedTempFile::new().unwrap();
+    let buf_size = 4096 + 4096 + 4096 * 8192;
+    buf_tmp.as_file().set_len(buf_size).unwrap();
+    let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
+    let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
+
+    let data_tmp = NamedTempFile::new().unwrap();
+    data_tmp.as_file().set_len(4096 * 10000).unwrap();
+    let data_dev = RawDevice::open(data_tmp.path()).unwrap();
+    let session = Arc::new(IoUringSession::new(64).unwrap());
+    let io_engine = Arc::new(IoEngine::new_uring(data_dev, false, session));
+
+    std::mem::forget(meta_dir);
+    std::mem::forget(buf_tmp);
+    std::mem::forget(data_tmp);
+
+    // Use zone_count=1 deliberately — under the old code every LBA mapped
+    // to zone 0, so all reads were serialised through one worker. With the
+    // inline read design, parallel readers must complete in parallel.
+    let zm = Arc::new(ZoneManager::new(1, 256, meta, buffer_pool, io_engine).unwrap());
+
+    let vol = "concurrent-readers";
+    for i in 0..32u64 {
+        let mut data = vec![0u8; 4096];
+        data[0] = i as u8;
+        zm.submit_write(vol, Lba(i), 1, &data, 0).unwrap();
+    }
+
+    // Spin up 8 reader threads, each reading the full LBA range twice.
+    // Without zone-level serialisation, all reads should succeed without
+    // any deadlock or starvation.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let zm = zm.clone();
+        let vol = vol.to_string();
+        handles.push(thread::spawn(move || {
+            for _ in 0..2 {
+                for i in 0..32u64 {
+                    let data = zm
+                        .submit_read(&vol, Lba(i))
+                        .expect("read must succeed under concurrent inline path")
+                        .expect("each LBA must map");
+                    assert_eq!(data[0], i as u8, "wrong payload for lba {}", i);
+                }
+            }
+        }));
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    for h in handles {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now());
+        assert!(
+            remaining.is_some(),
+            "reader thread deadlocked — inline read path should not stall"
+        );
+        h.join().unwrap();
+    }
+}
+
+#[test]
+fn zone_manager_read_pool_decompresses_concurrently() {
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Duration;
+    use onyx_storage::buffer::flush::BufferFlusher;
+    use onyx_storage::config::FlushConfig;
+    use onyx_storage::io::read_pool::ReadPool;
+    use onyx_storage::io::uring::IoUringSession;
+    use onyx_storage::lifecycle::VolumeLifecycleManager;
+    use onyx_storage::space::allocator::SpaceAllocator;
+
+    // Stand up the full read path: WriteBufferPool → MetaStore → IoEngine
+    // (uring backend) → ReadPool. Then write LZ4-compressible data through
+    // the flusher and read it back concurrently from many threads to verify
+    // batched io_uring + parallel decompression works end-to-end.
+    let meta_dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        wal_dir: None,
+    };
+    let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
+
+    let buf_tmp = NamedTempFile::new().unwrap();
+    let buf_size = 4096 + 4096 + 1024 * 8192;
+    buf_tmp.as_file().set_len(buf_size).unwrap();
+    let buf_dev = RawDevice::open_or_create(buf_tmp.path(), buf_size).unwrap();
+    let buffer_pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
+
+    let data_tmp = NamedTempFile::new().unwrap();
+    let data_size = 4096 * 10000;
+    data_tmp.as_file().set_len(data_size as u64).unwrap();
+    let data_dev = RawDevice::open(data_tmp.path()).unwrap();
+    let session = Arc::new(IoUringSession::new(64).unwrap());
+    let io_engine = Arc::new(IoEngine::new_uring(data_dev, false, session));
+
+    let lifecycle = Arc::new(VolumeLifecycleManager::default());
+    let allocator = Arc::new(SpaceAllocator::new(data_size as u64, 0));
+    let metrics = Arc::new(onyx_storage::metrics::EngineMetrics::default());
+
+    // Build the ReadPool against the same data device.
+    let pool_dev = RawDevice::open(data_tmp.path()).unwrap();
+    let read_pool = Arc::new(
+        ReadPool::start(
+            4,
+            64,
+            &pool_dev,
+            onyx_storage::types::RESERVED_BLOCKS,
+            BLOCK_SIZE,
+            false,
+            metrics.clone(),
+        )
+        .unwrap(),
+    );
+    drop(pool_dev);
+
+    std::mem::forget(meta_dir);
+    std::mem::forget(buf_tmp);
+    std::mem::forget(data_tmp);
+
+    let zm = Arc::new(
+        ZoneManager::new_full(
+            1,
+            256,
+            meta.clone(),
+            buffer_pool.clone(),
+            io_engine.clone(),
+            metrics.clone(),
+            Some(allocator.clone()),
+            Some(read_pool.clone()),
+        )
+        .unwrap(),
+    );
+
+    // Register a volume that uses LZ4 so reads exercise the decompression
+    // path on the ReadPool worker.
+    let vol = "rp-soak";
+    meta.put_volume(&onyx_storage::types::VolumeConfig {
+        id: VolumeId(vol.to_string()),
+        size_bytes: data_size as u64,
+        block_size: 4096,
+        compression: CompressionAlgo::Lz4,
+        created_at: 0,
+        zone_count: 1,
+    })
+    .unwrap();
+
+    // Compressible payload (repeating pattern → high LZ4 ratio).
+    let payloads: Vec<Vec<u8>> = (0..32u64)
+        .map(|i| {
+            let mut v = Vec::with_capacity(4096);
+            for j in 0..4096u32 {
+                v.push(((j as u64 ^ i).wrapping_mul(0x100000001b3)) as u8);
+            }
+            v
+        })
+        .collect();
+
+    for (i, p) in payloads.iter().enumerate() {
+        zm.submit_write(vol, Lba(i as u64), 1, p, 0).unwrap();
+    }
+
+    // Flush to push everything through to LV3 so reads must go through the
+    // ReadPool (buffer index will be empty after flush).
+    let mut flusher = BufferFlusher::start(
+        buffer_pool.clone(),
+        meta.clone(),
+        lifecycle.clone(),
+        allocator.clone(),
+        io_engine.clone(),
+        &FlushConfig::default(),
+        &onyx_storage::dedup::config::DedupConfig::default(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while buffer_pool.pending_count() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "flush did not drain in time"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    flusher.stop();
+
+    // Fire 8 reader threads, each reading the full LBA range twice. With
+    // ReadPool active these reads dispatch to 4 worker threads, get batched
+    // into io_uring submits, then decompressed in parallel.
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+    for t in 0..8 {
+        let zm = zm.clone();
+        let payloads = payloads.clone();
+        let barrier = barrier.clone();
+        let vol = vol.to_string();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for round in 0..2 {
+                for i in 0..32u64 {
+                    let got = zm
+                        .submit_read(&vol, Lba(i))
+                        .expect("read must succeed via ReadPool")
+                        .expect("LBA must map after flush");
+                    assert_eq!(
+                        got,
+                        payloads[i as usize],
+                        "thread {} round {} lba {} mismatch",
+                        t,
+                        round,
+                        i
+                    );
+                }
+            }
+        }));
+    }
+    let timeout = std::time::Instant::now() + Duration::from_secs(10);
+    for h in handles {
+        assert!(
+            std::time::Instant::now() < timeout,
+            "ReadPool reader thread deadlocked"
+        );
+        h.join().unwrap();
+    }
+
+    // Sanity: at least one CRC-clean LV3 hit went through the pool.
+    let lv3_hits = metrics
+        .read_lv3_hits
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(lv3_hits >= 32 * 16, "expected many lv3 hits, got {lv3_hits}");
+    assert_eq!(
+        metrics
+            .read_crc_errors
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no CRC errors expected on cold reads"
+    );
+}

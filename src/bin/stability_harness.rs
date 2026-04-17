@@ -54,6 +54,9 @@ fn write_and_abort(
             block_size: BLOCK_SIZE,
             use_hugepages: false,
             default_compression: CompressionAlgo::Lz4,
+            io_backend: Default::default(),
+            uring_sq_entries: 128,
+            read_pool_workers: 4,
         },
         buffer: BufferConfig {
             device: Some(buffer),

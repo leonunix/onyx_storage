@@ -35,6 +35,9 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             block_size: 4096,
             use_hugepages: false,
             default_compression: CompressionAlgo::None,
+            io_backend: Default::default(),
+            uring_sq_entries: 128,
+            read_pool_workers: 4,
         },
         buffer: BufferConfig {
             device: Some(buf_tmp.path().to_path_buf()),

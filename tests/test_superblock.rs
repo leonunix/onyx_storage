@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::superblock::*;
+use onyx_storage::io::uring::IoUringSession;
 use onyx_storage::types::RESERVED_BLOCKS;
 use tempfile::NamedTempFile;
 
@@ -260,4 +262,27 @@ fn heartbeat_writer_stop_is_idempotent() {
     let mut writer = HeartbeatWriter::start(hb_dev, 1, Duration::from_secs(1));
     writer.stop();
     writer.stop(); // Should not panic
+}
+
+#[test]
+fn heartbeat_writer_uring_writes_periodically() {
+    let (dev, _tmp) = create_test_device(100);
+    format_device(&dev).unwrap();
+
+    let session = Arc::new(IoUringSession::new(8).unwrap());
+    let hb_dev = RawDevice::open(_tmp.path()).unwrap();
+    let mut writer =
+        HeartbeatWriter::start_uring(hb_dev, 99, Duration::from_millis(80), session);
+
+    std::thread::sleep(Duration::from_millis(300));
+    writer.stop();
+
+    let hb = read_heartbeat(&dev).unwrap().unwrap();
+    assert_eq!(hb.node_id, 99);
+    assert!(
+        hb.sequence >= 2,
+        "expected >= 2 heartbeats via io_uring, got {}",
+        hb.sequence
+    );
+    assert!(hb.timestamp_nanos > 0);
 }

@@ -160,35 +160,39 @@ impl BufferFlusher {
             let _ = cleanup_tx.send(dead);
         }
 
-        // Populate dedup index for newly written fragments
+        // Populate dedup index for newly written fragments.
+        // Aggregate every fragment's hash → DedupEntry into one Vec and commit
+        // them in a single `put_dedup_entries` call, so a packed slot with N
+        // fragments costs 1 RocksDB write instead of N.
         let dedup_start = Instant::now();
+        let mut dedup_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
         for frag in &sealed.fragments {
-            if let Some(ref hashes) = frag.unit.block_hashes {
-                let live_positions = Self::live_positions_for_unit(&frag.unit, pool)?;
-                let mut dedup_entries = Vec::new();
-                for &pos in &live_positions {
-                    let hash = hashes[pos];
-                    if hash == [0u8; 32] {
-                        continue;
-                    }
-                    dedup_entries.push((
-                        hash,
-                        DedupEntry {
-                            pba: sealed.pba,
-                            slot_offset: frag.slot_offset,
-                            compression: frag.unit.compression,
-                            unit_compressed_size: frag.unit.compressed_data.len() as u32,
-                            unit_original_size: frag.unit.original_size,
-                            unit_lba_count: frag.unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: frag.unit.crc32,
-                        },
-                    ));
+            let Some(ref hashes) = frag.unit.block_hashes else {
+                continue;
+            };
+            let live_positions = Self::live_positions_for_unit(&frag.unit, pool)?;
+            for &pos in &live_positions {
+                let hash = hashes[pos];
+                if hash == [0u8; 32] {
+                    continue;
                 }
-                if !dedup_entries.is_empty() {
-                    meta.put_dedup_entries(&dedup_entries)?;
-                }
+                dedup_entries.push((
+                    hash,
+                    DedupEntry {
+                        pba: sealed.pba,
+                        slot_offset: frag.slot_offset,
+                        compression: frag.unit.compression,
+                        unit_compressed_size: frag.unit.compressed_data.len() as u32,
+                        unit_original_size: frag.unit.original_size,
+                        unit_lba_count: frag.unit.lba_count as u16,
+                        offset_in_unit: pos as u16,
+                        crc32: frag.unit.crc32,
+                    },
+                ));
             }
+        }
+        if !dedup_entries.is_empty() {
+            meta.put_dedup_entries(&dedup_entries)?;
         }
         Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 

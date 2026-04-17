@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("onyx-storage only supports Linux");
+
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

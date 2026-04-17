@@ -120,6 +120,22 @@ impl Default for MetaConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IoBackend {
+    /// Classic pread/pwrite + fsync via libc.
+    Syscall,
+    /// io_uring batched submission (Linux only). Default backend.
+    Uring,
+}
+
+impl Default for IoBackend {
+    fn default() -> Self {
+        // Set `[storage] io_backend = "syscall"` to fall back to pread/pwrite.
+        IoBackend::Uring
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
     /// Path to data device (LV3). None = standby mode (no IO).
@@ -134,6 +150,17 @@ pub struct StorageConfig {
     /// Default compression algorithm for new volumes
     #[serde(default = "default_compression")]
     pub default_compression: CompressionAlgo,
+    /// IO backend for LV3 + buffer commit log + heartbeat (default syscall).
+    #[serde(default)]
+    pub io_backend: IoBackend,
+    /// io_uring submission-queue depth per ring (default 128).
+    #[serde(default = "default_uring_sq_entries")]
+    pub uring_sq_entries: u32,
+    /// Number of LV3 read-pool worker threads (default 4). Each owns its own
+    /// io_uring ring; reads are sharded across workers by hash(PBA). 0 = disable
+    /// the pool and execute reads inline on the caller thread.
+    #[serde(default = "default_read_pool_workers")]
+    pub read_pool_workers: usize,
 }
 
 impl Default for StorageConfig {
@@ -143,8 +170,19 @@ impl Default for StorageConfig {
             block_size: default_block_size(),
             use_hugepages: false,
             default_compression: default_compression(),
+            io_backend: IoBackend::default(),
+            uring_sq_entries: default_uring_sq_entries(),
+            read_pool_workers: default_read_pool_workers(),
         }
     }
+}
+
+fn default_uring_sq_entries() -> u32 {
+    128
+}
+
+fn default_read_pool_workers() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Deserialize)]

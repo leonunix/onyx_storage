@@ -316,53 +316,65 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
-        // Phase 3: Parallel IO writes (one scoped thread per unit for NVMe QD > 1).
+        // Phase 3: Batched IO writes — one submit per batch.
+        // io_uring backend: 1 io_uring_enter + 1 wait_for_completions(N).
+        // Syscall backend: scoped threads inside submit_batch keep NVMe QD > 1.
         let io_start = Instant::now();
         {
-            let io_errors: Vec<Option<crate::error::OnyxError>> = std::thread::scope(|s| {
-                let handles: Vec<_> = (0..n)
-                    .filter(|i| !skip[*i])
-                    .map(|i| {
-                        let pba = pbas[i].unwrap();
-                        let data = &units[i].compressed_data;
-                        let blk = alloc_blocks[i];
-                        (i, blk, s.spawn(move || io_engine.write_blocks(pba, data)))
-                    })
-                    .collect();
-                let mut errs: Vec<Option<crate::error::OnyxError>> = (0..n).map(|_| None).collect();
-                for (i, blk, handle) in handles {
-                    match handle.join() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            let pba = pbas[i].unwrap();
-                            if blk == 1 {
-                                let _ = allocator.free_one(pba);
-                            } else {
-                                let _ = allocator.free_extent(Extent::new(pba, blk));
+            use crate::io::engine::{LvOp, LvOpResult};
+
+            let mut ops: Vec<LvOp> = Vec::with_capacity(n);
+            let mut op_to_unit: Vec<usize> = Vec::with_capacity(n);
+            for i in 0..n {
+                if skip[i] {
+                    continue;
+                }
+                ops.push(LvOp::Write {
+                    pba: pbas[i].unwrap(),
+                    payload: units[i].compressed_data.as_slice(),
+                });
+                op_to_unit.push(i);
+            }
+
+            if !ops.is_empty() {
+                match io_engine.submit_batch(ops, false) {
+                    Ok(write_results) => {
+                        for (idx, r) in write_results.into_iter().enumerate() {
+                            let unit_idx = op_to_unit[idx];
+                            if let LvOpResult::Write(Err(e)) = r {
+                                let pba = pbas[unit_idx].unwrap();
+                                let blk = alloc_blocks[unit_idx];
+                                if blk == 1 {
+                                    let _ = allocator.free_one(pba);
+                                } else {
+                                    let _ = allocator.free_extent(Extent::new(pba, blk));
+                                }
+                                results[unit_idx] = Err(crate::error::OnyxError::Io(
+                                    std::io::Error::other(format!("IO write failed: {e}")),
+                                ));
+                                skip[unit_idx] = true;
                             }
-                            errs[i] = Some(e);
-                        }
-                        Err(_) => {
-                            let pba = pbas[i].unwrap();
-                            if blk == 1 {
-                                let _ = allocator.free_one(pba);
-                            } else {
-                                let _ = allocator.free_extent(Extent::new(pba, blk));
-                            }
-                            errs[i] = Some(crate::error::OnyxError::Io(std::io::Error::other(
-                                "IO thread panicked",
-                            )));
                         }
                     }
-                }
-                errs
-            });
-            for (i, err) in io_errors.into_iter().enumerate() {
-                if let Some(e) = err {
-                    results[i] = Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
-                        "IO write failed: {e}"
-                    ))));
-                    skip[i] = true;
+                    Err(e) => {
+                        // Whole submission failed — roll back all live units.
+                        for &unit_idx in &op_to_unit {
+                            if skip[unit_idx] {
+                                continue;
+                            }
+                            let pba = pbas[unit_idx].unwrap();
+                            let blk = alloc_blocks[unit_idx];
+                            if blk == 1 {
+                                let _ = allocator.free_one(pba);
+                            } else {
+                                let _ = allocator.free_extent(Extent::new(pba, blk));
+                            }
+                            results[unit_idx] = Err(crate::error::OnyxError::Io(
+                                std::io::Error::other(format!("IO batch submit failed: {e}")),
+                            ));
+                            skip[unit_idx] = true;
+                        }
+                    }
                 }
             }
         }

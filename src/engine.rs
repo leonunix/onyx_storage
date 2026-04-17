@@ -3,12 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
-use crate::config::OnyxConfig;
+use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::runner::GcRunner;
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
+use crate::io::read_pool::ReadPool;
+use crate::io::uring::IoUringSession;
 use crate::io::superblock::{self, HeartbeatWriter};
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
@@ -40,6 +42,8 @@ pub struct OnyxEngine {
     gc_runner: Mutex<Option<GcRunner>>,
     dedup_scanner: Mutex<Option<DedupScanner>>,
     heartbeat_writer: Mutex<Option<HeartbeatWriter>>,
+    #[allow(dead_code)]
+    read_pool: Option<Arc<ReadPool>>,
     zone_manager: Option<Arc<ZoneManager>>,
     /// Live volume handles: (vol_name, alive_flag).
     /// delete_volume sets all matching flags to false.
@@ -87,6 +91,79 @@ impl OnyxEngine {
             .unwrap()
             .as_nanos();
         u64::try_from(nanos).unwrap_or(u64::MAX)
+    }
+
+    fn build_read_pool(
+        config: &OnyxConfig,
+        metrics: Arc<EngineMetrics>,
+    ) -> OnyxResult<Option<Arc<ReadPool>>> {
+        let workers = config.storage.read_pool_workers;
+        if workers == 0 {
+            tracing::info!("read pool disabled (read_pool_workers=0) — LV3 reads run inline");
+            return Ok(None);
+        }
+        let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
+            OnyxError::Config("storage.data_device is required to build the read pool".into())
+        })?;
+        let device = RawDevice::open(data_path)?;
+        let pool = ReadPool::start(
+            workers,
+            config.storage.uring_sq_entries,
+            &device,
+            crate::types::RESERVED_BLOCKS,
+            config.storage.block_size,
+            config.storage.use_hugepages,
+            metrics,
+        )?;
+        // Each worker opens its own io_uring; the `device` handle itself is
+        // only needed for fd + base_offset, so drop it once the pool has
+        // captured what it needs.
+        drop(device);
+        Ok(Some(Arc::new(pool)))
+    }
+
+    fn build_heartbeat_writer(
+        device: RawDevice,
+        node_id: u64,
+        interval: std::time::Duration,
+        storage: &StorageConfig,
+    ) -> OnyxResult<HeartbeatWriter> {
+        match storage.io_backend {
+            IoBackendConfig::Syscall => Ok(HeartbeatWriter::start(device, node_id, interval)),
+            IoBackendConfig::Uring => {
+                let session = Arc::new(IoUringSession::new(8)?);
+                Ok(HeartbeatWriter::start_uring(
+                    device, node_id, interval, session,
+                ))
+            }
+        }
+    }
+
+    fn build_io_engine(
+        data_dev: RawDevice,
+        storage: &StorageConfig,
+        metrics: Arc<EngineMetrics>,
+    ) -> OnyxResult<Arc<IoEngine>> {
+        match storage.io_backend {
+            IoBackendConfig::Syscall => Ok(Arc::new(IoEngine::new_with_metrics(
+                data_dev,
+                storage.use_hugepages,
+                metrics,
+            ))),
+            IoBackendConfig::Uring => {
+                let session = Arc::new(IoUringSession::new(storage.uring_sq_entries)?);
+                tracing::info!(
+                    sq_entries = storage.uring_sq_entries,
+                    "LV3 IoEngine using io_uring backend"
+                );
+                Ok(Arc::new(IoEngine::new_with_metrics_uring(
+                    data_dev,
+                    storage.use_hugepages,
+                    metrics,
+                    session,
+                )))
+            }
+        }
     }
 
     fn seed_generation_clock(meta: &MetaStore) -> OnyxResult<u64> {
@@ -209,13 +286,18 @@ impl OnyxEngine {
         } else {
             Self::auto_detect_max_payload_memory()
         };
-        let pool = Arc::new(WriteBufferPool::open_with_options_and_memory_limit(
+        let buffer_uring_entries = match config.storage.io_backend {
+            IoBackendConfig::Uring => Some(config.storage.uring_sq_entries),
+            IoBackendConfig::Syscall => None,
+        };
+        let pool = Arc::new(WriteBufferPool::open_with_options_full(
             buf_dev,
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
             config.buffer.shards,
             config.engine.zone_size_blocks,
             Self::buffer_backpressure_timeout(),
             max_payload_memory,
+            buffer_uring_entries,
         )?);
         pool.attach_metrics(metrics.clone());
 
@@ -297,11 +379,7 @@ impl OnyxEngine {
             }
         }
 
-        let io_engine = Arc::new(IoEngine::new_with_metrics(
-            data_dev,
-            config.storage.use_hugepages,
-            metrics.clone(),
-        ));
+        let io_engine = Self::build_io_engine(data_dev, &config.storage, metrics.clone())?;
 
         // 3. Space allocator
         let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
@@ -323,8 +401,11 @@ impl OnyxEngine {
             metrics.clone(),
         );
 
-        // 8. Zone manager
-        let zone_manager = Arc::new(ZoneManager::new_with_metrics(
+        // 8. LV3 read pool (built before ZoneManager so writes/reads share metrics)
+        let read_pool = Self::build_read_pool(config, metrics.clone())?;
+
+        // 9. Zone manager
+        let zone_manager = Arc::new(ZoneManager::new_full(
             config.engine.zone_count,
             config.engine.zone_size_blocks,
             meta.clone(),
@@ -332,6 +413,7 @@ impl OnyxEngine {
             io_engine.clone(),
             metrics.clone(),
             Some(allocator.clone()),
+            read_pool.clone(),
         )?);
 
         // 9. Dedup scanner (after flusher; re-processes skipped blocks)
@@ -367,11 +449,12 @@ impl OnyxEngine {
         // 11. Heartbeat writer (after all other subsystems)
         let heartbeat_writer = if config.ha.enabled {
             let hb_dev = RawDevice::open(data_path)?;
-            Some(HeartbeatWriter::start(
+            Some(Self::build_heartbeat_writer(
                 hb_dev,
                 config.ha.node_id,
                 std::time::Duration::from_millis(config.ha.heartbeat_interval_ms),
-            ))
+                &config.storage,
+            )?)
         } else {
             None
         };
@@ -387,6 +470,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             heartbeat_writer: Mutex::new(heartbeat_writer),
+            read_pool,
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -418,6 +502,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(None),
             dedup_scanner: Mutex::new(None),
             heartbeat_writer: Mutex::new(None),
+            read_pool: None,
             zone_manager: None,
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
@@ -689,11 +774,7 @@ impl OnyxEngine {
             }
         }
 
-        let io_engine = Arc::new(IoEngine::new_with_metrics(
-            data_dev,
-            config.storage.use_hugepages,
-            metrics.clone(),
-        ));
+        let io_engine = Self::build_io_engine(data_dev, &config.storage, metrics.clone())?;
 
         // Space allocator
         let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
@@ -715,8 +796,11 @@ impl OnyxEngine {
             metrics.clone(),
         );
 
+        // LV3 read pool
+        let read_pool = Self::build_read_pool(config, metrics.clone())?;
+
         // Zone manager
-        let zone_manager = Arc::new(ZoneManager::new_with_metrics(
+        let zone_manager = Arc::new(ZoneManager::new_full(
             config.engine.zone_count,
             config.engine.zone_size_blocks,
             meta.clone(),
@@ -724,6 +808,7 @@ impl OnyxEngine {
             io_engine.clone(),
             metrics.clone(),
             Some(allocator.clone()),
+            read_pool.clone(),
         )?);
 
         // Dedup scanner
@@ -779,6 +864,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             heartbeat_writer: Mutex::new(heartbeat_writer),
+            read_pool,
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
             lifecycle,

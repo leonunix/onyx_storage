@@ -679,6 +679,24 @@ impl BufferShard {
         }
     }
 
+    /// Encode the current checkpoint with the supplied max_seq, ready to be
+    /// passed as a write SQE inside the sync_loop's batched io_uring submission.
+    pub(super) fn encode_checkpoint_for_uring(&self, max_seq: u64) -> Option<Vec<u8>> {
+        let _ = self.checkpoint_device.as_ref()?;
+        let mut ckpt = self.snapshot_checkpoint();
+        ckpt.max_seq = max_seq;
+        Some(ckpt.encode().to_vec())
+    }
+
+    /// Returns the checkpoint device's raw fd plus the absolute offset where
+    /// the checkpoint block is written. Used by the io_uring sync_loop path to
+    /// piggyback the checkpoint write onto the same submit_batch as the entry
+    /// writes + fsync. Returns None when no checkpoint device is attached.
+    pub(super) fn checkpoint_target(&self) -> Option<(std::os::fd::RawFd, u64)> {
+        let dev = self.checkpoint_device.as_ref()?;
+        Some((dev.as_raw_fd(), dev.base_offset()))
+    }
+
     /// After fdatasync, unconditionally evict all in-memory payloads from
     /// committed entries (write-through policy). Entries remain in
     /// pending_entries with payload=None; reads hydrate from the buffer
@@ -944,136 +962,19 @@ impl BufferShard {
         let mut buf = vec![0u8; slot_bytes];
         self.device.read_at(&mut buf, pending.disk_offset)?;
         let entry = BufferEntry::from_bytes(&buf).ok_or_else(|| {
-            // Diagnose why the entry cannot be parsed.
-            Self::diagnose_hydration_failure(&buf, pending, &self.device);
+            tracing::error!(
+                disk_offset = pending.disk_offset,
+                disk_len = pending.disk_len,
+                expected_seq = pending.seq,
+                expected_lba = pending.start_lba.0,
+                "failed to parse buffer entry during payload hydration"
+            );
             OnyxError::Io(std::io::Error::other(format!(
                 "failed to parse entry at offset {} during payload hydration",
                 pending.disk_offset,
             )))
         })?;
         Ok(entry.payload)
-    }
-
-    /// Log forensic details when a buffer entry on disk cannot be parsed.
-    pub(super) fn diagnose_hydration_failure(
-        buf: &[u8],
-        pending: &PendingEntry,
-        device: &RawDevice,
-    ) {
-        use crate::buffer::entry::BUFFER_ENTRY_MAGIC;
-        const HDR: usize = 48; // FIXED_HEADER_SIZE
-
-        let all_zero = buf.iter().all(|&b| b == 0);
-        let magic_ok = buf.len() >= 8 && {
-            let m = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-            m == BUFFER_ENTRY_MAGIC
-        };
-        let stored_total_len = if buf.len() >= 4 {
-            u32::from_le_bytes(buf[0..4].try_into().unwrap())
-        } else {
-            0
-        };
-        let stored_seq = if buf.len() >= HDR {
-            u64::from_le_bytes(buf[8..16].try_into().unwrap())
-        } else {
-            0
-        };
-        let stored_lba = if buf.len() >= HDR {
-            u64::from_le_bytes(buf[16..24].try_into().unwrap())
-        } else {
-            0
-        };
-        let stored_lba_count = if buf.len() >= HDR {
-            u32::from_le_bytes(buf[24..28].try_into().unwrap())
-        } else {
-            0
-        };
-        let stored_version = if buf.len() >= 32 { buf[31] } else { 0 };
-        let stored_crc = if buf.len() >= 40 {
-            u32::from_le_bytes(buf[36..40].try_into().unwrap())
-        } else {
-            0
-        };
-        let first_16: Vec<u8> = buf.iter().take(16).copied().collect();
-
-        // Compute what the CRC *should* be for the header bytes we just read.
-        let header_end = if buf.len() >= HDR {
-            let vid_len = u16::from_le_bytes(buf[28..30].try_into().unwrap()) as usize;
-            HDR + vid_len
-        } else {
-            HDR
-        };
-        let computed_crc = if buf.len() >= header_end.max(40) {
-            let mut h = crc32fast::Hasher::new();
-            h.update(&buf[0..36]);
-            h.update(&buf[40..header_end.min(buf.len())]);
-            h.finalize()
-        } else {
-            0
-        };
-
-        let read_base_offset = device.base_offset();
-        let read_global_offset = read_base_offset + pending.disk_offset;
-        let read_direct_io = device.is_direct_io();
-
-        // Cross-check: open a FRESH fd to the same raw device and re-read the
-        // same global offset.  Compares shard device fd vs fresh fd to detect
-        // O_DIRECT cache coherency / fd aliasing issues.
-        let (reread_magic_ok, reread_same_as_shard) = match RawDevice::open(device.path()) {
-            Ok(fresh_dev) => {
-                let mut tmp = vec![0u8; BLOCK_SIZE as usize];
-                match fresh_dev.read_at(&mut tmp, read_global_offset) {
-                    Ok(()) => {
-                        let m = u32::from_le_bytes(tmp[4..8].try_into().unwrap());
-                        let ok = m == BUFFER_ENTRY_MAGIC;
-                        let same = tmp[..16] == buf[..16.min(buf.len())];
-                        let fresh_16: Vec<u8> = tmp[..16].to_vec();
-                        tracing::warn!(
-                            global_offset = read_global_offset,
-                            fresh_magic = m,
-                            fresh_magic_ok = ok,
-                            fresh_same_as_shard = same,
-                            fresh_first_bytes = ?fresh_16,
-                            fresh_direct_io = fresh_dev.is_direct_io(),
-                            "cross-fd re-read at global offset"
-                        );
-                        (ok, same)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "cross-fd re-read IO failed");
-                        (false, false)
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "cross-fd device open failed");
-                (false, false)
-            }
-        };
-
-        tracing::warn!(
-            expected_seq = pending.seq,
-            expected_lba = pending.start_lba.0,
-            expected_lba_count = pending.lba_count,
-            disk_offset = pending.disk_offset,
-            disk_len = pending.disk_len,
-            read_base_offset,
-            read_global_offset,
-            read_direct_io,
-            reread_magic_ok,
-            reread_same_as_shard,
-            all_zero,
-            magic_ok,
-            stored_total_len,
-            stored_seq,
-            stored_lba,
-            stored_lba_count,
-            stored_version,
-            stored_crc,
-            computed_crc,
-            first_bytes = ?first_16,
-            "hydration failure forensics"
-        );
     }
 
     pub(super) fn volatile_payload(&self, seq: u64) -> Option<Arc<[u8]>> {

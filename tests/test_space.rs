@@ -4,6 +4,10 @@ use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::space::extent::Extent;
 use onyx_storage::types::{Lba, Pba, VolumeId, RESERVED_BLOCKS};
 
+fn ensure_blockmap_cf(store: &MetaStore, vol_id: &str) {
+    store.create_blockmap_cf(vol_id).unwrap();
+}
+
 // --- extent tests ---
 
 #[test]
@@ -228,6 +232,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-a".into());
+    ensure_blockmap_cf(&meta, "vol-a");
 
     // Use PBAs in usable range (>= RESERVED_BLOCKS)
     let value0 = onyx_storage::meta::schema::BlockmapValue {

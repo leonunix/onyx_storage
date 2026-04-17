@@ -2,7 +2,7 @@ use rocksdb::WriteBatch;
 
 use crate::error::OnyxResult;
 use crate::meta::schema::*;
-use crate::types::{Lba, Pba, BLOCK_SIZE};
+use crate::types::{Pba, BLOCK_SIZE};
 
 use super::MetaStore;
 
@@ -25,7 +25,9 @@ impl MetaStore {
         Ok(false)
     }
 
-    fn count_blockmap_refs_for_pba_inner(&self, target_pba: Pba) -> OnyxResult<u32> {
+    /// Count live blockmap references that currently point at `target_pba`.
+    /// Full scan across all volumes — test helper / diagnostic only, not for hot paths.
+    pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {
         let mut refs = 0u32;
         for cf_name in self.all_blockmap_cf_names() {
             if let Some(cf) = self.db.cf_handle(&cf_name) {
@@ -41,104 +43,6 @@ impl MetaStore {
             }
         }
         Ok(refs)
-    }
-
-    // TEMP(soak-debug): full blockmap scan used to diagnose allocator/PBA reuse
-    // corruption. Remove or gate after the root cause is fixed and soak proves
-    // stable without the extra protection.
-    /// Count live blockmap references that currently point at `target_pba`.
-    pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {
-        self.count_blockmap_refs_for_pba_inner(target_pba)
-    }
-
-    fn unique_fragments_for_pba_inner(
-        &self,
-        target_pba: Pba,
-        limit: Option<usize>,
-    ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
-        let mut seen = std::collections::HashSet::new();
-        let mut fragments = Vec::new();
-        for cf_name in self.all_blockmap_cf_names() {
-            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            let Some(cf) = self.db.cf_handle(&cf_name) else {
-                continue;
-            };
-            let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-            for item in iter {
-                let (key, value) = item?;
-                let Some(bv) = decode_blockmap_value(&value) else {
-                    continue;
-                };
-                if bv.pba != target_pba {
-                    continue;
-                }
-                let frag_key = (
-                    bv.slot_offset,
-                    bv.unit_compressed_size,
-                    bv.unit_original_size,
-                    bv.unit_lba_count,
-                    bv.compression,
-                    bv.crc32,
-                    bv.flags,
-                );
-                if !seen.insert(frag_key) {
-                    continue;
-                }
-                let Some(lba) = decode_blockmap_key(&key) else {
-                    continue;
-                };
-                fragments.push((vol_id.clone(), lba, bv));
-                if limit.is_some_and(|max| fragments.len() >= max) {
-                    return Ok(fragments);
-                }
-            }
-        }
-        Ok(fragments)
-    }
-
-    // TEMP(soak-debug): exemplar collection for corruption logs. Full scan;
-    // remove or gate once the root cause is fixed.
-    /// Return exemplar live fragment mappings for a PBA.
-    pub fn unique_fragments_for_pba(
-        &self,
-        target_pba: Pba,
-        limit: usize,
-    ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
-        self.unique_fragments_for_pba_inner(target_pba, Some(limit))
-    }
-
-    // TEMP(soak-debug): heavy refcount reconciliation used to keep soak runs
-    // alive while we locate the real bug. Remove or gate after the allocator /
-    // hole-map issue is fixed and verified.
-    /// Repair a single PBA's refcount from the live blockmap if it drifted.
-    pub fn reconcile_refcount_for_pba(&self, pba: Pba) -> OnyxResult<u32> {
-        let _refcount_guards = self.lock_refcount_pbas([pba]);
-        let current = self.get_refcount(pba)?;
-        let actual = self.count_blockmap_refs_for_pba_inner(pba)?;
-        if current == actual {
-            return Ok(actual);
-        }
-
-        let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
-        let key = encode_refcount_key(pba);
-        if actual == 0 {
-            self.db.delete_cf(&cf_refcount, &key)?;
-        } else {
-            self.db
-                .put_cf(&cf_refcount, &key, &encode_refcount_value(actual))?;
-        }
-
-        tracing::error!(
-            pba = pba.0,
-            recorded_refcount = current,
-            actual_refcount = actual,
-            "reconciled refcount from live blockmap references"
-        );
-
-        Ok(actual)
     }
 
     /// Scan for and remove orphaned refcount entries — PBAs with refcount > 0

@@ -10,6 +10,7 @@ use onyx_storage::buffer::pool::WriteBufferPool;
 use onyx_storage::config::{FlushConfig, MetaConfig};
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::engine::IoEngine;
+use onyx_storage::io::uring::IoUringSession;
 use onyx_storage::lifecycle::VolumeLifecycleManager;
 use onyx_storage::meta::store::MetaStore;
 use onyx_storage::space::allocator::SpaceAllocator;
@@ -17,6 +18,28 @@ use onyx_storage::types::*;
 use tempfile::{tempdir, NamedTempFile};
 
 fn setup_flush_env() -> (
+    Arc<WriteBufferPool>,
+    Arc<MetaStore>,
+    Arc<VolumeLifecycleManager>,
+    Arc<SpaceAllocator>,
+    Arc<IoEngine>,
+) {
+    setup_flush_env_with_backend(false)
+}
+
+fn setup_flush_env_uring() -> (
+    Arc<WriteBufferPool>,
+    Arc<MetaStore>,
+    Arc<VolumeLifecycleManager>,
+    Arc<SpaceAllocator>,
+    Arc<IoEngine>,
+) {
+    setup_flush_env_with_backend(true)
+}
+
+fn setup_flush_env_with_backend(
+    uring: bool,
+) -> (
     Arc<WriteBufferPool>,
     Arc<MetaStore>,
     Arc<VolumeLifecycleManager>,
@@ -41,7 +64,12 @@ fn setup_flush_env() -> (
     let data_size = 4096 * 10000;
     data_tmp.as_file().set_len(data_size as u64).unwrap();
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
-    let io_engine = Arc::new(IoEngine::new(data_dev, false));
+    let io_engine = if uring {
+        let ring = Arc::new(IoUringSession::new(64).unwrap());
+        Arc::new(IoEngine::new_uring(data_dev, false, ring))
+    } else {
+        Arc::new(IoEngine::new(data_dev, false))
+    };
 
     let lifecycle = Arc::new(VolumeLifecycleManager::default());
     let allocator = Arc::new(SpaceAllocator::new(data_size as u64, 0));
@@ -452,4 +480,90 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
         "all pending entries should eventually drain"
     );
     flusher.stop();
+}
+
+#[test]
+fn flusher_uring_backend_flushes_batch() {
+    let (pool, meta, lifecycle, allocator, io_engine) = setup_flush_env_uring();
+    register_volume(&meta, "uring-batch");
+
+    // 16 distinct LBAs to exercise the batched io_uring submit path.
+    for lba in 0..16u64 {
+        let mut data = vec![0u8; 4096];
+        data[0] = lba as u8;
+        pool.append("uring-batch", Lba(lba), 1, &data, 0).unwrap();
+    }
+
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    assert!(wait_flushed(&pool, 5000), "uring flush timeout");
+    flusher.stop();
+
+    let vol_id = VolumeId("uring-batch".into());
+    for lba in 0..16u64 {
+        let mapping = meta.get_mapping(&vol_id, Lba(lba)).unwrap();
+        assert!(
+            mapping.is_some(),
+            "uring batch flush should have written blockmap for lba {lba}"
+        );
+    }
+}
+
+#[test]
+fn flusher_uring_round_trip_preserves_data() {
+    use onyx_storage::compress::codec::create_compressor;
+
+    let (pool, meta, lifecycle, allocator, io_engine) = setup_flush_env_uring();
+    register_volume(&meta, "uring-rt");
+
+    // Mixed payloads — some compressible, some not — through the batched writer.
+    let payloads: Vec<Vec<u8>> = (0..8u64)
+        .map(|i| {
+            if i % 2 == 0 {
+                // Highly compressible.
+                vec![(i as u8).wrapping_mul(7); 4096]
+            } else {
+                // Pseudo-random, low compressibility.
+                let mut v = Vec::with_capacity(4096);
+                for j in 0..4096u32 {
+                    v.push(((j ^ (i as u32)).wrapping_mul(2654435761)) as u8);
+                }
+                v
+            }
+        })
+        .collect();
+
+    for (i, p) in payloads.iter().enumerate() {
+        pool.append("uring-rt", Lba(i as u64), 1, p, 0).unwrap();
+    }
+
+    let mut flusher = start_flusher(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    assert!(wait_flushed(&pool, 5000));
+    flusher.stop();
+
+    let vol_id = VolumeId("uring-rt".into());
+    for (i, expected) in payloads.iter().enumerate() {
+        let mapping = meta.get_mapping(&vol_id, Lba(i as u64)).unwrap();
+        let mapping = mapping.expect("blockmap entry");
+        let raw = io_engine
+            .read_blocks(mapping.pba, mapping.unit_compressed_size as usize)
+            .unwrap();
+        let unit_bytes = if mapping.compression == 0 {
+            raw[..mapping.unit_original_size as usize].to_vec()
+        } else {
+            let algo = match mapping.compression {
+                1 => CompressionAlgo::Lz4,
+                2 => CompressionAlgo::Zstd { level: 3 },
+                _ => panic!("unexpected compression {}", mapping.compression),
+            };
+            let codec = create_compressor(algo);
+            let mut out = vec![0u8; mapping.unit_original_size as usize];
+            codec
+                .decompress(&raw, &mut out, mapping.unit_original_size as usize)
+                .unwrap();
+            out
+        };
+        let off = mapping.offset_in_unit as usize * 4096;
+        let slice = &unit_bytes[off..off + 4096];
+        assert_eq!(slice, expected.as_slice(), "lba {} round-trip mismatch", i);
+    }
 }

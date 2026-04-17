@@ -1558,8 +1558,7 @@ fn packed_slot_full_chain_no_premature_free() {
     );
 
     // Step 5: verify cleanup would NOT free this PBA
-    let live_rc =
-        BufferFlusher::live_refcount_with_reconcile(&meta, packed_pba, "test_chain").unwrap();
+    let live_rc = meta.get_refcount(packed_pba).unwrap();
     assert_eq!(
         live_rc, 4,
         "cleanup must see refcount > 0 and NOT free the PBA"

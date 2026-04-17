@@ -51,6 +51,36 @@ pub struct BlockmapValue {
     pub flags: u8,
 }
 
+impl BlockmapValue {
+    /// On-disk read footprint for this fragment, rounded up to `block_size`.
+    /// Packed fragments share a 4 KB slot, so callers always read the whole
+    /// physical slot and slice the fragment out by `slot_offset`.
+    pub fn compressed_read_size(&self, block_size: usize) -> usize {
+        if self.slot_offset > 0 {
+            block_size
+        } else {
+            let raw = self.unit_compressed_size as usize;
+            ((raw + block_size - 1) / block_size) * block_size
+        }
+    }
+
+    /// Slice range `[start, end)` of the compressed unit inside the buffer
+    /// returned by `compressed_read_size`. For unpacked fragments this starts
+    /// at 0; for packed fragments it starts at `slot_offset`.
+    pub fn compressed_slice_range(&self) -> (usize, usize) {
+        let start = if self.slot_offset > 0 {
+            self.slot_offset as usize
+        } else {
+            0
+        };
+        (start, start + self.unit_compressed_size as usize)
+    }
+
+    pub fn is_uncompressed(&self) -> bool {
+        self.compression == 0
+    }
+}
+
 // --- Per-volume blockmap key: just lba (8B BE) ---
 // Each volume has its own CF, so vol_id is implicit in the CF name.
 

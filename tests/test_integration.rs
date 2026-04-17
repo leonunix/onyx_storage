@@ -101,6 +101,9 @@ fn setup_with_all_options(
             block_size: 4096,
             use_hugepages: false,
             default_compression: CompressionAlgo::Lz4,
+            io_backend: Default::default(),
+            uring_sq_entries: 128,
+            read_pool_workers: 4,
         },
         buffer: BufferConfig {
             device: Some(buf_file.path().to_path_buf()),
