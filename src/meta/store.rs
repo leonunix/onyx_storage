@@ -5,6 +5,9 @@ mod refcount;
 mod scan;
 mod volume;
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rocksdb::{DBWithThreadMode, MergeOperands, MultiThreaded, WriteOptions};
