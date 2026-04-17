@@ -503,6 +503,12 @@ impl IoEngine {
         Ok(out.into_iter().map(|s| s.expect("all slots filled")).collect())
     }
 
+    /// Borrow the underlying data device. Used by the engine shutdown path
+    /// to stamp the `FLAG_CLEAN_SHUTDOWN` bit in the LV3 superblock.
+    pub fn data_device(&self) -> &RawDevice {
+        &self.data_device
+    }
+
     pub fn device_size(&self) -> u64 {
         self.data_device.size()
     }

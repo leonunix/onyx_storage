@@ -14,6 +14,12 @@ use crate::types::{BLOCK_SIZE, RESERVED_BLOCKS};
 pub const DATA_SUPERBLOCK_MAGIC: u32 = 0x4F4C_5633; // "OLV3"
 pub const DATA_SUPERBLOCK_VERSION: u32 = 1;
 
+/// `DataSuperblock::flags` bit: set when the engine has performed a graceful
+/// shutdown (flusher drained, cleanup_tx empty, metadata consistent). Absence
+/// on startup triggers the dirty-recovery path: scan the redb paged blockmap
+/// and rebuild RocksDB refcount from ground truth.
+pub const FLAG_CLEAN_SHUTDOWN: u64 = 1 << 0;
+
 pub const HEARTBEAT_MAGIC: u32 = 0x4F48_4254; // "OHBT"
 pub const HEARTBEAT_VERSION: u32 = 1;
 
@@ -133,6 +139,21 @@ impl DataSuperblock {
         tmp[48..56].copy_from_slice(&self.format_timestamp.to_le_bytes());
         tmp[56..64].copy_from_slice(&self.flags.to_le_bytes());
         self.crc32 = crc32fast::hash(&tmp);
+    }
+
+    /// Test whether the previous run exited via graceful shutdown.
+    pub fn is_clean_shutdown(&self) -> bool {
+        self.flags & FLAG_CLEAN_SHUTDOWN != 0
+    }
+
+    /// Flip the `FLAG_CLEAN_SHUTDOWN` bit. Caller must follow with
+    /// `update_crc()` + `write_superblock()` for the change to be durable.
+    pub fn set_clean_shutdown(&mut self, clean: bool) {
+        if clean {
+            self.flags |= FLAG_CLEAN_SHUTDOWN;
+        } else {
+            self.flags &= !FLAG_CLEAN_SHUTDOWN;
+        }
     }
 
     /// Format UUID as standard hex string (e.g. "550e8400-e29b-41d4-a716-446655440000").

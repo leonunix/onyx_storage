@@ -349,7 +349,7 @@ impl OnyxEngine {
         let device_size = data_dev.size();
 
         // 2a. Validate / format LV3 superblock
-        match superblock::read_superblock(&data_dev)? {
+        let mut superblock = match superblock::read_superblock(&data_dev)? {
             Some(sb) => {
                 if sb.device_size_bytes != device_size {
                     return Err(OnyxError::Config(format!(
@@ -360,8 +360,10 @@ impl OnyxEngine {
                 tracing::info!(
                     uuid = sb.uuid_string(),
                     version = sb.version,
+                    clean_shutdown = sb.is_clean_shutdown(),
                     "LV3 superblock validated"
                 );
+                sb
             }
             None => {
                 // Check if the device is fresh (all zeros in block 0)
@@ -369,7 +371,7 @@ impl OnyxEngine {
                 data_dev.read_at(&mut block0, 0)?;
                 if block0.iter().all(|&b| b == 0) {
                     tracing::info!("fresh LV3 device — formatting");
-                    superblock::format_device(&data_dev)?;
+                    superblock::format_device(&data_dev)?
                 } else {
                     return Err(OnyxError::Config(
                         "LV3 block 0 has data but invalid superblock (magic/CRC/version failed)"
@@ -377,7 +379,33 @@ impl OnyxEngine {
                     ));
                 }
             }
+        };
+
+        // 2b. Recovery branch based on clean/dirty shutdown marker.
+        if superblock.is_clean_shutdown() {
+            tracing::info!(
+                "clean shutdown marker present — skipping refcount rebuild"
+            );
+        } else {
+            tracing::warn!(
+                "dirty startup detected — rebuilding refcount CF from redb blockmap + dedup_index"
+            );
+            let summary = meta.rebuild_refcount_from_blockmap()?;
+            tracing::info!(
+                referenced_pbas = summary.referenced_pbas,
+                fixed_entries = summary.fixed_entries,
+                orphan_entries_removed = summary.orphan_entries_removed,
+                total_set = summary.total_set,
+                "refcount CF rebuilt"
+            );
         }
+
+        // 2c. Mark dirty before serving IO. The bit is cleared again only on
+        //     graceful shutdown, so an unexpected exit automatically forces a
+        //     dirty recovery on the next boot.
+        superblock.set_clean_shutdown(false);
+        superblock.update_crc();
+        superblock::write_superblock(&data_dev, &superblock)?;
 
         let io_engine = Self::build_io_engine(data_dev, &config.storage, metrics.clone())?;
 
@@ -723,6 +751,35 @@ impl OnyxEngine {
 
         // Zone manager shutdown is handled by Drop (it sends Shutdown to all workers)
         // We can't call shutdown(&mut self) through Arc, but Drop handles it.
+
+        // Stamp the LV3 superblock with FLAG_CLEAN_SHUTDOWN so the next boot
+        // can skip dirty recovery. This is the last persistent act of the
+        // engine — by this point flusher has drained, cleanup_tx is idle, and
+        // the refcount CF is consistent with the redb paged blockmap.
+        if let Some(ref io_engine) = self.io_engine {
+            match superblock::read_superblock(io_engine.data_device()) {
+                Ok(Some(mut sb)) => {
+                    sb.set_clean_shutdown(true);
+                    sb.update_crc();
+                    if let Err(e) = superblock::write_superblock(io_engine.data_device(), &sb) {
+                        tracing::error!(
+                            error = %e,
+                            "failed to write clean-shutdown superblock — next boot will do dirty recovery"
+                        );
+                    } else {
+                        tracing::info!("LV3 superblock marked clean");
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "LV3 superblock missing at shutdown — cannot mark clean"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "reading LV3 superblock failed at shutdown");
+                }
+            }
+        }
 
         tracing::info!("onyx engine shut down");
         Ok(())
