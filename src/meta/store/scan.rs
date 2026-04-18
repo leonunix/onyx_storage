@@ -103,14 +103,19 @@ impl MetaStore {
     }
 
     /// Recompute the RocksDB `refcount` CF from ground truth: the redb paged
-    /// blockmap plus the dedup_index registry. Each PBA's target refcount is
-    /// the sum of:
-    ///   - LBA mappings referencing it (from redb)
-    ///   - dedup_index entries pointing to it (each counts as one reference;
-    ///     dedup adds a persistent claim even when no LBA currently maps)
+    /// blockmap. Each PBA's target refcount is the number of LBA mappings
+    /// referencing it.
     ///
     /// The RocksDB refcount CF is then overwritten to match — entries not in
     /// the computed set are deleted (they were drifted orphans).
+    ///
+    /// **Note**: `dedup_index` / `dedup_reverse` do **not** contribute to
+    /// refcount. The hot path never bumps refcount on dedup-index insert;
+    /// `cleanup_dedup_for_pba` deletes index entries when the PBA's refcount
+    /// (driven by blockmap refs only) hits zero. An earlier version of this
+    /// function incorrectly added `iter_dedup_entries()` into the count,
+    /// which drifted every PBA's refcount upward by 1 per dirty-recovery
+    /// cycle.
     ///
     /// Invoked from the dirty-recovery path at engine startup. Hold all
     /// blockmap and refcount stripes so no concurrent write sees the table in
@@ -120,16 +125,13 @@ impl MetaStore {
         let _refcount_guards = self.lock_all_refcount_stripes();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
-        // 1. Count LBA references per PBA.
+        // Count LBA references per PBA — this is the full definition of
+        // refcount. Dedup entries are NOT counted (they are cleaned up when
+        // the underlying PBA drops to zero blockmap refs).
         let mut computed: std::collections::HashMap<Pba, u32> = std::collections::HashMap::new();
         self.redb.scan_all_mappings(|_, _, bv| {
             *computed.entry(bv.pba).or_insert(0) += 1;
         })?;
-
-        // 2. Add dedup_index persistent claims.
-        for (_hash, entry) in self.iter_dedup_entries()? {
-            *computed.entry(entry.pba).or_insert(0) += 1;
-        }
 
         // 3. Write back: overwrite every computed entry, delete anything in
         //    refcount CF that is not in the computed set.

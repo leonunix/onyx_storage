@@ -193,7 +193,7 @@ fn ring_wrap_gap_prevents_overlap() {
 
     // Reclaim entry 1 so that tail advances.
     ring.flushed_seqs.insert(1);
-    BufferShard::reclaim_log_prefix(&mut ring);
+    BufferShard::reclaim_log_prefix(&mut ring, u64::MAX);
     assert_eq!(ring.used_bytes, 0);
     // head=7*slot, tail=7*slot (ring empty).
 
@@ -245,7 +245,7 @@ fn ring_gap_freed_on_reclaim_past_wrap() {
     BufferShard::reserve_log_space(&mut ring, 1, 7);
     // Reclaim entry 1.
     ring.flushed_seqs.insert(1);
-    BufferShard::reclaim_log_prefix(&mut ring);
+    BufferShard::reclaim_log_prefix(&mut ring, u64::MAX);
     // head=7*slot, tail=7*slot, used=0.
 
     // Entry 2: 2 slots at [7*slot, 9*slot).
@@ -256,14 +256,14 @@ fn ring_gap_freed_on_reclaim_past_wrap() {
 
     // Reclaim entry 2 — should also free the gap.
     ring.flushed_seqs.insert(2);
-    BufferShard::reclaim_log_prefix(&mut ring);
+    BufferShard::reclaim_log_prefix(&mut ring, u64::MAX);
     // Entry 2 was 2 slots, gap was 1 slot. Total freed = 3 slots.
     assert_eq!(ring.used_bytes, 3 * slot); // only entry 3 remains
     assert_eq!(ring.tail_offset, 0); // tail advanced past gap to entry 3
 
     // Reclaim entry 3.
     ring.flushed_seqs.insert(3);
-    BufferShard::reclaim_log_prefix(&mut ring);
+    BufferShard::reclaim_log_prefix(&mut ring, u64::MAX);
     assert_eq!(ring.used_bytes, 0);
 }
 
@@ -284,7 +284,7 @@ fn ring_empty_wrap_tracks_gap() {
 
     // Reclaim — gap should be freed along with the entry.
     ring.flushed_seqs.insert(1);
-    BufferShard::reclaim_log_prefix(&mut ring);
+    BufferShard::reclaim_log_prefix(&mut ring, u64::MAX);
     assert_eq!(ring.used_bytes, 0);
 }
 

@@ -162,9 +162,15 @@ fn rebuild_refcount_removes_orphans() {
 }
 
 #[test]
-fn rebuild_refcount_counts_dedup_index_claims() {
-    // A PBA is referenced only by a dedup_index entry (no LBA maps to it).
-    // Rebuild must still give it refcount >= 1 so the dedup claim stays live.
+fn rebuild_refcount_ignores_standalone_dedup_entries() {
+    // A PBA with a dedup_index entry but **no blockmap ref** is a stale
+    // index entry — the PBA is not actually in use. Rebuild must give it
+    // refcount = 0; a later atomic_dedup_hit will reject the hit (refcount
+    // 0 guard) and cleanup_dedup_for_pba will drop the stale entries.
+    //
+    // This is the inverse of an earlier version that incorrectly added
+    // iter_dedup_entries() into the computed count, drifting refcount up
+    // by 1 per dirty-recovery cycle.
     let dir = TempDir::new().unwrap();
     let meta = fresh_meta(dir.path());
     meta.put_volume(&vol_config("v")).unwrap();
@@ -172,15 +178,10 @@ fn rebuild_refcount_counts_dedup_index_claims() {
     let hash: ContentHash = [7u8; 32];
     let entry = sample_dedup_entry(300);
     meta.put_dedup_entries(&[(hash, entry)]).unwrap();
-    let rev_cf = meta.db.cf_handle(CF_DEDUP_REVERSE).unwrap();
-    let rev_key = encode_dedup_reverse_key(Pba(300), &hash);
-    assert!(meta.db.get_cf(&rev_cf, &rev_key).unwrap().is_some());
-    let idx_cf = meta.db.cf_handle(CF_DEDUP_INDEX).unwrap();
-    assert!(meta.db.get_cf(&idx_cf, &hash).unwrap().is_some());
 
     let summary = meta.rebuild_refcount_from_blockmap().unwrap();
-    assert!(summary.referenced_pbas >= 1);
-    assert_eq!(meta.get_refcount(Pba(300)).unwrap(), 1);
+    assert_eq!(summary.referenced_pbas, 0);
+    assert_eq!(meta.get_refcount(Pba(300)).unwrap(), 0);
 }
 
 #[test]

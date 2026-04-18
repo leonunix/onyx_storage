@@ -857,6 +857,11 @@ impl WriteBufferPool {
         // ── Parallel shard recovery ──────────────────────────────────
         let metrics = Arc::new(OnceLock::new());
         let payload_bytes_in_memory = Arc::new(AtomicU64::new(0));
+        // Durability-watermark atomics shared with every shard. `max_flushed_seq`
+        // is bumped in free_seq_allocation; `durable_seq` is advanced by the
+        // engine-owned watermark thread after MetaStore::sync_durable().
+        let max_flushed_seq = Arc::new(AtomicU64::new(0));
+        let durable_seq = Arc::new(AtomicU64::new(0));
         let shard_results: Vec<OnyxResult<(BufferShard, u64)>> = if shard_count > 1 {
             std::thread::scope(|s| {
                 let handles: Vec<_> = shard_configs
@@ -864,6 +869,8 @@ impl WriteBufferPool {
                     .map(|cfg| {
                         let m = metrics.clone();
                         let pb = payload_bytes_in_memory.clone();
+                        let mfs = max_flushed_seq.clone();
+                        let ds = durable_seq.clone();
                         s.spawn(move || {
                             BufferShard::open(
                                 cfg.data_device,
@@ -873,6 +880,8 @@ impl WriteBufferPool {
                                 cfg.checkpoint_device,
                                 pb,
                                 max_payload_memory,
+                                mfs,
+                                ds,
                             )
                         })
                     })
@@ -895,6 +904,8 @@ impl WriteBufferPool {
                         cfg.checkpoint_device,
                         payload_bytes_in_memory.clone(),
                         max_payload_memory,
+                        max_flushed_seq.clone(),
+                        durable_seq.clone(),
                     )
                 })
                 .collect()
@@ -1000,6 +1011,8 @@ impl WriteBufferPool {
             payload_bytes_in_memory,
             max_payload_memory,
             disk_version,
+            max_flushed_seq,
+            durable_seq,
         };
 
         let expected_sb = GlobalSuperblock {
@@ -1364,6 +1377,20 @@ impl WriteBufferPool {
     /// Configured in-memory payload ceiling. 0 means "no limit".
     pub fn payload_memory_limit_bytes(&self) -> u64 {
         self.max_payload_memory
+    }
+
+    /// Atomic shared with every shard that tracks the highest seq to have
+    /// been mark_flushed'd. Intended for the durability-watermark thread
+    /// to capture before invoking `MetaStore::sync_durable`.
+    pub fn max_flushed_seq_handle(&self) -> Arc<AtomicU64> {
+        self.max_flushed_seq.clone()
+    }
+
+    /// Atomic shared with every shard that gates ring-reclaim: an entry is
+    /// only truly reclaimable once its seq ≤ `durable_seq`. The durability
+    /// watermark thread advances this after a successful sync.
+    pub fn durable_seq_handle(&self) -> Arc<AtomicU64> {
+        self.durable_seq.clone()
     }
 
     /// Snapshot per-shard buffer statistics for monitoring.

@@ -141,6 +141,22 @@ impl MetaStore {
         self.redb.sync()
     }
 
+    /// Drive both RocksDB and redb to physical durability.
+    ///
+    /// RocksDB hot-path writes use `WriteOptions::sync = false` (only the
+    /// buffer commit log fsyncs on user IO). redb hot-path writes use
+    /// `Durability::None`. Both defer their fsyncs so we can amortize the
+    /// cost across many IOs; this method performs the amortized fsync.
+    ///
+    /// Intended caller: the durability-watermark background thread, which
+    /// invokes this on a periodic cadence and then advances the watermark
+    /// the buffer pool reclaim path observes.
+    pub fn sync_durable(&self) -> OnyxResult<()> {
+        self.db.flush_wal(true)?;
+        self.redb.sync()?;
+        Ok(())
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<RocksDbMemorySnapshot> {
         let cf_names: Vec<&str> = Self::GLOBAL_CFS.to_vec();
 

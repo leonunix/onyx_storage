@@ -1,5 +1,87 @@
 use super::*;
 
+/// Startup-scan chunk size. Recovery reads the commit-log ring in 16 MiB
+/// windows and parses entries from memory. Chosen so that typical shards
+/// finish in a handful of sequential pread() calls instead of one per 4 KiB
+/// slot (MAX_ENTRY_SIZE is 2 MiB, leaving ≥ 14 MiB of new data per window).
+const SCAN_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Sliding read-ahead buffer for recovery scans. Holds one aligned window
+/// from the commit-log device; refills when the caller's offset leaves the
+/// window or when fewer than MAX_ENTRY_SIZE bytes remain ahead of the
+/// cursor (so the next entry is always fully buffered unless we have truly
+/// hit the end of the ring).
+struct ChunkReader<'a> {
+    device: &'a RawDevice,
+    buf: AlignedBuf,
+    buf_disk_start: u64,
+    buf_valid_bytes: usize,
+    capacity_bytes: u64,
+}
+
+impl<'a> ChunkReader<'a> {
+    fn new(device: &'a RawDevice, capacity_bytes: u64) -> OnyxResult<Self> {
+        let block = BLOCK_SIZE as usize;
+        let cap_usize = usize::try_from(capacity_bytes).unwrap_or(usize::MAX);
+        let mut chunk = SCAN_CHUNK_BYTES.min(cap_usize);
+        chunk &= !(block - 1);
+        if chunk < block {
+            chunk = block;
+        }
+        let buf = AlignedBuf::new(chunk, false)?;
+        Ok(Self {
+            device,
+            buf,
+            buf_disk_start: 0,
+            buf_valid_bytes: 0,
+            capacity_bytes,
+        })
+    }
+
+    /// Return a slice starting at `disk_offset` with as many valid bytes as
+    /// are currently buffered (at least one full entry unless we have
+    /// reached `capacity_bytes`).
+    fn slice_at(&mut self, disk_offset: u64) -> OnyxResult<&[u8]> {
+        debug_assert!(disk_offset.is_multiple_of(BLOCK_SIZE as u64));
+        debug_assert!(disk_offset < self.capacity_bytes);
+
+        let buf_end = self.buf_disk_start + self.buf_valid_bytes as u64;
+        let in_window = self.buf_valid_bytes > 0
+            && disk_offset >= self.buf_disk_start
+            && disk_offset < buf_end;
+        let need_refill = if !in_window {
+            true
+        } else {
+            let tail = buf_end - disk_offset;
+            tail < MAX_ENTRY_SIZE as u64 && buf_end < self.capacity_bytes
+        };
+
+        if need_refill {
+            self.load(disk_offset)?;
+        }
+        let local = (disk_offset - self.buf_disk_start) as usize;
+        Ok(&self.buf.as_slice()[local..self.buf_valid_bytes])
+    }
+
+    fn load(&mut self, disk_offset: u64) -> OnyxResult<()> {
+        debug_assert!(disk_offset.is_multiple_of(BLOCK_SIZE as u64));
+        let remaining = self.capacity_bytes.saturating_sub(disk_offset);
+        let cap = self.buf.len();
+        let mut want = usize::try_from(remaining).unwrap_or(usize::MAX).min(cap);
+        want &= !(BLOCK_SIZE as usize - 1);
+        if want == 0 {
+            self.buf_disk_start = disk_offset;
+            self.buf_valid_bytes = 0;
+            return Ok(());
+        }
+        self.device
+            .read_at(&mut self.buf.as_mut_slice()[..want], disk_offset)?;
+        self.buf_disk_start = disk_offset;
+        self.buf_valid_bytes = want;
+        Ok(())
+    }
+}
+
 impl BufferShard {
     pub(super) fn elapsed_ns(start: Instant) -> u64 {
         start.elapsed().as_nanos().min(u64::MAX as u128) as u64
@@ -136,7 +218,18 @@ impl BufferShard {
         Some(offset)
     }
 
-    pub(super) fn reclaim_log_prefix(ring: &mut RingState) {
+    /// Advance the ring tail past contiguously-flushed-and-durable entries
+    /// at the front of `log_order`. An entry is reclaimable only when
+    /// BOTH conditions hold:
+    ///   1. its seq is in `ring.flushed_seqs` (flusher has finished with it)
+    ///   2. its seq ≤ `durable_seq` (the DB commits it drove have been fsync'd)
+    ///
+    /// Condition 2 closes the race where a flushed but not-yet-durable entry
+    /// would otherwise be physically overwritten by a newer append and then
+    /// lost on crash before its DB writes reached disk. Pass
+    /// `u64::MAX` from legacy tests / paths that already guarantee durability
+    /// separately (e.g. `mark_entry_flushed` in the purge path).
+    pub(super) fn reclaim_log_prefix(ring: &mut RingState, durable_seq: u64) {
         loop {
             let Some(front) = ring.log_order.front().copied() else {
                 ring.tail_offset = ring.head_offset;
@@ -146,6 +239,12 @@ impl BufferShard {
                 break;
             };
             if !ring.flushed_seqs.contains(&front.seq) {
+                ring.tail_offset = front.disk_offset;
+                break;
+            }
+            if front.seq > durable_seq {
+                // Flushed but not yet durable — leave at front so its ring
+                // slot stays intact until the watermark thread catches up.
                 ring.tail_offset = front.disk_offset;
                 break;
             }
@@ -218,36 +317,40 @@ impl BufferShard {
         Ok(())
     }
 
-    pub(super) fn scan_entry(
-        device: &RawDevice,
-        offset: u64,
+    /// Parse a single entry from an already-buffered slice beginning at
+    /// `disk_offset`. Returns `None` when there is no valid entry at the
+    /// current offset (bad magic, bad length, or end-of-capacity).
+    ///
+    /// Callers must ensure `buf` contains at least `MAX_ENTRY_SIZE` bytes or
+    /// all remaining bytes up to `capacity_bytes`. `ChunkReader::slice_at`
+    /// guarantees this.
+    pub(super) fn scan_entry_buf(
+        buf: &[u8],
+        disk_offset: u64,
         capacity_bytes: u64,
-    ) -> OnyxResult<Option<(BufferEntry, u32)>> {
-        if offset + Self::slot_size() > capacity_bytes {
-            return Ok(None);
+    ) -> Option<(BufferEntry, u32)> {
+        if disk_offset + Self::slot_size() > capacity_bytes {
+            return None;
         }
-
-        let mut header = vec![0u8; BLOCK_SIZE as usize];
-        device.read_at(&mut header, offset)?;
-        let total_len = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let magic = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if buf.len() < BLOCK_SIZE as usize {
+            return None;
+        }
+        let total_len = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let magic = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         if total_len < MIN_ENTRY_SIZE || total_len > MAX_ENTRY_SIZE || magic != BUFFER_ENTRY_MAGIC {
-            return Ok(None);
+            return None;
         }
-
         let slot_count = round_up(total_len as usize, BLOCK_SIZE as usize) as u32 / BLOCK_SIZE;
-        let slot_bytes = Self::slot_bytes(slot_count);
-        if offset + slot_bytes > capacity_bytes {
-            return Ok(None);
+        let slot_bytes = Self::slot_bytes(slot_count) as usize;
+        if disk_offset + slot_bytes as u64 > capacity_bytes {
+            return None;
         }
-
-        let mut buf = vec![0u8; slot_bytes as usize];
-        device.read_at(&mut buf, offset)?;
-        let Some(entry) = BufferEntry::from_bytes(&buf) else {
-            return Ok(None);
-        };
-        Ok(Some((entry, slot_count)))
+        if buf.len() < slot_bytes {
+            return None;
+        }
+        BufferEntry::from_bytes(&buf[..slot_bytes]).map(|entry| (entry, slot_count))
     }
+
 
     pub(super) fn rebuild_indices(
         device: &RawDevice,
@@ -269,10 +372,12 @@ impl BufferShard {
         let mut slot = 0u64;
         let mut max_seq = 0u64;
         let mut scanned = Vec::new();
+        let mut reader = ChunkReader::new(device, capacity_bytes)?;
 
         while slot < total_slots {
             let offset = slot * Self::slot_size();
-            match Self::scan_entry(device, offset, capacity_bytes)? {
+            let window = reader.slice_at(offset)?;
+            match Self::scan_entry_buf(window, offset, capacity_bytes) {
                 Some((entry, slot_count)) => {
                     let disk_len = Self::slot_bytes(slot_count) as u32;
                     max_seq = max_seq.max(entry.seq);
@@ -458,10 +563,12 @@ impl BufferShard {
         // Scan the checkpoint-declared occupied region. Here we can tolerate
         // gaps and continue scanning slot-by-slot because corruption should not
         // hide later still-live entries inside the known used range.
+        let mut reader = ChunkReader::new(device, capacity_bytes)?;
         for (range_start, range_end) in &occupied_ranges {
             let mut offset = *range_start;
             while offset < *range_end {
-                match Self::scan_entry(device, offset, capacity_bytes)? {
+                let window = reader.slice_at(offset)?;
+                match Self::scan_entry_buf(window, offset, capacity_bytes) {
                     Some((entry, slot_count)) => {
                         record_scanned(offset, entry, slot_count, &mut scanned);
                         offset += Self::slot_bytes(slot_count);
@@ -485,7 +592,8 @@ impl BufferShard {
         let mut forward_scanned_bytes = 0u64;
         let mut last_forward_seq = checkpoint.max_seq;
         while forward_scanned_bytes < capacity_bytes {
-            match Self::scan_entry(device, forward_offset, capacity_bytes)? {
+            let window = reader.slice_at(forward_offset)?;
+            match Self::scan_entry_buf(window, forward_offset, capacity_bytes) {
                 Some((entry, slot_count)) => {
                     if entry.seq <= last_forward_seq {
                         break;
@@ -568,6 +676,8 @@ impl BufferShard {
         checkpoint_device: Option<RawDevice>,
         payload_bytes_in_memory: Arc<AtomicU64>,
         max_payload_memory_bytes: u64,
+        max_flushed_seq: Arc<AtomicU64>,
+        durable_seq: Arc<AtomicU64>,
     ) -> OnyxResult<(Self, u64)> {
         let capacity_bytes = device.size();
         if capacity_bytes < Self::slot_size() {
@@ -651,6 +761,8 @@ impl BufferShard {
                 checkpoint_device,
                 payload_bytes_in_memory,
                 max_payload_memory_bytes,
+                max_flushed_seq,
+                durable_seq,
             },
             scan.max_seq,
         ))
@@ -1376,6 +1488,10 @@ impl BufferShard {
     /// No disk write — metadata commit to RocksDB is the durable record.
     /// On crash recovery, stale "unflushed" entries are detected by
     /// cross-checking against the blockmap.
+    ///
+    /// The reclaim tail is gated on `durable_seq` so a flushed-but-not-yet-
+    /// durable entry cannot be physically overwritten until the engine's
+    /// watermark thread has fsync'd the DB commits that back it.
     pub(super) fn free_seq_allocation(&self, seq: u64, _pending: &PendingEntry) {
         {
             let mut lc = self.lifecycle.lock();
@@ -1386,6 +1502,10 @@ impl BufferShard {
                 lc.cancelled.insert(seq);
             }
         }
+        // Record that this seq has been mark_flushed'd so the durability
+        // watermark thread can include it in its next sync cycle.
+        self.max_flushed_seq.fetch_max(seq, Ordering::Relaxed);
+        let durable_seq = self.durable_seq.load(Ordering::Acquire);
         {
             let mut ring = self.ring.lock();
             if !ring.flushed_seqs.insert(seq) {
@@ -1394,7 +1514,7 @@ impl BufferShard {
                 return;
             }
             let before = ring.used_bytes;
-            Self::reclaim_log_prefix(&mut ring);
+            Self::reclaim_log_prefix(&mut ring, durable_seq);
             if ring.used_bytes < before {
                 self.ring_space_cv.notify_all();
             }
@@ -1404,6 +1524,11 @@ impl BufferShard {
 
     /// Durable mark: writes flushed header to disk. Only used by purge_volume
     /// which needs disk-durable state before returning.
+    ///
+    /// This path writes the entry's flushed flag directly to disk via
+    /// `mark_entry_flushed`, so the entry is durably "done" independent of
+    /// the `durable_seq` watermark. Reclaim is therefore unconditional
+    /// (`u64::MAX`).
     pub(super) fn free_seq_allocation_durable(
         &self,
         seq: u64,
@@ -1425,7 +1550,7 @@ impl BufferShard {
                 return Ok(());
             }
             let before = ring.used_bytes;
-            Self::reclaim_log_prefix(&mut ring);
+            Self::reclaim_log_prefix(&mut ring, u64::MAX);
             if ring.used_bytes < before {
                 self.ring_space_cv.notify_all();
             }

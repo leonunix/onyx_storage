@@ -224,6 +224,13 @@ struct BufferShard {
     payload_bytes_in_memory: Arc<AtomicU64>,
     /// Maximum allowed in-memory payload bytes (shared with pool). 0 = no limit.
     max_payload_memory_bytes: u64,
+    /// Global upper bound of seqs that have been mark_flushed'd (across all
+    /// shards). Updated in `free_seq_allocation` to `max(current, seq)`.
+    max_flushed_seq: Arc<AtomicU64>,
+    /// Watermark of seqs whose DB commits have been fsync'd. Set by the
+    /// engine-owned durability-watermark thread. `reclaim_log_prefix` only
+    /// advances the tail past entries whose seq ≤ this.
+    durable_seq: Arc<AtomicU64>,
 }
 
 pub struct WriteBufferPool {
@@ -240,6 +247,26 @@ pub struct WriteBufferPool {
     max_payload_memory: u64,
     /// On-disk layout version — persisted on Drop. Must match the actual disk layout.
     disk_version: u32,
+    /// Highest seq that has ever been passed to `mark_flushed` across any shard.
+    /// Updated by flusher writers when they ack a completed seq. Read by the
+    /// durability-watermark background thread to decide how far `durable_seq`
+    /// can be advanced after an fsync completes.
+    ///
+    /// NOTE: this is a global upper bound, not a "contiguous prefix". Use it
+    /// as "this seq has been mark_flushed", not "all seqs up to this have
+    /// been mark_flushed". The watermark thread captures this BEFORE calling
+    /// sync, so any seq ≤ captured value is guaranteed to have had its DB
+    /// writes issued before the fsync and is therefore durable afterwards.
+    pub(crate) max_flushed_seq: Arc<AtomicU64>,
+    /// Watermark of seqs that are guaranteed durable on both RocksDB and
+    /// redb. Advanced only by the durability-watermark background thread
+    /// after `MetaStore::sync_durable()` returns.
+    ///
+    /// Buffer ring reclaim path consults this: `reclaim_log_prefix` only
+    /// advances the tail past entries whose seq ≤ `durable_seq`, even if
+    /// `mark_flushed` has been called. This guarantees that a buffer entry
+    /// is never physically overwritten before its DB writes hit disk.
+    pub(crate) durable_seq: Arc<AtomicU64>,
 }
 
 static TEST_PURGE_FAIL_VOLUMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();

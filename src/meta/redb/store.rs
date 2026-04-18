@@ -29,13 +29,18 @@ pub struct RedbStore {
     db: Arc<Database>,
 }
 
-/// Begin a write transaction configured with the hot-path durability. redb's
-/// `Durability::None` skips fsync on commit; the page changes stay queryable
-/// by subsequent read transactions (logical commit) but are not persistent
-/// until a later [`RedbStore::sync`] call. The buffer commit log is the
-/// persistence anchor for any unsynced blockmap updates — on crash, recovery
-/// replays from buffer and the partial redb state is discarded in the
-/// reconcile step.
+/// Begin a write transaction for the blockmap hot path.
+///
+/// `Durability::None` means each commit is logically visible to new read
+/// txns but not yet fsync'd — changes sit in the OS page cache until the
+/// background durability watermark thread explicitly calls [`RedbStore::sync`].
+///
+/// Correctness contract: the buffer ring may only reclaim an entry after
+/// its seq has passed `durable_seq`. `durable_seq` is advanced only after
+/// both RocksDB (`flush_wal(sync=true)`) and redb (`sync`) have fsync'd.
+/// Without that interlock, a crash inside the OS flush window (≲30 s) can
+/// let a reclaimed buffer entry vanish while its redb commit is still only
+/// in page cache — producing a lost write and stale reads.
 fn begin_hot_write(db: &Database) -> OnyxResult<redb::WriteTransaction> {
     let mut write = db.begin_write().map_err(to_onyx)?;
     write.set_durability(Durability::None).map_err(to_onyx)?;

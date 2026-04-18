@@ -42,6 +42,10 @@ pub struct OnyxEngine {
     gc_runner: Mutex<Option<GcRunner>>,
     dedup_scanner: Mutex<Option<DedupScanner>>,
     heartbeat_writer: Mutex<Option<HeartbeatWriter>>,
+    /// Background thread that periodically fsyncs RocksDB WAL + redb file,
+    /// then advances the buffer pool's `durable_seq` watermark so ring
+    /// reclaim can safely proceed. Keeps the hot path at Durability::None.
+    durability_watermark: Mutex<Option<DurabilityWatermarkHandle>>,
     #[allow(dead_code)]
     read_pool: Option<Arc<ReadPool>>,
     zone_manager: Option<Arc<ZoneManager>>,
@@ -55,6 +59,90 @@ pub struct OnyxEngine {
     generation_clock: AtomicU64,
     config: OnyxConfig,
     shutdown_done: Mutex<bool>,
+}
+
+/// Handle for the durability-watermark background thread.
+///
+/// The thread runs until `stop` is signaled, then drains any seqs pending
+/// durability by issuing one final sync before joining. Engine shutdown
+/// owns the handle and joins it before marking the LV3 superblock clean.
+struct DurabilityWatermarkHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DurabilityWatermarkHandle {
+    /// Spawn the watermark thread. `interval` is the minimum delay between
+    /// syncs (coarser = less fsync overhead, longer stall between ring
+    /// reclaim catch-up cycles).
+    fn start(
+        meta: Arc<MetaStore>,
+        max_flushed_seq: Arc<AtomicU64>,
+        durable_seq: Arc<AtomicU64>,
+        interval: std::time::Duration,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("durability-watermark".into())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    // Capture BEFORE sync: any seq that enters max_flushed_seq
+                    // after the sync begins may not be covered by this fsync,
+                    // which is fine — it will ride the next cycle.
+                    let captured = max_flushed_seq.load(Ordering::Relaxed);
+                    let current = durable_seq.load(Ordering::Relaxed);
+                    if captured <= current {
+                        continue;
+                    }
+                    if let Err(e) = meta.sync_durable() {
+                        tracing::error!(
+                            error = %e,
+                            "durability watermark sync failed — ring reclaim will stall until recovery"
+                        );
+                        continue;
+                    }
+                    // Only advance; never retreat.
+                    let _ = durable_seq.fetch_update(
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                        |cur| if captured > cur { Some(captured) } else { None },
+                    );
+                }
+                // Final flush at shutdown: pick up anything that was mark_flushed'd
+                // between the last tick and the stop signal.
+                let captured = max_flushed_seq.load(Ordering::Relaxed);
+                if captured > durable_seq.load(Ordering::Relaxed) {
+                    if let Err(e) = meta.sync_durable() {
+                        tracing::error!(
+                            error = %e,
+                            "durability watermark final sync failed at shutdown"
+                        );
+                    } else {
+                        durable_seq.store(captured, Ordering::Release);
+                    }
+                }
+            })
+            .expect("spawn durability-watermark thread");
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for DurabilityWatermarkHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl OnyxEngine {
@@ -489,6 +577,16 @@ impl OnyxEngine {
 
         tracing::info!("onyx engine opened (full mode)");
 
+        // Start the durability watermark thread now that both meta and
+        // buffer_pool are live. The thread fsyncs both DBs every 50ms and
+        // advances `durable_seq`, unblocking the buffer ring reclaim path.
+        let watermark = DurabilityWatermarkHandle::start(
+            meta.clone(),
+            buffer_pool.max_flushed_seq_handle(),
+            buffer_pool.durable_seq_handle(),
+            std::time::Duration::from_millis(50),
+        );
+
         Ok(Self {
             meta,
             io_engine: Some(io_engine),
@@ -498,6 +596,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             heartbeat_writer: Mutex::new(heartbeat_writer),
+            durability_watermark: Mutex::new(Some(watermark)),
             read_pool,
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
@@ -530,6 +629,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(None),
             dedup_scanner: Mutex::new(None),
             heartbeat_writer: Mutex::new(None),
+            durability_watermark: Mutex::new(None),
             read_pool: None,
             zone_manager: None,
             live_handles: Mutex::new(Vec::new()),
@@ -752,14 +852,21 @@ impl OnyxEngine {
         // Zone manager shutdown is handled by Drop (it sends Shutdown to all workers)
         // We can't call shutdown(&mut self) through Arc, but Drop handles it.
 
-        // Flush redb: hot-path writes run with Durability::None and need an
-        // explicit Immediate commit to hit disk. MUST precede the clean
-        // shutdown marker; otherwise a crash between the marker and the
-        // physical sync would boot into fast path with unsynced blockmap.
-        if let Err(e) = self.meta.sync_redb() {
+        // Stop the durability watermark thread. Its final iteration does one
+        // sync_durable (rocksdb flush_wal + redb sync) which covers everything
+        // the flusher has mark_flushed'd right up to now — so by the time the
+        // thread has joined, both DBs are physically durable for all acked
+        // writes.
+        if let Some(mut watermark) = self.durability_watermark.lock().unwrap().take() {
+            watermark.stop();
+        }
+
+        // Belt-and-suspenders: one more explicit sync in case new writes
+        // arrived between the watermark thread's final tick and now.
+        if let Err(e) = self.meta.sync_durable() {
             tracing::error!(
                 error = %e,
-                "failed to sync redb at shutdown — forcing dirty recovery on next boot"
+                "failed to sync_durable at shutdown — forcing dirty recovery on next boot"
             );
             return Ok(());
         }
@@ -924,6 +1031,13 @@ impl OnyxEngine {
 
         tracing::info!("onyx engine upgraded to full mode");
 
+        let watermark = DurabilityWatermarkHandle::start(
+            meta.clone(),
+            buffer_pool.max_flushed_seq_handle(),
+            buffer_pool.durable_seq_handle(),
+            std::time::Duration::from_millis(50),
+        );
+
         Ok(Self {
             meta,
             io_engine: Some(io_engine),
@@ -933,6 +1047,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             heartbeat_writer: Mutex::new(heartbeat_writer),
+            durability_watermark: Mutex::new(Some(watermark)),
             read_pool,
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
