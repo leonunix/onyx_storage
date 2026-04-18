@@ -236,6 +236,8 @@ impl BufferFlusher {
         seen: &mut std::collections::HashSet<u64>,
         queued_bytes: &mut usize,
         new_entries: &mut Vec<Arc<crate::buffer::commit_log::PendingEntry>>,
+        metrics: &EngineMetrics,
+        skip_fully_superseded: bool,
     ) -> EnqueuePendingSeq {
         if in_flight.contains_key(&seq) || !in_flight_tracker.retry_ready(seq) || !seen.insert(seq)
         {
@@ -245,6 +247,40 @@ impl BufferFlusher {
         let Some(meta) = pool.get_pending_arc(seq) else {
             return EnqueuePendingSeq::Skipped;
         };
+
+        // Fast-path drop: if every LBA in this entry has already been
+        // superseded by a later seq still in the ring, the writer would
+        // discard it at the very end anyway — we just do all the hashing /
+        // compression / dedup_index churn in between for nothing. Retire
+        // this seq now so the ring tail can advance past it.
+        if skip_fully_superseded
+            && pool.is_entry_fully_superseded(
+                &meta.vol_id,
+                meta.start_lba,
+                meta.lba_count,
+                seq,
+                meta.vol_created_at,
+            )
+        {
+            if let Err(err) = pool.mark_flushed(seq, meta.start_lba, meta.lba_count) {
+                tracing::warn!(
+                    seq,
+                    vol = %meta.vol_id,
+                    error = %err,
+                    "mark_flushed failed for superseded entry; falling back to full flush"
+                );
+                // Fall through and enqueue normally so nothing is lost.
+            } else {
+                metrics
+                    .coalesce_superseded_entries
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .coalesce_superseded_lbas
+                    .fetch_add(meta.lba_count as u64, Ordering::Relaxed);
+                return EnqueuePendingSeq::Skipped;
+            }
+        }
+
         let estimated_bytes = Self::pending_entry_bytes(meta.as_ref());
         if !new_entries.is_empty()
             && queued_bytes.saturating_add(estimated_bytes) > Self::COALESCE_READY_WINDOW_BYTES

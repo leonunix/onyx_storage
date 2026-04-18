@@ -48,6 +48,7 @@ fn setup_dedup_env_with_sizes(
     let meta_config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -286,6 +287,7 @@ fn dedup_index_crud() {
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -324,6 +326,7 @@ fn dedup_cleanup_on_pba_free() {
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -374,6 +377,7 @@ fn scan_dedup_skipped() {
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -422,6 +426,7 @@ fn update_blockmap_flags_clears_dedup_skipped() {
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -537,6 +542,7 @@ fn delete_volume_cleans_dedup_index() {
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -595,6 +601,7 @@ fn cleanup_old_pba_preserves_newer_forward_index() {
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();

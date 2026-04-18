@@ -50,6 +50,7 @@ fn setup_flush_env_with_backend(
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -390,6 +391,7 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
         MetaStore::open(&MetaConfig {
             rocksdb_path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
+            memtable_budget_mb: 0,
             wal_dir: None,
         })
         .unwrap(),

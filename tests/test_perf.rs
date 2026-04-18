@@ -181,6 +181,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
         meta: MetaConfig {
             rocksdb_path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 64,
+            memtable_budget_mb: 0,
             wal_dir: None,
         },
         storage: StorageConfig {

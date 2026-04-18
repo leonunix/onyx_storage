@@ -17,6 +17,7 @@ fn setup_worker() -> (ZoneWorker, Arc<MetaStore>) {
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -45,6 +46,7 @@ fn setup_zone_manager(zone_count: u32) -> ZoneManager {
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -247,6 +249,7 @@ fn zone_manager_concurrent_reads_inline_no_serialization() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -330,6 +333,7 @@ fn zone_manager_read_pool_decompresses_concurrently() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());

@@ -44,6 +44,7 @@ fn fresh_meta(path: &Path) -> MetaStore {
     MetaStore::open(&MetaConfig {
         rocksdb_path: Some(path.to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     })
     .unwrap()

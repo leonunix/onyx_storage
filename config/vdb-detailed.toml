@@ -19,7 +19,14 @@
 
 [meta]
 rocksdb_path = "/mnt/onyx-vdb-meta/rocksdb"
+# Shared RocksDB block cache across all CFs (blockmap + refcount + dedup_*).
+# Index + filter blocks are cached inside this budget too, so this is the hard
+# upper bound on RocksDB read-side memory. Scale with host RAM and working set
+# (e.g. 256 GiB box → 16384–32768; test box → 512–1024).
 block_cache_mb = 1024
+# Total memtable budget across all CFs (WriteBufferManager). 0 = auto = half
+# of block_cache_mb. Raise for write-heavy workloads, lower for read-heavy.
+memtable_budget_mb = 0
 wal_dir = "/mnt/onyx-vdb-meta/wal"
 
 [storage]

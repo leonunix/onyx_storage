@@ -65,6 +65,7 @@ impl EngineHarness {
             meta: MetaConfig {
                 rocksdb_path: Some(meta_dir.path().to_path_buf()),
                 block_cache_mb: 32,
+                memtable_budget_mb: 0,
                 wal_dir: None,
             },
             storage: StorageConfig {

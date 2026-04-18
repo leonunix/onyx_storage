@@ -8,9 +8,9 @@ mod volume;
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use rocksdb::{DBWithThreadMode, MergeOperands, MultiThreaded, WriteOptions};
+use rocksdb::{Cache, DBWithThreadMode, MergeOperands, MultiThreaded, WriteBufferManager, WriteOptions};
 
 use crate::types::Pba;
 
@@ -112,8 +112,18 @@ pub struct MetaStore {
     /// Cold-path operations (create/delete volume, reconciliation) keep
     /// sync = true via the default `db.write(batch)`.
     hot_write_opts: WriteOptions,
-    /// Block cache size from config — reused when creating new per-volume CFs.
-    block_cache_mb: usize,
+    /// Shared block cache across all CFs. Index and filter blocks are pinned
+    /// into this cache (see `shared_block_opts` in `open.rs`), so its capacity
+    /// is the authoritative upper bound on RocksDB read-side memory. Every
+    /// per-volume blockmap CF created at runtime must reuse this instance —
+    /// creating a new `Cache` per CF would leak multiple capacities worth of
+    /// memory outside the reported `block_cache_usage_bytes`.
+    block_cache: Arc<Cache>,
+    /// Shared WriteBufferManager: caps the sum of active + immutable memtable
+    /// memory across all CFs. Prevents per-CF memtables from compounding when
+    /// many blockmap CFs exist (every volume has its own).
+    #[allow(dead_code)]
+    write_buffer_manager: Arc<WriteBufferManager>,
 }
 
 impl MetaStore {

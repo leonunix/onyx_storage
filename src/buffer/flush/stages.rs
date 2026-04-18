@@ -12,6 +12,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         max_raw: usize,
         max_lbas: u32,
+        skip_fully_superseded: bool,
     ) {
         // in_flight tracks how many pipeline units still reference each seq.
         // A multi-LBA entry split into 2 units → refcount=2 for that seq.

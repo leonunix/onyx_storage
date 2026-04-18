@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use rocksdb::{
-    properties, BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode,
-    MultiThreaded, Options, WriteOptions,
+    properties, BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor,
+    DBWithThreadMode, MultiThreaded, Options, WriteBufferManager, WriteOptions,
 };
 
 use crate::config::MetaConfig;
@@ -16,17 +16,34 @@ use super::{
 };
 
 impl MetaStore {
-    /// Build the Options for a per-volume blockmap CF (bloom + LZ4 + cache).
-    fn blockmap_cf_opts(block_cache_mb: usize) -> Options {
+    /// Build `BlockBasedOptions` shared by every CF.
+    ///
+    /// Key invariants, all critical for bounded memory:
+    /// - `set_block_cache(cache)`: every CF points at the ONE shared cache so
+    ///   total RocksDB read memory is capped by the cache's capacity.
+    /// - `set_cache_index_and_filter_blocks(true)`: filter + index blocks are
+    ///   accounted against the cache. Without this, they sit outside the cache
+    ///   in `estimate_table_readers_mem_bytes` and grow unbounded with the
+    ///   dataset.
+    /// - `set_pin_l0_filter_and_index_blocks_in_cache(true)`: L0 filter/index
+    ///   stay pinned so the hot path never eats a cache miss on them. Higher
+    ///   levels are still evictable.
+    fn shared_block_opts(cache: &Cache, bloom_bits_per_key: f64) -> BlockBasedOptions {
+        let mut bbto = BlockBasedOptions::default();
+        bbto.set_bloom_filter(bloom_bits_per_key, false);
+        bbto.set_block_size(4096);
+        bbto.set_block_cache(cache);
+        bbto.set_cache_index_and_filter_blocks(true);
+        bbto.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        bbto
+    }
+
+    /// Build the Options for a per-volume blockmap CF (bloom + LZ4).
+    /// All CFs share the same `Cache` instance passed in — creating a new
+    /// `Cache` per CF used to multiply memory by the number of volumes.
+    fn blockmap_cf_opts(cache: &Cache) -> Options {
         let mut opts = Options::default();
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_bloom_filter(10.0, false);
-        block_opts.set_block_size(4096);
-        if block_cache_mb > 0 {
-            let cache = rocksdb::Cache::new_lru_cache(block_cache_mb * 1024 * 1024);
-            block_opts.set_block_cache(&cache);
-        }
-        opts.set_block_based_table_factory(&block_opts);
+        opts.set_block_based_table_factory(&Self::shared_block_opts(cache, 10.0));
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts
     }
@@ -41,6 +58,19 @@ impl MetaStore {
         if let Some(ref wal_dir) = config.wal_dir {
             db_opts.set_wal_dir(wal_dir);
         }
+
+        // Single shared block cache for every CF. Capacity from config.
+        let block_cache = Arc::new(Cache::new_lru_cache(config.block_cache_bytes()));
+
+        // Cap total memtable memory across all CFs (default = half of cache,
+        // overridable via `meta.memtable_budget_mb`). `allow_stall = true`
+        // lets writes block briefly rather than balloon memory when many CFs
+        // flush at once.
+        let write_buffer_manager = Arc::new(WriteBufferManager::new_write_buffer_manager(
+            config.memtable_budget_bytes(),
+            true,
+        ));
+        db_opts.set_write_buffer_manager(&write_buffer_manager);
 
         let rocksdb_path = config.rocksdb_path.as_ref().ok_or_else(|| {
             OnyxError::Config("meta.rocksdb_path is required to open MetaStore".into())
@@ -58,9 +88,7 @@ impl MetaStore {
         descriptors.push(ColumnFamilyDescriptor::new(CF_VOLUMES, Options::default()));
 
         let mut refcount_opts = Options::default();
-        let mut refcount_block_opts = BlockBasedOptions::default();
-        refcount_block_opts.set_bloom_filter(10.0, false);
-        refcount_opts.set_block_based_table_factory(&refcount_block_opts);
+        refcount_opts.set_block_based_table_factory(&Self::shared_block_opts(&block_cache, 10.0));
         refcount_opts.set_merge_operator(
             "refcount_sum",
             refcount_full_merge,
@@ -69,18 +97,16 @@ impl MetaStore {
         descriptors.push(ColumnFamilyDescriptor::new(CF_REFCOUNT, refcount_opts));
 
         let mut dedup_index_opts = Options::default();
-        let mut dedup_index_block_opts = BlockBasedOptions::default();
-        dedup_index_block_opts.set_bloom_filter(15.0, false);
-        dedup_index_opts.set_block_based_table_factory(&dedup_index_block_opts);
+        dedup_index_opts
+            .set_block_based_table_factory(&Self::shared_block_opts(&block_cache, 15.0));
         descriptors.push(ColumnFamilyDescriptor::new(
             CF_DEDUP_INDEX,
             dedup_index_opts,
         ));
 
         let mut dedup_reverse_opts = Options::default();
-        let mut dedup_reverse_block_opts = BlockBasedOptions::default();
-        dedup_reverse_block_opts.set_bloom_filter(10.0, false);
-        dedup_reverse_opts.set_block_based_table_factory(&dedup_reverse_block_opts);
+        dedup_reverse_opts
+            .set_block_based_table_factory(&Self::shared_block_opts(&block_cache, 10.0));
         descriptors.push(ColumnFamilyDescriptor::new(
             CF_DEDUP_REVERSE,
             dedup_reverse_opts,
@@ -90,7 +116,7 @@ impl MetaStore {
             if vol_id_from_blockmap_cf(cf_name).is_some() {
                 descriptors.push(ColumnFamilyDescriptor::new(
                     cf_name.as_str(),
-                    Self::blockmap_cf_opts(config.block_cache_mb),
+                    Self::blockmap_cf_opts(&block_cache),
                 ));
             }
         }
@@ -109,7 +135,8 @@ impl MetaStore {
             blockmap_locks: (0..BLOCKMAP_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             refcount_locks: (0..REFCOUNT_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             hot_write_opts,
-            block_cache_mb: config.block_cache_mb,
+            block_cache,
+            write_buffer_manager,
         };
 
         Ok(store)
@@ -121,7 +148,7 @@ impl MetaStore {
         if self.db.cf_handle(&cf_name).is_some() {
             return Ok(());
         }
-        let opts = Self::blockmap_cf_opts(self.block_cache_mb);
+        let opts = Self::blockmap_cf_opts(&self.block_cache);
         self.db.create_cf(&cf_name, &opts)?;
         tracing::info!(volume = vol_id, cf = %cf_name, "created per-volume blockmap CF");
         Ok(())
@@ -198,12 +225,12 @@ impl MetaStore {
             Ok(total)
         };
 
-        let cache_cf_name = self
-            .all_blockmap_cf_names()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| CF_REFCOUNT.to_string());
-        let cache_cf = self.db.cf_handle(&cache_cf_name).unwrap();
+        // All CFs share one Cache instance now, so any CF reports the same
+        // capacity/usage figures. Use CF_REFCOUNT (always present) so the
+        // reported numbers stay correct even when no volume exists.
+        let cache_cf = self.db.cf_handle(CF_REFCOUNT).ok_or_else(|| {
+            OnyxError::Config("refcount CF missing — cannot query block cache stats".into())
+        })?;
 
         Ok(RocksDbMemorySnapshot {
             block_cache_capacity_bytes: self

@@ -1172,6 +1172,51 @@ impl BufferShard {
             .unwrap_or(true)
     }
 
+    /// Return `true` iff every LBA covered by this entry has a strictly later
+    /// seq in `latest_lba_seq` (same vol generation). That means a newer
+    /// pending write will supply each LBA's content to the flusher, so this
+    /// older entry can be dropped without ever compressing, hashing, or
+    /// writing it to LV3.
+    ///
+    /// The check is conservative — we only return true when *all* LBAs are
+    /// covered; a partially-superseded entry still goes through the pipeline
+    /// (the writer's per-LBA `is_latest_lba_seq` filter handles that case).
+    pub(super) fn is_entry_fully_superseded(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        seq: u64,
+        vol_created_at: u64,
+    ) -> bool {
+        if lba_count == 0 {
+            return false;
+        }
+        let vid = self.intern_vol_id(vol_id);
+        for offset in 0..lba_count {
+            let key = LbaKey {
+                vol_id: vid.clone(),
+                lba: Lba(start_lba.0 + offset as u64),
+            };
+            match self.latest_lba_seq.get(&key) {
+                Some(entry) => {
+                    let (latest_seq, latest_created_at) = *entry;
+                    // Map says *this* entry is still the latest for this LBA
+                    // (or the generation changed — leave it to writer).
+                    if latest_seq == seq || latest_created_at != vol_created_at {
+                        return false;
+                    }
+                    // latest_seq > seq here → this LBA is superseded. Continue.
+                }
+                // Absent → the coalescer/writer has already processed the
+                // latest seq for this LBA and retired it. Treat as superseded;
+                // there's nothing useful left to flush.
+                None => continue,
+            }
+        }
+        true
+    }
+
     pub(super) fn pending_to_buffer_entry(pending: &PendingEntry) -> BufferEntry {
         BufferEntry {
             seq: pending.seq,

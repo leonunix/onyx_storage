@@ -58,6 +58,7 @@ fn setup_e2e() -> (
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -192,6 +193,7 @@ fn write_flush_read_zstd() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -240,6 +242,7 @@ fn write_flush_read_no_compression() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());

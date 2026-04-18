@@ -59,6 +59,7 @@ fn test_config(dir: &std::path::Path) -> MetaConfig {
     MetaConfig {
         rocksdb_path: Some(dir.to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     }
 }

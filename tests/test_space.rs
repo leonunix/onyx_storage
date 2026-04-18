@@ -112,6 +112,7 @@ fn rebuild_from_metadata() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -186,6 +187,7 @@ fn rebuild_empty_metadata() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -205,6 +207,7 @@ fn rebuild_fully_allocated() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -228,6 +231,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
+        memtable_budget_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();

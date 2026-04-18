@@ -1122,6 +1122,28 @@ impl WriteBufferPool {
             .is_latest_lba_seq(vol_id, lba, seq, vol_created_at)
     }
 
+    /// Check whether every LBA in this entry has been superseded by a later
+    /// pending write in the same volume generation. Used by the coalescer to
+    /// drop fully-shadowed entries before hash/compress/metadata work.
+    ///
+    /// Entries that span multiple routing shards query the shard owning the
+    /// `start_lba`; callers need to use this only for entries that were
+    /// originally appended whole (`zone_manager::submit_write` already splits
+    /// at zone boundaries, so pending entries never cross shards).
+    pub fn is_entry_fully_superseded(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        seq: u64,
+        vol_created_at: u64,
+    ) -> bool {
+        let shard_idx = self.shard_for_lba(start_lba);
+        self.shards[shard_idx]
+            .shard
+            .is_entry_fully_superseded(vol_id, start_lba, lba_count, seq, vol_created_at)
+    }
+
     pub fn pending_entries_snapshot(&self) -> Vec<BufferEntry> {
         let mut entries = Vec::new();
         for shard in &self.shards {

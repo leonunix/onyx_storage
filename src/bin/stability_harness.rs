@@ -47,6 +47,7 @@ fn write_and_abort(
         meta: MetaConfig {
             rocksdb_path: Some(meta_dir),
             block_cache_mb: 32,
+            memtable_budget_mb: 0,
             wal_dir: None,
         },
         storage: StorageConfig {

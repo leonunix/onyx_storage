@@ -103,11 +103,46 @@ pub struct MetaConfig {
     /// dedup index, volume metadata. None = bare mode (no metadata store).
     #[serde(default)]
     pub rocksdb_path: Option<PathBuf>,
-    /// Block cache size in MB for RocksDB (default 256)
+    /// Shared block cache size in MB. One LRU cache is created at startup and
+    /// shared across every CF (blockmap + refcount + dedup_index +
+    /// dedup_reverse). Index + filter blocks are accounted against this cache
+    /// (`cache_index_and_filter_blocks=true`), so this is the authoritative
+    /// upper bound on RocksDB read-side memory. Scale roughly proportional to
+    /// working set; on a 256 GiB host, 16–32 GiB is a reasonable starting
+    /// point.
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
+    /// Total memtable memory budget in MB across all CFs. Enforced via
+    /// RocksDB's `WriteBufferManager`; when this is exceeded, writes stall
+    /// (`allow_stall=true`) rather than blow up RSS. Default 0 = auto = half
+    /// of `block_cache_mb`. Override when you want a different write-buffer
+    /// vs read-cache ratio (e.g. write-heavy: raise; read-heavy: lower).
+    #[serde(default)]
+    pub memtable_budget_mb: usize,
     /// Optional separate WAL directory for RocksDB
     pub wal_dir: Option<PathBuf>,
+}
+
+impl MetaConfig {
+    /// Resolved memtable budget in bytes. `memtable_budget_mb = 0` → half of
+    /// `block_cache_mb`, clamped to at least 64 MiB so a tiny config doesn't
+    /// starve memtables entirely.
+    pub fn memtable_budget_bytes(&self) -> usize {
+        let explicit = self.memtable_budget_mb.saturating_mul(1024 * 1024);
+        if explicit > 0 {
+            return explicit.max(64 * 1024 * 1024);
+        }
+        let cache_bytes = self.block_cache_mb.saturating_mul(1024 * 1024);
+        (cache_bytes / 2).max(64 * 1024 * 1024)
+    }
+
+    /// Resolved block cache capacity in bytes, with a minimum floor so an
+    /// empty/zero config still yields a usable cache.
+    pub fn block_cache_bytes(&self) -> usize {
+        self.block_cache_mb
+            .saturating_mul(1024 * 1024)
+            .max(8 * 1024 * 1024)
+    }
 }
 
 impl Default for MetaConfig {
@@ -115,6 +150,7 @@ impl Default for MetaConfig {
         Self {
             rocksdb_path: None,
             block_cache_mb: default_block_cache_mb(),
+            memtable_budget_mb: 0,
             wal_dir: None,
         }
     }
@@ -256,6 +292,13 @@ pub struct FlushConfig {
     /// Max number of LBAs to coalesce into one compression unit (default 32)
     #[serde(default = "default_coalesce_max_lbas")]
     pub coalesce_max_lbas: u32,
+    /// Skip coalesce/compress/dedup work for pending entries whose LBAs have
+    /// all been superseded by a later seq still in the ring. Entries are
+    /// mark_flushed immediately so the ring tail can advance without paying
+    /// SHA-256 + compress + dedup_index insert/delete for soon-to-be-dead
+    /// data. Default `true`; set `false` to regression-test the full path.
+    #[serde(default = "default_skip_fully_superseded")]
+    pub skip_fully_superseded: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,6 +326,7 @@ impl Default for FlushConfig {
             compress_workers: default_compress_workers(),
             coalesce_max_raw_bytes: default_coalesce_max_raw_bytes(),
             coalesce_max_lbas: default_coalesce_max_lbas(),
+            skip_fully_superseded: default_skip_fully_superseded(),
         }
     }
 }
@@ -295,6 +339,9 @@ fn default_coalesce_max_raw_bytes() -> usize {
 }
 fn default_coalesce_max_lbas() -> u32 {
     32
+}
+fn default_skip_fully_superseded() -> bool {
+    true
 }
 fn default_zone_count() -> u32 {
     4
