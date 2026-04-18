@@ -5,7 +5,7 @@ use onyx_storage::space::extent::Extent;
 use onyx_storage::types::{Lba, Pba, VolumeId, RESERVED_BLOCKS};
 
 fn ensure_blockmap_cf(store: &MetaStore, vol_id: &str) {
-    // removed: store.create_blockmap_cf(vol_id).unwrap();
+    store.create_blockmap_cf(vol_id).unwrap();
 }
 
 // --- extent tests ---
@@ -111,7 +111,6 @@ fn rebuild_from_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -186,7 +185,6 @@ fn rebuild_empty_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -206,7 +204,6 @@ fn rebuild_fully_allocated() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -230,7 +227,6 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };

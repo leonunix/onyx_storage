@@ -1,10 +1,8 @@
 use crate::error::OnyxError;
-use crate::types::{Lba, Pba, VolumeId};
+use crate::types::{Lba, Pba};
 
 /// Column family names
 pub const CF_VOLUMES: &str = "volumes";
-/// Legacy single blockmap CF — only used during migration to per-volume CFs.
-pub const CF_BLOCKMAP_LEGACY: &str = "blockmap";
 pub const CF_REFCOUNT: &str = "refcount";
 pub const CF_DEDUP_INDEX: &str = "dedup_index";
 pub const CF_DEDUP_REVERSE: &str = "dedup_reverse";
@@ -95,37 +93,6 @@ pub fn decode_blockmap_key(key: &[u8]) -> Option<Lba> {
         return None;
     }
     Some(Lba(u64::from_be_bytes(key[..8].try_into().unwrap())))
-}
-
-// --- Legacy blockmap key (for migration): vol_id_len(1B) + vol_id + lba(8B BE) ---
-
-/// Encode legacy blockmap key: vol_id_len(1B) + vol_id + lba(8B BE).
-/// Used only during migration from the old single CF_BLOCKMAP.
-pub fn encode_blockmap_key_legacy(vol_id: &VolumeId, lba: Lba) -> Result<Vec<u8>, OnyxError> {
-    let id_bytes = vol_id.0.as_bytes();
-    validate_vol_id_len(id_bytes.len())?;
-    let id_len = id_bytes.len() as u8;
-    let mut key = Vec::with_capacity(1 + id_len as usize + 8);
-    key.push(id_len);
-    key.extend_from_slice(id_bytes);
-    key.extend_from_slice(&lba.0.to_be_bytes());
-    Ok(key)
-}
-
-/// Decode legacy blockmap key back to (vol_id_str, lba).
-/// Used only during migration from the old single CF_BLOCKMAP.
-pub fn decode_blockmap_key_legacy(key: &[u8]) -> Option<(String, Lba)> {
-    if key.len() < 1 + 8 {
-        return None;
-    }
-    let id_len = key[0] as usize;
-    if key.len() != 1 + id_len + 8 {
-        return None;
-    }
-    let vol_id = std::str::from_utf8(&key[1..1 + id_len]).ok()?.to_string();
-    let lba_bytes: [u8; 8] = key[1 + id_len..].try_into().ok()?;
-    let lba = u64::from_be_bytes(lba_bytes);
-    Some((vol_id, Lba(lba)))
 }
 
 fn validate_vol_id_len(len: usize) -> Result<(), OnyxError> {

@@ -42,9 +42,9 @@ pub struct OnyxEngine {
     gc_runner: Mutex<Option<GcRunner>>,
     dedup_scanner: Mutex<Option<DedupScanner>>,
     heartbeat_writer: Mutex<Option<HeartbeatWriter>>,
-    /// Background thread that periodically fsyncs RocksDB WAL + redb file,
-    /// then advances the buffer pool's `durable_seq` watermark so ring
-    /// reclaim can safely proceed. Keeps the hot path at Durability::None.
+    /// Background thread that periodically fsyncs RocksDB WAL, then advances
+    /// the buffer pool's `durable_seq` watermark so ring reclaim can safely
+    /// proceed. Keeps the hot path at `WriteOptions::sync = false`.
     durability_watermark: Mutex<Option<DurabilityWatermarkHandle>>,
     #[allow(dead_code)]
     read_pool: Option<Arc<ReadPool>>,
@@ -476,7 +476,7 @@ impl OnyxEngine {
             );
         } else {
             tracing::warn!(
-                "dirty startup detected — rebuilding refcount CF from redb blockmap + dedup_index"
+                "dirty startup detected — rebuilding refcount CF from per-volume blockmap CFs"
             );
             let summary = meta.rebuild_refcount_from_blockmap()?;
             tracing::info!(
@@ -853,10 +853,9 @@ impl OnyxEngine {
         // We can't call shutdown(&mut self) through Arc, but Drop handles it.
 
         // Stop the durability watermark thread. Its final iteration does one
-        // sync_durable (rocksdb flush_wal + redb sync) which covers everything
-        // the flusher has mark_flushed'd right up to now — so by the time the
-        // thread has joined, both DBs are physically durable for all acked
-        // writes.
+        // sync_durable (rocksdb flush_wal) which covers everything the flusher
+        // has mark_flushed'd right up to now — so by the time the thread has
+        // joined, RocksDB is physically durable for all acked writes.
         if let Some(mut watermark) = self.durability_watermark.lock().unwrap().take() {
             watermark.stop();
         }
@@ -871,10 +870,29 @@ impl OnyxEngine {
             return Ok(());
         }
 
+        // Drive one final reclaim pass. The durability watermark thread has
+        // already advanced `durable_seq` to cover every mark_flushed'd seq,
+        // but `free_seq_allocation`'s inline reclaim used a stale watermark
+        // for the last few seqs in the drain. Re-running `advance_tail` with
+        // the now-up-to-date durable_seq lets those seqs release their ring
+        // slots so the next boot starts with a clean buffer log.
+        if let Some(pool) = self.buffer_pool.as_ref() {
+            pool.durable_seq_handle().store(
+                pool.max_flushed_seq_handle().load(std::sync::atomic::Ordering::Acquire),
+                std::sync::atomic::Ordering::Release,
+            );
+            if let Err(e) = pool.advance_tail() {
+                tracing::warn!(
+                    error = %e,
+                    "final advance_tail at shutdown failed — pending entries may persist"
+                );
+            }
+        }
+
         // Stamp the LV3 superblock with FLAG_CLEAN_SHUTDOWN so the next boot
         // can skip dirty recovery. This is the last persistent act of the
         // engine — by this point flusher has drained, cleanup_tx is idle, and
-        // the refcount CF is consistent with the redb paged blockmap.
+        // the refcount CF is consistent with the per-volume blockmap CFs.
         if let Some(ref io_engine) = self.io_engine {
             match superblock::read_superblock(io_engine.data_device()) {
                 Ok(Some(mut sb)) => {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use rocksdb::WriteBatch;
+use rocksdb::{ReadOptions, WriteBatch};
 
-use crate::error::OnyxResult;
+use crate::error::{OnyxError, OnyxResult};
 use crate::meta::schema::*;
 use crate::types::{Lba, Pba, VolumeId, BLOCK_SIZE};
 
@@ -15,30 +15,64 @@ impl MetaStore {
         lba: Lba,
         value: &BlockmapValue,
     ) -> OnyxResult<()> {
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([key.as_slice()]);
-        self.redb.put_mapping(&vol_id.0, lba, *value)?;
+        let val = encode_blockmap_value(value);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf_blockmap, &key, &val);
+        self.db.write_opt(batch, &self.hot_write_opts)?;
         Ok(())
     }
 
     pub fn get_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<Option<BlockmapValue>> {
-        self.redb.get_mapping(&vol_id.0, lba)
+        let cf = match self.blockmap_cf(&vol_id.0) {
+            Some(cf) => cf,
+            None => return Ok(None),
+        };
+        let key = encode_blockmap_key(lba);
+        match self.db.get_cf(&cf, &key)? {
+            Some(data) => Ok(decode_blockmap_value(&data)),
+            None => Ok(None),
+        }
     }
 
-    /// Batch-read multiple LBA mappings in a single redb read transaction.
-    /// Results are returned in the same order as the input `lbas` slice.
+    /// Batch-read multiple LBA mappings in one RocksDB multi_get_cf call.
+    /// Returns results in the same order as the input `lbas` slice.
     pub fn multi_get_mappings(
         &self,
         vol_id: &VolumeId,
         lbas: &[Lba],
     ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
-        self.redb.batch_get_mappings(&vol_id.0, lbas)
+        if lbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = match self.blockmap_cf(&vol_id.0) {
+            Some(cf) => cf,
+            None => return Ok(vec![None; lbas.len()]),
+        };
+        let keys: Vec<[u8; 8]> = lbas.iter().map(|lba| encode_blockmap_key(*lba)).collect();
+        let results = self
+            .db
+            .multi_get_cf(keys.iter().map(|k| (&cf, k.as_slice())));
+        let mut out = Vec::with_capacity(lbas.len());
+        for result in results {
+            match result {
+                Ok(Some(data)) => out.push(decode_blockmap_value(&data)),
+                Ok(None) => out.push(None),
+                Err(e) => return Err(OnyxError::Meta(e)),
+            }
+        }
+        Ok(out)
     }
 
     pub fn delete_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<()> {
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([key.as_slice()]);
-        self.redb.delete_mapping(&vol_id.0, lba)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&cf_blockmap, &key);
+        self.db.write_opt(batch, &self.hot_write_opts)?;
         Ok(())
     }
 
@@ -48,41 +82,59 @@ impl MetaStore {
         start: Lba,
         end: Lba,
     ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
-        self.redb.get_mappings_range(&vol_id.0, start, end)
+        let cf = match self.blockmap_cf(&vol_id.0) {
+            Some(cf) => cf,
+            None => return Ok(Vec::new()),
+        };
+        let start_key = encode_blockmap_key(start);
+        let end_key = encode_blockmap_key(end);
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_upper_bound(end_key.to_vec());
+
+        let mut results = Vec::new();
+        let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
+        iter.seek(&start_key);
+
+        while iter.valid() {
+            if let (Some(key), Some(val)) = (iter.key(), iter.value()) {
+                if let Some(lba) = decode_blockmap_key(key) {
+                    if let Some(bv) = decode_blockmap_value(val) {
+                        results.push((lba, bv));
+                    }
+                }
+            }
+            iter.next();
+        }
+        iter.status()?;
+        Ok(results)
     }
 
-    /// Atomically write a blockmap entry + set refcount = 1.
-    ///
-    /// Cross-DB ordering (per redb_paged_blockmap plan §5.2): RocksDB refcount
-    /// first, redb blockmap second. A crash between the two leaks the PBA
-    /// refcount but never corrupts data; startup recovery reconciles.
+    /// Atomically write a blockmap entry + set refcount=1
     pub fn atomic_write_mapping(
         &self,
         vol_id: &VolumeId,
         lba: Lba,
         value: &BlockmapValue,
     ) -> OnyxResult<()> {
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let bm_key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([bm_key.as_slice()]);
         let _refcount_guards = self.lock_refcount_pbas([value.pba]);
+        let bm_val = encode_blockmap_value(value);
+        let rc_key = encode_refcount_key(value.pba);
+        let rc_val = encode_refcount_value(1);
 
         let mut batch = WriteBatch::default();
-        let rc_key = encode_refcount_key(value.pba);
-        batch.put_cf(&cf_refcount, &rc_key, &encode_refcount_value(1));
+        batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+        batch.put_cf(&cf_refcount, &rc_key, &rc_val);
         self.db.write_opt(batch, &self.hot_write_opts)?;
-
-        self.redb.put_mapping(&vol_id.0, lba, *value)?;
         Ok(())
     }
 
-    /// Atomically update mapping: decrement old PBA refcount, write new mapping + new refcount.
-    ///
-    /// The authoritative old PBA is read from redb inside the blockmap stripe
-    /// lock (prevents same-LBA races from decrementing the wrong PBA). The
-    /// caller's `old_pba` hint is only used as a fallback when redb has no
-    /// prior mapping.
+    /// Atomically update mapping: decrement old PBA refcount, write new mapping + new refcount
     pub fn atomic_remap(
         &self,
         vol_id: &VolumeId,
@@ -90,14 +142,14 @@ impl MetaStore {
         old_pba: Option<Pba>,
         new_value: &BlockmapValue,
     ) -> OnyxResult<()> {
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let bm_key = encode_blockmap_key(lba);
         let _blockmap_guards = self.lock_blockmap_keys([bm_key.as_slice()]);
-        let current_old_mapping = self.redb.get_mapping(&vol_id.0, lba)?;
+        let current_old_mapping = self.get_mapping(vol_id, lba)?;
         let current_old_pba = current_old_mapping.as_ref().map(|mapping| mapping.pba);
         let old_pba = current_old_pba.or(old_pba);
-
         let mut touched_pbas = vec![new_value.pba];
         if let Some(old) = old_pba {
             touched_pbas.push(old);
@@ -105,6 +157,10 @@ impl MetaStore {
         let _refcount_guards = self.lock_refcount_pbas(touched_pbas);
 
         let mut batch = WriteBatch::default();
+
+        let bm_val = encode_blockmap_value(new_value);
+        batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+
         let new_rc_key = encode_refcount_key(new_value.pba);
         batch.put_cf(&cf_refcount, &new_rc_key, &encode_refcount_value(1));
 
@@ -120,26 +176,25 @@ impl MetaStore {
         }
 
         self.db.write_opt(batch, &self.hot_write_opts)?;
-        self.redb.put_mapping(&vol_id.0, lba, *new_value)?;
         Ok(())
     }
 
     /// Atomically write multiple blockmap entries sharing the same PBA (compression unit),
     /// set new PBA refcount, and decrement old PBA refcounts.
     ///
-    /// Old mappings are re-read **inside** the blockmap stripe lock to prevent
-    /// stale-read races (another thread remapping an LBA between the caller's
-    /// read and this write would cause the wrong old PBA to be decremented,
-    /// leading to refcount drift).
+    /// Old mappings are re-read **inside** the refcount lock to prevent stale-read races
+    /// (another thread remapping an LBA between the caller's read and this write would
+    /// cause the wrong old PBA to be decremented, leading to refcount drift).
     ///
-    /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were
-    /// decremented, so the caller can check refcounts and free dead PBAs.
+    /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were decremented,
+    /// so the caller can check refcounts and free dead PBAs.
     pub fn atomic_batch_write(
         &self,
         vol_id: &VolumeId,
         batch_values: &[(Lba, BlockmapValue)],
         new_refcount: u32,
     ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        let cf_blockmap = self.require_blockmap_cf(&vol_id.0)?;
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let lbas: Vec<Lba> = batch_values.iter().map(|(lba, _)| *lba).collect();
@@ -147,7 +202,7 @@ impl MetaStore {
         let _blockmap_guards = self.lock_blockmap_keys(&bm_keys);
 
         let new_pba = batch_values.first().map(|(_, v)| v.pba);
-        let old_mappings = self.redb.batch_get_mappings(&vol_id.0, &lbas)?;
+        let old_mappings = self.multi_get_mappings(vol_id, &lbas)?;
 
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
         for old in old_mappings.iter().flatten() {
@@ -168,6 +223,11 @@ impl MetaStore {
         let old_refcounts = self.refcounts_by_pba(&old_pbas)?;
 
         let mut batch = WriteBatch::default();
+
+        for ((_, value), bm_key) in batch_values.iter().zip(bm_keys.iter()) {
+            let bm_val = encode_blockmap_value(value);
+            batch.put_cf(&cf_blockmap, &bm_key, &bm_val);
+        }
 
         if let Some((_, first_val)) = batch_values.first() {
             let rc_key = encode_refcount_key(first_val.pba);
@@ -190,14 +250,6 @@ impl MetaStore {
         }
 
         self.db.write_opt(batch, &self.hot_write_opts)?;
-
-        // Commit blockmap updates to redb after refcount bumps are durable.
-        let redb_entries: Vec<(&str, Lba, BlockmapValue)> = batch_values
-            .iter()
-            .map(|(lba, v)| (vol_id.0.as_str(), *lba, *v))
-            .collect();
-        self.redb.batch_put_mappings(&redb_entries)?;
-
         Ok(newly_zeroed)
     }
 
@@ -224,7 +276,7 @@ impl MetaStore {
         let mut old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
         let mut self_decrement: u32 = 0;
         for (vol_id, lba, _new_value) in batch_values {
-            let old_mapping = self.redb.get_mapping(&vol_id.0, *lba)?;
+            let old_mapping = self.get_mapping(vol_id, *lba)?;
             if let Some(old) = old_mapping {
                 if old.pba == new_pba {
                     self_decrement += 1;
@@ -245,6 +297,11 @@ impl MetaStore {
 
         let mut batch = WriteBatch::default();
 
+        for ((vol_id, _, value), bm_key) in batch_values.iter().zip(bm_keys.iter()) {
+            let vol_cf = self.require_blockmap_cf(&vol_id.0)?;
+            let bm_val = encode_blockmap_value(value);
+            batch.put_cf(&vol_cf, bm_key, &bm_val);
+        }
         // Read current refcount and compute net increment, instead of blind PUT.
         // A blind PUT would overwrite any refs added by concurrent dedup hits or
         // other paths, causing refcount drift -> premature PBA free -> CRC mismatch.
@@ -270,23 +327,15 @@ impl MetaStore {
         }
 
         self.db.write_opt(batch, &self.hot_write_opts)?;
-
-        let redb_entries: Vec<(&str, Lba, BlockmapValue)> = batch_values
-            .iter()
-            .map(|(vol_id, lba, v)| (vol_id.0.as_str(), *lba, *v))
-            .collect();
-        self.redb.batch_put_mappings(&redb_entries)?;
-
         Ok(newly_zeroed)
     }
 
     /// Atomically write blockmap entries for multiple units, each with its own PBA.
-    /// Combines all units into a single RocksDB WriteBatch for one WAL sync and a
-    /// single redb write transaction for the blockmap updates.
+    /// Combines all units into a single RocksDB WriteBatch for one WAL sync.
     ///
     /// Old mappings are re-read inside the lock (same rationale as `atomic_batch_write`).
     ///
-    /// Each item in `units`: (vol_id, blockmap entries, new_pba refcount).
+    /// Each item in `units`: (vol_id, blockmap entries, new_pba refcount)
     /// Returns `HashMap<Pba, (decrement, block_count)>` for old PBAs that were decremented.
     pub fn atomic_batch_write_multi(
         &self,
@@ -308,13 +357,15 @@ impl MetaStore {
         let _blockmap_guards =
             self.lock_blockmap_keys(unit_keys.iter().flat_map(|keys| keys.iter()));
 
+        let mut batch = WriteBatch::default();
+
         let mut new_refcounts: HashMap<Pba, u32> = HashMap::new();
         let mut aggregated_decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
 
         for (unit_idx, (vol_id, batch_values, new_refcount)) in units.iter().enumerate() {
             let new_pba = batch_values.first().map(|(_, v)| v.pba);
 
-            let old_mappings = self.redb.batch_get_mappings(&vol_id.0, &unit_lbas[unit_idx])?;
+            let old_mappings = self.multi_get_mappings(vol_id, &unit_lbas[unit_idx])?;
             for old in old_mappings.iter().flatten() {
                 if Some(old.pba) != new_pba {
                     let old_blocks = old.unit_compressed_size.div_ceil(BLOCK_SIZE);
@@ -324,6 +375,12 @@ impl MetaStore {
                     entry.0 += 1;
                     entry.1 = entry.1.max(old_blocks);
                 }
+            }
+
+            let vol_cf = self.require_blockmap_cf(&vol_id.0)?;
+            for ((_, value), bm_key) in batch_values.iter().zip(unit_keys[unit_idx].iter()) {
+                let bm_val = encode_blockmap_value(value);
+                batch.put_cf(&vol_cf, bm_key, &bm_val);
             }
 
             if let Some((_, first_val)) = batch_values.first() {
@@ -338,7 +395,6 @@ impl MetaStore {
         let _refcount_guards = self.lock_refcount_pbas(touched_pbas.iter().copied());
         let current_refcounts = self.refcounts_by_pba(&touched_pbas)?;
 
-        let mut batch = WriteBatch::default();
         let mut newly_zeroed: HashMap<Pba, (u32, u32)> = HashMap::new();
 
         for pba in touched_pbas {
@@ -365,16 +421,6 @@ impl MetaStore {
         }
 
         self.db.write_opt(batch, &self.hot_write_opts)?;
-
-        // Commit all blockmap updates in a single redb transaction.
-        let mut redb_entries: Vec<(&str, Lba, BlockmapValue)> = Vec::new();
-        for (vol_id, batch_values, _) in units {
-            for (lba, value) in batch_values.iter() {
-                redb_entries.push((vol_id.0.as_str(), *lba, *value));
-            }
-        }
-        self.redb.batch_put_mappings(&redb_entries)?;
-
         Ok(newly_zeroed)
     }
 }

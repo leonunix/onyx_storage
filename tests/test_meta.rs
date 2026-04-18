@@ -58,7 +58,6 @@ fn refcount_roundtrip() {
 fn test_config(dir: &std::path::Path) -> MetaConfig {
     MetaConfig {
         rocksdb_path: Some(dir.to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     }
@@ -77,7 +76,7 @@ fn test_volume() -> VolumeConfig {
 
 /// Ensure the per-volume blockmap CF exists for tests that skip put_volume.
 fn ensure_blockmap_cf(store: &MetaStore, vol_id: &str) {
-    // removed: store.create_blockmap_cf(vol_id).unwrap();
+    store.create_blockmap_cf(vol_id).unwrap();
 }
 
 #[test]

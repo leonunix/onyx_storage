@@ -10,7 +10,6 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 # metadata
 rocksdb = { version = "0.24", features = ["lz4", "zstd"] }
-redb = "4"
 
 # compression
 lz4_flex = "0.11"

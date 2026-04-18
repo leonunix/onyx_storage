@@ -1,5 +1,5 @@
-//! MetaStore integration tests exercising the redb-backed blockmap paths
-//! + the dirty-recovery rebuild logic added in phase 4.
+//! MetaStore integration tests: CRUD, atomic batch writes, and dirty-recovery
+//! rebuild against the per-volume RocksDB blockmap CFs.
 
 use std::path::Path;
 
@@ -7,8 +7,8 @@ use tempfile::TempDir;
 
 use crate::config::MetaConfig;
 use crate::meta::schema::{
-    encode_dedup_reverse_key, encode_refcount_key, encode_refcount_value, BlockmapValue,
-    ContentHash, DedupEntry, CF_DEDUP_INDEX, CF_DEDUP_REVERSE, CF_REFCOUNT,
+    encode_refcount_key, encode_refcount_value, BlockmapValue, ContentHash, DedupEntry,
+    CF_REFCOUNT,
 };
 use crate::meta::store::MetaStore;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
@@ -43,7 +43,6 @@ fn sample_dedup_entry(pba: u64) -> DedupEntry {
 fn fresh_meta(path: &Path) -> MetaStore {
     MetaStore::open(&MetaConfig {
         rocksdb_path: Some(path.to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     })
@@ -62,7 +61,7 @@ fn vol_config(id: &str) -> VolumeConfig {
 }
 
 #[test]
-fn put_and_get_mapping_via_redb() {
+fn put_and_get_mapping_round_trip() {
     let dir = TempDir::new().unwrap();
     let meta = fresh_meta(dir.path());
     let vol = VolumeId("v".into());
@@ -114,17 +113,18 @@ fn delete_volume_cleans_up_blockmap_and_decrements_refcount() {
 
 #[test]
 fn rebuild_refcount_fills_missing_entries() {
-    // Redb has mappings; refcount CF is empty. Rebuild should populate it.
+    // Blockmap CF has mappings; refcount CF is empty. Rebuild should populate it.
+    // Simulates the "crash between blockmap commit and refcount commit" case
+    // (theoretical — they're in the same WriteBatch today, but rebuild must
+    // still be able to re-derive refcount from blockmap ground truth).
     let dir = TempDir::new().unwrap();
     let meta = fresh_meta(dir.path());
     let vol = VolumeId("v".into());
     meta.put_volume(&vol_config("v")).unwrap();
 
-    // Insert mappings directly via redb to bypass RocksDB refcount update.
+    // put_mapping writes blockmap only (no refcount update) — perfect for this test.
     for i in 0..5 {
-        meta.redb
-            .put_mapping("v", Lba(i), sample_bv(200 + i))
-            .unwrap();
+        meta.put_mapping(&vol, Lba(i), &sample_bv(200 + i)).unwrap();
     }
 
     // Pre-rebuild: refcount CF has nothing for PBAs 200..205.
@@ -143,7 +143,7 @@ fn rebuild_refcount_fills_missing_entries() {
 
 #[test]
 fn rebuild_refcount_removes_orphans() {
-    // Refcount CF has rows that nobody references in redb.
+    // Refcount CF has rows that nobody references in blockmap.
     let dir = TempDir::new().unwrap();
     let meta = fresh_meta(dir.path());
     meta.put_volume(&vol_config("v")).unwrap();
@@ -194,9 +194,7 @@ fn rebuild_refcount_handles_multiple_lbas_per_pba() {
     meta.put_volume(&vol_config("v")).unwrap();
 
     for i in 0..3 {
-        meta.redb
-            .put_mapping("v", Lba(i), sample_bv(400))
-            .unwrap();
+        meta.put_mapping(&vol, Lba(i), &sample_bv(400)).unwrap();
     }
 
     meta.rebuild_refcount_from_blockmap().unwrap();
@@ -213,9 +211,7 @@ fn rebuild_refcount_fixes_drifted_value() {
 
     // Two LBAs → PBA 500 (true count = 2).
     for i in 0..2 {
-        meta.redb
-            .put_mapping("v", Lba(i), sample_bv(500))
-            .unwrap();
+        meta.put_mapping(&vol, Lba(i), &sample_bv(500)).unwrap();
     }
 
     // Corrupt refcount to 99.
@@ -231,7 +227,7 @@ fn rebuild_refcount_fixes_drifted_value() {
 }
 
 #[test]
-fn scan_all_blockmap_entries_via_redb_matches_put_set() {
+fn scan_all_blockmap_entries_matches_put_set() {
     let dir = TempDir::new().unwrap();
     let meta = fresh_meta(dir.path());
     let vol = VolumeId("v".into());

@@ -82,14 +82,44 @@ fn inline_lv3_read(
     extract_lba_from_compressed(&raw, &mapping, metrics).map(Some)
 }
 
-/// Shared post-IO pipeline: slice out the compressed unit, verify CRC,
-/// decompress, then carve out the requested 4 KB LBA. Used by both the inline
-/// LV3 read path and the `ReadPool` worker so the two paths can never drift.
-pub(crate) fn extract_lba_from_compressed(
-    raw: &[u8],
+/// Decoded compression-unit payload. Either a borrowed slice of the raw LV3
+/// read buffer (uncompressed case) or an owned buffer produced by the codec
+/// (compressed case). Callers slice out individual LBAs by
+/// `offset_in_unit * BLOCK_SIZE`.
+#[derive(Debug)]
+pub(crate) enum UnitPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl<'a> UnitPayload<'a> {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            UnitPayload::Borrowed(s) => s,
+            UnitPayload::Owned(v) => v.as_slice(),
+        }
+    }
+
+    pub(crate) fn into_owned(self) -> Vec<u8> {
+        match self {
+            UnitPayload::Borrowed(s) => s.to_vec(),
+            UnitPayload::Owned(v) => v,
+        }
+    }
+}
+
+/// Verify CRC and decompress a compression unit. Returns the full unit payload
+/// (`unit_original_size` bytes). Shared by the inline LV3 path, the `ReadPool`
+/// worker, and the vectorized batch read path so they cannot drift.
+///
+/// Per-unit metrics (`read_crc_errors`, `read_decompress_errors`) live here.
+/// Per-LBA metrics stay with the caller so that callers serving multiple LBAs
+/// from one unit bump counters the right number of times.
+pub(crate) fn decode_unit<'a>(
+    raw: &'a [u8],
     mapping: &crate::meta::schema::BlockmapValue,
     metrics: &EngineMetrics,
-) -> OnyxResult<Vec<u8>> {
+) -> OnyxResult<UnitPayload<'a>> {
     use std::sync::atomic::Ordering;
 
     let (start, end) = mapping.compressed_slice_range();
@@ -110,17 +140,15 @@ pub(crate) fn extract_lba_from_compressed(
         });
     }
 
-    let lba_off = mapping.offset_in_unit as usize * BLOCK_SIZE as usize;
-    let lba_end = lba_off + BLOCK_SIZE as usize;
-
-    let result = if mapping.is_uncompressed() {
-        if lba_end > compressed.len() {
+    if mapping.is_uncompressed() {
+        let needed = mapping.unit_original_size as usize;
+        if needed > compressed.len() {
             return Err(OnyxError::Compress(format!(
-                "uncompressed unit too small: {} bytes, need {lba_off}..{lba_end}",
+                "uncompressed unit too small: {} bytes, need {needed}",
                 compressed.len()
             )));
         }
-        compressed[lba_off..lba_end].to_vec()
+        Ok(UnitPayload::Borrowed(&compressed[..needed]))
     } else {
         let algo = CompressionAlgo::from_u8(mapping.compression).unwrap_or(CompressionAlgo::None);
         let codec = create_compressor(algo);
@@ -131,20 +159,211 @@ pub(crate) fn extract_lba_from_compressed(
             metrics.read_decompress_errors.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if lba_end > decompressed.len() {
-            return Err(OnyxError::Compress(format!(
-                "decompressed unit too small: {} bytes, need {lba_off}..{lba_end}",
-                decompressed.len()
-            )));
-        }
-        decompressed[lba_off..lba_end].to_vec()
-    };
+        Ok(UnitPayload::Owned(decompressed))
+    }
+}
+
+/// Pure slice helper — extract the 4 KB LBA at `offset_in_unit` from a decoded
+/// unit payload. Returns an error if the offset runs past the payload.
+pub(crate) fn slice_lba<'a>(
+    payload: &'a UnitPayload<'a>,
+    offset_in_unit: u16,
+) -> OnyxResult<&'a [u8]> {
+    let bs = BLOCK_SIZE as usize;
+    let lba_off = offset_in_unit as usize * bs;
+    let lba_end = lba_off + bs;
+    let buf = payload.as_slice();
+    if lba_end > buf.len() {
+        return Err(OnyxError::Compress(format!(
+            "unit payload too small: {} bytes, need {lba_off}..{lba_end}",
+            buf.len()
+        )));
+    }
+    Ok(&buf[lba_off..lba_end])
+}
+
+/// Shared post-IO pipeline: decode the unit then carve out one 4 KB LBA.
+/// Thin wrapper over `decode_unit` + `slice_lba` used by the inline LV3 path
+/// and the per-LBA `ReadPool` entry point.
+pub(crate) fn extract_lba_from_compressed(
+    raw: &[u8],
+    mapping: &crate::meta::schema::BlockmapValue,
+    metrics: &EngineMetrics,
+) -> OnyxResult<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+
+    let payload = decode_unit(raw, mapping, metrics)?;
+    let lba = slice_lba(&payload, mapping.offset_in_unit)?.to_vec();
 
     metrics.read_lv3_hits.fetch_add(1, Ordering::Relaxed);
     metrics
         .lv3_read_decompressed_bytes
         .fetch_add(BLOCK_SIZE as u64, Ordering::Relaxed);
-    Ok(result)
+    Ok(lba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compress::codec::create_compressor;
+    use crate::meta::schema::BlockmapValue;
+    use crate::types::{CompressionAlgo, Pba};
+
+    fn make_mapping(
+        pba: u64,
+        compression: u8,
+        unit_compressed_size: u32,
+        unit_original_size: u32,
+        unit_lba_count: u16,
+        offset_in_unit: u16,
+        crc32: u32,
+        slot_offset: u16,
+    ) -> BlockmapValue {
+        BlockmapValue {
+            pba: Pba(pba),
+            compression,
+            unit_compressed_size,
+            unit_original_size,
+            unit_lba_count,
+            offset_in_unit,
+            crc32,
+            slot_offset,
+            flags: 0,
+        }
+    }
+
+    /// Uncompressed unit: `decode_unit` returns a borrowed slice into `raw`,
+    /// and `slice_lba` picks out each LBA by offset.
+    #[test]
+    fn decode_unit_uncompressed_unpacked() {
+        let mut raw = vec![0u8; BLOCK_SIZE as usize * 4];
+        for (i, chunk) in raw.chunks_mut(BLOCK_SIZE as usize).enumerate() {
+            chunk.fill((i + 1) as u8);
+        }
+        let crc = crc32fast::hash(&raw);
+        let mapping = make_mapping(
+            0,
+            CompressionAlgo::None.to_u8(),
+            raw.len() as u32,
+            raw.len() as u32,
+            4,
+            0,
+            crc,
+            0,
+        );
+        let metrics = EngineMetrics::default();
+        let payload = decode_unit(&raw, &mapping, &metrics).unwrap();
+        assert!(
+            matches!(payload, UnitPayload::Borrowed(_)),
+            "uncompressed path must borrow from raw buffer"
+        );
+        for i in 0..4u16 {
+            let lba = slice_lba(&payload, i).unwrap();
+            assert_eq!(lba, &[(i + 1) as u8; BLOCK_SIZE as usize]);
+        }
+    }
+
+    /// LZ4-compressed unit: every LBA in the unit must decode back to the
+    /// original block. This exercises the coalescing path's invariant — one
+    /// decode fans out to N LBAs.
+    #[test]
+    fn decode_unit_lz4_fans_out_all_lbas() {
+        let lba_count = 8u16;
+        let unit_original_size = (lba_count as usize) * BLOCK_SIZE as usize;
+        let mut original = vec![0u8; unit_original_size];
+        for (i, chunk) in original.chunks_mut(BLOCK_SIZE as usize).enumerate() {
+            chunk.fill(0xA0 | i as u8);
+        }
+        let codec = create_compressor(CompressionAlgo::Lz4);
+        let mut compressed = vec![0u8; unit_original_size + 64];
+        let csize = codec.compress(&original, &mut compressed).unwrap();
+        compressed.truncate(csize);
+        let crc = crc32fast::hash(&compressed);
+
+        // Raw buffer is compressed bytes rounded up to block_size for O_DIRECT.
+        let read_size = ((csize + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
+            * BLOCK_SIZE as usize;
+        let mut raw = vec![0u8; read_size];
+        raw[..csize].copy_from_slice(&compressed);
+
+        let mapping = make_mapping(
+            1,
+            CompressionAlgo::Lz4.to_u8(),
+            csize as u32,
+            unit_original_size as u32,
+            lba_count,
+            0,
+            crc,
+            0,
+        );
+        let metrics = EngineMetrics::default();
+        let payload = decode_unit(&raw, &mapping, &metrics).unwrap();
+        assert!(matches!(payload, UnitPayload::Owned(_)));
+        for i in 0..lba_count {
+            let lba = slice_lba(&payload, i).unwrap();
+            assert_eq!(lba, &[0xA0 | i as u8; BLOCK_SIZE as usize]);
+        }
+    }
+
+    /// Packed fragment: `slot_offset > 0` means `decode_unit` must honor
+    /// `compressed_slice_range` — it slices compressed bytes out of the
+    /// middle of a shared 4 KB physical slot.
+    #[test]
+    fn decode_unit_packed_fragment_uses_slot_offset() {
+        let payload_a = vec![0x11u8; 1024];
+        let payload_b = vec![0x22u8; 1024];
+        let mut slot = vec![0u8; BLOCK_SIZE as usize];
+        slot[..1024].copy_from_slice(&payload_a);
+        slot[1024..2048].copy_from_slice(&payload_b);
+        let crc_b = crc32fast::hash(&payload_b);
+
+        let mapping = make_mapping(
+            7,
+            CompressionAlgo::None.to_u8(),
+            1024,
+            1024,
+            1,
+            0,
+            crc_b,
+            1024, // slot_offset — second fragment
+        );
+        let metrics = EngineMetrics::default();
+        let payload = decode_unit(&slot, &mapping, &metrics).unwrap();
+        assert_eq!(payload.as_slice(), payload_b.as_slice());
+    }
+
+    #[test]
+    fn decode_unit_crc_mismatch_returns_error_and_bumps_metric() {
+        let raw = vec![0u8; BLOCK_SIZE as usize];
+        let bad_crc = crc32fast::hash(&raw).wrapping_add(1);
+        let mapping = make_mapping(
+            0,
+            CompressionAlgo::None.to_u8(),
+            BLOCK_SIZE,
+            BLOCK_SIZE,
+            1,
+            0,
+            bad_crc,
+            0,
+        );
+        let metrics = EngineMetrics::default();
+        let err = decode_unit(&raw, &mapping, &metrics).unwrap_err();
+        assert!(matches!(err, OnyxError::CrcMismatch { .. }));
+        assert_eq!(
+            metrics
+                .read_crc_errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn slice_lba_rejects_out_of_range_offset() {
+        let payload = UnitPayload::Owned(vec![0u8; BLOCK_SIZE as usize]);
+        assert!(slice_lba(&payload, 0).is_ok());
+        // offset_in_unit = 1 requires 2 × BLOCK_SIZE of payload.
+        assert!(slice_lba(&payload, 1).is_err());
+    }
 }
 
 /// Convenience wrapper that takes `Arc`s and an optional pool — used by

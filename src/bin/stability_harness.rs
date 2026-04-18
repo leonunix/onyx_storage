@@ -46,7 +46,6 @@ fn write_and_abort(
     let config = OnyxConfig {
         meta: MetaConfig {
             rocksdb_path: Some(meta_dir),
-            redb_path: None,
             block_cache_mb: 32,
             wal_dir: None,
         },

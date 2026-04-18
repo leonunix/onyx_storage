@@ -1636,7 +1636,21 @@ impl BufferShard {
     }
 
     pub(super) fn advance_tail(&self) -> OnyxResult<u64> {
+        // Re-run reclaim with the LATEST durable_seq. The original
+        // `mark_flushed` → `free_seq_allocation` chain runs `reclaim_log_prefix`
+        // inline, but only with whatever durable_seq was visible at that
+        // instant. When the durability watermark thread advances durable_seq
+        // after that point, no one re-visits the stuck prefix — so the tail
+        // lags the actual durability envelope and a clean shutdown reopens
+        // with phantom pending entries. Driving another reclaim pass here
+        // closes that gap with no extra IO.
+        let durable_seq = self.durable_seq.load(Ordering::Acquire);
         let mut ring = self.ring.lock();
+        let before = ring.used_bytes;
+        Self::reclaim_log_prefix(&mut ring, durable_seq);
+        if ring.used_bytes < before {
+            self.ring_space_cv.notify_all();
+        }
         let advanced = ring.reclaim_ready;
         ring.reclaim_ready = 0;
         Ok(advanced)

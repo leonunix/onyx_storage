@@ -137,7 +137,21 @@ fn create_test_pool(num_entries: u64) -> (WriteBufferPool, NamedTempFile) {
     tmp.as_file().set_len(size).unwrap();
     let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
     let pool = WriteBufferPool::open(dev).unwrap();
+    // Simulate a perpetually-caught-up durability watermark. In production the
+    // engine-owned watermark thread advances `durable_seq` after every
+    // MetaStore::sync_durable(); without it, `reclaim_log_prefix` refuses to
+    // release ring slots and `advance_tail()` returns 0. Tests that drive
+    // `mark_flushed` / `advance_tail` directly must stand in for that thread.
+    force_durable(&pool);
     (pool, tmp)
+}
+
+/// Simulate the engine's durability-watermark thread for tests that open a
+/// pool standalone. Stores `u64::MAX` so every mark_flushed'd seq is treated
+/// as durable and can reclaim its ring slot immediately.
+fn force_durable(pool: &WriteBufferPool) {
+    pool.durable_seq_handle()
+        .store(u64::MAX, std::sync::atomic::Ordering::Release);
 }
 
 #[test]
@@ -589,6 +603,7 @@ fn concurrent_duplicate_mark_flushed_does_not_underflow_payload_memory() {
     let pool = Arc::new(
         WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(200)).unwrap(),
     );
+    force_durable(&pool);
 
     for lba in 0..64u64 {
         let seq = pool
@@ -718,6 +733,7 @@ fn persistence_across_reopen_after_ring_wrap() {
     let (keep_seq, wrapped_seq) = {
         let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
         let pool = WriteBufferPool::open(dev).unwrap();
+        force_durable(&pool);
 
         let seq0 = pool
             .append("test-vol", Lba(0), 1, &vec![0x10; 4096], 0)

@@ -94,7 +94,13 @@ pub struct EngineMetrics {
     pub buffer_read_ops: AtomicU64,
     pub buffer_read_bytes: AtomicU64,
     pub read_buffer_hits: AtomicU64,
+    /// Per-LBA counter: number of 4 KB LBAs served out of an LV3 compression
+    /// unit. With unit coalescing, one io_uring read can serve many LBAs, so
+    /// this can be much larger than `lv3_read_ops`.
     pub read_lv3_hits: AtomicU64,
+    /// Per-io_uring-read counter: number of LV3 read operations issued. One
+    /// read covers one compression unit and may serve many LBAs
+    /// (`read_lv3_hits / lv3_read_ops` ≈ LBAs per unit).
     pub lv3_read_ops: AtomicU64,
     pub lv3_read_compressed_bytes: AtomicU64,
     pub lv3_read_decompressed_bytes: AtomicU64,

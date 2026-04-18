@@ -47,7 +47,6 @@ fn setup_dedup_env_with_sizes(
 
     let meta_config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(meta_dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -55,6 +54,13 @@ fn setup_dedup_env_with_sizes(
 
     let buf_dev = RawDevice::open(buf_tmp.path()).unwrap();
     let pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
+    // Simulate the engine's durability-watermark thread so mark_flushed'd
+    // seqs actually release their ring slots. Without this the flusher's
+    // mark_flushed would run but reclaim_log_prefix would stall on
+    // durable_seq=0, buffer fill% would never drop, and the scanner
+    // pressure-relief path would never see a green signal.
+    pool.durable_seq_handle()
+        .store(u64::MAX, std::sync::atomic::Ordering::Release);
 
     let data_dev = RawDevice::open(data_tmp.path()).unwrap();
     let io_engine = Arc::new(IoEngine::new(data_dev, false));
@@ -279,7 +285,6 @@ fn dedup_index_crud() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -318,7 +323,6 @@ fn dedup_cleanup_on_pba_free() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -369,12 +373,11 @@ fn scan_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
-    // removed: store.create_blockmap_cf("test-vol").unwrap();
+    store.create_blockmap_cf("test-vol").unwrap();
     let vol_id = VolumeId("test-vol".into());
 
     // Write entry with DEDUP_SKIPPED flag
@@ -418,12 +421,11 @@ fn update_blockmap_flags_clears_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
-    // removed: store.create_blockmap_cf("test-vol").unwrap();
+    store.create_blockmap_cf("test-vol").unwrap();
     let vol_id = VolumeId("test-vol".into());
 
     let val = BlockmapValue {
@@ -534,7 +536,6 @@ fn delete_volume_cleans_dedup_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };
@@ -593,7 +594,6 @@ fn cleanup_old_pba_preserves_newer_forward_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
         rocksdb_path: Some(dir.path().to_path_buf()),
-        redb_path: None,
         block_cache_mb: 8,
         wal_dir: None,
     };

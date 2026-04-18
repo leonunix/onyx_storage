@@ -36,7 +36,7 @@ use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, UringOp};
 use crate::meta::schema::BlockmapValue;
 use crate::metrics::EngineMetrics;
-use crate::zone::read::extract_lba_from_compressed;
+use crate::zone::read::{decode_unit, extract_lba_from_compressed};
 
 /// Maximum requests folded into one `submit_batch` per worker iteration.
 const BATCH_MAX: usize = 32;
@@ -49,6 +49,11 @@ const REQUEST_CHANNEL_CAP: usize = 128;
 struct ReadRequest {
     mapping: BlockmapValue,
     reply: Sender<OnyxResult<Vec<u8>>>,
+    /// `false` → worker returns one 4 KB LBA at `mapping.offset_in_unit`
+    /// (legacy single-LBA path). `true` → worker returns the full decoded
+    /// unit payload (`unit_original_size` bytes) so the caller can fan out
+    /// multiple LBAs from one IO+decompress.
+    return_unit: bool,
 }
 
 struct WorkerHandle {
@@ -126,9 +131,46 @@ impl ReadPool {
         Ok(Self { workers: handles })
     }
 
-    /// Submit a mapped LV3 read. Blocks the caller on a oneshot until the
-    /// worker has read + CRC-verified + decompressed the requested 4 KB.
+    /// Submit a mapped LV3 read and block until the worker has read + CRC
+    /// verified + decompressed the requested 4 KB LBA.
     pub fn submit_read(&self, mapping: BlockmapValue) -> OnyxResult<Vec<u8>> {
+        let rx = self.enqueue(mapping, false)?;
+        rx.recv()
+            .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool reply dropped")))?
+    }
+
+    /// Non-blocking send of a single-LBA read. Returns the reply receiver so
+    /// the caller can fan multiple requests out across workers before draining
+    /// them, avoiding per-request round-trip serialization.
+    pub fn submit_read_async(
+        &self,
+        mapping: BlockmapValue,
+    ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
+        self.enqueue(mapping, false)
+    }
+
+    /// Submit a compression-unit read and block for the full decoded unit
+    /// payload (`unit_original_size` bytes). Callers slice out multiple LBAs
+    /// from the returned buffer via `offset_in_unit`.
+    pub fn submit_unit_read(&self, mapping: BlockmapValue) -> OnyxResult<Vec<u8>> {
+        let rx = self.enqueue(mapping, true)?;
+        rx.recv()
+            .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool reply dropped")))?
+    }
+
+    /// Non-blocking companion to `submit_unit_read`.
+    pub fn submit_unit_read_async(
+        &self,
+        mapping: BlockmapValue,
+    ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
+        self.enqueue(mapping, true)
+    }
+
+    fn enqueue(
+        &self,
+        mapping: BlockmapValue,
+        return_unit: bool,
+    ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
         let worker_idx = (mapping.pba.0 as usize) % self.workers.len();
         let (reply_tx, reply_rx) = bounded::<OnyxResult<Vec<u8>>>(1);
         let sender = self.workers[worker_idx]
@@ -139,11 +181,10 @@ impl ReadPool {
             .send(ReadRequest {
                 mapping,
                 reply: reply_tx,
+                return_unit,
             })
             .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool worker channel closed")))?;
-        reply_rx
-            .recv()
-            .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool reply dropped")))?
+        Ok(reply_rx)
     }
 
     pub fn worker_count(&self) -> usize {
@@ -323,9 +364,16 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
             .lv3_read_compressed_bytes
             .fetch_add(exp_bytes as u64, Ordering::Relaxed);
 
-        // CRC + decompress + LBA slice — shared with the inline LV3 path so
-        // the two cannot drift.
-        let result = extract_lba_from_compressed(buf.as_slice(), &req.mapping, &ctx.metrics);
+        // Two output modes — both share the same CRC + decompress path:
+        //   return_unit=false: slice out a single 4 KB LBA (legacy).
+        //   return_unit=true:  hand back the full decoded unit so the caller
+        //                      can fan out multiple LBAs from one IO.
+        let result = if req.return_unit {
+            decode_unit(buf.as_slice(), &req.mapping, &ctx.metrics)
+                .map(|payload| payload.into_owned())
+        } else {
+            extract_lba_from_compressed(buf.as_slice(), &req.mapping, &ctx.metrics)
+        };
         let _ = req.reply.send(result);
     }
 }
@@ -424,6 +472,79 @@ mod tests {
         }
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    /// `submit_unit_read` must return the full decoded unit payload so that
+    /// callers can fan out multiple LBAs from one io_uring read + decompress.
+    #[test]
+    fn submit_unit_read_returns_full_payload() {
+        let (dev, tmp) = fresh_device();
+        let engine = IoEngine::new_raw(dev, false);
+
+        // A 4-LBA uncompressed "unit" — all four 4 KB slots laid out
+        // contiguously, each filled with a distinct byte pattern.
+        let unit_bytes = 4 * BLOCK_SIZE as usize;
+        let mut unit = vec![0u8; unit_bytes];
+        for (i, chunk) in unit.chunks_mut(BLOCK_SIZE as usize).enumerate() {
+            chunk.fill((i as u8) + 0x30);
+        }
+        engine.write_blocks(Pba(0), &unit).unwrap();
+        let crc = crc32fast::hash(&unit);
+
+        let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
+        let metrics = Arc::new(EngineMetrics::default());
+        let pool =
+            ReadPool::start(1, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics.clone()).unwrap();
+
+        let mut mapping = make_mapping(Pba(0), unit_bytes as u32, crc);
+        mapping.unit_original_size = unit_bytes as u32;
+        mapping.unit_lba_count = 4;
+
+        let got = pool.submit_unit_read(mapping).unwrap();
+        assert_eq!(got.len(), unit_bytes);
+        for (i, chunk) in got.chunks(BLOCK_SIZE as usize).enumerate() {
+            assert_eq!(chunk, &[(i as u8) + 0x30; BLOCK_SIZE as usize]);
+        }
+        // One io_uring op served the whole unit — the bedrock of coalescing.
+        assert_eq!(metrics.lv3_read_ops.load(Ordering::Relaxed), 1);
+        // `submit_unit_read` does NOT bump per-LBA hits; callers do that in
+        // their fan-out loop.
+        assert_eq!(metrics.read_lv3_hits.load(Ordering::Relaxed), 0);
+    }
+
+    /// `submit_read_async` lets callers fire N requests before draining any
+    /// reply — the worker batches them into one `submit_batch` io_uring enter.
+    #[test]
+    fn submit_read_async_fans_out_before_draining() {
+        let (dev, tmp) = fresh_device();
+        let engine = IoEngine::new_raw(dev, false);
+
+        let payloads: Vec<Vec<u8>> = (0..8)
+            .map(|i| vec![(i & 0xFF) as u8; BLOCK_SIZE as usize])
+            .collect();
+        for (i, p) in payloads.iter().enumerate() {
+            write_uncompressed(&engine, Pba(i as u64), p);
+        }
+        let crcs: Vec<u32> = payloads.iter().map(|p| crc32fast::hash(p)).collect();
+
+        // Single worker forces all requests to share one channel — this is
+        // the scenario where pre-draining vs serial round-trip matters.
+        let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
+        let metrics = Arc::new(EngineMetrics::default());
+        let pool =
+            ReadPool::start(1, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics).unwrap();
+
+        let mut rxs = Vec::new();
+        for i in 0..8 {
+            let rx = pool
+                .submit_read_async(make_mapping(Pba(i as u64), BLOCK_SIZE, crcs[i]))
+                .unwrap();
+            rxs.push(rx);
+        }
+        for (i, rx) in rxs.into_iter().enumerate() {
+            let got = rx.recv().unwrap().unwrap();
+            assert_eq!(got, payloads[i]);
         }
     }
 

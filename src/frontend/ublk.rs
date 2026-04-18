@@ -132,59 +132,94 @@ impl OnyxUblkTarget {
                     } else {
                         match op {
                             sys::UBLK_IO_OP_READ => {
-                                let mut buf_offset = 0usize;
-                                let mut remaining = io_bytes;
-                                let mut cur_offset = offset_bytes;
-                                let mut status = io_bytes as i32;
-
-                                while remaining > 0 {
-                                    let block_lba = Lba(cur_offset / block_size);
-                                    let offset_in_block = (cur_offset % block_size) as usize;
-                                    let avail_in_block = block_size as usize - offset_in_block;
-                                    let copy_len = (remaining as usize).min(avail_in_block);
-
-                                    match zm.submit_read_with_generation(
+                                // Fast path: block-aligned user read → one
+                                // vectorized call. One multi_get_mappings, one
+                                // io_uring read per unique compression unit,
+                                // one decompress per unit, and the pool writes
+                                // straight into `io_slice` with no per-LBA
+                                // intermediate allocation.
+                                if offset_bytes % block_size == 0
+                                    && io_bytes % block_size == 0
+                                {
+                                    let start_lba = Lba(offset_bytes / block_size);
+                                    let lba_count = (io_bytes / block_size) as u32;
+                                    match zm.submit_reads(
                                         &vol_id,
-                                        block_lba,
+                                        start_lba,
+                                        lba_count,
                                         vol_created_at,
+                                        &mut io_slice[..io_len],
                                     ) {
-                                        Ok(Some(data)) => {
-                                            let src_end =
-                                                (offset_in_block + copy_len).min(data.len());
-                                            let actual_copy =
-                                                src_end.saturating_sub(offset_in_block);
-                                            if actual_copy > 0 {
-                                                io_slice[buf_offset..buf_offset + actual_copy]
-                                                    .copy_from_slice(
-                                                        &data[offset_in_block
-                                                            ..offset_in_block + actual_copy],
-                                                    );
-                                            }
-                                            if actual_copy < copy_len {
-                                                io_slice[buf_offset + actual_copy
-                                                    ..buf_offset + copy_len]
-                                                    .fill(0);
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            io_slice[buf_offset..buf_offset + copy_len].fill(0);
-                                        }
+                                        Ok(()) => io_bytes as i32,
                                         Err(e) => {
                                             tracing::error!(
-                                                lba = block_lba.0,
+                                                start_lba = start_lba.0,
+                                                lba_count,
                                                 error = %e,
-                                                "read failed"
+                                                "batched read failed"
                                             );
-                                            status = -(libc::EIO as i32);
-                                            break;
+                                            -(libc::EIO as i32)
                                         }
                                     }
-                                    buf_offset += copy_len;
-                                    cur_offset += copy_len as u64;
-                                    remaining -= copy_len as u64;
-                                }
+                                } else {
+                                    // Unaligned fallback — per-LBA RMW loop.
+                                    let mut buf_offset = 0usize;
+                                    let mut remaining = io_bytes;
+                                    let mut cur_offset = offset_bytes;
+                                    let mut status = io_bytes as i32;
 
-                                status
+                                    while remaining > 0 {
+                                        let block_lba = Lba(cur_offset / block_size);
+                                        let offset_in_block =
+                                            (cur_offset % block_size) as usize;
+                                        let avail_in_block =
+                                            block_size as usize - offset_in_block;
+                                        let copy_len = (remaining as usize).min(avail_in_block);
+
+                                        match zm.submit_read_with_generation(
+                                            &vol_id,
+                                            block_lba,
+                                            vol_created_at,
+                                        ) {
+                                            Ok(Some(data)) => {
+                                                let src_end =
+                                                    (offset_in_block + copy_len).min(data.len());
+                                                let actual_copy =
+                                                    src_end.saturating_sub(offset_in_block);
+                                                if actual_copy > 0 {
+                                                    io_slice[buf_offset..buf_offset + actual_copy]
+                                                        .copy_from_slice(
+                                                            &data[offset_in_block
+                                                                ..offset_in_block + actual_copy],
+                                                        );
+                                                }
+                                                if actual_copy < copy_len {
+                                                    io_slice[buf_offset + actual_copy
+                                                        ..buf_offset + copy_len]
+                                                        .fill(0);
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                io_slice[buf_offset..buf_offset + copy_len]
+                                                    .fill(0);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    lba = block_lba.0,
+                                                    error = %e,
+                                                    "read failed"
+                                                );
+                                                status = -(libc::EIO as i32);
+                                                break;
+                                            }
+                                        }
+                                        buf_offset += copy_len;
+                                        cur_offset += copy_len as u64;
+                                        remaining -= copy_len as u64;
+                                    }
+
+                                    status
+                                }
                             }
                             sys::UBLK_IO_OP_WRITE => {
                                 let req = &io_slice[..io_len];

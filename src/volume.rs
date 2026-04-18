@@ -304,44 +304,59 @@ impl OnyxVolume {
         }
 
         let bs = BLOCK_SIZE as u64;
-        if offset_bytes % bs != 0 || len64 % bs != 0 {
+        let mut result = vec![0u8; len];
+
+        // Fast path: block-aligned → one vectorized call. Unit coalescing on
+        // the backend means one io_uring read + one decompress per unique
+        // compression unit, regardless of how many LBAs the read spans.
+        if offset_bytes % bs == 0 && len64 % bs == 0 {
+            let start_lba = Lba(offset_bytes / bs);
+            let lba_count = (len64 / bs) as u32;
+            self.zone_manager.submit_reads(
+                &self.vol_id,
+                start_lba,
+                lba_count,
+                self.created_at,
+                &mut result,
+            )?;
+        } else {
             self.metrics
                 .volume_partial_read_ops
                 .fetch_add(1, Ordering::Relaxed);
-        }
-        let mut result = vec![0u8; len];
-        let mut buf_offset = 0usize;
-        let mut remaining = len64;
-        let mut cur_offset = offset_bytes;
 
-        while remaining > 0 {
-            let block_lba = Lba(cur_offset / bs);
-            let offset_in_block = (cur_offset % bs) as usize;
-            let avail = BLOCK_SIZE as usize - offset_in_block;
-            let copy_len = (remaining as usize).min(avail);
+            let mut buf_offset = 0usize;
+            let mut remaining = len64;
+            let mut cur_offset = offset_bytes;
 
-            match self.zone_manager.submit_read_with_generation(
-                &self.vol_id,
-                block_lba,
-                self.created_at,
-            )? {
-                Some(data) => {
-                    let src_end = (offset_in_block + copy_len).min(data.len());
-                    let actual = src_end.saturating_sub(offset_in_block);
-                    if actual > 0 {
-                        result[buf_offset..buf_offset + actual]
-                            .copy_from_slice(&data[offset_in_block..offset_in_block + actual]);
+            while remaining > 0 {
+                let block_lba = Lba(cur_offset / bs);
+                let offset_in_block = (cur_offset % bs) as usize;
+                let avail = BLOCK_SIZE as usize - offset_in_block;
+                let copy_len = (remaining as usize).min(avail);
+
+                match self.zone_manager.submit_read_with_generation(
+                    &self.vol_id,
+                    block_lba,
+                    self.created_at,
+                )? {
+                    Some(data) => {
+                        let src_end = (offset_in_block + copy_len).min(data.len());
+                        let actual = src_end.saturating_sub(offset_in_block);
+                        if actual > 0 {
+                            result[buf_offset..buf_offset + actual].copy_from_slice(
+                                &data[offset_in_block..offset_in_block + actual],
+                            );
+                        }
                     }
-                    // Any remaining bytes in copy_len stay zero (already initialized)
+                    None => {
+                        // Unmapped — zeros (already initialized)
+                    }
                 }
-                None => {
-                    // Unmapped — zeros (already initialized)
-                }
-            }
 
-            buf_offset += copy_len;
-            cur_offset += copy_len as u64;
-            remaining -= copy_len as u64;
+                buf_offset += copy_len;
+                cur_offset += copy_len as u64;
+                remaining -= copy_len as u64;
+            }
         }
 
         self.metrics.volume_read_ops.fetch_add(1, Ordering::Relaxed);

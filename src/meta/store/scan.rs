@@ -11,7 +11,7 @@ use super::MetaStore;
 /// had to fix.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RebuildSummary {
-    /// Distinct PBAs referenced by redb blockmap + dedup_index.
+    /// Distinct PBAs referenced by the per-volume blockmap CFs.
     pub referenced_pbas: u64,
     /// PBAs whose RocksDB refcount differed from the recomputed value.
     pub fixed_entries: u64,
@@ -24,39 +24,61 @@ pub struct RebuildSummary {
 impl MetaStore {
     /// Check if any blockmap entry across all volumes references the given PBA.
     pub fn has_any_blockmap_ref(&self, target_pba: Pba) -> OnyxResult<bool> {
-        let mut found = false;
-        self.redb.scan_all_mappings(|_, _, bv| {
-            if bv.pba == target_pba {
-                found = true;
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        if bv.pba == target_pba {
+                            return Ok(true);
+                        }
+                    }
+                }
             }
-        })?;
-        Ok(found)
+        }
+        Ok(false)
     }
 
     /// Count live blockmap references that currently point at `target_pba`.
-    /// Full redb scan — test helper / diagnostic only, not for hot paths.
+    /// Full scan across all volumes — test helper / diagnostic only, not for hot paths.
     pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {
         let mut refs = 0u32;
-        self.redb.scan_all_mappings(|_, _, bv| {
-            if bv.pba == target_pba {
-                refs = refs.saturating_add(1);
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        if bv.pba == target_pba {
+                            refs = refs.saturating_add(1);
+                        }
+                    }
+                }
             }
-        })?;
+        }
         Ok(refs)
     }
 
     /// Scan for and remove orphaned refcount entries — PBAs with refcount > 0
-    /// but no blockmap entries referencing them. Returns the PBAs that were
-    /// cleaned up. Uses the redb paged scan as the blockmap source of truth.
+    /// but no blockmap entries referencing them. Returns the PBAs that were cleaned up.
     pub fn cleanup_orphaned_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
         let _blockmap_guards = self.lock_all_blockmap_stripes();
         let _refcount_guards = self.lock_all_refcount_stripes();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
         let mut referenced_pbas = std::collections::HashSet::new();
-        self.redb.scan_all_mappings(|_, _, bv| {
-            referenced_pbas.insert(bv.pba);
-        })?;
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let bm_iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in bm_iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        referenced_pbas.insert(bv.pba);
+                    }
+                }
+            }
+        }
 
         let mut orphans = Vec::new();
         let mut batch = WriteBatch::default();
@@ -86,36 +108,41 @@ impl MetaStore {
         Ok(orphans)
     }
 
-    /// Scan all blockmap entries across all volumes via the redb paged layout.
-    /// Callback receives (vol_id, encoded_key, encoded_value) for each entry,
-    /// matching the legacy byte-level interface so existing consumers (GC
-    /// scanner, probe tools) work without change.
+    /// Scan all blockmap entries across all volume CFs.
+    /// Callback receives (vol_id, key, value) for each entry.
+    /// Used by GC scanner to identify compression units with dead blocks.
     pub fn scan_all_blockmap_entries(
         &self,
         callback: &mut dyn FnMut(&str, &[u8], &[u8]),
     ) -> OnyxResult<()> {
-        self.redb.scan_all_mappings(|vol_id, lba, bv| {
-            let key = encode_blockmap_key(lba);
-            let value = encode_blockmap_value(&bv);
-            callback(vol_id, &key, &value);
-        })?;
+        for cf_name in self.all_blockmap_cf_names() {
+            let vol_id = match vol_id_from_blockmap_cf(&cf_name) {
+                Some(v) => v,
+                None => continue,
+            };
+            let Some(cf) = self.db.cf_handle(&cf_name) else {
+                continue;
+            };
+            let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (key, value) = item?;
+                callback(vol_id, &key, &value);
+            }
+        }
         Ok(())
     }
 
-    /// Recompute the RocksDB `refcount` CF from ground truth: the redb paged
-    /// blockmap. Each PBA's target refcount is the number of LBA mappings
+    /// Recompute the RocksDB `refcount` CF from ground truth: the per-volume
+    /// blockmap CFs. Each PBA's target refcount is the number of LBA mappings
     /// referencing it.
     ///
-    /// The RocksDB refcount CF is then overwritten to match — entries not in
-    /// the computed set are deleted (they were drifted orphans).
+    /// The refcount CF is overwritten to match — entries not in the computed
+    /// set are deleted (they were drifted orphans).
     ///
     /// **Note**: `dedup_index` / `dedup_reverse` do **not** contribute to
     /// refcount. The hot path never bumps refcount on dedup-index insert;
     /// `cleanup_dedup_for_pba` deletes index entries when the PBA's refcount
-    /// (driven by blockmap refs only) hits zero. An earlier version of this
-    /// function incorrectly added `iter_dedup_entries()` into the count,
-    /// which drifted every PBA's refcount upward by 1 per dirty-recovery
-    /// cycle.
+    /// (driven by blockmap refs only) hits zero.
     ///
     /// Invoked from the dirty-recovery path at engine startup. Hold all
     /// blockmap and refcount stripes so no concurrent write sees the table in
@@ -125,16 +152,22 @@ impl MetaStore {
         let _refcount_guards = self.lock_all_refcount_stripes();
         let cf_refcount = self.db.cf_handle(CF_REFCOUNT).unwrap();
 
-        // Count LBA references per PBA — this is the full definition of
-        // refcount. Dedup entries are NOT counted (they are cleaned up when
-        // the underlying PBA drops to zero blockmap refs).
+        // Count LBA references per PBA — full definition of refcount.
         let mut computed: std::collections::HashMap<Pba, u32> = std::collections::HashMap::new();
-        self.redb.scan_all_mappings(|_, _, bv| {
-            *computed.entry(bv.pba).or_insert(0) += 1;
-        })?;
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        *computed.entry(bv.pba).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
 
-        // 3. Write back: overwrite every computed entry, delete anything in
-        //    refcount CF that is not in the computed set.
+        // Write back: overwrite every computed entry, delete anything in
+        // refcount CF that is not in the computed set.
         let mut existing: std::collections::HashSet<Pba> = std::collections::HashSet::new();
         let mut batch = WriteBatch::default();
         let rc_iter = self
@@ -153,9 +186,8 @@ impl MetaStore {
         }
         let mut set_count: u64 = 0;
         let mut fixed_count: u64 = 0;
-        let current_refs = self.refcounts_by_pba(
-            &computed.keys().copied().collect::<Vec<_>>(),
-        )?;
+        let current_refs =
+            self.refcounts_by_pba(&computed.keys().copied().collect::<Vec<_>>())?;
         for (pba, target) in &computed {
             let current = current_refs.get(pba).copied().unwrap_or(0);
             if current != *target {
@@ -174,7 +206,7 @@ impl MetaStore {
             orphan_count,
             pba_universe = computed.len(),
             existing_entries = existing.len(),
-            "rebuilt refcount CF from redb blockmap + dedup_index"
+            "rebuilt refcount CF from per-volume blockmap CFs"
         );
 
         Ok(RebuildSummary {
@@ -185,7 +217,7 @@ impl MetaStore {
         })
     }
 
-    /// Iterate all refcount entries (for space allocator rebuild).
+    /// Iterate all refcount entries (for space allocator rebuild)
     pub fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
         let cf = self.db.cf_handle(CF_REFCOUNT).unwrap();
         let mut results = Vec::new();
@@ -203,20 +235,24 @@ impl MetaStore {
         Ok(results)
     }
 
-    /// Iterate all allocated physical blocks across all volumes, expanding
-    /// compression-unit spans into individual PBAs. Combines redb blockmap +
-    /// RocksDB refcount so allocator rebuild never misses a PBA that is tracked
-    /// by refcount but not yet mapped (e.g., crash window between RocksDB
-    /// refcount bump and redb blockmap commit).
+    /// Iterate all allocated physical blocks across all volume CFs.
     pub fn iter_allocated_blocks(&self) -> OnyxResult<Vec<Pba>> {
         let mut allocated = std::collections::BTreeSet::new();
 
-        self.redb.scan_all_mappings(|_, _, bv| {
-            let blocks = bv.unit_compressed_size.div_ceil(BLOCK_SIZE);
-            for block in 0..blocks {
-                allocated.insert(Pba(bv.pba.0 + block as u64));
+        for cf_name in self.all_blockmap_cf_names() {
+            if let Some(cf) = self.db.cf_handle(&cf_name) {
+                let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (_, value) = item?;
+                    if let Some(bv) = decode_blockmap_value(&value) {
+                        let blocks = bv.unit_compressed_size.div_ceil(BLOCK_SIZE);
+                        for block in 0..blocks {
+                            allocated.insert(Pba(bv.pba.0 + block as u64));
+                        }
+                    }
+                }
             }
-        })?;
+        }
 
         for (pba, _) in self.iter_refcounts()? {
             allocated.insert(pba);

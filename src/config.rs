@@ -99,13 +99,10 @@ impl OnyxConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaConfig {
-    /// Path to RocksDB data directory (on LV1 / XFS). Holds refcount, dedup
-    /// index, volume metadata. None = bare mode (no metadata store).
+    /// Path to RocksDB data directory (on LV1 / XFS). Holds blockmap, refcount,
+    /// dedup index, volume metadata. None = bare mode (no metadata store).
     #[serde(default)]
     pub rocksdb_path: Option<PathBuf>,
-    /// Path to redb file holding paged blockmap. Defaults to `{rocksdb_path}/blockmap.redb`.
-    #[serde(default)]
-    pub redb_path: Option<PathBuf>,
     /// Block cache size in MB for RocksDB (default 256)
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
@@ -117,20 +114,9 @@ impl Default for MetaConfig {
     fn default() -> Self {
         Self {
             rocksdb_path: None,
-            redb_path: None,
             block_cache_mb: default_block_cache_mb(),
             wal_dir: None,
         }
-    }
-}
-
-impl MetaConfig {
-    /// Resolve the redb path: use `redb_path` if set, else `{rocksdb_path}/blockmap.redb`.
-    pub fn resolved_redb_path(&self) -> Option<PathBuf> {
-        if let Some(p) = &self.redb_path {
-            return Some(p.clone());
-        }
-        self.rocksdb_path.as_ref().map(|p| p.join("blockmap.redb"))
     }
 }
 

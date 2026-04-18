@@ -93,7 +93,6 @@ fn setup_with_all_options(
     let config = OnyxConfig {
         meta: MetaConfig {
             rocksdb_path: Some(meta_dir.path().to_path_buf()),
-            redb_path: None,
             block_cache_mb: 8,
             wal_dir: None,
         },
@@ -633,6 +632,149 @@ fn prove_coalescer_merged_lbas() {
         mappings[0].unit_original_size,
         mappings[0].unit_compressed_size,
         mappings[0].unit_original_size as f64 / mappings[0].unit_compressed_size as f64
+    );
+}
+
+// ===========================================================================
+// Test 5b: Prove vectorized read coalesces many LBAs into one LV3 IO + decompress
+//
+// Writes 16 contiguous, highly compressible LBAs so the coalescer packs them
+// into a single compression unit. Reads all 16 back through `vol.read`, which
+// (post-optimization) takes the aligned fast path → one `submit_reads` →
+// one `multi_get_mappings`, one io_uring read, and ONE decompress that fans
+// out to all 16 LBAs.
+//
+// Regression guard: without coalescing, `lv3_read_ops` would increment by 16.
+// ===========================================================================
+#[test]
+#[serial]
+fn prove_batch_read_coalesces_lv3_ops() {
+    let env = setup();
+    let vol_size = 128 * 4096u64;
+    env.engine
+        .create_volume("vol-coal-read", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    let vol = env.engine.open_volume("vol-coal-read").unwrap();
+
+    // Same payload shape as `prove_coalescer_merged_lbas` — 16 LBAs that the
+    // flusher will merge into one compression unit.
+    let mut data = vec![0u8; 16 * 4096];
+    for i in 0..16 {
+        for j in 0..4096 {
+            data[i * 4096 + j] = ((i * 3 + j / 256) & 0xFF) as u8;
+        }
+    }
+    vol.write(0, &data).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    // All 16 LBAs must share one PBA (sanity — this is what makes coalescing
+    // kick in on the read side).
+    let meta = env.engine.meta();
+    let vol_id = VolumeId("vol-coal-read".into());
+    let shared_pba = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap().pba;
+    for lba in 1..16u64 {
+        let bv = meta.get_mapping(&vol_id, Lba(lba)).unwrap().unwrap();
+        assert_eq!(bv.pba, shared_pba, "LBA {} must share the coalesced PBA", lba);
+    }
+
+    // Snapshot before the read so we measure the delta of *this* read only.
+    let before = env.engine.metrics_snapshot();
+    let got = vol.read(0, 16 * 4096).unwrap();
+    let after = env.engine.metrics_snapshot();
+
+    assert_eq!(got, data, "read data mismatch");
+
+    let lv3_ops_delta = after.lv3_read_ops - before.lv3_read_ops;
+    let lv3_hits_delta = after.read_lv3_hits - before.read_lv3_hits;
+    let decompressed_delta =
+        after.lv3_read_decompressed_bytes - before.lv3_read_decompressed_bytes;
+
+    eprintln!(
+        "  coalesced read: lv3_read_ops={}, read_lv3_hits={}, decompressed_bytes={}",
+        lv3_ops_delta, lv3_hits_delta, decompressed_delta
+    );
+
+    // Core claim: 16 LBAs, one unit → one io_uring read, one decompress.
+    assert_eq!(
+        lv3_ops_delta, 1,
+        "16 LBAs in one compression unit must issue exactly 1 LV3 IO (got {})",
+        lv3_ops_delta
+    );
+    // Per-LBA metrics still count all 16 LBAs served.
+    assert_eq!(
+        lv3_hits_delta, 16,
+        "all 16 LBAs must be counted as hits (got {})",
+        lv3_hits_delta
+    );
+    assert_eq!(
+        decompressed_delta,
+        16 * 4096,
+        "decompressed byte counter must reflect 16 × 4 KB"
+    );
+}
+
+// ===========================================================================
+// Test 5c: Prove vectorized read interleaves buffer hits, unmapped holes,
+// and coalesced LV3 lookups in one shot.
+// ===========================================================================
+#[test]
+#[serial]
+fn prove_batch_read_mixes_buffer_and_unmapped_and_lv3() {
+    let env = setup();
+    let vol_size = 128 * 4096u64;
+    env.engine
+        .create_volume("vol-mix-read", vol_size, CompressionAlgo::Lz4)
+        .unwrap();
+    let vol = env.engine.open_volume("vol-mix-read").unwrap();
+
+    // LBAs 0..8: written + flushed → served from LV3 (one coalesced unit).
+    let mut flushed = vec![0u8; 8 * 4096];
+    for i in 0..8 {
+        for j in 0..4096 {
+            flushed[i * 4096 + j] = ((i + 1) * 7 + j / 512) as u8;
+        }
+    }
+    vol.write(0, &flushed).unwrap();
+    wait_for_flush(&env, Duration::from_secs(10));
+
+    // LBAs 8..12: written but NOT flushed → served from the write buffer.
+    let mut hot = vec![0u8; 4 * 4096];
+    for i in 0..4 {
+        for j in 0..4096 {
+            hot[i * 4096 + j] = (0x80 | (i as u8)).wrapping_add((j & 0xFF) as u8);
+        }
+    }
+    vol.write(8 * 4096, &hot).unwrap();
+    // No wait_for_flush here — we want these LBAs still in the buffer.
+
+    // LBAs 12..16: never written → served as zero-fill (unmapped).
+
+    let before = env.engine.metrics_snapshot();
+    let got = vol.read(0, 16 * 4096).unwrap();
+    let after = env.engine.metrics_snapshot();
+
+    assert_eq!(&got[0..8 * 4096], flushed.as_slice(), "LV3 segment mismatch");
+    assert_eq!(
+        &got[8 * 4096..12 * 4096],
+        hot.as_slice(),
+        "buffer segment mismatch"
+    );
+    assert!(
+        got[12 * 4096..].iter().all(|b| *b == 0),
+        "unmapped segment must be zero-filled"
+    );
+
+    assert!(
+        after.read_buffer_hits - before.read_buffer_hits >= 4,
+        "expected ≥4 buffer hits"
+    );
+    assert!(
+        after.read_unmapped - before.read_unmapped >= 4,
+        "expected ≥4 unmapped reads"
+    );
+    assert!(
+        after.read_lv3_hits - before.read_lv3_hits >= 8,
+        "expected ≥8 LV3 hits"
     );
 }
 

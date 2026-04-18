@@ -8,11 +8,10 @@ mod volume;
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 
 use rocksdb::{DBWithThreadMode, MergeOperands, MultiThreaded, WriteOptions};
 
-use crate::meta::redb::RedbStore;
 use crate::types::Pba;
 
 const BLOCKMAP_LOCK_STRIPES: usize = 1024;
@@ -113,14 +112,8 @@ pub struct MetaStore {
     /// Cold-path operations (create/delete volume, reconciliation) keep
     /// sync = true via the default `db.write(batch)`.
     hot_write_opts: WriteOptions,
-    /// Block cache size from config. Preserved for potential future tuning of
-    /// the RocksDB-backed CFs; currently unused after the blockmap migrated to
-    /// redb. `#[allow(dead_code)]` until we wire it into the CF options again.
-    #[allow(dead_code)]
+    /// Block cache size from config — reused when creating new per-volume CFs.
     block_cache_mb: usize,
-    /// Paged blockmap backend (redb). Holds `T_L1` / `T_L2_PAGES` /
-    /// `T_PAGE_REFS` / `T_PAGE_FREE` / `T_PAGE_NEXT_ID` / `T_VOLUMES`.
-    pub(super) redb: Arc<RedbStore>,
 }
 
 impl MetaStore {

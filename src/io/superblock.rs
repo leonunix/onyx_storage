@@ -16,8 +16,8 @@ pub const DATA_SUPERBLOCK_VERSION: u32 = 1;
 
 /// `DataSuperblock::flags` bit: set when the engine has performed a graceful
 /// shutdown (flusher drained, cleanup_tx empty, metadata consistent). Absence
-/// on startup triggers the dirty-recovery path: scan the redb paged blockmap
-/// and rebuild RocksDB refcount from ground truth.
+/// on startup triggers the dirty-recovery path: scan the per-volume blockmap
+/// CFs and rebuild RocksDB refcount from ground truth.
 pub const FLAG_CLEAN_SHUTDOWN: u64 = 1 << 0;
 
 pub const HEARTBEAT_MAGIC: u32 = 0x4F48_4254; // "OHBT"
