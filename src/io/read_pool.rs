@@ -320,7 +320,7 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
 
         ctx.metrics.lv3_read_ops.fetch_add(1, Ordering::Relaxed);
         ctx.metrics
-            .lv3_read_bytes
+            .lv3_read_compressed_bytes
             .fetch_add(exp_bytes as u64, Ordering::Relaxed);
 
         // CRC + decompress + LBA slice — shared with the inline LV3 path so

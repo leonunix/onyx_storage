@@ -316,9 +316,12 @@ fn engine_metrics_snapshot_tracks_reads_writes_and_dedup() {
     assert!(snapshot.buffer_read_bytes >= 4096);
     assert!(snapshot.read_lv3_hits >= 1);
     assert!(snapshot.lv3_read_ops >= 1);
-    assert!(snapshot.lv3_read_bytes >= 4096);
+    assert!(snapshot.lv3_read_compressed_bytes >= 4096);
     assert!(snapshot.lv3_write_ops >= 1);
-    assert!(snapshot.lv3_write_bytes >= 4096);
+    assert!(snapshot.lv3_write_compressed_bytes >= 4096);
+    assert!(snapshot.lv3_read_decompressed_bytes >= 4096);
+    assert!(snapshot.volume_read_total_ns > 0);
+    assert!(snapshot.volume_write_total_ns > 0);
     assert!(snapshot.flush_units_written >= 1 || snapshot.flush_packed_slots_written >= 1);
     assert!(
         snapshot.dedup_hits >= 1,

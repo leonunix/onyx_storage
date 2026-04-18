@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use crate::engine::VolumeAliveFlag;
 use crate::error::{OnyxError, OnyxResult};
@@ -132,6 +133,7 @@ impl OnyxVolume {
             });
         }
 
+        let start = Instant::now();
         let bs = BLOCK_SIZE as u64;
         if offset_bytes % bs == 0 && len % bs == 0 {
             self.check_alive()?;
@@ -150,6 +152,9 @@ impl OnyxVolume {
             self.metrics
                 .volume_write_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .volume_write_total_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             self.vol_metrics.write_ops.fetch_add(1, Ordering::Relaxed);
             self.vol_metrics
                 .write_bytes
@@ -158,13 +163,26 @@ impl OnyxVolume {
         }
 
         let _guard = self.vol_lock.read().unwrap();
-        self.write_locked(offset_bytes, data)
+        let result = self.write_locked(offset_bytes, data);
+        if result.is_ok() {
+            self.metrics
+                .volume_write_total_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Read `len` bytes from a byte offset. Unmapped blocks return zeros.
     pub fn read(&self, offset_bytes: u64, len: usize) -> OnyxResult<Vec<u8>> {
+        let start = Instant::now();
         let _guard = self.vol_lock.read().unwrap();
-        self.read_locked(offset_bytes, len)
+        let result = self.read_locked(offset_bytes, len);
+        if result.is_ok() {
+            self.metrics
+                .volume_read_total_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        result
     }
 
     fn write_locked(&self, offset_bytes: u64, data: &[u8]) -> OnyxResult<()> {

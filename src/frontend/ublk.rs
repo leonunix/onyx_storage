@@ -116,6 +116,7 @@ impl OnyxUblkTarget {
                 let io_len = io_bytes as usize;
 
                 let metrics = zm.metrics();
+                let io_start = std::time::Instant::now();
                 let res = {
                     let mut bufs = io_bufs.borrow_mut();
                     let io_buf = &mut bufs[tag as usize];
@@ -300,18 +301,25 @@ impl OnyxUblkTarget {
                 // Record volume-level IO metrics for successful operations.
                 if res > 0 {
                     let bytes = res as u64;
+                    let elapsed_ns = io_start.elapsed().as_nanos() as u64;
                     match op {
                         sys::UBLK_IO_OP_READ => {
                             metrics.volume_read_ops.fetch_add(1, Ordering::Relaxed);
                             metrics
                                 .volume_read_bytes
                                 .fetch_add(bytes, Ordering::Relaxed);
+                            metrics
+                                .volume_read_total_ns
+                                .fetch_add(elapsed_ns, Ordering::Relaxed);
                         }
                         sys::UBLK_IO_OP_WRITE => {
                             metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
                             metrics
                                 .volume_write_bytes
                                 .fetch_add(bytes, Ordering::Relaxed);
+                            metrics
+                                .volume_write_total_ns
+                                .fetch_add(elapsed_ns, Ordering::Relaxed);
                         }
                         _ => {}
                     }

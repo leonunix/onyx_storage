@@ -141,6 +141,9 @@ pub(crate) fn extract_lba_from_compressed(
     };
 
     metrics.read_lv3_hits.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .lv3_read_decompressed_bytes
+        .fetch_add(BLOCK_SIZE as u64, Ordering::Relaxed);
     Ok(result)
 }
 

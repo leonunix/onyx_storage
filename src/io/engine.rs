@@ -157,7 +157,7 @@ impl IoEngine {
         if let Some(metrics) = &self.metrics {
             metrics.lv3_read_ops.fetch_add(1, Ordering::Relaxed);
             metrics
-                .lv3_read_bytes
+                .lv3_read_compressed_bytes
                 .fetch_add(bytes as u64, Ordering::Relaxed);
         }
     }
@@ -166,7 +166,7 @@ impl IoEngine {
         if let Some(metrics) = &self.metrics {
             metrics.lv3_write_ops.fetch_add(1, Ordering::Relaxed);
             metrics
-                .lv3_write_bytes
+                .lv3_write_compressed_bytes
                 .fetch_add(bytes as u64, Ordering::Relaxed);
         }
     }
