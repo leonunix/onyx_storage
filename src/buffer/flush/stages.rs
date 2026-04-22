@@ -80,6 +80,8 @@ impl BufferFlusher {
                             &mut seen,
                             &mut queued_bytes,
                             &mut new_entries,
+                            metrics,
+                            skip_fully_superseded,
                         );
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -100,6 +102,8 @@ impl BufferFlusher {
                         &mut seen,
                         &mut queued_bytes,
                         &mut new_entries,
+                        metrics,
+                        skip_fully_superseded,
                     ),
                     EnqueuePendingSeq::WindowFull
                 ) {
@@ -132,6 +136,8 @@ impl BufferFlusher {
                             &mut seen,
                             &mut queued_bytes,
                             &mut new_entries,
+                            metrics,
+                            skip_fully_superseded,
                         ),
                         EnqueuePendingSeq::Queued
                     ) {

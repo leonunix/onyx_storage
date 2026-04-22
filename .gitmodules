@@ -1,3 +1,6 @@
 [submodule "dashboard"]
 	path = dashboard
 	url = git@github.com:leonunix/oynx_storage_dashboard.git
+[submodule "metadb"]
+	path = metadb
+	url = git@github.com:leonunix/onyx_metadb.git

@@ -9,3 +9,5 @@ dashboard/backend/internal/ui/dist
 bin/
 .dev/
 *.pyc
+/metadb/
+.codex

@@ -35,6 +35,7 @@ impl Default for HarnessOptions {
                 compress_workers: 2,
                 coalesce_max_raw_bytes: 131072,
                 coalesce_max_lbas: 32,
+            skip_fully_superseded: true,
             },
             gc: GcConfig {
                 enabled: false,

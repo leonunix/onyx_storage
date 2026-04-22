@@ -53,6 +53,7 @@ fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
+        skip_fully_superseded: true,
         },
         GcConfig {
             enabled: false,
@@ -1796,6 +1797,7 @@ fn prove_background_gc_runner_reclaims_old_units() {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
+        skip_fully_superseded: true,
         },
         GcConfig {
             enabled: true,

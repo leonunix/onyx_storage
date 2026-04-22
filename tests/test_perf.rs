@@ -206,6 +206,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
+        skip_fully_superseded: true,
         },
         engine: EngineConfig {
             zone_count: 4,

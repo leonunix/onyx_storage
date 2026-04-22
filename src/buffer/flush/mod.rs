@@ -350,6 +350,7 @@ impl BufferFlusher {
             Self::per_lane_worker_count(config.compress_workers.max(1), lane_count);
         let max_raw = config.coalesce_max_raw_bytes;
         let max_lbas = config.coalesce_max_lbas;
+        let skip_fully_superseded = config.skip_fully_superseded;
         let dedup_enabled = dedup_config.enabled;
         let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
@@ -391,6 +392,7 @@ impl BufferFlusher {
                         &metrics_c,
                         max_raw,
                         max_lbas,
+                        skip_fully_superseded,
                     );
                 })
                 .expect("failed to spawn coalescer thread");
