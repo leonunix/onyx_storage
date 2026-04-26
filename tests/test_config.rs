@@ -55,6 +55,19 @@ io_buf_bytes = 2097152
     assert_eq!(config.ublk.nr_queues, 8);
 }
 
+#[test]
+fn parse_meta_path_alias() {
+    let toml_str = r#"
+[meta]
+path = "/data/onyx/meta"
+"#;
+    let config: OnyxConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+        config.meta.path().unwrap(),
+        std::path::Path::new("/data/onyx/meta")
+    );
+}
+
 /// Loading config from nonexistent file → error.
 #[test]
 fn load_nonexistent_config() {

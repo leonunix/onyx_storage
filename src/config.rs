@@ -56,11 +56,11 @@ impl OnyxConfig {
     /// Detect what mode the engine should operate in, based on which
     /// paths are configured and actually exist on disk.
     pub fn detect_mode(&self) -> ConfiguredMode {
-        // Check RocksDB path
+        // Check metadata path. During the metadb migration `meta.path` is
+        // accepted as an alias for the existing `rocksdb_path` field.
         let meta_ok = self
             .meta
-            .rocksdb_path
-            .as_ref()
+            .path()
             .map(|p| !p.as_os_str().is_empty())
             .unwrap_or(false);
         if !meta_ok {
@@ -99,9 +99,12 @@ impl OnyxConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaConfig {
-    /// Path to RocksDB data directory (on LV1 / XFS). Holds blockmap, refcount,
+    /// Path to metadata directory (on LV1 / XFS). Holds blockmap, refcount,
     /// dedup index, volume metadata. None = bare mode (no metadata store).
-    #[serde(default)]
+    ///
+    /// Transitional note: the Rust field keeps its old `rocksdb_path` name
+    /// while the metadb adapter lands, but TOML may already use `path`.
+    #[serde(default, alias = "path")]
     pub rocksdb_path: Option<PathBuf>,
     /// Shared block cache size in MB. One LRU cache is created at startup and
     /// shared across every CF (blockmap + refcount + dedup_index +
@@ -124,6 +127,10 @@ pub struct MetaConfig {
 }
 
 impl MetaConfig {
+    pub fn path(&self) -> Option<&PathBuf> {
+        self.rocksdb_path.as_ref()
+    }
+
     /// Resolved memtable budget in bytes. `memtable_budget_mb = 0` → half of
     /// `block_cache_mb`, clamped to at least 64 MiB so a tiny config doesn't
     /// starve memtables entirely.
