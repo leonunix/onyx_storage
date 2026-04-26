@@ -1,7 +1,16 @@
-use onyx_metadb::{DedupValue, L2pValue};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use onyx_metadb::{Config as MetaDbConfig, Db, DedupValue, L2pValue, VolumeOrdinal};
+use serde::{Deserialize, Serialize};
+
+use crate::config::MetaConfig;
+use crate::error::{OnyxError, OnyxResult};
 use crate::meta::schema::{BlockmapValue, DedupEntry};
-use crate::types::Pba;
+use crate::types::{Pba, VolumeConfig, VolumeId};
 
 use super::codec::{
     blockmap_from_l2p_bytes, blockmap_to_l2p_bytes, dedup_from_value_bytes, dedup_to_value_bytes,
@@ -9,6 +18,186 @@ use super::codec::{
 };
 
 const METADB_DEDUP_VALUE_BYTES: usize = 28;
+const CATALOG_VERSION: u32 = 1;
+const CATALOG_FILE: &str = "onyx-volume-catalog.bin";
+const METADB_PAGE_FILE: &str = "pages.onyx_meta";
+
+pub(crate) struct MetadbBackend {
+    db: Db,
+    catalog: Mutex<VolumeCatalog>,
+    catalog_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VolumeCatalogFile {
+    version: u32,
+    volumes: Vec<VolumeCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VolumeCatalogEntry {
+    ordinal: VolumeOrdinal,
+    config: VolumeConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VolumeCatalog {
+    by_id: HashMap<String, VolumeCatalogEntry>,
+}
+
+impl MetadbBackend {
+    pub(crate) fn open(config: &MetaConfig) -> OnyxResult<Self> {
+        let path = config.path().ok_or_else(|| {
+            OnyxError::Config(
+                "meta.path (or legacy meta.rocksdb_path) is required to open metadb backend".into(),
+            )
+        })?;
+        fs::create_dir_all(path)?;
+
+        let db_config = metadb_config_from_onyx(path, config);
+        let db = if path.join(METADB_PAGE_FILE).exists() {
+            Db::open_with_config(db_config)?
+        } else {
+            Db::create_with_config(db_config)?
+        };
+
+        let catalog_path = path.join(CATALOG_FILE);
+        let catalog = VolumeCatalog::load(&catalog_path)?;
+        catalog.validate_against_db(&db)?;
+
+        Ok(Self {
+            db,
+            catalog: Mutex::new(catalog),
+            catalog_path,
+        })
+    }
+
+    pub(crate) fn put_volume(&self, config: &VolumeConfig) -> OnyxResult<()> {
+        let mut catalog = self.catalog.lock().unwrap();
+        if let Some(entry) = catalog.by_id.get_mut(&config.id.0) {
+            entry.config = config.clone();
+            catalog.persist(&self.catalog_path)?;
+            return Ok(());
+        }
+
+        let ordinal = self.db.create_volume()?;
+        catalog.by_id.insert(
+            config.id.0.clone(),
+            VolumeCatalogEntry {
+                ordinal,
+                config: config.clone(),
+            },
+        );
+        catalog.persist(&self.catalog_path)?;
+        Ok(())
+    }
+
+    pub(crate) fn get_volume(&self, id: &VolumeId) -> OnyxResult<Option<VolumeConfig>> {
+        let catalog = self.catalog.lock().unwrap();
+        Ok(catalog.by_id.get(&id.0).map(|entry| entry.config.clone()))
+    }
+
+    pub(crate) fn list_volumes(&self) -> OnyxResult<Vec<VolumeConfig>> {
+        let catalog = self.catalog.lock().unwrap();
+        let mut volumes: Vec<VolumeConfig> = catalog
+            .by_id
+            .values()
+            .map(|entry| entry.config.clone())
+            .collect();
+        volumes.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        Ok(volumes)
+    }
+
+    pub(crate) fn volume_ordinal(&self, id: &VolumeId) -> OnyxResult<VolumeOrdinal> {
+        let catalog = self.catalog.lock().unwrap();
+        catalog
+            .by_id
+            .get(&id.0)
+            .map(|entry| entry.ordinal)
+            .ok_or_else(|| OnyxError::VolumeNotFound(id.0.clone()))
+    }
+}
+
+impl VolumeCatalog {
+    fn load(path: &Path) -> OnyxResult<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let bytes = fs::read(path)?;
+        let file: VolumeCatalogFile =
+            bincode::deserialize(&bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
+        if file.version != CATALOG_VERSION {
+            return Err(OnyxError::Config(format!(
+                "unsupported metadb volume catalog version {}, expected {}",
+                file.version, CATALOG_VERSION
+            )));
+        }
+
+        let mut by_id = HashMap::with_capacity(file.volumes.len());
+        for entry in file.volumes {
+            let id = entry.config.id.0.clone();
+            if by_id.insert(id.clone(), entry).is_some() {
+                return Err(OnyxError::Config(format!(
+                    "duplicate volume id '{id}' in metadb volume catalog"
+                )));
+            }
+        }
+        Ok(Self { by_id })
+    }
+
+    fn persist(&self, path: &Path) -> OnyxResult<()> {
+        let mut volumes: Vec<VolumeCatalogEntry> = self.by_id.values().cloned().collect();
+        volumes.sort_by_key(|entry| entry.ordinal);
+        let file = VolumeCatalogFile {
+            version: CATALOG_VERSION,
+            volumes,
+        };
+        let bytes = bincode::serialize(&file).map_err(|e| OnyxError::Config(e.to_string()))?;
+        atomic_write(path, &bytes)
+    }
+
+    fn validate_against_db(&self, db: &Db) -> OnyxResult<()> {
+        let live_ordinals: std::collections::HashSet<VolumeOrdinal> =
+            db.volumes().into_iter().collect();
+        for entry in self.by_id.values() {
+            if !live_ordinals.contains(&entry.ordinal) {
+                return Err(OnyxError::Config(format!(
+                    "volume '{}' maps to missing metadb ordinal {}",
+                    entry.config.id, entry.ordinal
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
+    let mut cfg = MetaDbConfig::new(path);
+    cfg.page_cache_bytes = config.block_cache_bytes() as u64;
+    cfg.lsm_memtable_bytes = config.memtable_budget_bytes() as u64;
+    cfg
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> OnyxResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        OnyxError::Config(format!(
+            "cannot persist metadb catalog at path without parent: {}",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
 
 pub(crate) fn to_metadb_pba(pba: Pba) -> onyx_metadb::Pba {
     pba.0
@@ -41,6 +230,7 @@ pub(crate) fn from_dedup_value(value: DedupValue) -> Option<DedupEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{CompressionAlgo, VolumeId};
 
     #[test]
     fn pba_newtypes_cross_backend_losslessly() {
@@ -64,5 +254,34 @@ mod tests {
         let value = to_dedup_value(&entry);
         assert_eq!(value.as_bytes()[27], 0);
         assert_eq!(from_dedup_value(value), Some(entry));
+    }
+
+    #[test]
+    fn volume_catalog_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CATALOG_FILE);
+        let mut catalog = VolumeCatalog::default();
+        catalog.by_id.insert(
+            "vol-a".to_string(),
+            VolumeCatalogEntry {
+                ordinal: 3,
+                config: VolumeConfig {
+                    id: VolumeId("vol-a".to_string()),
+                    size_bytes: 4096,
+                    block_size: 4096,
+                    compression: CompressionAlgo::Lz4,
+                    created_at: 10,
+                    zone_count: 4,
+                },
+            },
+        );
+
+        catalog.persist(&path).unwrap();
+        let loaded = VolumeCatalog::load(&path).unwrap();
+
+        let entry = loaded.by_id.get("vol-a").unwrap();
+        assert_eq!(entry.ordinal, 3);
+        assert_eq!(entry.config.size_bytes, 4096);
+        assert_eq!(entry.config.compression, CompressionAlgo::Lz4);
     }
 }
