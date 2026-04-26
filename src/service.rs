@@ -331,8 +331,8 @@ impl ServiceController {
         if old_config.buffer.device != new_config.buffer.device {
             tracing::warn!("buffer.device changed — requires restart to take effect");
         }
-        if old_config.meta.rocksdb_path != new_config.meta.rocksdb_path {
-            tracing::warn!("meta.rocksdb_path changed — requires restart to take effect");
+        if old_config.meta.path() != new_config.meta.path() {
+            tracing::warn!("meta.path changed — requires restart to take effect");
         }
         if old_config.engine.zone_count != new_config.engine.zone_count {
             tracing::warn!("engine.zone_count changed — requires restart to take effect");

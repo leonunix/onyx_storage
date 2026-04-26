@@ -72,8 +72,10 @@ impl MetaStore {
         ));
         db_opts.set_write_buffer_manager(&write_buffer_manager);
 
-        let rocksdb_path = config.rocksdb_path.as_ref().ok_or_else(|| {
-            OnyxError::Config("meta.rocksdb_path is required to open MetaStore".into())
+        let rocksdb_path = config.path().ok_or_else(|| {
+            OnyxError::Config(
+                "meta.path (or legacy meta.rocksdb_path) is required to open MetaStore".into(),
+            )
         })?;
 
         // Discover existing CFs so we don't lose per-volume blockmap CFs on reopen.
