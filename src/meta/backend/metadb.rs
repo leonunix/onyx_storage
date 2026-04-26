@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
-use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry};
+use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
+use crate::meta::store::DedupHitResult;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
 use super::codec::{
@@ -240,6 +241,141 @@ impl MetadbBackend {
         let (_, outcomes) = tx.commit_with_outcomes()?;
         newly_zeroed_from_remaps(new_values, outcomes)
     }
+
+    pub(crate) fn put_dedup_entries(
+        &self,
+        entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.begin();
+        for (hash, entry) in entries {
+            tx.put_dedup(*hash, to_dedup_value(entry));
+            tx.register_dedup_reverse(to_metadb_pba(entry.pba), *hash);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
+        let mut tx = self.db.begin();
+        if let Some(entry) = self.db.get_dedup(hash)? {
+            tx.unregister_dedup_reverse(entry.head_pba(), *hash);
+        }
+        tx.delete_dedup(*hash);
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn dedup_entry_is_live(
+        &self,
+        hash: &ContentHash,
+        entry: &DedupEntry,
+    ) -> OnyxResult<bool> {
+        if self.get_refcount(entry.pba)? == 0 {
+            return Ok(false);
+        }
+        let hashes = self
+            .db
+            .scan_dedup_reverse_for_pba(to_metadb_pba(entry.pba))?;
+        Ok(hashes.iter().any(|candidate| candidate == hash))
+    }
+
+    pub(crate) fn cleanup_dedup_for_pbas_batch(&self, pbas: &[Pba]) -> OnyxResult<()> {
+        let pbas: Vec<onyx_metadb::Pba> = pbas.iter().map(|pba| to_metadb_pba(*pba)).collect();
+        self.db.cleanup_dedup_for_dead_pbas(&pbas)?;
+        Ok(())
+    }
+
+    pub(crate) fn scan_dedup_skipped(
+        &self,
+        limit: usize,
+    ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
+        let volumes = self.list_volumes()?;
+        let mut results = Vec::new();
+        for volume in volumes {
+            let ord = self.volume_ordinal(&volume.id)?;
+            let lba_count = volume.size_bytes / u64::from(volume.block_size);
+            for item in self.db.range(ord, 0..lba_count)? {
+                let (lba, value) = item?;
+                let value = decode_l2p_value(value)?;
+                if value.flags & FLAG_DEDUP_SKIPPED == 0 {
+                    continue;
+                }
+                results.push((volume.id.0.clone(), Lba(lba), value));
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub(crate) fn update_blockmap_flags(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        new_flags: u8,
+    ) -> OnyxResult<()> {
+        let Some(mut value) = self.get_mapping(vol_id, lba)? else {
+            return Ok(());
+        };
+        if value.flags == new_flags {
+            return Ok(());
+        }
+        value.flags = new_flags;
+        let ord = self.volume_ordinal(vol_id)?;
+        let mut tx = self.db.begin();
+        tx.l2p_remap(ord, lba.0, to_l2p_value(&value), None);
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn atomic_dedup_hit(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        new_value: &BlockmapValue,
+        _hash: &ContentHash,
+    ) -> OnyxResult<Option<(Pba, u32)>> {
+        let ord = self.volume_ordinal(vol_id)?;
+        let mut tx = self.db.begin();
+        tx.l2p_remap(
+            ord,
+            lba.0,
+            to_l2p_value(new_value),
+            Some((to_metadb_pba(new_value.pba), 1)),
+        );
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        let newly_zeroed = newly_zeroed_from_remaps([*new_value], outcomes)?;
+        Ok(newly_zeroed
+            .into_iter()
+            .next()
+            .map(|(pba, (_, blocks))| (pba, blocks)))
+    }
+
+    pub(crate) fn atomic_batch_dedup_hits(
+        &self,
+        vol_id: &VolumeId,
+        hits: &[(Lba, BlockmapValue, ContentHash)],
+    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+        if hits.is_empty() {
+            return Ok((Vec::new(), HashMap::new()));
+        }
+        let ord = self.volume_ordinal(vol_id)?;
+        let mut tx = self.db.begin();
+        for (lba, value, _) in hits {
+            tx.l2p_remap(
+                ord,
+                lba.0,
+                to_l2p_value(value),
+                Some((to_metadb_pba(value.pba), 1)),
+            );
+        }
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        dedup_hit_results_from_remaps(hits, outcomes)
+    }
 }
 
 impl VolumeCatalog {
@@ -386,6 +522,57 @@ where
 
     decrements.retain(|pba, _| freed.contains(pba));
     Ok(decrements)
+}
+
+fn dedup_hit_results_from_remaps(
+    hits: &[(Lba, BlockmapValue, ContentHash)],
+    outcomes: Vec<ApplyOutcome>,
+) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+    if hits.len() != outcomes.len() {
+        return Err(OnyxError::Config(format!(
+            "metadb dedup outcome length mismatch: {} hits, {} outcomes",
+            hits.len(),
+            outcomes.len()
+        )));
+    }
+
+    let mut results = Vec::with_capacity(hits.len());
+    let mut newly_zeroed = HashMap::new();
+    for ((_, new_value, _), outcome) in hits.iter().zip(outcomes.into_iter()) {
+        let ApplyOutcome::L2pRemap {
+            applied,
+            prev,
+            freed_pba,
+        } = outcome
+        else {
+            return Err(OnyxError::Config(
+                "metadb returned non-remap outcome for dedup hit batch".into(),
+            ));
+        };
+
+        if !applied {
+            results.push(DedupHitResult::Rejected);
+            continue;
+        }
+
+        let decremented = match prev {
+            Some(prev) => {
+                let old = decode_l2p_value(prev)?;
+                if old.pba == new_value.pba {
+                    None
+                } else {
+                    let blocks = freed_blocks_for_l2p_value(&old);
+                    if freed_pba.is_some_and(|pba| from_metadb_pba(pba) == old.pba) {
+                        newly_zeroed.insert(old.pba, blocks);
+                    }
+                    Some((old.pba, blocks))
+                }
+            }
+            None => None,
+        };
+        results.push(DedupHitResult::Accepted(decremented));
+    }
+    Ok((results, newly_zeroed))
 }
 
 pub(crate) fn to_metadb_pba(pba: Pba) -> onyx_metadb::Pba {
@@ -606,5 +793,73 @@ mod tests {
         assert_eq!(backend.get_refcount(Pba(10)).unwrap(), 0);
         assert_eq!(backend.get_refcount(Pba(20)).unwrap(), 2);
         assert_eq!(freed.get(&Pba(10)), Some(&(2, 1)));
+    }
+
+    #[test]
+    fn dedup_entries_and_flag_scan_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            rocksdb_path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            wal_dir: None,
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 8,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+
+        let value = BlockmapValue {
+            pba: Pba(30),
+            compression: 1,
+            unit_compressed_size: 2048,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 1,
+            slot_offset: 0,
+            flags: FLAG_DEDUP_SKIPPED,
+        };
+        backend
+            .atomic_batch_write(&vol.id, &[(Lba(0), value)], 1)
+            .unwrap();
+
+        let hash = [9u8; 32];
+        let dedup = DedupEntry {
+            pba: value.pba,
+            slot_offset: value.slot_offset,
+            compression: value.compression,
+            unit_compressed_size: value.unit_compressed_size,
+            unit_original_size: value.unit_original_size,
+            unit_lba_count: value.unit_lba_count,
+            offset_in_unit: value.offset_in_unit,
+            crc32: value.crc32,
+        };
+        backend.put_dedup_entries(&[(hash, dedup)]).unwrap();
+
+        assert_eq!(backend.get_dedup(&hash).unwrap(), Some(dedup));
+        assert!(backend.dedup_entry_is_live(&hash, &dedup).unwrap());
+        assert_eq!(backend.scan_dedup_skipped(8).unwrap().len(), 1);
+
+        backend.update_blockmap_flags(&vol.id, Lba(0), 0).unwrap();
+        assert!(backend.scan_dedup_skipped(8).unwrap().is_empty());
+
+        let replacement = BlockmapValue {
+            pba: Pba(40),
+            flags: 0,
+            ..value
+        };
+        backend
+            .atomic_batch_write(&vol.id, &[(Lba(0), replacement)], 1)
+            .unwrap();
+        assert_eq!(backend.get_refcount(value.pba).unwrap(), 0);
+        backend.cleanup_dedup_for_pbas_batch(&[value.pba]).unwrap();
+        assert_eq!(backend.get_dedup(&hash).unwrap(), None);
     }
 }
