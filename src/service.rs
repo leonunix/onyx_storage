@@ -253,7 +253,7 @@ impl ServiceController {
     fn transition_to_active(&self, new_config: &OnyxConfig) -> OnyxResult<()> {
         tracing::info!("transitioning from standby to active mode");
 
-        // Extract MetaStore from old engine (avoid RocksDB double-open)
+        // Extract MetaStore from old engine (avoid metadb double-open)
         let meta = {
             let guard = self.engine.load();
             let opt: &Option<OnyxEngine> = &guard;

@@ -72,12 +72,12 @@ if [ ! -f "${CONFIG_FILE}" ]; then
 #   systemctl reload onyx-storage
 #
 # Mode transitions:
-#   bare   → standby : configure [meta] section (rocksdb_path)
+#   bare   → standby : configure [meta] section (path)
 #   standby → active  : also configure [storage] + [buffer] sections
 #   bare   → active   : configure all three at once
 
 # [meta]
-# rocksdb_path = "/var/lib/onyx-storage/meta"
+# path = "/var/lib/onyx-storage/meta"
 # block_cache_mb = 256
 
 # [storage]

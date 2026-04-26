@@ -74,7 +74,7 @@ struct TestEnv {
 fn setup_gc_env() -> TestEnv {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -114,7 +114,7 @@ fn setup_gc_env() -> TestEnv {
 fn scanner_finds_candidates_with_dead_blocks() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -192,7 +192,7 @@ fn scanner_finds_candidates_with_dead_blocks() {
 fn scanner_skips_below_threshold() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -245,7 +245,7 @@ fn scanner_skips_below_threshold() {
 fn scanner_skips_single_lba_units() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -276,7 +276,7 @@ fn scanner_skips_single_lba_units() {
 fn scanner_sorts_by_dead_ratio_descending() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -633,7 +633,7 @@ fn blockmap_value_rejects_wrong_length() {
 fn scanner_distinguishes_packed_fragments_same_pba() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -716,7 +716,7 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
 fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_identity() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,

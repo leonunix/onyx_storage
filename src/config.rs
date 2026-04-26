@@ -36,7 +36,7 @@ pub struct OnyxConfig {
 pub enum ConfiguredMode {
     /// Nothing configured — only IPC socket, no engine at all.
     Bare,
-    /// RocksDB available but storage devices missing — metadata-only operations.
+    /// Metadata store available but storage devices missing — metadata-only operations.
     Standby,
     /// Everything configured — full IO.
     Active,
@@ -56,8 +56,6 @@ impl OnyxConfig {
     /// Detect what mode the engine should operate in, based on which
     /// paths are configured and actually exist on disk.
     pub fn detect_mode(&self) -> ConfiguredMode {
-        // Check metadata path. During the metadb migration `meta.path` is
-        // accepted as an alias for the existing `rocksdb_path` field.
         let meta_ok = self
             .meta
             .path()
@@ -101,34 +99,31 @@ impl OnyxConfig {
 pub struct MetaConfig {
     /// Path to metadata directory (on LV1 / XFS). Holds blockmap, refcount,
     /// dedup index, volume metadata. None = bare mode (no metadata store).
-    ///
-    /// Transitional note: the Rust field keeps its old `rocksdb_path` name
-    /// while the metadb adapter lands, but TOML may already use `path`.
-    #[serde(default, alias = "path")]
-    pub rocksdb_path: Option<PathBuf>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     /// Shared block cache size in MB. One LRU cache is created at startup and
     /// shared across every CF (blockmap + refcount + dedup_index +
     /// dedup_reverse). Index + filter blocks are accounted against this cache
     /// (`cache_index_and_filter_blocks=true`), so this is the authoritative
-    /// upper bound on RocksDB read-side memory. Scale roughly proportional to
+    /// upper bound on metadb read-side memory. Scale roughly proportional to
     /// working set; on a 256 GiB host, 16–32 GiB is a reasonable starting
     /// point.
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
     /// Total memtable memory budget in MB across all CFs. Enforced via
-    /// RocksDB's `WriteBufferManager`; when this is exceeded, writes stall
+    /// metadb's `WriteBufferManager`; when this is exceeded, writes stall
     /// (`allow_stall=true`) rather than blow up RSS. Default 0 = auto = half
     /// of `block_cache_mb`. Override when you want a different write-buffer
     /// vs read-cache ratio (e.g. write-heavy: raise; read-heavy: lower).
     #[serde(default)]
     pub memtable_budget_mb: usize,
-    /// Optional separate WAL directory for RocksDB
+    /// Optional separate WAL directory for the metadata store.
     pub wal_dir: Option<PathBuf>,
 }
 
 impl MetaConfig {
     pub fn path(&self) -> Option<&PathBuf> {
-        self.rocksdb_path.as_ref()
+        self.path.as_ref()
     }
 
     /// Resolved memtable budget in bytes. `memtable_budget_mb = 0` → half of
@@ -155,7 +150,7 @@ impl MetaConfig {
 impl Default for MetaConfig {
     fn default() -> Self {
         Self {
-            rocksdb_path: None,
+            path: None,
             block_cache_mb: default_block_cache_mb(),
             memtable_budget_mb: 0,
             wal_dir: None,

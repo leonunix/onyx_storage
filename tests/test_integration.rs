@@ -9,7 +9,7 @@
 //!   4. compression: unit_compressed_size < unit_original_size, compression byte != 0
 //!   5. LV3: raw bytes on disk are compressed (not original plaintext)
 //!   6. coalescer: multiple LBAs share same PBA, offset_in_unit sequential
-//!   7. refcount: correct count in RocksDB
+//!   7. refcount: correct count in metadb
 //!   8. space: old PBAs freed on overwrite
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +53,7 @@ fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
-        skip_fully_superseded: true,
+            skip_fully_superseded: true,
         },
         GcConfig {
             enabled: false,
@@ -93,7 +93,7 @@ fn setup_with_all_options(
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 0,
             wal_dir: None,
@@ -676,7 +676,11 @@ fn prove_batch_read_coalesces_lv3_ops() {
     let shared_pba = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap().pba;
     for lba in 1..16u64 {
         let bv = meta.get_mapping(&vol_id, Lba(lba)).unwrap().unwrap();
-        assert_eq!(bv.pba, shared_pba, "LBA {} must share the coalesced PBA", lba);
+        assert_eq!(
+            bv.pba, shared_pba,
+            "LBA {} must share the coalesced PBA",
+            lba
+        );
     }
 
     // Snapshot before the read so we measure the delta of *this* read only.
@@ -688,8 +692,7 @@ fn prove_batch_read_coalesces_lv3_ops() {
 
     let lv3_ops_delta = after.lv3_read_ops - before.lv3_read_ops;
     let lv3_hits_delta = after.read_lv3_hits - before.read_lv3_hits;
-    let decompressed_delta =
-        after.lv3_read_decompressed_bytes - before.lv3_read_decompressed_bytes;
+    let decompressed_delta = after.lv3_read_decompressed_bytes - before.lv3_read_decompressed_bytes;
 
     eprintln!(
         "  coalesced read: lv3_read_ops={}, read_lv3_hits={}, decompressed_bytes={}",
@@ -755,7 +758,11 @@ fn prove_batch_read_mixes_buffer_and_unmapped_and_lv3() {
     let got = vol.read(0, 16 * 4096).unwrap();
     let after = env.engine.metrics_snapshot();
 
-    assert_eq!(&got[0..8 * 4096], flushed.as_slice(), "LV3 segment mismatch");
+    assert_eq!(
+        &got[0..8 * 4096],
+        flushed.as_slice(),
+        "LV3 segment mismatch"
+    );
     assert_eq!(
         &got[8 * 4096..12 * 4096],
         hot.as_slice(),
@@ -1797,7 +1804,7 @@ fn prove_background_gc_runner_reclaims_old_units() {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
-        skip_fully_superseded: true,
+            skip_fully_superseded: true,
         },
         GcConfig {
             enabled: true,

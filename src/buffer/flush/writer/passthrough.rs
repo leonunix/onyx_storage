@@ -224,7 +224,7 @@ impl BufferFlusher {
     /// 3. Allocate PBAs for all units
     /// 4. Batch IO writes
     /// 5. Batch multi_get old mappings
-    /// 6. ONE RocksDB WriteBatch for all blockmap + refcount updates
+    /// 6. ONE metadata batch for all blockmap + refcount updates
     /// 7. Batch cleanup + dedup index + mark_flushed
     pub(in crate::buffer::flush) fn write_units_batch(
         shard_idx: usize,

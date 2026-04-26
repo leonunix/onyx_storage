@@ -49,9 +49,7 @@ struct VolumeCatalog {
 impl MetadbBackend {
     pub(crate) fn open(config: &MetaConfig) -> OnyxResult<Self> {
         let path = config.path().ok_or_else(|| {
-            OnyxError::Config(
-                "meta.path (or legacy meta.rocksdb_path) is required to open metadb backend".into(),
-            )
+            OnyxError::Config("meta.path is required to open metadb backend".into())
         })?;
         fs::create_dir_all(path)?;
 
@@ -118,6 +116,11 @@ impl MetadbBackend {
             .ok_or_else(|| OnyxError::VolumeNotFound(id.0.clone()))
     }
 
+    fn volume_ordinal_optional(&self, id: &VolumeId) -> Option<VolumeOrdinal> {
+        let catalog = self.catalog.lock().unwrap();
+        catalog.by_id.get(&id.0).map(|entry| entry.ordinal)
+    }
+
     pub(crate) fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<(Pba, u32)>> {
         let (ordinal, config) = {
             let catalog = self.catalog.lock().unwrap();
@@ -143,7 +146,9 @@ impl MetadbBackend {
         vol_id: &VolumeId,
         lba: Lba,
     ) -> OnyxResult<Option<BlockmapValue>> {
-        let ord = self.volume_ordinal(vol_id)?;
+        let Some(ord) = self.volume_ordinal_optional(vol_id) else {
+            return Ok(None);
+        };
         self.db.get(ord, lba.0)?.map(decode_l2p_value).transpose()
     }
 
@@ -172,7 +177,9 @@ impl MetadbBackend {
         if lbas.is_empty() {
             return Ok(Vec::new());
         }
-        let ord = self.volume_ordinal(vol_id)?;
+        let Some(ord) = self.volume_ordinal_optional(vol_id) else {
+            return Ok(vec![None; lbas.len()]);
+        };
         let raw_lbas: Vec<onyx_metadb::Lba> = lbas.iter().map(|lba| lba.0).collect();
         self.db
             .multi_get(ord, &raw_lbas)?
@@ -187,7 +194,9 @@ impl MetadbBackend {
         start: Lba,
         end: Lba,
     ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
-        let ord = self.volume_ordinal(vol_id)?;
+        let Some(ord) = self.volume_ordinal_optional(vol_id) else {
+            return Ok(Vec::new());
+        };
         self.db
             .range(ord, start.0..end.0)?
             .map(|item| {
@@ -207,7 +216,9 @@ impl MetadbBackend {
             return Ok(Vec::new());
         }
 
-        let ord = self.volume_ordinal(vol_id)?;
+        let Some(ord) = self.volume_ordinal_optional(vol_id) else {
+            return Ok(Vec::new());
+        };
         let mut pba_meta: HashMap<Pba, u32> = HashMap::new();
         for item in self.db.range(ord, start.0..end.0)? {
             let (_, value) = item?;
@@ -234,6 +245,8 @@ impl MetadbBackend {
             }
         }
         freed.sort_unstable_by_key(|(pba, _)| *pba);
+        let freed_pbas: Vec<Pba> = freed.iter().map(|(pba, _)| *pba).collect();
+        self.cleanup_dedup_for_pbas_batch(&freed_pbas)?;
         Ok(freed)
     }
 
@@ -304,7 +317,7 @@ impl MetadbBackend {
         &self,
         vol_id: &VolumeId,
         batch_values: &[(Lba, BlockmapValue)],
-        _new_refcount: u32,
+        new_refcount: u32,
     ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
         if batch_values.is_empty() {
             return Ok(HashMap::new());
@@ -314,8 +327,16 @@ impl MetadbBackend {
         for (lba, value) in batch_values {
             tx.l2p_remap(ord, lba.0, to_l2p_value(value), None);
         }
+        for (pba, delta) in
+            extra_new_refcount_increfs(batch_values.iter().map(|(_, value)| *value), new_refcount)
+        {
+            tx.incref_pba(to_metadb_pba(pba), delta);
+        }
         let (_, outcomes) = tx.commit_with_outcomes()?;
-        newly_zeroed_from_remaps(batch_values.iter().map(|(_, value)| *value), outcomes)
+        newly_zeroed_from_remaps(
+            batch_values.iter().map(|(_, value)| *value),
+            outcomes.into_iter().take(batch_values.len()).collect(),
+        )
     }
 
     pub(crate) fn atomic_batch_write_packed(
@@ -347,15 +368,26 @@ impl MetadbBackend {
         }
         let mut tx = self.db.begin();
         let mut new_values = Vec::new();
-        for (vol_id, batch_values, _) in units {
+        let mut extra_increfs: HashMap<Pba, u32> = HashMap::new();
+        for (vol_id, batch_values, new_refcount) in units {
             let ord = self.volume_ordinal(vol_id)?;
             for (lba, value) in *batch_values {
                 tx.l2p_remap(ord, lba.0, to_l2p_value(value), None);
                 new_values.push(*value);
             }
+            for (pba, delta) in extra_new_refcount_increfs(
+                batch_values.iter().map(|(_, value)| *value),
+                *new_refcount,
+            ) {
+                *extra_increfs.entry(pba).or_insert(0) += delta;
+            }
+        }
+        for (pba, delta) in extra_increfs {
+            tx.incref_pba(to_metadb_pba(pba), delta);
         }
         let (_, outcomes) = tx.commit_with_outcomes()?;
-        newly_zeroed_from_remaps(new_values, outcomes)
+        let remap_count = new_values.len();
+        newly_zeroed_from_remaps(new_values, outcomes.into_iter().take(remap_count).collect())
     }
 
     pub(crate) fn put_dedup_entries(
@@ -734,6 +766,28 @@ where
     Ok(decrements)
 }
 
+fn extra_new_refcount_increfs<I>(new_values: I, new_refcount: u32) -> HashMap<Pba, u32>
+where
+    I: IntoIterator<Item = BlockmapValue>,
+{
+    let mut occurrences: HashMap<Pba, u32> = HashMap::new();
+    for value in new_values {
+        *occurrences.entry(value.pba).or_insert(0) += 1;
+    }
+    if occurrences.len() != 1 {
+        return HashMap::new();
+    }
+    occurrences
+        .into_iter()
+        .filter_map(|(pba, count)| {
+            new_refcount
+                .checked_sub(count)
+                .filter(|delta| *delta > 0)
+                .map(|delta| (pba, delta))
+        })
+        .collect()
+}
+
 fn dedup_hit_results_from_remaps(
     hits: &[(Lba, BlockmapValue, ContentHash)],
     outcomes: Vec<ApplyOutcome>,
@@ -765,22 +819,16 @@ fn dedup_hit_results_from_remaps(
             continue;
         }
 
-        let decremented = match prev {
-            Some(prev) => {
-                let old = decode_l2p_value(prev)?;
-                if old.pba == new_value.pba {
-                    None
-                } else {
-                    let blocks = freed_blocks_for_l2p_value(&old);
-                    if freed_pba.is_some_and(|pba| from_metadb_pba(pba) == old.pba) {
-                        newly_zeroed.insert(old.pba, blocks);
-                    }
-                    Some((old.pba, blocks))
+        if let Some(prev) = prev {
+            let old = decode_l2p_value(prev)?;
+            if old.pba != new_value.pba {
+                let blocks = freed_blocks_for_l2p_value(&old);
+                if freed_pba.is_some_and(|pba| from_metadb_pba(pba) == old.pba) {
+                    newly_zeroed.insert(old.pba, blocks);
                 }
             }
-            None => None,
-        };
-        results.push(DedupHitResult::Accepted(decremented));
+        }
+        results.push(DedupHitResult::Accepted(None));
     }
     Ok((results, newly_zeroed))
 }
@@ -875,7 +923,7 @@ mod tests {
     fn backend_volume_catalog_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
-            rocksdb_path: Some(dir.path().to_path_buf()),
+            path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             wal_dir: None,
@@ -908,7 +956,7 @@ mod tests {
     fn backend_reads_l2p_values_by_volume_id() {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
-            rocksdb_path: Some(dir.path().to_path_buf()),
+            path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             wal_dir: None,
@@ -958,7 +1006,7 @@ mod tests {
     fn atomic_batch_write_updates_refcounts_and_reports_freed_pba() {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
-            rocksdb_path: Some(dir.path().to_path_buf()),
+            path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             wal_dir: None,
@@ -1009,7 +1057,7 @@ mod tests {
     fn dedup_entries_and_flag_scan_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
-            rocksdb_path: Some(dir.path().to_path_buf()),
+            path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             wal_dir: None,
@@ -1077,7 +1125,7 @@ mod tests {
     fn delete_range_and_volume_report_freed_extents() {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
-            rocksdb_path: Some(dir.path().to_path_buf()),
+            path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             wal_dir: None,
@@ -1128,7 +1176,7 @@ mod tests {
     fn diagnostic_helpers_track_refs_and_allocated_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
-            rocksdb_path: Some(dir.path().to_path_buf()),
+            path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             wal_dir: None,

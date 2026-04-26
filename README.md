@@ -6,7 +6,7 @@
 
 **Userspace all-flash block storage engine with inline compression, content-addressable dedup, and RAID-aware space management.**
 
-Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses RocksDB for metadata management, O_DIRECT for data I/O, and exposes block devices via Linux ublk. Designed for NVMe SSD arrays behind dm-raid / LVM.
+Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses the in-tree onyx-metadb engine for metadata management, O_DIRECT for data I/O, and exposes block devices via Linux ublk. Designed for NVMe SSD arrays behind dm-raid / LVM.
 
 > **Early Technology Preview** &mdash; This project is in early development for learning and research purposes. Core functionality (compression, dedup, GC, packer) is implemented and tested, but it is NOT production-ready. Do not use in production environments.
 
@@ -16,9 +16,9 @@ Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses
 - **Content-addressable dedup** &mdash; SHA-256 fingerprinting, reference counting, background rescan for skipped blocks
 - **Fragment packing** &mdash; VDO-style bin-packing of sub-4KB compressed fragments into shared physical slots
 - **Garbage collection** &mdash; background dead-block scanner and rewriter with back-pressure control
-- **Crash consistency** &mdash; RocksDB WriteBatch atomic updates; write-buffer sync-before-ack
+- **Crash consistency** &mdash; metadb atomic commits; write-buffer sync-before-ack
 - **High-performance write path** &mdash; staging channel + write thread batch (encode/CRC off hot path), jemalloc, DashMap 256-shard indices, per-shard backpressure
-- **Batched backend** &mdash; writer drains up to 32 units per batch: one RocksDB WriteBatch, multi_get for old mappings, batched dedup cleanup
+- **Batched backend** &mdash; writer drains up to 32 units per batch: one metadata commit, multi_get for old mappings, batched dedup cleanup
 - **Zone-based parallelism** &mdash; LBA space partitioned into zones, each served by a dedicated worker thread
 - **ublk frontend** (Linux) &mdash; expose volumes as `/dev/ublkbN` block devices with 512B sector alignment
 - **Service mode** &mdash; multi-volume serving in a single process, Unix socket IPC for online management and graceful shutdown
@@ -35,7 +35,7 @@ WriteBufferPool  (staging channel + write thread batch, ring log on LV2, jemallo
   v
 Dedup Workers --> Compress Workers --> Batch Writer (drain N units)
   |
-IoEngine (O_DIRECT --> LV3) + MetaStore (RocksDB multi_get + batch WriteBatch)
+IoEngine (O_DIRECT --> LV3) + MetaStore (metadb multi_get + batch commit)
   |
 SpaceAllocator (BTreeSet free list, strip-aligned allocation)
   |
@@ -62,7 +62,7 @@ dm-raid + LVM --> NVMe SSD x N
 ### Prerequisites
 
 - Rust 1.75+ (2021 edition)
-- RocksDB system library (bundled via `rocksdb` crate)
+- No external metadata database dependency; onyx-metadb is built from this workspace
 - Linux 6.0+ for ublk frontend (macOS supported for development via stdin frontend)
 
 ### Build
@@ -104,7 +104,7 @@ Edit `config/default.toml`:
 
 ```toml
 [meta]
-rocksdb_path = "/data/onyx/rocksdb"
+path = "/data/onyx/metadb"
 block_cache_mb = 256
 
 [storage]
@@ -209,9 +209,9 @@ User-perceived latency = ring lock + memcpy + channel send. Encoding, CRC, disk 
 - Old PBA refcounts naturally reach zero &rarr; space reclaimed
 - Back-pressure: GC pauses when buffer utilization exceeds 80%
 
-## RocksDB Column Families
+## metadb Metadata Tables
 
-Global CFs (fixed):
+Global metadata:
 
 | CF              | Key                     | Value               | Purpose                        |
 |-----------------|-------------------------|----------------------|--------------------------------|
@@ -220,17 +220,17 @@ Global CFs (fixed):
 | `dedup_index`   | `sha256(32B)`           | DedupEntry(27B)      | Content hash &rarr; PBA        |
 | `dedup_reverse` | `pba(BE) + sha256(32B)` | empty                | Reverse lookup for cleanup     |
 
-Per-volume blockmap CF (one per volume, created/dropped dynamically):
+Per-volume blockmap:
 
-| CF                       | Key        | Value            | Purpose                |
+| Table                    | Key        | Value            | Purpose                |
 |--------------------------|------------|------------------|------------------------|
 | `blockmap:{volume_id}`   | `lba(BE)`  | 28B BlockmapValue| LBA &rarr; PBA mapping |
 
-Each volume gets its own LSM tree with independent bloom filter, compaction, and block cache. Volume deletion drops the entire CF in O(1). Legacy single-CF blockmap is auto-migrated on first open.
+Each volume gets its own metadb L2P namespace. Volume deletion drops the namespace and decrements refcounts; dedup reverse entries are cleaned when the target PBA reaches zero.
 
 ## Roadmap
 
-- [x] MVP: ublk + RocksDB + compression + space management
+- [x] MVP: ublk + metadb + compression + space management
 - [x] Packer + GC: fragment bin-packing, GC scanner/rewriter, back-pressure, hole-map reuse
 - [x] Dedup: worker pool, dedup_index/dedup_reverse, tiered skip strategy, background rescan
 - [x] Performance: staging buffer, write thread batch, jemalloc, batched backend writer, multi_get, batched dedup cleanup

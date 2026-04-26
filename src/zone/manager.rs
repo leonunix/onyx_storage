@@ -18,7 +18,7 @@ use crate::zone::read;
 /// * Writes go straight into `WriteBufferPool::append` — same-zone ordering is
 ///   preserved by the per-shard append lock inside the pool.
 /// * Reads run via `crate::zone::read::execute_read` — the buffer DashMap is
-///   lock-free and `MetaStore::get_mapping` is a RocksDB point-get, so no
+///   lock-free and `MetaStore::get_mapping` is a metadb point-get, so no
 ///   external serialization is needed.
 ///
 /// `zone_count` / `zone_size_blocks` are kept for write-splitting at zone
@@ -226,7 +226,7 @@ impl ZoneManager {
     /// directly into `out_buf`, which must be `count * BLOCK_SIZE` bytes.
     ///
     /// Why it's faster than looping `submit_read_with_generation` per LBA:
-    /// one `multi_get_mappings` instead of N RocksDB point gets; LBAs sharing
+    /// one `multi_get_mappings` instead of N metadb point gets; LBAs sharing
     /// a compression unit on disk do **one** io_uring read + **one**
     /// decompression, then fan out into N output slots; per-LBA `to_vec()`
     /// intermediate copies are eliminated by copying straight into `out_buf`.
@@ -275,7 +275,9 @@ impl ZoneManager {
                         let end = offset + bs;
                         if end <= payload.len() {
                             dst.copy_from_slice(&payload[offset..end]);
-                            self.metrics.read_buffer_hits.fetch_add(1, Ordering::Relaxed);
+                            self.metrics
+                                .read_buffer_hits
+                                .fetch_add(1, Ordering::Relaxed);
                             self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
                             self.metrics
                                 .buffer_read_bytes
@@ -303,7 +305,7 @@ impl ZoneManager {
             return Ok(());
         }
 
-        // Pass 2: one batched RocksDB multi_get for the miss set.
+        // Pass 2: one batched metadb multi_get for the miss set.
         let vid = VolumeId(vol_id.to_string());
         let mappings = self.meta.multi_get_mappings(&vid, &pending_lbas)?;
 
@@ -326,8 +328,11 @@ impl ZoneManager {
                     self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(mapping) => {
-                    let key: UnitKey =
-                        (mapping.pba.0, mapping.slot_offset, mapping.unit_compressed_size);
+                    let key: UnitKey = (
+                        mapping.pba.0,
+                        mapping.slot_offset,
+                        mapping.unit_compressed_size,
+                    );
                     groups
                         .entry(key)
                         .or_insert_with(|| UnitGroup {
@@ -357,9 +362,7 @@ impl ZoneManager {
             }
             for (rx, group) in receivers.into_iter().zip(units.into_iter()) {
                 let payload = rx.recv().map_err(|_| {
-                    crate::error::OnyxError::Io(std::io::Error::other(
-                        "read-pool reply dropped",
-                    ))
+                    crate::error::OnyxError::Io(std::io::Error::other("read-pool reply dropped"))
                 })??;
                 self.fan_out_unit(&payload, &group.members, out_buf)?;
             }

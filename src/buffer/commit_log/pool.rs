@@ -434,9 +434,8 @@ impl WriteBufferPool {
                         offset,
                         data_len = data.len(),
                         disk_magic = magic,
-                        expected_magic = u32::from_le_bytes(
-                            expected_magic_bytes.try_into().unwrap()
-                        ),
+                        expected_magic =
+                            u32::from_le_bytes(expected_magic_bytes.try_into().unwrap()),
                         "POST-WRITE VERIFICATION FAILED (io_uring path): entry not on disk"
                     );
                 }
@@ -1139,9 +1138,13 @@ impl WriteBufferPool {
         vol_created_at: u64,
     ) -> bool {
         let shard_idx = self.shard_for_lba(start_lba);
-        self.shards[shard_idx]
-            .shard
-            .is_entry_fully_superseded(vol_id, start_lba, lba_count, seq, vol_created_at)
+        self.shards[shard_idx].shard.is_entry_fully_superseded(
+            vol_id,
+            start_lba,
+            lba_count,
+            seq,
+            vol_created_at,
+        )
     }
 
     pub fn pending_entries_snapshot(&self) -> Vec<BufferEntry> {

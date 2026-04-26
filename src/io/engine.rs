@@ -32,7 +32,7 @@ impl std::fmt::Debug for IoBackend {
 /// IO engine for reading/writing raw data blocks on LV3.
 ///
 /// LV3 slots are pure payload — no on-disk header. All metadata (compression,
-/// crc32, original_size) lives in RocksDB BlockmapValue, which is crash-consistent
+/// crc32, original_size) lives in metadb BlockmapValue, which is crash-consistent
 /// via WriteBatch. This allows a full 4096-byte payload per slot.
 ///
 /// PBA addresses are translated by `pba_offset` (default `RESERVED_BLOCKS`)
@@ -298,7 +298,11 @@ impl IoEngine {
     ///
     /// `fsync_after` appends a barrier-fdatasync SQE (only meaningful for the
     /// uring backend; the syscall path always issues a `sync()` if requested).
-    pub fn submit_batch(&self, ops: Vec<LvOp<'_>>, fsync_after: bool) -> OnyxResult<Vec<LvOpResult>> {
+    pub fn submit_batch(
+        &self,
+        ops: Vec<LvOp<'_>>,
+        fsync_after: bool,
+    ) -> OnyxResult<Vec<LvOpResult>> {
         match &self.backend {
             IoBackend::Syscall => self.submit_batch_syscall(ops, fsync_after),
             IoBackend::Uring(session) => self.submit_batch_uring(session, ops, fsync_after),
@@ -500,7 +504,10 @@ impl IoEngine {
             }
         }
 
-        Ok(out.into_iter().map(|s| s.expect("all slots filled")).collect())
+        Ok(out
+            .into_iter()
+            .map(|s| s.expect("all slots filled"))
+            .collect())
     }
 
     /// Borrow the underlying data device. Used by the engine shutdown path
@@ -568,13 +575,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dev = fresh_device(&dir, "lv3", 1024 * 1024);
         let session = Arc::new(IoUringSession::new(16).unwrap());
-        let engine = IoEngine::with_options(
-            dev,
-            false,
-            0,
-            None,
-            IoBackend::Uring(session),
-        );
+        let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
 
         let payload = vec![0xCDu8; 4096];
         engine.write_blocks(Pba(2), &payload).unwrap();
@@ -587,13 +588,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dev = fresh_device(&dir, "lv3", 1024 * 1024);
         let session = Arc::new(IoUringSession::new(64).unwrap());
-        let engine = IoEngine::with_options(
-            dev,
-            false,
-            0,
-            None,
-            IoBackend::Uring(session),
-        );
+        let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
 
         let payloads: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; 4096]).collect();
         let writes: Vec<LvOp> = payloads

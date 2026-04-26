@@ -4,7 +4,7 @@ use onyx_storage::config::*;
 fn parse_minimal_config() {
     let toml_str = r#"
 [meta]
-rocksdb_path = "/data/lv1/rocksdb"
+path = "/data/lv1/metadb"
 
 [storage]
 data_device = "/dev/vg0/lv3"
@@ -26,7 +26,7 @@ device = "/dev/vg0/lv2"
 fn parse_full_config() {
     let toml_str = r#"
 [meta]
-rocksdb_path = "/data/rocksdb"
+path = "/data/metadb"
 block_cache_mb = 512
 wal_dir = "/data/wal"
 
@@ -56,7 +56,7 @@ io_buf_bytes = 2097152
 }
 
 #[test]
-fn parse_meta_path_alias() {
+fn parse_meta_path() {
     let toml_str = r#"
 [meta]
 path = "/data/onyx/meta"

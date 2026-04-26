@@ -57,7 +57,7 @@ impl CompressionAlgo {
     }
 }
 
-/// Volume configuration stored in RocksDB "volumes" CF
+/// Volume configuration stored in metadb "volumes" CF
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeConfig {
     pub id: VolumeId,

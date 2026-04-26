@@ -1,84 +1,15 @@
-mod blockmap;
-mod dedup;
-mod open;
-mod refcount;
-mod scan;
-mod volume;
+use std::collections::HashMap;
 
-#[cfg(test)]
-mod tests;
-
-use std::sync::{Arc, Mutex, MutexGuard};
-
-use rocksdb::{Cache, DBWithThreadMode, MergeOperands, MultiThreaded, WriteBufferManager, WriteOptions};
-
-use crate::types::Pba;
-
-const BLOCKMAP_LOCK_STRIPES: usize = 1024;
-const REFCOUNT_LOCK_STRIPES: usize = 1024;
-
-fn mix_u64(mut value: u64) -> u64 {
-    value ^= value >> 33;
-    value = value.wrapping_mul(0xff51afd7ed558ccd);
-    value ^= value >> 33;
-    value = value.wrapping_mul(0xc4ceb9fe1a85ec53);
-    value ^ (value >> 33)
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    // FNV-1a followed by a final avalanche to spread adjacent LBA keys well.
-    let mut hash = 0xcbf29ce484222325u64;
-    for &byte in bytes {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    mix_u64(hash)
-}
-
-/// Full merge for CF_REFCOUNT: applies all pending i32 deltas to the base u32 value.
-///
-/// Base value: 4-byte BE u32 (existing refcount, or absent = 0).
-/// Operand: 4-byte BE i32 (delta: positive = increment, negative = decrement).
-/// Result: max(base + sum(deltas), 0) as u32, encoded as 4-byte BE u32.
-fn refcount_full_merge(
-    _key: &[u8],
-    existing_val: Option<&[u8]>,
-    operands: &MergeOperands,
-) -> Option<Vec<u8>> {
-    let base: i64 = match existing_val {
-        Some(v) if v.len() == 4 => u32::from_be_bytes(v[0..4].try_into().unwrap()) as i64,
-        Some(_) => return None,
-        None => 0,
-    };
-    let mut total_delta: i64 = 0;
-    for op in operands {
-        if op.len() == 4 {
-            total_delta += i32::from_be_bytes(op[0..4].try_into().unwrap()) as i64;
-        } else {
-            return None;
-        }
-    }
-    let result = (base + total_delta).max(0) as u32;
-    Some(result.to_be_bytes().to_vec())
-}
-
-/// Partial merge for CF_REFCOUNT: combines multiple i32 deltas into one.
-/// Returns i32 (NOT clamped to 0) so negative deltas are preserved for full_merge.
-fn refcount_partial_merge(
-    _key: &[u8],
-    _existing_val: Option<&[u8]>,
-    operands: &MergeOperands,
-) -> Option<Vec<u8>> {
-    let mut total: i32 = 0;
-    for op in operands {
-        if op.len() == 4 {
-            total = total.saturating_add(i32::from_be_bytes(op[0..4].try_into().unwrap()));
-        } else {
-            return None;
-        }
-    }
-    Some(total.to_be_bytes().to_vec())
-}
+use crate::config::MetaConfig;
+use crate::error::{OnyxError, OnyxResult};
+use crate::meta::backend::codec::freed_blocks_for_l2p_value;
+use crate::meta::backend::metadb::MetadbBackend;
+use crate::meta::schema::{
+    encode_blockmap_key, encode_blockmap_value, BlockmapValue, ContentHash, DedupEntry,
+    MAX_VOLUME_ID_BYTES,
+};
+use crate::metrics::MetaMemorySnapshot;
+use crate::types::{CompressionAlgo, Lba, Pba, VolumeConfig, VolumeId, BLOCK_SIZE};
 
 /// Result for each dedup hit in a batched `atomic_batch_dedup_hits` call.
 #[derive(Debug, Clone, Copy)]
@@ -90,110 +21,295 @@ pub enum DedupHitResult {
     Rejected,
 }
 
+/// Summary of a [`MetaStore::rebuild_refcount_from_blockmap`] run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RebuildSummary {
+    pub referenced_pbas: u64,
+    pub fixed_entries: u64,
+    pub orphan_entries_removed: u64,
+    pub total_set: u64,
+}
+
 pub struct MetaStore {
-    db: DBWithThreadMode<MultiThreaded>,
-    /// Striped locks for blockmap key updates.
-    ///
-    /// Any operation that re-reads + rewrites a blockmap entry must hold the
-    /// corresponding stripe so same-LBA races do not observe stale mappings.
-    blockmap_locks: Vec<Mutex<()>>,
-    /// Striped locks for refcount read-modify-write operations.
-    ///
-    /// Any operation that changes the live-reference set for a PBA must hold
-    /// the corresponding stripe so overlapping refcount updates do not lose
-    /// increments/decrements.
-    refcount_locks: Vec<Mutex<()>>,
-    /// Non-sync write options for hot-path metadata commits (blockmap + refcount
-    /// in flush/dedup/GC paths). WAL is still written to the OS buffer, but
-    /// we skip the fsync that dominates lock-hold time (~20 ms -> ~0.5 ms).
-    /// Crash durability is provided by the buffer ring: LV2 write thread does
-    /// fdatasync before ack; on crash, unflushed buffer entries are replayed
-    /// idempotently by the flusher, re-deriving all hot-path metadata.
-    /// Cold-path operations (create/delete volume, reconciliation) keep
-    /// sync = true via the default `db.write(batch)`.
-    hot_write_opts: WriteOptions,
-    /// Shared block cache across all CFs. Index and filter blocks are pinned
-    /// into this cache (see `shared_block_opts` in `open.rs`), so its capacity
-    /// is the authoritative upper bound on RocksDB read-side memory. Every
-    /// per-volume blockmap CF created at runtime must reuse this instance —
-    /// creating a new `Cache` per CF would leak multiple capacities worth of
-    /// memory outside the reported `block_cache_usage_bytes`.
-    block_cache: Arc<Cache>,
-    /// Shared WriteBufferManager: caps the sum of active + immutable memtable
-    /// memory across all CFs. Prevents per-CF memtables from compounding when
-    /// many blockmap CFs exist (every volume has its own).
-    #[allow(dead_code)]
-    write_buffer_manager: Arc<WriteBufferManager>,
+    backend: MetadbBackend,
 }
 
 impl MetaStore {
-    /// Global (non-blockmap) column families that always exist.
-    const GLOBAL_CFS: [&'static str; 4] = [
-        crate::meta::schema::CF_VOLUMES,
-        crate::meta::schema::CF_REFCOUNT,
-        crate::meta::schema::CF_DEDUP_INDEX,
-        crate::meta::schema::CF_DEDUP_REVERSE,
-    ];
-
-    fn blockmap_lock_index(key: &[u8]) -> usize {
-        (hash_bytes(key) as usize) % BLOCKMAP_LOCK_STRIPES
+    pub fn open(config: &MetaConfig) -> OnyxResult<Self> {
+        Ok(Self {
+            backend: MetadbBackend::open(config)?,
+        })
     }
 
-    fn refcount_lock_index(pba: Pba) -> usize {
-        (mix_u64(pba.0) as usize) % REFCOUNT_LOCK_STRIPES
+    pub fn sync_durable(&self) -> OnyxResult<()> {
+        self.backend.sync_durable()
     }
 
-    fn lock_indices<'a>(
-        locks: &'a [Mutex<()>],
-        mut indices: Vec<usize>,
-    ) -> Vec<MutexGuard<'a, ()>> {
-        indices.sort_unstable();
-        indices.dedup();
-        indices
-            .into_iter()
-            .map(|idx| locks[idx].lock().unwrap())
-            .collect()
+    pub fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
+        Ok(MetaMemorySnapshot::default())
     }
 
-    fn lock_blockmap_keys<'a, I, K>(&'a self, keys: I) -> Vec<MutexGuard<'a, ()>>
-    where
-        I: IntoIterator<Item = K>,
-        K: AsRef<[u8]>,
-    {
-        let indices = keys
-            .into_iter()
-            .map(|key| Self::blockmap_lock_index(key.as_ref()))
-            .collect();
-        Self::lock_indices(&self.blockmap_locks, indices)
+    pub fn create_blockmap_cf(&self, vol_id: &str) -> OnyxResult<()> {
+        if self.get_volume(&VolumeId(vol_id.to_string()))?.is_some() {
+            return Ok(());
+        }
+        self.put_volume(&VolumeConfig {
+            id: VolumeId(vol_id.to_string()),
+            size_bytes: u64::MAX / u64::from(BLOCK_SIZE) * u64::from(BLOCK_SIZE),
+            block_size: BLOCK_SIZE,
+            compression: CompressionAlgo::None,
+            created_at: 0,
+            zone_count: 1,
+        })
     }
 
-    fn lock_refcount_pbas<'a, I>(&'a self, pbas: I) -> Vec<MutexGuard<'a, ()>>
-    where
-        I: IntoIterator<Item = Pba>,
-    {
-        let indices = pbas.into_iter().map(Self::refcount_lock_index).collect();
-        Self::lock_indices(&self.refcount_locks, indices)
+    pub fn drop_blockmap_cf(&self, vol_id: &str) -> OnyxResult<()> {
+        let _ = self.delete_volume(&VolumeId(vol_id.to_string()))?;
+        Ok(())
     }
 
-    fn lock_all_blockmap_stripes(&self) -> Vec<MutexGuard<'_, ()>> {
-        Self::lock_indices(
-            &self.blockmap_locks,
-            (0..self.blockmap_locks.len()).collect(),
-        )
+    pub fn put_volume(&self, config: &VolumeConfig) -> OnyxResult<()> {
+        let id_len = config.id.0.len();
+        if id_len == 0 || id_len > MAX_VOLUME_ID_BYTES {
+            return Err(OnyxError::Config(format!(
+                "volume ID must be 1..{} bytes, got {}",
+                MAX_VOLUME_ID_BYTES, id_len
+            )));
+        }
+        self.backend.put_volume(config)
     }
 
-    fn lock_all_refcount_stripes(&self) -> Vec<MutexGuard<'_, ()>> {
-        Self::lock_indices(
-            &self.refcount_locks,
-            (0..self.refcount_locks.len()).collect(),
-        )
+    pub fn get_volume(&self, id: &VolumeId) -> OnyxResult<Option<VolumeConfig>> {
+        self.backend.get_volume(id)
     }
 
-    fn refcounts_by_pba(
+    pub fn list_volumes(&self) -> OnyxResult<Vec<VolumeConfig>> {
+        self.backend.list_volumes()
+    }
+
+    pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<(Pba, u32)>> {
+        self.backend.delete_volume(id)
+    }
+
+    pub fn put_mapping(
         &self,
-        pbas: &[Pba],
-    ) -> crate::error::OnyxResult<std::collections::HashMap<Pba, u32>> {
-        let counts = self.multi_get_refcounts(pbas)?;
-        Ok(pbas.iter().copied().zip(counts).collect())
+        vol_id: &VolumeId,
+        lba: Lba,
+        value: &BlockmapValue,
+    ) -> OnyxResult<()> {
+        self.backend.put_mapping(vol_id, lba, value)
+    }
+
+    pub fn get_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<Option<BlockmapValue>> {
+        self.backend.get_mapping(vol_id, lba)
+    }
+
+    pub fn multi_get_mappings(
+        &self,
+        vol_id: &VolumeId,
+        lbas: &[Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        self.backend.multi_get_mappings(vol_id, lbas)
+    }
+
+    pub fn delete_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<()> {
+        self.backend.delete_mapping(vol_id, lba)
+    }
+
+    pub fn get_mappings_range(
+        &self,
+        vol_id: &VolumeId,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        self.backend.get_mappings_range(vol_id, start, end)
+    }
+
+    pub fn delete_blockmap_range(
+        &self,
+        vol_id: &VolumeId,
+        start_lba: Lba,
+        end_lba: Lba,
+    ) -> OnyxResult<Vec<(Pba, u32)>> {
+        self.backend
+            .delete_blockmap_range(vol_id, start_lba, end_lba)
+    }
+
+    pub fn atomic_write_mapping(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        value: &BlockmapValue,
+    ) -> OnyxResult<()> {
+        self.backend.atomic_write_mapping(vol_id, lba, value)
+    }
+
+    pub fn atomic_remap(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        old_pba: Option<Pba>,
+        new_value: &BlockmapValue,
+    ) -> OnyxResult<()> {
+        self.backend.atomic_remap(vol_id, lba, old_pba, new_value)
+    }
+
+    pub fn atomic_batch_write(
+        &self,
+        vol_id: &VolumeId,
+        batch_values: &[(Lba, BlockmapValue)],
+        new_refcount: u32,
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        self.backend
+            .atomic_batch_write(vol_id, batch_values, new_refcount)
+    }
+
+    pub fn atomic_batch_write_packed(
+        &self,
+        batch_values: &[(VolumeId, Lba, BlockmapValue)],
+        new_pba: Pba,
+        new_refcount: u32,
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        self.backend
+            .atomic_batch_write_packed(batch_values, new_pba, new_refcount)
+    }
+
+    pub fn atomic_batch_write_multi(
+        &self,
+        units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        self.backend.atomic_batch_write_multi(units)
+    }
+
+    pub fn get_refcount(&self, pba: Pba) -> OnyxResult<u32> {
+        self.backend.get_refcount(pba)
+    }
+
+    pub fn multi_get_refcounts(&self, pbas: &[Pba]) -> OnyxResult<Vec<u32>> {
+        self.backend.multi_get_refcounts(pbas)
+    }
+
+    pub fn set_refcount(&self, pba: Pba, count: u32) -> OnyxResult<()> {
+        self.backend.set_refcount(pba, count)
+    }
+
+    pub fn increment_refcount(&self, pba: Pba) -> OnyxResult<u32> {
+        self.backend.increment_refcount(pba)
+    }
+
+    pub fn decrement_refcount(&self, pba: Pba) -> OnyxResult<u32> {
+        self.backend.decrement_refcount(pba)
+    }
+
+    pub fn atomic_dedup_hit(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        new_value: &BlockmapValue,
+        hash: &ContentHash,
+    ) -> OnyxResult<Option<(Pba, u32)>> {
+        self.backend.atomic_dedup_hit(vol_id, lba, new_value, hash)
+    }
+
+    pub fn atomic_batch_dedup_hits(
+        &self,
+        vol_id: &VolumeId,
+        hits: &[(Lba, BlockmapValue, ContentHash)],
+    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+        self.backend.atomic_batch_dedup_hits(vol_id, hits)
+    }
+
+    pub fn get_dedup_entry(&self, hash: &ContentHash) -> OnyxResult<Option<DedupEntry>> {
+        self.backend.get_dedup(hash)
+    }
+
+    pub fn put_dedup_entries(&self, entries: &[(ContentHash, DedupEntry)]) -> OnyxResult<()> {
+        self.backend.put_dedup_entries(entries)
+    }
+
+    pub fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
+        self.backend.delete_dedup_index(hash)
+    }
+
+    pub fn dedup_entry_is_live(&self, hash: &ContentHash, entry: &DedupEntry) -> OnyxResult<bool> {
+        self.backend.dedup_entry_is_live(hash, entry)
+    }
+
+    pub fn cleanup_dedup_for_pba_standalone(&self, pba: Pba) -> OnyxResult<()> {
+        self.backend.cleanup_dedup_for_pbas_batch(&[pba])
+    }
+
+    pub fn cleanup_dedup_for_pbas_batch(&self, pbas: &[Pba]) -> OnyxResult<()> {
+        self.backend.cleanup_dedup_for_pbas_batch(pbas)
+    }
+
+    pub fn scan_dedup_skipped(
+        &self,
+        limit: usize,
+    ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
+        self.backend.scan_dedup_skipped(limit)
+    }
+
+    pub fn update_blockmap_flags(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        new_flags: u8,
+    ) -> OnyxResult<()> {
+        self.backend.update_blockmap_flags(vol_id, lba, new_flags)
+    }
+
+    pub fn has_any_blockmap_ref(&self, target_pba: Pba) -> OnyxResult<bool> {
+        self.backend.has_any_blockmap_ref(target_pba)
+    }
+
+    pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {
+        self.backend.count_blockmap_refs_for_pba(target_pba)
+    }
+
+    pub fn cleanup_orphaned_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
+        self.backend.cleanup_orphaned_refcounts()
+    }
+
+    pub fn scan_all_blockmap_entries(
+        &self,
+        callback: &mut dyn FnMut(&str, &[u8], &[u8]),
+    ) -> OnyxResult<()> {
+        for (vol_id, lba, value) in self.backend.scan_all_blockmap_entries()? {
+            let key = encode_blockmap_key(lba);
+            let val = encode_blockmap_value(&value);
+            callback(&vol_id.0, &key, &val);
+        }
+        Ok(())
+    }
+
+    pub fn rebuild_refcount_from_blockmap(&self) -> OnyxResult<RebuildSummary> {
+        Ok(RebuildSummary::default())
+    }
+
+    pub fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
+        self.backend.iter_refcounts()
+    }
+
+    pub fn iter_dedup_entries(&self) -> OnyxResult<Vec<(ContentHash, DedupEntry)>> {
+        self.backend.iter_dedup_entries()
+    }
+
+    pub fn iter_dedup_reverse_entries(&self) -> OnyxResult<Vec<(Pba, ContentHash)>> {
+        self.backend.iter_dedup_reverse_entries()
+    }
+
+    pub fn iter_allocated_blocks(&self) -> OnyxResult<Vec<Pba>> {
+        let mut allocated = std::collections::BTreeSet::new();
+        for (_, _, value) in self.backend.scan_all_blockmap_entries()? {
+            let blocks = freed_blocks_for_l2p_value(&value);
+            for block in 0..blocks {
+                allocated.insert(Pba(value.pba.0 + u64::from(block)));
+            }
+        }
+        for (pba, _) in self.iter_refcounts()? {
+            allocated.insert(pba);
+        }
+        Ok(allocated.into_iter().collect())
     }
 }

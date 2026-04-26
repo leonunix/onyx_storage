@@ -258,7 +258,7 @@ pub struct WriteBufferPool {
     /// sync, so any seq ≤ captured value is guaranteed to have had its DB
     /// writes issued before the fsync and is therefore durable afterwards.
     pub(crate) max_flushed_seq: Arc<AtomicU64>,
-    /// Watermark of seqs that are guaranteed durable on RocksDB. Advanced
+    /// Watermark of seqs that are guaranteed durable on metadb. Advanced
     /// only by the durability-watermark background thread after
     /// `MetaStore::sync_durable()` returns.
     ///
