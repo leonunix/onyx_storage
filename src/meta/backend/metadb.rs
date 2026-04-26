@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
-use crate::meta::schema::{BlockmapValue, DedupEntry};
-use crate::types::{Pba, VolumeConfig, VolumeId};
+use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry};
+use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
 use super::codec::{
     blockmap_from_l2p_bytes, blockmap_to_l2p_bytes, dedup_from_value_bytes, dedup_to_value_bytes,
@@ -116,6 +116,72 @@ impl MetadbBackend {
             .map(|entry| entry.ordinal)
             .ok_or_else(|| OnyxError::VolumeNotFound(id.0.clone()))
     }
+
+    pub(crate) fn get_mapping(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+    ) -> OnyxResult<Option<BlockmapValue>> {
+        let ord = self.volume_ordinal(vol_id)?;
+        self.db.get(ord, lba.0)?.map(decode_l2p_value).transpose()
+    }
+
+    pub(crate) fn multi_get_mappings(
+        &self,
+        vol_id: &VolumeId,
+        lbas: &[Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        if lbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ord = self.volume_ordinal(vol_id)?;
+        let raw_lbas: Vec<onyx_metadb::Lba> = lbas.iter().map(|lba| lba.0).collect();
+        self.db
+            .multi_get(ord, &raw_lbas)?
+            .into_iter()
+            .map(|value| value.map(decode_l2p_value).transpose())
+            .collect()
+    }
+
+    pub(crate) fn get_mappings_range(
+        &self,
+        vol_id: &VolumeId,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        let ord = self.volume_ordinal(vol_id)?;
+        self.db
+            .range(ord, start.0..end.0)?
+            .map(|item| {
+                let (lba, value) = item?;
+                Ok((Lba(lba), decode_l2p_value(value)?))
+            })
+            .collect()
+    }
+
+    pub(crate) fn get_refcount(&self, pba: Pba) -> OnyxResult<u32> {
+        Ok(self.db.get_refcount(to_metadb_pba(pba))?)
+    }
+
+    pub(crate) fn multi_get_refcounts(&self, pbas: &[Pba]) -> OnyxResult<Vec<u32>> {
+        let pbas: Vec<onyx_metadb::Pba> = pbas.iter().map(|pba| to_metadb_pba(*pba)).collect();
+        Ok(self.db.multi_get_refcount(&pbas)?)
+    }
+
+    pub(crate) fn get_dedup(&self, hash: &ContentHash) -> OnyxResult<Option<DedupEntry>> {
+        self.db.get_dedup(hash)?.map(decode_dedup_value).transpose()
+    }
+
+    pub(crate) fn multi_get_dedup(
+        &self,
+        hashes: &[ContentHash],
+    ) -> OnyxResult<Vec<Option<DedupEntry>>> {
+        self.db
+            .multi_get_dedup(hashes)?
+            .into_iter()
+            .map(|value| value.map(decode_dedup_value).transpose())
+            .collect()
+    }
 }
 
 impl VolumeCatalog {
@@ -197,6 +263,16 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> OnyxResult<()> {
     fs::rename(&tmp, path)?;
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+fn decode_l2p_value(value: L2pValue) -> OnyxResult<BlockmapValue> {
+    from_l2p_value(value)
+        .ok_or_else(|| OnyxError::Config("metadb L2P value has invalid Onyx layout".into()))
+}
+
+fn decode_dedup_value(value: DedupValue) -> OnyxResult<DedupEntry> {
+    from_dedup_value(value)
+        .ok_or_else(|| OnyxError::Config("metadb dedup value has invalid Onyx layout".into()))
 }
 
 pub(crate) fn to_metadb_pba(pba: Pba) -> onyx_metadb::Pba {
@@ -283,5 +359,88 @@ mod tests {
         assert_eq!(entry.ordinal, 3);
         assert_eq!(entry.config.size_bytes, 4096);
         assert_eq!(entry.config.compression, CompressionAlgo::Lz4);
+    }
+
+    #[test]
+    fn backend_volume_catalog_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            rocksdb_path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            wal_dir: None,
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+
+        {
+            let backend = MetadbBackend::open(&meta).unwrap();
+            backend.put_volume(&vol).unwrap();
+        }
+
+        let backend = MetadbBackend::open(&meta).unwrap();
+        let loaded = backend.get_volume(&vol.id).unwrap().unwrap();
+        assert_eq!(loaded.id, vol.id);
+        assert_eq!(loaded.size_bytes, vol.size_bytes);
+        assert_eq!(loaded.compression, vol.compression);
+        let listed = backend.list_volumes().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, vol.id);
+    }
+
+    #[test]
+    fn backend_reads_l2p_values_by_volume_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            rocksdb_path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            wal_dir: None,
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 8,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let value = BlockmapValue {
+            pba: Pba(77),
+            compression: 1,
+            unit_compressed_size: 1234,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 0xCAFE_BABE,
+            slot_offset: 0,
+            flags: 0,
+        };
+
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+        let ord = backend.volume_ordinal(&vol.id).unwrap();
+        backend
+            .db
+            .insert(ord, 3, to_l2p_value(&value))
+            .expect("insert test mapping");
+
+        assert_eq!(backend.get_mapping(&vol.id, Lba(3)).unwrap(), Some(value));
+        assert_eq!(
+            backend
+                .multi_get_mappings(&vol.id, &[Lba(2), Lba(3)])
+                .unwrap(),
+            vec![None, Some(value)]
+        );
+        assert_eq!(
+            backend.get_mappings_range(&vol.id, Lba(0), Lba(8)).unwrap(),
+            vec![(Lba(3), value)]
+        );
     }
 }
