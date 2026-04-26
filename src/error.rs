@@ -5,6 +5,10 @@ pub enum OnyxError {
     #[error("RocksDB error: {0}")]
     Meta(#[from] rocksdb::Error),
 
+    #[cfg(feature = "metadb")]
+    #[error("metadb error: {0}")]
+    MetaDb(#[from] onyx_metadb::MetaDbError),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
