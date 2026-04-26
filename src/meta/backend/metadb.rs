@@ -118,6 +118,26 @@ impl MetadbBackend {
             .ok_or_else(|| OnyxError::VolumeNotFound(id.0.clone()))
     }
 
+    pub(crate) fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<(Pba, u32)>> {
+        let (ordinal, config) = {
+            let catalog = self.catalog.lock().unwrap();
+            let Some(entry) = catalog.by_id.get(&id.0) else {
+                return Ok(Vec::new());
+            };
+            (entry.ordinal, entry.config.clone())
+        };
+
+        let end = Lba(config.size_bytes / u64::from(config.block_size));
+        let freed = self.delete_blockmap_range(id, Lba(0), end)?;
+        self.db.drop_volume(ordinal)?;
+
+        let mut catalog = self.catalog.lock().unwrap();
+        catalog.by_id.remove(&id.0);
+        catalog.persist(&self.catalog_path)?;
+
+        Ok(freed)
+    }
+
     pub(crate) fn get_mapping(
         &self,
         vol_id: &VolumeId,
@@ -158,6 +178,46 @@ impl MetadbBackend {
                 Ok((Lba(lba), decode_l2p_value(value)?))
             })
             .collect()
+    }
+
+    pub(crate) fn delete_blockmap_range(
+        &self,
+        vol_id: &VolumeId,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Pba, u32)>> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
+        let ord = self.volume_ordinal(vol_id)?;
+        let mut pba_meta: HashMap<Pba, u32> = HashMap::new();
+        for item in self.db.range(ord, start.0..end.0)? {
+            let (_, value) = item?;
+            let value = decode_l2p_value(value)?;
+            let blocks = freed_blocks_for_l2p_value(&value);
+            pba_meta
+                .entry(value.pba)
+                .and_modify(|existing| *existing = (*existing).max(blocks))
+                .or_insert(blocks);
+        }
+        if pba_meta.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.db.range_delete(ord, start.0, end.0)?;
+
+        let mut freed = Vec::new();
+        let pbas: Vec<Pba> = pba_meta.keys().copied().collect();
+        let refcounts = self.multi_get_refcounts(&pbas)?;
+        for (pba, refcount) in pbas.into_iter().zip(refcounts.into_iter()) {
+            if refcount == 0 {
+                let blocks = pba_meta.get(&pba).copied().unwrap_or(1);
+                freed.push((pba, blocks));
+            }
+        }
+        freed.sort_unstable_by_key(|(pba, _)| *pba);
+        Ok(freed)
     }
 
     pub(crate) fn get_refcount(&self, pba: Pba) -> OnyxResult<u32> {
@@ -286,6 +346,30 @@ impl MetadbBackend {
         let pbas: Vec<onyx_metadb::Pba> = pbas.iter().map(|pba| to_metadb_pba(*pba)).collect();
         self.db.cleanup_dedup_for_dead_pbas(&pbas)?;
         Ok(())
+    }
+
+    pub(crate) fn scan_all_blockmap_entries(
+        &self,
+    ) -> OnyxResult<Vec<(VolumeId, Lba, BlockmapValue)>> {
+        let volumes = self.list_volumes()?;
+        let mut entries = Vec::new();
+        for volume in volumes {
+            let ord = self.volume_ordinal(&volume.id)?;
+            for item in self.db.range(ord, 0..u64::MAX)? {
+                let (lba, value) = item?;
+                entries.push((volume.id.clone(), Lba(lba), decode_l2p_value(value)?));
+            }
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn count_blockmap_refs_for_pba(&self, target: Pba) -> OnyxResult<u32> {
+        let count = self
+            .scan_all_blockmap_entries()?
+            .into_iter()
+            .filter(|(_, _, value)| value.pba == target)
+            .count();
+        Ok(count as u32)
     }
 
     pub(crate) fn scan_dedup_skipped(
@@ -861,5 +945,56 @@ mod tests {
         assert_eq!(backend.get_refcount(value.pba).unwrap(), 0);
         backend.cleanup_dedup_for_pbas_batch(&[value.pba]).unwrap();
         assert_eq!(backend.get_dedup(&hash).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_range_and_volume_report_freed_extents() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            rocksdb_path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            wal_dir: None,
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 8,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+
+        let a = BlockmapValue {
+            pba: Pba(100),
+            compression: 1,
+            unit_compressed_size: 2048,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 1,
+            slot_offset: 0,
+            flags: 0,
+        };
+        let b = BlockmapValue {
+            pba: Pba(200),
+            crc32: 2,
+            ..a
+        };
+        backend
+            .atomic_batch_write(&vol.id, &[(Lba(0), a), (Lba(1), b), (Lba(2), b)], 3)
+            .unwrap();
+
+        let freed = backend
+            .delete_blockmap_range(&vol.id, Lba(1), Lba(3))
+            .unwrap();
+        assert_eq!(freed, vec![(Pba(200), 1)]);
+        assert_eq!(backend.count_blockmap_refs_for_pba(Pba(100)).unwrap(), 1);
+
+        let freed = backend.delete_volume(&vol.id).unwrap();
+        assert_eq!(freed, vec![(Pba(100), 1)]);
+        assert!(backend.get_volume(&vol.id).unwrap().is_none());
     }
 }
