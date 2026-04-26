@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use onyx_metadb::{Config as MetaDbConfig, Db, DedupValue, L2pValue, VolumeOrdinal};
+use onyx_metadb::{ApplyOutcome, Config as MetaDbConfig, Db, DedupValue, L2pValue, VolumeOrdinal};
 use serde::{Deserialize, Serialize};
 
 use crate::config::MetaConfig;
@@ -14,7 +14,7 @@ use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
 use super::codec::{
     blockmap_from_l2p_bytes, blockmap_to_l2p_bytes, dedup_from_value_bytes, dedup_to_value_bytes,
-    DEDUP_VALUE_BYTES,
+    freed_blocks_for_l2p_value, DEDUP_VALUE_BYTES,
 };
 
 const METADB_DEDUP_VALUE_BYTES: usize = 28;
@@ -182,6 +182,64 @@ impl MetadbBackend {
             .map(|value| value.map(decode_dedup_value).transpose())
             .collect()
     }
+
+    pub(crate) fn atomic_batch_write(
+        &self,
+        vol_id: &VolumeId,
+        batch_values: &[(Lba, BlockmapValue)],
+        _new_refcount: u32,
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        if batch_values.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ord = self.volume_ordinal(vol_id)?;
+        let mut tx = self.db.begin();
+        for (lba, value) in batch_values {
+            tx.l2p_remap(ord, lba.0, to_l2p_value(value), None);
+        }
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        newly_zeroed_from_remaps(batch_values.iter().map(|(_, value)| *value), outcomes)
+    }
+
+    pub(crate) fn atomic_batch_write_packed(
+        &self,
+        batch_values: &[(VolumeId, Lba, BlockmapValue)],
+        _new_pba: Pba,
+        _new_refcount: u32,
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        if batch_values.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut tx = self.db.begin();
+        let mut new_values = Vec::with_capacity(batch_values.len());
+        for (vol_id, lba, value) in batch_values {
+            let ord = self.volume_ordinal(vol_id)?;
+            tx.l2p_remap(ord, lba.0, to_l2p_value(value), None);
+            new_values.push(*value);
+        }
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        newly_zeroed_from_remaps(new_values, outcomes)
+    }
+
+    pub(crate) fn atomic_batch_write_multi(
+        &self,
+        units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        if units.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut tx = self.db.begin();
+        let mut new_values = Vec::new();
+        for (vol_id, batch_values, _) in units {
+            let ord = self.volume_ordinal(vol_id)?;
+            for (lba, value) in *batch_values {
+                tx.l2p_remap(ord, lba.0, to_l2p_value(value), None);
+                new_values.push(*value);
+            }
+        }
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        newly_zeroed_from_remaps(new_values, outcomes)
+    }
 }
 
 impl VolumeCatalog {
@@ -273,6 +331,61 @@ fn decode_l2p_value(value: L2pValue) -> OnyxResult<BlockmapValue> {
 fn decode_dedup_value(value: DedupValue) -> OnyxResult<DedupEntry> {
     from_dedup_value(value)
         .ok_or_else(|| OnyxError::Config("metadb dedup value has invalid Onyx layout".into()))
+}
+
+fn newly_zeroed_from_remaps<I>(
+    new_values: I,
+    outcomes: Vec<ApplyOutcome>,
+) -> OnyxResult<HashMap<Pba, (u32, u32)>>
+where
+    I: IntoIterator<Item = BlockmapValue>,
+{
+    let new_values: Vec<BlockmapValue> = new_values.into_iter().collect();
+    if new_values.len() != outcomes.len() {
+        return Err(OnyxError::Config(format!(
+            "metadb outcome length mismatch: {} new values, {} outcomes",
+            new_values.len(),
+            outcomes.len()
+        )));
+    }
+
+    let mut decrements: HashMap<Pba, (u32, u32)> = HashMap::new();
+    let mut freed = std::collections::HashSet::new();
+
+    for (new_value, outcome) in new_values.into_iter().zip(outcomes.into_iter()) {
+        let ApplyOutcome::L2pRemap {
+            applied,
+            prev,
+            freed_pba,
+        } = outcome
+        else {
+            return Err(OnyxError::Config(
+                "metadb returned non-remap outcome for remap batch".into(),
+            ));
+        };
+
+        if let Some(pba) = freed_pba {
+            freed.insert(from_metadb_pba(pba));
+        }
+
+        if !applied {
+            continue;
+        }
+        let Some(prev) = prev else {
+            continue;
+        };
+        let old = decode_l2p_value(prev)?;
+        if old.pba == new_value.pba {
+            continue;
+        }
+        let blocks = freed_blocks_for_l2p_value(&old);
+        let entry = decrements.entry(old.pba).or_insert((0, blocks));
+        entry.0 += 1;
+        entry.1 = entry.1.max(blocks);
+    }
+
+    decrements.retain(|pba, _| freed.contains(pba));
+    Ok(decrements)
 }
 
 pub(crate) fn to_metadb_pba(pba: Pba) -> onyx_metadb::Pba {
@@ -442,5 +555,56 @@ mod tests {
             backend.get_mappings_range(&vol.id, Lba(0), Lba(8)).unwrap(),
             vec![(Lba(3), value)]
         );
+    }
+
+    #[test]
+    fn atomic_batch_write_updates_refcounts_and_reports_freed_pba() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            rocksdb_path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            wal_dir: None,
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 8,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+
+        let old = BlockmapValue {
+            pba: Pba(10),
+            compression: 1,
+            unit_compressed_size: 2048,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 1,
+            slot_offset: 0,
+            flags: 0,
+        };
+        let new = BlockmapValue {
+            pba: Pba(20),
+            crc32: 2,
+            ..old
+        };
+
+        backend
+            .atomic_batch_write(&vol.id, &[(Lba(0), old), (Lba(1), old)], 2)
+            .unwrap();
+        assert_eq!(backend.get_refcount(Pba(10)).unwrap(), 2);
+
+        let freed = backend
+            .atomic_batch_write(&vol.id, &[(Lba(0), new), (Lba(1), new)], 2)
+            .unwrap();
+
+        assert_eq!(backend.get_refcount(Pba(10)).unwrap(), 0);
+        assert_eq!(backend.get_refcount(Pba(20)).unwrap(), 2);
+        assert_eq!(freed.get(&Pba(10)), Some(&(2, 1)));
     }
 }
