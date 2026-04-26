@@ -147,6 +147,23 @@ impl MetadbBackend {
         self.db.get(ord, lba.0)?.map(decode_l2p_value).transpose()
     }
 
+    pub(crate) fn put_mapping(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        value: &BlockmapValue,
+    ) -> OnyxResult<()> {
+        let ord = self.volume_ordinal(vol_id)?;
+        self.db.insert(ord, lba.0, to_l2p_value(value))?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<()> {
+        let ord = self.volume_ordinal(vol_id)?;
+        self.db.delete(ord, lba.0)?;
+        Ok(())
+    }
+
     pub(crate) fn multi_get_mappings(
         &self,
         vol_id: &VolumeId,
@@ -227,6 +244,45 @@ impl MetadbBackend {
     pub(crate) fn multi_get_refcounts(&self, pbas: &[Pba]) -> OnyxResult<Vec<u32>> {
         let pbas: Vec<onyx_metadb::Pba> = pbas.iter().map(|pba| to_metadb_pba(*pba)).collect();
         Ok(self.db.multi_get_refcount(&pbas)?)
+    }
+
+    pub(crate) fn set_refcount(&self, pba: Pba, count: u32) -> OnyxResult<()> {
+        let current = self.get_refcount(pba)?;
+        if count > current {
+            self.db.incref_pba(to_metadb_pba(pba), count - current)?;
+        } else if current > count {
+            self.db.decref_pba(to_metadb_pba(pba), current - count)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn increment_refcount(&self, pba: Pba) -> OnyxResult<u32> {
+        Ok(self.db.incref_pba(to_metadb_pba(pba), 1)?)
+    }
+
+    pub(crate) fn decrement_refcount(&self, pba: Pba) -> OnyxResult<u32> {
+        Ok(self.db.decref_pba(to_metadb_pba(pba), 1)?)
+    }
+
+    pub(crate) fn atomic_write_mapping(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        value: &BlockmapValue,
+    ) -> OnyxResult<()> {
+        self.atomic_batch_write(vol_id, &[(lba, *value)], 1)?;
+        Ok(())
+    }
+
+    pub(crate) fn atomic_remap(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        _old_pba: Option<Pba>,
+        new_value: &BlockmapValue,
+    ) -> OnyxResult<()> {
+        self.atomic_batch_write(vol_id, &[(lba, *new_value)], 1)?;
+        Ok(())
     }
 
     pub(crate) fn get_dedup(&self, hash: &ContentHash) -> OnyxResult<Option<DedupEntry>> {
@@ -370,6 +426,76 @@ impl MetadbBackend {
             .filter(|(_, _, value)| value.pba == target)
             .count();
         Ok(count as u32)
+    }
+
+    pub(crate) fn has_any_blockmap_ref(&self, target: Pba) -> OnyxResult<bool> {
+        Ok(self
+            .scan_all_blockmap_entries()?
+            .into_iter()
+            .any(|(_, _, value)| value.pba == target))
+    }
+
+    pub(crate) fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
+        self.db
+            .iter_refcounts()?
+            .map(|item| {
+                let (pba, rc) = item?;
+                Ok((from_metadb_pba(pba), rc))
+            })
+            .collect()
+    }
+
+    pub(crate) fn iter_dedup_entries(&self) -> OnyxResult<Vec<(ContentHash, DedupEntry)>> {
+        self.db
+            .iter_dedup()?
+            .map(|item| {
+                let (hash, value) = item?;
+                Ok((hash, decode_dedup_value(value)?))
+            })
+            .collect()
+    }
+
+    pub(crate) fn iter_dedup_reverse_entries(&self) -> OnyxResult<Vec<(Pba, ContentHash)>> {
+        let mut entries = Vec::new();
+        for (hash, entry) in self.iter_dedup_entries()? {
+            entries.push((entry.pba, hash));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn iter_allocated_blocks(&self) -> OnyxResult<Vec<(Pba, u32)>> {
+        let mut blocks: Vec<(Pba, u32)> = self
+            .scan_all_blockmap_entries()?
+            .into_iter()
+            .map(|(_, _, value)| (value.pba, freed_blocks_for_l2p_value(&value)))
+            .collect();
+        blocks.sort_unstable_by_key(|(pba, _)| *pba);
+        blocks.dedup_by_key(|(pba, _)| *pba);
+        Ok(blocks)
+    }
+
+    pub(crate) fn cleanup_orphaned_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
+        let refs = self.iter_refcounts()?;
+        let mut orphaned = Vec::new();
+        for (pba, rc) in refs {
+            if rc > 0 && !self.has_any_blockmap_ref(pba)? {
+                self.set_refcount(pba, 0)?;
+                orphaned.push((pba, rc));
+            }
+        }
+        Ok(orphaned)
+    }
+
+    pub(crate) fn rebuild_refcount_from_blockmap(&self) -> OnyxResult<()> {
+        Err(OnyxError::Config(
+            "refcount rebuild is not supported by metadb backend; WAL recovery owns refcount"
+                .into(),
+        ))
+    }
+
+    pub(crate) fn sync_durable(&self) -> OnyxResult<()> {
+        self.db.flush()?;
+        Ok(())
     }
 
     pub(crate) fn scan_dedup_skipped(
@@ -996,5 +1122,51 @@ mod tests {
         let freed = backend.delete_volume(&vol.id).unwrap();
         assert_eq!(freed, vec![(Pba(100), 1)]);
         assert!(backend.get_volume(&vol.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn diagnostic_helpers_track_refs_and_allocated_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            rocksdb_path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            wal_dir: None,
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 8,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+        let value = BlockmapValue {
+            pba: Pba(55),
+            compression: 1,
+            unit_compressed_size: 2048,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 1,
+            slot_offset: 0,
+            flags: 0,
+        };
+
+        backend
+            .atomic_write_mapping(&vol.id, Lba(0), &value)
+            .unwrap();
+        assert_eq!(backend.iter_refcounts().unwrap(), vec![(Pba(55), 1)]);
+        assert_eq!(backend.iter_allocated_blocks().unwrap(), vec![(Pba(55), 1)]);
+        assert!(backend.has_any_blockmap_ref(Pba(55)).unwrap());
+
+        backend.delete_mapping(&vol.id, Lba(0)).unwrap();
+        assert_eq!(
+            backend.cleanup_orphaned_refcounts().unwrap(),
+            vec![(Pba(55), 1)]
+        );
+        assert_eq!(backend.get_refcount(Pba(55)).unwrap(), 0);
     }
 }
