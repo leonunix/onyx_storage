@@ -46,7 +46,7 @@ impl MetaStore {
     }
 
     pub fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
-        Ok(MetaMemorySnapshot::default())
+        self.backend.memory_stats()
     }
 
     pub fn create_blockmap_cf(&self, vol_id: &str) -> OnyxResult<()> {

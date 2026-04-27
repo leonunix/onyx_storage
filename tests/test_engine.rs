@@ -344,6 +344,12 @@ fn engine_status_report_includes_metrics_sections() {
     assert!(report.contains("buffer_pending_entries:"));
     assert!(report.contains("metadb_block_cache_bytes:"));
     assert!(report.contains("metadb_meta_bytes:"));
+    assert!(report.contains("metadb_state:"));
+    assert!(report.contains("metadb_cache:"));
+    assert!(report.contains("metadb_commit:"));
+    assert!(report.contains("metadb_wal:"));
+    assert!(report.contains("metadb_range_delete:"));
+    assert!(report.contains("metadb_cleanup:"));
     assert!(report.contains("volume_ops:"));
     assert!(report.contains("read_path:"));
     assert!(report.contains("lv3_io:"));

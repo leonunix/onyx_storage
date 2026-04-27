@@ -11,6 +11,7 @@ use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
 use crate::meta::store::DedupHitResult;
+use crate::metrics::MetaMemorySnapshot;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
 use super::codec::{
@@ -528,6 +529,15 @@ impl MetadbBackend {
     pub(crate) fn sync_durable(&self) -> OnyxResult<()> {
         self.db.flush()?;
         Ok(())
+    }
+
+    pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
+        Ok(MetaMemorySnapshot::from_metadb(
+            self.db.last_applied_lsn(),
+            self.db.high_water(),
+            self.db.cache_stats(),
+            self.db.metrics_snapshot(),
+        ))
     }
 
     pub(crate) fn scan_dedup_skipped(
