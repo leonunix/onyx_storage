@@ -425,7 +425,9 @@ mod tests {
         let metrics = Arc::new(EngineMetrics::default());
         let pool = ReadPool::start(2, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics).unwrap();
 
-        let got = pool.submit_read(make_mapping(Pba(0), BLOCK_SIZE, crc)).unwrap();
+        let got = pool
+            .submit_read(make_mapping(Pba(0), BLOCK_SIZE, crc))
+            .unwrap();
         assert_eq!(got, payload);
     }
 
@@ -444,9 +446,8 @@ mod tests {
 
         let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
         let metrics = Arc::new(EngineMetrics::default());
-        let pool = Arc::new(
-            ReadPool::start(4, 64, &pool_dev, 0, BLOCK_SIZE, false, metrics).unwrap(),
-        );
+        let pool =
+            Arc::new(ReadPool::start(4, 64, &pool_dev, 0, BLOCK_SIZE, false, metrics).unwrap());
 
         let barrier = Arc::new(Barrier::new(8));
         let mut handles = Vec::new();
@@ -532,8 +533,7 @@ mod tests {
         // the scenario where pre-draining vs serial round-trip matters.
         let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
         let metrics = Arc::new(EngineMetrics::default());
-        let pool =
-            ReadPool::start(1, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics).unwrap();
+        let pool = ReadPool::start(1, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics).unwrap();
 
         let mut rxs = Vec::new();
         for i in 0..8 {

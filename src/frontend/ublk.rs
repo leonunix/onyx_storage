@@ -138,9 +138,7 @@ impl OnyxUblkTarget {
                                 // one decompress per unit, and the pool writes
                                 // straight into `io_slice` with no per-LBA
                                 // intermediate allocation.
-                                if offset_bytes % block_size == 0
-                                    && io_bytes % block_size == 0
-                                {
+                                if offset_bytes % block_size == 0 && io_bytes % block_size == 0 {
                                     let start_lba = Lba(offset_bytes / block_size);
                                     let lba_count = (io_bytes / block_size) as u32;
                                     match zm.submit_reads(
@@ -170,10 +168,8 @@ impl OnyxUblkTarget {
 
                                     while remaining > 0 {
                                         let block_lba = Lba(cur_offset / block_size);
-                                        let offset_in_block =
-                                            (cur_offset % block_size) as usize;
-                                        let avail_in_block =
-                                            block_size as usize - offset_in_block;
+                                        let offset_in_block = (cur_offset % block_size) as usize;
+                                        let avail_in_block = block_size as usize - offset_in_block;
                                         let copy_len = (remaining as usize).min(avail_in_block);
 
                                         match zm.submit_read_with_generation(
@@ -200,8 +196,7 @@ impl OnyxUblkTarget {
                                                 }
                                             }
                                             Ok(None) => {
-                                                io_slice[buf_offset..buf_offset + copy_len]
-                                                    .fill(0);
+                                                io_slice[buf_offset..buf_offset + copy_len].fill(0);
                                             }
                                             Err(e) => {
                                                 tracing::error!(

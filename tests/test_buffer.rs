@@ -1240,7 +1240,10 @@ fn uring_sync_loop_persists_and_recovers() {
     let recovered = pool2.recover().unwrap();
     assert_eq!(recovered.len(), 16, "all entries must survive restart");
     for (_, lba, expected) in &seqs {
-        let entry = pool2.lookup("uring-vol", *lba).unwrap().expect("lba must map");
+        let entry = pool2
+            .lookup("uring-vol", *lba)
+            .unwrap()
+            .expect("lba must map");
         assert_eq!(entry.start_lba, *lba);
         assert_eq!(entry.lba_count, 1);
         let payload = entry.payload.as_ref().expect("payload should hydrate");

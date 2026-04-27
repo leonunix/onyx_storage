@@ -343,9 +343,8 @@ impl OnyxVolume {
                         let src_end = (offset_in_block + copy_len).min(data.len());
                         let actual = src_end.saturating_sub(offset_in_block);
                         if actual > 0 {
-                            result[buf_offset..buf_offset + actual].copy_from_slice(
-                                &data[offset_in_block..offset_in_block + actual],
-                            );
+                            result[buf_offset..buf_offset + actual]
+                                .copy_from_slice(&data[offset_in_block..offset_in_block + actual]);
                         }
                     }
                     None => {
