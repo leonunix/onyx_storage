@@ -21,7 +21,7 @@ fn setup_flush_test_env() -> (
     let meta_dir = tempdir().unwrap();
     let meta = Arc::new(
         MetaStore::open(&MetaConfig {
-            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 0,
             wal_dir: None,

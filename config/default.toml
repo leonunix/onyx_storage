@@ -1,5 +1,5 @@
 [meta]
-rocksdb_path = "/data/onyx/rocksdb"
+path = "/data/onyx/metadb"
 block_cache_mb = 256
 # wal_dir = "/data/onyx/wal"
 

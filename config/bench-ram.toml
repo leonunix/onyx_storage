@@ -1,5 +1,5 @@
 [meta]
-rocksdb_path = "/Volumes/OnyxMetaRam/rocksdb"
+path = "/Volumes/OnyxMetaRam/metadb"
 block_cache_mb = 64
 
 [storage]

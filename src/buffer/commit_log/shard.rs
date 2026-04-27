@@ -46,9 +46,8 @@ impl<'a> ChunkReader<'a> {
         debug_assert!(disk_offset < self.capacity_bytes);
 
         let buf_end = self.buf_disk_start + self.buf_valid_bytes as u64;
-        let in_window = self.buf_valid_bytes > 0
-            && disk_offset >= self.buf_disk_start
-            && disk_offset < buf_end;
+        let in_window =
+            self.buf_valid_bytes > 0 && disk_offset >= self.buf_disk_start && disk_offset < buf_end;
         let need_refill = if !in_window {
             true
         } else {
@@ -350,7 +349,6 @@ impl BufferShard {
         }
         BufferEntry::from_bytes(&buf[..slot_bytes]).map(|entry| (entry, slot_count))
     }
-
 
     pub(super) fn rebuild_indices(
         device: &RawDevice,
@@ -1530,7 +1528,7 @@ impl BufferShard {
     }
 
     /// Memory-only: reclaim ring space, cancel write thread if needed.
-    /// No disk write — metadata commit to RocksDB is the durable record.
+    /// No disk write — metadata commit to metadb is the durable record.
     /// On crash recovery, stale "unflushed" entries are detected by
     /// cross-checking against the blockmap.
     ///

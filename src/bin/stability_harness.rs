@@ -45,7 +45,7 @@ fn write_and_abort(
 ) -> ! {
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: Some(meta_dir),
+            path: Some(meta_dir),
             block_cache_mb: 32,
             memtable_budget_mb: 0,
             wal_dir: None,
@@ -72,7 +72,7 @@ fn write_and_abort(
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
-        skip_fully_superseded: true,
+            skip_fully_superseded: true,
         },
         engine: EngineConfig {
             zone_count: 4,

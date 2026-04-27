@@ -660,22 +660,140 @@ pub struct BufferShardSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct RocksDbMemorySnapshot {
+pub struct MetaMemorySnapshot {
     pub block_cache_capacity_bytes: Option<u64>,
     pub block_cache_usage_bytes: Option<u64>,
     pub block_cache_pinned_usage_bytes: Option<u64>,
     pub cur_size_all_mem_tables_bytes: u64,
     pub size_all_mem_tables_bytes: u64,
     pub estimate_table_readers_mem_bytes: u64,
+    pub last_applied_lsn: u64,
+    pub high_water_pages: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_evictions: u64,
+    pub cache_current_pages: u64,
+    pub cache_capacity_bytes: u64,
+    pub cache_pinned_pages: u64,
+    pub cache_pin_budget_bytes: u64,
+    pub commit_attempts: u64,
+    pub commit_success: u64,
+    pub commit_errors: u64,
+    pub commit_empty: u64,
+    pub commit_ops: u64,
+    pub commit_total_us: u64,
+    pub commit_total_max_us: u64,
+    pub commit_apply_wait_us: u64,
+    pub commit_apply_wait_max_us: u64,
+    pub commit_apply_us: u64,
+    pub commit_apply_max_us: u64,
+    pub wal_submit_calls: u64,
+    pub wal_batches: u64,
+    pub wal_records: u64,
+    pub wal_bytes: u64,
+    pub wal_rotates: u64,
+    pub wal_fsyncs: u64,
+    pub wal_write_us: u64,
+    pub wal_write_max_us: u64,
+    pub wal_fsync_us: u64,
+    pub wal_fsync_max_us: u64,
+    pub wal_batch_records_max: u64,
+    pub wal_batch_bytes_max: u64,
+    pub range_delete_calls: u64,
+    pub range_delete_success: u64,
+    pub range_delete_errors: u64,
+    pub range_delete_noop: u64,
+    pub range_delete_captured_entries: u64,
+    pub range_delete_chunks: u64,
+    pub range_delete_total_us: u64,
+    pub range_delete_total_max_us: u64,
+    pub cleanup_calls: u64,
+    pub cleanup_success: u64,
+    pub cleanup_errors: u64,
+    pub cleanup_noop: u64,
+    pub cleanup_pbas: u64,
+    pub cleanup_hashes_found: u64,
+    pub cleanup_tombstones_emitted: u64,
+    pub cleanup_tx_ops: u64,
+    pub cleanup_total_us: u64,
+    pub cleanup_total_max_us: u64,
 }
 
-impl RocksDbMemorySnapshot {
+impl MetaMemorySnapshot {
     pub fn total_estimate_bytes(&self) -> Option<u64> {
         self.block_cache_usage_bytes.map(|block_cache| {
             block_cache
                 .saturating_add(self.size_all_mem_tables_bytes)
                 .saturating_add(self.estimate_table_readers_mem_bytes)
         })
+    }
+}
+
+impl MetaMemorySnapshot {
+    pub fn from_metadb(
+        last_applied_lsn: u64,
+        high_water_pages: u64,
+        cache: onyx_metadb::PageCacheStats,
+        meta: onyx_metadb::MetaMetricsSnapshot,
+    ) -> Self {
+        Self {
+            block_cache_capacity_bytes: Some(cache.capacity_bytes),
+            block_cache_usage_bytes: Some(cache.current_bytes),
+            block_cache_pinned_usage_bytes: Some(cache.pinned_bytes),
+            cur_size_all_mem_tables_bytes: 0,
+            size_all_mem_tables_bytes: 0,
+            estimate_table_readers_mem_bytes: 0,
+            last_applied_lsn,
+            high_water_pages,
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
+            cache_evictions: cache.evictions,
+            cache_current_pages: cache.current_pages,
+            cache_capacity_bytes: cache.capacity_bytes,
+            cache_pinned_pages: cache.pinned_pages,
+            cache_pin_budget_bytes: cache.pin_budget_bytes,
+            commit_attempts: meta.commit_attempts,
+            commit_success: meta.commit_success,
+            commit_errors: meta.commit_errors,
+            commit_empty: meta.commit_empty,
+            commit_ops: meta.commit_ops,
+            commit_total_us: meta.commit_total_us,
+            commit_total_max_us: meta.commit_total_max_us,
+            commit_apply_wait_us: meta.commit_apply_wait_us,
+            commit_apply_wait_max_us: meta.commit_apply_wait_max_us,
+            commit_apply_us: meta.commit_apply_us,
+            commit_apply_max_us: meta.commit_apply_max_us,
+            wal_submit_calls: meta.wal_submit_calls,
+            wal_batches: meta.wal_batches,
+            wal_records: meta.wal_records,
+            wal_bytes: meta.wal_bytes,
+            wal_rotates: meta.wal_rotates,
+            wal_fsyncs: meta.wal_fsyncs,
+            wal_write_us: meta.wal_write_us,
+            wal_write_max_us: meta.wal_write_max_us,
+            wal_fsync_us: meta.wal_fsync_us,
+            wal_fsync_max_us: meta.wal_fsync_max_us,
+            wal_batch_records_max: meta.wal_batch_records_max,
+            wal_batch_bytes_max: meta.wal_batch_bytes_max,
+            range_delete_calls: meta.range_delete_calls,
+            range_delete_success: meta.range_delete_success,
+            range_delete_errors: meta.range_delete_errors,
+            range_delete_noop: meta.range_delete_noop,
+            range_delete_captured_entries: meta.range_delete_captured_entries,
+            range_delete_chunks: meta.range_delete_chunks,
+            range_delete_total_us: meta.range_delete_total_us,
+            range_delete_total_max_us: meta.range_delete_total_max_us,
+            cleanup_calls: meta.cleanup_calls,
+            cleanup_success: meta.cleanup_success,
+            cleanup_errors: meta.cleanup_errors,
+            cleanup_noop: meta.cleanup_noop,
+            cleanup_pbas: meta.cleanup_pbas,
+            cleanup_hashes_found: meta.cleanup_hashes_found,
+            cleanup_tombstones_emitted: meta.cleanup_tombstones_emitted,
+            cleanup_tx_ops: meta.cleanup_tx_ops,
+            cleanup_total_us: meta.cleanup_total_us,
+            cleanup_total_max_us: meta.cleanup_total_max_us,
+        }
     }
 }
 
@@ -690,7 +808,7 @@ pub struct EngineStatusSnapshot {
     pub buffer_fill_pct: Option<u8>,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
-    pub rocksdb_memory: Option<RocksDbMemorySnapshot>,
+    pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
     pub allocator_total_blocks: Option<u64>,
@@ -721,24 +839,97 @@ impl EngineStatusSnapshot {
                 payload_bytes, limit
             );
         }
-        if let Some(rocksdb) = &self.rocksdb_memory {
+        if let Some(metadb) = &self.metadb_memory {
             let _ = writeln!(
                 out,
-                "rocksdb_block_cache_bytes: usage={} pinned={} capacity={}",
-                rocksdb.block_cache_usage_bytes.unwrap_or(0),
-                rocksdb.block_cache_pinned_usage_bytes.unwrap_or(0),
-                rocksdb.block_cache_capacity_bytes.unwrap_or(0)
+                "metadb_block_cache_bytes: usage={} pinned={} capacity={}",
+                metadb.block_cache_usage_bytes.unwrap_or(0),
+                metadb.block_cache_pinned_usage_bytes.unwrap_or(0),
+                metadb.block_cache_capacity_bytes.unwrap_or(0)
             );
             let _ = writeln!(
                 out,
-                "rocksdb_meta_bytes: memtables_current={} memtables_total={} table_readers={}",
-                rocksdb.cur_size_all_mem_tables_bytes,
-                rocksdb.size_all_mem_tables_bytes,
-                rocksdb.estimate_table_readers_mem_bytes
+                "metadb_meta_bytes: memtables_current={} memtables_total={} table_readers={}",
+                metadb.cur_size_all_mem_tables_bytes,
+                metadb.size_all_mem_tables_bytes,
+                metadb.estimate_table_readers_mem_bytes
             );
-            if let Some(total) = rocksdb.total_estimate_bytes() {
-                let _ = writeln!(out, "rocksdb_total_estimate_bytes: {}", total);
+            if let Some(total) = metadb.total_estimate_bytes() {
+                let _ = writeln!(out, "metadb_total_estimate_bytes: {}", total);
             }
+            let _ = writeln!(
+                out,
+                "metadb_state: last_applied_lsn={} high_water_pages={}",
+                metadb.last_applied_lsn, metadb.high_water_pages
+            );
+            let _ = writeln!(
+                out,
+                "metadb_cache: hits={} misses={} evictions={} pages={}/{} pinned_pages={} pin_budget_bytes={}",
+                metadb.cache_hits,
+                metadb.cache_misses,
+                metadb.cache_evictions,
+                metadb.cache_current_pages,
+                metadb.cache_capacity_bytes / 4096,
+                metadb.cache_pinned_pages,
+                metadb.cache_pin_budget_bytes
+            );
+            let _ = writeln!(
+                out,
+                "metadb_commit: attempts={} success={} errors={} empty={} ops={} total_us={} max_us={} apply_wait_us={} apply_wait_max_us={} apply_us={} apply_max_us={}",
+                metadb.commit_attempts,
+                metadb.commit_success,
+                metadb.commit_errors,
+                metadb.commit_empty,
+                metadb.commit_ops,
+                metadb.commit_total_us,
+                metadb.commit_total_max_us,
+                metadb.commit_apply_wait_us,
+                metadb.commit_apply_wait_max_us,
+                metadb.commit_apply_us,
+                metadb.commit_apply_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_wal: submits={} batches={} records={} bytes={} rotates={} fsyncs={} write_us={} write_max_us={} fsync_us={} fsync_max_us={} batch_records_max={} batch_bytes_max={}",
+                metadb.wal_submit_calls,
+                metadb.wal_batches,
+                metadb.wal_records,
+                metadb.wal_bytes,
+                metadb.wal_rotates,
+                metadb.wal_fsyncs,
+                metadb.wal_write_us,
+                metadb.wal_write_max_us,
+                metadb.wal_fsync_us,
+                metadb.wal_fsync_max_us,
+                metadb.wal_batch_records_max,
+                metadb.wal_batch_bytes_max
+            );
+            let _ = writeln!(
+                out,
+                "metadb_range_delete: calls={} success={} errors={} noop={} captured={} chunks={} total_us={} max_us={}",
+                metadb.range_delete_calls,
+                metadb.range_delete_success,
+                metadb.range_delete_errors,
+                metadb.range_delete_noop,
+                metadb.range_delete_captured_entries,
+                metadb.range_delete_chunks,
+                metadb.range_delete_total_us,
+                metadb.range_delete_total_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_cleanup: calls={} success={} errors={} noop={} pbas={} hashes_found={} tombstones={} tx_ops={} total_us={} max_us={}",
+                metadb.cleanup_calls,
+                metadb.cleanup_success,
+                metadb.cleanup_errors,
+                metadb.cleanup_noop,
+                metadb.cleanup_pbas,
+                metadb.cleanup_hashes_found,
+                metadb.cleanup_tombstones_emitted,
+                metadb.cleanup_tx_ops,
+                metadb.cleanup_total_us,
+                metadb.cleanup_total_max_us
+            );
         }
         if let (Some(free), Some(total)) = (self.allocator_free_blocks, self.allocator_total_blocks)
         {

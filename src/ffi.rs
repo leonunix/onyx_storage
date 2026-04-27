@@ -35,7 +35,7 @@ fn set_last_error(msg: &str) {
 fn error_code(e: &OnyxError) -> c_int {
     match e {
         OnyxError::Io(_) => ONYX_ERR_IO,
-        OnyxError::Meta(_) => ONYX_ERR_IO,
+        OnyxError::MetaDb(_) => ONYX_ERR_IO,
         OnyxError::SpaceExhausted => ONYX_ERR_NOSPACE,
         OnyxError::VolumeNotFound(_) => ONYX_ERR_NOTFOUND,
         OnyxError::Config(_) => ONYX_ERR_CONFIG,

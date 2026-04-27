@@ -179,7 +179,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 64,
             memtable_budget_mb: 0,
             wal_dir: None,
@@ -206,7 +206,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
-        skip_fully_superseded: true,
+            skip_fully_superseded: true,
         },
         engine: EngineConfig {
             zone_count: 4,

@@ -15,7 +15,7 @@ use tempfile::{tempdir, NamedTempFile};
 fn setup_worker() -> (ZoneWorker, Arc<MetaStore>) {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -44,7 +44,7 @@ fn setup_worker() -> (ZoneWorker, Arc<MetaStore>) {
 fn setup_zone_manager(zone_count: u32) -> ZoneManager {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -239,15 +239,15 @@ fn zone_manager_read_unmapped() {
 
 #[test]
 fn zone_manager_concurrent_reads_inline_no_serialization() {
+    use onyx_storage::io::uring::IoUringSession;
     use std::thread;
     use std::time::Duration;
-    use onyx_storage::io::uring::IoUringSession;
 
     // Build a zone manager that uses the io_uring backend so the inline
     // read path also exercises the new code in this configuration.
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -315,15 +315,15 @@ fn zone_manager_concurrent_reads_inline_no_serialization() {
 
 #[test]
 fn zone_manager_read_pool_decompresses_concurrently() {
-    use std::sync::Barrier;
-    use std::thread;
-    use std::time::Duration;
     use onyx_storage::buffer::flush::BufferFlusher;
     use onyx_storage::config::FlushConfig;
     use onyx_storage::io::read_pool::ReadPool;
     use onyx_storage::io::uring::IoUringSession;
     use onyx_storage::lifecycle::VolumeLifecycleManager;
     use onyx_storage::space::allocator::SpaceAllocator;
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Duration;
 
     // Stand up the full read path: WriteBufferPool → MetaStore → IoEngine
     // (uring backend) → ReadPool. Then write LZ4-compressible data through
@@ -331,7 +331,7 @@ fn zone_manager_read_pool_decompresses_concurrently() {
     // batched io_uring + parallel decompression works end-to-end.
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         wal_dir: None,
@@ -457,12 +457,9 @@ fn zone_manager_read_pool_decompresses_concurrently() {
                         .expect("read must succeed via ReadPool")
                         .expect("LBA must map after flush");
                     assert_eq!(
-                        got,
-                        payloads[i as usize],
+                        got, payloads[i as usize],
                         "thread {} round {} lba {} mismatch",
-                        t,
-                        round,
-                        i
+                        t, round, i
                     );
                 }
             }
@@ -481,7 +478,10 @@ fn zone_manager_read_pool_decompresses_concurrently() {
     let lv3_hits = metrics
         .read_lv3_hits
         .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(lv3_hits >= 32 * 16, "expected many lv3 hits, got {lv3_hits}");
+    assert!(
+        lv3_hits >= 32 * 16,
+        "expected many lv3 hits, got {lv3_hits}"
+    );
     assert_eq!(
         metrics
             .read_crc_errors

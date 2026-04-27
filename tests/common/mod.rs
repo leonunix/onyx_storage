@@ -35,7 +35,7 @@ impl Default for HarnessOptions {
                 compress_workers: 2,
                 coalesce_max_raw_bytes: 131072,
                 coalesce_max_lbas: 32,
-            skip_fully_superseded: true,
+                skip_fully_superseded: true,
             },
             gc: GcConfig {
                 enabled: false,
@@ -64,7 +64,7 @@ impl EngineHarness {
 
         let config = OnyxConfig {
             meta: MetaConfig {
-                rocksdb_path: Some(meta_dir.path().to_path_buf()),
+                path: Some(meta_dir.path().to_path_buf()),
                 block_cache_mb: 32,
                 memtable_budget_mb: 0,
                 wal_dir: None,
@@ -76,8 +76,8 @@ impl EngineHarness {
                 default_compression: CompressionAlgo::Lz4,
                 io_backend: Default::default(),
                 uring_sq_entries: 128,
-            read_pool_workers: 4,
-        },
+                read_pool_workers: 4,
+            },
             buffer: BufferConfig {
                 device: Some(buffer_file.path().to_path_buf()),
                 capacity_mb: ((options.buffer_bytes / 1024 / 1024).max(1)) as usize,
@@ -125,7 +125,7 @@ impl EngineHarness {
     }
 
     pub fn meta_path(&self) -> PathBuf {
-        self.config.meta.rocksdb_path.clone().unwrap()
+        self.config.meta.path.clone().unwrap()
     }
 
     pub fn buffer_path(&self) -> PathBuf {

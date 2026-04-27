@@ -26,7 +26,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 0,
             wal_dir: None,
@@ -342,8 +342,14 @@ fn engine_status_report_includes_metrics_sections() {
     assert!(report.contains("mode: active"));
     assert!(report.contains("volumes: 1"));
     assert!(report.contains("buffer_pending_entries:"));
-    assert!(report.contains("rocksdb_block_cache_bytes:"));
-    assert!(report.contains("rocksdb_meta_bytes:"));
+    assert!(report.contains("metadb_block_cache_bytes:"));
+    assert!(report.contains("metadb_meta_bytes:"));
+    assert!(report.contains("metadb_state:"));
+    assert!(report.contains("metadb_cache:"));
+    assert!(report.contains("metadb_commit:"));
+    assert!(report.contains("metadb_wal:"));
+    assert!(report.contains("metadb_range_delete:"));
+    assert!(report.contains("metadb_cleanup:"));
     assert!(report.contains("volume_ops:"));
     assert!(report.contains("read_path:"));
     assert!(report.contains("lv3_io:"));

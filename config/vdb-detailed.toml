@@ -1,7 +1,7 @@
 # Detailed single-disk test profile for a dedicated `/dev/vdb`.
 #
 # Expected layout on this host:
-#   /dev/vdb1 -> filesystem for RocksDB metadata
+#   /dev/vdb1 -> filesystem for metadb metadata
 #   /dev/vdb2 -> raw buffer device
 #   /dev/vdb3 -> raw data device
 #
@@ -18,10 +18,10 @@
 #   usable buffer capacity comes from the size of `buffer.device`.
 
 [meta]
-rocksdb_path = "/mnt/onyx-vdb-meta/rocksdb"
-# Shared RocksDB block cache across all CFs (blockmap + refcount + dedup_*).
+path = "/mnt/onyx-vdb-meta/metadb"
+# Shared metadb block cache across all CFs (blockmap + refcount + dedup_*).
 # Index + filter blocks are cached inside this budget too, so this is the hard
-# upper bound on RocksDB read-side memory. Scale with host RAM and working set
+# upper bound on metadb read-side memory. Scale with host RAM and working set
 # (e.g. 256 GiB box → 16384–32768; test box → 512–1024).
 block_cache_mb = 1024
 # Total memtable budget across all CFs (WriteBufferManager). 0 = auto = half

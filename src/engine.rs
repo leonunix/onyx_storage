@@ -10,8 +10,8 @@ use crate::gc::runner::GcRunner;
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
-use crate::io::uring::IoUringSession;
 use crate::io::superblock::{self, HeartbeatWriter};
+use crate::io::uring::IoUringSession;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
 use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, EngineStatusSnapshot};
@@ -42,7 +42,7 @@ pub struct OnyxEngine {
     gc_runner: Mutex<Option<GcRunner>>,
     dedup_scanner: Mutex<Option<DedupScanner>>,
     heartbeat_writer: Mutex<Option<HeartbeatWriter>>,
-    /// Background thread that periodically fsyncs RocksDB WAL, then advances
+    /// Background thread that periodically syncs metadata, then advances
     /// the buffer pool's `durable_seq` watermark so ring reclaim can safely
     /// proceed. Keeps the hot path at `WriteOptions::sync = false`.
     durability_watermark: Mutex<Option<DurabilityWatermarkHandle>>,
@@ -471,9 +471,7 @@ impl OnyxEngine {
 
         // 2b. Recovery branch based on clean/dirty shutdown marker.
         if superblock.is_clean_shutdown() {
-            tracing::info!(
-                "clean shutdown marker present — skipping refcount rebuild"
-            );
+            tracing::info!("clean shutdown marker present — skipping refcount rebuild");
         } else {
             tracing::warn!(
                 "dirty startup detected — rebuilding refcount CF from per-volume blockmap CFs"
@@ -852,10 +850,9 @@ impl OnyxEngine {
         // Zone manager shutdown is handled by Drop (it sends Shutdown to all workers)
         // We can't call shutdown(&mut self) through Arc, but Drop handles it.
 
-        // Stop the durability watermark thread. Its final iteration does one
-        // sync_durable (rocksdb flush_wal) which covers everything the flusher
-        // has mark_flushed'd right up to now — so by the time the thread has
-        // joined, RocksDB is physically durable for all acked writes.
+        // Stop the durability watermark thread. Its final sync covers
+        // everything the flusher has mark_flushed'd right up to now, so by the
+        // time the thread has joined, metadb is durable for all acked writes.
         if let Some(mut watermark) = self.durability_watermark.lock().unwrap().take() {
             watermark.stop();
         }
@@ -878,7 +875,8 @@ impl OnyxEngine {
         // slots so the next boot starts with a clean buffer log.
         if let Some(pool) = self.buffer_pool.as_ref() {
             pool.durable_seq_handle().store(
-                pool.max_flushed_seq_handle().load(std::sync::atomic::Ordering::Acquire),
+                pool.max_flushed_seq_handle()
+                    .load(std::sync::atomic::Ordering::Acquire),
                 std::sync::atomic::Ordering::Release,
             );
             if let Err(e) = pool.advance_tail() {
@@ -908,9 +906,7 @@ impl OnyxEngine {
                     }
                 }
                 Ok(None) => {
-                    tracing::warn!(
-                        "LV3 superblock missing at shutdown — cannot mark clean"
-                    );
+                    tracing::warn!("LV3 superblock missing at shutdown — cannot mark clean");
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "reading LV3 superblock failed at shutdown");
@@ -924,7 +920,7 @@ impl OnyxEngine {
 
     /// Upgrade from a meta-only engine to full mode, reusing the existing MetaStore.
     ///
-    /// This avoids the RocksDB exclusive directory lock problem: the old engine's
+    /// This avoids the metadb exclusive directory lock problem: the old engine's
     /// MetaStore Arc is shared with the new engine rather than opening a second one.
     pub fn upgrade_from_meta_only(meta: Arc<MetaStore>, config: &OnyxConfig) -> OnyxResult<Self> {
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
@@ -1155,7 +1151,7 @@ impl OnyxEngine {
                 .buffer_pool
                 .as_ref()
                 .map(|pool| pool.payload_memory_limit_bytes()),
-            rocksdb_memory: self.meta.memory_stats().ok(),
+            metadb_memory: self.meta.memory_stats().ok(),
             buffer_shards: self
                 .buffer_pool
                 .as_ref()

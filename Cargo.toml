@@ -9,7 +9,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 # metadata
-rocksdb = { version = "0.24", features = ["lz4", "zstd"] }
+onyx_metadb = { package = "onyx-metadb", path = "metadb" }
 
 # compression
 lz4_flex = "0.11"

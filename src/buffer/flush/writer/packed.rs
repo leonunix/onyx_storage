@@ -163,7 +163,7 @@ impl BufferFlusher {
         // Populate dedup index for newly written fragments.
         // Aggregate every fragment's hash → DedupEntry into one Vec and commit
         // them in a single `put_dedup_entries` call, so a packed slot with N
-        // fragments costs 1 RocksDB write instead of N.
+        // fragments costs 1 metadata write instead of N.
         let dedup_start = Instant::now();
         let mut dedup_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
         for frag in &sealed.fragments {
