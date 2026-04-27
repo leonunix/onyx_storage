@@ -223,6 +223,13 @@ impl MetaStore {
         self.backend.get_dedup(hash)
     }
 
+    pub fn multi_get_dedup_entries(
+        &self,
+        hashes: &[ContentHash],
+    ) -> OnyxResult<Vec<Option<DedupEntry>>> {
+        self.backend.multi_get_dedup(hashes)
+    }
+
     pub fn put_dedup_entries(&self, entries: &[(ContentHash, DedupEntry)]) -> OnyxResult<()> {
         self.backend.put_dedup_entries(entries)
     }

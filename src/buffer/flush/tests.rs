@@ -24,6 +24,7 @@ fn setup_flush_test_env() -> (
             path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 0,
+            index_pin_mb: 64,
             wal_dir: None,
         })
         .unwrap(),

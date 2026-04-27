@@ -91,6 +91,15 @@ pub struct EngineMetrics {
     pub buffer_hydration_head_bypass_count: AtomicU64,
     pub buffer_lookup_hits: AtomicU64,
     pub buffer_lookup_misses: AtomicU64,
+    /// Inner timing for `BufferPool::lookup`. `index_ns` is the time spent
+    /// probing the DashMap index across all shards (cheap path that returns
+    /// `None` when nothing is pending). `hydrate_ns` / `hydrate_ops` cover
+    /// the lazy `read_payload_from_disk` path taken when a hit's payload
+    /// isn't resident — this is the suspected ms-level cost source on the
+    /// read path. Both counters accumulate per-call across all shards.
+    pub buffer_lookup_index_ns: AtomicU64,
+    pub buffer_lookup_hydrate_ns: AtomicU64,
+    pub buffer_lookup_hydrate_ops: AtomicU64,
     pub buffer_read_ops: AtomicU64,
     pub buffer_read_bytes: AtomicU64,
     pub read_buffer_hits: AtomicU64,
@@ -109,6 +118,16 @@ pub struct EngineMetrics {
     pub read_unmapped: AtomicU64,
     pub read_crc_errors: AtomicU64,
     pub read_decompress_errors: AtomicU64,
+    /// `ZoneManager::submit_reads` timing breakdown. `*_calls` increments once
+    /// per outer `submit_reads` invocation; the three `*_ns` counters split
+    /// the wall time across the three phases. Phase counters only accumulate
+    /// when that phase actually ran (e.g. `meta_get_ns` is 0 if every LBA hit
+    /// the buffer; `unit_io_ns` is 0 if no LBA was mapped).
+    pub read_submit_calls: AtomicU64,
+    pub read_submit_total_ns: AtomicU64,
+    pub read_submit_buffer_lookup_ns: AtomicU64,
+    pub read_submit_meta_get_ns: AtomicU64,
+    pub read_submit_unit_io_ns: AtomicU64,
     pub coalesce_runs: AtomicU64,
     pub coalesced_units: AtomicU64,
     pub coalesced_lbas: AtomicU64,
@@ -230,6 +249,9 @@ impl Default for EngineMetrics {
             buffer_hydration_head_bypass_count: AtomicU64::new(0),
             buffer_lookup_hits: AtomicU64::new(0),
             buffer_lookup_misses: AtomicU64::new(0),
+            buffer_lookup_index_ns: AtomicU64::new(0),
+            buffer_lookup_hydrate_ns: AtomicU64::new(0),
+            buffer_lookup_hydrate_ops: AtomicU64::new(0),
             buffer_read_ops: AtomicU64::new(0),
             buffer_read_bytes: AtomicU64::new(0),
             read_buffer_hits: AtomicU64::new(0),
@@ -242,6 +264,11 @@ impl Default for EngineMetrics {
             read_unmapped: AtomicU64::new(0),
             read_crc_errors: AtomicU64::new(0),
             read_decompress_errors: AtomicU64::new(0),
+            read_submit_calls: AtomicU64::new(0),
+            read_submit_total_ns: AtomicU64::new(0),
+            read_submit_buffer_lookup_ns: AtomicU64::new(0),
+            read_submit_meta_get_ns: AtomicU64::new(0),
+            read_submit_unit_io_ns: AtomicU64::new(0),
             coalesce_runs: AtomicU64::new(0),
             coalesced_units: AtomicU64::new(0),
             coalesced_lbas: AtomicU64::new(0),
@@ -341,6 +368,9 @@ impl EngineMetrics {
             buffer_hydration_head_bypass_count: load(&self.buffer_hydration_head_bypass_count),
             buffer_lookup_hits: load(&self.buffer_lookup_hits),
             buffer_lookup_misses: load(&self.buffer_lookup_misses),
+            buffer_lookup_index_ns: load(&self.buffer_lookup_index_ns),
+            buffer_lookup_hydrate_ns: load(&self.buffer_lookup_hydrate_ns),
+            buffer_lookup_hydrate_ops: load(&self.buffer_lookup_hydrate_ops),
             buffer_read_ops: load(&self.buffer_read_ops),
             buffer_read_bytes: load(&self.buffer_read_bytes),
             read_buffer_hits: load(&self.read_buffer_hits),
@@ -353,6 +383,11 @@ impl EngineMetrics {
             read_unmapped: load(&self.read_unmapped),
             read_crc_errors: load(&self.read_crc_errors),
             read_decompress_errors: load(&self.read_decompress_errors),
+            read_submit_calls: load(&self.read_submit_calls),
+            read_submit_total_ns: load(&self.read_submit_total_ns),
+            read_submit_buffer_lookup_ns: load(&self.read_submit_buffer_lookup_ns),
+            read_submit_meta_get_ns: load(&self.read_submit_meta_get_ns),
+            read_submit_unit_io_ns: load(&self.read_submit_unit_io_ns),
             coalesce_runs: load(&self.coalesce_runs),
             coalesced_units: load(&self.coalesced_units),
             coalesced_lbas: load(&self.coalesced_lbas),
@@ -450,6 +485,9 @@ pub struct EngineMetricsSnapshot {
     pub buffer_hydration_head_bypass_count: u64,
     pub buffer_lookup_hits: u64,
     pub buffer_lookup_misses: u64,
+    pub buffer_lookup_index_ns: u64,
+    pub buffer_lookup_hydrate_ns: u64,
+    pub buffer_lookup_hydrate_ops: u64,
     pub buffer_read_ops: u64,
     pub buffer_read_bytes: u64,
     pub read_buffer_hits: u64,
@@ -462,6 +500,11 @@ pub struct EngineMetricsSnapshot {
     pub read_unmapped: u64,
     pub read_crc_errors: u64,
     pub read_decompress_errors: u64,
+    pub read_submit_calls: u64,
+    pub read_submit_total_ns: u64,
+    pub read_submit_buffer_lookup_ns: u64,
+    pub read_submit_meta_get_ns: u64,
+    pub read_submit_unit_io_ns: u64,
     pub coalesce_runs: u64,
     pub coalesced_units: u64,
     pub coalesced_lbas: u64,
@@ -566,6 +609,9 @@ impl EngineMetricsSnapshot {
             buffer_hydration_head_bypass_count,
             buffer_lookup_hits,
             buffer_lookup_misses,
+            buffer_lookup_index_ns,
+            buffer_lookup_hydrate_ns,
+            buffer_lookup_hydrate_ops,
             buffer_read_ops,
             buffer_read_bytes,
             read_buffer_hits,
@@ -578,6 +624,11 @@ impl EngineMetricsSnapshot {
             read_unmapped,
             read_crc_errors,
             read_decompress_errors,
+            read_submit_calls,
+            read_submit_total_ns,
+            read_submit_buffer_lookup_ns,
+            read_submit_meta_get_ns,
+            read_submit_unit_io_ns,
             coalesce_runs,
             coalesced_units,
             coalesced_lbas,
@@ -717,6 +768,29 @@ pub struct MetaMemorySnapshot {
     pub cleanup_tx_ops: u64,
     pub cleanup_total_us: u64,
     pub cleanup_total_max_us: u64,
+    pub apply_l2p_put_count: u64,
+    pub apply_l2p_put_us: u64,
+    pub apply_l2p_put_max_us: u64,
+    pub apply_l2p_delete_count: u64,
+    pub apply_l2p_delete_us: u64,
+    pub apply_l2p_delete_max_us: u64,
+    pub apply_l2p_remap_count: u64,
+    pub apply_l2p_remap_us: u64,
+    pub apply_l2p_remap_max_us: u64,
+    pub apply_l2p_range_delete_count: u64,
+    pub apply_l2p_range_delete_us: u64,
+    pub apply_l2p_range_delete_max_us: u64,
+    pub apply_refcount_count: u64,
+    pub apply_refcount_us: u64,
+    pub apply_refcount_max_us: u64,
+    pub apply_dedup_count: u64,
+    pub apply_dedup_us: u64,
+    pub apply_dedup_max_us: u64,
+    pub l2p_get_calls: u64,
+    pub l2p_get_lock_wait_us: u64,
+    pub l2p_get_lock_wait_max_us: u64,
+    pub l2p_get_tree_walk_us: u64,
+    pub l2p_get_tree_walk_max_us: u64,
 }
 
 impl MetaMemorySnapshot {
@@ -793,6 +867,29 @@ impl MetaMemorySnapshot {
             cleanup_tx_ops: meta.cleanup_tx_ops,
             cleanup_total_us: meta.cleanup_total_us,
             cleanup_total_max_us: meta.cleanup_total_max_us,
+            apply_l2p_put_count: meta.apply_l2p_put_count,
+            apply_l2p_put_us: meta.apply_l2p_put_us,
+            apply_l2p_put_max_us: meta.apply_l2p_put_max_us,
+            apply_l2p_delete_count: meta.apply_l2p_delete_count,
+            apply_l2p_delete_us: meta.apply_l2p_delete_us,
+            apply_l2p_delete_max_us: meta.apply_l2p_delete_max_us,
+            apply_l2p_remap_count: meta.apply_l2p_remap_count,
+            apply_l2p_remap_us: meta.apply_l2p_remap_us,
+            apply_l2p_remap_max_us: meta.apply_l2p_remap_max_us,
+            apply_l2p_range_delete_count: meta.apply_l2p_range_delete_count,
+            apply_l2p_range_delete_us: meta.apply_l2p_range_delete_us,
+            apply_l2p_range_delete_max_us: meta.apply_l2p_range_delete_max_us,
+            apply_refcount_count: meta.apply_refcount_count,
+            apply_refcount_us: meta.apply_refcount_us,
+            apply_refcount_max_us: meta.apply_refcount_max_us,
+            apply_dedup_count: meta.apply_dedup_count,
+            apply_dedup_us: meta.apply_dedup_us,
+            apply_dedup_max_us: meta.apply_dedup_max_us,
+            l2p_get_calls: meta.l2p_get_calls,
+            l2p_get_lock_wait_us: meta.l2p_get_lock_wait_us,
+            l2p_get_lock_wait_max_us: meta.l2p_get_lock_wait_max_us,
+            l2p_get_tree_walk_us: meta.l2p_get_tree_walk_us,
+            l2p_get_tree_walk_max_us: meta.l2p_get_tree_walk_max_us,
         }
     }
 }
@@ -918,6 +1015,37 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
+                "metadb_apply_by_op: l2p_put={}/{} (max={}) l2p_delete={}/{} (max={}) l2p_remap={}/{} (max={}) l2p_range_delete={}/{} (max={}) refcount={}/{} (max={}) dedup={}/{} (max={})",
+                metadb.apply_l2p_put_count,
+                metadb.apply_l2p_put_us,
+                metadb.apply_l2p_put_max_us,
+                metadb.apply_l2p_delete_count,
+                metadb.apply_l2p_delete_us,
+                metadb.apply_l2p_delete_max_us,
+                metadb.apply_l2p_remap_count,
+                metadb.apply_l2p_remap_us,
+                metadb.apply_l2p_remap_max_us,
+                metadb.apply_l2p_range_delete_count,
+                metadb.apply_l2p_range_delete_us,
+                metadb.apply_l2p_range_delete_max_us,
+                metadb.apply_refcount_count,
+                metadb.apply_refcount_us,
+                metadb.apply_refcount_max_us,
+                metadb.apply_dedup_count,
+                metadb.apply_dedup_us,
+                metadb.apply_dedup_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_l2p_get: calls={} lock_wait_us={} lock_wait_max_us={} tree_walk_us={} tree_walk_max_us={}",
+                metadb.l2p_get_calls,
+                metadb.l2p_get_lock_wait_us,
+                metadb.l2p_get_lock_wait_max_us,
+                metadb.l2p_get_tree_walk_us,
+                metadb.l2p_get_tree_walk_max_us
+            );
+            let _ = writeln!(
+                out,
                 "metadb_cleanup: calls={} success={} errors={} noop={} pbas={} hashes_found={} tombstones={} tx_ops={} total_us={} max_us={}",
                 metadb.cleanup_calls,
                 metadb.cleanup_success,
@@ -976,12 +1104,28 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "buffer_lookup_split: index_ns={} hydrate_ns={} hydrate_ops={}",
+            self.metrics.buffer_lookup_index_ns,
+            self.metrics.buffer_lookup_hydrate_ns,
+            self.metrics.buffer_lookup_hydrate_ops
+        );
+        let _ = writeln!(
+            out,
             "lv3_io: read_ops={} read_compressed_bytes={} read_decompressed_bytes={} write_ops={} write_compressed_bytes={}",
             self.metrics.lv3_read_ops,
             self.metrics.lv3_read_compressed_bytes,
             self.metrics.lv3_read_decompressed_bytes,
             self.metrics.lv3_write_ops,
             self.metrics.lv3_write_compressed_bytes
+        );
+        let _ = writeln!(
+            out,
+            "read_submit: calls={} total_ns={} buffer_lookup_ns={} meta_get_ns={} unit_io_ns={}",
+            self.metrics.read_submit_calls,
+            self.metrics.read_submit_total_ns,
+            self.metrics.read_submit_buffer_lookup_ns,
+            self.metrics.read_submit_meta_get_ns,
+            self.metrics.read_submit_unit_io_ns
         );
         let _ = writeln!(
             out,

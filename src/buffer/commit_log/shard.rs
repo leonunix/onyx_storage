@@ -1108,8 +1108,16 @@ impl BufferShard {
         vol_id: &str,
         lba: Lba,
     ) -> OnyxResult<Option<PendingEntry>> {
+        let index_started = Instant::now();
         let vid = self.intern_vol_id(vol_id);
-        let Some(entry_ref) = self.lba_index.get(&LbaKey { vol_id: vid, lba }) else {
+        let entry_ref = self.lba_index.get(&LbaKey { vol_id: vid, lba });
+        let index_elapsed = Self::elapsed_ns(index_started);
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_lookup_index_ns
+                .fetch_add(index_elapsed, Ordering::Relaxed);
+        }
+        let Some(entry_ref) = entry_ref else {
             return Ok(None);
         };
         let entry = &*entry_ref;
@@ -1123,7 +1131,18 @@ impl BufferShard {
         }
         // Lazy hydration: read payload from buffer device.
         let seq = entry.seq;
-        match self.read_payload_from_disk(entry) {
+        let hydrate_started = Instant::now();
+        let result = self.read_payload_from_disk(entry);
+        let hydrate_elapsed = Self::elapsed_ns(hydrate_started);
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_lookup_hydrate_ns
+                .fetch_add(hydrate_elapsed, Ordering::Relaxed);
+            metrics
+                .buffer_lookup_hydrate_ops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        match result {
             Ok(payload) => {
                 let mut hydrated = (**entry_ref).clone();
                 hydrated.payload = Some(payload);

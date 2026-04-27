@@ -338,66 +338,90 @@ impl BufferFlusher {
                     // Collect hit info for processing
                     let mut hit_infos: Vec<(usize, BlockmapValue, ContentHash)> = Vec::new();
 
+                    // Pass 1: hash every present block and collect the
+                    // indices we want to look up. Missing blocks keep the
+                    // sentinel hash so all_hashes stays index-aligned.
+                    let mut lookup_indices: Vec<usize> = Vec::with_capacity(lba_count);
                     for i in 0..lba_count {
                         let Some(block) = unit.raw_blocks.get(i) else {
                             all_hashes.push([0u8; 32]);
                             continue;
                         };
-                        let block_data = block.bytes();
-                        let hash: ContentHash = *blake3::hash(block_data).as_bytes();
+                        let hash: ContentHash = *blake3::hash(block.bytes()).as_bytes();
                         all_hashes.push(hash);
+                        lookup_indices.push(i);
+                    }
 
-                        // Look up dedup index
-                        metrics.dedup_lookup_ops.fetch_add(1, Ordering::Relaxed);
+                    // Single batched dedup-index lookup for the whole unit.
+                    // multi_get_dedup shares one LSM reader-drain + one
+                    // levels snapshot across all hashes.
+                    let lookup_hashes: Vec<ContentHash> =
+                        lookup_indices.iter().map(|&i| all_hashes[i]).collect();
+                    let entries: Vec<Option<DedupEntry>> = if lookup_hashes.is_empty() {
+                        Vec::new()
+                    } else {
                         let lookup_start = Instant::now();
-                        match meta.get_dedup_entry(&hash) {
-                            Ok(Some(entry)) => {
-                                Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
-                                metrics.dedup_live_check_ops.fetch_add(1, Ordering::Relaxed);
-                                let live_check_start = Instant::now();
-                                match meta.dedup_entry_is_live(&hash, &entry) {
-                                    Ok(true) => {
-                                        Self::record_elapsed(
-                                            &metrics.dedup_live_check_ns,
-                                            live_check_start,
-                                        );
-                                        is_hit[i] = true;
-                                        hit_infos.push((i, entry.to_blockmap_value(), hash));
-                                    }
-                                    Ok(false) => {
-                                        Self::record_elapsed(
-                                            &metrics.dedup_live_check_ns,
-                                            live_check_start,
-                                        );
-                                        metrics
-                                            .dedup_stale_index_entries
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        let stale_delete_start = Instant::now();
-                                        let _ = meta.delete_dedup_index(&hash);
-                                        Self::record_elapsed(
-                                            &metrics.dedup_stale_delete_ns,
-                                            stale_delete_start,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        Self::record_elapsed(
-                                            &metrics.dedup_live_check_ns,
-                                            live_check_start,
-                                        );
-                                        tracing::warn!(
-                                            error = %e,
-                                            pba = entry.pba.0,
-                                            "dedup worker: failed to validate dedup entry liveness"
-                                        );
-                                    }
-                                }
+                        let result = meta.multi_get_dedup_entries(&lookup_hashes);
+                        Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
+                        metrics
+                            .dedup_lookup_ops
+                            .fetch_add(lookup_hashes.len() as u64, Ordering::Relaxed);
+                        match result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "dedup worker: batched dedup lookup failed; treating unit as all-miss"
+                                );
+                                vec![None; lookup_hashes.len()]
+                            }
+                        }
+                    };
+
+                    // Pass 2: per-hit live check + stale cleanup. Same
+                    // semantics as the prior per-LBA loop, just driven by
+                    // the batched results.
+                    for (entry_pos, &i) in lookup_indices.iter().enumerate() {
+                        let Some(entry) = entries[entry_pos] else {
+                            continue;
+                        };
+                        let hash = all_hashes[i];
+                        metrics.dedup_live_check_ops.fetch_add(1, Ordering::Relaxed);
+                        let live_check_start = Instant::now();
+                        match meta.dedup_entry_is_live(&hash, &entry) {
+                            Ok(true) => {
+                                Self::record_elapsed(
+                                    &metrics.dedup_live_check_ns,
+                                    live_check_start,
+                                );
+                                is_hit[i] = true;
+                                hit_infos.push((i, entry.to_blockmap_value(), hash));
+                            }
+                            Ok(false) => {
+                                Self::record_elapsed(
+                                    &metrics.dedup_live_check_ns,
+                                    live_check_start,
+                                );
+                                metrics
+                                    .dedup_stale_index_entries
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let stale_delete_start = Instant::now();
+                                let _ = meta.delete_dedup_index(&hash);
+                                Self::record_elapsed(
+                                    &metrics.dedup_stale_delete_ns,
+                                    stale_delete_start,
+                                );
                             }
                             Err(e) => {
-                                Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
-                                tracing::warn!(error = %e, "dedup worker: failed to read dedup entry");
-                            }
-                            Ok(None) => {
-                                Self::record_elapsed(&metrics.dedup_lookup_ns, lookup_start);
+                                Self::record_elapsed(
+                                    &metrics.dedup_live_check_ns,
+                                    live_check_start,
+                                );
+                                tracing::warn!(
+                                    error = %e,
+                                    pba = entry.pba.0,
+                                    "dedup worker: failed to validate dedup entry liveness"
+                                );
                             }
                         }
                     }

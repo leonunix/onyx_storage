@@ -38,6 +38,33 @@ pub struct ZoneManager {
     read_pool: Option<Arc<ReadPool>>,
 }
 
+#[inline]
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// RAII guard that records elapsed wall time on drop. Used so `submit_reads`
+/// charges the total ns counter once on every exit (early-return paths and
+/// the success path) without having to thread the bookkeeping through each
+/// branch.
+struct ReadSubmitTimer<'a> {
+    counter: &'a std::sync::atomic::AtomicU64,
+    start: Instant,
+}
+
+impl<'a> ReadSubmitTimer<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicU64, start: Instant) -> Self {
+        Self { counter, start }
+    }
+}
+
+impl Drop for ReadSubmitTimer<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_add(elapsed_ns(self.start), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl ZoneManager {
     pub fn new(
         zone_count: u32,
@@ -259,9 +286,18 @@ impl ZoneManager {
         self.metrics
             .zone_read_dispatches
             .fetch_add(count as u64, Ordering::Relaxed);
+        self.metrics
+            .read_submit_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let total_start = Instant::now();
+        let _scope_total = ReadSubmitTimer::new(
+            &self.metrics.read_submit_total_ns,
+            total_start,
+        );
 
         // Pass 1: buffer lookups. Hits write directly into `out_buf`; misses
         // queue up for a single blockmap batch.
+        let pass1_start = Instant::now();
         let mut pending_lbas: Vec<Lba> = Vec::new();
         let mut pending_slots: Vec<u32> = Vec::new();
         for i in 0..count {
@@ -300,14 +336,21 @@ impl ZoneManager {
                 pending_slots.push(i);
             }
         }
+        self.metrics
+            .read_submit_buffer_lookup_ns
+            .fetch_add(elapsed_ns(pass1_start), Ordering::Relaxed);
 
         if pending_lbas.is_empty() {
             return Ok(());
         }
 
         // Pass 2: one batched metadb multi_get for the miss set.
+        let pass2_start = Instant::now();
         let vid = VolumeId(vol_id.to_string());
         let mappings = self.meta.multi_get_mappings(&vid, &pending_lbas)?;
+        self.metrics
+            .read_submit_meta_get_ns
+            .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
 
         // Pass 3: group mapped LBAs by (pba, slot_offset, unit_compressed_size)
         // — the on-disk unit identity. Zero-fill unmapped slots inline.
@@ -352,7 +395,8 @@ impl ZoneManager {
         // Pass 4: fan out unit reads. Send all first, then drain — the
         // ReadPool worker coalesces same-worker requests into one io_uring
         // submit, and other workers run in parallel.
-        if let Some(pool) = self.read_pool.as_deref() {
+        let pass4_start = Instant::now();
+        let pass4_result = if let Some(pool) = self.read_pool.as_deref() {
             let mut receivers = Vec::with_capacity(groups.len());
             let mut units: Vec<UnitGroup> = Vec::with_capacity(groups.len());
             for (_, group) in groups.into_iter() {
@@ -360,25 +404,56 @@ impl ZoneManager {
                 receivers.push(rx);
                 units.push(group);
             }
+            let mut result: OnyxResult<()> = Ok(());
             for (rx, group) in receivers.into_iter().zip(units.into_iter()) {
-                let payload = rx.recv().map_err(|_| {
+                match rx.recv().map_err(|_| {
                     crate::error::OnyxError::Io(std::io::Error::other("read-pool reply dropped"))
-                })??;
-                self.fan_out_unit(&payload, &group.members, out_buf)?;
+                }) {
+                    Ok(Ok(payload)) => {
+                        if let Err(e) = self.fan_out_unit(&payload, &group.members, out_buf) {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) | Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
             }
+            result
         } else {
             // Inline fallback: no pool configured. Still benefits from unit
             // coalescing — one IoEngine read + decompress per unit.
+            let mut result: OnyxResult<()> = Ok(());
             for (_, group) in groups.into_iter() {
                 let read_size = group.mapping.compressed_read_size(bs);
-                let raw = self.io_engine.read_blocks(group.mapping.pba, read_size)?;
-                let payload = read::decode_unit(&raw, &group.mapping, &self.metrics)?;
+                let raw = match self.io_engine.read_blocks(group.mapping.pba, read_size) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
+                let payload = match read::decode_unit(&raw, &group.mapping, &self.metrics) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
                 let payload_buf = payload.into_owned();
-                self.fan_out_unit(&payload_buf, &group.members, out_buf)?;
+                if let Err(e) = self.fan_out_unit(&payload_buf, &group.members, out_buf) {
+                    result = Err(e);
+                    break;
+                }
             }
-        }
-
-        Ok(())
+            result
+        };
+        self.metrics
+            .read_submit_unit_io_ns
+            .fetch_add(elapsed_ns(pass4_start), Ordering::Relaxed);
+        pass4_result
     }
 
     /// Copy each `(slot, offset_in_unit)` member's 4 KB from the decoded unit

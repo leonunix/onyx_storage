@@ -688,6 +688,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     let mut cfg = MetaDbConfig::new(path);
     cfg.page_cache_bytes = config.block_cache_bytes() as u64;
     cfg.lsm_memtable_bytes = config.memtable_budget_bytes() as u64;
+    cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg
 }
 
@@ -936,6 +937,7 @@ mod tests {
             path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
+            index_pin_mb: 64,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -969,6 +971,7 @@ mod tests {
             path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
+            index_pin_mb: 64,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1019,6 +1022,7 @@ mod tests {
             path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
+            index_pin_mb: 64,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1070,6 +1074,7 @@ mod tests {
             path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
+            index_pin_mb: 64,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1138,6 +1143,7 @@ mod tests {
             path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
+            index_pin_mb: 64,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1189,6 +1195,7 @@ mod tests {
             path: Some(dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 64,
+            index_pin_mb: 64,
             wal_dir: None,
         };
         let vol = VolumeConfig {

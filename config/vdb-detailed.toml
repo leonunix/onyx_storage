@@ -23,10 +23,15 @@ path = "/mnt/onyx-vdb-meta/metadb"
 # Index + filter blocks are cached inside this budget too, so this is the hard
 # upper bound on metadb read-side memory. Scale with host RAM and working set
 # (e.g. 256 GiB box → 16384–32768; test box → 512–1024).
-block_cache_mb = 1024
+block_cache_mb = 4096
 # Total memtable budget across all CFs (WriteBufferManager). 0 = auto = half
 # of block_cache_mb. Raise for write-heavy workloads, lower for read-heavy.
-memtable_budget_mb = 0
+# Pinned explicitly here so it doesn't track block_cache_mb / 2 = 2 GiB.
+memtable_budget_mb = 256
+# Index-page pin budget for the L2P paged radix. Lives outside the LRU so
+# random L2P gets never miss on inner nodes. 1 GiB covers ~hundreds of GiB
+# of leaf data; raise on large-memory boxes.
+index_pin_mb = 1024
 wal_dir = "/mnt/onyx-vdb-meta/wal"
 
 [storage]

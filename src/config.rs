@@ -117,6 +117,14 @@ pub struct MetaConfig {
     /// vs read-cache ratio (e.g. write-heavy: raise; read-heavy: lower).
     #[serde(default)]
     pub memtable_budget_mb: usize,
+    /// Per-`Db` upper bound on bytes used to pin L2P index pages in metadb's
+    /// page cache. Pinned pages live outside the LRU and never compete with
+    /// leaf capacity, so random L2P gets never miss on inner nodes. Index
+    /// pages are ~1/256 of leaf bytes, so 1 GiB covers on the order of
+    /// hundreds of GiB of leaf data. Default 1024 = 1 GiB; raise on
+    /// large-memory deployments. Set to 0 to disable.
+    #[serde(default = "default_index_pin_mb")]
+    pub index_pin_mb: usize,
     /// Optional separate WAL directory for the metadata store.
     pub wal_dir: Option<PathBuf>,
 }
@@ -145,6 +153,12 @@ impl MetaConfig {
             .saturating_mul(1024 * 1024)
             .max(8 * 1024 * 1024)
     }
+
+    /// Resolved index-pin budget in bytes. `index_pin_mb = 0` disables
+    /// pinning and lets index pages compete with leaves for LRU space.
+    pub fn index_pin_bytes(&self) -> usize {
+        self.index_pin_mb.saturating_mul(1024 * 1024)
+    }
 }
 
 impl Default for MetaConfig {
@@ -153,6 +167,7 @@ impl Default for MetaConfig {
             path: None,
             block_cache_mb: default_block_cache_mb(),
             memtable_budget_mb: 0,
+            index_pin_mb: default_index_pin_mb(),
             wal_dir: None,
         }
     }
@@ -353,6 +368,9 @@ fn default_zone_size_blocks() -> u64 {
 }
 fn default_block_cache_mb() -> usize {
     256
+}
+fn default_index_pin_mb() -> usize {
+    1024
 }
 fn default_block_size() -> u32 {
     4096
