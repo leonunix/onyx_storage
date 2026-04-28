@@ -11,6 +11,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
 
@@ -160,12 +161,12 @@ impl BufferFlusher {
             let _ = cleanup_tx.send(dead);
         }
 
-        // Populate dedup index for newly written fragments.
-        // Aggregate every fragment's hash → DedupEntry into one Vec and commit
-        // them in a single `put_dedup_entries` call, so a packed slot with N
-        // fragments costs 1 metadata write instead of N.
+        // Queue dedup index registration for newly written fragments.
+        // Registration is opportunistic and the background worker revalidates
+        // the blockmap entry before committing, so this no longer adds a
+        // second WAL/apply wait to the packed-slot hot path.
         let dedup_start = Instant::now();
-        let mut dedup_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
         for frag in &sealed.fragments {
             let Some(ref hashes) = frag.unit.block_hashes else {
                 continue;
@@ -176,9 +177,23 @@ impl BufferFlusher {
                 if hash == [0u8; 32] {
                     continue;
                 }
-                dedup_entries.push((
+                let lba = Lba(frag.unit.start_lba.0 + pos as u64);
+                let expected = BlockmapValue {
+                    pba: sealed.pba,
+                    compression: frag.unit.compression,
+                    unit_compressed_size: frag.unit.compressed_data.len() as u32,
+                    unit_original_size: frag.unit.original_size,
+                    unit_lba_count: frag.unit.lba_count as u16,
+                    offset_in_unit: pos as u16,
+                    crc32: frag.unit.crc32,
+                    slot_offset: frag.slot_offset,
+                    flags: 0,
+                };
+                dedup_registrations.push(DedupRegistration {
+                    vol_id: VolumeId(frag.unit.vol_id.clone()),
+                    lba,
                     hash,
-                    DedupEntry {
+                    entry: DedupEntry {
                         pba: sealed.pba,
                         slot_offset: frag.slot_offset,
                         compression: frag.unit.compression,
@@ -188,11 +203,12 @@ impl BufferFlusher {
                         offset_in_unit: pos as u16,
                         crc32: frag.unit.crc32,
                     },
-                ));
+                    expected,
+                });
             }
         }
-        if !dedup_entries.is_empty() {
-            meta.put_dedup_entries(&dedup_entries)?;
+        if !dedup_registrations.is_empty() {
+            let _ = dedup_register_tx.send(dedup_registrations);
         }
         Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 
@@ -225,5 +241,343 @@ impl BufferFlusher {
 
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
         Ok(())
+    }
+
+    /// Batched counterpart of [`write_packed_slot`]. Folds N sealed
+    /// slots into:
+    /// - one set of lifecycle read locks (sorted union of all touched
+    ///   volumes), held across the whole batch;
+    /// - one batched IO submit (`io_engine.submit_batch`) so the device
+    ///   queue depth grows with the batch instead of one write at a time;
+    /// - **one** `meta.atomic_batch_write_packed` call covering every
+    ///   surviving slot's blockmap entries — the metadb tx auto-derives
+    ///   refcount deltas from the L2pRemap ops, so concatenating batches
+    ///   from different slots is equivalent to issuing them serially;
+    /// - one background dedup registration batch for every surviving
+    ///   slot's newly-written fragments.
+    ///
+    /// Soak shows ~1 ms per metadb commit fixed cost (WAL fsync barrier
+    /// + per-shard apply lane scheduling); a sealed-slot batch of 10
+    /// drops 9 commits → ~10x throughput in the writer's metadata phase.
+    ///
+    /// Returns one `OnyxResult<()>` per input slot. Failure semantics
+    /// per slot:
+    /// - IO failure → that slot's PBA freed, slot dropped from the
+    ///   metadata commit, surviving slots still committed.
+    /// - Combined metadata commit failure → every surviving slot's PBA
+    ///   freed, all marked failed (caller queues whole-slot retries).
+    /// - Dedup put failure → logged, not rolled back (best-effort,
+    ///   matches `write_packed_slot` semantics).
+    pub(in crate::buffer::flush) fn write_packed_slots_batch(
+        _shard_idx: usize,
+        sealed_slots: &[SealedSlot],
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
+        metrics: &EngineMetrics,
+        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+    ) -> Vec<OnyxResult<()>> {
+        if sealed_slots.is_empty() {
+            return Vec::new();
+        }
+        let total_start = Instant::now();
+        let n = sealed_slots.len();
+        let mut results: Vec<OnyxResult<()>> = (0..n).map(|_| Ok(())).collect();
+
+        // Lifecycle locks: union of every fragment's vol_id, sorted to
+        // avoid deadlock with concurrent batches.
+        let mut vol_ids: Vec<String> = sealed_slots
+            .iter()
+            .flat_map(|s| s.fragments.iter().map(|f| f.unit.vol_id.clone()))
+            .collect();
+        vol_ids.sort();
+        vol_ids.dedup();
+        let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
+        let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
+
+        struct SlotMeta {
+            batch_values: Vec<(VolumeId, Lba, BlockmapValue)>,
+            all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
+            dedup_registrations: Vec<DedupRegistration>,
+        }
+        let mut slot_metas: Vec<Option<SlotMeta>> = (0..n).map(|_| None).collect();
+
+        // Phase 1: per-slot validation + build batch_values + dedup registrations.
+        // A slot whose every fragment is stale (volume deleted / version
+        // mismatch / no live positions) is dropped here and its PBA freed.
+        for (i, sealed) in sealed_slots.iter().enumerate() {
+            let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+            let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
+            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+
+            for frag in &sealed.fragments {
+                let unit = &frag.unit;
+                let vol_id = VolumeId(unit.vol_id.clone());
+
+                let should_discard = match meta.get_volume(&vol_id) {
+                    Ok(None) => true,
+                    Ok(Some(vc))
+                        if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
+                    {
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) => false,
+                };
+
+                if should_discard {
+                    metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
+                    for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                    }
+                    continue;
+                }
+
+                let live_positions = match Self::live_positions_for_unit(unit, pool) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Fragment scan failed — abandon this whole slot's
+                        // commit so we don't write a half-built batch_values
+                        // entry. Mark and skip.
+                        results[i] = Err(e);
+                        batch_values.clear();
+                        all_seq_lba_ranges.clear();
+                        dedup_registrations.clear();
+                        break;
+                    }
+                };
+                if live_positions.is_empty() {
+                    for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                    }
+                    continue;
+                }
+
+                let frag_lbas: Vec<Lba> = live_positions
+                    .iter()
+                    .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
+                    .collect();
+                for j in 0..live_positions.len() {
+                    let flags = if unit.dedup_skipped {
+                        FLAG_DEDUP_SKIPPED
+                    } else {
+                        0
+                    };
+                    batch_values.push((
+                        vol_id.clone(),
+                        frag_lbas[j],
+                        BlockmapValue {
+                            pba: sealed.pba,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: live_positions[j] as u16,
+                            crc32: unit.crc32,
+                            slot_offset: frag.slot_offset,
+                            flags,
+                        },
+                    ));
+                }
+                all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
+
+                if let Some(ref hashes) = unit.block_hashes {
+                    for &pos in &live_positions {
+                        let hash = hashes[pos];
+                        if hash == [0u8; 32] {
+                            continue;
+                        }
+                        let lba = Lba(unit.start_lba.0 + pos as u64);
+                        let expected = BlockmapValue {
+                            pba: sealed.pba,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: pos as u16,
+                            crc32: unit.crc32,
+                            slot_offset: frag.slot_offset,
+                            flags: 0,
+                        };
+                        dedup_registrations.push(DedupRegistration {
+                            vol_id: vol_id.clone(),
+                            lba,
+                            hash,
+                            entry: DedupEntry {
+                                pba: sealed.pba,
+                                slot_offset: frag.slot_offset,
+                                compression: unit.compression,
+                                unit_compressed_size: unit.compressed_data.len() as u32,
+                                unit_original_size: unit.original_size,
+                                unit_lba_count: unit.lba_count as u16,
+                                offset_in_unit: pos as u16,
+                                crc32: unit.crc32,
+                            },
+                            expected,
+                        });
+                    }
+                }
+            }
+
+            if batch_values.is_empty() {
+                // Either every fragment was stale or live_positions_for_unit
+                // failed. Free the PBA so the allocator reclaims it. If it
+                // was a hard error we already recorded that in `results[i]`.
+                let _ = allocator.free_one(sealed.pba);
+                continue;
+            }
+
+            slot_metas[i] = Some(SlotMeta {
+                batch_values,
+                all_seq_lba_ranges,
+                dedup_registrations,
+            });
+        }
+
+        // Phase 2: batched IO writes — one submit_batch keeps the NVMe
+        // queue full instead of one fsync-style write per slot.
+        let io_start = Instant::now();
+        {
+            use crate::io::engine::{LvOp, LvOpResult};
+            let mut ops: Vec<LvOp> = Vec::new();
+            let mut op_to_slot: Vec<usize> = Vec::new();
+            for i in 0..n {
+                if slot_metas[i].is_none() {
+                    continue;
+                }
+                ops.push(LvOp::Write {
+                    pba: sealed_slots[i].pba,
+                    payload: sealed_slots[i].data.as_slice(),
+                });
+                op_to_slot.push(i);
+            }
+            if !ops.is_empty() {
+                match io_engine.submit_batch(ops, false) {
+                    Ok(write_results) => {
+                        for (idx, r) in write_results.into_iter().enumerate() {
+                            let slot_idx = op_to_slot[idx];
+                            if let LvOpResult::Write(Err(e)) = r {
+                                let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                                results[slot_idx] =
+                                    Err(crate::error::OnyxError::Io(std::io::Error::other(
+                                        format!("packed-slot batch IO write failed: {e}"),
+                                    )));
+                                slot_metas[slot_idx] = None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for &slot_idx in &op_to_slot {
+                            if slot_metas[slot_idx].is_none() {
+                                continue;
+                            }
+                            let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                            results[slot_idx] =
+                                Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
+                                    "packed-slot batch IO submit failed: {e}"
+                                ))));
+                            slot_metas[slot_idx] = None;
+                        }
+                    }
+                }
+            }
+        }
+        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+
+        // Phase 3: ONE atomic_batch_write_packed for the union of all
+        // surviving slots' blockmap entries. The metadb backend ignores
+        // the `new_pba`/`new_refcount` args (refcount deltas are derived
+        // from the L2pRemap ops themselves), so a concatenated batch
+        // commits identically to issuing the slots one by one — minus
+        // the per-commit WAL fsync + apply-lane scheduling overhead.
+        let meta_start = Instant::now();
+        let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+        for i in 0..n {
+            if let Some(ref sm) = slot_metas[i] {
+                combined_batch_values.extend_from_slice(&sm.batch_values);
+            }
+        }
+
+        if !combined_batch_values.is_empty() {
+            // sealed_slots[surviving].pba is just a placeholder — backend ignores it.
+            let placeholder_pba = sealed_slots
+                .iter()
+                .enumerate()
+                .find_map(|(i, s)| slot_metas[i].as_ref().map(|_| s.pba))
+                .expect("at least one slot survived (combined_batch_values non-empty)");
+            match meta.atomic_batch_write_packed(&combined_batch_values, placeholder_pba, 0) {
+                Ok(actual_old_pba_meta) => {
+                    if !actual_old_pba_meta.is_empty() {
+                        let dead: Vec<(Pba, u32)> = actual_old_pba_meta
+                            .iter()
+                            .map(|(pba, (_, blocks))| (*pba, *blocks))
+                            .collect();
+                        let _ = cleanup_tx.send(dead);
+                    }
+                }
+                Err(e) => {
+                    // Whole batch's metadata commit failed — every surviving
+                    // slot is rolled back: free PBA, mark failed. Caller
+                    // queues per-slot retries via the existing path.
+                    for i in 0..n {
+                        if slot_metas[i].is_some() {
+                            let _ = allocator.free_one(sealed_slots[i].pba);
+                            results[i] = Err(crate::error::OnyxError::Io(std::io::Error::other(
+                                format!("packed-slot batch metadata commit failed: {e}"),
+                            )));
+                            slot_metas[i] = None;
+                        }
+                    }
+                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                    return results;
+                }
+            }
+        }
+        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+
+        // Phase 4: queue combined dedup registrations. Best-effort — a
+        // failure here only loses dedup opportunities, the L2P state is durable.
+        let dedup_start = Instant::now();
+        let mut all_dedup_registrations: Vec<DedupRegistration> = Vec::new();
+        for i in 0..n {
+            if let Some(ref sm) = slot_metas[i] {
+                all_dedup_registrations.extend_from_slice(&sm.dedup_registrations);
+            }
+        }
+        if !all_dedup_registrations.is_empty() {
+            let _ = dedup_register_tx.send(all_dedup_registrations);
+        }
+        Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
+
+        // Phase 5: counters + mark_flushed per surviving slot.
+        let mark_start = Instant::now();
+        for i in 0..n {
+            let Some(sm) = slot_metas[i].as_ref() else {
+                continue;
+            };
+            let sealed = &sealed_slots[i];
+            metrics
+                .flush_packed_slots_written
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .flush_packed_fragments_written
+                .fetch_add(sealed.fragments.len() as u64, Ordering::Relaxed);
+            metrics
+                .flush_packed_bytes
+                .fetch_add(sealed.data.len() as u64, Ordering::Relaxed);
+            for (seq, lba_start, lba_count) in &sm.all_seq_lba_ranges {
+                if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                    tracing::warn!(seq, error = %e, "failed to mark entry flushed (packed batch)");
+                }
+            }
+        }
+        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+        Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+
+        results
     }
 }

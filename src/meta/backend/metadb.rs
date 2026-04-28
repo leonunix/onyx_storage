@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use onyx_metadb::{ApplyOutcome, Config as MetaDbConfig, Db, DedupValue, L2pValue, VolumeOrdinal};
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,29 @@ const CATALOG_FILE: &str = "onyx-volume-catalog.bin";
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
 
 pub(crate) struct MetadbBackend {
-    db: Db,
+    db: Arc<Db>,
+    checkpoint: AsyncCheckpoint,
     catalog: Mutex<VolumeCatalog>,
     catalog_path: PathBuf,
+}
+
+struct AsyncCheckpoint {
+    state: Arc<(Mutex<CheckpointState>, Condvar)>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct CheckpointState {
+    requested: u64,
+    completed: u64,
+    failures: Vec<CheckpointFailure>,
+    shutdown: bool,
+}
+
+struct CheckpointFailure {
+    start: u64,
+    end: u64,
+    message: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,13 +81,16 @@ impl MetadbBackend {
         } else {
             Db::create_with_config(db_config)?
         };
+        let db = Arc::new(db);
 
         let catalog_path = path.join(CATALOG_FILE);
         let catalog = VolumeCatalog::load(&catalog_path)?;
         catalog.validate_against_db(&db)?;
+        let checkpoint = AsyncCheckpoint::start(db.clone())?;
 
         Ok(Self {
             db,
+            checkpoint,
             catalog: Mutex::new(catalog),
             catalog_path,
         })
@@ -422,13 +446,25 @@ impl MetadbBackend {
         hash: &ContentHash,
         entry: &DedupEntry,
     ) -> OnyxResult<bool> {
+        // Hot-path liveness check (one per dedup hit). Two semantics:
+        //   1. Re-lookup the forward index for `hash`. If it still
+        //      points at exactly `entry` (same pba + payload), the
+        //      original lookup hasn't been superseded by a concurrent
+        //      re-registration or tombstoned by `cleanup_dedup_for_dead_pbas`.
+        //      Forward lookup is a single LSM point query — bloom-filtered,
+        //      memtable-first, ~µs. The previous implementation prefix-scanned
+        //      `dedup_reverse` here, which `scan_dedup_reverse_for_pba`'s own
+        //      doc warns is "not suitable for hot-path queries" — soak shows
+        //      ~15 ms per call dominating dedup-worker time.
+        //   2. Short-circuit if the entry's pba already nets to refcount 0.
+        //      Cleanup runs lazily; the forward entry can momentarily point
+        //      at a doomed pba whose final decref already landed. Treating
+        //      it as live here would let us bump a refcount that's about
+        //      to be reclaimed.
         if self.get_refcount(entry.pba)? == 0 {
             return Ok(false);
         }
-        let hashes = self
-            .db
-            .scan_dedup_reverse_for_pba(to_metadb_pba(entry.pba))?;
-        Ok(hashes.iter().any(|candidate| candidate == hash))
+        Ok(self.get_dedup(hash)?.as_ref() == Some(entry))
     }
 
     pub(crate) fn cleanup_dedup_for_pbas_batch(&self, pbas: &[Pba]) -> OnyxResult<()> {
@@ -527,8 +563,11 @@ impl MetadbBackend {
     }
 
     pub(crate) fn sync_durable(&self) -> OnyxResult<()> {
-        self.db.flush()?;
-        Ok(())
+        self.checkpoint.sync()
+    }
+
+    pub(crate) fn request_durable_checkpoint(&self) -> OnyxResult<()> {
+        self.checkpoint.request_async()
     }
 
     pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
@@ -537,6 +576,7 @@ impl MetadbBackend {
             self.db.high_water(),
             self.db.cache_stats(),
             self.db.metrics_snapshot(),
+            self.db.pending_state(),
         ))
     }
 
@@ -627,6 +667,106 @@ impl MetadbBackend {
         }
         let (_, outcomes) = tx.commit_with_outcomes()?;
         dedup_hit_results_from_remaps(hits, outcomes)
+    }
+}
+
+impl AsyncCheckpoint {
+    fn start(db: Arc<Db>) -> OnyxResult<Self> {
+        let state = Arc::new((Mutex::new(CheckpointState::default()), Condvar::new()));
+        let worker_state = state.clone();
+        let thread = std::thread::Builder::new()
+            .name("metadb-checkpoint".into())
+            .spawn(move || loop {
+                let (start, target) = {
+                    let (lock, cvar) = &*worker_state;
+                    let mut state = lock.lock().unwrap();
+                    while state.requested == state.completed && !state.shutdown {
+                        state = cvar.wait(state).unwrap();
+                    }
+                    if state.shutdown && state.requested == state.completed {
+                        return;
+                    }
+                    (state.completed + 1, state.requested)
+                };
+
+                let result = db.flush();
+                let (lock, cvar) = &*worker_state;
+                let mut state = lock.lock().unwrap();
+                if let Err(err) = result {
+                    state.failures.push(CheckpointFailure {
+                        start,
+                        end: target,
+                        message: err.to_string(),
+                    });
+                }
+                state.completed = state.completed.max(target);
+                cvar.notify_all();
+            })
+            .map_err(OnyxError::Io)?;
+        Ok(Self {
+            state,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn request_async(&self) -> OnyxResult<()> {
+        self.request().map(|_| ())
+    }
+
+    fn sync(&self) -> OnyxResult<()> {
+        let token = self.request()?;
+        self.wait(token)
+    }
+
+    fn request(&self) -> OnyxResult<u64> {
+        let (lock, cvar) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        if state.shutdown {
+            return Err(OnyxError::Config(
+                "metadb checkpoint worker is shutting down".into(),
+            ));
+        }
+        state.requested = state
+            .requested
+            .checked_add(1)
+            .ok_or_else(|| OnyxError::Config("metadb checkpoint token overflow".into()))?;
+        let token = state.requested;
+        cvar.notify_one();
+        Ok(token)
+    }
+
+    fn wait(&self, token: u64) -> OnyxResult<()> {
+        let (lock, cvar) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        while state.completed < token {
+            state = cvar.wait(state).unwrap();
+        }
+        if let Some(failure) = state
+            .failures
+            .iter()
+            .find(|failure| failure.start <= token && token <= failure.end)
+        {
+            return Err(OnyxError::Config(format!(
+                "metadb checkpoint failed: {}",
+                failure.message
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncCheckpoint {
+    fn drop(&mut self) {
+        {
+            let (lock, cvar) = &*self.state;
+            let mut state = lock.lock().unwrap();
+            state.shutdown = true;
+            cvar.notify_all();
+        }
+        let handle = self.thread.lock().unwrap().take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
     }
 }
 

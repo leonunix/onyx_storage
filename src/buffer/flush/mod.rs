@@ -43,6 +43,7 @@ struct FlusherLane {
     dedup_handles: Vec<JoinHandle<()>>,
     compress_handles: Vec<JoinHandle<()>>,
     writer_handle: Option<JoinHandle<()>>,
+    dedup_register_handle: Option<JoinHandle<()>>,
     cleanup_handle: Option<JoinHandle<()>>,
 }
 
@@ -57,6 +58,15 @@ struct PackedSlotRetry {
     buffered_seqs: Vec<u64>,
     buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
     retry_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct DedupRegistration {
+    vol_id: VolumeId,
+    lba: Lba,
+    hash: ContentHash,
+    entry: DedupEntry,
+    expected: BlockmapValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,16 +367,31 @@ impl BufferFlusher {
         let mut lanes = Vec::with_capacity(lane_count);
 
         for shard_idx in 0..lane_count {
+            // Inter-stage channel sizes — sized to keep the writer's
+            // per-cycle drain (Self::WRITER_BATCH_SIZE) from starving
+            // when an upstream stage briefly stalls. Multipliers picked
+            // so write_rx exactly fits one full writer batch and the
+            // upstream stages have ~4 batches' worth of slack.
+            // Pre-2026-04-27 sizes were workers*4 (~8 slots), which
+            // capped writer drain at 8 units regardless of
+            // WRITER_BATCH_SIZE — bumping the const alone was a no-op.
+            //
             // Stage 1 → Stage 1.5 (dedup) or Stage 2 (compress)
-            let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(dedup_workers * 4);
+            let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(dedup_workers * 32);
             // Stage 1.5 → Stage 2
-            let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(compress_workers * 4);
-            // Stage 2 → Stage 3
-            let (write_tx, write_rx) = bounded::<CompressedUnit>(compress_workers * 4);
+            let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(compress_workers * 32);
+            // Stage 2 → Stage 3 — sized to one full writer batch so a
+            // single writer cycle can drain to capacity.
+            let (write_tx, write_rx) =
+                bounded::<CompressedUnit>(Self::WRITER_BATCH_SIZE.max(compress_workers * 4));
             // Stage 3 → Stage 1 (feedback: completed seqs)
             let (done_tx, done_rx) = unbounded::<Vec<u64>>();
             // Writer/dedup → cleanup thread (async dead PBA reclamation)
             let (cleanup_tx, cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+            // Writer → dedup registration thread. New dedup rows are
+            // opportunistic, so keep their WAL/apply work off the writer's
+            // critical path and batch them independently.
+            let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
             let running_c = running.clone();
             let pool_c = pool.clone();
@@ -461,6 +486,7 @@ impl BufferFlusher {
             let io_engine_w = io_engine.clone();
             let metrics_w = metrics.clone();
             let in_flight_w = in_flight.clone();
+            let dedup_register_tx_w = dedup_register_tx.clone();
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
@@ -479,9 +505,20 @@ impl BufferFlusher {
                         &mut packer,
                         &metrics_w,
                         &cleanup_tx,
+                        &dedup_register_tx_w,
                     );
                 })
                 .expect("failed to spawn writer thread");
+            drop(dedup_register_tx);
+
+            let meta_dr = meta.clone();
+            let metrics_dr = metrics.clone();
+            let dedup_register_handle = thread::Builder::new()
+                .name(format!("flusher-dedup-register-{}", shard_idx))
+                .spawn(move || {
+                    Self::dedup_register_loop(shard_idx, &dedup_register_rx, &meta_dr, &metrics_dr);
+                })
+                .expect("failed to spawn dedup registration thread");
 
             let running_cl = running.clone();
             let meta_cl = meta.clone();
@@ -506,6 +543,7 @@ impl BufferFlusher {
                 dedup_handles,
                 compress_handles,
                 writer_handle: Some(writer_handle),
+                dedup_register_handle: Some(dedup_register_handle),
                 cleanup_handle: Some(cleanup_handle),
             });
         }
@@ -569,6 +607,10 @@ impl BufferFlusher {
                 let _ = h.join();
             }
             if let Some(h) = lane.writer_handle.take() {
+                let _ = h.join();
+            }
+            // Dedup registration drains after writer stops and drops its sender.
+            if let Some(h) = lane.dedup_register_handle.take() {
                 let _ = h.join();
             }
             // Cleanup thread drains after writer stops (writer drop closes cleanup_tx).

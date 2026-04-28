@@ -4,7 +4,25 @@ mod packed;
 mod passthrough;
 
 impl BufferFlusher {
-    pub(super) const WRITER_BATCH_SIZE: usize = 32;
+    /// Maximum units a single writer cycle drains from `write_rx` and
+    /// folds into one combined metadb commit (packed slots through
+    /// `write_packed_slots_batch`, passthrough through `write_units_batch`).
+    ///
+    /// Bigger batch amortises the per-commit fixed cost — apply_gate
+    /// dispatch FIFO + WAL fsync barrier + lane scheduling. Soak
+    /// (2026-04-27) showed the bottleneck is **dispatch FIFO**: with
+    /// 30 ms apply_wait per commit, throughput is gated by commits/sec
+    /// not by per-op work, so 8x larger batches translate ~5x ops/sec.
+    /// 256 was picked as the cost/latency knee — 512 doubles per-commit
+    /// latency for marginal extra throughput; 1024 starts to bloat the
+    /// in-flight memory footprint per writer (~50 KB/unit avg ×
+    /// 1024 × 4 writers = 200 MB).
+    ///
+    /// Must stay paired with the bounded channel capacities in
+    /// [`BufferFlusher::start_with_metrics`] — write_rx in particular
+    /// caps at `WRITER_BATCH_SIZE`, so a smaller channel would silently
+    /// starve the writer below this batch.
+    pub(super) const WRITER_BATCH_SIZE: usize = 256;
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
     pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(50);
 
@@ -22,6 +40,7 @@ impl BufferFlusher {
         packer: &mut Packer,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) {
         let mut buffered_seqs: Vec<u64> = Vec::new();
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
@@ -35,7 +54,7 @@ impl BufferFlusher {
                 if !$batch.is_empty() {
                     let results = Self::write_units_batch(
                         shard_idx, &$batch, pool, meta, lifecycle, allocator,
-                        io_engine, metrics, cleanup_tx,
+                        io_engine, metrics, cleanup_tx, dedup_register_tx,
                     );
                     for (idx, result) in results.into_iter().enumerate() {
                         if let Err(e) = result {
@@ -86,6 +105,7 @@ impl BufferFlusher {
                 done_tx,
                 metrics,
                 cleanup_tx,
+                dedup_register_tx,
             ) {
                 tail_dirty = true;
             }
@@ -104,6 +124,7 @@ impl BufferFlusher {
                 done_tx,
                 metrics,
                 cleanup_tx,
+                dedup_register_tx,
             ) {
                 tail_dirty = true;
             }
@@ -113,8 +134,16 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if let Some(sealed) = packer.flush_open_slot() {
                         if let Err(e) = Self::write_packed_slot(
-                            shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine,
-                            metrics, cleanup_tx,
+                            shard_idx,
+                            &sealed,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            io_engine,
+                            metrics,
+                            cleanup_tx,
+                            dedup_register_tx,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             let failed_pba = sealed.pba;
@@ -156,11 +185,25 @@ impl BufferFlusher {
                 }
             }
 
-            // Run through packer, collect Passthrough units for batching.
+            // Run through packer, collect Passthrough AND SealedSlot
+            // batches. Each SealedSlot's metadata commit was previously
+            // issued inline (one metadb tx per slot — soak shows ~1 ms
+            // fixed cost in WAL fsync + apply-lane scheduling). The
+            // packed-slot batch (`packed_batch`) folds N sealed slots
+            // into one combined commit via `write_packed_slots_batch`.
+            // `packed_buffered_per_slot` captures the buffered_seqs /
+            // completions that belong to each sealed slot at the moment
+            // it sealed, so done_tx still fires per-slot after the batch
+            // commits.
             let mut pt_batch: Vec<CompressedUnit> = Vec::new();
             let mut pt_seqs: Vec<Vec<u64>> = Vec::new();
             let mut pt_completions: Vec<Option<Arc<crate::buffer::pipeline::DedupCompletion>>> =
                 Vec::new();
+            let mut packed_batch: Vec<SealedSlot> = Vec::new();
+            let mut packed_buffered_per_slot: Vec<(
+                Vec<u64>,
+                Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+            )> = Vec::new();
 
             for unit in incoming {
                 let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
@@ -177,64 +220,26 @@ impl BufferFlusher {
                         Some(dc) => buffered_completions.push(dc.clone()),
                     },
                     Ok(PackResult::SealedSlot(sealed)) => {
-                        flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
-                        if let Err(e) = Self::write_packed_slot(
-                            shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine,
-                            metrics, cleanup_tx,
-                        ) {
-                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            let failed_pba = sealed.pba;
-                            Self::queue_packed_slot_retry(
-                                &mut packed_retries,
-                                sealed,
-                                &mut buffered_seqs,
-                                &mut buffered_completions,
-                            );
-                            tracing::error!(
-                                pba = failed_pba.0,
-                                error = %e,
-                                "writer: failed to flush packed slot; queued whole-slot retry"
-                            );
-                        } else {
-                            Self::flush_buffered_done(
-                                &mut buffered_seqs,
-                                &mut buffered_completions,
-                                done_tx,
-                            );
-                            tail_dirty = true;
-                        }
+                        // Snapshot the buffered_seqs/completions that
+                        // were destined for the now-sealed open slot;
+                        // the current unit will accumulate into the
+                        // freshly opened next slot below.
+                        packed_buffered_per_slot.push((
+                            std::mem::take(&mut buffered_seqs),
+                            std::mem::take(&mut buffered_completions),
+                        ));
+                        packed_batch.push(sealed);
                         match &completion {
                             None => buffered_seqs.extend(&seqs),
                             Some(dc) => buffered_completions.push(dc.clone()),
                         }
                     }
                     Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
-                        flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
-                        if let Err(e) = Self::write_packed_slot(
-                            shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine,
-                            metrics, cleanup_tx,
-                        ) {
-                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            let failed_pba = sealed.pba;
-                            Self::queue_packed_slot_retry(
-                                &mut packed_retries,
-                                sealed,
-                                &mut buffered_seqs,
-                                &mut buffered_completions,
-                            );
-                            tracing::error!(
-                                pba = failed_pba.0,
-                                error = %e,
-                                "writer: failed to flush packed slot (passthrough fallback); queued whole-slot retry"
-                            );
-                        } else {
-                            Self::flush_buffered_done(
-                                &mut buffered_seqs,
-                                &mut buffered_completions,
-                                done_tx,
-                            );
-                            tail_dirty = true;
-                        }
+                        packed_buffered_per_slot.push((
+                            std::mem::take(&mut buffered_seqs),
+                            std::mem::take(&mut buffered_completions),
+                        ));
+                        packed_batch.push(sealed);
                         pt_batch.push(unit);
                         pt_seqs.push(seqs);
                         pt_completions.push(completion);
@@ -262,6 +267,57 @@ impl BufferFlusher {
                 }
             }
 
+            // Flush packed batch first so its commits land before the
+            // passthrough batch — preserves the historic ordering where a
+            // SealedSlot's metadata committed before any subsequent
+            // Passthrough unit's. The single combined metadb tx replaces
+            // N per-slot commits.
+            if !packed_batch.is_empty() {
+                let slot_results = Self::write_packed_slots_batch(
+                    shard_idx,
+                    &packed_batch,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    metrics,
+                    cleanup_tx,
+                    dedup_register_tx,
+                );
+                for ((sealed, result), (mut slot_seqs, mut slot_completions)) in packed_batch
+                    .into_iter()
+                    .zip(slot_results)
+                    .zip(packed_buffered_per_slot)
+                {
+                    match result {
+                        Err(e) => {
+                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                            let failed_pba = sealed.pba;
+                            Self::queue_packed_slot_retry(
+                                &mut packed_retries,
+                                sealed,
+                                &mut slot_seqs,
+                                &mut slot_completions,
+                            );
+                            tracing::error!(
+                                pba = failed_pba.0,
+                                error = %e,
+                                "writer: packed slot failed in batch; queued whole-slot retry"
+                            );
+                        }
+                        Ok(()) => {
+                            Self::flush_buffered_done(
+                                &mut slot_seqs,
+                                &mut slot_completions,
+                                done_tx,
+                            );
+                            tail_dirty = true;
+                        }
+                    }
+                }
+            }
+
             flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
         }
 
@@ -281,6 +337,7 @@ impl BufferFlusher {
                 &mut buffered_completions,
                 metrics,
                 cleanup_tx,
+                dedup_register_tx,
             );
             tail_dirty = true;
         }
@@ -296,14 +353,23 @@ impl BufferFlusher {
             done_tx,
             metrics,
             cleanup_tx,
+            dedup_register_tx,
         ) {
             tail_dirty = true;
         }
 
         if let Some(sealed) = packer.flush_open_slot() {
             if let Err(e) = Self::write_packed_slot(
-                shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
+                shard_idx,
+                &sealed,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                io_engine,
+                metrics,
                 cleanup_tx,
+                dedup_register_tx,
             ) {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(pba = sealed.pba.0, error = %e,
@@ -332,12 +398,22 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> bool {
         let Some(sealed) = packer.flush_open_slot_if_older_than(Self::PACKED_SLOT_MAX_AGE) else {
             return false;
         };
         if let Err(e) = Self::write_packed_slot(
-            shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics, cleanup_tx,
+            shard_idx,
+            &sealed,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            io_engine,
+            metrics,
+            cleanup_tx,
+            dedup_register_tx,
         ) {
             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
             let failed_pba = sealed.pba;
@@ -403,6 +479,7 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> bool {
         let Some(retry_at) = retries.front().map(|retry| retry.retry_at) else {
             return false;
@@ -438,6 +515,7 @@ impl BufferFlusher {
             io_engine,
             metrics,
             cleanup_tx,
+            dedup_register_tx,
         ) {
             Ok(()) => {
                 let mut buffered_seqs = retry.buffered_seqs;
@@ -475,6 +553,7 @@ impl BufferFlusher {
         buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) {
         let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
         let completion = unit.dedup_completion.clone();
@@ -501,8 +580,16 @@ impl BufferFlusher {
         match packer.pack_or_passthrough(unit) {
             Ok(PackResult::Passthrough(unit)) => {
                 if let Err(e) = Self::write_unit(
-                    shard_idx, &unit, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    shard_idx,
+                    &unit,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    metrics,
                     cleanup_tx,
+                    dedup_register_tx,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -521,8 +608,16 @@ impl BufferFlusher {
             },
             Ok(PackResult::SealedSlot(sealed)) => {
                 if let Err(e) = Self::write_packed_slot(
-                    shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    shard_idx,
+                    &sealed,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    metrics,
                     cleanup_tx,
+                    dedup_register_tx,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -542,8 +637,16 @@ impl BufferFlusher {
             }
             Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
                 if let Err(e) = Self::write_packed_slot(
-                    shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    shard_idx,
+                    &sealed,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    metrics,
                     cleanup_tx,
+                    dedup_register_tx,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -555,8 +658,16 @@ impl BufferFlusher {
                 Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
 
                 if let Err(e) = Self::write_unit(
-                    shard_idx, &unit, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    shard_idx,
+                    &unit,
+                    pool,
+                    meta,
+                    lifecycle,
+                    allocator,
+                    io_engine,
+                    metrics,
                     cleanup_tx,
+                    dedup_register_tx,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(

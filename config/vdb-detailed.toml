@@ -71,7 +71,7 @@ buffer_usage_resume_pct = 50
 max_rewrite_per_cycle = 64
 
 [dedup]
-enabled = true
+enabled = false
 workers = 4
 buffer_skip_threshold_pct = 90
 rescan_interval_ms = 30000

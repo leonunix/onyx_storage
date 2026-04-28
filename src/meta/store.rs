@@ -45,6 +45,10 @@ impl MetaStore {
         self.backend.sync_durable()
     }
 
+    pub fn request_durable_checkpoint(&self) -> OnyxResult<()> {
+        self.backend.request_durable_checkpoint()
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         self.backend.memory_stats()
     }

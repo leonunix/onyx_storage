@@ -11,6 +11,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
             let total_start = Instant::now();
@@ -161,18 +162,32 @@ impl BufferFlusher {
                 let _ = cleanup_tx.send(dead);
             }
 
-            // Populate dedup index for newly written blocks
+            // Queue dedup index registration for newly written blocks.
             let dedup_start = Instant::now();
             if let Some(ref hashes) = unit.block_hashes {
-                let mut dedup_entries = Vec::new();
+                let mut dedup_registrations = Vec::new();
                 for &pos in &live_positions {
                     let hash = hashes[pos];
                     if hash == [0u8; 32] {
                         continue; // Skip empty hashes
                     }
-                    dedup_entries.push((
+                    let lba = Lba(unit.start_lba.0 + pos as u64);
+                    let expected = BlockmapValue {
+                        pba,
+                        compression: unit.compression,
+                        unit_compressed_size: unit.compressed_data.len() as u32,
+                        unit_original_size: unit.original_size,
+                        unit_lba_count: unit.lba_count as u16,
+                        offset_in_unit: pos as u16,
+                        crc32: unit.crc32,
+                        slot_offset: 0,
+                        flags: 0,
+                    };
+                    dedup_registrations.push(DedupRegistration {
+                        vol_id: vol_id.clone(),
+                        lba,
                         hash,
-                        DedupEntry {
+                        entry: DedupEntry {
                             pba,
                             slot_offset: 0,
                             compression: unit.compression,
@@ -182,10 +197,11 @@ impl BufferFlusher {
                             offset_in_unit: pos as u16,
                             crc32: unit.crc32,
                         },
-                    ));
+                        expected,
+                    });
                 }
-                if !dedup_entries.is_empty() {
-                    meta.put_dedup_entries(&dedup_entries)?;
+                if !dedup_registrations.is_empty() {
+                    let _ = dedup_register_tx.send(dedup_registrations);
                 }
             }
             Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
@@ -225,7 +241,7 @@ impl BufferFlusher {
     /// 4. Batch IO writes
     /// 5. Batch multi_get old mappings
     /// 6. ONE metadata batch for all blockmap + refcount updates
-    /// 7. Batch cleanup + dedup index + mark_flushed
+    /// 7. Batch cleanup + queue dedup registration + mark_flushed
     pub(in crate::buffer::flush) fn write_units_batch(
         shard_idx: usize,
         units: &[CompressedUnit],
@@ -236,6 +252,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> Vec<OnyxResult<()>> {
         if units.is_empty() {
             return Vec::new();
@@ -503,7 +520,7 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
-        // Phase 6: Cleanup (free old PBAs) + dedup index.
+        // Phase 6: Cleanup (free old PBAs) + dedup registration queueing.
         //
         // `actual_old_pba_meta` now contains only PBAs that THIS batch actually
         // drove to refcount 0 (current_rc > 0 before, final_rc == 0 after).
@@ -511,7 +528,7 @@ impl BufferFlusher {
         // freed them, and double-freeing after re-allocation causes corruption.
         let cleanup_start = Instant::now();
 
-        let mut all_dedup_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        let mut all_dedup_registrations: Vec<DedupRegistration> = Vec::new();
 
         for &unit_idx in &meta_indices {
             if skip[unit_idx] {
@@ -529,16 +546,30 @@ impl BufferFlusher {
                 continue;
             }
 
-            // Collect dedup index entries for batch write
+            // Collect dedup index registrations for background batch write.
             if let Some(ref hashes) = unit.block_hashes {
                 for &pos in &um.live_positions {
                     let hash = hashes[pos];
                     if hash == [0u8; 32] {
                         continue;
                     }
-                    all_dedup_entries.push((
+                    let lba = Lba(unit.start_lba.0 + pos as u64);
+                    let expected = BlockmapValue {
+                        pba,
+                        compression: unit.compression,
+                        unit_compressed_size: unit.compressed_data.len() as u32,
+                        unit_original_size: unit.original_size,
+                        unit_lba_count: unit.lba_count as u16,
+                        offset_in_unit: pos as u16,
+                        crc32: unit.crc32,
+                        slot_offset: 0,
+                        flags: 0,
+                    };
+                    all_dedup_registrations.push(DedupRegistration {
+                        vol_id: VolumeId(unit.vol_id.clone()),
+                        lba,
                         hash,
-                        DedupEntry {
+                        entry: DedupEntry {
                             pba,
                             slot_offset: 0,
                             compression: unit.compression,
@@ -548,7 +579,8 @@ impl BufferFlusher {
                             offset_in_unit: pos as u16,
                             crc32: unit.crc32,
                         },
-                    ));
+                        expected,
+                    });
                 }
             }
 
@@ -565,9 +597,10 @@ impl BufferFlusher {
                 .collect();
             let _ = cleanup_tx.send(dead);
         }
-        // One batch for all new dedup index entries
-        if !all_dedup_entries.is_empty() {
-            let _ = meta.put_dedup_entries(&all_dedup_entries);
+        // Register new dedup index entries off the writer path. The
+        // background worker revalidates blockmap/refcount before committing.
+        if !all_dedup_registrations.is_empty() {
+            let _ = dedup_register_tx.send(all_dedup_registrations);
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 

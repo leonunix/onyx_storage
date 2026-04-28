@@ -215,6 +215,142 @@ impl BufferFlusher {
         }
     }
 
+    /// Background dedup registration: writer commits blockmap/refcount first,
+    /// then hands these best-effort rows here. We revalidate under the same PBA
+    /// cleanup locks used by allocator free so a late registration cannot race
+    /// with PBA reclamation and leave a stale dedup_index pointer behind.
+    pub(super) fn dedup_register_loop(
+        shard_idx: usize,
+        rx: &Receiver<Vec<DedupRegistration>>,
+        meta: &MetaStore,
+        metrics: &EngineMetrics,
+    ) {
+        const BATCH_WAIT: Duration = Duration::from_micros(500);
+        const BATCH_LIMIT: usize = 8192;
+
+        loop {
+            let first = match rx.recv() {
+                Ok(items) => items,
+                Err(_) => break,
+            };
+            let mut all = first;
+            let deadline = Instant::now() + BATCH_WAIT;
+            let mut disconnected = false;
+
+            while all.len() < BATCH_LIMIT {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(mut more) => all.append(&mut more),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            let count = all.len();
+            let start = Instant::now();
+            Self::register_dedup_batch(meta, &all, "dedup_register_thread");
+            Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, start);
+            tracing::debug!(
+                shard = shard_idx,
+                registrations = count,
+                "dedup register thread: batch processed"
+            );
+
+            if disconnected {
+                break;
+            }
+        }
+
+        let mut remaining = Vec::new();
+        while let Ok(mut batch) = rx.try_recv() {
+            remaining.append(&mut batch);
+        }
+        if !remaining.is_empty() {
+            let start = Instant::now();
+            Self::register_dedup_batch(meta, &remaining, "dedup_register_thread_drain");
+            Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, start);
+        }
+    }
+
+    fn register_dedup_batch(
+        meta: &MetaStore,
+        registrations: &[DedupRegistration],
+        context: &'static str,
+    ) {
+        if registrations.is_empty() {
+            return;
+        }
+
+        let mut pbas: Vec<Pba> = registrations.iter().map(|reg| reg.entry.pba).collect();
+        pbas.sort_unstable();
+        pbas.dedup();
+        let locks: Vec<_> = pbas.iter().map(|pba| Self::cleanup_lock(*pba)).collect();
+        let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+
+        let mut by_vol: HashMap<VolumeId, Vec<(usize, Lba)>> = HashMap::new();
+        for (idx, reg) in registrations.iter().enumerate() {
+            by_vol
+                .entry(reg.vol_id.clone())
+                .or_default()
+                .push((idx, reg.lba));
+        }
+
+        let mut valid: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        for (vol_id, items) in by_vol {
+            let lbas: Vec<Lba> = items.iter().map(|(_, lba)| *lba).collect();
+            let mappings = match meta.multi_get_mappings(&vol_id, &lbas) {
+                Ok(mappings) => mappings,
+                Err(e) => {
+                    tracing::warn!(
+                        vol = %vol_id,
+                        count = items.len(),
+                        error = %e,
+                        context,
+                        "dedup register: failed to validate blockmap batch"
+                    );
+                    continue;
+                }
+            };
+
+            for ((idx, _), mapping) in items.into_iter().zip(mappings.into_iter()) {
+                let reg = &registrations[idx];
+                if mapping != Some(reg.expected) {
+                    continue;
+                }
+                match meta.get_refcount(reg.entry.pba) {
+                    Ok(0) => continue,
+                    Ok(_) => valid.push((reg.hash, reg.entry)),
+                    Err(e) => {
+                        tracing::warn!(
+                            pba = reg.entry.pba.0,
+                            error = %e,
+                            context,
+                            "dedup register: failed to validate refcount"
+                        );
+                    }
+                }
+            }
+        }
+
+        if valid.is_empty() {
+            return;
+        }
+        if let Err(e) = meta.put_dedup_entries(&valid) {
+            tracing::warn!(
+                count = valid.len(),
+                error = %e,
+                context,
+                "dedup register: batched put_dedup_entries failed"
+            );
+        }
+    }
+
     pub(super) fn pba_lock(pba: Pba) -> Arc<Mutex<()>> {
         let mut locks = PBA_LOCKS
             .get_or_init(|| Mutex::new(HashMap::new()))

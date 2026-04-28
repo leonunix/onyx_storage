@@ -124,6 +124,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let newer = make_unit(0x33, 2);
     pool.note_latest_lba_seq_for_test("flush-race", Lba(0), 2, 1);
@@ -137,6 +138,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
         &io_engine,
         &metrics,
         &cleanup_tx,
+        &dedup_register_tx,
     )
     .unwrap();
 
@@ -151,6 +153,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
         &io_engine,
         &metrics,
         &cleanup_tx,
+        &dedup_register_tx,
     )
     .unwrap();
 
@@ -165,10 +168,49 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
 }
 
 #[test]
+fn dedup_registration_thread_registers_live_mapping_after_writer_commit() {
+    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+
+    let payload = vec![0x5A; BLOCK_SIZE as usize];
+    let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+    let seq = pool.append("flush-race", Lba(0), 1, &payload, 1).unwrap();
+    let mut unit = make_unit(0x5A, seq);
+    unit.block_hashes = Some(vec![hash]);
+
+    BufferFlusher::write_unit(
+        0,
+        &unit,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &cleanup_tx,
+        &dedup_register_tx,
+    )
+    .unwrap();
+
+    drop(dedup_register_tx);
+    BufferFlusher::dedup_register_loop(0, &dedup_register_rx, &meta, &metrics);
+
+    let mapping = meta
+        .get_mapping(&VolumeId("flush-race".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
+    assert_eq!(dedup.to_blockmap_value(), mapping);
+}
+
+#[test]
 fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let seq = pool
         .append("flush-race", Lba(0), 1, &vec![0x44; BLOCK_SIZE as usize], 1)
@@ -214,6 +256,7 @@ fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
         &io_engine,
         &metrics,
         &cleanup_tx,
+        &dedup_register_tx,
     )
     .unwrap();
 
@@ -472,6 +515,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     let (tx, rx) = bounded::<CompressedUnit>(64);
     let (done_tx, done_rx) = unbounded::<Vec<u64>>();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let running_w = running.clone();
     let pool_w = pool.clone();
@@ -481,6 +525,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     let io_engine_w = io_engine.clone();
     let metrics_w = metrics.clone();
     let cleanup_tx_w = cleanup_tx.clone();
+    let dedup_register_tx_w = dedup_register_tx.clone();
 
     let handle = thread::spawn(move || {
         let mut packer = Packer::new_with_lane(allocator_w.clone(), 0);
@@ -498,6 +543,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &mut packer,
             &metrics_w,
             &cleanup_tx_w,
+            &dedup_register_tx_w,
         );
     });
 
@@ -1304,6 +1350,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
     let vol_id = "flush-race";
     let vol = VolumeId(vol_id.into());
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
     let found_drift = AtomicBool::new(false);
     let barrier = Barrier::new(2);
     let rounds = 500;
@@ -1316,6 +1363,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
         let io_engine1 = &io_engine;
         let metrics1 = &metrics;
         let cleanup_tx1 = &cleanup_tx;
+        let dedup_register_tx1 = &dedup_register_tx;
         let barrier1 = &barrier;
         let vol1 = &vol;
 
@@ -1377,6 +1425,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
                     io_engine1,
                     metrics1,
                     cleanup_tx1,
+                    dedup_register_tx1,
                 );
             }
         });
@@ -1682,6 +1731,7 @@ fn packed_slot_overlapping_lba_race() {
 
     let vol_id = "flush-race";
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
     let found_drift = AtomicBool::new(false);
     let rounds = 1000;
 
@@ -1770,6 +1820,7 @@ fn packed_slot_overlapping_lba_race() {
                         &io_engine,
                         &metrics,
                         &cleanup_tx,
+                        &dedup_register_tx,
                     );
                 });
             }

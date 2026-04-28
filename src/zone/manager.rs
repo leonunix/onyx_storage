@@ -290,10 +290,7 @@ impl ZoneManager {
             .read_submit_calls
             .fetch_add(1, Ordering::Relaxed);
         let total_start = Instant::now();
-        let _scope_total = ReadSubmitTimer::new(
-            &self.metrics.read_submit_total_ns,
-            total_start,
-        );
+        let _scope_total = ReadSubmitTimer::new(&self.metrics.read_submit_total_ns, total_start);
 
         // Pass 1: buffer lookups. Hits write directly into `out_buf`; misses
         // queue up for a single blockmap batch.
