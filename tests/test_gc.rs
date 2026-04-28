@@ -77,6 +77,7 @@ fn setup_gc_env() -> TestEnv {
         path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -117,6 +118,7 @@ fn scanner_finds_candidates_with_dead_blocks() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -195,6 +197,7 @@ fn scanner_skips_below_threshold() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -248,6 +251,7 @@ fn scanner_skips_single_lba_units() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -279,6 +283,7 @@ fn scanner_sorts_by_dead_ratio_descending() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -636,6 +641,7 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -719,6 +725,7 @@ fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();

@@ -113,6 +113,7 @@ fn rebuild_from_metadata() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -188,6 +189,7 @@ fn rebuild_empty_metadata() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -208,6 +210,7 @@ fn rebuild_fully_allocated() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -232,6 +235,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
         path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();

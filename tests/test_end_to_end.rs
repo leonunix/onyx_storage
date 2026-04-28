@@ -59,6 +59,7 @@ fn setup_e2e() -> (
         path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -194,6 +195,7 @@ fn write_flush_read_zstd() {
         path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -243,6 +245,7 @@ fn write_flush_read_no_compression() {
         path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());

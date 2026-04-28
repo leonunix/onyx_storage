@@ -669,7 +669,7 @@ fn fully_superseded_entry_skipped_at_coalesce() {
         &test_metrics,
         true,
     );
-    assert_eq!(out, EnqueuePendingSeq::Skipped);
+    assert_eq!(out, EnqueuePendingSeq::Skipped(SkipReason::Superseded));
     assert!(new_entries.is_empty(), "superseded entry must not enqueue");
     let snap = test_metrics.snapshot();
     assert_eq!(snap.coalesce_superseded_entries, 1);

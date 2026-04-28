@@ -1486,10 +1486,7 @@ impl BufferShard {
         !self.lifecycle.lock().inflight.contains(&seq)
     }
 
-    pub(super) fn head_pending_entry_arc_hydrated_if_stuck(
-        &self,
-        min_age: Duration,
-    ) -> Option<Arc<PendingEntry>> {
+    pub(super) fn head_pending_seq_if_stuck(&self, min_age: Duration) -> Option<u64> {
         let head_seq = self
             .ring
             .lock()
@@ -1506,7 +1503,29 @@ impl BufferShard {
         if !has_partial_progress && !old_enough {
             return None;
         }
-        self.pending_entry_arc_hydrated(head_seq)
+        Some(head_seq)
+    }
+
+    /// Cheap, non-hydrating diagnostic snapshot for a given seq. Returns
+    /// (lba_count, flushed_count, age_ms, vol_id) so the flusher can correlate
+    /// "head stuck" symptoms with in_flight refcount and per-LBA flush progress
+    /// without paying the hydration cost of `pending_entry_arc_hydrated`.
+    pub(super) fn pending_diag_snapshot(&self, seq: u64) -> Option<(u32, u32, u64, String)> {
+        let entry = self.pending_entries.get(&seq)?;
+        let lba_count = entry.lba_count;
+        let age_ms = entry
+            .enqueued_at
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let vol_id = entry.vol_id.to_string();
+        drop(entry);
+        let flushed_count = self
+            .flush_progress
+            .get(&seq)
+            .map(|set| set.len() as u32)
+            .unwrap_or(0);
+        Some((lba_count, flushed_count, age_ms, vol_id))
     }
 
     pub(super) fn head_seq_debug_state(

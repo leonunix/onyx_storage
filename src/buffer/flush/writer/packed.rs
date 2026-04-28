@@ -485,6 +485,7 @@ impl BufferFlusher {
                 }
             }
         }
+        let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
         // Phase 3: ONE atomic_batch_write_packed for the union of all
@@ -537,6 +538,7 @@ impl BufferFlusher {
                 }
             }
         }
+        let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Phase 4: queue combined dedup registrations. Best-effort — a
@@ -576,7 +578,55 @@ impl BufferFlusher {
             }
         }
         Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+        let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+        if total_elapsed >= Duration::from_secs(1) {
+            let surviving = slot_metas.iter().filter(|s| s.is_some()).count();
+            match meta.memory_stats() {
+                Ok(meta_stats) => {
+                    tracing::warn!(
+                        slots = n,
+                        surviving,
+                        total_ms = total_elapsed.as_millis() as u64,
+                        io_ms = io_elapsed.as_millis() as u64,
+                        meta_ms = meta_elapsed.as_millis() as u64,
+                        metadb_last_applied_lsn = meta_stats.last_applied_lsn,
+                        metadb_high_water_pages = meta_stats.high_water_pages,
+                        metadb_commit_max_ms = meta_stats.commit_total_max_us / 1_000,
+                        metadb_commit_apply_wait_max_ms =
+                            meta_stats.commit_apply_wait_max_us / 1_000,
+                        metadb_commit_apply_gate_wait_max_ms =
+                            meta_stats.commit_apply_gate_wait_max_us / 1_000,
+                        metadb_commit_apply_max_ms = meta_stats.commit_apply_max_us / 1_000,
+                        metadb_wal_write_max_ms = meta_stats.wal_write_max_us / 1_000,
+                        metadb_wal_fsync_max_ms = meta_stats.wal_fsync_max_us / 1_000,
+                        metadb_wal_batch_records_max = meta_stats.wal_batch_records_max,
+                        metadb_pending_dispatch = meta_stats.pending_dispatch,
+                        metadb_pending_dedup_lane_q = meta_stats.pending_dedup_lane_queue,
+                        metadb_pending_l2p_apply_q = meta_stats.pending_l2p_apply_queue,
+                        metadb_pending_l2p_dirty = meta_stats.pending_l2p_pagebuf_dirty,
+                        metadb_pending_rc_apply_q = meta_stats.pending_rc_apply_queue,
+                        metadb_pending_rc_dirty = meta_stats.pending_rc_pagebuf_dirty,
+                        metadb_flush_total_max_ms = meta_stats.flush_total_max_us / 1_000,
+                        metadb_flush_io_max_ms = meta_stats.flush_io_max_us / 1_000,
+                        metadb_flush_install_max_ms = meta_stats.flush_install_max_us / 1_000,
+                        metadb_flush_reclaim_max_ms = meta_stats.flush_reclaim_max_us / 1_000,
+                        "writer: slow packed-slot batch (>=1s)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        slots = n,
+                        surviving,
+                        total_ms = total_elapsed.as_millis() as u64,
+                        io_ms = io_elapsed.as_millis() as u64,
+                        meta_ms = meta_elapsed.as_millis() as u64,
+                        metadb_stats_error = %e,
+                        "writer: slow packed-slot batch (>=1s)"
+                    );
+                }
+            }
+        }
 
         results
     }

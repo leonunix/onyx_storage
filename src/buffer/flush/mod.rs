@@ -70,9 +70,19 @@ struct DedupRegistration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    InFlight,
+    RetryDeferred,
+    AlreadySeen,
+    NoPendingEntry,
+    Superseded,
+    HydrationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnqueuePendingSeq {
     Queued,
-    Skipped,
+    Skipped(SkipReason),
     WindowFull,
 }
 
@@ -249,13 +259,18 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         skip_fully_superseded: bool,
     ) -> EnqueuePendingSeq {
-        if in_flight.contains_key(&seq) || !in_flight_tracker.retry_ready(seq) || !seen.insert(seq)
-        {
-            return EnqueuePendingSeq::Skipped;
+        if in_flight.contains_key(&seq) {
+            return EnqueuePendingSeq::Skipped(SkipReason::InFlight);
+        }
+        if !in_flight_tracker.retry_ready(seq) {
+            return EnqueuePendingSeq::Skipped(SkipReason::RetryDeferred);
+        }
+        if !seen.insert(seq) {
+            return EnqueuePendingSeq::Skipped(SkipReason::AlreadySeen);
         }
 
         let Some(meta) = pool.get_pending_arc(seq) else {
-            return EnqueuePendingSeq::Skipped;
+            return EnqueuePendingSeq::Skipped(SkipReason::NoPendingEntry);
         };
 
         // Fast-path drop: if every LBA in this entry has already been
@@ -287,7 +302,7 @@ impl BufferFlusher {
                 metrics
                     .coalesce_superseded_lbas
                     .fetch_add(meta.lba_count as u64, Ordering::Relaxed);
-                return EnqueuePendingSeq::Skipped;
+                return EnqueuePendingSeq::Skipped(SkipReason::Superseded);
             }
         }
 
@@ -303,7 +318,7 @@ impl BufferFlusher {
             new_entries.push(entry);
             EnqueuePendingSeq::Queued
         } else {
-            EnqueuePendingSeq::Skipped
+            EnqueuePendingSeq::Skipped(SkipReason::HydrationFailed)
         }
     }
 

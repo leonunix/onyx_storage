@@ -1204,15 +1204,9 @@ impl WriteBufferPool {
             .unwrap_or_default()
     }
 
-    pub fn head_stuck_pending_entry_arc_for_shard(
-        &self,
-        shard_idx: usize,
-        min_age: Duration,
-    ) -> Option<Arc<PendingEntry>> {
+    pub fn head_stuck_seq_for_shard(&self, shard_idx: usize, min_age: Duration) -> Option<u64> {
         self.shards.get(shard_idx).and_then(|shard| {
-            shard
-                .shard
-                .head_pending_entry_arc_hydrated_if_stuck(min_age)
+            shard.shard.head_pending_seq_if_stuck(min_age)
         })
     }
 
@@ -1220,6 +1214,19 @@ impl WriteBufferPool {
         self.shards
             .get(shard_idx)
             .and_then(|shard| shard.shard.flushed_offsets_snapshot(seq))
+    }
+
+    /// Cheap, non-hydrating diagnostic snapshot for a given (shard, seq).
+    /// Returns (lba_count, flushed_count, age_ms, vol_id). Used by the flusher
+    /// to log head-stuck states without triggering payload re-hydration.
+    pub fn pending_diag_snapshot_for_shard(
+        &self,
+        shard_idx: usize,
+        seq: u64,
+    ) -> Option<(u32, u32, u64, String)> {
+        self.shards
+            .get(shard_idx)
+            .and_then(|shard| shard.shard.pending_diag_snapshot(seq))
     }
 
     pub fn recv_ready_timeout(&self, timeout: Duration) -> Result<u64, RecvTimeoutError> {

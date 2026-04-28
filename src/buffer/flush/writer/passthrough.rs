@@ -331,6 +331,7 @@ impl BufferFlusher {
                 }
             }
         }
+        let alloc_elapsed = alloc_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
         // Phase 3: Batched IO writes — one submit per batch.
@@ -395,6 +396,7 @@ impl BufferFlusher {
                 }
             }
         }
+        let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
         // Phase 4: Build batch values + live positions.
@@ -518,6 +520,7 @@ impl BufferFlusher {
                 }
             }
         }
+        let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Phase 6: Cleanup (free old PBAs) + dedup registration queueing.
@@ -617,7 +620,20 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
         let _ = pool.advance_tail_for_shard(shard_idx);
 
+        let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+        if total_elapsed >= Duration::from_secs(1) {
+            tracing::warn!(
+                shard = shard_idx,
+                units = n,
+                live_units = meta_indices.len(),
+                total_ms = total_elapsed.as_millis() as u64,
+                alloc_ms = alloc_elapsed.as_millis() as u64,
+                io_ms = io_elapsed.as_millis() as u64,
+                meta_ms = meta_elapsed.as_millis() as u64,
+                "writer: slow passthrough batch (>=1s)"
+            );
+        }
         results
     }
 }

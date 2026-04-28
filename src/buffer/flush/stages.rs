@@ -34,6 +34,17 @@ impl BufferFlusher {
         let retry_snapshot_topup_limit = 64usize;
         let mut last_retry_snapshot = Instant::now();
 
+        // Head-stuck diagnostic: emit at most one warn per shard every
+        // DIAG_LOG_INTERVAL while the head is older than DIAG_AGE_THRESHOLD_MS.
+        // This narrows the "head pinned for minutes" mystery to one of two
+        // failure modes:
+        //   in_flight_count > 0  → writer-side path forgot to send done_tx
+        //   in_flight_count == 0 && flushed_count < lba_count → some LBA was
+        //                          never mark_flushed (no enqueue, no supersede)
+        let mut last_diag_log: Option<(u64, Instant)> = None;
+        const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(5);
+        const DIAG_AGE_THRESHOLD_MS: u64 = 3000;
+
         while running.load(Ordering::Relaxed) {
             // Drain completed seqs from writer feedback — decrement refcounts
             while let Ok(seqs) = done_rx.try_recv() {
@@ -55,17 +66,52 @@ impl BufferFlusher {
             // Always give the front of log_order a retry chance first. A single
             // partially flushed seq can otherwise starve behind newer ready work
             // and pin tail reclamation for minutes.
-            if let Some(entry) = pool
-                .head_stuck_pending_entry_arc_for_shard(shard_idx, Self::HEAD_RETRY_AGE_THRESHOLD)
+            if let Some(seq) =
+                pool.head_stuck_seq_for_shard(shard_idx, Self::HEAD_RETRY_AGE_THRESHOLD)
             {
-                let seq = entry.seq;
-                if !in_flight.contains_key(&seq)
-                    && in_flight_tracker.retry_ready(seq)
-                    && seen.insert(seq)
-                {
-                    queued_bytes =
-                        queued_bytes.saturating_add(Self::pending_entry_bytes(entry.as_ref()));
-                    new_entries.push(entry);
+                let diag_snapshot = pool.pending_diag_snapshot_for_shard(shard_idx, seq);
+                let enqueue_result = Self::try_enqueue_pending_seq(
+                    seq,
+                    pool,
+                    &in_flight,
+                    in_flight_tracker,
+                    &mut seen,
+                    &mut queued_bytes,
+                    &mut new_entries,
+                    metrics,
+                    skip_fully_superseded,
+                );
+                if let Some((lba_count, flushed_count, age_ms, vol_id)) = diag_snapshot {
+                    if age_ms >= DIAG_AGE_THRESHOLD_MS {
+                        let due = match last_diag_log {
+                            Some((logged_seq, ts)) => {
+                                logged_seq != seq || ts.elapsed() >= DIAG_LOG_INTERVAL
+                            }
+                            None => true,
+                        };
+                        if due {
+                            let in_flight_count =
+                                in_flight.get(&seq).copied().unwrap_or(0);
+                            let outcome = match enqueue_result {
+                                EnqueuePendingSeq::Queued => "Queued".to_string(),
+                                EnqueuePendingSeq::WindowFull => "WindowFull".to_string(),
+                                EnqueuePendingSeq::Skipped(r) => format!("Skipped({:?})", r),
+                            };
+                            tracing::warn!(
+                                shard = shard_idx,
+                                seq,
+                                age_ms,
+                                in_flight_count,
+                                flushed_count,
+                                lba_count,
+                                vol = %vol_id,
+                                outcome = %outcome,
+                                "head stuck >{}ms — diagnostic",
+                                DIAG_AGE_THRESHOLD_MS
+                            );
+                            last_diag_log = Some((seq, Instant::now()));
+                        }
+                    }
                 }
             }
 
