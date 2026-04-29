@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -5,12 +6,45 @@ use crate::buffer::pool::WriteBufferPool;
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
+use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, ZoneId, BLOCK_SIZE};
 use crate::zone::read;
+
+// Normal ublk reads top out at 1 MiB (256 LBAs in the detailed profile). Once
+// metadb range reads only touch the leaf shards covered by the request, the
+// range path is cheaper for medium/large reads because it skips per-LBA hole
+// probes on sparse volumes.
+const RANGE_META_LOOKUP_MIN_LBAS: u32 = 32;
+type ReadUnitKey = (u64, u16, u32);
+
+struct ReadUnitGroup {
+    mapping: BlockmapValue,
+    members: Vec<(usize, u16)>, // (out_buf slot, offset_in_unit)
+}
+
+fn push_read_unit_group(
+    groups: &mut HashMap<ReadUnitKey, ReadUnitGroup>,
+    slot: usize,
+    mapping: BlockmapValue,
+) {
+    let key: ReadUnitKey = (
+        mapping.pba.0,
+        mapping.slot_offset,
+        mapping.unit_compressed_size,
+    );
+    groups
+        .entry(key)
+        .or_insert_with(|| ReadUnitGroup {
+            mapping,
+            members: Vec::new(),
+        })
+        .members
+        .push((slot, mapping.offset_in_unit));
+}
 
 /// Routes IO across LBAs.
 ///
@@ -297,25 +331,39 @@ impl ZoneManager {
         let pass1_start = Instant::now();
         let mut pending_lbas: Vec<Lba> = Vec::new();
         let mut pending_slots: Vec<u32> = Vec::new();
-        for i in 0..count {
-            let lba = Lba(start_lba.0 + i as u64);
-            let slot = i as usize;
-            let dst = &mut out_buf[slot * bs..slot * bs + bs];
-            let hit = if let Some(pending) = self.buffer_pool.lookup(vol_id, lba)? {
-                if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
-                    if let Some(ref payload) = pending.payload {
-                        let offset = (lba.0 - pending.start_lba.0) as usize * bs;
-                        let end = offset + bs;
-                        if end <= payload.len() {
-                            dst.copy_from_slice(&payload[offset..end]);
-                            self.metrics
-                                .read_buffer_hits
-                                .fetch_add(1, Ordering::Relaxed);
-                            self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
-                            self.metrics
-                                .buffer_read_bytes
-                                .fetch_add(bs as u64, Ordering::Relaxed);
-                            true
+        if self.buffer_pool.pending_count() == 0 {
+            pending_lbas.reserve(count as usize);
+            pending_slots.reserve(count as usize);
+            for i in 0..count {
+                pending_lbas.push(Lba(start_lba.0 + i as u64));
+                pending_slots.push(i);
+            }
+        } else {
+            let buffer_hits = self
+                .buffer_pool
+                .lookup_primary_range(vol_id, start_lba, count)?;
+            for (i, hit) in buffer_hits.into_iter().enumerate() {
+                let lba = Lba(start_lba.0 + i as u64);
+                let slot = i;
+                let dst = &mut out_buf[slot * bs..slot * bs + bs];
+                let hit = if let Some(pending) = hit {
+                    if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
+                        if let Some(ref payload) = pending.payload {
+                            let offset = (lba.0 - pending.start_lba.0) as usize * bs;
+                            let end = offset + bs;
+                            if end <= payload.len() {
+                                dst.copy_from_slice(&payload[offset..end]);
+                                self.metrics
+                                    .read_buffer_hits
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
+                                self.metrics
+                                    .buffer_read_bytes
+                                    .fetch_add(bs as u64, Ordering::Relaxed);
+                                true
+                            } else {
+                                false
+                            }
                         } else {
                             false
                         }
@@ -324,13 +372,11 @@ impl ZoneManager {
                     }
                 } else {
                     false
+                };
+                if !hit {
+                    pending_lbas.push(lba);
+                    pending_slots.push(i as u32);
                 }
-            } else {
-                false
-            };
-            if !hit {
-                pending_lbas.push(lba);
-                pending_slots.push(i);
             }
         }
         self.metrics
@@ -341,49 +387,71 @@ impl ZoneManager {
             return Ok(());
         }
 
-        // Pass 2: one batched metadb multi_get for the miss set.
-        let pass2_start = Instant::now();
-        let vid = VolumeId(vol_id.to_string());
-        let mappings = self.meta.multi_get_mappings(&vid, &pending_lbas)?;
-        self.metrics
-            .read_submit_meta_get_ns
-            .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
-
         // Pass 3: group mapped LBAs by (pba, slot_offset, unit_compressed_size)
         // — the on-disk unit identity. Zero-fill unmapped slots inline.
-        use std::collections::HashMap;
-        type UnitKey = (u64, u16, u32);
-        struct UnitGroup {
-            mapping: crate::meta::schema::BlockmapValue,
-            members: Vec<(usize, u16)>, // (out_buf slot, offset_in_unit)
-        }
-        let mut groups: HashMap<UnitKey, UnitGroup> = HashMap::new();
+        let mut groups: HashMap<ReadUnitKey, ReadUnitGroup> = HashMap::new();
 
-        for (idx, mapping_opt) in mappings.into_iter().enumerate() {
-            let slot = pending_slots[idx] as usize;
-            match mapping_opt {
-                None => {
-                    let dst = &mut out_buf[slot * bs..slot * bs + bs];
-                    dst.fill(0);
-                    self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
+        // Pass 2: for real read requests we are looking up one contiguous LBA
+        // span. A range scan returns only mapped entries, which avoids paying
+        // one point lookup per hole when the volume is still sparse. Small
+        // reads stay on multi_get to keep the one-block path minimal.
+        let pass2_start = Instant::now();
+        let vid = VolumeId(vol_id.to_string());
+        if count >= RANGE_META_LOOKUP_MIN_LBAS {
+            for &slot in &pending_slots {
+                let slot = slot as usize;
+                out_buf[slot * bs..slot * bs + bs].fill(0);
+            }
+
+            let end_lba = Lba(start_lba.0 + count as u64);
+            let mapped = self
+                .meta
+                .get_mappings_range_unordered(&vid, start_lba, end_lba)?;
+            let mut mapped_pending = 0usize;
+            if pending_lbas.len() == count as usize {
+                for (lba, mapping) in mapped {
+                    let slot = (lba.0 - start_lba.0) as usize;
+                    if slot < count as usize {
+                        mapped_pending += 1;
+                        push_read_unit_group(&mut groups, slot, mapping);
+                    }
                 }
-                Some(mapping) => {
-                    let key: UnitKey = (
-                        mapping.pba.0,
-                        mapping.slot_offset,
-                        mapping.unit_compressed_size,
-                    );
-                    groups
-                        .entry(key)
-                        .or_insert_with(|| UnitGroup {
-                            mapping,
-                            members: Vec::new(),
-                        })
-                        .members
-                        .push((slot, mapping.offset_in_unit));
+            } else {
+                let mut pending_slot_by_lba: HashMap<u64, usize> =
+                    HashMap::with_capacity(pending_lbas.len());
+                for (lba, slot) in pending_lbas.iter().zip(pending_slots.iter().copied()) {
+                    pending_slot_by_lba.insert(lba.0, slot as usize);
+                }
+                for (lba, mapping) in mapped {
+                    if let Some(slot) = pending_slot_by_lba.get(&lba.0).copied() {
+                        mapped_pending += 1;
+                        push_read_unit_group(&mut groups, slot, mapping);
+                    }
+                }
+            }
+            let unmapped = pending_lbas.len().saturating_sub(mapped_pending);
+            self.metrics
+                .read_unmapped
+                .fetch_add(unmapped as u64, Ordering::Relaxed);
+        } else {
+            let mappings = self.meta.multi_get_mappings(&vid, &pending_lbas)?;
+            for (idx, mapping_opt) in mappings.into_iter().enumerate() {
+                let slot = pending_slots[idx] as usize;
+                match mapping_opt {
+                    None => {
+                        let dst = &mut out_buf[slot * bs..slot * bs + bs];
+                        dst.fill(0);
+                        self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(mapping) => {
+                        push_read_unit_group(&mut groups, slot, mapping);
+                    }
                 }
             }
         }
+        self.metrics
+            .read_submit_meta_get_ns
+            .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
 
         if groups.is_empty() {
             return Ok(());
@@ -395,7 +463,7 @@ impl ZoneManager {
         let pass4_start = Instant::now();
         let pass4_result = if let Some(pool) = self.read_pool.as_deref() {
             let mut receivers = Vec::with_capacity(groups.len());
-            let mut units: Vec<UnitGroup> = Vec::with_capacity(groups.len());
+            let mut units: Vec<ReadUnitGroup> = Vec::with_capacity(groups.len());
             for (_, group) in groups.into_iter() {
                 let rx = pool.submit_unit_read_async(group.mapping)?;
                 receivers.push(rx);

@@ -259,7 +259,11 @@ impl SpaceAllocator {
     /// handed out to a caller).
     pub fn is_free(&self, pba: Pba) -> bool {
         let free = self.free_extents.lock().unwrap();
-        if free.iter().any(|extent| extent.contains(pba)) {
+        if free
+            .range(..=Extent::single(pba))
+            .next_back()
+            .is_some_and(|extent| extent.contains(pba))
+        {
             return true;
         }
         drop(free);
@@ -372,7 +376,7 @@ impl SpaceAllocator {
     /// or all its blocks are sitting in lane caches.
     pub fn is_extent_free(&self, extent: Extent) -> bool {
         let free = self.free_extents.lock().unwrap();
-        if free.iter().any(|existing| {
+        if free.range(..=extent).next_back().is_some_and(|existing| {
             extent.start.0 >= existing.start.0 && extent.end_pba().0 <= existing.end_pba().0
         }) {
             return true;

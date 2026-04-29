@@ -41,8 +41,8 @@ impl BufferFlusher {
         //   in_flight_count > 0  → writer-side path forgot to send done_tx
         //   in_flight_count == 0 && flushed_count < lba_count → some LBA was
         //                          never mark_flushed (no enqueue, no supersede)
-        let mut last_diag_log: Option<(u64, Instant)> = None;
-        const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(5);
+        let mut last_diag_log: Option<Instant> = None;
+        const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(30);
         const DIAG_AGE_THRESHOLD_MS: u64 = 3000;
 
         while running.load(Ordering::Relaxed) {
@@ -84,9 +84,7 @@ impl BufferFlusher {
                 if let Some((lba_count, flushed_count, age_ms, vol_id)) = diag_snapshot {
                     if age_ms >= DIAG_AGE_THRESHOLD_MS {
                         let due = match last_diag_log {
-                            Some((logged_seq, ts)) => {
-                                logged_seq != seq || ts.elapsed() >= DIAG_LOG_INTERVAL
-                            }
+                            Some(ts) => ts.elapsed() >= DIAG_LOG_INTERVAL,
                             None => true,
                         };
                         if due {
@@ -108,7 +106,7 @@ impl BufferFlusher {
                                 "head stuck >{}ms — diagnostic",
                                 DIAG_AGE_THRESHOLD_MS
                             );
-                            last_diag_log = Some((seq, Instant::now()));
+                            last_diag_log = Some(Instant::now());
                         }
                     }
                 }
@@ -360,14 +358,24 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
         skip_threshold_pct: u8,
+        pending_skip_threshold_entries: u64,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
     ) {
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(mut unit) => {
-                    // Backpressure: skip dedup if this shard's buffer is filling up
-                    if pool.fill_percentage_for_shard(shard_idx) > skip_threshold_pct as u8 {
+                    // Backpressure: skip dedup if this shard's buffer is
+                    // filling up. Optionally also skip when the queue is deep:
+                    // large LV2 buffers can have tens of thousands of pending
+                    // entries while fill% is still low. Keep the pending gate
+                    // configurable so Optane/NVMe deployments can preserve a
+                    // stricter dedup-first foreground path.
+                    let pending_gate_tripped = pending_skip_threshold_entries > 0
+                        && pool.pending_count_for_shard(shard_idx) > pending_skip_threshold_entries;
+                    if pool.fill_percentage_for_shard(shard_idx) > skip_threshold_pct as u8
+                        || pending_gate_tripped
+                    {
                         unit.dedup_skipped = true;
                         metrics.dedup_skipped_units.fetch_add(1, Ordering::Relaxed);
                         if miss_tx.send(unit).is_err() {

@@ -89,21 +89,21 @@ impl GcRunner {
     ///
     /// When space is plentiful, only reclaim heavily fragmented slots.
     /// As space gets tighter, lower the threshold to reclaim more aggressively.
-    fn dynamic_threshold(cfg: &GcConfig, allocator: &SpaceAllocator) -> f64 {
+    fn dynamic_threshold(cfg: &GcConfig, allocator: &SpaceAllocator) -> Option<f64> {
         let total = allocator.total_block_count();
         if total == 0 {
-            return cfg.dead_ratio_threshold;
+            return Some(cfg.dead_ratio_threshold);
         }
         let free_pct = (allocator.free_block_count() * 100) / total;
 
         if free_pct > 50 {
-            0.70 // Plentiful — only GC very dead slots
+            None // Plentiful — do not scan the whole blockmap just to compact.
         } else if free_pct > 30 {
-            0.50 // Moderate pressure
+            Some(0.50) // Moderate pressure
         } else if free_pct > 10 {
-            0.30 // Getting tight
+            Some(0.30) // Getting tight
         } else {
-            cfg.dead_ratio_threshold // Critical — use configured minimum (default 0.25)
+            Some(cfg.dead_ratio_threshold) // Critical — use configured minimum (default 0.25)
         }
     }
 
@@ -157,7 +157,11 @@ impl GcRunner {
 
             // Smart GC: dynamic dead_ratio_threshold based on space pressure.
             // More aggressive reclamation when space is tight.
-            let threshold = Self::dynamic_threshold(&cfg, allocator);
+            let Some(threshold) = Self::dynamic_threshold(&cfg, allocator) else {
+                metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("gc: skipping scan while free space is plentiful");
+                continue;
+            };
 
             // Scan for GC rewrite candidates
             let candidates = match scan_gc_candidates(meta, threshold, cfg.max_rewrite_per_cycle) {

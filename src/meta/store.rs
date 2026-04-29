@@ -63,7 +63,7 @@ impl MetaStore {
         }
         self.put_volume(&VolumeConfig {
             id: VolumeId(vol_id.to_string()),
-            size_bytes: u64::MAX / u64::from(BLOCK_SIZE) * u64::from(BLOCK_SIZE),
+            size_bytes: u64::from(BLOCK_SIZE) * 1024,
             block_size: BLOCK_SIZE,
             compression: CompressionAlgo::None,
             created_at: 0,
@@ -131,6 +131,16 @@ impl MetaStore {
         end: Lba,
     ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
         self.backend.get_mappings_range(vol_id, start, end)
+    }
+
+    pub fn get_mappings_range_unordered(
+        &self,
+        vol_id: &VolumeId,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        self.backend
+            .get_mappings_range_unordered(vol_id, start, end)
     }
 
     pub fn delete_blockmap_range(

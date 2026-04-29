@@ -54,7 +54,11 @@ fn setup_flush_test_env() -> (
 
     meta.put_volume(&VolumeConfig {
         id: VolumeId("flush-race".into()),
-        size_bytes: 4096 * 1024,
+        // Packed/dedup stress cases below intentionally spread mappings far
+        // apart to avoid accidental overwrite between scenarios. Keep the
+        // test volume large enough that diagnostic full-blockmap scans include
+        // those high LBAs now that metadb scans are bounded by volume size.
+        size_bytes: 4096 * 1_000_000,
         block_size: 4096,
         compression: CompressionAlgo::None,
         created_at: 1,

@@ -12,6 +12,11 @@ pub struct DedupConfig {
     /// Skip dedup when buffer usage exceeds this percentage (default 90).
     #[serde(default = "default_buffer_skip_threshold_pct")]
     pub buffer_skip_threshold_pct: u8,
+    /// Skip foreground dedup when a buffer shard has more than this many
+    /// pending entries. 0 disables the pending-depth gate and keeps dedup
+    /// admission controlled only by buffer fill percentage.
+    #[serde(default)]
+    pub pending_skip_threshold_entries: u64,
     /// Background re-dedup scan interval in milliseconds (default 30000).
     #[serde(default = "default_rescan_interval_ms")]
     pub rescan_interval_ms: u64,
@@ -26,6 +31,7 @@ impl Default for DedupConfig {
             enabled: default_enabled(),
             workers: default_workers(),
             buffer_skip_threshold_pct: default_buffer_skip_threshold_pct(),
+            pending_skip_threshold_entries: 0,
             rescan_interval_ms: default_rescan_interval_ms(),
             max_rescan_per_cycle: default_max_rescan_per_cycle(),
         }

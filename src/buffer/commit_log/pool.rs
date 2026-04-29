@@ -1113,6 +1113,75 @@ impl WriteBufferPool {
         Ok(result)
     }
 
+    /// Fast lookup for the aligned batched read path.
+    ///
+    /// `ZoneManager::submit_write` splits writes at `routing_zone_size_blocks`
+    /// boundaries before appending to the buffer, so every LBA covered by a
+    /// pending entry maps back to the entry's primary shard. The full
+    /// [`lookup`](Self::lookup) keeps its cross-shard safety net for recovery
+    /// compatibility and odd direct callers; normal ublk reads use this method
+    /// to avoid `shard_count` DashMap probes per 4 KiB block.
+    pub fn lookup_primary(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<PendingEntry>> {
+        let primary = self.shard_for_lba(lba);
+        let result = self.shards[primary].shard.lookup_hydrated(vol_id, lba)?;
+        if let Some(metrics) = self.metrics.get() {
+            let counter = if result.is_some() {
+                &metrics.buffer_lookup_hits
+            } else {
+                &metrics.buffer_lookup_misses
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    /// Batched primary-shard lookup for a contiguous read span.
+    ///
+    /// This keeps read-after-write checks in the buffer layer, but removes
+    /// the hottest avoidable overhead from large reads: repeated volume-id
+    /// interning and routing work for every 4 KiB LBA. The span is split only
+    /// where the buffer routing shard changes.
+    pub fn lookup_primary_range(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+    ) -> OnyxResult<Vec<Option<PendingEntry>>> {
+        let mut out = Vec::with_capacity(lba_count as usize);
+        if lba_count == 0 {
+            return Ok(out);
+        }
+
+        let mut done = 0u32;
+        while done < lba_count {
+            let lba = Lba(start_lba.0 + done as u64);
+            let shard_idx = self.shard_for_lba(lba);
+            let shard = &self.shards[shard_idx].shard;
+            let vid = shard.intern_vol_id(vol_id);
+
+            let shard_end_lba =
+                ((lba.0 / self.routing_zone_size_blocks) + 1) * self.routing_zone_size_blocks;
+            let this_count = (lba_count - done)
+                .min(shard_end_lba.saturating_sub(lba.0).min(u32::MAX as u64) as u32);
+            for i in 0..this_count {
+                out.push(shard.lookup_hydrated_interned(&vid, Lba(lba.0 + i as u64))?);
+            }
+            done += this_count;
+        }
+
+        if let Some(metrics) = self.metrics.get() {
+            for result in &out {
+                let counter = if result.is_some() {
+                    &metrics.buffer_lookup_hits
+                } else {
+                    &metrics.buffer_lookup_misses
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn pending_entry(&self, seq: u64) -> Option<BufferEntry> {
         self.shard_for_seq(seq)
             .and_then(|idx| self.shards[idx].shard.pending_entry(seq))
@@ -1340,6 +1409,13 @@ impl WriteBufferPool {
             .iter()
             .map(|shard| shard.shard.pending_count())
             .sum()
+    }
+
+    pub fn pending_count_for_shard(&self, shard_idx: usize) -> u64 {
+        self.shards
+            .get(shard_idx)
+            .map(|shard| shard.shard.pending_count())
+            .unwrap_or(0)
     }
 
     pub fn capacity(&self) -> u64 {

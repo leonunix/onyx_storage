@@ -1829,6 +1829,15 @@ fn prove_background_gc_runner_reclaims_old_units() {
         .unwrap();
     let vol = env.engine.open_volume("gc-bg").unwrap();
 
+    // The GC runner now deliberately skips full blockmap scans while free
+    // space is plentiful. Reserve enough allocator space to put this test in
+    // the "moderate pressure" band so the runner is expected to scan.
+    let allocator = env.engine.allocator().unwrap();
+    let mut _pressure_reservations = Vec::new();
+    while allocator.free_block_count() * 100 / allocator.total_block_count() > 50 {
+        _pressure_reservations.push(allocator.allocate_one().unwrap());
+    }
+
     let mut initial = Vec::with_capacity(8 * 4096);
     for i in 0u8..8 {
         initial.extend_from_slice(&vec![i + 10; 4096]);

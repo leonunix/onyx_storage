@@ -506,6 +506,21 @@ impl BufferShard {
             );
         }
 
+        if checkpoint.used_bytes == 0
+            && checkpoint.max_seq == 0
+            && checkpoint.head_offset == 0
+            && checkpoint.tail_offset == 0
+        {
+            return Ok(ScanResult {
+                max_seq: 0,
+                used_bytes: 0,
+                head_offset: 0,
+                tail_offset: 0,
+                log_order: VecDeque::new(),
+                flushed_seqs: HashSet::new(),
+            });
+        }
+
         let mut scanned = Vec::new();
         let mut max_seq = 0u64;
         let mut seen_offsets = HashSet::new();
@@ -1117,14 +1132,25 @@ impl BufferShard {
         vol_id: &str,
         lba: Lba,
     ) -> OnyxResult<Option<PendingEntry>> {
-        let index_started = Instant::now();
         let vid = self.intern_vol_id(vol_id);
+        self.lookup_hydrated_interned(&vid, lba)
+    }
+
+    pub(super) fn lookup_hydrated_interned(
+        &self,
+        vid: &Arc<str>,
+        lba: Lba,
+    ) -> OnyxResult<Option<PendingEntry>> {
+        let index_started = Instant::now();
         // Clone the Arc and release the DashMap guard before disk hydration.
         // Holding lba_index across pread() can stall flusher mark_flushed under
         // heavy buffered reads.
         let entry = self
             .lba_index
-            .get(&LbaKey { vol_id: vid, lba })
+            .get(&LbaKey {
+                vol_id: vid.clone(),
+                lba,
+            })
             .map(|entry_ref| entry_ref.value().clone());
         let index_elapsed = Self::elapsed_ns(index_started);
         if let Some(metrics) = self.metrics.get() {

@@ -379,6 +379,7 @@ impl BufferFlusher {
         let dedup_enabled = dedup_config.enabled;
         let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
+        let dedup_pending_skip_threshold = dedup_config.pending_skip_threshold_entries;
         let mut lanes = Vec::with_capacity(lane_count);
 
         for shard_idx in 0..lane_count {
@@ -464,6 +465,7 @@ impl BufferFlusher {
                                 &done_tx_d,
                                 &running_d,
                                 dedup_skip_threshold,
+                                dedup_pending_skip_threshold,
                                 &metrics_d,
                                 &cleanup_tx_d,
                             );

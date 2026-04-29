@@ -479,6 +479,7 @@ fn dedup_config_defaults() {
     assert!(config.enabled);
     assert_eq!(config.workers, 2);
     assert_eq!(config.buffer_skip_threshold_pct, 90);
+    assert_eq!(config.pending_skip_threshold_entries, 0);
     assert_eq!(config.rescan_interval_ms, 30000);
     assert_eq!(config.max_rescan_per_cycle, 256);
 }

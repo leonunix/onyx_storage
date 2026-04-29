@@ -24,6 +24,7 @@ const METADB_DEDUP_VALUE_BYTES: usize = 28;
 const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "onyx-volume-catalog.bin";
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
+const BLOCKMAP_SCAN_CHUNK_LBAS: u64 = 262_144; // 1 GiB of 4 KiB LBAs.
 
 pub(crate) struct MetadbBackend {
     db: Arc<Db>,
@@ -229,6 +230,27 @@ impl MetadbBackend {
                 Ok((Lba(lba), decode_l2p_value(value)?))
             })
             .collect()
+    }
+
+    pub(crate) fn get_mappings_range_unordered(
+        &self,
+        vol_id: &VolumeId,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        let Some(ord) = self.volume_ordinal_optional(vol_id) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        self.db
+            .scan_range_unordered(ord, start.0..end.0, |lba, value| {
+                let decoded = from_l2p_value(value).ok_or_else(|| {
+                    onyx_metadb::MetaDbError::Corruption("invalid onyx blockmap value".into())
+                })?;
+                out.push((Lba(lba), decoded));
+                Ok(())
+            })?;
+        Ok(out)
     }
 
     pub(crate) fn delete_blockmap_range(
@@ -490,10 +512,14 @@ impl MetadbBackend {
         let volumes = self.list_volumes()?;
         for volume in volumes {
             let ord = self.volume_ordinal(&volume.id)?;
+            let lba_count = volume.size_bytes / u64::from(volume.block_size);
             let mut decode_error = None;
-            let scan_result = self
-                .db
-                .scan_range_unordered(ord, 0..u64::MAX, |lba, value| {
+            let scan_result = self.db.scan_range_unordered_chunked(
+                ord,
+                0,
+                lba_count,
+                BLOCKMAP_SCAN_CHUNK_LBAS,
+                |lba, value| {
                     match decode_l2p_value(value) {
                         Ok(decoded) => callback(&volume.id, Lba(lba), decoded),
                         Err(err) => {
@@ -504,7 +530,8 @@ impl MetadbBackend {
                         }
                     }
                     Ok(())
-                });
+                },
+            );
             if let Some(err) = decode_error {
                 return Err(err);
             }
@@ -604,9 +631,13 @@ impl MetadbBackend {
     }
 
     pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
+        let (dedup_index, dedup_reverse) = self.db.dedup_lsm_stats();
         Ok(MetaMemorySnapshot::from_metadb(
             self.db.last_applied_lsn(),
             self.db.high_water(),
+            self.db.free_list_len() as u64,
+            dedup_index,
+            dedup_reverse,
             self.db.cache_stats(),
             self.db.metrics_snapshot(),
             self.db.pending_state(),
@@ -617,6 +648,9 @@ impl MetadbBackend {
         &self,
         limit: usize,
     ) -> OnyxResult<Vec<(String, Lba, BlockmapValue)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let volumes = self.list_volumes()?;
         let mut results = Vec::new();
         for volume in volumes {

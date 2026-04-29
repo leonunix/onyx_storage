@@ -720,6 +720,11 @@ pub struct MetaMemorySnapshot {
     pub estimate_table_readers_mem_bytes: u64,
     pub last_applied_lsn: u64,
     pub high_water_pages: u64,
+    pub free_list_pages: u64,
+    pub dedup_index_ssts: u64,
+    pub dedup_index_records: u64,
+    pub dedup_reverse_ssts: u64,
+    pub dedup_reverse_records: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_evictions: u64,
@@ -844,6 +849,9 @@ impl MetaMemorySnapshot {
     pub fn from_metadb(
         last_applied_lsn: u64,
         high_water_pages: u64,
+        free_list_pages: u64,
+        dedup_index: onyx_metadb::LsmStats,
+        dedup_reverse: onyx_metadb::LsmStats,
         cache: onyx_metadb::PageCacheStats,
         meta: onyx_metadb::MetaMetricsSnapshot,
         pending: onyx_metadb::PendingState,
@@ -857,6 +865,11 @@ impl MetaMemorySnapshot {
             estimate_table_readers_mem_bytes: 0,
             last_applied_lsn,
             high_water_pages,
+            free_list_pages,
+            dedup_index_ssts: dedup_index.total_ssts as u64,
+            dedup_index_records: dedup_index.total_records,
+            dedup_reverse_ssts: dedup_reverse.total_ssts as u64,
+            dedup_reverse_records: dedup_reverse.total_records,
             cache_hits: cache.hits,
             cache_misses: cache.misses,
             cache_evictions: cache.evictions,
@@ -1025,8 +1038,16 @@ impl EngineStatusSnapshot {
             }
             let _ = writeln!(
                 out,
-                "metadb_state: last_applied_lsn={} high_water_pages={}",
-                metadb.last_applied_lsn, metadb.high_water_pages
+                "metadb_state: last_applied_lsn={} high_water_pages={} free_list_pages={}",
+                metadb.last_applied_lsn, metadb.high_water_pages, metadb.free_list_pages
+            );
+            let _ = writeln!(
+                out,
+                "metadb_dedup_lsm: index_ssts={} index_records={} reverse_ssts={} reverse_records={}",
+                metadb.dedup_index_ssts,
+                metadb.dedup_index_records,
+                metadb.dedup_reverse_ssts,
+                metadb.dedup_reverse_records
             );
             let _ = writeln!(
                 out,

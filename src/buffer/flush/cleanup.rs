@@ -86,25 +86,39 @@ impl BufferFlusher {
             return;
         }
 
-        // Phase 1: per-PBA lock + refcount verify → filter to truly dead
-        let mut truly_dead: Vec<(Pba, u32)> = Vec::new();
+        let mut candidates_by_pba: HashMap<Pba, u32> = HashMap::new();
         for &(pba, blocks) in dead_pbas {
-            let cleanup_lock = Self::cleanup_lock(pba);
-            let _cleanup_guard = cleanup_lock.lock().unwrap();
+            candidates_by_pba
+                .entry(pba)
+                .and_modify(|existing| *existing = (*existing).max(blocks))
+                .or_insert(blocks);
+        }
+        let mut candidates: Vec<(Pba, u32)> = candidates_by_pba.into_iter().collect();
+        candidates.sort_unstable_by_key(|(pba, _)| *pba);
 
-            let remaining = match meta.get_refcount(pba) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(
-                        pba = pba.0,
-                        blocks,
-                        error = %e,
-                        context,
-                        "batch cleanup: failed to confirm dead PBA; skipping"
-                    );
-                    continue;
-                }
-            };
+        let locks: Vec<_> = candidates
+            .iter()
+            .map(|(pba, _)| Self::cleanup_lock(*pba))
+            .collect();
+        let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+
+        let pbas: Vec<Pba> = candidates.iter().map(|(pba, _)| *pba).collect();
+        let refcounts = match meta.multi_get_refcounts(&pbas) {
+            Ok(refcounts) => refcounts,
+            Err(e) => {
+                tracing::error!(
+                    count = pbas.len(),
+                    error = %e,
+                    context,
+                    "batch cleanup: failed to confirm dead PBAs; skipping"
+                );
+                return;
+            }
+        };
+
+        // Phase 1: locks + batched refcount verify → filter to truly dead
+        let mut truly_dead: Vec<(Pba, u32)> = Vec::new();
+        for ((pba, blocks), remaining) in candidates.into_iter().zip(refcounts.into_iter()) {
             if remaining != 0 {
                 continue;
             }
@@ -301,7 +315,7 @@ impl BufferFlusher {
                 .push((idx, reg.lba));
         }
 
-        let mut valid: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        let mut candidate_indices: Vec<usize> = Vec::new();
         for (vol_id, items) in by_vol {
             let lbas: Vec<Lba> = items.iter().map(|(_, lba)| *lba).collect();
             let mappings = match meta.multi_get_mappings(&vol_id, &lbas) {
@@ -323,18 +337,41 @@ impl BufferFlusher {
                 if mapping != Some(reg.expected) {
                     continue;
                 }
-                match meta.get_refcount(reg.entry.pba) {
-                    Ok(0) => continue,
-                    Ok(_) => valid.push((reg.hash, reg.entry)),
-                    Err(e) => {
-                        tracing::warn!(
-                            pba = reg.entry.pba.0,
-                            error = %e,
-                            context,
-                            "dedup register: failed to validate refcount"
-                        );
-                    }
-                }
+                candidate_indices.push(idx);
+            }
+        }
+
+        if candidate_indices.is_empty() {
+            return;
+        }
+
+        let mut candidate_pbas: Vec<Pba> = candidate_indices
+            .iter()
+            .map(|idx| registrations[*idx].entry.pba)
+            .collect();
+        candidate_pbas.sort_unstable();
+        candidate_pbas.dedup();
+
+        let refcounts = match meta.multi_get_refcounts(&candidate_pbas) {
+            Ok(refcounts) => refcounts,
+            Err(e) => {
+                tracing::warn!(
+                    count = candidate_pbas.len(),
+                    error = %e,
+                    context,
+                    "dedup register: failed to validate refcount batch"
+                );
+                return;
+            }
+        };
+        let refcount_by_pba: HashMap<Pba, u32> =
+            candidate_pbas.into_iter().zip(refcounts).collect();
+
+        let mut valid: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        for idx in candidate_indices {
+            let reg = &registrations[idx];
+            if refcount_by_pba.get(&reg.entry.pba).copied().unwrap_or(0) != 0 {
+                valid.push((reg.hash, reg.entry));
             }
         }
 

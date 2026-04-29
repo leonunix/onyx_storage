@@ -47,6 +47,7 @@ data_device = "/dev/vdb3"
 block_size = 4096
 use_hugepages = false
 default_compression = "Lz4"
+read_pool_workers = 8
 
 [buffer]
 device = "/dev/vdb2"
@@ -79,9 +80,14 @@ buffer_usage_resume_pct = 50
 max_rewrite_per_cycle = 64
 
 [dedup]
-enabled = false
+enabled = true
 workers = 4
 buffer_skip_threshold_pct = 90
+# Optional pending-depth gate for low-latency LV2 devices.
+# 0 = dedup-first: only buffer fill percentage can defer foreground dedup.
+# Set e.g. 2048 on weak/virtual buffer devices if buffer-hit hydration starts
+# hurting read latency before fill% reaches buffer_skip_threshold_pct.
+pending_skip_threshold_entries = 0
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 256
 
