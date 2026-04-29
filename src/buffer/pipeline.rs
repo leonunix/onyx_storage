@@ -159,6 +159,14 @@ fn add_seq_lba(acc: &mut Vec<(u64, Lba, u32)>, seq: u64, lba: Lba) {
     }
 }
 
+fn block_payload(payload: &Arc<[u8]>, offset: usize, bs: usize) -> Arc<[u8]> {
+    if offset == 0 && payload.len() == bs {
+        Arc::clone(payload)
+    } else {
+        Arc::from(payload[offset..offset + bs].to_vec())
+    }
+}
+
 /// Coalesce buffer entries into compression units.
 ///
 /// Multi-LBA entries are expanded into per-LBA slices for dedup, then
@@ -296,8 +304,8 @@ fn coalesce_slices(
             let cur = current.as_mut().unwrap();
             cur.lba_count += 1;
             cur.raw_blocks.push(RawBlockRef {
-                payload: Arc::clone(&ds.latest.payload),
-                offset: ds.latest.offset,
+                payload: block_payload(&ds.latest.payload, ds.latest.offset, bs),
+                offset: 0,
             });
             for &seq in &ds.all_seqs {
                 add_seq_lba(&mut cur.seq_lba_ranges, seq, ds.latest.lba);
@@ -315,8 +323,8 @@ fn coalesce_slices(
                 start_lba: ds.latest.lba,
                 lba_count: 1,
                 raw_blocks: vec![RawBlockRef {
-                    payload: Arc::clone(&ds.latest.payload),
-                    offset: ds.latest.offset,
+                    payload: block_payload(&ds.latest.payload, ds.latest.offset, bs),
+                    offset: 0,
                 }],
                 compression: vol_compression(ds.latest.vol_id),
                 vol_created_at: ds.latest.vol_created_at,
@@ -370,6 +378,36 @@ mod tests {
         let units = coalesce(&entries, 131072, 32, &|_| CompressionAlgo::None);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].lba_count, 4);
+    }
+
+    #[test]
+    fn coalesce_does_not_retain_large_source_payloads() {
+        let payload: Arc<[u8]> = Arc::from(vec![0xCC; 256 * BLOCK_SIZE as usize]);
+        let payload_crc32 = crc32fast::hash(&payload);
+        let entries = vec![BufferEntry {
+            seq: 7,
+            vol_id: "vol-a".to_string(),
+            start_lba: Lba(0),
+            lba_count: 256,
+            payload_crc32,
+            flushed: false,
+            vol_created_at: 0,
+            payload: Arc::clone(&payload),
+        }];
+
+        let units = coalesce(&entries, BLOCK_SIZE as usize, 1, &|_| CompressionAlgo::None);
+        assert_eq!(units.len(), 256);
+        drop(entries);
+
+        assert_eq!(
+            Arc::strong_count(&payload),
+            1,
+            "coalesced 4KB units must not keep a 1MB buffer entry alive"
+        );
+        assert_eq!(
+            units[17].materialize_raw_data(),
+            vec![0xCC; BLOCK_SIZE as usize]
+        );
     }
 
     #[test]

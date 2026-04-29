@@ -547,8 +547,18 @@ impl BufferShard {
         // physically contiguous. Once we hit the first gap, later "valid-looking"
         // bytes are stale reclaimed history and must not be recovered.
         let mut occupied_ranges: Vec<(u64, u64)> = Vec::new();
-        if checkpoint.used_bytes == 0 && checkpoint.head_offset == checkpoint.tail_offset {
-            // Checkpoint says empty. Only do the contiguous forward scan below.
+        if checkpoint.used_bytes == 0 {
+            // Checkpoint says empty. A head/tail mismatch here is stale pointer
+            // drift from prior wrap/reclaim history, not a live occupied range.
+            // Only do the contiguous forward scan below to catch post-checkpoint
+            // appends.
+            if checkpoint.head_offset != checkpoint.tail_offset {
+                tracing::warn!(
+                    head = checkpoint.head_offset,
+                    tail = checkpoint.tail_offset,
+                    "empty shard checkpoint has mismatched offsets; ignoring stale occupied range"
+                );
+            }
         } else if checkpoint.head_offset >= checkpoint.tail_offset {
             // No wrap in occupied region: [tail, head)
             occupied_ranges.push((checkpoint.tail_offset, checkpoint.head_offset));
@@ -673,7 +683,6 @@ impl BufferShard {
         checkpoint: Option<ShardCheckpoint>,
         checkpoint_device: Option<RawDevice>,
         payload_bytes_in_memory: Arc<AtomicU64>,
-        max_payload_memory_bytes: u64,
         max_flushed_seq: Arc<AtomicU64>,
         durable_seq: Arc<AtomicU64>,
     ) -> OnyxResult<(Self, u64)> {
@@ -758,7 +767,6 @@ impl BufferShard {
                 metrics,
                 checkpoint_device,
                 payload_bytes_in_memory,
-                max_payload_memory_bytes,
                 max_flushed_seq,
                 durable_seq,
             },
@@ -769,9 +777,14 @@ impl BufferShard {
     /// Snapshot current ring state into a checkpoint structure.
     pub(super) fn snapshot_checkpoint(&self) -> ShardCheckpoint {
         let ring = self.ring.lock();
+        let tail_offset = if ring.used_bytes == 0 {
+            ring.head_offset
+        } else {
+            ring.tail_offset
+        };
         ShardCheckpoint {
             head_offset: ring.head_offset,
-            tail_offset: ring.tail_offset,
+            tail_offset,
             max_seq: 0, // updated by caller with global max_seq
             used_bytes: ring.used_bytes,
         }
@@ -844,10 +857,6 @@ impl BufferShard {
                 self.replace_lba_index_if_current(&pending, &evicted);
             }
         }
-    }
-
-    pub(super) fn max_payload_memory(&self) -> u64 {
-        self.max_payload_memory_bytes
     }
 
     pub(super) fn backpressure_waits_forever(&self) -> bool {
@@ -1110,29 +1119,34 @@ impl BufferShard {
     ) -> OnyxResult<Option<PendingEntry>> {
         let index_started = Instant::now();
         let vid = self.intern_vol_id(vol_id);
-        let entry_ref = self.lba_index.get(&LbaKey { vol_id: vid, lba });
+        // Clone the Arc and release the DashMap guard before disk hydration.
+        // Holding lba_index across pread() can stall flusher mark_flushed under
+        // heavy buffered reads.
+        let entry = self
+            .lba_index
+            .get(&LbaKey { vol_id: vid, lba })
+            .map(|entry_ref| entry_ref.value().clone());
         let index_elapsed = Self::elapsed_ns(index_started);
         if let Some(metrics) = self.metrics.get() {
             metrics
                 .buffer_lookup_index_ns
                 .fetch_add(index_elapsed, Ordering::Relaxed);
         }
-        let Some(entry_ref) = entry_ref else {
+        let Some(entry) = entry else {
             return Ok(None);
         };
-        let entry = &*entry_ref;
         if entry.payload.is_some() {
-            return Ok(Some((**entry_ref).clone()));
+            return Ok(Some((*entry).clone()));
         }
         if let Some(payload) = self.volatile_payload(entry.seq) {
-            let mut hydrated = (**entry_ref).clone();
+            let mut hydrated = (*entry).clone();
             hydrated.payload = Some(payload);
             return Ok(Some(hydrated));
         }
         // Lazy hydration: read payload from buffer device.
         let seq = entry.seq;
         let hydrate_started = Instant::now();
-        let result = self.read_payload_from_disk(entry);
+        let result = self.read_payload_from_disk(entry.as_ref());
         let hydrate_elapsed = Self::elapsed_ns(hydrate_started);
         if let Some(metrics) = self.metrics.get() {
             metrics
@@ -1144,13 +1158,12 @@ impl BufferShard {
         }
         match result {
             Ok(payload) => {
-                let mut hydrated = (**entry_ref).clone();
+                let mut hydrated = (*entry).clone();
                 hydrated.payload = Some(payload);
                 Ok(Some(hydrated))
             }
             Err(e) => {
                 tracing::warn!(seq, error = %e, "read-path hydration failed, evicting corrupt entry");
-                drop(entry_ref);
                 self.evict_corrupt_entry(seq);
                 // Return None — caller falls through to blockmap/LV3.
                 Ok(None)
@@ -1377,11 +1390,11 @@ impl BufferShard {
         );
     }
 
-    /// Return Arc<PendingEntry> with payload hydrated from the buffer device.
-    /// With write-through append, committed entries always have payload=None,
-    /// so this function is the primary hydration path for the flusher.
-    /// max_payload_memory exclusively governs flusher hydration rate.
-    /// Returns None if payload memory limit is exceeded (flusher will retry later).
+    /// Return a detached PendingEntry with payload hydrated from the buffer
+    /// device. The flusher only needs a transient payload copy to build
+    /// CoalesceUnits; installing that copy back into pending_entries/lba_index
+    /// makes the coalescer contend with foreground read lookups and can stall
+    /// the whole flush pipeline under buffered-read pressure.
     pub(super) fn pending_entry_arc_hydrated(&self, seq: u64) -> Option<Arc<PendingEntry>> {
         let entry_ref = self.pending_entries.get(&seq)?;
         let entry = entry_ref.value().clone();
@@ -1394,71 +1407,14 @@ impl BufferShard {
             hydrated.payload = Some(payload);
             return Some(Arc::new(hydrated));
         }
-        // Memory guard: refuse to hydrate if flusher memory budget is exhausted.
-        // The flusher's retry-snapshot mechanism will pick this entry up later
-        // once in-flight entries have been drained and memory is freed.
-        //
-        // EXCEPTION: always allow hydration for the entry at the front of log_order.
-        // That entry blocks reclaim_log_prefix (tail advancement). With write-through
-        // append, all committed payloads are evicted; the flusher hydrates on demand.
-        // If the memory limit prevents re-hydration, the tail never advances.
-        // Exempting the single head-of-queue entry (at most one 128 KB payload over
-        // the limit) breaks the cycle and lets the ring reclaim space.
-        let limit = self.max_payload_memory();
-        if limit > 0 {
-            let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
-            if current >= limit {
-                let is_head = self.ring.lock().log_order.front().map(|f| f.seq) == Some(seq);
-                if !is_head {
-                    if let Some(metrics) = self.metrics.get() {
-                        metrics
-                            .buffer_hydration_skipped_due_to_mem_limit
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    tracing::debug!(
-                        seq,
-                        current_mb = current / (1024 * 1024),
-                        limit_mb = limit / (1024 * 1024),
-                        "skipping hydration: payload memory limit reached"
-                    );
-                    return None;
-                }
-                if let Some(metrics) = self.metrics.get() {
-                    metrics
-                        .buffer_hydration_head_bypass_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                tracing::debug!(
-                    seq,
-                    current_mb = current / (1024 * 1024),
-                    limit_mb = limit / (1024 * 1024),
-                    "head-of-queue entry: bypassing memory limit to unblock tail"
-                );
-            }
-        }
-        // Lazy hydration: read payload from disk.
+        // Lazy hydration: read payload from disk, but keep it detached from
+        // the shared indices. Coalescer window/channel bounds cap this
+        // transient memory; persistent payload residency remains zero.
         match self.read_payload_from_disk(entry.as_ref()) {
             Ok(payload) => {
-                let payload_len = payload.len() as u64;
                 let mut hydrated = (*entry).clone();
                 hydrated.payload = Some(payload);
-                let hydrated = Arc::new(hydrated);
-                if self.replace_pending_entry_if_current(&entry, hydrated.clone()) {
-                    self.payload_bytes_in_memory
-                        .fetch_add(payload_len, Ordering::Relaxed);
-                    self.replace_lba_index_if_current(&entry, &hydrated);
-                    Some(hydrated)
-                } else {
-                    if let Some(payload) = self.volatile_payload(seq) {
-                        let mut hydrated = (*entry).clone();
-                        hydrated.payload = Some(payload);
-                        Some(Arc::new(hydrated))
-                    } else {
-                        self.pending_entries.get(&seq).and_then(|current| {
-                            current.payload.is_some().then(|| current.value().clone())
-                        })
-                    }
-                }
+                Some(Arc::new(hydrated))
             }
             Err(e) => {
                 tracing::warn!(seq, error = %e, "failed to hydrate pending entry payload, evicting corrupt entry");
@@ -1487,19 +1443,20 @@ impl BufferShard {
     }
 
     pub(super) fn head_pending_seq_if_stuck(&self, min_age: Duration) -> Option<u64> {
-        let head_seq = self
-            .ring
-            .lock()
-            .log_order
-            .front()
-            .map(|record| record.seq)?;
+        let (head_seq, head_became_at) = {
+            let ring = self.ring.lock();
+            (
+                ring.log_order.front().map(|record| record.seq)?,
+                ring.head_became_at,
+            )
+        };
         if !self.is_seq_ready_for_flush(head_seq) {
             return None;
         }
         let pending = self.pending_entries.get(&head_seq)?;
         let has_partial_progress = self.flush_progress.contains_key(&head_seq);
-        let old_enough = pending.enqueued_at.elapsed() >= min_age;
         drop(pending);
+        let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
         if !has_partial_progress && !old_enough {
             return None;
         }

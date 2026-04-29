@@ -90,8 +90,7 @@ impl BufferFlusher {
                             None => true,
                         };
                         if due {
-                            let in_flight_count =
-                                in_flight.get(&seq).copied().unwrap_or(0);
+                            let in_flight_count = in_flight.get(&seq).copied().unwrap_or(0);
                             let outcome = match enqueue_result {
                                 EnqueuePendingSeq::Queued => "Queued".to_string(),
                                 EnqueuePendingSeq::WindowFull => "WindowFull".to_string(),
@@ -224,11 +223,11 @@ impl BufferFlusher {
             );
 
             // Payload ownership has been moved into Arc-backed block refs inside
-            // the coalesced units, so the pending-entry copy can be evicted
-            // immediately without losing the bytes needed by dedup/compress.
-            let consumed_seqs: Vec<u64> = new_entries.iter().map(|e| e.seq).collect();
+            // the coalesced units. Flusher hydration returns detached payload
+            // clones, so there is no pending_entries/lba_index payload to evict
+            // here; avoiding that synchronous index rewrite keeps coalescing
+            // independent from foreground buffer reads.
             drop(new_entries);
-            pool.evict_hydrated_payloads_for_shard(shard_idx, &consumed_seqs);
 
             if !units.is_empty() {
                 metrics.coalesce_runs.fetch_add(1, Ordering::Relaxed);

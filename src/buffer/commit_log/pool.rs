@@ -256,13 +256,14 @@ impl WriteBufferPool {
     }
 
     /// io_uring variant of `write_batch` that also includes the checkpoint
-    /// write and a barrier-fdatasync in the same `submit_batch` call. On
-    /// success, both data and checkpoint are persisted with one
-    /// `io_uring_enter` + one `wait_for_completions(N+2)`.
+    /// write and a barrier-fdatasync. On success, both data and checkpoint are
+    /// persisted before returning. Large batches are split at the ring's SQ
+    /// depth so group commit can grow past `uring_sq_entries` without turning
+    /// into a retry loop.
     ///
     /// The failpoint-driven test injection from `sync_device_impl` is checked
     /// after CQE harvest so existing recovery tests still cover this path.
-    fn write_batch_and_sync_uring(
+    pub(super) fn write_batch_and_sync_uring(
         device: &RawDevice,
         shard: &BufferShard,
         ring: &Arc<IoUringSession>,
@@ -363,13 +364,23 @@ impl WriteBufferPool {
         ops.push(UringOp::FsyncDataBarrier { fd: data_fd });
 
         // 5. Submit + wait under the same io_lock that the syscall path uses,
-        //    so concurrent writers see consistent ordering.
+        //    so concurrent writers see consistent ordering. Data writes may
+        //    exceed the ring depth; checkpoint and fsync are submitted after
+        //    all data chunks complete to preserve the durability order.
         let write_start = Instant::now();
         let _guard = io_lock.lock();
-        let results = unsafe { ring.submit_batch(&ops)? };
+        let span_count = spans.len();
+        let max_ops = (ring.sq_entries() as usize).max(1);
+        let mut results = Vec::with_capacity(ops.len());
+        for chunk in ops[..span_count].chunks(max_ops) {
+            results.extend(unsafe { ring.submit_batch(chunk)? });
+        }
+        if ckpt_aligned.is_some() {
+            results.extend(unsafe { ring.submit_batch(&ops[span_count..span_count + 1])? });
+        }
+        results.extend(unsafe { ring.submit_batch(&ops[ops.len() - 1..])? });
 
         // 6. Validate per-op CQE results.
-        let span_count = spans.len();
         for (i, span) in spans.iter().enumerate() {
             let r = &results[i];
             if let Some(errno) = r.errno() {
@@ -878,7 +889,6 @@ impl WriteBufferPool {
                                 cfg.checkpoint,
                                 cfg.checkpoint_device,
                                 pb,
-                                max_payload_memory,
                                 mfs,
                                 ds,
                             )
@@ -902,7 +912,6 @@ impl WriteBufferPool {
                         cfg.checkpoint,
                         cfg.checkpoint_device,
                         payload_bytes_in_memory.clone(),
-                        max_payload_memory,
                         max_flushed_seq.clone(),
                         durable_seq.clone(),
                     )
@@ -1205,9 +1214,9 @@ impl WriteBufferPool {
     }
 
     pub fn head_stuck_seq_for_shard(&self, shard_idx: usize, min_age: Duration) -> Option<u64> {
-        self.shards.get(shard_idx).and_then(|shard| {
-            shard.shard.head_pending_seq_if_stuck(min_age)
-        })
+        self.shards
+            .get(shard_idx)
+            .and_then(|shard| shard.shard.head_pending_seq_if_stuck(min_age))
     }
 
     pub fn flushed_offsets_for_shard(&self, shard_idx: usize, seq: u64) -> Option<HashSet<u16>> {

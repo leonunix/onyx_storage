@@ -222,8 +222,6 @@ struct BufferShard {
     checkpoint_device: Option<RawDevice>,
     /// Shared counter for total payload bytes in memory (across all shards).
     payload_bytes_in_memory: Arc<AtomicU64>,
-    /// Maximum allowed in-memory payload bytes (shared with pool). 0 = no limit.
-    max_payload_memory_bytes: u64,
     /// Global upper bound of seqs that have been mark_flushed'd (across all
     /// shards). Updated in `free_seq_allocation` to `max(current, seq)`.
     max_flushed_seq: Arc<AtomicU64>,

@@ -13,6 +13,86 @@ fn create_pool(size: u64, group_commit_wait: Duration) -> (WriteBufferPool, Name
 }
 
 #[test]
+fn uring_sync_batch_chunks_over_sq_depth() {
+    let tmp = NamedTempFile::new().unwrap();
+    let slot = BufferShard::slot_size();
+    let data_start = COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE;
+    let size = data_start + 128 * slot;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full(
+        dev,
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::ZERO,
+        0,
+        None,
+    )
+    .unwrap();
+    let shard = &pool.shards[0].shard;
+    let shard_device = pool
+        .root_device
+        .slice(data_start, size - data_start)
+        .unwrap();
+    let ring = Arc::new(IoUringSession::new(4).unwrap());
+    let metrics = Arc::new(OnceLock::new());
+
+    let mut entries = Vec::new();
+    for i in 0..10u64 {
+        let payload: Arc<[u8]> = vec![0x80u8 + i as u8; BLOCK_SIZE as usize].into();
+        let payload_crc = crc32fast::hash(payload.as_ref());
+        let encoded = BufferEntry::encode(
+            i + 1,
+            "test-vol",
+            Lba(i),
+            1,
+            payload_crc,
+            false,
+            7,
+            payload.as_ref(),
+        )
+        .unwrap();
+        let disk_len = encoded.len() as u32;
+        let pending = Arc::new(PendingEntry {
+            seq: i + 1,
+            vol_id: "test-vol".to_string(),
+            start_lba: Lba(i),
+            lba_count: 1,
+            payload_crc32: payload_crc,
+            vol_created_at: 7,
+            payload: Some(payload.clone()),
+            disk_offset: i * (disk_len as u64 + slot),
+            disk_len,
+            enqueued_at: Instant::now(),
+            superseded_ranges: Vec::new(),
+        });
+        entries.push(StagedEntry { pending, payload });
+    }
+
+    WriteBufferPool::write_batch_and_sync_uring(
+        &shard_device,
+        shard,
+        &ring,
+        &shard.io_lock,
+        &entries,
+        10,
+        &metrics,
+    )
+    .unwrap();
+
+    for entry in &entries {
+        let mut buf = vec![0u8; entry.pending.disk_len as usize];
+        shard_device
+            .read_at(&mut buf, entry.pending.disk_offset)
+            .unwrap();
+        let decoded = BufferEntry::from_bytes(&buf).unwrap();
+        assert_eq!(decoded.seq, entry.pending.seq);
+        assert_eq!(decoded.payload.as_ref(), entry.payload.as_ref());
+    }
+}
+
+#[test]
 fn flushed_entry_cannot_be_reinstalled_by_stale_eviction_state() {
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;
@@ -83,6 +163,127 @@ fn hydrated_payload_is_not_reinstalled_after_flush_race() {
     );
     assert!(shard.pending_entry_arc(seq).is_none());
     assert_eq!(pool.payload_memory_bytes(), 0);
+}
+
+#[test]
+fn lookup_hydrates_from_disk_without_volatile_payload() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+    let payload = vec![0x6D; BLOCK_SIZE as usize];
+
+    let seq = pool.append("test-vol", Lba(23), 1, &payload, 0).unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+
+    let before = shard.pending_entry_arc(seq).unwrap();
+    assert!(before.payload.is_none());
+    assert!(
+        shard.volatile_payload(seq).is_none(),
+        "ready entries should hydrate from disk, not volatile payload"
+    );
+
+    let found = pool.lookup("test-vol", Lba(23)).unwrap().unwrap();
+    assert_eq!(found.payload.as_deref(), Some(payload.as_slice()));
+
+    let after = shard.pending_entry_arc(seq).unwrap();
+    assert!(after.payload.is_none());
+    assert!(Arc::ptr_eq(&before, &after));
+}
+
+#[test]
+fn flusher_hydration_does_not_install_payload_into_indices() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+    let payload = vec![0x71; BLOCK_SIZE as usize];
+
+    let seq = pool.append("test-vol", Lba(31), 1, &payload, 0).unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+
+    let before = shard.pending_entry_arc(seq).unwrap();
+    assert!(before.payload.is_none());
+    assert!(shard.volatile_payload(seq).is_none());
+
+    let hydrated = shard.pending_entry_arc_hydrated(seq).unwrap();
+    assert_eq!(hydrated.payload.as_deref(), Some(payload.as_slice()));
+
+    let after = shard.pending_entry_arc(seq).unwrap();
+    assert!(after.payload.is_none());
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(pool.payload_memory_bytes(), 0);
+}
+
+#[test]
+fn guided_recovery_treats_zero_used_checkpoint_as_empty_even_if_offsets_differ() {
+    let tmp = NamedTempFile::new().unwrap();
+    let slot = BufferShard::slot_size();
+    let capacity = 8 * slot;
+    tmp.as_file().set_len(capacity).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), capacity).unwrap();
+    let payload = vec![0x42; BLOCK_SIZE as usize];
+    let encoded = BufferEntry::encode(
+        42,
+        "test-vol",
+        Lba(7),
+        1,
+        crc32fast::hash(&payload),
+        false,
+        1,
+        &payload,
+    )
+    .unwrap();
+    dev.write_at(&encoded, 0).unwrap();
+    dev.sync().unwrap();
+
+    let lba_index = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let latest_lba_seq = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let checkpoint = ShardCheckpoint {
+        head_offset: 2 * slot,
+        tail_offset: 0,
+        max_seq: 42,
+        used_bytes: 0,
+    };
+
+    let scan = BufferShard::rebuild_indices_guided(
+        &dev,
+        capacity,
+        &checkpoint,
+        &lba_index,
+        &latest_lba_seq,
+        &pending_entries,
+    )
+    .unwrap();
+
+    assert_eq!(scan.used_bytes, 0);
+    assert_eq!(scan.head_offset, checkpoint.head_offset);
+    assert_eq!(scan.tail_offset, checkpoint.head_offset);
+    assert!(scan.log_order.is_empty());
+    assert!(pending_entries.is_empty());
+    assert!(lba_index.is_empty());
+}
+
+#[test]
+fn empty_ring_checkpoint_normalizes_tail_to_head() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+    let slot = BufferShard::slot_size();
+    {
+        let mut ring = shard.ring.lock();
+        ring.used_bytes = 0;
+        ring.head_offset = 3 * slot;
+        ring.tail_offset = slot;
+    }
+
+    let checkpoint = shard.snapshot_checkpoint();
+
+    assert_eq!(checkpoint.used_bytes, 0);
+    assert_eq!(checkpoint.head_offset, 3 * slot);
+    assert_eq!(checkpoint.tail_offset, checkpoint.head_offset);
 }
 
 #[test]
