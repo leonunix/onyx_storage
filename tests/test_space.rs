@@ -114,6 +114,8 @@ fn rebuild_from_metadata() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -190,6 +192,8 @@ fn rebuild_empty_metadata() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -211,6 +215,8 @@ fn rebuild_fully_allocated() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -236,6 +242,8 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();

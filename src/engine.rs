@@ -149,17 +149,26 @@ impl DurabilityWatermarkHandle {
                         // Nothing new to checkpoint; defer to next round.
                         continue;
                     }
-                    if let Err(e) = meta.request_durable_checkpoint() {
-                        tracing::error!(
-                            error = %e,
-                            "durability watermark checkpoint request failed — WAL prune deferred to next cycle"
-                        );
-                    } else {
-                        last_checkpoint_request_seq = captured;
-                        tracing::debug!(
-                            max_flushed_seq = captured,
-                            "durability watermark requested metadb checkpoint"
-                        );
+                    match meta.try_request_durable_checkpoint() {
+                        Ok(true) => {
+                            last_checkpoint_request_seq = captured;
+                            tracing::debug!(
+                                max_flushed_seq = captured,
+                                "durability watermark requested metadb checkpoint"
+                            );
+                        }
+                        Ok(false) => {
+                            tracing::debug!(
+                                max_flushed_seq = captured,
+                                "durability watermark skipped metadb checkpoint; previous checkpoint still running"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "durability watermark checkpoint request failed; WAL prune deferred to next cycle"
+                            );
+                        }
                     }
                 }
                 // Final checkpoint at shutdown so the WAL segment-prune
@@ -650,14 +659,14 @@ impl OnyxEngine {
 
         // Start the durability watermark thread now that both meta and
         // buffer_pool are live. It advances `durable_seq` cheaply and asks
-        // metadb for a checkpoint every 50ms, unblocking the buffer ring
+        // metadb for low-frequency checkpoints, unblocking the buffer ring
         // reclaim path without forcing every tick through metadata IO.
         let watermark = DurabilityWatermarkHandle::start(
             meta.clone(),
             buffer_pool.clone(),
             buffer_pool.max_flushed_seq_handle(),
             buffer_pool.durable_seq_handle(),
-            std::time::Duration::from_millis(50),
+            config.meta.checkpoint_interval(),
         );
 
         Ok(Self {

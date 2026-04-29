@@ -476,32 +476,61 @@ impl MetadbBackend {
     pub(crate) fn scan_all_blockmap_entries(
         &self,
     ) -> OnyxResult<Vec<(VolumeId, Lba, BlockmapValue)>> {
-        let volumes = self.list_volumes()?;
         let mut entries = Vec::new();
-        for volume in volumes {
-            let ord = self.volume_ordinal(&volume.id)?;
-            for item in self.db.range(ord, 0..u64::MAX)? {
-                let (lba, value) = item?;
-                entries.push((volume.id.clone(), Lba(lba), decode_l2p_value(value)?));
-            }
-        }
+        self.scan_all_blockmap_entries_with(&mut |volume, lba, value| {
+            entries.push((volume.clone(), lba, value));
+        })?;
         Ok(entries)
     }
 
+    pub(crate) fn scan_all_blockmap_entries_with(
+        &self,
+        callback: &mut dyn FnMut(&VolumeId, Lba, BlockmapValue),
+    ) -> OnyxResult<()> {
+        let volumes = self.list_volumes()?;
+        for volume in volumes {
+            let ord = self.volume_ordinal(&volume.id)?;
+            let mut decode_error = None;
+            let scan_result = self
+                .db
+                .scan_range_unordered(ord, 0..u64::MAX, |lba, value| {
+                    match decode_l2p_value(value) {
+                        Ok(decoded) => callback(&volume.id, Lba(lba), decoded),
+                        Err(err) => {
+                            decode_error = Some(err);
+                            return Err(onyx_metadb::MetaDbError::Corruption(
+                                "onyx blockmap decode failed".into(),
+                            ));
+                        }
+                    }
+                    Ok(())
+                });
+            if let Some(err) = decode_error {
+                return Err(err);
+            }
+            scan_result?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn count_blockmap_refs_for_pba(&self, target: Pba) -> OnyxResult<u32> {
-        let count = self
-            .scan_all_blockmap_entries()?
-            .into_iter()
-            .filter(|(_, _, value)| value.pba == target)
-            .count();
-        Ok(count as u32)
+        let mut count = 0u32;
+        self.scan_all_blockmap_entries_with(&mut |_, _, value| {
+            if value.pba == target {
+                count = count.saturating_add(1);
+            }
+        })?;
+        Ok(count)
     }
 
     pub(crate) fn has_any_blockmap_ref(&self, target: Pba) -> OnyxResult<bool> {
-        Ok(self
-            .scan_all_blockmap_entries()?
-            .into_iter()
-            .any(|(_, _, value)| value.pba == target))
+        let mut found = false;
+        self.scan_all_blockmap_entries_with(&mut |_, _, value| {
+            if value.pba == target {
+                found = true;
+            }
+        })?;
+        Ok(found)
     }
 
     pub(crate) fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
@@ -568,6 +597,10 @@ impl MetadbBackend {
 
     pub(crate) fn request_durable_checkpoint(&self) -> OnyxResult<()> {
         self.checkpoint.request_async()
+    }
+
+    pub(crate) fn try_request_durable_checkpoint(&self) -> OnyxResult<bool> {
+        self.checkpoint.try_request_async()
     }
 
     pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
@@ -713,6 +746,25 @@ impl AsyncCheckpoint {
         self.request().map(|_| ())
     }
 
+    fn try_request_async(&self) -> OnyxResult<bool> {
+        let (lock, cvar) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        if state.shutdown {
+            return Err(OnyxError::Config(
+                "metadb checkpoint worker is shutting down".into(),
+            ));
+        }
+        if state.requested != state.completed {
+            return Ok(false);
+        }
+        state.requested = state
+            .requested
+            .checked_add(1)
+            .ok_or_else(|| OnyxError::Config("metadb checkpoint token overflow".into()))?;
+        cvar.notify_one();
+        Ok(true)
+    }
+
     fn sync(&self) -> OnyxResult<()> {
         let token = self.request()?;
         self.wait(token)
@@ -829,6 +881,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.page_cache_bytes = config.block_cache_bytes() as u64;
     cfg.lsm_memtable_bytes = config.memtable_budget_bytes() as u64;
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
+    cfg.group_commit_timeout_us = config.group_commit_timeout_us();
     cfg
 }
 
@@ -1078,6 +1131,8 @@ mod tests {
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             index_pin_mb: 64,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1112,6 +1167,8 @@ mod tests {
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             index_pin_mb: 64,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1163,6 +1220,8 @@ mod tests {
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             index_pin_mb: 64,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1215,6 +1274,8 @@ mod tests {
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             index_pin_mb: 64,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1284,6 +1345,8 @@ mod tests {
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             index_pin_mb: 64,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
         };
         let vol = VolumeConfig {
@@ -1336,6 +1399,8 @@ mod tests {
             block_cache_mb: 8,
             memtable_budget_mb: 64,
             index_pin_mb: 64,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
         };
         let vol = VolumeConfig {

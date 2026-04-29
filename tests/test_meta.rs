@@ -61,6 +61,8 @@ fn test_config(dir: &std::path::Path) -> MetaConfig {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     }
 }

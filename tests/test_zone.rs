@@ -19,6 +19,8 @@ fn setup_worker() -> (ZoneWorker, Arc<MetaStore>) {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -49,6 +51,8 @@ fn setup_zone_manager(zone_count: u32) -> ZoneManager {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -253,6 +257,8 @@ fn zone_manager_concurrent_reads_inline_no_serialization() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -338,6 +344,8 @@ fn zone_manager_read_pool_decompresses_concurrently() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());

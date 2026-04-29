@@ -50,6 +50,8 @@ fn setup_dedup_env_with_sizes(
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -290,6 +292,8 @@ fn dedup_index_crud() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -330,6 +334,8 @@ fn dedup_cleanup_on_pba_free() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -382,6 +388,8 @@ fn scan_dedup_skipped() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -432,6 +440,8 @@ fn update_blockmap_flags_clears_dedup_skipped() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -549,6 +559,8 @@ fn delete_volume_cleans_dedup_index() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();
@@ -609,6 +621,8 @@ fn cleanup_old_pba_preserves_newer_forward_index() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let store = MetaStore::open(&config).unwrap();

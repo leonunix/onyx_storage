@@ -49,6 +49,8 @@ fn write_and_abort(
             block_cache_mb: 32,
             memtable_budget_mb: 0,
             index_pin_mb: 64,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1000,
             wal_dir: None,
         },
         storage: StorageConfig {

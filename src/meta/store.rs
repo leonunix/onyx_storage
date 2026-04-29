@@ -49,6 +49,10 @@ impl MetaStore {
         self.backend.request_durable_checkpoint()
     }
 
+    pub fn try_request_durable_checkpoint(&self) -> OnyxResult<bool> {
+        self.backend.try_request_durable_checkpoint()
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         self.backend.memory_stats()
     }
@@ -286,11 +290,12 @@ impl MetaStore {
         &self,
         callback: &mut dyn FnMut(&str, &[u8], &[u8]),
     ) -> OnyxResult<()> {
-        for (vol_id, lba, value) in self.backend.scan_all_blockmap_entries()? {
-            let key = encode_blockmap_key(lba);
-            let val = encode_blockmap_value(&value);
-            callback(&vol_id.0, &key, &val);
-        }
+        self.backend
+            .scan_all_blockmap_entries_with(&mut |vol_id, lba, value| {
+                let key = encode_blockmap_key(lba);
+                let val = encode_blockmap_value(&value);
+                callback(&vol_id.0, &key, &val);
+            })?;
         Ok(())
     }
 

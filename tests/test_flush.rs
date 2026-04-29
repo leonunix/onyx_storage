@@ -52,6 +52,8 @@ fn setup_flush_env_with_backend(
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -394,6 +396,8 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
             block_cache_mb: 8,
             memtable_budget_mb: 0,
             index_pin_mb: 0,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
         })
         .unwrap(),

@@ -125,6 +125,17 @@ pub struct MetaConfig {
     /// large-memory deployments. Set to 0 to disable.
     #[serde(default = "default_index_pin_mb")]
     pub index_pin_mb: usize,
+    /// Minimum interval between background metadb checkpoints, in
+    /// milliseconds. Metadb WAL fsync makes user writes durable; full
+    /// checkpoints are for WAL pruning and recovery-time control, so they
+    /// should not run at buffer-ring watermark cadence.
+    #[serde(default = "default_metadb_checkpoint_interval_ms")]
+    pub checkpoint_interval_ms: u64,
+    /// How long metadb's WAL writer waits for new sibling committers before
+    /// fsyncing a partial group-commit batch. The writer still drains already
+    /// queued commits first, so this should stay tiny on low-latency NVMe.
+    #[serde(default = "default_metadb_group_commit_timeout_us")]
+    pub group_commit_timeout_us: u64,
     /// Optional separate WAL directory for the metadata store.
     pub wal_dir: Option<PathBuf>,
 }
@@ -159,6 +170,14 @@ impl MetaConfig {
     pub fn index_pin_bytes(&self) -> usize {
         self.index_pin_mb.saturating_mul(1024 * 1024)
     }
+
+    pub fn checkpoint_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.checkpoint_interval_ms.max(1))
+    }
+
+    pub fn group_commit_timeout_us(&self) -> u64 {
+        self.group_commit_timeout_us.max(1)
+    }
 }
 
 impl Default for MetaConfig {
@@ -168,6 +187,8 @@ impl Default for MetaConfig {
             block_cache_mb: default_block_cache_mb(),
             memtable_budget_mb: 0,
             index_pin_mb: default_index_pin_mb(),
+            checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
+            group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_dir: None,
         }
     }
@@ -371,6 +392,12 @@ fn default_block_cache_mb() -> usize {
 }
 fn default_index_pin_mb() -> usize {
     1024
+}
+fn default_metadb_checkpoint_interval_ms() -> u64 {
+    5_000
+}
+fn default_metadb_group_commit_timeout_us() -> u64 {
+    1
 }
 fn default_block_size() -> u32 {
     4096

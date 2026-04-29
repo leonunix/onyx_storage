@@ -78,6 +78,8 @@ fn setup_gc_env() -> TestEnv {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
@@ -119,6 +121,8 @@ fn scanner_finds_candidates_with_dead_blocks() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -198,6 +202,8 @@ fn scanner_skips_below_threshold() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -252,6 +258,8 @@ fn scanner_skips_single_lba_units() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -284,6 +292,8 @@ fn scanner_sorts_by_dead_ratio_descending() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -642,6 +652,8 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
@@ -726,6 +738,8 @@ fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
     };
     let meta = MetaStore::open(&meta_config).unwrap();

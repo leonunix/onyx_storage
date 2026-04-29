@@ -32,6 +32,14 @@ memtable_budget_mb = 256
 # random L2P gets never miss on inner nodes. 1 GiB covers ~hundreds of GiB
 # of leaf data; raise on large-memory boxes.
 index_pin_mb = 1024
+# Background metadb checkpoint cadence. WAL fsync on each metadb commit
+# already makes user writes durable; checkpoints mainly prune WAL and cap
+# recovery time, so keep them off the 10-50ms buffer watermark cadence.
+checkpoint_interval_ms = 5000
+# WAL group-commit coalescing window. The WAL writer still drains already
+# queued commits opportunistically; this only caps how long it waits for new
+# siblings before fsyncing.
+group_commit_timeout_us = 1
 wal_dir = "/mnt/onyx-vdb-meta/wal"
 
 [storage]
