@@ -117,6 +117,7 @@ fn setup_with_all_options(
             group_commit_wait_us: 250,
             shards: 1,
             max_memory_mb: 0,
+            ..BufferConfig::default()
         },
         ublk: UblkConfig::default(),
         flush,

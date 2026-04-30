@@ -708,6 +708,11 @@ pub struct BufferShardSnapshot {
     pub head_age_ms: Option<u64>,
     /// How long the current seq has continuously remained at the head/front.
     pub head_residency_ms: Option<u64>,
+    /// Entries staged for the sync thread but not yet part of the current
+    /// fdatasync batch.
+    pub staged_entries: usize,
+    /// Payloads still resident only for the sync-before-publish window.
+    pub volatile_payloads: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -987,6 +992,8 @@ pub struct EngineStatusSnapshot {
     pub buffer_fill_pct: Option<u8>,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
+    pub buffer_volatile_payload_memory_bytes: Option<u64>,
+    pub buffer_volatile_payload_memory_limit_bytes: Option<u64>,
     pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
@@ -1015,6 +1022,14 @@ impl EngineStatusSnapshot {
             let _ = writeln!(
                 out,
                 "buffer_payload_memory_bytes: {}/{}",
+                payload_bytes, limit
+            );
+        }
+        if let Some(payload_bytes) = self.buffer_volatile_payload_memory_bytes {
+            let limit = self.buffer_volatile_payload_memory_limit_bytes.unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "buffer_volatile_payload_memory_bytes: {}/{}",
                 payload_bytes, limit
             );
         }

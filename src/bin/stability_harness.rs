@@ -69,6 +69,7 @@ fn write_and_abort(
             group_commit_wait_us: 250,
             shards: 1,
             max_memory_mb: 0,
+            ..BufferConfig::default()
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig {

@@ -145,7 +145,7 @@ fn hydrated_payload_is_not_reinstalled_after_flush_race() {
         }
         assert!(
             Instant::now() < deadline,
-            "sync loop did not evict committed payload in time"
+            "sync loop did not publish an uncached ready entry in time"
         );
         thread::sleep(Duration::from_millis(10));
     };
@@ -190,6 +190,44 @@ fn lookup_hydrates_from_disk_without_volatile_payload() {
     let after = shard.pending_entry_arc(seq).unwrap();
     assert!(after.payload.is_none());
     assert!(Arc::ptr_eq(&before, &after));
+}
+
+#[test]
+fn lookup_primary_range_batches_contiguous_hydration() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 32 * 8192, Duration::from_millis(1));
+    let metrics = Arc::new(EngineMetrics::default());
+
+    let mut expected = Vec::new();
+    for i in 0..8u64 {
+        let payload = vec![0x30 + i as u8; BLOCK_SIZE as usize];
+        expected.push(payload.clone());
+        let seq = pool.append("test-vol", Lba(i), 1, &payload, 0).unwrap();
+        assert_eq!(
+            pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+            seq
+        );
+        assert!(
+            pool.shards[0].shard.volatile_payload(seq).is_none(),
+            "ready entries should hydrate from disk"
+        );
+    }
+
+    pool.attach_metrics(metrics.clone());
+    let hits = pool.lookup_primary_range("test-vol", Lba(0), 8).unwrap();
+    assert_eq!(hits.len(), 8);
+    for (idx, hit) in hits.into_iter().enumerate() {
+        let pending = hit.unwrap();
+        assert_eq!(pending.start_lba, Lba(idx as u64));
+        assert_eq!(pending.payload.as_deref(), Some(expected[idx].as_slice()));
+    }
+
+    assert_eq!(
+        metrics
+            .buffer_lookup_hydrate_ops
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "contiguous one-LBA entries should hydrate with one batched LV2 read"
+    );
 }
 
 #[test]

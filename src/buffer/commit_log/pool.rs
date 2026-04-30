@@ -479,32 +479,34 @@ impl WriteBufferPool {
 
         loop {
             if inflight.is_empty() {
-                match wake_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(()) => {}
-                    Err(RecvTimeoutError::Timeout) => {
-                        if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
-                            return;
+                if shard.staging_rx.is_empty() {
+                    match wake_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(()) => {}
+                        Err(RecvTimeoutError::Timeout) => {
+                            if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
-                            return;
+                        Err(RecvTimeoutError::Disconnected) => {
+                            if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                }
-                while wake_rx.try_recv().is_ok() {}
-                if !batch_wait.is_zero() {
-                    let sleep_start = Instant::now();
-                    thread::sleep(batch_wait);
-                    if let Some(metrics) = metrics.get() {
-                        BufferShard::record_metric(&metrics.buffer_sync_sleep_ns, sleep_start);
                     }
                     while wake_rx.try_recv().is_ok() {}
+                    if !batch_wait.is_zero() {
+                        let sleep_start = Instant::now();
+                        thread::sleep(batch_wait);
+                        if let Some(metrics) = metrics.get() {
+                            BufferShard::record_metric(&metrics.buffer_sync_sleep_ns, sleep_start);
+                        }
+                        while wake_rx.try_recv().is_ok() {}
+                    }
                 }
 
-                inflight = shard.drain_staged();
+                inflight = shard.drain_staged_limited();
                 if inflight.is_empty() {
                     if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
                         return;
@@ -613,18 +615,29 @@ impl WriteBufferPool {
                     let inflight_pending: Vec<Arc<PendingEntry>> =
                         inflight.iter().map(|entry| entry.pending.clone()).collect();
                     shard.retire_superseded_by_durable_entries(&inflight_pending);
+                    let mut cache_after_sync = Vec::new();
+                    let mut publish_after_sync = Vec::new();
                     {
                         let mut lc = shard.lifecycle.lock();
                         for entry in &inflight {
                             let seq = entry.pending.seq;
                             lc.inflight.remove(&seq);
-                            shard.remove_volatile_payload(seq);
+                            let payload = shard.remove_volatile_payload(seq);
                             if lc.cancelled.remove(&seq) {
                                 continue;
                             }
-                            let _ = ready_tx.send(seq);
-                            let _ = shard_ready_tx.send(seq);
+                            if let Some(payload) = payload {
+                                cache_after_sync.push((entry.pending.clone(), payload));
+                            }
+                            publish_after_sync.push(seq);
                         }
+                    }
+                    for (pending, payload) in cache_after_sync {
+                        shard.cache_committed_payload(&pending, payload);
+                    }
+                    for seq in publish_after_sync {
+                        let _ = ready_tx.send(seq);
+                        let _ = shard_ready_tx.send(seq);
                     }
                     if let Some(metrics) = metrics.get() {
                         metrics.buffer_sync_batches.fetch_add(1, Ordering::Relaxed);
@@ -739,6 +752,29 @@ impl WriteBufferPool {
         backpressure_timeout: Duration,
         max_payload_memory: u64,
         uring_sq_entries: Option<u32>,
+    ) -> OnyxResult<Self> {
+        let runtime_limits = BufferRuntimeLimits::for_durable_payload_limit(max_payload_memory);
+        Self::open_with_options_full_and_limits(
+            device,
+            group_commit_wait,
+            shard_count,
+            routing_zone_size_blocks,
+            backpressure_timeout,
+            max_payload_memory,
+            uring_sq_entries,
+            runtime_limits,
+        )
+    }
+
+    pub fn open_with_options_full_and_limits(
+        device: RawDevice,
+        group_commit_wait: Duration,
+        shard_count: usize,
+        routing_zone_size_blocks: u64,
+        backpressure_timeout: Duration,
+        max_payload_memory: u64,
+        uring_sq_entries: Option<u32>,
+        runtime_limits: BufferRuntimeLimits,
     ) -> OnyxResult<Self> {
         Self::validate_shard_count(shard_count)?;
         let routing_zone_size_blocks = routing_zone_size_blocks.max(1);
@@ -867,6 +903,9 @@ impl WriteBufferPool {
         // ── Parallel shard recovery ──────────────────────────────────
         let metrics = Arc::new(OnceLock::new());
         let payload_bytes_in_memory = Arc::new(AtomicU64::new(0));
+        let volatile_payload_budget = Arc::new(VolatilePayloadBudget::new(
+            runtime_limits.volatile_payload_memory,
+        ));
         // Durability-watermark atomics shared with every shard. `max_flushed_seq`
         // is bumped in free_seq_allocation; `durable_seq` is advanced by the
         // engine-owned watermark thread after MetaStore::sync_durable().
@@ -879,6 +918,7 @@ impl WriteBufferPool {
                     .map(|cfg| {
                         let m = metrics.clone();
                         let pb = payload_bytes_in_memory.clone();
+                        let vb = volatile_payload_budget.clone();
                         let mfs = max_flushed_seq.clone();
                         let ds = durable_seq.clone();
                         s.spawn(move || {
@@ -889,6 +929,9 @@ impl WriteBufferPool {
                                 cfg.checkpoint,
                                 cfg.checkpoint_device,
                                 pb,
+                                max_payload_memory,
+                                vb,
+                                runtime_limits,
                                 mfs,
                                 ds,
                             )
@@ -912,6 +955,9 @@ impl WriteBufferPool {
                         cfg.checkpoint,
                         cfg.checkpoint_device,
                         payload_bytes_in_memory.clone(),
+                        max_payload_memory,
+                        volatile_payload_budget.clone(),
+                        runtime_limits,
                         max_flushed_seq.clone(),
                         durable_seq.clone(),
                     )
@@ -1018,6 +1064,7 @@ impl WriteBufferPool {
             metrics,
             payload_bytes_in_memory,
             max_payload_memory,
+            volatile_payload_budget,
             disk_version,
             max_flushed_seq,
             durable_seq,
@@ -1163,9 +1210,7 @@ impl WriteBufferPool {
                 ((lba.0 / self.routing_zone_size_blocks) + 1) * self.routing_zone_size_blocks;
             let this_count = (lba_count - done)
                 .min(shard_end_lba.saturating_sub(lba.0).min(u32::MAX as u64) as u32);
-            for i in 0..this_count {
-                out.push(shard.lookup_hydrated_interned(&vid, Lba(lba.0 + i as u64))?);
-            }
+            out.extend(shard.lookup_hydrated_range_interned(&vid, lba, this_count)?);
             done += this_count;
         }
 
@@ -1190,6 +1235,17 @@ impl WriteBufferPool {
     pub fn pending_entry_arc(&self, seq: u64) -> Option<Arc<PendingEntry>> {
         self.shard_for_seq(seq)
             .and_then(|idx| self.shards[idx].shard.pending_entry_arc_hydrated(seq))
+    }
+
+    pub fn hydrate_pending_entries_for_shard(
+        &self,
+        shard_idx: usize,
+        entries: Vec<Arc<PendingEntry>>,
+    ) -> Vec<Arc<PendingEntry>> {
+        self.shards
+            .get(shard_idx)
+            .map(|shard| shard.shard.pending_entry_arcs_hydrated(entries))
+            .unwrap_or_default()
     }
 
     pub fn is_latest_lba_seq(&self, vol_id: &str, lba: Lba, seq: u64, vol_created_at: u64) -> bool {
@@ -1491,9 +1547,19 @@ impl WriteBufferPool {
         self.payload_bytes_in_memory.load(Ordering::Relaxed)
     }
 
-    /// Configured in-memory payload ceiling. 0 means "no limit".
+    /// Configured durable payload-cache ceiling. 0 disables resident caching.
     pub fn payload_memory_limit_bytes(&self) -> u64 {
         self.max_payload_memory
+    }
+
+    /// Bytes currently held only until the buffer sync thread fdatasyncs them.
+    pub fn volatile_payload_memory_bytes(&self) -> u64 {
+        self.volatile_payload_budget.bytes()
+    }
+
+    /// Write-admission budget for sync-before-publish payloads.
+    pub fn volatile_payload_memory_limit_bytes(&self) -> u64 {
+        self.volatile_payload_budget.limit()
     }
 
     /// Atomic shared with every shard that tracks the highest seq to have
@@ -1560,6 +1626,8 @@ impl WriteBufferPool {
                     head_remaining_lbas,
                     head_age_ms,
                     head_residency_ms,
+                    staged_entries: s.staging_rx.len(),
+                    volatile_payloads: s.volatile_payloads.len(),
                 }
             })
             .collect()

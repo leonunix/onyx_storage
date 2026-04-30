@@ -203,6 +203,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             group_commit_wait_us: cfg.group_commit_wait_us,
             shards: 1,
             max_memory_mb: 0,
+            ..BufferConfig::default()
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig {

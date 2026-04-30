@@ -13,18 +13,19 @@ impl BufferFlusher {
     /// (2026-04-27) showed the bottleneck is **dispatch FIFO**: with
     /// 30 ms apply_wait per commit, throughput is gated by commits/sec
     /// not by per-op work, so 8x larger batches translate ~5x ops/sec.
-    /// 256 was picked as the cost/latency knee — 512 doubles per-commit
-    /// latency for marginal extra throughput; 1024 starts to bloat the
-    /// in-flight memory footprint per writer (~50 KB/unit avg ×
-    /// 1024 × 4 writers = 200 MB).
+    /// The NVMe mixed workload exposes metadb's per-commit tail more
+    /// sharply than the old 4-lane soak: more buffer shards means more
+    /// writer threads, so reducing commit count matters more than keeping
+    /// each writer cycle tiny. 1024 keeps per-writer transient memory
+    /// bounded while giving metadb enough work to amortise apply/WAL cost.
     ///
     /// Must stay paired with the bounded channel capacities in
     /// [`BufferFlusher::start_with_metrics`] — write_rx in particular
     /// caps at `WRITER_BATCH_SIZE`, so a smaller channel would silently
     /// starve the writer below this batch.
-    pub(super) const WRITER_BATCH_SIZE: usize = 256;
+    pub(super) const WRITER_BATCH_SIZE: usize = 1024;
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
-    pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(50);
+    pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(200);
 
     pub(super) fn writer_loop(
         shard_idx: usize,
@@ -96,25 +97,6 @@ impl BufferFlusher {
         while running.load(Ordering::Relaxed) {
             if Self::retry_one_packed_slot(
                 shard_idx,
-                &mut packed_retries,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                io_engine,
-                done_tx,
-                metrics,
-                cleanup_tx,
-                dedup_register_tx,
-            ) {
-                tail_dirty = true;
-            }
-
-            if Self::flush_aged_open_slot(
-                shard_idx,
-                packer,
-                &mut buffered_seqs,
-                &mut buffered_completions,
                 &mut packed_retries,
                 pool,
                 meta,
@@ -204,6 +186,19 @@ impl BufferFlusher {
                 Vec<u64>,
                 Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
             )> = Vec::new();
+
+            if let Some(sealed) = packer.flush_open_slot_if_older_than(Self::PACKED_SLOT_MAX_AGE) {
+                // Do not commit an aged open slot by itself at the top of
+                // the loop. Under steady load the next write_rx drain is
+                // available immediately; folding the aged slot into this
+                // packed_batch preserves done_tx ordering while avoiding a
+                // one-slot metadb commit.
+                packed_buffered_per_slot.push((
+                    std::mem::take(&mut buffered_seqs),
+                    std::mem::take(&mut buffered_completions),
+                ));
+                packed_batch.push(sealed);
+            }
 
             for unit in incoming {
                 let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
@@ -382,56 +377,6 @@ impl BufferFlusher {
         if tail_dirty {
             let _ = pool.advance_tail_for_shard(shard_idx);
         }
-    }
-
-    pub(super) fn flush_aged_open_slot(
-        shard_idx: usize,
-        packer: &mut Packer,
-        buffered_seqs: &mut Vec<u64>,
-        buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
-        packed_retries: &mut VecDeque<PackedSlotRetry>,
-        pool: &WriteBufferPool,
-        meta: &MetaStore,
-        lifecycle: &VolumeLifecycleManager,
-        allocator: &SpaceAllocator,
-        io_engine: &IoEngine,
-        done_tx: &Sender<Vec<u64>>,
-        metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
-    ) -> bool {
-        let Some(sealed) = packer.flush_open_slot_if_older_than(Self::PACKED_SLOT_MAX_AGE) else {
-            return false;
-        };
-        if let Err(e) = Self::write_packed_slot(
-            shard_idx,
-            &sealed,
-            pool,
-            meta,
-            lifecycle,
-            allocator,
-            io_engine,
-            metrics,
-            cleanup_tx,
-            dedup_register_tx,
-        ) {
-            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-            let failed_pba = sealed.pba;
-            Self::queue_packed_slot_retry(
-                packed_retries,
-                sealed,
-                buffered_seqs,
-                buffered_completions,
-            );
-            tracing::error!(
-                pba = failed_pba.0,
-                error = %e,
-                "writer: failed to flush aged packed slot; queued whole-slot retry"
-            );
-        } else {
-            Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
-        }
-        true
     }
 
     /// Flush buffered done_tx for sealed packer slots.

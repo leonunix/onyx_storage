@@ -916,6 +916,11 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.lsm_memtable_bytes = config.memtable_budget_bytes() as u64;
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
+    // Onyx treats startup as a data-plane path. Full page-file scans are
+    // available through offline metadb-verify, but should not gate service
+    // restart on large metadata files.
+    cfg.rebuild_free_list_on_open = false;
+    cfg.reclaim_orphans_on_open = false;
     cfg
 }
 

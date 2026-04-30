@@ -280,6 +280,21 @@ pub struct BufferConfig {
     /// Default 0 = auto (50% of system memory, capped at 8 GiB).
     #[serde(default)]
     pub max_memory_mb: usize,
+    /// Maximum pre-sync payload bytes. 0 = derive from max_memory_mb.
+    #[serde(default)]
+    pub volatile_memory_mb: usize,
+    /// Per-shard staging queue length between appenders and sync thread.
+    /// 0 = engine default.
+    #[serde(default)]
+    pub staging_queue_entries: usize,
+    /// Max entries one sync thread drains into a single fdatasync epoch.
+    /// 0 = engine default.
+    #[serde(default)]
+    pub sync_batch_max_entries: usize,
+    /// Max payload bytes one sync thread drains into a single fdatasync epoch.
+    /// 0 = engine default.
+    #[serde(default)]
+    pub sync_batch_max_bytes_mb: usize,
 }
 
 impl Default for BufferConfig {
@@ -291,6 +306,10 @@ impl Default for BufferConfig {
             group_commit_wait_us: default_group_commit_wait_us(),
             shards: default_buffer_shards(),
             max_memory_mb: 0,
+            volatile_memory_mb: 0,
+            staging_queue_entries: 0,
+            sync_batch_max_entries: 0,
+            sync_batch_max_bytes_mb: 0,
         }
     }
 }

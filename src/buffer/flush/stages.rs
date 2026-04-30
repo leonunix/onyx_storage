@@ -193,6 +193,11 @@ impl BufferFlusher {
                 continue;
             }
 
+            new_entries = pool.hydrate_pending_entries_for_shard(shard_idx, new_entries);
+            if new_entries.is_empty() {
+                continue;
+            }
+
             // Build per-volume compression lookup using cache
             for entry in &new_entries {
                 vol_compression_cache

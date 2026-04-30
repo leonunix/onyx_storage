@@ -76,7 +76,6 @@ enum SkipReason {
     AlreadySeen,
     NoPendingEntry,
     Superseded,
-    HydrationFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,13 +312,9 @@ impl BufferFlusher {
             return EnqueuePendingSeq::WindowFull;
         }
 
-        if let Some(entry) = pool.pending_entry_arc(seq) {
-            *queued_bytes = queued_bytes.saturating_add(Self::pending_entry_bytes(entry.as_ref()));
-            new_entries.push(entry);
-            EnqueuePendingSeq::Queued
-        } else {
-            EnqueuePendingSeq::Skipped(SkipReason::HydrationFailed)
-        }
+        *queued_bytes = queued_bytes.saturating_add(Self::pending_entry_bytes(meta.as_ref()));
+        new_entries.push(meta);
+        EnqueuePendingSeq::Queued
     }
 
     fn live_positions_for_unit(

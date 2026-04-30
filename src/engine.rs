@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::flush::BufferFlusher;
-use crate::buffer::pool::WriteBufferPool;
+use crate::buffer::pool::{BufferRuntimeLimits, WriteBufferPool};
 use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
@@ -460,7 +460,14 @@ impl OnyxEngine {
             IoBackendConfig::Uring => Some(config.storage.uring_sq_entries),
             IoBackendConfig::Syscall => None,
         };
-        let pool = Arc::new(WriteBufferPool::open_with_options_full(
+        let buffer_runtime_limits = BufferRuntimeLimits::from_config(
+            max_payload_memory,
+            config.buffer.staging_queue_entries,
+            config.buffer.sync_batch_max_entries,
+            config.buffer.sync_batch_max_bytes_mb as usize * 1024 * 1024,
+            config.buffer.volatile_memory_mb as u64 * 1024 * 1024,
+        );
+        let pool = Arc::new(WriteBufferPool::open_with_options_full_and_limits(
             buf_dev,
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
             config.buffer.shards,
@@ -468,6 +475,7 @@ impl OnyxEngine {
             Self::buffer_backpressure_timeout(),
             max_payload_memory,
             buffer_uring_entries,
+            buffer_runtime_limits,
         )?);
         pool.attach_metrics(metrics.clone());
 
@@ -1236,6 +1244,14 @@ impl OnyxEngine {
                 .buffer_pool
                 .as_ref()
                 .map(|pool| pool.payload_memory_limit_bytes()),
+            buffer_volatile_payload_memory_bytes: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.volatile_payload_memory_bytes()),
+            buffer_volatile_payload_memory_limit_bytes: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.volatile_payload_memory_limit_bytes()),
             metadb_memory: self.meta.memory_stats().ok(),
             buffer_shards: self
                 .buffer_pool
