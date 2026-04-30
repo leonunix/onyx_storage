@@ -101,6 +101,7 @@ impl EngineHarness {
             dedup: options.dedup,
             service: Default::default(),
             ha: Default::default(),
+            threading: Default::default(),
         };
 
         let engine = OnyxEngine::open(&config).unwrap();

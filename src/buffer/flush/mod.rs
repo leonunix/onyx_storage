@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
+use crate::affinity::{self, ThreadRole};
 use crate::buffer::pipeline::{coalesce_pending, CoalesceUnit, CompressedUnit};
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
@@ -417,6 +418,7 @@ impl BufferFlusher {
             let coalesce_handle = thread::Builder::new()
                 .name(format!("flusher-coalesce-{}", shard_idx))
                 .spawn(move || {
+                    affinity::bind_current(ThreadRole::FlusherCoalesce, shard_idx);
                     Self::coalesce_loop(
                         shard_idx,
                         &pool_c,
@@ -449,6 +451,10 @@ impl BufferFlusher {
                     let h = thread::Builder::new()
                         .name(format!("flusher-dedup-{}-{}", shard_idx, worker_idx))
                         .spawn(move || {
+                            affinity::bind_current(
+                                ThreadRole::FlusherDedup,
+                                shard_idx * dedup_workers + worker_idx,
+                            );
                             Self::dedup_loop(
                                 shard_idx,
                                 &rx,
@@ -482,6 +488,10 @@ impl BufferFlusher {
                 let h = thread::Builder::new()
                     .name(format!("flusher-compress-{}-{}", shard_idx, worker_idx))
                     .spawn(move || {
+                        affinity::bind_current(
+                            ThreadRole::FlusherCompress,
+                            shard_idx * compress_workers + worker_idx,
+                        );
                         Self::compress_loop(&rx, &tx, &running_w, &metrics_w);
                     })
                     .expect("failed to spawn compress worker");
@@ -502,6 +512,7 @@ impl BufferFlusher {
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
+                    affinity::bind_current(ThreadRole::FlusherWriter, shard_idx);
                     let mut packer = Packer::new_with_lane(allocator_w.clone(), shard_idx);
                     Self::writer_loop(
                         shard_idx,
@@ -528,6 +539,7 @@ impl BufferFlusher {
             let dedup_register_handle = thread::Builder::new()
                 .name(format!("flusher-dedup-register-{}", shard_idx))
                 .spawn(move || {
+                    affinity::bind_current(ThreadRole::FlusherDedupRegister, shard_idx);
                     Self::dedup_register_loop(shard_idx, &dedup_register_rx, &meta_dr, &metrics_dr);
                 })
                 .expect("failed to spawn dedup registration thread");
@@ -539,6 +551,7 @@ impl BufferFlusher {
             let cleanup_handle = thread::Builder::new()
                 .name(format!("flusher-cleanup-{}", shard_idx))
                 .spawn(move || {
+                    affinity::bind_current(ThreadRole::FlusherCleanup, shard_idx);
                     Self::cleanup_loop(
                         shard_idx,
                         &cleanup_rx,

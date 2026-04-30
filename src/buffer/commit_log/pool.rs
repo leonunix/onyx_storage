@@ -1023,6 +1023,10 @@ impl WriteBufferPool {
                     let shard_ready_tx = shard_ready_tx.clone();
                     let uring = shard_uring.clone();
                     move || {
+                        crate::affinity::bind_current(
+                            crate::affinity::ThreadRole::BufferSync,
+                            shard_idx,
+                        );
                         Self::sync_loop(
                             sync_device,
                             shard,

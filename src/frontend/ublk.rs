@@ -1,7 +1,7 @@
 // ublk frontend: exposes a Linux block device via the ublk kernel module.
 // This module is only compiled on Linux (cfg(target_os = "linux")).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -104,9 +104,15 @@ impl OnyxUblkTarget {
         let sector_size = SECTOR_SIZE as u64;
 
         let q_handler = move |qid: u16, dev: &UblkDev| {
+            crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
             let bufs = Rc::new(RefCell::new(dev.alloc_queue_io_bufs()));
             let io_bufs = bufs.clone();
+            let queue_thread_bound = Rc::new(Cell::new(false));
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                if !queue_thread_bound.get() {
+                    crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
+                    queue_thread_bound.set(true);
+                }
                 let iod = q.get_iod(tag);
                 let op = iod.op_flags & 0xFF;
                 let start_sector = iod.start_sector;

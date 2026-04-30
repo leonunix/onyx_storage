@@ -29,6 +29,8 @@ pub struct OnyxConfig {
     pub service: ServiceConfig,
     #[serde(default)]
     pub ha: HaConfig,
+    #[serde(default)]
+    pub threading: ThreadingConfig,
 }
 
 /// What the engine can do given the current configuration.
@@ -501,6 +503,67 @@ fn default_heartbeat_interval_ms() -> u64 {
 }
 fn default_lease_duration_secs() -> u64 {
     30
+}
+
+/// Optional CPU affinity layout. All fields accept Linux CPU-list syntax such
+/// as `"0-7,16-23"`. Empty fields leave that role unbound.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThreadingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ublk_cpus: String,
+    #[serde(default)]
+    pub read_pool_cpus: String,
+    #[serde(default)]
+    pub buffer_sync_cpus: String,
+    #[serde(default)]
+    pub flusher_coalesce_cpus: String,
+    #[serde(default)]
+    pub flusher_dedup_cpus: String,
+    #[serde(default)]
+    pub flusher_compress_cpus: String,
+    #[serde(default)]
+    pub flusher_writer_cpus: String,
+    #[serde(default)]
+    pub flusher_dedup_register_cpus: String,
+    #[serde(default)]
+    pub flusher_cleanup_cpus: String,
+    #[serde(default)]
+    pub metadb_wal_cpus: String,
+    #[serde(default)]
+    pub metadb_l2p_apply_cpus: String,
+    #[serde(default)]
+    pub metadb_refcount_apply_cpus: String,
+    #[serde(default)]
+    pub metadb_dedup_apply_cpus: String,
+    #[serde(default)]
+    pub metadb_checkpoint_cpus: String,
+    #[serde(default)]
+    pub background_cpus: String,
+}
+
+impl Default for ThreadingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ublk_cpus: String::new(),
+            read_pool_cpus: String::new(),
+            buffer_sync_cpus: String::new(),
+            flusher_coalesce_cpus: String::new(),
+            flusher_dedup_cpus: String::new(),
+            flusher_compress_cpus: String::new(),
+            flusher_writer_cpus: String::new(),
+            flusher_dedup_register_cpus: String::new(),
+            flusher_cleanup_cpus: String::new(),
+            metadb_wal_cpus: String::new(),
+            metadb_l2p_apply_cpus: String::new(),
+            metadb_refcount_apply_cpus: String::new(),
+            metadb_dedup_apply_cpus: String::new(),
+            metadb_checkpoint_cpus: String::new(),
+            background_cpus: String::new(),
+        }
+    }
 }
 
 fn default_nr_queues() -> u16 {

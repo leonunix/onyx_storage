@@ -130,6 +130,7 @@ fn setup_with_all_options(
         dedup,
         service: Default::default(),
         ha: Default::default(),
+        threading: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

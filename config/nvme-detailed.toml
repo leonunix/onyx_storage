@@ -80,6 +80,28 @@ pending_skip_threshold_entries = 0
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 4096
 
+[threading]
+enabled = true
+# RHEL NVMe dev host: 96 logical CPUs split across two NUMA nodes as even/odd
+# siblings. Keep frontend reads on the low cores, compression/dedup in the
+# middle, and metadata/background work on the high cores so perf samples are
+# not dominated by scheduler drift.
+ublk_cpus = "0-15"
+read_pool_cpus = "16-31"
+buffer_sync_cpus = "32-47"
+flusher_coalesce_cpus = "48-55"
+flusher_dedup_cpus = "56-71"
+flusher_compress_cpus = "72-79"
+flusher_writer_cpus = "80-87"
+flusher_dedup_register_cpus = "80-87"
+flusher_cleanup_cpus = "88-91"
+metadb_wal_cpus = "92"
+metadb_l2p_apply_cpus = "56-71"
+metadb_refcount_apply_cpus = "80-87"
+metadb_dedup_apply_cpus = "80-87"
+metadb_checkpoint_cpus = "88-91"
+background_cpus = "88-95"
+
 [service]
 socket_path = "/tmp/onyx-storage-nvme.sock"
 

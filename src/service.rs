@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 
 use arc_swap::ArcSwap;
 
+use crate::affinity::{self, ThreadRole};
 use crate::config::{ConfiguredMode, OnyxConfig};
 use crate::engine::OnyxEngine;
 use crate::error::{OnyxError, OnyxResult};
@@ -302,6 +303,7 @@ impl ServiceController {
                 thread::Builder::new()
                     .name(format!("ublk-{}", vol_name))
                     .spawn(move || {
+                        affinity::bind_current(ThreadRole::Ublk, 0);
                         let (tx, rx) = std::sync::mpsc::channel();
                         let dev_ids_inner = dev_ids.clone();
                         let vol_name_inner = vol_name.clone();
@@ -405,6 +407,7 @@ impl ServiceController {
             let handle = thread::Builder::new()
                 .name(format!("ublk-{}", vol_name))
                 .spawn(move || {
+                    affinity::bind_current(ThreadRole::Ublk, 0);
                     let (tx, rx) = std::sync::mpsc::channel();
                     let dev_ids_inner = dev_ids.clone();
                     let vol_name_inner = vol_name.clone();

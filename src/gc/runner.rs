@@ -59,6 +59,7 @@ impl GcRunner {
         let handle = thread::Builder::new()
             .name("gc-runner".into())
             .spawn(move || {
+                crate::affinity::bind_current(crate::affinity::ThreadRole::Background, 1);
                 Self::gc_loop(
                     &metrics,
                     &meta,

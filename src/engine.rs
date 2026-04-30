@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::affinity::{self, ThreadRole};
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::{BufferRuntimeLimits, WriteBufferPool};
 use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
@@ -102,6 +103,7 @@ impl DurabilityWatermarkHandle {
         let thread = std::thread::Builder::new()
             .name("durability-watermark".into())
             .spawn(move || {
+                affinity::bind_current(ThreadRole::Background, 0);
                 let mut last_checkpoint = std::time::Instant::now();
                 let mut last_checkpoint_request_seq = 0u64;
                 while !stop_clone.load(Ordering::Relaxed) {

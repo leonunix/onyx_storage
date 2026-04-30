@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod types;
 
+pub mod affinity;
 pub mod buffer;
 pub mod compress;
 pub mod dedup;

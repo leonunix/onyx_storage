@@ -62,6 +62,7 @@ impl DedupScanner {
         let handle = thread::Builder::new()
             .name("dedup-scanner".into())
             .spawn(move || {
+                crate::affinity::bind_current(crate::affinity::ThreadRole::Background, 0);
                 Self::scan_loop(
                     &metrics,
                     &meta,
@@ -279,8 +280,9 @@ impl DedupScanner {
                         stats.hits += 1;
                     }
                     Some(_) => {
-                        meta.delete_dedup_index(&hash)?;
-                        // Dedup miss: register in index and clear flag
+                        // The forward index may already have been re-registered
+                        // to a different live PBA. Do not tombstone it here;
+                        // normal dead-PBA cleanup owns stale reverse/index rows.
                         let entry = DedupEntry {
                             pba: current.pba,
                             slot_offset: current.slot_offset,

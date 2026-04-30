@@ -30,6 +30,7 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
+use crate::affinity::{self, ThreadRole};
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
 use crate::io::device::RawDevice;
@@ -100,6 +101,7 @@ impl ReadPool {
             let join = thread::Builder::new()
                 .name(format!("read-pool-{}", worker_idx))
                 .spawn(move || {
+                    affinity::bind_current(ThreadRole::ReadPool, worker_idx);
                     let fd = worker_device.as_raw_fd();
                     let ctx = WorkerCtx {
                         ring: session,

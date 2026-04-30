@@ -321,6 +321,13 @@ impl MetaStore {
         self.backend.dedup_entry_is_live(hash, entry)
     }
 
+    pub fn multi_dedup_entries_are_live(
+        &self,
+        entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<Vec<bool>> {
+        self.backend.multi_dedup_entries_are_live(entries)
+    }
+
     pub fn cleanup_dedup_for_pba_standalone(&self, pba: Pba) -> OnyxResult<()> {
         self.backend.cleanup_dedup_for_pbas_batch(&[pba])
     }

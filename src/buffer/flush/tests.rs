@@ -783,6 +783,118 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
 }
 
 #[test]
+fn dedup_worker_batches_hits_across_units() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    pool.durable_seq_handle().store(u64::MAX, Ordering::Release);
+
+    let source = vec![0x7Bu8; BLOCK_SIZE as usize];
+    let hash: ContentHash = *blake3::hash(&source).as_bytes();
+    let target = BlockmapValue {
+        pba: Pba(77),
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&source),
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.set_refcount(target.pba, 1).unwrap();
+    meta.put_dedup_entries(&[(
+        hash,
+        DedupEntry {
+            pba: target.pba,
+            slot_offset: target.slot_offset,
+            compression: target.compression,
+            unit_compressed_size: target.unit_compressed_size,
+            unit_original_size: target.unit_original_size,
+            unit_lba_count: target.unit_lba_count,
+            offset_in_unit: target.offset_in_unit,
+            crc32: target.crc32,
+        },
+    )])
+    .unwrap();
+
+    let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(128);
+    let (miss_tx, miss_rx) = bounded::<CoalesceUnit>(128);
+    let (done_tx, done_rx) = unbounded::<Vec<u64>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let running = AtomicBool::new(true);
+
+    for i in 0..8u64 {
+        let lba = Lba(10_000 + i);
+        pool.note_latest_lba_seq_for_test("flush-race", lba, i, 1);
+        dedup_tx
+            .send(CoalesceUnit {
+                vol_id: "flush-race".into(),
+                start_lba: lba,
+                lba_count: 1,
+                raw_blocks: vec![crate::buffer::pipeline::RawBlockRef {
+                    payload: Arc::from(source.clone()),
+                    offset: 0,
+                }],
+                compression: CompressionAlgo::None,
+                vol_created_at: 1,
+                seq_lba_ranges: vec![(i, lba, 1)],
+                dedup_skipped: false,
+                block_hashes: None,
+                dedup_completion: None,
+            })
+            .unwrap();
+    }
+    drop(dedup_tx);
+
+    BufferFlusher::dedup_loop(
+        0,
+        &dedup_rx,
+        &miss_tx,
+        &meta,
+        &pool,
+        &lifecycle,
+        &allocator,
+        &done_tx,
+        &running,
+        100,
+        0,
+        &metrics,
+        &cleanup_tx,
+    );
+    drop(miss_tx);
+
+    assert!(
+        miss_rx.is_empty(),
+        "all duplicate blocks should be handled as metadata-only hits"
+    );
+
+    let mut done = Vec::new();
+    while let Ok(seqs) = done_rx.try_recv() {
+        done.extend(seqs);
+    }
+    done.sort_unstable();
+    assert_eq!(done, (0u64..8).collect::<Vec<_>>());
+
+    for i in 0..8u64 {
+        let mapping = meta
+            .get_mapping(&VolumeId("flush-race".into()), Lba(10_000 + i))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.pba, target.pba);
+    }
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.dedup_hits, 8);
+    assert_eq!(snap.dedup_misses, 0);
+    assert_eq!(snap.dedup_hit_commit_ops, 8);
+    assert_eq!(
+        meta.memory_stats().unwrap().commit_attempts,
+        3,
+        "setup uses set_refcount + put_dedup_entries; the 8 hits should share one commit"
+    );
+}
+
+#[test]
 fn coalesce_enqueue_caps_ready_window_bytes() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 96 * 1024 * 1024;

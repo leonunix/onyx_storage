@@ -407,6 +407,17 @@ impl MetadbBackend {
             .collect()
     }
 
+    pub(crate) fn multi_dedup_entries_are_live(
+        &self,
+        entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<Vec<bool>> {
+        let metadb_entries: Vec<(ContentHash, DedupValue)> = entries
+            .iter()
+            .map(|(hash, entry)| (*hash, to_dedup_value(entry)))
+            .collect();
+        Ok(self.db.multi_dedup_entries_are_live(&metadb_entries)?)
+    }
+
     pub(crate) fn atomic_batch_write(
         &self,
         vol_id: &VolumeId,
@@ -580,10 +591,7 @@ impl MetadbBackend {
         //      at a doomed pba whose final decref already landed. Treating
         //      it as live here would let us bump a refcount that's about
         //      to be reclaimed.
-        if self.get_refcount(entry.pba)? == 0 {
-            return Ok(false);
-        }
-        Ok(self.get_dedup(hash)?.as_ref() == Some(entry))
+        Ok(self.multi_dedup_entries_are_live(&[(*hash, *entry)])?[0])
     }
 
     pub(crate) fn cleanup_dedup_for_pbas_batch(&self, pbas: &[Pba]) -> OnyxResult<()> {
@@ -841,6 +849,7 @@ impl AsyncCheckpoint {
         let thread = std::thread::Builder::new()
             .name("metadb-checkpoint".into())
             .spawn(move || loop {
+                crate::affinity::bind_current(crate::affinity::ThreadRole::MetadbCheckpoint, 0);
                 let (start, target) = {
                     let (lock, cvar) = &*worker_state;
                     let mut state = lock.lock().unwrap();
