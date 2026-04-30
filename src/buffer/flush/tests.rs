@@ -25,6 +25,7 @@ fn setup_flush_test_env() -> (
             block_cache_mb: 8,
             memtable_budget_mb: 0,
             index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
@@ -174,7 +175,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
 }
 
 #[test]
-fn dedup_registration_thread_registers_live_mapping_after_writer_commit() {
+fn write_unit_queues_dedup_registration_after_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
@@ -200,15 +201,221 @@ fn dedup_registration_thread_registers_live_mapping_after_writer_commit() {
     )
     .unwrap();
 
-    drop(dedup_register_tx);
-    BufferFlusher::dedup_register_loop(0, &dedup_register_rx, &meta, &metrics);
+    let mapping = meta
+        .get_mapping(&VolumeId("flush-race".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "dedup miss registration should not bloat the foreground mapping commit"
+    );
+    let regs = dedup_register_rx
+        .try_recv()
+        .expect("writer should queue a best-effort dedup registration batch");
+    BufferFlusher::register_dedup_batch(&meta, &regs, "test");
+    let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
+    assert_eq!(dedup.to_blockmap_value(), mapping);
+}
+
+#[test]
+fn write_packed_slot_queues_dedup_registration_after_mapping_commit() {
+    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+
+    let payload = vec![0x6B; BLOCK_SIZE as usize];
+    let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+    let seq = pool.append("flush-race", Lba(0), 1, &payload, 1).unwrap();
+    let mut unit = make_packed_unit(0x6B, seq);
+    unit.block_hashes = Some(vec![hash]);
+
+    let pba = allocator.allocate_one_for_lane(0).unwrap();
+    let sealed = SealedSlot {
+        pba,
+        data: vec![0x6B; BLOCK_SIZE as usize],
+        fragments: vec![crate::packer::packer::SlotFragment {
+            unit,
+            slot_offset: 0,
+        }],
+    };
+
+    BufferFlusher::write_packed_slot(
+        0,
+        &sealed,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &cleanup_tx,
+        &dedup_register_tx,
+    )
+    .unwrap();
 
     let mapping = meta
         .get_mapping(&VolumeId("flush-race".into()), Lba(0))
         .unwrap()
         .unwrap();
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "packed miss registration should not bloat the foreground mapping commit"
+    );
+    let regs = dedup_register_rx
+        .try_recv()
+        .expect("writer should queue a best-effort packed dedup registration batch");
+    BufferFlusher::register_dedup_batch(&meta, &regs, "test");
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
+}
+
+#[test]
+fn write_packed_slots_batch_queues_dedup_registration_after_mapping_commit() {
+    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+
+    let mut sealed_slots = Vec::new();
+    let mut expected = Vec::new();
+    for (idx, lba) in [10_u64, 20_u64].into_iter().enumerate() {
+        let fill = 0x70 + idx as u8;
+        let payload = vec![fill; BLOCK_SIZE as usize];
+        let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+        let seq = pool.append("flush-race", Lba(lba), 1, &payload, 1).unwrap();
+        let mut unit = make_packed_unit_at(fill, seq, lba);
+        unit.block_hashes = Some(vec![hash]);
+
+        let pba = allocator.allocate_one_for_lane(0).unwrap();
+        sealed_slots.push(SealedSlot {
+            pba,
+            data: vec![fill; BLOCK_SIZE as usize],
+            fragments: vec![crate::packer::packer::SlotFragment {
+                unit,
+                slot_offset: 0,
+            }],
+        });
+        expected.push((hash, Lba(lba)));
+    }
+
+    let results = BufferFlusher::write_packed_slots_batch(
+        0,
+        &sealed_slots,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &cleanup_tx,
+        &dedup_register_tx,
+    );
+    assert!(results.into_iter().all(|result| result.is_ok()));
+
+    let regs = dedup_register_rx
+        .try_recv()
+        .expect("packed batch should queue best-effort dedup registrations");
+    BufferFlusher::register_dedup_batch(&meta, &regs, "test");
+
+    for (hash, lba) in expected {
+        let mapping = meta
+            .get_mapping(&VolumeId("flush-race".into()), lba)
+            .unwrap()
+            .unwrap();
+        let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
+        assert_eq!(dedup.to_blockmap_value(), mapping);
+    }
+}
+
+#[test]
+fn write_packed_slots_batch_splits_oversized_metadata_commits() {
+    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+
+    let slot_count = 270usize;
+    let lbas_per_slot = 1024u32;
+    let total_lbas = slot_count * lbas_per_slot as usize;
+    let mut sealed_slots = Vec::with_capacity(slot_count);
+    for idx in 0..slot_count {
+        let start_lba = Lba(idx as u64 * lbas_per_slot as u64);
+        let seq = idx as u64 + 1;
+        for off in 0..lbas_per_slot {
+            pool.note_latest_lba_seq_for_test("flush-race", Lba(start_lba.0 + off as u64), seq, 1);
+        }
+
+        let pba = allocator.allocate_one_for_lane(0).unwrap();
+        let fill = (idx as u8).wrapping_add(1);
+        let data = vec![fill; 1];
+        let unit = CompressedUnit {
+            vol_id: "flush-race".into(),
+            start_lba,
+            lba_count: lbas_per_slot,
+            original_size: BLOCK_SIZE * lbas_per_slot,
+            compressed_data: data.clone(),
+            compression: 0,
+            crc32: crc32fast::hash(&data),
+            vol_created_at: 1,
+            seq_lba_ranges: vec![(seq, start_lba, lbas_per_slot)],
+            block_hashes: None,
+            dedup_skipped: false,
+            dedup_completion: None,
+        };
+        sealed_slots.push(SealedSlot {
+            pba,
+            data: vec![fill; BLOCK_SIZE as usize],
+            fragments: vec![crate::packer::packer::SlotFragment {
+                unit,
+                slot_offset: 0,
+            }],
+        });
+    }
+
+    let before = meta.memory_stats().unwrap();
+    let results = BufferFlusher::write_packed_slots_batch(
+        0,
+        &sealed_slots,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &cleanup_tx,
+        &dedup_register_tx,
+    );
+    assert!(results.into_iter().all(|result| result.is_ok()));
+
+    let after = meta.memory_stats().unwrap();
+    let commits = after.commit_success - before.commit_success;
+    assert!(
+        commits >= 2,
+        "oversized packed metadata batch should split into multiple commits, got {commits}"
+    );
+    assert!(
+        after.wal_batch_bytes_max < 16 * 1024 * 1024,
+        "split commits must stay under the WAL body hard limit"
+    );
+
+    assert!(
+        dedup_register_rx.try_recv().is_err(),
+        "this regression isolates foreground L2P commit splitting, not background dedup registration"
+    );
+
+    for &idx in &[0usize, 131_000, total_lbas - 1] {
+        let slot_idx = idx / lbas_per_slot as usize;
+        let mapping = meta
+            .get_mapping(&VolumeId("flush-race".into()), Lba(idx as u64))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.pba, sealed_slots[slot_idx].pba);
+        assert_eq!(
+            mapping.offset_in_unit,
+            (idx % lbas_per_slot as usize) as u16
+        );
+    }
 }
 
 #[test]

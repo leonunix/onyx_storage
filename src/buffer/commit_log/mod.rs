@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -40,6 +40,12 @@ const MAX_VOLATILE_PAYLOAD_MEMORY: u64 = 8 * 1024 * 1024 * 1024;
 /// Online payload hydration read-ahead. 128 KiB matches the common coalesce
 /// unit while keeping foreground read tail latency bounded.
 const HYDRATE_BATCH_MAX_BYTES: usize = 128 * 1024;
+/// Coarse read-path filter for pending buffer entries. A read range whose
+/// buckets are absent can skip the DashMap LBA index entirely. Collisions and
+/// stale buckets are harmless false positives; false negatives are avoided by
+/// installing buckets before publishing LBA index entries and removing them
+/// only after the entry is fully retired.
+const PENDING_LBA_BUCKET_BLOCKS: u64 = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BufferRuntimeLimits {
@@ -212,6 +218,12 @@ struct LbaKey {
     lba: Lba,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PendingBucketKey {
+    vol_hash: u64,
+    bucket: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LogRecord {
     seq: u64,
@@ -350,7 +362,9 @@ struct BufferShard {
     backpressure_timeout: Duration,
     lba_index: DashMap<LbaKey, Arc<PendingEntry>>,
     latest_lba_seq: DashMap<LbaKey, (u64, u64)>,
+    pending_lba_buckets: DashMap<PendingBucketKey, AtomicU32>,
     pending_entries: DashMap<u64, Arc<PendingEntry>>,
+    pending_count: AtomicU64,
     flush_progress: DashMap<u64, HashSet<u16>>,
     staging_tx: Sender<StagedEntry>,
     staging_rx: Receiver<StagedEntry>,

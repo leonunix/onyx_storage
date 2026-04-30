@@ -97,6 +97,7 @@ fn setup_with_all_options(
             block_cache_mb: 8,
             memtable_budget_mb: 0,
             index_pin_mb: 0,
+            lsm_bloom_bits_per_entry: 10,
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,

@@ -32,6 +32,10 @@ memtable_budget_mb = 256
 # random L2P gets never miss on inner nodes. 1 GiB covers ~hundreds of GiB
 # of leaf data; raise on large-memory boxes.
 index_pin_mb = 1024
+# Keep dedup all-miss lookups from turning into random SST reads as the index
+# grows. 16 bits/entry costs modest metadata space on the small test box while
+# materially lowering bloom false positives.
+lsm_bloom_bits_per_entry = 16
 # Background metadb checkpoint cadence. WAL fsync on each metadb commit
 # already makes user writes durable; checkpoints mainly prune WAL and cap
 # recovery time, so keep them off the 10-50ms buffer watermark cadence.

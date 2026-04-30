@@ -1,5 +1,8 @@
 use super::*;
 
+const DEDUP_REGISTER_BATCH_LIMIT: usize = 1024;
+const CLEANUP_PBA_COMMIT_LIMIT: usize = 256;
+
 impl BufferFlusher {
     pub(crate) fn cleanup_dead_pba_post_commit(
         meta: &MetaStore,
@@ -139,43 +142,46 @@ impl BufferFlusher {
             return;
         }
 
-        // Phase 2: ONE WriteBatch for all dedup cleanup
-        let pbas: Vec<Pba> = truly_dead.iter().map(|(p, _)| *p).collect();
-        if let Err(e) = meta.cleanup_dedup_for_pbas_batch(&pbas) {
-            tracing::error!(
-                count = pbas.len(),
-                error = %e,
-                context,
-                "batch cleanup: dedup metadata cleanup failed; skipping allocator free"
-            );
-            return;
-        }
-
-        // Phase 3: per-PBA allocator free
-        for (pba, blocks) in truly_dead {
-            #[cfg(test)]
-            CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-
-            tracing::debug!(
-                pba = pba.0,
-                blocks,
-                context,
-                "batch cleanup: freeing PBA to allocator"
-            );
-
-            let free_result = if blocks <= 1 {
-                allocator.free_one(pba)
-            } else {
-                allocator.free_extent(Extent::new(pba, blocks))
-            };
-            if let Err(e) = free_result {
-                tracing::warn!(
-                    pba = pba.0,
-                    blocks,
+        // Phase 2/3: bounded dedup cleanup commits, then free only the
+        // successfully-cleaned chunk. A large shutdown drain can otherwise
+        // build a multi-MiB WAL body and block allocator reclamation.
+        for chunk in truly_dead.chunks(CLEANUP_PBA_COMMIT_LIMIT) {
+            let pbas: Vec<Pba> = chunk.iter().map(|(p, _)| *p).collect();
+            if let Err(e) = meta.cleanup_dedup_for_pbas_batch(&pbas) {
+                tracing::error!(
+                    count = pbas.len(),
                     error = %e,
                     context,
-                    "batch cleanup: allocator free failed (benign if already freed); continuing"
+                    "batch cleanup: dedup metadata cleanup failed; skipping allocator free for chunk"
                 );
+                continue;
+            }
+
+            for &(pba, blocks) in chunk {
+                #[cfg(test)]
+                CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+
+                tracing::debug!(
+                    pba = pba.0,
+                    blocks,
+                    context,
+                    "batch cleanup: freeing PBA to allocator"
+                );
+
+                let free_result = if blocks <= 1 {
+                    allocator.free_one(pba)
+                } else {
+                    allocator.free_extent(Extent::new(pba, blocks))
+                };
+                if let Err(e) = free_result {
+                    tracing::warn!(
+                        pba = pba.0,
+                        blocks,
+                        error = %e,
+                        context,
+                        "batch cleanup: allocator free failed (benign if already freed); continuing"
+                    );
+                }
             }
         }
     }
@@ -240,7 +246,6 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
     ) {
         const BATCH_WAIT: Duration = Duration::from_micros(500);
-        const BATCH_LIMIT: usize = 8192;
 
         loop {
             let first = match rx.recv() {
@@ -251,7 +256,7 @@ impl BufferFlusher {
             let deadline = Instant::now() + BATCH_WAIT;
             let mut disconnected = false;
 
-            while all.len() < BATCH_LIMIT {
+            while all.len() < DEDUP_REGISTER_BATCH_LIMIT {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -292,11 +297,18 @@ impl BufferFlusher {
         }
     }
 
-    fn register_dedup_batch(
+    pub(super) fn register_dedup_batch(
         meta: &MetaStore,
         registrations: &[DedupRegistration],
         context: &'static str,
     ) {
+        if registrations.len() > DEDUP_REGISTER_BATCH_LIMIT {
+            for chunk in registrations.chunks(DEDUP_REGISTER_BATCH_LIMIT) {
+                Self::register_dedup_batch(meta, chunk, context);
+            }
+            return;
+        }
+
         if registrations.is_empty() {
             return;
         }
@@ -378,13 +390,15 @@ impl BufferFlusher {
         if valid.is_empty() {
             return;
         }
-        if let Err(e) = meta.put_dedup_entries(&valid) {
-            tracing::warn!(
-                count = valid.len(),
-                error = %e,
-                context,
-                "dedup register: batched put_dedup_entries failed"
-            );
+        for chunk in valid.chunks(DEDUP_REGISTER_BATCH_LIMIT) {
+            if let Err(e) = meta.put_dedup_entries(chunk) {
+                tracing::warn!(
+                    count = chunk.len(),
+                    error = %e,
+                    context,
+                    "dedup register: batched put_dedup_entries failed"
+                );
+            }
         }
     }
 

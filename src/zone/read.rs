@@ -7,7 +7,7 @@ use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
-use crate::types::{CompressionAlgo, Lba, VolumeId, BLOCK_SIZE};
+use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
 
 /// Execute a read for one 4KB LBA.
 ///
@@ -50,8 +50,7 @@ pub fn execute_read(
     }
 
     // 2. Persistent blockmap — metadb point read, no IO yet.
-    let vid = VolumeId(vol_id.to_string());
-    let mapping = match meta.get_mapping(&vid, lba)? {
+    let mapping = match meta.get_mapping_str(vol_id, lba)? {
         Some(m) => m,
         None => {
             metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);

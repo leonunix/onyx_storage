@@ -413,6 +413,42 @@ impl BufferFlusher {
         });
     }
 
+    pub(super) fn dedup_registration(
+        vol_id: VolumeId,
+        lba: Lba,
+        hash: ContentHash,
+        expected: BlockmapValue,
+    ) -> DedupRegistration {
+        DedupRegistration {
+            vol_id,
+            lba,
+            hash,
+            entry: DedupEntry {
+                pba: expected.pba,
+                slot_offset: expected.slot_offset,
+                compression: expected.compression,
+                unit_compressed_size: expected.unit_compressed_size,
+                unit_original_size: expected.unit_original_size,
+                unit_lba_count: expected.unit_lba_count,
+                offset_in_unit: expected.offset_in_unit,
+                crc32: expected.crc32,
+            },
+            expected,
+        }
+    }
+
+    pub(super) fn send_dedup_registrations(
+        tx: &Sender<Vec<DedupRegistration>>,
+        registrations: Vec<DedupRegistration>,
+    ) {
+        if registrations.is_empty() {
+            return;
+        }
+        if tx.send(registrations).is_err() {
+            tracing::debug!("dedup register queue closed; dropping best-effort registrations");
+        }
+    }
+
     pub(super) fn retry_one_packed_slot(
         shard_idx: usize,
         retries: &mut VecDeque<PackedSlotRetry>,

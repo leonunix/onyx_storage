@@ -279,7 +279,9 @@ fn guided_recovery_treats_zero_used_checkpoint_as_empty_even_if_offsets_differ()
 
     let lba_index = DashMap::with_shard_amount(DASHMAP_SHARDS);
     let latest_lba_seq = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let pending_lba_buckets = DashMap::with_shard_amount(DASHMAP_SHARDS);
     let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let pending_count = AtomicU64::new(0);
     let checkpoint = ShardCheckpoint {
         head_offset: 2 * slot,
         tail_offset: 0,
@@ -293,7 +295,9 @@ fn guided_recovery_treats_zero_used_checkpoint_as_empty_even_if_offsets_differ()
         &checkpoint,
         &lba_index,
         &latest_lba_seq,
+        &pending_lba_buckets,
         &pending_entries,
+        &pending_count,
     )
     .unwrap();
 

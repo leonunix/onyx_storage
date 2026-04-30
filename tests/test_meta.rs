@@ -61,6 +61,7 @@ fn test_config(dir: &std::path::Path) -> MetaConfig {
         block_cache_mb: 8,
         memtable_budget_mb: 0,
         index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
@@ -927,6 +928,50 @@ fn register_dedup_reverse(store: &MetaStore, pba: u64, hashes: &[ContentHash]) {
         })
         .collect();
     store.put_dedup_entries(&entries).unwrap();
+}
+
+#[test]
+fn put_dedup_entries_splits_large_batches() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+
+    let mut entries = Vec::new();
+    for idx in 0..2500u64 {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&idx.to_be_bytes());
+        entries.push((
+            hash,
+            DedupEntry {
+                pba: Pba(10_000 + idx),
+                slot_offset: 0,
+                compression: 0,
+                unit_compressed_size: 4096,
+                unit_original_size: 4096,
+                unit_lba_count: 1,
+                offset_in_unit: 0,
+                crc32: idx as u32,
+            },
+        ));
+    }
+
+    store.put_dedup_entries(&entries).unwrap();
+
+    for (hash, expected) in [
+        entries[0],
+        entries[1023],
+        entries[1024],
+        entries[2047],
+        entries[2048],
+        entries[2499],
+    ] {
+        assert_eq!(store.get_dedup_entry(&hash).unwrap(), Some(expected));
+    }
+
+    let stats = store.memory_stats().unwrap();
+    assert!(
+        stats.wal_batch_bytes_max < 16 * 1024 * 1024,
+        "dedup registration batches must stay below WAL_MAX_BODY"
+    );
 }
 
 #[test]

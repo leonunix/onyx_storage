@@ -125,6 +125,12 @@ pub struct MetaConfig {
     /// large-memory deployments. Set to 0 to disable.
     #[serde(default = "default_index_pin_mb")]
     pub index_pin_mb: usize,
+    /// Bloom-filter budget for metadb's dedup LSM SSTs. Higher values
+    /// reduce false positives on all-miss foreground dedup lookups at the
+    /// cost of more metadata pages. Large-memory NVMe deployments should
+    /// prefer 16-20 bits/entry; the default stays RocksDB-like.
+    #[serde(default = "default_lsm_bloom_bits_per_entry")]
+    pub lsm_bloom_bits_per_entry: u32,
     /// Minimum interval between background metadb checkpoints, in
     /// milliseconds. Metadb WAL fsync makes user writes durable; full
     /// checkpoints are for WAL pruning and recovery-time control, so they
@@ -178,6 +184,10 @@ impl MetaConfig {
     pub fn group_commit_timeout_us(&self) -> u64 {
         self.group_commit_timeout_us.max(1)
     }
+
+    pub fn lsm_bloom_bits_per_entry(&self) -> u32 {
+        self.lsm_bloom_bits_per_entry.clamp(1, 32)
+    }
 }
 
 impl Default for MetaConfig {
@@ -187,6 +197,7 @@ impl Default for MetaConfig {
             block_cache_mb: default_block_cache_mb(),
             memtable_budget_mb: 0,
             index_pin_mb: default_index_pin_mb(),
+            lsm_bloom_bits_per_entry: default_lsm_bloom_bits_per_entry(),
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_dir: None,
@@ -411,6 +422,9 @@ fn default_block_cache_mb() -> usize {
 }
 fn default_index_pin_mb() -> usize {
     1024
+}
+fn default_lsm_bloom_bits_per_entry() -> u32 {
+    10
 }
 fn default_metadb_checkpoint_interval_ms() -> u64 {
     5_000

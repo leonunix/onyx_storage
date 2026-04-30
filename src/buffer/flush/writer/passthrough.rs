@@ -127,6 +127,35 @@ impl BufferFlusher {
                     },
                 ));
             }
+            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+            if !unit.dedup_skipped {
+                if let Some(ref hashes) = unit.block_hashes {
+                    dedup_registrations.reserve(live_positions.len());
+                    for &pos in &live_positions {
+                        let hash = hashes[pos];
+                        if hash == [0u8; 32] {
+                            continue;
+                        }
+                        let blockmap = BlockmapValue {
+                            pba,
+                            slot_offset: 0,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: pos as u16,
+                            crc32: unit.crc32,
+                            flags: 0,
+                        };
+                        dedup_registrations.push(Self::dedup_registration(
+                            vol_id.clone(),
+                            Lba(unit.start_lba.0 + pos as u64),
+                            hash,
+                            blockmap,
+                        ));
+                    }
+                }
+            }
 
             if let Err(e) = maybe_inject_test_failure(
                 &unit.vol_id,
@@ -139,10 +168,11 @@ impl BufferFlusher {
                 return Err(e);
             }
 
-            let actual_old_pba_meta = match meta.atomic_batch_write(
+            let actual_old_pba_meta = match meta.atomic_batch_write_with_dedup(
                 &vol_id,
                 &batch_values,
                 live_positions.len() as u32,
+                &[],
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -153,6 +183,7 @@ impl BufferFlusher {
                 }
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+            Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
 
             if !actual_old_pba_meta.is_empty() {
                 let dead: Vec<(Pba, u32)> = actual_old_pba_meta
@@ -161,50 +192,6 @@ impl BufferFlusher {
                     .collect();
                 let _ = cleanup_tx.send(dead);
             }
-
-            // Queue dedup index registration for newly written blocks.
-            let dedup_start = Instant::now();
-            if let Some(ref hashes) = unit.block_hashes {
-                let mut dedup_registrations = Vec::new();
-                for &pos in &live_positions {
-                    let hash = hashes[pos];
-                    if hash == [0u8; 32] {
-                        continue; // Skip empty hashes
-                    }
-                    let lba = Lba(unit.start_lba.0 + pos as u64);
-                    let expected = BlockmapValue {
-                        pba,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: pos as u16,
-                        crc32: unit.crc32,
-                        slot_offset: 0,
-                        flags: 0,
-                    };
-                    dedup_registrations.push(DedupRegistration {
-                        vol_id: vol_id.clone(),
-                        lba,
-                        hash,
-                        entry: DedupEntry {
-                            pba,
-                            slot_offset: 0,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                        },
-                        expected,
-                    });
-                }
-                if !dedup_registrations.is_empty() {
-                    let _ = dedup_register_tx.send(dedup_registrations);
-                }
-            }
-            Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -405,6 +392,7 @@ impl BufferFlusher {
         struct UnitMeta {
             batch_values: Vec<(Lba, BlockmapValue)>,
             live_positions: Vec<usize>,
+            dedup_registrations: Vec<DedupRegistration>,
         }
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
 
@@ -431,6 +419,7 @@ impl BufferFlusher {
                 unit_metas[i] = Some(UnitMeta {
                     batch_values: Vec::new(),
                     live_positions,
+                    dedup_registrations: Vec::new(),
                 });
                 continue;
             }
@@ -441,6 +430,7 @@ impl BufferFlusher {
                 .collect();
 
             let mut batch_values = Vec::with_capacity(live_positions.len());
+            let mut dedup_registrations = Vec::new();
 
             for j in 0..live_positions.len() {
                 let flags = if unit.dedup_skipped {
@@ -448,24 +438,51 @@ impl BufferFlusher {
                 } else {
                     0
                 };
-                batch_values.push((
-                    lbas[j],
-                    BlockmapValue {
-                        pba,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: live_positions[j] as u16,
-                        crc32: unit.crc32,
-                        slot_offset: 0,
-                        flags,
-                    },
-                ));
+                let blockmap = BlockmapValue {
+                    pba,
+                    compression: unit.compression,
+                    unit_compressed_size: unit.compressed_data.len() as u32,
+                    unit_original_size: unit.original_size,
+                    unit_lba_count: unit.lba_count as u16,
+                    offset_in_unit: live_positions[j] as u16,
+                    crc32: unit.crc32,
+                    slot_offset: 0,
+                    flags,
+                };
+                batch_values.push((lbas[j], blockmap));
+            }
+            if !unit.dedup_skipped {
+                if let Some(ref hashes) = unit.block_hashes {
+                    dedup_registrations.reserve(live_positions.len());
+                    for &pos in &live_positions {
+                        let hash = hashes[pos];
+                        if hash == [0u8; 32] {
+                            continue;
+                        }
+                        let blockmap = BlockmapValue {
+                            pba,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: pos as u16,
+                            crc32: unit.crc32,
+                            slot_offset: 0,
+                            flags: 0,
+                        };
+                        dedup_registrations.push(Self::dedup_registration(
+                            VolumeId(unit.vol_id.clone()),
+                            Lba(unit.start_lba.0 + pos as u64),
+                            hash,
+                            blockmap,
+                        ));
+                    }
+                }
             }
             unit_metas[i] = Some(UnitMeta {
                 batch_values,
                 live_positions,
+                dedup_registrations,
             });
         }
 
@@ -499,9 +516,15 @@ impl BufferFlusher {
                 })
                 .collect();
 
-            match meta.atomic_batch_write_multi(&batch_args) {
+            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+
+            match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
                 Ok(returned) => {
                     actual_old_pba_meta = returned;
+                    for &unit_idx in &meta_indices {
+                        let um = unit_metas[unit_idx].as_ref().unwrap();
+                        dedup_registrations.extend_from_slice(&um.dedup_registrations);
+                    }
                 }
                 Err(e) => {
                     // Entire batch failed — rollback all allocations.
@@ -519,6 +542,7 @@ impl BufferFlusher {
                     }
                 }
             }
+            Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
         }
         let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
@@ -530,8 +554,6 @@ impl BufferFlusher {
         // PBAs that were already 0 are excluded — another batch/lane already
         // freed them, and double-freeing after re-allocation causes corruption.
         let cleanup_start = Instant::now();
-
-        let mut all_dedup_registrations: Vec<DedupRegistration> = Vec::new();
 
         for &unit_idx in &meta_indices {
             if skip[unit_idx] {
@@ -549,44 +571,6 @@ impl BufferFlusher {
                 continue;
             }
 
-            // Collect dedup index registrations for background batch write.
-            if let Some(ref hashes) = unit.block_hashes {
-                for &pos in &um.live_positions {
-                    let hash = hashes[pos];
-                    if hash == [0u8; 32] {
-                        continue;
-                    }
-                    let lba = Lba(unit.start_lba.0 + pos as u64);
-                    let expected = BlockmapValue {
-                        pba,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: pos as u16,
-                        crc32: unit.crc32,
-                        slot_offset: 0,
-                        flags: 0,
-                    };
-                    all_dedup_registrations.push(DedupRegistration {
-                        vol_id: VolumeId(unit.vol_id.clone()),
-                        lba,
-                        hash,
-                        entry: DedupEntry {
-                            pba,
-                            slot_offset: 0,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                        },
-                        expected,
-                    });
-                }
-            }
-
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
                 .flush_unit_bytes
@@ -599,11 +583,6 @@ impl BufferFlusher {
                 .map(|(pba, (_, blocks))| (*pba, *blocks))
                 .collect();
             let _ = cleanup_tx.send(dead);
-        }
-        // Register new dedup index entries off the writer path. The
-        // background worker revalidates blockmap/refcount before committing.
-        if !all_dedup_registrations.is_empty() {
-            let _ = dedup_register_tx.send(all_dedup_registrations);
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 

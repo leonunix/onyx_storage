@@ -112,12 +112,24 @@ impl MetaStore {
         self.backend.get_mapping(vol_id, lba)
     }
 
+    pub fn get_mapping_str(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<BlockmapValue>> {
+        self.backend.get_mapping_str(vol_id, lba)
+    }
+
     pub fn multi_get_mappings(
         &self,
         vol_id: &VolumeId,
         lbas: &[Lba],
     ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
         self.backend.multi_get_mappings(vol_id, lbas)
+    }
+
+    pub fn multi_get_mappings_str(
+        &self,
+        vol_id: &str,
+        lbas: &[Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        self.backend.multi_get_mappings_str(vol_id, lbas)
     }
 
     pub fn delete_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<()> {
@@ -141,6 +153,16 @@ impl MetaStore {
     ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
         self.backend
             .get_mappings_range_unordered(vol_id, start, end)
+    }
+
+    pub fn get_mappings_range_unordered_str(
+        &self,
+        vol_id: &str,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        self.backend
+            .get_mappings_range_unordered_str(vol_id, start, end)
     }
 
     pub fn delete_blockmap_range(
@@ -182,6 +204,21 @@ impl MetaStore {
             .atomic_batch_write(vol_id, batch_values, new_refcount)
     }
 
+    pub fn atomic_batch_write_with_dedup(
+        &self,
+        vol_id: &VolumeId,
+        batch_values: &[(Lba, BlockmapValue)],
+        new_refcount: u32,
+        dedup_entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        self.backend.atomic_batch_write_with_dedup(
+            vol_id,
+            batch_values,
+            new_refcount,
+            dedup_entries,
+        )
+    }
+
     pub fn atomic_batch_write_packed(
         &self,
         batch_values: &[(VolumeId, Lba, BlockmapValue)],
@@ -192,11 +229,35 @@ impl MetaStore {
             .atomic_batch_write_packed(batch_values, new_pba, new_refcount)
     }
 
+    pub fn atomic_batch_write_packed_with_dedup(
+        &self,
+        batch_values: &[(VolumeId, Lba, BlockmapValue)],
+        new_pba: Pba,
+        new_refcount: u32,
+        dedup_entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        self.backend.atomic_batch_write_packed_with_dedup(
+            batch_values,
+            new_pba,
+            new_refcount,
+            dedup_entries,
+        )
+    }
+
     pub fn atomic_batch_write_multi(
         &self,
         units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
     ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
         self.backend.atomic_batch_write_multi(units)
+    }
+
+    pub fn atomic_batch_write_multi_with_dedup(
+        &self,
+        units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
+        dedup_entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+        self.backend
+            .atomic_batch_write_multi_with_dedup(units, dedup_entries)
     }
 
     pub fn get_refcount(&self, pba: Pba) -> OnyxResult<u32> {

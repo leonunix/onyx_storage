@@ -1,5 +1,78 @@
 use super::*;
 
+const PACKED_META_BATCH_LBA_LIMIT: usize = 262_144;
+
+struct PackedSlotMeta {
+    batch_values: Vec<(VolumeId, Lba, BlockmapValue)>,
+    all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
+    dedup_registrations: Vec<DedupRegistration>,
+}
+
+fn merge_dead_pbas(dst: &mut HashMap<Pba, (u32, u32)>, src: HashMap<Pba, (u32, u32)>) {
+    for (pba, (count, blocks)) in src {
+        dst.entry(pba)
+            .and_modify(|entry| {
+                entry.0 += count;
+                entry.1 = entry.1.max(blocks);
+            })
+            .or_insert((count, blocks));
+    }
+}
+
+fn commit_packed_meta_batch(
+    batch_slots: &mut Vec<usize>,
+    batch_lbas: &mut usize,
+    sealed_slots: &[SealedSlot],
+    slot_metas: &mut [Option<PackedSlotMeta>],
+    meta: &MetaStore,
+    allocator: &SpaceAllocator,
+    results: &mut [OnyxResult<()>],
+    actual_old_pba_meta: &mut HashMap<Pba, (u32, u32)>,
+    dedup_registrations: &mut Vec<DedupRegistration>,
+) {
+    if batch_slots.is_empty() {
+        return;
+    }
+
+    let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> =
+        Vec::with_capacity(*batch_lbas);
+    for &slot_idx in batch_slots.iter() {
+        if let Some(ref sm) = slot_metas[slot_idx] {
+            combined_batch_values.extend_from_slice(&sm.batch_values);
+        }
+    }
+
+    match meta.atomic_batch_write_packed_with_dedup(
+        &combined_batch_values,
+        sealed_slots[batch_slots[0]].pba,
+        0,
+        &[],
+    ) {
+        Ok(dead) => {
+            merge_dead_pbas(actual_old_pba_meta, dead);
+            for &slot_idx in batch_slots.iter() {
+                if let Some(ref sm) = slot_metas[slot_idx] {
+                    dedup_registrations.extend_from_slice(&sm.dedup_registrations);
+                }
+            }
+        }
+        Err(e) => {
+            for &slot_idx in batch_slots.iter() {
+                if slot_metas[slot_idx].is_some() {
+                    let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                    results[slot_idx] = Err(crate::error::OnyxError::Io(std::io::Error::other(
+                        format!("packed-slot batch metadata commit failed: {e}"),
+                    )));
+                    slot_metas[slot_idx] = None;
+                }
+            }
+        }
+    }
+
+    batch_slots.clear();
+    *batch_lbas = 0;
+}
+
 impl BufferFlusher {
     pub(in crate::buffer::flush) fn write_packed_slot(
         shard_idx: usize,
@@ -35,6 +108,7 @@ impl BufferFlusher {
         // Build blockmap entries.
         // Refcount decrements are re-computed inside the lock by atomic_batch_write_packed.
         let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+        let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
         let mut total_refcount: u32 = 0;
         let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
         let mut any_discarded = false;
@@ -81,21 +155,45 @@ impl BufferFlusher {
                 } else {
                     0
                 };
-                batch_values.push((
-                    vol_id.clone(),
-                    frag_lbas[i],
-                    BlockmapValue {
-                        pba: sealed.pba,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: live_positions[i] as u16,
-                        crc32: unit.crc32,
-                        slot_offset: frag.slot_offset,
-                        flags,
-                    },
-                ));
+                let blockmap = BlockmapValue {
+                    pba: sealed.pba,
+                    compression: unit.compression,
+                    unit_compressed_size: unit.compressed_data.len() as u32,
+                    unit_original_size: unit.original_size,
+                    unit_lba_count: unit.lba_count as u16,
+                    offset_in_unit: live_positions[i] as u16,
+                    crc32: unit.crc32,
+                    slot_offset: frag.slot_offset,
+                    flags,
+                };
+                batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
+            }
+            if !unit.dedup_skipped {
+                if let Some(ref hashes) = unit.block_hashes {
+                    for &pos in &live_positions {
+                        let hash = hashes[pos];
+                        if hash == [0u8; 32] {
+                            continue;
+                        }
+                        let blockmap = BlockmapValue {
+                            pba: sealed.pba,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: pos as u16,
+                            crc32: unit.crc32,
+                            slot_offset: frag.slot_offset,
+                            flags: 0,
+                        };
+                        dedup_registrations.push(Self::dedup_registration(
+                            vol_id.clone(),
+                            Lba(unit.start_lba.0 + pos as u64),
+                            hash,
+                            blockmap,
+                        ));
+                    }
+                }
             }
             total_refcount += live_positions.len() as u32;
             all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
@@ -141,17 +239,22 @@ impl BufferFlusher {
         maybe_pause_before_packed_meta_write(&sealed.fragments)?;
 
         // Metadata commit — old PBA decrements re-computed inside the lock
-        let actual_old_pba_meta =
-            match meta.atomic_batch_write_packed(&batch_values, sealed.pba, total_refcount) {
-                Ok(m) => m,
-                Err(e) => {
-                    allocator.free_one(sealed.pba)?;
-                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                    return Err(e);
-                }
-            };
+        let actual_old_pba_meta = match meta.atomic_batch_write_packed_with_dedup(
+            &batch_values,
+            sealed.pba,
+            total_refcount,
+            &[],
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                allocator.free_one(sealed.pba)?;
+                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                return Err(e);
+            }
+        };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+        Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
 
         if !actual_old_pba_meta.is_empty() {
             let dead: Vec<(Pba, u32)> = actual_old_pba_meta
@@ -160,57 +263,6 @@ impl BufferFlusher {
                 .collect();
             let _ = cleanup_tx.send(dead);
         }
-
-        // Queue dedup index registration for newly written fragments.
-        // Registration is opportunistic and the background worker revalidates
-        // the blockmap entry before committing, so this no longer adds a
-        // second WAL/apply wait to the packed-slot hot path.
-        let dedup_start = Instant::now();
-        let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
-        for frag in &sealed.fragments {
-            let Some(ref hashes) = frag.unit.block_hashes else {
-                continue;
-            };
-            let live_positions = Self::live_positions_for_unit(&frag.unit, pool)?;
-            for &pos in &live_positions {
-                let hash = hashes[pos];
-                if hash == [0u8; 32] {
-                    continue;
-                }
-                let lba = Lba(frag.unit.start_lba.0 + pos as u64);
-                let expected = BlockmapValue {
-                    pba: sealed.pba,
-                    compression: frag.unit.compression,
-                    unit_compressed_size: frag.unit.compressed_data.len() as u32,
-                    unit_original_size: frag.unit.original_size,
-                    unit_lba_count: frag.unit.lba_count as u16,
-                    offset_in_unit: pos as u16,
-                    crc32: frag.unit.crc32,
-                    slot_offset: frag.slot_offset,
-                    flags: 0,
-                };
-                dedup_registrations.push(DedupRegistration {
-                    vol_id: VolumeId(frag.unit.vol_id.clone()),
-                    lba,
-                    hash,
-                    entry: DedupEntry {
-                        pba: sealed.pba,
-                        slot_offset: frag.slot_offset,
-                        compression: frag.unit.compression,
-                        unit_compressed_size: frag.unit.compressed_data.len() as u32,
-                        unit_original_size: frag.unit.original_size,
-                        unit_lba_count: frag.unit.lba_count as u16,
-                        offset_in_unit: pos as u16,
-                        crc32: frag.unit.crc32,
-                    },
-                    expected,
-                });
-            }
-        }
-        if !dedup_registrations.is_empty() {
-            let _ = dedup_register_tx.send(dedup_registrations);
-        }
-        Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 
         metrics
             .flush_packed_slots_written
@@ -249,12 +301,10 @@ impl BufferFlusher {
     ///   volumes), held across the whole batch;
     /// - one batched IO submit (`io_engine.submit_batch`) so the device
     ///   queue depth grows with the batch instead of one write at a time;
-    /// - **one** `meta.atomic_batch_write_packed` call covering every
-    ///   surviving slot's blockmap entries — the metadb tx auto-derives
+    /// - **one** metadata transaction covering every surviving slot's L2P,
+    ///   refcount, and dedup index entries — the metadb tx auto-derives
     ///   refcount deltas from the L2pRemap ops, so concatenating batches
-    ///   from different slots is equivalent to issuing them serially;
-    /// - one background dedup registration batch for every surviving
-    ///   slot's newly-written fragments.
+    ///   from different slots is equivalent to issuing them serially.
     ///
     /// Soak shows ~1 ms per metadb commit fixed cost (WAL fsync barrier
     /// + per-shard apply lane scheduling); a sealed-slot batch of 10
@@ -266,8 +316,8 @@ impl BufferFlusher {
     ///   metadata commit, surviving slots still committed.
     /// - Combined metadata commit failure → every surviving slot's PBA
     ///   freed, all marked failed (caller queues whole-slot retries).
-    /// - Dedup put failure → logged, not rolled back (best-effort,
-    ///   matches `write_packed_slot` semantics).
+    /// - Dedup put failure → metadata commit fails and every surviving slot's
+    ///   PBA is rolled back.
     pub(in crate::buffer::flush) fn write_packed_slots_batch(
         _shard_idx: usize,
         sealed_slots: &[SealedSlot],
@@ -298,12 +348,7 @@ impl BufferFlusher {
         let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
-        struct SlotMeta {
-            batch_values: Vec<(VolumeId, Lba, BlockmapValue)>,
-            all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
-            dedup_registrations: Vec<DedupRegistration>,
-        }
-        let mut slot_metas: Vec<Option<SlotMeta>> = (0..n).map(|_| None).collect();
+        let mut slot_metas: Vec<Option<PackedSlotMeta>> = (0..n).map(|_| None).collect();
 
         // Phase 1: per-slot validation + build batch_values + dedup registrations.
         // A slot whose every fragment is stale (volume deleted / version
@@ -366,32 +411,31 @@ impl BufferFlusher {
                     } else {
                         0
                     };
-                    batch_values.push((
-                        vol_id.clone(),
-                        frag_lbas[j],
-                        BlockmapValue {
-                            pba: sealed.pba,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: live_positions[j] as u16,
-                            crc32: unit.crc32,
-                            slot_offset: frag.slot_offset,
-                            flags,
-                        },
-                    ));
+                    let blockmap = BlockmapValue {
+                        pba: sealed.pba,
+                        compression: unit.compression,
+                        unit_compressed_size: unit.compressed_data.len() as u32,
+                        unit_original_size: unit.original_size,
+                        unit_lba_count: unit.lba_count as u16,
+                        offset_in_unit: live_positions[j] as u16,
+                        crc32: unit.crc32,
+                        slot_offset: frag.slot_offset,
+                        flags,
+                    };
+                    batch_values.push((vol_id.clone(), frag_lbas[j], blockmap));
                 }
                 all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
 
-                if let Some(ref hashes) = unit.block_hashes {
+                if !unit.dedup_skipped {
+                    let Some(ref hashes) = unit.block_hashes else {
+                        continue;
+                    };
                     for &pos in &live_positions {
                         let hash = hashes[pos];
                         if hash == [0u8; 32] {
                             continue;
                         }
-                        let lba = Lba(unit.start_lba.0 + pos as u64);
-                        let expected = BlockmapValue {
+                        let blockmap = BlockmapValue {
                             pba: sealed.pba,
                             compression: unit.compression,
                             unit_compressed_size: unit.compressed_data.len() as u32,
@@ -402,22 +446,12 @@ impl BufferFlusher {
                             slot_offset: frag.slot_offset,
                             flags: 0,
                         };
-                        dedup_registrations.push(DedupRegistration {
-                            vol_id: vol_id.clone(),
-                            lba,
+                        dedup_registrations.push(Self::dedup_registration(
+                            vol_id.clone(),
+                            Lba(unit.start_lba.0 + pos as u64),
                             hash,
-                            entry: DedupEntry {
-                                pba: sealed.pba,
-                                slot_offset: frag.slot_offset,
-                                compression: unit.compression,
-                                unit_compressed_size: unit.compressed_data.len() as u32,
-                                unit_original_size: unit.original_size,
-                                unit_lba_count: unit.lba_count as u16,
-                                offset_in_unit: pos as u16,
-                                crc32: unit.crc32,
-                            },
-                            expected,
-                        });
+                            blockmap,
+                        ));
                     }
                 }
             }
@@ -430,7 +464,7 @@ impl BufferFlusher {
                 continue;
             }
 
-            slot_metas[i] = Some(SlotMeta {
+            slot_metas[i] = Some(PackedSlotMeta {
                 batch_values,
                 all_seq_lba_ranges,
                 dedup_registrations,
@@ -488,74 +522,76 @@ impl BufferFlusher {
         let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
-        // Phase 3: ONE atomic_batch_write_packed for the union of all
-        // surviving slots' blockmap entries. The metadb backend ignores
-        // the `new_pba`/`new_refcount` args (refcount deltas are derived
-        // from the L2pRemap ops themselves), so a concatenated batch
-        // commits identically to issuing the slots one by one — minus
-        // the per-commit WAL fsync + apply-lane scheduling overhead.
+        // Phase 3: bounded metadata batches over the surviving slots'
+        // blockmap entries. Keep each WAL record safely below the record
+        // limit while still amortising the fixed commit cost across many
+        // slots. Dedup miss registrations are queued to the background
+        // validator so the foreground L2P/refcount commit stays lean.
         let meta_start = Instant::now();
-        let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
-        for i in 0..n {
-            if let Some(ref sm) = slot_metas[i] {
-                combined_batch_values.extend_from_slice(&sm.batch_values);
-            }
-        }
+        let mut actual_old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+        let mut batch_slots: Vec<usize> = Vec::new();
+        let mut batch_lbas = 0usize;
 
-        if !combined_batch_values.is_empty() {
-            // sealed_slots[surviving].pba is just a placeholder — backend ignores it.
-            let placeholder_pba = sealed_slots
-                .iter()
-                .enumerate()
-                .find_map(|(i, s)| slot_metas[i].as_ref().map(|_| s.pba))
-                .expect("at least one slot survived (combined_batch_values non-empty)");
-            match meta.atomic_batch_write_packed(&combined_batch_values, placeholder_pba, 0) {
-                Ok(actual_old_pba_meta) => {
-                    if !actual_old_pba_meta.is_empty() {
-                        let dead: Vec<(Pba, u32)> = actual_old_pba_meta
-                            .iter()
-                            .map(|(pba, (_, blocks))| (*pba, *blocks))
-                            .collect();
-                        let _ = cleanup_tx.send(dead);
-                    }
-                }
-                Err(e) => {
-                    // Whole batch's metadata commit failed — every surviving
-                    // slot is rolled back: free PBA, mark failed. Caller
-                    // queues per-slot retries via the existing path.
-                    for i in 0..n {
-                        if slot_metas[i].is_some() {
-                            let _ = allocator.free_one(sealed_slots[i].pba);
-                            results[i] = Err(crate::error::OnyxError::Io(std::io::Error::other(
-                                format!("packed-slot batch metadata commit failed: {e}"),
-                            )));
-                            slot_metas[i] = None;
-                        }
-                    }
-                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                    return results;
-                }
+        for i in 0..n {
+            let Some(ref sm) = slot_metas[i] else {
+                continue;
+            };
+            let slot_lbas = sm.batch_values.len();
+            if !batch_slots.is_empty()
+                && batch_lbas.saturating_add(slot_lbas) > PACKED_META_BATCH_LBA_LIMIT
+            {
+                commit_packed_meta_batch(
+                    &mut batch_slots,
+                    &mut batch_lbas,
+                    sealed_slots,
+                    &mut slot_metas,
+                    meta,
+                    allocator,
+                    &mut results,
+                    &mut actual_old_pba_meta,
+                    &mut dedup_registrations,
+                );
+            }
+            batch_slots.push(i);
+            batch_lbas += slot_lbas;
+            if slot_lbas > PACKED_META_BATCH_LBA_LIMIT {
+                commit_packed_meta_batch(
+                    &mut batch_slots,
+                    &mut batch_lbas,
+                    sealed_slots,
+                    &mut slot_metas,
+                    meta,
+                    allocator,
+                    &mut results,
+                    &mut actual_old_pba_meta,
+                    &mut dedup_registrations,
+                );
             }
         }
+        commit_packed_meta_batch(
+            &mut batch_slots,
+            &mut batch_lbas,
+            sealed_slots,
+            &mut slot_metas,
+            meta,
+            allocator,
+            &mut results,
+            &mut actual_old_pba_meta,
+            &mut dedup_registrations,
+        );
+        if !actual_old_pba_meta.is_empty() {
+            let dead: Vec<(Pba, u32)> = actual_old_pba_meta
+                .iter()
+                .map(|(pba, (_, blocks))| (*pba, *blocks))
+                .collect();
+            let _ = cleanup_tx.send(dead);
+        }
+        Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
         let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
-        // Phase 4: queue combined dedup registrations. Best-effort — a
-        // failure here only loses dedup opportunities, the L2P state is durable.
-        let dedup_start = Instant::now();
-        let mut all_dedup_registrations: Vec<DedupRegistration> = Vec::new();
-        for i in 0..n {
-            if let Some(ref sm) = slot_metas[i] {
-                all_dedup_registrations.extend_from_slice(&sm.dedup_registrations);
-            }
-        }
-        if !all_dedup_registrations.is_empty() {
-            let _ = dedup_register_tx.send(all_dedup_registrations);
-        }
-        Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
-
-        // Phase 5: counters + mark_flushed per surviving slot.
+        // Phase 4: counters + mark_flushed per surviving slot.
         let mark_start = Instant::now();
         for i in 0..n {
             let Some(sm) = slot_metas[i].as_ref() else {

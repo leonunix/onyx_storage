@@ -97,13 +97,17 @@ impl WriteBufferPool {
             let shard_dev = device.slice(shard_offset, shard_bytes)?;
             let lba_index = DashMap::with_shard_amount(4);
             let latest_lba_seq = DashMap::with_shard_amount(4);
+            let pending_lba_buckets = DashMap::with_shard_amount(4);
             let pending = DashMap::with_shard_amount(4);
+            let pending_count = AtomicU64::new(0);
             BufferShard::rebuild_indices(
                 &shard_dev,
                 shard_bytes,
                 &lba_index,
                 &latest_lba_seq,
+                &pending_lba_buckets,
                 &pending,
+                &pending_count,
             )?;
 
             if !pending.is_empty() {

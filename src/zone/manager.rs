@@ -396,7 +396,6 @@ impl ZoneManager {
         // one point lookup per hole when the volume is still sparse. Small
         // reads stay on multi_get to keep the one-block path minimal.
         let pass2_start = Instant::now();
-        let vid = VolumeId(vol_id.to_string());
         if count >= RANGE_META_LOOKUP_MIN_LBAS {
             for &slot in &pending_slots {
                 let slot = slot as usize;
@@ -406,7 +405,7 @@ impl ZoneManager {
             let end_lba = Lba(start_lba.0 + count as u64);
             let mapped = self
                 .meta
-                .get_mappings_range_unordered(&vid, start_lba, end_lba)?;
+                .get_mappings_range_unordered_str(vol_id, start_lba, end_lba)?;
             let mut mapped_pending = 0usize;
             if pending_lbas.len() == count as usize {
                 for (lba, mapping) in mapped {
@@ -434,7 +433,7 @@ impl ZoneManager {
                 .read_unmapped
                 .fetch_add(unmapped as u64, Ordering::Relaxed);
         } else {
-            let mappings = self.meta.multi_get_mappings(&vid, &pending_lbas)?;
+            let mappings = self.meta.multi_get_mappings_str(vol_id, &pending_lbas)?;
             for (idx, mapping_opt) in mappings.into_iter().enumerate() {
                 let slot = pending_slots[idx] as usize;
                 match mapping_opt {

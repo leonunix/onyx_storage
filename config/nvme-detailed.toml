@@ -23,6 +23,7 @@ wal_dir = "/mnt/onyx-meta/wal"
 block_cache_mb = 65536
 memtable_budget_mb = 8192
 index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
 checkpoint_interval_ms = 5000
 group_commit_timeout_us = 1
 

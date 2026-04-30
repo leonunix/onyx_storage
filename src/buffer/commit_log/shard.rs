@@ -194,6 +194,82 @@ impl BufferShard {
         acc.push((seq, lba, 1));
     }
 
+    fn bucket_key(vid: &Arc<str>, bucket: u64) -> PendingBucketKey {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        vid.hash(&mut hasher);
+        PendingBucketKey {
+            vol_hash: hasher.finish(),
+            bucket,
+        }
+    }
+
+    fn bucket_range(start_lba: Lba, lba_count: u32) -> Option<std::ops::RangeInclusive<u64>> {
+        if lba_count == 0 {
+            return None;
+        }
+        let first = start_lba.0 / PENDING_LBA_BUCKET_BLOCKS;
+        let last_lba = start_lba.0.saturating_add(lba_count as u64 - 1);
+        let last = last_lba / PENDING_LBA_BUCKET_BLOCKS;
+        Some(first..=last)
+    }
+
+    fn add_pending_buckets(
+        buckets: &DashMap<PendingBucketKey, AtomicU32>,
+        vid: &Arc<str>,
+        start_lba: Lba,
+        lba_count: u32,
+    ) {
+        let Some(range) = Self::bucket_range(start_lba, lba_count) else {
+            return;
+        };
+        for bucket in range {
+            buckets
+                .entry(Self::bucket_key(vid, bucket))
+                .and_modify(|count| {
+                    count
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                            Some(current.saturating_add(1))
+                        })
+                        .ok();
+                })
+                .or_insert_with(|| AtomicU32::new(1));
+        }
+    }
+
+    fn remove_pending_buckets(&self, vid: &Arc<str>, start_lba: Lba, lba_count: u32) {
+        let Some(range) = Self::bucket_range(start_lba, lba_count) else {
+            return;
+        };
+        for bucket in range {
+            let key = Self::bucket_key(vid, bucket);
+            if let Some(count) = self.pending_lba_buckets.get(&key) {
+                count
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(1))
+                    })
+                    .ok();
+            }
+        }
+    }
+
+    fn pending_range_maybe_contains_interned(
+        &self,
+        vid: &Arc<str>,
+        start_lba: Lba,
+        lba_count: u32,
+    ) -> bool {
+        let Some(range) = Self::bucket_range(start_lba, lba_count) else {
+            return false;
+        };
+        range.into_iter().any(|bucket| {
+            self.pending_lba_buckets
+                .get(&Self::bucket_key(vid, bucket))
+                .is_some_and(|count| count.load(Ordering::Relaxed) > 0)
+        })
+    }
+
     pub(super) fn total_slots(capacity_bytes: u64) -> u64 {
         capacity_bytes / Self::slot_size()
     }
@@ -424,7 +500,9 @@ impl BufferShard {
         capacity_bytes: u64,
         lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,
         latest_lba_seq: &DashMap<LbaKey, (u64, u64)>,
+        pending_lba_buckets: &DashMap<PendingBucketKey, AtomicU32>,
         pending_entries: &DashMap<u64, Arc<PendingEntry>>,
+        pending_count: &AtomicU64,
     ) -> OnyxResult<ScanResult> {
         #[derive(Debug)]
         struct ScannedRecord {
@@ -485,7 +563,18 @@ impl BufferShard {
                 continue;
             };
             let vid: Arc<str> = Arc::from(pending.vol_id.as_str());
-            pending_entries.insert(pending.seq, pending.clone());
+            if pending_entries
+                .insert(pending.seq, pending.clone())
+                .is_none()
+            {
+                pending_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Self::add_pending_buckets(
+                pending_lba_buckets,
+                &vid,
+                pending.start_lba,
+                pending.lba_count,
+            );
             for i in 0..pending.lba_count {
                 let key = LbaKey {
                     vol_id: vid.clone(),
@@ -547,7 +636,9 @@ impl BufferShard {
         checkpoint: &ShardCheckpoint,
         lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,
         latest_lba_seq: &DashMap<LbaKey, (u64, u64)>,
+        pending_lba_buckets: &DashMap<PendingBucketKey, AtomicU32>,
         pending_entries: &DashMap<u64, Arc<PendingEntry>>,
+        pending_count: &AtomicU64,
     ) -> OnyxResult<ScanResult> {
         #[derive(Debug)]
         struct ScannedRecord {
@@ -571,7 +662,9 @@ impl BufferShard {
                 capacity_bytes,
                 lba_index,
                 latest_lba_seq,
+                pending_lba_buckets,
                 pending_entries,
+                pending_count,
             );
         }
 
@@ -707,7 +800,18 @@ impl BufferShard {
                 continue;
             };
             let vid: Arc<str> = Arc::from(pending.vol_id.as_str());
-            pending_entries.insert(pending.seq, pending.clone());
+            if pending_entries
+                .insert(pending.seq, pending.clone())
+                .is_none()
+            {
+                pending_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Self::add_pending_buckets(
+                pending_lba_buckets,
+                &vid,
+                pending.start_lba,
+                pending.lba_count,
+            );
             for i in 0..pending.lba_count {
                 let key = LbaKey {
                     vol_id: vid.clone(),
@@ -782,7 +886,9 @@ impl BufferShard {
 
         let lba_index = DashMap::with_shard_amount(DASHMAP_SHARDS);
         let latest_lba_seq = DashMap::with_shard_amount(DASHMAP_SHARDS);
+        let pending_lba_buckets = DashMap::with_shard_amount(DASHMAP_SHARDS);
         let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
+        let pending_count = AtomicU64::new(0);
         let recover_start = Instant::now();
         let scan = if let Some(ref ckpt) = checkpoint {
             let r = Self::rebuild_indices_guided(
@@ -791,7 +897,9 @@ impl BufferShard {
                 ckpt,
                 &lba_index,
                 &latest_lba_seq,
+                &pending_lba_buckets,
                 &pending_entries,
+                &pending_count,
             )?;
             tracing::info!(
                 elapsed_us = recover_start.elapsed().as_micros() as u64,
@@ -807,7 +915,9 @@ impl BufferShard {
                 capacity_bytes,
                 &lba_index,
                 &latest_lba_seq,
+                &pending_lba_buckets,
                 &pending_entries,
+                &pending_count,
             )?;
             tracing::info!(
                 elapsed_us = recover_start.elapsed().as_micros() as u64,
@@ -840,7 +950,9 @@ impl BufferShard {
                 backpressure_timeout,
                 lba_index,
                 latest_lba_seq,
+                pending_lba_buckets,
                 pending_entries,
+                pending_count,
                 flush_progress: DashMap::with_shard_amount(DASHMAP_SHARDS),
                 staging_tx,
                 staging_rx,
@@ -1129,11 +1241,14 @@ impl BufferShard {
 
         // ── DashMap inserts (concurrent sharded locks) ──
         // Interned Arc<str>: read-lock fast path, no alloc after first encounter.
+        Self::add_pending_buckets(&self.pending_lba_buckets, &vid, start_lba, lba_count);
         for key in keys {
             self.lba_index.insert(key.clone(), pending.clone());
             self.latest_lba_seq.insert(key, (seq, vol_created_at));
         }
-        self.pending_entries.insert(seq, pending.clone());
+        if self.pending_entries.insert(seq, pending.clone()).is_none() {
+            self.pending_count.fetch_add(1, Ordering::Relaxed);
+        }
         self.volatile_payloads.insert(seq, payload.clone());
 
         // ── Channel send (lock-free MPSC, ~30ns) ──
@@ -1437,6 +1552,10 @@ impl BufferShard {
         vid: &Arc<str>,
         lba: Lba,
     ) -> OnyxResult<Option<PendingEntry>> {
+        if !self.pending_range_maybe_contains_interned(vid, lba, 1) {
+            return Ok(None);
+        }
+
         let index_started = Instant::now();
         // Clone the Arc and release the DashMap guard before disk hydration.
         // Holding lba_index across pread() can stall flusher mark_flushed under
@@ -1499,6 +1618,15 @@ impl BufferShard {
         start_lba: Lba,
         lba_count: u32,
     ) -> OnyxResult<Vec<Option<PendingEntry>>> {
+        if !self.pending_range_maybe_contains_interned(vid, start_lba, lba_count) {
+            if let Some(metrics) = self.metrics.get() {
+                metrics
+                    .buffer_lookup_index_ns
+                    .fetch_add(Self::elapsed_ns(Instant::now()), Ordering::Relaxed);
+            }
+            return Ok(vec![None; lba_count as usize]);
+        }
+
         let mut indexed = Vec::with_capacity(lba_count as usize);
         let index_started = Instant::now();
         for i in 0..lba_count {
@@ -1729,6 +1857,7 @@ impl BufferShard {
         let Some((_, pending)) = self.pending_entries.remove(&seq) else {
             return;
         };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
         self.remove_volatile_payload(seq);
         let vid = self.intern_vol_id(&pending.vol_id);
         for i in 0..pending.lba_count {
@@ -1739,6 +1868,7 @@ impl BufferShard {
             self.lba_index.remove_if(&key, |_, value| value.seq == seq);
             self.latest_lba_seq.remove_if(&key, |_, &(s, _)| s == seq);
         }
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         if let Some(ref p) = pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }
@@ -2036,7 +2166,7 @@ impl BufferShard {
             let vid = self.intern_vol_id(&pending.vol_id);
             self.lba_index.remove_if(
                 &LbaKey {
-                    vol_id: vid,
+                    vol_id: vid.clone(),
                     lba: pending.start_lba,
                 },
                 |_, value| value.seq == seq,
@@ -2044,6 +2174,8 @@ impl BufferShard {
             let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
                 return Ok(());
             };
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
             self.remove_volatile_payload(seq);
             if let Some(ref p) = removed_pending.payload {
                 Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -2079,6 +2211,8 @@ impl BufferShard {
         let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
             return Ok(());
         };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         self.remove_volatile_payload(seq);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -2130,7 +2264,7 @@ impl BufferShard {
     }
 
     pub(super) fn pending_count(&self) -> u64 {
-        self.pending_entries.len() as u64
+        self.pending_count.load(Ordering::Relaxed)
     }
 
     pub(super) fn purge_volume(&self, vol_id: &str) -> OnyxResult<Vec<u64>> {
@@ -2161,6 +2295,9 @@ impl BufferShard {
         let mut removed_entries = Vec::with_capacity(to_purge.len());
         for (seq, _) in &to_purge {
             if let Some((_, pending)) = self.pending_entries.remove(seq) {
+                self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                let vid = self.intern_vol_id(&pending.vol_id);
+                self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
                 self.remove_volatile_payload(*seq);
                 if let Some(ref p) = pending.payload {
                     Self::release_payload_bytes(
@@ -2199,6 +2336,8 @@ impl BufferShard {
         let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
             return Ok(false);
         };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         self.remove_volatile_payload(seq);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
