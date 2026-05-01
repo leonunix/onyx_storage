@@ -1262,9 +1262,30 @@ class IntegrityHarness:
             "dedup_register_batch_max_entries": metric_get(
                 metrics_payload, "dedup_register_batch_max_entries"
             ),
+            "dedup_register_lock_ns": metric_get(
+                metrics_payload, "dedup_register_lock_ns"
+            ),
+            "dedup_register_validate_blockmap_ns": metric_get(
+                metrics_payload, "dedup_register_validate_blockmap_ns"
+            ),
+            "dedup_register_validate_refcount_ns": metric_get(
+                metrics_payload, "dedup_register_validate_refcount_ns"
+            ),
+            "dedup_register_commit_ns": metric_get(
+                metrics_payload, "dedup_register_commit_ns"
+            ),
             "flush_writer_meta_ns": metric_get(metrics_payload, "flush_writer_meta_ns"),
             "flush_writer_dedup_index_ns": metric_get(
                 metrics_payload, "flush_writer_dedup_index_ns"
+            ),
+            "metadb_cleanup_scan_us": metric_get(
+                status_payload, "metadb_memory", "cleanup_scan_us"
+            ),
+            "metadb_cleanup_forward_check_us": metric_get(
+                status_payload, "metadb_memory", "cleanup_forward_check_us"
+            ),
+            "metadb_cleanup_commit_us": metric_get(
+                status_payload, "metadb_memory", "cleanup_commit_us"
             ),
             "flush_errors": metric_get(metrics_payload, "flush_errors"),
             "read_crc_errors": metric_get(metrics_payload, "read_crc_errors"),

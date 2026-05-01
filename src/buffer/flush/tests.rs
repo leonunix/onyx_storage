@@ -339,7 +339,7 @@ fn write_unit_queues_dedup_registration_after_mapping_commit() {
     let regs = dedup_register_rx
         .try_recv()
         .expect("writer should queue a best-effort dedup registration batch");
-    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, "test");
+    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, &metrics, "test");
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
 }
@@ -392,7 +392,7 @@ fn write_packed_slot_queues_dedup_registration_after_mapping_commit() {
     let regs = dedup_register_rx
         .try_recv()
         .expect("writer should queue a best-effort packed dedup registration batch");
-    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, "test");
+    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, &metrics, "test");
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
 }
@@ -443,7 +443,7 @@ fn write_packed_slots_batch_queues_dedup_registration_after_mapping_commit() {
     let regs = dedup_register_rx
         .try_recv()
         .expect("packed batch should queue best-effort dedup registrations");
-    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, "test");
+    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, &metrics, "test");
 
     for (hash, lba) in expected {
         let mapping = meta

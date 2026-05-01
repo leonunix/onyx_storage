@@ -6,6 +6,10 @@ const DEDUP_REGISTER_FALLBACK_BATCH_LIMIT: usize =
 const CLEANUP_PBA_COMMIT_LIMIT: usize = 256;
 
 impl BufferFlusher {
+    fn meta_lock_id(meta: &MetaStore) -> usize {
+        meta as *const MetaStore as usize
+    }
+
     pub(crate) fn cleanup_dead_pba_post_commit(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
@@ -13,24 +17,32 @@ impl BufferFlusher {
         old_blocks: u32,
         context: &'static str,
     ) {
-        let cleanup_lock = Self::cleanup_lock(old_pba);
-        let _cleanup_guard = cleanup_lock.lock().unwrap();
-
-        let remaining = match meta.get_refcount(old_pba) {
-            Ok(remaining) => remaining,
-            Err(e) => {
-                tracing::error!(
-                    pba = old_pba.0,
-                    old_blocks,
-                    error = %e,
-                    context,
-                    "post-commit cleanup: failed to confirm dead PBA; leaving allocator reservation"
-                );
+        let meta_lock_id = Self::meta_lock_id(meta);
+        {
+            let cleanup_lock = Self::cleanup_lock(meta_lock_id, old_pba);
+            let _cleanup_guard = cleanup_lock.lock().unwrap();
+            if Self::mark_pba_cleaning(meta_lock_id, old_pba) {
                 return;
             }
-        };
-        if remaining != 0 {
-            return;
+
+            let remaining = match meta.get_refcount(old_pba) {
+                Ok(remaining) => remaining,
+                Err(e) => {
+                    tracing::error!(
+                        pba = old_pba.0,
+                        old_blocks,
+                        error = %e,
+                        context,
+                        "post-commit cleanup: failed to confirm dead PBA; leaving allocator reservation"
+                    );
+                    Self::unmark_pba_cleaning(meta_lock_id, old_pba);
+                    return;
+                }
+            };
+            if remaining != 0 {
+                Self::unmark_pba_cleaning(meta_lock_id, old_pba);
+                return;
+            }
         }
 
         if let Err(e) = meta.cleanup_dedup_for_pba_standalone(old_pba) {
@@ -41,41 +53,48 @@ impl BufferFlusher {
                 context,
                 "post-commit cleanup: failed to cleanup dedup metadata; leaving allocator reservation"
             );
+            Self::unmark_pba_cleaning(meta_lock_id, old_pba);
             return;
         }
 
-        let already_free = if old_blocks <= 1 {
-            allocator.is_free(old_pba)
-        } else {
-            allocator.is_extent_free(Extent::new(old_pba, old_blocks))
-        };
-        if already_free {
-            return;
-        }
+        {
+            let cleanup_lock = Self::cleanup_lock(meta_lock_id, old_pba);
+            let _cleanup_guard = cleanup_lock.lock().unwrap();
+            let already_free = if old_blocks <= 1 {
+                allocator.is_free(old_pba)
+            } else {
+                allocator.is_extent_free(Extent::new(old_pba, old_blocks))
+            };
+            if already_free {
+                Self::unmark_pba_cleaning(meta_lock_id, old_pba);
+                return;
+            }
 
-        #[cfg(test)]
-        CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
 
-        tracing::debug!(
-            pba = old_pba.0,
-            old_blocks,
-            context,
-            "cleanup_dead_pba: freeing PBA to allocator"
-        );
-
-        let free_result = if old_blocks <= 1 {
-            allocator.free_one(old_pba)
-        } else {
-            allocator.free_extent(Extent::new(old_pba, old_blocks))
-        };
-        if let Err(e) = free_result {
-            tracing::warn!(
+            tracing::debug!(
                 pba = old_pba.0,
                 old_blocks,
-                error = %e,
                 context,
-                "post-commit cleanup: allocator free failed after metadata commit (benign if already freed by another path); continuing without retry"
+                "cleanup_dead_pba: freeing PBA to allocator"
             );
+
+            let free_result = if old_blocks <= 1 {
+                allocator.free_one(old_pba)
+            } else {
+                allocator.free_extent(Extent::new(old_pba, old_blocks))
+            };
+            if let Err(e) = free_result {
+                tracing::warn!(
+                    pba = old_pba.0,
+                    old_blocks,
+                    error = %e,
+                    context,
+                    "post-commit cleanup: allocator free failed after metadata commit (benign if already freed by another path); continuing without retry"
+                );
+            }
+            Self::unmark_pba_cleaning(meta_lock_id, old_pba);
         }
     }
 
@@ -90,6 +109,7 @@ impl BufferFlusher {
         if dead_pbas.is_empty() {
             return;
         }
+        let meta_lock_id = Self::meta_lock_id(meta);
 
         let mut candidates_by_pba: HashMap<Pba, u32> = HashMap::new();
         for &(pba, blocks) in dead_pbas {
@@ -101,54 +121,70 @@ impl BufferFlusher {
         let mut candidates: Vec<(Pba, u32)> = candidates_by_pba.into_iter().collect();
         candidates.sort_unstable_by_key(|(pba, _)| *pba);
 
-        let locks: Vec<_> = candidates
-            .iter()
-            .map(|(pba, _)| Self::cleanup_lock(*pba))
-            .collect();
-        let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
-
-        let pbas: Vec<Pba> = candidates.iter().map(|(pba, _)| *pba).collect();
-        let refcounts = match meta.multi_get_refcounts(&pbas) {
-            Ok(refcounts) => refcounts,
-            Err(e) => {
-                tracing::error!(
-                    count = pbas.len(),
-                    error = %e,
-                    context,
-                    "batch cleanup: failed to confirm dead PBAs; skipping"
-                );
-                return;
-            }
-        };
-
-        // Phase 1: locks + batched refcount verify → filter to truly dead
-        let mut truly_dead: Vec<(Pba, u32)> = Vec::new();
-        for ((pba, blocks), remaining) in candidates.into_iter().zip(refcounts.into_iter()) {
-            if remaining != 0 {
+        // Process in bounded chunks. The slow reverse-index scan runs outside
+        // PBA locks; locks only guard the transition into/out of the "cleaning"
+        // set and allocator free. Dedup registration treats "cleaning" as a
+        // best-effort skip for that PBA, which is safe because the register
+        // path can always be reconstructed by later writes/scans.
+        for candidate_chunk in candidates.chunks(CLEANUP_PBA_COMMIT_LIMIT) {
+            let pbas: Vec<Pba> = candidate_chunk
+                .iter()
+                .map(|(pba, _)| *pba)
+                .filter(|pba| {
+                    let cleanup_lock = Self::cleanup_lock(meta_lock_id, *pba);
+                    let _cleanup_guard = cleanup_lock.lock().unwrap();
+                    !Self::mark_pba_cleaning(meta_lock_id, *pba)
+                })
+                .collect();
+            if pbas.is_empty() {
                 continue;
             }
-
-            let already_free = if blocks <= 1 {
-                allocator.is_free(pba)
-            } else {
-                allocator.is_extent_free(Extent::new(pba, blocks))
+            let refcounts = match meta.multi_get_refcounts(&pbas) {
+                Ok(refcounts) => refcounts,
+                Err(e) => {
+                    tracing::error!(
+                        count = pbas.len(),
+                        error = %e,
+                        context,
+                        "batch cleanup: failed to confirm dead PBAs; skipping chunk"
+                    );
+                    for pba in pbas {
+                        Self::unmark_pba_cleaning(meta_lock_id, pba);
+                    }
+                    continue;
+                }
             };
-            if already_free {
+            let refcount_by_pba: HashMap<Pba, u32> = pbas.iter().copied().zip(refcounts).collect();
+
+            let mut truly_dead: Vec<(Pba, u32)> = Vec::new();
+            for &(pba, blocks) in candidate_chunk {
+                if !refcount_by_pba.contains_key(&pba) {
+                    continue;
+                }
+                let remaining = refcount_by_pba[&pba];
+                if remaining != 0 {
+                    Self::unmark_pba_cleaning(meta_lock_id, pba);
+                    continue;
+                }
+
+                let already_free = if blocks <= 1 {
+                    allocator.is_free(pba)
+                } else {
+                    allocator.is_extent_free(Extent::new(pba, blocks))
+                };
+                if already_free {
+                    Self::unmark_pba_cleaning(meta_lock_id, pba);
+                    continue;
+                }
+
+                truly_dead.push((pba, blocks));
+            }
+
+            if truly_dead.is_empty() {
                 continue;
             }
 
-            truly_dead.push((pba, blocks));
-        }
-
-        if truly_dead.is_empty() {
-            return;
-        }
-
-        // Phase 2/3: bounded dedup cleanup commits, then free only the
-        // successfully-cleaned chunk. A large shutdown drain can otherwise
-        // build a multi-MiB WAL body and block allocator reclamation.
-        for chunk in truly_dead.chunks(CLEANUP_PBA_COMMIT_LIMIT) {
-            let pbas: Vec<Pba> = chunk.iter().map(|(p, _)| *p).collect();
+            let pbas: Vec<Pba> = truly_dead.iter().map(|(p, _)| *p).collect();
             if let Err(e) = meta.cleanup_dedup_for_pbas_batch(&pbas) {
                 tracing::error!(
                     count = pbas.len(),
@@ -156,10 +192,15 @@ impl BufferFlusher {
                     context,
                     "batch cleanup: dedup metadata cleanup failed; skipping allocator free for chunk"
                 );
+                for pba in pbas {
+                    Self::unmark_pba_cleaning(meta_lock_id, pba);
+                }
                 continue;
             }
 
-            for &(pba, blocks) in chunk {
+            for &(pba, blocks) in &truly_dead {
+                let cleanup_lock = Self::cleanup_lock(meta_lock_id, pba);
+                let _cleanup_guard = cleanup_lock.lock().unwrap();
                 #[cfg(test)]
                 CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
 
@@ -184,6 +225,7 @@ impl BufferFlusher {
                         "batch cleanup: allocator free failed (benign if already freed); continuing"
                     );
                 }
+                Self::unmark_pba_cleaning(meta_lock_id, pba);
             }
         }
     }
@@ -277,7 +319,7 @@ impl BufferFlusher {
 
             let count = all.len();
             let start = Instant::now();
-            Self::register_dedup_batch(meta, &all, batch_limit, "dedup_register_thread");
+            Self::register_dedup_batch(meta, &all, batch_limit, metrics, "dedup_register_thread");
             Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, start);
             Self::record_dedup_register_batch_metrics(metrics, count, batch_limit);
             tracing::debug!(
@@ -302,6 +344,7 @@ impl BufferFlusher {
                 meta,
                 &remaining,
                 batch_limit,
+                metrics,
                 "dedup_register_thread_drain",
             );
             Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, start);
@@ -335,12 +378,13 @@ impl BufferFlusher {
         meta: &MetaStore,
         registrations: &[DedupRegistration],
         batch_limit: usize,
+        metrics: &EngineMetrics,
         context: &'static str,
     ) {
         let batch_limit = batch_limit.max(1);
         if registrations.len() > batch_limit {
             for chunk in registrations.chunks(batch_limit) {
-                Self::register_dedup_batch(meta, chunk, batch_limit, context);
+                Self::register_dedup_batch(meta, chunk, batch_limit, metrics, context);
             }
             return;
         }
@@ -348,15 +392,28 @@ impl BufferFlusher {
         if registrations.is_empty() {
             return;
         }
+        let meta_lock_id = Self::meta_lock_id(meta);
 
         let mut pbas: Vec<Pba> = registrations.iter().map(|reg| reg.entry.pba).collect();
         pbas.sort_unstable();
         pbas.dedup();
-        let locks: Vec<_> = pbas.iter().map(|pba| Self::cleanup_lock(*pba)).collect();
+        let lock_start = Instant::now();
+        let locks: Vec<_> = pbas
+            .iter()
+            .map(|pba| Self::cleanup_lock(meta_lock_id, *pba))
+            .collect();
         let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+        Self::record_elapsed(&metrics.dedup_register_lock_ns, lock_start);
+        let cleaning_pbas: HashSet<Pba> = pbas
+            .into_iter()
+            .filter(|pba| Self::is_pba_cleaning(meta_lock_id, *pba))
+            .collect();
 
         let mut by_vol: HashMap<VolumeId, Vec<(usize, Lba)>> = HashMap::new();
         for (idx, reg) in registrations.iter().enumerate() {
+            if cleaning_pbas.contains(&reg.entry.pba) {
+                continue;
+            }
             by_vol
                 .entry(reg.vol_id.clone())
                 .or_default()
@@ -366,9 +423,14 @@ impl BufferFlusher {
         let mut candidate_indices: Vec<usize> = Vec::new();
         for (vol_id, items) in by_vol {
             let lbas: Vec<Lba> = items.iter().map(|(_, lba)| *lba).collect();
+            let validate_start = Instant::now();
             let mappings = match meta.multi_get_mappings(&vol_id, &lbas) {
                 Ok(mappings) => mappings,
                 Err(e) => {
+                    Self::record_elapsed(
+                        &metrics.dedup_register_validate_blockmap_ns,
+                        validate_start,
+                    );
                     tracing::warn!(
                         vol = %vol_id,
                         count = items.len(),
@@ -379,6 +441,7 @@ impl BufferFlusher {
                     continue;
                 }
             };
+            Self::record_elapsed(&metrics.dedup_register_validate_blockmap_ns, validate_start);
 
             for ((idx, _), mapping) in items.into_iter().zip(mappings.into_iter()) {
                 let reg = &registrations[idx];
@@ -400,9 +463,11 @@ impl BufferFlusher {
         candidate_pbas.sort_unstable();
         candidate_pbas.dedup();
 
+        let refcount_start = Instant::now();
         let refcounts = match meta.multi_get_refcounts(&candidate_pbas) {
             Ok(refcounts) => refcounts,
             Err(e) => {
+                Self::record_elapsed(&metrics.dedup_register_validate_refcount_ns, refcount_start);
                 tracing::warn!(
                     count = candidate_pbas.len(),
                     error = %e,
@@ -412,6 +477,7 @@ impl BufferFlusher {
                 return;
             }
         };
+        Self::record_elapsed(&metrics.dedup_register_validate_refcount_ns, refcount_start);
         let refcount_by_pba: HashMap<Pba, u32> =
             candidate_pbas.into_iter().zip(refcounts).collect();
 
@@ -427,7 +493,10 @@ impl BufferFlusher {
             return;
         }
         for chunk in valid.chunks(batch_limit) {
-            if let Err(e) = meta.put_dedup_entries(chunk) {
+            let commit_start = Instant::now();
+            let result = meta.put_dedup_entries(chunk);
+            Self::record_elapsed(&metrics.dedup_register_commit_ns, commit_start);
+            if let Err(e) = result {
                 tracing::warn!(
                     count = chunk.len(),
                     error = %e,
@@ -442,17 +511,19 @@ impl BufferFlusher {
     pub(super) fn register_dedup_batch_for_test(
         meta: &MetaStore,
         registrations: &[DedupRegistration],
+        metrics: &EngineMetrics,
         context: &'static str,
     ) {
         Self::register_dedup_batch(
             meta,
             registrations,
             DEDUP_REGISTER_FALLBACK_BATCH_LIMIT,
+            metrics,
             context,
         );
     }
 
-    pub(super) fn pba_lock(pba: Pba) -> Arc<Mutex<()>> {
+    pub(super) fn pba_lock(meta_lock_id: usize, pba: Pba) -> Arc<Mutex<()>> {
         let mut locks = PBA_LOCKS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -463,12 +534,37 @@ impl BufferFlusher {
             locks.retain(|_, arc| Arc::strong_count(arc) > 1);
         }
         locks
-            .entry(pba)
+            .entry((meta_lock_id, pba))
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
-    pub(crate) fn cleanup_lock(pba: Pba) -> Arc<Mutex<()>> {
-        Self::pba_lock(pba)
+    pub(crate) fn cleanup_lock(meta_lock_id: usize, pba: Pba) -> Arc<Mutex<()>> {
+        Self::pba_lock(meta_lock_id, pba)
+    }
+
+    fn pba_cleaning_set() -> &'static Mutex<HashSet<PbaLockKey>> {
+        PBA_CLEANING.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    fn mark_pba_cleaning(meta_lock_id: usize, pba: Pba) -> bool {
+        !Self::pba_cleaning_set()
+            .lock()
+            .unwrap()
+            .insert((meta_lock_id, pba))
+    }
+
+    fn unmark_pba_cleaning(meta_lock_id: usize, pba: Pba) {
+        Self::pba_cleaning_set()
+            .lock()
+            .unwrap()
+            .remove(&(meta_lock_id, pba));
+    }
+
+    fn is_pba_cleaning(meta_lock_id: usize, pba: Pba) -> bool {
+        Self::pba_cleaning_set()
+            .lock()
+            .unwrap()
+            .contains(&(meta_lock_id, pba))
     }
 }
