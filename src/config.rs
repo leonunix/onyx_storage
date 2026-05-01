@@ -338,6 +338,10 @@ pub struct UblkConfig {
     /// IO buffer size in bytes (default 1MB)
     #[serde(default = "default_io_buf_bytes")]
     pub io_buf_bytes: u32,
+    /// Worker threads per ublk queue used to offload backend IO before
+    /// completing commands on the queue thread.
+    #[serde(default = "default_queue_workers")]
+    pub queue_workers: usize,
 }
 
 impl Default for UblkConfig {
@@ -346,6 +350,7 @@ impl Default for UblkConfig {
             nr_queues: default_nr_queues(),
             queue_depth: default_queue_depth(),
             io_buf_bytes: default_io_buf_bytes(),
+            queue_workers: default_queue_workers(),
         }
     }
 }
@@ -574,6 +579,9 @@ fn default_queue_depth() -> u16 {
 }
 fn default_io_buf_bytes() -> u32 {
     1024 * 1024
+}
+fn default_queue_workers() -> usize {
+    1
 }
 
 // OnyxConfig::load and should_standby are defined in the impl block above.

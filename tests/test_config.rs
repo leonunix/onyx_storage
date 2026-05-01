@@ -20,6 +20,7 @@ device = "/dev/vg0/lv2"
     assert_eq!(config.buffer.capacity_mb, 16384);
     assert_eq!(config.buffer.group_commit_wait_us, 500);
     assert_eq!(config.ublk.nr_queues, 4);
+    assert_eq!(config.ublk.queue_workers, 1);
 }
 
 #[test]
@@ -46,6 +47,7 @@ group_commit_wait_us = 500
 nr_queues = 8
 queue_depth = 256
 io_buf_bytes = 2097152
+queue_workers = 3
 "#;
     let config: OnyxConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(config.meta.block_cache_mb, 512);
@@ -53,6 +55,7 @@ io_buf_bytes = 2097152
     assert_eq!(config.buffer.flush_watermark_pct, 90);
     assert_eq!(config.buffer.group_commit_wait_us, 500);
     assert_eq!(config.ublk.nr_queues, 8);
+    assert_eq!(config.ublk.queue_workers, 3);
 }
 
 #[test]

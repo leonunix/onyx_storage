@@ -2,14 +2,20 @@
 // This module is only compiled on Linux (cfg(target_os = "linux")).
 
 use std::cell::{Cell, RefCell};
+use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
+use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes, UblkUringData};
 
 use std::sync::atomic::Ordering;
+
+use crossbeam_channel::{Receiver, Sender};
+use io_uring::{opcode, types};
 
 use crate::config::UblkConfig;
 use crate::error::{OnyxError, OnyxResult};
@@ -23,6 +29,368 @@ pub struct OnyxUblkTarget {
     vol_id: String,
     device_size_bytes: u64,
     vol_created_at: u64,
+}
+
+#[derive(Clone)]
+struct IoWorkerContext {
+    zone_manager: Arc<ZoneManager>,
+    vol_id: String,
+    vol_created_at: u64,
+    block_size: u64,
+    sector_size: u64,
+}
+
+struct QueuedIo {
+    tag: u16,
+    op: u32,
+    start_sector: u64,
+    nr_sectors: u32,
+    data: QueuedIoData,
+    queued_at: Instant,
+}
+
+enum QueuedIoData {
+    Owned(Vec<u8>),
+    /// Direct pointer into libublk's per-tag queue buffer.
+    ///
+    /// Safety invariant: ublk does not reuse a tag's buffer until userspace
+    /// completes that tag, and the queue thread only completes a direct read
+    /// after this worker returns. This removes one allocation and one memcpy
+    /// from the read path while still letting the queue thread fetch more
+    /// commands instead of serialising the whole hardware queue.
+    Direct {
+        ptr: usize,
+        len: usize,
+    },
+}
+
+struct CompletedIo {
+    tag: u16,
+    op: u32,
+    res: i32,
+    elapsed_ns: u64,
+}
+
+impl IoWorkerContext {
+    fn handle_io(&self, op: u32, start_sector: u64, nr_sectors: u32, io_slice: &mut [u8]) -> i32 {
+        let offset_bytes = start_sector * self.sector_size;
+        let io_bytes = nr_sectors as u64 * self.sector_size;
+        let io_len = io_bytes as usize;
+
+        if matches!(op, sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE) && io_len > io_slice.len() {
+            tracing::error!(
+                io_len,
+                buf_len = io_slice.len(),
+                "ublk request exceeds queue buffer size"
+            );
+            return -(libc::EIO as i32);
+        }
+
+        match op {
+            sys::UBLK_IO_OP_READ => {
+                self.handle_read(offset_bytes, io_bytes, &mut io_slice[..io_len])
+            }
+            sys::UBLK_IO_OP_WRITE => self.handle_write(offset_bytes, io_bytes, &io_slice[..io_len]),
+            sys::UBLK_IO_OP_FLUSH => 0,
+            sys::UBLK_IO_OP_DISCARD => self.handle_discard(offset_bytes, io_bytes),
+            _ => -(libc::ENOTSUP as i32),
+        }
+    }
+
+    fn handle_read(&self, offset_bytes: u64, io_bytes: u64, out: &mut [u8]) -> i32 {
+        if offset_bytes % self.block_size == 0 && io_bytes % self.block_size == 0 {
+            let start_lba = Lba(offset_bytes / self.block_size);
+            let lba_count = (io_bytes / self.block_size) as u32;
+            return match self.zone_manager.submit_reads(
+                &self.vol_id,
+                start_lba,
+                lba_count,
+                self.vol_created_at,
+                out,
+            ) {
+                Ok(()) => io_bytes as i32,
+                Err(e) => {
+                    tracing::error!(
+                        start_lba = start_lba.0,
+                        lba_count,
+                        error = %e,
+                        "batched read failed"
+                    );
+                    -(libc::EIO as i32)
+                }
+            };
+        }
+
+        let mut buf_offset = 0usize;
+        let mut remaining = io_bytes;
+        let mut cur_offset = offset_bytes;
+        let mut status = io_bytes as i32;
+
+        while remaining > 0 {
+            let block_lba = Lba(cur_offset / self.block_size);
+            let offset_in_block = (cur_offset % self.block_size) as usize;
+            let avail_in_block = self.block_size as usize - offset_in_block;
+            let copy_len = (remaining as usize).min(avail_in_block);
+
+            match self.zone_manager.submit_read_with_generation(
+                &self.vol_id,
+                block_lba,
+                self.vol_created_at,
+            ) {
+                Ok(Some(data)) => {
+                    let src_end = (offset_in_block + copy_len).min(data.len());
+                    let actual_copy = src_end.saturating_sub(offset_in_block);
+                    if actual_copy > 0 {
+                        out[buf_offset..buf_offset + actual_copy]
+                            .copy_from_slice(&data[offset_in_block..offset_in_block + actual_copy]);
+                    }
+                    if actual_copy < copy_len {
+                        out[buf_offset + actual_copy..buf_offset + copy_len].fill(0);
+                    }
+                }
+                Ok(None) => {
+                    out[buf_offset..buf_offset + copy_len].fill(0);
+                }
+                Err(e) => {
+                    tracing::error!(lba = block_lba.0, error = %e, "read failed");
+                    status = -(libc::EIO as i32);
+                    break;
+                }
+            }
+
+            buf_offset += copy_len;
+            cur_offset += copy_len as u64;
+            remaining -= copy_len as u64;
+        }
+
+        status
+    }
+
+    fn handle_write(&self, offset_bytes: u64, io_bytes: u64, req: &[u8]) -> i32 {
+        if offset_bytes % self.block_size == 0 && io_bytes % self.block_size == 0 {
+            let start_lba = Lba(offset_bytes / self.block_size);
+            let lba_count = (io_bytes / self.block_size) as u32;
+            return if let Err(e) = self.zone_manager.submit_write(
+                &self.vol_id,
+                start_lba,
+                lba_count,
+                req,
+                self.vol_created_at,
+            ) {
+                tracing::error!(
+                    lba = start_lba.0,
+                    count = lba_count,
+                    error = %e,
+                    "write failed"
+                );
+                -(libc::EIO as i32)
+            } else {
+                io_bytes as i32
+            };
+        }
+
+        let mut buf_offset = 0usize;
+        let mut remaining = io_bytes;
+        let mut cur_offset = offset_bytes;
+        let mut status = io_bytes as i32;
+
+        while remaining > 0 {
+            let block_lba = Lba(cur_offset / self.block_size);
+            let offset_in_block = (cur_offset % self.block_size) as usize;
+            let avail_in_block = self.block_size as usize - offset_in_block;
+            let write_len = (remaining as usize).min(avail_in_block);
+
+            let mut block = match self.zone_manager.submit_read_with_generation(
+                &self.vol_id,
+                block_lba,
+                self.vol_created_at,
+            ) {
+                Ok(Some(data)) => {
+                    let mut b = data;
+                    b.resize(self.block_size as usize, 0);
+                    b
+                }
+                Ok(None) => vec![0u8; self.block_size as usize],
+                Err(e) => {
+                    tracing::error!(lba = block_lba.0, error = %e, "RMW read failed");
+                    status = -(libc::EIO as i32);
+                    break;
+                }
+            };
+
+            block[offset_in_block..offset_in_block + write_len]
+                .copy_from_slice(&req[buf_offset..buf_offset + write_len]);
+
+            if let Err(e) = self.zone_manager.submit_write(
+                &self.vol_id,
+                block_lba,
+                1,
+                &block,
+                self.vol_created_at,
+            ) {
+                tracing::error!(lba = block_lba.0, error = %e, "write failed");
+                status = -(libc::EIO as i32);
+                break;
+            }
+
+            buf_offset += write_len;
+            cur_offset += write_len as u64;
+            remaining -= write_len as u64;
+        }
+
+        status
+    }
+
+    fn handle_discard(&self, offset_bytes: u64, io_bytes: u64) -> i32 {
+        let start_lba = Lba(offset_bytes / self.block_size);
+        let lba_count = (io_bytes / self.block_size) as u32;
+        if lba_count == 0 {
+            return 0;
+        }
+
+        match self
+            .zone_manager
+            .submit_discard(&self.vol_id, start_lba, lba_count)
+        {
+            Ok(()) => io_bytes as i32,
+            Err(e) => {
+                tracing::error!(
+                    lba = start_lba.0,
+                    count = lba_count,
+                    error = %e,
+                    "discard failed"
+                );
+                -(libc::EIO as i32)
+            }
+        }
+    }
+}
+
+fn eventfd_write(fd: RawFd) {
+    let value = 1u64.to_ne_bytes();
+    let rc = unsafe { libc::write(fd, value.as_ptr().cast(), value.len()) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EAGAIN) {
+            tracing::warn!(error = %err, "failed to wake ublk queue eventfd");
+        }
+    }
+}
+
+fn drain_eventfd(fd: RawFd) {
+    loop {
+        let mut value = 0u64;
+        let rc = unsafe {
+            libc::read(
+                fd,
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc == std::mem::size_of::<u64>() as isize {
+            continue;
+        }
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EAGAIN) {
+                tracing::warn!(error = %err, "failed to drain ublk queue eventfd");
+            }
+        }
+        break;
+    }
+}
+
+fn submit_eventfd_poll(q: &UblkQueue, event_fd: RawFd, qid: u16) {
+    let sqe = opcode::PollAdd::new(types::Fd(event_fd), libc::POLLIN as _)
+        .build()
+        .user_data(
+            UblkUringData::Target as u64 | ((sys::UBLK_IO_OP_FLUSH as u64) << 16) | qid as u64,
+        );
+    if let Err(err) = q.ublk_submit_sqe_sync(sqe) {
+        tracing::error!(error = ?err, "failed to submit ublk eventfd poll");
+    }
+}
+
+fn record_completed_io_metrics(ctx: &IoWorkerContext, op: u32, res: i32, elapsed_ns: u64) {
+    if res <= 0 {
+        return;
+    }
+
+    let bytes = res as u64;
+    let metrics = ctx.zone_manager.metrics();
+    match op {
+        sys::UBLK_IO_OP_READ => {
+            metrics.volume_read_ops.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .volume_read_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            metrics
+                .volume_read_total_ns
+                .fetch_add(elapsed_ns, Ordering::Relaxed);
+        }
+        sys::UBLK_IO_OP_WRITE => {
+            metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .volume_write_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            metrics
+                .volume_write_total_ns
+                .fetch_add(elapsed_ns, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+fn spawn_queue_workers(
+    qid: u16,
+    workers: usize,
+    ctx: IoWorkerContext,
+    request_rx: Receiver<QueuedIo>,
+    completion_tx: Sender<CompletedIo>,
+    event_fd: RawFd,
+) -> Vec<JoinHandle<()>> {
+    (0..workers)
+        .map(|worker_idx| {
+            let rx = request_rx.clone();
+            let tx = completion_tx.clone();
+            let ctx = ctx.clone();
+            thread::Builder::new()
+                .name(format!("ublk-q{qid}-worker-{worker_idx}"))
+                .spawn(move || {
+                    crate::affinity::bind_current(
+                        crate::affinity::ThreadRole::Ublk,
+                        qid as usize + worker_idx,
+                    );
+                    while let Ok(mut req) = rx.recv() {
+                        let res = match &mut req.data {
+                            QueuedIoData::Owned(data) => ctx.handle_io(
+                                req.op,
+                                req.start_sector,
+                                req.nr_sectors,
+                                data.as_mut_slice(),
+                            ),
+                            QueuedIoData::Direct { ptr, len } => {
+                                let io_slice = unsafe {
+                                    std::slice::from_raw_parts_mut(*ptr as *mut u8, *len)
+                                };
+                                ctx.handle_io(req.op, req.start_sector, req.nr_sectors, io_slice)
+                            }
+                        };
+                        let completed = CompletedIo {
+                            tag: req.tag,
+                            op: req.op,
+                            res,
+                            elapsed_ns: req.queued_at.elapsed().as_nanos() as u64,
+                        };
+                        if tx.send(completed).is_err() {
+                            break;
+                        }
+                        eventfd_write(event_fd);
+                    }
+                })
+                .unwrap_or_else(|err| panic!("failed to spawn ublk worker: {err}"))
+        })
+        .collect()
 }
 
 impl OnyxUblkTarget {
@@ -58,9 +426,6 @@ impl OnyxUblkTarget {
         let depth = self.config.queue_depth;
         let io_buf_bytes = self.config.io_buf_bytes;
         let dev_size = self.device_size_bytes;
-        let vol_id = self.vol_id.clone();
-        let vol_created_at = self.vol_created_at;
-        let zm = self.zone_manager.clone();
         let dev_name = format!("onyx-{}", self.vol_id);
 
         let sess = UblkCtrlBuilder::default()
@@ -100,30 +465,75 @@ impl OnyxUblkTarget {
             Ok::<(), UblkError>(())
         };
 
-        let block_size = BLOCK_SIZE as u64;
-        let sector_size = SECTOR_SIZE as u64;
+        let worker_ctx = IoWorkerContext {
+            zone_manager: self.zone_manager.clone(),
+            vol_id: self.vol_id.clone(),
+            vol_created_at: self.vol_created_at,
+            block_size: BLOCK_SIZE as u64,
+            sector_size: SECTOR_SIZE as u64,
+        };
+        let queue_workers = self.config.queue_workers.max(1);
 
         let q_handler = move |qid: u16, dev: &UblkDev| {
             crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
             let bufs = Rc::new(RefCell::new(dev.alloc_queue_io_bufs()));
             let io_bufs = bufs.clone();
             let queue_thread_bound = Rc::new(Cell::new(false));
+            let (request_tx, request_rx) = crossbeam_channel::unbounded::<QueuedIo>();
+            let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<CompletedIo>();
+            let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if event_fd < 0 {
+                tracing::error!(
+                    error = %std::io::Error::last_os_error(),
+                    "failed to create ublk queue eventfd"
+                );
+                return;
+            }
+            let workers = queue_workers;
+            let worker_handles = spawn_queue_workers(
+                qid,
+                workers,
+                worker_ctx.clone(),
+                request_rx,
+                completion_tx,
+                event_fd,
+            );
+            let submit_tx = request_tx.clone();
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 if !queue_thread_bound.get() {
                     crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
                     queue_thread_bound.set(true);
                 }
+                if tag == qid && _io.is_tgt_io() {
+                    drain_eventfd(event_fd);
+                    let bufs = io_bufs.borrow();
+                    while let Ok(done) = completion_rx.try_recv() {
+                        record_completed_io_metrics(
+                            &worker_ctx,
+                            done.op,
+                            done.res,
+                            done.elapsed_ns,
+                        );
+
+                        if let Err(err) = q.complete_io_cmd_unified(
+                            done.tag,
+                            BufDesc::Slice(bufs[done.tag as usize].as_slice()),
+                            Ok(UblkIORes::Result(done.res)),
+                        ) {
+                            tracing::error!(error = ?err, "ublk completion failed");
+                        }
+                    }
+                    submit_eventfd_poll(q, event_fd, qid);
+                    return;
+                }
                 let iod = q.get_iod(tag);
+                let queued_at = Instant::now();
                 let op = iod.op_flags & 0xFF;
                 let start_sector = iod.start_sector;
-                let nr_sectors = iod.nr_sectors as u64;
-                let offset_bytes = start_sector * sector_size;
-                let io_bytes = nr_sectors * sector_size;
+                let nr_sectors = iod.nr_sectors;
+                let io_bytes = nr_sectors as u64 * SECTOR_SIZE as u64;
                 let io_len = io_bytes as usize;
-
-                let metrics = zm.metrics();
-                let io_start = std::time::Instant::now();
-                let res = {
+                if op == sys::UBLK_IO_OP_READ {
                     let mut bufs = io_bufs.borrow_mut();
                     let io_buf = &mut bufs[tag as usize];
                     let io_slice = io_buf.as_mut_slice();
@@ -134,240 +544,83 @@ impl OnyxUblkTarget {
                             buf_len = io_slice.len(),
                             "ublk request exceeds queue buffer size"
                         );
-                        -(libc::EIO as i32)
-                    } else {
-                        match op {
-                            sys::UBLK_IO_OP_READ => {
-                                // Fast path: block-aligned user read → one
-                                // vectorized call. One multi_get_mappings, one
-                                // io_uring read per unique compression unit,
-                                // one decompress per unit, and the pool writes
-                                // straight into `io_slice` with no per-LBA
-                                // intermediate allocation.
-                                if offset_bytes % block_size == 0 && io_bytes % block_size == 0 {
-                                    let start_lba = Lba(offset_bytes / block_size);
-                                    let lba_count = (io_bytes / block_size) as u32;
-                                    match zm.submit_reads(
-                                        &vol_id,
-                                        start_lba,
-                                        lba_count,
-                                        vol_created_at,
-                                        &mut io_slice[..io_len],
-                                    ) {
-                                        Ok(()) => io_bytes as i32,
-                                        Err(e) => {
-                                            tracing::error!(
-                                                start_lba = start_lba.0,
-                                                lba_count,
-                                                error = %e,
-                                                "batched read failed"
-                                            );
-                                            -(libc::EIO as i32)
-                                        }
-                                    }
-                                } else {
-                                    // Unaligned fallback — per-LBA RMW loop.
-                                    let mut buf_offset = 0usize;
-                                    let mut remaining = io_bytes;
-                                    let mut cur_offset = offset_bytes;
-                                    let mut status = io_bytes as i32;
+                        if let Err(err) = q.complete_io_cmd_unified(
+                            tag,
+                            BufDesc::Slice(io_buf.as_slice()),
+                            Ok(UblkIORes::Result(-(libc::EIO as i32))),
+                        ) {
+                            tracing::error!(error = ?err, "ublk completion failed");
+                        }
+                        return;
+                    }
 
-                                    while remaining > 0 {
-                                        let block_lba = Lba(cur_offset / block_size);
-                                        let offset_in_block = (cur_offset % block_size) as usize;
-                                        let avail_in_block = block_size as usize - offset_in_block;
-                                        let copy_len = (remaining as usize).min(avail_in_block);
-
-                                        match zm.submit_read_with_generation(
-                                            &vol_id,
-                                            block_lba,
-                                            vol_created_at,
-                                        ) {
-                                            Ok(Some(data)) => {
-                                                let src_end =
-                                                    (offset_in_block + copy_len).min(data.len());
-                                                let actual_copy =
-                                                    src_end.saturating_sub(offset_in_block);
-                                                if actual_copy > 0 {
-                                                    io_slice[buf_offset..buf_offset + actual_copy]
-                                                        .copy_from_slice(
-                                                            &data[offset_in_block
-                                                                ..offset_in_block + actual_copy],
-                                                        );
-                                                }
-                                                if actual_copy < copy_len {
-                                                    io_slice[buf_offset + actual_copy
-                                                        ..buf_offset + copy_len]
-                                                        .fill(0);
-                                                }
-                                            }
-                                            Ok(None) => {
-                                                io_slice[buf_offset..buf_offset + copy_len].fill(0);
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    lba = block_lba.0,
-                                                    error = %e,
-                                                    "read failed"
-                                                );
-                                                status = -(libc::EIO as i32);
-                                                break;
-                                            }
-                                        }
-                                        buf_offset += copy_len;
-                                        cur_offset += copy_len as u64;
-                                        remaining -= copy_len as u64;
-                                    }
-
-                                    status
-                                }
-                            }
-                            sys::UBLK_IO_OP_WRITE => {
-                                let req = &io_slice[..io_len];
-                                #[allow(clippy::collapsible_if)]
-                                if offset_bytes % block_size == 0 && io_bytes % block_size == 0 {
-                                    let start_lba = Lba(offset_bytes / block_size);
-                                    let lba_count = (io_bytes / block_size) as u32;
-                                    if let Err(e) = zm.submit_write(
-                                        &vol_id,
-                                        start_lba,
-                                        lba_count,
-                                        req,
-                                        vol_created_at,
-                                    ) {
-                                        tracing::error!(
-                                            lba = start_lba.0,
-                                            count = lba_count,
-                                            error = %e,
-                                            "write failed"
-                                        );
-                                        -(libc::EIO as i32)
-                                    } else {
-                                        io_bytes as i32
-                                    }
-                                } else {
-                                    let mut buf_offset = 0usize;
-                                    let mut remaining = io_bytes;
-                                    let mut cur_offset = offset_bytes;
-                                    let mut status = io_bytes as i32;
-
-                                    while remaining > 0 {
-                                        let block_lba = Lba(cur_offset / block_size);
-                                        let offset_in_block = (cur_offset % block_size) as usize;
-                                        let avail_in_block = block_size as usize - offset_in_block;
-                                        let write_len = (remaining as usize).min(avail_in_block);
-
-                                        let mut block = match zm.submit_read_with_generation(
-                                            &vol_id,
-                                            block_lba,
-                                            vol_created_at,
-                                        ) {
-                                            Ok(Some(data)) => {
-                                                let mut b = data;
-                                                b.resize(block_size as usize, 0);
-                                                b
-                                            }
-                                            Ok(None) => vec![0u8; block_size as usize],
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    lba = block_lba.0,
-                                                    error = %e,
-                                                    "RMW read failed"
-                                                );
-                                                status = -(libc::EIO as i32);
-                                                break;
-                                            }
-                                        };
-
-                                        block[offset_in_block..offset_in_block + write_len]
-                                            .copy_from_slice(
-                                                &req[buf_offset..buf_offset + write_len],
-                                            );
-
-                                        if let Err(e) = zm.submit_write(
-                                            &vol_id,
-                                            block_lba,
-                                            1,
-                                            &block,
-                                            vol_created_at,
-                                        ) {
-                                            tracing::error!(
-                                                lba = block_lba.0,
-                                                error = %e,
-                                                "write failed"
-                                            );
-                                            status = -(libc::EIO as i32);
-                                            break;
-                                        }
-
-                                        buf_offset += write_len;
-                                        cur_offset += write_len as u64;
-                                        remaining -= write_len as u64;
-                                    }
-
-                                    status
-                                }
-                            }
-                            sys::UBLK_IO_OP_FLUSH => 0,
-                            sys::UBLK_IO_OP_DISCARD => {
-                                let start_lba = Lba(offset_bytes / block_size);
-                                let lba_count = (io_bytes / block_size) as u32;
-                                if lba_count == 0 {
-                                    0
-                                } else {
-                                    match zm.submit_discard(&vol_id, start_lba, lba_count) {
-                                        Ok(()) => io_bytes as i32,
-                                        Err(e) => {
-                                            tracing::error!(
-                                                lba = start_lba.0,
-                                                count = lba_count,
-                                                error = %e,
-                                                "discard failed"
-                                            );
-                                            -(libc::EIO as i32)
-                                        }
-                                    }
-                                }
-                            }
-                            _ => -(libc::ENOTSUP as i32),
+                    let queued = QueuedIo {
+                        tag,
+                        op,
+                        start_sector,
+                        nr_sectors,
+                        data: QueuedIoData::Direct {
+                            ptr: io_slice.as_mut_ptr() as usize,
+                            len: io_len,
+                        },
+                        queued_at,
+                    };
+                    drop(bufs);
+                    if submit_tx.send(queued).is_err() {
+                        tracing::warn!(qid, tag, "ublk queue workers stopped");
+                        let bufs = io_bufs.borrow();
+                        if let Err(err) = q.complete_io_cmd_unified(
+                            tag,
+                            BufDesc::Slice(bufs[tag as usize].as_slice()),
+                            Ok(UblkIORes::Result(-(libc::EIO as i32))),
+                        ) {
+                            tracing::error!(error = ?err, "ublk completion failed");
                         }
                     }
-                };
-
-                // Record volume-level IO metrics for successful operations.
-                if res > 0 {
-                    let bytes = res as u64;
-                    let elapsed_ns = io_start.elapsed().as_nanos() as u64;
-                    match op {
-                        sys::UBLK_IO_OP_READ => {
-                            metrics.volume_read_ops.fetch_add(1, Ordering::Relaxed);
-                            metrics
-                                .volume_read_bytes
-                                .fetch_add(bytes, Ordering::Relaxed);
-                            metrics
-                                .volume_read_total_ns
-                                .fetch_add(elapsed_ns, Ordering::Relaxed);
-                        }
-                        sys::UBLK_IO_OP_WRITE => {
-                            metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
-                            metrics
-                                .volume_write_bytes
-                                .fetch_add(bytes, Ordering::Relaxed);
-                            metrics
-                                .volume_write_total_ns
-                                .fetch_add(elapsed_ns, Ordering::Relaxed);
-                        }
-                        _ => {}
-                    }
+                    return;
                 }
 
-                let bufs = io_bufs.borrow();
-                if let Err(err) = q.complete_io_cmd_unified(
+                let data = {
+                    let mut bufs = io_bufs.borrow_mut();
+                    let io_buf = &mut bufs[tag as usize];
+                    let io_slice = io_buf.as_mut_slice();
+                    if io_len > io_slice.len() {
+                        tracing::error!(
+                            tag,
+                            io_len,
+                            buf_len = io_slice.len(),
+                            "ublk request exceeds queue buffer size"
+                        );
+                        if let Err(err) = q.complete_io_cmd_unified(
+                            tag,
+                            BufDesc::Slice(io_buf.as_slice()),
+                            Ok(UblkIORes::Result(-(libc::EIO as i32))),
+                        ) {
+                            tracing::error!(error = ?err, "ublk completion failed");
+                        }
+                        return;
+                    } else {
+                        io_slice[..io_len].to_vec()
+                    }
+                };
+                let queued = QueuedIo {
                     tag,
-                    BufDesc::Slice(bufs[tag as usize].as_slice()),
-                    Ok(UblkIORes::Result(res)),
-                ) {
-                    tracing::error!(error = ?err, "ublk completion failed");
+                    op,
+                    start_sector,
+                    nr_sectors,
+                    data: QueuedIoData::Owned(data),
+                    queued_at,
+                };
+                if submit_tx.send(queued).is_err() {
+                    tracing::warn!(qid, tag, "ublk queue workers stopped");
+                    let bufs = io_bufs.borrow();
+                    if let Err(err) = q.complete_io_cmd_unified(
+                        tag,
+                        BufDesc::Slice(bufs[tag as usize].as_slice()),
+                        Ok(UblkIORes::Result(-(libc::EIO as i32))),
+                    ) {
+                        tracing::error!(error = ?err, "ublk completion failed");
+                    }
                 }
             };
 
@@ -384,7 +637,15 @@ impl OnyxUblkTarget {
                 }
             };
 
+            submit_eventfd_poll(&queue, event_fd, qid);
             queue.wait_and_handle_io(io_handler);
+            drop(request_tx);
+            for handle in worker_handles {
+                let _ = handle.join();
+            }
+            unsafe {
+                libc::close(event_fd);
+            }
         };
 
         let dev_handler = move |ctrl: &UblkCtrl| {

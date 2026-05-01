@@ -52,6 +52,7 @@ sync_batch_max_bytes_mb = 1024
 nr_queues = 32
 queue_depth = 256
 io_buf_bytes = 1048576
+queue_workers = 4
 
 [flush]
 compress_workers = 2

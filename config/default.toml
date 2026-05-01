@@ -19,3 +19,4 @@ group_commit_wait_us = 250
 nr_queues = 4
 queue_depth = 128
 io_buf_bytes = 1048576
+queue_workers = 1
