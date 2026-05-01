@@ -26,7 +26,7 @@ const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "onyx-volume-catalog.bin";
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
 const BLOCKMAP_SCAN_CHUNK_LBAS: u64 = 262_144; // 1 GiB of 4 KiB LBAs.
-const DEDUP_PERSIST_BATCH_LIMIT: usize = 1024;
+const DEDUP_PERSIST_BATCH_LIMIT: usize = crate::dedup::config::REGISTER_BATCH_HARD_MAX_ENTRIES;
 
 pub(crate) struct MetadbBackend {
     db: Arc<Db>,
@@ -1021,6 +1021,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.page_cache_bytes = config.block_cache_bytes() as u64;
     cfg.lsm_memtable_bytes = config.memtable_budget_bytes() as u64;
     cfg.lsm_bloom_bits_per_entry = config.lsm_bloom_bits_per_entry();
+    cfg.group_commit_max_batch_bytes = 16 * 1024 * 1024;
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
     // Onyx treats startup as a data-plane path. Full page-file scans are

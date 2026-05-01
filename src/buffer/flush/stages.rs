@@ -284,6 +284,7 @@ impl BufferFlusher {
         tx: &Sender<CompressedUnit>,
         running: &AtomicBool,
         metrics: &EngineMetrics,
+        min_compression_savings_pct: u8,
     ) {
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
@@ -306,6 +307,7 @@ impl BufferFlusher {
                     for block in &raw_blocks {
                         raw_data.extend_from_slice(block.bytes());
                     }
+                    let mut compression_bypassed = false;
                     let (compression_byte, compressed_data) = match algo {
                         CompressionAlgo::None => (0u8, raw_data),
                         _ => {
@@ -313,8 +315,23 @@ impl BufferFlusher {
                             let max_out = compressor.max_compressed_size(original_size);
                             let mut compressed_buf = vec![0u8; max_out];
                             match compressor.compress(&raw_data, &mut compressed_buf) {
-                                Some(size) => (algo.to_u8(), compressed_buf[..size].to_vec()),
-                                None => (0u8, raw_data),
+                                Some(size)
+                                    if Self::compression_saves_enough(
+                                        original_size,
+                                        size,
+                                        min_compression_savings_pct,
+                                    ) =>
+                                {
+                                    (algo.to_u8(), compressed_buf[..size].to_vec())
+                                }
+                                None => {
+                                    compression_bypassed = true;
+                                    (0u8, raw_data)
+                                }
+                                _ => {
+                                    compression_bypassed = true;
+                                    (0u8, raw_data)
+                                }
                             }
                         }
                     };
@@ -325,6 +342,14 @@ impl BufferFlusher {
                     metrics
                         .compress_output_bytes
                         .fetch_add(compressed_data.len() as u64, Ordering::Relaxed);
+                    if compression_bypassed {
+                        metrics
+                            .compress_bypass_units
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .compress_bypass_bytes
+                            .fetch_add(original_size as u64, Ordering::Relaxed);
+                    }
 
                     let crc32 = crc32fast::hash(&compressed_data);
 
@@ -351,6 +376,17 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+
+    fn compression_saves_enough(original_size: usize, compressed_size: usize, min_pct: u8) -> bool {
+        if original_size == 0 || compressed_size >= original_size {
+            return false;
+        }
+        if min_pct == 0 {
+            return true;
+        }
+        let saved = original_size - compressed_size;
+        saved.saturating_mul(100) >= original_size.saturating_mul(min_pct as usize)
     }
 
     /// Dedup stage: hash 4KB blocks, check dedup index, handle hits inline.

@@ -26,6 +26,40 @@ struct ReadUnitGroup {
     members: Vec<(usize, u16)>, // (out_buf slot, offset_in_unit)
 }
 
+struct RawExtentGroup {
+    start_slot: usize,
+    mappings: Vec<BlockmapValue>,
+}
+
+impl RawExtentGroup {
+    fn new(slot: usize, mapping: BlockmapValue) -> Self {
+        Self {
+            start_slot: slot,
+            mappings: vec![mapping],
+        }
+    }
+
+    fn can_extend(&self, slot: usize, mapping: &BlockmapValue) -> bool {
+        let Some(prev) = self.mappings.last() else {
+            return false;
+        };
+        slot == self.start_slot + self.mappings.len()
+            && is_single_raw_block(prev)
+            && is_single_raw_block(mapping)
+            && mapping.pba.0 == prev.pba.0 + 1
+    }
+}
+
+#[inline]
+fn is_single_raw_block(mapping: &BlockmapValue) -> bool {
+    mapping.compression == 0
+        && mapping.slot_offset == 0
+        && mapping.unit_compressed_size == BLOCK_SIZE
+        && mapping.unit_original_size == BLOCK_SIZE
+        && mapping.unit_lba_count == 1
+        && mapping.offset_in_unit == 0
+}
+
 fn push_read_unit_group(
     groups: &mut HashMap<ReadUnitKey, ReadUnitGroup>,
     slot: usize,
@@ -387,9 +421,10 @@ impl ZoneManager {
             return Ok(());
         }
 
-        // Pass 3: group mapped LBAs by (pba, slot_offset, unit_compressed_size)
-        // — the on-disk unit identity. Zero-fill unmapped slots inline.
-        let mut groups: HashMap<ReadUnitKey, ReadUnitGroup> = HashMap::new();
+        // Pass 3 input: mapped LBAs still keyed by output slot. We sort after
+        // metadata lookup so unordered range scans can still form contiguous
+        // raw extents.
+        let mut mapped_units: Vec<(usize, BlockmapValue)> = Vec::with_capacity(pending_lbas.len());
 
         // Pass 2: for real read requests we are looking up one contiguous LBA
         // span. A range scan returns only mapped entries, which avoids paying
@@ -412,7 +447,7 @@ impl ZoneManager {
                     let slot = (lba.0 - start_lba.0) as usize;
                     if slot < count as usize {
                         mapped_pending += 1;
-                        push_read_unit_group(&mut groups, slot, mapping);
+                        mapped_units.push((slot, mapping));
                     }
                 }
             } else {
@@ -424,7 +459,7 @@ impl ZoneManager {
                 for (lba, mapping) in mapped {
                     if let Some(slot) = pending_slot_by_lba.get(&lba.0).copied() {
                         mapped_pending += 1;
-                        push_read_unit_group(&mut groups, slot, mapping);
+                        mapped_units.push((slot, mapping));
                     }
                 }
             }
@@ -443,7 +478,7 @@ impl ZoneManager {
                         self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(mapping) => {
-                        push_read_unit_group(&mut groups, slot, mapping);
+                        mapped_units.push((slot, mapping));
                     }
                 }
             }
@@ -452,8 +487,39 @@ impl ZoneManager {
             .read_submit_meta_get_ns
             .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
 
-        if groups.is_empty() {
+        if mapped_units.is_empty() {
             return Ok(());
+        }
+
+        // Pass 3: split mapped LBAs into two shapes:
+        // - raw single-block mappings with consecutive output slots and PBAs
+        //   become one extent read (4K/8K/16K/32K as one SQE);
+        // - compressed/packed units stay grouped by unit identity.
+        let mut groups: HashMap<ReadUnitKey, ReadUnitGroup> = HashMap::new();
+        let mut raw_extents: Vec<RawExtentGroup> = Vec::new();
+        mapped_units.sort_unstable_by_key(|(slot, _)| *slot);
+        let mut current_raw: Option<RawExtentGroup> = None;
+        for (slot, mapping) in mapped_units {
+            if is_single_raw_block(&mapping) {
+                if let Some(raw) = current_raw.as_mut() {
+                    if raw.can_extend(slot, &mapping) {
+                        raw.mappings.push(mapping);
+                        continue;
+                    }
+                }
+                if let Some(raw) = current_raw.take() {
+                    raw_extents.push(raw);
+                }
+                current_raw = Some(RawExtentGroup::new(slot, mapping));
+            } else {
+                if let Some(raw) = current_raw.take() {
+                    raw_extents.push(raw);
+                }
+                push_read_unit_group(&mut groups, slot, mapping);
+            }
+        }
+        if let Some(raw) = current_raw {
+            raw_extents.push(raw);
         }
 
         // Pass 4: fan out unit reads. Send all first, then drain — the
@@ -461,6 +527,11 @@ impl ZoneManager {
         // submit, and other workers run in parallel.
         let pass4_start = Instant::now();
         let pass4_result = if let Some(pool) = self.read_pool.as_deref() {
+            let mut raw_receivers = Vec::with_capacity(raw_extents.len());
+            for raw in raw_extents.into_iter() {
+                let rx = pool.submit_raw_extent_read_async(raw.mappings)?;
+                raw_receivers.push((rx, raw.start_slot));
+            }
             let mut receivers = Vec::with_capacity(groups.len());
             let mut units: Vec<ReadUnitGroup> = Vec::with_capacity(groups.len());
             for (_, group) in groups.into_iter() {
@@ -469,7 +540,32 @@ impl ZoneManager {
                 units.push(group);
             }
             let mut result: OnyxResult<()> = Ok(());
+            for (rx, start_slot) in raw_receivers {
+                match rx.recv().map_err(|_| {
+                    crate::error::OnyxError::Io(std::io::Error::other("read-pool reply dropped"))
+                }) {
+                    Ok(Ok(payload)) => {
+                        let start = start_slot * bs;
+                        let end = start + payload.len();
+                        if end > out_buf.len() {
+                            result = Err(crate::error::OnyxError::Compress(format!(
+                                "raw extent output out of bounds: {start}..{end} > {}",
+                                out_buf.len()
+                            )));
+                            break;
+                        }
+                        out_buf[start..end].copy_from_slice(&payload);
+                    }
+                    Ok(Err(e)) | Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
             for (rx, group) in receivers.into_iter().zip(units.into_iter()) {
+                if result.is_err() {
+                    break;
+                }
                 match rx.recv().map_err(|_| {
                     crate::error::OnyxError::Io(std::io::Error::other("read-pool reply dropped"))
                 }) {
@@ -490,7 +586,45 @@ impl ZoneManager {
             // Inline fallback: no pool configured. Still benefits from unit
             // coalescing — one IoEngine read + decompress per unit.
             let mut result: OnyxResult<()> = Ok(());
+            for raw in raw_extents.into_iter() {
+                let read_size = raw.mappings.len() * bs;
+                let raw_payload = match self.io_engine.read_blocks(raw.mappings[0].pba, read_size) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
+                for (idx, mapping) in raw.mappings.iter().enumerate() {
+                    let off = idx * bs;
+                    let block = &raw_payload[off..off + bs];
+                    let actual_crc = crc32fast::hash(block);
+                    if actual_crc != mapping.crc32 {
+                        self.metrics.read_crc_errors.fetch_add(1, Ordering::Relaxed);
+                        result = Err(crate::error::OnyxError::CrcMismatch {
+                            expected: mapping.crc32,
+                            actual: actual_crc,
+                        });
+                        break;
+                    }
+                }
+                if result.is_err() {
+                    break;
+                }
+                let start = raw.start_slot * bs;
+                let end = start + raw_payload.len();
+                out_buf[start..end].copy_from_slice(&raw_payload);
+                self.metrics
+                    .read_lv3_hits
+                    .fetch_add(raw.mappings.len() as u64, Ordering::Relaxed);
+                self.metrics
+                    .lv3_read_decompressed_bytes
+                    .fetch_add(read_size as u64, Ordering::Relaxed);
+            }
             for (_, group) in groups.into_iter() {
+                if result.is_err() {
+                    break;
+                }
                 let read_size = group.mapping.compressed_read_size(bs);
                 let raw = match self.io_engine.read_blocks(group.mapping.pba, read_size) {
                     Ok(r) => r,

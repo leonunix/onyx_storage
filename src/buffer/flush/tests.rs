@@ -90,6 +90,27 @@ fn make_unit(fill: u8, seq: u64) -> CompressedUnit {
     }
 }
 
+fn make_raw_unit_at(start_lba: u64, lba_count: u32, first_byte: u8, seq: u64) -> CompressedUnit {
+    let mut data = vec![0u8; lba_count as usize * BLOCK_SIZE as usize];
+    for (idx, block) in data.chunks_mut(BLOCK_SIZE as usize).enumerate() {
+        block.fill(first_byte.wrapping_add(idx as u8));
+    }
+    CompressedUnit {
+        vol_id: "flush-race".into(),
+        start_lba: Lba(start_lba),
+        lba_count,
+        original_size: data.len() as u32,
+        compressed_data: data.clone(),
+        compression: 0,
+        crc32: crc32fast::hash(&data),
+        vol_created_at: 1,
+        seq_lba_ranges: vec![(seq, Lba(start_lba), lba_count)],
+        block_hashes: None,
+        dedup_skipped: false,
+        dedup_completion: None,
+    }
+}
+
 fn make_packed_unit(fill: u8, seq: u64) -> CompressedUnit {
     let data = vec![fill; 512];
     CompressedUnit {
@@ -175,6 +196,112 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
 }
 
 #[test]
+fn raw_passthrough_unit_maps_each_lba_to_its_own_pba() {
+    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+
+    let unit = make_raw_unit_at(100, 4, 0x40, 10);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(100), 10, 1);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(101), 10, 1);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(102), 10, 1);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(103), 10, 1);
+
+    BufferFlusher::write_unit(
+        0,
+        &unit,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &cleanup_tx,
+        &dedup_register_tx,
+    )
+    .unwrap();
+
+    let vol = VolumeId("flush-race".into());
+    let first = meta.get_mapping(&vol, Lba(100)).unwrap().unwrap();
+    assert_eq!(first.unit_compressed_size, BLOCK_SIZE);
+    assert_eq!(first.unit_original_size, BLOCK_SIZE);
+    assert_eq!(first.unit_lba_count, 1);
+    assert_eq!(first.offset_in_unit, 0);
+    assert_eq!(
+        first.crc32,
+        crc32fast::hash(&vec![0x40; BLOCK_SIZE as usize])
+    );
+    assert_eq!(
+        first.compressed_read_size(BLOCK_SIZE as usize),
+        BLOCK_SIZE as usize
+    );
+
+    for idx in 0..4u64 {
+        let mapping = meta.get_mapping(&vol, Lba(100 + idx)).unwrap().unwrap();
+        assert_eq!(mapping.pba, Pba(first.pba.0 + idx));
+        assert_eq!(mapping.compression, 0);
+        assert_eq!(mapping.unit_compressed_size, BLOCK_SIZE);
+        assert_eq!(mapping.unit_original_size, BLOCK_SIZE);
+        assert_eq!(mapping.unit_lba_count, 1);
+        assert_eq!(mapping.offset_in_unit, 0);
+        assert_eq!(mapping.slot_offset, 0);
+        assert_eq!(meta.get_refcount(mapping.pba).unwrap(), 1);
+
+        let got = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone())
+            .handle_read("flush-race", Lba(100 + idx))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![0x40u8.wrapping_add(idx as u8); BLOCK_SIZE as usize]
+        );
+    }
+}
+
+#[test]
+fn raw_passthrough_unit_frees_unreferenced_blocks() {
+    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+
+    let unit = make_raw_unit_at(200, 4, 0x60, 20);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(200), 20, 1);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(201), 999, 1);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(202), 20, 1);
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(203), 999, 1);
+
+    BufferFlusher::write_unit(
+        0,
+        &unit,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &cleanup_tx,
+        &dedup_register_tx,
+    )
+    .unwrap();
+
+    let vol = VolumeId("flush-race".into());
+    let mapping0 = meta.get_mapping(&vol, Lba(200)).unwrap().unwrap();
+    let mapping2 = meta.get_mapping(&vol, Lba(202)).unwrap().unwrap();
+    assert_eq!(mapping2.pba, Pba(mapping0.pba.0 + 2));
+    assert!(meta.get_mapping(&vol, Lba(201)).unwrap().is_none());
+    assert!(meta.get_mapping(&vol, Lba(203)).unwrap().is_none());
+
+    assert_eq!(meta.get_refcount(mapping0.pba).unwrap(), 1);
+    assert_eq!(meta.get_refcount(Pba(mapping0.pba.0 + 1)).unwrap(), 0);
+    assert_eq!(meta.get_refcount(mapping2.pba).unwrap(), 1);
+    assert_eq!(meta.get_refcount(Pba(mapping0.pba.0 + 3)).unwrap(), 0);
+    assert!(allocator.is_free(Pba(mapping0.pba.0 + 1)));
+    assert!(allocator.is_free(Pba(mapping0.pba.0 + 3)));
+}
+
+#[test]
 fn write_unit_queues_dedup_registration_after_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
@@ -212,7 +339,7 @@ fn write_unit_queues_dedup_registration_after_mapping_commit() {
     let regs = dedup_register_rx
         .try_recv()
         .expect("writer should queue a best-effort dedup registration batch");
-    BufferFlusher::register_dedup_batch(&meta, &regs, "test");
+    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, "test");
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
 }
@@ -265,7 +392,7 @@ fn write_packed_slot_queues_dedup_registration_after_mapping_commit() {
     let regs = dedup_register_rx
         .try_recv()
         .expect("writer should queue a best-effort packed dedup registration batch");
-    BufferFlusher::register_dedup_batch(&meta, &regs, "test");
+    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, "test");
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
 }
@@ -316,7 +443,7 @@ fn write_packed_slots_batch_queues_dedup_registration_after_mapping_commit() {
     let regs = dedup_register_rx
         .try_recv()
         .expect("packed batch should queue best-effort dedup registrations");
-    BufferFlusher::register_dedup_batch(&meta, &regs, "test");
+    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, "test");
 
     for (hash, lba) in expected {
         let mapping = meta
@@ -780,6 +907,66 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     running.store(false, Ordering::Relaxed);
     drop(tx);
     handle.join().unwrap();
+}
+
+#[test]
+fn compress_loop_bypasses_low_savings_units() {
+    let metrics = EngineMetrics::default();
+    let running = AtomicBool::new(true);
+    let (tx, rx) = bounded::<CoalesceUnit>(1);
+    let (out_tx, out_rx) = bounded::<CompressedUnit>(1);
+
+    let mut raw = Vec::with_capacity(8 * BLOCK_SIZE as usize);
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..8 * BLOCK_SIZE as usize {
+        state ^= state << 7;
+        state ^= state >> 9;
+        state ^= state << 8;
+        raw.push((state & 0xff) as u8);
+    }
+    let raw_arc: Arc<[u8]> = Arc::from(raw.clone());
+    let raw_blocks = (0..8)
+        .map(|i| crate::buffer::pipeline::RawBlockRef {
+            payload: raw_arc.clone(),
+            offset: i * BLOCK_SIZE as usize,
+        })
+        .collect();
+
+    tx.send(CoalesceUnit {
+        vol_id: "flush-race".into(),
+        start_lba: Lba(10_000),
+        lba_count: 8,
+        raw_blocks,
+        compression: CompressionAlgo::Lz4,
+        vol_created_at: 1,
+        seq_lba_ranges: vec![(1, Lba(10_000), 8)],
+        dedup_skipped: false,
+        block_hashes: None,
+        dedup_completion: None,
+    })
+    .unwrap();
+    drop(tx);
+
+    BufferFlusher::compress_loop(&rx, &out_tx, &running, &metrics, 12);
+    drop(out_tx);
+
+    let unit = out_rx
+        .try_recv()
+        .expect("compressed unit should be emitted");
+    assert_eq!(unit.compression, CompressionAlgo::None.to_u8());
+    assert_eq!(unit.compressed_data, raw);
+    assert_eq!(unit.original_size, (8 * BLOCK_SIZE) as u32);
+    assert_eq!(unit.lba_count, 8);
+    assert_eq!(unit.crc32, crc32fast::hash(&unit.compressed_data));
+    assert_eq!(
+        metrics.compress_bypass_units.load(Ordering::Relaxed),
+        1,
+        "low-savings compression attempts should be accounted"
+    );
+    assert_eq!(
+        metrics.compress_bypass_bytes.load(Ordering::Relaxed),
+        (8 * BLOCK_SIZE) as u64
+    );
 }
 
 #[test]

@@ -361,12 +361,18 @@ pub struct FlushConfig {
     /// Each buffer shard has its own flush lane. Total compress threads = shards × compress_workers.
     #[serde(default = "default_compress_workers")]
     pub compress_workers: usize,
-    /// Max raw bytes to coalesce before compressing (default 128KB)
+    /// Max raw bytes to coalesce before compressing (default 32KB)
     #[serde(default = "default_coalesce_max_raw_bytes")]
     pub coalesce_max_raw_bytes: usize,
-    /// Max number of LBAs to coalesce into one compression unit (default 32)
+    /// Max number of LBAs to coalesce into one compression unit (default 8)
     #[serde(default = "default_coalesce_max_lbas")]
     pub coalesce_max_lbas: u32,
+    /// Minimum space saving required to keep a compressed unit after the
+    /// compression attempt. If compression saves less than this percentage,
+    /// the flusher stores the unit raw to avoid read-time decompression and
+    /// reduce compressed-byte read amplification.
+    #[serde(default = "default_min_compression_savings_pct")]
+    pub min_compression_savings_pct: u8,
     /// Skip coalesce/compress/dedup work for pending entries whose LBAs have
     /// all been superseded by a later seq still in the ring. Entries are
     /// mark_flushed immediately so the ring tail can advance without paying
@@ -401,6 +407,7 @@ impl Default for FlushConfig {
             compress_workers: default_compress_workers(),
             coalesce_max_raw_bytes: default_coalesce_max_raw_bytes(),
             coalesce_max_lbas: default_coalesce_max_lbas(),
+            min_compression_savings_pct: default_min_compression_savings_pct(),
             skip_fully_superseded: default_skip_fully_superseded(),
         }
     }
@@ -410,10 +417,13 @@ fn default_compress_workers() -> usize {
     2 // per flush lane (1 lane per buffer shard)
 }
 fn default_coalesce_max_raw_bytes() -> usize {
-    131072 // 128KB
+    32768 // 32KB
 }
 fn default_coalesce_max_lbas() -> u32 {
-    32
+    8
+}
+fn default_min_compression_savings_pct() -> u8 {
+    12
 }
 fn default_skip_fully_superseded() -> bool {
     true

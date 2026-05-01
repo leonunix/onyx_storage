@@ -87,6 +87,43 @@ fn extent_allocation() {
 }
 
 #[test]
+fn lane_extent_cache_serves_contiguous_extents() {
+    let alloc = SpaceAllocator::new(4096 * 20_000, 2);
+    let usable = 20_000 - RESERVED_BLOCKS;
+
+    let ext1 = alloc.allocate_extent_for_lane(1, 8).unwrap();
+    let ext2 = alloc.allocate_extent_for_lane(1, 8).unwrap();
+
+    assert_eq!(ext1, Extent::new(Pba(RESERVED_BLOCKS), 8));
+    assert_eq!(ext2, Extent::new(Pba(RESERVED_BLOCKS + 8), 8));
+    assert_eq!(alloc.free_block_count(), usable - 16);
+    assert_eq!(alloc.allocated_block_count(), 16);
+}
+
+#[test]
+fn lane_extent_cache_rejects_freeing_cached_blocks() {
+    let alloc = SpaceAllocator::new(4096 * 20_000, 2);
+    let ext = alloc.allocate_extent_for_lane(0, 8).unwrap();
+    let cached_free = Extent::new(ext.end_pba(), 8);
+
+    assert!(
+        alloc.free_extent(cached_free).is_err(),
+        "blocks reserved in a lane extent cache are already free"
+    );
+}
+
+#[test]
+fn drain_lane_extent_cache_returns_cached_blocks_to_global() {
+    let alloc = SpaceAllocator::new(4096 * 20_000, 2);
+    let ext = alloc.allocate_extent_for_lane(0, 8).unwrap();
+
+    alloc.drain_lane_caches();
+    let next = alloc.allocate_extent(8).unwrap();
+
+    assert_eq!(next, Extent::new(ext.end_pba(), 8));
+}
+
+#[test]
 fn coalescing() {
     // 18 total = 10 usable
     let alloc = SpaceAllocator::new(4096 * 18, 0);
@@ -257,7 +294,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
     // Use PBAs in usable range (>= RESERVED_BLOCKS)
     let value0 = onyx_storage::meta::schema::BlockmapValue {
         pba: Pba(12),
-        compression: 0,
+        compression: 1,
         unit_compressed_size: 8192,
         unit_original_size: 8192,
         unit_lba_count: 2,

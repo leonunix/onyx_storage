@@ -26,6 +26,9 @@ pub(crate) fn dedup_from_value_bytes(bytes: &[u8; DEDUP_VALUE_BYTES]) -> Option<
 /// Number of physical 4 KiB blocks Onyx should return to `SpaceAllocator`
 /// when metadb reports the head PBA of this value transitioned to refcount 0.
 pub(crate) fn freed_blocks_for_l2p_value(value: &BlockmapValue) -> u32 {
+    if value.compression == 0 {
+        return 1;
+    }
     if value.slot_offset > 0 || value.unit_compressed_size < BLOCK_SIZE {
         1
     } else {
@@ -85,6 +88,7 @@ mod tests {
         let mut value = sample_blockmap_value();
 
         value.slot_offset = 9;
+        value.compression = 1;
         value.unit_compressed_size = 8193;
         assert_eq!(freed_blocks_for_l2p_value(&value), 1);
 
@@ -95,5 +99,12 @@ mod tests {
         value.slot_offset = 0;
         value.unit_compressed_size = BLOCK_SIZE * 2 + 1;
         assert_eq!(freed_blocks_for_l2p_value(&value), 3);
+
+        value.compression = 0;
+        value.unit_compressed_size = BLOCK_SIZE * 8;
+        value.unit_original_size = BLOCK_SIZE * 8;
+        value.unit_lba_count = 8;
+        value.offset_in_unit = 7;
+        assert_eq!(freed_blocks_for_l2p_value(&value), 1);
     }
 }

@@ -56,8 +56,9 @@ queue_workers = 4
 
 [flush]
 compress_workers = 2
-coalesce_max_raw_bytes = 131072
-coalesce_max_lbas = 32
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
 skip_fully_superseded = true
 
 [engine]
@@ -78,6 +79,8 @@ enabled = true
 workers = 2
 buffer_skip_threshold_pct = 90
 pending_skip_threshold_entries = 0
+register_batch_max_entries = 2048
+register_batch_wait_us = 500
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 4096
 

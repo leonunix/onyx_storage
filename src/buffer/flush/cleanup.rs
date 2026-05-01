@@ -1,6 +1,8 @@
 use super::*;
 
-const DEDUP_REGISTER_BATCH_LIMIT: usize = 1024;
+#[cfg(test)]
+const DEDUP_REGISTER_FALLBACK_BATCH_LIMIT: usize =
+    crate::dedup::config::DEFAULT_REGISTER_BATCH_MAX_ENTRIES;
 const CLEANUP_PBA_COMMIT_LIMIT: usize = 256;
 
 impl BufferFlusher {
@@ -244,8 +246,10 @@ impl BufferFlusher {
         rx: &Receiver<Vec<DedupRegistration>>,
         meta: &MetaStore,
         metrics: &EngineMetrics,
+        batch_limit: usize,
+        batch_wait: Duration,
     ) {
-        const BATCH_WAIT: Duration = Duration::from_micros(500);
+        let batch_limit = batch_limit.max(1);
 
         loop {
             let first = match rx.recv() {
@@ -253,10 +257,10 @@ impl BufferFlusher {
                 Err(_) => break,
             };
             let mut all = first;
-            let deadline = Instant::now() + BATCH_WAIT;
+            let deadline = Instant::now() + batch_wait;
             let mut disconnected = false;
 
-            while all.len() < DEDUP_REGISTER_BATCH_LIMIT {
+            while all.len() < batch_limit {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -273,8 +277,9 @@ impl BufferFlusher {
 
             let count = all.len();
             let start = Instant::now();
-            Self::register_dedup_batch(meta, &all, "dedup_register_thread");
+            Self::register_dedup_batch(meta, &all, batch_limit, "dedup_register_thread");
             Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, start);
+            Self::record_dedup_register_batch_metrics(metrics, count, batch_limit);
             tracing::debug!(
                 shard = shard_idx,
                 registrations = count,
@@ -292,19 +297,50 @@ impl BufferFlusher {
         }
         if !remaining.is_empty() {
             let start = Instant::now();
-            Self::register_dedup_batch(meta, &remaining, "dedup_register_thread_drain");
+            let count = remaining.len();
+            Self::register_dedup_batch(
+                meta,
+                &remaining,
+                batch_limit,
+                "dedup_register_thread_drain",
+            );
             Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, start);
+            Self::record_dedup_register_batch_metrics(metrics, count, batch_limit);
         }
+    }
+
+    fn record_dedup_register_batch_metrics(
+        metrics: &EngineMetrics,
+        entries: usize,
+        batch_limit: usize,
+    ) {
+        if entries == 0 {
+            return;
+        }
+        let batch_limit = batch_limit.max(1);
+        let batches = (entries + batch_limit - 1) / batch_limit;
+        metrics
+            .dedup_register_batches
+            .fetch_add(batches as u64, Ordering::Relaxed);
+        metrics
+            .dedup_register_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        Self::record_max(
+            &metrics.dedup_register_batch_max_entries,
+            entries.min(batch_limit) as u64,
+        );
     }
 
     pub(super) fn register_dedup_batch(
         meta: &MetaStore,
         registrations: &[DedupRegistration],
+        batch_limit: usize,
         context: &'static str,
     ) {
-        if registrations.len() > DEDUP_REGISTER_BATCH_LIMIT {
-            for chunk in registrations.chunks(DEDUP_REGISTER_BATCH_LIMIT) {
-                Self::register_dedup_batch(meta, chunk, context);
+        let batch_limit = batch_limit.max(1);
+        if registrations.len() > batch_limit {
+            for chunk in registrations.chunks(batch_limit) {
+                Self::register_dedup_batch(meta, chunk, batch_limit, context);
             }
             return;
         }
@@ -390,7 +426,7 @@ impl BufferFlusher {
         if valid.is_empty() {
             return;
         }
-        for chunk in valid.chunks(DEDUP_REGISTER_BATCH_LIMIT) {
+        for chunk in valid.chunks(batch_limit) {
             if let Err(e) = meta.put_dedup_entries(chunk) {
                 tracing::warn!(
                     count = chunk.len(),
@@ -400,6 +436,20 @@ impl BufferFlusher {
                 );
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn register_dedup_batch_for_test(
+        meta: &MetaStore,
+        registrations: &[DedupRegistration],
+        context: &'static str,
+    ) {
+        Self::register_dedup_batch(
+            meta,
+            registrations,
+            DEDUP_REGISTER_FALLBACK_BATCH_LIMIT,
+            context,
+        );
     }
 
     pub(super) fn pba_lock(pba: Pba) -> Arc<Mutex<()>> {

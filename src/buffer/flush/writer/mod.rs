@@ -24,6 +24,11 @@ impl BufferFlusher {
     /// caps at `WRITER_BATCH_SIZE`, so a smaller channel would silently
     /// starve the writer below this batch.
     pub(super) const WRITER_BATCH_SIZE: usize = 1024;
+    /// Foreground reads are latency-sensitive, while flush writes are already
+    /// decoupled by LV2. When reads are flowing, cap each writer drain so one
+    /// background batch cannot monopolize LV3 IO and metadb apply for hundreds
+    /// of milliseconds.
+    pub(super) const WRITER_BATCH_SIZE_READ_ACTIVE: usize = 128;
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
     pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(200);
 
@@ -48,6 +53,7 @@ impl BufferFlusher {
             Vec::new();
         let mut packed_retries: VecDeque<PackedSlotRetry> = VecDeque::new();
         let mut tail_dirty = false;
+        let mut last_read_submit_calls = metrics.read_submit_calls.load(Ordering::Relaxed);
 
         /// Helper: flush accumulated Passthrough units through write_units_batch.
         macro_rules! flush_pt_batch {
@@ -158,9 +164,18 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
 
-            // Drain up to WRITER_BATCH_SIZE units.
+            let read_submit_calls = metrics.read_submit_calls.load(Ordering::Relaxed);
+            let read_active = read_submit_calls != last_read_submit_calls;
+            last_read_submit_calls = read_submit_calls;
+            let writer_batch_limit = if read_active {
+                Self::WRITER_BATCH_SIZE_READ_ACTIVE
+            } else {
+                Self::WRITER_BATCH_SIZE
+            };
+
+            // Drain up to the current writer batch limit.
             let mut incoming = vec![first];
-            while incoming.len() < Self::WRITER_BATCH_SIZE {
+            while incoming.len() < writer_batch_limit {
                 match rx.try_recv() {
                     Ok(unit) => incoming.push(unit),
                     Err(_) => break,

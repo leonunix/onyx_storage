@@ -38,6 +38,7 @@ TEST_DEFAULT_VOLUME_SIZE="320g"
 TEST_DEFAULT_ENGINE_CMD="target/release/onyx-storage"
 TEST_DEFAULT_STARTUP_TIMEOUT="15m"
 TEST_DURATION="${ONYX_TEST_DURATION:-$TEST_DEFAULT_DURATION}"
+TEST_PROFILE="${ONYX_TEST_PROFILE:-}"
 
 # ── helpers ────────────────────────────────────────────────────────
 
@@ -212,7 +213,7 @@ command_for() {
             printf '%s' "${CMD[$name]}"
             ;;
         test)
-            local run_dir volume volume_size workers engine_cmd extra_args startup_timeout qrun_dir qvolume qsize qworkers qengine qroot qstartup
+            local run_dir volume volume_size workers engine_cmd extra_args startup_timeout profile_args qrun_dir qvolume qsize qworkers qengine qroot qstartup
             run_dir="${ONYX_TEST_RUN_DIR:-$PROJ_ROOT/.dev/soak/$(date -u +%Y%m%dT%H%M%SZ)}"
             volume="${ONYX_TEST_VOLUME:-$TEST_DEFAULT_VOLUME}"
             volume_size="${ONYX_TEST_VOLUME_SIZE:-$TEST_DEFAULT_VOLUME_SIZE}"
@@ -220,6 +221,18 @@ command_for() {
             engine_cmd="${ONYX_TEST_ENGINE_CMD:-$TEST_DEFAULT_ENGINE_CMD}"
             startup_timeout="${ONYX_TEST_STARTUP_TIMEOUT:-$TEST_DEFAULT_STARTUP_TIMEOUT}"
             extra_args="${ONYX_TEST_EXTRA_ARGS:-}"
+            profile_args=""
+            case "$TEST_PROFILE" in
+                ""|default)
+                    ;;
+                perf-mix)
+                    profile_args="--io-sizes 4k,8k,16k,32k --write-pattern random-miss --write-probability 0.30 --read-probability 0.70 --operation-log-stride 8192"
+                    ;;
+                *)
+                    echo "unknown ONYX_TEST_PROFILE: $TEST_PROFILE" >&2
+                    exit 1
+                    ;;
+            esac
             save_test_run_dir "$run_dir"
             mkdir -p "$run_dir"
             qrun_dir="$(quote_shell_arg "$run_dir")"
@@ -229,8 +242,8 @@ command_for() {
             qengine="$(quote_shell_arg "$engine_cmd")"
             qroot="$(quote_shell_arg "$PROJ_ROOT")"
             qstartup="$(quote_shell_arg "$startup_timeout")"
-            printf 'python3 scripts/os_integrity_stress.py --repo-root %s --config %s --engine-cmd %s --run-dir %s --volume %s --volume-size %s --duration %s --workers %s --startup-timeout %s %s' \
-                "$qroot" "$qcfg" "$qengine" "$qrun_dir" "$qvolume" "$qsize" "$(quote_shell_arg "$TEST_DURATION")" "$qworkers" "$qstartup" "$extra_args"
+            printf 'python3 scripts/os_integrity_stress.py --repo-root %s --config %s --engine-cmd %s --run-dir %s --volume %s --volume-size %s --duration %s --workers %s --startup-timeout %s %s %s' \
+                "$qroot" "$qcfg" "$qengine" "$qrun_dir" "$qvolume" "$qsize" "$(quote_shell_arg "$TEST_DURATION")" "$qworkers" "$qstartup" "$profile_args" "$extra_args"
             ;;
         *)
             echo "unknown component: $name" >&2
@@ -406,6 +419,7 @@ usage() {
     echo "  ONYX_TEST_ENGINE_CMD=${ONYX_TEST_ENGINE_CMD:-$TEST_DEFAULT_ENGINE_CMD}"
     echo "  ONYX_TEST_WORKERS=${ONYX_TEST_WORKERS:-auto}"
     echo "  ONYX_TEST_STARTUP_TIMEOUT=${ONYX_TEST_STARTUP_TIMEOUT:-$TEST_DEFAULT_STARTUP_TIMEOUT}"
+    echo "  ONYX_TEST_PROFILE=perf-mix   # 70/30 read/write, 4K-32K, random-miss dedup pressure"
     echo "  ONYX_TEST_EXTRA_ARGS=<extra soak args>"
 }
 

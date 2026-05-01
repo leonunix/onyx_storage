@@ -69,8 +69,9 @@ queue_workers = 1
 [flush]
 # per flush lane; total compress workers = shards × compress_workers
 compress_workers = 2
-coalesce_max_raw_bytes = 131072
-coalesce_max_lbas = 32
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
 
 [engine]
 zone_count = 16
@@ -93,6 +94,8 @@ buffer_skip_threshold_pct = 90
 # Set e.g. 2048 on weak/virtual buffer devices if buffer-hit hydration starts
 # hurting read latency before fill% reaches buffer_skip_threshold_pct.
 pending_skip_threshold_entries = 0
+register_batch_max_entries = 1024
+register_batch_wait_us = 500
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 256
 

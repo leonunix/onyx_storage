@@ -53,6 +53,7 @@ fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
+            min_compression_savings_pct: 12,
             skip_fully_superseded: true,
         },
         GcConfig {
@@ -880,18 +881,33 @@ fn prove_incompressible_fallback() {
         "incompressible data should fall back to compression=None"
     );
 
-    // EVIDENCE 2: compressed size == original size (no savings, stored raw)
-    assert_eq!(
-        bv.unit_compressed_size, bv.unit_original_size,
-        "no compression: sizes should be equal"
-    );
+    // EVIDENCE 2: raw fallback maps each LBA to an exact 4KB physical block.
+    // The write may still be issued as one contiguous extent, but metadata
+    // must not force later 4KB reads to pull the whole raw extent.
+    assert_eq!(bv.unit_compressed_size, 4096);
+    assert_eq!(bv.unit_original_size, 4096);
+    assert_eq!(bv.unit_lba_count, 1);
+    assert_eq!(bv.offset_in_unit, 0);
 
-    // EVIDENCE 3: raw LV3 bytes ARE the original plaintext (stored uncompressed)
-    let raw_lv3 = read_raw_lv3(&env, bv.pba, bv.unit_compressed_size as usize);
-    assert_eq!(
-        raw_lv3, data,
-        "uncompressed data should be stored as-is on LV3"
-    );
+    // EVIDENCE 3: every raw LV3 block is the original plaintext for that LBA.
+    for lba in 0..8u64 {
+        let mapping = meta
+            .get_mapping(&VolumeId("vol-incomp".into()), Lba(lba))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.compression, 0);
+        assert_eq!(mapping.unit_compressed_size, 4096);
+        assert_eq!(mapping.unit_original_size, 4096);
+        assert_eq!(mapping.unit_lba_count, 1);
+        assert_eq!(mapping.offset_in_unit, 0);
+        let raw_lv3 = read_raw_lv3(&env, mapping.pba, mapping.unit_compressed_size as usize);
+        let off = lba as usize * 4096;
+        assert_eq!(
+            raw_lv3,
+            data[off..off + 4096],
+            "uncompressed LBA {lba} should be stored as an exact 4KB raw block"
+        );
+    }
 
     // EVIDENCE 4: data reads back correctly
     let result = vol.read(0, 8 * 4096).unwrap();
@@ -1810,6 +1826,7 @@ fn prove_background_gc_runner_reclaims_old_units() {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
+            min_compression_savings_pct: 12,
             skip_fully_superseded: true,
         },
         GcConfig {

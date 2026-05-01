@@ -230,6 +230,101 @@ impl BufferFlusher {
         counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
     }
 
+    fn record_max(counter: &std::sync::atomic::AtomicU64, value: u64) {
+        let mut current = counter.load(Ordering::Relaxed);
+        while value > current {
+            match counter.compare_exchange_weak(
+                current,
+                value,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn is_full_raw_unit(unit: &CompressedUnit) -> bool {
+        let bs = BLOCK_SIZE as usize;
+        unit.compression == 0
+            && unit.compressed_data.len() == unit.original_size as usize
+            && unit.compressed_data.len() == unit.lba_count as usize * bs
+            && unit.compressed_data.len().is_multiple_of(bs)
+    }
+
+    fn blockmap_for_unit_position(
+        unit: &CompressedUnit,
+        base_pba: Pba,
+        position: usize,
+        slot_offset: u16,
+        flags: u8,
+    ) -> BlockmapValue {
+        if slot_offset == 0 && Self::is_full_raw_unit(unit) {
+            let bs = BLOCK_SIZE as usize;
+            let start = position * bs;
+            let end = start + bs;
+            let block = &unit.compressed_data[start..end];
+            BlockmapValue {
+                pba: Pba(base_pba.0 + position as u64),
+                compression: 0,
+                unit_compressed_size: BLOCK_SIZE,
+                unit_original_size: BLOCK_SIZE,
+                unit_lba_count: 1,
+                offset_in_unit: 0,
+                crc32: crc32fast::hash(block),
+                slot_offset: 0,
+                flags,
+            }
+        } else {
+            BlockmapValue {
+                pba: base_pba,
+                compression: unit.compression,
+                unit_compressed_size: unit.compressed_data.len() as u32,
+                unit_original_size: unit.original_size,
+                unit_lba_count: unit.lba_count as u16,
+                offset_in_unit: position as u16,
+                crc32: unit.crc32,
+                slot_offset,
+                flags,
+            }
+        }
+    }
+
+    fn free_unreferenced_raw_blocks(
+        unit: &CompressedUnit,
+        base_pba: Pba,
+        live_positions: &[usize],
+        allocator: &SpaceAllocator,
+        context: &'static str,
+    ) {
+        if !Self::is_full_raw_unit(unit) {
+            return;
+        }
+
+        let mut live = vec![false; unit.lba_count as usize];
+        for &pos in live_positions {
+            if let Some(slot) = live.get_mut(pos) {
+                *slot = true;
+            }
+        }
+
+        for (pos, is_live) in live.into_iter().enumerate() {
+            if is_live {
+                continue;
+            }
+            let pba = Pba(base_pba.0 + pos as u64);
+            if let Err(e) = allocator.free_one(pba) {
+                tracing::warn!(
+                    pba = pba.0,
+                    context,
+                    error = %e,
+                    "failed to free unreferenced raw block after metadata commit"
+                );
+            }
+        }
+    }
+
     /// Once blockmap/refcount metadata has committed, reclaiming the old PBA is
     /// strictly best-effort. Failing this cleanup must not turn the flush into a
     /// retry loop, or the buffer head will stay pinned behind work that already
@@ -371,11 +466,16 @@ impl BufferFlusher {
             Self::per_lane_worker_count(config.compress_workers.max(1), lane_count);
         let max_raw = config.coalesce_max_raw_bytes;
         let max_lbas = config.coalesce_max_lbas;
+        let min_compression_savings_pct = config.min_compression_savings_pct.min(100);
         let skip_fully_superseded = config.skip_fully_superseded;
         let dedup_enabled = dedup_config.enabled;
         let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
         let dedup_pending_skip_threshold = dedup_config.pending_skip_threshold_entries;
+        let dedup_register_batch_limit = dedup_config
+            .register_batch_max_entries
+            .clamp(1, crate::dedup::config::REGISTER_BATCH_HARD_MAX_ENTRIES);
+        let dedup_register_batch_wait = Duration::from_micros(dedup_config.register_batch_wait_us);
         let mut lanes = Vec::with_capacity(lane_count);
 
         for shard_idx in 0..lane_count {
@@ -492,7 +592,13 @@ impl BufferFlusher {
                             ThreadRole::FlusherCompress,
                             shard_idx * compress_workers + worker_idx,
                         );
-                        Self::compress_loop(&rx, &tx, &running_w, &metrics_w);
+                        Self::compress_loop(
+                            &rx,
+                            &tx,
+                            &running_w,
+                            &metrics_w,
+                            min_compression_savings_pct,
+                        );
                     })
                     .expect("failed to spawn compress worker");
                 compress_handles.push(h);
@@ -536,11 +642,20 @@ impl BufferFlusher {
 
             let meta_dr = meta.clone();
             let metrics_dr = metrics.clone();
+            let register_batch_limit = dedup_register_batch_limit;
+            let register_batch_wait = dedup_register_batch_wait;
             let dedup_register_handle = thread::Builder::new()
                 .name(format!("flusher-dedup-register-{}", shard_idx))
                 .spawn(move || {
                     affinity::bind_current(ThreadRole::FlusherDedupRegister, shard_idx);
-                    Self::dedup_register_loop(shard_idx, &dedup_register_rx, &meta_dr, &metrics_dr);
+                    Self::dedup_register_loop(
+                        shard_idx,
+                        &dedup_register_rx,
+                        &meta_dr,
+                        &metrics_dr,
+                        register_batch_limit,
+                        register_batch_wait,
+                    );
                 })
                 .expect("failed to spawn dedup registration thread");
 

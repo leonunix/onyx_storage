@@ -77,6 +77,7 @@ fn write_and_abort(
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
+            min_compression_savings_pct: 12,
             skip_fully_superseded: true,
         },
         engine: EngineConfig {

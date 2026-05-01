@@ -27,6 +27,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -37,10 +38,20 @@ use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, UringOp};
 use crate::meta::schema::BlockmapValue;
 use crate::metrics::EngineMetrics;
+use crate::types::BLOCK_SIZE;
 use crate::zone::read::{decode_unit, extract_lba_from_compressed};
 
 /// Maximum requests folded into one `submit_batch` per worker iteration.
 const BATCH_MAX: usize = 32;
+
+/// Tiny coalescing window used after the first request wakes a worker.
+///
+/// 4 KB NVMe reads complete fast enough that "recv one, submit one, wait one"
+/// leaves most of the device queue depth unused. Waiting a few microseconds
+/// lets sibling ublk queues enqueue adjacent requests so one read-pool worker
+/// can submit a real io_uring batch. The bound is intentionally small so light
+/// read traffic does not pay a visible latency tax.
+const BATCH_COALESCE_WINDOW: Duration = Duration::from_micros(8);
 
 /// Per-worker request channel capacity. With BATCH_MAX=32 and bounded(128) the
 /// channel can hold ~4 batches worth of in-flight requests, giving callers
@@ -55,6 +66,21 @@ struct ReadRequest {
     /// unit payload (`unit_original_size` bytes) so the caller can fan out
     /// multiple LBAs from one IO+decompress.
     return_unit: bool,
+    raw_extent: Option<Vec<BlockmapValue>>,
+}
+
+impl ReadRequest {
+    fn start_pba(&self) -> crate::types::Pba {
+        self.mapping.pba
+    }
+
+    fn read_size(&self, block_size: usize) -> usize {
+        if let Some(mappings) = &self.raw_extent {
+            mappings.len() * block_size
+        } else {
+            self.mapping.compressed_read_size(block_size)
+        }
+    }
 }
 
 struct WorkerHandle {
@@ -168,6 +194,21 @@ impl ReadPool {
         self.enqueue(mapping, true)
     }
 
+    /// Submit a contiguous raw extent read. Every mapping must be one
+    /// uncompressed 4 KiB block and PBAs must be consecutive. The worker reads
+    /// the whole span with one SQE, verifies each block's CRC, and returns the
+    /// raw bytes.
+    pub fn submit_raw_extent_read_async(
+        &self,
+        mappings: Vec<BlockmapValue>,
+    ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
+        let first = mappings.first().copied().ok_or_else(|| {
+            OnyxError::Config("ReadPool raw extent requires at least one mapping".into())
+        })?;
+        validate_raw_extent(&mappings)?;
+        self.enqueue_raw_extent(first, mappings)
+    }
+
     fn enqueue(
         &self,
         mapping: BlockmapValue,
@@ -184,6 +225,29 @@ impl ReadPool {
                 mapping,
                 reply: reply_tx,
                 return_unit,
+                raw_extent: None,
+            })
+            .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool worker channel closed")))?;
+        Ok(reply_rx)
+    }
+
+    fn enqueue_raw_extent(
+        &self,
+        first: BlockmapValue,
+        mappings: Vec<BlockmapValue>,
+    ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
+        let worker_idx = (first.pba.0 as usize) % self.workers.len();
+        let (reply_tx, reply_rx) = bounded::<OnyxResult<Vec<u8>>>(1);
+        let sender = self.workers[worker_idx]
+            .sender
+            .as_ref()
+            .ok_or_else(|| OnyxError::Io(std::io::Error::other("read-pool already shut down")))?;
+        sender
+            .send(ReadRequest {
+                mapping: first,
+                reply: reply_tx,
+                return_unit: true,
+                raw_extent: Some(mappings),
             })
             .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool worker channel closed")))?;
         Ok(reply_rx)
@@ -269,8 +333,22 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
         };
         batch.clear();
         batch.push(first);
-        while batch.len() < BATCH_MAX {
-            match rx.try_recv() {
+        let deadline = Instant::now() + BATCH_COALESCE_WINDOW;
+        loop {
+            while batch.len() < BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(req) => batch.push(req),
+                    Err(_) => break,
+                }
+            }
+            if batch.len() >= BATCH_MAX {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline.saturating_duration_since(now)) {
                 Ok(req) => batch.push(req),
                 Err(_) => break,
             }
@@ -284,15 +362,15 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
     scratch.clear();
 
     for req in batch.drain(..) {
-        let m = &req.mapping;
-        let read_size = m.compressed_read_size(bs);
+        let read_size = req.read_size(bs);
         if read_size == 0 {
             let _ = req.reply.send(Err(OnyxError::Compress(
                 "ReadPool: zero-length compressed unit".into(),
             )));
             continue;
         }
-        let offset = ctx.base_offset + (m.pba.0 + ctx.pba_offset) * ctx.block_size as u64;
+        let pba = req.start_pba();
+        let offset = ctx.base_offset + (pba.0 + ctx.pba_offset) * ctx.block_size as u64;
 
         let mut buf = match AlignedBuf::new(read_size, ctx.use_hugepages) {
             Ok(b) => b,
@@ -370,7 +448,9 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         //   return_unit=false: slice out a single 4 KB LBA (legacy).
         //   return_unit=true:  hand back the full decoded unit so the caller
         //                      can fan out multiple LBAs from one IO.
-        let result = if req.return_unit {
+        let result = if let Some(mappings) = req.raw_extent.as_ref() {
+            decode_raw_extent(buf.as_slice(), mappings, &ctx.metrics)
+        } else if req.return_unit {
             decode_unit(buf.as_slice(), &req.mapping, &ctx.metrics)
                 .map(|payload| payload.into_owned())
         } else {
@@ -378,6 +458,67 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         };
         let _ = req.reply.send(result);
     }
+}
+
+fn decode_raw_extent(
+    raw: &[u8],
+    mappings: &[BlockmapValue],
+    metrics: &EngineMetrics,
+) -> OnyxResult<Vec<u8>> {
+    let bs = BLOCK_SIZE as usize;
+    let expected = mappings.len() * bs;
+    if raw.len() < expected {
+        return Err(OnyxError::Compress(format!(
+            "raw extent too short: {} bytes, need {expected}",
+            raw.len()
+        )));
+    }
+
+    for (idx, mapping) in mappings.iter().enumerate() {
+        let off = idx * bs;
+        let end = off + bs;
+        let block = &raw[off..end];
+        let actual_crc = crc32fast::hash(block);
+        if actual_crc != mapping.crc32 {
+            metrics.read_crc_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(OnyxError::CrcMismatch {
+                expected: mapping.crc32,
+                actual: actual_crc,
+            });
+        }
+    }
+
+    metrics
+        .read_lv3_hits
+        .fetch_add(mappings.len() as u64, Ordering::Relaxed);
+    metrics
+        .lv3_read_decompressed_bytes
+        .fetch_add(expected as u64, Ordering::Relaxed);
+    Ok(raw[..expected].to_vec())
+}
+
+fn validate_raw_extent(mappings: &[BlockmapValue]) -> OnyxResult<()> {
+    for (idx, mapping) in mappings.iter().enumerate() {
+        let is_raw_block = mapping.compression == 0
+            && mapping.slot_offset == 0
+            && mapping.unit_compressed_size == BLOCK_SIZE
+            && mapping.unit_original_size == BLOCK_SIZE
+            && mapping.unit_lba_count == 1
+            && mapping.offset_in_unit == 0;
+        if !is_raw_block {
+            return Err(OnyxError::Config(format!(
+                "ReadPool raw extent contains non-raw mapping at index {idx}: {mapping:?}"
+            )));
+        }
+        if idx > 0 && mapping.pba.0 != mappings[idx - 1].pba.0 + 1 {
+            return Err(OnyxError::Config(format!(
+                "ReadPool raw extent PBAs are not contiguous at index {idx}: {} after {}",
+                mapping.pba.0,
+                mappings[idx - 1].pba.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -514,6 +655,32 @@ mod tests {
         // `submit_unit_read` does NOT bump per-LBA hits; callers do that in
         // their fan-out loop.
         assert_eq!(metrics.read_lv3_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn submit_raw_extent_read_async_reads_one_contiguous_span() {
+        let (dev, tmp) = fresh_device();
+        let engine = IoEngine::new_raw(dev, false);
+
+        let mut mappings = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..4u64 {
+            let payload = vec![0x40 + i as u8; BLOCK_SIZE as usize];
+            write_uncompressed(&engine, Pba(i), &payload);
+            expected.extend_from_slice(&payload);
+            mappings.push(make_mapping(Pba(i), BLOCK_SIZE, crc32fast::hash(&payload)));
+        }
+
+        let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
+        let metrics = Arc::new(EngineMetrics::default());
+        let pool =
+            ReadPool::start(1, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics.clone()).unwrap();
+
+        let rx = pool.submit_raw_extent_read_async(mappings).unwrap();
+        let got = rx.recv().unwrap().unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(metrics.lv3_read_ops.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.read_lv3_hits.load(Ordering::Relaxed), 4);
     }
 
     /// `submit_read_async` lets callers fire N requests before draining any

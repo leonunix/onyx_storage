@@ -9,6 +9,10 @@ use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
 /// Number of blocks to refill a lane cache from the global free list at once.
 const LANE_CACHE_REFILL_SIZE: u32 = 256;
+/// Number of blocks to reserve for each lane's contiguous extent cache.
+/// Raw passthrough flushes commonly allocate 4-8 contiguous blocks per unit;
+/// serving those from a lane-local slice avoids hammering the global BTreeSet.
+const LANE_EXTENT_CACHE_REFILL_BLOCKS: u32 = 8192;
 
 pub struct SpaceAllocator {
     total_blocks: u64,
@@ -18,6 +22,8 @@ pub struct SpaceAllocator {
     /// Per-lane single-block caches. Each flush lane pops from its own cache
     /// to avoid contending on `free_extents`. Refilled in bulk from global.
     lane_caches: Vec<Mutex<Vec<Pba>>>,
+    /// Per-lane contiguous extent caches for raw multi-block writes.
+    lane_extent_caches: Vec<Mutex<Vec<Extent>>>,
 }
 
 impl SpaceAllocator {
@@ -35,12 +41,14 @@ impl SpaceAllocator {
             ));
         }
         let lane_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
+        let lane_extent_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
         Self {
             total_blocks,
             free_extents: Mutex::new(free_extents),
             allocated_blocks: AtomicU64::new(0),
             free_blocks: AtomicU64::new(usable_blocks),
             lane_caches,
+            lane_extent_caches,
         }
     }
 
@@ -96,6 +104,7 @@ impl SpaceAllocator {
         let free_count = usable_blocks - alloc_count;
 
         *self.free_extents.lock().unwrap() = free;
+        self.clear_lane_caches();
         self.allocated_blocks.store(alloc_count, Ordering::Relaxed);
         self.free_blocks.store(free_count, Ordering::Relaxed);
 
@@ -161,22 +170,15 @@ impl SpaceAllocator {
             }
         }
         // Slow path: refill from global (blocks stay logically "free" in the cache)
-        let (first_pba, refill) = {
-            let mut free = self.free_extents.lock().unwrap();
-            let extent = free
-                .iter()
-                .next()
-                .copied()
-                .ok_or(OnyxError::SpaceExhausted)?;
-            free.remove(&extent);
-            let take = extent.count.min(LANE_CACHE_REFILL_SIZE);
-            if extent.count > take {
-                free.insert(Extent::new(
-                    Pba(extent.start.0 + take as u64),
-                    extent.count - take,
-                ));
+        let (first_pba, refill) = match self.take_extent_from_global(LANE_CACHE_REFILL_SIZE) {
+            Some(extent) => (extent.start, extent.count),
+            None => {
+                self.drain_lane_caches();
+                let extent = self
+                    .take_extent_from_global(LANE_CACHE_REFILL_SIZE)
+                    .ok_or(OnyxError::SpaceExhausted)?;
+                (extent.start, extent.count)
             }
-            (extent.start, take)
         };
         // First block goes to caller (counted as allocated), rest into cache
         self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
@@ -193,17 +195,20 @@ impl SpaceAllocator {
     /// Return all cached blocks from lane caches to the global free list.
     /// Called during shutdown to prevent block leaks.
     pub fn drain_lane_caches(&self) {
+        let mut free = self.free_extents.lock().unwrap();
         for cache_mutex in &self.lane_caches {
             let mut cache = cache_mutex.lock().unwrap();
-            if cache.is_empty() {
-                continue;
-            }
-            let mut free = self.free_extents.lock().unwrap();
             for pba in cache.drain(..) {
-                self.coalesce_and_insert(&mut free, Extent::single(pba));
+                Self::coalesce_and_insert(&mut free, Extent::single(pba));
             }
-            // No counter adjustment needed: cached blocks were never counted as allocated
         }
+        for cache_mutex in &self.lane_extent_caches {
+            let mut cache = cache_mutex.lock().unwrap();
+            for extent in cache.drain(..) {
+                Self::coalesce_and_insert(&mut free, extent);
+            }
+        }
+        // No counter adjustment needed: cached blocks were never counted as allocated
     }
 
     /// Free a single block.
@@ -228,17 +233,24 @@ impl SpaceAllocator {
                 )));
             }
         }
+        for (lane_idx, cache_mutex) in self.lane_extent_caches.iter().enumerate() {
+            let cache = cache_mutex.lock().unwrap();
+            if cache.iter().any(|extent| extent.contains(pba)) {
+                return Err(OnyxError::Config(format!(
+                    "free_one: PBA {} is already free (in lane extent cache {})",
+                    pba.0, lane_idx
+                )));
+            }
+        }
 
         let mut free = self.free_extents.lock().unwrap();
 
         // Check not already free (contained in any existing free extent)
-        for e in free.iter() {
-            if e.contains(pba) {
-                return Err(OnyxError::Config(format!(
-                    "free_one: PBA {} is already free (in extent {:?})",
-                    pba.0, e
-                )));
-            }
+        if let Some(e) = Self::covering_extent(&free, pba) {
+            return Err(OnyxError::Config(format!(
+                "free_one: PBA {} is already free (in extent {:?})",
+                pba.0, e
+            )));
         }
 
         let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
@@ -248,7 +260,7 @@ impl SpaceAllocator {
             ));
         }
 
-        self.coalesce_and_insert(&mut free, Extent::single(pba));
+        Self::coalesce_and_insert(&mut free, Extent::single(pba));
         self.allocated_blocks.fetch_sub(1, Ordering::Relaxed);
         self.free_blocks.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -273,7 +285,57 @@ impl SpaceAllocator {
                 return true;
             }
         }
+        for cache_mutex in &self.lane_extent_caches {
+            let cache = cache_mutex.lock().unwrap();
+            if cache.iter().any(|extent| extent.contains(pba)) {
+                return true;
+            }
+        }
         false
+    }
+
+    /// Allocate a contiguous extent using a lane-local cache before touching
+    /// the global free list. This is the hot path for raw 8/16/32 KiB flushes.
+    pub fn allocate_extent_for_lane(&self, lane: usize, count: u32) -> OnyxResult<Extent> {
+        if count == 0 {
+            return Err(OnyxError::Config("cannot allocate 0 blocks".into()));
+        }
+        if lane >= self.lane_extent_caches.len() {
+            return self.allocate_extent(count);
+        }
+
+        {
+            let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+            if let Some(extent) = Self::take_from_extent_cache(&mut cache, count) {
+                self.allocated_blocks
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
+                return Ok(extent);
+            }
+        }
+
+        let target = LANE_EXTENT_CACHE_REFILL_BLOCKS.max(count);
+        let refill = self
+            .take_extent_from_global_at_least(count, target)
+            .or_else(|| {
+                self.drain_lane_caches();
+                self.take_extent_from_global_at_least(count, target)
+            });
+
+        let Some(refill) = refill else {
+            return self.allocate_extent(count);
+        };
+
+        let result = Extent::new(refill.start, count);
+        self.allocated_blocks
+            .fetch_add(count as u64, Ordering::Relaxed);
+        self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
+
+        if refill.count > count {
+            let rest = Extent::new(Pba(refill.start.0 + count as u64), refill.count - count);
+            self.lane_extent_caches[lane].lock().unwrap().push(rest);
+        }
+        Ok(result)
     }
 
     /// Allocate up to `count` contiguous blocks. Returns the extent actually allocated
@@ -305,6 +367,15 @@ impl SpaceAllocator {
                 return Ok(result);
             }
 
+            // No contiguous extent large enough. Cached lane extents may hold
+            // enough free contiguous space, so fold them back once before
+            // falling back to the largest global fragment.
+            if attempt == 0 && self.has_lane_cached_blocks() {
+                drop(free);
+                self.drain_lane_caches();
+                continue;
+            }
+
             // No contiguous extent large enough — return the largest available
             let largest = free.iter().max_by_key(|e| e.count).copied();
             if let Some(extent) = largest {
@@ -318,7 +389,7 @@ impl SpaceAllocator {
 
             // No free extents at all — drain lane caches and retry once
             drop(free);
-            if attempt == 0 && !self.lane_caches.is_empty() {
+            if attempt == 0 && self.has_lane_cached_blocks() {
                 self.drain_lane_caches();
                 continue;
             }
@@ -344,16 +415,36 @@ impl SpaceAllocator {
             )));
         }
 
+        for (lane_idx, cache_mutex) in self.lane_caches.iter().enumerate() {
+            let cache = cache_mutex.lock().unwrap();
+            if (0..extent.count).any(|i| cache.contains(&Pba(extent.start.0 + i as u64))) {
+                return Err(OnyxError::Config(format!(
+                    "free_extent: extent {:?} overlaps lane cache {}",
+                    extent, lane_idx
+                )));
+            }
+        }
+        for (lane_idx, cache_mutex) in self.lane_extent_caches.iter().enumerate() {
+            let cache = cache_mutex.lock().unwrap();
+            if cache
+                .iter()
+                .any(|cached| Self::extents_overlap(extent, *cached))
+            {
+                return Err(OnyxError::Config(format!(
+                    "free_extent: extent {:?} overlaps lane extent cache {}",
+                    extent, lane_idx
+                )));
+            }
+        }
+
         let mut free = self.free_extents.lock().unwrap();
 
         // Check no overlap with existing free extents
-        for e in free.iter() {
-            if extent.start.0 < e.end_pba().0 && extent.end_pba().0 > e.start.0 {
-                return Err(OnyxError::Config(format!(
-                    "free_extent: extent {:?} overlaps free extent {:?}",
-                    extent, e
-                )));
-            }
+        if let Some(e) = Self::overlapping_extent(&free, extent) {
+            return Err(OnyxError::Config(format!(
+                "free_extent: extent {:?} overlaps free extent {:?}",
+                extent, e
+            )));
         }
 
         let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
@@ -364,7 +455,7 @@ impl SpaceAllocator {
             )));
         }
 
-        self.coalesce_and_insert(&mut free, extent);
+        Self::coalesce_and_insert(&mut free, extent);
         self.allocated_blocks
             .fetch_sub(extent.count as u64, Ordering::Relaxed);
         self.free_blocks
@@ -388,6 +479,10 @@ impl SpaceAllocator {
             self.lane_caches
                 .iter()
                 .any(|c| c.lock().unwrap().contains(&pba))
+                || self
+                    .lane_extent_caches
+                    .iter()
+                    .any(|c| c.lock().unwrap().iter().any(|e| e.contains(pba)))
         })
     }
 
@@ -404,27 +499,110 @@ impl SpaceAllocator {
     }
 
     /// Insert an extent and merge with adjacent free extents.
-    fn coalesce_and_insert(&self, free: &mut BTreeSet<Extent>, new: Extent) {
+    fn coalesce_and_insert(free: &mut BTreeSet<Extent>, new: Extent) {
         let mut merged_start = new.start.0;
         let mut merged_end = new.end_pba().0;
-        let mut to_remove = Vec::new();
 
-        // Check for extent immediately before
-        for e in free.iter() {
-            if e.end_pba().0 == merged_start {
-                merged_start = e.start.0;
-                to_remove.push(*e);
-            } else if e.start.0 == merged_end {
-                merged_end = e.end_pba().0;
-                to_remove.push(*e);
+        let before = free.range(..=new).next_back().copied();
+        if let Some(extent) = before {
+            if extent.end_pba().0 == merged_start {
+                merged_start = extent.start.0;
+                free.remove(&extent);
             }
         }
 
-        for e in &to_remove {
-            free.remove(e);
+        let probe = Extent::new(Pba(merged_end), 0);
+        let after = free.range(probe..).next().copied();
+        if let Some(extent) = after {
+            if extent.start.0 == merged_end {
+                merged_end = extent.end_pba().0;
+                free.remove(&extent);
+            }
         }
 
         let count = (merged_end - merged_start) as u32;
         free.insert(Extent::new(Pba(merged_start), count));
+    }
+
+    fn clear_lane_caches(&self) {
+        for cache in &self.lane_caches {
+            cache.lock().unwrap().clear();
+        }
+        for cache in &self.lane_extent_caches {
+            cache.lock().unwrap().clear();
+        }
+    }
+
+    fn has_lane_cached_blocks(&self) -> bool {
+        self.lane_caches
+            .iter()
+            .any(|cache| !cache.lock().unwrap().is_empty())
+            || self
+                .lane_extent_caches
+                .iter()
+                .any(|cache| !cache.lock().unwrap().is_empty())
+    }
+
+    fn take_extent_from_global(&self, max_count: u32) -> Option<Extent> {
+        let mut free = self.free_extents.lock().unwrap();
+        let extent = free.iter().next().copied()?;
+        free.remove(&extent);
+        let take = extent.count.min(max_count);
+        if extent.count > take {
+            free.insert(Extent::new(
+                Pba(extent.start.0 + take as u64),
+                extent.count - take,
+            ));
+        }
+        Some(Extent::new(extent.start, take))
+    }
+
+    fn take_extent_from_global_at_least(&self, count: u32, max_count: u32) -> Option<Extent> {
+        let mut free = self.free_extents.lock().unwrap();
+        let extent = free.iter().find(|e| e.count >= count).copied()?;
+        free.remove(&extent);
+        let take = extent.count.min(max_count);
+        if extent.count > take {
+            free.insert(Extent::new(
+                Pba(extent.start.0 + take as u64),
+                extent.count - take,
+            ));
+        }
+        Some(Extent::new(extent.start, take))
+    }
+
+    fn take_from_extent_cache(cache: &mut Vec<Extent>, count: u32) -> Option<Extent> {
+        let idx = cache.iter().position(|extent| extent.count >= count)?;
+        let extent = cache[idx];
+        let result = Extent::new(extent.start, count);
+        if extent.count == count {
+            cache.swap_remove(idx);
+        } else {
+            cache[idx] = Extent::new(Pba(extent.start.0 + count as u64), extent.count - count);
+        }
+        Some(result)
+    }
+
+    fn covering_extent(free: &BTreeSet<Extent>, pba: Pba) -> Option<Extent> {
+        free.range(..=Extent::single(pba))
+            .next_back()
+            .copied()
+            .filter(|extent| extent.contains(pba))
+    }
+
+    fn overlapping_extent(free: &BTreeSet<Extent>, extent: Extent) -> Option<Extent> {
+        if let Some(before) = free.range(..=extent).next_back().copied() {
+            if Self::extents_overlap(before, extent) {
+                return Some(before);
+            }
+        }
+        free.range(extent..)
+            .next()
+            .copied()
+            .filter(|candidate| Self::extents_overlap(*candidate, extent))
+    }
+
+    fn extents_overlap(a: Extent, b: Extent) -> bool {
+        a.start.0 < b.end_pba().0 && a.end_pba().0 > b.start.0
     }
 }
