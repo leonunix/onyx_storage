@@ -1024,6 +1024,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.group_commit_max_batch_bytes = 16 * 1024 * 1024;
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
+    cfg.dedup_shards = config.dedup_shards;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.
@@ -1282,6 +1283,7 @@ mod tests {
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 1,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1319,6 +1321,7 @@ mod tests {
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 1,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1373,6 +1376,7 @@ mod tests {
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 1,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1428,6 +1432,7 @@ mod tests {
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 1,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1500,6 +1505,7 @@ mod tests {
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 1,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1555,6 +1561,7 @@ mod tests {
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 1,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),

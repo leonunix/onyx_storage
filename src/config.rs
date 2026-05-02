@@ -146,6 +146,13 @@ pub struct MetaConfig {
     pub group_commit_timeout_us: u64,
     /// Optional separate WAL directory for the metadata store.
     pub wal_dir: Option<PathBuf>,
+    /// Number of metadb dedup LSM shards. Must be a power of two in
+    /// `[1, 64]`. Recorded in the metadb manifest at create time;
+    /// changing this value on an existing database will be rejected
+    /// at open with a "recreate the database" error. Default 1
+    /// matches the pre-Phase-2 metadb layout.
+    #[serde(default = "default_metadb_dedup_shards")]
+    pub dedup_shards: u32,
 }
 
 impl MetaConfig {
@@ -203,8 +210,13 @@ impl Default for MetaConfig {
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_dir: None,
+            dedup_shards: default_metadb_dedup_shards(),
         }
     }
+}
+
+fn default_metadb_dedup_shards() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

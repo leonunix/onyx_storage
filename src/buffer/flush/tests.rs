@@ -29,6 +29,7 @@ fn setup_flush_test_env() -> (
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 1,
         })
         .unwrap(),
     );
