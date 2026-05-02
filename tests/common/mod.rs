@@ -37,6 +37,7 @@ impl Default for HarnessOptions {
                 coalesce_max_lbas: 32,
                 min_compression_savings_pct: 12,
                 skip_fully_superseded: true,
+                ..FlushConfig::default()
             },
             gc: GcConfig {
                 enabled: false,
@@ -73,6 +74,7 @@ impl EngineHarness {
                 checkpoint_interval_ms: 5000,
                 group_commit_timeout_us: 1,
                 wal_dir: None,
+                dedup_shards: 8,
             },
             storage: StorageConfig {
                 data_device: Some(data_file.path().to_path_buf()),

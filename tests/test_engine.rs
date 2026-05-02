@@ -34,6 +34,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 8,
         },
         storage: StorageConfig {
             data_device: Some(data_tmp.path().to_path_buf()),

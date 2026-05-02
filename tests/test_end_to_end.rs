@@ -64,6 +64,7 @@ fn setup_e2e() -> (
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -203,6 +204,7 @@ fn write_flush_read_zstd() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -256,6 +258,7 @@ fn write_flush_read_no_compression() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 

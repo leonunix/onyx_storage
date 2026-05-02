@@ -54,6 +54,7 @@ fn setup_dedup_env_with_sizes(
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -297,6 +298,7 @@ fn dedup_index_crud() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -340,6 +342,7 @@ fn dedup_cleanup_on_pba_free() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -395,6 +398,7 @@ fn scan_dedup_skipped() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();
@@ -448,6 +452,7 @@ fn update_blockmap_flags_clears_dedup_skipped() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();
@@ -569,6 +574,7 @@ fn delete_volume_cleans_dedup_index() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -632,6 +638,7 @@ fn cleanup_old_pba_preserves_newer_forward_index() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let store = MetaStore::open(&config).unwrap();
 

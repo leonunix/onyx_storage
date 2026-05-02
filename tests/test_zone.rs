@@ -23,6 +23,7 @@ fn setup_worker() -> (ZoneWorker, Arc<MetaStore>) {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -56,6 +57,7 @@ fn setup_zone_manager(zone_count: u32) -> ZoneManager {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -263,6 +265,7 @@ fn zone_manager_concurrent_reads_inline_no_serialization() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -351,6 +354,7 @@ fn zone_manager_read_pool_decompresses_concurrently() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 

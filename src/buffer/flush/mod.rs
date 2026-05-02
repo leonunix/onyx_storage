@@ -27,6 +27,8 @@ use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 
 type PbaLockKey = (usize, Pba);
 
+pub(crate) const DEFAULT_PACKED_META_BATCH_LBA_LIMIT: usize = 1024;
+
 /// 3-stage flusher pipeline:
 ///   Stage 1 (coalescer): drain ready queue → filter in-flight → coalesce → dispatch
 ///   Stage 2 (N compress workers): parallel compression
@@ -65,11 +67,8 @@ struct PackedSlotRetry {
 
 #[derive(Debug, Clone)]
 struct DedupRegistration {
-    vol_id: VolumeId,
-    lba: Lba,
     hash: ContentHash,
     entry: DedupEntry,
-    expected: BlockmapValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,14 +470,15 @@ impl BufferFlusher {
         let max_lbas = config.coalesce_max_lbas;
         let min_compression_savings_pct = config.min_compression_savings_pct.min(100);
         let skip_fully_superseded = config.skip_fully_superseded;
+        let packed_meta_batch_max_lbas = if config.packed_meta_batch_max_lbas == 0 {
+            DEFAULT_PACKED_META_BATCH_LBA_LIMIT
+        } else {
+            config.packed_meta_batch_max_lbas
+        };
         let dedup_enabled = dedup_config.enabled;
         let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
         let dedup_pending_skip_threshold = dedup_config.pending_skip_threshold_entries;
-        let dedup_register_batch_limit = dedup_config
-            .register_batch_max_entries
-            .clamp(1, crate::dedup::config::REGISTER_BATCH_HARD_MAX_ENTRIES);
-        let dedup_register_batch_wait = Duration::from_micros(dedup_config.register_batch_wait_us);
         let mut lanes = Vec::with_capacity(lane_count);
 
         for shard_idx in 0..lane_count {
@@ -506,7 +506,7 @@ impl BufferFlusher {
             // Writer → dedup registration thread. New dedup rows are
             // opportunistic, so keep their WAL/apply work off the writer's
             // critical path and batch them independently.
-            let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+            let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
             let running_c = running.clone();
             let pool_c = pool.clone();
@@ -638,29 +638,11 @@ impl BufferFlusher {
                         &metrics_w,
                         &cleanup_tx,
                         &dedup_register_tx_w,
+                        packed_meta_batch_max_lbas,
                     );
                 })
                 .expect("failed to spawn writer thread");
             drop(dedup_register_tx);
-
-            let meta_dr = meta.clone();
-            let metrics_dr = metrics.clone();
-            let register_batch_limit = dedup_register_batch_limit;
-            let register_batch_wait = dedup_register_batch_wait;
-            let dedup_register_handle = thread::Builder::new()
-                .name(format!("flusher-dedup-register-{}", shard_idx))
-                .spawn(move || {
-                    affinity::bind_current(ThreadRole::FlusherDedupRegister, shard_idx);
-                    Self::dedup_register_loop(
-                        shard_idx,
-                        &dedup_register_rx,
-                        &meta_dr,
-                        &metrics_dr,
-                        register_batch_limit,
-                        register_batch_wait,
-                    );
-                })
-                .expect("failed to spawn dedup registration thread");
 
             let running_cl = running.clone();
             let meta_cl = meta.clone();
@@ -686,7 +668,7 @@ impl BufferFlusher {
                 dedup_handles,
                 compress_handles,
                 writer_handle: Some(writer_handle),
-                dedup_register_handle: Some(dedup_register_handle),
+                dedup_register_handle: None,
                 cleanup_handle: Some(cleanup_handle),
             });
         }

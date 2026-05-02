@@ -882,6 +882,7 @@ impl OnyxEngine {
                 .meta
                 .get_volume(&vol_id)?
                 .ok_or_else(|| OnyxError::VolumeNotFound(name.to_string()))?;
+            let vol_ord = self.meta.volume_ordinal_str(name)?;
 
             let alive = Arc::new(AtomicBool::new(true));
             self.live_handles
@@ -893,6 +894,7 @@ impl OnyxEngine {
             let vol_lock = self.lifecycle.get_lock(name);
             Ok(OnyxVolume::new(
                 name.to_string(),
+                vol_ord,
                 vol_config.size_bytes,
                 vol_config.created_at,
                 zm.clone(),

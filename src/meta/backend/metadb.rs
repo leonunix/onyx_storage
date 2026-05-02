@@ -45,6 +45,7 @@ struct AsyncCheckpoint {
 struct CheckpointState {
     requested: u64,
     completed: u64,
+    force_requested: u64,
     failures: Vec<CheckpointFailure>,
     shutdown: bool,
 }
@@ -153,7 +154,7 @@ impl MetadbBackend {
         self.volume_ordinal_optional_str(&id.0)
     }
 
-    fn volume_ordinal_str(&self, id: &str) -> OnyxResult<VolumeOrdinal> {
+    pub(crate) fn volume_ordinal_str(&self, id: &str) -> OnyxResult<VolumeOrdinal> {
         self.volume_ordinal_optional_str(id)
             .ok_or_else(|| OnyxError::VolumeNotFound(id.to_string()))
     }
@@ -244,9 +245,28 @@ impl MetadbBackend {
         let Some(ord) = self.volume_ordinal_optional_str(vol_id) else {
             return Ok(vec![None; lbas.len()]);
         };
+        self.multi_get_mappings_ord(ord, lbas)
+    }
+
+    pub(crate) fn multi_get_mappings_ord(
+        &self,
+        ord: VolumeOrdinal,
+        lbas: &[Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
         let raw_lbas: Vec<onyx_metadb::Lba> = lbas.iter().map(|lba| lba.0).collect();
+        self.multi_get_mappings_raw_ord(ord, &raw_lbas)
+    }
+
+    pub(crate) fn multi_get_mappings_raw_ord(
+        &self,
+        ord: VolumeOrdinal,
+        lbas: &[onyx_metadb::Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        if lbas.is_empty() {
+            return Ok(Vec::new());
+        }
         self.db
-            .multi_get(ord, &raw_lbas)?
+            .multi_get(ord, lbas)?
             .into_iter()
             .map(|value| value.map(decode_l2p_value).transpose())
             .collect()
@@ -288,6 +308,15 @@ impl MetadbBackend {
         let Some(ord) = self.volume_ordinal_optional_str(vol_id) else {
             return Ok(Vec::new());
         };
+        self.get_mappings_range_unordered_ord(ord, start, end)
+    }
+
+    pub(crate) fn get_mappings_range_unordered_ord(
+        &self,
+        ord: VolumeOrdinal,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
         let mut out = Vec::new();
         self.db
             .scan_range_unordered(ord, start.0..end.0, |lba, value| {
@@ -552,6 +581,7 @@ impl MetadbBackend {
             }
             return Ok(());
         }
+
         let mut tx = self.db.begin();
         for (hash, entry) in entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
@@ -850,7 +880,7 @@ impl AsyncCheckpoint {
             .name("metadb-checkpoint".into())
             .spawn(move || loop {
                 crate::affinity::bind_current(crate::affinity::ThreadRole::MetadbCheckpoint, 0);
-                let (start, target) = {
+                let (start, target, force) = {
                     let (lock, cvar) = &*worker_state;
                     let mut state = lock.lock().unwrap();
                     while state.requested == state.completed && !state.shutdown {
@@ -859,18 +889,36 @@ impl AsyncCheckpoint {
                     if state.shutdown && state.requested == state.completed {
                         return;
                     }
-                    (state.completed + 1, state.requested)
+                    (
+                        state.completed + 1,
+                        state.requested,
+                        state.force_requested > state.completed,
+                    )
                 };
 
-                let result = db.flush();
+                let result = if force {
+                    db.flush().map(|_| true)
+                } else {
+                    db.try_flush()
+                };
                 let (lock, cvar) = &*worker_state;
                 let mut state = lock.lock().unwrap();
-                if let Err(err) = result {
-                    state.failures.push(CheckpointFailure {
-                        start,
-                        end: target,
-                        message: err.to_string(),
-                    });
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(
+                            start,
+                            target,
+                            "metadb checkpoint skipped; apply gate busy"
+                        );
+                    }
+                    Err(err) => {
+                        state.failures.push(CheckpointFailure {
+                            start,
+                            end: target,
+                            message: err.to_string(),
+                        });
+                    }
                 }
                 state.completed = state.completed.max(target);
                 cvar.notify_all();
@@ -923,6 +971,7 @@ impl AsyncCheckpoint {
             .checked_add(1)
             .ok_or_else(|| OnyxError::Config("metadb checkpoint token overflow".into()))?;
         let token = state.requested;
+        state.force_requested = state.force_requested.max(token);
         cvar.notify_one();
         Ok(token)
     }
@@ -1359,7 +1408,19 @@ mod tests {
             vec![None, Some(value)]
         );
         assert_eq!(
+            backend
+                .multi_get_mappings_ord(ord, &[Lba(2), Lba(3)])
+                .unwrap(),
+            vec![None, Some(value)]
+        );
+        assert_eq!(
             backend.get_mappings_range(&vol.id, Lba(0), Lba(8)).unwrap(),
+            vec![(Lba(3), value)]
+        );
+        assert_eq!(
+            backend
+                .get_mappings_range_unordered_ord(ord, Lba(0), Lba(8))
+                .unwrap(),
             vec![(Lba(3), value)]
         );
     }

@@ -56,6 +56,7 @@ fn setup_flush_env_with_backend(
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -401,6 +402,7 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 8,
         })
         .unwrap(),
     );

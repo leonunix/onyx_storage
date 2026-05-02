@@ -80,6 +80,7 @@ fn write_and_abort(
             coalesce_max_lbas: 32,
             min_compression_savings_pct: 12,
             skip_fully_superseded: true,
+            ..FlushConfig::default()
         },
         engine: EngineConfig {
             zone_count: 4,

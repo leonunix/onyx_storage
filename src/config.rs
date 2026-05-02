@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::buffer::flush::DEFAULT_PACKED_META_BATCH_LBA_LIMIT;
 use crate::dedup::config::DedupConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::config::GcConfig;
@@ -393,6 +394,12 @@ pub struct FlushConfig {
     /// data. Default `true`; set `false` to regression-test the full path.
     #[serde(default = "default_skip_fully_superseded")]
     pub skip_fully_superseded: bool,
+    /// Maximum mapped LBAs folded into one packed-slot metadata commit.
+    /// Lower values reduce metadb apply head-of-line tail under heavy mixed
+    /// read/write load; higher values amortise WAL/apply overhead and improve
+    /// drain throughput. Set 0 to use the built-in default.
+    #[serde(default = "default_packed_meta_batch_max_lbas")]
+    pub packed_meta_batch_max_lbas: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -422,6 +429,7 @@ impl Default for FlushConfig {
             coalesce_max_lbas: default_coalesce_max_lbas(),
             min_compression_savings_pct: default_min_compression_savings_pct(),
             skip_fully_superseded: default_skip_fully_superseded(),
+            packed_meta_batch_max_lbas: default_packed_meta_batch_max_lbas(),
         }
     }
 }
@@ -440,6 +448,9 @@ fn default_min_compression_savings_pct() -> u8 {
 }
 fn default_skip_fully_superseded() -> bool {
     true
+}
+fn default_packed_meta_batch_max_lbas() -> usize {
+    DEFAULT_PACKED_META_BATCH_LBA_LIMIT
 }
 fn default_zone_count() -> u32 {
     4

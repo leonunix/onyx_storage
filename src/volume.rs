@@ -7,6 +7,7 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::metrics::{EngineMetrics, VolumeMetrics};
 use crate::types::{Lba, BLOCK_SIZE};
 use crate::zone::manager::ZoneManager;
+use onyx_metadb::VolumeOrdinal;
 
 /// Per-volume IO handle (librbd-style).
 ///
@@ -20,6 +21,7 @@ use crate::zone::manager::ZoneManager;
 /// Callers must open a fresh handle via `engine.open_volume()`.
 pub struct OnyxVolume {
     vol_id: String,
+    vol_ord: VolumeOrdinal,
     size_bytes: u64,
     /// Volume generation epoch, passed to buffer entries so the flusher can
     /// detect and discard stale entries from a prior generation.
@@ -35,6 +37,7 @@ pub struct OnyxVolume {
 impl OnyxVolume {
     pub(crate) fn new(
         vol_id: String,
+        vol_ord: VolumeOrdinal,
         size_bytes: u64,
         created_at: u64,
         zone_manager: Arc<ZoneManager>,
@@ -45,6 +48,7 @@ impl OnyxVolume {
         let vol_metrics = metrics.get_volume_metrics(&vol_id);
         Self {
             vol_id,
+            vol_ord,
             size_bytes,
             created_at,
             zone_manager,
@@ -312,8 +316,9 @@ impl OnyxVolume {
         if offset_bytes % bs == 0 && len64 % bs == 0 {
             let start_lba = Lba(offset_bytes / bs);
             let lba_count = (len64 / bs) as u32;
-            self.zone_manager.submit_reads(
+            self.zone_manager.submit_reads_with_ordinal(
                 &self.vol_id,
+                Some(self.vol_ord),
                 start_lba,
                 lba_count,
                 self.created_at,

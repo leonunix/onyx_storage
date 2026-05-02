@@ -47,6 +47,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
         dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        packed_meta_batch_max_lbas: usize,
     ) {
         let mut buffered_seqs: Vec<u64> = Vec::new();
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
@@ -294,6 +295,7 @@ impl BufferFlusher {
                     metrics,
                     cleanup_tx,
                     dedup_register_tx,
+                    packed_meta_batch_max_lbas,
                 );
                 for ((sealed, result), (mut slot_seqs, mut slot_completions)) in packed_batch
                     .into_iter()
@@ -429,14 +431,12 @@ impl BufferFlusher {
     }
 
     pub(super) fn dedup_registration(
-        vol_id: VolumeId,
-        lba: Lba,
+        _vol_id: VolumeId,
+        _lba: Lba,
         hash: ContentHash,
         expected: BlockmapValue,
     ) -> DedupRegistration {
         DedupRegistration {
-            vol_id,
-            lba,
             hash,
             entry: DedupEntry {
                 pba: expected.pba,
@@ -448,20 +448,29 @@ impl BufferFlusher {
                 offset_in_unit: expected.offset_in_unit,
                 crc32: expected.crc32,
             },
-            expected,
         }
     }
 
-    pub(super) fn send_dedup_registrations(
-        tx: &Sender<Vec<DedupRegistration>>,
-        registrations: Vec<DedupRegistration>,
-    ) {
-        if registrations.is_empty() {
+    pub(super) fn dedup_entries_from_registrations(
+        registrations: &[DedupRegistration],
+    ) -> Vec<(ContentHash, DedupEntry)> {
+        registrations
+            .iter()
+            .map(|reg| (reg.hash, reg.entry))
+            .collect()
+    }
+
+    pub(super) fn record_inline_dedup_register_metrics(metrics: &EngineMetrics, entries: usize) {
+        if entries == 0 {
             return;
         }
-        if tx.send(registrations).is_err() {
-            tracing::debug!("dedup register queue closed; dropping best-effort registrations");
-        }
+        metrics
+            .dedup_register_batches
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .dedup_register_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        Self::record_max(&metrics.dedup_register_batch_max_entries, entries as u64);
     }
 
     pub(super) fn retry_one_packed_slot(

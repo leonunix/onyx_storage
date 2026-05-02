@@ -127,6 +127,8 @@ pub struct EngineMetrics {
     pub read_submit_total_ns: AtomicU64,
     pub read_submit_buffer_lookup_ns: AtomicU64,
     pub read_submit_meta_get_ns: AtomicU64,
+    pub read_submit_meta_query_ns: AtomicU64,
+    pub read_submit_meta_route_ns: AtomicU64,
     pub read_submit_unit_io_ns: AtomicU64,
     pub coalesce_runs: AtomicU64,
     pub coalesced_units: AtomicU64,
@@ -277,6 +279,8 @@ impl Default for EngineMetrics {
             read_submit_total_ns: AtomicU64::new(0),
             read_submit_buffer_lookup_ns: AtomicU64::new(0),
             read_submit_meta_get_ns: AtomicU64::new(0),
+            read_submit_meta_query_ns: AtomicU64::new(0),
+            read_submit_meta_route_ns: AtomicU64::new(0),
             read_submit_unit_io_ns: AtomicU64::new(0),
             coalesce_runs: AtomicU64::new(0),
             coalesced_units: AtomicU64::new(0),
@@ -405,6 +409,8 @@ impl EngineMetrics {
             read_submit_total_ns: load(&self.read_submit_total_ns),
             read_submit_buffer_lookup_ns: load(&self.read_submit_buffer_lookup_ns),
             read_submit_meta_get_ns: load(&self.read_submit_meta_get_ns),
+            read_submit_meta_query_ns: load(&self.read_submit_meta_query_ns),
+            read_submit_meta_route_ns: load(&self.read_submit_meta_route_ns),
             read_submit_unit_io_ns: load(&self.read_submit_unit_io_ns),
             coalesce_runs: load(&self.coalesce_runs),
             coalesced_units: load(&self.coalesced_units),
@@ -531,6 +537,8 @@ pub struct EngineMetricsSnapshot {
     pub read_submit_total_ns: u64,
     pub read_submit_buffer_lookup_ns: u64,
     pub read_submit_meta_get_ns: u64,
+    pub read_submit_meta_query_ns: u64,
+    pub read_submit_meta_route_ns: u64,
     pub read_submit_unit_io_ns: u64,
     pub coalesce_runs: u64,
     pub coalesced_units: u64,
@@ -664,6 +672,8 @@ impl EngineMetricsSnapshot {
             read_submit_total_ns,
             read_submit_buffer_lookup_ns,
             read_submit_meta_get_ns,
+            read_submit_meta_query_ns,
+            read_submit_meta_route_ns,
             read_submit_unit_io_ns,
             coalesce_runs,
             coalesced_units,
@@ -855,6 +865,18 @@ pub struct MetaMemorySnapshot {
     pub l2p_get_lock_wait_max_us: u64,
     pub l2p_get_tree_walk_us: u64,
     pub l2p_get_tree_walk_max_us: u64,
+    pub l2p_multi_get_calls: u64,
+    pub l2p_multi_get_lbas: u64,
+    pub l2p_multi_get_pin_us: u64,
+    pub l2p_multi_get_pin_max_us: u64,
+    pub l2p_multi_get_volume_us: u64,
+    pub l2p_multi_get_volume_max_us: u64,
+    pub l2p_multi_get_sort_us: u64,
+    pub l2p_multi_get_sort_max_us: u64,
+    pub l2p_multi_get_view_us: u64,
+    pub l2p_multi_get_view_max_us: u64,
+    pub l2p_multi_get_tree_us: u64,
+    pub l2p_multi_get_tree_max_us: u64,
     // Per-phase flush timers. Splits `Db::flush()` so we can see whether
     // the long pole is the apply_gate write barrier, the dirty-page IO,
     // the manifest commit, or the post-flush install/reclaim.
@@ -1007,6 +1029,18 @@ impl MetaMemorySnapshot {
             l2p_get_lock_wait_max_us: meta.l2p_get_lock_wait_max_us,
             l2p_get_tree_walk_us: meta.l2p_get_tree_walk_us,
             l2p_get_tree_walk_max_us: meta.l2p_get_tree_walk_max_us,
+            l2p_multi_get_calls: meta.l2p_multi_get_calls,
+            l2p_multi_get_lbas: meta.l2p_multi_get_lbas,
+            l2p_multi_get_pin_us: meta.l2p_multi_get_pin_us,
+            l2p_multi_get_pin_max_us: meta.l2p_multi_get_pin_max_us,
+            l2p_multi_get_volume_us: meta.l2p_multi_get_volume_us,
+            l2p_multi_get_volume_max_us: meta.l2p_multi_get_volume_max_us,
+            l2p_multi_get_sort_us: meta.l2p_multi_get_sort_us,
+            l2p_multi_get_sort_max_us: meta.l2p_multi_get_sort_max_us,
+            l2p_multi_get_view_us: meta.l2p_multi_get_view_us,
+            l2p_multi_get_view_max_us: meta.l2p_multi_get_view_max_us,
+            l2p_multi_get_tree_us: meta.l2p_multi_get_tree_us,
+            l2p_multi_get_tree_max_us: meta.l2p_multi_get_tree_max_us,
             flush_calls: meta.flush_calls,
             flush_total_us: meta.flush_total_us,
             flush_total_max_us: meta.flush_total_max_us,
@@ -1248,6 +1282,22 @@ impl EngineStatusSnapshot {
                 metadb.l2p_get_tree_walk_max_us
             );
             let _ = writeln!(
+                out,
+                "metadb_l2p_multi_get: calls={} lbas={} pin_us={} pin_max_us={} volume_us={} volume_max_us={} sort_us={} sort_max_us={} view_us={} view_max_us={} tree_us={} tree_max_us={}",
+                metadb.l2p_multi_get_calls,
+                metadb.l2p_multi_get_lbas,
+                metadb.l2p_multi_get_pin_us,
+                metadb.l2p_multi_get_pin_max_us,
+                metadb.l2p_multi_get_volume_us,
+                metadb.l2p_multi_get_volume_max_us,
+                metadb.l2p_multi_get_sort_us,
+                metadb.l2p_multi_get_sort_max_us,
+                metadb.l2p_multi_get_view_us,
+                metadb.l2p_multi_get_view_max_us,
+                metadb.l2p_multi_get_tree_us,
+                metadb.l2p_multi_get_tree_max_us
+            );
+            let _ = writeln!(
             out,
                 "metadb_cleanup: calls={} success={} errors={} noop={} pbas={} hashes_found={} forward_checks={} tombstones={} tx_ops={} total_us={} max_us={} scan_us={} scan_max_us={} forward_check_us={} forward_check_max_us={} commit_us={} commit_max_us={}",
                 metadb.cleanup_calls,
@@ -1336,6 +1386,11 @@ impl EngineStatusSnapshot {
             self.metrics.read_submit_buffer_lookup_ns,
             self.metrics.read_submit_meta_get_ns,
             self.metrics.read_submit_unit_io_ns
+        );
+        let _ = writeln!(
+            out,
+            "read_submit_meta_split: query_ns={} route_ns={}",
+            self.metrics.read_submit_meta_query_ns, self.metrics.read_submit_meta_route_ns
         );
         let _ = writeln!(
             out,

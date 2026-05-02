@@ -10,6 +10,7 @@ use crate::meta::schema::{
 };
 use crate::metrics::MetaMemorySnapshot;
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeConfig, VolumeId, BLOCK_SIZE};
+use onyx_metadb::VolumeOrdinal;
 
 /// Result for each dedup hit in a batched `atomic_batch_dedup_hits` call.
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +92,10 @@ impl MetaStore {
         self.backend.get_volume(id)
     }
 
+    pub fn volume_ordinal_str(&self, id: &str) -> OnyxResult<VolumeOrdinal> {
+        self.backend.volume_ordinal_str(id)
+    }
+
     pub fn list_volumes(&self) -> OnyxResult<Vec<VolumeConfig>> {
         self.backend.list_volumes()
     }
@@ -132,6 +137,22 @@ impl MetaStore {
         self.backend.multi_get_mappings_str(vol_id, lbas)
     }
 
+    pub fn multi_get_mappings_ord(
+        &self,
+        ord: VolumeOrdinal,
+        lbas: &[Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        self.backend.multi_get_mappings_ord(ord, lbas)
+    }
+
+    pub fn multi_get_mappings_raw_ord(
+        &self,
+        ord: VolumeOrdinal,
+        lbas: &[onyx_metadb::Lba],
+    ) -> OnyxResult<Vec<Option<BlockmapValue>>> {
+        self.backend.multi_get_mappings_raw_ord(ord, lbas)
+    }
+
     pub fn delete_mapping(&self, vol_id: &VolumeId, lba: Lba) -> OnyxResult<()> {
         self.backend.delete_mapping(vol_id, lba)
     }
@@ -163,6 +184,16 @@ impl MetaStore {
     ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
         self.backend
             .get_mappings_range_unordered_str(vol_id, start, end)
+    }
+
+    pub fn get_mappings_range_unordered_ord(
+        &self,
+        ord: VolumeOrdinal,
+        start: Lba,
+        end: Lba,
+    ) -> OnyxResult<Vec<(Lba, BlockmapValue)>> {
+        self.backend
+            .get_mappings_range_unordered_ord(ord, start, end)
     }
 
     pub fn delete_blockmap_range(

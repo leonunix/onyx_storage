@@ -13,11 +13,13 @@ use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, ZoneId, BLOCK_SIZE};
 use crate::zone::read;
+use onyx_metadb::VolumeOrdinal;
 
 // Normal ublk reads top out at 1 MiB (256 LBAs in the detailed profile). Once
 // metadb range reads only touch the leaf shards covered by the request, the
 // range path is cheaper for medium/large reads because it skips per-LBA hole
-// probes on sparse volumes.
+// probes on sparse volumes. Tiny reads stay on multi_get: range iterator setup
+// is measurably more expensive for the 4K-32K fio mix.
 const RANGE_META_LOOKUP_MIN_LBAS: u32 = 32;
 type ReadUnitKey = (u64, u16, u32);
 
@@ -211,6 +213,10 @@ impl ZoneManager {
         &self.metrics
     }
 
+    pub fn volume_ordinal(&self, vol_id: &str) -> OnyxResult<VolumeOrdinal> {
+        self.meta.volume_ordinal_str(vol_id)
+    }
+
     /// Determine which zone handles a given LBA
     pub fn zone_for_lba(&self, lba: Lba) -> ZoneId {
         let zone_idx = (lba.0 / self.zone_size_blocks) % self.zone_count as u64;
@@ -337,6 +343,18 @@ impl ZoneManager {
         vol_created_at: u64,
         out_buf: &mut [u8],
     ) -> OnyxResult<()> {
+        self.submit_reads_with_ordinal(vol_id, None, start_lba, count, vol_created_at, out_buf)
+    }
+
+    pub fn submit_reads_with_ordinal(
+        &self,
+        vol_id: &str,
+        vol_ord: Option<VolumeOrdinal>,
+        start_lba: Lba,
+        count: u32,
+        vol_created_at: u64,
+        out_buf: &mut [u8],
+    ) -> OnyxResult<()> {
         use std::sync::atomic::Ordering;
 
         if count == 0 {
@@ -363,13 +381,13 @@ impl ZoneManager {
         // Pass 1: buffer lookups. Hits write directly into `out_buf`; misses
         // queue up for a single blockmap batch.
         let pass1_start = Instant::now();
-        let mut pending_lbas: Vec<Lba> = Vec::new();
+        let mut pending_lbas: Vec<u64> = Vec::new();
         let mut pending_slots: Vec<u32> = Vec::new();
         if self.buffer_pool.pending_count() == 0 {
             pending_lbas.reserve(count as usize);
             pending_slots.reserve(count as usize);
             for i in 0..count {
-                pending_lbas.push(Lba(start_lba.0 + i as u64));
+                pending_lbas.push(start_lba.0 + i as u64);
                 pending_slots.push(i);
             }
         } else {
@@ -377,13 +395,13 @@ impl ZoneManager {
                 .buffer_pool
                 .lookup_primary_range(vol_id, start_lba, count)?;
             for (i, hit) in buffer_hits.into_iter().enumerate() {
-                let lba = Lba(start_lba.0 + i as u64);
+                let lba = start_lba.0 + i as u64;
                 let slot = i;
                 let dst = &mut out_buf[slot * bs..slot * bs + bs];
                 let hit = if let Some(pending) = hit {
                     if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
                         if let Some(ref payload) = pending.payload {
-                            let offset = (lba.0 - pending.start_lba.0) as usize * bs;
+                            let offset = (lba - pending.start_lba.0) as usize * bs;
                             let end = offset + bs;
                             if end <= payload.len() {
                                 dst.copy_from_slice(&payload[offset..end]);
@@ -431,6 +449,7 @@ impl ZoneManager {
         // one point lookup per hole when the volume is still sparse. Small
         // reads stay on multi_get to keep the one-block path minimal.
         let pass2_start = Instant::now();
+        let meta_query_ns;
         if count >= RANGE_META_LOOKUP_MIN_LBAS {
             for &slot in &pending_slots {
                 let slot = slot as usize;
@@ -438,9 +457,15 @@ impl ZoneManager {
             }
 
             let end_lba = Lba(start_lba.0 + count as u64);
-            let mapped = self
-                .meta
-                .get_mappings_range_unordered_str(vol_id, start_lba, end_lba)?;
+            let query_start = Instant::now();
+            let mapped = if let Some(ord) = vol_ord {
+                self.meta
+                    .get_mappings_range_unordered_ord(ord, start_lba, end_lba)?
+            } else {
+                self.meta
+                    .get_mappings_range_unordered_str(vol_id, start_lba, end_lba)?
+            };
+            meta_query_ns = elapsed_ns(query_start);
             let mut mapped_pending = 0usize;
             if pending_lbas.len() == count as usize {
                 for (lba, mapping) in mapped {
@@ -454,7 +479,7 @@ impl ZoneManager {
                 let mut pending_slot_by_lba: HashMap<u64, usize> =
                     HashMap::with_capacity(pending_lbas.len());
                 for (lba, slot) in pending_lbas.iter().zip(pending_slots.iter().copied()) {
-                    pending_slot_by_lba.insert(lba.0, slot as usize);
+                    pending_slot_by_lba.insert(*lba, slot as usize);
                 }
                 for (lba, mapping) in mapped {
                     if let Some(slot) = pending_slot_by_lba.get(&lba.0).copied() {
@@ -468,7 +493,14 @@ impl ZoneManager {
                 .read_unmapped
                 .fetch_add(unmapped as u64, Ordering::Relaxed);
         } else {
-            let mappings = self.meta.multi_get_mappings_str(vol_id, &pending_lbas)?;
+            let query_start = Instant::now();
+            let mappings = if let Some(ord) = vol_ord {
+                self.meta.multi_get_mappings_raw_ord(ord, &pending_lbas)?
+            } else {
+                let pending_lbas: Vec<Lba> = pending_lbas.iter().copied().map(Lba).collect();
+                self.meta.multi_get_mappings_str(vol_id, &pending_lbas)?
+            };
+            meta_query_ns = elapsed_ns(query_start);
             for (idx, mapping_opt) in mappings.into_iter().enumerate() {
                 let slot = pending_slots[idx] as usize;
                 match mapping_opt {
@@ -486,6 +518,13 @@ impl ZoneManager {
         self.metrics
             .read_submit_meta_get_ns
             .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
+        self.metrics
+            .read_submit_meta_query_ns
+            .fetch_add(meta_query_ns, Ordering::Relaxed);
+        self.metrics.read_submit_meta_route_ns.fetch_add(
+            elapsed_ns(pass2_start).saturating_sub(meta_query_ns),
+            Ordering::Relaxed,
+        );
 
         if mapped_units.is_empty() {
             return Ok(());

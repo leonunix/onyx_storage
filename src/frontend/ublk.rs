@@ -11,6 +11,7 @@ use std::time::Instant;
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes, UblkUringData};
+use onyx_metadb::VolumeOrdinal;
 
 use std::sync::atomic::Ordering;
 
@@ -27,6 +28,7 @@ pub struct OnyxUblkTarget {
     config: UblkConfig,
     zone_manager: Arc<ZoneManager>,
     vol_id: String,
+    vol_ord: VolumeOrdinal,
     device_size_bytes: u64,
     vol_created_at: u64,
 }
@@ -35,6 +37,7 @@ pub struct OnyxUblkTarget {
 struct IoWorkerContext {
     zone_manager: Arc<ZoneManager>,
     vol_id: String,
+    vol_ord: VolumeOrdinal,
     vol_created_at: u64,
     block_size: u64,
     sector_size: u64,
@@ -101,8 +104,9 @@ impl IoWorkerContext {
         if offset_bytes % self.block_size == 0 && io_bytes % self.block_size == 0 {
             let start_lba = Lba(offset_bytes / self.block_size);
             let lba_count = (io_bytes / self.block_size) as u32;
-            return match self.zone_manager.submit_reads(
+            return match self.zone_manager.submit_reads_with_ordinal(
                 &self.vol_id,
+                Some(self.vol_ord),
                 start_lba,
                 lba_count,
                 self.vol_created_at,
@@ -399,10 +403,12 @@ impl OnyxUblkTarget {
         zone_manager: Arc<ZoneManager>,
         vol: &VolumeConfig,
     ) -> OnyxResult<Self> {
+        let vol_ord = zone_manager.volume_ordinal(&vol.id.0)?;
         Ok(Self {
             config: config.clone(),
             zone_manager,
             vol_id: vol.id.0.clone(),
+            vol_ord,
             device_size_bytes: vol.size_bytes,
             vol_created_at: vol.created_at,
         })
@@ -468,6 +474,7 @@ impl OnyxUblkTarget {
         let worker_ctx = IoWorkerContext {
             zone_manager: self.zone_manager.clone(),
             vol_id: self.vol_id.clone(),
+            vol_ord: self.vol_ord,
             vol_created_at: self.vol_created_at,
             block_size: BLOCK_SIZE as u64,
             sector_size: SECTOR_SIZE as u64,

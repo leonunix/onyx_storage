@@ -155,6 +155,7 @@ fn rebuild_from_metadata() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -234,6 +235,7 @@ fn rebuild_empty_metadata() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -258,6 +260,7 @@ fn rebuild_fully_allocated() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -286,6 +289,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-a".into());

@@ -55,6 +55,7 @@ fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
             coalesce_max_lbas: 32,
             min_compression_savings_pct: 12,
             skip_fully_superseded: true,
+            ..FlushConfig::default()
         },
         GcConfig {
             enabled: false,
@@ -102,6 +103,7 @@ fn setup_with_all_options(
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 8,
         },
         storage: StorageConfig {
             data_device: Some(data_file.path().to_path_buf()),
@@ -1828,6 +1830,7 @@ fn prove_background_gc_runner_reclaims_old_units() {
             coalesce_max_lbas: 32,
             min_compression_savings_pct: 12,
             skip_fully_superseded: true,
+            ..FlushConfig::default()
         },
         GcConfig {
             enabled: true,

@@ -65,6 +65,7 @@ fn test_config(dir: &std::path::Path) -> MetaConfig {
         checkpoint_interval_ms: 5000,
         group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
     }
 }
 

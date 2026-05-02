@@ -73,6 +73,7 @@ compress_workers = 2
 coalesce_max_raw_bytes = 32768
 coalesce_max_lbas = 8
 min_compression_savings_pct = 12
+packed_meta_batch_max_lbas = 1024
 
 [engine]
 zone_count = 16

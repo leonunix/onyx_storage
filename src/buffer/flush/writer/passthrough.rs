@@ -11,7 +11,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
             let total_start = Instant::now();
@@ -151,7 +151,7 @@ impl BufferFlusher {
                 &vol_id,
                 &batch_values,
                 live_positions.len() as u32,
-                &[],
+                &Self::dedup_entries_from_registrations(&dedup_registrations),
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -162,7 +162,7 @@ impl BufferFlusher {
                 }
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-            Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
+            Self::record_inline_dedup_register_metrics(metrics, dedup_registrations.len());
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
@@ -219,7 +219,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> Vec<OnyxResult<()>> {
         if units.is_empty() {
             return Vec::new();
@@ -478,14 +478,16 @@ impl BufferFlusher {
                 .collect();
 
             let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+            for &unit_idx in &meta_indices {
+                let um = unit_metas[unit_idx].as_ref().unwrap();
+                dedup_registrations.extend_from_slice(&um.dedup_registrations);
+            }
+            let dedup_entries = Self::dedup_entries_from_registrations(&dedup_registrations);
 
-            match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
+            match meta.atomic_batch_write_multi_with_dedup(&batch_args, &dedup_entries) {
                 Ok(returned) => {
                     actual_old_pba_meta = returned;
-                    for &unit_idx in &meta_indices {
-                        let um = unit_metas[unit_idx].as_ref().unwrap();
-                        dedup_registrations.extend_from_slice(&um.dedup_registrations);
-                    }
+                    Self::record_inline_dedup_register_metrics(metrics, dedup_registrations.len());
                 }
                 Err(e) => {
                     // Entire batch failed — rollback all allocations.
@@ -503,7 +505,6 @@ impl BufferFlusher {
                     }
                 }
             }
-            Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
         }
         let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);

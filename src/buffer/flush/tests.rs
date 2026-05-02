@@ -303,7 +303,7 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
 }
 
 #[test]
-fn write_unit_queues_dedup_registration_after_mapping_commit() {
+fn write_unit_registers_dedup_in_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
@@ -333,20 +333,16 @@ fn write_unit_queues_dedup_registration_after_mapping_commit() {
         .get_mapping(&VolumeId("flush-race".into()), Lba(0))
         .unwrap()
         .unwrap();
-    assert!(
-        meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "dedup miss registration should not bloat the foreground mapping commit"
-    );
-    let regs = dedup_register_rx
-        .try_recv()
-        .expect("writer should queue a best-effort dedup registration batch");
-    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, &metrics, "test");
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
+    assert!(
+        dedup_register_rx.try_recv().is_err(),
+        "dedup miss registration is folded into the mapping commit"
+    );
 }
 
 #[test]
-fn write_packed_slot_queues_dedup_registration_after_mapping_commit() {
+fn write_packed_slot_registers_dedup_in_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
@@ -386,20 +382,16 @@ fn write_packed_slot_queues_dedup_registration_after_mapping_commit() {
         .get_mapping(&VolumeId("flush-race".into()), Lba(0))
         .unwrap()
         .unwrap();
-    assert!(
-        meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "packed miss registration should not bloat the foreground mapping commit"
-    );
-    let regs = dedup_register_rx
-        .try_recv()
-        .expect("writer should queue a best-effort packed dedup registration batch");
-    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, &metrics, "test");
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
+    assert!(
+        dedup_register_rx.try_recv().is_err(),
+        "packed miss registration is folded into the mapping commit"
+    );
 }
 
 #[test]
-fn write_packed_slots_batch_queues_dedup_registration_after_mapping_commit() {
+fn write_packed_slots_batch_registers_dedup_in_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
@@ -438,13 +430,9 @@ fn write_packed_slots_batch_queues_dedup_registration_after_mapping_commit() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
     );
     assert!(results.into_iter().all(|result| result.is_ok()));
-
-    let regs = dedup_register_rx
-        .try_recv()
-        .expect("packed batch should queue best-effort dedup registrations");
-    BufferFlusher::register_dedup_batch_for_test(&meta, &regs, &metrics, "test");
 
     for (hash, lba) in expected {
         let mapping = meta
@@ -454,6 +442,10 @@ fn write_packed_slots_batch_queues_dedup_registration_after_mapping_commit() {
         let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
         assert_eq!(dedup.to_blockmap_value(), mapping);
     }
+    assert!(
+        dedup_register_rx.try_recv().is_err(),
+        "packed batch dedup registrations are folded into mapping commits"
+    );
 }
 
 #[test]
@@ -513,6 +505,7 @@ fn write_packed_slots_batch_splits_oversized_metadata_commits() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
     );
     assert!(results.into_iter().all(|result| result.is_ok()));
 
@@ -885,6 +878,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &metrics_w,
             &cleanup_tx_w,
             &dedup_register_tx_w,
+            DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
         );
     });
 

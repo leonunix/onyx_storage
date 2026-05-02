@@ -1,7 +1,5 @@
 use super::*;
 
-const PACKED_META_BATCH_LBA_LIMIT: usize = 262_144;
-
 struct PackedSlotMeta {
     batch_values: Vec<(VolumeId, Lba, BlockmapValue)>,
     all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
@@ -26,35 +24,38 @@ fn commit_packed_meta_batch(
     slot_metas: &mut [Option<PackedSlotMeta>],
     meta: &MetaStore,
     allocator: &SpaceAllocator,
+    metrics: &EngineMetrics,
     results: &mut [OnyxResult<()>],
     actual_old_pba_meta: &mut HashMap<Pba, (u32, u32)>,
-    dedup_registrations: &mut Vec<DedupRegistration>,
-) {
+) -> bool {
     if batch_slots.is_empty() {
-        return;
+        return false;
     }
 
     let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> =
         Vec::with_capacity(*batch_lbas);
+    let mut combined_dedup_registrations: Vec<DedupRegistration> = Vec::new();
     for &slot_idx in batch_slots.iter() {
         if let Some(ref sm) = slot_metas[slot_idx] {
             combined_batch_values.extend_from_slice(&sm.batch_values);
+            combined_dedup_registrations.extend_from_slice(&sm.dedup_registrations);
         }
     }
+    let dedup_entries =
+        BufferFlusher::dedup_entries_from_registrations(&combined_dedup_registrations);
 
     match meta.atomic_batch_write_packed_with_dedup(
         &combined_batch_values,
         sealed_slots[batch_slots[0]].pba,
         0,
-        &[],
+        &dedup_entries,
     ) {
         Ok(dead) => {
             merge_dead_pbas(actual_old_pba_meta, dead);
-            for &slot_idx in batch_slots.iter() {
-                if let Some(ref sm) = slot_metas[slot_idx] {
-                    dedup_registrations.extend_from_slice(&sm.dedup_registrations);
-                }
-            }
+            BufferFlusher::record_inline_dedup_register_metrics(
+                metrics,
+                combined_dedup_registrations.len(),
+            );
         }
         Err(e) => {
             for &slot_idx in batch_slots.iter() {
@@ -71,6 +72,7 @@ fn commit_packed_meta_batch(
 
     batch_slots.clear();
     *batch_lbas = 0;
+    true
 }
 
 impl BufferFlusher {
@@ -84,7 +86,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
 
@@ -243,7 +245,7 @@ impl BufferFlusher {
             &batch_values,
             sealed.pba,
             total_refcount,
-            &[],
+            &Self::dedup_entries_from_registrations(&dedup_registrations),
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -254,7 +256,7 @@ impl BufferFlusher {
             }
         };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-        Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
+        Self::record_inline_dedup_register_metrics(metrics, dedup_registrations.len());
 
         if !actual_old_pba_meta.is_empty() {
             let dead: Vec<(Pba, u32)> = actual_old_pba_meta
@@ -328,11 +330,13 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        packed_meta_batch_max_lbas: usize,
     ) -> Vec<OnyxResult<()>> {
         if sealed_slots.is_empty() {
             return Vec::new();
         }
+        let packed_meta_batch_max_lbas = packed_meta_batch_max_lbas.max(1);
         let total_start = Instant::now();
         let n = sealed_slots.len();
         let mut results: Vec<OnyxResult<()>> = (0..n).map(|_| Ok(())).collect();
@@ -525,13 +529,15 @@ impl BufferFlusher {
         // Phase 3: bounded metadata batches over the surviving slots'
         // blockmap entries. Keep each WAL record safely below the record
         // limit while still amortising the fixed commit cost across many
-        // slots. Dedup miss registrations are queued to the background
-        // validator so the foreground L2P/refcount commit stays lean.
+        // slots. Dedup miss registrations are folded into the same
+        // transaction so we avoid a second blockmap validation pass and a
+        // second WAL/apply round for every miss batch.
         let meta_start = Instant::now();
         let mut actual_old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
-        let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
         let mut batch_slots: Vec<usize> = Vec::new();
         let mut batch_lbas = 0usize;
+        let mut meta_commits = 0usize;
+        let mut meta_lbas = 0usize;
 
         for i in 0..n {
             let Some(ref sm) = slot_metas[i] else {
@@ -539,47 +545,54 @@ impl BufferFlusher {
             };
             let slot_lbas = sm.batch_values.len();
             if !batch_slots.is_empty()
-                && batch_lbas.saturating_add(slot_lbas) > PACKED_META_BATCH_LBA_LIMIT
+                && batch_lbas.saturating_add(slot_lbas) > packed_meta_batch_max_lbas
             {
-                commit_packed_meta_batch(
+                if commit_packed_meta_batch(
                     &mut batch_slots,
                     &mut batch_lbas,
                     sealed_slots,
                     &mut slot_metas,
                     meta,
                     allocator,
+                    metrics,
                     &mut results,
                     &mut actual_old_pba_meta,
-                    &mut dedup_registrations,
-                );
+                ) {
+                    meta_commits += 1;
+                }
             }
             batch_slots.push(i);
             batch_lbas += slot_lbas;
-            if slot_lbas > PACKED_META_BATCH_LBA_LIMIT {
-                commit_packed_meta_batch(
+            meta_lbas += slot_lbas;
+            if slot_lbas > packed_meta_batch_max_lbas {
+                if commit_packed_meta_batch(
                     &mut batch_slots,
                     &mut batch_lbas,
                     sealed_slots,
                     &mut slot_metas,
                     meta,
                     allocator,
+                    metrics,
                     &mut results,
                     &mut actual_old_pba_meta,
-                    &mut dedup_registrations,
-                );
+                ) {
+                    meta_commits += 1;
+                }
             }
         }
-        commit_packed_meta_batch(
+        if commit_packed_meta_batch(
             &mut batch_slots,
             &mut batch_lbas,
             sealed_slots,
             &mut slot_metas,
             meta,
             allocator,
+            metrics,
             &mut results,
             &mut actual_old_pba_meta,
-            &mut dedup_registrations,
-        );
+        ) {
+            meta_commits += 1;
+        }
         if !actual_old_pba_meta.is_empty() {
             let dead: Vec<(Pba, u32)> = actual_old_pba_meta
                 .iter()
@@ -587,7 +600,6 @@ impl BufferFlusher {
                 .collect();
             let _ = cleanup_tx.send(dead);
         }
-        Self::send_dedup_registrations(dedup_register_tx, dedup_registrations);
         let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
@@ -623,6 +635,9 @@ impl BufferFlusher {
                     tracing::warn!(
                         slots = n,
                         surviving,
+                        meta_commits,
+                        meta_lbas,
+                        meta_batch_lba_limit = packed_meta_batch_max_lbas,
                         total_ms = total_elapsed.as_millis() as u64,
                         io_ms = io_elapsed.as_millis() as u64,
                         meta_ms = meta_elapsed.as_millis() as u64,
@@ -654,6 +669,9 @@ impl BufferFlusher {
                     tracing::warn!(
                         slots = n,
                         surviving,
+                        meta_commits,
+                        meta_lbas,
+                        meta_batch_lba_limit = packed_meta_batch_max_lbas,
                         total_ms = total_elapsed.as_millis() as u64,
                         io_ms = io_elapsed.as_millis() as u64,
                         meta_ms = meta_elapsed.as_millis() as u64,
