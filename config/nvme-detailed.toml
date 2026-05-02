@@ -26,6 +26,7 @@ index_pin_mb = 8192
 lsm_bloom_bits_per_entry = 20
 checkpoint_interval_ms = 5000
 group_commit_timeout_us = 1
+dedup_shards = 8
 
 [storage]
 data_device = "/dev/nvme2n1"

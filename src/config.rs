@@ -149,8 +149,9 @@ pub struct MetaConfig {
     /// Number of metadb dedup LSM shards. Must be a power of two in
     /// `[1, 64]`. Recorded in the metadb manifest at create time;
     /// changing this value on an existing database will be rejected
-    /// at open with a "recreate the database" error. Default 1
-    /// matches the pre-Phase-2 metadb layout.
+    /// at open with a "recreate the database" error. Default 8 matches
+    /// the 2026-05 NVMe phase-4 perf result: it removes the single dedup
+    /// apply-lane ceiling without the unstable N=4 balance point.
     #[serde(default = "default_metadb_dedup_shards")]
     pub dedup_shards: u32,
 }
@@ -216,7 +217,7 @@ impl Default for MetaConfig {
 }
 
 fn default_metadb_dedup_shards() -> u32 {
-    1
+    8
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

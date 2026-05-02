@@ -45,6 +45,7 @@ checkpoint_interval_ms = 5000
 # siblings before fsyncing.
 group_commit_timeout_us = 1
 wal_dir = "/mnt/onyx-vdb-meta/wal"
+dedup_shards = 8
 
 [storage]
 data_device = "/dev/vdb3"
