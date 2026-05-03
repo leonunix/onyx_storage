@@ -83,6 +83,8 @@ fn setup_gc_env() -> TestEnv {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -128,6 +130,8 @@ fn scanner_finds_candidates_with_dead_blocks() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -211,6 +215,8 @@ fn scanner_skips_below_threshold() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -269,6 +275,8 @@ fn scanner_skips_single_lba_units() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -305,6 +313,8 @@ fn scanner_sorts_by_dead_ratio_descending() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -667,6 +677,8 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -755,6 +767,8 @@ fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 

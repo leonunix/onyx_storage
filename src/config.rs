@@ -155,6 +155,14 @@ pub struct MetaConfig {
     /// apply-lane ceiling without the unstable N=4 balance point.
     #[serde(default = "default_metadb_dedup_shards")]
     pub dedup_shards: u32,
+    /// Number of buckets in metadb's cuckoo dedup index. Each data page
+    /// holds 64 slots; choose enough buckets that the unique-hash working
+    /// set stays well below the physical slot count. Recorded at create time.
+    #[serde(default = "default_metadb_dedup_cuckoo_buckets")]
+    pub dedup_cuckoo_buckets: u64,
+    /// Entries in metadb's in-memory dedup L1 hot cache.
+    #[serde(default = "default_metadb_dedup_l1_cache_entries")]
+    pub dedup_l1_cache_entries: usize,
 }
 
 impl MetaConfig {
@@ -213,12 +221,22 @@ impl Default for MetaConfig {
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
+            dedup_cuckoo_buckets: default_metadb_dedup_cuckoo_buckets(),
+            dedup_l1_cache_entries: default_metadb_dedup_l1_cache_entries(),
         }
     }
 }
 
 fn default_metadb_dedup_shards() -> u32 {
     8
+}
+
+fn default_metadb_dedup_cuckoo_buckets() -> u64 {
+    1_000_000
+}
+
+fn default_metadb_dedup_l1_cache_entries() -> usize {
+    256_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

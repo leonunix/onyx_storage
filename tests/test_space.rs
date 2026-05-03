@@ -156,6 +156,8 @@ fn rebuild_from_metadata() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -236,6 +238,8 @@ fn rebuild_empty_metadata() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -261,6 +265,8 @@ fn rebuild_fully_allocated() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -290,6 +296,8 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-a".into());

@@ -766,13 +766,11 @@ impl MetadbBackend {
     }
 
     pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
-        let (dedup_index, dedup_reverse) = self.db.dedup_lsm_stats();
         Ok(MetaMemorySnapshot::from_metadb(
             self.db.last_applied_lsn(),
             self.db.high_water(),
             self.db.free_list_len() as u64,
-            dedup_index,
-            dedup_reverse,
+            self.db.dedup_tier_sizes(),
             self.db.cache_stats(),
             self.db.metrics_snapshot(),
             self.db.pending_state(),
@@ -1074,6 +1072,8 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
     cfg.dedup_shards = config.dedup_shards;
+    cfg.dedup_cuckoo_buckets = config.dedup_cuckoo_buckets;
+    cfg.dedup_l1_cache_entries = config.dedup_l1_cache_entries;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.
@@ -1333,6 +1333,8 @@ mod tests {
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1371,6 +1373,8 @@ mod tests {
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1438,6 +1442,8 @@ mod tests {
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1494,6 +1500,8 @@ mod tests {
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1567,6 +1575,8 @@ mod tests {
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1623,6 +1633,8 @@ mod tests {
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),

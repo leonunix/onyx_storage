@@ -24,6 +24,8 @@ fn setup_worker() -> (ZoneWorker, Arc<MetaStore>) {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -58,6 +60,8 @@ fn setup_zone_manager(zone_count: u32) -> ZoneManager {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -266,6 +270,8 @@ fn zone_manager_concurrent_reads_inline_no_serialization() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -355,6 +361,8 @@ fn zone_manager_read_pool_decompresses_concurrently() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 

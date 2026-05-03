@@ -65,6 +65,8 @@ fn setup_e2e() -> (
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -205,6 +207,8 @@ fn write_flush_read_zstd() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -259,6 +263,8 @@ fn write_flush_read_no_compression() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 

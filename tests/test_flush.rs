@@ -57,6 +57,8 @@ fn setup_flush_env_with_backend(
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -403,6 +405,8 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 8,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         })
         .unwrap(),
     );

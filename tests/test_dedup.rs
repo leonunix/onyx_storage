@@ -55,6 +55,8 @@ fn setup_dedup_env_with_sizes(
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -299,6 +301,8 @@ fn dedup_index_crud() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -343,6 +347,8 @@ fn dedup_cleanup_on_pba_free() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -399,6 +405,8 @@ fn scan_dedup_skipped() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();
@@ -453,6 +461,8 @@ fn update_blockmap_flags_clears_dedup_skipped() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();
@@ -575,6 +585,8 @@ fn delete_volume_cleans_dedup_index() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -639,6 +651,8 @@ fn cleanup_old_pba_preserves_newer_forward_index() {
         group_commit_timeout_us: 1,
         wal_dir: None,
         dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 

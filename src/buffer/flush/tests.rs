@@ -30,6 +30,8 @@ fn setup_flush_test_env() -> (
             group_commit_timeout_us: 1,
             wal_dir: None,
             dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         })
         .unwrap(),
     );
