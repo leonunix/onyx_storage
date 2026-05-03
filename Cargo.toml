@@ -68,6 +68,10 @@ serial_test = "3"
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
 
+[[bin]]
+name = "onyx-engine-bench"
+path = "src/bin/engine_bench.rs"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk = "0.4"
 io-uring = "0.7"

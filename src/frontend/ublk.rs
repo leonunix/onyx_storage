@@ -57,9 +57,9 @@ enum QueuedIoData {
     /// Direct pointer into libublk's per-tag queue buffer.
     ///
     /// Safety invariant: ublk does not reuse a tag's buffer until userspace
-    /// completes that tag, and the queue thread only completes a direct read
+    /// completes that tag, and the queue thread only completes a direct IO
     /// after this worker returns. This removes one allocation and one memcpy
-    /// from the read path while still letting the queue thread fetch more
+    /// from the hot path while still letting the queue thread fetch more
     /// commands instead of serialising the whole hardware queue.
     Direct {
         ptr: usize,
@@ -72,7 +72,12 @@ struct CompletedIo {
     op: u32,
     res: i32,
     elapsed_ns: u64,
+    queue_wait_ns: u64,
+    worker_ns: u64,
+    completed_at: Instant,
 }
+
+const OPPORTUNISTIC_COMPLETION_DRAIN_MAX: usize = 8;
 
 impl IoWorkerContext {
     fn handle_io(&self, op: u32, start_sector: u64, nr_sectors: u32, io_slice: &mut [u8]) -> i32 {
@@ -315,7 +320,15 @@ fn submit_eventfd_poll(q: &UblkQueue, event_fd: RawFd, qid: u16) {
     }
 }
 
-fn record_completed_io_metrics(ctx: &IoWorkerContext, op: u32, res: i32, elapsed_ns: u64) {
+fn record_completed_io_metrics(
+    ctx: &IoWorkerContext,
+    op: u32,
+    res: i32,
+    elapsed_ns: u64,
+    queue_wait_ns: u64,
+    worker_ns: u64,
+    completion_wait_ns: u64,
+) {
     if res <= 0 {
         return;
     }
@@ -331,6 +344,15 @@ fn record_completed_io_metrics(ctx: &IoWorkerContext, op: u32, res: i32, elapsed
             metrics
                 .volume_read_total_ns
                 .fetch_add(elapsed_ns, Ordering::Relaxed);
+            metrics
+                .ublk_read_queue_wait_ns
+                .fetch_add(queue_wait_ns, Ordering::Relaxed);
+            metrics
+                .ublk_read_worker_ns
+                .fetch_add(worker_ns, Ordering::Relaxed);
+            metrics
+                .ublk_read_completion_wait_ns
+                .fetch_add(completion_wait_ns, Ordering::Relaxed);
         }
         sys::UBLK_IO_OP_WRITE => {
             metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
@@ -340,6 +362,15 @@ fn record_completed_io_metrics(ctx: &IoWorkerContext, op: u32, res: i32, elapsed
             metrics
                 .volume_write_total_ns
                 .fetch_add(elapsed_ns, Ordering::Relaxed);
+            metrics
+                .ublk_write_queue_wait_ns
+                .fetch_add(queue_wait_ns, Ordering::Relaxed);
+            metrics
+                .ublk_write_worker_ns
+                .fetch_add(worker_ns, Ordering::Relaxed);
+            metrics
+                .ublk_write_completion_wait_ns
+                .fetch_add(completion_wait_ns, Ordering::Relaxed);
         }
         _ => {}
     }
@@ -366,6 +397,8 @@ fn spawn_queue_workers(
                         qid as usize + worker_idx,
                     );
                     while let Ok(mut req) = rx.recv() {
+                        let worker_start = Instant::now();
+                        let queue_wait_ns = req.queued_at.elapsed().as_nanos() as u64;
                         let res = match &mut req.data {
                             QueuedIoData::Owned(data) => ctx.handle_io(
                                 req.op,
@@ -380,11 +413,15 @@ fn spawn_queue_workers(
                                 ctx.handle_io(req.op, req.start_sector, req.nr_sectors, io_slice)
                             }
                         };
+                        let worker_ns = worker_start.elapsed().as_nanos() as u64;
                         let completed = CompletedIo {
                             tag: req.tag,
                             op: req.op,
                             res,
                             elapsed_ns: req.queued_at.elapsed().as_nanos() as u64,
+                            queue_wait_ns,
+                            worker_ns,
+                            completed_at: Instant::now(),
                         };
                         if tx.send(completed).is_err() {
                             break;
@@ -511,15 +548,24 @@ impl OnyxUblkTarget {
                     crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
                     queue_thread_bound.set(true);
                 }
-                if tag == qid && _io.is_tgt_io() {
-                    drain_eventfd(event_fd);
+
+                let complete_ready = |drain_wakeup: bool, max_completions: Option<usize>| {
+                    if drain_wakeup {
+                        drain_eventfd(event_fd);
+                    }
                     let bufs = io_bufs.borrow();
+                    let mut completed = 0usize;
                     while let Ok(done) = completion_rx.try_recv() {
+                        let completion_wait_ns = done.completed_at.elapsed().as_nanos() as u64;
+                        let elapsed_ns = done.elapsed_ns.saturating_add(completion_wait_ns);
                         record_completed_io_metrics(
                             &worker_ctx,
                             done.op,
                             done.res,
-                            done.elapsed_ns,
+                            elapsed_ns,
+                            done.queue_wait_ns,
+                            done.worker_ns,
+                            completion_wait_ns,
                         );
 
                         if let Err(err) = q.complete_io_cmd_unified(
@@ -529,10 +575,19 @@ impl OnyxUblkTarget {
                         ) {
                             tracing::error!(error = ?err, "ublk completion failed");
                         }
+                        completed += 1;
+                        if max_completions.is_some_and(|limit| completed >= limit) {
+                            break;
+                        }
                     }
+                };
+
+                if tag == qid && _io.is_tgt_io() {
+                    complete_ready(true, None);
                     submit_eventfd_poll(q, event_fd, qid);
                     return;
                 }
+                complete_ready(false, Some(OPPORTUNISTIC_COMPLETION_DRAIN_MAX));
                 let iod = q.get_iod(tag);
                 let queued_at = Instant::now();
                 let op = iod.op_flags & 0xFF;
@@ -540,7 +595,7 @@ impl OnyxUblkTarget {
                 let nr_sectors = iod.nr_sectors;
                 let io_bytes = nr_sectors as u64 * SECTOR_SIZE as u64;
                 let io_len = io_bytes as usize;
-                if op == sys::UBLK_IO_OP_READ {
+                if matches!(op, sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE) {
                     let mut bufs = io_bufs.borrow_mut();
                     let io_buf = &mut bufs[tag as usize];
                     let io_slice = io_buf.as_mut_slice();
@@ -587,35 +642,12 @@ impl OnyxUblkTarget {
                     return;
                 }
 
-                let data = {
-                    let mut bufs = io_bufs.borrow_mut();
-                    let io_buf = &mut bufs[tag as usize];
-                    let io_slice = io_buf.as_mut_slice();
-                    if io_len > io_slice.len() {
-                        tracing::error!(
-                            tag,
-                            io_len,
-                            buf_len = io_slice.len(),
-                            "ublk request exceeds queue buffer size"
-                        );
-                        if let Err(err) = q.complete_io_cmd_unified(
-                            tag,
-                            BufDesc::Slice(io_buf.as_slice()),
-                            Ok(UblkIORes::Result(-(libc::EIO as i32))),
-                        ) {
-                            tracing::error!(error = ?err, "ublk completion failed");
-                        }
-                        return;
-                    } else {
-                        io_slice[..io_len].to_vec()
-                    }
-                };
                 let queued = QueuedIo {
                     tag,
                     op,
                     start_sector,
                     nr_sectors,
-                    data: QueuedIoData::Owned(data),
+                    data: QueuedIoData::Owned(Vec::new()),
                     queued_at,
                 };
                 if submit_tx.send(queued).is_err() {

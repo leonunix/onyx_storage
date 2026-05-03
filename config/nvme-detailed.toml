@@ -27,7 +27,7 @@ lsm_bloom_bits_per_entry = 20
 checkpoint_interval_ms = 5000
 group_commit_timeout_us = 1
 dedup_shards = 8
-dedup_cuckoo_buckets = 1000000
+dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 
 [storage]
@@ -94,21 +94,21 @@ enabled = true
 # siblings. Keep frontend reads on the low cores, compression/dedup in the
 # middle, and metadata/background work on the high cores so perf samples are
 # not dominated by scheduler drift.
-ublk_cpus = "0-15"
-read_pool_cpus = "16-31"
-buffer_sync_cpus = "32-47"
-flusher_coalesce_cpus = "48-55"
-flusher_dedup_cpus = "56-71"
-flusher_compress_cpus = "72-79"
-flusher_writer_cpus = "80-87"
-flusher_dedup_register_cpus = "80-87"
-flusher_cleanup_cpus = "88-91"
+ublk_cpus = "0-31"
+read_pool_cpus = "32-47"
+buffer_sync_cpus = "48-55"
+flusher_coalesce_cpus = "56-63"
+flusher_dedup_cpus = "64-79"
+flusher_compress_cpus = "80-87"
+flusher_writer_cpus = "88-91"
+flusher_dedup_register_cpus = "88-91"
+flusher_cleanup_cpus = "92-95"
 metadb_wal_cpus = "92"
-metadb_l2p_apply_cpus = "56-71"
-metadb_refcount_apply_cpus = "80-87"
-metadb_dedup_apply_cpus = "80-87"
-metadb_checkpoint_cpus = "88-91"
-background_cpus = "88-95"
+metadb_l2p_apply_cpus = "64-79"
+metadb_refcount_apply_cpus = "88-91"
+metadb_dedup_apply_cpus = "88-91"
+metadb_checkpoint_cpus = "92-95"
+background_cpus = "92-95"
 
 [service]
 socket_path = "/tmp/onyx-storage-nvme.sock"
