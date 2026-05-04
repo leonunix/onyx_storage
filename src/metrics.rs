@@ -257,6 +257,17 @@ pub struct EngineMetrics {
     pub dedup_rescan_hits: AtomicU64,
     pub dedup_rescan_misses: AtomicU64,
     pub dedup_rescan_errors: AtomicU64,
+    /// Cold-tail rescan: live blockmap entries the scanner walked, hashed,
+    /// and inserted into the candidate cache so a future duplicate write
+    /// can verify-and-promote against an already-warmed fingerprint.
+    pub dedup_cold_tail_blocks: AtomicU64,
+    /// Cold-tail entries skipped because the scanner already had a hash
+    /// recorded for that PBA (warmed by a prior cycle or the writer).
+    pub dedup_cold_tail_already_warm: AtomicU64,
+    /// Cold-tail read/decode failures (CRC mismatch, decompress error,
+    /// LV3 IO error). The scanner moves on; the cursor still advances so
+    /// one bad block does not stall progress.
+    pub dedup_cold_tail_errors: AtomicU64,
     pub volume_discard_ops: AtomicU64,
     pub volume_discard_lbas: AtomicU64,
     pub discard_blocks_freed: AtomicU64,
@@ -464,6 +475,9 @@ impl Default for EngineMetrics {
             dedup_rescan_hits: AtomicU64::new(0),
             dedup_rescan_misses: AtomicU64::new(0),
             dedup_rescan_errors: AtomicU64::new(0),
+            dedup_cold_tail_blocks: AtomicU64::new(0),
+            dedup_cold_tail_already_warm: AtomicU64::new(0),
+            dedup_cold_tail_errors: AtomicU64::new(0),
             volume_discard_ops: AtomicU64::new(0),
             volume_discard_lbas: AtomicU64::new(0),
             discard_blocks_freed: AtomicU64::new(0),
@@ -623,6 +637,9 @@ impl EngineMetrics {
             dedup_rescan_hits: load(&self.dedup_rescan_hits),
             dedup_rescan_misses: load(&self.dedup_rescan_misses),
             dedup_rescan_errors: load(&self.dedup_rescan_errors),
+            dedup_cold_tail_blocks: load(&self.dedup_cold_tail_blocks),
+            dedup_cold_tail_already_warm: load(&self.dedup_cold_tail_already_warm),
+            dedup_cold_tail_errors: load(&self.dedup_cold_tail_errors),
             volume_discard_ops: load(&self.volume_discard_ops),
             volume_discard_lbas: load(&self.volume_discard_lbas),
             discard_blocks_freed: load(&self.discard_blocks_freed),
@@ -766,6 +783,9 @@ pub struct EngineMetricsSnapshot {
     pub dedup_rescan_hits: u64,
     pub dedup_rescan_misses: u64,
     pub dedup_rescan_errors: u64,
+    pub dedup_cold_tail_blocks: u64,
+    pub dedup_cold_tail_already_warm: u64,
+    pub dedup_cold_tail_errors: u64,
     pub volume_discard_ops: u64,
     pub volume_discard_lbas: u64,
     pub discard_blocks_freed: u64,
@@ -942,6 +962,9 @@ impl EngineMetricsSnapshot {
             dedup_rescan_hits,
             dedup_rescan_misses,
             dedup_rescan_errors,
+            dedup_cold_tail_blocks,
+            dedup_cold_tail_already_warm,
+            dedup_cold_tail_errors,
             volume_discard_ops,
             volume_discard_lbas,
             discard_blocks_freed,
@@ -1993,7 +2016,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={}",
+            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={}",
             self.metrics.dedup_hits,
             self.metrics.dedup_misses,
             self.metrics.dedup_skipped_units,
@@ -2009,7 +2032,10 @@ impl EngineStatusSnapshot {
             self.metrics.dedup_rescan_blocks,
             self.metrics.dedup_rescan_hits,
             self.metrics.dedup_rescan_misses,
-            self.metrics.dedup_rescan_errors
+            self.metrics.dedup_rescan_errors,
+            self.metrics.dedup_cold_tail_blocks,
+            self.metrics.dedup_cold_tail_already_warm,
+            self.metrics.dedup_cold_tail_errors
         );
         let _ = writeln!(
             out,

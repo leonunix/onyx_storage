@@ -424,6 +424,22 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Visit live blockmap entries for one volume in `[start_lba, start_lba + count)`.
+    /// Order within the range is shard-internal (not LBA-sorted), so callers that
+    /// only need to bound work per cycle can checkpoint by `start + count` and
+    /// resume on the next cycle. Used by the dedup scanner's cold-tail warming
+    /// pass to walk live mappings whose hashes are not yet in the candidate cache.
+    pub fn scan_blockmap_range(
+        &self,
+        vol_id: &VolumeId,
+        start_lba: Lba,
+        count: u64,
+        callback: &mut dyn FnMut(Lba, BlockmapValue),
+    ) -> OnyxResult<()> {
+        self.backend
+            .scan_blockmap_range(vol_id, start_lba, count, callback)
+    }
+
     pub fn rebuild_refcount_from_blockmap(&self) -> OnyxResult<RebuildSummary> {
         Ok(RebuildSummary::default())
     }

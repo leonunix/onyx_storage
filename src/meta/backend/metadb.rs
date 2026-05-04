@@ -675,6 +675,44 @@ impl MetadbBackend {
         Ok(())
     }
 
+    pub(crate) fn scan_blockmap_range(
+        &self,
+        vol_id: &VolumeId,
+        start_lba: Lba,
+        count: u64,
+        callback: &mut dyn FnMut(Lba, BlockmapValue),
+    ) -> OnyxResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let ord = self.volume_ordinal(vol_id)?;
+        let end = start_lba.0.saturating_add(count);
+        let mut decode_error = None;
+        let scan_result = self.db.scan_range_unordered_chunked(
+            ord,
+            start_lba.0,
+            end,
+            count,
+            |lba, value| {
+                match decode_l2p_value(value) {
+                    Ok(decoded) => callback(Lba(lba), decoded),
+                    Err(err) => {
+                        decode_error = Some(err);
+                        return Err(onyx_metadb::MetaDbError::Corruption(
+                            "onyx blockmap decode failed".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        );
+        if let Some(err) = decode_error {
+            return Err(err);
+        }
+        scan_result?;
+        Ok(())
+    }
+
     pub(crate) fn count_blockmap_refs_for_pba(&self, target: Pba) -> OnyxResult<u32> {
         let mut count = 0u32;
         self.scan_all_blockmap_entries_with(&mut |_, _, value| {
@@ -1209,7 +1247,14 @@ fn dedup_hit_results_from_remaps(
     hits: &[(Lba, BlockmapValue, ContentHash)],
     outcomes: Vec<ApplyOutcome>,
 ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
-    if hits.len() != outcomes.len() {
+    // The atomic_batch_dedup_hits_with_promote tx queues `hits.len()`
+    // L2pRemap ops followed by 2 ops per promote entry (DedupPut +
+    // DedupReverseRegister). commit_with_outcomes returns one outcome
+    // per WAL op in submission order, so the L2pRemap outcomes are
+    // exactly the first `hits.len()` entries; promote-side outcomes
+    // (DedupPut, DedupReverseRegister) are not L2pRemap variants and
+    // do not feed back into the per-LBA hit-result decoder.
+    if outcomes.len() < hits.len() {
         return Err(OnyxError::Config(format!(
             "metadb dedup outcome length mismatch: {} hits, {} outcomes",
             hits.len(),
@@ -1219,7 +1264,7 @@ fn dedup_hit_results_from_remaps(
 
     let mut results = Vec::with_capacity(hits.len());
     let mut newly_zeroed = HashMap::new();
-    for ((_, new_value, _), outcome) in hits.iter().zip(outcomes.into_iter()) {
+    for ((_, new_value, _), outcome) in hits.iter().zip(outcomes.into_iter().take(hits.len())) {
         let ApplyOutcome::L2pRemap {
             applied,
             prev,

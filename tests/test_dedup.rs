@@ -12,6 +12,7 @@ use onyx_storage::dedup::config::DedupConfig;
 use onyx_storage::dedup::scanner::DedupScanner;
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::engine::IoEngine;
+use onyx_storage::io::read_pool::ReadPool;
 use onyx_storage::lifecycle::VolumeLifecycleManager;
 use onyx_storage::meta::schema::*;
 use onyx_storage::meta::store::MetaStore;
@@ -91,6 +92,75 @@ fn setup_dedup_env_small_buffer() -> (
     Arc<IoEngine>,
 ) {
     setup_dedup_env_with_sizes(64 * 1024, 16 * 1024 * 1024)
+}
+
+/// Variant of [`setup_dedup_env`] that also returns a `ReadPool` and
+/// the underlying data file path. Used by cold-tail tests: the scanner
+/// only runs the cold-tail pass when a `ReadPool` is configured (the
+/// pass batches LV3 reads through io_uring, so trying to do the
+/// equivalent serially would dwarf the cycle budget).
+fn setup_dedup_env_with_read_pool() -> (
+    Arc<WriteBufferPool>,
+    Arc<MetaStore>,
+    Arc<VolumeLifecycleManager>,
+    Arc<SpaceAllocator>,
+    Arc<IoEngine>,
+    Arc<ReadPool>,
+) {
+    let buf_bytes: u64 = 1024 * 1024;
+    let data_bytes: u64 = 16 * 1024 * 1024;
+    let meta_dir = tempdir().unwrap();
+    let buf_tmp = NamedTempFile::new().unwrap();
+    let data_tmp = NamedTempFile::new().unwrap();
+    buf_tmp.as_file().set_len(buf_bytes).unwrap();
+    data_tmp.as_file().set_len(data_bytes).unwrap();
+
+    let meta_config = onyx_storage::config::MetaConfig {
+        path: Some(meta_dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
+        wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
+    };
+    let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
+
+    let buf_dev = RawDevice::open(buf_tmp.path()).unwrap();
+    let pool = Arc::new(WriteBufferPool::open(buf_dev).unwrap());
+    pool.durable_seq_handle()
+        .store(u64::MAX, std::sync::atomic::Ordering::Release);
+
+    let data_dev = RawDevice::open(data_tmp.path()).unwrap();
+    let io_engine = Arc::new(IoEngine::new(data_dev, false));
+    let allocator = Arc::new(SpaceAllocator::new(16 * 1024 * 1024, 0));
+    let lifecycle = Arc::new(VolumeLifecycleManager::default());
+
+    let metrics = Arc::new(onyx_storage::metrics::EngineMetrics::default());
+    let pool_dev = RawDevice::open(data_tmp.path()).unwrap();
+    let read_pool = Arc::new(
+        ReadPool::start(
+            2,
+            32,
+            &pool_dev,
+            onyx_storage::types::RESERVED_BLOCKS,
+            BLOCK_SIZE,
+            false,
+            metrics,
+        )
+        .unwrap(),
+    );
+    drop(pool_dev);
+
+    std::mem::forget(meta_dir);
+    std::mem::forget(buf_tmp);
+    std::mem::forget(data_tmp);
+
+    (pool, meta, lifecycle, allocator, io_engine, read_pool)
 }
 
 fn register_volume(meta: &MetaStore, name: &str) {
@@ -183,15 +253,45 @@ fn start_scanner(
     io_engine: &Arc<IoEngine>,
     config: DedupConfig,
 ) -> DedupScanner {
-    DedupScanner::start(
+    let (scanner, _candidate) =
+        start_scanner_with_candidate(pool, meta, lifecycle, allocator, io_engine, config);
+    scanner
+}
+
+fn start_scanner_with_candidate(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+    config: DedupConfig,
+) -> (DedupScanner, onyx_storage::dedup::CandidateCache) {
+    start_scanner_with_candidate_and_read_pool(
+        pool, meta, lifecycle, allocator, io_engine, None, config,
+    )
+}
+
+fn start_scanner_with_candidate_and_read_pool(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+    read_pool: Option<Arc<ReadPool>>,
+    config: DedupConfig,
+) -> (DedupScanner, onyx_storage::dedup::CandidateCache) {
+    let candidate = onyx_storage::dedup::CandidateCache::new(8, 64);
+    let scanner = DedupScanner::start(
         meta.clone(),
         io_engine.clone(),
         allocator.clone(),
         lifecycle.clone(),
         pool.clone(),
-        onyx_storage::dedup::CandidateCache::new(8, 64),
+        candidate.clone(),
+        read_pool,
         config,
-    )
+    );
+    (scanner, candidate)
 }
 
 fn wait_flushed(pool: &WriteBufferPool, timeout_ms: u64) -> bool {
@@ -236,10 +336,12 @@ fn dedup_entry_roundtrip() {
 
 #[test]
 fn dedup_reverse_key_roundtrip() {
+    // Reverse-key layout under the xxh3_64 hash schema: 8 B pba + 8 B
+    // hash = 16 B.
     let pba = Pba(123);
     let hash: ContentHash = [0xAB; 8];
     let key = encode_dedup_reverse_key(pba, &hash);
-    assert_eq!(key.len(), 40);
+    assert_eq!(key.len(), 16);
     let (decoded_pba, decoded_hash) = decode_dedup_reverse_key(&key).unwrap();
     assert_eq!(decoded_pba, pba);
     assert_eq!(decoded_hash, hash);
@@ -508,11 +610,14 @@ fn dedup_config_defaults() {
 // --- Integration: flusher with dedup enabled ---
 
 #[test]
-fn dedup_miss_populates_index() {
+fn dedup_miss_does_not_populate_index() {
+    // Promote-on-verified-hit invariant: a single fresh write must NOT
+    // publish to the persistent dedup_index. The first occurrence of a
+    // fingerprint lives only in the in-memory candidate cache; the
+    // index gets populated on the *second* sighting after LV3 verify.
     let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
     register_volume(&meta, "test-vol");
 
-    // Write a unique block
     let data = vec![0xAA; 4096];
     let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
@@ -521,20 +626,16 @@ fn dedup_miss_populates_index() {
     assert!(wait_flushed(&pool, 10000), "flush timeout");
     flusher.stop();
 
-    // Verify block was written
     let mapping = meta
         .get_mapping(&VolumeId("test-vol".into()), Lba(0))
         .unwrap()
         .unwrap();
-    assert_eq!(mapping.flags, 0); // Not skipped
+    assert_eq!(mapping.flags, 0);
 
-    // Verify dedup index was populated
-    let dedup_entry = meta.get_dedup_entry(&hash).unwrap();
     assert!(
-        dedup_entry.is_some(),
-        "dedup index should be populated for miss blocks"
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "fresh write must not publish to dedup_index until a duplicate verifies"
     );
-    assert_eq!(dedup_entry.unwrap().pba, mapping.pba);
 }
 
 #[test]
@@ -941,9 +1042,17 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
     let data = vec![0x5A; 4096];
     let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
 
+    // Two writes of the same data force the verify-on-hit pipeline to
+    // promote the (hash, blockmap) pair into the persistent
+    // dedup_index. The scanner's hit path can then remap a later
+    // skipped write onto that PBA. Without the second write the index
+    // would stay empty under promote-on-verified-hit and the scanner
+    // miss path would just warm the candidate cache.
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
     assert!(wait_flushed(&pool, 10000), "initial flush timeout");
+    pool.append("test-vol", Lba(2), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "promote flush timeout");
     flusher.stop();
 
     let original_pba = meta
@@ -953,7 +1062,8 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
         .pba;
     assert_eq!(
         meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
-        original_pba
+        original_pba,
+        "second matching write should promote the fingerprint into dedup_index"
     );
 
     let mut skip_flusher = start_flusher_custom(
@@ -1007,7 +1117,7 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
 }
 
 #[test]
-fn scanner_miss_registers_index_and_clears_flag() {
+fn scanner_miss_warms_candidate_and_clears_flag() {
     let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env_small_buffer();
     register_volume(&meta, "test-vol");
 
@@ -1033,7 +1143,7 @@ fn scanner_miss_registers_index_and_clears_flag() {
     assert_eq!(skipped_mapping.flags, FLAG_DEDUP_SKIPPED);
     assert!(meta.get_dedup_entry(&hash).unwrap().is_none());
 
-    let mut scanner = start_scanner(
+    let (mut scanner, candidate) = start_scanner_with_candidate(
         &pool,
         &meta,
         &lifecycle,
@@ -1048,15 +1158,21 @@ fn scanner_miss_registers_index_and_clears_flag() {
                 .unwrap()
                 .unwrap();
             mapping.flags == 0
-                && meta
-                    .get_dedup_entry(&hash)
-                    .unwrap()
-                    .map(|e| e.pba == skipped_mapping.pba)
+                && candidate
+                    .lookup(&hash)
+                    .map(|cached| cached.pba == skipped_mapping.pba)
                     .unwrap_or(false)
         }),
-        "scanner should register index and clear skipped flag for unique block"
+        "scanner should warm candidate cache and clear skipped flag for unique block"
     );
     scanner.stop();
+
+    // Promote-on-verified-hit invariant: the persistent dedup_index
+    // stays empty until a future duplicate verifies against this PBA.
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "scanner miss must not publish to dedup_index"
+    );
 }
 
 #[test]
@@ -1089,7 +1205,7 @@ fn scanner_skips_under_pressure_then_resumes() {
     let filler = vec![0xEE; 4096];
     pool.append("test-vol", Lba(100), 1, &filler, 1000).unwrap();
 
-    let mut scanner = start_scanner(
+    let (mut scanner, candidate) = start_scanner_with_candidate(
         &pool,
         &meta,
         &lifecycle,
@@ -1107,7 +1223,7 @@ fn scanner_skips_under_pressure_then_resumes() {
         FLAG_DEDUP_SKIPPED,
         "scanner must skip rescans while buffer pressure is above threshold"
     );
-    assert!(meta.get_dedup_entry(&skipped_hash).unwrap().is_none());
+    assert!(candidate.lookup(&skipped_hash).is_none());
 
     let mut drain_flusher =
         start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
@@ -1120,7 +1236,7 @@ fn scanner_skips_under_pressure_then_resumes() {
                 .get_mapping(&VolumeId("test-vol".into()), Lba(0))
                 .unwrap()
                 .unwrap();
-            mapping.flags == 0 && meta.get_dedup_entry(&skipped_hash).unwrap().is_some()
+            mapping.flags == 0 && candidate.lookup(&skipped_hash).is_some()
         }),
         "scanner should resume once buffer pressure is relieved"
     );
@@ -1177,7 +1293,72 @@ fn scanner_crc_mismatch_leaves_block_skipped() {
 }
 
 #[test]
-fn dedup_miss_before_meta_write_recovers_and_populates_index() {
+fn cold_tail_pass_warms_candidate_from_live_blockmap() {
+    // Cold-tail rescan walks live (non-skipped) blockmap entries in
+    // chunks and warms the candidate cache via batched io_uring reads.
+    //
+    // The scanner is a fresh process state — its candidate cache
+    // starts empty, just like after an engine restart. Once the
+    // cold-tail pass runs the cache must contain the fingerprint for
+    // the live entry without any duplicate write driving it.
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) =
+        setup_dedup_env_with_read_pool();
+    register_volume(&meta, "test-vol");
+
+    let data = vec![0xC1; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
+
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "flush timeout");
+    flusher.stop();
+
+    let mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+
+    let cold_cfg = DedupConfig {
+        rescan_interval_ms: 20,
+        max_rescan_per_cycle: 0, // No DEDUP_SKIPPED debt on this volume; cold-tail only.
+        cold_tail_max_per_cycle: 64,
+        ..dedup_test_config()
+    };
+    let (mut scanner, candidate) = start_scanner_with_candidate_and_read_pool(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        cold_cfg,
+    );
+
+    assert!(
+        wait_until(3000, || candidate
+            .lookup(&hash)
+            .map(|v| v.pba == mapping.pba)
+            .unwrap_or(false)),
+        "cold-tail pass should hash the live blockmap entry and warm the candidate cache"
+    );
+    scanner.stop();
+
+    // Promote-on-verified-hit invariant: cold-tail warming never
+    // publishes into the persistent dedup_index. The promote happens
+    // later, only after a duplicate write byte-verifies against this
+    // PBA.
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "cold-tail must not publish to dedup_index; promote stays gated on verified hits"
+    );
+}
+
+#[test]
+fn dedup_miss_recovers_after_meta_write_failure() {
+    // Forced failure before the metadata write should be retried; the
+    // recovered fresh write must commit a clean blockmap (flags=0,
+    // refcount=1) and — under promote-on-verified-hit — leave the
+    // dedup_index empty until a duplicate verifies.
     let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
     register_volume(&meta, "test-vol-meta-fail");
 
@@ -1210,9 +1391,9 @@ fn dedup_miss_before_meta_write_recovers_and_populates_index() {
         .unwrap();
     assert_eq!(mapping.flags, 0);
     assert_eq!(meta.get_refcount(mapping.pba).unwrap(), 1);
-    assert_eq!(
-        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
-        mapping.pba
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "fresh write must not publish dedup_index until a duplicate verifies"
     );
 }
 
@@ -1251,8 +1432,11 @@ fn dedup_hit_failure_demotes_to_miss() {
     );
     assert_eq!(meta.get_refcount(original_mapping.pba).unwrap(), 1);
     assert_eq!(meta.get_refcount(second_mapping.pba).unwrap(), 1);
-    assert_eq!(
-        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
-        second_mapping.pba
+    // Promote-on-verified-hit: the demoted write is a fresh miss, so
+    // it warms the candidate cache rather than publishing into
+    // dedup_index. Both fresh writes leave the persistent index empty.
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "demoted miss must not publish to dedup_index"
     );
 }

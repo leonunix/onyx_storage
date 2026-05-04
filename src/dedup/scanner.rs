@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -9,16 +10,40 @@ use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
 use crate::dedup::config::DedupConfig;
+use crate::dedup::CandidateCache;
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
+use crate::io::read_pool::ReadPool;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::*;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
-use crate::types::{VolumeId, BLOCK_SIZE};
+use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 
-/// Background dedup scanner: re-processes blocks that skipped dedup under pressure.
+/// Background dedup scanner.
+///
+/// Runs two complementary passes per cycle:
+///
+/// 1. **DEDUP_SKIPPED rescan**: foreground writes that bypassed dedup
+///    under buffer pressure get the `FLAG_DEDUP_SKIPPED` flag in their
+///    blockmap. The scanner drains them: read LV3, hash the 4 KiB
+///    block, look up the persistent dedup index, and either remap the
+///    LBA to the existing live PBA (hit) or warm the candidate cache
+///    so a *future* duplicate write triggers verify-and-promote.
+///    Misses do **not** publish into `dedup_index` directly — that
+///    would defeat the promote-on-verified-hit invariant introduced on
+///    the dedup-promote-on-hit branch.
+///
+/// 2. **Cold-tail warming**: a per-volume cursor walks live blockmap
+///    entries that are not flagged DEDUP_SKIPPED, hashes their
+///    content, and inserts the fingerprint into the candidate cache.
+///    This recovers dedup ratio after a process restart (the cache is
+///    RAM-only) and on long-running engines whose dedup window has
+///    moved past entries the writer originally cached. LV3 reads are
+///    fanned out through the engine's `ReadPool` (io_uring batched at
+///    high queue depth) so the cycle's IO is amortised across the
+///    drain instead of paying serial round-trips per block.
 pub struct DedupScanner {
     running: Arc<AtomicBool>,
     config: Arc<ArcSwap<DedupConfig>>,
@@ -26,13 +51,15 @@ pub struct DedupScanner {
 }
 
 impl DedupScanner {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         meta: Arc<MetaStore>,
         io_engine: Arc<IoEngine>,
         allocator: Arc<SpaceAllocator>,
         lifecycle: Arc<VolumeLifecycleManager>,
         buffer_pool: Arc<WriteBufferPool>,
-        candidate: crate::dedup::CandidateCache,
+        candidate: CandidateCache,
+        read_pool: Option<Arc<ReadPool>>,
         config: DedupConfig,
     ) -> Self {
         Self::start_with_metrics(
@@ -43,10 +70,12 @@ impl DedupScanner {
             lifecycle,
             buffer_pool,
             candidate,
+            read_pool,
             config,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_metrics(
         metrics: Arc<EngineMetrics>,
         meta: Arc<MetaStore>,
@@ -54,7 +83,8 @@ impl DedupScanner {
         allocator: Arc<SpaceAllocator>,
         lifecycle: Arc<VolumeLifecycleManager>,
         buffer_pool: Arc<WriteBufferPool>,
-        candidate: crate::dedup::CandidateCache,
+        candidate: CandidateCache,
+        read_pool: Option<Arc<ReadPool>>,
         config: DedupConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -74,6 +104,7 @@ impl DedupScanner {
                     &lifecycle,
                     &buffer_pool,
                     &candidate,
+                    read_pool.as_deref(),
                     &config_clone,
                     &running_clone,
                 );
@@ -93,6 +124,7 @@ impl DedupScanner {
         self.config.store(Arc::new(new_config));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_loop(
         metrics: &EngineMetrics,
         meta: &MetaStore,
@@ -100,7 +132,8 @@ impl DedupScanner {
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         buffer_pool: &WriteBufferPool,
-        candidate: &crate::dedup::CandidateCache,
+        candidate: &CandidateCache,
+        read_pool: Option<&ReadPool>,
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
@@ -109,6 +142,11 @@ impl DedupScanner {
         // move. This covers scanner restarts and tests that inject skipped
         // mappings before the scanner shares runtime metrics with the flusher.
         let mut rescan_debt = true;
+        // Per-volume LBA cursor for cold-tail warming. The scanner walks
+        // live blockmap entries in chunked passes; each cycle advances
+        // the cursor by `cold_tail_max_per_cycle` LBAs and wraps at the
+        // end of the volume.
+        let mut cold_tail_cursors: HashMap<String, u64> = HashMap::new();
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
             thread::sleep(Duration::from_millis(cfg.rescan_interval_ms));
@@ -127,47 +165,89 @@ impl DedupScanner {
             }
 
             let skipped_units = metrics.dedup_skipped_units.load(Ordering::Relaxed);
-            if !rescan_debt && skipped_units == last_drained_skipped_units {
-                continue;
-            }
-
-            match Self::rescan_skipped_blocks(
-                meta,
-                io_engine,
-                allocator,
-                lifecycle,
-                candidate,
-                cfg.max_rescan_per_cycle,
-            ) {
-                Ok(stats) => {
-                    metrics
-                        .dedup_rescan_blocks
-                        .fetch_add(stats.rescanned as u64, Ordering::Relaxed);
-                    metrics
-                        .dedup_rescan_hits
-                        .fetch_add(stats.hits as u64, Ordering::Relaxed);
-                    metrics
-                        .dedup_rescan_misses
-                        .fetch_add(stats.misses as u64, Ordering::Relaxed);
-                    if stats.rescanned > 0 {
-                        tracing::info!(
-                            rescanned = stats.rescanned,
-                            hits = stats.hits,
-                            misses = stats.misses,
-                            "dedup scanner: re-processed skipped blocks"
-                        );
+            let need_skipped_pass = rescan_debt || skipped_units != last_drained_skipped_units;
+            if need_skipped_pass {
+                match Self::rescan_skipped_blocks(
+                    meta,
+                    io_engine,
+                    allocator,
+                    lifecycle,
+                    candidate,
+                    cfg.max_rescan_per_cycle,
+                ) {
+                    Ok(stats) => {
+                        metrics
+                            .dedup_rescan_blocks
+                            .fetch_add(stats.rescanned as u64, Ordering::Relaxed);
+                        metrics
+                            .dedup_rescan_hits
+                            .fetch_add(stats.hits as u64, Ordering::Relaxed);
+                        metrics
+                            .dedup_rescan_misses
+                            .fetch_add(stats.misses as u64, Ordering::Relaxed);
+                        if stats.rescanned > 0 {
+                            tracing::info!(
+                                rescanned = stats.rescanned,
+                                hits = stats.hits,
+                                misses = stats.misses,
+                                "dedup scanner: re-processed skipped blocks"
+                            );
+                        }
+                        if cfg.max_rescan_per_cycle > 0
+                            && stats.rescanned >= cfg.max_rescan_per_cycle
+                        {
+                            rescan_debt = true;
+                        } else {
+                            rescan_debt = false;
+                            last_drained_skipped_units = skipped_units;
+                        }
                     }
-                    if cfg.max_rescan_per_cycle > 0 && stats.rescanned >= cfg.max_rescan_per_cycle {
+                    Err(e) => {
                         rescan_debt = true;
-                    } else {
-                        rescan_debt = false;
-                        last_drained_skipped_units = skipped_units;
+                        metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(error = %e, "dedup scanner: rescan failed");
                     }
                 }
-                Err(e) => {
-                    rescan_debt = true;
-                    metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(error = %e, "dedup scanner: rescan failed");
+            }
+
+            // Cold-tail warming runs in cycles where DEDUP_SKIPPED debt
+            // is drained. The skipped path is higher-value (it knows
+            // which entries were never hashed); cold-tail is a
+            // background sweep that recovers ratio for entries warmed
+            // by prior runs of the engine.
+            if !rescan_debt && cfg.cold_tail_max_per_cycle > 0 {
+                match Self::cold_tail_rescan(
+                    meta,
+                    candidate,
+                    read_pool,
+                    &mut cold_tail_cursors,
+                    cfg.cold_tail_max_per_cycle,
+                ) {
+                    Ok(stats) => {
+                        metrics
+                            .dedup_cold_tail_blocks
+                            .fetch_add(stats.warmed as u64, Ordering::Relaxed);
+                        metrics
+                            .dedup_cold_tail_already_warm
+                            .fetch_add(stats.already_warm as u64, Ordering::Relaxed);
+                        metrics
+                            .dedup_cold_tail_errors
+                            .fetch_add(stats.errors as u64, Ordering::Relaxed);
+                        if stats.warmed > 0 || stats.already_warm > 0 {
+                            tracing::debug!(
+                                warmed = stats.warmed,
+                                already_warm = stats.already_warm,
+                                errors = stats.errors,
+                                "dedup scanner: cold-tail pass"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        metrics
+                            .dedup_cold_tail_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(error = %e, "dedup scanner: cold-tail pass failed");
+                    }
                 }
             }
         }
@@ -178,7 +258,7 @@ impl DedupScanner {
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
-        candidate: &crate::dedup::CandidateCache,
+        candidate: &CandidateCache,
         max_per_cycle: usize,
     ) -> OnyxResult<RescanStats> {
         let skipped = meta.scan_dedup_skipped(max_per_cycle)?;
@@ -187,7 +267,6 @@ impl DedupScanner {
         for (vol_id_str, lba, bv) in &skipped {
             let vol_id = VolumeId(vol_id_str.clone());
 
-            // Hold lifecycle read lock
             let result = lifecycle.with_read_lock(vol_id_str, || -> OnyxResult<bool> {
                 // Re-read the mapping to ensure it's still the same
                 let current = meta.get_mapping(&vol_id, *lba)?;
@@ -208,73 +287,21 @@ impl DedupScanner {
                     _ => return Ok(false), // Changed or flag already cleared
                 };
 
-                // Read the physical data
-                let bs = BLOCK_SIZE as usize;
-                let read_size = if current.unit_compressed_size < BLOCK_SIZE {
-                    bs // packed slot: always read full 4KB
-                } else {
-                    ((current.unit_compressed_size as usize + bs - 1) / bs) * bs
+                let block = match read_lba_block(io_engine, &current)? {
+                    Some(b) => b,
+                    None => return Ok(false),
                 };
-                let raw = io_engine.read_blocks(current.pba, read_size)?;
+                let hash: ContentHash = compute_content_hash(&block);
 
-                // Extract the compressed fragment
-                let start = current.slot_offset as usize;
-                let end = start + current.unit_compressed_size as usize;
-                if end > raw.len() {
-                    return Ok(false);
-                }
-                let compressed = &raw[start..end];
-
-                // CRC verification — detect silent corruption before trusting data
-                let actual_crc = crc32fast::hash(compressed);
-                if actual_crc != current.crc32 {
-                    tracing::warn!(
-                        pba = current.pba.0,
-                        slot_offset = current.slot_offset,
-                        expected_crc = current.crc32,
-                        actual_crc,
-                        "dedup scanner: CRC mismatch, skipping corrupt block"
-                    );
-                    return Ok(false);
-                }
-
-                // Decompress
-                let algo = crate::types::CompressionAlgo::from_u8(current.compression)
-                    .unwrap_or(crate::types::CompressionAlgo::None);
-                let compressor = create_compressor(algo);
-                let mut decompressed = vec![0u8; current.unit_original_size as usize];
-                if current.compression != 0 {
-                    compressor.decompress(
-                        compressed,
-                        &mut decompressed,
-                        current.unit_original_size as usize,
-                    )?;
-                } else {
-                    decompressed[..compressed.len()].copy_from_slice(compressed);
-                }
-
-                // Extract this LBA's 4KB block
-                let offset = current.offset_in_unit as usize * bs;
-                if offset + bs > decompressed.len() {
-                    return Ok(false);
-                }
-                let block = &decompressed[offset..offset + bs];
-
-                // Hash the block
-                let hash: ContentHash = crate::meta::schema::compute_content_hash(block);
-
-                // Look up dedup index
                 match meta.get_dedup_entry(&hash)? {
                     Some(existing) if meta.dedup_entry_is_live(&hash, &existing)? => {
-                        // Dedup hit! Remap this LBA to existing PBA
+                        // Persistent dedup hit: remap LBA to the live
+                        // PBA and decrement the now-orphaned old PBA.
                         let new_bv = BlockmapValue {
                             flags: 0, // Clear DEDUP_SKIPPED
                             ..existing.to_blockmap_value()
                         };
-                        // atomic_dedup_hit re-reads old mapping inside the lock
                         let decremented = meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash)?;
-
-                        // Free old PBA if refcount dropped to 0
                         if let Some((old_pba, old_blocks)) = decremented {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
@@ -287,37 +314,15 @@ impl DedupScanner {
                         }
                         stats.hits += 1;
                     }
-                    Some(_) => {
-                        // The forward index may already have been re-registered
-                        // to a different live PBA. Do not tombstone it here;
-                        // normal dead-PBA cleanup owns stale reverse/index rows.
-                        let entry = DedupEntry {
-                            pba: current.pba,
-                            slot_offset: current.slot_offset,
-                            compression: current.compression,
-                            unit_compressed_size: current.unit_compressed_size,
-                            unit_original_size: current.unit_original_size,
-                            unit_lba_count: current.unit_lba_count,
-                            offset_in_unit: current.offset_in_unit,
-                            crc32: current.crc32,
-                        };
-                        meta.put_dedup_entries(&[(hash, entry)])?;
-                        meta.update_blockmap_flags(&vol_id, *lba, 0)?;
-                        stats.misses += 1;
-                    }
                     _ => {
-                        // Dedup miss: register in index and clear flag
-                        let entry = DedupEntry {
-                            pba: current.pba,
-                            slot_offset: current.slot_offset,
-                            compression: current.compression,
-                            unit_compressed_size: current.unit_compressed_size,
-                            unit_original_size: current.unit_original_size,
-                            unit_lba_count: current.unit_lba_count,
-                            offset_in_unit: current.offset_in_unit,
-                            crc32: current.crc32,
-                        };
-                        meta.put_dedup_entries(&[(hash, entry)])?;
+                        // No live persistent entry. Promote-on-verified-hit
+                        // means we do **not** write the dedup_index here:
+                        // first-occurrence misses go to the candidate cache
+                        // and only get promoted when a future duplicate
+                        // write byte-verifies against this PBA. Drop the
+                        // FLAG_DEDUP_SKIPPED bit so the scanner does not
+                        // re-process this LBA forever.
+                        candidate.insert(hash, BlockmapValue { flags: 0, ..current });
                         meta.update_blockmap_flags(&vol_id, *lba, 0)?;
                         stats.misses += 1;
                     }
@@ -328,6 +333,155 @@ impl DedupScanner {
 
             if result {
                 stats.rescanned += 1;
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Cold-tail warming pass: walk a chunk of live blockmap entries
+    /// per cycle, hash the content, and warm the candidate cache. The
+    /// cursor advances `chunk` LBAs each cycle; when it reaches the
+    /// end of a volume it wraps to 0.
+    ///
+    /// LV3 reads go through the engine's `ReadPool` so the cycle's IO
+    /// is fanned out via io_uring at high queue depth. When no
+    /// `ReadPool` is configured the pass is skipped — serial blocking
+    /// reads would dominate scanner runtime and squander budget.
+    fn cold_tail_rescan(
+        meta: &MetaStore,
+        candidate: &CandidateCache,
+        read_pool: Option<&ReadPool>,
+        cursors: &mut HashMap<String, u64>,
+        budget: usize,
+    ) -> OnyxResult<ColdTailStats> {
+        let mut stats = ColdTailStats::default();
+        let Some(pool) = read_pool else {
+            // Without a ReadPool we cannot batch reads through io_uring.
+            // Serial blocking reads here would compete with foreground
+            // IO and rarely finish a meaningful budget per cycle, so
+            // we skip cold-tail entirely.
+            return Ok(stats);
+        };
+        if budget == 0 {
+            return Ok(stats);
+        }
+
+        let volumes = meta.list_volumes()?;
+        if volumes.is_empty() {
+            return Ok(stats);
+        }
+
+        // Walk each volume in turn until we exhaust the per-cycle
+        // budget. The cursor is per-volume so a small volume that
+        // wraps quickly does not starve a large volume of progress.
+        let mut remaining = budget;
+        for vol in &volumes {
+            if remaining == 0 {
+                break;
+            }
+            let total_lbas = vol.size_bytes / u64::from(vol.block_size);
+            if total_lbas == 0 {
+                continue;
+            }
+            let cursor = cursors.entry(vol.id.0.clone()).or_insert(0);
+            if *cursor >= total_lbas {
+                *cursor = 0;
+            }
+
+            let chunk = (remaining as u64).min(total_lbas - *cursor);
+
+            // Collect candidate entries to warm in this chunk. We
+            // reject entries that:
+            //  - are flagged DEDUP_SKIPPED (the rescan_skipped path
+            //    handles those — their hashes are not yet known so we
+            //    do not want a duplicate read here),
+            //  - already have a candidate cache entry pointing at
+            //    their PBA (warmed by the writer or a previous cycle),
+            //  - already live in the persistent dedup_index (a future
+            //    duplicate would hit the index directly without need
+            //    of a candidate slot).
+            let mut targets: Vec<(Lba, BlockmapValue)> = Vec::new();
+            let mut already_warm = 0usize;
+            meta.scan_blockmap_range(&vol.id, Lba(*cursor), chunk, &mut |lba, value| {
+                if value.flags & FLAG_DEDUP_SKIPPED != 0 {
+                    return;
+                }
+                if candidate.has_pba(value.pba) {
+                    already_warm += 1;
+                    return;
+                }
+                targets.push((lba, value));
+            })?;
+
+            stats.already_warm += already_warm;
+            *cursor = cursor.saturating_add(chunk);
+            remaining = remaining.saturating_sub(chunk as usize);
+
+            if targets.is_empty() {
+                continue;
+            }
+
+            // Fan out the LV3 reads through ReadPool so io_uring can
+            // keep multiple SQEs in flight for one drain.
+            let mut receivers = Vec::with_capacity(targets.len());
+            for (_lba, bv) in &targets {
+                match pool.submit_read_async(*bv) {
+                    Ok(rx) => receivers.push(Some(rx)),
+                    Err(e) => {
+                        stats.errors += 1;
+                        tracing::debug!(
+                            pba = bv.pba.0,
+                            error = %e,
+                            "cold-tail: failed to enqueue ReadPool request"
+                        );
+                        receivers.push(None);
+                    }
+                }
+            }
+
+            for ((_lba, bv), rx_opt) in targets.iter().zip(receivers.into_iter()) {
+                let Some(rx) = rx_opt else { continue };
+                let block = match rx.recv() {
+                    Ok(Ok(buf)) if buf.len() == BLOCK_SIZE as usize => buf,
+                    Ok(Ok(_)) => {
+                        stats.errors += 1;
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        stats.errors += 1;
+                        tracing::debug!(
+                            pba = bv.pba.0,
+                            error = %e,
+                            "cold-tail: ReadPool returned error"
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        stats.errors += 1;
+                        tracing::debug!(
+                            pba = bv.pba.0,
+                            "cold-tail: ReadPool reply channel dropped"
+                        );
+                        continue;
+                    }
+                };
+                let hash = compute_content_hash(&block);
+
+                // If the hash is already in the persistent dedup
+                // index, warming the candidate cache is wasted: future
+                // duplicate writes hit dedup_index directly without
+                // probing the candidate cache. Count as already_warm
+                // and skip the insert so we do not push useful entries
+                // out of the LRU.
+                let already_in_index = matches!(meta.get_dedup_entry(&hash), Ok(Some(_)));
+                if already_in_index {
+                    stats.already_warm += 1;
+                    continue;
+                }
+
+                candidate.insert(hash, BlockmapValue { flags: 0, ..*bv });
+                stats.warmed += 1;
             }
         }
 
@@ -353,4 +507,72 @@ struct RescanStats {
     rescanned: usize,
     hits: usize,
     misses: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ColdTailStats {
+    /// Entries the scanner read, hashed, and inserted into the
+    /// candidate cache.
+    warmed: usize,
+    /// Entries the scanner skipped because either the candidate cache
+    /// already had a fingerprint for the PBA or the persistent dedup
+    /// index already had an entry for the hash.
+    already_warm: usize,
+    /// Entries the scanner could not warm due to ReadPool errors,
+    /// short reads, or dedup-index probe failures.
+    errors: usize,
+}
+
+/// Read the 4 KiB physical block backing one blockmap entry. Handles
+/// packed slots (`slot_offset > 0`), compression, and unit-internal
+/// LBA offsets. Returns `Ok(None)` for soft failures (CRC mismatch,
+/// out-of-range slot, decode failure) so the scanner can skip the
+/// entry instead of erroring out the whole pass.
+fn read_lba_block(io_engine: &IoEngine, bv: &BlockmapValue) -> OnyxResult<Option<Vec<u8>>> {
+    let bs = BLOCK_SIZE as usize;
+    let read_size = if bv.unit_compressed_size < BLOCK_SIZE {
+        bs // packed slot: always read full 4KB
+    } else {
+        ((bv.unit_compressed_size as usize + bs - 1) / bs) * bs
+    };
+    let raw = io_engine.read_blocks(bv.pba, read_size)?;
+
+    let start = bv.slot_offset as usize;
+    let end = start + bv.unit_compressed_size as usize;
+    if end > raw.len() {
+        return Ok(None);
+    }
+    let compressed = &raw[start..end];
+
+    let actual_crc = crc32fast::hash(compressed);
+    if actual_crc != bv.crc32 {
+        tracing::warn!(
+            pba = bv.pba.0,
+            slot_offset = bv.slot_offset,
+            expected_crc = bv.crc32,
+            actual_crc,
+            "dedup scanner: CRC mismatch, skipping corrupt block"
+        );
+        return Ok(None);
+    }
+
+    let algo = crate::types::CompressionAlgo::from_u8(bv.compression)
+        .unwrap_or(crate::types::CompressionAlgo::None);
+    let compressor = create_compressor(algo);
+    let mut decompressed = vec![0u8; bv.unit_original_size as usize];
+    if bv.compression != 0 {
+        compressor.decompress(
+            compressed,
+            &mut decompressed,
+            bv.unit_original_size as usize,
+        )?;
+    } else {
+        decompressed[..compressed.len()].copy_from_slice(compressed);
+    }
+
+    let offset = bv.offset_in_unit as usize * bs;
+    if offset + bs > decompressed.len() {
+        return Ok(None);
+    }
+    Ok(Some(decompressed[offset..offset + bs].to_vec()))
 }

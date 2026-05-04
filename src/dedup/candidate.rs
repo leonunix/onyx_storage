@@ -253,6 +253,18 @@ impl CandidateCache {
         }
     }
 
+    /// True if the cache currently holds at least one fingerprint
+    /// pointing at `pba`. Cheap (one DashMap probe, no LRU lock); used
+    /// by the cold-tail rescan to skip warming entries the writer or a
+    /// previous cycle already cached.
+    pub fn has_pba(&self, pba: Pba) -> bool {
+        self.inner
+            .pba_to_hashes
+            .get(&pba)
+            .map(|entry| !entry.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Total live entries across all shards. Acquires every shard
     /// mutex once; intended for metrics, not the hot path.
     pub fn len(&self) -> usize {
