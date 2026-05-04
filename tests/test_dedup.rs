@@ -189,6 +189,7 @@ fn start_scanner(
         allocator.clone(),
         lifecycle.clone(),
         pool.clone(),
+        onyx_storage::dedup::CandidateCache::new(8, 64),
         config,
     )
 }

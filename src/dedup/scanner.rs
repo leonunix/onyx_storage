@@ -32,6 +32,7 @@ impl DedupScanner {
         allocator: Arc<SpaceAllocator>,
         lifecycle: Arc<VolumeLifecycleManager>,
         buffer_pool: Arc<WriteBufferPool>,
+        candidate: crate::dedup::CandidateCache,
         config: DedupConfig,
     ) -> Self {
         Self::start_with_metrics(
@@ -41,6 +42,7 @@ impl DedupScanner {
             allocator,
             lifecycle,
             buffer_pool,
+            candidate,
             config,
         )
     }
@@ -52,6 +54,7 @@ impl DedupScanner {
         allocator: Arc<SpaceAllocator>,
         lifecycle: Arc<VolumeLifecycleManager>,
         buffer_pool: Arc<WriteBufferPool>,
+        candidate: crate::dedup::CandidateCache,
         config: DedupConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -70,6 +73,7 @@ impl DedupScanner {
                     &allocator,
                     &lifecycle,
                     &buffer_pool,
+                    &candidate,
                     &config_clone,
                     &running_clone,
                 );
@@ -96,6 +100,7 @@ impl DedupScanner {
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         buffer_pool: &WriteBufferPool,
+        candidate: &crate::dedup::CandidateCache,
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
@@ -131,6 +136,7 @@ impl DedupScanner {
                 io_engine,
                 allocator,
                 lifecycle,
+                candidate,
                 cfg.max_rescan_per_cycle,
             ) {
                 Ok(stats) => {
@@ -172,6 +178,7 @@ impl DedupScanner {
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
+        candidate: &crate::dedup::CandidateCache,
         max_per_cycle: usize,
     ) -> OnyxResult<RescanStats> {
         let skipped = meta.scan_dedup_skipped(max_per_cycle)?;
@@ -272,6 +279,7 @@ impl DedupScanner {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
                                 allocator,
+                                candidate,
                                 old_pba,
                                 old_blocks,
                                 "dedup_scanner_cleanup",

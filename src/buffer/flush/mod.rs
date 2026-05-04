@@ -50,8 +50,7 @@ pub struct BufferFlusher {
     /// pre-wired so the rest of the engine can already construct a
     /// flusher with a real cache and the integration commits don't
     /// have to re-touch the public constructor signature.
-    #[allow(dead_code)]
-    candidate: Arc<crate::dedup::CandidateCache>,
+    candidate: crate::dedup::CandidateCache,
 }
 
 struct FlusherLane {
@@ -491,9 +490,11 @@ impl BufferFlusher {
         // the same metadb shard, preserving the inline-dedup commit
         // fast path. Per-shard capacity defaults to
         // CandidateCache::DEFAULT_PER_SHARD_CAPACITY when the dedup
-        // config does not pin a value (the field is optional so
-        // existing configs keep working).
-        let candidate = Arc::new(crate::dedup::CandidateCache::new(
+        // config does not pin a value. CandidateCache is itself an
+        // Arc<Inner> wrapper — `.clone()` is cheap and shares the
+        // same backing storage across every flusher thread that
+        // captures a copy.
+        let candidate = crate::dedup::CandidateCache::new(
             dedup_config
                 .candidate_shards
                 .unwrap_or(8)
@@ -501,7 +502,7 @@ impl BufferFlusher {
             dedup_config
                 .candidate_per_shard_capacity
                 .unwrap_or(crate::dedup::candidate::DEFAULT_PER_SHARD_CAPACITY),
-        ));
+        );
         let running = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(FlusherInFlightTracker::default());
         let lane_count = pool.shard_count().max(1);
@@ -712,6 +713,7 @@ impl BufferFlusher {
             let meta_cl = meta.clone();
             let allocator_cl = allocator.clone();
             let metrics_cl = metrics.clone();
+            let candidate_cl = candidate.clone();
             let cleanup_handle = thread::Builder::new()
                 .name(format!("flusher-cleanup-{}", shard_idx))
                 .spawn(move || {
@@ -721,6 +723,7 @@ impl BufferFlusher {
                         &cleanup_rx,
                         &meta_cl,
                         &allocator_cl,
+                        &candidate_cl,
                         &running_cl,
                         &metrics_cl,
                     );
@@ -748,8 +751,9 @@ impl BufferFlusher {
     /// Handle to the per-shard RAM candidate cache. Exposed so the
     /// engine can wire the cleanup hook (refcount→0 → candidate
     /// remove) and the dedup scanner can warm the cache during
-    /// background rescans.
-    pub fn candidate_cache(&self) -> Arc<crate::dedup::CandidateCache> {
+    /// background rescans. Cheap clone — shares the same backing
+    /// shards.
+    pub fn candidate_cache(&self) -> crate::dedup::CandidateCache {
         self.candidate.clone()
     }
 

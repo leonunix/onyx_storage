@@ -640,6 +640,7 @@ impl OnyxEngine {
                 allocator.clone(),
                 lifecycle.clone(),
                 buffer_pool.clone(),
+                flusher.candidate_cache(),
                 config.dedup.clone(),
             ))
         } else {
@@ -1119,6 +1120,7 @@ impl OnyxEngine {
                 allocator.clone(),
                 lifecycle.clone(),
                 buffer_pool.clone(),
+                flusher.candidate_cache(),
                 config.dedup.clone(),
             ))
         } else {
