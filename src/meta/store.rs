@@ -329,6 +329,22 @@ impl MetaStore {
         self.backend.atomic_batch_dedup_hits(vol_id, hits)
     }
 
+    /// Same as [`atomic_batch_dedup_hits`] but also writes
+    /// `promote_entries` into `dedup_index` + `dedup_reverse` in the
+    /// same metadb transaction. Used by the promote-on-verified-hit
+    /// path so the dedup_index registration and the LBA remap land
+    /// atomically — a crash between the two would leave the cache
+    /// promotion half-applied.
+    pub fn atomic_batch_dedup_hits_with_promote(
+        &self,
+        vol_id: &VolumeId,
+        hits: &[(Lba, BlockmapValue, ContentHash)],
+        promote_entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+        self.backend
+            .atomic_batch_dedup_hits_with_promote(vol_id, hits, promote_entries)
+    }
+
     pub fn get_dedup_entry(&self, hash: &ContentHash) -> OnyxResult<Option<DedupEntry>> {
         self.backend.get_dedup(hash)
     }

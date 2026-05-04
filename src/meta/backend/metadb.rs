@@ -889,7 +889,16 @@ impl MetadbBackend {
         vol_id: &VolumeId,
         hits: &[(Lba, BlockmapValue, ContentHash)],
     ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
-        if hits.is_empty() {
+        self.atomic_batch_dedup_hits_with_promote(vol_id, hits, &[])
+    }
+
+    pub(crate) fn atomic_batch_dedup_hits_with_promote(
+        &self,
+        vol_id: &VolumeId,
+        hits: &[(Lba, BlockmapValue, ContentHash)],
+        promote_entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+        if hits.is_empty() && promote_entries.is_empty() {
             return Ok((Vec::new(), HashMap::new()));
         }
         let ord = self.volume_ordinal(vol_id)?;
@@ -901,6 +910,13 @@ impl MetadbBackend {
                 to_l2p_value(value),
                 Some((to_metadb_pba(value.pba), 1)),
             );
+        }
+        // Promote candidate-cache hits into the persistent dedup
+        // tables. Atomic with the LBA remaps: if the commit succeeds,
+        // both happen; if it fails, neither.
+        for (hash, entry) in promote_entries {
+            tx.put_dedup(*hash, to_dedup_value(entry));
+            tx.register_dedup_reverse(to_metadb_pba(entry.pba), *hash);
         }
         let (_, outcomes) = tx.commit_with_outcomes()?;
         dedup_hit_results_from_remaps(hits, outcomes)

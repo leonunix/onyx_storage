@@ -490,6 +490,7 @@ impl BufferFlusher {
                 lifecycle,
                 metrics,
                 cleanup_tx,
+                candidate,
             );
 
             for prepared_unit in prepared {
@@ -753,6 +754,7 @@ impl BufferFlusher {
         lifecycle: &VolumeLifecycleManager,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        candidate: &crate::dedup::CandidateCache,
     ) {
         let mut by_volume: HashMap<String, Vec<usize>> = HashMap::new();
         for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
@@ -834,6 +836,7 @@ impl BufferFlusher {
                                         meta,
                                         metrics,
                                         cleanup_tx,
+                                        candidate,
                                     );
                                 }
                             } else {
@@ -853,6 +856,7 @@ impl BufferFlusher {
                         meta,
                         metrics,
                         cleanup_tx,
+                        candidate,
                     );
                 }
             });
@@ -867,6 +871,7 @@ impl BufferFlusher {
         meta: &MetaStore,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        candidate: &crate::dedup::CandidateCache,
     ) {
         let chunk = std::mem::take(pending);
         metrics
@@ -876,12 +881,41 @@ impl BufferFlusher {
             .iter()
             .map(|(_, _, lba, value, hash)| (*lba, *value, *hash))
             .collect();
+
+        // Collect promote_candidates from the unit_idx values present
+        // in this chunk. Each (lba_idx, hash, dedup_entry) tuple is a
+        // confirmed candidate-source hit that we want to register
+        // into dedup_index/dedup_reverse atomically with the LBA
+        // remap. Drain `promote_candidates` so we don't re-promote
+        // the same entry on a subsequent chunk.
+        let mut chunk_unit_idxs: std::collections::HashSet<usize> =
+            chunk.iter().map(|(u, _, _, _, _)| *u).collect();
+        let mut promote_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        for unit_idx in chunk_unit_idxs.drain() {
+            let drained = std::mem::take(&mut prepared[unit_idx].promote_candidates);
+            for (_, hash, entry) in drained {
+                promote_entries.push((hash, entry));
+            }
+        }
+
         let hit_commit_start = Instant::now();
-        let batch_result = meta.atomic_batch_dedup_hits(vol_id, &batch_input);
+        let batch_result =
+            meta.atomic_batch_dedup_hits_with_promote(vol_id, &batch_input, &promote_entries);
         Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
 
         match batch_result {
             Ok((results, newly_zeroed)) => {
+                // Promotion landed in the persistent dedup_index — drop
+                // the now-redundant candidate slot. If promote_entries
+                // was empty (no candidate hits in this chunk) this is
+                // a no-op.
+                for (hash, _) in &promote_entries {
+                    candidate.remove_by_hash(hash);
+                }
+                metrics
+                    .dedup_promotions_committed
+                    .fetch_add(promote_entries.len() as u64, Ordering::Relaxed);
+
                 for ((unit_idx, hit_idx, lba, _, _), result) in chunk.into_iter().zip(results) {
                     match result {
                         DedupHitResult::Accepted(_) => {
@@ -908,14 +942,18 @@ impl BufferFlusher {
                 metrics
                     .dedup_hit_failures
                     .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                metrics
+                    .dedup_promotions_failed
+                    .fetch_add(promote_entries.len() as u64, Ordering::Relaxed);
                 for (unit_idx, hit_idx, _, _, _) in chunk {
                     prepared[unit_idx].is_hit[hit_idx] = false;
                 }
                 tracing::error!(
                     vol = %vol_id_str,
                     count = batch_input.len(),
+                    promotes = promote_entries.len(),
                     error = %e,
-                    "dedup worker: batch hit failed, demoting all to miss"
+                    "dedup worker: batch hit + promote commit failed, demoting all to miss"
                 );
             }
         }

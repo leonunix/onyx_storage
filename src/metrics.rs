@@ -216,6 +216,18 @@ pub struct EngineMetrics {
     pub dedup_stale_delete_ns: AtomicU64,
     pub dedup_hit_commit_ops: AtomicU64,
     pub dedup_hit_commit_ns: AtomicU64,
+    /// Number of candidate-cache hits that have been verified
+    /// (LV3 byte-compare passed) and successfully promoted into the
+    /// persistent dedup_index/dedup_reverse tables in the dedup
+    /// worker's atomic commit batch. Counts confirmed-duplicate
+    /// promotions only — first-occurrence inserts into the candidate
+    /// cache do not bump this counter.
+    pub dedup_promotions_committed: AtomicU64,
+    /// Promotions that were lost to a failed atomic commit (entire
+    /// chunk rolled back). The candidate cache slot stays around so
+    /// the next sighting will retry; counter helps detect persistent
+    /// commit-failure stuck states.
+    pub dedup_promotions_failed: AtomicU64,
     pub dedup_register_batches: AtomicU64,
     pub dedup_register_entries: AtomicU64,
     pub dedup_register_batch_max_entries: AtomicU64,
@@ -428,6 +440,8 @@ impl Default for EngineMetrics {
             dedup_stale_delete_ns: AtomicU64::new(0),
             dedup_hit_commit_ops: AtomicU64::new(0),
             dedup_hit_commit_ns: AtomicU64::new(0),
+            dedup_promotions_committed: AtomicU64::new(0),
+            dedup_promotions_failed: AtomicU64::new(0),
             dedup_register_batches: AtomicU64::new(0),
             dedup_register_entries: AtomicU64::new(0),
             dedup_register_batch_max_entries: AtomicU64::new(0),
@@ -590,6 +604,8 @@ impl EngineMetrics {
             dedup_stale_delete_ns: load(&self.dedup_stale_delete_ns),
             dedup_hit_commit_ops: load(&self.dedup_hit_commit_ops),
             dedup_hit_commit_ns: load(&self.dedup_hit_commit_ns),
+            dedup_promotions_committed: load(&self.dedup_promotions_committed),
+            dedup_promotions_failed: load(&self.dedup_promotions_failed),
             dedup_register_batches: load(&self.dedup_register_batches),
             dedup_register_entries: load(&self.dedup_register_entries),
             dedup_register_batch_max_entries: load(&self.dedup_register_batch_max_entries),
@@ -740,6 +756,8 @@ pub struct EngineMetricsSnapshot {
     pub dedup_stale_delete_ns: u64,
     pub dedup_hit_commit_ops: u64,
     pub dedup_hit_commit_ns: u64,
+    pub dedup_promotions_committed: u64,
+    pub dedup_promotions_failed: u64,
     pub dedup_register_batches: u64,
     pub dedup_register_entries: u64,
     pub dedup_register_batch_max_entries: u64,
@@ -921,6 +939,8 @@ impl EngineMetricsSnapshot {
             dedup_stale_delete_ns,
             dedup_hit_commit_ops,
             dedup_hit_commit_ns,
+            dedup_promotions_committed,
+            dedup_promotions_failed,
             dedup_register_batches,
             dedup_register_entries,
             dedup_register_batch_max_entries,
