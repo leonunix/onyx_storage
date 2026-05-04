@@ -6,6 +6,39 @@ use std::time::Instant;
 use dashmap::DashMap;
 use serde::Serialize;
 
+const LATENCY_BUCKETS: usize = 64;
+const MAX_READ_POOL_WORKERS: usize = 128;
+
+fn latency_bucket(ns: u64) -> usize {
+    if ns == 0 {
+        0
+    } else {
+        (u64::BITS as usize - ns.leading_zeros() as usize).min(LATENCY_BUCKETS - 1)
+    }
+}
+
+fn record_latency_bucket(buckets: &[AtomicU64; LATENCY_BUCKETS], ns: u64) {
+    buckets[latency_bucket(ns)].fetch_add(1, Ordering::Relaxed);
+}
+
+fn load_latency_buckets(buckets: &[AtomicU64; LATENCY_BUCKETS]) -> Vec<u64> {
+    load_atomic_slice(buckets)
+}
+
+fn load_atomic_slice(counters: &[AtomicU64]) -> Vec<u64> {
+    counters
+        .iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .collect()
+}
+
+fn sub_latency_buckets(now: &[u64], earlier: &[u64]) -> Vec<u64> {
+    now.iter()
+        .enumerate()
+        .map(|(idx, value)| value.saturating_sub(earlier.get(idx).copied().unwrap_or(0)))
+        .collect()
+}
+
 /// Per-volume IO counters.
 #[derive(Debug)]
 pub struct VolumeMetrics {
@@ -132,6 +165,13 @@ pub struct EngineMetrics {
     pub read_pool_alloc_ns: AtomicU64,
     pub read_pool_submit_wait_ns: AtomicU64,
     pub read_pool_decode_ns: AtomicU64,
+    pub read_pool_queue_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub read_pool_submit_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub read_pool_decode_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub read_pool_worker_requests: [AtomicU64; MAX_READ_POOL_WORKERS],
+    pub read_pool_worker_batches: [AtomicU64; MAX_READ_POOL_WORKERS],
+    pub read_pool_worker_queue_wait_ns: [AtomicU64; MAX_READ_POOL_WORKERS],
+    pub read_pool_worker_submit_wait_ns: [AtomicU64; MAX_READ_POOL_WORKERS],
     pub lv3_write_ops: AtomicU64,
     pub lv3_write_compressed_bytes: AtomicU64,
     pub read_unmapped: AtomicU64,
@@ -149,6 +189,7 @@ pub struct EngineMetrics {
     pub read_submit_meta_query_ns: AtomicU64,
     pub read_submit_meta_route_ns: AtomicU64,
     pub read_submit_unit_io_ns: AtomicU64,
+    pub read_submit_unit_io_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub coalesce_runs: AtomicU64,
     pub coalesced_units: AtomicU64,
     pub coalesced_lbas: AtomicU64,
@@ -237,6 +278,47 @@ impl EngineMetrics {
     pub fn remove_volume_metrics(&self, vol_id: &str) {
         self.volume_metrics.remove(vol_id);
     }
+
+    pub fn record_read_pool_queue_wait_ns(&self, ns: u64) {
+        self.read_pool_queue_wait_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_pool_queue_wait_latency_buckets, ns);
+    }
+
+    pub fn record_read_pool_worker_queue_wait_ns(&self, worker_idx: usize, ns: u64) {
+        if let Some(counter) = self.read_pool_worker_queue_wait_ns.get(worker_idx) {
+            counter.fetch_add(ns, Ordering::Relaxed);
+        }
+        self.record_read_pool_queue_wait_ns(ns);
+    }
+
+    pub fn record_read_pool_submit_wait_ns(&self, worker_idx: usize, ns: u64) {
+        self.read_pool_submit_wait_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_pool_submit_wait_latency_buckets, ns);
+        if let Some(counter) = self.read_pool_worker_submit_wait_ns.get(worker_idx) {
+            counter.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_read_pool_decode_ns(&self, ns: u64) {
+        self.read_pool_decode_ns.fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_pool_decode_latency_buckets, ns);
+    }
+
+    pub fn record_read_pool_worker_batch(&self, worker_idx: usize, requests: u64) {
+        if let Some(counter) = self.read_pool_worker_requests.get(worker_idx) {
+            counter.fetch_add(requests, Ordering::Relaxed);
+        }
+        if let Some(counter) = self.read_pool_worker_batches.get(worker_idx) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_read_submit_unit_io_ns(&self, ns: u64) {
+        self.read_submit_unit_io_ns.fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_submit_unit_io_latency_buckets, ns);
+    }
 }
 
 impl Default for EngineMetrics {
@@ -303,6 +385,13 @@ impl Default for EngineMetrics {
             read_pool_alloc_ns: AtomicU64::new(0),
             read_pool_submit_wait_ns: AtomicU64::new(0),
             read_pool_decode_ns: AtomicU64::new(0),
+            read_pool_queue_wait_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_submit_wait_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_decode_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_batches: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_queue_wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_submit_wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             lv3_write_ops: AtomicU64::new(0),
             lv3_write_compressed_bytes: AtomicU64::new(0),
             read_unmapped: AtomicU64::new(0),
@@ -315,6 +404,7 @@ impl Default for EngineMetrics {
             read_submit_meta_query_ns: AtomicU64::new(0),
             read_submit_meta_route_ns: AtomicU64::new(0),
             read_submit_unit_io_ns: AtomicU64::new(0),
+            read_submit_unit_io_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             coalesce_runs: AtomicU64::new(0),
             coalesced_units: AtomicU64::new(0),
             coalesced_lbas: AtomicU64::new(0),
@@ -447,6 +537,21 @@ impl EngineMetrics {
             read_pool_alloc_ns: load(&self.read_pool_alloc_ns),
             read_pool_submit_wait_ns: load(&self.read_pool_submit_wait_ns),
             read_pool_decode_ns: load(&self.read_pool_decode_ns),
+            read_pool_queue_wait_latency_buckets: load_latency_buckets(
+                &self.read_pool_queue_wait_latency_buckets,
+            ),
+            read_pool_submit_wait_latency_buckets: load_latency_buckets(
+                &self.read_pool_submit_wait_latency_buckets,
+            ),
+            read_pool_decode_latency_buckets: load_latency_buckets(
+                &self.read_pool_decode_latency_buckets,
+            ),
+            read_pool_worker_requests: load_atomic_slice(&self.read_pool_worker_requests),
+            read_pool_worker_batches: load_atomic_slice(&self.read_pool_worker_batches),
+            read_pool_worker_queue_wait_ns: load_atomic_slice(&self.read_pool_worker_queue_wait_ns),
+            read_pool_worker_submit_wait_ns: load_atomic_slice(
+                &self.read_pool_worker_submit_wait_ns,
+            ),
             lv3_write_ops: load(&self.lv3_write_ops),
             lv3_write_compressed_bytes: load(&self.lv3_write_compressed_bytes),
             read_unmapped: load(&self.read_unmapped),
@@ -459,6 +564,9 @@ impl EngineMetrics {
             read_submit_meta_query_ns: load(&self.read_submit_meta_query_ns),
             read_submit_meta_route_ns: load(&self.read_submit_meta_route_ns),
             read_submit_unit_io_ns: load(&self.read_submit_unit_io_ns),
+            read_submit_unit_io_latency_buckets: load_latency_buckets(
+                &self.read_submit_unit_io_latency_buckets,
+            ),
             coalesce_runs: load(&self.coalesce_runs),
             coalesced_units: load(&self.coalesced_units),
             coalesced_lbas: load(&self.coalesced_lbas),
@@ -589,6 +697,13 @@ pub struct EngineMetricsSnapshot {
     pub read_pool_alloc_ns: u64,
     pub read_pool_submit_wait_ns: u64,
     pub read_pool_decode_ns: u64,
+    pub read_pool_queue_wait_latency_buckets: Vec<u64>,
+    pub read_pool_submit_wait_latency_buckets: Vec<u64>,
+    pub read_pool_decode_latency_buckets: Vec<u64>,
+    pub read_pool_worker_requests: Vec<u64>,
+    pub read_pool_worker_batches: Vec<u64>,
+    pub read_pool_worker_queue_wait_ns: Vec<u64>,
+    pub read_pool_worker_submit_wait_ns: Vec<u64>,
     pub lv3_write_ops: u64,
     pub lv3_write_compressed_bytes: u64,
     pub read_unmapped: u64,
@@ -601,6 +716,7 @@ pub struct EngineMetricsSnapshot {
     pub read_submit_meta_query_ns: u64,
     pub read_submit_meta_route_ns: u64,
     pub read_submit_unit_io_ns: u64,
+    pub read_submit_unit_io_latency_buckets: Vec<u64>,
     pub coalesce_runs: u64,
     pub coalesced_units: u64,
     pub coalesced_lbas: u64,
@@ -673,6 +789,38 @@ impl EngineMetricsSnapshot {
                     $(
                         $field: self.$field.saturating_sub(earlier.$field),
                     )+
+                    read_pool_queue_wait_latency_buckets: sub_latency_buckets(
+                        &self.read_pool_queue_wait_latency_buckets,
+                        &earlier.read_pool_queue_wait_latency_buckets,
+                    ),
+                    read_pool_submit_wait_latency_buckets: sub_latency_buckets(
+                        &self.read_pool_submit_wait_latency_buckets,
+                        &earlier.read_pool_submit_wait_latency_buckets,
+                    ),
+                    read_pool_decode_latency_buckets: sub_latency_buckets(
+                        &self.read_pool_decode_latency_buckets,
+                        &earlier.read_pool_decode_latency_buckets,
+                    ),
+                    read_pool_worker_requests: sub_latency_buckets(
+                        &self.read_pool_worker_requests,
+                        &earlier.read_pool_worker_requests,
+                    ),
+                    read_pool_worker_batches: sub_latency_buckets(
+                        &self.read_pool_worker_batches,
+                        &earlier.read_pool_worker_batches,
+                    ),
+                    read_pool_worker_queue_wait_ns: sub_latency_buckets(
+                        &self.read_pool_worker_queue_wait_ns,
+                        &earlier.read_pool_worker_queue_wait_ns,
+                    ),
+                    read_pool_worker_submit_wait_ns: sub_latency_buckets(
+                        &self.read_pool_worker_submit_wait_ns,
+                        &earlier.read_pool_worker_submit_wait_ns,
+                    ),
+                    read_submit_unit_io_latency_buckets: sub_latency_buckets(
+                        &self.read_submit_unit_io_latency_buckets,
+                        &earlier.read_submit_unit_io_latency_buckets,
+                    ),
                 }
             };
         }
@@ -960,6 +1108,9 @@ pub struct MetaMemorySnapshot {
     pub dedup_lane_ready_queue_wait_max_us: u64,
     pub dedup_lane_exec_us: u64,
     pub dedup_lane_exec_max_us: u64,
+    pub dedup_apply_guard_count: u64,
+    pub dedup_apply_guard_us: u64,
+    pub dedup_apply_guard_max_us: u64,
     pub dedup_apply_forward_put_count: u64,
     pub dedup_apply_forward_put_us: u64,
     pub dedup_apply_forward_put_max_us: u64,
@@ -1162,6 +1313,9 @@ impl MetaMemorySnapshot {
             dedup_lane_ready_queue_wait_max_us: self.dedup_lane_ready_queue_wait_max_us,
             dedup_lane_exec_us: sub!(dedup_lane_exec_us),
             dedup_lane_exec_max_us: self.dedup_lane_exec_max_us,
+            dedup_apply_guard_count: sub!(dedup_apply_guard_count),
+            dedup_apply_guard_us: sub!(dedup_apply_guard_us),
+            dedup_apply_guard_max_us: self.dedup_apply_guard_max_us,
             dedup_apply_forward_put_count: sub!(dedup_apply_forward_put_count),
             dedup_apply_forward_put_us: sub!(dedup_apply_forward_put_us),
             dedup_apply_forward_put_max_us: self.dedup_apply_forward_put_max_us,
@@ -1356,6 +1510,9 @@ impl MetaMemorySnapshot {
             dedup_lane_ready_queue_wait_max_us: meta.dedup_lane_ready_queue_wait_max_us,
             dedup_lane_exec_us: meta.dedup_lane_exec_us,
             dedup_lane_exec_max_us: meta.dedup_lane_exec_max_us,
+            dedup_apply_guard_count: meta.dedup_apply_guard_count,
+            dedup_apply_guard_us: meta.dedup_apply_guard_us,
+            dedup_apply_guard_max_us: meta.dedup_apply_guard_max_us,
             dedup_apply_forward_put_count: meta.dedup_apply_forward_put_count,
             dedup_apply_forward_put_us: meta.dedup_apply_forward_put_us,
             dedup_apply_forward_put_max_us: meta.dedup_apply_forward_put_max_us,

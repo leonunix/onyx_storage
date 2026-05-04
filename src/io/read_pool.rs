@@ -16,9 +16,9 @@
 //!   (NVMe sees N concurrent IOs from one syscall), then CRC + decompress on
 //!   the worker thread (decompression scales with worker count).
 //!
-//! Routing: requests are sharded by `hash(pba) % workers` so that future
-//! optimisations (in-flight read coalescing for fragments sharing a slot) can
-//! happen worker-locally.
+//! Routing: requests go through one shared bounded MPMC queue. Faster workers
+//! naturally pull more work, which avoids per-PBA shard hotspots while each
+//! worker still owns its own io_uring instance.
 //!
 //! Buffer hits and unmapped reads are *not* sent through the pool — those
 //! paths are zero-IO and stay inline on the caller thread.
@@ -85,11 +85,11 @@ impl ReadRequest {
 }
 
 struct WorkerHandle {
-    sender: Option<Sender<ReadRequest>>,
     join: Option<JoinHandle<()>>,
 }
 
 pub struct ReadPool {
+    sender: Option<Sender<ReadRequest>>,
     workers: Vec<WorkerHandle>,
 }
 
@@ -117,10 +117,14 @@ impl ReadPool {
         }
         let device_path = device.path().to_path_buf();
         let base_offset = device.base_offset();
+        let channel_cap = workers
+            .saturating_mul(REQUEST_CHANNEL_CAP)
+            .max(REQUEST_CHANNEL_CAP);
+        let (tx, rx) = bounded::<ReadRequest>(channel_cap);
 
         let mut handles = Vec::with_capacity(workers);
         for worker_idx in 0..workers {
-            let (tx, rx) = bounded::<ReadRequest>(REQUEST_CHANNEL_CAP);
+            let rx = rx.clone();
             let session = IoUringSession::new(sq_entries)?;
             let worker_device = RawDevice::open(&device_path)?;
             let metrics = metrics.clone();
@@ -131,6 +135,7 @@ impl ReadPool {
                     affinity::bind_current(ThreadRole::ReadPool, worker_idx);
                     let fd = worker_device.as_raw_fd();
                     let ctx = WorkerCtx {
+                        worker_idx,
                         ring: session,
                         fd,
                         base_offset,
@@ -149,15 +154,20 @@ impl ReadPool {
                         worker_idx, e
                     ))
                 })?;
-            handles.push(WorkerHandle {
-                sender: Some(tx),
-                join: Some(join),
-            });
+            handles.push(WorkerHandle { join: Some(join) });
         }
 
-        tracing::info!(workers, sq_entries, "read pool started");
+        tracing::info!(
+            workers,
+            sq_entries,
+            channel_cap,
+            "read pool started with shared queue"
+        );
 
-        Ok(Self { workers: handles })
+        Ok(Self {
+            sender: Some(tx),
+            workers: handles,
+        })
     }
 
     /// Submit a mapped LV3 read and block until the worker has read + CRC
@@ -215,9 +225,8 @@ impl ReadPool {
         mapping: BlockmapValue,
         return_unit: bool,
     ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
-        let worker_idx = (mapping.pba.0 as usize) % self.workers.len();
         let (reply_tx, reply_rx) = bounded::<OnyxResult<Vec<u8>>>(1);
-        let sender = self.workers[worker_idx]
+        let sender = self
             .sender
             .as_ref()
             .ok_or_else(|| OnyxError::Io(std::io::Error::other("read-pool already shut down")))?;
@@ -238,9 +247,8 @@ impl ReadPool {
         first: BlockmapValue,
         mappings: Vec<BlockmapValue>,
     ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
-        let worker_idx = (first.pba.0 as usize) % self.workers.len();
         let (reply_tx, reply_rx) = bounded::<OnyxResult<Vec<u8>>>(1);
-        let sender = self.workers[worker_idx]
+        let sender = self
             .sender
             .as_ref()
             .ok_or_else(|| OnyxError::Io(std::io::Error::other("read-pool already shut down")))?;
@@ -263,9 +271,7 @@ impl ReadPool {
     /// Drop every sender so worker threads observe a closed channel and exit,
     /// then join. Idempotent — safe to call from `Drop`.
     pub fn shutdown(&mut self) {
-        for w in &mut self.workers {
-            w.sender.take();
-        }
+        self.sender.take();
         for w in &mut self.workers {
             if let Some(join) = w.join.take() {
                 let _ = join.join();
@@ -281,6 +287,7 @@ impl Drop for ReadPool {
 }
 
 struct WorkerCtx {
+    worker_idx: usize,
     ring: IoUringSession,
     fd: RawFd,
     base_offset: u64,
@@ -351,7 +358,7 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
     loop {
         let first = match rx.recv() {
             Ok(req) => {
-                record_queue_wait(&ctx.metrics, &req);
+                record_queue_wait(&ctx.metrics, ctx.worker_idx, &req);
                 req
             }
             Err(_) => return,
@@ -364,7 +371,7 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
             while batch.len() < BATCH_MAX {
                 match rx.try_recv() {
                     Ok(req) => {
-                        record_queue_wait(&ctx.metrics, &req);
+                        record_queue_wait(&ctx.metrics, ctx.worker_idx, &req);
                         batch.push(req);
                     }
                     Err(_) => break,
@@ -379,7 +386,7 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
             }
             match rx.recv_timeout(deadline.saturating_duration_since(now)) {
                 Ok(req) => {
-                    record_queue_wait(&ctx.metrics, &req);
+                    record_queue_wait(&ctx.metrics, ctx.worker_idx, &req);
                     batch.push(req);
                 }
                 Err(_) => break,
@@ -405,6 +412,8 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
     ctx.metrics
         .read_pool_batch_ops
         .fetch_add(request_count, Ordering::Relaxed);
+    ctx.metrics
+        .record_read_pool_worker_batch(ctx.worker_idx, request_count);
 
     for req in batch.drain(..) {
         let read_size = req.read_size(bs);
@@ -452,8 +461,7 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         Ok(c) => c,
         Err(e) => {
             ctx.metrics
-                .read_pool_submit_wait_ns
-                .fetch_add(elapsed_ns(submit_start), Ordering::Relaxed);
+                .record_read_pool_submit_wait_ns(ctx.worker_idx, elapsed_ns(submit_start));
             for req in &scratch.requests {
                 let _ = req
                     .reply
@@ -465,8 +473,7 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         }
     };
     ctx.metrics
-        .read_pool_submit_wait_ns
-        .fetch_add(elapsed_ns(submit_start), Ordering::Relaxed);
+        .record_read_pool_submit_wait_ns(ctx.worker_idx, elapsed_ns(submit_start));
 
     for (i, (req, exp_bytes)) in scratch
         .requests
@@ -514,8 +521,7 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
             extract_lba_from_compressed(buf.as_slice(), &req.mapping, &ctx.metrics)
         };
         ctx.metrics
-            .read_pool_decode_ns
-            .fetch_add(elapsed_ns(decode_start), Ordering::Relaxed);
+            .record_read_pool_decode_ns(elapsed_ns(decode_start));
         let _ = req.reply.send(result);
     }
 }
@@ -524,12 +530,12 @@ fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
-fn record_queue_wait(metrics: &EngineMetrics, req: &ReadRequest) {
-    metrics.read_pool_queue_wait_ns.fetch_add(
+fn record_queue_wait(metrics: &EngineMetrics, worker_idx: usize, req: &ReadRequest) {
+    metrics.record_read_pool_worker_queue_wait_ns(
+        worker_idx,
         Instant::now()
             .saturating_duration_since(req.enqueued_at)
             .as_nanos() as u64,
-        Ordering::Relaxed,
     );
 }
 

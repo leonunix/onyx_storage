@@ -37,7 +37,7 @@ use_hugepages = false
 default_compression = "Lz4"
 io_backend = "uring"
 uring_sq_entries = 1024
-read_pool_workers = 32
+read_pool_workers = 16
 
 [buffer]
 device = "/dev/md/onyx-lv2"

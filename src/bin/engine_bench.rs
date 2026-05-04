@@ -429,6 +429,32 @@ fn print_report(
     let lv3_bytes_per_lba = avg(metrics.lv3_read_compressed_bytes, mapped_lbas);
     let lv3_reads_per_submit = avg(metrics.lv3_read_ops, metrics.read_submit_calls);
     let read_pool_batch_avg = avg(metrics.read_pool_batch_ops, metrics.read_pool_batches);
+    let read_pool_queue_p95 =
+        latency_bucket_percentile(&metrics.read_pool_queue_wait_latency_buckets, 95.0);
+    let read_pool_queue_p99 =
+        latency_bucket_percentile(&metrics.read_pool_queue_wait_latency_buckets, 99.0);
+    let read_pool_queue_p999 =
+        latency_bucket_percentile(&metrics.read_pool_queue_wait_latency_buckets, 99.9);
+    let read_pool_submit_p95 =
+        latency_bucket_percentile(&metrics.read_pool_submit_wait_latency_buckets, 95.0);
+    let read_pool_submit_p99 =
+        latency_bucket_percentile(&metrics.read_pool_submit_wait_latency_buckets, 99.0);
+    let read_pool_submit_p999 =
+        latency_bucket_percentile(&metrics.read_pool_submit_wait_latency_buckets, 99.9);
+    let read_pool_decode_p99 =
+        latency_bucket_percentile(&metrics.read_pool_decode_latency_buckets, 99.0);
+    let worker_stats = read_pool_worker_stats(metrics);
+    let read_pool_worker_top_share_pct = if metrics.read_pool_batch_ops == 0 {
+        0.0
+    } else {
+        worker_stats.top_requests as f64 * 100.0 / metrics.read_pool_batch_ops as f64
+    };
+    let read_submit_unit_io_p95 =
+        latency_bucket_percentile(&metrics.read_submit_unit_io_latency_buckets, 95.0);
+    let read_submit_unit_io_p99 =
+        latency_bucket_percentile(&metrics.read_submit_unit_io_latency_buckets, 99.0);
+    let read_submit_unit_io_p999 =
+        latency_bucket_percentile(&metrics.read_submit_unit_io_latency_buckets, 99.9);
 
     println!("{{");
     println!("  \"kind\": \"onyx-engine-bench\",");
@@ -475,6 +501,18 @@ fn print_report(
         "  \"read_submit_unit_io_ns\": {},",
         metrics.read_submit_unit_io_ns
     );
+    println!(
+        "  \"read_submit_unit_io_p95_ns\": {},",
+        read_submit_unit_io_p95
+    );
+    println!(
+        "  \"read_submit_unit_io_p99_ns\": {},",
+        read_submit_unit_io_p99
+    );
+    println!(
+        "  \"read_submit_unit_io_p999_ns\": {},",
+        read_submit_unit_io_p999
+    );
     println!("  \"read_buffer_hits\": {},", metrics.read_buffer_hits);
     println!("  \"read_lv3_hits\": {},", metrics.read_lv3_hits);
     println!("  \"lv3_read_ops\": {},", metrics.lv3_read_ops);
@@ -495,9 +533,39 @@ fn print_report(
         metrics.read_pool_batch_ops
     );
     println!("  \"read_pool_batch_avg\": {:.3},", read_pool_batch_avg);
+    println!("  \"read_pool_worker_active\": {},", worker_stats.active);
+    println!("  \"read_pool_worker_top_idx\": {},", worker_stats.top_idx);
+    println!(
+        "  \"read_pool_worker_top_requests\": {},",
+        worker_stats.top_requests
+    );
+    println!(
+        "  \"read_pool_worker_top_share_pct\": {:.3},",
+        read_pool_worker_top_share_pct
+    );
+    println!(
+        "  \"read_pool_worker_top_queue_wait_avg_ns\": {:.3},",
+        avg_u64(worker_stats.top_queue_wait_ns, worker_stats.top_requests)
+    );
+    println!(
+        "  \"read_pool_worker_top_submit_wait_avg_ns\": {:.3},",
+        avg_u64(worker_stats.top_submit_wait_ns, worker_stats.top_batches)
+    );
     println!(
         "  \"read_pool_queue_wait_ns\": {},",
         metrics.read_pool_queue_wait_ns
+    );
+    println!(
+        "  \"read_pool_queue_wait_p95_ns\": {},",
+        read_pool_queue_p95
+    );
+    println!(
+        "  \"read_pool_queue_wait_p99_ns\": {},",
+        read_pool_queue_p99
+    );
+    println!(
+        "  \"read_pool_queue_wait_p999_ns\": {},",
+        read_pool_queue_p999
     );
     println!(
         "  \"read_pool_coalesce_wait_ns\": {},",
@@ -509,9 +577,22 @@ fn print_report(
         metrics.read_pool_submit_wait_ns
     );
     println!(
+        "  \"read_pool_submit_wait_p95_ns\": {},",
+        read_pool_submit_p95
+    );
+    println!(
+        "  \"read_pool_submit_wait_p99_ns\": {},",
+        read_pool_submit_p99
+    );
+    println!(
+        "  \"read_pool_submit_wait_p999_ns\": {},",
+        read_pool_submit_p999
+    );
+    println!(
         "  \"read_pool_decode_ns\": {},",
         metrics.read_pool_decode_ns
     );
+    println!("  \"read_pool_decode_p99_ns\": {},", read_pool_decode_p99);
     println!("  \"dedup_lookups\": {},", metrics.dedup_lookup_ops);
     println!("  \"dedup_lookup_ns\": {},", metrics.dedup_lookup_ns);
     println!("  \"dedup_misses\": {},", metrics.dedup_misses);
@@ -736,6 +817,22 @@ fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
         meta.dedup_apply_forward_put_max_us
     );
     println!(
+        "  \"metadb_dedup_guard_count\": {},",
+        meta.dedup_apply_guard_count
+    );
+    println!(
+        "  \"metadb_dedup_guard_us\": {},",
+        meta.dedup_apply_guard_us
+    );
+    println!(
+        "  \"metadb_dedup_guard_avg_us\": {:.3},",
+        avg_u64(meta.dedup_apply_guard_us, meta.dedup_apply_guard_count)
+    );
+    println!(
+        "  \"metadb_dedup_guard_max_us\": {},",
+        meta.dedup_apply_guard_max_us
+    );
+    println!(
         "  \"metadb_dedup_forward_delete_count\": {},",
         meta.dedup_apply_forward_delete_count
     );
@@ -890,6 +987,78 @@ fn percentile(values: &[u64], pct: f64) -> u64 {
     }
     let rank = ((pct / 100.0) * (values.len().saturating_sub(1) as f64)).round() as usize;
     values[rank.min(values.len() - 1)]
+}
+
+fn latency_bucket_percentile(buckets: &[u64], pct: f64) -> u64 {
+    let total: u64 = buckets.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let rank = ((total as f64 * pct / 100.0).ceil() as u64).max(1);
+    let mut seen = 0u64;
+    for (idx, count) in buckets.iter().copied().enumerate() {
+        seen = seen.saturating_add(count);
+        if seen >= rank {
+            if idx == 0 {
+                return 0;
+            }
+            return 1u64.checked_shl(idx as u32).unwrap_or(u64::MAX);
+        }
+    }
+    u64::MAX
+}
+
+struct ReadPoolWorkerStats {
+    active: usize,
+    top_idx: usize,
+    top_requests: u64,
+    top_batches: u64,
+    top_queue_wait_ns: u64,
+    top_submit_wait_ns: u64,
+}
+
+fn read_pool_worker_stats(metrics: &EngineMetricsSnapshot) -> ReadPoolWorkerStats {
+    let mut stats = ReadPoolWorkerStats {
+        active: 0,
+        top_idx: 0,
+        top_requests: 0,
+        top_batches: 0,
+        top_queue_wait_ns: 0,
+        top_submit_wait_ns: 0,
+    };
+
+    for (idx, requests) in metrics
+        .read_pool_worker_requests
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        if requests == 0 {
+            continue;
+        }
+        stats.active += 1;
+        if requests > stats.top_requests {
+            stats.top_idx = idx;
+            stats.top_requests = requests;
+            stats.top_batches = metrics
+                .read_pool_worker_batches
+                .get(idx)
+                .copied()
+                .unwrap_or(0);
+            stats.top_queue_wait_ns = metrics
+                .read_pool_worker_queue_wait_ns
+                .get(idx)
+                .copied()
+                .unwrap_or(0);
+            stats.top_submit_wait_ns = metrics
+                .read_pool_worker_submit_wait_ns
+                .get(idx)
+                .copied()
+                .unwrap_or(0);
+        }
+    }
+
+    stats
 }
 
 fn fill_buffer(pattern: Pattern, buf: &mut [u8], rng: &mut XorShift64, tid: usize, op_idx: u64) {

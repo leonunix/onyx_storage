@@ -688,8 +688,7 @@ impl ZoneManager {
             result
         };
         self.metrics
-            .read_submit_unit_io_ns
-            .fetch_add(elapsed_ns(pass4_start), Ordering::Relaxed);
+            .record_read_submit_unit_io_ns(elapsed_ns(pass4_start));
         pass4_result
     }
 
