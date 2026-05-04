@@ -37,6 +37,16 @@ pub struct DedupConfig {
     /// Max blocks to re-dedup per scan cycle (default 256).
     #[serde(default = "default_max_rescan_per_cycle")]
     pub max_rescan_per_cycle: usize,
+    /// Number of shards in the in-memory candidate cache. Defaults to 8 when
+    /// unset (matching the metadb dedup_shards default). Must be a power of
+    /// two; the constructor rounds up if not.
+    #[serde(default)]
+    pub candidate_shards: Option<usize>,
+    /// Per-shard capacity of the candidate cache. Defaults to
+    /// `CandidateCache::DEFAULT_PER_SHARD_CAPACITY` (1 M / shard) when unset.
+    /// Total memory ≈ shards × per_shard × ~32 B.
+    #[serde(default)]
+    pub candidate_per_shard_capacity: Option<usize>,
 }
 
 impl Default for DedupConfig {
@@ -50,6 +60,8 @@ impl Default for DedupConfig {
             register_batch_wait_us: default_register_batch_wait_us(),
             rescan_interval_ms: default_rescan_interval_ms(),
             max_rescan_per_cycle: default_max_rescan_per_cycle(),
+            candidate_shards: None,
+            candidate_per_shard_capacity: None,
         }
     }
 }

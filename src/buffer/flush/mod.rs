@@ -41,6 +41,17 @@ pub struct BufferFlusher {
     running: Arc<AtomicBool>,
     lanes: Vec<FlusherLane>,
     in_flight: Arc<FlusherInFlightTracker>,
+    /// Per-shard RAM candidate cache. The first occurrence of a
+    /// fingerprint lands here instead of dedup_index; the next
+    /// sighting (verified by LV3 read-back) is promoted into the
+    /// persistent dedup tables in the writer's atomic batch. The
+    /// writer/dedup-worker integration that actually consumes this
+    /// cache is staged as follow-up commits — this struct slot is
+    /// pre-wired so the rest of the engine can already construct a
+    /// flusher with a real cache and the integration commits don't
+    /// have to re-touch the public constructor signature.
+    #[allow(dead_code)]
+    candidate: Arc<crate::dedup::CandidateCache>,
 }
 
 struct FlusherLane {
@@ -467,6 +478,23 @@ impl BufferFlusher {
         dedup_config: &DedupConfig,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
+        // Build a candidate cache sized from the dedup config. The
+        // shard count tracks the metadb dedup_shards routing so that a
+        // candidate hit and the eventual promote commit always land in
+        // the same metadb shard, preserving the inline-dedup commit
+        // fast path. Per-shard capacity defaults to
+        // CandidateCache::DEFAULT_PER_SHARD_CAPACITY when the dedup
+        // config does not pin a value (the field is optional so
+        // existing configs keep working).
+        let candidate = Arc::new(crate::dedup::CandidateCache::new(
+            dedup_config
+                .candidate_shards
+                .unwrap_or(8)
+                .next_power_of_two(),
+            dedup_config
+                .candidate_per_shard_capacity
+                .unwrap_or(crate::dedup::candidate::DEFAULT_PER_SHARD_CAPACITY),
+        ));
         let running = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(FlusherInFlightTracker::default());
         let lane_count = pool.shard_count().max(1);
@@ -700,7 +728,16 @@ impl BufferFlusher {
             running,
             lanes,
             in_flight,
+            candidate,
         }
+    }
+
+    /// Handle to the per-shard RAM candidate cache. Exposed so the
+    /// engine can wire the cleanup hook (refcount→0 → candidate
+    /// remove) and the dedup scanner can warm the cache during
+    /// background rescans.
+    pub fn candidate_cache(&self) -> Arc<crate::dedup::CandidateCache> {
+        self.candidate.clone()
     }
 
     pub fn stop(&mut self) {
