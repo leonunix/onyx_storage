@@ -583,8 +583,6 @@ pub struct ThreadingConfig {
     #[serde(default)]
     pub flusher_writer_cpus: String,
     #[serde(default)]
-    pub flusher_dedup_register_cpus: String,
-    #[serde(default)]
     pub flusher_cleanup_cpus: String,
     #[serde(default)]
     pub metadb_wal_cpus: String,
@@ -611,7 +609,6 @@ impl Default for ThreadingConfig {
             flusher_dedup_cpus: String::new(),
             flusher_compress_cpus: String::new(),
             flusher_writer_cpus: String::new(),
-            flusher_dedup_register_cpus: String::new(),
             flusher_cleanup_cpus: String::new(),
             metadb_wal_cpus: String::new(),
             metadb_l2p_apply_cpus: String::new(),

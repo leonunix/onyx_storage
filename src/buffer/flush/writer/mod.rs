@@ -46,7 +46,6 @@ impl BufferFlusher {
         packer: &mut Packer,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         candidate: &crate::dedup::CandidateCache,
         packed_meta_batch_max_lbas: usize,
     ) {
@@ -63,8 +62,7 @@ impl BufferFlusher {
                 if !$batch.is_empty() {
                     let results = Self::write_units_batch(
                         shard_idx, &$batch, pool, meta, lifecycle, allocator,
-                        io_engine, metrics, cleanup_tx, dedup_register_tx,
-                        candidate,
+                        io_engine, metrics, cleanup_tx, candidate,
                     );
                     for (idx, result) in results.into_iter().enumerate() {
                         if let Err(e) = result {
@@ -115,7 +113,6 @@ impl BufferFlusher {
                 done_tx,
                 metrics,
                 cleanup_tx,
-                dedup_register_tx,
                 candidate,
             ) {
                 tail_dirty = true;
@@ -135,7 +132,6 @@ impl BufferFlusher {
                             io_engine,
                             metrics,
                             cleanup_tx,
-                            dedup_register_tx,
                             candidate,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
@@ -298,7 +294,6 @@ impl BufferFlusher {
                     io_engine,
                     metrics,
                     cleanup_tx,
-                    dedup_register_tx,
                     candidate,
                     packed_meta_batch_max_lbas,
                 );
@@ -354,7 +349,6 @@ impl BufferFlusher {
                 &mut buffered_completions,
                 metrics,
                 cleanup_tx,
-                dedup_register_tx,
                 candidate,
             );
             tail_dirty = true;
@@ -371,7 +365,6 @@ impl BufferFlusher {
             done_tx,
             metrics,
             cleanup_tx,
-            dedup_register_tx,
             candidate,
         ) {
             tail_dirty = true;
@@ -388,7 +381,6 @@ impl BufferFlusher {
                 io_engine,
                 metrics,
                 cleanup_tx,
-                dedup_register_tx,
                 candidate,
             ) {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
@@ -438,30 +430,6 @@ impl BufferFlusher {
         });
     }
 
-    pub(super) fn dedup_registration(
-        vol_id: VolumeId,
-        lba: Lba,
-        hash: ContentHash,
-        expected: BlockmapValue,
-    ) -> DedupRegistration {
-        DedupRegistration {
-            vol_id,
-            lba,
-            hash,
-            entry: DedupEntry {
-                pba: expected.pba,
-                slot_offset: expected.slot_offset,
-                compression: expected.compression,
-                unit_compressed_size: expected.unit_compressed_size,
-                unit_original_size: expected.unit_original_size,
-                unit_lba_count: expected.unit_lba_count,
-                offset_in_unit: expected.offset_in_unit,
-                crc32: expected.crc32,
-            },
-            expected,
-        }
-    }
-
     pub(super) fn retry_one_packed_slot(
         shard_idx: usize,
         retries: &mut VecDeque<PackedSlotRetry>,
@@ -473,7 +441,6 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         candidate: &crate::dedup::CandidateCache,
     ) -> bool {
         let Some(retry_at) = retries.front().map(|retry| retry.retry_at) else {
@@ -510,7 +477,6 @@ impl BufferFlusher {
             io_engine,
             metrics,
             cleanup_tx,
-            dedup_register_tx,
             candidate,
         ) {
             Ok(()) => {
@@ -549,7 +515,6 @@ impl BufferFlusher {
         buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         candidate: &crate::dedup::CandidateCache,
     ) {
         let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
@@ -586,7 +551,6 @@ impl BufferFlusher {
                     io_engine,
                     metrics,
                     cleanup_tx,
-                    dedup_register_tx,
                     candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
@@ -615,7 +579,6 @@ impl BufferFlusher {
                     io_engine,
                     metrics,
                     cleanup_tx,
-                    dedup_register_tx,
                     candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
@@ -645,7 +608,6 @@ impl BufferFlusher {
                     io_engine,
                     metrics,
                     cleanup_tx,
-                    dedup_register_tx,
                     candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
@@ -667,7 +629,6 @@ impl BufferFlusher {
                     io_engine,
                     metrics,
                     cleanup_tx,
-                    dedup_register_tx,
                     candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);

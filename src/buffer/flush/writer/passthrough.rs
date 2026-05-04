@@ -11,7 +11,6 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         candidate: &crate::dedup::CandidateCache,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
@@ -215,7 +214,6 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         candidate: &crate::dedup::CandidateCache,
     ) -> Vec<OnyxResult<()>> {
         if units.is_empty() {

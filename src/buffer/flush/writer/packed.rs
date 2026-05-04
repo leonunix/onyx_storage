@@ -26,10 +26,8 @@ fn commit_packed_meta_batch(
     slot_metas: &mut [Option<PackedSlotMeta>],
     meta: &MetaStore,
     allocator: &SpaceAllocator,
-    metrics: &EngineMetrics,
     results: &mut [OnyxResult<()>],
     actual_old_pba_meta: &mut HashMap<Pba, (u32, u32)>,
-    _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     candidate: &crate::dedup::CandidateCache,
 ) -> bool {
     if batch_slots.is_empty() {
@@ -84,11 +82,6 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        // Old async-register channel kept on the signature so the
-        // existing call sites keep compiling; unused under
-        // promote-on-verified-hit (Step D), to be removed in the
-        // post-Step-D cleanup commit.
-        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         candidate: &crate::dedup::CandidateCache,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
@@ -328,7 +321,6 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         candidate: &crate::dedup::CandidateCache,
         packed_meta_batch_max_lbas: usize,
     ) -> Vec<OnyxResult<()>> {
@@ -535,10 +527,8 @@ impl BufferFlusher {
                     &mut slot_metas,
                     meta,
                     allocator,
-                    metrics,
                     &mut results,
                     &mut actual_old_pba_meta,
-                    dedup_register_tx,
                     candidate,
                 ) {
                     meta_commits += 1;
@@ -555,10 +545,8 @@ impl BufferFlusher {
                     &mut slot_metas,
                     meta,
                     allocator,
-                    metrics,
                     &mut results,
                     &mut actual_old_pba_meta,
-                    dedup_register_tx,
                     candidate,
                 ) {
                     meta_commits += 1;
@@ -572,10 +560,8 @@ impl BufferFlusher {
             &mut slot_metas,
             meta,
             allocator,
-            metrics,
             &mut results,
             &mut actual_old_pba_meta,
-            dedup_register_tx,
             candidate,
         ) {
             meta_commits += 1;

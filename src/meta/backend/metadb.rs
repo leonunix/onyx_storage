@@ -591,43 +591,6 @@ impl MetadbBackend {
         Ok(())
     }
 
-    pub(crate) fn put_dedup_entries_guarded(
-        &self,
-        entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        if entries.len() > DEDUP_PERSIST_BATCH_LIMIT {
-            for chunk in entries.chunks(DEDUP_PERSIST_BATCH_LIMIT) {
-                self.put_dedup_entries_guarded(chunk)?;
-            }
-            return Ok(());
-        }
-
-        let mut tx = self.db.begin();
-        for (hash, entry) in entries {
-            tx.put_dedup_guarded(*hash, to_dedup_value(entry), to_metadb_pba(entry.pba), 1);
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn dedup_registration_is_current(
-        &self,
-        vol_id: &VolumeId,
-        lba: Lba,
-        expected: &BlockmapValue,
-    ) -> OnyxResult<bool> {
-        let Some(current) = self.get_mapping(vol_id, lba)? else {
-            return Ok(false);
-        };
-        if current != *expected {
-            return Ok(false);
-        }
-        Ok(self.get_refcount(expected.pba)? > 0)
-    }
-
     pub(crate) fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
         let mut tx = self.db.begin();
         if let Some(entry) = self.db.get_dedup(hash)? {
