@@ -12,6 +12,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
         _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        candidate: &crate::dedup::CandidateCache,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
             let total_start = Instant::now();
@@ -116,22 +117,17 @@ impl BufferFlusher {
                     Self::blockmap_for_unit_position(unit, pba, live_positions[i], 0, flags);
                 batch_values.push((lbas[i], blockmap));
             }
-            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
             if !unit.dedup_skipped {
                 if let Some(ref hashes) = unit.block_hashes {
-                    dedup_registrations.reserve(live_positions.len());
+                    fresh_dedup_pairs.reserve(live_positions.len());
                     for &pos in &live_positions {
                         let hash = hashes[pos];
                         if hash == [0u8; 8] {
                             continue;
                         }
                         let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
-                        dedup_registrations.push(Self::dedup_registration(
-                            vol_id.clone(),
-                            Lba(unit.start_lba.0 + pos as u64),
-                            hash,
-                            blockmap,
-                        ));
+                        fresh_dedup_pairs.push((hash, blockmap));
                     }
                 }
             }
@@ -162,12 +158,13 @@ impl BufferFlusher {
                 }
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-            Self::enqueue_dedup_registrations(
-                meta,
-                metrics,
-                _dedup_register_tx,
-                dedup_registrations,
-            );
+            // Post-commit: register first-occurrence (hash, blockmap)
+            // in the RAM candidate cache. dedup_index is left
+            // untouched here — the dedup worker promotes verified
+            // duplicates into the persistent tables.
+            for (hash, blockmap) in fresh_dedup_pairs {
+                candidate.insert(hash, blockmap);
+            }
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
@@ -225,6 +222,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
         _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        candidate: &crate::dedup::CandidateCache,
     ) -> Vec<OnyxResult<()>> {
         if units.is_empty() {
             return Vec::new();
@@ -377,7 +375,9 @@ impl BufferFlusher {
         struct UnitMeta {
             batch_values: Vec<(Lba, BlockmapValue)>,
             live_positions: Vec<usize>,
-            dedup_registrations: Vec<DedupRegistration>,
+            /// First-occurrence (hash, blockmap) pairs for the
+            /// candidate cache; populated alongside batch_values.
+            fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
         }
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
 
@@ -404,7 +404,7 @@ impl BufferFlusher {
                 unit_metas[i] = Some(UnitMeta {
                     batch_values: Vec::new(),
                     live_positions,
-                    dedup_registrations: Vec::new(),
+                    fresh_dedup_pairs: Vec::new(),
                 });
                 continue;
             }
@@ -415,7 +415,7 @@ impl BufferFlusher {
                 .collect();
 
             let mut batch_values = Vec::with_capacity(live_positions.len());
-            let mut dedup_registrations = Vec::new();
+            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
 
             for j in 0..live_positions.len() {
                 let flags = if unit.dedup_skipped {
@@ -429,26 +429,21 @@ impl BufferFlusher {
             }
             if !unit.dedup_skipped {
                 if let Some(ref hashes) = unit.block_hashes {
-                    dedup_registrations.reserve(live_positions.len());
+                    fresh_dedup_pairs.reserve(live_positions.len());
                     for &pos in &live_positions {
                         let hash = hashes[pos];
                         if hash == [0u8; 8] {
                             continue;
                         }
                         let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
-                        dedup_registrations.push(Self::dedup_registration(
-                            VolumeId(unit.vol_id.clone()),
-                            Lba(unit.start_lba.0 + pos as u64),
-                            hash,
-                            blockmap,
-                        ));
+                        fresh_dedup_pairs.push((hash, blockmap));
                     }
                 }
             }
             unit_metas[i] = Some(UnitMeta {
                 batch_values,
                 live_positions,
-                dedup_registrations,
+                fresh_dedup_pairs,
             });
         }
 
@@ -482,20 +477,20 @@ impl BufferFlusher {
                 })
                 .collect();
 
-            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+            let mut all_fresh_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
             for &unit_idx in &meta_indices {
                 let um = unit_metas[unit_idx].as_ref().unwrap();
-                dedup_registrations.extend_from_slice(&um.dedup_registrations);
+                all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
             }
             match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
                 Ok(returned) => {
                     actual_old_pba_meta = returned;
-                    Self::enqueue_dedup_registrations(
-                        meta,
-                        metrics,
-                        _dedup_register_tx,
-                        dedup_registrations,
-                    );
+                    // Post-commit: warm the candidate cache with
+                    // every first-occurrence (hash, blockmap) we just
+                    // wrote.
+                    for (hash, blockmap) in all_fresh_pairs {
+                        candidate.insert(hash, blockmap);
+                    }
                 }
                 Err(e) => {
                     // Entire batch failed — rollback all allocations.

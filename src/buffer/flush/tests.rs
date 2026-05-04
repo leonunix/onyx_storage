@@ -180,6 +180,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -195,6 +196,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -232,6 +234,7 @@ fn raw_passthrough_unit_maps_each_lba_to_its_own_pba() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -296,6 +299,7 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -315,11 +319,12 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
 }
 
 #[test]
-fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
+fn write_unit_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let payload = vec![0x5A; BLOCK_SIZE as usize];
     let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
@@ -338,6 +343,7 @@ fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &candidate,
     )
     .unwrap();
 
@@ -345,21 +351,28 @@ fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
         .get_mapping(&VolumeId("flush-race".into()), Lba(0))
         .unwrap()
         .unwrap();
+    // Promote-on-verified-hit invariant: dedup_index is only written
+    // after a candidate hit is byte-confirmed by LV3 verify, so a
+    // first-occurrence write leaves dedup_index empty.
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "dedup miss registration is kept off the foreground mapping commit"
+        "first-occurrence misses must not write dedup_index"
     );
-    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
-    let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
-    assert_eq!(dedup.to_blockmap_value(), mapping);
+    // Instead, the (hash, blockmap) lands in the RAM candidate cache.
+    assert_eq!(
+        candidate.lookup(&hash),
+        Some(mapping),
+        "first occurrence must register the (hash, blockmap) pair in the candidate cache"
+    );
 }
 
 #[test]
-fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
+fn write_packed_slot_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let payload = vec![0x6B; BLOCK_SIZE as usize];
     let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
@@ -388,6 +401,7 @@ fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &candidate,
     )
     .unwrap();
 
@@ -397,19 +411,22 @@ fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
         .unwrap();
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "packed miss registration is kept off the foreground mapping commit"
+        "packed first-occurrence misses must not write dedup_index"
     );
-    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
-    let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
-    assert_eq!(dedup.to_blockmap_value(), mapping);
+    assert_eq!(
+        candidate.lookup(&hash),
+        Some(mapping),
+        "packed first occurrence must register (hash, blockmap) in candidate cache"
+    );
 }
 
 #[test]
-fn write_packed_slots_batch_enqueues_dedup_registration_after_mapping_commit() {
+fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let mut sealed_slots = Vec::new();
     let mut expected = Vec::new();
@@ -444,25 +461,29 @@ fn write_packed_slots_batch_enqueues_dedup_registration_after_mapping_commit() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &candidate,
         DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
     );
     assert!(results.into_iter().all(|result| result.is_ok()));
 
-    for (hash, _) in &expected {
-        assert!(
-            meta.get_dedup_entry(hash).unwrap().is_none(),
-            "packed batch registration is kept off foreground mapping commits"
-        );
-    }
-    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
-
-    for (hash, lba) in expected {
+    // Promote-on-verified-hit: dedup_index stays empty after a fresh
+    // batch; the (hash, blockmap) pairs land only in the candidate
+    // cache and are promoted later when the dedup worker confirms a
+    // duplicate via LV3 verify.
+    for (hash, lba) in &expected {
         let mapping = meta
-            .get_mapping(&VolumeId("flush-race".into()), lba)
+            .get_mapping(&VolumeId("flush-race".into()), *lba)
             .unwrap()
             .unwrap();
-        let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
-        assert_eq!(dedup.to_blockmap_value(), mapping);
+        assert!(
+            meta.get_dedup_entry(hash).unwrap().is_none(),
+            "packed batch first-occurrence misses must not write dedup_index"
+        );
+        assert_eq!(
+            candidate.lookup(hash),
+            Some(mapping),
+            "packed batch first occurrence must register (hash, blockmap) in candidate cache"
+        );
     }
 }
 
@@ -523,6 +544,7 @@ fn write_packed_slots_batch_splits_oversized_metadata_commits() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
         DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
     );
     assert!(results.into_iter().all(|result| result.is_ok()));
@@ -609,6 +631,7 @@ fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
         &metrics,
         &cleanup_tx,
         &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -945,6 +968,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &metrics_w,
             &cleanup_tx_w,
             &dedup_register_tx_w,
+            &crate::dedup::CandidateCache::new(8, 64),
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
         );
     });
@@ -2005,6 +2029,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
                     metrics1,
                     cleanup_tx1,
                     dedup_register_tx1,
+                    &crate::dedup::CandidateCache::new(8, 64),
                 );
             }
         });
@@ -2400,6 +2425,7 @@ fn packed_slot_overlapping_lba_race() {
                         &metrics,
                         &cleanup_tx,
                         &dedup_register_tx,
+                        &crate::dedup::CandidateCache::new(8, 64),
                     );
                 });
             }

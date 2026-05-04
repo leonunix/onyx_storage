@@ -3,7 +3,9 @@ use super::*;
 struct PackedSlotMeta {
     batch_values: Vec<(VolumeId, Lba, BlockmapValue)>,
     all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
-    dedup_registrations: Vec<DedupRegistration>,
+    /// First-occurrence (hash, blockmap) pairs for the candidate
+    /// cache; populated alongside batch_values.
+    fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
 }
 
 fn merge_dead_pbas(dst: &mut HashMap<Pba, (u32, u32)>, src: HashMap<Pba, (u32, u32)>) {
@@ -27,7 +29,8 @@ fn commit_packed_meta_batch(
     metrics: &EngineMetrics,
     results: &mut [OnyxResult<()>],
     actual_old_pba_meta: &mut HashMap<Pba, (u32, u32)>,
-    dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+    _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+    candidate: &crate::dedup::CandidateCache,
 ) -> bool {
     if batch_slots.is_empty() {
         return false;
@@ -35,11 +38,11 @@ fn commit_packed_meta_batch(
 
     let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> =
         Vec::with_capacity(*batch_lbas);
-    let mut combined_dedup_registrations: Vec<DedupRegistration> = Vec::new();
+    let mut combined_fresh_dedup: Vec<(ContentHash, BlockmapValue)> = Vec::new();
     for &slot_idx in batch_slots.iter() {
         if let Some(ref sm) = slot_metas[slot_idx] {
             combined_batch_values.extend_from_slice(&sm.batch_values);
-            combined_dedup_registrations.extend_from_slice(&sm.dedup_registrations);
+            combined_fresh_dedup.extend_from_slice(&sm.fresh_dedup_pairs);
         }
     }
     match meta.atomic_batch_write_packed_with_dedup(
@@ -50,12 +53,9 @@ fn commit_packed_meta_batch(
     ) {
         Ok(dead) => {
             merge_dead_pbas(actual_old_pba_meta, dead);
-            BufferFlusher::enqueue_dedup_registrations(
-                meta,
-                metrics,
-                dedup_register_tx,
-                combined_dedup_registrations,
-            );
+            for (hash, blockmap) in combined_fresh_dedup {
+                candidate.insert(hash, blockmap);
+            }
         }
         Err(e) => {
             for &slot_idx in batch_slots.iter() {
@@ -86,7 +86,12 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        // Old async-register channel kept on the signature so the
+        // existing call sites keep compiling; unused under
+        // promote-on-verified-hit (Step D), to be removed in the
+        // post-Step-D cleanup commit.
+        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        candidate: &crate::dedup::CandidateCache,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
 
@@ -110,7 +115,12 @@ impl BufferFlusher {
         // Build blockmap entries.
         // Refcount decrements are re-computed inside the lock by atomic_batch_write_packed.
         let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
-        let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+        // First-occurrence (hash, blockmap) pairs to insert into the
+        // RAM candidate cache after the metadata commit succeeds.
+        // These do *not* go into dedup_index — promote-on-verified-hit
+        // moves them there only when a duplicate is later confirmed
+        // by LV3 byte-compare in the dedup worker.
+        let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
         let mut total_refcount: u32 = 0;
         let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
         let mut any_discarded = false;
@@ -188,12 +198,7 @@ impl BufferFlusher {
                             slot_offset: frag.slot_offset,
                             flags: 0,
                         };
-                        dedup_registrations.push(Self::dedup_registration(
-                            vol_id.clone(),
-                            Lba(unit.start_lba.0 + pos as u64),
-                            hash,
-                            blockmap,
-                        ));
+                        fresh_dedup_pairs.push((hash, blockmap));
                     }
                 }
             }
@@ -256,7 +261,15 @@ impl BufferFlusher {
             }
         };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-        Self::enqueue_dedup_registrations(meta, metrics, dedup_register_tx, dedup_registrations);
+
+        // Post-commit: register first-occurrence (hash, blockmap)
+        // pairs into the RAM candidate cache. dedup_index /
+        // dedup_reverse stay untouched on miss — they only learn
+        // about a fingerprint when the dedup worker promotes a
+        // verified duplicate (Step C).
+        for (hash, blockmap) in fresh_dedup_pairs {
+            candidate.insert(hash, blockmap);
+        }
 
         if !actual_old_pba_meta.is_empty() {
             let dead: Vec<(Pba, u32)> = actual_old_pba_meta
@@ -331,6 +344,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
         dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        candidate: &crate::dedup::CandidateCache,
         packed_meta_batch_max_lbas: usize,
     ) -> Vec<OnyxResult<()>> {
         if sealed_slots.is_empty() {
@@ -360,7 +374,7 @@ impl BufferFlusher {
         for (i, sealed) in sealed_slots.iter().enumerate() {
             let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
             let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
-            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
 
             for frag in &sealed.fragments {
                 let unit = &frag.unit;
@@ -394,7 +408,7 @@ impl BufferFlusher {
                         results[i] = Err(e);
                         batch_values.clear();
                         all_seq_lba_ranges.clear();
-                        dedup_registrations.clear();
+                        fresh_dedup_pairs.clear();
                         break;
                     }
                 };
@@ -450,12 +464,7 @@ impl BufferFlusher {
                             slot_offset: frag.slot_offset,
                             flags: 0,
                         };
-                        dedup_registrations.push(Self::dedup_registration(
-                            vol_id.clone(),
-                            Lba(unit.start_lba.0 + pos as u64),
-                            hash,
-                            blockmap,
-                        ));
+                        fresh_dedup_pairs.push((hash, blockmap));
                     }
                 }
             }
@@ -471,7 +480,7 @@ impl BufferFlusher {
             slot_metas[i] = Some(PackedSlotMeta {
                 batch_values,
                 all_seq_lba_ranges,
-                dedup_registrations,
+                fresh_dedup_pairs,
             });
         }
 
@@ -558,6 +567,7 @@ impl BufferFlusher {
                     &mut results,
                     &mut actual_old_pba_meta,
                     dedup_register_tx,
+                    candidate,
                 ) {
                     meta_commits += 1;
                 }
@@ -577,6 +587,7 @@ impl BufferFlusher {
                     &mut results,
                     &mut actual_old_pba_meta,
                     dedup_register_tx,
+                    candidate,
                 ) {
                     meta_commits += 1;
                 }
@@ -593,6 +604,7 @@ impl BufferFlusher {
             &mut results,
             &mut actual_old_pba_meta,
             dedup_register_tx,
+            candidate,
         ) {
             meta_commits += 1;
         }

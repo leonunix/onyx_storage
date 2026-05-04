@@ -663,6 +663,7 @@ impl BufferFlusher {
             let metrics_w = metrics.clone();
             let in_flight_w = in_flight.clone();
             let dedup_register_tx_w = dedup_register_tx.clone();
+            let candidate_w = candidate.clone();
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
@@ -683,6 +684,7 @@ impl BufferFlusher {
                         &metrics_w,
                         &cleanup_tx,
                         &dedup_register_tx_w,
+                        &candidate_w,
                         packed_meta_batch_max_lbas,
                     );
                 })

@@ -47,6 +47,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
         dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        candidate: &crate::dedup::CandidateCache,
         packed_meta_batch_max_lbas: usize,
     ) {
         let mut buffered_seqs: Vec<u64> = Vec::new();
@@ -63,6 +64,7 @@ impl BufferFlusher {
                     let results = Self::write_units_batch(
                         shard_idx, &$batch, pool, meta, lifecycle, allocator,
                         io_engine, metrics, cleanup_tx, dedup_register_tx,
+                        candidate,
                     );
                     for (idx, result) in results.into_iter().enumerate() {
                         if let Err(e) = result {
@@ -114,6 +116,7 @@ impl BufferFlusher {
                 metrics,
                 cleanup_tx,
                 dedup_register_tx,
+                candidate,
             ) {
                 tail_dirty = true;
             }
@@ -133,6 +136,7 @@ impl BufferFlusher {
                             metrics,
                             cleanup_tx,
                             dedup_register_tx,
+                            candidate,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             let failed_pba = sealed.pba;
@@ -295,6 +299,7 @@ impl BufferFlusher {
                     metrics,
                     cleanup_tx,
                     dedup_register_tx,
+                    candidate,
                     packed_meta_batch_max_lbas,
                 );
                 for ((sealed, result), (mut slot_seqs, mut slot_completions)) in packed_batch
@@ -350,6 +355,7 @@ impl BufferFlusher {
                 metrics,
                 cleanup_tx,
                 dedup_register_tx,
+                candidate,
             );
             tail_dirty = true;
         }
@@ -366,6 +372,7 @@ impl BufferFlusher {
             metrics,
             cleanup_tx,
             dedup_register_tx,
+            candidate,
         ) {
             tail_dirty = true;
         }
@@ -382,6 +389,7 @@ impl BufferFlusher {
                 metrics,
                 cleanup_tx,
                 dedup_register_tx,
+                candidate,
             ) {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(pba = sealed.pba.0, error = %e,
@@ -466,6 +474,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
         dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        candidate: &crate::dedup::CandidateCache,
     ) -> bool {
         let Some(retry_at) = retries.front().map(|retry| retry.retry_at) else {
             return false;
@@ -502,6 +511,7 @@ impl BufferFlusher {
             metrics,
             cleanup_tx,
             dedup_register_tx,
+            candidate,
         ) {
             Ok(()) => {
                 let mut buffered_seqs = retry.buffered_seqs;
@@ -540,6 +550,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
         dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        candidate: &crate::dedup::CandidateCache,
     ) {
         let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
         let completion = unit.dedup_completion.clone();
@@ -576,6 +587,7 @@ impl BufferFlusher {
                     metrics,
                     cleanup_tx,
                     dedup_register_tx,
+                    candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -604,6 +616,7 @@ impl BufferFlusher {
                     metrics,
                     cleanup_tx,
                     dedup_register_tx,
+                    candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -633,6 +646,7 @@ impl BufferFlusher {
                     metrics,
                     cleanup_tx,
                     dedup_register_tx,
+                    candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -654,6 +668,7 @@ impl BufferFlusher {
                     metrics,
                     cleanup_tx,
                     dedup_register_tx,
+                    candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
