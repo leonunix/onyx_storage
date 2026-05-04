@@ -254,7 +254,7 @@ impl DedupScanner {
                 let block = &decompressed[offset..offset + bs];
 
                 // Hash the block
-                let hash: ContentHash = *blake3::hash(block).as_bytes();
+                let hash: ContentHash = crate::meta::schema::compute_content_hash(block);
 
                 // Look up dedup index
                 match meta.get_dedup_entry(&hash)? {

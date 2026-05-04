@@ -174,7 +174,7 @@ impl BufferFlusher {
                 if let Some(ref hashes) = unit.block_hashes {
                     for &pos in &live_positions {
                         let hash = hashes[pos];
-                        if hash == [0u8; 32] {
+                        if hash == [0u8; 8] {
                             continue;
                         }
                         let blockmap = BlockmapValue {
@@ -436,7 +436,7 @@ impl BufferFlusher {
                     };
                     for &pos in &live_positions {
                         let hash = hashes[pos];
-                        if hash == [0u8; 32] {
+                        if hash == [0u8; 8] {
                             continue;
                         }
                         let blockmap = BlockmapValue {

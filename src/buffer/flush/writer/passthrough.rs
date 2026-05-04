@@ -122,7 +122,7 @@ impl BufferFlusher {
                     dedup_registrations.reserve(live_positions.len());
                     for &pos in &live_positions {
                         let hash = hashes[pos];
-                        if hash == [0u8; 32] {
+                        if hash == [0u8; 8] {
                             continue;
                         }
                         let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
@@ -432,7 +432,7 @@ impl BufferFlusher {
                     dedup_registrations.reserve(live_positions.len());
                     for &pos in &live_positions {
                         let hash = hashes[pos];
-                        if hash == [0u8; 32] {
+                        if hash == [0u8; 8] {
                             continue;
                         }
                         let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);

@@ -493,10 +493,10 @@ impl BufferFlusher {
 
         for i in 0..lba_count {
             let Some(block) = unit.raw_blocks.get(i) else {
-                all_hashes.push([0u8; 32]);
+                all_hashes.push([0u8; 8]);
                 continue;
             };
-            let hash: ContentHash = *blake3::hash(block.bytes()).as_bytes();
+            let hash: ContentHash = crate::meta::schema::compute_content_hash(block.bytes());
             all_hashes.push(hash);
             lookup_indices.push(i);
         }

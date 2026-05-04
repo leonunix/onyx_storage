@@ -355,9 +355,9 @@ impl EngineHarness {
             let block = handle
                 .read(lba.0 * BLOCK_SIZE as u64, BLOCK_SIZE as usize)
                 .unwrap();
-            let actual_hash = blake3::hash(&block);
+            let actual_hash = onyx_storage::meta::schema::compute_content_hash(&block);
             assert_eq!(
-                actual_hash.as_bytes().as_slice(),
+                actual_hash.as_slice(),
                 hash.as_slice(),
                 "dedup index hash does not match logical block content"
             );

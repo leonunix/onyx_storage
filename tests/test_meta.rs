@@ -906,7 +906,7 @@ fn make_bv(pba: u64, compressed: u32, lba_count: u16, offset: u16) -> BlockmapVa
 
 /// Create a unique ContentHash from a u8 seed.
 fn test_hash(seed: u8) -> ContentHash {
-    [seed; 32]
+    [seed; 8]
 }
 
 /// Register dedup_reverse entries so the dedup_reverse guard in
@@ -940,7 +940,7 @@ fn put_dedup_entries_splits_large_batches() {
 
     let mut entries = Vec::new();
     for idx in 0..2500u64 {
-        let mut hash = [0u8; 32];
+        let mut hash = [0u8; 8];
         hash[..8].copy_from_slice(&idx.to_be_bytes());
         entries.push((
             hash,

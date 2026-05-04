@@ -1566,7 +1566,7 @@ mod tests {
             .atomic_batch_write(&vol.id, &[(Lba(0), value)], 1)
             .unwrap();
 
-        let hash = [9u8; 32];
+        let hash = [9u8; 8];
         let dedup = DedupEntry {
             pba: value.pba,
             slot_offset: value.slot_offset,

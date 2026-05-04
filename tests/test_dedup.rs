@@ -236,7 +236,7 @@ fn dedup_entry_roundtrip() {
 #[test]
 fn dedup_reverse_key_roundtrip() {
     let pba = Pba(123);
-    let hash: ContentHash = [0xAB; 32];
+    let hash: ContentHash = [0xAB; 8];
     let key = encode_dedup_reverse_key(pba, &hash);
     assert_eq!(key.len(), 40);
     let (decoded_pba, decoded_hash) = decode_dedup_reverse_key(&key).unwrap();
@@ -306,7 +306,7 @@ fn dedup_index_crud() {
     };
     let store = MetaStore::open(&config).unwrap();
 
-    let hash: ContentHash = *blake3::hash(b"hello world").as_bytes();
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(b"hello world");
     let entry = DedupEntry {
         pba: Pba(100),
         slot_offset: 0,
@@ -352,8 +352,8 @@ fn dedup_cleanup_on_pba_free() {
     };
     let store = MetaStore::open(&config).unwrap();
 
-    let hash1: ContentHash = [0x01; 32];
-    let hash2: ContentHash = [0x02; 32];
+    let hash1: ContentHash = [0x01; 8];
+    let hash2: ContentHash = [0x02; 8];
     let pba = Pba(200);
 
     let entry1 = DedupEntry {
@@ -513,7 +513,7 @@ fn dedup_miss_populates_index() {
 
     // Write a unique block
     let data = vec![0xAA; 4096];
-    let hash: ContentHash = *blake3::hash(&data).as_bytes();
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
@@ -601,7 +601,7 @@ fn delete_volume_cleans_dedup_index() {
     store.put_volume(&vol).unwrap();
 
     // Set up a dedup entry pointing to PBA 100
-    let hash: ContentHash = [0xCC; 32];
+    let hash: ContentHash = [0xCC; 8];
     let dedup_entry = DedupEntry {
         pba: Pba(100),
         slot_offset: 0,
@@ -656,7 +656,7 @@ fn cleanup_old_pba_preserves_newer_forward_index() {
     };
     let store = MetaStore::open(&config).unwrap();
 
-    let hash: ContentHash = [0xDD; 32];
+    let hash: ContentHash = [0xDD; 8];
     let entry_old = DedupEntry {
         pba: Pba(100),
         slot_offset: 0,
@@ -938,7 +938,7 @@ fn scanner_hit_remaps_skipped_block_and_clears_flag() {
     register_volume(&meta, "test-vol");
 
     let data = vec![0x5A; 4096];
-    let hash: ContentHash = *blake3::hash(&data).as_bytes();
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
     pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
@@ -1011,7 +1011,7 @@ fn scanner_miss_registers_index_and_clears_flag() {
     register_volume(&meta, "test-vol");
 
     let data = vec![0x6B; 4096];
-    let hash: ContentHash = *blake3::hash(&data).as_bytes();
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
 
     let mut flusher = start_flusher_custom(
         &pool,
@@ -1064,7 +1064,7 @@ fn scanner_skips_under_pressure_then_resumes() {
     register_volume(&meta, "test-vol");
 
     let skipped_data = vec![0x7C; 4096];
-    let skipped_hash: ContentHash = *blake3::hash(&skipped_data).as_bytes();
+    let skipped_hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&skipped_data);
 
     let mut skip_flusher = start_flusher_custom(
         &pool,
@@ -1132,7 +1132,7 @@ fn scanner_crc_mismatch_leaves_block_skipped() {
     register_volume(&meta, "test-vol");
 
     let data = vec![0x8D; 4096];
-    let hash: ContentHash = *blake3::hash(&data).as_bytes();
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
 
     let mut flusher = start_flusher_custom(
         &pool,
@@ -1181,7 +1181,7 @@ fn dedup_miss_before_meta_write_recovers_and_populates_index() {
     register_volume(&meta, "test-vol-meta-fail");
 
     let data = vec![0x91; 4096];
-    let hash: ContentHash = *blake3::hash(&data).as_bytes();
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
     install_test_failpoint(
         "test-vol-meta-fail",
         Lba(0),
@@ -1221,7 +1221,7 @@ fn dedup_hit_failure_demotes_to_miss() {
     register_volume(&meta, "test-vol-hit-fail");
 
     let data = vec![0xA5; 4096];
-    let hash: ContentHash = *blake3::hash(&data).as_bytes();
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
 
     let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
     pool.append("test-vol-hit-fail", Lba(0), 1, &data, 1000)

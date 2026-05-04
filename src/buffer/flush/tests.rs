@@ -322,7 +322,7 @@ fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
     let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let payload = vec![0x5A; BLOCK_SIZE as usize];
-    let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
     let seq = pool.append("flush-race", Lba(0), 1, &payload, 1).unwrap();
     let mut unit = make_unit(0x5A, seq);
     unit.block_hashes = Some(vec![hash]);
@@ -362,7 +362,7 @@ fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
     let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let payload = vec![0x6B; BLOCK_SIZE as usize];
-    let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
     let seq = pool.append("flush-race", Lba(0), 1, &payload, 1).unwrap();
     let mut unit = make_packed_unit(0x6B, seq);
     unit.block_hashes = Some(vec![hash]);
@@ -416,7 +416,7 @@ fn write_packed_slots_batch_enqueues_dedup_registration_after_mapping_commit() {
     for (idx, lba) in [10_u64, 20_u64].into_iter().enumerate() {
         let fill = 0x70 + idx as u8;
         let payload = vec![fill; BLOCK_SIZE as usize];
-        let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+        let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
         let seq = pool.append("flush-race", Lba(lba), 1, &payload, 1).unwrap();
         let mut unit = make_packed_unit_at(fill, seq, lba);
         unit.block_hashes = Some(vec![hash]);
@@ -630,7 +630,7 @@ fn stale_async_dedup_registration_is_dropped() {
     let (meta, _pool, _lifecycle, _allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
-    let hash: ContentHash = [0xA5; 32];
+    let hash: ContentHash = [0xA5; 8];
     let pba = Pba(100);
     let expected = BlockmapValue {
         pba,
@@ -704,9 +704,9 @@ fn dedup_hit_cleanup_deduplicates_repeated_old_pbas() {
     meta.set_refcount(new_pba, 8).unwrap();
 
     // Each LBA needs a dedup_reverse entry for the guard to accept the hit.
-    let hash_0: ContentHash = [0x01; 32];
-    let hash_1: ContentHash = [0x02; 32];
-    let hash_2: ContentHash = [0x03; 32];
+    let hash_0: ContentHash = [0x01; 8];
+    let hash_1: ContentHash = [0x02; 8];
+    let hash_2: ContentHash = [0x03; 8];
     meta.put_dedup_entries(&[
         (
             hash_0,
@@ -815,7 +815,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         setup_flush_test_env();
 
     let pba = allocator.allocate_one_for_lane(0).unwrap();
-    let hash: ContentHash = [0xAB; 32];
+    let hash: ContentHash = [0xAB; 8];
     meta.put_dedup_entries(&[(
         hash,
         DedupEntry {
@@ -1038,7 +1038,7 @@ fn dedup_worker_batches_hits_across_units() {
     pool.durable_seq_handle().store(u64::MAX, Ordering::Release);
 
     let source = vec![0x7Bu8; BLOCK_SIZE as usize];
-    let hash: ContentHash = *blake3::hash(&source).as_bytes();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&source);
     let target = BlockmapValue {
         pba: Pba(77),
         compression: 0,
@@ -1470,7 +1470,7 @@ fn packed_slot_refcount_with_dedup_and_overwrite() {
 
     // --- Step 2: Dedup hits map 16 additional LBAs to the same packed PBA ---
     // Register dedup_reverse entries so the guard passes
-    let dedup_hashes: Vec<ContentHash> = (0u8..16).map(|i| [i + 100; 32]).collect();
+    let dedup_hashes: Vec<ContentHash> = (0u8..16).map(|i| [i + 100; 8]).collect();
     let dedup_entries: Vec<(ContentHash, DedupEntry)> = dedup_hashes
         .iter()
         .enumerate()
@@ -1740,7 +1740,7 @@ fn packed_slot_concurrent_dedup_refcount_drift() {
         // Register dedup entries so dedup hits work
         let hashes: Vec<ContentHash> = (0..8u8)
             .map(|i| {
-                let mut h = [0u8; 32];
+                let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
                 h
@@ -1779,7 +1779,7 @@ fn packed_slot_concurrent_dedup_refcount_drift() {
 
                 let hashes: Vec<ContentHash> = (0..4u8)
                     .map(|i| {
-                        let mut h = [0u8; 32];
+                        let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
                         h
@@ -2203,7 +2203,7 @@ fn packed_slot_full_chain_no_premature_free() {
     assert_eq!(meta.get_refcount(packed_pba).unwrap(), 8);
 
     // Step 2: dedup hits add 4 more refs
-    let dedup_hashes: Vec<ContentHash> = (0u8..4).map(|i| [i + 50; 32]).collect();
+    let dedup_hashes: Vec<ContentHash> = (0u8..4).map(|i| [i + 50; 8]).collect();
     let dedup_entries: Vec<(ContentHash, DedupEntry)> = dedup_hashes
         .iter()
         .enumerate()
@@ -2725,10 +2725,10 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
         // Register dedup entries
         let entries: Vec<(ContentHash, DedupEntry)> = (0..8u8)
             .map(|i| {
-                let mut h = [0u8; 32];
+                let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
-                h[31] = 0xFE; // marker
+                 // marker
                 (
                     h,
                     DedupEntry {
@@ -2758,10 +2758,10 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
 
                 let hashes: Vec<ContentHash> = (0..2u8)
                     .map(|i| {
-                        let mut h = [0u8; 32];
+                        let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
-                        h[31] = 0xFE;
+                        
                         h
                     })
                     .collect();
@@ -3248,10 +3248,10 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
         meta.atomic_batch_write_packed(&batch, pba, 8).unwrap();
         let entries: Vec<(ContentHash, DedupEntry)> = (0..8u8)
             .map(|i| {
-                let mut h = [0u8; 32];
+                let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
-                h[31] = 0xAA;
+                
                 (
                     h,
                     DedupEntry {
@@ -3366,10 +3366,10 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                 let base_lba = lba_counter.fetch_add(2, Ordering::Relaxed);
                 let hashes: Vec<ContentHash> = (0..2u8)
                     .map(|i| {
-                        let mut h = [0u8; 32];
+                        let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
-                        h[31] = 0xAA;
+                        
                         h
                     })
                     .collect();
