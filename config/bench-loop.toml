@@ -1,5 +1,5 @@
 [meta]
-rocksdb_path = "/mnt/rocksdb/onyx-bench"
+path = "/mnt/metadb/onyx-bench"
 block_cache_mb = 64
 
 [storage]

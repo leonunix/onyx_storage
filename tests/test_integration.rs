@@ -9,7 +9,7 @@
 //!   4. compression: unit_compressed_size < unit_original_size, compression byte != 0
 //!   5. LV3: raw bytes on disk are compressed (not original plaintext)
 //!   6. coalescer: multiple LBAs share same PBA, offset_in_unit sequential
-//!   7. refcount: correct count in RocksDB
+//!   7. refcount: correct count in metadb
 //!   8. space: old PBAs freed on overwrite
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +53,9 @@ fn setup_with_sizes(data_bytes: u64, buf_bytes: u64) -> TestEnv {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
-        skip_fully_superseded: true,
+            min_compression_savings_pct: 12,
+            skip_fully_superseded: true,
+            ..FlushConfig::default()
         },
         GcConfig {
             enabled: false,
@@ -93,10 +95,17 @@ fn setup_with_all_options(
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 0,
+            index_pin_mb: 0,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 8,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         },
         storage: StorageConfig {
             data_device: Some(data_file.path().to_path_buf()),
@@ -114,6 +123,7 @@ fn setup_with_all_options(
             group_commit_wait_us: 250,
             shards: 1,
             max_memory_mb: 0,
+            ..BufferConfig::default()
         },
         ublk: UblkConfig::default(),
         flush,
@@ -125,6 +135,7 @@ fn setup_with_all_options(
         dedup,
         service: Default::default(),
         ha: Default::default(),
+        threading: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();
@@ -676,7 +687,11 @@ fn prove_batch_read_coalesces_lv3_ops() {
     let shared_pba = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap().pba;
     for lba in 1..16u64 {
         let bv = meta.get_mapping(&vol_id, Lba(lba)).unwrap().unwrap();
-        assert_eq!(bv.pba, shared_pba, "LBA {} must share the coalesced PBA", lba);
+        assert_eq!(
+            bv.pba, shared_pba,
+            "LBA {} must share the coalesced PBA",
+            lba
+        );
     }
 
     // Snapshot before the read so we measure the delta of *this* read only.
@@ -688,8 +703,7 @@ fn prove_batch_read_coalesces_lv3_ops() {
 
     let lv3_ops_delta = after.lv3_read_ops - before.lv3_read_ops;
     let lv3_hits_delta = after.read_lv3_hits - before.read_lv3_hits;
-    let decompressed_delta =
-        after.lv3_read_decompressed_bytes - before.lv3_read_decompressed_bytes;
+    let decompressed_delta = after.lv3_read_decompressed_bytes - before.lv3_read_decompressed_bytes;
 
     eprintln!(
         "  coalesced read: lv3_read_ops={}, read_lv3_hits={}, decompressed_bytes={}",
@@ -755,7 +769,11 @@ fn prove_batch_read_mixes_buffer_and_unmapped_and_lv3() {
     let got = vol.read(0, 16 * 4096).unwrap();
     let after = env.engine.metrics_snapshot();
 
-    assert_eq!(&got[0..8 * 4096], flushed.as_slice(), "LV3 segment mismatch");
+    assert_eq!(
+        &got[0..8 * 4096],
+        flushed.as_slice(),
+        "LV3 segment mismatch"
+    );
     assert_eq!(
         &got[8 * 4096..12 * 4096],
         hot.as_slice(),
@@ -867,18 +885,33 @@ fn prove_incompressible_fallback() {
         "incompressible data should fall back to compression=None"
     );
 
-    // EVIDENCE 2: compressed size == original size (no savings, stored raw)
-    assert_eq!(
-        bv.unit_compressed_size, bv.unit_original_size,
-        "no compression: sizes should be equal"
-    );
+    // EVIDENCE 2: raw fallback maps each LBA to an exact 4KB physical block.
+    // The write may still be issued as one contiguous extent, but metadata
+    // must not force later 4KB reads to pull the whole raw extent.
+    assert_eq!(bv.unit_compressed_size, 4096);
+    assert_eq!(bv.unit_original_size, 4096);
+    assert_eq!(bv.unit_lba_count, 1);
+    assert_eq!(bv.offset_in_unit, 0);
 
-    // EVIDENCE 3: raw LV3 bytes ARE the original plaintext (stored uncompressed)
-    let raw_lv3 = read_raw_lv3(&env, bv.pba, bv.unit_compressed_size as usize);
-    assert_eq!(
-        raw_lv3, data,
-        "uncompressed data should be stored as-is on LV3"
-    );
+    // EVIDENCE 3: every raw LV3 block is the original plaintext for that LBA.
+    for lba in 0..8u64 {
+        let mapping = meta
+            .get_mapping(&VolumeId("vol-incomp".into()), Lba(lba))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.compression, 0);
+        assert_eq!(mapping.unit_compressed_size, 4096);
+        assert_eq!(mapping.unit_original_size, 4096);
+        assert_eq!(mapping.unit_lba_count, 1);
+        assert_eq!(mapping.offset_in_unit, 0);
+        let raw_lv3 = read_raw_lv3(&env, mapping.pba, mapping.unit_compressed_size as usize);
+        let off = lba as usize * 4096;
+        assert_eq!(
+            raw_lv3,
+            data[off..off + 4096],
+            "uncompressed LBA {lba} should be stored as an exact 4KB raw block"
+        );
+    }
 
     // EVIDENCE 4: data reads back correctly
     let result = vol.read(0, 8 * 4096).unwrap();
@@ -1797,7 +1830,9 @@ fn prove_background_gc_runner_reclaims_old_units() {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
-        skip_fully_superseded: true,
+            min_compression_savings_pct: 12,
+            skip_fully_superseded: true,
+            ..FlushConfig::default()
         },
         GcConfig {
             enabled: true,
@@ -1818,6 +1853,15 @@ fn prove_background_gc_runner_reclaims_old_units() {
         .create_volume("gc-bg", vol_size, CompressionAlgo::Lz4)
         .unwrap();
     let vol = env.engine.open_volume("gc-bg").unwrap();
+
+    // The GC runner now deliberately skips full blockmap scans while free
+    // space is plentiful. Reserve enough allocator space to put this test in
+    // the "moderate pressure" band so the runner is expected to scan.
+    let allocator = env.engine.allocator().unwrap();
+    let mut _pressure_reservations = Vec::new();
+    while allocator.free_block_count() * 100 / allocator.total_block_count() > 50 {
+        _pressure_reservations.push(allocator.allocate_one().unwrap());
+    }
 
     let mut initial = Vec::with_capacity(8 * 4096);
     for i in 0u8..8 {

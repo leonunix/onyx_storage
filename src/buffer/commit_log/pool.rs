@@ -97,13 +97,17 @@ impl WriteBufferPool {
             let shard_dev = device.slice(shard_offset, shard_bytes)?;
             let lba_index = DashMap::with_shard_amount(4);
             let latest_lba_seq = DashMap::with_shard_amount(4);
+            let pending_lba_buckets = DashMap::with_shard_amount(4);
             let pending = DashMap::with_shard_amount(4);
+            let pending_count = AtomicU64::new(0);
             BufferShard::rebuild_indices(
                 &shard_dev,
                 shard_bytes,
                 &lba_index,
                 &latest_lba_seq,
+                &pending_lba_buckets,
                 &pending,
+                &pending_count,
             )?;
 
             if !pending.is_empty() {
@@ -256,13 +260,14 @@ impl WriteBufferPool {
     }
 
     /// io_uring variant of `write_batch` that also includes the checkpoint
-    /// write and a barrier-fdatasync in the same `submit_batch` call. On
-    /// success, both data and checkpoint are persisted with one
-    /// `io_uring_enter` + one `wait_for_completions(N+2)`.
+    /// write and a barrier-fdatasync. On success, both data and checkpoint are
+    /// persisted before returning. Large batches are split at the ring's SQ
+    /// depth so group commit can grow past `uring_sq_entries` without turning
+    /// into a retry loop.
     ///
     /// The failpoint-driven test injection from `sync_device_impl` is checked
     /// after CQE harvest so existing recovery tests still cover this path.
-    fn write_batch_and_sync_uring(
+    pub(super) fn write_batch_and_sync_uring(
         device: &RawDevice,
         shard: &BufferShard,
         ring: &Arc<IoUringSession>,
@@ -363,13 +368,23 @@ impl WriteBufferPool {
         ops.push(UringOp::FsyncDataBarrier { fd: data_fd });
 
         // 5. Submit + wait under the same io_lock that the syscall path uses,
-        //    so concurrent writers see consistent ordering.
+        //    so concurrent writers see consistent ordering. Data writes may
+        //    exceed the ring depth; checkpoint and fsync are submitted after
+        //    all data chunks complete to preserve the durability order.
         let write_start = Instant::now();
         let _guard = io_lock.lock();
-        let results = unsafe { ring.submit_batch(&ops)? };
+        let span_count = spans.len();
+        let max_ops = (ring.sq_entries() as usize).max(1);
+        let mut results = Vec::with_capacity(ops.len());
+        for chunk in ops[..span_count].chunks(max_ops) {
+            results.extend(unsafe { ring.submit_batch(chunk)? });
+        }
+        if ckpt_aligned.is_some() {
+            results.extend(unsafe { ring.submit_batch(&ops[span_count..span_count + 1])? });
+        }
+        results.extend(unsafe { ring.submit_batch(&ops[ops.len() - 1..])? });
 
         // 6. Validate per-op CQE results.
-        let span_count = spans.len();
         for (i, span) in spans.iter().enumerate() {
             let r = &results[i];
             if let Some(errno) = r.errno() {
@@ -434,9 +449,8 @@ impl WriteBufferPool {
                         offset,
                         data_len = data.len(),
                         disk_magic = magic,
-                        expected_magic = u32::from_le_bytes(
-                            expected_magic_bytes.try_into().unwrap()
-                        ),
+                        expected_magic =
+                            u32::from_le_bytes(expected_magic_bytes.try_into().unwrap()),
                         "POST-WRITE VERIFICATION FAILED (io_uring path): entry not on disk"
                     );
                 }
@@ -469,32 +483,34 @@ impl WriteBufferPool {
 
         loop {
             if inflight.is_empty() {
-                match wake_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(()) => {}
-                    Err(RecvTimeoutError::Timeout) => {
-                        if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
-                            return;
+                if shard.staging_rx.is_empty() {
+                    match wake_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(()) => {}
+                        Err(RecvTimeoutError::Timeout) => {
+                            if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
-                            return;
+                        Err(RecvTimeoutError::Disconnected) => {
+                            if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                }
-                while wake_rx.try_recv().is_ok() {}
-                if !batch_wait.is_zero() {
-                    let sleep_start = Instant::now();
-                    thread::sleep(batch_wait);
-                    if let Some(metrics) = metrics.get() {
-                        BufferShard::record_metric(&metrics.buffer_sync_sleep_ns, sleep_start);
                     }
                     while wake_rx.try_recv().is_ok() {}
+                    if !batch_wait.is_zero() {
+                        let sleep_start = Instant::now();
+                        thread::sleep(batch_wait);
+                        if let Some(metrics) = metrics.get() {
+                            BufferShard::record_metric(&metrics.buffer_sync_sleep_ns, sleep_start);
+                        }
+                        while wake_rx.try_recv().is_ok() {}
+                    }
                 }
 
-                inflight = shard.drain_staged();
+                inflight = shard.drain_staged_limited();
                 if inflight.is_empty() {
                     if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
                         return;
@@ -603,18 +619,29 @@ impl WriteBufferPool {
                     let inflight_pending: Vec<Arc<PendingEntry>> =
                         inflight.iter().map(|entry| entry.pending.clone()).collect();
                     shard.retire_superseded_by_durable_entries(&inflight_pending);
+                    let mut cache_after_sync = Vec::new();
+                    let mut publish_after_sync = Vec::new();
                     {
                         let mut lc = shard.lifecycle.lock();
                         for entry in &inflight {
                             let seq = entry.pending.seq;
                             lc.inflight.remove(&seq);
-                            shard.remove_volatile_payload(seq);
+                            let payload = shard.remove_volatile_payload(seq);
                             if lc.cancelled.remove(&seq) {
                                 continue;
                             }
-                            let _ = ready_tx.send(seq);
-                            let _ = shard_ready_tx.send(seq);
+                            if let Some(payload) = payload {
+                                cache_after_sync.push((entry.pending.clone(), payload));
+                            }
+                            publish_after_sync.push(seq);
                         }
+                    }
+                    for (pending, payload) in cache_after_sync {
+                        shard.cache_committed_payload(&pending, payload);
+                    }
+                    for seq in publish_after_sync {
+                        let _ = ready_tx.send(seq);
+                        let _ = shard_ready_tx.send(seq);
                     }
                     if let Some(metrics) = metrics.get() {
                         metrics.buffer_sync_batches.fetch_add(1, Ordering::Relaxed);
@@ -729,6 +756,29 @@ impl WriteBufferPool {
         backpressure_timeout: Duration,
         max_payload_memory: u64,
         uring_sq_entries: Option<u32>,
+    ) -> OnyxResult<Self> {
+        let runtime_limits = BufferRuntimeLimits::for_durable_payload_limit(max_payload_memory);
+        Self::open_with_options_full_and_limits(
+            device,
+            group_commit_wait,
+            shard_count,
+            routing_zone_size_blocks,
+            backpressure_timeout,
+            max_payload_memory,
+            uring_sq_entries,
+            runtime_limits,
+        )
+    }
+
+    pub fn open_with_options_full_and_limits(
+        device: RawDevice,
+        group_commit_wait: Duration,
+        shard_count: usize,
+        routing_zone_size_blocks: u64,
+        backpressure_timeout: Duration,
+        max_payload_memory: u64,
+        uring_sq_entries: Option<u32>,
+        runtime_limits: BufferRuntimeLimits,
     ) -> OnyxResult<Self> {
         Self::validate_shard_count(shard_count)?;
         let routing_zone_size_blocks = routing_zone_size_blocks.max(1);
@@ -857,6 +907,9 @@ impl WriteBufferPool {
         // ── Parallel shard recovery ──────────────────────────────────
         let metrics = Arc::new(OnceLock::new());
         let payload_bytes_in_memory = Arc::new(AtomicU64::new(0));
+        let volatile_payload_budget = Arc::new(VolatilePayloadBudget::new(
+            runtime_limits.volatile_payload_memory,
+        ));
         // Durability-watermark atomics shared with every shard. `max_flushed_seq`
         // is bumped in free_seq_allocation; `durable_seq` is advanced by the
         // engine-owned watermark thread after MetaStore::sync_durable().
@@ -869,6 +922,7 @@ impl WriteBufferPool {
                     .map(|cfg| {
                         let m = metrics.clone();
                         let pb = payload_bytes_in_memory.clone();
+                        let vb = volatile_payload_budget.clone();
                         let mfs = max_flushed_seq.clone();
                         let ds = durable_seq.clone();
                         s.spawn(move || {
@@ -880,6 +934,8 @@ impl WriteBufferPool {
                                 cfg.checkpoint_device,
                                 pb,
                                 max_payload_memory,
+                                vb,
+                                runtime_limits,
                                 mfs,
                                 ds,
                             )
@@ -904,6 +960,8 @@ impl WriteBufferPool {
                         cfg.checkpoint_device,
                         payload_bytes_in_memory.clone(),
                         max_payload_memory,
+                        volatile_payload_budget.clone(),
+                        runtime_limits,
                         max_flushed_seq.clone(),
                         durable_seq.clone(),
                     )
@@ -965,6 +1023,10 @@ impl WriteBufferPool {
                     let shard_ready_tx = shard_ready_tx.clone();
                     let uring = shard_uring.clone();
                     move || {
+                        crate::affinity::bind_current(
+                            crate::affinity::ThreadRole::BufferSync,
+                            shard_idx,
+                        );
                         Self::sync_loop(
                             sync_device,
                             shard,
@@ -1010,6 +1072,7 @@ impl WriteBufferPool {
             metrics,
             payload_bytes_in_memory,
             max_payload_memory,
+            volatile_payload_budget,
             disk_version,
             max_flushed_seq,
             durable_seq,
@@ -1105,6 +1168,73 @@ impl WriteBufferPool {
         Ok(result)
     }
 
+    /// Fast lookup for the aligned batched read path.
+    ///
+    /// `ZoneManager::submit_write` splits writes at `routing_zone_size_blocks`
+    /// boundaries before appending to the buffer, so every LBA covered by a
+    /// pending entry maps back to the entry's primary shard. The full
+    /// [`lookup`](Self::lookup) keeps its cross-shard safety net for recovery
+    /// compatibility and odd direct callers; normal ublk reads use this method
+    /// to avoid `shard_count` DashMap probes per 4 KiB block.
+    pub fn lookup_primary(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<PendingEntry>> {
+        let primary = self.shard_for_lba(lba);
+        let result = self.shards[primary].shard.lookup_hydrated(vol_id, lba)?;
+        if let Some(metrics) = self.metrics.get() {
+            let counter = if result.is_some() {
+                &metrics.buffer_lookup_hits
+            } else {
+                &metrics.buffer_lookup_misses
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    /// Batched primary-shard lookup for a contiguous read span.
+    ///
+    /// This keeps read-after-write checks in the buffer layer, but removes
+    /// the hottest avoidable overhead from large reads: repeated volume-id
+    /// interning and routing work for every 4 KiB LBA. The span is split only
+    /// where the buffer routing shard changes.
+    pub fn lookup_primary_range(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+    ) -> OnyxResult<Vec<Option<PendingEntry>>> {
+        let mut out = Vec::with_capacity(lba_count as usize);
+        if lba_count == 0 {
+            return Ok(out);
+        }
+
+        let mut done = 0u32;
+        while done < lba_count {
+            let lba = Lba(start_lba.0 + done as u64);
+            let shard_idx = self.shard_for_lba(lba);
+            let shard = &self.shards[shard_idx].shard;
+            let vid = shard.intern_vol_id(vol_id);
+
+            let shard_end_lba =
+                ((lba.0 / self.routing_zone_size_blocks) + 1) * self.routing_zone_size_blocks;
+            let this_count = (lba_count - done)
+                .min(shard_end_lba.saturating_sub(lba.0).min(u32::MAX as u64) as u32);
+            out.extend(shard.lookup_hydrated_range_interned(&vid, lba, this_count)?);
+            done += this_count;
+        }
+
+        if let Some(metrics) = self.metrics.get() {
+            for result in &out {
+                let counter = if result.is_some() {
+                    &metrics.buffer_lookup_hits
+                } else {
+                    &metrics.buffer_lookup_misses
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn pending_entry(&self, seq: u64) -> Option<BufferEntry> {
         self.shard_for_seq(seq)
             .and_then(|idx| self.shards[idx].shard.pending_entry(seq))
@@ -1113,6 +1243,17 @@ impl WriteBufferPool {
     pub fn pending_entry_arc(&self, seq: u64) -> Option<Arc<PendingEntry>> {
         self.shard_for_seq(seq)
             .and_then(|idx| self.shards[idx].shard.pending_entry_arc_hydrated(seq))
+    }
+
+    pub fn hydrate_pending_entries_for_shard(
+        &self,
+        shard_idx: usize,
+        entries: Vec<Arc<PendingEntry>>,
+    ) -> Vec<Arc<PendingEntry>> {
+        self.shards
+            .get(shard_idx)
+            .map(|shard| shard.shard.pending_entry_arcs_hydrated(entries))
+            .unwrap_or_default()
     }
 
     pub fn is_latest_lba_seq(&self, vol_id: &str, lba: Lba, seq: u64, vol_created_at: u64) -> bool {
@@ -1139,9 +1280,13 @@ impl WriteBufferPool {
         vol_created_at: u64,
     ) -> bool {
         let shard_idx = self.shard_for_lba(start_lba);
-        self.shards[shard_idx]
-            .shard
-            .is_entry_fully_superseded(vol_id, start_lba, lba_count, seq, vol_created_at)
+        self.shards[shard_idx].shard.is_entry_fully_superseded(
+            vol_id,
+            start_lba,
+            lba_count,
+            seq,
+            vol_created_at,
+        )
     }
 
     pub fn pending_entries_snapshot(&self) -> Vec<BufferEntry> {
@@ -1201,22 +1346,29 @@ impl WriteBufferPool {
             .unwrap_or_default()
     }
 
-    pub fn head_stuck_pending_entry_arc_for_shard(
-        &self,
-        shard_idx: usize,
-        min_age: Duration,
-    ) -> Option<Arc<PendingEntry>> {
-        self.shards.get(shard_idx).and_then(|shard| {
-            shard
-                .shard
-                .head_pending_entry_arc_hydrated_if_stuck(min_age)
-        })
+    pub fn head_stuck_seq_for_shard(&self, shard_idx: usize, min_age: Duration) -> Option<u64> {
+        self.shards
+            .get(shard_idx)
+            .and_then(|shard| shard.shard.head_pending_seq_if_stuck(min_age))
     }
 
     pub fn flushed_offsets_for_shard(&self, shard_idx: usize, seq: u64) -> Option<HashSet<u16>> {
         self.shards
             .get(shard_idx)
             .and_then(|shard| shard.shard.flushed_offsets_snapshot(seq))
+    }
+
+    /// Cheap, non-hydrating diagnostic snapshot for a given (shard, seq).
+    /// Returns (lba_count, flushed_count, age_ms, vol_id). Used by the flusher
+    /// to log head-stuck states without triggering payload re-hydration.
+    pub fn pending_diag_snapshot_for_shard(
+        &self,
+        shard_idx: usize,
+        seq: u64,
+    ) -> Option<(u32, u32, u64, String)> {
+        self.shards
+            .get(shard_idx)
+            .and_then(|shard| shard.shard.pending_diag_snapshot(seq))
     }
 
     pub fn recv_ready_timeout(&self, timeout: Duration) -> Result<u64, RecvTimeoutError> {
@@ -1323,6 +1475,13 @@ impl WriteBufferPool {
             .sum()
     }
 
+    pub fn pending_count_for_shard(&self, shard_idx: usize) -> u64 {
+        self.shards
+            .get(shard_idx)
+            .map(|shard| shard.shard.pending_count())
+            .unwrap_or(0)
+    }
+
     pub fn capacity(&self) -> u64 {
         self.shards.iter().map(|shard| shard.shard.capacity()).sum()
     }
@@ -1396,9 +1555,19 @@ impl WriteBufferPool {
         self.payload_bytes_in_memory.load(Ordering::Relaxed)
     }
 
-    /// Configured in-memory payload ceiling. 0 means "no limit".
+    /// Configured durable payload-cache ceiling. 0 disables resident caching.
     pub fn payload_memory_limit_bytes(&self) -> u64 {
         self.max_payload_memory
+    }
+
+    /// Bytes currently held only until the buffer sync thread fdatasyncs them.
+    pub fn volatile_payload_memory_bytes(&self) -> u64 {
+        self.volatile_payload_budget.bytes()
+    }
+
+    /// Write-admission budget for sync-before-publish payloads.
+    pub fn volatile_payload_memory_limit_bytes(&self) -> u64 {
+        self.volatile_payload_budget.limit()
     }
 
     /// Atomic shared with every shard that tracks the highest seq to have
@@ -1465,6 +1634,8 @@ impl WriteBufferPool {
                     head_remaining_lbas,
                     head_age_ms,
                     head_residency_ms,
+                    staged_entries: s.staging_rx.len(),
+                    volatile_payloads: s.volatile_payloads.len(),
                 }
             })
             .collect()

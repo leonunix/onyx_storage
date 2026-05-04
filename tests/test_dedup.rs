@@ -46,10 +46,17 @@ fn setup_dedup_env_with_sizes(
     data_tmp.as_file().set_len(data_bytes).unwrap();
 
     let meta_config = onyx_storage::config::MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -285,10 +292,17 @@ fn blockmap_value_rejects_27byte_format() {
 fn dedup_index_crud() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -324,10 +338,17 @@ fn dedup_index_crud() {
 fn dedup_cleanup_on_pba_free() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -375,10 +396,17 @@ fn dedup_cleanup_on_pba_free() {
 fn scan_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();
@@ -424,10 +452,17 @@ fn scan_dedup_skipped() {
 fn update_blockmap_flags_clears_dedup_skipped() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();
@@ -464,6 +499,7 @@ fn dedup_config_defaults() {
     assert!(config.enabled);
     assert_eq!(config.workers, 2);
     assert_eq!(config.buffer_skip_threshold_pct, 90);
+    assert_eq!(config.pending_skip_threshold_entries, 0);
     assert_eq!(config.rescan_interval_ms, 30000);
     assert_eq!(config.max_rescan_per_cycle, 256);
 }
@@ -540,10 +576,17 @@ fn dedup_hit_reuses_pba() {
 fn delete_volume_cleans_dedup_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -599,10 +642,17 @@ fn delete_volume_cleans_dedup_index() {
 fn cleanup_old_pba_preserves_newer_forward_index() {
     let dir = tempdir().unwrap();
     let config = onyx_storage::config::MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let store = MetaStore::open(&config).unwrap();
 

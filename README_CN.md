@@ -6,7 +6,7 @@
 
 **用户态全闪块存储引擎，支持内联压缩、内容寻址去重和 RAID 感知空间管理。**
 
-Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用 RocksDB 管理元数据，O_DIRECT 进行数据 I/O，通过 Linux ublk 对外暴露块设备。面向 dm-raid / LVM 之上的 NVMe SSD 阵列。
+Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用仓库内的 onyx-metadb 管理元数据，O_DIRECT 进行数据 I/O，通过 Linux ublk 对外暴露块设备。面向 dm-raid / LVM 之上的 NVMe SSD 阵列。
 
 > **早期技术预览** &mdash; 本项目处于早期开发阶段，用于学习和研究存储引擎内部原理。核心功能（压缩、去重、GC、Packer）已实现并通过测试，但尚未达到生产级别，请勿用于生产环境。
 
@@ -16,7 +16,7 @@ Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用
 - **内容寻址去重** &mdash; SHA-256 指纹识别、引用计数、后台补扫跳过的块
 - **Fragment 打包** &mdash; VDO 风格 bin-packing，多个 < 4KB 压缩 fragment 共享物理 slot
 - **垃圾回收** &mdash; 后台 dead block 扫描与回写，带背压控制
-- **崩溃一致性** &mdash; RocksDB WriteBatch 原子更新；写缓冲 sync 后才 ack
+- **崩溃一致性** &mdash; metadb 原子提交；写缓冲 sync 后才 ack
 - **Zone 并发** &mdash; LBA 空间分区为多个 zone，每个 zone 由独立工作线程服务
 - **ublk 前端**（仅 Linux）&mdash; 将卷暴露为 `/dev/ublkbN` 块设备，512B 扇区对齐
 
@@ -32,7 +32,7 @@ WriteBufferPool（LV2 上 O_DIRECT 环形日志，8KB slot，sync 后 ack）
   v
 Dedup Workers --> Compress Workers --> Packer（bin-pack fragments）
   |
-IoEngine（O_DIRECT --> LV3）+ MetaStore（RocksDB WriteBatch）
+IoEngine（O_DIRECT --> LV3）+ MetaStore（metadb 原子提交）
   |
 SpaceAllocator（BTreeSet 空闲链表，strip 对齐分配）
   |
@@ -44,7 +44,7 @@ dm-raid + LVM --> NVMe SSD x N
 ### 前置依赖
 
 - Rust 1.75+（2021 edition）
-- RocksDB 系统库（通过 `rocksdb` crate 自动构建）
+- 无外部元数据数据库依赖；onyx-metadb 随工作区构建
 - Linux 6.0+ 用于 ublk 前端（macOS 通过 stdin 前端支持开发调试）
 
 ### 构建
@@ -59,7 +59,7 @@ cargo build --release
 
 ```toml
 [meta]
-rocksdb_path = "/data/onyx/rocksdb"
+path = "/data/onyx/metadb"
 block_cache_mb = 256
 
 [storage]
@@ -100,7 +100,7 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 1. 用户 I/O 到达 ZoneWorker
 2. 原始数据（未压缩）追加到 WriteBufferPool &rarr; sync &rarr; **ack 返回用户**
 3. 后台 flusher 排空缓冲：合并连续 LBA &rarr; 去重（4KB SHA-256）&rarr; 压缩合并单元 &rarr; Packer 打包 &rarr; O_DIRECT 写入 LV3
-4. RocksDB WriteBatch 原子更新 blockmap + refcount
+4. metadb 原子提交 blockmap + refcount
 
 用户感知延迟 = 缓冲写入 + sync。压缩和去重完全不在热路径上。
 
@@ -114,7 +114,7 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 
 - 4KB 是去重粒度（固定大小指纹）；压缩粒度远大于此（最大 128KB 合并单元）
 - 缓冲压力 > 90% 时跳过去重，标记 `DEDUP_SKIPPED`；后台 DedupScanner 补扫
-- 去重索引清理是原子的：refcount 归零时，前缀扫描 dedup_reverse 清理过期条目，在同一 WriteBatch 中提交
+- 去重索引清理是原子的：refcount 归零时，前缀扫描 dedup_reverse 清理过期条目，在同一元数据事务中提交
 
 ### 垃圾回收
 
@@ -123,9 +123,9 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 - 旧 PBA refcount 自然归零 &rarr; 空间回收
 - 背压：缓冲利用率超过 80% 时暂停 GC
 
-## RocksDB Column Families
+## metadb 元数据表
 
-全局 CF（固定）：
+全局元数据（固定）：
 
 | CF              | Key                     | Value               | 用途                    |
 |-----------------|-------------------------|----------------------|-------------------------|
@@ -134,17 +134,17 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 | `dedup_index`   | `sha256(32B)`           | DedupEntry(27B)      | 内容哈希 &rarr; PBA     |
 | `dedup_reverse` | `pba(BE) + sha256(32B)` | empty                | 反向查找用于清理        |
 
-Per-volume blockmap CF（每个 volume 一个，动态创建/销毁）：
+Per-volume blockmap（每个 volume 一个命名空间）：
 
-| CF                     | Key       | Value            | 用途                  |
+| 表                     | Key       | Value            | 用途                  |
 |------------------------|-----------|------------------|-----------------------|
 | `blockmap:{volume_id}` | `lba(BE)` | 28B BlockmapValue| LBA &rarr; PBA 映射   |
 
-每个 volume 独立 LSM tree，独立 bloom filter、compaction 和 block cache。删卷时 `drop_cf` O(1) 删除整个 CF。旧的单 CF blockmap 在首次打开时自动迁移。
+每个 volume 独立 L2P 命名空间。删卷会删除该命名空间并递减 refcount；当 PBA refcount 归零时清理 dedup reverse/index。
 
 ## 演进路线
 
-- [x] MVP：ublk + RocksDB + 压缩 + 空间管理
+- [x] MVP：ublk + metadb + 压缩 + 空间管理
 - [x] Packer + GC：fragment bin-packing、GC 扫描/回写、背压控制、hole map 复用
 - [x] 去重：工作线程池、dedup_index/dedup_reverse、分级跳过策略、后台补扫
 - [ ] RAID 感知：strip 对齐写出、strip 粒度分配

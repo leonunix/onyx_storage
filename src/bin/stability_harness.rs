@@ -45,10 +45,17 @@ fn write_and_abort(
 ) -> ! {
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: Some(meta_dir),
+            path: Some(meta_dir),
             block_cache_mb: 32,
             memtable_budget_mb: 0,
+            index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1000,
             wal_dir: None,
+            dedup_shards: 1,
+            dedup_cuckoo_buckets: 4_000_000,
+            dedup_l1_cache_entries: 256_000,
         },
         storage: StorageConfig {
             data_device: Some(data),
@@ -66,13 +73,16 @@ fn write_and_abort(
             group_commit_wait_us: 250,
             shards: 1,
             max_memory_mb: 0,
+            ..BufferConfig::default()
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig {
             compress_workers: 2,
             coalesce_max_raw_bytes: 131072,
             coalesce_max_lbas: 32,
-        skip_fully_superseded: true,
+            min_compression_savings_pct: 12,
+            skip_fully_superseded: true,
+            ..FlushConfig::default()
         },
         engine: EngineConfig {
             zone_count: 4,
@@ -89,6 +99,7 @@ fn write_and_abort(
         },
         service: Default::default(),
         ha: Default::default(),
+        threading: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

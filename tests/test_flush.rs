@@ -48,10 +48,17 @@ fn setup_flush_env_with_backend(
 ) {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -389,10 +396,17 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
     let meta_dir = tempdir().unwrap();
     let meta = Arc::new(
         MetaStore::open(&MetaConfig {
-            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 0,
+            index_pin_mb: 0,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 8,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         })
         .unwrap(),
     );

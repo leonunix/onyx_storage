@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -5,12 +6,81 @@ use crate::buffer::pool::WriteBufferPool;
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
+use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, ZoneId, BLOCK_SIZE};
 use crate::zone::read;
+use onyx_metadb::VolumeOrdinal;
+
+// Normal ublk reads top out at 1 MiB (256 LBAs in the detailed profile). Once
+// metadb range reads only touch the leaf shards covered by the request, the
+// range path is cheaper for medium/large reads because it skips per-LBA hole
+// probes on sparse volumes. Tiny reads stay on multi_get: range iterator setup
+// is measurably more expensive for the 4K-32K fio mix.
+const RANGE_META_LOOKUP_MIN_LBAS: u32 = 32;
+type ReadUnitKey = (u64, u16, u32);
+
+struct ReadUnitGroup {
+    mapping: BlockmapValue,
+    members: Vec<(usize, u16)>, // (out_buf slot, offset_in_unit)
+}
+
+struct RawExtentGroup {
+    start_slot: usize,
+    mappings: Vec<BlockmapValue>,
+}
+
+impl RawExtentGroup {
+    fn new(slot: usize, mapping: BlockmapValue) -> Self {
+        Self {
+            start_slot: slot,
+            mappings: vec![mapping],
+        }
+    }
+
+    fn can_extend(&self, slot: usize, mapping: &BlockmapValue) -> bool {
+        let Some(prev) = self.mappings.last() else {
+            return false;
+        };
+        slot == self.start_slot + self.mappings.len()
+            && is_single_raw_block(prev)
+            && is_single_raw_block(mapping)
+            && mapping.pba.0 == prev.pba.0 + 1
+    }
+}
+
+#[inline]
+fn is_single_raw_block(mapping: &BlockmapValue) -> bool {
+    mapping.compression == 0
+        && mapping.slot_offset == 0
+        && mapping.unit_compressed_size == BLOCK_SIZE
+        && mapping.unit_original_size == BLOCK_SIZE
+        && mapping.unit_lba_count == 1
+        && mapping.offset_in_unit == 0
+}
+
+fn push_read_unit_group(
+    groups: &mut HashMap<ReadUnitKey, ReadUnitGroup>,
+    slot: usize,
+    mapping: BlockmapValue,
+) {
+    let key: ReadUnitKey = (
+        mapping.pba.0,
+        mapping.slot_offset,
+        mapping.unit_compressed_size,
+    );
+    groups
+        .entry(key)
+        .or_insert_with(|| ReadUnitGroup {
+            mapping,
+            members: Vec::new(),
+        })
+        .members
+        .push((slot, mapping.offset_in_unit));
+}
 
 /// Routes IO across LBAs.
 ///
@@ -18,7 +88,7 @@ use crate::zone::read;
 /// * Writes go straight into `WriteBufferPool::append` — same-zone ordering is
 ///   preserved by the per-shard append lock inside the pool.
 /// * Reads run via `crate::zone::read::execute_read` — the buffer DashMap is
-///   lock-free and `MetaStore::get_mapping` is a RocksDB point-get, so no
+///   lock-free and `MetaStore::get_mapping` is a metadb point-get, so no
 ///   external serialization is needed.
 ///
 /// `zone_count` / `zone_size_blocks` are kept for write-splitting at zone
@@ -36,6 +106,33 @@ pub struct ZoneManager {
     /// batched io_uring submission + parallel decompression. When absent,
     /// reads fall back to inline `IoEngine::read_blocks` on the caller thread.
     read_pool: Option<Arc<ReadPool>>,
+}
+
+#[inline]
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// RAII guard that records elapsed wall time on drop. Used so `submit_reads`
+/// charges the total ns counter once on every exit (early-return paths and
+/// the success path) without having to thread the bookkeeping through each
+/// branch.
+struct ReadSubmitTimer<'a> {
+    counter: &'a std::sync::atomic::AtomicU64,
+    start: Instant,
+}
+
+impl<'a> ReadSubmitTimer<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicU64, start: Instant) -> Self {
+        Self { counter, start }
+    }
+}
+
+impl Drop for ReadSubmitTimer<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_add(elapsed_ns(self.start), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl ZoneManager {
@@ -114,6 +211,10 @@ impl ZoneManager {
     /// Access the shared engine metrics.
     pub fn metrics(&self) -> &Arc<EngineMetrics> {
         &self.metrics
+    }
+
+    pub fn volume_ordinal(&self, vol_id: &str) -> OnyxResult<VolumeOrdinal> {
+        self.meta.volume_ordinal_str(vol_id)
     }
 
     /// Determine which zone handles a given LBA
@@ -226,7 +327,7 @@ impl ZoneManager {
     /// directly into `out_buf`, which must be `count * BLOCK_SIZE` bytes.
     ///
     /// Why it's faster than looping `submit_read_with_generation` per LBA:
-    /// one `multi_get_mappings` instead of N RocksDB point gets; LBAs sharing
+    /// one `multi_get_mappings` instead of N metadb point gets; LBAs sharing
     /// a compression unit on disk do **one** io_uring read + **one**
     /// decompression, then fan out into N output slots; per-LBA `to_vec()`
     /// intermediate copies are eliminated by copying straight into `out_buf`.
@@ -237,6 +338,18 @@ impl ZoneManager {
     pub fn submit_reads(
         &self,
         vol_id: &str,
+        start_lba: Lba,
+        count: u32,
+        vol_created_at: u64,
+        out_buf: &mut [u8],
+    ) -> OnyxResult<()> {
+        self.submit_reads_with_ordinal(vol_id, None, start_lba, count, vol_created_at, out_buf)
+    }
+
+    pub fn submit_reads_with_ordinal(
+        &self,
+        vol_id: &str,
+        vol_ord: Option<VolumeOrdinal>,
         start_lba: Lba,
         count: u32,
         vol_created_at: u64,
@@ -259,28 +372,50 @@ impl ZoneManager {
         self.metrics
             .zone_read_dispatches
             .fetch_add(count as u64, Ordering::Relaxed);
+        self.metrics
+            .read_submit_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let total_start = Instant::now();
+        let _scope_total = ReadSubmitTimer::new(&self.metrics.read_submit_total_ns, total_start);
 
         // Pass 1: buffer lookups. Hits write directly into `out_buf`; misses
         // queue up for a single blockmap batch.
-        let mut pending_lbas: Vec<Lba> = Vec::new();
+        let pass1_start = Instant::now();
+        let mut pending_lbas: Vec<u64> = Vec::new();
         let mut pending_slots: Vec<u32> = Vec::new();
-        for i in 0..count {
-            let lba = Lba(start_lba.0 + i as u64);
-            let slot = i as usize;
-            let dst = &mut out_buf[slot * bs..slot * bs + bs];
-            let hit = if let Some(pending) = self.buffer_pool.lookup(vol_id, lba)? {
-                if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
-                    if let Some(ref payload) = pending.payload {
-                        let offset = (lba.0 - pending.start_lba.0) as usize * bs;
-                        let end = offset + bs;
-                        if end <= payload.len() {
-                            dst.copy_from_slice(&payload[offset..end]);
-                            self.metrics.read_buffer_hits.fetch_add(1, Ordering::Relaxed);
-                            self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
-                            self.metrics
-                                .buffer_read_bytes
-                                .fetch_add(bs as u64, Ordering::Relaxed);
-                            true
+        if self.buffer_pool.pending_count() == 0 {
+            pending_lbas.reserve(count as usize);
+            pending_slots.reserve(count as usize);
+            for i in 0..count {
+                pending_lbas.push(start_lba.0 + i as u64);
+                pending_slots.push(i);
+            }
+        } else {
+            let buffer_hits = self
+                .buffer_pool
+                .lookup_primary_range(vol_id, start_lba, count)?;
+            for (i, hit) in buffer_hits.into_iter().enumerate() {
+                let lba = start_lba.0 + i as u64;
+                let slot = i;
+                let dst = &mut out_buf[slot * bs..slot * bs + bs];
+                let hit = if let Some(pending) = hit {
+                    if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
+                        if let Some(ref payload) = pending.payload {
+                            let offset = (lba - pending.start_lba.0) as usize * bs;
+                            let end = offset + bs;
+                            if end <= payload.len() {
+                                dst.copy_from_slice(&payload[offset..end]);
+                                self.metrics
+                                    .read_buffer_hits
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
+                                self.metrics
+                                    .buffer_read_bytes
+                                    .fetch_add(bs as u64, Ordering::Relaxed);
+                                true
+                            } else {
+                                false
+                            }
                         } else {
                             false
                         }
@@ -289,93 +424,272 @@ impl ZoneManager {
                     }
                 } else {
                     false
+                };
+                if !hit {
+                    pending_lbas.push(lba);
+                    pending_slots.push(i as u32);
                 }
-            } else {
-                false
-            };
-            if !hit {
-                pending_lbas.push(lba);
-                pending_slots.push(i);
             }
         }
+        self.metrics
+            .read_submit_buffer_lookup_ns
+            .fetch_add(elapsed_ns(pass1_start), Ordering::Relaxed);
 
         if pending_lbas.is_empty() {
             return Ok(());
         }
 
-        // Pass 2: one batched RocksDB multi_get for the miss set.
-        let vid = VolumeId(vol_id.to_string());
-        let mappings = self.meta.multi_get_mappings(&vid, &pending_lbas)?;
+        // Pass 3 input: mapped LBAs still keyed by output slot. We sort after
+        // metadata lookup so unordered range scans can still form contiguous
+        // raw extents.
+        let mut mapped_units: Vec<(usize, BlockmapValue)> = Vec::with_capacity(pending_lbas.len());
 
-        // Pass 3: group mapped LBAs by (pba, slot_offset, unit_compressed_size)
-        // — the on-disk unit identity. Zero-fill unmapped slots inline.
-        use std::collections::HashMap;
-        type UnitKey = (u64, u16, u32);
-        struct UnitGroup {
-            mapping: crate::meta::schema::BlockmapValue,
-            members: Vec<(usize, u16)>, // (out_buf slot, offset_in_unit)
-        }
-        let mut groups: HashMap<UnitKey, UnitGroup> = HashMap::new();
+        // Pass 2: for real read requests we are looking up one contiguous LBA
+        // span. A range scan returns only mapped entries, which avoids paying
+        // one point lookup per hole when the volume is still sparse. Small
+        // reads stay on multi_get to keep the one-block path minimal.
+        let pass2_start = Instant::now();
+        let meta_query_ns;
+        if count >= RANGE_META_LOOKUP_MIN_LBAS {
+            for &slot in &pending_slots {
+                let slot = slot as usize;
+                out_buf[slot * bs..slot * bs + bs].fill(0);
+            }
 
-        for (idx, mapping_opt) in mappings.into_iter().enumerate() {
-            let slot = pending_slots[idx] as usize;
-            match mapping_opt {
-                None => {
-                    let dst = &mut out_buf[slot * bs..slot * bs + bs];
-                    dst.fill(0);
-                    self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
+            let end_lba = Lba(start_lba.0 + count as u64);
+            let query_start = Instant::now();
+            let mapped = if let Some(ord) = vol_ord {
+                self.meta
+                    .get_mappings_range_unordered_ord(ord, start_lba, end_lba)?
+            } else {
+                self.meta
+                    .get_mappings_range_unordered_str(vol_id, start_lba, end_lba)?
+            };
+            meta_query_ns = elapsed_ns(query_start);
+            let mut mapped_pending = 0usize;
+            if pending_lbas.len() == count as usize {
+                for (lba, mapping) in mapped {
+                    let slot = (lba.0 - start_lba.0) as usize;
+                    if slot < count as usize {
+                        mapped_pending += 1;
+                        mapped_units.push((slot, mapping));
+                    }
                 }
-                Some(mapping) => {
-                    let key: UnitKey =
-                        (mapping.pba.0, mapping.slot_offset, mapping.unit_compressed_size);
-                    groups
-                        .entry(key)
-                        .or_insert_with(|| UnitGroup {
-                            mapping,
-                            members: Vec::new(),
-                        })
-                        .members
-                        .push((slot, mapping.offset_in_unit));
+            } else {
+                let mut pending_slot_by_lba: HashMap<u64, usize> =
+                    HashMap::with_capacity(pending_lbas.len());
+                for (lba, slot) in pending_lbas.iter().zip(pending_slots.iter().copied()) {
+                    pending_slot_by_lba.insert(*lba, slot as usize);
+                }
+                for (lba, mapping) in mapped {
+                    if let Some(slot) = pending_slot_by_lba.get(&lba.0).copied() {
+                        mapped_pending += 1;
+                        mapped_units.push((slot, mapping));
+                    }
+                }
+            }
+            let unmapped = pending_lbas.len().saturating_sub(mapped_pending);
+            self.metrics
+                .read_unmapped
+                .fetch_add(unmapped as u64, Ordering::Relaxed);
+        } else {
+            let query_start = Instant::now();
+            let mappings = if let Some(ord) = vol_ord {
+                self.meta.multi_get_mappings_raw_ord(ord, &pending_lbas)?
+            } else {
+                let pending_lbas: Vec<Lba> = pending_lbas.iter().copied().map(Lba).collect();
+                self.meta.multi_get_mappings_str(vol_id, &pending_lbas)?
+            };
+            meta_query_ns = elapsed_ns(query_start);
+            for (idx, mapping_opt) in mappings.into_iter().enumerate() {
+                let slot = pending_slots[idx] as usize;
+                match mapping_opt {
+                    None => {
+                        let dst = &mut out_buf[slot * bs..slot * bs + bs];
+                        dst.fill(0);
+                        self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(mapping) => {
+                        mapped_units.push((slot, mapping));
+                    }
                 }
             }
         }
+        self.metrics
+            .read_submit_meta_get_ns
+            .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
+        self.metrics
+            .read_submit_meta_query_ns
+            .fetch_add(meta_query_ns, Ordering::Relaxed);
+        self.metrics.read_submit_meta_route_ns.fetch_add(
+            elapsed_ns(pass2_start).saturating_sub(meta_query_ns),
+            Ordering::Relaxed,
+        );
 
-        if groups.is_empty() {
+        if mapped_units.is_empty() {
             return Ok(());
+        }
+
+        // Pass 3: split mapped LBAs into two shapes:
+        // - raw single-block mappings with consecutive output slots and PBAs
+        //   become one extent read (4K/8K/16K/32K as one SQE);
+        // - compressed/packed units stay grouped by unit identity.
+        let mut groups: HashMap<ReadUnitKey, ReadUnitGroup> = HashMap::new();
+        let mut raw_extents: Vec<RawExtentGroup> = Vec::new();
+        mapped_units.sort_unstable_by_key(|(slot, _)| *slot);
+        let mut current_raw: Option<RawExtentGroup> = None;
+        for (slot, mapping) in mapped_units {
+            if is_single_raw_block(&mapping) {
+                if let Some(raw) = current_raw.as_mut() {
+                    if raw.can_extend(slot, &mapping) {
+                        raw.mappings.push(mapping);
+                        continue;
+                    }
+                }
+                if let Some(raw) = current_raw.take() {
+                    raw_extents.push(raw);
+                }
+                current_raw = Some(RawExtentGroup::new(slot, mapping));
+            } else {
+                if let Some(raw) = current_raw.take() {
+                    raw_extents.push(raw);
+                }
+                push_read_unit_group(&mut groups, slot, mapping);
+            }
+        }
+        if let Some(raw) = current_raw {
+            raw_extents.push(raw);
         }
 
         // Pass 4: fan out unit reads. Send all first, then drain — the
         // ReadPool worker coalesces same-worker requests into one io_uring
         // submit, and other workers run in parallel.
-        if let Some(pool) = self.read_pool.as_deref() {
+        let pass4_start = Instant::now();
+        let pass4_result = if let Some(pool) = self.read_pool.as_deref() {
+            let mut raw_receivers = Vec::with_capacity(raw_extents.len());
+            for raw in raw_extents.into_iter() {
+                let rx = pool.submit_raw_extent_read_async(raw.mappings)?;
+                raw_receivers.push((rx, raw.start_slot));
+            }
             let mut receivers = Vec::with_capacity(groups.len());
-            let mut units: Vec<UnitGroup> = Vec::with_capacity(groups.len());
+            let mut units: Vec<ReadUnitGroup> = Vec::with_capacity(groups.len());
             for (_, group) in groups.into_iter() {
                 let rx = pool.submit_unit_read_async(group.mapping)?;
                 receivers.push(rx);
                 units.push(group);
             }
-            for (rx, group) in receivers.into_iter().zip(units.into_iter()) {
-                let payload = rx.recv().map_err(|_| {
-                    crate::error::OnyxError::Io(std::io::Error::other(
-                        "read-pool reply dropped",
-                    ))
-                })??;
-                self.fan_out_unit(&payload, &group.members, out_buf)?;
+            let mut result: OnyxResult<()> = Ok(());
+            for (rx, start_slot) in raw_receivers {
+                match rx.recv().map_err(|_| {
+                    crate::error::OnyxError::Io(std::io::Error::other("read-pool reply dropped"))
+                }) {
+                    Ok(Ok(payload)) => {
+                        let start = start_slot * bs;
+                        let end = start + payload.len();
+                        if end > out_buf.len() {
+                            result = Err(crate::error::OnyxError::Compress(format!(
+                                "raw extent output out of bounds: {start}..{end} > {}",
+                                out_buf.len()
+                            )));
+                            break;
+                        }
+                        out_buf[start..end].copy_from_slice(&payload);
+                    }
+                    Ok(Err(e)) | Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
             }
+            for (rx, group) in receivers.into_iter().zip(units.into_iter()) {
+                if result.is_err() {
+                    break;
+                }
+                match rx.recv().map_err(|_| {
+                    crate::error::OnyxError::Io(std::io::Error::other("read-pool reply dropped"))
+                }) {
+                    Ok(Ok(payload)) => {
+                        if let Err(e) = self.fan_out_unit(&payload, &group.members, out_buf) {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) | Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            result
         } else {
             // Inline fallback: no pool configured. Still benefits from unit
             // coalescing — one IoEngine read + decompress per unit.
-            for (_, group) in groups.into_iter() {
-                let read_size = group.mapping.compressed_read_size(bs);
-                let raw = self.io_engine.read_blocks(group.mapping.pba, read_size)?;
-                let payload = read::decode_unit(&raw, &group.mapping, &self.metrics)?;
-                let payload_buf = payload.into_owned();
-                self.fan_out_unit(&payload_buf, &group.members, out_buf)?;
+            let mut result: OnyxResult<()> = Ok(());
+            for raw in raw_extents.into_iter() {
+                let read_size = raw.mappings.len() * bs;
+                let raw_payload = match self.io_engine.read_blocks(raw.mappings[0].pba, read_size) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
+                for (idx, mapping) in raw.mappings.iter().enumerate() {
+                    let off = idx * bs;
+                    let block = &raw_payload[off..off + bs];
+                    let actual_crc = crc32fast::hash(block);
+                    if actual_crc != mapping.crc32 {
+                        self.metrics.read_crc_errors.fetch_add(1, Ordering::Relaxed);
+                        result = Err(crate::error::OnyxError::CrcMismatch {
+                            expected: mapping.crc32,
+                            actual: actual_crc,
+                        });
+                        break;
+                    }
+                }
+                if result.is_err() {
+                    break;
+                }
+                let start = raw.start_slot * bs;
+                let end = start + raw_payload.len();
+                out_buf[start..end].copy_from_slice(&raw_payload);
+                self.metrics
+                    .read_lv3_hits
+                    .fetch_add(raw.mappings.len() as u64, Ordering::Relaxed);
+                self.metrics
+                    .lv3_read_decompressed_bytes
+                    .fetch_add(read_size as u64, Ordering::Relaxed);
             }
-        }
-
-        Ok(())
+            for (_, group) in groups.into_iter() {
+                if result.is_err() {
+                    break;
+                }
+                let read_size = group.mapping.compressed_read_size(bs);
+                let raw = match self.io_engine.read_blocks(group.mapping.pba, read_size) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
+                let payload = match read::decode_unit(&raw, &group.mapping, &self.metrics) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
+                let payload_buf = payload.into_owned();
+                if let Err(e) = self.fan_out_unit(&payload_buf, &group.members, out_buf) {
+                    result = Err(e);
+                    break;
+                }
+            }
+            result
+        };
+        self.metrics
+            .record_read_submit_unit_io_ns(elapsed_ns(pass4_start));
+        pass4_result
     }
 
     /// Copy each `(slot, offset_in_unit)` member's 4 KB from the decoded unit

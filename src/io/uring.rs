@@ -34,13 +34,9 @@ pub enum UringOp {
     },
     /// fdatasync barrier: kernel waits for all earlier SQEs in the same submit
     /// to complete before issuing the fsync. Must come last in the batch.
-    FsyncDataBarrier {
-        fd: RawFd,
-    },
+    FsyncDataBarrier { fd: RawFd },
     /// Plain fdatasync (no ordering with other SQEs).
-    FsyncData {
-        fd: RawFd,
-    },
+    FsyncData { fd: RawFd },
 }
 
 // SAFETY: UringOp carries raw pointers; the caller guarantees they outlive the

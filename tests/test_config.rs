@@ -4,7 +4,7 @@ use onyx_storage::config::*;
 fn parse_minimal_config() {
     let toml_str = r#"
 [meta]
-rocksdb_path = "/data/lv1/rocksdb"
+path = "/data/lv1/metadb"
 
 [storage]
 data_device = "/dev/vg0/lv3"
@@ -20,13 +20,14 @@ device = "/dev/vg0/lv2"
     assert_eq!(config.buffer.capacity_mb, 16384);
     assert_eq!(config.buffer.group_commit_wait_us, 500);
     assert_eq!(config.ublk.nr_queues, 4);
+    assert_eq!(config.ublk.queue_workers, 1);
 }
 
 #[test]
 fn parse_full_config() {
     let toml_str = r#"
 [meta]
-rocksdb_path = "/data/rocksdb"
+path = "/data/metadb"
 block_cache_mb = 512
 wal_dir = "/data/wal"
 
@@ -46,6 +47,7 @@ group_commit_wait_us = 500
 nr_queues = 8
 queue_depth = 256
 io_buf_bytes = 2097152
+queue_workers = 3
 "#;
     let config: OnyxConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(config.meta.block_cache_mb, 512);
@@ -53,6 +55,20 @@ io_buf_bytes = 2097152
     assert_eq!(config.buffer.flush_watermark_pct, 90);
     assert_eq!(config.buffer.group_commit_wait_us, 500);
     assert_eq!(config.ublk.nr_queues, 8);
+    assert_eq!(config.ublk.queue_workers, 3);
+}
+
+#[test]
+fn parse_meta_path() {
+    let toml_str = r#"
+[meta]
+path = "/data/onyx/meta"
+"#;
+    let config: OnyxConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+        config.meta.path().unwrap(),
+        std::path::Path::new("/data/onyx/meta")
+    );
 }
 
 /// Loading config from nonexistent file → error.

@@ -1,12 +1,12 @@
-use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Condvar, RwLock};
 
 use crate::buffer::entry::{BufferEntry, BUFFER_ENTRY_MAGIC, MAX_ENTRY_SIZE, MIN_ENTRY_SIZE};
 use crate::error::{OnyxError, OnyxResult};
@@ -29,6 +29,156 @@ const SHARD_CHECKPOINT_MAGIC: u32 = 0x5348_434B; // "SHCK"
 const SHARD_CHECKPOINT_VERSION: u32 = 1;
 const SHARD_CHECKPOINT_SIZE: u64 = 4096;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STAGING_CHANNEL_CAPACITY: usize = 32 * 1024;
+/// Bound one sync epoch per shard. The previous unbounded drain could pull
+/// millions of staged 4K writes into one Vec under fio, multiplying memory
+/// before the device had a chance to fsync the first batch.
+const SYNC_BATCH_MAX_ENTRIES: usize = 4096;
+const SYNC_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+const MIN_VOLATILE_PAYLOAD_MEMORY: u64 = 64 * 1024 * 1024;
+const MAX_VOLATILE_PAYLOAD_MEMORY: u64 = 8 * 1024 * 1024 * 1024;
+/// Online payload hydration read-ahead. 128 KiB matches the common coalesce
+/// unit while keeping foreground read tail latency bounded.
+const HYDRATE_BATCH_MAX_BYTES: usize = 128 * 1024;
+/// Coarse read-path filter for pending buffer entries. A read range whose
+/// buckets are absent can skip the DashMap LBA index entirely. Collisions and
+/// stale buckets are harmless false positives; false negatives are avoided by
+/// installing buckets before publishing LBA index entries and removing them
+/// only after the entry is fully retired.
+const PENDING_LBA_BUCKET_BLOCKS: u64 = 256;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BufferRuntimeLimits {
+    pub staging_channel_capacity: usize,
+    pub sync_batch_max_entries: usize,
+    pub sync_batch_max_bytes: usize,
+    pub volatile_payload_memory: u64,
+}
+
+impl BufferRuntimeLimits {
+    pub fn from_config(
+        durable_payload_limit: u64,
+        staging_channel_capacity: usize,
+        sync_batch_max_entries: usize,
+        sync_batch_max_bytes: usize,
+        volatile_payload_memory: u64,
+    ) -> Self {
+        let defaults = Self::for_durable_payload_limit(durable_payload_limit);
+        Self {
+            staging_channel_capacity: if staging_channel_capacity == 0 {
+                defaults.staging_channel_capacity
+            } else {
+                staging_channel_capacity
+            },
+            sync_batch_max_entries: if sync_batch_max_entries == 0 {
+                defaults.sync_batch_max_entries
+            } else {
+                sync_batch_max_entries
+            },
+            sync_batch_max_bytes: if sync_batch_max_bytes == 0 {
+                defaults.sync_batch_max_bytes
+            } else {
+                sync_batch_max_bytes
+            },
+            volatile_payload_memory: if volatile_payload_memory == 0 {
+                defaults.volatile_payload_memory
+            } else {
+                volatile_payload_memory
+            },
+        }
+    }
+
+    pub fn for_durable_payload_limit(durable_payload_limit: u64) -> Self {
+        let volatile_payload_memory = if durable_payload_limit == 0 {
+            0
+        } else {
+            (durable_payload_limit / 4)
+                .clamp(MIN_VOLATILE_PAYLOAD_MEMORY, MAX_VOLATILE_PAYLOAD_MEMORY)
+        };
+        Self {
+            staging_channel_capacity: STAGING_CHANNEL_CAPACITY,
+            sync_batch_max_entries: SYNC_BATCH_MAX_ENTRIES,
+            sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
+            volatile_payload_memory,
+        }
+    }
+}
+
+struct VolatilePayloadBudget {
+    bytes: AtomicU64,
+    limit: u64,
+    lock: parking_lot::Mutex<()>,
+    cv: Condvar,
+}
+
+impl VolatilePayloadBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            limit,
+            lock: parking_lot::Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn reserve(&self, bytes: u64) {
+        if self.limit == 0 {
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+
+        let mut guard = self.lock.lock();
+        loop {
+            let current = self.bytes.load(Ordering::Relaxed);
+            let fits = current.saturating_add(bytes) <= self.limit;
+            let oversized_single_write = current == 0 && bytes > self.limit;
+            if fits || oversized_single_write {
+                if self
+                    .bytes
+                    .compare_exchange_weak(
+                        current,
+                        current.saturating_add(bytes),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+                continue;
+            }
+            let _ = self.cv.wait_for(&mut guard, BACKPRESSURE_POLL_INTERVAL);
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut current = self.bytes.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.cv.notify_all();
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    fn limit(&self) -> u64 {
+        self.limit
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingEntry {
     pub seq: u64,
@@ -66,6 +216,12 @@ pub struct RecoveredMeta {
 struct LbaKey {
     vol_id: Arc<str>,
     lba: Lba,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PendingBucketKey {
+    vol_hash: u64,
+    bucket: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,11 +362,20 @@ struct BufferShard {
     backpressure_timeout: Duration,
     lba_index: DashMap<LbaKey, Arc<PendingEntry>>,
     latest_lba_seq: DashMap<LbaKey, (u64, u64)>,
+    pending_lba_buckets: DashMap<PendingBucketKey, AtomicU32>,
     pending_entries: DashMap<u64, Arc<PendingEntry>>,
+    pending_count: AtomicU64,
     flush_progress: DashMap<u64, HashSet<u16>>,
     staging_tx: Sender<StagedEntry>,
     staging_rx: Receiver<StagedEntry>,
+    sync_batch_max_entries: usize,
+    sync_batch_max_bytes: usize,
+    /// Durable, memory-resident payload cache. `volatile_payloads` covers the
+    /// pre-fdatasync window; once sync publishes an entry as ready, payloads
+    /// move into `PendingEntry::payload` and this FIFO tracks eviction order.
+    cached_payload_order: parking_lot::Mutex<VecDeque<u64>>,
     volatile_payloads: DashMap<u64, Arc<[u8]>>,
+    volatile_payload_budget: Arc<VolatilePayloadBudget>,
     lifecycle: parking_lot::Mutex<LifecycleState>,
     io_lock: parking_lot::Mutex<()>,
     /// Intern cache: vol_id → Arc<str>. Typically 1-10 entries.
@@ -222,8 +387,10 @@ struct BufferShard {
     checkpoint_device: Option<RawDevice>,
     /// Shared counter for total payload bytes in memory (across all shards).
     payload_bytes_in_memory: Arc<AtomicU64>,
-    /// Maximum allowed in-memory payload bytes (shared with pool). 0 = no limit.
-    max_payload_memory_bytes: u64,
+    /// Global budget for durable in-memory buffer payload cache. 0 disables
+    /// the resident cache; the transient pre-sync `volatile_payloads` path
+    /// still serves read-after-write.
+    max_payload_memory: u64,
     /// Global upper bound of seqs that have been mark_flushed'd (across all
     /// shards). Updated in `free_seq_allocation` to `max(current, seq)`.
     max_flushed_seq: Arc<AtomicU64>,
@@ -243,8 +410,13 @@ pub struct WriteBufferPool {
     metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
     /// Total payload bytes currently held in memory across all shards.
     payload_bytes_in_memory: Arc<AtomicU64>,
-    /// Maximum allowed in-memory payload bytes. 0 means no limit (for tests).
+    /// Maximum allowed durable in-memory payload cache bytes. 0 disables the
+    /// resident cache (used by tests that need forced lazy hydration).
     max_payload_memory: u64,
+    /// Sync-before-publish payloads. These are intentionally separate from
+    /// durable cache bytes because they are write-admission pressure, not a
+    /// reusable read cache.
+    volatile_payload_budget: Arc<VolatilePayloadBudget>,
     /// On-disk layout version — persisted on Drop. Must match the actual disk layout.
     disk_version: u32,
     /// Highest seq that has ever been passed to `mark_flushed` across any shard.
@@ -258,7 +430,7 @@ pub struct WriteBufferPool {
     /// sync, so any seq ≤ captured value is guaranteed to have had its DB
     /// writes issued before the fsync and is therefore durable afterwards.
     pub(crate) max_flushed_seq: Arc<AtomicU64>,
-    /// Watermark of seqs that are guaranteed durable on RocksDB. Advanced
+    /// Watermark of seqs that are guaranteed durable on metadb. Advanced
     /// only by the durability-watermark background thread after
     /// `MetaStore::sync_durable()` returns.
     ///

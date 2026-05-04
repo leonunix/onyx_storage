@@ -1,6 +1,7 @@
 [meta]
-rocksdb_path = "/data/onyx/rocksdb"
+path = "/data/onyx/metadb"
 block_cache_mb = 256
+dedup_shards = 8
 # wal_dir = "/data/onyx/wal"
 
 [storage]
@@ -19,3 +20,4 @@ group_commit_wait_us = 250
 nr_queues = 4
 queue_depth = 128
 io_buf_bytes = 1048576
+queue_workers = 1

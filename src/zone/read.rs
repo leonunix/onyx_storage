@@ -7,7 +7,7 @@ use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
-use crate::types::{CompressionAlgo, Lba, VolumeId, BLOCK_SIZE};
+use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
 
 /// Execute a read for one 4KB LBA.
 ///
@@ -49,9 +49,8 @@ pub fn execute_read(
         }
     }
 
-    // 2. Persistent blockmap — RocksDB point read, no IO yet.
-    let vid = VolumeId(vol_id.to_string());
-    let mapping = match meta.get_mapping(&vid, lba)? {
+    // 2. Persistent blockmap — metadb point read, no IO yet.
+    let mapping = match meta.get_mapping_str(vol_id, lba)? {
         Some(m) => m,
         None => {
             metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
@@ -153,10 +152,14 @@ pub(crate) fn decode_unit<'a>(
         let algo = CompressionAlgo::from_u8(mapping.compression).unwrap_or(CompressionAlgo::None);
         let codec = create_compressor(algo);
         let mut decompressed = vec![0u8; mapping.unit_original_size as usize];
-        if let Err(err) =
-            codec.decompress(compressed, &mut decompressed, mapping.unit_original_size as usize)
-        {
-            metrics.read_decompress_errors.fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = codec.decompress(
+            compressed,
+            &mut decompressed,
+            mapping.unit_original_size as usize,
+        ) {
+            metrics
+                .read_decompress_errors
+                .fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
         Ok(UnitPayload::Owned(decompressed))
@@ -281,8 +284,8 @@ mod tests {
         let crc = crc32fast::hash(&compressed);
 
         // Raw buffer is compressed bytes rounded up to block_size for O_DIRECT.
-        let read_size = ((csize + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
-            * BLOCK_SIZE as usize;
+        let read_size =
+            ((csize + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize) * BLOCK_SIZE as usize;
         let mut raw = vec![0u8; read_size];
         raw[..csize].copy_from_slice(&compressed);
 

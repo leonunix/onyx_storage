@@ -11,6 +11,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
             let total_start = Instant::now();
@@ -51,7 +52,7 @@ impl BufferFlusher {
             let allocation = if blocks_needed == 1 {
                 Allocation::Single(allocator.allocate_one_for_lane(shard_idx)?)
             } else {
-                let extent = allocator.allocate_extent(blocks_needed as u32)?;
+                let extent = allocator.allocate_extent_for_lane(shard_idx, blocks_needed as u32)?;
                 if (extent.count as usize) < blocks_needed {
                     allocator.free_extent(extent)?;
                     Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
@@ -111,20 +112,28 @@ impl BufferFlusher {
                 } else {
                     0
                 };
-                batch_values.push((
-                    lbas[i],
-                    BlockmapValue {
-                        pba,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: live_positions[i] as u16,
-                        crc32: unit.crc32,
-                        slot_offset: 0,
-                        flags,
-                    },
-                ));
+                let blockmap =
+                    Self::blockmap_for_unit_position(unit, pba, live_positions[i], 0, flags);
+                batch_values.push((lbas[i], blockmap));
+            }
+            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+            if !unit.dedup_skipped {
+                if let Some(ref hashes) = unit.block_hashes {
+                    dedup_registrations.reserve(live_positions.len());
+                    for &pos in &live_positions {
+                        let hash = hashes[pos];
+                        if hash == [0u8; 32] {
+                            continue;
+                        }
+                        let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
+                        dedup_registrations.push(Self::dedup_registration(
+                            vol_id.clone(),
+                            Lba(unit.start_lba.0 + pos as u64),
+                            hash,
+                            blockmap,
+                        ));
+                    }
+                }
             }
 
             if let Err(e) = maybe_inject_test_failure(
@@ -138,10 +147,11 @@ impl BufferFlusher {
                 return Err(e);
             }
 
-            let actual_old_pba_meta = match meta.atomic_batch_write(
+            let actual_old_pba_meta = match meta.atomic_batch_write_with_dedup(
                 &vol_id,
                 &batch_values,
                 live_positions.len() as u32,
+                &[],
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -152,6 +162,13 @@ impl BufferFlusher {
                 }
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+            Self::enqueue_dedup_registrations(
+                meta,
+                metrics,
+                _dedup_register_tx,
+                dedup_registrations,
+            );
+            Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
                 let dead: Vec<(Pba, u32)> = actual_old_pba_meta
@@ -160,35 +177,6 @@ impl BufferFlusher {
                     .collect();
                 let _ = cleanup_tx.send(dead);
             }
-
-            // Populate dedup index for newly written blocks
-            let dedup_start = Instant::now();
-            if let Some(ref hashes) = unit.block_hashes {
-                let mut dedup_entries = Vec::new();
-                for &pos in &live_positions {
-                    let hash = hashes[pos];
-                    if hash == [0u8; 32] {
-                        continue; // Skip empty hashes
-                    }
-                    dedup_entries.push((
-                        hash,
-                        DedupEntry {
-                            pba,
-                            slot_offset: 0,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                        },
-                    ));
-                }
-                if !dedup_entries.is_empty() {
-                    meta.put_dedup_entries(&dedup_entries)?;
-                }
-            }
-            Self::record_elapsed(&metrics.flush_writer_dedup_index_ns, dedup_start);
 
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -224,8 +212,8 @@ impl BufferFlusher {
     /// 3. Allocate PBAs for all units
     /// 4. Batch IO writes
     /// 5. Batch multi_get old mappings
-    /// 6. ONE RocksDB WriteBatch for all blockmap + refcount updates
-    /// 7. Batch cleanup + dedup index + mark_flushed
+    /// 6. ONE metadata batch for all blockmap + refcount updates
+    /// 7. Batch cleanup + queue dedup registration + mark_flushed
     pub(in crate::buffer::flush) fn write_units_batch(
         shard_idx: usize,
         units: &[CompressedUnit],
@@ -236,6 +224,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> Vec<OnyxResult<()>> {
         if units.is_empty() {
             return Vec::new();
@@ -294,7 +283,7 @@ impl BufferFlusher {
                     .map(|pba| (pba, 1u32))
             } else {
                 allocator
-                    .allocate_extent(blocks_needed as u32)
+                    .allocate_extent_for_lane(shard_idx, blocks_needed as u32)
                     .and_then(|ext| {
                         if (ext.count as usize) < blocks_needed {
                             allocator.free_extent(ext)?;
@@ -314,6 +303,7 @@ impl BufferFlusher {
                 }
             }
         }
+        let alloc_elapsed = alloc_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
         // Phase 3: Batched IO writes — one submit per batch.
@@ -378,6 +368,7 @@ impl BufferFlusher {
                 }
             }
         }
+        let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
         // Phase 4: Build batch values + live positions.
@@ -386,6 +377,7 @@ impl BufferFlusher {
         struct UnitMeta {
             batch_values: Vec<(Lba, BlockmapValue)>,
             live_positions: Vec<usize>,
+            dedup_registrations: Vec<DedupRegistration>,
         }
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
 
@@ -412,6 +404,7 @@ impl BufferFlusher {
                 unit_metas[i] = Some(UnitMeta {
                     batch_values: Vec::new(),
                     live_positions,
+                    dedup_registrations: Vec::new(),
                 });
                 continue;
             }
@@ -422,6 +415,7 @@ impl BufferFlusher {
                 .collect();
 
             let mut batch_values = Vec::with_capacity(live_positions.len());
+            let mut dedup_registrations = Vec::new();
 
             for j in 0..live_positions.len() {
                 let flags = if unit.dedup_skipped {
@@ -429,24 +423,32 @@ impl BufferFlusher {
                 } else {
                     0
                 };
-                batch_values.push((
-                    lbas[j],
-                    BlockmapValue {
-                        pba,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: live_positions[j] as u16,
-                        crc32: unit.crc32,
-                        slot_offset: 0,
-                        flags,
-                    },
-                ));
+                let blockmap =
+                    Self::blockmap_for_unit_position(unit, pba, live_positions[j], 0, flags);
+                batch_values.push((lbas[j], blockmap));
+            }
+            if !unit.dedup_skipped {
+                if let Some(ref hashes) = unit.block_hashes {
+                    dedup_registrations.reserve(live_positions.len());
+                    for &pos in &live_positions {
+                        let hash = hashes[pos];
+                        if hash == [0u8; 32] {
+                            continue;
+                        }
+                        let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
+                        dedup_registrations.push(Self::dedup_registration(
+                            VolumeId(unit.vol_id.clone()),
+                            Lba(unit.start_lba.0 + pos as u64),
+                            hash,
+                            blockmap,
+                        ));
+                    }
+                }
             }
             unit_metas[i] = Some(UnitMeta {
                 batch_values,
                 live_positions,
+                dedup_registrations,
             });
         }
 
@@ -480,9 +482,20 @@ impl BufferFlusher {
                 })
                 .collect();
 
-            match meta.atomic_batch_write_multi(&batch_args) {
+            let mut dedup_registrations: Vec<DedupRegistration> = Vec::new();
+            for &unit_idx in &meta_indices {
+                let um = unit_metas[unit_idx].as_ref().unwrap();
+                dedup_registrations.extend_from_slice(&um.dedup_registrations);
+            }
+            match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
                 Ok(returned) => {
                     actual_old_pba_meta = returned;
+                    Self::enqueue_dedup_registrations(
+                        meta,
+                        metrics,
+                        _dedup_register_tx,
+                        dedup_registrations,
+                    );
                 }
                 Err(e) => {
                     // Entire batch failed — rollback all allocations.
@@ -501,17 +514,34 @@ impl BufferFlusher {
                 }
             }
         }
+        let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
-        // Phase 6: Cleanup (free old PBAs) + dedup index.
+        // Phase 6: Cleanup (free old PBAs) + dedup registration queueing.
         //
         // `actual_old_pba_meta` now contains only PBAs that THIS batch actually
         // drove to refcount 0 (current_rc > 0 before, final_rc == 0 after).
         // PBAs that were already 0 are excluded — another batch/lane already
         // freed them, and double-freeing after re-allocation causes corruption.
         let cleanup_start = Instant::now();
+        let empty_live_raw_units: Vec<usize> = meta_indices
+            .iter()
+            .copied()
+            .filter(|&unit_idx| {
+                unit_metas[unit_idx]
+                    .as_ref()
+                    .is_some_and(|um| um.live_positions.is_empty())
+            })
+            .collect();
 
-        let mut all_dedup_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        for &unit_idx in &empty_live_raw_units {
+            let pba = pbas[unit_idx].unwrap();
+            if alloc_blocks[unit_idx] == 1 {
+                let _ = allocator.free_one(pba);
+            } else {
+                let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
+            }
+        }
 
         for &unit_idx in &meta_indices {
             if skip[unit_idx] {
@@ -521,36 +551,16 @@ impl BufferFlusher {
             let unit = &units[unit_idx];
             let pba = pbas[unit_idx].unwrap();
             if um.live_positions.is_empty() {
-                if alloc_blocks[unit_idx] == 1 {
-                    let _ = allocator.free_one(pba);
-                } else {
-                    let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
-                }
                 continue;
             }
 
-            // Collect dedup index entries for batch write
-            if let Some(ref hashes) = unit.block_hashes {
-                for &pos in &um.live_positions {
-                    let hash = hashes[pos];
-                    if hash == [0u8; 32] {
-                        continue;
-                    }
-                    all_dedup_entries.push((
-                        hash,
-                        DedupEntry {
-                            pba,
-                            slot_offset: 0,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                        },
-                    ));
-                }
-            }
+            Self::free_unreferenced_raw_blocks(
+                unit,
+                pba,
+                &um.live_positions,
+                allocator,
+                "write_units_batch",
+            );
 
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -564,10 +574,6 @@ impl BufferFlusher {
                 .map(|(pba, (_, blocks))| (*pba, *blocks))
                 .collect();
             let _ = cleanup_tx.send(dead);
-        }
-        // One batch for all new dedup index entries
-        if !all_dedup_entries.is_empty() {
-            let _ = meta.put_dedup_entries(&all_dedup_entries);
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
@@ -584,7 +590,20 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
         let _ = pool.advance_tail_for_shard(shard_idx);
 
+        let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+        if total_elapsed >= Duration::from_secs(1) {
+            tracing::debug!(
+                shard = shard_idx,
+                units = n,
+                live_units = meta_indices.len(),
+                total_ms = total_elapsed.as_millis() as u64,
+                alloc_ms = alloc_elapsed.as_millis() as u64,
+                io_ms = io_elapsed.as_millis() as u64,
+                meta_ms = meta_elapsed.as_millis() as u64,
+                "writer: slow passthrough batch (>=1s)"
+            );
+        }
         results
     }
 }

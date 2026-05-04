@@ -1,6 +1,12 @@
 use super::*;
 
+const CLEANUP_PBA_COMMIT_LIMIT: usize = 256;
+
 impl BufferFlusher {
+    fn meta_lock_id(meta: &MetaStore) -> usize {
+        meta as *const MetaStore as usize
+    }
+
     pub(crate) fn cleanup_dead_pba_post_commit(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
@@ -8,24 +14,32 @@ impl BufferFlusher {
         old_blocks: u32,
         context: &'static str,
     ) {
-        let cleanup_lock = Self::cleanup_lock(old_pba);
-        let _cleanup_guard = cleanup_lock.lock().unwrap();
-
-        let remaining = match meta.get_refcount(old_pba) {
-            Ok(remaining) => remaining,
-            Err(e) => {
-                tracing::error!(
-                    pba = old_pba.0,
-                    old_blocks,
-                    error = %e,
-                    context,
-                    "post-commit cleanup: failed to confirm dead PBA; leaving allocator reservation"
-                );
+        let meta_lock_id = Self::meta_lock_id(meta);
+        {
+            let cleanup_lock = Self::cleanup_lock(meta_lock_id, old_pba);
+            let _cleanup_guard = cleanup_lock.lock().unwrap();
+            if Self::mark_pba_cleaning(meta_lock_id, old_pba) {
                 return;
             }
-        };
-        if remaining != 0 {
-            return;
+
+            let remaining = match meta.get_refcount(old_pba) {
+                Ok(remaining) => remaining,
+                Err(e) => {
+                    tracing::error!(
+                        pba = old_pba.0,
+                        old_blocks,
+                        error = %e,
+                        context,
+                        "post-commit cleanup: failed to confirm dead PBA; leaving allocator reservation"
+                    );
+                    Self::unmark_pba_cleaning(meta_lock_id, old_pba);
+                    return;
+                }
+            };
+            if remaining != 0 {
+                Self::unmark_pba_cleaning(meta_lock_id, old_pba);
+                return;
+            }
         }
 
         if let Err(e) = meta.cleanup_dedup_for_pba_standalone(old_pba) {
@@ -36,41 +50,48 @@ impl BufferFlusher {
                 context,
                 "post-commit cleanup: failed to cleanup dedup metadata; leaving allocator reservation"
             );
+            Self::unmark_pba_cleaning(meta_lock_id, old_pba);
             return;
         }
 
-        let already_free = if old_blocks <= 1 {
-            allocator.is_free(old_pba)
-        } else {
-            allocator.is_extent_free(Extent::new(old_pba, old_blocks))
-        };
-        if already_free {
-            return;
-        }
+        {
+            let cleanup_lock = Self::cleanup_lock(meta_lock_id, old_pba);
+            let _cleanup_guard = cleanup_lock.lock().unwrap();
+            let already_free = if old_blocks <= 1 {
+                allocator.is_free(old_pba)
+            } else {
+                allocator.is_extent_free(Extent::new(old_pba, old_blocks))
+            };
+            if already_free {
+                Self::unmark_pba_cleaning(meta_lock_id, old_pba);
+                return;
+            }
 
-        #[cfg(test)]
-        CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
 
-        tracing::debug!(
-            pba = old_pba.0,
-            old_blocks,
-            context,
-            "cleanup_dead_pba: freeing PBA to allocator"
-        );
-
-        let free_result = if old_blocks <= 1 {
-            allocator.free_one(old_pba)
-        } else {
-            allocator.free_extent(Extent::new(old_pba, old_blocks))
-        };
-        if let Err(e) = free_result {
-            tracing::warn!(
+            tracing::debug!(
                 pba = old_pba.0,
                 old_blocks,
-                error = %e,
                 context,
-                "post-commit cleanup: allocator free failed after metadata commit (benign if already freed by another path); continuing without retry"
+                "cleanup_dead_pba: freeing PBA to allocator"
             );
+
+            let free_result = if old_blocks <= 1 {
+                allocator.free_one(old_pba)
+            } else {
+                allocator.free_extent(Extent::new(old_pba, old_blocks))
+            };
+            if let Err(e) = free_result {
+                tracing::warn!(
+                    pba = old_pba.0,
+                    old_blocks,
+                    error = %e,
+                    context,
+                    "post-commit cleanup: allocator free failed after metadata commit (benign if already freed by another path); continuing without retry"
+                );
+            }
+            Self::unmark_pba_cleaning(meta_lock_id, old_pba);
         }
     }
 
@@ -85,83 +106,123 @@ impl BufferFlusher {
         if dead_pbas.is_empty() {
             return;
         }
+        let meta_lock_id = Self::meta_lock_id(meta);
 
-        // Phase 1: per-PBA lock + refcount verify → filter to truly dead
-        let mut truly_dead: Vec<(Pba, u32)> = Vec::new();
+        let mut candidates_by_pba: HashMap<Pba, u32> = HashMap::new();
         for &(pba, blocks) in dead_pbas {
-            let cleanup_lock = Self::cleanup_lock(pba);
-            let _cleanup_guard = cleanup_lock.lock().unwrap();
+            candidates_by_pba
+                .entry(pba)
+                .and_modify(|existing| *existing = (*existing).max(blocks))
+                .or_insert(blocks);
+        }
+        let mut candidates: Vec<(Pba, u32)> = candidates_by_pba.into_iter().collect();
+        candidates.sort_unstable_by_key(|(pba, _)| *pba);
 
-            let remaining = match meta.get_refcount(pba) {
-                Ok(r) => r,
+        // Process in bounded chunks. The slow reverse-index scan runs outside
+        // PBA locks; locks only guard the transition into/out of the "cleaning"
+        // set and allocator free. Dedup registration treats "cleaning" as a
+        // best-effort skip for that PBA, which is safe because the register
+        // path can always be reconstructed by later writes/scans.
+        for candidate_chunk in candidates.chunks(CLEANUP_PBA_COMMIT_LIMIT) {
+            let pbas: Vec<Pba> = candidate_chunk
+                .iter()
+                .map(|(pba, _)| *pba)
+                .filter(|pba| {
+                    let cleanup_lock = Self::cleanup_lock(meta_lock_id, *pba);
+                    let _cleanup_guard = cleanup_lock.lock().unwrap();
+                    !Self::mark_pba_cleaning(meta_lock_id, *pba)
+                })
+                .collect();
+            if pbas.is_empty() {
+                continue;
+            }
+            let refcounts = match meta.multi_get_refcounts(&pbas) {
+                Ok(refcounts) => refcounts,
                 Err(e) => {
                     tracing::error!(
+                        count = pbas.len(),
+                        error = %e,
+                        context,
+                        "batch cleanup: failed to confirm dead PBAs; skipping chunk"
+                    );
+                    for pba in pbas {
+                        Self::unmark_pba_cleaning(meta_lock_id, pba);
+                    }
+                    continue;
+                }
+            };
+            let refcount_by_pba: HashMap<Pba, u32> = pbas.iter().copied().zip(refcounts).collect();
+
+            let mut truly_dead: Vec<(Pba, u32)> = Vec::new();
+            for &(pba, blocks) in candidate_chunk {
+                if !refcount_by_pba.contains_key(&pba) {
+                    continue;
+                }
+                let remaining = refcount_by_pba[&pba];
+                if remaining != 0 {
+                    Self::unmark_pba_cleaning(meta_lock_id, pba);
+                    continue;
+                }
+
+                let already_free = if blocks <= 1 {
+                    allocator.is_free(pba)
+                } else {
+                    allocator.is_extent_free(Extent::new(pba, blocks))
+                };
+                if already_free {
+                    Self::unmark_pba_cleaning(meta_lock_id, pba);
+                    continue;
+                }
+
+                truly_dead.push((pba, blocks));
+            }
+
+            if truly_dead.is_empty() {
+                continue;
+            }
+
+            let pbas: Vec<Pba> = truly_dead.iter().map(|(p, _)| *p).collect();
+            if let Err(e) = meta.cleanup_dedup_for_pbas_batch(&pbas) {
+                tracing::error!(
+                    count = pbas.len(),
+                    error = %e,
+                    context,
+                    "batch cleanup: dedup metadata cleanup failed; skipping allocator free for chunk"
+                );
+                for pba in pbas {
+                    Self::unmark_pba_cleaning(meta_lock_id, pba);
+                }
+                continue;
+            }
+
+            for &(pba, blocks) in &truly_dead {
+                let cleanup_lock = Self::cleanup_lock(meta_lock_id, pba);
+                let _cleanup_guard = cleanup_lock.lock().unwrap();
+                #[cfg(test)]
+                CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+
+                tracing::debug!(
+                    pba = pba.0,
+                    blocks,
+                    context,
+                    "batch cleanup: freeing PBA to allocator"
+                );
+
+                let free_result = if blocks <= 1 {
+                    allocator.free_one(pba)
+                } else {
+                    allocator.free_extent(Extent::new(pba, blocks))
+                };
+                if let Err(e) = free_result {
+                    tracing::warn!(
                         pba = pba.0,
                         blocks,
                         error = %e,
                         context,
-                        "batch cleanup: failed to confirm dead PBA; skipping"
+                        "batch cleanup: allocator free failed (benign if already freed); continuing"
                     );
-                    continue;
                 }
-            };
-            if remaining != 0 {
-                continue;
-            }
-
-            let already_free = if blocks <= 1 {
-                allocator.is_free(pba)
-            } else {
-                allocator.is_extent_free(Extent::new(pba, blocks))
-            };
-            if already_free {
-                continue;
-            }
-
-            truly_dead.push((pba, blocks));
-        }
-
-        if truly_dead.is_empty() {
-            return;
-        }
-
-        // Phase 2: ONE WriteBatch for all dedup cleanup
-        let pbas: Vec<Pba> = truly_dead.iter().map(|(p, _)| *p).collect();
-        if let Err(e) = meta.cleanup_dedup_for_pbas_batch(&pbas) {
-            tracing::error!(
-                count = pbas.len(),
-                error = %e,
-                context,
-                "batch cleanup: dedup metadata cleanup failed; skipping allocator free"
-            );
-            return;
-        }
-
-        // Phase 3: per-PBA allocator free
-        for (pba, blocks) in truly_dead {
-            #[cfg(test)]
-            CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-
-            tracing::debug!(
-                pba = pba.0,
-                blocks,
-                context,
-                "batch cleanup: freeing PBA to allocator"
-            );
-
-            let free_result = if blocks <= 1 {
-                allocator.free_one(pba)
-            } else {
-                allocator.free_extent(Extent::new(pba, blocks))
-            };
-            if let Err(e) = free_result {
-                tracing::warn!(
-                    pba = pba.0,
-                    blocks,
-                    error = %e,
-                    context,
-                    "batch cleanup: allocator free failed (benign if already freed); continuing"
-                );
+                Self::unmark_pba_cleaning(meta_lock_id, pba);
             }
         }
     }
@@ -215,7 +276,7 @@ impl BufferFlusher {
         }
     }
 
-    pub(super) fn pba_lock(pba: Pba) -> Arc<Mutex<()>> {
+    pub(super) fn pba_lock(meta_lock_id: usize, pba: Pba) -> Arc<Mutex<()>> {
         let mut locks = PBA_LOCKS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -226,12 +287,30 @@ impl BufferFlusher {
             locks.retain(|_, arc| Arc::strong_count(arc) > 1);
         }
         locks
-            .entry(pba)
+            .entry((meta_lock_id, pba))
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
-    pub(crate) fn cleanup_lock(pba: Pba) -> Arc<Mutex<()>> {
-        Self::pba_lock(pba)
+    pub(crate) fn cleanup_lock(meta_lock_id: usize, pba: Pba) -> Arc<Mutex<()>> {
+        Self::pba_lock(meta_lock_id, pba)
+    }
+
+    fn pba_cleaning_set() -> &'static Mutex<HashSet<PbaLockKey>> {
+        PBA_CLEANING.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    fn mark_pba_cleaning(meta_lock_id: usize, pba: Pba) -> bool {
+        !Self::pba_cleaning_set()
+            .lock()
+            .unwrap()
+            .insert((meta_lock_id, pba))
+    }
+
+    fn unmark_pba_cleaning(meta_lock_id: usize, pba: Pba) {
+        Self::pba_cleaning_set()
+            .lock()
+            .unwrap()
+            .remove(&(meta_lock_id, pba));
     }
 }

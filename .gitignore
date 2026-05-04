@@ -7,6 +7,9 @@ dashboard/frontend/dist
 dashboard/backend/.env.local
 dashboard/backend/internal/ui/dist
 bin/
+!src/bin/
+src/bin/*
+!src/bin/engine_bench.rs
 .dev/
 *.pyc
 /metadb/

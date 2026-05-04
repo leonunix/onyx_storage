@@ -62,6 +62,7 @@ impl DedupScanner {
         let handle = thread::Builder::new()
             .name("dedup-scanner".into())
             .spawn(move || {
+                crate::affinity::bind_current(crate::affinity::ThreadRole::Background, 0);
                 Self::scan_loop(
                     &metrics,
                     &meta,
@@ -98,6 +99,11 @@ impl DedupScanner {
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
+        let mut last_drained_skipped_units = metrics.dedup_skipped_units.load(Ordering::Relaxed);
+        // Scan once on startup even if the in-memory skipped counter did not
+        // move. This covers scanner restarts and tests that inject skipped
+        // mappings before the scanner shares runtime metrics with the flusher.
+        let mut rescan_debt = true;
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
             thread::sleep(Duration::from_millis(cfg.rescan_interval_ms));
@@ -112,6 +118,11 @@ impl DedupScanner {
                 metrics
                     .dedup_rescan_skipped_cycles
                     .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            let skipped_units = metrics.dedup_skipped_units.load(Ordering::Relaxed);
+            if !rescan_debt && skipped_units == last_drained_skipped_units {
                 continue;
             }
 
@@ -140,8 +151,15 @@ impl DedupScanner {
                             "dedup scanner: re-processed skipped blocks"
                         );
                     }
+                    if cfg.max_rescan_per_cycle > 0 && stats.rescanned >= cfg.max_rescan_per_cycle {
+                        rescan_debt = true;
+                    } else {
+                        rescan_debt = false;
+                        last_drained_skipped_units = skipped_units;
+                    }
                 }
                 Err(e) => {
+                    rescan_debt = true;
                     metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, "dedup scanner: rescan failed");
                 }
@@ -262,8 +280,9 @@ impl DedupScanner {
                         stats.hits += 1;
                     }
                     Some(_) => {
-                        meta.delete_dedup_index(&hash)?;
-                        // Dedup miss: register in index and clear flag
+                        // The forward index may already have been re-registered
+                        // to a different live PBA. Do not tombstone it here;
+                        // normal dead-PBA cleanup owns stale reverse/index rows.
                         let entry = DedupEntry {
                             pba: current.pba,
                             slot_offset: current.slot_offset,

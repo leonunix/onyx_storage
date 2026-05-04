@@ -87,6 +87,43 @@ fn extent_allocation() {
 }
 
 #[test]
+fn lane_extent_cache_serves_contiguous_extents() {
+    let alloc = SpaceAllocator::new(4096 * 20_000, 2);
+    let usable = 20_000 - RESERVED_BLOCKS;
+
+    let ext1 = alloc.allocate_extent_for_lane(1, 8).unwrap();
+    let ext2 = alloc.allocate_extent_for_lane(1, 8).unwrap();
+
+    assert_eq!(ext1, Extent::new(Pba(RESERVED_BLOCKS), 8));
+    assert_eq!(ext2, Extent::new(Pba(RESERVED_BLOCKS + 8), 8));
+    assert_eq!(alloc.free_block_count(), usable - 16);
+    assert_eq!(alloc.allocated_block_count(), 16);
+}
+
+#[test]
+fn lane_extent_cache_rejects_freeing_cached_blocks() {
+    let alloc = SpaceAllocator::new(4096 * 20_000, 2);
+    let ext = alloc.allocate_extent_for_lane(0, 8).unwrap();
+    let cached_free = Extent::new(ext.end_pba(), 8);
+
+    assert!(
+        alloc.free_extent(cached_free).is_err(),
+        "blocks reserved in a lane extent cache are already free"
+    );
+}
+
+#[test]
+fn drain_lane_extent_cache_returns_cached_blocks_to_global() {
+    let alloc = SpaceAllocator::new(4096 * 20_000, 2);
+    let ext = alloc.allocate_extent_for_lane(0, 8).unwrap();
+
+    alloc.drain_lane_caches();
+    let next = alloc.allocate_extent(8).unwrap();
+
+    assert_eq!(next, Extent::new(ext.end_pba(), 8));
+}
+
+#[test]
 fn coalescing() {
     // 18 total = 10 usable
     let alloc = SpaceAllocator::new(4096 * 18, 0);
@@ -110,10 +147,17 @@ fn coalescing() {
 fn rebuild_from_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -185,10 +229,17 @@ fn total_block_count() {
 fn rebuild_empty_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -205,10 +256,17 @@ fn rebuild_empty_metadata() {
 fn rebuild_fully_allocated() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -229,10 +287,17 @@ fn rebuild_fully_allocated() {
 fn rebuild_from_blockmap_marks_multi_block_units() {
     let dir = tempfile::tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-a".into());
@@ -241,7 +306,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
     // Use PBAs in usable range (>= RESERVED_BLOCKS)
     let value0 = onyx_storage::meta::schema::BlockmapValue {
         pba: Pba(12),
-        compression: 0,
+        compression: 1,
         unit_compressed_size: 8192,
         unit_original_size: 8192,
         unit_lba_count: 2,

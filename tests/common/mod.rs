@@ -35,7 +35,9 @@ impl Default for HarnessOptions {
                 compress_workers: 2,
                 coalesce_max_raw_bytes: 131072,
                 coalesce_max_lbas: 32,
-            skip_fully_superseded: true,
+                min_compression_savings_pct: 12,
+                skip_fully_superseded: true,
+                ..FlushConfig::default()
             },
             gc: GcConfig {
                 enabled: false,
@@ -64,10 +66,17 @@ impl EngineHarness {
 
         let config = OnyxConfig {
             meta: MetaConfig {
-                rocksdb_path: Some(meta_dir.path().to_path_buf()),
+                path: Some(meta_dir.path().to_path_buf()),
                 block_cache_mb: 32,
                 memtable_budget_mb: 0,
+                index_pin_mb: 0,
+                lsm_bloom_bits_per_entry: 10,
+                checkpoint_interval_ms: 5000,
+                group_commit_timeout_us: 1,
                 wal_dir: None,
+                dedup_shards: 8,
+                dedup_cuckoo_buckets: 1_000_000,
+                dedup_l1_cache_entries: 256_000,
             },
             storage: StorageConfig {
                 data_device: Some(data_file.path().to_path_buf()),
@@ -76,8 +85,8 @@ impl EngineHarness {
                 default_compression: CompressionAlgo::Lz4,
                 io_backend: Default::default(),
                 uring_sq_entries: 128,
-            read_pool_workers: 4,
-        },
+                read_pool_workers: 4,
+            },
             buffer: BufferConfig {
                 device: Some(buffer_file.path().to_path_buf()),
                 capacity_mb: ((options.buffer_bytes / 1024 / 1024).max(1)) as usize,
@@ -85,6 +94,7 @@ impl EngineHarness {
                 group_commit_wait_us: 250,
                 shards: 1,
                 max_memory_mb: 0,
+                ..BufferConfig::default()
             },
             ublk: UblkConfig::default(),
             flush: options.flush,
@@ -96,6 +106,7 @@ impl EngineHarness {
             dedup: options.dedup,
             service: Default::default(),
             ha: Default::default(),
+            threading: Default::default(),
         };
 
         let engine = OnyxEngine::open(&config).unwrap();
@@ -125,7 +136,7 @@ impl EngineHarness {
     }
 
     pub fn meta_path(&self) -> PathBuf {
-        self.config.meta.rocksdb_path.clone().unwrap()
+        self.config.meta.path.clone().unwrap()
     }
 
     pub fn buffer_path(&self) -> PathBuf {

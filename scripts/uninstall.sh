@@ -54,7 +54,7 @@ fi
 # 5. Ask about data
 echo "[5/5] Data directory: ${DATA_DIR}"
 if [ -d "${DATA_DIR}" ]; then
-    read -rp "      Remove data (RocksDB metadata)? [y/N] " answer
+    read -rp "      Remove data (metadata)? [y/N] " answer
     if [[ "${answer}" =~ ^[Yy] ]]; then
         rm -rf "${DATA_DIR}"
         echo "      Removed."

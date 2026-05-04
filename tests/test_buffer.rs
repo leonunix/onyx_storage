@@ -246,13 +246,14 @@ fn full_buffer_rejected() {
 }
 
 #[test]
-fn write_through_evicts_payload_after_fdatasync() {
+fn durable_payload_cache_uses_memory_budget_without_blocking_appends() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 8 * 8192;
     tmp.as_file().set_len(size).unwrap();
     let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
-    // Memory limit = 1 block (4KB). With write-through, append never blocks
-    // on memory — payload is evicted after fdatasync.
+    // Memory limit = 1 block (4KB). Appends still never block on resident
+    // cache capacity; once entries become durable, the cache keeps the newest
+    // payloads that fit and evicts older ones.
     let pool = WriteBufferPool::open_with_options_and_memory_limit(
         dev,
         Duration::ZERO,
@@ -264,19 +265,63 @@ fn write_through_evicts_payload_after_fdatasync() {
     .unwrap();
 
     // Append two entries — both succeed immediately despite memory limit of 1 block.
-    let _seq1 = pool
+    let seq1 = pool
         .append("test-vol", Lba(0), 1, &vec![0x11; 4096], 0)
         .unwrap();
-    let _seq2 = pool
+    let seq2 = pool
         .append("test-vol", Lba(1), 1, &vec![0x22; 4096], 0)
         .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq1
+    );
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq2
+    );
     assert_eq!(pool.pending_count(), 2);
+    assert!(
+        pool.payload_memory_bytes() <= BLOCK_SIZE as u64,
+        "resident cache must stay within the configured budget"
+    );
 
-    // Payload is still recoverable via lookup (hydrates from buffer device).
+    // Payloads are still recoverable: the newest one can be resident, and the
+    // evicted one hydrates from the buffer device.
     let found = pool.lookup("test-vol", Lba(0)).unwrap().unwrap();
     assert_eq!(&**found.payload.as_ref().unwrap(), &vec![0x11; 4096][..]);
     let found = pool.lookup("test-vol", Lba(1)).unwrap().unwrap();
     assert_eq!(&**found.payload.as_ref().unwrap(), &vec![0x22; 4096][..]);
+}
+
+#[test]
+fn durable_payload_cache_releases_on_mark_flushed() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_options_and_memory_limit(
+        dev,
+        Duration::ZERO,
+        1,
+        256,
+        Duration::MAX,
+        2 * BLOCK_SIZE as u64,
+    )
+    .unwrap();
+
+    let seq = pool
+        .append("test-vol", Lba(3), 1, &vec![0x33; 4096], 0)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+    assert_eq!(pool.payload_memory_bytes(), BLOCK_SIZE as u64);
+
+    pool.mark_flushed(seq, Lba(3), 1).unwrap();
+    assert_eq!(pool.pending_count(), 0);
+    assert_eq!(pool.payload_memory_bytes(), 0);
+    assert!(pool.lookup("test-vol", Lba(3)).unwrap().is_none());
 }
 
 #[test]
@@ -1128,16 +1173,14 @@ fn guided_recovery_forward_scan_stops_at_first_gap() {
     );
 }
 
-/// Regression test: under memory pressure the head-of-queue entry must still be
-/// hydratable so reclaim_log_prefix can advance the tail.  Without the fix in
-/// pending_entry_arc_hydrated, the head entry's payload eviction + memory limit
-/// creates a deadlock where the tail never moves.
+/// Regression test: under memory pressure the head-of-queue entry must stay
+/// readable. It may be served from resident cache or hydrated from disk after
+/// cache eviction; either way the flusher can process it and move the tail.
 #[test]
 fn head_of_queue_hydration_bypasses_memory_limit() {
-    // Create a pool with a 1-block memory limit. After appending one entry the
-    // limit is reached; sync_loop will evict its payload. A second append pushes
-    // us over the limit. The first (head-of-queue) entry must still be
-    // hydratable so the flusher can process it.
+    // Create a pool with a 1-block resident cache limit. A second append may
+    // evict the first cached payload, but must not make the live head entry
+    // unreadable.
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 8 * 8192;
     tmp.as_file().set_len(size).unwrap();
@@ -1155,7 +1198,7 @@ fn head_of_queue_hydration_bypasses_memory_limit() {
     // Append entry 1 — uses the entire memory budget.
     let seq1 = pool.append("vol", Lba(0), 1, &vec![0xAA; 4096], 0).unwrap();
 
-    // Wait for the sync thread to publish seq1 and evict its payload.
+    // Wait for the sync thread to publish seq1.
     thread::sleep(Duration::from_millis(50));
 
     // Manually mark_flushed to reclaim memory so we can append a second entry.
@@ -1163,13 +1206,12 @@ fn head_of_queue_hydration_bypasses_memory_limit() {
 
     let seq2 = pool.append("vol", Lba(1), 1, &vec![0xBB; 4096], 0).unwrap();
 
-    // Wait for sync thread to publish and evict seq2's payload.
+    // Wait for sync thread to publish seq2.
     thread::sleep(Duration::from_millis(50));
 
     // seq1 was mark_flushed above and removed from pending — it's gone.
-    // seq2 should be the head-of-queue entry with payload evicted.
-    // Even though memory is at the limit, pending_entry_arc must succeed
-    // for the head-of-queue entry.
+    // seq2 should be the head-of-queue entry. Even though memory is at the
+    // limit, pending_entry_arc must succeed for that entry.
     let hydrated = pool.pending_entry_arc(seq2);
     assert!(
         hydrated.is_some(),
@@ -1240,7 +1282,10 @@ fn uring_sync_loop_persists_and_recovers() {
     let recovered = pool2.recover().unwrap();
     assert_eq!(recovered.len(), 16, "all entries must survive restart");
     for (_, lba, expected) in &seqs {
-        let entry = pool2.lookup("uring-vol", *lba).unwrap().expect("lba must map");
+        let entry = pool2
+            .lookup("uring-vol", *lba)
+            .unwrap()
+            .expect("lba must map");
         assert_eq!(entry.start_lba, *lba);
         assert_eq!(entry.lba_count, 1);
         let payload = entry.payload.as_ref().expect("payload should hydrate");

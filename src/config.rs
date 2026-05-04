@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::buffer::flush::DEFAULT_PACKED_META_BATCH_LBA_LIMIT;
 use crate::dedup::config::DedupConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::config::GcConfig;
@@ -29,6 +30,8 @@ pub struct OnyxConfig {
     pub service: ServiceConfig,
     #[serde(default)]
     pub ha: HaConfig,
+    #[serde(default)]
+    pub threading: ThreadingConfig,
 }
 
 /// What the engine can do given the current configuration.
@@ -36,7 +39,7 @@ pub struct OnyxConfig {
 pub enum ConfiguredMode {
     /// Nothing configured — only IPC socket, no engine at all.
     Bare,
-    /// RocksDB available but storage devices missing — metadata-only operations.
+    /// Metadata store available but storage devices missing — metadata-only operations.
     Standby,
     /// Everything configured — full IO.
     Active,
@@ -56,11 +59,9 @@ impl OnyxConfig {
     /// Detect what mode the engine should operate in, based on which
     /// paths are configured and actually exist on disk.
     pub fn detect_mode(&self) -> ConfiguredMode {
-        // Check RocksDB path
         let meta_ok = self
             .meta
-            .rocksdb_path
-            .as_ref()
+            .path()
             .map(|p| !p.as_os_str().is_empty())
             .unwrap_or(false);
         if !meta_ok {
@@ -99,31 +100,76 @@ impl OnyxConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaConfig {
-    /// Path to RocksDB data directory (on LV1 / XFS). Holds blockmap, refcount,
+    /// Path to metadata directory (on LV1 / XFS). Holds blockmap, refcount,
     /// dedup index, volume metadata. None = bare mode (no metadata store).
     #[serde(default)]
-    pub rocksdb_path: Option<PathBuf>,
+    pub path: Option<PathBuf>,
     /// Shared block cache size in MB. One LRU cache is created at startup and
     /// shared across every CF (blockmap + refcount + dedup_index +
     /// dedup_reverse). Index + filter blocks are accounted against this cache
     /// (`cache_index_and_filter_blocks=true`), so this is the authoritative
-    /// upper bound on RocksDB read-side memory. Scale roughly proportional to
+    /// upper bound on metadb read-side memory. Scale roughly proportional to
     /// working set; on a 256 GiB host, 16–32 GiB is a reasonable starting
     /// point.
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
     /// Total memtable memory budget in MB across all CFs. Enforced via
-    /// RocksDB's `WriteBufferManager`; when this is exceeded, writes stall
+    /// metadb's `WriteBufferManager`; when this is exceeded, writes stall
     /// (`allow_stall=true`) rather than blow up RSS. Default 0 = auto = half
     /// of `block_cache_mb`. Override when you want a different write-buffer
     /// vs read-cache ratio (e.g. write-heavy: raise; read-heavy: lower).
     #[serde(default)]
     pub memtable_budget_mb: usize,
-    /// Optional separate WAL directory for RocksDB
+    /// Per-`Db` upper bound on bytes used to pin L2P index pages in metadb's
+    /// page cache. Pinned pages live outside the LRU and never compete with
+    /// leaf capacity, so random L2P gets never miss on inner nodes. Index
+    /// pages are ~1/256 of leaf bytes, so 1 GiB covers on the order of
+    /// hundreds of GiB of leaf data. Default 1024 = 1 GiB; raise on
+    /// large-memory deployments. Set to 0 to disable.
+    #[serde(default = "default_index_pin_mb")]
+    pub index_pin_mb: usize,
+    /// Bloom-filter budget for metadb's dedup LSM SSTs. Higher values
+    /// reduce false positives on all-miss foreground dedup lookups at the
+    /// cost of more metadata pages. Large-memory NVMe deployments should
+    /// prefer 16-20 bits/entry; the default stays RocksDB-like.
+    #[serde(default = "default_lsm_bloom_bits_per_entry")]
+    pub lsm_bloom_bits_per_entry: u32,
+    /// Minimum interval between background metadb checkpoints, in
+    /// milliseconds. Metadb WAL fsync makes user writes durable; full
+    /// checkpoints are for WAL pruning and recovery-time control, so they
+    /// should not run at buffer-ring watermark cadence.
+    #[serde(default = "default_metadb_checkpoint_interval_ms")]
+    pub checkpoint_interval_ms: u64,
+    /// How long metadb's WAL writer waits for new sibling committers before
+    /// fsyncing a partial group-commit batch. The writer still drains already
+    /// queued commits first, so this should stay tiny on low-latency NVMe.
+    #[serde(default = "default_metadb_group_commit_timeout_us")]
+    pub group_commit_timeout_us: u64,
+    /// Optional separate WAL directory for the metadata store.
     pub wal_dir: Option<PathBuf>,
+    /// Number of metadb dedup LSM shards. Must be a power of two in
+    /// `[1, 64]`. Recorded in the metadb manifest at create time;
+    /// changing this value on an existing database will be rejected
+    /// at open with a "recreate the database" error. Default 8 matches
+    /// the 2026-05 NVMe phase-4 perf result: it removes the single dedup
+    /// apply-lane ceiling without the unstable N=4 balance point.
+    #[serde(default = "default_metadb_dedup_shards")]
+    pub dedup_shards: u32,
+    /// Number of buckets in metadb's cuckoo dedup index. Each data page
+    /// holds 64 slots; choose enough buckets that the unique-hash working
+    /// set stays well below the physical slot count. Recorded at create time.
+    #[serde(default = "default_metadb_dedup_cuckoo_buckets")]
+    pub dedup_cuckoo_buckets: u64,
+    /// Entries in metadb's in-memory dedup L1 hot cache.
+    #[serde(default = "default_metadb_dedup_l1_cache_entries")]
+    pub dedup_l1_cache_entries: usize,
 }
 
 impl MetaConfig {
+    pub fn path(&self) -> Option<&PathBuf> {
+        self.path.as_ref()
+    }
+
     /// Resolved memtable budget in bytes. `memtable_budget_mb = 0` → half of
     /// `block_cache_mb`, clamped to at least 64 MiB so a tiny config doesn't
     /// starve memtables entirely.
@@ -143,17 +189,54 @@ impl MetaConfig {
             .saturating_mul(1024 * 1024)
             .max(8 * 1024 * 1024)
     }
+
+    /// Resolved index-pin budget in bytes. `index_pin_mb = 0` disables
+    /// pinning and lets index pages compete with leaves for LRU space.
+    pub fn index_pin_bytes(&self) -> usize {
+        self.index_pin_mb.saturating_mul(1024 * 1024)
+    }
+
+    pub fn checkpoint_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.checkpoint_interval_ms.max(1))
+    }
+
+    pub fn group_commit_timeout_us(&self) -> u64 {
+        self.group_commit_timeout_us.max(1)
+    }
+
+    pub fn lsm_bloom_bits_per_entry(&self) -> u32 {
+        self.lsm_bloom_bits_per_entry.clamp(1, 32)
+    }
 }
 
 impl Default for MetaConfig {
     fn default() -> Self {
         Self {
-            rocksdb_path: None,
+            path: None,
             block_cache_mb: default_block_cache_mb(),
             memtable_budget_mb: 0,
+            index_pin_mb: default_index_pin_mb(),
+            lsm_bloom_bits_per_entry: default_lsm_bloom_bits_per_entry(),
+            checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
+            group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_dir: None,
+            dedup_shards: default_metadb_dedup_shards(),
+            dedup_cuckoo_buckets: default_metadb_dedup_cuckoo_buckets(),
+            dedup_l1_cache_entries: default_metadb_dedup_l1_cache_entries(),
         }
     }
+}
+
+fn default_metadb_dedup_shards() -> u32 {
+    8
+}
+
+fn default_metadb_dedup_cuckoo_buckets() -> u64 {
+    1_000_000
+}
+
+fn default_metadb_dedup_l1_cache_entries() -> usize {
+    256_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -242,6 +325,21 @@ pub struct BufferConfig {
     /// Default 0 = auto (50% of system memory, capped at 8 GiB).
     #[serde(default)]
     pub max_memory_mb: usize,
+    /// Maximum pre-sync payload bytes. 0 = derive from max_memory_mb.
+    #[serde(default)]
+    pub volatile_memory_mb: usize,
+    /// Per-shard staging queue length between appenders and sync thread.
+    /// 0 = engine default.
+    #[serde(default)]
+    pub staging_queue_entries: usize,
+    /// Max entries one sync thread drains into a single fdatasync epoch.
+    /// 0 = engine default.
+    #[serde(default)]
+    pub sync_batch_max_entries: usize,
+    /// Max payload bytes one sync thread drains into a single fdatasync epoch.
+    /// 0 = engine default.
+    #[serde(default)]
+    pub sync_batch_max_bytes_mb: usize,
 }
 
 impl Default for BufferConfig {
@@ -253,6 +351,10 @@ impl Default for BufferConfig {
             group_commit_wait_us: default_group_commit_wait_us(),
             shards: default_buffer_shards(),
             max_memory_mb: 0,
+            volatile_memory_mb: 0,
+            staging_queue_entries: 0,
+            sync_batch_max_entries: 0,
+            sync_batch_max_bytes_mb: 0,
         }
     }
 }
@@ -268,6 +370,10 @@ pub struct UblkConfig {
     /// IO buffer size in bytes (default 1MB)
     #[serde(default = "default_io_buf_bytes")]
     pub io_buf_bytes: u32,
+    /// Worker threads per ublk queue used to offload backend IO before
+    /// completing commands on the queue thread.
+    #[serde(default = "default_queue_workers")]
+    pub queue_workers: usize,
 }
 
 impl Default for UblkConfig {
@@ -276,6 +382,7 @@ impl Default for UblkConfig {
             nr_queues: default_nr_queues(),
             queue_depth: default_queue_depth(),
             io_buf_bytes: default_io_buf_bytes(),
+            queue_workers: default_queue_workers(),
         }
     }
 }
@@ -286,12 +393,18 @@ pub struct FlushConfig {
     /// Each buffer shard has its own flush lane. Total compress threads = shards × compress_workers.
     #[serde(default = "default_compress_workers")]
     pub compress_workers: usize,
-    /// Max raw bytes to coalesce before compressing (default 128KB)
+    /// Max raw bytes to coalesce before compressing (default 32KB)
     #[serde(default = "default_coalesce_max_raw_bytes")]
     pub coalesce_max_raw_bytes: usize,
-    /// Max number of LBAs to coalesce into one compression unit (default 32)
+    /// Max number of LBAs to coalesce into one compression unit (default 8)
     #[serde(default = "default_coalesce_max_lbas")]
     pub coalesce_max_lbas: u32,
+    /// Minimum space saving required to keep a compressed unit after the
+    /// compression attempt. If compression saves less than this percentage,
+    /// the flusher stores the unit raw to avoid read-time decompression and
+    /// reduce compressed-byte read amplification.
+    #[serde(default = "default_min_compression_savings_pct")]
+    pub min_compression_savings_pct: u8,
     /// Skip coalesce/compress/dedup work for pending entries whose LBAs have
     /// all been superseded by a later seq still in the ring. Entries are
     /// mark_flushed immediately so the ring tail can advance without paying
@@ -299,6 +412,12 @@ pub struct FlushConfig {
     /// data. Default `true`; set `false` to regression-test the full path.
     #[serde(default = "default_skip_fully_superseded")]
     pub skip_fully_superseded: bool,
+    /// Maximum mapped LBAs folded into one packed-slot metadata commit.
+    /// Lower values reduce metadb apply head-of-line tail under heavy mixed
+    /// read/write load; higher values amortise WAL/apply overhead and improve
+    /// drain throughput. Set 0 to use the built-in default.
+    #[serde(default = "default_packed_meta_batch_max_lbas")]
+    pub packed_meta_batch_max_lbas: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,7 +445,9 @@ impl Default for FlushConfig {
             compress_workers: default_compress_workers(),
             coalesce_max_raw_bytes: default_coalesce_max_raw_bytes(),
             coalesce_max_lbas: default_coalesce_max_lbas(),
+            min_compression_savings_pct: default_min_compression_savings_pct(),
             skip_fully_superseded: default_skip_fully_superseded(),
+            packed_meta_batch_max_lbas: default_packed_meta_batch_max_lbas(),
         }
     }
 }
@@ -335,13 +456,19 @@ fn default_compress_workers() -> usize {
     2 // per flush lane (1 lane per buffer shard)
 }
 fn default_coalesce_max_raw_bytes() -> usize {
-    131072 // 128KB
+    32768 // 32KB
 }
 fn default_coalesce_max_lbas() -> u32 {
-    32
+    8
+}
+fn default_min_compression_savings_pct() -> u8 {
+    12
 }
 fn default_skip_fully_superseded() -> bool {
     true
+}
+fn default_packed_meta_batch_max_lbas() -> usize {
+    DEFAULT_PACKED_META_BATCH_LBA_LIMIT
 }
 fn default_zone_count() -> u32 {
     4
@@ -351,6 +478,18 @@ fn default_zone_size_blocks() -> u64 {
 }
 fn default_block_cache_mb() -> usize {
     256
+}
+fn default_index_pin_mb() -> usize {
+    1024
+}
+fn default_lsm_bloom_bits_per_entry() -> u32 {
+    10
+}
+fn default_metadb_checkpoint_interval_ms() -> u64 {
+    5_000
+}
+fn default_metadb_group_commit_timeout_us() -> u64 {
+    1
 }
 fn default_block_size() -> u32 {
     4096
@@ -423,6 +562,67 @@ fn default_lease_duration_secs() -> u64 {
     30
 }
 
+/// Optional CPU affinity layout. All fields accept Linux CPU-list syntax such
+/// as `"0-7,16-23"`. Empty fields leave that role unbound.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThreadingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ublk_cpus: String,
+    #[serde(default)]
+    pub read_pool_cpus: String,
+    #[serde(default)]
+    pub buffer_sync_cpus: String,
+    #[serde(default)]
+    pub flusher_coalesce_cpus: String,
+    #[serde(default)]
+    pub flusher_dedup_cpus: String,
+    #[serde(default)]
+    pub flusher_compress_cpus: String,
+    #[serde(default)]
+    pub flusher_writer_cpus: String,
+    #[serde(default)]
+    pub flusher_dedup_register_cpus: String,
+    #[serde(default)]
+    pub flusher_cleanup_cpus: String,
+    #[serde(default)]
+    pub metadb_wal_cpus: String,
+    #[serde(default)]
+    pub metadb_l2p_apply_cpus: String,
+    #[serde(default)]
+    pub metadb_refcount_apply_cpus: String,
+    #[serde(default)]
+    pub metadb_dedup_apply_cpus: String,
+    #[serde(default)]
+    pub metadb_checkpoint_cpus: String,
+    #[serde(default)]
+    pub background_cpus: String,
+}
+
+impl Default for ThreadingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ublk_cpus: String::new(),
+            read_pool_cpus: String::new(),
+            buffer_sync_cpus: String::new(),
+            flusher_coalesce_cpus: String::new(),
+            flusher_dedup_cpus: String::new(),
+            flusher_compress_cpus: String::new(),
+            flusher_writer_cpus: String::new(),
+            flusher_dedup_register_cpus: String::new(),
+            flusher_cleanup_cpus: String::new(),
+            metadb_wal_cpus: String::new(),
+            metadb_l2p_apply_cpus: String::new(),
+            metadb_refcount_apply_cpus: String::new(),
+            metadb_dedup_apply_cpus: String::new(),
+            metadb_checkpoint_cpus: String::new(),
+            background_cpus: String::new(),
+        }
+    }
+}
+
 fn default_nr_queues() -> u16 {
     4
 }
@@ -431,6 +631,9 @@ fn default_queue_depth() -> u16 {
 }
 fn default_io_buf_bytes() -> u32 {
     1024 * 1024
+}
+fn default_queue_workers() -> usize {
+    1
 }
 
 // OnyxConfig::load and should_standby are defined in the impl block above.

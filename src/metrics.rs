@@ -6,6 +6,39 @@ use std::time::Instant;
 use dashmap::DashMap;
 use serde::Serialize;
 
+const LATENCY_BUCKETS: usize = 64;
+const MAX_READ_POOL_WORKERS: usize = 128;
+
+fn latency_bucket(ns: u64) -> usize {
+    if ns == 0 {
+        0
+    } else {
+        (u64::BITS as usize - ns.leading_zeros() as usize).min(LATENCY_BUCKETS - 1)
+    }
+}
+
+fn record_latency_bucket(buckets: &[AtomicU64; LATENCY_BUCKETS], ns: u64) {
+    buckets[latency_bucket(ns)].fetch_add(1, Ordering::Relaxed);
+}
+
+fn load_latency_buckets(buckets: &[AtomicU64; LATENCY_BUCKETS]) -> Vec<u64> {
+    load_atomic_slice(buckets)
+}
+
+fn load_atomic_slice(counters: &[AtomicU64]) -> Vec<u64> {
+    counters
+        .iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .collect()
+}
+
+fn sub_latency_buckets(now: &[u64], earlier: &[u64]) -> Vec<u64> {
+    now.iter()
+        .enumerate()
+        .map(|(idx, value)| value.saturating_sub(earlier.get(idx).copied().unwrap_or(0)))
+        .collect()
+}
+
 /// Per-volume IO counters.
 #[derive(Debug)]
 pub struct VolumeMetrics {
@@ -62,10 +95,16 @@ pub struct EngineMetrics {
     pub volume_read_ops: AtomicU64,
     pub volume_read_bytes: AtomicU64,
     pub volume_read_total_ns: AtomicU64,
+    pub ublk_read_queue_wait_ns: AtomicU64,
+    pub ublk_read_worker_ns: AtomicU64,
+    pub ublk_read_completion_wait_ns: AtomicU64,
     pub volume_partial_read_ops: AtomicU64,
     pub volume_write_ops: AtomicU64,
     pub volume_write_bytes: AtomicU64,
     pub volume_write_total_ns: AtomicU64,
+    pub ublk_write_queue_wait_ns: AtomicU64,
+    pub ublk_write_worker_ns: AtomicU64,
+    pub ublk_write_completion_wait_ns: AtomicU64,
     pub volume_partial_write_ops: AtomicU64,
     pub zone_write_dispatches: AtomicU64,
     pub zone_submit_write_ns: AtomicU64,
@@ -91,6 +130,15 @@ pub struct EngineMetrics {
     pub buffer_hydration_head_bypass_count: AtomicU64,
     pub buffer_lookup_hits: AtomicU64,
     pub buffer_lookup_misses: AtomicU64,
+    /// Inner timing for `BufferPool::lookup`. `index_ns` is the time spent
+    /// probing the DashMap index across all shards (cheap path that returns
+    /// `None` when nothing is pending). `hydrate_ns` / `hydrate_ops` cover
+    /// the lazy `read_payload_from_disk` path taken when a hit's payload
+    /// isn't resident — this is the suspected ms-level cost source on the
+    /// read path. Both counters accumulate per-call across all shards.
+    pub buffer_lookup_index_ns: AtomicU64,
+    pub buffer_lookup_hydrate_ns: AtomicU64,
+    pub buffer_lookup_hydrate_ops: AtomicU64,
     pub buffer_read_ops: AtomicU64,
     pub buffer_read_bytes: AtomicU64,
     pub read_buffer_hits: AtomicU64,
@@ -104,11 +152,44 @@ pub struct EngineMetrics {
     pub lv3_read_ops: AtomicU64,
     pub lv3_read_compressed_bytes: AtomicU64,
     pub lv3_read_decompressed_bytes: AtomicU64,
+    /// ReadPool timing split. `requests` counts caller-submitted LV3 read
+    /// work items; `batches` counts worker io_uring submissions; `batch_ops`
+    /// is the number of requests folded into those batches. Queue wait is
+    /// measured from caller enqueue to worker processing. Submit wait covers
+    /// `io_uring submit_batch`, including kernel/device completion wait.
+    pub read_pool_requests: AtomicU64,
+    pub read_pool_batches: AtomicU64,
+    pub read_pool_batch_ops: AtomicU64,
+    pub read_pool_queue_wait_ns: AtomicU64,
+    pub read_pool_coalesce_wait_ns: AtomicU64,
+    pub read_pool_alloc_ns: AtomicU64,
+    pub read_pool_submit_wait_ns: AtomicU64,
+    pub read_pool_decode_ns: AtomicU64,
+    pub read_pool_queue_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub read_pool_submit_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub read_pool_decode_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub read_pool_worker_requests: [AtomicU64; MAX_READ_POOL_WORKERS],
+    pub read_pool_worker_batches: [AtomicU64; MAX_READ_POOL_WORKERS],
+    pub read_pool_worker_queue_wait_ns: [AtomicU64; MAX_READ_POOL_WORKERS],
+    pub read_pool_worker_submit_wait_ns: [AtomicU64; MAX_READ_POOL_WORKERS],
     pub lv3_write_ops: AtomicU64,
     pub lv3_write_compressed_bytes: AtomicU64,
     pub read_unmapped: AtomicU64,
     pub read_crc_errors: AtomicU64,
     pub read_decompress_errors: AtomicU64,
+    /// `ZoneManager::submit_reads` timing breakdown. `*_calls` increments once
+    /// per outer `submit_reads` invocation; the three `*_ns` counters split
+    /// the wall time across the three phases. Phase counters only accumulate
+    /// when that phase actually ran (e.g. `meta_get_ns` is 0 if every LBA hit
+    /// the buffer; `unit_io_ns` is 0 if no LBA was mapped).
+    pub read_submit_calls: AtomicU64,
+    pub read_submit_total_ns: AtomicU64,
+    pub read_submit_buffer_lookup_ns: AtomicU64,
+    pub read_submit_meta_get_ns: AtomicU64,
+    pub read_submit_meta_query_ns: AtomicU64,
+    pub read_submit_meta_route_ns: AtomicU64,
+    pub read_submit_unit_io_ns: AtomicU64,
+    pub read_submit_unit_io_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub coalesce_runs: AtomicU64,
     pub coalesced_units: AtomicU64,
     pub coalesced_lbas: AtomicU64,
@@ -121,6 +202,8 @@ pub struct EngineMetrics {
     pub compress_units: AtomicU64,
     pub compress_input_bytes: AtomicU64,
     pub compress_output_bytes: AtomicU64,
+    pub compress_bypass_units: AtomicU64,
+    pub compress_bypass_bytes: AtomicU64,
     pub dedup_hits: AtomicU64,
     pub dedup_misses: AtomicU64,
     pub dedup_skipped_units: AtomicU64,
@@ -133,6 +216,13 @@ pub struct EngineMetrics {
     pub dedup_stale_delete_ns: AtomicU64,
     pub dedup_hit_commit_ops: AtomicU64,
     pub dedup_hit_commit_ns: AtomicU64,
+    pub dedup_register_batches: AtomicU64,
+    pub dedup_register_entries: AtomicU64,
+    pub dedup_register_batch_max_entries: AtomicU64,
+    pub dedup_register_lock_ns: AtomicU64,
+    pub dedup_register_validate_blockmap_ns: AtomicU64,
+    pub dedup_register_validate_refcount_ns: AtomicU64,
+    pub dedup_register_commit_ns: AtomicU64,
     pub flush_units_written: AtomicU64,
     pub flush_unit_bytes: AtomicU64,
     pub flush_packed_slots_written: AtomicU64,
@@ -188,6 +278,47 @@ impl EngineMetrics {
     pub fn remove_volume_metrics(&self, vol_id: &str) {
         self.volume_metrics.remove(vol_id);
     }
+
+    pub fn record_read_pool_queue_wait_ns(&self, ns: u64) {
+        self.read_pool_queue_wait_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_pool_queue_wait_latency_buckets, ns);
+    }
+
+    pub fn record_read_pool_worker_queue_wait_ns(&self, worker_idx: usize, ns: u64) {
+        if let Some(counter) = self.read_pool_worker_queue_wait_ns.get(worker_idx) {
+            counter.fetch_add(ns, Ordering::Relaxed);
+        }
+        self.record_read_pool_queue_wait_ns(ns);
+    }
+
+    pub fn record_read_pool_submit_wait_ns(&self, worker_idx: usize, ns: u64) {
+        self.read_pool_submit_wait_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_pool_submit_wait_latency_buckets, ns);
+        if let Some(counter) = self.read_pool_worker_submit_wait_ns.get(worker_idx) {
+            counter.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_read_pool_decode_ns(&self, ns: u64) {
+        self.read_pool_decode_ns.fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_pool_decode_latency_buckets, ns);
+    }
+
+    pub fn record_read_pool_worker_batch(&self, worker_idx: usize, requests: u64) {
+        if let Some(counter) = self.read_pool_worker_requests.get(worker_idx) {
+            counter.fetch_add(requests, Ordering::Relaxed);
+        }
+        if let Some(counter) = self.read_pool_worker_batches.get(worker_idx) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_read_submit_unit_io_ns(&self, ns: u64) {
+        self.read_submit_unit_io_ns.fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.read_submit_unit_io_latency_buckets, ns);
+    }
 }
 
 impl Default for EngineMetrics {
@@ -201,10 +332,16 @@ impl Default for EngineMetrics {
             volume_read_ops: AtomicU64::new(0),
             volume_read_bytes: AtomicU64::new(0),
             volume_read_total_ns: AtomicU64::new(0),
+            ublk_read_queue_wait_ns: AtomicU64::new(0),
+            ublk_read_worker_ns: AtomicU64::new(0),
+            ublk_read_completion_wait_ns: AtomicU64::new(0),
             volume_partial_read_ops: AtomicU64::new(0),
             volume_write_ops: AtomicU64::new(0),
             volume_write_bytes: AtomicU64::new(0),
             volume_write_total_ns: AtomicU64::new(0),
+            ublk_write_queue_wait_ns: AtomicU64::new(0),
+            ublk_write_worker_ns: AtomicU64::new(0),
+            ublk_write_completion_wait_ns: AtomicU64::new(0),
             volume_partial_write_ops: AtomicU64::new(0),
             zone_write_dispatches: AtomicU64::new(0),
             zone_submit_write_ns: AtomicU64::new(0),
@@ -230,6 +367,9 @@ impl Default for EngineMetrics {
             buffer_hydration_head_bypass_count: AtomicU64::new(0),
             buffer_lookup_hits: AtomicU64::new(0),
             buffer_lookup_misses: AtomicU64::new(0),
+            buffer_lookup_index_ns: AtomicU64::new(0),
+            buffer_lookup_hydrate_ns: AtomicU64::new(0),
+            buffer_lookup_hydrate_ops: AtomicU64::new(0),
             buffer_read_ops: AtomicU64::new(0),
             buffer_read_bytes: AtomicU64::new(0),
             read_buffer_hits: AtomicU64::new(0),
@@ -237,11 +377,34 @@ impl Default for EngineMetrics {
             lv3_read_ops: AtomicU64::new(0),
             lv3_read_compressed_bytes: AtomicU64::new(0),
             lv3_read_decompressed_bytes: AtomicU64::new(0),
+            read_pool_requests: AtomicU64::new(0),
+            read_pool_batches: AtomicU64::new(0),
+            read_pool_batch_ops: AtomicU64::new(0),
+            read_pool_queue_wait_ns: AtomicU64::new(0),
+            read_pool_coalesce_wait_ns: AtomicU64::new(0),
+            read_pool_alloc_ns: AtomicU64::new(0),
+            read_pool_submit_wait_ns: AtomicU64::new(0),
+            read_pool_decode_ns: AtomicU64::new(0),
+            read_pool_queue_wait_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_submit_wait_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_decode_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_batches: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_queue_wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_pool_worker_submit_wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             lv3_write_ops: AtomicU64::new(0),
             lv3_write_compressed_bytes: AtomicU64::new(0),
             read_unmapped: AtomicU64::new(0),
             read_crc_errors: AtomicU64::new(0),
             read_decompress_errors: AtomicU64::new(0),
+            read_submit_calls: AtomicU64::new(0),
+            read_submit_total_ns: AtomicU64::new(0),
+            read_submit_buffer_lookup_ns: AtomicU64::new(0),
+            read_submit_meta_get_ns: AtomicU64::new(0),
+            read_submit_meta_query_ns: AtomicU64::new(0),
+            read_submit_meta_route_ns: AtomicU64::new(0),
+            read_submit_unit_io_ns: AtomicU64::new(0),
+            read_submit_unit_io_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             coalesce_runs: AtomicU64::new(0),
             coalesced_units: AtomicU64::new(0),
             coalesced_lbas: AtomicU64::new(0),
@@ -251,6 +414,8 @@ impl Default for EngineMetrics {
             compress_units: AtomicU64::new(0),
             compress_input_bytes: AtomicU64::new(0),
             compress_output_bytes: AtomicU64::new(0),
+            compress_bypass_units: AtomicU64::new(0),
+            compress_bypass_bytes: AtomicU64::new(0),
             dedup_hits: AtomicU64::new(0),
             dedup_misses: AtomicU64::new(0),
             dedup_skipped_units: AtomicU64::new(0),
@@ -263,6 +428,13 @@ impl Default for EngineMetrics {
             dedup_stale_delete_ns: AtomicU64::new(0),
             dedup_hit_commit_ops: AtomicU64::new(0),
             dedup_hit_commit_ns: AtomicU64::new(0),
+            dedup_register_batches: AtomicU64::new(0),
+            dedup_register_entries: AtomicU64::new(0),
+            dedup_register_batch_max_entries: AtomicU64::new(0),
+            dedup_register_lock_ns: AtomicU64::new(0),
+            dedup_register_validate_blockmap_ns: AtomicU64::new(0),
+            dedup_register_validate_refcount_ns: AtomicU64::new(0),
+            dedup_register_commit_ns: AtomicU64::new(0),
             flush_units_written: AtomicU64::new(0),
             flush_unit_bytes: AtomicU64::new(0),
             flush_packed_slots_written: AtomicU64::new(0),
@@ -310,10 +482,16 @@ impl EngineMetrics {
             volume_read_ops: load(&self.volume_read_ops),
             volume_read_bytes: load(&self.volume_read_bytes),
             volume_read_total_ns: load(&self.volume_read_total_ns),
+            ublk_read_queue_wait_ns: load(&self.ublk_read_queue_wait_ns),
+            ublk_read_worker_ns: load(&self.ublk_read_worker_ns),
+            ublk_read_completion_wait_ns: load(&self.ublk_read_completion_wait_ns),
             volume_partial_read_ops: load(&self.volume_partial_read_ops),
             volume_write_ops: load(&self.volume_write_ops),
             volume_write_bytes: load(&self.volume_write_bytes),
             volume_write_total_ns: load(&self.volume_write_total_ns),
+            ublk_write_queue_wait_ns: load(&self.ublk_write_queue_wait_ns),
+            ublk_write_worker_ns: load(&self.ublk_write_worker_ns),
+            ublk_write_completion_wait_ns: load(&self.ublk_write_completion_wait_ns),
             volume_partial_write_ops: load(&self.volume_partial_write_ops),
             zone_write_dispatches: load(&self.zone_write_dispatches),
             zone_submit_write_ns: load(&self.zone_submit_write_ns),
@@ -341,6 +519,9 @@ impl EngineMetrics {
             buffer_hydration_head_bypass_count: load(&self.buffer_hydration_head_bypass_count),
             buffer_lookup_hits: load(&self.buffer_lookup_hits),
             buffer_lookup_misses: load(&self.buffer_lookup_misses),
+            buffer_lookup_index_ns: load(&self.buffer_lookup_index_ns),
+            buffer_lookup_hydrate_ns: load(&self.buffer_lookup_hydrate_ns),
+            buffer_lookup_hydrate_ops: load(&self.buffer_lookup_hydrate_ops),
             buffer_read_ops: load(&self.buffer_read_ops),
             buffer_read_bytes: load(&self.buffer_read_bytes),
             read_buffer_hits: load(&self.read_buffer_hits),
@@ -348,11 +529,44 @@ impl EngineMetrics {
             lv3_read_ops: load(&self.lv3_read_ops),
             lv3_read_compressed_bytes: load(&self.lv3_read_compressed_bytes),
             lv3_read_decompressed_bytes: load(&self.lv3_read_decompressed_bytes),
+            read_pool_requests: load(&self.read_pool_requests),
+            read_pool_batches: load(&self.read_pool_batches),
+            read_pool_batch_ops: load(&self.read_pool_batch_ops),
+            read_pool_queue_wait_ns: load(&self.read_pool_queue_wait_ns),
+            read_pool_coalesce_wait_ns: load(&self.read_pool_coalesce_wait_ns),
+            read_pool_alloc_ns: load(&self.read_pool_alloc_ns),
+            read_pool_submit_wait_ns: load(&self.read_pool_submit_wait_ns),
+            read_pool_decode_ns: load(&self.read_pool_decode_ns),
+            read_pool_queue_wait_latency_buckets: load_latency_buckets(
+                &self.read_pool_queue_wait_latency_buckets,
+            ),
+            read_pool_submit_wait_latency_buckets: load_latency_buckets(
+                &self.read_pool_submit_wait_latency_buckets,
+            ),
+            read_pool_decode_latency_buckets: load_latency_buckets(
+                &self.read_pool_decode_latency_buckets,
+            ),
+            read_pool_worker_requests: load_atomic_slice(&self.read_pool_worker_requests),
+            read_pool_worker_batches: load_atomic_slice(&self.read_pool_worker_batches),
+            read_pool_worker_queue_wait_ns: load_atomic_slice(&self.read_pool_worker_queue_wait_ns),
+            read_pool_worker_submit_wait_ns: load_atomic_slice(
+                &self.read_pool_worker_submit_wait_ns,
+            ),
             lv3_write_ops: load(&self.lv3_write_ops),
             lv3_write_compressed_bytes: load(&self.lv3_write_compressed_bytes),
             read_unmapped: load(&self.read_unmapped),
             read_crc_errors: load(&self.read_crc_errors),
             read_decompress_errors: load(&self.read_decompress_errors),
+            read_submit_calls: load(&self.read_submit_calls),
+            read_submit_total_ns: load(&self.read_submit_total_ns),
+            read_submit_buffer_lookup_ns: load(&self.read_submit_buffer_lookup_ns),
+            read_submit_meta_get_ns: load(&self.read_submit_meta_get_ns),
+            read_submit_meta_query_ns: load(&self.read_submit_meta_query_ns),
+            read_submit_meta_route_ns: load(&self.read_submit_meta_route_ns),
+            read_submit_unit_io_ns: load(&self.read_submit_unit_io_ns),
+            read_submit_unit_io_latency_buckets: load_latency_buckets(
+                &self.read_submit_unit_io_latency_buckets,
+            ),
             coalesce_runs: load(&self.coalesce_runs),
             coalesced_units: load(&self.coalesced_units),
             coalesced_lbas: load(&self.coalesced_lbas),
@@ -362,6 +576,8 @@ impl EngineMetrics {
             compress_units: load(&self.compress_units),
             compress_input_bytes: load(&self.compress_input_bytes),
             compress_output_bytes: load(&self.compress_output_bytes),
+            compress_bypass_units: load(&self.compress_bypass_units),
+            compress_bypass_bytes: load(&self.compress_bypass_bytes),
             dedup_hits: load(&self.dedup_hits),
             dedup_misses: load(&self.dedup_misses),
             dedup_skipped_units: load(&self.dedup_skipped_units),
@@ -374,6 +590,13 @@ impl EngineMetrics {
             dedup_stale_delete_ns: load(&self.dedup_stale_delete_ns),
             dedup_hit_commit_ops: load(&self.dedup_hit_commit_ops),
             dedup_hit_commit_ns: load(&self.dedup_hit_commit_ns),
+            dedup_register_batches: load(&self.dedup_register_batches),
+            dedup_register_entries: load(&self.dedup_register_entries),
+            dedup_register_batch_max_entries: load(&self.dedup_register_batch_max_entries),
+            dedup_register_lock_ns: load(&self.dedup_register_lock_ns),
+            dedup_register_validate_blockmap_ns: load(&self.dedup_register_validate_blockmap_ns),
+            dedup_register_validate_refcount_ns: load(&self.dedup_register_validate_refcount_ns),
+            dedup_register_commit_ns: load(&self.dedup_register_commit_ns),
             flush_units_written: load(&self.flush_units_written),
             flush_unit_bytes: load(&self.flush_unit_bytes),
             flush_packed_slots_written: load(&self.flush_packed_slots_written),
@@ -421,10 +644,16 @@ pub struct EngineMetricsSnapshot {
     pub volume_read_ops: u64,
     pub volume_read_bytes: u64,
     pub volume_read_total_ns: u64,
+    pub ublk_read_queue_wait_ns: u64,
+    pub ublk_read_worker_ns: u64,
+    pub ublk_read_completion_wait_ns: u64,
     pub volume_partial_read_ops: u64,
     pub volume_write_ops: u64,
     pub volume_write_bytes: u64,
     pub volume_write_total_ns: u64,
+    pub ublk_write_queue_wait_ns: u64,
+    pub ublk_write_worker_ns: u64,
+    pub ublk_write_completion_wait_ns: u64,
     pub volume_partial_write_ops: u64,
     pub zone_write_dispatches: u64,
     pub zone_submit_write_ns: u64,
@@ -450,6 +679,9 @@ pub struct EngineMetricsSnapshot {
     pub buffer_hydration_head_bypass_count: u64,
     pub buffer_lookup_hits: u64,
     pub buffer_lookup_misses: u64,
+    pub buffer_lookup_index_ns: u64,
+    pub buffer_lookup_hydrate_ns: u64,
+    pub buffer_lookup_hydrate_ops: u64,
     pub buffer_read_ops: u64,
     pub buffer_read_bytes: u64,
     pub read_buffer_hits: u64,
@@ -457,11 +689,34 @@ pub struct EngineMetricsSnapshot {
     pub lv3_read_ops: u64,
     pub lv3_read_compressed_bytes: u64,
     pub lv3_read_decompressed_bytes: u64,
+    pub read_pool_requests: u64,
+    pub read_pool_batches: u64,
+    pub read_pool_batch_ops: u64,
+    pub read_pool_queue_wait_ns: u64,
+    pub read_pool_coalesce_wait_ns: u64,
+    pub read_pool_alloc_ns: u64,
+    pub read_pool_submit_wait_ns: u64,
+    pub read_pool_decode_ns: u64,
+    pub read_pool_queue_wait_latency_buckets: Vec<u64>,
+    pub read_pool_submit_wait_latency_buckets: Vec<u64>,
+    pub read_pool_decode_latency_buckets: Vec<u64>,
+    pub read_pool_worker_requests: Vec<u64>,
+    pub read_pool_worker_batches: Vec<u64>,
+    pub read_pool_worker_queue_wait_ns: Vec<u64>,
+    pub read_pool_worker_submit_wait_ns: Vec<u64>,
     pub lv3_write_ops: u64,
     pub lv3_write_compressed_bytes: u64,
     pub read_unmapped: u64,
     pub read_crc_errors: u64,
     pub read_decompress_errors: u64,
+    pub read_submit_calls: u64,
+    pub read_submit_total_ns: u64,
+    pub read_submit_buffer_lookup_ns: u64,
+    pub read_submit_meta_get_ns: u64,
+    pub read_submit_meta_query_ns: u64,
+    pub read_submit_meta_route_ns: u64,
+    pub read_submit_unit_io_ns: u64,
+    pub read_submit_unit_io_latency_buckets: Vec<u64>,
     pub coalesce_runs: u64,
     pub coalesced_units: u64,
     pub coalesced_lbas: u64,
@@ -471,6 +726,8 @@ pub struct EngineMetricsSnapshot {
     pub compress_units: u64,
     pub compress_input_bytes: u64,
     pub compress_output_bytes: u64,
+    pub compress_bypass_units: u64,
+    pub compress_bypass_bytes: u64,
     pub dedup_hits: u64,
     pub dedup_misses: u64,
     pub dedup_skipped_units: u64,
@@ -483,6 +740,13 @@ pub struct EngineMetricsSnapshot {
     pub dedup_stale_delete_ns: u64,
     pub dedup_hit_commit_ops: u64,
     pub dedup_hit_commit_ns: u64,
+    pub dedup_register_batches: u64,
+    pub dedup_register_entries: u64,
+    pub dedup_register_batch_max_entries: u64,
+    pub dedup_register_lock_ns: u64,
+    pub dedup_register_validate_blockmap_ns: u64,
+    pub dedup_register_validate_refcount_ns: u64,
+    pub dedup_register_commit_ns: u64,
     pub flush_units_written: u64,
     pub flush_unit_bytes: u64,
     pub flush_packed_slots_written: u64,
@@ -525,6 +789,38 @@ impl EngineMetricsSnapshot {
                     $(
                         $field: self.$field.saturating_sub(earlier.$field),
                     )+
+                    read_pool_queue_wait_latency_buckets: sub_latency_buckets(
+                        &self.read_pool_queue_wait_latency_buckets,
+                        &earlier.read_pool_queue_wait_latency_buckets,
+                    ),
+                    read_pool_submit_wait_latency_buckets: sub_latency_buckets(
+                        &self.read_pool_submit_wait_latency_buckets,
+                        &earlier.read_pool_submit_wait_latency_buckets,
+                    ),
+                    read_pool_decode_latency_buckets: sub_latency_buckets(
+                        &self.read_pool_decode_latency_buckets,
+                        &earlier.read_pool_decode_latency_buckets,
+                    ),
+                    read_pool_worker_requests: sub_latency_buckets(
+                        &self.read_pool_worker_requests,
+                        &earlier.read_pool_worker_requests,
+                    ),
+                    read_pool_worker_batches: sub_latency_buckets(
+                        &self.read_pool_worker_batches,
+                        &earlier.read_pool_worker_batches,
+                    ),
+                    read_pool_worker_queue_wait_ns: sub_latency_buckets(
+                        &self.read_pool_worker_queue_wait_ns,
+                        &earlier.read_pool_worker_queue_wait_ns,
+                    ),
+                    read_pool_worker_submit_wait_ns: sub_latency_buckets(
+                        &self.read_pool_worker_submit_wait_ns,
+                        &earlier.read_pool_worker_submit_wait_ns,
+                    ),
+                    read_submit_unit_io_latency_buckets: sub_latency_buckets(
+                        &self.read_submit_unit_io_latency_buckets,
+                        &earlier.read_submit_unit_io_latency_buckets,
+                    ),
                 }
             };
         }
@@ -537,10 +833,16 @@ impl EngineMetricsSnapshot {
             volume_read_ops,
             volume_read_bytes,
             volume_read_total_ns,
+            ublk_read_queue_wait_ns,
+            ublk_read_worker_ns,
+            ublk_read_completion_wait_ns,
             volume_partial_read_ops,
             volume_write_ops,
             volume_write_bytes,
             volume_write_total_ns,
+            ublk_write_queue_wait_ns,
+            ublk_write_worker_ns,
+            ublk_write_completion_wait_ns,
             volume_partial_write_ops,
             zone_write_dispatches,
             zone_submit_write_ns,
@@ -566,6 +868,9 @@ impl EngineMetricsSnapshot {
             buffer_hydration_head_bypass_count,
             buffer_lookup_hits,
             buffer_lookup_misses,
+            buffer_lookup_index_ns,
+            buffer_lookup_hydrate_ns,
+            buffer_lookup_hydrate_ops,
             buffer_read_ops,
             buffer_read_bytes,
             read_buffer_hits,
@@ -573,11 +878,26 @@ impl EngineMetricsSnapshot {
             lv3_read_ops,
             lv3_read_compressed_bytes,
             lv3_read_decompressed_bytes,
+            read_pool_requests,
+            read_pool_batches,
+            read_pool_batch_ops,
+            read_pool_queue_wait_ns,
+            read_pool_coalesce_wait_ns,
+            read_pool_alloc_ns,
+            read_pool_submit_wait_ns,
+            read_pool_decode_ns,
             lv3_write_ops,
             lv3_write_compressed_bytes,
             read_unmapped,
             read_crc_errors,
             read_decompress_errors,
+            read_submit_calls,
+            read_submit_total_ns,
+            read_submit_buffer_lookup_ns,
+            read_submit_meta_get_ns,
+            read_submit_meta_query_ns,
+            read_submit_meta_route_ns,
+            read_submit_unit_io_ns,
             coalesce_runs,
             coalesced_units,
             coalesced_lbas,
@@ -587,6 +907,8 @@ impl EngineMetricsSnapshot {
             compress_units,
             compress_input_bytes,
             compress_output_bytes,
+            compress_bypass_units,
+            compress_bypass_bytes,
             dedup_hits,
             dedup_misses,
             dedup_skipped_units,
@@ -599,6 +921,13 @@ impl EngineMetricsSnapshot {
             dedup_stale_delete_ns,
             dedup_hit_commit_ops,
             dedup_hit_commit_ns,
+            dedup_register_batches,
+            dedup_register_entries,
+            dedup_register_batch_max_entries,
+            dedup_register_lock_ns,
+            dedup_register_validate_blockmap_ns,
+            dedup_register_validate_refcount_ns,
+            dedup_register_commit_ns,
             flush_units_written,
             flush_unit_bytes,
             flush_packed_slots_written,
@@ -657,25 +986,592 @@ pub struct BufferShardSnapshot {
     pub head_age_ms: Option<u64>,
     /// How long the current seq has continuously remained at the head/front.
     pub head_residency_ms: Option<u64>,
+    /// Entries staged for the sync thread but not yet part of the current
+    /// fdatasync batch.
+    pub staged_entries: usize,
+    /// Payloads still resident only for the sync-before-publish window.
+    pub volatile_payloads: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct RocksDbMemorySnapshot {
+pub struct MetaMemorySnapshot {
     pub block_cache_capacity_bytes: Option<u64>,
     pub block_cache_usage_bytes: Option<u64>,
     pub block_cache_pinned_usage_bytes: Option<u64>,
     pub cur_size_all_mem_tables_bytes: u64,
     pub size_all_mem_tables_bytes: u64,
     pub estimate_table_readers_mem_bytes: u64,
+    pub last_applied_lsn: u64,
+    pub high_water_pages: u64,
+    pub free_list_pages: u64,
+    pub dedup_index_ssts: u64,
+    pub dedup_index_records: u64,
+    pub dedup_reverse_ssts: u64,
+    pub dedup_reverse_records: u64,
+    pub dedup_l0_distinct_fps: u64,
+    pub dedup_l0_approx_bytes: u64,
+    pub dedup_l1_entries: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_evictions: u64,
+    pub cache_current_pages: u64,
+    pub cache_capacity_bytes: u64,
+    pub cache_pinned_pages: u64,
+    pub cache_pin_budget_bytes: u64,
+    pub commit_attempts: u64,
+    pub commit_success: u64,
+    pub commit_errors: u64,
+    pub commit_empty: u64,
+    pub commit_ops: u64,
+    pub commit_total_us: u64,
+    pub commit_total_max_us: u64,
+    pub commit_wal_submit_us: u64,
+    pub commit_wal_submit_max_us: u64,
+    pub commit_drop_gate_wait_us: u64,
+    pub commit_drop_gate_wait_max_us: u64,
+    pub commit_apply_wait_us: u64,
+    pub commit_apply_wait_max_us: u64,
+    pub commit_apply_gate_wait_us: u64,
+    pub commit_apply_gate_wait_max_us: u64,
+    pub commit_apply_us: u64,
+    pub commit_apply_max_us: u64,
+    pub commit_apply_l2p_wait_us: u64,
+    pub commit_apply_l2p_wait_max_us: u64,
+    pub commit_apply_rc_enqueue_us: u64,
+    pub commit_apply_rc_enqueue_max_us: u64,
+    pub commit_apply_rc_wait_us: u64,
+    pub commit_apply_rc_wait_max_us: u64,
+    pub commit_apply_dedup_enqueue_us: u64,
+    pub commit_apply_dedup_enqueue_max_us: u64,
+    pub commit_apply_dedup_wait_us: u64,
+    pub commit_apply_dedup_wait_max_us: u64,
+    pub wal_submit_calls: u64,
+    pub wal_submit_wait_us: u64,
+    pub wal_submit_wait_max_us: u64,
+    pub wal_batches: u64,
+    pub wal_records: u64,
+    pub wal_bytes: u64,
+    pub wal_rotates: u64,
+    pub wal_fsyncs: u64,
+    pub wal_write_us: u64,
+    pub wal_write_max_us: u64,
+    pub wal_fsync_us: u64,
+    pub wal_fsync_max_us: u64,
+    pub wal_batch_records_max: u64,
+    pub wal_batch_bytes_max: u64,
+    pub range_delete_calls: u64,
+    pub range_delete_success: u64,
+    pub range_delete_errors: u64,
+    pub range_delete_noop: u64,
+    pub range_delete_captured_entries: u64,
+    pub range_delete_chunks: u64,
+    pub range_delete_total_us: u64,
+    pub range_delete_total_max_us: u64,
+    pub cleanup_calls: u64,
+    pub cleanup_success: u64,
+    pub cleanup_errors: u64,
+    pub cleanup_noop: u64,
+    pub cleanup_pbas: u64,
+    pub cleanup_hashes_found: u64,
+    pub cleanup_forward_checks: u64,
+    pub cleanup_tombstones_emitted: u64,
+    pub cleanup_tx_ops: u64,
+    pub cleanup_total_us: u64,
+    pub cleanup_total_max_us: u64,
+    pub cleanup_scan_us: u64,
+    pub cleanup_scan_max_us: u64,
+    pub cleanup_forward_check_us: u64,
+    pub cleanup_forward_check_max_us: u64,
+    pub cleanup_commit_us: u64,
+    pub cleanup_commit_max_us: u64,
+    pub apply_l2p_put_count: u64,
+    pub apply_l2p_put_us: u64,
+    pub apply_l2p_put_max_us: u64,
+    pub apply_l2p_delete_count: u64,
+    pub apply_l2p_delete_us: u64,
+    pub apply_l2p_delete_max_us: u64,
+    pub apply_l2p_remap_count: u64,
+    pub apply_l2p_remap_us: u64,
+    pub apply_l2p_remap_max_us: u64,
+    pub apply_l2p_range_delete_count: u64,
+    pub apply_l2p_range_delete_us: u64,
+    pub apply_l2p_range_delete_max_us: u64,
+    pub apply_refcount_count: u64,
+    pub apply_refcount_us: u64,
+    pub apply_refcount_max_us: u64,
+    pub apply_dedup_count: u64,
+    pub apply_dedup_us: u64,
+    pub apply_dedup_max_us: u64,
+    pub dedup_lane_tasks: u64,
+    pub dedup_lane_ops: u64,
+    pub dedup_lane_ready_queue_wait_us: u64,
+    pub dedup_lane_ready_queue_wait_max_us: u64,
+    pub dedup_lane_exec_us: u64,
+    pub dedup_lane_exec_max_us: u64,
+    pub dedup_apply_guard_count: u64,
+    pub dedup_apply_guard_us: u64,
+    pub dedup_apply_guard_max_us: u64,
+    pub dedup_apply_forward_put_count: u64,
+    pub dedup_apply_forward_put_us: u64,
+    pub dedup_apply_forward_put_max_us: u64,
+    pub dedup_apply_forward_delete_count: u64,
+    pub dedup_apply_forward_delete_us: u64,
+    pub dedup_apply_forward_delete_max_us: u64,
+    pub dedup_apply_reverse_put_count: u64,
+    pub dedup_apply_reverse_put_us: u64,
+    pub dedup_apply_reverse_put_max_us: u64,
+    pub dedup_apply_reverse_delete_count: u64,
+    pub dedup_apply_reverse_delete_us: u64,
+    pub dedup_apply_reverse_delete_max_us: u64,
+    pub l2p_get_calls: u64,
+    pub l2p_get_lock_wait_us: u64,
+    pub l2p_get_lock_wait_max_us: u64,
+    pub l2p_get_tree_walk_us: u64,
+    pub l2p_get_tree_walk_max_us: u64,
+    pub l2p_multi_get_calls: u64,
+    pub l2p_multi_get_lbas: u64,
+    pub l2p_multi_get_pin_us: u64,
+    pub l2p_multi_get_pin_max_us: u64,
+    pub l2p_multi_get_volume_us: u64,
+    pub l2p_multi_get_volume_max_us: u64,
+    pub l2p_multi_get_sort_us: u64,
+    pub l2p_multi_get_sort_max_us: u64,
+    pub l2p_multi_get_view_us: u64,
+    pub l2p_multi_get_view_max_us: u64,
+    pub l2p_multi_get_tree_us: u64,
+    pub l2p_multi_get_tree_max_us: u64,
+    // Per-phase flush timers. Splits `Db::flush()` so we can see whether
+    // the long pole is the apply_gate write barrier, the dirty-page IO,
+    // the manifest commit, or the post-flush install/reclaim.
+    pub flush_calls: u64,
+    pub flush_total_us: u64,
+    pub flush_total_max_us: u64,
+    pub flush_gate_wait_us: u64,
+    pub flush_gate_wait_max_us: u64,
+    pub flush_sample_us: u64,
+    pub flush_sample_max_us: u64,
+    pub flush_io_us: u64,
+    pub flush_io_max_us: u64,
+    pub flush_manifest_us: u64,
+    pub flush_manifest_max_us: u64,
+    pub flush_install_us: u64,
+    pub flush_install_max_us: u64,
+    pub flush_reclaim_us: u64,
+    pub flush_reclaim_max_us: u64,
+    pub flush_pages_written: u64,
+    // Diagnostic in-memory growth counters. Each is a `len()` of an
+    // unbounded structure that should drain regularly; runaway growth
+    // here is the signature of a stuck consumer / reclaim path.
+    pub pending_dispatch: u64,
+    pub pending_deferred_free: u64,
+    pub pending_dedup_lane_queue: u64,
+    pub pending_l2p_apply_queue: u64,
+    pub pending_l2p_private_pages: u64,
+    pub pending_l2p_retired_pages: u64,
+    pub pending_l2p_pagebuf_total: u64,
+    pub pending_l2p_pagebuf_dirty: u64,
+    pub pending_rc_apply_queue: u64,
+    pub pending_rc_private_pages: u64,
+    pub pending_rc_retired_pages: u64,
+    pub pending_rc_pagebuf_total: u64,
+    pub pending_rc_pagebuf_dirty: u64,
 }
 
-impl RocksDbMemorySnapshot {
+impl MetaMemorySnapshot {
+    pub fn saturating_sub(&self, earlier: &Self) -> Self {
+        fn opt_sub(value: Option<u64>, earlier: Option<u64>) -> Option<u64> {
+            match (value, earlier) {
+                (Some(value), Some(earlier)) => Some(value.saturating_sub(earlier)),
+                (Some(value), None) => Some(value),
+                _ => None,
+            }
+        }
+
+        macro_rules! sub {
+            ($field:ident) => {
+                self.$field.saturating_sub(earlier.$field)
+            };
+        }
+
+        Self {
+            block_cache_capacity_bytes: self.block_cache_capacity_bytes,
+            block_cache_usage_bytes: opt_sub(
+                self.block_cache_usage_bytes,
+                earlier.block_cache_usage_bytes,
+            ),
+            block_cache_pinned_usage_bytes: opt_sub(
+                self.block_cache_pinned_usage_bytes,
+                earlier.block_cache_pinned_usage_bytes,
+            ),
+            cur_size_all_mem_tables_bytes: sub!(cur_size_all_mem_tables_bytes),
+            size_all_mem_tables_bytes: sub!(size_all_mem_tables_bytes),
+            estimate_table_readers_mem_bytes: sub!(estimate_table_readers_mem_bytes),
+            last_applied_lsn: sub!(last_applied_lsn),
+            high_water_pages: sub!(high_water_pages),
+            free_list_pages: sub!(free_list_pages),
+            dedup_index_ssts: sub!(dedup_index_ssts),
+            dedup_index_records: sub!(dedup_index_records),
+            dedup_reverse_ssts: sub!(dedup_reverse_ssts),
+            dedup_reverse_records: sub!(dedup_reverse_records),
+            dedup_l0_distinct_fps: sub!(dedup_l0_distinct_fps),
+            dedup_l0_approx_bytes: sub!(dedup_l0_approx_bytes),
+            dedup_l1_entries: sub!(dedup_l1_entries),
+            cache_hits: sub!(cache_hits),
+            cache_misses: sub!(cache_misses),
+            cache_evictions: sub!(cache_evictions),
+            cache_current_pages: sub!(cache_current_pages),
+            cache_capacity_bytes: self.cache_capacity_bytes,
+            cache_pinned_pages: sub!(cache_pinned_pages),
+            cache_pin_budget_bytes: self.cache_pin_budget_bytes,
+            commit_attempts: sub!(commit_attempts),
+            commit_success: sub!(commit_success),
+            commit_errors: sub!(commit_errors),
+            commit_empty: sub!(commit_empty),
+            commit_ops: sub!(commit_ops),
+            commit_total_us: sub!(commit_total_us),
+            commit_total_max_us: self.commit_total_max_us,
+            commit_wal_submit_us: sub!(commit_wal_submit_us),
+            commit_wal_submit_max_us: self.commit_wal_submit_max_us,
+            commit_drop_gate_wait_us: sub!(commit_drop_gate_wait_us),
+            commit_drop_gate_wait_max_us: self.commit_drop_gate_wait_max_us,
+            commit_apply_wait_us: sub!(commit_apply_wait_us),
+            commit_apply_wait_max_us: self.commit_apply_wait_max_us,
+            commit_apply_gate_wait_us: sub!(commit_apply_gate_wait_us),
+            commit_apply_gate_wait_max_us: self.commit_apply_gate_wait_max_us,
+            commit_apply_us: sub!(commit_apply_us),
+            commit_apply_max_us: self.commit_apply_max_us,
+            commit_apply_l2p_wait_us: sub!(commit_apply_l2p_wait_us),
+            commit_apply_l2p_wait_max_us: self.commit_apply_l2p_wait_max_us,
+            commit_apply_rc_enqueue_us: sub!(commit_apply_rc_enqueue_us),
+            commit_apply_rc_enqueue_max_us: self.commit_apply_rc_enqueue_max_us,
+            commit_apply_rc_wait_us: sub!(commit_apply_rc_wait_us),
+            commit_apply_rc_wait_max_us: self.commit_apply_rc_wait_max_us,
+            commit_apply_dedup_enqueue_us: sub!(commit_apply_dedup_enqueue_us),
+            commit_apply_dedup_enqueue_max_us: self.commit_apply_dedup_enqueue_max_us,
+            commit_apply_dedup_wait_us: sub!(commit_apply_dedup_wait_us),
+            commit_apply_dedup_wait_max_us: self.commit_apply_dedup_wait_max_us,
+            wal_submit_calls: sub!(wal_submit_calls),
+            wal_submit_wait_us: sub!(wal_submit_wait_us),
+            wal_submit_wait_max_us: self.wal_submit_wait_max_us,
+            wal_batches: sub!(wal_batches),
+            wal_records: sub!(wal_records),
+            wal_bytes: sub!(wal_bytes),
+            wal_rotates: sub!(wal_rotates),
+            wal_fsyncs: sub!(wal_fsyncs),
+            wal_write_us: sub!(wal_write_us),
+            wal_write_max_us: self.wal_write_max_us,
+            wal_fsync_us: sub!(wal_fsync_us),
+            wal_fsync_max_us: self.wal_fsync_max_us,
+            wal_batch_records_max: self.wal_batch_records_max,
+            wal_batch_bytes_max: self.wal_batch_bytes_max,
+            range_delete_calls: sub!(range_delete_calls),
+            range_delete_success: sub!(range_delete_success),
+            range_delete_errors: sub!(range_delete_errors),
+            range_delete_noop: sub!(range_delete_noop),
+            range_delete_captured_entries: sub!(range_delete_captured_entries),
+            range_delete_chunks: sub!(range_delete_chunks),
+            range_delete_total_us: sub!(range_delete_total_us),
+            range_delete_total_max_us: self.range_delete_total_max_us,
+            cleanup_calls: sub!(cleanup_calls),
+            cleanup_success: sub!(cleanup_success),
+            cleanup_errors: sub!(cleanup_errors),
+            cleanup_noop: sub!(cleanup_noop),
+            cleanup_pbas: sub!(cleanup_pbas),
+            cleanup_hashes_found: sub!(cleanup_hashes_found),
+            cleanup_forward_checks: sub!(cleanup_forward_checks),
+            cleanup_tombstones_emitted: sub!(cleanup_tombstones_emitted),
+            cleanup_tx_ops: sub!(cleanup_tx_ops),
+            cleanup_total_us: sub!(cleanup_total_us),
+            cleanup_total_max_us: self.cleanup_total_max_us,
+            cleanup_scan_us: sub!(cleanup_scan_us),
+            cleanup_scan_max_us: self.cleanup_scan_max_us,
+            cleanup_forward_check_us: sub!(cleanup_forward_check_us),
+            cleanup_forward_check_max_us: self.cleanup_forward_check_max_us,
+            cleanup_commit_us: sub!(cleanup_commit_us),
+            cleanup_commit_max_us: self.cleanup_commit_max_us,
+            apply_l2p_put_count: sub!(apply_l2p_put_count),
+            apply_l2p_put_us: sub!(apply_l2p_put_us),
+            apply_l2p_put_max_us: self.apply_l2p_put_max_us,
+            apply_l2p_delete_count: sub!(apply_l2p_delete_count),
+            apply_l2p_delete_us: sub!(apply_l2p_delete_us),
+            apply_l2p_delete_max_us: self.apply_l2p_delete_max_us,
+            apply_l2p_remap_count: sub!(apply_l2p_remap_count),
+            apply_l2p_remap_us: sub!(apply_l2p_remap_us),
+            apply_l2p_remap_max_us: self.apply_l2p_remap_max_us,
+            apply_l2p_range_delete_count: sub!(apply_l2p_range_delete_count),
+            apply_l2p_range_delete_us: sub!(apply_l2p_range_delete_us),
+            apply_l2p_range_delete_max_us: self.apply_l2p_range_delete_max_us,
+            apply_refcount_count: sub!(apply_refcount_count),
+            apply_refcount_us: sub!(apply_refcount_us),
+            apply_refcount_max_us: self.apply_refcount_max_us,
+            apply_dedup_count: sub!(apply_dedup_count),
+            apply_dedup_us: sub!(apply_dedup_us),
+            apply_dedup_max_us: self.apply_dedup_max_us,
+            dedup_lane_tasks: sub!(dedup_lane_tasks),
+            dedup_lane_ops: sub!(dedup_lane_ops),
+            dedup_lane_ready_queue_wait_us: sub!(dedup_lane_ready_queue_wait_us),
+            dedup_lane_ready_queue_wait_max_us: self.dedup_lane_ready_queue_wait_max_us,
+            dedup_lane_exec_us: sub!(dedup_lane_exec_us),
+            dedup_lane_exec_max_us: self.dedup_lane_exec_max_us,
+            dedup_apply_guard_count: sub!(dedup_apply_guard_count),
+            dedup_apply_guard_us: sub!(dedup_apply_guard_us),
+            dedup_apply_guard_max_us: self.dedup_apply_guard_max_us,
+            dedup_apply_forward_put_count: sub!(dedup_apply_forward_put_count),
+            dedup_apply_forward_put_us: sub!(dedup_apply_forward_put_us),
+            dedup_apply_forward_put_max_us: self.dedup_apply_forward_put_max_us,
+            dedup_apply_forward_delete_count: sub!(dedup_apply_forward_delete_count),
+            dedup_apply_forward_delete_us: sub!(dedup_apply_forward_delete_us),
+            dedup_apply_forward_delete_max_us: self.dedup_apply_forward_delete_max_us,
+            dedup_apply_reverse_put_count: sub!(dedup_apply_reverse_put_count),
+            dedup_apply_reverse_put_us: sub!(dedup_apply_reverse_put_us),
+            dedup_apply_reverse_put_max_us: self.dedup_apply_reverse_put_max_us,
+            dedup_apply_reverse_delete_count: sub!(dedup_apply_reverse_delete_count),
+            dedup_apply_reverse_delete_us: sub!(dedup_apply_reverse_delete_us),
+            dedup_apply_reverse_delete_max_us: self.dedup_apply_reverse_delete_max_us,
+            l2p_get_calls: sub!(l2p_get_calls),
+            l2p_get_lock_wait_us: sub!(l2p_get_lock_wait_us),
+            l2p_get_lock_wait_max_us: self.l2p_get_lock_wait_max_us,
+            l2p_get_tree_walk_us: sub!(l2p_get_tree_walk_us),
+            l2p_get_tree_walk_max_us: self.l2p_get_tree_walk_max_us,
+            l2p_multi_get_calls: sub!(l2p_multi_get_calls),
+            l2p_multi_get_lbas: sub!(l2p_multi_get_lbas),
+            l2p_multi_get_pin_us: sub!(l2p_multi_get_pin_us),
+            l2p_multi_get_pin_max_us: self.l2p_multi_get_pin_max_us,
+            l2p_multi_get_volume_us: sub!(l2p_multi_get_volume_us),
+            l2p_multi_get_volume_max_us: self.l2p_multi_get_volume_max_us,
+            l2p_multi_get_sort_us: sub!(l2p_multi_get_sort_us),
+            l2p_multi_get_sort_max_us: self.l2p_multi_get_sort_max_us,
+            l2p_multi_get_view_us: sub!(l2p_multi_get_view_us),
+            l2p_multi_get_view_max_us: self.l2p_multi_get_view_max_us,
+            l2p_multi_get_tree_us: sub!(l2p_multi_get_tree_us),
+            l2p_multi_get_tree_max_us: self.l2p_multi_get_tree_max_us,
+            flush_calls: sub!(flush_calls),
+            flush_total_us: sub!(flush_total_us),
+            flush_total_max_us: self.flush_total_max_us,
+            flush_gate_wait_us: sub!(flush_gate_wait_us),
+            flush_gate_wait_max_us: self.flush_gate_wait_max_us,
+            flush_sample_us: sub!(flush_sample_us),
+            flush_sample_max_us: self.flush_sample_max_us,
+            flush_io_us: sub!(flush_io_us),
+            flush_io_max_us: self.flush_io_max_us,
+            flush_manifest_us: sub!(flush_manifest_us),
+            flush_manifest_max_us: self.flush_manifest_max_us,
+            flush_install_us: sub!(flush_install_us),
+            flush_install_max_us: self.flush_install_max_us,
+            flush_reclaim_us: sub!(flush_reclaim_us),
+            flush_reclaim_max_us: self.flush_reclaim_max_us,
+            flush_pages_written: sub!(flush_pages_written),
+            pending_dispatch: self.pending_dispatch,
+            pending_deferred_free: self.pending_deferred_free,
+            pending_dedup_lane_queue: self.pending_dedup_lane_queue,
+            pending_l2p_apply_queue: self.pending_l2p_apply_queue,
+            pending_l2p_private_pages: self.pending_l2p_private_pages,
+            pending_l2p_retired_pages: self.pending_l2p_retired_pages,
+            pending_l2p_pagebuf_total: self.pending_l2p_pagebuf_total,
+            pending_l2p_pagebuf_dirty: self.pending_l2p_pagebuf_dirty,
+            pending_rc_apply_queue: self.pending_rc_apply_queue,
+            pending_rc_private_pages: self.pending_rc_private_pages,
+            pending_rc_retired_pages: self.pending_rc_retired_pages,
+            pending_rc_pagebuf_total: self.pending_rc_pagebuf_total,
+            pending_rc_pagebuf_dirty: self.pending_rc_pagebuf_dirty,
+        }
+    }
+
     pub fn total_estimate_bytes(&self) -> Option<u64> {
         self.block_cache_usage_bytes.map(|block_cache| {
             block_cache
                 .saturating_add(self.size_all_mem_tables_bytes)
                 .saturating_add(self.estimate_table_readers_mem_bytes)
         })
+    }
+}
+
+impl MetaMemorySnapshot {
+    pub fn from_metadb(
+        last_applied_lsn: u64,
+        high_water_pages: u64,
+        free_list_pages: u64,
+        dedup_tiers: onyx_metadb::dedup::TierSizes,
+        cache: onyx_metadb::PageCacheStats,
+        meta: onyx_metadb::MetaMetricsSnapshot,
+        pending: onyx_metadb::PendingState,
+    ) -> Self {
+        Self {
+            block_cache_capacity_bytes: Some(cache.capacity_bytes),
+            block_cache_usage_bytes: Some(cache.current_bytes),
+            block_cache_pinned_usage_bytes: Some(cache.pinned_bytes),
+            cur_size_all_mem_tables_bytes: 0,
+            size_all_mem_tables_bytes: 0,
+            estimate_table_readers_mem_bytes: 0,
+            last_applied_lsn,
+            high_water_pages,
+            free_list_pages,
+            dedup_index_ssts: 0,
+            dedup_index_records: 0,
+            dedup_reverse_ssts: 0,
+            dedup_reverse_records: 0,
+            dedup_l0_distinct_fps: dedup_tiers.l0_distinct_fps as u64,
+            dedup_l0_approx_bytes: dedup_tiers.l0_approx_bytes as u64,
+            dedup_l1_entries: dedup_tiers.l1_entries as u64,
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
+            cache_evictions: cache.evictions,
+            cache_current_pages: cache.current_pages,
+            cache_capacity_bytes: cache.capacity_bytes,
+            cache_pinned_pages: cache.pinned_pages,
+            cache_pin_budget_bytes: cache.pin_budget_bytes,
+            commit_attempts: meta.commit_attempts,
+            commit_success: meta.commit_success,
+            commit_errors: meta.commit_errors,
+            commit_empty: meta.commit_empty,
+            commit_ops: meta.commit_ops,
+            commit_total_us: meta.commit_total_us,
+            commit_total_max_us: meta.commit_total_max_us,
+            commit_wal_submit_us: meta.commit_wal_submit_us,
+            commit_wal_submit_max_us: meta.commit_wal_submit_max_us,
+            commit_drop_gate_wait_us: meta.commit_drop_gate_wait_us,
+            commit_drop_gate_wait_max_us: meta.commit_drop_gate_wait_max_us,
+            commit_apply_wait_us: meta.commit_apply_wait_us,
+            commit_apply_wait_max_us: meta.commit_apply_wait_max_us,
+            commit_apply_gate_wait_us: meta.commit_apply_gate_wait_us,
+            commit_apply_gate_wait_max_us: meta.commit_apply_gate_wait_max_us,
+            commit_apply_us: meta.commit_apply_us,
+            commit_apply_max_us: meta.commit_apply_max_us,
+            commit_apply_l2p_wait_us: meta.commit_apply_l2p_wait_us,
+            commit_apply_l2p_wait_max_us: meta.commit_apply_l2p_wait_max_us,
+            commit_apply_rc_enqueue_us: meta.commit_apply_rc_enqueue_us,
+            commit_apply_rc_enqueue_max_us: meta.commit_apply_rc_enqueue_max_us,
+            commit_apply_rc_wait_us: meta.commit_apply_rc_wait_us,
+            commit_apply_rc_wait_max_us: meta.commit_apply_rc_wait_max_us,
+            commit_apply_dedup_enqueue_us: meta.commit_apply_dedup_enqueue_us,
+            commit_apply_dedup_enqueue_max_us: meta.commit_apply_dedup_enqueue_max_us,
+            commit_apply_dedup_wait_us: meta.commit_apply_dedup_wait_us,
+            commit_apply_dedup_wait_max_us: meta.commit_apply_dedup_wait_max_us,
+            wal_submit_calls: meta.wal_submit_calls,
+            wal_submit_wait_us: meta.wal_submit_wait_us,
+            wal_submit_wait_max_us: meta.wal_submit_wait_max_us,
+            wal_batches: meta.wal_batches,
+            wal_records: meta.wal_records,
+            wal_bytes: meta.wal_bytes,
+            wal_rotates: meta.wal_rotates,
+            wal_fsyncs: meta.wal_fsyncs,
+            wal_write_us: meta.wal_write_us,
+            wal_write_max_us: meta.wal_write_max_us,
+            wal_fsync_us: meta.wal_fsync_us,
+            wal_fsync_max_us: meta.wal_fsync_max_us,
+            wal_batch_records_max: meta.wal_batch_records_max,
+            wal_batch_bytes_max: meta.wal_batch_bytes_max,
+            range_delete_calls: meta.range_delete_calls,
+            range_delete_success: meta.range_delete_success,
+            range_delete_errors: meta.range_delete_errors,
+            range_delete_noop: meta.range_delete_noop,
+            range_delete_captured_entries: meta.range_delete_captured_entries,
+            range_delete_chunks: meta.range_delete_chunks,
+            range_delete_total_us: meta.range_delete_total_us,
+            range_delete_total_max_us: meta.range_delete_total_max_us,
+            cleanup_calls: meta.cleanup_calls,
+            cleanup_success: meta.cleanup_success,
+            cleanup_errors: meta.cleanup_errors,
+            cleanup_noop: meta.cleanup_noop,
+            cleanup_pbas: meta.cleanup_pbas,
+            cleanup_hashes_found: meta.cleanup_hashes_found,
+            cleanup_forward_checks: meta.cleanup_forward_checks,
+            cleanup_tombstones_emitted: meta.cleanup_tombstones_emitted,
+            cleanup_tx_ops: meta.cleanup_tx_ops,
+            cleanup_total_us: meta.cleanup_total_us,
+            cleanup_total_max_us: meta.cleanup_total_max_us,
+            cleanup_scan_us: meta.cleanup_scan_us,
+            cleanup_scan_max_us: meta.cleanup_scan_max_us,
+            cleanup_forward_check_us: meta.cleanup_forward_check_us,
+            cleanup_forward_check_max_us: meta.cleanup_forward_check_max_us,
+            cleanup_commit_us: meta.cleanup_commit_us,
+            cleanup_commit_max_us: meta.cleanup_commit_max_us,
+            apply_l2p_put_count: meta.apply_l2p_put_count,
+            apply_l2p_put_us: meta.apply_l2p_put_us,
+            apply_l2p_put_max_us: meta.apply_l2p_put_max_us,
+            apply_l2p_delete_count: meta.apply_l2p_delete_count,
+            apply_l2p_delete_us: meta.apply_l2p_delete_us,
+            apply_l2p_delete_max_us: meta.apply_l2p_delete_max_us,
+            apply_l2p_remap_count: meta.apply_l2p_remap_count,
+            apply_l2p_remap_us: meta.apply_l2p_remap_us,
+            apply_l2p_remap_max_us: meta.apply_l2p_remap_max_us,
+            apply_l2p_range_delete_count: meta.apply_l2p_range_delete_count,
+            apply_l2p_range_delete_us: meta.apply_l2p_range_delete_us,
+            apply_l2p_range_delete_max_us: meta.apply_l2p_range_delete_max_us,
+            apply_refcount_count: meta.apply_refcount_count,
+            apply_refcount_us: meta.apply_refcount_us,
+            apply_refcount_max_us: meta.apply_refcount_max_us,
+            apply_dedup_count: meta.apply_dedup_count,
+            apply_dedup_us: meta.apply_dedup_us,
+            apply_dedup_max_us: meta.apply_dedup_max_us,
+            dedup_lane_tasks: meta.dedup_lane_tasks,
+            dedup_lane_ops: meta.dedup_lane_ops,
+            dedup_lane_ready_queue_wait_us: meta.dedup_lane_ready_queue_wait_us,
+            dedup_lane_ready_queue_wait_max_us: meta.dedup_lane_ready_queue_wait_max_us,
+            dedup_lane_exec_us: meta.dedup_lane_exec_us,
+            dedup_lane_exec_max_us: meta.dedup_lane_exec_max_us,
+            dedup_apply_guard_count: meta.dedup_apply_guard_count,
+            dedup_apply_guard_us: meta.dedup_apply_guard_us,
+            dedup_apply_guard_max_us: meta.dedup_apply_guard_max_us,
+            dedup_apply_forward_put_count: meta.dedup_apply_forward_put_count,
+            dedup_apply_forward_put_us: meta.dedup_apply_forward_put_us,
+            dedup_apply_forward_put_max_us: meta.dedup_apply_forward_put_max_us,
+            dedup_apply_forward_delete_count: meta.dedup_apply_forward_delete_count,
+            dedup_apply_forward_delete_us: meta.dedup_apply_forward_delete_us,
+            dedup_apply_forward_delete_max_us: meta.dedup_apply_forward_delete_max_us,
+            dedup_apply_reverse_put_count: meta.dedup_apply_reverse_put_count,
+            dedup_apply_reverse_put_us: meta.dedup_apply_reverse_put_us,
+            dedup_apply_reverse_put_max_us: meta.dedup_apply_reverse_put_max_us,
+            dedup_apply_reverse_delete_count: meta.dedup_apply_reverse_delete_count,
+            dedup_apply_reverse_delete_us: meta.dedup_apply_reverse_delete_us,
+            dedup_apply_reverse_delete_max_us: meta.dedup_apply_reverse_delete_max_us,
+            l2p_get_calls: meta.l2p_get_calls,
+            l2p_get_lock_wait_us: meta.l2p_get_lock_wait_us,
+            l2p_get_lock_wait_max_us: meta.l2p_get_lock_wait_max_us,
+            l2p_get_tree_walk_us: meta.l2p_get_tree_walk_us,
+            l2p_get_tree_walk_max_us: meta.l2p_get_tree_walk_max_us,
+            l2p_multi_get_calls: meta.l2p_multi_get_calls,
+            l2p_multi_get_lbas: meta.l2p_multi_get_lbas,
+            l2p_multi_get_pin_us: meta.l2p_multi_get_pin_us,
+            l2p_multi_get_pin_max_us: meta.l2p_multi_get_pin_max_us,
+            l2p_multi_get_volume_us: meta.l2p_multi_get_volume_us,
+            l2p_multi_get_volume_max_us: meta.l2p_multi_get_volume_max_us,
+            l2p_multi_get_sort_us: meta.l2p_multi_get_sort_us,
+            l2p_multi_get_sort_max_us: meta.l2p_multi_get_sort_max_us,
+            l2p_multi_get_view_us: meta.l2p_multi_get_view_us,
+            l2p_multi_get_view_max_us: meta.l2p_multi_get_view_max_us,
+            l2p_multi_get_tree_us: meta.l2p_multi_get_tree_us,
+            l2p_multi_get_tree_max_us: meta.l2p_multi_get_tree_max_us,
+            flush_calls: meta.flush_calls,
+            flush_total_us: meta.flush_total_us,
+            flush_total_max_us: meta.flush_total_max_us,
+            flush_gate_wait_us: meta.flush_gate_wait_us,
+            flush_gate_wait_max_us: meta.flush_gate_wait_max_us,
+            flush_sample_us: meta.flush_sample_us,
+            flush_sample_max_us: meta.flush_sample_max_us,
+            flush_io_us: meta.flush_io_us,
+            flush_io_max_us: meta.flush_io_max_us,
+            flush_manifest_us: meta.flush_manifest_us,
+            flush_manifest_max_us: meta.flush_manifest_max_us,
+            flush_install_us: meta.flush_install_us,
+            flush_install_max_us: meta.flush_install_max_us,
+            flush_reclaim_us: meta.flush_reclaim_us,
+            flush_reclaim_max_us: meta.flush_reclaim_max_us,
+            flush_pages_written: meta.flush_pages_written,
+            pending_dispatch: pending.dispatch_pending as u64,
+            pending_deferred_free: pending.deferred_free as u64,
+            pending_dedup_lane_queue: pending.dedup_lane_queue as u64,
+            pending_l2p_apply_queue: pending.l2p_apply_queue as u64,
+            pending_l2p_private_pages: pending.l2p_private_pages as u64,
+            pending_l2p_retired_pages: pending.l2p_retired_pages as u64,
+            pending_l2p_pagebuf_total: pending.l2p_pagebuf_total as u64,
+            pending_l2p_pagebuf_dirty: pending.l2p_pagebuf_dirty as u64,
+            pending_rc_apply_queue: pending.rc_apply_queue as u64,
+            pending_rc_private_pages: pending.rc_private_pages as u64,
+            pending_rc_retired_pages: pending.rc_retired_pages as u64,
+            pending_rc_pagebuf_total: pending.rc_pagebuf_total as u64,
+            pending_rc_pagebuf_dirty: pending.rc_pagebuf_dirty as u64,
+        }
     }
 }
 
@@ -690,7 +1586,9 @@ pub struct EngineStatusSnapshot {
     pub buffer_fill_pct: Option<u8>,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
-    pub rocksdb_memory: Option<RocksDbMemorySnapshot>,
+    pub buffer_volatile_payload_memory_bytes: Option<u64>,
+    pub buffer_volatile_payload_memory_limit_bytes: Option<u64>,
+    pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
     pub allocator_total_blocks: Option<u64>,
@@ -721,24 +1619,225 @@ impl EngineStatusSnapshot {
                 payload_bytes, limit
             );
         }
-        if let Some(rocksdb) = &self.rocksdb_memory {
+        if let Some(payload_bytes) = self.buffer_volatile_payload_memory_bytes {
+            let limit = self.buffer_volatile_payload_memory_limit_bytes.unwrap_or(0);
             let _ = writeln!(
                 out,
-                "rocksdb_block_cache_bytes: usage={} pinned={} capacity={}",
-                rocksdb.block_cache_usage_bytes.unwrap_or(0),
-                rocksdb.block_cache_pinned_usage_bytes.unwrap_or(0),
-                rocksdb.block_cache_capacity_bytes.unwrap_or(0)
+                "buffer_volatile_payload_memory_bytes: {}/{}",
+                payload_bytes, limit
+            );
+        }
+        if let Some(metadb) = &self.metadb_memory {
+            let _ = writeln!(
+                out,
+                "metadb_block_cache_bytes: usage={} pinned={} capacity={}",
+                metadb.block_cache_usage_bytes.unwrap_or(0),
+                metadb.block_cache_pinned_usage_bytes.unwrap_or(0),
+                metadb.block_cache_capacity_bytes.unwrap_or(0)
             );
             let _ = writeln!(
                 out,
-                "rocksdb_meta_bytes: memtables_current={} memtables_total={} table_readers={}",
-                rocksdb.cur_size_all_mem_tables_bytes,
-                rocksdb.size_all_mem_tables_bytes,
-                rocksdb.estimate_table_readers_mem_bytes
+                "metadb_meta_bytes: memtables_current={} memtables_total={} table_readers={}",
+                metadb.cur_size_all_mem_tables_bytes,
+                metadb.size_all_mem_tables_bytes,
+                metadb.estimate_table_readers_mem_bytes
             );
-            if let Some(total) = rocksdb.total_estimate_bytes() {
-                let _ = writeln!(out, "rocksdb_total_estimate_bytes: {}", total);
+            if let Some(total) = metadb.total_estimate_bytes() {
+                let _ = writeln!(out, "metadb_total_estimate_bytes: {}", total);
             }
+            let _ = writeln!(
+                out,
+                "metadb_state: last_applied_lsn={} high_water_pages={} free_list_pages={}",
+                metadb.last_applied_lsn, metadb.high_water_pages, metadb.free_list_pages
+            );
+            let _ = writeln!(
+                out,
+                "metadb_dedup_lsm: index_ssts={} index_records={} reverse_ssts={} reverse_records={}",
+                metadb.dedup_index_ssts,
+                metadb.dedup_index_records,
+                metadb.dedup_reverse_ssts,
+                metadb.dedup_reverse_records
+            );
+            let _ = writeln!(
+                out,
+                "metadb_dedup_cuckoo: l0_distinct_fps={} l0_approx_bytes={} l1_entries={}",
+                metadb.dedup_l0_distinct_fps, metadb.dedup_l0_approx_bytes, metadb.dedup_l1_entries
+            );
+            let _ = writeln!(
+                out,
+                "metadb_cache: hits={} misses={} evictions={} pages={}/{} pinned_pages={} pin_budget_bytes={}",
+                metadb.cache_hits,
+                metadb.cache_misses,
+                metadb.cache_evictions,
+                metadb.cache_current_pages,
+                metadb.cache_capacity_bytes / 4096,
+                metadb.cache_pinned_pages,
+                metadb.cache_pin_budget_bytes
+            );
+            let _ = writeln!(
+                out,
+                "metadb_pending: dispatch={} deferred_free={} dedup_lane_q={} l2p_apply_q={} l2p_priv={} l2p_retired={} l2p_buf_total={} l2p_buf_dirty={} rc_apply_q={} rc_priv={} rc_retired={} rc_buf_total={} rc_buf_dirty={}",
+                metadb.pending_dispatch,
+                metadb.pending_deferred_free,
+                metadb.pending_dedup_lane_queue,
+                metadb.pending_l2p_apply_queue,
+                metadb.pending_l2p_private_pages,
+                metadb.pending_l2p_retired_pages,
+                metadb.pending_l2p_pagebuf_total,
+                metadb.pending_l2p_pagebuf_dirty,
+                metadb.pending_rc_apply_queue,
+                metadb.pending_rc_private_pages,
+                metadb.pending_rc_retired_pages,
+                metadb.pending_rc_pagebuf_total,
+                metadb.pending_rc_pagebuf_dirty
+            );
+            let _ = writeln!(
+                out,
+                "metadb_flush: calls={} pages={} total_us={} max_us={} gate_us={} gate_max_us={} sample_us={} sample_max_us={} io_us={} io_max_us={} manifest_us={} manifest_max_us={} install_us={} install_max_us={} reclaim_us={} reclaim_max_us={}",
+                metadb.flush_calls,
+                metadb.flush_pages_written,
+                metadb.flush_total_us,
+                metadb.flush_total_max_us,
+                metadb.flush_gate_wait_us,
+                metadb.flush_gate_wait_max_us,
+                metadb.flush_sample_us,
+                metadb.flush_sample_max_us,
+                metadb.flush_io_us,
+                metadb.flush_io_max_us,
+                metadb.flush_manifest_us,
+                metadb.flush_manifest_max_us,
+                metadb.flush_install_us,
+                metadb.flush_install_max_us,
+                metadb.flush_reclaim_us,
+                metadb.flush_reclaim_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_commit: attempts={} success={} errors={} empty={} ops={} total_us={} max_us={} apply_wait_us={} apply_wait_max_us={} apply_gate_wait_us={} apply_gate_wait_max_us={} apply_us={} apply_max_us={}",
+                metadb.commit_attempts,
+                metadb.commit_success,
+                metadb.commit_errors,
+                metadb.commit_empty,
+                metadb.commit_ops,
+                metadb.commit_total_us,
+                metadb.commit_total_max_us,
+                metadb.commit_apply_wait_us,
+                metadb.commit_apply_wait_max_us,
+                metadb.commit_apply_gate_wait_us,
+                metadb.commit_apply_gate_wait_max_us,
+                metadb.commit_apply_us,
+                metadb.commit_apply_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_commit_apply_split: l2p_wait_us={} l2p_wait_max_us={} rc_enqueue_us={} rc_enqueue_max_us={} rc_wait_us={} rc_wait_max_us={} dedup_enqueue_us={} dedup_enqueue_max_us={} dedup_wait_us={} dedup_wait_max_us={}",
+                metadb.commit_apply_l2p_wait_us,
+                metadb.commit_apply_l2p_wait_max_us,
+                metadb.commit_apply_rc_enqueue_us,
+                metadb.commit_apply_rc_enqueue_max_us,
+                metadb.commit_apply_rc_wait_us,
+                metadb.commit_apply_rc_wait_max_us,
+                metadb.commit_apply_dedup_enqueue_us,
+                metadb.commit_apply_dedup_enqueue_max_us,
+                metadb.commit_apply_dedup_wait_us,
+                metadb.commit_apply_dedup_wait_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_wal: submits={} batches={} records={} bytes={} rotates={} fsyncs={} write_us={} write_max_us={} fsync_us={} fsync_max_us={} batch_records_max={} batch_bytes_max={}",
+                metadb.wal_submit_calls,
+                metadb.wal_batches,
+                metadb.wal_records,
+                metadb.wal_bytes,
+                metadb.wal_rotates,
+                metadb.wal_fsyncs,
+                metadb.wal_write_us,
+                metadb.wal_write_max_us,
+                metadb.wal_fsync_us,
+                metadb.wal_fsync_max_us,
+                metadb.wal_batch_records_max,
+                metadb.wal_batch_bytes_max
+            );
+            let _ = writeln!(
+                out,
+                "metadb_range_delete: calls={} success={} errors={} noop={} captured={} chunks={} total_us={} max_us={}",
+                metadb.range_delete_calls,
+                metadb.range_delete_success,
+                metadb.range_delete_errors,
+                metadb.range_delete_noop,
+                metadb.range_delete_captured_entries,
+                metadb.range_delete_chunks,
+                metadb.range_delete_total_us,
+                metadb.range_delete_total_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_apply_by_op: l2p_put={}/{} (max={}) l2p_delete={}/{} (max={}) l2p_remap={}/{} (max={}) l2p_range_delete={}/{} (max={}) refcount={}/{} (max={}) dedup={}/{} (max={})",
+                metadb.apply_l2p_put_count,
+                metadb.apply_l2p_put_us,
+                metadb.apply_l2p_put_max_us,
+                metadb.apply_l2p_delete_count,
+                metadb.apply_l2p_delete_us,
+                metadb.apply_l2p_delete_max_us,
+                metadb.apply_l2p_remap_count,
+                metadb.apply_l2p_remap_us,
+                metadb.apply_l2p_remap_max_us,
+                metadb.apply_l2p_range_delete_count,
+                metadb.apply_l2p_range_delete_us,
+                metadb.apply_l2p_range_delete_max_us,
+                metadb.apply_refcount_count,
+                metadb.apply_refcount_us,
+                metadb.apply_refcount_max_us,
+                metadb.apply_dedup_count,
+                metadb.apply_dedup_us,
+                metadb.apply_dedup_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_l2p_get: calls={} lock_wait_us={} lock_wait_max_us={} tree_walk_us={} tree_walk_max_us={}",
+                metadb.l2p_get_calls,
+                metadb.l2p_get_lock_wait_us,
+                metadb.l2p_get_lock_wait_max_us,
+                metadb.l2p_get_tree_walk_us,
+                metadb.l2p_get_tree_walk_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_l2p_multi_get: calls={} lbas={} pin_us={} pin_max_us={} volume_us={} volume_max_us={} sort_us={} sort_max_us={} view_us={} view_max_us={} tree_us={} tree_max_us={}",
+                metadb.l2p_multi_get_calls,
+                metadb.l2p_multi_get_lbas,
+                metadb.l2p_multi_get_pin_us,
+                metadb.l2p_multi_get_pin_max_us,
+                metadb.l2p_multi_get_volume_us,
+                metadb.l2p_multi_get_volume_max_us,
+                metadb.l2p_multi_get_sort_us,
+                metadb.l2p_multi_get_sort_max_us,
+                metadb.l2p_multi_get_view_us,
+                metadb.l2p_multi_get_view_max_us,
+                metadb.l2p_multi_get_tree_us,
+                metadb.l2p_multi_get_tree_max_us
+            );
+            let _ = writeln!(
+            out,
+                "metadb_cleanup: calls={} success={} errors={} noop={} pbas={} hashes_found={} forward_checks={} tombstones={} tx_ops={} total_us={} max_us={} scan_us={} scan_max_us={} forward_check_us={} forward_check_max_us={} commit_us={} commit_max_us={}",
+                metadb.cleanup_calls,
+                metadb.cleanup_success,
+                metadb.cleanup_errors,
+                metadb.cleanup_noop,
+                metadb.cleanup_pbas,
+                metadb.cleanup_hashes_found,
+                metadb.cleanup_forward_checks,
+                metadb.cleanup_tombstones_emitted,
+                metadb.cleanup_tx_ops,
+                metadb.cleanup_total_us,
+                metadb.cleanup_total_max_us,
+                metadb.cleanup_scan_us,
+                metadb.cleanup_scan_max_us,
+                metadb.cleanup_forward_check_us,
+                metadb.cleanup_forward_check_max_us,
+                metadb.cleanup_commit_us,
+                metadb.cleanup_commit_max_us
+            );
         }
         if let (Some(free), Some(total)) = (self.allocator_free_blocks, self.allocator_total_blocks)
         {
@@ -785,6 +1884,13 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "buffer_lookup_split: index_ns={} hydrate_ns={} hydrate_ops={}",
+            self.metrics.buffer_lookup_index_ns,
+            self.metrics.buffer_lookup_hydrate_ns,
+            self.metrics.buffer_lookup_hydrate_ops
+        );
+        let _ = writeln!(
+            out,
             "lv3_io: read_ops={} read_compressed_bytes={} read_decompressed_bytes={} write_ops={} write_compressed_bytes={}",
             self.metrics.lv3_read_ops,
             self.metrics.lv3_read_compressed_bytes,
@@ -794,8 +1900,48 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "read_pool: requests={} batches={} batch_ops={} queue_wait_ns={} coalesce_wait_ns={} alloc_ns={} submit_wait_ns={} decode_ns={}",
+            self.metrics.read_pool_requests,
+            self.metrics.read_pool_batches,
+            self.metrics.read_pool_batch_ops,
+            self.metrics.read_pool_queue_wait_ns,
+            self.metrics.read_pool_coalesce_wait_ns,
+            self.metrics.read_pool_alloc_ns,
+            self.metrics.read_pool_submit_wait_ns,
+            self.metrics.read_pool_decode_ns
+        );
+        let _ = writeln!(
+            out,
+            "read_submit: calls={} total_ns={} buffer_lookup_ns={} meta_get_ns={} unit_io_ns={}",
+            self.metrics.read_submit_calls,
+            self.metrics.read_submit_total_ns,
+            self.metrics.read_submit_buffer_lookup_ns,
+            self.metrics.read_submit_meta_get_ns,
+            self.metrics.read_submit_unit_io_ns
+        );
+        let _ = writeln!(
+            out,
+            "read_submit_meta_split: query_ns={} route_ns={}",
+            self.metrics.read_submit_meta_query_ns, self.metrics.read_submit_meta_route_ns
+        );
+        let _ = writeln!(
+            out,
             "user_io_latency_ns: read_total={} write_total={}",
             self.metrics.volume_read_total_ns, self.metrics.volume_write_total_ns
+        );
+        let _ = writeln!(
+            out,
+            "ublk_read_split_ns: queue_wait={} worker={} completion_wait={}",
+            self.metrics.ublk_read_queue_wait_ns,
+            self.metrics.ublk_read_worker_ns,
+            self.metrics.ublk_read_completion_wait_ns
+        );
+        let _ = writeln!(
+            out,
+            "ublk_write_split_ns: queue_wait={} worker={} completion_wait={}",
+            self.metrics.ublk_write_queue_wait_ns,
+            self.metrics.ublk_write_worker_ns,
+            self.metrics.ublk_write_completion_wait_ns
         );
         let _ = writeln!(
             out,
@@ -822,7 +1968,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "flush: coalesce_runs={} units={} lbas={} raw_bytes={} superseded_entries={} superseded_lbas={} compressed_units={} compressed_in={} compressed_out={} written_units={} written_bytes={} packed_slots={} packed_fragments={} packed_bytes={} stale_discards={} errors={}",
+            "flush: coalesce_runs={} units={} lbas={} raw_bytes={} superseded_entries={} superseded_lbas={} compressed_units={} compressed_in={} compressed_out={} compression_bypass_units={} compression_bypass_bytes={} written_units={} written_bytes={} packed_slots={} packed_fragments={} packed_bytes={} stale_discards={} errors={}",
             self.metrics.coalesce_runs,
             self.metrics.coalesced_units,
             self.metrics.coalesced_lbas,
@@ -832,6 +1978,8 @@ impl EngineStatusSnapshot {
             self.metrics.compress_units,
             self.metrics.compress_input_bytes,
             self.metrics.compress_output_bytes,
+            self.metrics.compress_bypass_units,
+            self.metrics.compress_bypass_bytes,
             self.metrics.flush_units_written,
             self.metrics.flush_unit_bytes,
             self.metrics.flush_packed_slots_written,
@@ -860,7 +2008,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={}",
+            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} register_batches={} register_entries={} register_batch_max={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={}",
             self.metrics.dedup_hits,
             self.metrics.dedup_misses,
             self.metrics.dedup_skipped_units,
@@ -869,6 +2017,9 @@ impl EngineStatusSnapshot {
             self.metrics.dedup_live_check_ops,
             self.metrics.dedup_stale_index_entries,
             self.metrics.dedup_hit_commit_ops,
+            self.metrics.dedup_register_batches,
+            self.metrics.dedup_register_entries,
+            self.metrics.dedup_register_batch_max_entries,
             self.metrics.dedup_rescan_cycles,
             self.metrics.dedup_rescan_skipped_cycles,
             self.metrics.dedup_rescan_blocks,
@@ -878,11 +2029,15 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup_ns: lookup={} live_check={} stale_delete={} hit_commit={}",
+            "dedup_ns: lookup={} live_check={} stale_delete={} hit_commit={} register_lock={} register_validate_blockmap={} register_validate_refcount={} register_commit={}",
             self.metrics.dedup_lookup_ns,
             self.metrics.dedup_live_check_ns,
             self.metrics.dedup_stale_delete_ns,
-            self.metrics.dedup_hit_commit_ns
+            self.metrics.dedup_hit_commit_ns,
+            self.metrics.dedup_register_lock_ns,
+            self.metrics.dedup_register_validate_blockmap_ns,
+            self.metrics.dedup_register_validate_refcount_ns,
+            self.metrics.dedup_register_commit_ns
         );
         let _ = writeln!(
             out,

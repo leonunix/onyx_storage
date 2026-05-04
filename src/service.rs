@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 
 use arc_swap::ArcSwap;
 
+use crate::affinity::{self, ThreadRole};
 use crate::config::{ConfiguredMode, OnyxConfig};
 use crate::engine::OnyxEngine;
 use crate::error::{OnyxError, OnyxResult};
@@ -253,7 +254,7 @@ impl ServiceController {
     fn transition_to_active(&self, new_config: &OnyxConfig) -> OnyxResult<()> {
         tracing::info!("transitioning from standby to active mode");
 
-        // Extract MetaStore from old engine (avoid RocksDB double-open)
+        // Extract MetaStore from old engine (avoid metadb double-open)
         let meta = {
             let guard = self.engine.load();
             let opt: &Option<OnyxEngine> = &guard;
@@ -302,6 +303,7 @@ impl ServiceController {
                 thread::Builder::new()
                     .name(format!("ublk-{}", vol_name))
                     .spawn(move || {
+                        affinity::bind_current(ThreadRole::Ublk, 0);
                         let (tx, rx) = std::sync::mpsc::channel();
                         let dev_ids_inner = dev_ids.clone();
                         let vol_name_inner = vol_name.clone();
@@ -331,8 +333,8 @@ impl ServiceController {
         if old_config.buffer.device != new_config.buffer.device {
             tracing::warn!("buffer.device changed — requires restart to take effect");
         }
-        if old_config.meta.rocksdb_path != new_config.meta.rocksdb_path {
-            tracing::warn!("meta.rocksdb_path changed — requires restart to take effect");
+        if old_config.meta.path() != new_config.meta.path() {
+            tracing::warn!("meta.path changed — requires restart to take effect");
         }
         if old_config.engine.zone_count != new_config.engine.zone_count {
             tracing::warn!("engine.zone_count changed — requires restart to take effect");
@@ -405,6 +407,7 @@ impl ServiceController {
             let handle = thread::Builder::new()
                 .name(format!("ublk-{}", vol_name))
                 .spawn(move || {
+                    affinity::bind_current(ThreadRole::Ublk, 0);
                     let (tx, rx) = std::sync::mpsc::channel();
                     let dev_ids_inner = dev_ids.clone();
                     let vol_name_inner = vol_name.clone();

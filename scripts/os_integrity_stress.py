@@ -5,6 +5,7 @@ import argparse
 import collections
 import contextlib
 import errno
+import functools
 import json
 import mmap
 import os
@@ -34,11 +35,15 @@ MODE_ZERO = 0
 MODE_REPEAT_A = 1
 MODE_REPEAT_B = 2
 MODE_REPEAT_C = 3
+MODE_RANDOM_MISS = 4
+MODE_BITS = 3
+MODE_MASK = (1 << MODE_BITS) - 1
 MODE_NAMES = {
     MODE_ZERO: "zero",
     MODE_REPEAT_A: "repeat-a",
     MODE_REPEAT_B: "repeat-b",
     MODE_REPEAT_C: "repeat-c",
+    MODE_RANDOM_MISS: "random-miss",
 }
 SIZE_SUFFIXES = {
     "k": 1024,
@@ -161,12 +166,18 @@ def wait_for(predicate, timeout_secs: int, interval_secs: float = 0.5) -> None:
     raise HarnessError("timeout waiting for condition")
 
 
+@functools.lru_cache(maxsize=8192)
+def random_template(seed: int, template_idx: int) -> bytes:
+    rng = random.Random((seed * 0x9E3779B185EBCA87) ^ template_idx)
+    return rng.randbytes(BLOCK_SIZE)
+
+
 def build_block(seed: int, state: int, block_index: int) -> bytes:
     if state == 0:
         return ZERO_BLOCK
 
-    mode = state & 0x3
-    stamp = state >> 2
+    mode = state & MODE_MASK
+    stamp = state >> MODE_BITS
     word0 = seed & 0xFFFFFFFFFFFFFFFF
     word1 = stamp & 0xFFFFFFFFFFFFFFFF
     word2 = block_index & 0xFFFFFFFFFFFFFFFF
@@ -203,6 +214,13 @@ def build_block(seed: int, state: int, block_index: int) -> bytes:
             (word3 + 0xD6E8FEB86659FD93) & 0xFFFFFFFFFFFFFFFF,
         )
         return pattern * (BLOCK_SIZE // len(pattern))
+    if mode == MODE_RANDOM_MISS:
+        block = bytearray(random_template(seed, block_index % 8192))
+        # Keep the block deterministic and unique per write while leaving the
+        # rest high-entropy. This reproduces fio's all-miss dedup pressure
+        # without making Python generate 4 KiB of fresh random data per op.
+        struct.pack_into("<QQQQ", block, 0, word0, word1, word2, word3)
+        return bytes(block)
     raise HarnessError(f"unsupported mode {mode}")
 
 
@@ -385,6 +403,19 @@ class DeviceHandle:
         os.fsync(fd)
 
 
+def metric_get(payload: Optional[dict[str, object]], *path: str, default: int = 0) -> int:
+    current: object = payload or {}
+    for key in path:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+    if isinstance(current, bool):
+        return int(current)
+    if isinstance(current, (int, float)):
+        return int(current)
+    return default
+
+
 class ServiceManager:
     DEVICE_REMOVAL_WAIT_SECS = 20.0
     CLEANUP_UBLK_TIMEOUT_SECS = 5.0
@@ -523,6 +554,12 @@ class ServiceManager:
         lines = self._send_socket_cmd("status-json")
         if not lines:
             raise HarnessError("empty status-json response")
+        return json.loads(lines[0])
+
+    def metrics_json(self) -> dict[str, object]:
+        lines = self._send_socket_cmd("metrics-json")
+        if not lines:
+            return {}
         return json.loads(lines[0])
 
     def wait_for_recovered_buffer_drain(self) -> None:
@@ -732,6 +769,8 @@ class IntegrityHarness:
         self.stats = StatsTracker()
         self.summary_cursor_lock = threading.Lock()
         self.summary_cursor: Optional[SummaryCursor] = None
+        self.metrics_log = (self.run_dir / "metrics.jsonl").open("a", encoding="utf-8")
+        self.last_metrics_snapshot: Optional[dict[str, object]] = None
         self.next_stamp = 1
         self.next_stamp_lock = threading.Lock()
         self.op_trace_counter = 0
@@ -856,6 +895,25 @@ class IntegrityHarness:
             out[start : start + BLOCK_SIZE] = block
         return bytes(out)
 
+    def _capture_engine_snapshot(self) -> Optional[dict[str, object]]:
+        try:
+            status = self.service.status_json()
+            metrics = self.service.metrics_json()
+        except Exception as exc:
+            self.event_log.remember(
+                {
+                    "event": "metrics-snapshot-error",
+                    "message": str(exc),
+                    "ts": time.time(),
+                }
+            )
+            return None
+        return {
+            "ts": time.time(),
+            "status": status.get("status") or {},
+            "metrics": metrics,
+        }
+
     def _expected_read_bytes(self, start_block: int, count: int) -> bytes:
         states = self.state_map.read_states(start_block, count)
         out = bytearray(count * BLOCK_SIZE)
@@ -869,12 +927,12 @@ class IntegrityHarness:
         offset = start_block * BLOCK_SIZE
         length = block_count * BLOCK_SIZE
         mode = rng.choices(
-            [MODE_ZERO, MODE_REPEAT_A, MODE_REPEAT_B, MODE_REPEAT_C],
+            [MODE_ZERO, MODE_REPEAT_A, MODE_REPEAT_B, MODE_REPEAT_C, MODE_RANDOM_MISS],
             weights=self.args.write_mode_weights,
             k=1,
         )[0]
         stamp = self._new_stamp()
-        state = (stamp << 2) | mode
+        state = (stamp << MODE_BITS) | mode
 
         with self.pause_gate.enter():
             with self.range_locks.hold(start_block, block_count):
@@ -1143,6 +1201,21 @@ class IntegrityHarness:
                 recent_read_bytes = max(0, stats.read_bytes - previous.stats.read_bytes)
             self.summary_cursor = SummaryCursor(timestamp=now, stats=stats)
 
+        engine_snapshot = self._capture_engine_snapshot()
+        if engine_snapshot is not None:
+            self.last_metrics_snapshot = engine_snapshot
+            self.metrics_log.write(json.dumps(engine_snapshot, sort_keys=True) + "\n")
+            self.metrics_log.flush()
+        else:
+            engine_snapshot = self.last_metrics_snapshot
+
+        status_payload = (
+            engine_snapshot.get("status") if isinstance(engine_snapshot, dict) else {}
+        )
+        metrics_payload = (
+            engine_snapshot.get("metrics") if isinstance(engine_snapshot, dict) else {}
+        )
+
         summary = {
             "seed": self.seed,
             "elapsed_secs": elapsed,
@@ -1174,6 +1247,48 @@ class IntegrityHarness:
             "read_bw_recent": format_bytes(recent_read_bytes / recent_window_secs) + "/s",
             "failure": self.failure,
             "device": str(self.device.path) if self.device.path else None,
+            "buffer_pending_entries": metric_get(status_payload, "buffer_pending_entries"),
+            "buffer_fill_pct": metric_get(status_payload, "buffer_fill_pct"),
+            "dedup_hits": metric_get(metrics_payload, "dedup_hits"),
+            "dedup_misses": metric_get(metrics_payload, "dedup_misses"),
+            "dedup_skipped_units": metric_get(metrics_payload, "dedup_skipped_units"),
+            "dedup_lookup_ns": metric_get(metrics_payload, "dedup_lookup_ns"),
+            "dedup_register_batches": metric_get(
+                metrics_payload, "dedup_register_batches"
+            ),
+            "dedup_register_entries": metric_get(
+                metrics_payload, "dedup_register_entries"
+            ),
+            "dedup_register_batch_max_entries": metric_get(
+                metrics_payload, "dedup_register_batch_max_entries"
+            ),
+            "dedup_register_lock_ns": metric_get(
+                metrics_payload, "dedup_register_lock_ns"
+            ),
+            "dedup_register_validate_blockmap_ns": metric_get(
+                metrics_payload, "dedup_register_validate_blockmap_ns"
+            ),
+            "dedup_register_validate_refcount_ns": metric_get(
+                metrics_payload, "dedup_register_validate_refcount_ns"
+            ),
+            "dedup_register_commit_ns": metric_get(
+                metrics_payload, "dedup_register_commit_ns"
+            ),
+            "flush_writer_meta_ns": metric_get(metrics_payload, "flush_writer_meta_ns"),
+            "flush_writer_dedup_index_ns": metric_get(
+                metrics_payload, "flush_writer_dedup_index_ns"
+            ),
+            "metadb_cleanup_scan_us": metric_get(
+                status_payload, "metadb_memory", "cleanup_scan_us"
+            ),
+            "metadb_cleanup_forward_check_us": metric_get(
+                status_payload, "metadb_memory", "cleanup_forward_check_us"
+            ),
+            "metadb_cleanup_commit_us": metric_get(
+                status_payload, "metadb_memory", "cleanup_commit_us"
+            ),
+            "flush_errors": metric_get(metrics_payload, "flush_errors"),
+            "read_crc_errors": metric_get(metrics_payload, "read_crc_errors"),
         }
         return summary
 
@@ -1190,6 +1305,8 @@ class IntegrityHarness:
             f"write_ops={summary['write_ops']} read_ops={summary['read_ops']} "
             f"write_bw_avg={summary['write_bw_avg']} write_bw_recent={summary['write_bw_recent']} "
             f"read_bw_avg={summary['read_bw_avg']} read_bw_recent={summary['read_bw_recent']} "
+            f"pending={summary['buffer_pending_entries']} dedup_miss={summary['dedup_misses']} "
+            f"dedup_reg_max={summary['dedup_register_batch_max_entries']} "
             f"restarts={summary['restarts']} scrubs={summary['scrub_checks']} "
             f"errors={summary['io_errors']} mismatches={summary['mismatches']}",
             flush=True,
@@ -1226,6 +1343,7 @@ class IntegrityHarness:
         self.state_map.flush()
         self.state_map.close()
         self.service.close()
+        self.metrics_log.close()
         self.event_log.close()
 
     def run(self) -> int:
@@ -1333,6 +1451,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--io-sizes",
         default="4k,8k,16k,32k,64k,128k,256k,512k,1m",
         help="Comma-separated IO sizes; each must be 4KiB aligned",
+    )
+    parser.add_argument(
+        "--write-pattern",
+        default="compressible",
+        choices=["compressible", "random-miss"],
+        help="Write payload profile. random-miss uses deterministic high-entropy blocks to stress all-miss dedup lookup while preserving verification.",
     )
     parser.add_argument(
         "--blocks-per-lock",
@@ -1463,7 +1587,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("all --io-sizes entries must be positive and 4KiB aligned")
         io_sizes.append(size)
     args.io_sizes_blocks = [size // BLOCK_SIZE for size in sorted(set(io_sizes))]
-    args.write_mode_weights = [10, 35, 25, 30]
+    if args.write_pattern == "random-miss":
+        args.write_mode_weights = [0, 0, 0, 0, 100]
+    else:
+        args.write_mode_weights = [10, 35, 25, 30, 0]
     return args
 
 

@@ -32,7 +32,7 @@ impl std::fmt::Debug for IoBackend {
 /// IO engine for reading/writing raw data blocks on LV3.
 ///
 /// LV3 slots are pure payload — no on-disk header. All metadata (compression,
-/// crc32, original_size) lives in RocksDB BlockmapValue, which is crash-consistent
+/// crc32, original_size) lives in metadb BlockmapValue, which is crash-consistent
 /// via WriteBatch. This allows a full 4096-byte payload per slot.
 ///
 /// PBA addresses are translated by `pba_offset` (default `RESERVED_BLOCKS`)
@@ -298,7 +298,11 @@ impl IoEngine {
     ///
     /// `fsync_after` appends a barrier-fdatasync SQE (only meaningful for the
     /// uring backend; the syscall path always issues a `sync()` if requested).
-    pub fn submit_batch(&self, ops: Vec<LvOp<'_>>, fsync_after: bool) -> OnyxResult<Vec<LvOpResult>> {
+    pub fn submit_batch(
+        &self,
+        ops: Vec<LvOp<'_>>,
+        fsync_after: bool,
+    ) -> OnyxResult<Vec<LvOpResult>> {
         match &self.backend {
             IoBackend::Syscall => self.submit_batch_syscall(ops, fsync_after),
             IoBackend::Uring(session) => self.submit_batch_uring(session, ops, fsync_after),
@@ -424,18 +428,28 @@ impl IoEngine {
             }
         }
 
+        let data_op_count = uring_ops.len();
         if fsync_after {
             uring_ops.push(UringOp::FsyncDataBarrier { fd });
         }
 
-        let results = if uring_ops.is_empty() {
-            Vec::new()
-        } else {
-            unsafe { session.submit_batch(&uring_ops)? }
-        };
+        let mut results = Vec::with_capacity(uring_ops.len());
+        if data_op_count > 0 {
+            let max_ops = (session.sq_entries() as usize).max(1);
+            for chunk in uring_ops[..data_op_count].chunks(max_ops) {
+                results.extend(unsafe { session.submit_batch(chunk)? });
+            }
+        }
+        if fsync_after {
+            // The data chunks above are fully completed before this fdatasync is
+            // submitted, so a single-op barrier preserves submit_batch's
+            // "writes then sync" contract even when the write batch is larger
+            // than the ring's SQ depth.
+            results.extend(unsafe { session.submit_batch(&uring_ops[data_op_count..])? });
+        }
 
         let fsync_offset = if fsync_after {
-            uring_ops.len() - 1
+            results.len() - 1
         } else {
             usize::MAX
         };
@@ -500,7 +514,10 @@ impl IoEngine {
             }
         }
 
-        Ok(out.into_iter().map(|s| s.expect("all slots filled")).collect())
+        Ok(out
+            .into_iter()
+            .map(|s| s.expect("all slots filled"))
+            .collect())
     }
 
     /// Borrow the underlying data device. Used by the engine shutdown path
@@ -568,13 +585,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dev = fresh_device(&dir, "lv3", 1024 * 1024);
         let session = Arc::new(IoUringSession::new(16).unwrap());
-        let engine = IoEngine::with_options(
-            dev,
-            false,
-            0,
-            None,
-            IoBackend::Uring(session),
-        );
+        let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
 
         let payload = vec![0xCDu8; 4096];
         engine.write_blocks(Pba(2), &payload).unwrap();
@@ -587,13 +598,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dev = fresh_device(&dir, "lv3", 1024 * 1024);
         let session = Arc::new(IoUringSession::new(64).unwrap());
-        let engine = IoEngine::with_options(
-            dev,
-            false,
-            0,
-            None,
-            IoBackend::Uring(session),
-        );
+        let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
 
         let payloads: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; 4096]).collect();
         let writes: Vec<LvOp> = payloads
@@ -626,6 +631,43 @@ mod tests {
                     assert_eq!(bytes, payloads[i], "read {} mismatch", i);
                 }
                 _ => panic!("read {} failed", i),
+            }
+        }
+    }
+
+    #[test]
+    fn uring_batch_chunks_when_ops_exceed_sq_entries() {
+        let dir = TempDir::new().unwrap();
+        let dev = fresh_device(&dir, "lv3", 1024 * 1024);
+        let session = Arc::new(IoUringSession::new(4).unwrap());
+        let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
+
+        let payloads: Vec<Vec<u8>> = (0..10).map(|i| vec![(i + 1) as u8; 4096]).collect();
+        let writes: Vec<LvOp> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| LvOp::Write {
+                pba: Pba(i as u64),
+                payload: p.as_slice(),
+            })
+            .collect();
+        let results = engine.submit_batch(writes, true).unwrap();
+        assert_eq!(results.len(), payloads.len());
+        for result in results {
+            assert!(matches!(result, LvOpResult::Write(Ok(()))));
+        }
+
+        let reads: Vec<LvOp> = (0..payloads.len())
+            .map(|i| LvOp::Read {
+                pba: Pba(i as u64),
+                size: 4096,
+            })
+            .collect();
+        let results = engine.submit_batch(reads, false).unwrap();
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                LvOpResult::Read(Ok(bytes)) => assert_eq!(bytes, payloads[i]),
+                _ => panic!("read {i} failed"),
             }
         }
     }

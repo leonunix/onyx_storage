@@ -7,6 +7,7 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::metrics::{EngineMetrics, VolumeMetrics};
 use crate::types::{Lba, BLOCK_SIZE};
 use crate::zone::manager::ZoneManager;
+use onyx_metadb::VolumeOrdinal;
 
 /// Per-volume IO handle (librbd-style).
 ///
@@ -20,6 +21,7 @@ use crate::zone::manager::ZoneManager;
 /// Callers must open a fresh handle via `engine.open_volume()`.
 pub struct OnyxVolume {
     vol_id: String,
+    vol_ord: VolumeOrdinal,
     size_bytes: u64,
     /// Volume generation epoch, passed to buffer entries so the flusher can
     /// detect and discard stale entries from a prior generation.
@@ -35,6 +37,7 @@ pub struct OnyxVolume {
 impl OnyxVolume {
     pub(crate) fn new(
         vol_id: String,
+        vol_ord: VolumeOrdinal,
         size_bytes: u64,
         created_at: u64,
         zone_manager: Arc<ZoneManager>,
@@ -45,6 +48,7 @@ impl OnyxVolume {
         let vol_metrics = metrics.get_volume_metrics(&vol_id);
         Self {
             vol_id,
+            vol_ord,
             size_bytes,
             created_at,
             zone_manager,
@@ -185,6 +189,22 @@ impl OnyxVolume {
         result
     }
 
+    /// Read into a caller-owned buffer. Unmapped blocks return zeros.
+    ///
+    /// This avoids one allocation per read for benchmark/protocol-front-end
+    /// paths that already own an IO buffer.
+    pub fn read_into(&self, offset_bytes: u64, out: &mut [u8]) -> OnyxResult<()> {
+        let start = Instant::now();
+        let _guard = self.vol_lock.read().unwrap();
+        let result = self.read_locked_into(offset_bytes, out);
+        if result.is_ok() {
+            self.metrics
+                .volume_read_total_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
     fn write_locked(&self, offset_bytes: u64, data: &[u8]) -> OnyxResult<()> {
         self.check_alive()?;
         if data.is_empty() {
@@ -290,9 +310,16 @@ impl OnyxVolume {
     }
 
     fn read_locked(&self, offset_bytes: u64, len: usize) -> OnyxResult<Vec<u8>> {
+        let mut result = vec![0u8; len];
+        self.read_locked_into(offset_bytes, &mut result)?;
+        Ok(result)
+    }
+
+    fn read_locked_into(&self, offset_bytes: u64, result: &mut [u8]) -> OnyxResult<()> {
         self.check_alive()?;
+        let len = result.len();
         if len == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let len64 = len as u64;
         if offset_bytes + len64 > self.size_bytes {
@@ -304,7 +331,7 @@ impl OnyxVolume {
         }
 
         let bs = BLOCK_SIZE as u64;
-        let mut result = vec![0u8; len];
+        result.fill(0);
 
         // Fast path: block-aligned → one vectorized call. Unit coalescing on
         // the backend means one io_uring read + one decompress per unique
@@ -312,12 +339,13 @@ impl OnyxVolume {
         if offset_bytes % bs == 0 && len64 % bs == 0 {
             let start_lba = Lba(offset_bytes / bs);
             let lba_count = (len64 / bs) as u32;
-            self.zone_manager.submit_reads(
+            self.zone_manager.submit_reads_with_ordinal(
                 &self.vol_id,
+                Some(self.vol_ord),
                 start_lba,
                 lba_count,
                 self.created_at,
-                &mut result,
+                result,
             )?;
         } else {
             self.metrics
@@ -343,9 +371,8 @@ impl OnyxVolume {
                         let src_end = (offset_in_block + copy_len).min(data.len());
                         let actual = src_end.saturating_sub(offset_in_block);
                         if actual > 0 {
-                            result[buf_offset..buf_offset + actual].copy_from_slice(
-                                &data[offset_in_block..offset_in_block + actual],
-                            );
+                            result[buf_offset..buf_offset + actual]
+                                .copy_from_slice(&data[offset_in_block..offset_in_block + actual]);
                         }
                     }
                     None => {
@@ -368,6 +395,6 @@ impl OnyxVolume {
             .read_bytes
             .fetch_add(len as u64, Ordering::Relaxed);
 
-        Ok(result)
+        Ok(())
     }
 }

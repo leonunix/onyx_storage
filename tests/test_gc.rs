@@ -74,10 +74,17 @@ struct TestEnv {
 fn setup_gc_env() -> TestEnv {
     let meta_dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(meta_dir.path().to_path_buf()),
+        path: Some(meta_dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -114,10 +121,17 @@ fn setup_gc_env() -> TestEnv {
 fn scanner_finds_candidates_with_dead_blocks() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -192,10 +206,17 @@ fn scanner_finds_candidates_with_dead_blocks() {
 fn scanner_skips_below_threshold() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -245,10 +266,17 @@ fn scanner_skips_below_threshold() {
 fn scanner_skips_single_lba_units() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -276,10 +304,17 @@ fn scanner_skips_single_lba_units() {
 fn scanner_sorts_by_dead_ratio_descending() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -633,10 +668,17 @@ fn blockmap_value_rejects_wrong_length() {
 fn scanner_distinguishes_packed_fragments_same_pba() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -716,10 +758,17 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
 fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_identity() {
     let dir = tempdir().unwrap();
     let meta_config = MetaConfig {
-        rocksdb_path: Some(dir.path().to_path_buf()),
+        path: Some(dir.path().to_path_buf()),
         block_cache_mb: 8,
         memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
         wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 

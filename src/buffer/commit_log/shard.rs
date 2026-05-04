@@ -46,9 +46,8 @@ impl<'a> ChunkReader<'a> {
         debug_assert!(disk_offset < self.capacity_bytes);
 
         let buf_end = self.buf_disk_start + self.buf_valid_bytes as u64;
-        let in_window = self.buf_valid_bytes > 0
-            && disk_offset >= self.buf_disk_start
-            && disk_offset < buf_end;
+        let in_window =
+            self.buf_valid_bytes > 0 && disk_offset >= self.buf_disk_start && disk_offset < buf_end;
         let need_refill = if !in_window {
             true
         } else {
@@ -112,6 +111,75 @@ impl BufferShard {
         }
     }
 
+    pub(super) fn cache_committed_payload(&self, pending: &Arc<PendingEntry>, payload: Arc<[u8]>) {
+        let payload_len = payload.len() as u64;
+        if self.max_payload_memory == 0 || payload_len > self.max_payload_memory {
+            return;
+        }
+
+        let mut cached = pending.as_ref().clone();
+        cached.payload = Some(payload);
+        let cached = Arc::new(cached);
+        if !self.replace_pending_entry_if_current(pending, cached.clone()) {
+            return;
+        }
+
+        self.payload_bytes_in_memory
+            .fetch_add(payload_len, Ordering::Relaxed);
+        self.replace_lba_index_if_current(pending, &cached);
+        self.cached_payload_order.lock().push_back(pending.seq);
+        self.evict_payload_cache_to_budget();
+        self.compact_payload_cache_order_if_needed();
+    }
+
+    fn evict_payload_cache_to_budget(&self) {
+        let budget = self.max_payload_memory;
+        if budget == 0 {
+            return;
+        }
+        while self.payload_bytes_in_memory.load(Ordering::Relaxed) > budget {
+            let Some(seq) = self.cached_payload_order.lock().pop_front() else {
+                return;
+            };
+            self.evict_cached_payload(seq);
+        }
+    }
+
+    fn evict_cached_payload(&self, seq: u64) -> bool {
+        let Some(pending) = self
+            .pending_entries
+            .get(&seq)
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+        let Some(ref payload) = pending.payload else {
+            return false;
+        };
+        let payload_len = payload.len() as u64;
+        let evicted = Self::evicted_pending_entry(pending.as_ref());
+        if !self.replace_pending_entry_if_current(&pending, evicted.clone()) {
+            return false;
+        }
+        Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), payload_len);
+        self.replace_lba_index_if_current(&pending, &evicted);
+        true
+    }
+
+    fn compact_payload_cache_order_if_needed(&self) {
+        let live_pending = self.pending_entries.len();
+        let max_order_len = live_pending.saturating_mul(2).max(1024);
+        let mut order = self.cached_payload_order.lock();
+        if order.len() <= max_order_len {
+            return;
+        }
+        order.retain(|seq| {
+            self.pending_entries
+                .get(seq)
+                .is_some_and(|entry| entry.payload.is_some())
+        });
+    }
+
     pub(super) fn slot_size() -> u64 {
         BLOCK_SIZE as u64
     }
@@ -124,6 +192,82 @@ impl BufferShard {
             }
         }
         acc.push((seq, lba, 1));
+    }
+
+    fn bucket_key(vid: &Arc<str>, bucket: u64) -> PendingBucketKey {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        vid.hash(&mut hasher);
+        PendingBucketKey {
+            vol_hash: hasher.finish(),
+            bucket,
+        }
+    }
+
+    fn bucket_range(start_lba: Lba, lba_count: u32) -> Option<std::ops::RangeInclusive<u64>> {
+        if lba_count == 0 {
+            return None;
+        }
+        let first = start_lba.0 / PENDING_LBA_BUCKET_BLOCKS;
+        let last_lba = start_lba.0.saturating_add(lba_count as u64 - 1);
+        let last = last_lba / PENDING_LBA_BUCKET_BLOCKS;
+        Some(first..=last)
+    }
+
+    fn add_pending_buckets(
+        buckets: &DashMap<PendingBucketKey, AtomicU32>,
+        vid: &Arc<str>,
+        start_lba: Lba,
+        lba_count: u32,
+    ) {
+        let Some(range) = Self::bucket_range(start_lba, lba_count) else {
+            return;
+        };
+        for bucket in range {
+            buckets
+                .entry(Self::bucket_key(vid, bucket))
+                .and_modify(|count| {
+                    count
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                            Some(current.saturating_add(1))
+                        })
+                        .ok();
+                })
+                .or_insert_with(|| AtomicU32::new(1));
+        }
+    }
+
+    fn remove_pending_buckets(&self, vid: &Arc<str>, start_lba: Lba, lba_count: u32) {
+        let Some(range) = Self::bucket_range(start_lba, lba_count) else {
+            return;
+        };
+        for bucket in range {
+            let key = Self::bucket_key(vid, bucket);
+            if let Some(count) = self.pending_lba_buckets.get(&key) {
+                count
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(1))
+                    })
+                    .ok();
+            }
+        }
+    }
+
+    fn pending_range_maybe_contains_interned(
+        &self,
+        vid: &Arc<str>,
+        start_lba: Lba,
+        lba_count: u32,
+    ) -> bool {
+        let Some(range) = Self::bucket_range(start_lba, lba_count) else {
+            return false;
+        };
+        range.into_iter().any(|bucket| {
+            self.pending_lba_buckets
+                .get(&Self::bucket_key(vid, bucket))
+                .is_some_and(|count| count.load(Ordering::Relaxed) > 0)
+        })
     }
 
     pub(super) fn total_slots(capacity_bytes: u64) -> u64 {
@@ -351,13 +495,14 @@ impl BufferShard {
         BufferEntry::from_bytes(&buf[..slot_bytes]).map(|entry| (entry, slot_count))
     }
 
-
     pub(super) fn rebuild_indices(
         device: &RawDevice,
         capacity_bytes: u64,
         lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,
         latest_lba_seq: &DashMap<LbaKey, (u64, u64)>,
+        pending_lba_buckets: &DashMap<PendingBucketKey, AtomicU32>,
         pending_entries: &DashMap<u64, Arc<PendingEntry>>,
+        pending_count: &AtomicU64,
     ) -> OnyxResult<ScanResult> {
         #[derive(Debug)]
         struct ScannedRecord {
@@ -418,7 +563,18 @@ impl BufferShard {
                 continue;
             };
             let vid: Arc<str> = Arc::from(pending.vol_id.as_str());
-            pending_entries.insert(pending.seq, pending.clone());
+            if pending_entries
+                .insert(pending.seq, pending.clone())
+                .is_none()
+            {
+                pending_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Self::add_pending_buckets(
+                pending_lba_buckets,
+                &vid,
+                pending.start_lba,
+                pending.lba_count,
+            );
             for i in 0..pending.lba_count {
                 let key = LbaKey {
                     vol_id: vid.clone(),
@@ -480,7 +636,9 @@ impl BufferShard {
         checkpoint: &ShardCheckpoint,
         lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,
         latest_lba_seq: &DashMap<LbaKey, (u64, u64)>,
+        pending_lba_buckets: &DashMap<PendingBucketKey, AtomicU32>,
         pending_entries: &DashMap<u64, Arc<PendingEntry>>,
+        pending_count: &AtomicU64,
     ) -> OnyxResult<ScanResult> {
         #[derive(Debug)]
         struct ScannedRecord {
@@ -504,8 +662,25 @@ impl BufferShard {
                 capacity_bytes,
                 lba_index,
                 latest_lba_seq,
+                pending_lba_buckets,
                 pending_entries,
+                pending_count,
             );
+        }
+
+        if checkpoint.used_bytes == 0
+            && checkpoint.max_seq == 0
+            && checkpoint.head_offset == 0
+            && checkpoint.tail_offset == 0
+        {
+            return Ok(ScanResult {
+                max_seq: 0,
+                used_bytes: 0,
+                head_offset: 0,
+                tail_offset: 0,
+                log_order: VecDeque::new(),
+                flushed_seqs: HashSet::new(),
+            });
         }
 
         let mut scanned = Vec::new();
@@ -549,8 +724,18 @@ impl BufferShard {
         // physically contiguous. Once we hit the first gap, later "valid-looking"
         // bytes are stale reclaimed history and must not be recovered.
         let mut occupied_ranges: Vec<(u64, u64)> = Vec::new();
-        if checkpoint.used_bytes == 0 && checkpoint.head_offset == checkpoint.tail_offset {
-            // Checkpoint says empty. Only do the contiguous forward scan below.
+        if checkpoint.used_bytes == 0 {
+            // Checkpoint says empty. A head/tail mismatch here is stale pointer
+            // drift from prior wrap/reclaim history, not a live occupied range.
+            // Only do the contiguous forward scan below to catch post-checkpoint
+            // appends.
+            if checkpoint.head_offset != checkpoint.tail_offset {
+                tracing::warn!(
+                    head = checkpoint.head_offset,
+                    tail = checkpoint.tail_offset,
+                    "empty shard checkpoint has mismatched offsets; ignoring stale occupied range"
+                );
+            }
         } else if checkpoint.head_offset >= checkpoint.tail_offset {
             // No wrap in occupied region: [tail, head)
             occupied_ranges.push((checkpoint.tail_offset, checkpoint.head_offset));
@@ -615,7 +800,18 @@ impl BufferShard {
                 continue;
             };
             let vid: Arc<str> = Arc::from(pending.vol_id.as_str());
-            pending_entries.insert(pending.seq, pending.clone());
+            if pending_entries
+                .insert(pending.seq, pending.clone())
+                .is_none()
+            {
+                pending_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Self::add_pending_buckets(
+                pending_lba_buckets,
+                &vid,
+                pending.start_lba,
+                pending.lba_count,
+            );
             for i in 0..pending.lba_count {
                 let key = LbaKey {
                     vol_id: vid.clone(),
@@ -675,7 +871,9 @@ impl BufferShard {
         checkpoint: Option<ShardCheckpoint>,
         checkpoint_device: Option<RawDevice>,
         payload_bytes_in_memory: Arc<AtomicU64>,
-        max_payload_memory_bytes: u64,
+        max_payload_memory: u64,
+        volatile_payload_budget: Arc<VolatilePayloadBudget>,
+        runtime_limits: BufferRuntimeLimits,
         max_flushed_seq: Arc<AtomicU64>,
         durable_seq: Arc<AtomicU64>,
     ) -> OnyxResult<(Self, u64)> {
@@ -688,7 +886,9 @@ impl BufferShard {
 
         let lba_index = DashMap::with_shard_amount(DASHMAP_SHARDS);
         let latest_lba_seq = DashMap::with_shard_amount(DASHMAP_SHARDS);
+        let pending_lba_buckets = DashMap::with_shard_amount(DASHMAP_SHARDS);
         let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
+        let pending_count = AtomicU64::new(0);
         let recover_start = Instant::now();
         let scan = if let Some(ref ckpt) = checkpoint {
             let r = Self::rebuild_indices_guided(
@@ -697,7 +897,9 @@ impl BufferShard {
                 ckpt,
                 &lba_index,
                 &latest_lba_seq,
+                &pending_lba_buckets,
                 &pending_entries,
+                &pending_count,
             )?;
             tracing::info!(
                 elapsed_us = recover_start.elapsed().as_micros() as u64,
@@ -713,7 +915,9 @@ impl BufferShard {
                 capacity_bytes,
                 &lba_index,
                 &latest_lba_seq,
+                &pending_lba_buckets,
                 &pending_entries,
+                &pending_count,
             )?;
             tracing::info!(
                 elapsed_us = recover_start.elapsed().as_micros() as u64,
@@ -724,7 +928,7 @@ impl BufferShard {
             r
         };
 
-        let (staging_tx, staging_rx) = unbounded();
+        let (staging_tx, staging_rx) = bounded(runtime_limits.staging_channel_capacity.max(1));
         let had_head = !scan.log_order.is_empty();
         let mut log_order = VecDeque::with_capacity(scan.log_order.len());
         log_order.extend(scan.log_order);
@@ -746,11 +950,17 @@ impl BufferShard {
                 backpressure_timeout,
                 lba_index,
                 latest_lba_seq,
+                pending_lba_buckets,
                 pending_entries,
+                pending_count,
                 flush_progress: DashMap::with_shard_amount(DASHMAP_SHARDS),
                 staging_tx,
                 staging_rx,
+                sync_batch_max_entries: runtime_limits.sync_batch_max_entries.max(1),
+                sync_batch_max_bytes: runtime_limits.sync_batch_max_bytes.max(BLOCK_SIZE as usize),
+                cached_payload_order: parking_lot::Mutex::new(VecDeque::with_capacity(1024)),
                 volatile_payloads: DashMap::with_shard_amount(DASHMAP_SHARDS),
+                volatile_payload_budget,
                 lifecycle: parking_lot::Mutex::new(LifecycleState {
                     inflight: HashSet::with_capacity(256),
                     cancelled: HashSet::with_capacity(64),
@@ -760,7 +970,7 @@ impl BufferShard {
                 metrics,
                 checkpoint_device,
                 payload_bytes_in_memory,
-                max_payload_memory_bytes,
+                max_payload_memory,
                 max_flushed_seq,
                 durable_seq,
             },
@@ -771,9 +981,14 @@ impl BufferShard {
     /// Snapshot current ring state into a checkpoint structure.
     pub(super) fn snapshot_checkpoint(&self) -> ShardCheckpoint {
         let ring = self.ring.lock();
+        let tail_offset = if ring.used_bytes == 0 {
+            ring.head_offset
+        } else {
+            ring.tail_offset
+        };
         ShardCheckpoint {
             head_offset: ring.head_offset,
-            tail_offset: ring.tail_offset,
+            tail_offset,
             max_seq: 0, // updated by caller with global max_seq
             used_bytes: ring.used_bytes,
         }
@@ -809,10 +1024,9 @@ impl BufferShard {
         Some((dev.as_raw_fd(), dev.base_offset()))
     }
 
-    /// After fdatasync, unconditionally evict all in-memory payloads from
-    /// committed entries (write-through policy). Entries remain in
-    /// pending_entries with payload=None; reads hydrate from the buffer
-    /// device on demand, flusher hydrates via pending_entry_arc_hydrated().
+    /// Evict in-memory payloads from committed entries. The normal sync path
+    /// now keeps durable payloads resident while budget allows; this helper is
+    /// retained for tests and emergency cache trimming.
     #[allow(dead_code)]
     pub(super) fn evict_committed_payloads(&self, committed: &[Arc<PendingEntry>]) {
         for pending in committed {
@@ -846,10 +1060,6 @@ impl BufferShard {
                 self.replace_lba_index_if_current(&pending, &evicted);
             }
         }
-    }
-
-    pub(super) fn max_payload_memory(&self) -> u64 {
-        self.max_payload_memory_bytes
     }
 
     pub(super) fn backpressure_waits_forever(&self) -> bool {
@@ -979,8 +1189,10 @@ impl BufferShard {
             }
         };
 
-        let payload = Arc::<[u8]>::from(payload);
         let payload_len = payload.len() as u64;
+        self.volatile_payload_budget.reserve(payload_len);
+
+        let payload = Arc::<[u8]>::from(payload);
         let payload_crc32 = crc32fast::hash(&payload);
 
         let vid = self.intern_vol_id(vol_id);
@@ -1027,17 +1239,33 @@ impl BufferShard {
             lc.inflight.insert(seq);
         }
 
+        // Publish the volatile payload before the LBA indices. Once an entry
+        // appears in lba_index, foreground reads may need this payload before
+        // the sync thread has made the ring slot durable.
+        self.volatile_payloads.insert(seq, payload.clone());
+
         // ── DashMap inserts (concurrent sharded locks) ──
         // Interned Arc<str>: read-lock fast path, no alloc after first encounter.
+        Self::add_pending_buckets(&self.pending_lba_buckets, &vid, start_lba, lba_count);
         for key in keys {
             self.lba_index.insert(key.clone(), pending.clone());
             self.latest_lba_seq.insert(key, (seq, vol_created_at));
         }
-        self.pending_entries.insert(seq, pending.clone());
-        self.volatile_payloads.insert(seq, payload.clone());
+        if self.pending_entries.insert(seq, pending.clone()).is_none() {
+            self.pending_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         // ── Channel send (lock-free MPSC, ~30ns) ──
-        let _ = self.staging_tx.send(StagedEntry { pending, payload });
+        if self
+            .staging_tx
+            .send(StagedEntry { pending, payload })
+            .is_err()
+        {
+            self.remove_volatile_payload(seq);
+            return Err(OnyxError::Io(std::io::Error::other(
+                "buffer sync thread is not accepting staged entries",
+            )));
+        }
 
         if let Some(metrics) = self.metrics.get() {
             metrics.buffer_appends.fetch_add(1, Ordering::Relaxed);
@@ -1052,10 +1280,17 @@ impl BufferShard {
         Ok(())
     }
 
-    pub(super) fn drain_staged(&self) -> Vec<StagedEntry> {
+    pub(super) fn drain_staged_limited(&self) -> Vec<StagedEntry> {
         let mut batch = Vec::new();
+        let mut batch_bytes = 0usize;
         while let Ok(entry) = self.staging_rx.try_recv() {
+            batch_bytes = batch_bytes.saturating_add(entry.payload.len());
             batch.push(entry);
+            if batch.len() >= self.sync_batch_max_entries
+                || batch_bytes >= self.sync_batch_max_bytes
+            {
+                break;
+            }
         }
         batch
     }
@@ -1073,7 +1308,15 @@ impl BufferShard {
         let slot_bytes = pending.disk_len as usize;
         let mut buf = vec![0u8; slot_bytes];
         self.device.read_at(&mut buf, pending.disk_offset)?;
-        let entry = BufferEntry::from_bytes(&buf).ok_or_else(|| {
+        self.decode_hydrated_payload(pending, &buf)
+    }
+
+    fn decode_hydrated_payload(
+        &self,
+        pending: &PendingEntry,
+        bytes: &[u8],
+    ) -> OnyxResult<Arc<[u8]>> {
+        let entry = BufferEntry::from_bytes(bytes).ok_or_else(|| {
             tracing::error!(
                 disk_offset = pending.disk_offset,
                 disk_len = pending.disk_len,
@@ -1086,7 +1329,200 @@ impl BufferShard {
                 pending.disk_offset,
             )))
         })?;
+        if entry.seq != pending.seq
+            || entry.vol_id.as_str() != pending.vol_id.as_str()
+            || entry.start_lba != pending.start_lba
+            || entry.lba_count != pending.lba_count
+            || entry.payload_crc32 != pending.payload_crc32
+            || entry.vol_created_at != pending.vol_created_at
+        {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "buffer entry metadata mismatch during payload hydration: disk_offset={} expected seq={} vol={} lba={} count={} created_at={}",
+                pending.disk_offset,
+                pending.seq,
+                pending.vol_id,
+                pending.start_lba.0,
+                pending.lba_count,
+                pending.vol_created_at,
+            ))));
+        }
         Ok(entry.payload)
+    }
+
+    fn record_lookup_hydrate_metric(&self, start: Instant) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_lookup_hydrate_ns
+                .fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
+            metrics
+                .buffer_lookup_hydrate_ops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn hydrate_missing_payloads_batched(
+        &self,
+        entries: &[Arc<PendingEntry>],
+        record_lookup_metrics: bool,
+    ) -> HashMap<u64, Arc<[u8]>> {
+        let mut hydrated = HashMap::with_capacity(entries.len());
+        if entries.is_empty() {
+            return hydrated;
+        }
+
+        let mut sorted: Vec<_> = entries.to_vec();
+        sorted.sort_by_key(|entry| entry.disk_offset);
+
+        let mut start_idx = 0usize;
+        while start_idx < sorted.len() {
+            let start_offset = sorted[start_idx].disk_offset;
+            let mut span_len = sorted[start_idx].disk_len as u64;
+            let mut end_idx = start_idx + 1;
+
+            while end_idx < sorted.len() {
+                let next = &sorted[end_idx];
+                if next.disk_offset != start_offset.saturating_add(span_len) {
+                    break;
+                }
+                let next_len = next.disk_len as u64;
+                let Some(candidate_len) = span_len.checked_add(next_len) else {
+                    break;
+                };
+                if candidate_len as usize > HYDRATE_BATCH_MAX_BYTES {
+                    break;
+                }
+                span_len = candidate_len;
+                end_idx += 1;
+            }
+
+            let group = &sorted[start_idx..end_idx];
+            if group.len() == 1 || span_len as usize > HYDRATE_BATCH_MAX_BYTES {
+                for entry in group {
+                    let hydrate_started = Instant::now();
+                    let result = self.read_payload_from_disk(entry.as_ref());
+                    if record_lookup_metrics {
+                        self.record_lookup_hydrate_metric(hydrate_started);
+                    }
+                    match result {
+                        Ok(payload) => {
+                            hydrated.insert(entry.seq, payload);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                seq = entry.seq,
+                                error = %e,
+                                "failed to hydrate pending entry payload, evicting corrupt entry"
+                            );
+                            self.evict_corrupt_entry(entry.seq);
+                        }
+                    }
+                }
+                start_idx = end_idx;
+                continue;
+            }
+
+            let Ok(total_len) = usize::try_from(span_len) else {
+                start_idx = end_idx;
+                continue;
+            };
+            let hydrate_started = Instant::now();
+            let mut buf = match AlignedBuf::new(total_len, false) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    tracing::warn!(
+                        start_offset,
+                        span_len,
+                        error = %e,
+                        "batched payload hydration allocation failed; retrying individually"
+                    );
+                    for entry in group {
+                        let one_started = Instant::now();
+                        let result = self.read_payload_from_disk(entry.as_ref());
+                        if record_lookup_metrics {
+                            self.record_lookup_hydrate_metric(one_started);
+                        }
+                        match result {
+                            Ok(payload) => {
+                                hydrated.insert(entry.seq, payload);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    seq = entry.seq,
+                                    error = %e,
+                                    "failed to hydrate pending entry payload, evicting corrupt entry"
+                                );
+                                self.evict_corrupt_entry(entry.seq);
+                            }
+                        }
+                    }
+                    start_idx = end_idx;
+                    continue;
+                }
+            };
+
+            let read_result = self
+                .device
+                .read_at(&mut buf.as_mut_slice()[..total_len], start_offset);
+            if read_result.is_ok() {
+                for entry in group {
+                    let local = (entry.disk_offset - start_offset) as usize;
+                    let end = local + entry.disk_len as usize;
+                    match self.decode_hydrated_payload(entry.as_ref(), &buf.as_slice()[local..end])
+                    {
+                        Ok(payload) => {
+                            hydrated.insert(entry.seq, payload);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                seq = entry.seq,
+                                error = %e,
+                                "failed to parse batched hydrated payload, evicting corrupt entry"
+                            );
+                            self.evict_corrupt_entry(entry.seq);
+                        }
+                    }
+                }
+                if record_lookup_metrics {
+                    self.record_lookup_hydrate_metric(hydrate_started);
+                }
+            } else {
+                let err = read_result.err().unwrap();
+                if record_lookup_metrics {
+                    self.record_lookup_hydrate_metric(hydrate_started);
+                }
+                tracing::warn!(
+                    start_offset,
+                    span_len,
+                    entries = group.len(),
+                    error = %err,
+                    "batched payload hydration read failed; retrying individually"
+                );
+                for entry in group {
+                    let one_started = Instant::now();
+                    let result = self.read_payload_from_disk(entry.as_ref());
+                    if record_lookup_metrics {
+                        self.record_lookup_hydrate_metric(one_started);
+                    }
+                    match result {
+                        Ok(payload) => {
+                            hydrated.insert(entry.seq, payload);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                seq = entry.seq,
+                                error = %e,
+                                "failed to hydrate pending entry payload, evicting corrupt entry"
+                            );
+                            self.evict_corrupt_entry(entry.seq);
+                        }
+                    }
+                }
+            }
+
+            start_idx = end_idx;
+        }
+
+        hydrated
     }
 
     pub(super) fn volatile_payload(&self, seq: u64) -> Option<Arc<[u8]>> {
@@ -1096,9 +1532,14 @@ impl BufferShard {
     }
 
     pub(super) fn remove_volatile_payload(&self, seq: u64) -> Option<Arc<[u8]>> {
-        self.volatile_payloads
-            .remove(&seq)
-            .map(|(_, payload)| payload)
+        self.volatile_payloads.remove(&seq).map(|(_, payload)| {
+            self.volatile_payload_budget.release(payload.len() as u64);
+            payload
+        })
+    }
+
+    pub(super) fn is_seq_inflight(&self, seq: u64) -> bool {
+        self.lifecycle.lock().inflight.contains(&seq)
     }
 
     /// Return a PendingEntry with payload guaranteed present. If the entry
@@ -1111,34 +1552,153 @@ impl BufferShard {
         lba: Lba,
     ) -> OnyxResult<Option<PendingEntry>> {
         let vid = self.intern_vol_id(vol_id);
-        let Some(entry_ref) = self.lba_index.get(&LbaKey { vol_id: vid, lba }) else {
+        self.lookup_hydrated_interned(&vid, lba)
+    }
+
+    pub(super) fn lookup_hydrated_interned(
+        &self,
+        vid: &Arc<str>,
+        lba: Lba,
+    ) -> OnyxResult<Option<PendingEntry>> {
+        if !self.pending_range_maybe_contains_interned(vid, lba, 1) {
+            return Ok(None);
+        }
+
+        let index_started = Instant::now();
+        // Clone the Arc and release the DashMap guard before disk hydration.
+        // Holding lba_index across pread() can stall flusher mark_flushed under
+        // heavy buffered reads.
+        let entry = self
+            .lba_index
+            .get(&LbaKey {
+                vol_id: vid.clone(),
+                lba,
+            })
+            .map(|entry_ref| entry_ref.value().clone());
+        let index_elapsed = Self::elapsed_ns(index_started);
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_lookup_index_ns
+                .fetch_add(index_elapsed, Ordering::Relaxed);
+        }
+        let Some(entry) = entry else {
             return Ok(None);
         };
-        let entry = &*entry_ref;
         if entry.payload.is_some() {
-            return Ok(Some((**entry_ref).clone()));
+            return Ok(Some((*entry).clone()));
         }
         if let Some(payload) = self.volatile_payload(entry.seq) {
-            let mut hydrated = (**entry_ref).clone();
+            let mut hydrated = (*entry).clone();
             hydrated.payload = Some(payload);
             return Ok(Some(hydrated));
         }
+        if self.is_seq_inflight(entry.seq) {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "buffer payload for inflight seq {} is not memory-resident yet",
+                entry.seq
+            ))));
+        }
         // Lazy hydration: read payload from buffer device.
         let seq = entry.seq;
-        match self.read_payload_from_disk(entry) {
+        let hydrate_started = Instant::now();
+        let result = self.read_payload_from_disk(entry.as_ref());
+        let hydrate_elapsed = Self::elapsed_ns(hydrate_started);
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_lookup_hydrate_ns
+                .fetch_add(hydrate_elapsed, Ordering::Relaxed);
+            metrics
+                .buffer_lookup_hydrate_ops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        match result {
             Ok(payload) => {
-                let mut hydrated = (**entry_ref).clone();
+                let mut hydrated = (*entry).clone();
                 hydrated.payload = Some(payload);
                 Ok(Some(hydrated))
             }
             Err(e) => {
                 tracing::warn!(seq, error = %e, "read-path hydration failed, evicting corrupt entry");
-                drop(entry_ref);
                 self.evict_corrupt_entry(seq);
                 // Return None — caller falls through to blockmap/LV3.
                 Ok(None)
             }
         }
+    }
+
+    pub(super) fn lookup_hydrated_range_interned(
+        &self,
+        vid: &Arc<str>,
+        start_lba: Lba,
+        lba_count: u32,
+    ) -> OnyxResult<Vec<Option<PendingEntry>>> {
+        if !self.pending_range_maybe_contains_interned(vid, start_lba, lba_count) {
+            if let Some(metrics) = self.metrics.get() {
+                metrics
+                    .buffer_lookup_index_ns
+                    .fetch_add(Self::elapsed_ns(Instant::now()), Ordering::Relaxed);
+            }
+            return Ok(vec![None; lba_count as usize]);
+        }
+
+        let mut indexed = Vec::with_capacity(lba_count as usize);
+        let index_started = Instant::now();
+        for i in 0..lba_count {
+            let lba = Lba(start_lba.0 + i as u64);
+            let entry = self
+                .lba_index
+                .get(&LbaKey {
+                    vol_id: vid.clone(),
+                    lba,
+                })
+                .map(|entry_ref| entry_ref.value().clone());
+            indexed.push(entry);
+        }
+        let index_elapsed = Self::elapsed_ns(index_started);
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_lookup_index_ns
+                .fetch_add(index_elapsed, Ordering::Relaxed);
+        }
+
+        let mut payloads: HashMap<u64, Arc<[u8]>> = HashMap::new();
+        let mut missing = Vec::new();
+        let mut seen_missing = HashSet::new();
+        let mut missing_inflight_payload = None;
+        for entry in indexed.iter().flatten() {
+            if let Some(payload) = entry.payload.clone() {
+                payloads.entry(entry.seq).or_insert(payload);
+            } else if let Some(payload) = self.volatile_payload(entry.seq) {
+                payloads.entry(entry.seq).or_insert(payload);
+            } else if self.is_seq_inflight(entry.seq) {
+                missing_inflight_payload = Some(entry.seq);
+                break;
+            } else if seen_missing.insert(entry.seq) {
+                missing.push(entry.clone());
+            }
+        }
+        if let Some(seq) = missing_inflight_payload {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "buffer payload for inflight seq {seq} is not memory-resident yet"
+            ))));
+        }
+        payloads.extend(self.hydrate_missing_payloads_batched(&missing, true));
+
+        let mut out = Vec::with_capacity(indexed.len());
+        for entry in indexed {
+            let Some(entry) = entry else {
+                out.push(None);
+                continue;
+            };
+            if let Some(payload) = payloads.get(&entry.seq) {
+                let mut hydrated = (*entry).clone();
+                hydrated.payload = Some(payload.clone());
+                out.push(Some(hydrated));
+            } else {
+                out.push(None);
+            }
+        }
+        Ok(out)
     }
 
     /// Remove LBA index entries for a range so reads see unmapped immediately.
@@ -1320,6 +1880,7 @@ impl BufferShard {
         let Some((_, pending)) = self.pending_entries.remove(&seq) else {
             return;
         };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
         self.remove_volatile_payload(seq);
         let vid = self.intern_vol_id(&pending.vol_id);
         for i in 0..pending.lba_count {
@@ -1330,6 +1891,7 @@ impl BufferShard {
             self.lba_index.remove_if(&key, |_, value| value.seq == seq);
             self.latest_lba_seq.remove_if(&key, |_, &(s, _)| s == seq);
         }
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         if let Some(ref p) = pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }
@@ -1360,11 +1922,11 @@ impl BufferShard {
         );
     }
 
-    /// Return Arc<PendingEntry> with payload hydrated from the buffer device.
-    /// With write-through append, committed entries always have payload=None,
-    /// so this function is the primary hydration path for the flusher.
-    /// max_payload_memory exclusively governs flusher hydration rate.
-    /// Returns None if payload memory limit is exceeded (flusher will retry later).
+    /// Return a detached PendingEntry with payload hydrated from the buffer
+    /// device. The flusher only needs a transient payload copy to build
+    /// CoalesceUnits; installing that copy back into pending_entries/lba_index
+    /// makes the coalescer contend with foreground read lookups and can stall
+    /// the whole flush pipeline under buffered-read pressure.
     pub(super) fn pending_entry_arc_hydrated(&self, seq: u64) -> Option<Arc<PendingEntry>> {
         let entry_ref = self.pending_entries.get(&seq)?;
         let entry = entry_ref.value().clone();
@@ -1377,78 +1939,61 @@ impl BufferShard {
             hydrated.payload = Some(payload);
             return Some(Arc::new(hydrated));
         }
-        // Memory guard: refuse to hydrate if flusher memory budget is exhausted.
-        // The flusher's retry-snapshot mechanism will pick this entry up later
-        // once in-flight entries have been drained and memory is freed.
-        //
-        // EXCEPTION: always allow hydration for the entry at the front of log_order.
-        // That entry blocks reclaim_log_prefix (tail advancement). With write-through
-        // append, all committed payloads are evicted; the flusher hydrates on demand.
-        // If the memory limit prevents re-hydration, the tail never advances.
-        // Exempting the single head-of-queue entry (at most one 128 KB payload over
-        // the limit) breaks the cycle and lets the ring reclaim space.
-        let limit = self.max_payload_memory();
-        if limit > 0 {
-            let current = self.payload_bytes_in_memory.load(Ordering::Relaxed);
-            if current >= limit {
-                let is_head = self.ring.lock().log_order.front().map(|f| f.seq) == Some(seq);
-                if !is_head {
-                    if let Some(metrics) = self.metrics.get() {
-                        metrics
-                            .buffer_hydration_skipped_due_to_mem_limit
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    tracing::debug!(
-                        seq,
-                        current_mb = current / (1024 * 1024),
-                        limit_mb = limit / (1024 * 1024),
-                        "skipping hydration: payload memory limit reached"
-                    );
-                    return None;
-                }
-                if let Some(metrics) = self.metrics.get() {
-                    metrics
-                        .buffer_hydration_head_bypass_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                tracing::debug!(
-                    seq,
-                    current_mb = current / (1024 * 1024),
-                    limit_mb = limit / (1024 * 1024),
-                    "head-of-queue entry: bypassing memory limit to unblock tail"
-                );
-            }
+        if self.is_seq_inflight(seq) {
+            return None;
         }
-        // Lazy hydration: read payload from disk.
+        // Lazy hydration: read payload from disk, but keep it detached from
+        // the shared indices. Coalescer window/channel bounds cap this
+        // transient memory; persistent payload residency remains zero.
         match self.read_payload_from_disk(entry.as_ref()) {
             Ok(payload) => {
-                let payload_len = payload.len() as u64;
                 let mut hydrated = (*entry).clone();
                 hydrated.payload = Some(payload);
-                let hydrated = Arc::new(hydrated);
-                if self.replace_pending_entry_if_current(&entry, hydrated.clone()) {
-                    self.payload_bytes_in_memory
-                        .fetch_add(payload_len, Ordering::Relaxed);
-                    self.replace_lba_index_if_current(&entry, &hydrated);
-                    Some(hydrated)
-                } else {
-                    if let Some(payload) = self.volatile_payload(seq) {
-                        let mut hydrated = (*entry).clone();
-                        hydrated.payload = Some(payload);
-                        Some(Arc::new(hydrated))
-                    } else {
-                        self.pending_entries.get(&seq).and_then(|current| {
-                            current.payload.is_some().then(|| current.value().clone())
-                        })
-                    }
-                }
+                Some(Arc::new(hydrated))
             }
             Err(e) => {
-                tracing::warn!(seq, error = %e, "failed to hydrate pending entry payload, evicting corrupt entry");
+                tracing::debug!(seq, error = %e, "failed to hydrate pending entry payload, evicting corrupt entry");
                 self.evict_corrupt_entry(seq);
                 None
             }
         }
+    }
+
+    pub(super) fn pending_entry_arcs_hydrated(
+        &self,
+        entries: Vec<Arc<PendingEntry>>,
+    ) -> Vec<Arc<PendingEntry>> {
+        if entries.is_empty() {
+            return entries;
+        }
+
+        let mut payloads: HashMap<u64, Arc<[u8]>> = HashMap::with_capacity(entries.len());
+        let mut missing = Vec::new();
+        let mut seen_missing = HashSet::new();
+        for entry in &entries {
+            if let Some(payload) = entry.payload.clone() {
+                payloads.entry(entry.seq).or_insert(payload);
+            } else if let Some(payload) = self.volatile_payload(entry.seq) {
+                payloads.entry(entry.seq).or_insert(payload);
+            } else if self.is_seq_inflight(entry.seq) {
+                continue;
+            } else if seen_missing.insert(entry.seq) {
+                missing.push(entry.clone());
+            }
+        }
+        payloads.extend(self.hydrate_missing_payloads_batched(&missing, false));
+
+        let mut hydrated = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.payload.is_some() {
+                hydrated.push(entry);
+            } else if let Some(payload) = payloads.get(&entry.seq) {
+                let mut with_payload = entry.as_ref().clone();
+                with_payload.payload = Some(payload.clone());
+                hydrated.push(Arc::new(with_payload));
+            }
+        }
+        hydrated
     }
 
     pub(super) fn pending_entries_snapshot(&self) -> Vec<BufferEntry> {
@@ -1469,27 +2014,47 @@ impl BufferShard {
         !self.lifecycle.lock().inflight.contains(&seq)
     }
 
-    pub(super) fn head_pending_entry_arc_hydrated_if_stuck(
-        &self,
-        min_age: Duration,
-    ) -> Option<Arc<PendingEntry>> {
-        let head_seq = self
-            .ring
-            .lock()
-            .log_order
-            .front()
-            .map(|record| record.seq)?;
+    pub(super) fn head_pending_seq_if_stuck(&self, min_age: Duration) -> Option<u64> {
+        let (head_seq, head_became_at) = {
+            let ring = self.ring.lock();
+            (
+                ring.log_order.front().map(|record| record.seq)?,
+                ring.head_became_at,
+            )
+        };
         if !self.is_seq_ready_for_flush(head_seq) {
             return None;
         }
         let pending = self.pending_entries.get(&head_seq)?;
         let has_partial_progress = self.flush_progress.contains_key(&head_seq);
-        let old_enough = pending.enqueued_at.elapsed() >= min_age;
         drop(pending);
+        let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
         if !has_partial_progress && !old_enough {
             return None;
         }
-        self.pending_entry_arc_hydrated(head_seq)
+        Some(head_seq)
+    }
+
+    /// Cheap, non-hydrating diagnostic snapshot for a given seq. Returns
+    /// (lba_count, flushed_count, age_ms, vol_id) so the flusher can correlate
+    /// "head stuck" symptoms with in_flight refcount and per-LBA flush progress
+    /// without paying the hydration cost of `pending_entry_arc_hydrated`.
+    pub(super) fn pending_diag_snapshot(&self, seq: u64) -> Option<(u32, u32, u64, String)> {
+        let entry = self.pending_entries.get(&seq)?;
+        let lba_count = entry.lba_count;
+        let age_ms = entry
+            .enqueued_at
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let vol_id = entry.vol_id.to_string();
+        drop(entry);
+        let flushed_count = self
+            .flush_progress
+            .get(&seq)
+            .map(|set| set.len() as u32)
+            .unwrap_or(0);
+        Some((lba_count, flushed_count, age_ms, vol_id))
     }
 
     pub(super) fn head_seq_debug_state(
@@ -1530,7 +2095,7 @@ impl BufferShard {
     }
 
     /// Memory-only: reclaim ring space, cancel write thread if needed.
-    /// No disk write — metadata commit to RocksDB is the durable record.
+    /// No disk write — metadata commit to metadb is the durable record.
     /// On crash recovery, stale "unflushed" entries are detected by
     /// cross-checking against the blockmap.
     ///
@@ -1629,7 +2194,7 @@ impl BufferShard {
             let vid = self.intern_vol_id(&pending.vol_id);
             self.lba_index.remove_if(
                 &LbaKey {
-                    vol_id: vid,
+                    vol_id: vid.clone(),
                     lba: pending.start_lba,
                 },
                 |_, value| value.seq == seq,
@@ -1637,6 +2202,8 @@ impl BufferShard {
             let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
                 return Ok(());
             };
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
             self.remove_volatile_payload(seq);
             if let Some(ref p) = removed_pending.payload {
                 Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -1672,6 +2239,8 @@ impl BufferShard {
         let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
             return Ok(());
         };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         self.remove_volatile_payload(seq);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -1723,7 +2292,7 @@ impl BufferShard {
     }
 
     pub(super) fn pending_count(&self) -> u64 {
-        self.pending_entries.len() as u64
+        self.pending_count.load(Ordering::Relaxed)
     }
 
     pub(super) fn purge_volume(&self, vol_id: &str) -> OnyxResult<Vec<u64>> {
@@ -1754,6 +2323,9 @@ impl BufferShard {
         let mut removed_entries = Vec::with_capacity(to_purge.len());
         for (seq, _) in &to_purge {
             if let Some((_, pending)) = self.pending_entries.remove(seq) {
+                self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                let vid = self.intern_vol_id(&pending.vol_id);
+                self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
                 self.remove_volatile_payload(*seq);
                 if let Some(ref p) = pending.payload {
                     Self::release_payload_bytes(
@@ -1792,6 +2364,8 @@ impl BufferShard {
         let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
             return Ok(false);
         };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         self.remove_volatile_payload(seq);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);

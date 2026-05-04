@@ -9,7 +9,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 # metadata
-rocksdb = { version = "0.24", features = ["lz4", "zstd"] }
+onyx_metadb = { package = "onyx-metadb", path = "metadb" }
 
 # compression
 lz4_flex = "0.11"
@@ -67,6 +67,10 @@ serial_test = "3"
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
+
+[[bin]]
+name = "onyx-engine-bench"
+path = "src/bin/engine_bench.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk = "0.4"

@@ -26,10 +26,17 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
 
     let config = OnyxConfig {
         meta: MetaConfig {
-            rocksdb_path: Some(meta_dir.path().to_path_buf()),
+            path: Some(meta_dir.path().to_path_buf()),
             block_cache_mb: 8,
             memtable_budget_mb: 0,
+            index_pin_mb: 0,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
             wal_dir: None,
+            dedup_shards: 8,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
         },
         storage: StorageConfig {
             data_device: Some(data_tmp.path().to_path_buf()),
@@ -47,6 +54,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             group_commit_wait_us: 250,
             shards: 1,
             max_memory_mb: 0,
+            ..BufferConfig::default()
         },
         ublk: UblkConfig::default(),
         flush: FlushConfig::default(),
@@ -61,6 +69,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
         dedup: onyx_storage::dedup::config::DedupConfig::default(),
         service: Default::default(),
         ha: Default::default(),
+        threading: Default::default(),
     };
 
     (config, meta_dir, buf_tmp, data_tmp)
@@ -342,8 +351,14 @@ fn engine_status_report_includes_metrics_sections() {
     assert!(report.contains("mode: active"));
     assert!(report.contains("volumes: 1"));
     assert!(report.contains("buffer_pending_entries:"));
-    assert!(report.contains("rocksdb_block_cache_bytes:"));
-    assert!(report.contains("rocksdb_meta_bytes:"));
+    assert!(report.contains("metadb_block_cache_bytes:"));
+    assert!(report.contains("metadb_meta_bytes:"));
+    assert!(report.contains("metadb_state:"));
+    assert!(report.contains("metadb_cache:"));
+    assert!(report.contains("metadb_commit:"));
+    assert!(report.contains("metadb_wal:"));
+    assert!(report.contains("metadb_range_delete:"));
+    assert!(report.contains("metadb_cleanup:"));
     assert!(report.contains("volume_ops:"));
     assert!(report.contains("read_path:"));
     assert!(report.contains("lv3_io:"));

@@ -271,8 +271,7 @@ fn heartbeat_writer_uring_writes_periodically() {
 
     let session = Arc::new(IoUringSession::new(8).unwrap());
     let hb_dev = RawDevice::open(_tmp.path()).unwrap();
-    let mut writer =
-        HeartbeatWriter::start_uring(hb_dev, 99, Duration::from_millis(80), session);
+    let mut writer = HeartbeatWriter::start_uring(hb_dev, 99, Duration::from_millis(80), session);
 
     std::thread::sleep(Duration::from_millis(300));
     writer.stop();

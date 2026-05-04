@@ -1,0 +1,120 @@
+# Detailed profile for the RHEL NVMe development host.
+#
+# Expected layout:
+#   /dev/nvme0n1 -> XFS filesystem mounted at /mnt/onyx-meta
+#   /dev/md/onyx-lv2 -> 4x NVMe RAID0 LV2 write buffer device
+#   /dev/nvme2n1 -> raw LV3 data device
+#
+# This machine is intentionally treated as a disposable perf/dev box.
+#
+# Memory ownership on the 250 GiB host:
+#   metadb read cache:     64 GiB
+#   metadb memtables:       8 GiB
+#   metadb L2P index pin:   8 GiB
+#   buffer payload cache:  32 GiB
+#   buffer pre-sync bytes: 48 GiB
+# This keeps the hot metadata + hydrated buffer path in RAM while leaving
+# headroom for pending-entry indexes, kernel, ublk/io_uring, XFS, test
+# harnesses, and compaction.
+
+[meta]
+path = "/mnt/onyx-meta/metadb"
+wal_dir = "/mnt/onyx-meta/wal"
+block_cache_mb = 65536
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 5000
+group_commit_timeout_us = 1
+dedup_shards = 8
+dedup_cuckoo_buckets = 64000000
+dedup_l1_cache_entries = 256000
+
+[storage]
+data_device = "/dev/nvme2n1"
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 16
+
+[buffer]
+device = "/dev/md/onyx-lv2"
+capacity_mb = 1048576
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+shards = 16
+max_memory_mb = 32768
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+
+[dedup]
+enabled = true
+# Per buffer shard. With 16 shards this yields 32 foreground dedup workers.
+workers = 2
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 0
+register_batch_max_entries = 2048
+register_batch_wait_us = 500
+rescan_interval_ms = 30000
+max_rescan_per_cycle = 4096
+
+[threading]
+enabled = true
+# RHEL NVMe dev host: 96 logical CPUs split across two NUMA nodes as even/odd
+# siblings. Keep frontend reads on the low cores, compression/dedup in the
+# middle, and metadata/background work on the high cores so perf samples are
+# not dominated by scheduler drift.
+ublk_cpus = "0-31"
+read_pool_cpus = "32-47"
+buffer_sync_cpus = "48-55"
+flusher_coalesce_cpus = "56-63"
+flusher_dedup_cpus = "64-79"
+flusher_compress_cpus = "80-87"
+flusher_writer_cpus = "88-91"
+flusher_dedup_register_cpus = "88-91"
+flusher_cleanup_cpus = "92-95"
+metadb_wal_cpus = "92"
+metadb_l2p_apply_cpus = "64-79"
+metadb_refcount_apply_cpus = "88-91"
+metadb_dedup_apply_cpus = "88-91"
+metadb_checkpoint_cpus = "92-95"
+background_cpus = "92-95"
+
+[service]
+socket_path = "/tmp/onyx-storage-nvme.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30

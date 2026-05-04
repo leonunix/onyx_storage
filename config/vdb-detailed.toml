@@ -1,7 +1,7 @@
 # Detailed single-disk test profile for a dedicated `/dev/vdb`.
 #
 # Expected layout on this host:
-#   /dev/vdb1 -> filesystem for RocksDB metadata
+#   /dev/vdb1 -> filesystem for metadb metadata
 #   /dev/vdb2 -> raw buffer device
 #   /dev/vdb3 -> raw data device
 #
@@ -18,22 +18,43 @@
 #   usable buffer capacity comes from the size of `buffer.device`.
 
 [meta]
-rocksdb_path = "/mnt/onyx-vdb-meta/rocksdb"
-# Shared RocksDB block cache across all CFs (blockmap + refcount + dedup_*).
+path = "/mnt/onyx-vdb-meta/metadb"
+# Shared metadb block cache across all CFs (blockmap + refcount + dedup_*).
 # Index + filter blocks are cached inside this budget too, so this is the hard
-# upper bound on RocksDB read-side memory. Scale with host RAM and working set
+# upper bound on metadb read-side memory. Scale with host RAM and working set
 # (e.g. 256 GiB box → 16384–32768; test box → 512–1024).
-block_cache_mb = 1024
+block_cache_mb = 4096
 # Total memtable budget across all CFs (WriteBufferManager). 0 = auto = half
 # of block_cache_mb. Raise for write-heavy workloads, lower for read-heavy.
-memtable_budget_mb = 0
+# Pinned explicitly here so it doesn't track block_cache_mb / 2 = 2 GiB.
+memtable_budget_mb = 256
+# Index-page pin budget for the L2P paged radix. Lives outside the LRU so
+# random L2P gets never miss on inner nodes. 1 GiB covers ~hundreds of GiB
+# of leaf data; raise on large-memory boxes.
+index_pin_mb = 1024
+# Keep dedup all-miss lookups from turning into random SST reads as the index
+# grows. 16 bits/entry costs modest metadata space on the small test box while
+# materially lowering bloom false positives.
+lsm_bloom_bits_per_entry = 16
+# Background metadb checkpoint cadence. WAL fsync on each metadb commit
+# already makes user writes durable; checkpoints mainly prune WAL and cap
+# recovery time, so keep them off the 10-50ms buffer watermark cadence.
+checkpoint_interval_ms = 5000
+# WAL group-commit coalescing window. The WAL writer still drains already
+# queued commits opportunistically; this only caps how long it waits for new
+# siblings before fsyncing.
+group_commit_timeout_us = 1
 wal_dir = "/mnt/onyx-vdb-meta/wal"
+dedup_shards = 8
+dedup_cuckoo_buckets = 1000000
+dedup_l1_cache_entries = 256000
 
 [storage]
 data_device = "/dev/vdb3"
 block_size = 4096
 use_hugepages = false
 default_compression = "Lz4"
+read_pool_workers = 8
 
 [buffer]
 device = "/dev/vdb2"
@@ -46,12 +67,15 @@ shards = 4
 nr_queues = 4
 queue_depth = 128
 io_buf_bytes = 1048576
+queue_workers = 1
 
 [flush]
 # per flush lane; total compress workers = shards × compress_workers
 compress_workers = 2
-coalesce_max_raw_bytes = 131072
-coalesce_max_lbas = 32
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
+packed_meta_batch_max_lbas = 1024
 
 [engine]
 zone_count = 16
@@ -69,6 +93,13 @@ max_rewrite_per_cycle = 64
 enabled = true
 workers = 4
 buffer_skip_threshold_pct = 90
+# Optional pending-depth gate for low-latency LV2 devices.
+# 0 = dedup-first: only buffer fill percentage can defer foreground dedup.
+# Set e.g. 2048 on weak/virtual buffer devices if buffer-hit hydration starts
+# hurting read latency before fill% reaches buffer_skip_threshold_pct.
+pending_skip_threshold_entries = 0
+register_batch_max_entries = 1024
+register_batch_wait_us = 500
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 256
 
