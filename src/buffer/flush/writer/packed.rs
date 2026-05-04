@@ -27,6 +27,7 @@ fn commit_packed_meta_batch(
     metrics: &EngineMetrics,
     results: &mut [OnyxResult<()>],
     actual_old_pba_meta: &mut HashMap<Pba, (u32, u32)>,
+    dedup_register_tx: &Sender<Vec<DedupRegistration>>,
 ) -> bool {
     if batch_slots.is_empty() {
         return false;
@@ -41,20 +42,19 @@ fn commit_packed_meta_batch(
             combined_dedup_registrations.extend_from_slice(&sm.dedup_registrations);
         }
     }
-    let dedup_entries =
-        BufferFlusher::dedup_entries_from_registrations(&combined_dedup_registrations);
-
     match meta.atomic_batch_write_packed_with_dedup(
         &combined_batch_values,
         sealed_slots[batch_slots[0]].pba,
         0,
-        &dedup_entries,
+        &[],
     ) {
         Ok(dead) => {
             merge_dead_pbas(actual_old_pba_meta, dead);
-            BufferFlusher::record_inline_dedup_register_metrics(
+            BufferFlusher::enqueue_dedup_registrations(
+                meta,
                 metrics,
-                combined_dedup_registrations.len(),
+                dedup_register_tx,
+                combined_dedup_registrations,
             );
         }
         Err(e) => {
@@ -86,7 +86,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
 
@@ -245,7 +245,7 @@ impl BufferFlusher {
             &batch_values,
             sealed.pba,
             total_refcount,
-            &Self::dedup_entries_from_registrations(&dedup_registrations),
+            &[],
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -256,7 +256,7 @@ impl BufferFlusher {
             }
         };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-        Self::record_inline_dedup_register_metrics(metrics, dedup_registrations.len());
+        Self::enqueue_dedup_registrations(meta, metrics, dedup_register_tx, dedup_registrations);
 
         if !actual_old_pba_meta.is_empty() {
             let dead: Vec<(Pba, u32)> = actual_old_pba_meta
@@ -330,7 +330,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
-        _dedup_register_tx: &Sender<Vec<DedupRegistration>>,
+        dedup_register_tx: &Sender<Vec<DedupRegistration>>,
         packed_meta_batch_max_lbas: usize,
     ) -> Vec<OnyxResult<()>> {
         if sealed_slots.is_empty() {
@@ -557,6 +557,7 @@ impl BufferFlusher {
                     metrics,
                     &mut results,
                     &mut actual_old_pba_meta,
+                    dedup_register_tx,
                 ) {
                     meta_commits += 1;
                 }
@@ -575,6 +576,7 @@ impl BufferFlusher {
                     metrics,
                     &mut results,
                     &mut actual_old_pba_meta,
+                    dedup_register_tx,
                 ) {
                     meta_commits += 1;
                 }
@@ -590,6 +592,7 @@ impl BufferFlusher {
             metrics,
             &mut results,
             &mut actual_old_pba_meta,
+            dedup_register_tx,
         ) {
             meta_commits += 1;
         }

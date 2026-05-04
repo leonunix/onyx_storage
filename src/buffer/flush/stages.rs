@@ -107,7 +107,7 @@ impl BufferFlusher {
                                 EnqueuePendingSeq::WindowFull => "WindowFull".to_string(),
                                 EnqueuePendingSeq::Skipped(r) => format!("Skipped({:?})", r),
                             };
-                            tracing::warn!(
+                            tracing::debug!(
                                 shard = shard_idx,
                                 seq,
                                 age_ms,

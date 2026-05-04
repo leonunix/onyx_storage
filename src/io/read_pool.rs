@@ -61,6 +61,7 @@ const REQUEST_CHANNEL_CAP: usize = 128;
 struct ReadRequest {
     mapping: BlockmapValue,
     reply: Sender<OnyxResult<Vec<u8>>>,
+    enqueued_at: Instant,
     /// `false` → worker returns one 4 KB LBA at `mapping.offset_in_unit`
     /// (legacy single-LBA path). `true` → worker returns the full decoded
     /// unit payload (`unit_original_size` bytes) so the caller can fan out
@@ -224,6 +225,7 @@ impl ReadPool {
             .send(ReadRequest {
                 mapping,
                 reply: reply_tx,
+                enqueued_at: Instant::now(),
                 return_unit,
                 raw_extent: None,
             })
@@ -246,6 +248,7 @@ impl ReadPool {
             .send(ReadRequest {
                 mapping: first,
                 reply: reply_tx,
+                enqueued_at: Instant::now(),
                 return_unit: true,
                 raw_extent: Some(mappings),
             })
@@ -296,7 +299,7 @@ struct WorkerCtx {
 /// five fresh `Vec`s per loop turn.
 #[derive(Default)]
 struct BatchScratch {
-    bufs: Vec<AlignedBuf>,
+    bufs: Vec<ReadBuffer>,
     ops: Vec<UringOp>,
     requests: Vec<ReadRequest>,
     expected: Vec<u32>,
@@ -315,12 +318,31 @@ impl BatchScratch {
     }
 
     fn clear(&mut self) {
-        self.bufs.clear();
         self.ops.clear();
         self.requests.clear();
         self.expected.clear();
         self.offsets.clear();
     }
+
+    fn prepare_buffer(
+        &mut self,
+        slot: usize,
+        read_size: usize,
+        use_hugepages: bool,
+    ) -> OnyxResult<&mut AlignedBuf> {
+        if slot == self.bufs.len() {
+            self.bufs.push(ReadBuffer {
+                buf: AlignedBuf::new(read_size, use_hugepages)?,
+            });
+        } else if self.bufs[slot].buf.len() < read_size {
+            self.bufs[slot].buf = AlignedBuf::new(read_size, use_hugepages)?;
+        }
+        Ok(&mut self.bufs[slot].buf)
+    }
+}
+
+struct ReadBuffer {
+    buf: AlignedBuf,
 }
 
 fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
@@ -328,16 +350,23 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
     let mut batch: Vec<ReadRequest> = Vec::with_capacity(BATCH_MAX);
     loop {
         let first = match rx.recv() {
-            Ok(req) => req,
+            Ok(req) => {
+                record_queue_wait(&ctx.metrics, &req);
+                req
+            }
             Err(_) => return,
         };
         batch.clear();
         batch.push(first);
+        let coalesce_start = Instant::now();
         let deadline = Instant::now() + BATCH_COALESCE_WINDOW;
         loop {
             while batch.len() < BATCH_MAX {
                 match rx.try_recv() {
-                    Ok(req) => batch.push(req),
+                    Ok(req) => {
+                        record_queue_wait(&ctx.metrics, &req);
+                        batch.push(req);
+                    }
                     Err(_) => break,
                 }
             }
@@ -349,10 +378,16 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
                 break;
             }
             match rx.recv_timeout(deadline.saturating_duration_since(now)) {
-                Ok(req) => batch.push(req),
+                Ok(req) => {
+                    record_queue_wait(&ctx.metrics, &req);
+                    batch.push(req);
+                }
                 Err(_) => break,
             }
         }
+        ctx.metrics
+            .read_pool_coalesce_wait_ns
+            .fetch_add(elapsed_ns(coalesce_start), Ordering::Relaxed);
         process_batch(&ctx, &mut scratch, &mut batch);
     }
 }
@@ -360,6 +395,16 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
 fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<ReadRequest>) {
     let bs = ctx.block_size as usize;
     scratch.clear();
+    let request_count = batch.len() as u64;
+    ctx.metrics
+        .read_pool_requests
+        .fetch_add(request_count, Ordering::Relaxed);
+    ctx.metrics
+        .read_pool_batches
+        .fetch_add(1, Ordering::Relaxed);
+    ctx.metrics
+        .read_pool_batch_ops
+        .fetch_add(request_count, Ordering::Relaxed);
 
     for req in batch.drain(..) {
         let read_size = req.read_size(bs);
@@ -372,15 +417,19 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         let pba = req.start_pba();
         let offset = ctx.base_offset + (pba.0 + ctx.pba_offset) * ctx.block_size as u64;
 
-        let mut buf = match AlignedBuf::new(read_size, ctx.use_hugepages) {
+        let slot = scratch.requests.len();
+        let alloc_start = Instant::now();
+        let buf = match scratch.prepare_buffer(slot, read_size, ctx.use_hugepages) {
             Ok(b) => b,
             Err(e) => {
                 let _ = req.reply.send(Err(e));
                 continue;
             }
         };
+        ctx.metrics
+            .read_pool_alloc_ns
+            .fetch_add(elapsed_ns(alloc_start), Ordering::Relaxed);
         let ptr = buf.as_mut_ptr();
-        scratch.bufs.push(buf);
         scratch.ops.push(UringOp::Read {
             fd: ctx.fd,
             ptr,
@@ -398,10 +447,14 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
 
     // Single io_uring_enter for the whole batch — kernel processes the SQEs
     // in parallel, the worker waits for every CQE before harvesting.
+    let submit_start = Instant::now();
     let cqes = match unsafe { ctx.ring.submit_batch(&scratch.ops) } {
         Ok(c) => c,
         Err(e) => {
-            for req in scratch.requests.drain(..) {
+            ctx.metrics
+                .read_pool_submit_wait_ns
+                .fetch_add(elapsed_ns(submit_start), Ordering::Relaxed);
+            for req in &scratch.requests {
                 let _ = req
                     .reply
                     .send(Err(OnyxError::Io(std::io::Error::other(format!(
@@ -411,14 +464,17 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
             return;
         }
     };
+    ctx.metrics
+        .read_pool_submit_wait_ns
+        .fetch_add(elapsed_ns(submit_start), Ordering::Relaxed);
 
-    let bufs = std::mem::take(&mut scratch.bufs);
-    let requests = std::mem::take(&mut scratch.requests);
-    for ((req, buf), (i, exp_bytes)) in requests
-        .into_iter()
-        .zip(bufs.into_iter())
-        .zip(scratch.expected.iter().copied().enumerate())
+    for (i, (req, exp_bytes)) in scratch
+        .requests
+        .iter()
+        .zip(scratch.expected.iter().copied())
+        .enumerate()
     {
+        let buf = &scratch.bufs[i].buf;
         let cqe = &cqes[i];
         let offset = scratch.offsets[i];
         if let Some(errno) = cqe.errno() {
@@ -448,6 +504,7 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         //   return_unit=false: slice out a single 4 KB LBA (legacy).
         //   return_unit=true:  hand back the full decoded unit so the caller
         //                      can fan out multiple LBAs from one IO.
+        let decode_start = Instant::now();
         let result = if let Some(mappings) = req.raw_extent.as_ref() {
             decode_raw_extent(buf.as_slice(), mappings, &ctx.metrics)
         } else if req.return_unit {
@@ -456,8 +513,24 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         } else {
             extract_lba_from_compressed(buf.as_slice(), &req.mapping, &ctx.metrics)
         };
+        ctx.metrics
+            .read_pool_decode_ns
+            .fetch_add(elapsed_ns(decode_start), Ordering::Relaxed);
         let _ = req.reply.send(result);
     }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos() as u64
+}
+
+fn record_queue_wait(metrics: &EngineMetrics, req: &ReadRequest) {
+    metrics.read_pool_queue_wait_ns.fetch_add(
+        Instant::now()
+            .saturating_duration_since(req.enqueued_at)
+            .as_nanos() as u64,
+        Ordering::Relaxed,
+    );
 }
 
 fn decode_raw_extent(

@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::engine::OnyxEngine;
-use onyx_storage::metrics::EngineMetricsSnapshot;
+use onyx_storage::metrics::{EngineMetricsSnapshot, MetaMemorySnapshot};
 use onyx_storage::types::{CompressionAlgo, BLOCK_SIZE};
 
 #[derive(Debug, Parser)]
@@ -172,12 +172,20 @@ fn main() -> Result<()> {
         }
     }
 
+    let status_before = engine.status_snapshot()?;
     let before = engine.metrics_snapshot();
-    let pending_before = engine.status_snapshot()?.buffer_pending_entries;
+    let pending_before = status_before.buffer_pending_entries;
+    let meta_before = status_before.metadb_memory;
     let started = Instant::now();
     let (stats, samples) = run_mixed(&engine, &cli)?;
     let elapsed = started.elapsed();
-    let pending_after = engine.status_snapshot()?.buffer_pending_entries;
+    let status_after = engine.status_snapshot()?;
+    let pending_after = status_after.buffer_pending_entries;
+    let meta_delta = meta_before.and_then(|before| {
+        status_after
+            .metadb_memory
+            .map(|after| after.saturating_sub(&before))
+    });
     let metrics = engine.metrics_snapshot().saturating_sub(&before);
 
     print_report(
@@ -188,6 +196,7 @@ fn main() -> Result<()> {
         pending_before,
         pending_after,
         &metrics,
+        meta_delta.as_ref(),
     );
     engine.shutdown()?;
     Ok(())
@@ -400,6 +409,7 @@ fn print_report(
     pending_before: Option<u64>,
     pending_after: Option<u64>,
     metrics: &EngineMetricsSnapshot,
+    meta: Option<&MetaMemorySnapshot>,
 ) {
     samples.read_ns.sort_unstable();
     samples.write_ns.sort_unstable();
@@ -408,6 +418,17 @@ fn print_report(
     let write_iops = stats.write_ops as f64 / secs;
     let total_iops = stats.total_ops() as f64 / secs;
     let mibps = stats.total_bytes() as f64 / 1024.0 / 1024.0 / secs;
+    let avg = |num: u64, den: u64| -> f64 {
+        if den == 0 {
+            0.0
+        } else {
+            num as f64 / den as f64
+        }
+    };
+    let mapped_lbas = metrics.read_lv3_hits;
+    let lv3_bytes_per_lba = avg(metrics.lv3_read_compressed_bytes, mapped_lbas);
+    let lv3_reads_per_submit = avg(metrics.lv3_read_ops, metrics.read_submit_calls);
+    let read_pool_batch_avg = avg(metrics.read_pool_batch_ops, metrics.read_pool_batches);
 
     println!("{{");
     println!("  \"kind\": \"onyx-engine-bench\",");
@@ -456,7 +477,41 @@ fn print_report(
     );
     println!("  \"read_buffer_hits\": {},", metrics.read_buffer_hits);
     println!("  \"read_lv3_hits\": {},", metrics.read_lv3_hits);
+    println!("  \"lv3_read_ops\": {},", metrics.lv3_read_ops);
+    println!(
+        "  \"lv3_read_compressed_bytes\": {},",
+        metrics.lv3_read_compressed_bytes
+    );
+    println!(
+        "  \"lv3_read_bytes_per_mapped_lba\": {:.3},",
+        lv3_bytes_per_lba
+    );
+    println!("  \"lv3_reads_per_submit\": {:.3},", lv3_reads_per_submit);
     println!("  \"read_unmapped\": {},", metrics.read_unmapped);
+    println!("  \"read_pool_requests\": {},", metrics.read_pool_requests);
+    println!("  \"read_pool_batches\": {},", metrics.read_pool_batches);
+    println!(
+        "  \"read_pool_batch_ops\": {},",
+        metrics.read_pool_batch_ops
+    );
+    println!("  \"read_pool_batch_avg\": {:.3},", read_pool_batch_avg);
+    println!(
+        "  \"read_pool_queue_wait_ns\": {},",
+        metrics.read_pool_queue_wait_ns
+    );
+    println!(
+        "  \"read_pool_coalesce_wait_ns\": {},",
+        metrics.read_pool_coalesce_wait_ns
+    );
+    println!("  \"read_pool_alloc_ns\": {},", metrics.read_pool_alloc_ns);
+    println!(
+        "  \"read_pool_submit_wait_ns\": {},",
+        metrics.read_pool_submit_wait_ns
+    );
+    println!(
+        "  \"read_pool_decode_ns\": {},",
+        metrics.read_pool_decode_ns
+    );
     println!("  \"dedup_lookups\": {},", metrics.dedup_lookup_ops);
     println!("  \"dedup_lookup_ns\": {},", metrics.dedup_lookup_ns);
     println!("  \"dedup_misses\": {},", metrics.dedup_misses);
@@ -470,8 +525,357 @@ fn print_report(
         metrics.flush_writer_meta_ns
     );
     println!("  \"flush_errors\": {},", metrics.flush_errors);
-    println!("  \"read_crc_errors\": {}", metrics.read_crc_errors);
+    println!("  \"read_crc_errors\": {},", metrics.read_crc_errors);
+    print_meta_report(meta);
     println!("}}");
+}
+
+fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
+    let Some(meta) = meta else {
+        println!("  \"metadb_available\": false");
+        return;
+    };
+    println!("  \"metadb_available\": true,");
+    println!("  \"metadb_commit_success\": {},", meta.commit_success);
+    println!("  \"metadb_commit_ops\": {},", meta.commit_ops);
+    println!("  \"metadb_commit_total_us\": {},", meta.commit_total_us);
+    println!(
+        "  \"metadb_commit_total_avg_us\": {:.3},",
+        avg_u64(meta.commit_total_us, meta.commit_success)
+    );
+    println!(
+        "  \"metadb_commit_total_max_us\": {},",
+        meta.commit_total_max_us
+    );
+    println!(
+        "  \"metadb_commit_wal_submit_us\": {},",
+        meta.commit_wal_submit_us
+    );
+    println!(
+        "  \"metadb_commit_wal_submit_avg_us\": {:.3},",
+        avg_u64(meta.commit_wal_submit_us, meta.commit_success)
+    );
+    println!(
+        "  \"metadb_commit_wal_submit_max_us\": {},",
+        meta.commit_wal_submit_max_us
+    );
+    println!(
+        "  \"metadb_commit_apply_wait_us\": {},",
+        meta.commit_apply_wait_us
+    );
+    println!(
+        "  \"metadb_commit_apply_wait_avg_us\": {:.3},",
+        avg_u64(meta.commit_apply_wait_us, meta.commit_success)
+    );
+    println!(
+        "  \"metadb_commit_apply_wait_max_us\": {},",
+        meta.commit_apply_wait_max_us
+    );
+    println!(
+        "  \"metadb_commit_apply_gate_wait_us\": {},",
+        meta.commit_apply_gate_wait_us
+    );
+    println!(
+        "  \"metadb_commit_apply_gate_wait_avg_us\": {:.3},",
+        avg_u64(meta.commit_apply_gate_wait_us, meta.commit_success)
+    );
+    println!(
+        "  \"metadb_commit_apply_gate_wait_max_us\": {},",
+        meta.commit_apply_gate_wait_max_us
+    );
+    println!("  \"metadb_commit_apply_us\": {},", meta.commit_apply_us);
+    println!(
+        "  \"metadb_commit_apply_avg_us\": {:.3},",
+        avg_u64(meta.commit_apply_us, meta.commit_success)
+    );
+    println!(
+        "  \"metadb_commit_apply_max_us\": {},",
+        meta.commit_apply_max_us
+    );
+    println!(
+        "  \"metadb_commit_apply_l2p_wait_us\": {},",
+        meta.commit_apply_l2p_wait_us
+    );
+    println!(
+        "  \"metadb_commit_apply_rc_wait_us\": {},",
+        meta.commit_apply_rc_wait_us
+    );
+    println!(
+        "  \"metadb_commit_apply_dedup_wait_us\": {},",
+        meta.commit_apply_dedup_wait_us
+    );
+    println!("  \"metadb_wal_submit_calls\": {},", meta.wal_submit_calls);
+    println!(
+        "  \"metadb_wal_submit_wait_us\": {},",
+        meta.wal_submit_wait_us
+    );
+    println!(
+        "  \"metadb_wal_submit_wait_avg_us\": {:.3},",
+        avg_u64(meta.wal_submit_wait_us, meta.wal_submit_calls)
+    );
+    println!(
+        "  \"metadb_wal_submit_wait_max_us\": {},",
+        meta.wal_submit_wait_max_us
+    );
+    println!("  \"metadb_wal_batches\": {},", meta.wal_batches);
+    println!("  \"metadb_wal_records\": {},", meta.wal_records);
+    println!(
+        "  \"metadb_wal_records_per_batch\": {:.3},",
+        avg_u64(meta.wal_records, meta.wal_batches)
+    );
+    println!("  \"metadb_wal_bytes\": {},", meta.wal_bytes);
+    println!("  \"metadb_wal_fsyncs\": {},", meta.wal_fsyncs);
+    println!("  \"metadb_wal_write_us\": {},", meta.wal_write_us);
+    println!(
+        "  \"metadb_wal_write_avg_us\": {:.3},",
+        avg_u64(meta.wal_write_us, meta.wal_batches)
+    );
+    println!("  \"metadb_wal_write_max_us\": {},", meta.wal_write_max_us);
+    println!("  \"metadb_wal_fsync_us\": {},", meta.wal_fsync_us);
+    println!(
+        "  \"metadb_wal_fsync_avg_us\": {:.3},",
+        avg_u64(meta.wal_fsync_us, meta.wal_fsyncs)
+    );
+    println!("  \"metadb_wal_fsync_max_us\": {},", meta.wal_fsync_max_us);
+    println!(
+        "  \"metadb_wal_batch_records_max\": {},",
+        meta.wal_batch_records_max
+    );
+    println!(
+        "  \"metadb_apply_l2p_remap_count\": {},",
+        meta.apply_l2p_remap_count
+    );
+    println!(
+        "  \"metadb_apply_l2p_remap_us\": {},",
+        meta.apply_l2p_remap_us
+    );
+    println!(
+        "  \"metadb_apply_l2p_remap_avg_us\": {:.3},",
+        avg_u64(meta.apply_l2p_remap_us, meta.apply_l2p_remap_count)
+    );
+    println!(
+        "  \"metadb_apply_l2p_remap_max_us\": {},",
+        meta.apply_l2p_remap_max_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_count\": {},",
+        meta.apply_refcount_count
+    );
+    println!(
+        "  \"metadb_apply_refcount_us\": {},",
+        meta.apply_refcount_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_avg_us\": {:.3},",
+        avg_u64(meta.apply_refcount_us, meta.apply_refcount_count)
+    );
+    println!(
+        "  \"metadb_apply_refcount_max_us\": {},",
+        meta.apply_refcount_max_us
+    );
+    println!(
+        "  \"metadb_apply_dedup_count\": {},",
+        meta.apply_dedup_count
+    );
+    println!("  \"metadb_apply_dedup_us\": {},", meta.apply_dedup_us);
+    println!(
+        "  \"metadb_apply_dedup_avg_us\": {:.3},",
+        avg_u64(meta.apply_dedup_us, meta.apply_dedup_count)
+    );
+    println!(
+        "  \"metadb_apply_dedup_max_us\": {},",
+        meta.apply_dedup_max_us
+    );
+    println!("  \"metadb_dedup_lane_tasks\": {},", meta.dedup_lane_tasks);
+    println!("  \"metadb_dedup_lane_ops\": {},", meta.dedup_lane_ops);
+    println!(
+        "  \"metadb_dedup_lane_ops_per_task\": {:.3},",
+        avg_u64(meta.dedup_lane_ops, meta.dedup_lane_tasks)
+    );
+    println!(
+        "  \"metadb_dedup_lane_ready_queue_wait_us\": {},",
+        meta.dedup_lane_ready_queue_wait_us
+    );
+    println!(
+        "  \"metadb_dedup_lane_ready_queue_wait_avg_us\": {:.3},",
+        avg_u64(meta.dedup_lane_ready_queue_wait_us, meta.dedup_lane_tasks)
+    );
+    println!(
+        "  \"metadb_dedup_lane_ready_queue_wait_max_us\": {},",
+        meta.dedup_lane_ready_queue_wait_max_us
+    );
+    println!(
+        "  \"metadb_dedup_lane_exec_us\": {},",
+        meta.dedup_lane_exec_us
+    );
+    println!(
+        "  \"metadb_dedup_lane_exec_avg_us\": {:.3},",
+        avg_u64(meta.dedup_lane_exec_us, meta.dedup_lane_tasks)
+    );
+    println!(
+        "  \"metadb_dedup_lane_exec_max_us\": {},",
+        meta.dedup_lane_exec_max_us
+    );
+    println!(
+        "  \"metadb_dedup_forward_put_count\": {},",
+        meta.dedup_apply_forward_put_count
+    );
+    println!(
+        "  \"metadb_dedup_forward_put_us\": {},",
+        meta.dedup_apply_forward_put_us
+    );
+    println!(
+        "  \"metadb_dedup_forward_put_avg_us\": {:.3},",
+        avg_u64(
+            meta.dedup_apply_forward_put_us,
+            meta.dedup_apply_forward_put_count
+        )
+    );
+    println!(
+        "  \"metadb_dedup_forward_put_max_us\": {},",
+        meta.dedup_apply_forward_put_max_us
+    );
+    println!(
+        "  \"metadb_dedup_forward_delete_count\": {},",
+        meta.dedup_apply_forward_delete_count
+    );
+    println!(
+        "  \"metadb_dedup_forward_delete_us\": {},",
+        meta.dedup_apply_forward_delete_us
+    );
+    println!(
+        "  \"metadb_dedup_reverse_put_count\": {},",
+        meta.dedup_apply_reverse_put_count
+    );
+    println!(
+        "  \"metadb_dedup_reverse_put_us\": {},",
+        meta.dedup_apply_reverse_put_us
+    );
+    println!(
+        "  \"metadb_dedup_reverse_put_avg_us\": {:.3},",
+        avg_u64(
+            meta.dedup_apply_reverse_put_us,
+            meta.dedup_apply_reverse_put_count
+        )
+    );
+    println!(
+        "  \"metadb_dedup_reverse_put_max_us\": {},",
+        meta.dedup_apply_reverse_put_max_us
+    );
+    println!(
+        "  \"metadb_dedup_reverse_delete_count\": {},",
+        meta.dedup_apply_reverse_delete_count
+    );
+    println!(
+        "  \"metadb_dedup_reverse_delete_us\": {},",
+        meta.dedup_apply_reverse_delete_us
+    );
+    println!(
+        "  \"metadb_dedup_reverse_delete_avg_us\": {:.3},",
+        avg_u64(
+            meta.dedup_apply_reverse_delete_us,
+            meta.dedup_apply_reverse_delete_count
+        )
+    );
+    println!(
+        "  \"metadb_dedup_reverse_delete_max_us\": {},",
+        meta.dedup_apply_reverse_delete_max_us
+    );
+    println!("  \"metadb_l2p_get_calls\": {},", meta.l2p_get_calls);
+    println!(
+        "  \"metadb_l2p_get_lock_wait_us\": {},",
+        meta.l2p_get_lock_wait_us
+    );
+    println!(
+        "  \"metadb_l2p_get_lock_wait_avg_us\": {:.3},",
+        avg_u64(meta.l2p_get_lock_wait_us, meta.l2p_get_calls)
+    );
+    println!(
+        "  \"metadb_l2p_get_lock_wait_max_us\": {},",
+        meta.l2p_get_lock_wait_max_us
+    );
+    println!(
+        "  \"metadb_l2p_get_tree_walk_us\": {},",
+        meta.l2p_get_tree_walk_us
+    );
+    println!(
+        "  \"metadb_l2p_get_tree_walk_avg_us\": {:.3},",
+        avg_u64(meta.l2p_get_tree_walk_us, meta.l2p_get_calls)
+    );
+    println!(
+        "  \"metadb_l2p_get_tree_walk_max_us\": {},",
+        meta.l2p_get_tree_walk_max_us
+    );
+    println!(
+        "  \"metadb_l2p_multi_get_calls\": {},",
+        meta.l2p_multi_get_calls
+    );
+    println!(
+        "  \"metadb_l2p_multi_get_lbas\": {},",
+        meta.l2p_multi_get_lbas
+    );
+    println!(
+        "  \"metadb_l2p_multi_get_pin_us\": {},",
+        meta.l2p_multi_get_pin_us
+    );
+    println!(
+        "  \"metadb_l2p_multi_get_view_us\": {},",
+        meta.l2p_multi_get_view_us
+    );
+    println!(
+        "  \"metadb_l2p_multi_get_tree_us\": {},",
+        meta.l2p_multi_get_tree_us
+    );
+    println!(
+        "  \"metadb_l2p_multi_get_tree_avg_us\": {:.3},",
+        avg_u64(meta.l2p_multi_get_tree_us, meta.l2p_multi_get_calls)
+    );
+    println!(
+        "  \"metadb_l2p_multi_get_tree_max_us\": {},",
+        meta.l2p_multi_get_tree_max_us
+    );
+    println!("  \"metadb_flush_calls\": {},", meta.flush_calls);
+    println!("  \"metadb_flush_total_us\": {},", meta.flush_total_us);
+    println!(
+        "  \"metadb_flush_total_avg_us\": {:.3},",
+        avg_u64(meta.flush_total_us, meta.flush_calls)
+    );
+    println!(
+        "  \"metadb_flush_total_max_us\": {},",
+        meta.flush_total_max_us
+    );
+    println!(
+        "  \"metadb_flush_gate_wait_us\": {},",
+        meta.flush_gate_wait_us
+    );
+    println!("  \"metadb_flush_io_us\": {},", meta.flush_io_us);
+    println!(
+        "  \"metadb_flush_manifest_us\": {},",
+        meta.flush_manifest_us
+    );
+    println!("  \"metadb_flush_install_us\": {},", meta.flush_install_us);
+    println!("  \"metadb_flush_reclaim_us\": {},", meta.flush_reclaim_us);
+    println!(
+        "  \"metadb_flush_pages_written\": {},",
+        meta.flush_pages_written
+    );
+    println!("  \"metadb_pending_dispatch\": {},", meta.pending_dispatch);
+    println!(
+        "  \"metadb_pending_l2p_apply_queue\": {},",
+        meta.pending_l2p_apply_queue
+    );
+    println!(
+        "  \"metadb_pending_rc_apply_queue\": {}",
+        meta.pending_rc_apply_queue
+    );
+}
+
+fn avg_u64(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        num as f64 / den as f64
+    }
 }
 
 fn json_option_u64(value: Option<u64>) -> String {

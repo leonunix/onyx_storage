@@ -67,8 +67,11 @@ struct PackedSlotRetry {
 
 #[derive(Debug, Clone)]
 struct DedupRegistration {
+    vol_id: VolumeId,
+    lba: Lba,
     hash: ContentHash,
     entry: DedupEntry,
+    expected: BlockmapValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +218,9 @@ impl Allocation {
 }
 
 impl BufferFlusher {
+    const DEDUP_REGISTER_BATCH_MAX: usize = 8192;
+    const DEDUP_REGISTER_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
+
     const HEAD_RETRY_AGE_THRESHOLD: Duration = Duration::from_millis(500);
     const COALESCE_READY_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
@@ -506,7 +512,7 @@ impl BufferFlusher {
             // Writer → dedup registration thread. New dedup rows are
             // opportunistic, so keep their WAL/apply work off the writer's
             // critical path and batch them independently.
-            let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+            let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
             let running_c = running.clone();
             let pool_c = pool.clone();
@@ -644,6 +650,23 @@ impl BufferFlusher {
                 .expect("failed to spawn writer thread");
             drop(dedup_register_tx);
 
+            let running_dr = running.clone();
+            let meta_dr = meta.clone();
+            let metrics_dr = metrics.clone();
+            let dedup_register_handle = thread::Builder::new()
+                .name(format!("flusher-dedup-register-{}", shard_idx))
+                .spawn(move || {
+                    affinity::bind_current(ThreadRole::FlusherDedupRegister, shard_idx);
+                    Self::dedup_register_loop(
+                        shard_idx,
+                        &dedup_register_rx,
+                        &meta_dr,
+                        &running_dr,
+                        &metrics_dr,
+                    );
+                })
+                .expect("failed to spawn dedup registration thread");
+
             let running_cl = running.clone();
             let meta_cl = meta.clone();
             let allocator_cl = allocator.clone();
@@ -668,7 +691,7 @@ impl BufferFlusher {
                 dedup_handles,
                 compress_handles,
                 writer_handle: Some(writer_handle),
-                dedup_register_handle: None,
+                dedup_register_handle: Some(dedup_register_handle),
                 cleanup_handle: Some(cleanup_handle),
             });
         }
@@ -718,6 +741,111 @@ impl BufferFlusher {
         }
         self.running.store(false, Ordering::Relaxed);
         self.join_lanes();
+    }
+
+    fn enqueue_dedup_registrations(
+        meta: &MetaStore,
+        metrics: &EngineMetrics,
+        tx: &Sender<Vec<DedupRegistration>>,
+        registrations: Vec<DedupRegistration>,
+    ) {
+        if registrations.is_empty() {
+            return;
+        }
+        let entries = registrations.len();
+        if tx.send(registrations.clone()).is_ok() {
+            metrics
+                .dedup_register_batches
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .dedup_register_entries
+                .fetch_add(entries as u64, Ordering::Relaxed);
+            Self::record_max(&metrics.dedup_register_batch_max_entries, entries as u64);
+            return;
+        }
+        Self::persist_dedup_registrations(meta, metrics, registrations);
+    }
+
+    fn persist_dedup_registrations(
+        meta: &MetaStore,
+        metrics: &EngineMetrics,
+        registrations: Vec<DedupRegistration>,
+    ) {
+        if registrations.is_empty() {
+            return;
+        }
+
+        let mut filtered = Vec::with_capacity(registrations.len());
+        let validate_start = Instant::now();
+        for reg in registrations {
+            match meta.dedup_registration_is_current(&reg.vol_id, reg.lba, &reg.expected) {
+                Ok(true) => filtered.push((reg.hash, reg.entry)),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        vol = %reg.vol_id.0,
+                        lba = reg.lba.0,
+                        error = %e,
+                        "dedup register: validation failed; dropping stale registration"
+                    );
+                }
+            }
+        }
+        Self::record_elapsed(&metrics.dedup_register_validate_blockmap_ns, validate_start);
+        if filtered.is_empty() {
+            return;
+        }
+
+        let commit_start = Instant::now();
+        if let Err(e) = meta.put_dedup_entries_guarded(&filtered) {
+            tracing::warn!(
+                entries = filtered.len(),
+                error = %e,
+                "dedup register: failed to persist entries"
+            );
+        }
+        Self::record_elapsed(&metrics.dedup_register_commit_ns, commit_start);
+    }
+
+    fn dedup_register_loop(
+        shard_idx: usize,
+        rx: &Receiver<Vec<DedupRegistration>>,
+        meta: &MetaStore,
+        running: &AtomicBool,
+        metrics: &EngineMetrics,
+    ) {
+        let mut batch = Vec::new();
+        while running.load(Ordering::Relaxed) || !rx.is_empty() {
+            let first = match rx.recv_timeout(Self::DEDUP_REGISTER_DRAIN_TIMEOUT) {
+                Ok(regs) => regs,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            };
+            batch.extend(first);
+            while batch.len() < Self::DEDUP_REGISTER_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(regs) => batch.extend(regs),
+                    Err(_) => break,
+                }
+            }
+
+            let regs = std::mem::take(&mut batch);
+            tracing::trace!(
+                lane = shard_idx,
+                entries = regs.len(),
+                "dedup register: batch"
+            );
+            Self::persist_dedup_registrations(meta, metrics, regs);
+        }
+
+        for regs in rx.try_iter() {
+            batch.extend(regs);
+            if batch.len() >= Self::DEDUP_REGISTER_BATCH_MAX {
+                let regs = std::mem::take(&mut batch);
+                Self::persist_dedup_registrations(meta, metrics, regs);
+            }
+        }
+        Self::persist_dedup_registrations(meta, metrics, batch);
     }
 
     fn join_lanes(&mut self) {

@@ -151,7 +151,7 @@ impl BufferFlusher {
                 &vol_id,
                 &batch_values,
                 live_positions.len() as u32,
-                &Self::dedup_entries_from_registrations(&dedup_registrations),
+                &[],
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -162,7 +162,12 @@ impl BufferFlusher {
                 }
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-            Self::record_inline_dedup_register_metrics(metrics, dedup_registrations.len());
+            Self::enqueue_dedup_registrations(
+                meta,
+                metrics,
+                _dedup_register_tx,
+                dedup_registrations,
+            );
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
@@ -482,12 +487,15 @@ impl BufferFlusher {
                 let um = unit_metas[unit_idx].as_ref().unwrap();
                 dedup_registrations.extend_from_slice(&um.dedup_registrations);
             }
-            let dedup_entries = Self::dedup_entries_from_registrations(&dedup_registrations);
-
-            match meta.atomic_batch_write_multi_with_dedup(&batch_args, &dedup_entries) {
+            match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
                 Ok(returned) => {
                     actual_old_pba_meta = returned;
-                    Self::record_inline_dedup_register_metrics(metrics, dedup_registrations.len());
+                    Self::enqueue_dedup_registrations(
+                        meta,
+                        metrics,
+                        _dedup_register_tx,
+                        dedup_registrations,
+                    );
                 }
                 Err(e) => {
                     // Entire batch failed — rollback all allocations.
@@ -585,7 +593,7 @@ impl BufferFlusher {
         let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
         if total_elapsed >= Duration::from_secs(1) {
-            tracing::warn!(
+            tracing::debug!(
                 shard = shard_idx,
                 units = n,
                 live_units = meta_indices.len(),

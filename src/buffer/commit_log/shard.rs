@@ -1239,6 +1239,11 @@ impl BufferShard {
             lc.inflight.insert(seq);
         }
 
+        // Publish the volatile payload before the LBA indices. Once an entry
+        // appears in lba_index, foreground reads may need this payload before
+        // the sync thread has made the ring slot durable.
+        self.volatile_payloads.insert(seq, payload.clone());
+
         // ── DashMap inserts (concurrent sharded locks) ──
         // Interned Arc<str>: read-lock fast path, no alloc after first encounter.
         Self::add_pending_buckets(&self.pending_lba_buckets, &vid, start_lba, lba_count);
@@ -1249,7 +1254,6 @@ impl BufferShard {
         if self.pending_entries.insert(seq, pending.clone()).is_none() {
             self.pending_count.fetch_add(1, Ordering::Relaxed);
         }
-        self.volatile_payloads.insert(seq, payload.clone());
 
         // ── Channel send (lock-free MPSC, ~30ns) ──
         if self
@@ -1257,7 +1261,7 @@ impl BufferShard {
             .send(StagedEntry { pending, payload })
             .is_err()
         {
-            self.volatile_payload_budget.release(payload_len);
+            self.remove_volatile_payload(seq);
             return Err(OnyxError::Io(std::io::Error::other(
                 "buffer sync thread is not accepting staged entries",
             )));
@@ -1404,7 +1408,7 @@ impl BufferShard {
                             hydrated.insert(entry.seq, payload);
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 seq = entry.seq,
                                 error = %e,
                                 "failed to hydrate pending entry payload, evicting corrupt entry"
@@ -1442,7 +1446,7 @@ impl BufferShard {
                                 hydrated.insert(entry.seq, payload);
                             }
                             Err(e) => {
-                                tracing::warn!(
+                                tracing::debug!(
                                     seq = entry.seq,
                                     error = %e,
                                     "failed to hydrate pending entry payload, evicting corrupt entry"
@@ -1504,7 +1508,7 @@ impl BufferShard {
                             hydrated.insert(entry.seq, payload);
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 seq = entry.seq,
                                 error = %e,
                                 "failed to hydrate pending entry payload, evicting corrupt entry"
@@ -1532,6 +1536,10 @@ impl BufferShard {
             self.volatile_payload_budget.release(payload.len() as u64);
             payload
         })
+    }
+
+    pub(super) fn is_seq_inflight(&self, seq: u64) -> bool {
+        self.lifecycle.lock().inflight.contains(&seq)
     }
 
     /// Return a PendingEntry with payload guaranteed present. If the entry
@@ -1583,6 +1591,12 @@ impl BufferShard {
             let mut hydrated = (*entry).clone();
             hydrated.payload = Some(payload);
             return Ok(Some(hydrated));
+        }
+        if self.is_seq_inflight(entry.seq) {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "buffer payload for inflight seq {} is not memory-resident yet",
+                entry.seq
+            ))));
         }
         // Lazy hydration: read payload from buffer device.
         let seq = entry.seq;
@@ -1650,14 +1664,23 @@ impl BufferShard {
         let mut payloads: HashMap<u64, Arc<[u8]>> = HashMap::new();
         let mut missing = Vec::new();
         let mut seen_missing = HashSet::new();
+        let mut missing_inflight_payload = None;
         for entry in indexed.iter().flatten() {
             if let Some(payload) = entry.payload.clone() {
                 payloads.entry(entry.seq).or_insert(payload);
             } else if let Some(payload) = self.volatile_payload(entry.seq) {
                 payloads.entry(entry.seq).or_insert(payload);
+            } else if self.is_seq_inflight(entry.seq) {
+                missing_inflight_payload = Some(entry.seq);
+                break;
             } else if seen_missing.insert(entry.seq) {
                 missing.push(entry.clone());
             }
+        }
+        if let Some(seq) = missing_inflight_payload {
+            return Err(OnyxError::Io(std::io::Error::other(format!(
+                "buffer payload for inflight seq {seq} is not memory-resident yet"
+            ))));
         }
         payloads.extend(self.hydrate_missing_payloads_batched(&missing, true));
 
@@ -1916,6 +1939,9 @@ impl BufferShard {
             hydrated.payload = Some(payload);
             return Some(Arc::new(hydrated));
         }
+        if self.is_seq_inflight(seq) {
+            return None;
+        }
         // Lazy hydration: read payload from disk, but keep it detached from
         // the shared indices. Coalescer window/channel bounds cap this
         // transient memory; persistent payload residency remains zero.
@@ -1926,7 +1952,7 @@ impl BufferShard {
                 Some(Arc::new(hydrated))
             }
             Err(e) => {
-                tracing::warn!(seq, error = %e, "failed to hydrate pending entry payload, evicting corrupt entry");
+                tracing::debug!(seq, error = %e, "failed to hydrate pending entry payload, evicting corrupt entry");
                 self.evict_corrupt_entry(seq);
                 None
             }
@@ -1949,6 +1975,8 @@ impl BufferShard {
                 payloads.entry(entry.seq).or_insert(payload);
             } else if let Some(payload) = self.volatile_payload(entry.seq) {
                 payloads.entry(entry.seq).or_insert(payload);
+            } else if self.is_seq_inflight(entry.seq) {
+                continue;
             } else if seen_missing.insert(entry.seq) {
                 missing.push(entry.clone());
             }

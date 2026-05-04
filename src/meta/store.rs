@@ -344,6 +344,23 @@ impl MetaStore {
         self.backend.put_dedup_entries(entries)
     }
 
+    pub fn put_dedup_entries_guarded(
+        &self,
+        entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<()> {
+        self.backend.put_dedup_entries_guarded(entries)
+    }
+
+    pub fn dedup_registration_is_current(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+        expected: &BlockmapValue,
+    ) -> OnyxResult<bool> {
+        self.backend
+            .dedup_registration_is_current(vol_id, lba, expected)
+    }
+
     pub fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
         self.backend.delete_dedup_index(hash)
     }

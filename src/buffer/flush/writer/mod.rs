@@ -431,12 +431,14 @@ impl BufferFlusher {
     }
 
     pub(super) fn dedup_registration(
-        _vol_id: VolumeId,
-        _lba: Lba,
+        vol_id: VolumeId,
+        lba: Lba,
         hash: ContentHash,
         expected: BlockmapValue,
     ) -> DedupRegistration {
         DedupRegistration {
+            vol_id,
+            lba,
             hash,
             entry: DedupEntry {
                 pba: expected.pba,
@@ -448,29 +450,8 @@ impl BufferFlusher {
                 offset_in_unit: expected.offset_in_unit,
                 crc32: expected.crc32,
             },
+            expected,
         }
-    }
-
-    pub(super) fn dedup_entries_from_registrations(
-        registrations: &[DedupRegistration],
-    ) -> Vec<(ContentHash, DedupEntry)> {
-        registrations
-            .iter()
-            .map(|reg| (reg.hash, reg.entry))
-            .collect()
-    }
-
-    pub(super) fn record_inline_dedup_register_metrics(metrics: &EngineMetrics, entries: usize) {
-        if entries == 0 {
-            return;
-        }
-        metrics
-            .dedup_register_batches
-            .fetch_add(1, Ordering::Relaxed);
-        metrics
-            .dedup_register_entries
-            .fetch_add(entries as u64, Ordering::Relaxed);
-        Self::record_max(&metrics.dedup_register_batch_max_entries, entries as u64);
     }
 
     pub(super) fn retry_one_packed_slot(

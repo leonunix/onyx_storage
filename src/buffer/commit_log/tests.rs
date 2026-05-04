@@ -166,6 +166,58 @@ fn hydrated_payload_is_not_reinstalled_after_flush_race() {
 }
 
 #[test]
+fn inflight_missing_volatile_payload_is_not_hydrated_from_disk() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 8 * 8192;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let runtime_limits = BufferRuntimeLimits {
+        staging_channel_capacity: 1,
+        sync_batch_max_entries: 1,
+        sync_batch_max_bytes: usize::MAX,
+        volatile_payload_memory: 0,
+    };
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        dev,
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::ZERO,
+        0,
+        None,
+        runtime_limits,
+    )
+    .unwrap();
+    let shard = &pool.shards[0].shard;
+    let payload = vec![0xA7; BLOCK_SIZE as usize];
+
+    let seq = pool.append("test-vol", Lba(17), 1, &payload, 0).unwrap();
+    let pending = shard.pending_entries.get(&seq).unwrap().value().clone();
+    {
+        let mut lc = shard.lifecycle.lock();
+        lc.inflight.insert(seq);
+    }
+    let _ = shard.remove_volatile_payload(seq);
+
+    assert!(
+        shard.pending_entry_arc_hydrated(seq).is_none(),
+        "flusher hydration must not parse a pre-sync ring slot"
+    );
+    assert!(
+        shard.pending_entries.contains_key(&seq),
+        "pre-sync entry must not be evicted as corrupt"
+    );
+    assert!(
+        shard.lookup_hydrated("test-vol", Lba(17)).is_err(),
+        "foreground read must fail loudly instead of falling through to stale LV3 data"
+    );
+    assert!(Arc::ptr_eq(
+        &pending,
+        &shard.pending_entries.get(&seq).unwrap().value().clone()
+    ));
+}
+
+#[test]
 fn lookup_hydrates_from_disk_without_volatile_payload() {
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;

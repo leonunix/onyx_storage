@@ -150,6 +150,16 @@ fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
     }
 }
 
+fn drain_dedup_registrations(
+    meta: &MetaStore,
+    metrics: &EngineMetrics,
+    rx: &Receiver<Vec<DedupRegistration>>,
+) {
+    for registrations in rx.try_iter() {
+        BufferFlusher::persist_dedup_registrations(meta, metrics, registrations);
+    }
+}
+
 #[test]
 fn old_write_unit_can_overwrite_newer_committed_mapping() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
@@ -305,7 +315,7 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
 }
 
 #[test]
-fn write_unit_registers_dedup_in_mapping_commit() {
+fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
@@ -335,16 +345,17 @@ fn write_unit_registers_dedup_in_mapping_commit() {
         .get_mapping(&VolumeId("flush-race".into()), Lba(0))
         .unwrap()
         .unwrap();
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "dedup miss registration is kept off the foreground mapping commit"
+    );
+    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
-    assert!(
-        dedup_register_rx.try_recv().is_err(),
-        "dedup miss registration is folded into the mapping commit"
-    );
 }
 
 #[test]
-fn write_packed_slot_registers_dedup_in_mapping_commit() {
+fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
@@ -384,16 +395,17 @@ fn write_packed_slot_registers_dedup_in_mapping_commit() {
         .get_mapping(&VolumeId("flush-race".into()), Lba(0))
         .unwrap()
         .unwrap();
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "packed miss registration is kept off the foreground mapping commit"
+    );
+    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
     let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
     assert_eq!(dedup.to_blockmap_value(), mapping);
-    assert!(
-        dedup_register_rx.try_recv().is_err(),
-        "packed miss registration is folded into the mapping commit"
-    );
 }
 
 #[test]
-fn write_packed_slots_batch_registers_dedup_in_mapping_commit() {
+fn write_packed_slots_batch_enqueues_dedup_registration_after_mapping_commit() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
@@ -436,6 +448,14 @@ fn write_packed_slots_batch_registers_dedup_in_mapping_commit() {
     );
     assert!(results.into_iter().all(|result| result.is_ok()));
 
+    for (hash, _) in &expected {
+        assert!(
+            meta.get_dedup_entry(hash).unwrap().is_none(),
+            "packed batch registration is kept off foreground mapping commits"
+        );
+    }
+    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
+
     for (hash, lba) in expected {
         let mapping = meta
             .get_mapping(&VolumeId("flush-race".into()), lba)
@@ -444,10 +464,6 @@ fn write_packed_slots_batch_registers_dedup_in_mapping_commit() {
         let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
         assert_eq!(dedup.to_blockmap_value(), mapping);
     }
-    assert!(
-        dedup_register_rx.try_recv().is_err(),
-        "packed batch dedup registrations are folded into mapping commits"
-    );
 }
 
 #[test]
@@ -606,6 +622,55 @@ fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
     assert!(
         pool.pending_entry_arc(seq).is_none(),
         "post-commit cleanup drift must not leave the seq stuck in the buffer"
+    );
+}
+
+#[test]
+fn stale_async_dedup_registration_is_dropped() {
+    let (meta, _pool, _lifecycle, _allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let vol = VolumeId("flush-race".into());
+    let hash: ContentHash = [0xA5; 32];
+    let pba = Pba(100);
+    let expected = BlockmapValue {
+        pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0xCAFE_BABE,
+        slot_offset: 0,
+        flags: 0,
+    };
+
+    meta.put_mapping(&vol, Lba(0), &expected).unwrap();
+    meta.set_refcount(pba, 1).unwrap();
+    meta.put_mapping(
+        &vol,
+        Lba(0),
+        &BlockmapValue {
+            pba: Pba(101),
+            crc32: 0xDEAD_BEEF,
+            ..expected
+        },
+    )
+    .unwrap();
+
+    BufferFlusher::persist_dedup_registrations(
+        &meta,
+        &metrics,
+        vec![BufferFlusher::dedup_registration(
+            vol,
+            Lba(0),
+            hash,
+            expected,
+        )],
+    );
+
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "background registration must not publish stale mappings"
     );
 }
 
