@@ -53,9 +53,7 @@ fn commit_packed_meta_batch(
     ) {
         Ok(dead) => {
             merge_dead_pbas(actual_old_pba_meta, dead);
-            for (hash, blockmap) in combined_fresh_dedup {
-                candidate.insert(hash, blockmap);
-            }
+            candidate.insert_many(&combined_fresh_dedup);
         }
         Err(e) => {
             for &slot_idx in batch_slots.iter() {
@@ -161,44 +159,39 @@ impl BufferFlusher {
                 .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
                 .collect();
 
-            for i in 0..live_positions.len() {
-                let flags = if unit.dedup_skipped {
-                    FLAG_DEDUP_SKIPPED
-                } else {
-                    0
-                };
+            // Build the per-LBA BlockmapValue once and use it for both
+            // the metadata commit and the candidate-cache insert. The
+            // commit batch carries DEDUP_SKIPPED for skipped units;
+            // candidate inserts use the same BlockmapValue with flags
+            // forced to 0 (a cache entry is not the source of truth
+            // for skip state).
+            let frag_flags = if unit.dedup_skipped {
+                FLAG_DEDUP_SKIPPED
+            } else {
+                0
+            };
+            let hashes_for_promote = if !unit.dedup_skipped {
+                unit.block_hashes.as_ref()
+            } else {
+                None
+            };
+            for (i, pos) in live_positions.iter().copied().enumerate() {
                 let blockmap = BlockmapValue {
                     pba: sealed.pba,
                     compression: unit.compression,
                     unit_compressed_size: unit.compressed_data.len() as u32,
                     unit_original_size: unit.original_size,
                     unit_lba_count: unit.lba_count as u16,
-                    offset_in_unit: live_positions[i] as u16,
+                    offset_in_unit: pos as u16,
                     crc32: unit.crc32,
                     slot_offset: frag.slot_offset,
-                    flags,
+                    flags: frag_flags,
                 };
                 batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
-            }
-            if !unit.dedup_skipped {
-                if let Some(ref hashes) = unit.block_hashes {
-                    for &pos in &live_positions {
-                        let hash = hashes[pos];
-                        if hash == [0u8; 8] {
-                            continue;
-                        }
-                        let blockmap = BlockmapValue {
-                            pba: sealed.pba,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                            slot_offset: frag.slot_offset,
-                            flags: 0,
-                        };
-                        fresh_dedup_pairs.push((hash, blockmap));
+                if let Some(hashes) = hashes_for_promote {
+                    let hash = hashes[pos];
+                    if hash != [0u8; 8] {
+                        fresh_dedup_pairs.push((hash, BlockmapValue { flags: 0, ..blockmap }));
                     }
                 }
             }
@@ -261,15 +254,7 @@ impl BufferFlusher {
             }
         };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-
-        // Post-commit: register first-occurrence (hash, blockmap)
-        // pairs into the RAM candidate cache. dedup_index /
-        // dedup_reverse stay untouched on miss — they only learn
-        // about a fingerprint when the dedup worker promotes a
-        // verified duplicate (Step C).
-        for (hash, blockmap) in fresh_dedup_pairs {
-            candidate.insert(hash, blockmap);
-        }
+        candidate.insert_many(&fresh_dedup_pairs);
 
         if !actual_old_pba_meta.is_empty() {
             let dead: Vec<(Pba, u32)> = actual_old_pba_meta
@@ -423,50 +408,37 @@ impl BufferFlusher {
                     .iter()
                     .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
                     .collect();
-                for j in 0..live_positions.len() {
-                    let flags = if unit.dedup_skipped {
-                        FLAG_DEDUP_SKIPPED
-                    } else {
-                        0
-                    };
+                let frag_flags = if unit.dedup_skipped {
+                    FLAG_DEDUP_SKIPPED
+                } else {
+                    0
+                };
+                let hashes_for_promote = if !unit.dedup_skipped {
+                    unit.block_hashes.as_ref()
+                } else {
+                    None
+                };
+                for (j, pos) in live_positions.iter().copied().enumerate() {
                     let blockmap = BlockmapValue {
                         pba: sealed.pba,
                         compression: unit.compression,
                         unit_compressed_size: unit.compressed_data.len() as u32,
                         unit_original_size: unit.original_size,
                         unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: live_positions[j] as u16,
+                        offset_in_unit: pos as u16,
                         crc32: unit.crc32,
                         slot_offset: frag.slot_offset,
-                        flags,
+                        flags: frag_flags,
                     };
                     batch_values.push((vol_id.clone(), frag_lbas[j], blockmap));
-                }
-                all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
-
-                if !unit.dedup_skipped {
-                    let Some(ref hashes) = unit.block_hashes else {
-                        continue;
-                    };
-                    for &pos in &live_positions {
+                    if let Some(hashes) = hashes_for_promote {
                         let hash = hashes[pos];
-                        if hash == [0u8; 8] {
-                            continue;
+                        if hash != [0u8; 8] {
+                            fresh_dedup_pairs.push((hash, BlockmapValue { flags: 0, ..blockmap }));
                         }
-                        let blockmap = BlockmapValue {
-                            pba: sealed.pba,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                            slot_offset: frag.slot_offset,
-                            flags: 0,
-                        };
-                        fresh_dedup_pairs.push((hash, blockmap));
                     }
                 }
+                all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
             }
 
             if batch_values.is_empty() {

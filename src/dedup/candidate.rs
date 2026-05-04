@@ -133,45 +133,78 @@ impl CandidateCache {
         self.inner.shards[shard].lock().peek(fp).copied()
     }
 
-    /// Same as [`lookup`] but bumps the entry to the LRU head. Use
-    /// when a real duplicate has been confirmed (post LV3 verify) and
-    /// the entry is therefore still load-bearing.
-    pub fn mark_hit(&self, fp: &ContentHash) -> Option<BlockmapValue> {
-        let shard = self.shard_for(fp);
-        self.inner.shards[shard].lock().get(fp).copied()
-    }
-
     /// Insert a first-seen `(fp, value)` pair. Returns the previous
     /// stored value for this fp (if any) so callers can reason about
     /// idempotent re-inserts.
     pub fn insert(&self, fp: ContentHash, value: BlockmapValue) -> Option<BlockmapValue> {
         let shard = self.shard_for(&fp);
         let pba = value.pba;
-        let mut prev_for_fp: Option<BlockmapValue> = None;
-        let mut evicted_pair: Option<(ContentHash, BlockmapValue)> = None;
+        let prev_for_fp: Option<BlockmapValue>;
+        let evicted_pair: Option<(ContentHash, BlockmapValue)>;
         {
             let mut g = self.inner.shards[shard].lock();
-            // Capture the existing value for this fp (if any) before
-            // overwriting; `lru::LruCache::push` returns the *evicted*
-            // entry which may be a different fp.
+            // `lru::LruCache::push` returns the *evicted* entry, which
+            // may be a different fp. Capture the existing value for
+            // this fp first so we can return it as the "prior PBA"
+            // signal.
             prev_for_fp = g.peek(&fp).copied();
             evicted_pair = g.push(fp, value);
         }
-        // Update the reverse index. This is split from the LRU mutex
-        // critical section so the DashMap entry write does not
-        // contend with foreground lookups on the LRU shard.
+        // Reverse index update is split from the LRU critical section
+        // so the DashMap write does not contend with foreground
+        // lookups on the LRU shard.
         self.inner
             .pba_to_hashes
             .entry(pba)
             .or_default()
             .push(fp);
         if let Some((evicted_fp, evicted_value)) = evicted_pair {
-            // Same-fp eviction means we re-inserted; reverse index
-            // already covers the new (pba, fp) tuple, just remove the
-            // old (evicted_value.pba, fp) pair.
             self.drop_from_reverse(evicted_value.pba, &evicted_fp);
         }
         prev_for_fp
+    }
+
+    /// Bulk insert. Buckets `pairs` by LRU shard so the per-shard
+    /// mutex is acquired once per shard, not once per pair. Cuts
+    /// mutex traffic dramatically on the writer post-commit path
+    /// (one packed slot can carry hundreds of fragments).
+    pub fn insert_many(&self, pairs: &[(ContentHash, BlockmapValue)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        // Bucket by shard.
+        let n = self.inner.shards.len();
+        let mut by_shard: Vec<Vec<(ContentHash, BlockmapValue)>> = (0..n).map(|_| Vec::new()).collect();
+        for &(fp, value) in pairs {
+            by_shard[self.shard_for(&fp)].push((fp, value));
+        }
+        for (shard_idx, shard_pairs) in by_shard.into_iter().enumerate() {
+            if shard_pairs.is_empty() {
+                continue;
+            }
+            // Capture evictions under one lock, drain after release.
+            let mut evicted: Vec<(ContentHash, BlockmapValue)> =
+                Vec::with_capacity(shard_pairs.len());
+            {
+                let mut g = self.inner.shards[shard_idx].lock();
+                for (fp, value) in &shard_pairs {
+                    if let Some((ef, ev)) = g.push(*fp, *value) {
+                        evicted.push((ef, ev));
+                    }
+                }
+            }
+            // Reverse-map updates outside the LRU lock.
+            for (fp, value) in &shard_pairs {
+                self.inner
+                    .pba_to_hashes
+                    .entry(value.pba)
+                    .or_default()
+                    .push(*fp);
+            }
+            for (efp, evalue) in evicted {
+                self.drop_from_reverse(evalue.pba, &efp);
+            }
+        }
     }
 
     /// Drop the cache slot for `fp`. Called by the promote path once
@@ -190,11 +223,23 @@ impl CandidateCache {
     /// `pba`. Called from the writer's refcount→0 cleanup so a freed
     /// PBA can never be returned to a future verify check.
     pub fn remove_by_pba(&self, pba: Pba) {
-        let entry = self.inner.pba_to_hashes.remove(&pba);
-        if let Some((_, hashes)) = entry {
-            for fp in hashes {
-                let shard = self.shard_for(&fp);
-                let mut g = self.inner.shards[shard].lock();
+        let Some((_, hashes)) = self.inner.pba_to_hashes.remove(&pba) else {
+            return;
+        };
+        // Group fps by LRU shard so we acquire each shard mutex once
+        // even when a packed slot's reverse list spans dozens of
+        // fragments.
+        let n = self.inner.shards.len();
+        let mut by_shard: Vec<Vec<ContentHash>> = (0..n).map(|_| Vec::new()).collect();
+        for fp in hashes {
+            by_shard[self.shard_for(&fp)].push(fp);
+        }
+        for (shard_idx, shard_fps) in by_shard.into_iter().enumerate() {
+            if shard_fps.is_empty() {
+                continue;
+            }
+            let mut g = self.inner.shards[shard_idx].lock();
+            for fp in shard_fps {
                 // Pop only when the slot still points at the freed
                 // PBA. A racing `insert(fp, new_value)` for a *new*
                 // PBA may have stamped a fresh entry for the same fp;
@@ -301,13 +346,6 @@ mod tests {
         let c = CandidateCache::new(8, 16);
         c.insert(fp(0xAA), bv(42));
         assert_eq!(c.lookup(&fp(0xAA)), Some(bv(42)));
-    }
-
-    #[test]
-    fn mark_hit_returns_value() {
-        let c = CandidateCache::new(8, 16);
-        c.insert(fp(0xAA), bv(42));
-        assert_eq!(c.mark_hit(&fp(0xAA)), Some(bv(42)));
     }
 
     #[test]

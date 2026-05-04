@@ -158,13 +158,7 @@ impl BufferFlusher {
                 }
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-            // Post-commit: register first-occurrence (hash, blockmap)
-            // in the RAM candidate cache. dedup_index is left
-            // untouched here — the dedup worker promotes verified
-            // duplicates into the persistent tables.
-            for (hash, blockmap) in fresh_dedup_pairs {
-                candidate.insert(hash, blockmap);
-            }
+            candidate.insert_many(&fresh_dedup_pairs);
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
@@ -485,12 +479,7 @@ impl BufferFlusher {
             match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
                 Ok(returned) => {
                     actual_old_pba_meta = returned;
-                    // Post-commit: warm the candidate cache with
-                    // every first-occurrence (hash, blockmap) we just
-                    // wrote.
-                    for (hash, blockmap) in all_fresh_pairs {
-                        candidate.insert(hash, blockmap);
-                    }
+                    candidate.insert_many(&all_fresh_pairs);
                 }
                 Err(e) => {
                     // Entire batch failed — rollback all allocations.

@@ -719,18 +719,17 @@ impl BufferFlusher {
             }
         };
         Self::record_elapsed(&metrics.dedup_lookup_ns, verify_start);
-        // Group mismatches by unit so we can mutate without index
-        // confusion. Clear is_hit[lba_idx] and remove from both
-        // valid_hits and promote_candidates. Order within each Vec
-        // is not load-bearing; commit_prepared_dedup_hits walks them
-        // unordered.
-        let mut mismatches_per_unit: HashMap<usize, Vec<usize>> = HashMap::new();
+        // Group mismatches by unit. valid_hits / promote_candidates
+        // can hold tens of entries per unit; using a HashSet keeps
+        // the retain filters O(n) instead of O(n × |mismatches|).
+        let mut mismatches_per_unit: HashMap<usize, std::collections::HashSet<usize>> =
+            HashMap::new();
         for ((unit_idx, lba_idx), matched) in placement.into_iter().zip(results) {
             if !matched {
                 mismatches_per_unit
                     .entry(unit_idx)
                     .or_default()
-                    .push(lba_idx);
+                    .insert(lba_idx);
             }
         }
         for (unit_idx, mismatched_lbas) in mismatches_per_unit {
