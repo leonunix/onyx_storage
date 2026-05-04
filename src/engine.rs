@@ -436,6 +436,11 @@ impl OnyxEngine {
                             lifecycle.clone(),
                             allocator.clone(),
                             io_engine.clone(),
+                            // Drain-and-stop helper: no read pool
+                            // available here, drop verify (the flusher
+                            // is short-lived and writes through the
+                            // existing trust-hash path).
+                            None,
                             &config.flush,
                             &config.dedup,
                             metrics.clone(),
@@ -595,6 +600,12 @@ impl OnyxEngine {
         let buffer_pool =
             Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
 
+        // LV3 read pool — built BEFORE the flusher so the dedup
+        // workers can route candidate-hit / dedup_index-hit verifies
+        // through it (`dedup::verify::batched_verify`). Also still
+        // shared with ZoneManager for the foreground read path.
+        let read_pool = Self::build_read_pool(config, metrics.clone())?;
+
         // 6. Background flusher
         let flusher = BufferFlusher::start_with_metrics(
             buffer_pool.clone(),
@@ -602,13 +613,11 @@ impl OnyxEngine {
             lifecycle.clone(),
             allocator.clone(),
             io_engine.clone(),
+            read_pool.clone(),
             &config.flush,
             &config.dedup,
             metrics.clone(),
         );
-
-        // 8. LV3 read pool (built before ZoneManager so writes/reads share metrics)
-        let read_pool = Self::build_read_pool(config, metrics.clone())?;
 
         // 9. Zone manager
         let zone_manager = Arc::new(ZoneManager::new_full(
@@ -1070,6 +1079,11 @@ impl OnyxEngine {
         let buffer_pool =
             Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
 
+        // LV3 read pool — needed by the flusher's dedup verify-on-hit
+        // path. Built before the flusher so the read pool is wired up
+        // by the time the dedup workers spawn.
+        let read_pool = Self::build_read_pool(config, metrics.clone())?;
+
         // Background flusher
         let flusher = BufferFlusher::start_with_metrics(
             buffer_pool.clone(),
@@ -1077,15 +1091,14 @@ impl OnyxEngine {
             lifecycle.clone(),
             allocator.clone(),
             io_engine.clone(),
+            read_pool.clone(),
             &config.flush,
             &config.dedup,
             metrics.clone(),
         );
 
-        // LV3 read pool
-        let read_pool = Self::build_read_pool(config, metrics.clone())?;
-
-        // Zone manager
+        // Zone manager — reuses the read_pool built above for the
+        // flusher's dedup verify path.
         let zone_manager = Arc::new(ZoneManager::new_full(
             config.engine.zone_count,
             config.engine.zone_size_blocks,

@@ -462,18 +462,25 @@ impl BufferFlusher {
             lifecycle,
             allocator,
             io_engine,
+            None,
             config,
             dedup_config,
             Arc::new(EngineMetrics::default()),
         )
     }
 
+    /// `read_pool` is the LV3 read pool used for dedup verify-on-hit.
+    /// Pass `None` to run the dedup pipeline in trust-hash mode
+    /// (xxh3_64 collisions of ~1.5e-8 may produce occasional false
+    /// dedups); production deployments should always set
+    /// `read_pool_workers > 0`.
     pub fn start_with_metrics(
         pool: Arc<WriteBufferPool>,
         meta: Arc<MetaStore>,
         lifecycle: Arc<VolumeLifecycleManager>,
         allocator: Arc<SpaceAllocator>,
         io_engine: Arc<IoEngine>,
+        read_pool: Option<Arc<crate::io::read_pool::ReadPool>>,
         config: &FlushConfig,
         dedup_config: &DedupConfig,
         metrics: Arc<EngineMetrics>,
@@ -585,6 +592,8 @@ impl BufferFlusher {
                     let done_tx_d = done_tx.clone();
                     let metrics_d = metrics.clone();
                     let cleanup_tx_d = cleanup_tx.clone();
+                    let candidate_d = candidate.clone();
+                    let read_pool_d = read_pool.clone();
                     let h = thread::Builder::new()
                         .name(format!("flusher-dedup-{}-{}", shard_idx, worker_idx))
                         .spawn(move || {
@@ -606,6 +615,8 @@ impl BufferFlusher {
                                 dedup_pending_skip_threshold,
                                 &metrics_d,
                                 &cleanup_tx_d,
+                                &candidate_d,
+                                read_pool_d.as_deref(),
                             );
                         })
                         .expect("failed to spawn dedup worker");

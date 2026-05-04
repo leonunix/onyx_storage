@@ -1095,6 +1095,7 @@ fn dedup_worker_batches_hits_across_units() {
     }
     drop(dedup_tx);
 
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
     BufferFlusher::dedup_loop(
         0,
         &dedup_rx,
@@ -1109,6 +1110,10 @@ fn dedup_worker_batches_hits_across_units() {
         0,
         &metrics,
         &cleanup_tx,
+        &candidate,
+        // No verify in this unit-test path: hits trust hash. Tests
+        // that need verify should construct their own ReadPool.
+        None,
     );
     drop(miss_tx);
 

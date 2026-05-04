@@ -77,6 +77,26 @@ impl BlockmapValue {
     pub fn is_uncompressed(&self) -> bool {
         self.compression == 0
     }
+
+    /// Project this blockmap entry into a `DedupEntry`. Drops the
+    /// `flags` byte (DedupEntry has no flags field — flags are
+    /// per-LBA blockmap concerns, not per-deduplicated-content
+    /// concerns). Used by the promote-on-verified-hit path: when a
+    /// candidate-cache hit is byte-confirmed, the cached
+    /// BlockmapValue becomes the dedup_index payload for that
+    /// fingerprint.
+    pub fn to_dedup_entry(&self) -> DedupEntry {
+        DedupEntry {
+            pba: self.pba,
+            slot_offset: self.slot_offset,
+            compression: self.compression,
+            unit_compressed_size: self.unit_compressed_size,
+            unit_original_size: self.unit_original_size,
+            unit_lba_count: self.unit_lba_count,
+            offset_in_unit: self.offset_in_unit,
+            crc32: self.crc32,
+        }
+    }
 }
 
 // --- Per-volume blockmap key: just lba (8B BE) ---
