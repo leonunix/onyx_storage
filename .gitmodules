@@ -4,3 +4,6 @@
 [submodule "metadb"]
 	path = metadb
 	url = git@github.com:leonunix/onyx_metadb.git
+[submodule "chunklet"]
+	path = chunklet
+	url = git@github.com:leonunix/onyx_chunklet.git
