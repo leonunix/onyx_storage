@@ -16,10 +16,10 @@ Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses
 - **Content-addressable dedup** &mdash; xxh3_64 fingerprinting, RAM candidate cache for first-occurrence misses, LV3 byte-verified promote on duplicate sighting, sharded apply lanes, cuckoo-filter L0, cold-tail background rescan to recover ratio after restart
 - **Fragment packing** &mdash; VDO-style bin-packing of sub-4KB compressed fragments into shared physical slots
 - **Garbage collection** &mdash; background dead-block scanner and rewriter with back-pressure control
-- **Purpose-built metadata engine** &mdash; in-tree [onyx-metadb](metadb/) (paged COW radix L2P + paged-array refcount + cuckoo dedup_index + paged dedup_reverse) sharing one WAL with group commit
+- **Purpose-built metadata engine** &mdash; in-tree [onyx-metadb](metadb/) (paged COW radix L2P + paged-array refcount + cuckoo dedup_index) sharing one WAL with group commit
 - **Crash consistency** &mdash; one metadb tx per writer batch (L2P + refcount + dedup atomic under one fsync); write-buffer sync-before-ack
 - **High-performance write path** &mdash; staging channel + write thread batch (encode/CRC off hot path), jemalloc, DashMap 256-shard indices, per-shard backpressure
-- **Batched backend** &mdash; writer drains up to 32 units per batch: one metadb tx, `Db::multi_get` for old mappings, batched dedup cleanup via `cleanup_dedup_for_pbas_batch`
+- **Batched backend** &mdash; writer drains units into one metadb tx, captures old `BlockmapValue`s for freed PBAs, and cleans stale dedup entries by LV3 read-back + guarded forward delete
 - **Zone-based parallelism** &mdash; LBA space partitioned into zones, each served by a dedicated worker thread
 - **ublk frontend** (Linux) &mdash; expose volumes as `/dev/ublkbN` block devices with 512B sector alignment
 - **Service mode** &mdash; multi-volume serving in a single process, Unix socket IPC for online management and graceful shutdown
@@ -46,7 +46,6 @@ onyx-metadb (in-tree)
   paged COW radix L2P (per-volume, snapshot-able)
   paged-array refcount + per-shard delta
   cuckoo dedup_index (4 slots/bucket) + cuckoo-filter L0 + L1 hot cache
-  paged dedup_reverse (PBA-prefix scan)
   shared WAL + group commit + per-shard apply lanes
 ```
 
@@ -228,11 +227,11 @@ User-perceived latency = ring lock + memcpy + channel send. Encoding, CRC, disk 
 
 - 4 KiB is the dedup granularity (fixed-size fingerprinting); compression granularity is much larger (up to 128 KiB coalesced units).
 - **xxh3_64 fingerprints (8 B)**, not crypto-strength. Per-pair collision probability ~1.5e-8, so byte verify is *correctness*, not optimisation &mdash; every prospective hit re-reads the original fragment from LV3 through the engine's batched io_uring `ReadPool` and compares against the new write's source bytes before it is allowed to dedup.
-- **Promote-on-verified-hit**: a first-occurrence miss does **not** publish to the persistent `dedup_index` &mdash; instead it lands in a sharded RAM `CandidateCache` (per-shard LRU, ~1 M slots/shard by default). Only the second sighting of the same fingerprint, after LV3 byte-verify confirms a real duplicate, promotes the entry into `dedup_index` + `dedup_reverse` atomically with the LBA remap (`atomic_batch_dedup_hits_with_promote`). Singleton blocks therefore cost **zero metadb writes** for their dedup metadata.
+- **Promote-on-verified-hit**: a first-occurrence miss does **not** publish to the persistent `dedup_index` &mdash; instead it lands in a sharded RAM `CandidateCache` (per-shard LRU, ~1 M slots/shard by default). Only the second sighting of the same fingerprint, after LV3 byte-verify confirms a real duplicate, promotes the entry into `dedup_index` atomically with the LBA remap (`atomic_batch_dedup_hits_with_promote`). Singleton blocks therefore cost **zero metadb writes** for their dedup metadata.
 - **Two-stage L0**: `dedup_index` lookups go through L1 hot cache &rarr; cuckoo filter (16-bit fingerprint, 4 slots/bucket, packed u64) &rarr; on-disk cuckoo. The filter avoids reading cold cuckoo pages on every miss; FPR ~0.006%, lossless degradation when saturated.
 - **Cold-tail rescan** (in `DedupScanner`): a per-volume LBA cursor walks live blockmap entries one chunk per cycle, fans LV3 reads through the `ReadPool`, computes xxh3, and warms the candidate cache. This recovers dedup ratio after process restart (the cache is RAM-only) and on long-running engines whose dedup window has moved past entries the writer originally cached. Tunable via `dedup.cold_tail_max_per_cycle`.
 - Under per-shard buffer pressure (>90 %), foreground dedup is skipped and blocks are flagged `DEDUP_SKIPPED`; the same scanner drains them later, hashing in the background and warming the candidate cache (still no direct dedup_index write &mdash; promote stays gated on a verified second sighting).
-- Dedup index cleanup is atomic: when a PBA's refcount hits zero, `paged_reverse` PBA-prefix scan removes stale `dedup_index` entries in the same metadb tx, and the writer's cleanup hook drops every candidate-cache slot pointing at the freed PBA before the allocator can reuse it.
+- Dedup index cleanup avoids a persistent reverse table. When a PBA's refcount hits zero, the remap/delete path carries the old `BlockmapValue`; cleanup reads the old 4 KiB payload from LV3, recomputes xxh3, and calls `delete_dedup_index_if_matches`. The delete is guarded by both hash match and full `BlockmapValue` equality (flags ignored), so an xxh3 collision cannot remove a live entry for another physical mapping. The writer's cleanup hook also drops every candidate-cache slot pointing at the freed PBA before the allocator can reuse it.
 - `dedup_shards` (default 8) drives per-shard apply lanes inside metadb so concurrent flush lanes don't serialise on a single dedup hot lock; the candidate cache shards on the same routing so a hit and the eventual promote land in the same metadb shard.
 
 ### Garbage Collection
@@ -252,20 +251,19 @@ Onyx's logical "tables" map onto four purpose-built structures inside [onyx-meta
 | L2P (blockmap)  | per-volume paged COW radix tree                      | `Lba(u64 BE)`                | 28 B `L2pValue`     | LBA &rarr; PBA + compression metadata; supports per-volume snapshots / clones |
 | refcount        | global paged-array + per-shard delta                 | `Pba(u64 BE)`                | `u32` count         | Physical block reference counts (no snapshots) |
 | dedup_index     | global cuckoo (4 slots/bucket, 28 buckets/page) + cuckoo-filter L0 + L1 hot cache | `Hash8` (xxh3_64) | 27 B `DedupValue`   | Content hash &rarr; PBA fast lookup       |
-| dedup_reverse   | global paged radix + overflow chains (168 entries/page) | 16 B (`Pba` BE + `Hash8`)  | (empty)             | Prefix-scan-by-PBA &rarr; cleanup on refcount=0 |
 
-Cross-table atomicity comes from a single metadb transaction: writer drains up to 32 units and accumulates all L2P insert/delete + refcount incref/decref into one `tx`. **`dedup_index` / `dedup_reverse` writes are produced only by verified-hit promotes** (`atomic_batch_dedup_hits_with_promote`) &mdash; first-occurrence misses live in the RAM `CandidateCache` and never touch the persistent dedup tables. `tx.commit()` lands the whole bundle under one WAL group-commit fsync. There is no RocksDB, no column families, and no `WriteBatch` &mdash; the engine no longer has a `rocksdb` dependency at all.
+Cross-table atomicity comes from a single metadb transaction: writer drains units and accumulates all L2P insert/delete + refcount incref/decref into one `tx`. **`dedup_index` writes are produced only by verified-hit promotes** (`atomic_batch_dedup_hits_with_promote`) &mdash; first-occurrence misses live in the RAM `CandidateCache` and never touch the persistent dedup table. `tx.commit()` lands the whole bundle under one WAL group-commit fsync. There is no RocksDB, no column families, and no `WriteBatch` &mdash; the engine no longer has a `rocksdb` dependency at all.
 
-Volume deletion goes through `Db::drop_volume`: metadb walks the per-volume L2P shards, batches PBA decrefs, triggers dedup_reverse cleanup on PBAs whose refcount hits zero, and frees the shard pages.
+Volume deletion walks the per-volume L2P shards, batches PBA decrefs, returns only freed-PBA cleanup payloads to Onyx, and then Onyx reconstructs those old mappings from LV3 to conditionally remove matching `dedup_index` entries before allocator reuse.
 
 ## Roadmap
 
 - [x] MVP: ublk + metadata engine + compression + space management
 - [x] Packer + GC: fragment bin-packing, GC scanner/rewriter, back-pressure, hole-map reuse
-- [x] Dedup: worker pool, dedup_index/dedup_reverse, tiered skip strategy, DEDUP_SKIPPED rescan, RAM candidate cache + LV3 byte-verified promote on duplicate sighting, cold-tail blockmap rescan, cuckoo-filter L0
+- [x] Dedup: worker pool, dedup_index, tiered skip strategy, DEDUP_SKIPPED rescan, RAM candidate cache + LV3 byte-verified promote on duplicate sighting, old-mapping read-back cleanup, cold-tail blockmap rescan, cuckoo-filter L0
 - [x] Performance (frontend): staging buffer, write thread batch, jemalloc, DashMap 256-shard indices, ring backpressure
 - [x] Performance (backend): batched writer (drain 32 units per metadb tx), multi_get for old mappings, batched dedup cleanup, sharded dedup apply lanes, balanced read pool dispatch
-- [x] Metadata engine swap: replaced RocksDB with in-tree onyx-metadb (paged COW radix L2P, paged-array refcount + delta, cuckoo dedup_index, paged dedup_reverse, shared WAL with group commit)
+- [x] Metadata engine swap: replaced RocksDB with in-tree onyx-metadb (paged COW radix L2P, paged-array refcount + delta, cuckoo dedup_index, shared WAL with group commit)
 - [x] Service mode: multi-volume start, Unix socket IPC (stop/create/delete/list), signal handling (SIGTERM/SIGINT)
 - [ ] RAID-aware: strip-aligned writes, strip-granularity allocation
 - [ ] Production hardening: iSCSI frontend, HA (active-standby dual controller), Prometheus metrics

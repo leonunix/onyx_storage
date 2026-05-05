@@ -440,7 +440,7 @@ fn prove_lz4_compression_ran() {
     let mut original = vec![0u8; 8 * 4096];
     for i in 0..8 {
         for j in 0..4096 {
-            original[i * 4096 + j] = (i & 0xFF) as u8;
+            original[i * 4096 + j] = ((i + 10) & 0xFF) as u8;
         }
     }
     vol.write(0, &original).unwrap();
@@ -514,7 +514,7 @@ fn prove_zstd_compression_ran() {
     let mut original = vec![0u8; 8 * 4096];
     for i in 0..8 {
         for j in 0..4096 {
-            original[i * 4096 + j] = (i & 0xFF) as u8;
+            original[i * 4096 + j] = ((i + 10) & 0xFF) as u8;
         }
     }
     vol.write(0, &original).unwrap();

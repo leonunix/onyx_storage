@@ -218,7 +218,7 @@ pub struct EngineMetrics {
     pub dedup_hit_commit_ns: AtomicU64,
     /// Number of candidate-cache hits that have been verified
     /// (LV3 byte-compare passed) and successfully promoted into the
-    /// persistent dedup_index/dedup_reverse tables in the dedup
+    /// persistent dedup_index table in the dedup
     /// worker's atomic commit batch. Counts confirmed-duplicate
     /// promotions only — first-occurrence inserts into the candidate
     /// cache do not bump this counter.
@@ -228,6 +228,12 @@ pub struct EngineMetrics {
     /// the next sighting will retry; counter helps detect persistent
     /// commit-failure stuck states.
     pub dedup_promotions_failed: AtomicU64,
+    /// Old-mapping cleanup failed to reconstruct a freed block from LV3, so
+    /// the corresponding forward dedup_index entry was left in place.
+    pub dedup_cleanup_reconstruct_errors: AtomicU64,
+    /// Old-mapping cleanup reconstructed the block but failed to delete the
+    /// matching forward dedup_index entry.
+    pub dedup_cleanup_delete_errors: AtomicU64,
     pub flush_units_written: AtomicU64,
     pub flush_unit_bytes: AtomicU64,
     pub flush_packed_slots_written: AtomicU64,
@@ -446,6 +452,8 @@ impl Default for EngineMetrics {
             dedup_hit_commit_ns: AtomicU64::new(0),
             dedup_promotions_committed: AtomicU64::new(0),
             dedup_promotions_failed: AtomicU64::new(0),
+            dedup_cleanup_reconstruct_errors: AtomicU64::new(0),
+            dedup_cleanup_delete_errors: AtomicU64::new(0),
             flush_units_written: AtomicU64::new(0),
             flush_unit_bytes: AtomicU64::new(0),
             flush_packed_slots_written: AtomicU64::new(0),
@@ -606,6 +614,8 @@ impl EngineMetrics {
             dedup_hit_commit_ns: load(&self.dedup_hit_commit_ns),
             dedup_promotions_committed: load(&self.dedup_promotions_committed),
             dedup_promotions_failed: load(&self.dedup_promotions_failed),
+            dedup_cleanup_reconstruct_errors: load(&self.dedup_cleanup_reconstruct_errors),
+            dedup_cleanup_delete_errors: load(&self.dedup_cleanup_delete_errors),
             flush_units_written: load(&self.flush_units_written),
             flush_unit_bytes: load(&self.flush_unit_bytes),
             flush_packed_slots_written: load(&self.flush_packed_slots_written),
@@ -754,6 +764,8 @@ pub struct EngineMetricsSnapshot {
     pub dedup_hit_commit_ns: u64,
     pub dedup_promotions_committed: u64,
     pub dedup_promotions_failed: u64,
+    pub dedup_cleanup_reconstruct_errors: u64,
+    pub dedup_cleanup_delete_errors: u64,
     pub flush_units_written: u64,
     pub flush_unit_bytes: u64,
     pub flush_packed_slots_written: u64,
@@ -933,6 +945,8 @@ impl EngineMetricsSnapshot {
             dedup_hit_commit_ns,
             dedup_promotions_committed,
             dedup_promotions_failed,
+            dedup_cleanup_reconstruct_errors,
+            dedup_cleanup_delete_errors,
             flush_units_written,
             flush_unit_bytes,
             flush_packed_slots_written,
@@ -1014,8 +1028,6 @@ pub struct MetaMemorySnapshot {
     pub free_list_pages: u64,
     pub dedup_index_ssts: u64,
     pub dedup_index_records: u64,
-    pub dedup_reverse_ssts: u64,
-    pub dedup_reverse_records: u64,
     pub dedup_l0_distinct_fps: u64,
     pub dedup_l0_approx_bytes: u64,
     pub dedup_l1_entries: u64,
@@ -1219,8 +1231,6 @@ impl MetaMemorySnapshot {
             free_list_pages: sub!(free_list_pages),
             dedup_index_ssts: sub!(dedup_index_ssts),
             dedup_index_records: sub!(dedup_index_records),
-            dedup_reverse_ssts: sub!(dedup_reverse_ssts),
-            dedup_reverse_records: sub!(dedup_reverse_records),
             dedup_l0_distinct_fps: sub!(dedup_l0_distinct_fps),
             dedup_l0_approx_bytes: sub!(dedup_l0_approx_bytes),
             dedup_l1_entries: sub!(dedup_l1_entries),
@@ -1416,8 +1426,6 @@ impl MetaMemorySnapshot {
             free_list_pages,
             dedup_index_ssts: 0,
             dedup_index_records: 0,
-            dedup_reverse_ssts: 0,
-            dedup_reverse_records: 0,
             dedup_l0_distinct_fps: dedup_tiers.l0_distinct_fps as u64,
             dedup_l0_approx_bytes: dedup_tiers.l0_approx_bytes as u64,
             dedup_l1_entries: dedup_tiers.l1_entries as u64,
@@ -1660,11 +1668,8 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_dedup_lsm: index_ssts={} index_records={} reverse_ssts={} reverse_records={}",
-                metadb.dedup_index_ssts,
-                metadb.dedup_index_records,
-                metadb.dedup_reverse_ssts,
-                metadb.dedup_reverse_records
+                "metadb_dedup_lsm: index_ssts={} index_records={}",
+                metadb.dedup_index_ssts, metadb.dedup_index_records
             );
             let _ = writeln!(
                 out,
@@ -2016,7 +2021,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={}",
+            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} cleanup_reconstruct_errors={} cleanup_delete_errors={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={}",
             self.metrics.dedup_hits,
             self.metrics.dedup_misses,
             self.metrics.dedup_skipped_units,
@@ -2027,6 +2032,8 @@ impl EngineStatusSnapshot {
             self.metrics.dedup_hit_commit_ops,
             self.metrics.dedup_promotions_committed,
             self.metrics.dedup_promotions_failed,
+            self.metrics.dedup_cleanup_reconstruct_errors,
+            self.metrics.dedup_cleanup_delete_errors,
             self.metrics.dedup_rescan_cycles,
             self.metrics.dedup_rescan_skipped_cycles,
             self.metrics.dedup_rescan_blocks,

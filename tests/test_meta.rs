@@ -494,7 +494,9 @@ fn delete_volume_shared_pba_refcount() {
 
     // All 3 decrements aggregated: 3 - 3 = 0, PBA freed
     assert_eq!(freed.len(), 1);
-    assert_eq!(freed[0].0, shared_pba);
+    assert_eq!(freed[0].pba, shared_pba);
+    assert_eq!(freed[0].decrements, 3);
+    assert!(freed[0].pba_freed);
     assert_eq!(store.get_refcount(shared_pba).unwrap(), 0);
 }
 
@@ -531,7 +533,8 @@ fn delete_volume_shared_pba_partial_decrement() {
 
     let freed = store.delete_volume(&vol.id).unwrap();
 
-    // 5 - 2 = 3, not freed
+    // 5 - 2 = 3, so the PBA is still live and no cleanup payload should
+    // be returned to the post-commit cleanup channel.
     assert!(freed.is_empty());
     assert_eq!(store.get_refcount(shared_pba).unwrap(), 3);
 }
@@ -864,7 +867,10 @@ fn zero_mapping_does_not_refcount_pba_zero_and_can_be_overwritten() {
         .atomic_batch_write(&vol_id, &[(Lba(0), BlockmapValue::zero())], 0)
         .unwrap();
     assert_eq!(store.get_refcount(Pba(55)).unwrap(), 0);
-    assert_eq!(freed.get(&Pba(55)), Some(&(1, 1)));
+    let cleanup = freed.get(&Pba(55)).expect("PBA 55 should need cleanup");
+    assert_eq!(cleanup.decrements, 1);
+    assert_eq!(cleanup.blocks, 1);
+    assert!(cleanup.pba_freed);
     assert_eq!(store.get_refcount(Pba(0)).unwrap(), 0);
 }
 
@@ -963,9 +969,22 @@ fn test_hash(seed: u8) -> ContentHash {
     [seed; 8]
 }
 
-/// Register dedup_reverse entries so the dedup_reverse guard in
-/// atomic_batch_dedup_hits accepts the hits.
-fn register_dedup_reverse(store: &MetaStore, pba: u64, hashes: &[ContentHash]) {
+fn dedup_entry_from_blockmap(value: &BlockmapValue) -> DedupEntry {
+    DedupEntry {
+        pba: value.pba,
+        slot_offset: value.slot_offset,
+        compression: value.compression,
+        unit_compressed_size: value.unit_compressed_size,
+        unit_original_size: value.unit_original_size,
+        unit_lba_count: value.unit_lba_count,
+        offset_in_unit: value.offset_in_unit,
+        crc32: value.crc32,
+    }
+}
+
+/// Register forward dedup entries that the dedup hit path has already
+/// verified against LV3 content.
+fn register_dedup_entries(store: &MetaStore, pba: u64, hashes: &[ContentHash]) {
     let entries: Vec<(ContentHash, DedupEntry)> = hashes
         .iter()
         .map(|h| {
@@ -1041,7 +1060,7 @@ fn batch_dedup_hits_basic() {
     // Set up target PBA 100 with refcount 5
     store.set_refcount(Pba(100), 5).unwrap();
     let h = [test_hash(1), test_hash(2), test_hash(3)];
-    register_dedup_reverse(&store, 100, &h);
+    register_dedup_entries(&store, 100, &h);
 
     // Three hits, no old mapping, all targeting PBA 100
     let hits = vec![
@@ -1077,8 +1096,8 @@ fn batch_dedup_hits_rejected_target_freed() {
     // PBA 200 has no refcount entry → 0
     let h0 = test_hash(1);
     let h1 = test_hash(2);
-    register_dedup_reverse(&store, 100, &[h0]);
-    // No dedup_reverse for PBA 200 → rejected by dedup_reverse guard
+    register_dedup_entries(&store, 100, &[h0]);
+    register_dedup_entries(&store, 200, &[h1]);
 
     let hits = vec![
         (Lba(0), make_bv(100, 4096, 1, 0), h0),
@@ -1116,7 +1135,7 @@ fn batch_dedup_hits_same_pba_refresh() {
 
     // Dedup hit targets the same PBA 100 → blockmap refresh, no refcount change
     let h = test_hash(1);
-    register_dedup_reverse(&store, 100, &[h]);
+    register_dedup_entries(&store, 100, &[h]);
     let hits = vec![(Lba(5), make_bv(100, 4096, 1, 0), h)];
     let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     match results[0] {
@@ -1140,7 +1159,7 @@ fn batch_dedup_hits_old_pba_decrement() {
     // Target PBA 200 with refcount 5
     store.set_refcount(Pba(200), 5).unwrap();
     let h = test_hash(1);
-    register_dedup_reverse(&store, 200, &[h]);
+    register_dedup_entries(&store, 200, &[h]);
 
     let hits = vec![(Lba(5), make_bv(200, 4096, 1, 0), h)];
     let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
@@ -1168,7 +1187,7 @@ fn batch_dedup_hits_multiple_same_target() {
     // All target PBA 100 with refcount 5, no old mappings
     store.set_refcount(Pba(100), 5).unwrap();
     let h = [test_hash(1), test_hash(2), test_hash(3)];
-    register_dedup_reverse(&store, 100, &h);
+    register_dedup_entries(&store, 100, &h);
     let hits = vec![
         (Lba(10), make_bv(100, 4096, 1, 0), h[0]),
         (Lba(11), make_bv(100, 4096, 1, 0), h[1]),
@@ -1197,7 +1216,7 @@ fn batch_dedup_hits_multiple_decrement_same_old() {
     // Target PBA 200 with refcount 10
     store.set_refcount(Pba(200), 10).unwrap();
     let h = [test_hash(1), test_hash(2), test_hash(3)];
-    register_dedup_reverse(&store, 200, &h);
+    register_dedup_entries(&store, 200, &h);
 
     let hits = vec![
         (Lba(0), make_bv(200, 4096, 1, 0), h[0]),
@@ -1238,8 +1257,8 @@ fn batch_dedup_hits_pba_is_both_target_and_old() {
     // Hit 2: LBA 6 (no old mapping) targets 100 (increment 100)
     let h0 = test_hash(1);
     let h1 = test_hash(2);
-    register_dedup_reverse(&store, 200, &[h0]);
-    register_dedup_reverse(&store, 100, &[h1]);
+    register_dedup_entries(&store, 200, &[h0]);
+    register_dedup_entries(&store, 100, &[h1]);
     let hits = vec![
         (Lba(5), make_bv(200, 4096, 1, 0), h0),
         (Lba(6), make_bv(100, 4096, 1, 0), h1),
@@ -1261,6 +1280,42 @@ fn batch_dedup_hits_empty() {
     let (results, newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &[]).unwrap();
     assert!(results.is_empty());
     assert!(newly_zeroed.is_empty());
+}
+
+#[test]
+fn delete_dedup_index_if_matches_requires_full_mapping_match() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let hash = test_hash(42);
+    let old_mapping = make_bv(100, 4096, 1, 0);
+    let colliding_mapping = BlockmapValue {
+        pba: Pba(200),
+        crc32: 0xCAFE_BABE,
+        ..old_mapping
+    };
+
+    store
+        .put_dedup_entries(&[(hash, dedup_entry_from_blockmap(&colliding_mapping))])
+        .unwrap();
+
+    assert!(
+        !store
+            .delete_dedup_index_if_matches(&hash, &old_mapping)
+            .unwrap(),
+        "same 64-bit hash must not delete a different PBA/mapping"
+    );
+    assert_eq!(
+        store.get_dedup_entry(&hash).unwrap(),
+        Some(dedup_entry_from_blockmap(&colliding_mapping))
+    );
+
+    assert!(
+        store
+            .delete_dedup_index_if_matches(&hash, &colliding_mapping)
+            .unwrap(),
+        "matching hash plus matching PBA/mapping should delete the forward entry"
+    );
+    assert!(store.get_dedup_entry(&hash).unwrap().is_none());
 }
 
 // --- merge-based decrement tests for atomic_batch_write_packed ---
@@ -1294,8 +1349,8 @@ fn batch_write_packed_merge_decrement() {
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
     // PBA 300 refcount = 2
     assert_eq!(store.get_refcount(Pba(300)).unwrap(), 2);
-    // PBA 50 not in newly_zeroed (5→3, not driven to 0)
-    assert!(!old_meta.contains_key(&Pba(50)));
+    // PBA 50 remains live (5→3), so no cleanup payload is returned.
+    assert!(old_meta.is_empty());
 }
 
 #[test]
@@ -1344,8 +1399,8 @@ fn batch_write_multi_merge_decrement_only() {
     let units = vec![(&vol, batch_values.as_slice(), 1u32)];
     let old_meta = store.atomic_batch_write_multi(&units).unwrap();
 
-    // PBA 50 not in newly_zeroed (3→2, not driven to 0)
-    assert!(!old_meta.contains_key(&Pba(50)));
+    // PBA 50 remains live (3→2), so no cleanup payload is returned.
+    assert!(old_meta.is_empty());
     // PBA 50: 3 - 1 = 2
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 2);
     // PBA 400: 0 + 1 = 1 (new path)

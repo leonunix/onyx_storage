@@ -12,6 +12,41 @@ use crate::metrics::MetaMemorySnapshot;
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeConfig, VolumeId, BLOCK_SIZE};
 use onyx_metadb::VolumeOrdinal;
 
+/// Old physical metadata observed while replacing blockmap entries.
+///
+/// The cleanup thread uses the full old mapping to reconstruct the original
+/// 4 KiB payload, recompute its short dedup hash, and conditionally remove the
+/// matching forward dedup_index entry without maintaining a persistent reverse
+/// table.
+#[derive(Debug, Clone)]
+pub struct RemapCleanup {
+    pub pba: Pba,
+    pub decrements: u32,
+    pub blocks: u32,
+    pub pba_freed: bool,
+    pub mappings: Vec<BlockmapValue>,
+}
+
+impl RemapCleanup {
+    pub fn new(mapping: BlockmapValue, blocks: u32) -> Self {
+        Self {
+            pba: mapping.pba,
+            decrements: 1,
+            blocks,
+            pba_freed: false,
+            mappings: vec![mapping],
+        }
+    }
+
+    pub fn merge(&mut self, other: RemapCleanup) {
+        debug_assert_eq!(self.pba, other.pba);
+        self.decrements = self.decrements.saturating_add(other.decrements);
+        self.blocks = self.blocks.max(other.blocks);
+        self.pba_freed |= other.pba_freed;
+        self.mappings.extend(other.mappings);
+    }
+}
+
 /// Result for each dedup hit in a batched `atomic_batch_dedup_hits` call.
 #[derive(Debug, Clone, Copy)]
 pub enum DedupHitResult {
@@ -100,7 +135,7 @@ impl MetaStore {
         self.backend.list_volumes()
     }
 
-    pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<(Pba, u32)>> {
+    pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<RemapCleanup>> {
         self.backend.delete_volume(id)
     }
 
@@ -201,7 +236,7 @@ impl MetaStore {
         vol_id: &VolumeId,
         start_lba: Lba,
         end_lba: Lba,
-    ) -> OnyxResult<Vec<(Pba, u32)>> {
+    ) -> OnyxResult<Vec<RemapCleanup>> {
         self.backend
             .delete_blockmap_range(vol_id, start_lba, end_lba)
     }
@@ -230,7 +265,7 @@ impl MetaStore {
         vol_id: &VolumeId,
         batch_values: &[(Lba, BlockmapValue)],
         new_refcount: u32,
-    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
         self.backend
             .atomic_batch_write(vol_id, batch_values, new_refcount)
     }
@@ -241,7 +276,7 @@ impl MetaStore {
         batch_values: &[(Lba, BlockmapValue)],
         new_refcount: u32,
         dedup_entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
         self.backend.atomic_batch_write_with_dedup(
             vol_id,
             batch_values,
@@ -255,7 +290,7 @@ impl MetaStore {
         batch_values: &[(VolumeId, Lba, BlockmapValue)],
         new_pba: Pba,
         new_refcount: u32,
-    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
         self.backend
             .atomic_batch_write_packed(batch_values, new_pba, new_refcount)
     }
@@ -266,7 +301,7 @@ impl MetaStore {
         new_pba: Pba,
         new_refcount: u32,
         dedup_entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
         self.backend.atomic_batch_write_packed_with_dedup(
             batch_values,
             new_pba,
@@ -278,7 +313,7 @@ impl MetaStore {
     pub fn atomic_batch_write_multi(
         &self,
         units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
-    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
         self.backend.atomic_batch_write_multi(units)
     }
 
@@ -286,7 +321,7 @@ impl MetaStore {
         &self,
         units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
         dedup_entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<HashMap<Pba, (u32, u32)>> {
+    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
         self.backend
             .atomic_batch_write_multi_with_dedup(units, dedup_entries)
     }
@@ -317,7 +352,7 @@ impl MetaStore {
         lba: Lba,
         new_value: &BlockmapValue,
         hash: &ContentHash,
-    ) -> OnyxResult<Option<(Pba, u32)>> {
+    ) -> OnyxResult<Option<RemapCleanup>> {
         self.backend.atomic_dedup_hit(vol_id, lba, new_value, hash)
     }
 
@@ -325,22 +360,21 @@ impl MetaStore {
         &self,
         vol_id: &VolumeId,
         hits: &[(Lba, BlockmapValue, ContentHash)],
-    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, RemapCleanup>)> {
         self.backend.atomic_batch_dedup_hits(vol_id, hits)
     }
 
     /// Same as [`atomic_batch_dedup_hits`] but also writes
-    /// `promote_entries` into `dedup_index` + `dedup_reverse` in the
-    /// same metadb transaction. Used by the promote-on-verified-hit
-    /// path so the dedup_index registration and the LBA remap land
-    /// atomically — a crash between the two would leave the cache
-    /// promotion half-applied.
+    /// `promote_entries` into `dedup_index` in the same metadb
+    /// transaction. Used by the promote-on-verified-hit path so the
+    /// dedup_index registration and the LBA remap land atomically — a
+    /// crash between the two would leave the cache promotion half-applied.
     pub fn atomic_batch_dedup_hits_with_promote(
         &self,
         vol_id: &VolumeId,
         hits: &[(Lba, BlockmapValue, ContentHash)],
         promote_entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, RemapCleanup>)> {
         self.backend
             .atomic_batch_dedup_hits_with_promote(vol_id, hits, promote_entries)
     }
@@ -364,6 +398,14 @@ impl MetaStore {
         self.backend.delete_dedup_index(hash)
     }
 
+    pub fn delete_dedup_index_if_matches(
+        &self,
+        hash: &ContentHash,
+        mapping: &BlockmapValue,
+    ) -> OnyxResult<bool> {
+        self.backend.delete_dedup_index_if_matches(hash, mapping)
+    }
+
     pub fn dedup_entry_is_live(&self, hash: &ContentHash, entry: &DedupEntry) -> OnyxResult<bool> {
         self.backend.dedup_entry_is_live(hash, entry)
     }
@@ -373,14 +415,6 @@ impl MetaStore {
         entries: &[(ContentHash, DedupEntry)],
     ) -> OnyxResult<Vec<bool>> {
         self.backend.multi_dedup_entries_are_live(entries)
-    }
-
-    pub fn cleanup_dedup_for_pba_standalone(&self, pba: Pba) -> OnyxResult<()> {
-        self.backend.cleanup_dedup_for_pbas_batch(&[pba])
-    }
-
-    pub fn cleanup_dedup_for_pbas_batch(&self, pbas: &[Pba]) -> OnyxResult<()> {
-        self.backend.cleanup_dedup_for_pbas_batch(pbas)
     }
 
     pub fn scan_dedup_skipped(
@@ -450,10 +484,6 @@ impl MetaStore {
 
     pub fn iter_dedup_entries(&self) -> OnyxResult<Vec<(ContentHash, DedupEntry)>> {
         self.backend.iter_dedup_entries()
-    }
-
-    pub fn iter_dedup_reverse_entries(&self) -> OnyxResult<Vec<(Pba, ContentHash)>> {
-        self.backend.iter_dedup_reverse_entries()
     }
 
     pub fn iter_allocated_blocks(&self) -> OnyxResult<Vec<Pba>> {

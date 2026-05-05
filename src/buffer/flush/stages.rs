@@ -14,7 +14,7 @@ struct PreparedDedupUnit {
     /// `(lba_index_in_unit, blockmap_value, hash)`.
     valid_hits: Vec<(usize, BlockmapValue, ContentHash)>,
     /// Candidate-cache-sourced hits that, after verify, need to be
-    /// promoted into the persistent `dedup_index`/`dedup_reverse`.
+    /// promoted into the persistent `dedup_index`.
     /// Each entry's `lba_index_in_unit` matches a `valid_hits` entry;
     /// dedup_index-sourced hits do **not** appear here because they
     /// are already in the persistent layer.
@@ -425,7 +425,7 @@ impl BufferFlusher {
         skip_threshold_pct: u8,
         pending_skip_threshold_entries: u64,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
         read_pool: Option<&crate::io::read_pool::ReadPool>,
     ) {
@@ -623,7 +623,7 @@ impl BufferFlusher {
     /// Promotion candidates are recorded in
     /// `prepared_unit.promote_candidates` — the writer feeds them
     /// into the next `atomic_batch_write_*_with_dedup` so dedup_index
-    /// + dedup_reverse + blockmap remap + refcount land atomically.
+    /// + blockmap remap + refcount land atomically.
     /// Verify mismatches in `verify_prepared_dedup_hits` filter both
     /// `valid_hits` and `promote_candidates` so we never promote a
     /// fingerprint whose stored content has drifted from the new
@@ -759,7 +759,7 @@ impl BufferFlusher {
         pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
     ) {
         let mut by_volume: HashMap<String, Vec<usize>> = HashMap::new();
@@ -878,7 +878,7 @@ impl BufferFlusher {
         pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
     ) {
         let mut by_volume: HashMap<String, Vec<usize>> = HashMap::new();
         for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
@@ -961,11 +961,7 @@ impl BufferFlusher {
                             prepared[unit_idx].successful_hit_indices.extend(accepted);
                             prepared[unit_idx].zero_indices.clear();
                             if !newly_zeroed.is_empty() {
-                                let dead: Vec<(Pba, u32)> = newly_zeroed
-                                    .into_iter()
-                                    .map(|(pba, (_, blocks))| (pba, blocks))
-                                    .collect();
-                                let _ = cleanup_tx.send(dead);
+                                let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
                             }
                         }
                         Err(e) => {
@@ -992,7 +988,7 @@ impl BufferFlusher {
         pending: &mut Vec<(usize, usize, Lba, BlockmapValue, ContentHash)>,
         meta: &MetaStore,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
     ) {
         let chunk = std::mem::take(pending);
@@ -1007,8 +1003,8 @@ impl BufferFlusher {
         // Collect promote_candidates from the unit_idx values present
         // in this chunk. Each (lba_idx, hash, dedup_entry) tuple is a
         // confirmed candidate-source hit that we want to register
-        // into dedup_index/dedup_reverse atomically with the LBA
-        // remap. Drain `promote_candidates` so we don't re-promote
+        // into dedup_index atomically with the LBA remap. Drain
+        // `promote_candidates` so we don't re-promote
         // the same entry on a subsequent chunk.
         let mut chunk_unit_idxs: std::collections::HashSet<usize> =
             chunk.iter().map(|(u, _, _, _, _)| *u).collect();
@@ -1056,8 +1052,7 @@ impl BufferFlusher {
                 }
 
                 if !newly_zeroed.is_empty() {
-                    let dead: Vec<(Pba, u32)> = newly_zeroed.into_iter().collect();
-                    let _ = cleanup_tx.send(dead);
+                    let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
                 }
             }
             Err(e) => {

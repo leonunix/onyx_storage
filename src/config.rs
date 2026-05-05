@@ -105,8 +105,8 @@ pub struct MetaConfig {
     #[serde(default)]
     pub path: Option<PathBuf>,
     /// Shared block cache size in MB. One LRU cache is created at startup and
-    /// shared across every CF (blockmap + refcount + dedup_index +
-    /// dedup_reverse). Index + filter blocks are accounted against this cache
+    /// shared across the metadata indexes (blockmap + refcount + dedup_index).
+    /// Index + filter blocks are accounted against this cache
     /// (`cache_index_and_filter_blocks=true`), so this is the authoritative
     /// upper bound on metadb read-side memory. Scale roughly proportional to
     /// working set; on a 256 GiB host, 16–32 GiB is a reasonable starting

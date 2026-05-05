@@ -17,7 +17,6 @@ use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
 use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, EngineStatusSnapshot};
 use crate::space::allocator::SpaceAllocator;
-use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, VolumeConfig, VolumeId};
 use crate::volume::OnyxVolume;
 use crate::zone::manager::ZoneManager;
@@ -628,6 +627,7 @@ impl OnyxEngine {
             io_engine.clone(),
             metrics.clone(),
             Some(allocator.clone()),
+            flusher.candidate_cache(),
             read_pool.clone(),
         )?);
 
@@ -798,23 +798,37 @@ impl OnyxEngine {
                 pool.purge_volume(name)?;
             }
 
-            let freed = self.meta.delete_volume(&vol_id)?;
-            let freed_blocks: usize = freed.iter().map(|(_, blocks)| *blocks as usize).sum();
+            let cleanups = self.meta.delete_volume(&vol_id)?;
+            let freed_blocks: usize = cleanups
+                .iter()
+                .filter(|cleanup| cleanup.pba_freed)
+                .map(|cleanup| cleanup.blocks as usize)
+                .sum();
 
-            if let Some(allocator) = &self.allocator {
-                for (pba, block_count) in &freed {
-                    let result = if *block_count <= 1 {
-                        allocator.free_one(*pba)
-                    } else {
-                        allocator.free_extent(Extent::new(*pba, *block_count))
-                    };
-                    if let Err(e) = result {
-                        tracing::warn!(
-                            pba = pba.0, blocks = block_count,
-                            error = %e, "failed to free extent to allocator during volume delete"
-                        );
-                    }
+            if let (Some(allocator), Some(io_engine)) = (&self.allocator, &self.io_engine) {
+                let candidate = self
+                    .flusher
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|flusher| flusher.candidate_cache());
+                if let Some(candidate) = candidate {
+                    BufferFlusher::cleanup_dead_pbas_batch(
+                        &self.meta,
+                        allocator,
+                        io_engine,
+                        &self.metrics,
+                        &candidate,
+                        &cleanups,
+                        "volume_delete",
+                    );
                 }
+            } else if cleanups.iter().any(|cleanup| cleanup.pba_freed) {
+                tracing::warn!(
+                    name,
+                    cleanup_count = cleanups.len(),
+                    "delete_volume: meta-only mode cannot reconstruct old blocks; dedup_index cleanup skipped"
+                );
             }
 
             self.invalidate_live_handles(name);
@@ -826,7 +840,7 @@ impl OnyxEngine {
             tracing::info!(
                 name,
                 generation = deleted_generation,
-                freed_extents = freed.len(),
+                freed_extents = cleanups.iter().filter(|cleanup| cleanup.pba_freed).count(),
                 freed_blocks,
                 "volume deleted"
             );
@@ -1109,6 +1123,7 @@ impl OnyxEngine {
             io_engine.clone(),
             metrics.clone(),
             Some(allocator.clone()),
+            flusher.candidate_cache(),
             read_pool.clone(),
         )?);
 

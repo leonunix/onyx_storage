@@ -840,44 +840,6 @@ fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
         "  \"metadb_dedup_forward_delete_us\": {},",
         meta.dedup_apply_forward_delete_us
     );
-    println!(
-        "  \"metadb_dedup_reverse_put_count\": {},",
-        meta.dedup_apply_reverse_put_count
-    );
-    println!(
-        "  \"metadb_dedup_reverse_put_us\": {},",
-        meta.dedup_apply_reverse_put_us
-    );
-    println!(
-        "  \"metadb_dedup_reverse_put_avg_us\": {:.3},",
-        avg_u64(
-            meta.dedup_apply_reverse_put_us,
-            meta.dedup_apply_reverse_put_count
-        )
-    );
-    println!(
-        "  \"metadb_dedup_reverse_put_max_us\": {},",
-        meta.dedup_apply_reverse_put_max_us
-    );
-    println!(
-        "  \"metadb_dedup_reverse_delete_count\": {},",
-        meta.dedup_apply_reverse_delete_count
-    );
-    println!(
-        "  \"metadb_dedup_reverse_delete_us\": {},",
-        meta.dedup_apply_reverse_delete_us
-    );
-    println!(
-        "  \"metadb_dedup_reverse_delete_avg_us\": {:.3},",
-        avg_u64(
-            meta.dedup_apply_reverse_delete_us,
-            meta.dedup_apply_reverse_delete_count
-        )
-    );
-    println!(
-        "  \"metadb_dedup_reverse_delete_max_us\": {},",
-        meta.dedup_apply_reverse_delete_max_us
-    );
     println!("  \"metadb_l2p_get_calls\": {},", meta.l2p_get_calls);
     println!(
         "  \"metadb_l2p_get_lock_wait_us\": {},",

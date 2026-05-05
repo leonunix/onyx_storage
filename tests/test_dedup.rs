@@ -335,19 +335,6 @@ fn dedup_entry_roundtrip() {
 }
 
 #[test]
-fn dedup_reverse_key_roundtrip() {
-    // Reverse-key layout under the xxh3_64 hash schema: 8 B pba + 8 B
-    // hash = 16 B.
-    let pba = Pba(123);
-    let hash: ContentHash = [0xAB; 8];
-    let key = encode_dedup_reverse_key(pba, &hash);
-    assert_eq!(key.len(), 16);
-    let (decoded_pba, decoded_hash) = decode_dedup_reverse_key(&key).unwrap();
-    assert_eq!(decoded_pba, pba);
-    assert_eq!(decoded_hash, hash);
-}
-
-#[test]
 fn dedup_entry_to_blockmap_value() {
     let entry = DedupEntry {
         pba: Pba(42),
@@ -435,64 +422,6 @@ fn dedup_index_crud() {
     // Delete
     store.delete_dedup_index(&hash).unwrap();
     assert!(store.get_dedup_entry(&hash).unwrap().is_none());
-}
-
-#[test]
-fn dedup_cleanup_on_pba_free() {
-    let dir = tempdir().unwrap();
-    let config = onyx_storage::config::MetaConfig {
-        path: Some(dir.path().to_path_buf()),
-        block_cache_mb: 8,
-        memtable_budget_mb: 0,
-        index_pin_mb: 0,
-        lsm_bloom_bits_per_entry: 10,
-        checkpoint_interval_ms: 5000,
-        group_commit_timeout_us: 1,
-        wal_dir: None,
-        dedup_shards: 8,
-        dedup_cuckoo_buckets: 1_000_000,
-        dedup_l1_cache_entries: 256_000,
-    };
-    let store = MetaStore::open(&config).unwrap();
-
-    let hash1: ContentHash = [0x01; 8];
-    let hash2: ContentHash = [0x02; 8];
-    let pba = Pba(200);
-
-    let entry1 = DedupEntry {
-        pba,
-        slot_offset: 0,
-        compression: 0,
-        unit_compressed_size: 4096,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0xAAAA,
-    };
-    let entry2 = DedupEntry {
-        pba,
-        slot_offset: 0,
-        compression: 0,
-        unit_compressed_size: 4096,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 1,
-        crc32: 0xBBBB,
-    };
-
-    // Insert two entries for same PBA
-    store
-        .put_dedup_entries(&[(hash1, entry1), (hash2, entry2)])
-        .unwrap();
-    assert!(store.get_dedup_entry(&hash1).unwrap().is_some());
-    assert!(store.get_dedup_entry(&hash2).unwrap().is_some());
-
-    // Cleanup for PBA
-    store.cleanup_dedup_for_pba_standalone(pba).unwrap();
-
-    // Both should be gone
-    assert!(store.get_dedup_entry(&hash1).unwrap().is_none());
-    assert!(store.get_dedup_entry(&hash2).unwrap().is_none());
 }
 
 #[test]
@@ -675,121 +604,85 @@ fn dedup_hit_reuses_pba() {
 }
 
 #[test]
-fn delete_volume_cleans_dedup_index() {
-    let dir = tempdir().unwrap();
-    let config = onyx_storage::config::MetaConfig {
-        path: Some(dir.path().to_path_buf()),
-        block_cache_mb: 8,
-        memtable_budget_mb: 0,
-        index_pin_mb: 0,
-        lsm_bloom_bits_per_entry: 10,
-        checkpoint_interval_ms: 5000,
-        group_commit_timeout_us: 1,
-        wal_dir: None,
-        dedup_shards: 8,
-        dedup_cuckoo_buckets: 1_000_000,
-        dedup_l1_cache_entries: 256_000,
-    };
-    let store = MetaStore::open(&config).unwrap();
+fn overwrite_shared_dedup_pba_keeps_forward_index() {
+    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
+    register_volume(&meta, "test-vol");
 
-    let vol = VolumeConfig {
-        id: VolumeId("test-vol".into()),
-        size_bytes: 1024 * 1024 * 1024,
-        block_size: 4096,
-        compression: CompressionAlgo::None,
-        created_at: 1000,
-        zone_count: 4,
-    };
-    store.put_volume(&vol).unwrap();
+    let data = vec![0xB7; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
 
-    // Set up a dedup entry pointing to PBA 100
-    let hash: ContentHash = [0xCC; 8];
-    let dedup_entry = DedupEntry {
-        pba: Pba(100),
-        slot_offset: 0,
-        compression: 0,
-        unit_compressed_size: 4096,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0,
-    };
-    store.put_dedup_entries(&[(hash, dedup_entry)]).unwrap();
+    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "initial flush timeout");
+    pool.append("test-vol", Lba(1), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "dedup promote flush timeout");
 
-    // Map LBA 0 to PBA 100, refcount = 1
-    let bv = BlockmapValue {
-        pba: Pba(100),
-        compression: 0,
-        unit_compressed_size: 4096,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0,
-        slot_offset: 0,
-        flags: 0,
-    };
-    store.atomic_write_mapping(&vol.id, Lba(0), &bv).unwrap();
+    let before = meta
+        .get_dedup_entry(&hash)
+        .unwrap()
+        .expect("verified duplicate should promote dedup index");
+    assert_eq!(meta.get_refcount(before.pba).unwrap(), 2);
 
-    // Delete volume — should clean up dedup index for freed PBA
-    store.delete_volume(&vol.id).unwrap();
+    let replacement = vec![0x42; 4096];
+    pool.append("test-vol", Lba(0), 1, &replacement, 1000)
+        .unwrap();
+    assert!(wait_flushed(&pool, 10000), "overwrite flush timeout");
+    flusher.stop();
 
-    // Dedup entry should be cleaned up
-    assert!(
-        store.get_dedup_entry(&hash).unwrap().is_none(),
-        "dedup index should be cleaned up when PBA is freed"
+    assert_eq!(
+        meta.get_refcount(before.pba).unwrap(),
+        1,
+        "one shared reference should remain live"
+    );
+    assert_eq!(
+        meta.get_mapping(&VolumeId("test-vol".into()), Lba(1))
+            .unwrap()
+            .unwrap(),
+        before.to_blockmap_value(),
+        "the second LBA should still point at the canonical dedup mapping"
+    );
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap(),
+        Some(before),
+        "cleanup must not delete forward dedup_index while shared PBA is still live"
     );
 }
 
 #[test]
-fn cleanup_old_pba_preserves_newer_forward_index() {
-    let dir = tempdir().unwrap();
-    let config = onyx_storage::config::MetaConfig {
-        path: Some(dir.path().to_path_buf()),
-        block_cache_mb: 8,
-        memtable_budget_mb: 0,
-        index_pin_mb: 0,
-        lsm_bloom_bits_per_entry: 10,
-        checkpoint_interval_ms: 5000,
-        group_commit_timeout_us: 1,
-        wal_dir: None,
-        dedup_shards: 8,
-        dedup_cuckoo_buckets: 1_000_000,
-        dedup_l1_cache_entries: 256_000,
-    };
-    let store = MetaStore::open(&config).unwrap();
+fn delete_volume_cleans_dedup_index() {
+    let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
+    register_volume(&meta, "test-vol");
 
-    let hash: ContentHash = [0xDD; 8];
-    let entry_old = DedupEntry {
-        pba: Pba(100),
-        slot_offset: 0,
-        compression: 0,
-        unit_compressed_size: 4096,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0x1111,
-    };
-    let entry_new = DedupEntry {
-        pba: Pba(200),
-        slot_offset: 0,
-        compression: 0,
-        unit_compressed_size: 4096,
-        unit_original_size: 4096,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0x2222,
-    };
+    let data = vec![0xCC; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
 
-    store.put_dedup_entries(&[(hash, entry_old)]).unwrap();
-    store.put_dedup_entries(&[(hash, entry_new)]).unwrap();
+    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "initial flush timeout");
+    pool.append("test-vol", Lba(1), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "dedup promote flush timeout");
 
-    store.cleanup_dedup_for_pba_standalone(Pba(100)).unwrap();
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_some(),
+        "verified duplicate should promote the forward dedup entry"
+    );
 
-    let current = store.get_dedup_entry(&hash).unwrap().unwrap();
-    assert_eq!(
-        current.pba,
-        Pba(200),
-        "cleaning the old reverse entry must not delete the newer forward mapping"
+    let cleanups = meta
+        .delete_volume(&VolumeId("test-vol".into()))
+        .expect("delete volume should return old mappings for cleanup");
+    flusher.cleanup_mappings_now(
+        &meta,
+        &allocator,
+        &io_engine,
+        &onyx_storage::metrics::EngineMetrics::default(),
+        &cleanups,
+        "test_delete_volume_cleanup",
+    );
+    flusher.stop();
+
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "dedup index should be cleaned by reading old PBA content and matching the old mapping"
     );
 }
 

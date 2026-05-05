@@ -10,7 +10,7 @@ use onyx_storage::dedup::config::DedupConfig;
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::gc::config::GcConfig;
 use onyx_storage::meta::schema::{
-    decode_blockmap_key, decode_blockmap_value, BlockmapValue, ContentHash, DedupEntry,
+    decode_blockmap_key, decode_blockmap_value, BlockmapValue, DedupEntry,
 };
 use onyx_storage::types::{CompressionAlgo, Lba, Pba, BLOCK_SIZE};
 use rand::rngs::StdRng;
@@ -337,19 +337,9 @@ impl EngineHarness {
             );
         }
 
-        let dedup_entries = self.engine().meta().iter_dedup_entries().unwrap();
-        let reverse_entries = self.engine().meta().iter_dedup_reverse_entries().unwrap();
-        let reverse_set = reverse_entries.iter().copied().collect::<HashSet<_>>();
-        let dedup_map: HashMap<ContentHash, DedupEntry> = dedup_entries.iter().copied().collect();
-
-        for (hash, entry) in &dedup_entries {
-            assert!(
-                reverse_set.contains(&(entry.pba, *hash)),
-                "dedup reverse entry missing for hash {:?}",
-                hash
-            );
+        for (hash, entry) in self.engine().meta().iter_dedup_entries().unwrap() {
             let refs = live_phys_refs
-                .get(&PhysicalKey::from_dedup(*entry))
+                .get(&PhysicalKey::from_dedup(entry))
                 .unwrap_or_else(|| {
                     panic!(
                         "dedup entry points to non-live physical location: {:?}",
@@ -367,13 +357,6 @@ impl EngineHarness {
                 hash.as_slice(),
                 "dedup index hash does not match logical block content"
             );
-        }
-
-        for (pba, hash) in reverse_entries {
-            let entry = dedup_map
-                .get(&hash)
-                .unwrap_or_else(|| panic!("reverse dedup entry missing forward hash {:?}", hash));
-            assert_eq!(entry.pba, pba, "reverse entry points to stale PBA");
         }
     }
 }

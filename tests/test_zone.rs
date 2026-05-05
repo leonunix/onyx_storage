@@ -412,6 +412,7 @@ fn zone_manager_read_pool_decompresses_concurrently() {
             io_engine.clone(),
             metrics.clone(),
             Some(allocator.clone()),
+            onyx_storage::dedup::CandidateCache::new(1, 1),
             Some(read_pool.clone()),
         )
         .unwrap(),

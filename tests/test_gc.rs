@@ -526,7 +526,7 @@ fn gc_rewriter_skips_changed_lba() {
 
     // Write 4 LBAs
     for i in 0u8..4 {
-        let block = vec![i; BLOCK_SIZE as usize];
+        let block = vec![i + 10; BLOCK_SIZE as usize];
         env.pool
             .append(vol_id, Lba(i as u64), 1, &block, vol_created_at)
             .unwrap();

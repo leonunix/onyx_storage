@@ -18,7 +18,7 @@ use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
-use crate::meta::store::{DedupHitResult, MetaStore};
+use crate::meta::store::{DedupHitResult, MetaStore, RemapCleanup};
 use crate::metrics::EngineMetrics;
 use crate::packer::packer::{PackResult, Packer, SealedSlot};
 use crate::space::allocator::SpaceAllocator;
@@ -26,6 +26,7 @@ use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 
 type PbaLockKey = (usize, Pba);
+type CleanupBatch = Vec<RemapCleanup>;
 
 pub(crate) const DEFAULT_PACKED_META_BATCH_LBA_LIMIT: usize = 1024;
 
@@ -516,7 +517,7 @@ impl BufferFlusher {
             // Stage 3 → Stage 1 (feedback: completed seqs)
             let (done_tx, done_rx) = unbounded::<Vec<u64>>();
             // Writer/dedup → cleanup thread (async dead PBA reclamation)
-            let (cleanup_tx, cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+            let (cleanup_tx, cleanup_rx) = unbounded::<CleanupBatch>();
 
             let running_c = running.clone();
             let pool_c = pool.clone();
@@ -660,6 +661,7 @@ impl BufferFlusher {
             let running_cl = running.clone();
             let meta_cl = meta.clone();
             let allocator_cl = allocator.clone();
+            let io_engine_cl = io_engine.clone();
             let metrics_cl = metrics.clone();
             let candidate_cl = candidate.clone();
             let cleanup_handle = thread::Builder::new()
@@ -671,6 +673,7 @@ impl BufferFlusher {
                         &cleanup_rx,
                         &meta_cl,
                         &allocator_cl,
+                        &io_engine_cl,
                         &candidate_cl,
                         &running_cl,
                         &metrics_cl,
@@ -702,6 +705,26 @@ impl BufferFlusher {
     /// shards.
     pub fn candidate_cache(&self) -> crate::dedup::CandidateCache {
         self.candidate.clone()
+    }
+
+    pub fn cleanup_mappings_now(
+        &self,
+        meta: &MetaStore,
+        allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
+        metrics: &EngineMetrics,
+        cleanups: &[RemapCleanup],
+        context: &'static str,
+    ) {
+        Self::cleanup_dead_pbas_batch(
+            meta,
+            allocator,
+            io_engine,
+            metrics,
+            &self.candidate,
+            cleanups,
+            context,
+        );
     }
 
     pub fn stop(&mut self) {

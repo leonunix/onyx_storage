@@ -560,12 +560,17 @@ fn flusher_uring_round_trip_preserves_data() {
     for (i, expected) in payloads.iter().enumerate() {
         let mapping = meta.get_mapping(&vol_id, Lba(i as u64)).unwrap();
         let mapping = mapping.expect("blockmap entry");
-        let raw = io_engine
-            .read_blocks(mapping.pba, mapping.unit_compressed_size as usize)
-            .unwrap();
-        let unit_bytes = if mapping.compression == 0 {
+        let unit_bytes = if mapping.is_zero() {
+            vec![0u8; 4096]
+        } else if mapping.compression == 0 {
+            let raw = io_engine
+                .read_blocks(mapping.pba, mapping.unit_compressed_size as usize)
+                .unwrap();
             raw[..mapping.unit_original_size as usize].to_vec()
         } else {
+            let raw = io_engine
+                .read_blocks(mapping.pba, mapping.unit_compressed_size as usize)
+                .unwrap();
             let algo = match mapping.compression {
                 1 => CompressionAlgo::Lz4,
                 2 => CompressionAlgo::Zstd { level: 3 },

@@ -10,7 +10,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
     ) -> OnyxResult<()> {
         lifecycle.with_read_lock(&unit.vol_id, || {
@@ -161,11 +161,7 @@ impl BufferFlusher {
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
-                let dead: Vec<(Pba, u32)> = actual_old_pba_meta
-                    .iter()
-                    .map(|(pba, (_, blocks))| (*pba, *blocks))
-                    .collect();
-                let _ = cleanup_tx.send(dead);
+                let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
             }
 
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
@@ -213,7 +209,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
     ) -> Vec<OnyxResult<()>> {
         if units.is_empty() {
@@ -453,7 +449,7 @@ impl BufferFlusher {
         }
 
         // actual_old_pba_meta: returned by atomic_batch_write_multi with accurate data
-        let mut actual_old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
 
         if !meta_indices.is_empty() {
             let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = meta_indices
@@ -551,11 +547,7 @@ impl BufferFlusher {
         }
 
         if !actual_old_pba_meta.is_empty() {
-            let dead: Vec<(Pba, u32)> = actual_old_pba_meta
-                .iter()
-                .map(|(pba, (_, blocks))| (*pba, *blocks))
-                .collect();
-            let _ = cleanup_tx.send(dead);
+            let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 

@@ -5,7 +5,6 @@ use crate::types::{Lba, Pba};
 pub const CF_VOLUMES: &str = "volumes";
 pub const CF_REFCOUNT: &str = "refcount";
 pub const CF_DEDUP_INDEX: &str = "dedup_index";
-pub const CF_DEDUP_REVERSE: &str = "dedup_reverse";
 
 /// Prefix for per-volume blockmap column families: "blockmap:{vol_id}"
 pub const BLOCKMAP_CF_PREFIX: &str = "blockmap:";
@@ -276,25 +275,6 @@ pub fn decode_dedup_entry(val: &[u8]) -> Option<DedupEntry> {
         offset_in_unit: u16::from_be_bytes(val[21..23].try_into().unwrap()),
         crc32: u32::from_be_bytes(val[23..27].try_into().unwrap()),
     })
-}
-
-/// Encode dedup reverse key: pba(8B) + content_hash(8B) = 16B
-pub fn encode_dedup_reverse_key(pba: Pba, hash: &ContentHash) -> [u8; 16] {
-    let mut key = [0u8; 16];
-    key[0..8].copy_from_slice(&pba.0.to_be_bytes());
-    key[8..16].copy_from_slice(hash);
-    key
-}
-
-/// Decode dedup reverse key (16B) → (pba, hash)
-pub fn decode_dedup_reverse_key(key: &[u8]) -> Option<(Pba, ContentHash)> {
-    if key.len() != 16 {
-        return None;
-    }
-    let pba = Pba(u64::from_be_bytes(key[0..8].try_into().unwrap()));
-    let mut hash = [0u8; 8];
-    hash.copy_from_slice(&key[8..16]);
-    Some((pba, hash))
 }
 
 /// Encode refcount key: pba (8B BE)

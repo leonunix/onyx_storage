@@ -168,6 +168,7 @@ impl DedupScanner {
             let need_skipped_pass = rescan_debt || skipped_units != last_drained_skipped_units;
             if need_skipped_pass {
                 match Self::rescan_skipped_blocks(
+                    metrics,
                     meta,
                     io_engine,
                     allocator,
@@ -254,6 +255,7 @@ impl DedupScanner {
     }
 
     fn rescan_skipped_blocks(
+        metrics: &EngineMetrics,
         meta: &MetaStore,
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
@@ -305,13 +307,14 @@ impl DedupScanner {
                             ..existing.to_blockmap_value()
                         };
                         let decremented = meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash)?;
-                        if let Some((old_pba, old_blocks)) = decremented {
+                        if let Some(cleanup) = decremented {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
                                 allocator,
+                                io_engine,
+                                metrics,
                                 candidate,
-                                old_pba,
-                                old_blocks,
+                                cleanup,
                                 "dedup_scanner_cleanup",
                             );
                         }

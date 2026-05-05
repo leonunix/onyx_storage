@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::MetaConfig;
 use crate::io::device::RawDevice;
-use crate::meta::store::MetaStore;
+use crate::meta::store::{MetaStore, RemapCleanup};
 use crate::types::{VolumeConfig, ZoneId};
 use crate::zone::worker::ZoneWorker;
 use std::collections::{HashMap, HashSet};
@@ -73,6 +73,16 @@ fn setup_flush_test_env() -> (
     (
         meta, pool, lifecycle, allocator, io_engine, metrics, meta_dir, buf_tmp, data_tmp,
     )
+}
+
+fn cleanup_for_pba(pba: Pba, blocks: u32) -> RemapCleanup {
+    RemapCleanup {
+        pba,
+        decrements: blocks,
+        blocks,
+        pba_freed: true,
+        mappings: Vec::new(),
+    }
 }
 
 fn make_unit(fill: u8, seq: u64) -> CompressedUnit {
@@ -154,7 +164,7 @@ fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
 fn old_write_unit_can_overwrite_newer_committed_mapping() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
 
     let newer = make_unit(0x33, 2);
     pool.note_latest_lba_seq_for_test("flush-race", Lba(0), 2, 1);
@@ -201,7 +211,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
 fn raw_passthrough_unit_maps_each_lba_to_its_own_pba() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
 
     let unit = make_raw_unit_at(100, 4, 0x40, 10);
     pool.note_latest_lba_seq_for_test("flush-race", Lba(100), 10, 1);
@@ -264,7 +274,7 @@ fn raw_passthrough_unit_maps_each_lba_to_its_own_pba() {
 fn raw_passthrough_unit_frees_unreferenced_blocks() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
 
     let unit = make_raw_unit_at(200, 4, 0x60, 20);
     pool.note_latest_lba_seq_for_test("flush-race", Lba(200), 20, 1);
@@ -305,7 +315,7 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
 fn write_unit_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
     let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let payload = vec![0x5A; BLOCK_SIZE as usize];
@@ -351,7 +361,7 @@ fn write_unit_routes_first_occurrence_into_candidate_cache() {
 fn write_packed_slot_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
     let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let payload = vec![0x6B; BLOCK_SIZE as usize];
@@ -403,7 +413,7 @@ fn write_packed_slot_routes_first_occurrence_into_candidate_cache() {
 fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
     let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let mut sealed_slots = Vec::new();
@@ -468,7 +478,7 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
 fn write_packed_slots_batch_splits_oversized_metadata_commits() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
 
     let slot_count = 270usize;
     let lbas_per_slot = 1024u32;
@@ -553,7 +563,7 @@ fn write_packed_slots_batch_splits_oversized_metadata_commits() {
 fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
 
     let seq = pool
         .append("flush-race", Lba(0), 1, &vec![0x44; BLOCK_SIZE as usize], 1)
@@ -618,7 +628,7 @@ fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
 
 #[test]
 fn dedup_hit_cleanup_deduplicates_repeated_old_pbas() {
-    let (meta, _pool, _lifecycle, _allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, _allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
     let old_pba = Pba(100);
@@ -645,7 +655,7 @@ fn dedup_hit_cleanup_deduplicates_repeated_old_pbas() {
     meta.set_refcount(old_pba, 3).unwrap();
     meta.set_refcount(new_pba, 8).unwrap();
 
-    // Each LBA needs a dedup_reverse entry for the guard to accept the hit.
+    // Each LBA needs a forward dedup entry for the hit path.
     let hash_0: ContentHash = [0x01; 8];
     let hash_1: ContentHash = [0x02; 8];
     let hash_2: ContentHash = [0x03; 8];
@@ -753,22 +763,35 @@ fn dedup_hit_cleanup_deduplicates_repeated_old_pbas() {
 
 #[test]
 fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let pba = allocator.allocate_one_for_lane(0).unwrap();
-    let hash: ContentHash = [0xAB; 8];
+    let payload = vec![0xAB; BLOCK_SIZE as usize];
+    io_engine.write_blocks(pba, &payload).unwrap();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
+    let old_mapping = BlockmapValue {
+        pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&payload),
+        slot_offset: 0,
+        flags: 0,
+    };
     meta.put_dedup_entries(&[(
         hash,
         DedupEntry {
             pba,
-            slot_offset: 0,
-            compression: 0,
-            unit_compressed_size: BLOCK_SIZE,
-            unit_original_size: BLOCK_SIZE,
-            unit_lba_count: 1,
-            offset_in_unit: 0,
-            crc32: 0xDEAD_BEEF,
+            slot_offset: old_mapping.slot_offset,
+            compression: old_mapping.compression,
+            unit_compressed_size: old_mapping.unit_compressed_size,
+            unit_original_size: old_mapping.unit_original_size,
+            unit_lba_count: old_mapping.unit_lba_count,
+            offset_in_unit: old_mapping.offset_in_unit,
+            crc32: old_mapping.crc32,
         },
     )])
     .unwrap();
@@ -776,10 +799,15 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
 
     let meta_scanner = meta.clone();
     let allocator_scanner = allocator.clone();
+    let io_engine_scanner = io_engine.clone();
+    let metrics_scanner = metrics.clone();
+    let scanner_cleanup = RemapCleanup {
+        mappings: vec![old_mapping],
+        ..cleanup_for_pba(pba, 1)
+    };
+    let worker_cleanup = scanner_cleanup.clone();
     let (ready_tx, ready_rx) = bounded::<()>(1);
     let (resume_tx, resume_rx) = bounded::<()>(1);
-
-    let before = CLEANUP_FREE_ATTEMPTS.load(Ordering::SeqCst);
 
     let scanner = thread::spawn(move || {
         ready_tx.send(()).unwrap();
@@ -787,9 +815,10 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         BufferFlusher::cleanup_dead_pba_post_commit(
             &meta_scanner,
             &allocator_scanner,
+            &io_engine_scanner,
+            &metrics_scanner,
             &crate::dedup::CandidateCache::new(8, 64),
-            pba,
-            1,
+            scanner_cleanup,
             "dedup_scanner_cleanup",
         );
     });
@@ -801,9 +830,10 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
     BufferFlusher::cleanup_dead_pba_post_commit(
         &meta,
         &allocator,
+        &io_engine,
+        &metrics,
         &crate::dedup::CandidateCache::new(8, 64),
-        pba,
-        1,
+        worker_cleanup,
         "dedup_worker_hit_cleanup",
     );
 
@@ -816,8 +846,57 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
 }
 
 #[test]
+fn dedup_cleanup_reconstruct_failure_bumps_metric_and_keeps_index() {
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    let pba = allocator.allocate_one_for_lane(0).unwrap();
+    let payload = vec![0xCD; BLOCK_SIZE as usize];
+    io_engine.write_blocks(pba, &payload).unwrap();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
+    let mapping = BlockmapValue {
+        pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0xDEADBEEF,
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.put_dedup_entries(&[(hash, mapping.to_dedup_entry())])
+        .unwrap();
+
+    BufferFlusher::cleanup_dead_pba_post_commit(
+        &meta,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &crate::dedup::CandidateCache::new(8, 64),
+        RemapCleanup {
+            mappings: vec![mapping],
+            ..cleanup_for_pba(pba, 1)
+        },
+        "dedup_cleanup_reconstruct_failure_test",
+    );
+
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_some(),
+        "failed reconstruction must leave dedup_index entry in place"
+    );
+    assert_eq!(
+        metrics
+            .dedup_cleanup_reconstruct_errors
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(allocator.is_free(pba), "allocator cleanup still proceeds");
+}
+
+#[test]
 fn duplicate_dead_pba_cleanup_callers_without_shared_lock_double_free() {
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let pba = allocator.allocate_one_for_lane(0).unwrap();
@@ -859,7 +938,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     let in_flight = FlusherInFlightTracker::default();
     let (tx, rx) = bounded::<CompressedUnit>(64);
     let (done_tx, done_rx) = unbounded::<Vec<u64>>();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
 
     let running_w = running.clone();
     let pool_w = pool.clone();
@@ -975,7 +1054,7 @@ fn compress_loop_bypasses_low_savings_units() {
 
 #[test]
 fn dedup_worker_batches_hits_across_units() {
-    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     pool.durable_seq_handle().store(u64::MAX, Ordering::Release);
 
@@ -1011,7 +1090,7 @@ fn dedup_worker_batches_hits_across_units() {
     let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(128);
     let (miss_tx, miss_rx) = bounded::<CoalesceUnit>(128);
     let (done_tx, done_rx) = unbounded::<Vec<u64>>();
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
     let running = AtomicBool::new(true);
 
     for i in 0..8u64 {
@@ -1249,7 +1328,7 @@ fn fully_superseded_entry_skipped_at_coalesce() {
 /// reused, but old blockmap entries are not cleaned up.
 #[test]
 fn packed_slot_refcount_drift_on_overwrite() {
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let vol = VolumeId("flush-race".into());
@@ -1386,7 +1465,7 @@ fn packed_slot_refcount_drift_on_overwrite() {
 /// PBA alive.
 #[test]
 fn packed_slot_refcount_with_dedup_and_overwrite() {
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let vol = VolumeId("flush-race".into());
@@ -1416,7 +1495,7 @@ fn packed_slot_refcount_with_dedup_and_overwrite() {
     assert_eq!(meta.get_refcount(packed_pba).unwrap(), 32);
 
     // --- Step 2: Dedup hits map 16 additional LBAs to the same packed PBA ---
-    // Register dedup_reverse entries so the guard passes
+    // Register forward dedup entries for the hit path.
     let dedup_hashes: Vec<ContentHash> = (0u8..16).map(|i| [i + 100; 8]).collect();
     let dedup_entries: Vec<(ContentHash, DedupEntry)> = dedup_hashes
         .iter()
@@ -1522,7 +1601,7 @@ fn packed_slot_concurrent_refcount_drift() {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Barrier;
 
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let vol = VolumeId("flush-race".into());
@@ -1643,7 +1722,7 @@ fn packed_slot_concurrent_dedup_refcount_drift() {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Barrier;
 
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let vol = VolumeId("flush-race".into());
@@ -1870,7 +1949,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
 
     let vol_id = "flush-race";
     let vol = VolumeId(vol_id.into());
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
     let found_drift = AtomicBool::new(false);
     let barrier = Barrier::new(2);
     let rounds = 500;
@@ -2030,7 +2109,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
 /// incarnation), PUT overwrites the total, causing drift.
 #[test]
 fn packed_slot_put_overwrites_dedup_refcount() {
-    let (meta, _pool, _lifecycle, _allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, _allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let vol = VolumeId("flush-race".into());
@@ -2116,7 +2195,7 @@ fn packed_slot_put_overwrites_dedup_refcount() {
 /// 5. With the fix: refcount = 12-8=4 → PBA stays alive → no CRC mismatch
 #[test]
 fn packed_slot_full_chain_no_premature_free() {
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
 
@@ -2249,7 +2328,7 @@ fn packed_slot_overlapping_lba_race() {
         setup_flush_test_env();
 
     let vol_id = "flush-race";
-    let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
     let found_drift = AtomicBool::new(false);
     let rounds = 1000;
 
@@ -2502,7 +2581,7 @@ fn allocator_lane_cache_concurrent_free_allocate_no_double_handout() {
 /// those ghost references.
 #[test]
 fn rapid_pba_recycle_no_ghost_blockmap_refs() {
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
     let mut ghost_found = false;
@@ -2589,9 +2668,13 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
         BufferFlusher::cleanup_dead_pba_post_commit(
             &meta,
             &allocator,
+            &io_engine,
+            &metrics,
             &crate::dedup::CandidateCache::new(8, 64),
-            pba,
-            1,
+            newly_zeroed
+                .get(&pba)
+                .cloned()
+                .unwrap_or_else(|| cleanup_for_pba(pba, 1)),
             "recycle_test",
         );
 
@@ -2634,7 +2717,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
     use std::sync::atomic::AtomicBool;
     use std::sync::Barrier;
 
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
     let meta = &*meta;
@@ -2780,13 +2863,14 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
 
                 // If any old PBAs hit zero, clean them up
                 if let Ok(newly_zeroed) = result {
-                    for (dead_pba, (_, blocks)) in &newly_zeroed {
+                    for cleanup in newly_zeroed.values() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
                             meta,
                             allocator,
+                            &io_engine,
+                            &metrics,
                             &crate::dedup::CandidateCache::new(8, 64),
-                            *dead_pba,
-                            *blocks,
+                            cleanup.clone(),
                             "concurrent_test_overwrite",
                         );
                     }
@@ -2830,13 +2914,14 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                 let result = meta.atomic_batch_write_multi(&args);
 
                 if let Ok(newly_zeroed) = result {
-                    for (dead_pba, (_, blocks)) in &newly_zeroed {
+                    for cleanup in newly_zeroed.values() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
                             meta,
                             allocator,
+                            &io_engine,
+                            &metrics,
                             &crate::dedup::CandidateCache::new(8, 64),
-                            *dead_pba,
-                            *blocks,
+                            cleanup.clone(),
                             "concurrent_test_overwrite_c",
                         );
                     }
@@ -2903,7 +2988,7 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
     use std::sync::atomic::AtomicBool;
     use std::sync::Barrier;
 
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
     let meta = &*meta;
@@ -2919,6 +3004,8 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
             let barrier = &barrier;
             let lba_counter = &lba_counter;
             let found_stale = &found_stale;
+            let io_engine = io_engine.clone();
+            let metrics = metrics.clone();
 
             s.spawn(move || {
                 barrier.wait();
@@ -2986,13 +3073,14 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
 
                     // Only free via the production path: newly_zeroed + cleanup
                     if let Ok(newly_zeroed) = result {
-                        for (dead_pba, (_, blocks)) in &newly_zeroed {
+                        for cleanup in newly_zeroed.values() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
                                 allocator,
+                                &io_engine,
+                                &metrics,
                                 &crate::dedup::CandidateCache::new(8, 64),
-                                *dead_pba,
-                                *blocks,
+                                cleanup.clone(),
                                 "lifecycle_test",
                             );
                         }
@@ -3038,7 +3126,7 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
 /// cleanup path correctly handles this case.
 #[test]
 fn duplicate_flush_entry_causes_premature_pba_free() {
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
 
@@ -3104,9 +3192,13 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
     BufferFlusher::cleanup_dead_pba_post_commit(
         &meta,
         &allocator,
+        &io_engine,
+        &metrics,
         &crate::dedup::CandidateCache::new(8, 64),
-        pba_a,
-        1,
+        newly_zeroed
+            .get(&pba_a)
+            .cloned()
+            .unwrap_or_else(|| cleanup_for_pba(pba_a, 1)),
         "dup_flush_test",
     );
     assert!(allocator.is_free(pba_a), "PBA A should be free now");
@@ -3170,7 +3262,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Barrier;
 
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let vol = VolumeId("flush-race".into());
     let meta = &*meta;
@@ -3273,6 +3365,8 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
         // 2 overwrite threads targeting shared PBAs' original LBAs
         for tid in 2..4usize {
             let barrier = &barrier;
+            let io_engine = io_engine.clone();
+            let metrics = metrics.clone();
             s.spawn(move || {
                 barrier.wait();
                 for round in 0..150u64 {
@@ -3304,13 +3398,14 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                     let args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
                         vec![(vol, &overwrite, 2)];
                     if let Ok(newly_zeroed) = meta.atomic_batch_write_multi(&args) {
-                        for (dead_pba, (_, blocks)) in &newly_zeroed {
+                        for cleanup in newly_zeroed.values() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
                                 allocator,
+                                &io_engine,
+                                &metrics,
                                 &crate::dedup::CandidateCache::new(8, 64),
-                                *dead_pba,
-                                *blocks,
+                                cleanup.clone(),
                                 "pressure_test",
                             );
                         }

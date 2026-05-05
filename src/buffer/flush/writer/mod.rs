@@ -45,7 +45,7 @@ impl BufferFlusher {
         in_flight_tracker: &FlusherInFlightTracker,
         packer: &mut Packer,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
         packed_meta_batch_max_lbas: usize,
     ) {
@@ -424,7 +424,7 @@ impl BufferFlusher {
         io_engine: &IoEngine,
         done_tx: &Sender<Vec<u64>>,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
     ) -> bool {
         let Some(retry_at) = retries.front().map(|retry| retry.retry_at) else {
@@ -498,7 +498,7 @@ impl BufferFlusher {
         buffered_seqs: &mut Vec<u64>,
         buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
     ) {
         let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();

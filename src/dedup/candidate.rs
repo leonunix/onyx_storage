@@ -1,13 +1,13 @@
 //! Per-shard RAM candidate cache for promote-on-verified-hit dedup.
 //!
 //! Onyx's old write path inserted every dedup miss into the persistent
-//! `dedup_index` and `dedup_reverse`, paying two metadb puts per
-//! 4 KiB block whether or not the block was ever going to be referenced
-//! again. The new design routes the first occurrence of a fingerprint
+//! `dedup_index`, paying a metadb put per 4 KiB block whether or not
+//! the block was ever going to be referenced again. The current design
+//! routes the first occurrence of a fingerprint
 //! into this in-memory cache instead. A second occurrence (still in
 //! cache) confirms a real duplicate — the writer then verifies by
 //! reading the original fragment back from LV3 and, on byte match,
-//! promotes the entry into the persistent dedup tables in a single
+//! promotes the entry into the persistent dedup table in a single
 //! atomic batch. Cache entries that age out without ever seeing a
 //! duplicate are forgotten with zero on-disk cost.
 //!

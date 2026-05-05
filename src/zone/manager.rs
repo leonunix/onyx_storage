@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
@@ -10,7 +11,6 @@ use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
-use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, ZoneId, BLOCK_SIZE};
 use crate::zone::read;
 use onyx_metadb::VolumeOrdinal;
@@ -101,6 +101,7 @@ pub struct ZoneManager {
     buffer_pool: Arc<WriteBufferPool>,
     meta: Arc<MetaStore>,
     allocator: Option<Arc<SpaceAllocator>>,
+    candidate: crate::dedup::CandidateCache,
     metrics: Arc<EngineMetrics>,
     /// Optional LV3 read pool. When present, mapped reads dispatch here for
     /// batched io_uring submission + parallel decompression. When absent,
@@ -151,6 +152,7 @@ impl ZoneManager {
             io_engine,
             Arc::new(EngineMetrics::default()),
             None,
+            crate::dedup::CandidateCache::new(1, 1),
         )
     }
 
@@ -162,6 +164,7 @@ impl ZoneManager {
         io_engine: Arc<IoEngine>,
         metrics: Arc<EngineMetrics>,
         allocator: Option<Arc<SpaceAllocator>>,
+        candidate: crate::dedup::CandidateCache,
     ) -> OnyxResult<Self> {
         Self::new_full(
             zone_count,
@@ -171,6 +174,7 @@ impl ZoneManager {
             io_engine,
             metrics,
             allocator,
+            candidate,
             None,
         )
     }
@@ -187,6 +191,7 @@ impl ZoneManager {
         io_engine: Arc<IoEngine>,
         metrics: Arc<EngineMetrics>,
         allocator: Option<Arc<SpaceAllocator>>,
+        candidate: crate::dedup::CandidateCache,
         read_pool: Option<Arc<ReadPool>>,
     ) -> OnyxResult<Self> {
         tracing::info!(
@@ -203,6 +208,7 @@ impl ZoneManager {
             buffer_pool,
             meta,
             allocator,
+            candidate,
             metrics,
             read_pool,
         })
@@ -750,24 +756,25 @@ impl ZoneManager {
         // Step 2: delete blockmap entries + decrement refcounts atomically
         let vol_id_obj = VolumeId(vol_id.to_string());
         let end_lba = Lba(start_lba.0 + lba_count as u64);
-        let freed = self
+        let cleanups = self
             .meta
             .delete_blockmap_range(&vol_id_obj, start_lba, end_lba)?;
 
         // Step 3: return freed PBAs to allocator
         if let Some(allocator) = &self.allocator {
+            BufferFlusher::cleanup_dead_pbas_batch(
+                &self.meta,
+                allocator,
+                &self.io_engine,
+                &self.metrics,
+                &self.candidate,
+                &cleanups,
+                "discard",
+            );
             let mut blocks_freed = 0u64;
-            for (pba, block_count) in &freed {
-                let result = if *block_count <= 1 {
-                    allocator.free_one(*pba)
-                } else {
-                    allocator.free_extent(Extent::new(*pba, *block_count))
-                };
-                match result {
-                    Ok(()) => blocks_freed += *block_count as u64,
-                    Err(e) => {
-                        tracing::warn!(pba = pba.0, error = %e, "discard: failed to free extent");
-                    }
+            for cleanup in &cleanups {
+                if cleanup.pba_freed {
+                    blocks_freed += cleanup.blocks as u64;
                 }
             }
             if blocks_freed > 0 {

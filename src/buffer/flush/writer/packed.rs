@@ -8,14 +8,11 @@ struct PackedSlotMeta {
     fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
 }
 
-fn merge_dead_pbas(dst: &mut HashMap<Pba, (u32, u32)>, src: HashMap<Pba, (u32, u32)>) {
-    for (pba, (count, blocks)) in src {
+fn merge_dead_pbas(dst: &mut HashMap<Pba, RemapCleanup>, src: HashMap<Pba, RemapCleanup>) {
+    for (pba, cleanup) in src {
         dst.entry(pba)
-            .and_modify(|entry| {
-                entry.0 += count;
-                entry.1 = entry.1.max(blocks);
-            })
-            .or_insert((count, blocks));
+            .and_modify(|entry| entry.merge(cleanup.clone()))
+            .or_insert(cleanup);
     }
 }
 
@@ -27,7 +24,7 @@ fn commit_packed_meta_batch(
     meta: &MetaStore,
     allocator: &SpaceAllocator,
     results: &mut [OnyxResult<()>],
-    actual_old_pba_meta: &mut HashMap<Pba, (u32, u32)>,
+    actual_old_pba_meta: &mut HashMap<Pba, RemapCleanup>,
     candidate: &crate::dedup::CandidateCache,
 ) -> bool {
     if batch_slots.is_empty() {
@@ -81,7 +78,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
@@ -256,11 +253,7 @@ impl BufferFlusher {
         candidate.insert_many(&fresh_dedup_pairs);
 
         if !actual_old_pba_meta.is_empty() {
-            let dead: Vec<(Pba, u32)> = actual_old_pba_meta
-                .iter()
-                .map(|(pba, (_, blocks))| (*pba, *blocks))
-                .collect();
-            let _ = cleanup_tx.send(dead);
+            let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
         }
 
         metrics
@@ -326,7 +319,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
         packed_meta_batch_max_lbas: usize,
     ) -> Vec<OnyxResult<()>> {
@@ -518,7 +511,7 @@ impl BufferFlusher {
         // transaction so we avoid a second blockmap validation pass and a
         // second WAL/apply round for every miss batch.
         let meta_start = Instant::now();
-        let mut actual_old_pba_meta: HashMap<Pba, (u32, u32)> = HashMap::new();
+        let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
         let mut batch_slots: Vec<usize> = Vec::new();
         let mut batch_lbas = 0usize;
         let mut meta_commits = 0usize;
@@ -579,11 +572,7 @@ impl BufferFlusher {
             meta_commits += 1;
         }
         if !actual_old_pba_meta.is_empty() {
-            let dead: Vec<(Pba, u32)> = actual_old_pba_meta
-                .iter()
-                .map(|(pba, (_, blocks))| (*pba, *blocks))
-                .collect();
-            let _ = cleanup_tx.send(dead);
+            let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
         }
         let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
