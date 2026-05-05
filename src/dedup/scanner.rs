@@ -265,6 +265,9 @@ impl DedupScanner {
         let mut stats = RescanStats::default();
 
         for (vol_id_str, lba, bv) in &skipped {
+            if bv.is_zero() {
+                continue;
+            }
             let vol_id = VolumeId(vol_id_str.clone());
 
             let result = lifecycle.with_read_lock(vol_id_str, || -> OnyxResult<bool> {
@@ -410,6 +413,9 @@ impl DedupScanner {
             let mut targets: Vec<(Lba, BlockmapValue)> = Vec::new();
             let mut already_warm = 0usize;
             meta.scan_blockmap_range(&vol.id, Lba(*cursor), chunk, &mut |lba, value| {
+                if value.is_zero() {
+                    return;
+                }
                 if value.flags & FLAG_DEDUP_SKIPPED != 0 {
                     return;
                 }

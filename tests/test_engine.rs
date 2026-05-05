@@ -252,6 +252,39 @@ fn cross_zone_overwrite_must_not_return_stale_buffer_data() {
 }
 
 #[test]
+fn all_zero_write_flushes_as_zero_mapping() {
+    let (mut config, _md, _bf, _df) = make_config();
+    config.dedup.enabled = true;
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-zero", 16 * 4096, CompressionAlgo::Lz4)
+        .unwrap();
+    let vol = engine.open_volume("vol-zero").unwrap();
+
+    vol.write(0, &[0x5A; 4096]).unwrap();
+    assert!(wait_for_buffer_drain(&engine, 3000));
+    assert_eq!(vol.read(0, 4096).unwrap(), vec![0x5A; 4096]);
+
+    vol.write(0, &[0; 4096]).unwrap();
+    assert!(wait_for_buffer_drain(&engine, 3000));
+
+    let mapping = engine
+        .meta()
+        .get_mapping(&VolumeId("vol-zero".to_string()), Lba(0))
+        .unwrap()
+        .unwrap();
+    assert!(mapping.is_zero());
+    assert_eq!(
+        engine
+            .meta()
+            .get_refcount(onyx_storage::types::Pba(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(vol.read(0, 4096).unwrap(), vec![0; 4096]);
+}
+
+#[test]
 fn open_nonexistent_volume_fails() {
     let (config, _md, _bf, _df) = make_config();
     let engine = OnyxEngine::open(&config).unwrap();

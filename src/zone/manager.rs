@@ -472,7 +472,11 @@ impl ZoneManager {
                     let slot = (lba.0 - start_lba.0) as usize;
                     if slot < count as usize {
                         mapped_pending += 1;
-                        mapped_units.push((slot, mapping));
+                        if mapping.is_zero() {
+                            out_buf[slot * bs..slot * bs + bs].fill(0);
+                        } else {
+                            mapped_units.push((slot, mapping));
+                        }
                     }
                 }
             } else {
@@ -484,7 +488,11 @@ impl ZoneManager {
                 for (lba, mapping) in mapped {
                     if let Some(slot) = pending_slot_by_lba.get(&lba.0).copied() {
                         mapped_pending += 1;
-                        mapped_units.push((slot, mapping));
+                        if mapping.is_zero() {
+                            out_buf[slot * bs..slot * bs + bs].fill(0);
+                        } else {
+                            mapped_units.push((slot, mapping));
+                        }
                     }
                 }
             }
@@ -510,7 +518,12 @@ impl ZoneManager {
                         self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(mapping) => {
-                        mapped_units.push((slot, mapping));
+                        if mapping.is_zero() {
+                            let dst = &mut out_buf[slot * bs..slot * bs + bs];
+                            dst.fill(0);
+                        } else {
+                            mapped_units.push((slot, mapping));
+                        }
                     }
                 }
             }

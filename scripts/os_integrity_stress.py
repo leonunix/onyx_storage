@@ -419,6 +419,8 @@ def metric_get(payload: Optional[dict[str, object]], *path: str, default: int = 
 class ServiceManager:
     DEVICE_REMOVAL_WAIT_SECS = 20.0
     CLEANUP_UBLK_TIMEOUT_SECS = 5.0
+    STOP_GRACE_TIMEOUT_SECS = 120.0
+    STOP_KILL_TIMEOUT_SECS = 30.0
 
     def __init__(
         self,
@@ -605,17 +607,33 @@ class ServiceManager:
 
     def best_effort_stop(self) -> None:
         tracked_nodes = self._tracked_ublk_nodes()
+        started = time.time()
         try:
             run_cmd(self.cli("stop"), cwd=self.repo_root, env=self.env, check=False)
         except Exception:
             pass
         if self.proc is not None:
             try:
-                self.proc.wait(timeout=15)
+                self.proc.wait(timeout=self.STOP_GRACE_TIMEOUT_SECS)
             except subprocess.TimeoutExpired:
+                self.event_log.append(
+                    {
+                        "event": "service-stop-grace-timeout",
+                        "pid": self.proc.pid,
+                        "timeout_secs": self.STOP_GRACE_TIMEOUT_SECS,
+                        "ts": time.time(),
+                    }
+                )
                 self.proc.kill()
-                self.proc.wait(timeout=5)
+                self.proc.wait(timeout=self.STOP_KILL_TIMEOUT_SECS)
             self.proc = None
+            self.event_log.append(
+                {
+                    "event": "service-process-exited",
+                    "elapsed_secs": time.time() - started,
+                    "ts": time.time(),
+                }
+            )
         deadline = time.time() + 30
         while time.time() < deadline:
             if not self.socket_path.exists():

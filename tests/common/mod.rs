@@ -260,6 +260,12 @@ impl EngineHarness {
                     (lba.0 + 1) * BLOCK_SIZE as u64 <= volume.size_bytes,
                     "blockmap LBA {lba:?} out of bounds for volume {vol_id}"
                 );
+                if mapping.is_zero() {
+                    assert_eq!(mapping.pba, Pba(0), "zero mapping must use sentinel PBA 0");
+                    assert_eq!(mapping.unit_compressed_size, 0);
+                    assert_eq!(mapping.unit_original_size, 0);
+                    return;
+                }
                 assert!(mapping.unit_lba_count > 0, "unit_lba_count must be > 0");
                 assert!(
                     mapping.offset_in_unit < mapping.unit_lba_count,
