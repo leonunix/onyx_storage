@@ -184,7 +184,13 @@ impl BufferFlusher {
                 if let Some(hashes) = hashes_for_promote {
                     let hash = hashes[pos];
                     if hash != [0u8; 8] {
-                        fresh_dedup_pairs.push((hash, BlockmapValue { flags: 0, ..blockmap }));
+                        fresh_dedup_pairs.push((
+                            hash,
+                            BlockmapValue {
+                                flags: 0,
+                                ..blockmap
+                            },
+                        ));
                     }
                 }
             }
@@ -426,7 +432,13 @@ impl BufferFlusher {
                     if let Some(hashes) = hashes_for_promote {
                         let hash = hashes[pos];
                         if hash != [0u8; 8] {
-                            fresh_dedup_pairs.push((hash, BlockmapValue { flags: 0, ..blockmap }));
+                            fresh_dedup_pairs.push((
+                                hash,
+                                BlockmapValue {
+                                    flags: 0,
+                                    ..blockmap
+                                },
+                            ));
                         }
                     }
                 }

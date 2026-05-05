@@ -123,16 +123,8 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if let Some(sealed) = packer.flush_open_slot() {
                         if let Err(e) = Self::write_packed_slot(
-                            shard_idx,
-                            &sealed,
-                            pool,
-                            meta,
-                            lifecycle,
-                            allocator,
-                            io_engine,
-                            metrics,
-                            cleanup_tx,
-                            candidate,
+                            shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine,
+                            metrics, cleanup_tx, candidate,
                         ) {
                             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                             let failed_pba = sealed.pba;
@@ -372,16 +364,8 @@ impl BufferFlusher {
 
         if let Some(sealed) = packer.flush_open_slot() {
             if let Err(e) = Self::write_packed_slot(
-                shard_idx,
-                &sealed,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                io_engine,
-                metrics,
-                cleanup_tx,
-                candidate,
+                shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
+                cleanup_tx, candidate,
             ) {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(pba = sealed.pba.0, error = %e,
@@ -542,16 +526,8 @@ impl BufferFlusher {
         match packer.pack_or_passthrough(unit) {
             Ok(PackResult::Passthrough(unit)) => {
                 if let Err(e) = Self::write_unit(
-                    shard_idx,
-                    &unit,
-                    pool,
-                    meta,
-                    lifecycle,
-                    allocator,
-                    io_engine,
-                    metrics,
-                    cleanup_tx,
-                    candidate,
+                    shard_idx, &unit, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    cleanup_tx, candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -570,16 +546,8 @@ impl BufferFlusher {
             },
             Ok(PackResult::SealedSlot(sealed)) => {
                 if let Err(e) = Self::write_packed_slot(
-                    shard_idx,
-                    &sealed,
-                    pool,
-                    meta,
-                    lifecycle,
-                    allocator,
-                    io_engine,
-                    metrics,
-                    cleanup_tx,
-                    candidate,
+                    shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    cleanup_tx, candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -599,16 +567,8 @@ impl BufferFlusher {
             }
             Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
                 if let Err(e) = Self::write_packed_slot(
-                    shard_idx,
-                    &sealed,
-                    pool,
-                    meta,
-                    lifecycle,
-                    allocator,
-                    io_engine,
-                    metrics,
-                    cleanup_tx,
-                    candidate,
+                    shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    cleanup_tx, candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
@@ -620,16 +580,8 @@ impl BufferFlusher {
                 Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
 
                 if let Err(e) = Self::write_unit(
-                    shard_idx,
-                    &unit,
-                    pool,
-                    meta,
-                    lifecycle,
-                    allocator,
-                    io_engine,
-                    metrics,
-                    cleanup_tx,
-                    candidate,
+                    shard_idx, &unit, pool, meta, lifecycle, allocator, io_engine, metrics,
+                    cleanup_tx, candidate,
                 ) {
                     metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(

@@ -688,24 +688,20 @@ impl MetadbBackend {
         let ord = self.volume_ordinal(vol_id)?;
         let end = start_lba.0.saturating_add(count);
         let mut decode_error = None;
-        let scan_result = self.db.scan_range_unordered_chunked(
-            ord,
-            start_lba.0,
-            end,
-            count,
-            |lba, value| {
-                match decode_l2p_value(value) {
-                    Ok(decoded) => callback(Lba(lba), decoded),
-                    Err(err) => {
-                        decode_error = Some(err);
-                        return Err(onyx_metadb::MetaDbError::Corruption(
-                            "onyx blockmap decode failed".into(),
-                        ));
+        let scan_result =
+            self.db
+                .scan_range_unordered_chunked(ord, start_lba.0, end, count, |lba, value| {
+                    match decode_l2p_value(value) {
+                        Ok(decoded) => callback(Lba(lba), decoded),
+                        Err(err) => {
+                            decode_error = Some(err);
+                            return Err(onyx_metadb::MetaDbError::Corruption(
+                                "onyx blockmap decode failed".into(),
+                            ));
+                        }
                     }
-                }
-                Ok(())
-            },
-        );
+                    Ok(())
+                });
         if let Some(err) = decode_error {
             return Err(err);
         }

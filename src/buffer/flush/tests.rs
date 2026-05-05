@@ -2586,7 +2586,14 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
         );
 
         // Step 4: Cleanup and free
-        BufferFlusher::cleanup_dead_pba_post_commit(&meta, &allocator, &crate::dedup::CandidateCache::new(8, 64), pba, 1, "recycle_test");
+        BufferFlusher::cleanup_dead_pba_post_commit(
+            &meta,
+            &allocator,
+            &crate::dedup::CandidateCache::new(8, 64),
+            pba,
+            1,
+            "recycle_test",
+        );
 
         // Step 5: Reallocate — might get the same PBA back
         let new_pba = match allocator.allocate_one_for_lane(0) {
@@ -2672,7 +2679,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                 let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
-                 // marker
+                // marker
                 (
                     h,
                     DedupEntry {
@@ -2705,7 +2712,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                         let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
-                        
+
                         h
                     })
                     .collect();
@@ -3094,7 +3101,14 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
     );
 
     // Step 3: Cleanup frees PBA A
-    BufferFlusher::cleanup_dead_pba_post_commit(&meta, &allocator, &crate::dedup::CandidateCache::new(8, 64), pba_a, 1, "dup_flush_test");
+    BufferFlusher::cleanup_dead_pba_post_commit(
+        &meta,
+        &allocator,
+        &crate::dedup::CandidateCache::new(8, 64),
+        pba_a,
+        1,
+        "dup_flush_test",
+    );
     assert!(allocator.is_free(pba_a), "PBA A should be free now");
 
     // Step 4: Reallocate — should get PBA A back (FIFO-ish)
@@ -3198,7 +3212,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                 let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
-                
+
                 (
                     h,
                     DedupEntry {
@@ -3317,7 +3331,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                         let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
-                        
+
                         h
                     })
                     .collect();

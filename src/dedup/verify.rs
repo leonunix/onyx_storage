@@ -72,10 +72,7 @@ impl<'a> VerifyTarget<'a> {
 /// io_uring-sized chunks, and recv is sequential so the in-flight
 /// queue depth is bounded by the pool's request channel capacity.
 /// Callers that want hard caps can chunk before invoking.
-pub fn batched_verify(
-    read_pool: &ReadPool,
-    targets: &[VerifyTarget<'_>],
-) -> OnyxResult<Vec<bool>> {
+pub fn batched_verify(read_pool: &ReadPool, targets: &[VerifyTarget<'_>]) -> OnyxResult<Vec<bool>> {
     if targets.is_empty() {
         return Ok(Vec::new());
     }

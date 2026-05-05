@@ -1301,8 +1301,7 @@ fn cold_tail_pass_warms_candidate_from_live_blockmap() {
     // starts empty, just like after an engine restart. Once the
     // cold-tail pass runs the cache must contain the fingerprint for
     // the live entry without any duplicate write driving it.
-    let (pool, meta, lifecycle, allocator, io_engine, read_pool) =
-        setup_dedup_env_with_read_pool();
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
     register_volume(&meta, "test-vol");
 
     let data = vec![0xC1; 4096];

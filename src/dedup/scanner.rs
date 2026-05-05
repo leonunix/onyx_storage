@@ -322,7 +322,13 @@ impl DedupScanner {
                         // write byte-verifies against this PBA. Drop the
                         // FLAG_DEDUP_SKIPPED bit so the scanner does not
                         // re-process this LBA forever.
-                        candidate.insert(hash, BlockmapValue { flags: 0, ..current });
+                        candidate.insert(
+                            hash,
+                            BlockmapValue {
+                                flags: 0,
+                                ..current
+                            },
+                        );
                         meta.update_blockmap_flags(&vol_id, *lba, 0)?;
                         stats.misses += 1;
                     }

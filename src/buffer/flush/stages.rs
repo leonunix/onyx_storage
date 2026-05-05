@@ -640,8 +640,7 @@ impl BufferFlusher {
                     continue;
                 };
                 let lba = Lba(prepared_unit.unit.start_lba.0 + i as u64);
-                let latest_seq =
-                    Self::latest_seq_for_lba(&prepared_unit.unit.seq_lba_ranges, lba);
+                let latest_seq = Self::latest_seq_for_lba(&prepared_unit.unit.seq_lba_ranges, lba);
                 if !pool.is_latest_lba_seq(
                     &prepared_unit.unit.vol_id,
                     lba,

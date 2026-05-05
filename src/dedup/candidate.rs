@@ -153,11 +153,7 @@ impl CandidateCache {
         // Reverse index update is split from the LRU critical section
         // so the DashMap write does not contend with foreground
         // lookups on the LRU shard.
-        self.inner
-            .pba_to_hashes
-            .entry(pba)
-            .or_default()
-            .push(fp);
+        self.inner.pba_to_hashes.entry(pba).or_default().push(fp);
         if let Some((evicted_fp, evicted_value)) = evicted_pair {
             self.drop_from_reverse(evicted_value.pba, &evicted_fp);
         }
@@ -174,7 +170,8 @@ impl CandidateCache {
         }
         // Bucket by shard.
         let n = self.inner.shards.len();
-        let mut by_shard: Vec<Vec<(ContentHash, BlockmapValue)>> = (0..n).map(|_| Vec::new()).collect();
+        let mut by_shard: Vec<Vec<(ContentHash, BlockmapValue)>> =
+            (0..n).map(|_| Vec::new()).collect();
         for &(fp, value) in pairs {
             by_shard[self.shard_for(&fp)].push((fp, value));
         }
@@ -468,10 +465,7 @@ mod tests {
                 let mut h = [0u8; 8];
                 h[0] = t;
                 h[1..5].copy_from_slice(&i.to_be_bytes());
-                assert_eq!(
-                    c.lookup(&h),
-                    Some(bv(t as u64 * 1_000 + i as u64))
-                );
+                assert_eq!(c.lookup(&h), Some(bv(t as u64 * 1_000 + i as u64)));
             }
         }
     }

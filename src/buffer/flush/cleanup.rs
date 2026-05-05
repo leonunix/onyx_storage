@@ -293,7 +293,13 @@ impl BufferFlusher {
             remaining.extend(batch);
         }
         if !remaining.is_empty() {
-            Self::cleanup_dead_pbas_batch(meta, allocator, candidate, &remaining, "cleanup_thread_drain");
+            Self::cleanup_dead_pbas_batch(
+                meta,
+                allocator,
+                candidate,
+                &remaining,
+                "cleanup_thread_drain",
+            );
         }
     }
 
