@@ -13,7 +13,7 @@ Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用
 ## 特性
 
 - **内联压缩** &mdash; LZ4 / ZSTD，合并多块压缩单元以提高压缩比
-- **内容寻址去重** &mdash; SHA-256 指纹识别、引用计数、后台补扫跳过的块
+- **内容寻址去重** &mdash; xxh3_64 指纹、首次出现的 miss 进 RAM 候选缓存（CandidateCache）、第二次命中走 LV3 字节比对验证后再 promote 到 dedup_index/reverse、cuckoo-filter L0、后台 DEDUP_SKIPPED 补扫 + cold-tail 扫描恢复重启后的去重率
 - **Fragment 打包** &mdash; VDO 风格 bin-packing，多个 < 4KB 压缩 fragment 共享物理 slot
 - **垃圾回收** &mdash; 后台 dead block 扫描与回写，带背压控制
 - **崩溃一致性** &mdash; metadb 原子提交；写缓冲 sync 后才 ack
@@ -99,10 +99,10 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 
 1. 用户 I/O 到达 ZoneWorker
 2. 原始数据（未压缩）追加到 WriteBufferPool &rarr; sync &rarr; **ack 返回用户**
-3. 后台 flusher 排空缓冲：合并连续 LBA &rarr; 去重（4KB SHA-256）&rarr; 压缩合并单元 &rarr; Packer 打包 &rarr; O_DIRECT 写入 LV3
-4. metadb 原子提交 blockmap + refcount
+3. 后台 flusher 排空缓冲：合并连续 LBA &rarr; dedup workers（4KB xxh3_64 + dedup_index 查询 + 候选缓存查询 + LV3 批量 io_uring 字节验证）&rarr; 压缩合并单元 &rarr; Packer 打包 &rarr; O_DIRECT 写入 LV3
+4. metadb 原子提交 blockmap + refcount，verified hit 同事务 promote (hash, blockmap) 到 dedup_index + dedup_reverse
 
-用户感知延迟 = 缓冲写入 + sync。压缩和去重完全不在热路径上。
+用户感知延迟 = 缓冲写入 + sync。压缩、去重、verify 全部不在热路径上。
 
 ### 读路径
 
@@ -112,9 +112,14 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 
 ### 去重
 
-- 4KB 是去重粒度（固定大小指纹）；压缩粒度远大于此（最大 128KB 合并单元）
-- 缓冲压力 > 90% 时跳过去重，标记 `DEDUP_SKIPPED`；后台 DedupScanner 补扫
-- 去重索引清理是原子的：refcount 归零时，前缀扫描 dedup_reverse 清理过期条目，在同一元数据事务中提交
+- 4KB 是去重粒度（固定大小指纹）；压缩粒度远大于此（最大 128KB 合并单元）。
+- **xxh3_64 指纹（8 字节）**，不是 crypto-strength 哈希。pair 碰撞率约 1.5e-8，所以**字节验证是正确性而不是优化**：每个候选 hit 都会通过 `ReadPool` 把原始 fragment 从 LV3 重新读回来，与新写入的源数据 byte-compare 之后才允许 dedup。
+- **Promote-on-verified-hit**：首次出现的 miss **不**写 `dedup_index`，只进 sharded 的 RAM `CandidateCache`（默认每 shard ~1M slot 的 LRU）。第二次见到同一指纹、且 LV3 字节验证通过之后，才在 LBA remap 同事务里把 `(hash, blockmap)` promote 到 `dedup_index` + `dedup_reverse`（`atomic_batch_dedup_hits_with_promote`）。只出现一次的块在 dedup 元数据上**零写入**。
+- **两级 L0**：`dedup_index` 查询走 L1 hot cache &rarr; cuckoo filter（16-bit fp, 4 slots/bucket, packed u64）&rarr; on-disk cuckoo。filter 让 cold miss 不必触盘；FPR 约 0.006%，饱和后无损降级（contains 永远返回 true）。
+- **Cold-tail 扫描**（在 `DedupScanner` 内）：每 cycle 用 per-volume LBA 游标扫一段 live blockmap，通过 `ReadPool` 批量读 LV3，xxh3 后插入候选缓存。这能在进程重启后（candidate 是 RAM-only）和长跑场景下恢复 dedup 率。`dedup.cold_tail_max_per_cycle` 控制 cycle 预算。
+- per-shard buffer > 90% 时前台 dedup 跳过、标记 `DEDUP_SKIPPED`；同一个 scanner 后续把这些块拉出来 hash 后塞进候选缓存（仍**不**写 dedup_index，promote 永远靠 verified second sighting）。
+- dedup index 清理仍是原子的：PBA refcount 归零时 `paged_reverse` PBA-prefix 扫描清掉过期条目；writer 在 PBA 释放前会先把候选缓存里指向该 PBA 的所有 fp 全部 evict，避免 verifier 被指向已经被 allocator 重用的物理块。
+- `dedup_shards`（默认 8）驱动 metadb 内每 shard 的 apply lane；候选缓存复用同一套 shard 路由，hit 与 promote commit 永远落在同一个 metadb shard。
 
 ### 垃圾回收
 
@@ -127,12 +132,12 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 
 全局元数据（固定）：
 
-| CF              | Key                     | Value               | 用途                    |
-|-----------------|-------------------------|----------------------|-------------------------|
-| `volumes`       | `vol-{id}`              | bincode VolumeConfig | 卷注册表                |
-| `refcount`      | `pba(BE)`               | `count(BE)`          | 物理块引用计数          |
-| `dedup_index`   | `sha256(32B)`           | DedupEntry(27B)      | 内容哈希 &rarr; PBA     |
-| `dedup_reverse` | `pba(BE) + sha256(32B)` | empty                | 反向查找用于清理        |
+| 表              | Key                          | Value               | 用途                    |
+|-----------------|------------------------------|---------------------|-------------------------|
+| `volumes`       | `VolumeOrdinal`              | manifest entry      | 卷注册表（ordinal 缓存） |
+| `refcount`      | `pba(BE)`                    | `u32` 计数          | 物理块引用计数          |
+| `dedup_index`   | `Hash8` (xxh3_64)            | DedupEntry(27B)     | 内容哈希 &rarr; PBA（cuckoo + filter L0 + L1 hot cache）|
+| `dedup_reverse` | 16B（`pba(BE)` + `Hash8`）   | empty               | PBA 前缀反扫，refcount 归零时清理 |
 
 Per-volume blockmap（每个 volume 一个命名空间）：
 
@@ -146,7 +151,7 @@ Per-volume blockmap（每个 volume 一个命名空间）：
 
 - [x] MVP：ublk + metadb + 压缩 + 空间管理
 - [x] Packer + GC：fragment bin-packing、GC 扫描/回写、背压控制、hole map 复用
-- [x] 去重：工作线程池、dedup_index/dedup_reverse、分级跳过策略、后台补扫
+- [x] 去重：工作线程池、dedup_index/dedup_reverse、分级跳过策略、DEDUP_SKIPPED 补扫、RAM 候选缓存 + LV3 字节验证 promote、cold-tail blockmap 扫描、cuckoo-filter L0
 - [ ] RAID 感知：strip 对齐写出、strip 粒度分配
 - [ ] 生产化：iSCSI 前端、HA（双控 active-standby）、Prometheus 监控
 - [ ] 高性能：NVMe-oF over RDMA
