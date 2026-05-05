@@ -39,7 +39,9 @@ use crate::io::uring::{IoUringSession, UringOp};
 use crate::meta::schema::BlockmapValue;
 use crate::metrics::EngineMetrics;
 use crate::types::BLOCK_SIZE;
-use crate::zone::read::{decode_unit, extract_lba_from_compressed};
+use crate::zone::read::{
+    decode_unit_with_crc_accounting, extract_lba_from_compressed_with_crc_accounting,
+};
 
 /// Maximum requests folded into one `submit_batch` per worker iteration.
 const BATCH_MAX: usize = 32;
@@ -533,17 +535,49 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         //   return_unit=true:  hand back the full decoded unit so the caller
         //                      can fan out multiple LBAs from one IO.
         let decode_start = Instant::now();
+        let count_crc_error = counts_as_crc_error(req.purpose);
         let result = if let Some(mappings) = req.raw_extent.as_ref() {
             decode_raw_extent(buf.as_slice(), mappings, &ctx.metrics)
         } else if req.return_unit {
-            decode_unit(buf.as_slice(), &req.mapping, &ctx.metrics)
-                .map(|payload| payload.into_owned())
+            decode_unit_with_crc_accounting(
+                buf.as_slice(),
+                &req.mapping,
+                &ctx.metrics,
+                count_crc_error,
+            )
+            .map(|payload| payload.into_owned())
         } else {
-            extract_lba_from_compressed(buf.as_slice(), &req.mapping, &ctx.metrics)
+            extract_lba_from_compressed_with_crc_accounting(
+                buf.as_slice(),
+                &req.mapping,
+                &ctx.metrics,
+                count_crc_error,
+            )
         };
         if let Err(OnyxError::CrcMismatch { expected, actual }) = &result {
-            record_purpose_crc_error(&ctx.metrics, req.purpose);
-            tracing::warn!(
+            record_purpose_mismatch(&ctx.metrics, req.purpose);
+            if matches!(
+                req.purpose,
+                ReadPurpose::DedupVerify
+                    | ReadPurpose::DedupVerifyIndex
+                    | ReadPurpose::DedupVerifyCandidate
+            ) {
+                tracing::debug!(
+                    worker = ctx.worker_idx,
+                    purpose = ?req.purpose,
+                    pba = req.mapping.pba.0,
+                    slot_offset = req.mapping.slot_offset,
+                    unit_compressed_size = req.mapping.unit_compressed_size,
+                    unit_original_size = req.mapping.unit_original_size,
+                    unit_lba_count = req.mapping.unit_lba_count,
+                    offset_in_unit = req.mapping.offset_in_unit,
+                    expected_crc = *expected,
+                    actual_crc = *actual,
+                    raw_extent_blocks = req.raw_extent.as_ref().map_or(0, Vec::len),
+                    "read-pool: dedup verify mismatch"
+                );
+            } else {
+                tracing::warn!(
                 worker = ctx.worker_idx,
                 purpose = ?req.purpose,
                 pba = req.mapping.pba.0,
@@ -556,7 +590,8 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
                 actual_crc = *actual,
                 raw_extent_blocks = req.raw_extent.as_ref().map_or(0, Vec::len),
                 "read-pool: CRC mismatch"
-            );
+                );
+            }
         }
         ctx.metrics
             .record_read_pool_decode_ns(elapsed_ns(decode_start));
@@ -577,12 +612,21 @@ fn record_queue_wait(metrics: &EngineMetrics, worker_idx: usize, req: &ReadReque
     );
 }
 
-fn record_purpose_crc_error(metrics: &EngineMetrics, purpose: ReadPurpose) {
+fn counts_as_crc_error(purpose: ReadPurpose) -> bool {
+    !matches!(
+        purpose,
+        ReadPurpose::DedupVerify
+            | ReadPurpose::DedupVerifyIndex
+            | ReadPurpose::DedupVerifyCandidate
+    )
+}
+
+fn record_purpose_mismatch(metrics: &EngineMetrics, purpose: ReadPurpose) {
     match purpose {
         ReadPurpose::Foreground => &metrics.read_crc_errors_foreground,
         ReadPurpose::DedupVerify
         | ReadPurpose::DedupVerifyIndex
-        | ReadPurpose::DedupVerifyCandidate => &metrics.read_crc_errors_dedup_verify,
+        | ReadPurpose::DedupVerifyCandidate => &metrics.dedup_verify_mismatches,
         ReadPurpose::DedupScanner => &metrics.read_crc_errors_dedup_scanner,
     }
     .fetch_add(1, Ordering::Relaxed);
@@ -866,5 +910,34 @@ mod tests {
             other => panic!("expected CrcMismatch, got {other:?}"),
         }
         assert_eq!(metrics.read_crc_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dedup_verify_mismatch_is_not_counted_as_crc_error() {
+        let (dev, tmp) = fresh_device();
+        let engine = IoEngine::new_raw(dev, false);
+
+        let payload = vec![0x91u8; BLOCK_SIZE as usize];
+        write_uncompressed(&engine, Pba(0), &payload);
+        let bad_crc = crc32fast::hash(&payload).wrapping_add(1);
+
+        let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
+        let metrics = Arc::new(EngineMetrics::default());
+        let pool = ReadPool::start(1, 8, &pool_dev, 0, BLOCK_SIZE, false, metrics.clone()).unwrap();
+
+        let rx = pool
+            .submit_read_async_for(
+                make_mapping(Pba(0), BLOCK_SIZE, bad_crc),
+                ReadPurpose::DedupVerifyIndex,
+            )
+            .unwrap();
+        let err = rx.recv().unwrap().unwrap_err();
+        assert!(matches!(err, OnyxError::CrcMismatch { .. }));
+        assert_eq!(metrics.read_crc_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.read_crc_errors_foreground.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.dedup_verify_mismatches.load(Ordering::Relaxed), 1);
     }
 }

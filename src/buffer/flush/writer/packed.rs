@@ -9,6 +9,20 @@ struct PackedSlotMeta {
     stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
 }
 
+struct PackedSlotCommit {
+    actual_old_pba_meta: HashMap<Pba, RemapCleanup>,
+    fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
+    stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
+    total_refcount: u32,
+    all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
+    any_discarded: bool,
+}
+
+enum PackedSlotCommitOutcome {
+    Discarded,
+    Committed(PackedSlotCommit),
+}
+
 fn merge_dead_pbas(dst: &mut HashMap<Pba, RemapCleanup>, src: HashMap<Pba, RemapCleanup>) {
     for (pba, cleanup) in src {
         dst.entry(pba)
@@ -108,177 +122,180 @@ impl BufferFlusher {
         let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
-        // Under lifecycle read locks: check generation, build batch, IO, commit
+        let outcome = pool.with_l2p_commit_locks(vol_ids.iter().map(String::as_str), || {
+            // Under lifecycle read locks: check generation, build batch, IO, commit
 
-        // Build blockmap entries.
-        // Refcount decrements are re-computed inside the lock by atomic_batch_write_packed.
-        let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
-        // First-occurrence (hash, blockmap) pairs to insert into the
-        // RAM candidate cache after the metadata commit succeeds.
-        // These do *not* go into dedup_index — promote-on-verified-hit
-        // moves them there only when a duplicate is later confirmed
-        // by LV3 byte-compare in the dedup worker.
-        let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-        let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-        let mut total_refcount: u32 = 0;
-        let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
-        let mut any_discarded = false;
+            // Build blockmap entries.
+            // Refcount decrements are re-computed inside the lock by atomic_batch_write_packed.
+            let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+            let mut total_refcount: u32 = 0;
+            let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
+            let mut any_discarded = false;
 
-        for frag in &sealed.fragments {
-            let unit = &frag.unit;
-            let vol_id = VolumeId(unit.vol_id.clone());
+            for frag in &sealed.fragments {
+                let unit = &frag.unit;
+                let vol_id = VolumeId(unit.vol_id.clone());
 
-            // Lifecycle check: verify volume still exists and generation matches
-            let should_discard = match meta.get_volume(&vol_id)? {
-                None => true,
-                Some(vc) if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at => {
-                    true
-                }
-                _ => false,
-            };
-
-            if should_discard {
-                metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
-                any_discarded = true;
-                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                    let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                }
-                continue;
-            }
-
-            let live_positions = Self::live_positions_for_unit(unit, pool)?;
-            if live_positions.is_empty() {
-                any_discarded = true;
-                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                    let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                }
-                continue;
-            }
-
-            let frag_lbas: Vec<Lba> = live_positions
-                .iter()
-                .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                .collect();
-
-            // Build the per-LBA BlockmapValue once and use it for both
-            // the metadata commit and the candidate-cache insert. The
-            // commit batch carries DEDUP_SKIPPED for skipped units;
-            // candidate inserts use the same BlockmapValue with flags
-            // forced to 0 (a cache entry is not the source of truth
-            // for skip state).
-            let frag_flags = if unit.dedup_skipped {
-                FLAG_DEDUP_SKIPPED
-            } else {
-                0
-            };
-            let hashes_for_promote = if !unit.dedup_skipped {
-                unit.block_hashes.as_ref()
-            } else {
-                None
-            };
-            for (i, pos) in live_positions.iter().copied().enumerate() {
-                let blockmap = BlockmapValue {
-                    pba: sealed.pba,
-                    compression: unit.compression,
-                    unit_compressed_size: unit.compressed_data.len() as u32,
-                    unit_original_size: unit.original_size,
-                    unit_lba_count: unit.lba_count as u16,
-                    offset_in_unit: pos as u16,
-                    crc32: unit.crc32,
-                    slot_offset: frag.slot_offset,
-                    flags: frag_flags,
+                let should_discard = match meta.get_volume(&vol_id)? {
+                    None => true,
+                    Some(vc)
+                        if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
+                    {
+                        true
+                    }
+                    _ => false,
                 };
-                batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
-                if let Some(hashes) = hashes_for_promote {
-                    let hash = hashes[pos];
-                    if hash != [0u8; 8] {
-                        fresh_dedup_pairs.push((
-                            hash,
-                            BlockmapValue {
-                                flags: 0,
-                                ..blockmap
-                            },
-                        ));
-                        if let Some(repairs) = &unit.dedup_stale_repairs {
-                            if let Some(Some(old_entry)) = repairs.get(pos) {
-                                stale_repairs.push((
-                                    hash,
-                                    *old_entry,
-                                    BlockmapValue {
-                                        flags: 0,
-                                        ..blockmap
-                                    }
-                                    .to_dedup_entry(),
-                                ));
+
+                if should_discard {
+                    metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
+                    any_discarded = true;
+                    for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                    }
+                    continue;
+                }
+
+                let live_positions = Self::live_positions_for_unit(unit, pool)?;
+                if live_positions.is_empty() {
+                    any_discarded = true;
+                    for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                    }
+                    continue;
+                }
+
+                let frag_lbas: Vec<Lba> = live_positions
+                    .iter()
+                    .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
+                    .collect();
+
+                let frag_flags = if unit.dedup_skipped {
+                    FLAG_DEDUP_SKIPPED
+                } else {
+                    0
+                };
+                let hashes_for_promote = if !unit.dedup_skipped {
+                    unit.block_hashes.as_ref()
+                } else {
+                    None
+                };
+                for (i, pos) in live_positions.iter().copied().enumerate() {
+                    let blockmap = BlockmapValue {
+                        pba: sealed.pba,
+                        compression: unit.compression,
+                        unit_compressed_size: unit.compressed_data.len() as u32,
+                        unit_original_size: unit.original_size,
+                        unit_lba_count: unit.lba_count as u16,
+                        offset_in_unit: pos as u16,
+                        crc32: unit.crc32,
+                        slot_offset: frag.slot_offset,
+                        flags: frag_flags,
+                    };
+                    batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
+                    if let Some(hashes) = hashes_for_promote {
+                        let hash = hashes[pos];
+                        if hash != [0u8; 8] {
+                            fresh_dedup_pairs.push((
+                                hash,
+                                BlockmapValue {
+                                    flags: 0,
+                                    ..blockmap
+                                },
+                            ));
+                            if let Some(repairs) = &unit.dedup_stale_repairs {
+                                if let Some(Some(old_entry)) = repairs.get(pos) {
+                                    stale_repairs.push((
+                                        hash,
+                                        *old_entry,
+                                        BlockmapValue {
+                                            flags: 0,
+                                            ..blockmap
+                                        }
+                                        .to_dedup_entry(),
+                                    ));
+                                }
                             }
                         }
                     }
                 }
+                total_refcount += live_positions.len() as u32;
+                all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
             }
-            total_refcount += live_positions.len() as u32;
-            all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
-        }
 
-        // If all fragments were discarded, free the slot PBA
-        if batch_values.is_empty() {
-            allocator.free_one(sealed.pba)?;
-            let _ = pool.advance_tail_for_shard(shard_idx);
-            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-            return Ok(());
-        }
+            if batch_values.is_empty() {
+                allocator.free_one(sealed.pba)?;
+                let _ = pool.advance_tail_for_shard(shard_idx);
+                return Ok(PackedSlotCommitOutcome::Discarded);
+            }
 
-        let io_start = Instant::now();
-        if let Err(e) =
-            maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)
-        {
-            allocator.free_one(sealed.pba)?;
+            let io_start = Instant::now();
+            if let Err(e) =
+                maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)
+            {
+                allocator.free_one(sealed.pba)?;
+                Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+                return Err(e);
+            }
+
+            if let Err(e) = io_engine.write_blocks(sealed.pba, &sealed.data) {
+                allocator.free_one(sealed.pba)?;
+                Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+                return Err(e);
+            }
             Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
-            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-            return Err(e);
-        }
 
-        // Write the 4KB slot data to LV3
-        if let Err(e) = io_engine.write_blocks(sealed.pba, &sealed.data) {
-            allocator.free_one(sealed.pba)?;
-            Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
-            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-            return Err(e);
-        }
-        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+            let meta_start = Instant::now();
 
-        let meta_start = Instant::now();
-
-        if let Err(e) =
-            maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)
-        {
-            allocator.free_one(sealed.pba)?;
-            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-            Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-            return Err(e);
-        }
-        maybe_pause_before_packed_meta_write(&sealed.fragments)?;
-
-        // Metadata commit — old PBA decrements re-computed inside the lock
-        let actual_old_pba_meta = match meta.atomic_batch_write_packed_with_dedup(
-            &batch_values,
-            sealed.pba,
-            total_refcount,
-            &[],
-        ) {
-            Ok(m) => m,
-            Err(e) => {
+            if let Err(e) =
+                maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)
+            {
                 allocator.free_one(sealed.pba)?;
                 Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                return Err(e);
+            }
+            maybe_pause_before_packed_meta_write(&sealed.fragments)?;
+
+            let actual_old_pba_meta = match meta.atomic_batch_write_packed_with_dedup(
+                &batch_values,
+                sealed.pba,
+                total_refcount,
+                &[],
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    allocator.free_one(sealed.pba)?;
+                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                    return Err(e);
+                }
+            };
+            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+            Ok(PackedSlotCommitOutcome::Committed(PackedSlotCommit {
+                actual_old_pba_meta,
+                fresh_dedup_pairs,
+                stale_repairs,
+                total_refcount,
+                all_seq_lba_ranges,
+                any_discarded,
+            }))
+        });
+        let commit = match outcome {
+            Ok(PackedSlotCommitOutcome::Discarded) => {
+                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                return Ok(());
+            }
+            Ok(PackedSlotCommitOutcome::Committed(commit)) => commit,
+            Err(e) => {
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Err(e);
             }
         };
-        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-        candidate.insert_many(&fresh_dedup_pairs);
-        Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_packed_slot");
+        candidate.insert_many(&commit.fresh_dedup_pairs);
+        Self::repair_stale_dedup_index(meta, metrics, &commit.stale_repairs, "write_packed_slot");
 
-        if !actual_old_pba_meta.is_empty() {
-            let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
+        if !commit.actual_old_pba_meta.is_empty() {
+            let _ = cleanup_tx.send(commit.actual_old_pba_meta.into_values().collect());
         }
 
         metrics
@@ -293,7 +310,7 @@ impl BufferFlusher {
 
         // Mark entries flushed
         let mark_start = Instant::now();
-        for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
+        for (seq, lba_start, lba_count) in &commit.all_seq_lba_ranges {
             if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
                 tracing::warn!(seq, error = %e, "failed to mark entry flushed (packed)");
             }
@@ -303,8 +320,8 @@ impl BufferFlusher {
         tracing::debug!(
             pba = sealed.pba.0,
             fragments = sealed.fragments.len(),
-            total_lbas = total_refcount,
-            discarded = any_discarded,
+            total_lbas = commit.total_refcount,
+            discarded = commit.any_discarded,
             "flushed packed slot"
         );
 
@@ -368,258 +385,250 @@ impl BufferFlusher {
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
         let mut slot_metas: Vec<Option<PackedSlotMeta>> = (0..n).map(|_| None).collect();
+        let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
+        let mut meta_commits = 0usize;
+        let mut meta_lbas = 0usize;
+        let mut io_elapsed = Duration::ZERO;
+        let mut meta_elapsed = Duration::ZERO;
 
-        // Phase 1: per-slot validation + build batch_values + dedup registrations.
-        // A slot whose every fragment is stale (volume deleted / version
-        // mismatch / no live positions) is dropped here and its PBA freed.
-        for (i, sealed) in sealed_slots.iter().enumerate() {
-            let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
-            let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
-            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+        pool.with_l2p_commit_locks(vol_ids.iter().map(String::as_str), || {
+            // Phase 1: per-slot validation + build batch_values + dedup registrations.
+            // A slot whose every fragment is stale (volume deleted / version
+            // mismatch / no live positions) is dropped here and its PBA freed.
+            for (i, sealed) in sealed_slots.iter().enumerate() {
+                let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+                let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
+                let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+                let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
 
-            for frag in &sealed.fragments {
-                let unit = &frag.unit;
-                let vol_id = VolumeId(unit.vol_id.clone());
+                for frag in &sealed.fragments {
+                    let unit = &frag.unit;
+                    let vol_id = VolumeId(unit.vol_id.clone());
 
-                let should_discard = match meta.get_volume(&vol_id) {
-                    Ok(None) => true,
-                    Ok(Some(vc))
-                        if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
-                    {
-                        true
-                    }
-                    Ok(_) => false,
-                    Err(_) => false,
-                };
-
-                if should_discard {
-                    metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
-                    for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                    }
-                    continue;
-                }
-
-                let live_positions = match Self::live_positions_for_unit(unit, pool) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // Fragment scan failed — abandon this whole slot's
-                        // commit so we don't write a half-built batch_values
-                        // entry. Mark and skip.
-                        results[i] = Err(e);
-                        batch_values.clear();
-                        all_seq_lba_ranges.clear();
-                        fresh_dedup_pairs.clear();
-                        stale_repairs.clear();
-                        break;
-                    }
-                };
-                if live_positions.is_empty() {
-                    for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                    }
-                    continue;
-                }
-
-                let frag_lbas: Vec<Lba> = live_positions
-                    .iter()
-                    .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                    .collect();
-                let frag_flags = if unit.dedup_skipped {
-                    FLAG_DEDUP_SKIPPED
-                } else {
-                    0
-                };
-                let hashes_for_promote = if !unit.dedup_skipped {
-                    unit.block_hashes.as_ref()
-                } else {
-                    None
-                };
-                for (j, pos) in live_positions.iter().copied().enumerate() {
-                    let blockmap = BlockmapValue {
-                        pba: sealed.pba,
-                        compression: unit.compression,
-                        unit_compressed_size: unit.compressed_data.len() as u32,
-                        unit_original_size: unit.original_size,
-                        unit_lba_count: unit.lba_count as u16,
-                        offset_in_unit: pos as u16,
-                        crc32: unit.crc32,
-                        slot_offset: frag.slot_offset,
-                        flags: frag_flags,
+                    let should_discard = match meta.get_volume(&vol_id) {
+                        Ok(None) => true,
+                        Ok(Some(vc))
+                            if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
+                        {
+                            true
+                        }
+                        Ok(_) => false,
+                        Err(_) => false,
                     };
-                    batch_values.push((vol_id.clone(), frag_lbas[j], blockmap));
-                    if let Some(hashes) = hashes_for_promote {
-                        let hash = hashes[pos];
-                        if hash != [0u8; 8] {
-                            fresh_dedup_pairs.push((
-                                hash,
-                                BlockmapValue {
-                                    flags: 0,
-                                    ..blockmap
-                                },
-                            ));
-                            if let Some(repairs) = &unit.dedup_stale_repairs {
-                                if let Some(Some(old_entry)) = repairs.get(pos) {
-                                    stale_repairs.push((
-                                        hash,
-                                        *old_entry,
-                                        BlockmapValue {
-                                            flags: 0,
-                                            ..blockmap
-                                        }
-                                        .to_dedup_entry(),
-                                    ));
+
+                    if should_discard {
+                        metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
+                        for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                            let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                        }
+                        continue;
+                    }
+
+                    let live_positions = match Self::live_positions_for_unit(unit, pool) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            results[i] = Err(e);
+                            batch_values.clear();
+                            all_seq_lba_ranges.clear();
+                            fresh_dedup_pairs.clear();
+                            stale_repairs.clear();
+                            break;
+                        }
+                    };
+                    if live_positions.is_empty() {
+                        for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                            let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                        }
+                        continue;
+                    }
+
+                    let frag_lbas: Vec<Lba> = live_positions
+                        .iter()
+                        .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
+                        .collect();
+                    let frag_flags = if unit.dedup_skipped {
+                        FLAG_DEDUP_SKIPPED
+                    } else {
+                        0
+                    };
+                    let hashes_for_promote = if !unit.dedup_skipped {
+                        unit.block_hashes.as_ref()
+                    } else {
+                        None
+                    };
+                    for (j, pos) in live_positions.iter().copied().enumerate() {
+                        let blockmap = BlockmapValue {
+                            pba: sealed.pba,
+                            compression: unit.compression,
+                            unit_compressed_size: unit.compressed_data.len() as u32,
+                            unit_original_size: unit.original_size,
+                            unit_lba_count: unit.lba_count as u16,
+                            offset_in_unit: pos as u16,
+                            crc32: unit.crc32,
+                            slot_offset: frag.slot_offset,
+                            flags: frag_flags,
+                        };
+                        batch_values.push((vol_id.clone(), frag_lbas[j], blockmap));
+                        if let Some(hashes) = hashes_for_promote {
+                            let hash = hashes[pos];
+                            if hash != [0u8; 8] {
+                                fresh_dedup_pairs.push((
+                                    hash,
+                                    BlockmapValue {
+                                        flags: 0,
+                                        ..blockmap
+                                    },
+                                ));
+                                if let Some(repairs) = &unit.dedup_stale_repairs {
+                                    if let Some(Some(old_entry)) = repairs.get(pos) {
+                                        stale_repairs.push((
+                                            hash,
+                                            *old_entry,
+                                            BlockmapValue {
+                                                flags: 0,
+                                                ..blockmap
+                                            }
+                                            .to_dedup_entry(),
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
+                    all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
                 }
-                all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
-            }
 
-            if batch_values.is_empty() {
-                // Either every fragment was stale or live_positions_for_unit
-                // failed. Free the PBA so the allocator reclaims it. If it
-                // was a hard error we already recorded that in `results[i]`.
-                let _ = allocator.free_one(sealed.pba);
-                continue;
-            }
-
-            slot_metas[i] = Some(PackedSlotMeta {
-                batch_values,
-                all_seq_lba_ranges,
-                fresh_dedup_pairs,
-                stale_repairs,
-            });
-        }
-
-        // Phase 2: batched IO writes — one submit_batch keeps the NVMe
-        // queue full instead of one fsync-style write per slot.
-        let io_start = Instant::now();
-        {
-            use crate::io::engine::{LvOp, LvOpResult};
-            let mut ops: Vec<LvOp> = Vec::new();
-            let mut op_to_slot: Vec<usize> = Vec::new();
-            for i in 0..n {
-                if slot_metas[i].is_none() {
+                if batch_values.is_empty() {
+                    let _ = allocator.free_one(sealed.pba);
                     continue;
                 }
-                ops.push(LvOp::Write {
-                    pba: sealed_slots[i].pba,
-                    payload: sealed_slots[i].data.as_slice(),
+
+                slot_metas[i] = Some(PackedSlotMeta {
+                    batch_values,
+                    all_seq_lba_ranges,
+                    fresh_dedup_pairs,
+                    stale_repairs,
                 });
-                op_to_slot.push(i);
             }
-            if !ops.is_empty() {
-                match io_engine.submit_batch(ops, false) {
-                    Ok(write_results) => {
-                        for (idx, r) in write_results.into_iter().enumerate() {
-                            let slot_idx = op_to_slot[idx];
-                            if let LvOpResult::Write(Err(e)) = r {
+
+            // Phase 2: batched IO writes.
+            let io_start = Instant::now();
+            {
+                use crate::io::engine::{LvOp, LvOpResult};
+                let mut ops: Vec<LvOp> = Vec::new();
+                let mut op_to_slot: Vec<usize> = Vec::new();
+                for i in 0..n {
+                    if slot_metas[i].is_none() {
+                        continue;
+                    }
+                    ops.push(LvOp::Write {
+                        pba: sealed_slots[i].pba,
+                        payload: sealed_slots[i].data.as_slice(),
+                    });
+                    op_to_slot.push(i);
+                }
+                if !ops.is_empty() {
+                    match io_engine.submit_batch(ops, false) {
+                        Ok(write_results) => {
+                            for (idx, r) in write_results.into_iter().enumerate() {
+                                let slot_idx = op_to_slot[idx];
+                                if let LvOpResult::Write(Err(e)) = r {
+                                    let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                                    results[slot_idx] =
+                                        Err(crate::error::OnyxError::Io(std::io::Error::other(
+                                            format!("packed-slot batch IO write failed: {e}"),
+                                        )));
+                                    slot_metas[slot_idx] = None;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            for &slot_idx in &op_to_slot {
+                                if slot_metas[slot_idx].is_none() {
+                                    continue;
+                                }
                                 let _ = allocator.free_one(sealed_slots[slot_idx].pba);
                                 results[slot_idx] =
                                     Err(crate::error::OnyxError::Io(std::io::Error::other(
-                                        format!("packed-slot batch IO write failed: {e}"),
+                                        format!("packed-slot batch IO submit failed: {e}"),
                                     )));
                                 slot_metas[slot_idx] = None;
                             }
                         }
                     }
-                    Err(e) => {
-                        for &slot_idx in &op_to_slot {
-                            if slot_metas[slot_idx].is_none() {
-                                continue;
-                            }
-                            let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                            results[slot_idx] =
-                                Err(crate::error::OnyxError::Io(std::io::Error::other(format!(
-                                    "packed-slot batch IO submit failed: {e}"
-                                ))));
-                            slot_metas[slot_idx] = None;
-                        }
+                }
+            }
+            io_elapsed = io_start.elapsed();
+            Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+
+            // Phase 3: bounded metadata batches over surviving slots.
+            let meta_start = Instant::now();
+            let mut batch_slots: Vec<usize> = Vec::new();
+            let mut batch_lbas = 0usize;
+
+            for i in 0..n {
+                let Some(ref sm) = slot_metas[i] else {
+                    continue;
+                };
+                let slot_lbas = sm.batch_values.len();
+                if !batch_slots.is_empty()
+                    && batch_lbas.saturating_add(slot_lbas) > packed_meta_batch_max_lbas
+                {
+                    if commit_packed_meta_batch(
+                        &mut batch_slots,
+                        &mut batch_lbas,
+                        sealed_slots,
+                        &mut slot_metas,
+                        meta,
+                        allocator,
+                        &mut results,
+                        &mut actual_old_pba_meta,
+                        candidate,
+                        metrics,
+                    ) {
+                        meta_commits += 1;
+                    }
+                }
+                batch_slots.push(i);
+                batch_lbas += slot_lbas;
+                meta_lbas += slot_lbas;
+                if slot_lbas > packed_meta_batch_max_lbas {
+                    if commit_packed_meta_batch(
+                        &mut batch_slots,
+                        &mut batch_lbas,
+                        sealed_slots,
+                        &mut slot_metas,
+                        meta,
+                        allocator,
+                        &mut results,
+                        &mut actual_old_pba_meta,
+                        candidate,
+                        metrics,
+                    ) {
+                        meta_commits += 1;
                     }
                 }
             }
-        }
-        let io_elapsed = io_start.elapsed();
-        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
-
-        // Phase 3: bounded metadata batches over the surviving slots'
-        // blockmap entries. Keep each WAL record safely below the record
-        // limit while still amortising the fixed commit cost across many
-        // slots. Dedup miss registrations are folded into the same
-        // transaction so we avoid a second blockmap validation pass and a
-        // second WAL/apply round for every miss batch.
-        let meta_start = Instant::now();
-        let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
-        let mut batch_slots: Vec<usize> = Vec::new();
-        let mut batch_lbas = 0usize;
-        let mut meta_commits = 0usize;
-        let mut meta_lbas = 0usize;
-
-        for i in 0..n {
-            let Some(ref sm) = slot_metas[i] else {
-                continue;
-            };
-            let slot_lbas = sm.batch_values.len();
-            if !batch_slots.is_empty()
-                && batch_lbas.saturating_add(slot_lbas) > packed_meta_batch_max_lbas
-            {
-                if commit_packed_meta_batch(
-                    &mut batch_slots,
-                    &mut batch_lbas,
-                    sealed_slots,
-                    &mut slot_metas,
-                    meta,
-                    allocator,
-                    &mut results,
-                    &mut actual_old_pba_meta,
-                    candidate,
-                    metrics,
-                ) {
-                    meta_commits += 1;
-                }
+            if commit_packed_meta_batch(
+                &mut batch_slots,
+                &mut batch_lbas,
+                sealed_slots,
+                &mut slot_metas,
+                meta,
+                allocator,
+                &mut results,
+                &mut actual_old_pba_meta,
+                candidate,
+                metrics,
+            ) {
+                meta_commits += 1;
             }
-            batch_slots.push(i);
-            batch_lbas += slot_lbas;
-            meta_lbas += slot_lbas;
-            if slot_lbas > packed_meta_batch_max_lbas {
-                if commit_packed_meta_batch(
-                    &mut batch_slots,
-                    &mut batch_lbas,
-                    sealed_slots,
-                    &mut slot_metas,
-                    meta,
-                    allocator,
-                    &mut results,
-                    &mut actual_old_pba_meta,
-                    candidate,
-                    metrics,
-                ) {
-                    meta_commits += 1;
-                }
-            }
-        }
-        if commit_packed_meta_batch(
-            &mut batch_slots,
-            &mut batch_lbas,
-            sealed_slots,
-            &mut slot_metas,
-            meta,
-            allocator,
-            &mut results,
-            &mut actual_old_pba_meta,
-            candidate,
-            metrics,
-        ) {
-            meta_commits += 1;
-        }
+            meta_elapsed = meta_start.elapsed();
+            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+        });
         if !actual_old_pba_meta.is_empty() {
             let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
         }
-        let meta_elapsed = meta_start.elapsed();
-        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 
         // Phase 4: counters + mark_flushed per surviving slot.
         let mark_start = Instant::now();

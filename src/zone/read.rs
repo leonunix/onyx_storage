@@ -125,6 +125,15 @@ pub(crate) fn decode_unit<'a>(
     mapping: &crate::meta::schema::BlockmapValue,
     metrics: &EngineMetrics,
 ) -> OnyxResult<UnitPayload<'a>> {
+    decode_unit_with_crc_accounting(raw, mapping, metrics, true)
+}
+
+pub(crate) fn decode_unit_with_crc_accounting<'a>(
+    raw: &'a [u8],
+    mapping: &crate::meta::schema::BlockmapValue,
+    metrics: &EngineMetrics,
+    count_crc_error: bool,
+) -> OnyxResult<UnitPayload<'a>> {
     use std::sync::atomic::Ordering;
 
     let (start, end) = mapping.compressed_slice_range();
@@ -138,7 +147,9 @@ pub(crate) fn decode_unit<'a>(
 
     let actual_crc = crc32fast::hash(compressed);
     if actual_crc != mapping.crc32 {
-        metrics.read_crc_errors.fetch_add(1, Ordering::Relaxed);
+        if count_crc_error {
+            metrics.read_crc_errors.fetch_add(1, Ordering::Relaxed);
+        }
         return Err(OnyxError::CrcMismatch {
             expected: mapping.crc32,
             actual: actual_crc,
@@ -199,9 +210,18 @@ pub(crate) fn extract_lba_from_compressed(
     mapping: &crate::meta::schema::BlockmapValue,
     metrics: &EngineMetrics,
 ) -> OnyxResult<Vec<u8>> {
+    extract_lba_from_compressed_with_crc_accounting(raw, mapping, metrics, true)
+}
+
+pub(crate) fn extract_lba_from_compressed_with_crc_accounting(
+    raw: &[u8],
+    mapping: &crate::meta::schema::BlockmapValue,
+    metrics: &EngineMetrics,
+    count_crc_error: bool,
+) -> OnyxResult<Vec<u8>> {
     use std::sync::atomic::Ordering;
 
-    let payload = decode_unit(raw, mapping, metrics)?;
+    let payload = decode_unit_with_crc_accounting(raw, mapping, metrics, count_crc_error)?;
     let lba = slice_lba(&payload, mapping.offset_in_unit)?.to_vec();
 
     metrics.read_lv3_hits.fetch_add(1, Ordering::Relaxed);

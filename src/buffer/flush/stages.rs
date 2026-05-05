@@ -829,94 +829,96 @@ impl BufferFlusher {
             let mut pending: Vec<(usize, usize, Lba, BlockmapValue, ContentHash)> = Vec::new();
 
             lifecycle.with_read_lock(&vol_id_str, || {
-                for unit_idx in unit_indices {
-                    let unit = &prepared[unit_idx].unit;
-                    let generation_alive = generation_cache
-                        .entry(unit.vol_created_at)
-                        .or_insert_with(|| match meta.get_volume(&vol_id) {
-                            Ok(Some(vc)) => Ok(vc.created_at == unit.vol_created_at),
-                            Ok(None) => Ok(false),
-                            Err(e) => Err(e),
-                        })
-                        .as_ref()
-                        .copied();
-
-                    match generation_alive {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let hits = std::mem::take(&mut prepared[unit_idx].valid_hits);
-                            for (i, _, _) in &hits {
-                                prepared[unit_idx].is_hit[*i] = true;
-                            }
-                            prepared[unit_idx]
-                                .successful_hit_indices
-                                .extend(hits.into_iter().map(|(i, _, _)| i));
-                            continue;
-                        }
-                        Err(e) => {
-                            let hits = std::mem::take(&mut prepared[unit_idx].valid_hits);
-                            metrics
-                                .dedup_hit_failures
-                                .fetch_add(hits.len() as u64, Ordering::Relaxed);
-                            for (i, _, _) in hits {
-                                prepared[unit_idx].is_hit[i] = false;
-                            }
-                            tracing::warn!(
-                                vol = %vol_id_str,
-                                error = %e,
-                                "dedup worker: failed to check volume generation; demoting hits to miss"
-                            );
-                            continue;
-                        }
-                    }
-
-                    let hits = std::mem::take(&mut prepared[unit_idx].valid_hits);
-                    for (i, existing_value, hash) in hits {
+                pool.with_l2p_commit_lock(&vol_id_str, || {
+                    for unit_idx in unit_indices {
                         let unit = &prepared[unit_idx].unit;
-                        let lba = Lba(unit.start_lba.0 + i as u64);
-                        let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
-                        if !pool.is_latest_lba_seq(
-                            &unit.vol_id,
-                            lba,
-                            latest_seq,
-                            unit.vol_created_at,
-                        ) {
-                            prepared[unit_idx].successful_hit_indices.push(i);
-                            continue;
-                        }
-                        if maybe_inject_dedup_hit_failure(&vol_id_str, lba).is_ok() {
-                            pending.push((unit_idx, i, lba, existing_value, hash));
-                            if pending.len() >= Self::DEDUP_HIT_COMMIT_BATCH_SIZE {
-                                Self::commit_dedup_hit_chunk(
-                                    prepared,
-                                    &vol_id,
-                                    &vol_id_str,
-                                    &mut pending,
-                                    meta,
-                                    metrics,
-                                    cleanup_tx,
-                                    candidate,
-                                );
+                        let generation_alive = generation_cache
+                            .entry(unit.vol_created_at)
+                            .or_insert_with(|| match meta.get_volume(&vol_id) {
+                                Ok(Some(vc)) => Ok(vc.created_at == unit.vol_created_at),
+                                Ok(None) => Ok(false),
+                                Err(e) => Err(e),
+                            })
+                            .as_ref()
+                            .copied();
+
+                        match generation_alive {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                let hits = std::mem::take(&mut prepared[unit_idx].valid_hits);
+                                for (i, _, _) in &hits {
+                                    prepared[unit_idx].is_hit[*i] = true;
+                                }
+                                prepared[unit_idx]
+                                    .successful_hit_indices
+                                    .extend(hits.into_iter().map(|(i, _, _)| i));
+                                continue;
                             }
-                        } else {
-                            prepared[unit_idx].is_hit[i] = false;
-                            metrics.dedup_hit_failures.fetch_add(1, Ordering::Relaxed);
+                            Err(e) => {
+                                let hits = std::mem::take(&mut prepared[unit_idx].valid_hits);
+                                metrics
+                                    .dedup_hit_failures
+                                    .fetch_add(hits.len() as u64, Ordering::Relaxed);
+                                for (i, _, _) in hits {
+                                    prepared[unit_idx].is_hit[i] = false;
+                                }
+                                tracing::warn!(
+                                    vol = %vol_id_str,
+                                    error = %e,
+                                    "dedup worker: failed to check volume generation; demoting hits to miss"
+                                );
+                                continue;
+                            }
+                        }
+
+                        let hits = std::mem::take(&mut prepared[unit_idx].valid_hits);
+                        for (i, existing_value, hash) in hits {
+                            let unit = &prepared[unit_idx].unit;
+                            let lba = Lba(unit.start_lba.0 + i as u64);
+                            let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
+                            if !pool.is_latest_lba_seq(
+                                &unit.vol_id,
+                                lba,
+                                latest_seq,
+                                unit.vol_created_at,
+                            ) {
+                                prepared[unit_idx].successful_hit_indices.push(i);
+                                continue;
+                            }
+                            if maybe_inject_dedup_hit_failure(&vol_id_str, lba).is_ok() {
+                                pending.push((unit_idx, i, lba, existing_value, hash));
+                                if pending.len() >= Self::DEDUP_HIT_COMMIT_BATCH_SIZE {
+                                    Self::commit_dedup_hit_chunk(
+                                        prepared,
+                                        &vol_id,
+                                        &vol_id_str,
+                                        &mut pending,
+                                        meta,
+                                        metrics,
+                                        cleanup_tx,
+                                        candidate,
+                                    );
+                                }
+                            } else {
+                                prepared[unit_idx].is_hit[i] = false;
+                                metrics.dedup_hit_failures.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
-                }
 
-                if !pending.is_empty() {
-                    Self::commit_dedup_hit_chunk(
-                        prepared,
-                        &vol_id,
-                        &vol_id_str,
-                        &mut pending,
-                        meta,
-                        metrics,
-                        cleanup_tx,
-                        candidate,
-                    );
-                }
+                    if !pending.is_empty() {
+                        Self::commit_dedup_hit_chunk(
+                            prepared,
+                            &vol_id,
+                            &vol_id_str,
+                            &mut pending,
+                            meta,
+                            metrics,
+                            cleanup_tx,
+                            candidate,
+                        );
+                    }
+                });
             });
         }
 
@@ -945,89 +947,91 @@ impl BufferFlusher {
             let vol_id = VolumeId(vol_id_str.clone());
             let mut generation_cache: HashMap<u64, OnyxResult<bool>> = HashMap::new();
             lifecycle.with_read_lock(&vol_id_str, || {
-                for unit_idx in unit_indices {
-                    let unit = &prepared[unit_idx].unit;
-                    let generation_alive = generation_cache
-                        .entry(unit.vol_created_at)
-                        .or_insert_with(|| match meta.get_volume(&vol_id) {
-                            Ok(Some(vc)) => Ok(vc.created_at == unit.vol_created_at),
-                            Ok(None) => Ok(false),
-                            Err(e) => Err(e),
-                        })
-                        .as_ref()
-                        .copied();
+                pool.with_l2p_commit_lock(&vol_id_str, || {
+                    for unit_idx in unit_indices {
+                        let unit = &prepared[unit_idx].unit;
+                        let generation_alive = generation_cache
+                            .entry(unit.vol_created_at)
+                            .or_insert_with(|| match meta.get_volume(&vol_id) {
+                                Ok(Some(vc)) => Ok(vc.created_at == unit.vol_created_at),
+                                Ok(None) => Ok(false),
+                                Err(e) => Err(e),
+                            })
+                            .as_ref()
+                            .copied();
 
-                    match generation_alive {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let zeros = std::mem::take(&mut prepared[unit_idx].zero_indices);
-                            for &i in &zeros {
-                                prepared[unit_idx].is_hit[i] = true;
+                        match generation_alive {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                let zeros = std::mem::take(&mut prepared[unit_idx].zero_indices);
+                                for &i in &zeros {
+                                    prepared[unit_idx].is_hit[i] = true;
+                                }
+                                prepared[unit_idx].successful_hit_indices.extend(zeros);
+                                continue;
                             }
-                            prepared[unit_idx].successful_hit_indices.extend(zeros);
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                vol = %vol_id_str,
-                                error = %e,
-                                "dedup worker: failed to check volume generation for zero blocks"
-                            );
-                            continue;
-                        }
-                    }
-
-                    let zero_indices = prepared[unit_idx].zero_indices.clone();
-                    let mut batch_values: Vec<(Lba, BlockmapValue)> =
-                        Vec::with_capacity(zero_indices.len());
-                    for &i in &zero_indices {
-                        let lba = Lba(unit.start_lba.0 + i as u64);
-                        let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
-                        if !pool.is_latest_lba_seq(
-                            &unit.vol_id,
-                            lba,
-                            latest_seq,
-                            unit.vol_created_at,
-                        ) {
-                            prepared[unit_idx].is_hit[i] = true;
-                            prepared[unit_idx].successful_hit_indices.push(i);
-                            continue;
-                        }
-                        batch_values.push((lba, BlockmapValue::zero()));
-                    }
-                    if batch_values.is_empty() {
-                        prepared[unit_idx].zero_indices.clear();
-                        continue;
-                    }
-
-                    match meta.atomic_batch_write(&vol_id, &batch_values, 0) {
-                        Ok(newly_zeroed) => {
-                            let accepted: Vec<usize> = batch_values
-                                .iter()
-                                .map(|(lba, _)| (lba.0 - unit.start_lba.0) as usize)
-                                .collect();
-                            for &i in &accepted {
-                                prepared[unit_idx].is_hit[i] = true;
+                            Err(e) => {
+                                tracing::warn!(
+                                    vol = %vol_id_str,
+                                    error = %e,
+                                    "dedup worker: failed to check volume generation for zero blocks"
+                                );
+                                continue;
                             }
-                            prepared[unit_idx].successful_hit_indices.extend(accepted);
+                        }
+
+                        let zero_indices = prepared[unit_idx].zero_indices.clone();
+                        let mut batch_values: Vec<(Lba, BlockmapValue)> =
+                            Vec::with_capacity(zero_indices.len());
+                        for &i in &zero_indices {
+                            let lba = Lba(unit.start_lba.0 + i as u64);
+                            let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
+                            if !pool.is_latest_lba_seq(
+                                &unit.vol_id,
+                                lba,
+                                latest_seq,
+                                unit.vol_created_at,
+                            ) {
+                                prepared[unit_idx].is_hit[i] = true;
+                                prepared[unit_idx].successful_hit_indices.push(i);
+                                continue;
+                            }
+                            batch_values.push((lba, BlockmapValue::zero()));
+                        }
+                        if batch_values.is_empty() {
                             prepared[unit_idx].zero_indices.clear();
-                            if !newly_zeroed.is_empty() {
-                                let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
+                            continue;
+                        }
+
+                        match meta.atomic_batch_write(&vol_id, &batch_values, 0) {
+                            Ok(newly_zeroed) => {
+                                let accepted: Vec<usize> = batch_values
+                                    .iter()
+                                    .map(|(lba, _)| (lba.0 - unit.start_lba.0) as usize)
+                                    .collect();
+                                for &i in &accepted {
+                                    prepared[unit_idx].is_hit[i] = true;
+                                }
+                                prepared[unit_idx].successful_hit_indices.extend(accepted);
+                                prepared[unit_idx].zero_indices.clear();
+                                if !newly_zeroed.is_empty() {
+                                    let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
+                                }
+                            }
+                            Err(e) => {
+                                metrics
+                                    .dedup_hit_failures
+                                    .fetch_add(batch_values.len() as u64, Ordering::Relaxed);
+                                tracing::error!(
+                                    vol = %vol_id_str,
+                                    count = batch_values.len(),
+                                    error = %e,
+                                    "dedup worker: zero block remap failed, demoting to miss"
+                                );
                             }
                         }
-                        Err(e) => {
-                            metrics
-                                .dedup_hit_failures
-                                .fetch_add(batch_values.len() as u64, Ordering::Relaxed);
-                            tracing::error!(
-                                vol = %vol_id_str,
-                                count = batch_values.len(),
-                                error = %e,
-                                "dedup worker: zero block remap failed, demoting to miss"
-                            );
-                        }
                     }
-                }
+                });
             });
         }
     }

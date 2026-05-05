@@ -404,6 +404,16 @@ pub struct WriteBufferPool {
     root_device: RawDevice,
     shards: Vec<BufferShardHandle>,
     next_seq: AtomicU64,
+    /// Serializes background L2P commits. Flusher/scanner paths take this
+    /// while checking `is_latest_lba_seq` and updating metadb. That closes the
+    /// stale-commit window where an older seq could observe "latest", then
+    /// race behind a newer flush and overwrite the newer L2P mapping.
+    ///
+    /// Foreground append does not take this lock: if a newer write arrives
+    /// after an older commit has already passed the latest check, the older
+    /// commit may land first, but the newer buffered write remains visible and
+    /// its later flush will commit after it.
+    l2p_commit_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
     routing_zone_size_blocks: u64,
     ready_rx: Receiver<u64>,
     shard_ready_rxs: Vec<Receiver<u64>>,

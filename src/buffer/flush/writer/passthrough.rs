@@ -85,8 +85,86 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
             let meta_start = Instant::now();
-            let live_positions = Self::live_positions_for_unit(unit, pool)?;
-            if live_positions.is_empty() {
+            let commit = pool.with_l2p_commit_lock(
+                &unit.vol_id,
+                || -> OnyxResult<Option<(Vec<usize>, HashMap<Pba, RemapCleanup>)>> {
+                    let live_positions = Self::live_positions_for_unit(unit, pool)?;
+                    if live_positions.is_empty() {
+                        return Ok(None);
+                    }
+                    let lbas: Vec<Lba> = live_positions
+                        .iter()
+                        .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
+                        .collect();
+
+                    let mut batch_values = Vec::with_capacity(live_positions.len());
+                    for i in 0..live_positions.len() {
+                        let flags = if unit.dedup_skipped {
+                            FLAG_DEDUP_SKIPPED
+                        } else {
+                            0
+                        };
+                        let blockmap = Self::blockmap_for_unit_position(
+                            unit,
+                            pba,
+                            live_positions[i],
+                            0,
+                            flags,
+                        );
+                        batch_values.push((lbas[i], blockmap));
+                    }
+                    let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+                    let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+                    if !unit.dedup_skipped {
+                        if let Some(ref hashes) = unit.block_hashes {
+                            fresh_dedup_pairs.reserve(live_positions.len());
+                            for &pos in &live_positions {
+                                let hash = hashes[pos];
+                                if hash == [0u8; 8] {
+                                    continue;
+                                }
+                                let blockmap =
+                                    Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
+                                fresh_dedup_pairs.push((hash, blockmap));
+                                if let Some(repairs) = &unit.dedup_stale_repairs {
+                                    if let Some(Some(old_entry)) = repairs.get(pos) {
+                                        stale_repairs.push((
+                                            hash,
+                                            *old_entry,
+                                            blockmap.to_dedup_entry(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    maybe_inject_test_failure(
+                        &unit.vol_id,
+                        unit.start_lba,
+                        FlushFailStage::BeforeMetaWrite,
+                    )?;
+
+                    let actual_old_pba_meta = meta.atomic_batch_write_with_dedup(
+                        &vol_id,
+                        &batch_values,
+                        live_positions.len() as u32,
+                        &[],
+                    )?;
+                    candidate.insert_many(&fresh_dedup_pairs);
+                    Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
+                    Ok(Some((live_positions, actual_old_pba_meta)))
+                },
+            );
+            let Some((live_positions, actual_old_pba_meta)) = (match commit {
+                Ok(v) => v,
+                Err(e) => {
+                    allocation.free(allocator)?;
+                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                    return Err(e);
+                }
+            }) else {
                 allocation.free(allocator)?;
                 let mark_start = Instant::now();
                 for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
@@ -99,72 +177,8 @@ impl BufferFlusher {
                 Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Ok(());
-            }
-            let lbas: Vec<Lba> = live_positions
-                .iter()
-                .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                .collect();
-
-            let mut batch_values = Vec::with_capacity(live_positions.len());
-            for i in 0..live_positions.len() {
-                let flags = if unit.dedup_skipped {
-                    FLAG_DEDUP_SKIPPED
-                } else {
-                    0
-                };
-                let blockmap =
-                    Self::blockmap_for_unit_position(unit, pba, live_positions[i], 0, flags);
-                batch_values.push((lbas[i], blockmap));
-            }
-            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-            if !unit.dedup_skipped {
-                if let Some(ref hashes) = unit.block_hashes {
-                    fresh_dedup_pairs.reserve(live_positions.len());
-                    for &pos in &live_positions {
-                        let hash = hashes[pos];
-                        if hash == [0u8; 8] {
-                            continue;
-                        }
-                        let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
-                        fresh_dedup_pairs.push((hash, blockmap));
-                        if let Some(repairs) = &unit.dedup_stale_repairs {
-                            if let Some(Some(old_entry)) = repairs.get(pos) {
-                                stale_repairs.push((hash, *old_entry, blockmap.to_dedup_entry()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Err(e) = maybe_inject_test_failure(
-                &unit.vol_id,
-                unit.start_lba,
-                FlushFailStage::BeforeMetaWrite,
-            ) {
-                allocation.free(allocator)?;
-                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                return Err(e);
-            }
-
-            let actual_old_pba_meta = match meta.atomic_batch_write_with_dedup(
-                &vol_id,
-                &batch_values,
-                live_positions.len() as u32,
-                &[],
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    allocation.free(allocator)?;
-                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                    return Err(e);
-                }
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-            candidate.insert_many(&fresh_dedup_pairs);
-            Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
@@ -364,158 +378,179 @@ impl BufferFlusher {
         let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
-        // Phase 4: Build batch values + live positions.
-        // Refcount decrements are re-computed inside the lock by atomic_batch_write_multi.
         let meta_start = Instant::now();
-        struct UnitMeta {
-            batch_values: Vec<(Lba, BlockmapValue)>,
-            live_positions: Vec<usize>,
-            /// First-occurrence (hash, blockmap) pairs for the
-            /// candidate cache; populated alongside batch_values.
-            fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
-            stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
-        }
-        let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
-
-        for (i, unit) in units.iter().enumerate() {
-            if skip[i] {
-                continue;
-            }
-            let pba = pbas[i].unwrap();
-            let live_positions = match Self::live_positions_for_unit(unit, pool) {
-                Ok(positions) => positions,
-                Err(e) => {
-                    if alloc_blocks[i] == 1 {
-                        let _ = allocator.free_one(pba);
-                    } else {
-                        let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
-                    }
-                    results[i] = Err(e);
-                    skip[i] = true;
-                    continue;
+        let commit_vol_ids: Vec<&str> = units
+            .iter()
+            .enumerate()
+            .filter_map(|(i, unit)| (!skip[i]).then_some(unit.vol_id.as_str()))
+            .collect();
+        let (unit_metas, meta_indices, actual_old_pba_meta) =
+            pool.with_l2p_commit_locks(commit_vol_ids, || {
+                // Phase 4: Build batch values + live positions.
+                // Refcount decrements are re-computed inside the lock by atomic_batch_write_multi.
+                struct UnitMeta {
+                    batch_values: Vec<(Lba, BlockmapValue)>,
+                    live_positions: Vec<usize>,
+                    /// First-occurrence (hash, blockmap) pairs for the
+                    /// candidate cache; populated alongside batch_values.
+                    fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
+                    stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
                 }
-            };
+                let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
 
-            if live_positions.is_empty() {
-                unit_metas[i] = Some(UnitMeta {
-                    batch_values: Vec::new(),
-                    live_positions,
-                    fresh_dedup_pairs: Vec::new(),
-                    stale_repairs: Vec::new(),
-                });
-                continue;
-            }
-
-            let lbas: Vec<Lba> = live_positions
-                .iter()
-                .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                .collect();
-
-            let mut batch_values = Vec::with_capacity(live_positions.len());
-            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-
-            for j in 0..live_positions.len() {
-                let flags = if unit.dedup_skipped {
-                    FLAG_DEDUP_SKIPPED
-                } else {
-                    0
-                };
-                let blockmap =
-                    Self::blockmap_for_unit_position(unit, pba, live_positions[j], 0, flags);
-                batch_values.push((lbas[j], blockmap));
-            }
-            if !unit.dedup_skipped {
-                if let Some(ref hashes) = unit.block_hashes {
-                    fresh_dedup_pairs.reserve(live_positions.len());
-                    for &pos in &live_positions {
-                        let hash = hashes[pos];
-                        if hash == [0u8; 8] {
+                for (i, unit) in units.iter().enumerate() {
+                    if skip[i] {
+                        continue;
+                    }
+                    let pba = pbas[i].unwrap();
+                    let live_positions = match Self::live_positions_for_unit(unit, pool) {
+                        Ok(positions) => positions,
+                        Err(e) => {
+                            if alloc_blocks[i] == 1 {
+                                let _ = allocator.free_one(pba);
+                            } else {
+                                let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
+                            }
+                            results[i] = Err(e);
+                            skip[i] = true;
                             continue;
                         }
-                        let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
-                        fresh_dedup_pairs.push((hash, blockmap));
-                        if let Some(repairs) = &unit.dedup_stale_repairs {
-                            if let Some(Some(old_entry)) = repairs.get(pos) {
-                                stale_repairs.push((hash, *old_entry, blockmap.to_dedup_entry()));
+                    };
+
+                    if live_positions.is_empty() {
+                        unit_metas[i] = Some(UnitMeta {
+                            batch_values: Vec::new(),
+                            live_positions,
+                            fresh_dedup_pairs: Vec::new(),
+                            stale_repairs: Vec::new(),
+                        });
+                        continue;
+                    }
+
+                    let lbas: Vec<Lba> = live_positions
+                        .iter()
+                        .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
+                        .collect();
+
+                    let mut batch_values = Vec::with_capacity(live_positions.len());
+                    let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+                    let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+
+                    for j in 0..live_positions.len() {
+                        let flags = if unit.dedup_skipped {
+                            FLAG_DEDUP_SKIPPED
+                        } else {
+                            0
+                        };
+                        let blockmap = Self::blockmap_for_unit_position(
+                            unit,
+                            pba,
+                            live_positions[j],
+                            0,
+                            flags,
+                        );
+                        batch_values.push((lbas[j], blockmap));
+                    }
+                    if !unit.dedup_skipped {
+                        if let Some(ref hashes) = unit.block_hashes {
+                            fresh_dedup_pairs.reserve(live_positions.len());
+                            for &pos in &live_positions {
+                                let hash = hashes[pos];
+                                if hash == [0u8; 8] {
+                                    continue;
+                                }
+                                let blockmap =
+                                    Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
+                                fresh_dedup_pairs.push((hash, blockmap));
+                                if let Some(repairs) = &unit.dedup_stale_repairs {
+                                    if let Some(Some(old_entry)) = repairs.get(pos) {
+                                        stale_repairs.push((
+                                            hash,
+                                            *old_entry,
+                                            blockmap.to_dedup_entry(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    unit_metas[i] = Some(UnitMeta {
+                        batch_values,
+                        live_positions,
+                        fresh_dedup_pairs,
+                        stale_repairs,
+                    });
+                }
+
+                // Phase 5: ONE combined WriteBatch for all units.
+                // old PBA decrements are computed inside the lock by atomic_batch_write_multi.
+                let mut vol_ids_owned: Vec<VolumeId> = Vec::new();
+                let mut meta_indices: Vec<usize> = Vec::new();
+
+                for (i, unit) in units.iter().enumerate() {
+                    if skip[i] || unit_metas[i].is_none() {
+                        continue;
+                    }
+                    vol_ids_owned.push(VolumeId(unit.vol_id.clone()));
+                    meta_indices.push(i);
+                }
+
+                // actual_old_pba_meta: returned by atomic_batch_write_multi with accurate data
+                let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
+
+                if !meta_indices.is_empty() {
+                    let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = meta_indices
+                        .iter()
+                        .enumerate()
+                        .map(|(batch_idx, &unit_idx)| {
+                            let um = unit_metas[unit_idx].as_ref().unwrap();
+                            (
+                                &vol_ids_owned[batch_idx],
+                                um.batch_values.as_slice(),
+                                um.live_positions.len() as u32,
+                            )
+                        })
+                        .collect();
+
+                    let mut all_fresh_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+                    let mut all_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> =
+                        Vec::new();
+                    for &unit_idx in &meta_indices {
+                        let um = unit_metas[unit_idx].as_ref().unwrap();
+                        all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
+                        all_stale_repairs.extend_from_slice(&um.stale_repairs);
+                    }
+                    match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
+                        Ok(returned) => {
+                            actual_old_pba_meta = returned;
+                            candidate.insert_many(&all_fresh_pairs);
+                            Self::repair_stale_dedup_index(
+                                meta,
+                                metrics,
+                                &all_stale_repairs,
+                                "write_units_batch",
+                            );
+                        }
+                        Err(e) => {
+                            // Entire batch failed — rollback all allocations.
+                            for &unit_idx in &meta_indices {
+                                let pba = pbas[unit_idx].unwrap();
+                                if alloc_blocks[unit_idx] == 1 {
+                                    let _ = allocator.free_one(pba);
+                                } else {
+                                    let _ = allocator
+                                        .free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
+                                }
+                                results[unit_idx] = Err(crate::error::OnyxError::Io(
+                                    std::io::Error::other(format!("batch write failed: {e}",)),
+                                ));
+                                skip[unit_idx] = true;
                             }
                         }
                     }
                 }
-            }
-            unit_metas[i] = Some(UnitMeta {
-                batch_values,
-                live_positions,
-                fresh_dedup_pairs,
-                stale_repairs,
+                (unit_metas, meta_indices, actual_old_pba_meta)
             });
-        }
-
-        // Phase 5: ONE combined WriteBatch for all units.
-        // old PBA decrements are computed inside the lock by atomic_batch_write_multi.
-        let mut vol_ids_owned: Vec<VolumeId> = Vec::new();
-        let mut meta_indices: Vec<usize> = Vec::new();
-
-        for (i, unit) in units.iter().enumerate() {
-            if skip[i] || unit_metas[i].is_none() {
-                continue;
-            }
-            vol_ids_owned.push(VolumeId(unit.vol_id.clone()));
-            meta_indices.push(i);
-        }
-
-        // actual_old_pba_meta: returned by atomic_batch_write_multi with accurate data
-        let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
-
-        if !meta_indices.is_empty() {
-            let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = meta_indices
-                .iter()
-                .enumerate()
-                .map(|(batch_idx, &unit_idx)| {
-                    let um = unit_metas[unit_idx].as_ref().unwrap();
-                    (
-                        &vol_ids_owned[batch_idx],
-                        um.batch_values.as_slice(),
-                        um.live_positions.len() as u32,
-                    )
-                })
-                .collect();
-
-            let mut all_fresh_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-            let mut all_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-            for &unit_idx in &meta_indices {
-                let um = unit_metas[unit_idx].as_ref().unwrap();
-                all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
-                all_stale_repairs.extend_from_slice(&um.stale_repairs);
-            }
-            match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
-                Ok(returned) => {
-                    actual_old_pba_meta = returned;
-                    candidate.insert_many(&all_fresh_pairs);
-                    Self::repair_stale_dedup_index(
-                        meta,
-                        metrics,
-                        &all_stale_repairs,
-                        "write_units_batch",
-                    );
-                }
-                Err(e) => {
-                    // Entire batch failed — rollback all allocations.
-                    for &unit_idx in &meta_indices {
-                        let pba = pbas[unit_idx].unwrap();
-                        if alloc_blocks[unit_idx] == 1 {
-                            let _ = allocator.free_one(pba);
-                        } else {
-                            let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
-                        }
-                        results[unit_idx] = Err(crate::error::OnyxError::Io(
-                            std::io::Error::other(format!("batch write failed: {e}",)),
-                        ));
-                        skip[unit_idx] = true;
-                    }
-                }
-            }
-        }
         let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
 

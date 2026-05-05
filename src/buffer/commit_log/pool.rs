@@ -1066,6 +1066,7 @@ impl WriteBufferPool {
             root_device: device,
             shards,
             next_seq: AtomicU64::new(max_seq + 1),
+            l2p_commit_locks: DashMap::new(),
             routing_zone_size_blocks,
             ready_rx,
             shard_ready_rxs,
@@ -1261,6 +1262,39 @@ impl WriteBufferPool {
         self.shards[shard_idx]
             .shard
             .is_latest_lba_seq(vol_id, lba, seq, vol_created_at)
+    }
+
+    fn l2p_commit_lock_for_volume(&self, vol_id: &str) -> Arc<parking_lot::Mutex<()>> {
+        self.l2p_commit_locks
+            .entry(vol_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
+    pub(crate) fn with_l2p_commit_lock<R>(&self, vol_id: &str, f: impl FnOnce() -> R) -> R {
+        let lock = self.l2p_commit_lock_for_volume(vol_id);
+        let _guard = lock.lock();
+        f()
+    }
+
+    pub(crate) fn with_l2p_commit_locks<R>(
+        &self,
+        vol_ids: impl IntoIterator<Item = impl AsRef<str>>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let mut vol_ids: Vec<String> = vol_ids
+            .into_iter()
+            .map(|vol_id| vol_id.as_ref().to_string())
+            .collect();
+        vol_ids.sort();
+        vol_ids.dedup();
+
+        let locks: Vec<_> = vol_ids
+            .iter()
+            .map(|vol_id| self.l2p_commit_lock_for_volume(vol_id))
+            .collect();
+        let _guards: Vec<_> = locks.iter().map(|lock| lock.lock()).collect();
+        f()
     }
 
     /// Check whether every LBA in this entry has been superseded by a later

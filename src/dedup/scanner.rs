@@ -174,6 +174,7 @@ impl DedupScanner {
                     io_engine,
                     allocator,
                     lifecycle,
+                    buffer_pool,
                     candidate,
                     cfg.max_rescan_per_cycle,
                 ) {
@@ -286,6 +287,7 @@ impl DedupScanner {
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
+        buffer_pool: &WriteBufferPool,
         candidate: &CandidateCache,
         max_per_cycle: usize,
     ) -> OnyxResult<RescanStats> {
@@ -299,74 +301,77 @@ impl DedupScanner {
             let vol_id = VolumeId(vol_id_str.clone());
 
             let result = lifecycle.with_read_lock(vol_id_str, || -> OnyxResult<bool> {
-                // Re-read the mapping to ensure it's still the same
-                let current = meta.get_mapping(&vol_id, *lba)?;
-                let current = match current {
-                    Some(c)
-                        if c.pba == bv.pba
-                            && c.slot_offset == bv.slot_offset
-                            && c.unit_compressed_size == bv.unit_compressed_size
-                            && c.unit_original_size == bv.unit_original_size
-                            && c.unit_lba_count == bv.unit_lba_count
-                            && c.offset_in_unit == bv.offset_in_unit
-                            && c.compression == bv.compression
-                            && c.crc32 == bv.crc32
-                            && c.flags & FLAG_DEDUP_SKIPPED != 0 =>
-                    {
-                        c
-                    }
-                    _ => return Ok(false), // Changed or flag already cleared
-                };
-
-                let block = match read_lba_block(io_engine, &current)? {
-                    Some(b) => b,
-                    None => return Ok(false),
-                };
-                let hash: ContentHash = compute_content_hash(&block);
-
-                match meta.get_dedup_entry(&hash)? {
-                    Some(existing) if meta.dedup_entry_is_live(&hash, &existing)? => {
-                        // Persistent dedup hit: remap LBA to the live
-                        // PBA and decrement the now-orphaned old PBA.
-                        let new_bv = BlockmapValue {
-                            flags: 0, // Clear DEDUP_SKIPPED
-                            ..existing.to_blockmap_value()
-                        };
-                        let decremented = meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash)?;
-                        if let Some(cleanup) = decremented {
-                            BufferFlusher::cleanup_dead_pba_post_commit(
-                                meta,
-                                allocator,
-                                io_engine,
-                                metrics,
-                                candidate,
-                                cleanup,
-                                "dedup_scanner_cleanup",
-                            );
+                buffer_pool.with_l2p_commit_lock(vol_id_str, || -> OnyxResult<bool> {
+                    // Re-read the mapping to ensure it's still the same
+                    let current = meta.get_mapping(&vol_id, *lba)?;
+                    let current = match current {
+                        Some(c)
+                            if c.pba == bv.pba
+                                && c.slot_offset == bv.slot_offset
+                                && c.unit_compressed_size == bv.unit_compressed_size
+                                && c.unit_original_size == bv.unit_original_size
+                                && c.unit_lba_count == bv.unit_lba_count
+                                && c.offset_in_unit == bv.offset_in_unit
+                                && c.compression == bv.compression
+                                && c.crc32 == bv.crc32
+                                && c.flags & FLAG_DEDUP_SKIPPED != 0 =>
+                        {
+                            c
                         }
-                        stats.hits += 1;
-                    }
-                    _ => {
-                        // No live persistent entry. Promote-on-verified-hit
-                        // means we do **not** write the dedup_index here:
-                        // first-occurrence misses go to the candidate cache
-                        // and only get promoted when a future duplicate
-                        // write byte-verifies against this PBA. Drop the
-                        // FLAG_DEDUP_SKIPPED bit so the scanner does not
-                        // re-process this LBA forever.
-                        candidate.insert(
-                            hash,
-                            BlockmapValue {
-                                flags: 0,
-                                ..current
-                            },
-                        );
-                        meta.update_blockmap_flags(&vol_id, *lba, 0)?;
-                        stats.misses += 1;
-                    }
-                }
+                        _ => return Ok(false), // Changed or flag already cleared
+                    };
 
-                Ok(true)
+                    let block = match read_lba_block(io_engine, &current)? {
+                        Some(b) => b,
+                        None => return Ok(false),
+                    };
+                    let hash: ContentHash = compute_content_hash(&block);
+
+                    match meta.get_dedup_entry(&hash)? {
+                        Some(existing) if meta.dedup_entry_is_live(&hash, &existing)? => {
+                            // Persistent dedup hit: remap LBA to the live
+                            // PBA and decrement the now-orphaned old PBA.
+                            let new_bv = BlockmapValue {
+                                flags: 0, // Clear DEDUP_SKIPPED
+                                ..existing.to_blockmap_value()
+                            };
+                            let decremented =
+                                meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash)?;
+                            if let Some(cleanup) = decremented {
+                                BufferFlusher::cleanup_dead_pba_post_commit(
+                                    meta,
+                                    allocator,
+                                    io_engine,
+                                    metrics,
+                                    candidate,
+                                    cleanup,
+                                    "dedup_scanner_cleanup",
+                                );
+                            }
+                            stats.hits += 1;
+                        }
+                        _ => {
+                            // No live persistent entry. Promote-on-verified-hit
+                            // means we do **not** write the dedup_index here:
+                            // first-occurrence misses go to the candidate cache
+                            // and only get promoted when a future duplicate
+                            // write byte-verifies against this PBA. Drop the
+                            // FLAG_DEDUP_SKIPPED bit so the scanner does not
+                            // re-process this LBA forever.
+                            candidate.insert(
+                                hash,
+                                BlockmapValue {
+                                    flags: 0,
+                                    ..current
+                                },
+                            );
+                            meta.update_blockmap_flags(&vol_id, *lba, 0)?;
+                            stats.misses += 1;
+                        }
+                    }
+
+                    Ok(true)
+                })
             })?;
 
             if result {

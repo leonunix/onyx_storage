@@ -1729,7 +1729,7 @@ impl BufferShard {
                 let (latest_seq, latest_created_at) = *entry;
                 latest_seq == seq && latest_created_at == vol_created_at
             })
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Return `true` iff every LBA covered by this entry has a strictly later

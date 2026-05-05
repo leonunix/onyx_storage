@@ -1,0 +1,49 @@
+# Rendered by scripts/fio_dedupe_compress_soak.py before each run.
+# The checked-in file is a template so the same workload shape stays stable.
+
+[global]
+name=onyx-dedupe-compress-soak
+ioengine=libaio
+direct=1
+thread=1
+group_reporting=1
+time_based=1
+runtime=__RUNTIME__
+filename=__FILENAME__
+size=__SIZE__
+
+rw=randrw
+rwmixread=__RWMIXREAD__
+bsrange=__MIN_BS__-__MAX_BS__
+numjobs=__JOBS__
+iodepth=__IODEPTH__
+iodepth_batch_submit=__IODEPTH__
+iodepth_batch_complete_min=1
+
+# Keep this a correctness/health soak, not a maximum-throughput run.
+rate_iops=__RATE_IOPS__
+rate_process=poisson
+
+# Fio checksum verification writes per-block metadata, which makes otherwise
+# duplicate 4K blocks unique. The wrapper renders this section from
+# --verify-mode so reduction soak and strict fio verify can be run separately.
+__VERIFY_OPTIONS__
+serialize_overlap=1
+exitall_on_error=1
+continue_on_error=none
+
+# Model real data reduction: part of the stream is duplicate and the rest is
+# still compressible. Tune these two values when testing other expected ratios.
+refill_buffers=1
+scramble_buffers=0
+dedupe_percentage=__DEDUPE_PERCENTAGE__
+dedupe_mode=working_set
+dedupe_global=1
+dedupe_working_set_percentage=__DEDUPE_WORKING_SET_PERCENTAGE__
+buffer_compress_percentage=__BUFFER_COMPRESS_PERCENTAGE__
+buffer_compress_chunk=__BUFFER_COMPRESS_CHUNK__
+
+randrepeat=0
+random_generator=tausworthe64
+
+[mixed]
