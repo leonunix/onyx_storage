@@ -1,8 +1,10 @@
 use serde::Deserialize;
 
-pub const DEFAULT_REGISTER_BATCH_MAX_ENTRIES: usize = 1024;
-pub const DEFAULT_REGISTER_BATCH_WAIT_US: u64 = 500;
-pub const REGISTER_BATCH_HARD_MAX_ENTRIES: usize = 8192;
+/// Hard cap on the per-tx batch size used by `put_dedup_entries` when
+/// chunking a large input through metadb. Not user-tunable; the metadb
+/// backend chunks any larger input into pieces of this size to keep
+/// individual WAL records bounded.
+pub const DEDUP_PUT_BATCH_HARD_MAX_ENTRIES: usize = 8192;
 
 /// Dedup configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -21,16 +23,6 @@ pub struct DedupConfig {
     /// admission controlled only by buffer fill percentage.
     #[serde(default)]
     pub pending_skip_threshold_entries: u64,
-    /// Max dedup-index rows a background registration thread commits in one
-    /// metadb transaction. Bigger batches reduce fixed WAL/apply overhead but
-    /// can create long metadata apply bursts that hurt foreground reads.
-    #[serde(default = "default_register_batch_max_entries")]
-    pub register_batch_max_entries: usize,
-    /// How long a dedup registration thread waits for sibling batches before
-    /// committing a partial batch. 0 means commit the first received batch
-    /// immediately.
-    #[serde(default = "default_register_batch_wait_us")]
-    pub register_batch_wait_us: u64,
     /// Background re-dedup scan interval in milliseconds (default 30000).
     #[serde(default = "default_rescan_interval_ms")]
     pub rescan_interval_ms: u64,
@@ -62,8 +54,6 @@ impl Default for DedupConfig {
             workers: default_workers(),
             buffer_skip_threshold_pct: default_buffer_skip_threshold_pct(),
             pending_skip_threshold_entries: 0,
-            register_batch_max_entries: default_register_batch_max_entries(),
-            register_batch_wait_us: default_register_batch_wait_us(),
             rescan_interval_ms: default_rescan_interval_ms(),
             max_rescan_per_cycle: default_max_rescan_per_cycle(),
             candidate_shards: None,
@@ -81,12 +71,6 @@ fn default_workers() -> usize {
 }
 fn default_buffer_skip_threshold_pct() -> u8 {
     90
-}
-fn default_register_batch_max_entries() -> usize {
-    DEFAULT_REGISTER_BATCH_MAX_ENTRIES
-}
-fn default_register_batch_wait_us() -> u64 {
-    DEFAULT_REGISTER_BATCH_WAIT_US
 }
 fn default_rescan_interval_ms() -> u64 {
     30000

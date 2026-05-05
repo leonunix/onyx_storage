@@ -83,10 +83,12 @@ enabled = true
 workers = 2
 buffer_skip_threshold_pct = 90
 pending_skip_threshold_entries = 0
-register_batch_max_entries = 2048
-register_batch_wait_us = 500
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 4096
+# Cold-tail rescan: walk live blockmap entries and warm the candidate
+# cache so duplicate writes after restart can verify-and-promote against
+# an already-known fingerprint. 0 disables.
+cold_tail_max_per_cycle = 4096
 
 [threading]
 enabled = true

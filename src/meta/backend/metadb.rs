@@ -26,7 +26,7 @@ const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "onyx-volume-catalog.bin";
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
 const BLOCKMAP_SCAN_CHUNK_LBAS: u64 = 262_144; // 1 GiB of 4 KiB LBAs.
-const DEDUP_PERSIST_BATCH_LIMIT: usize = crate::dedup::config::REGISTER_BATCH_HARD_MAX_ENTRIES;
+const DEDUP_PERSIST_BATCH_LIMIT: usize = crate::dedup::config::DEDUP_PUT_BATCH_HARD_MAX_ENTRIES;
 
 pub(crate) struct MetadbBackend {
     db: Arc<Db>,
