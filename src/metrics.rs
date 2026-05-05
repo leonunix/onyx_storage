@@ -176,6 +176,9 @@ pub struct EngineMetrics {
     pub lv3_write_compressed_bytes: AtomicU64,
     pub read_unmapped: AtomicU64,
     pub read_crc_errors: AtomicU64,
+    pub read_crc_errors_foreground: AtomicU64,
+    pub read_crc_errors_dedup_verify: AtomicU64,
+    pub read_crc_errors_dedup_scanner: AtomicU64,
     pub read_decompress_errors: AtomicU64,
     /// `ZoneManager::submit_reads` timing breakdown. `*_calls` increments once
     /// per outer `submit_reads` invocation; the three `*_ns` counters split
@@ -418,6 +421,9 @@ impl Default for EngineMetrics {
             lv3_write_compressed_bytes: AtomicU64::new(0),
             read_unmapped: AtomicU64::new(0),
             read_crc_errors: AtomicU64::new(0),
+            read_crc_errors_foreground: AtomicU64::new(0),
+            read_crc_errors_dedup_verify: AtomicU64::new(0),
+            read_crc_errors_dedup_scanner: AtomicU64::new(0),
             read_decompress_errors: AtomicU64::new(0),
             read_submit_calls: AtomicU64::new(0),
             read_submit_total_ns: AtomicU64::new(0),
@@ -578,6 +584,9 @@ impl EngineMetrics {
             lv3_write_compressed_bytes: load(&self.lv3_write_compressed_bytes),
             read_unmapped: load(&self.read_unmapped),
             read_crc_errors: load(&self.read_crc_errors),
+            read_crc_errors_foreground: load(&self.read_crc_errors_foreground),
+            read_crc_errors_dedup_verify: load(&self.read_crc_errors_dedup_verify),
+            read_crc_errors_dedup_scanner: load(&self.read_crc_errors_dedup_scanner),
             read_decompress_errors: load(&self.read_decompress_errors),
             read_submit_calls: load(&self.read_submit_calls),
             read_submit_total_ns: load(&self.read_submit_total_ns),
@@ -730,6 +739,9 @@ pub struct EngineMetricsSnapshot {
     pub lv3_write_compressed_bytes: u64,
     pub read_unmapped: u64,
     pub read_crc_errors: u64,
+    pub read_crc_errors_foreground: u64,
+    pub read_crc_errors_dedup_verify: u64,
+    pub read_crc_errors_dedup_scanner: u64,
     pub read_decompress_errors: u64,
     pub read_submit_calls: u64,
     pub read_submit_total_ns: u64,
@@ -912,6 +924,9 @@ impl EngineMetricsSnapshot {
             lv3_write_compressed_bytes,
             read_unmapped,
             read_crc_errors,
+            read_crc_errors_foreground,
+            read_crc_errors_dedup_verify,
+            read_crc_errors_dedup_scanner,
             read_decompress_errors,
             read_submit_calls,
             read_submit_total_ns,
@@ -1873,11 +1888,14 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "read_path: buffer_hits={} lv3_hits={} unmapped={} crc_errors={} decompress_errors={}",
+            "read_path: buffer_hits={} lv3_hits={} unmapped={} crc_errors={} crc_fg={} crc_dedup_verify={} crc_dedup_scanner={} decompress_errors={}",
             self.metrics.read_buffer_hits,
             self.metrics.read_lv3_hits,
             self.metrics.read_unmapped,
             self.metrics.read_crc_errors,
+            self.metrics.read_crc_errors_foreground,
+            self.metrics.read_crc_errors_dedup_verify,
+            self.metrics.read_crc_errors_dedup_scanner,
             self.metrics.read_decompress_errors
         );
         let _ = writeln!(

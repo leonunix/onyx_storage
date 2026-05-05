@@ -45,6 +45,10 @@ pub struct DedupConfig {
     /// fingerprint instead of fresh-writing. Set 0 to disable.
     #[serde(default = "default_cold_tail_max_per_cycle")]
     pub cold_tail_max_per_cycle: usize,
+    /// Background dedup_index scrub: verify cached hash -> PBA hints
+    /// and conditionally delete stale entries. Set 0 to disable.
+    #[serde(default = "default_index_scrub_max_per_cycle")]
+    pub index_scrub_max_per_cycle: usize,
 }
 
 impl Default for DedupConfig {
@@ -59,6 +63,7 @@ impl Default for DedupConfig {
             candidate_shards: None,
             candidate_per_shard_capacity: None,
             cold_tail_max_per_cycle: default_cold_tail_max_per_cycle(),
+            index_scrub_max_per_cycle: default_index_scrub_max_per_cycle(),
         }
     }
 }
@@ -80,4 +85,7 @@ fn default_max_rescan_per_cycle() -> usize {
 }
 fn default_cold_tail_max_per_cycle() -> usize {
     256
+}
+fn default_index_scrub_max_per_cycle() -> usize {
+    64
 }

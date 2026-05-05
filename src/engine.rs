@@ -827,7 +827,7 @@ impl OnyxEngine {
                 tracing::warn!(
                     name,
                     cleanup_count = cleanups.len(),
-                    "delete_volume: meta-only mode cannot reconstruct old blocks; dedup_index cleanup skipped"
+                    "delete_volume: meta-only mode cannot return freed PBAs to allocator; dedup_index is left to verified repair/scrub"
                 );
             }
 

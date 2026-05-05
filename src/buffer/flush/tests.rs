@@ -98,6 +98,7 @@ fn make_unit(fill: u8, seq: u64) -> CompressedUnit {
         vol_created_at: 1,
         seq_lba_ranges: vec![(seq, Lba(0), 1)],
         block_hashes: None,
+        dedup_stale_repairs: None,
         dedup_skipped: false,
         dedup_completion: None,
     }
@@ -119,6 +120,7 @@ fn make_raw_unit_at(start_lba: u64, lba_count: u32, first_byte: u8, seq: u64) ->
         vol_created_at: 1,
         seq_lba_ranges: vec![(seq, Lba(start_lba), lba_count)],
         block_hashes: None,
+        dedup_stale_repairs: None,
         dedup_skipped: false,
         dedup_completion: None,
     }
@@ -137,6 +139,7 @@ fn make_packed_unit(fill: u8, seq: u64) -> CompressedUnit {
         vol_created_at: 1,
         seq_lba_ranges: vec![(seq, Lba(0), 1)],
         block_hashes: None,
+        dedup_stale_repairs: None,
         dedup_skipped: false,
         dedup_completion: None,
     }
@@ -155,6 +158,7 @@ fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
         vol_created_at: 1,
         seq_lba_ranges: vec![(seq, Lba(lba), 1)],
         block_hashes: None,
+        dedup_stale_repairs: None,
         dedup_skipped: false,
         dedup_completion: None,
     }
@@ -505,6 +509,7 @@ fn write_packed_slots_batch_splits_oversized_metadata_commits() {
             vol_created_at: 1,
             seq_lba_ranges: vec![(seq, start_lba, lbas_per_slot)],
             block_hashes: None,
+            dedup_stale_repairs: None,
             dedup_skipped: false,
             dedup_completion: None,
         };
@@ -839,14 +844,18 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
 
     resume_tx.send(()).unwrap();
     scanner.join().unwrap();
-    // The counter is global so other parallel tests can bump it.
-    // Just verify the dedup entry was cleaned and the PBA was freed.
+    // `dedup_index` is a verified cache now: allocator cleanup must not
+    // try to reconstruct hashes from the old PBA. Stale forward entries
+    // are repaired by foreground compare-put or background scrub.
     assert!(allocator.is_free(pba), "PBA should be freed after cleanup");
-    assert!(meta.get_dedup_entry(&hash).unwrap().is_none());
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap(),
+        Some(old_mapping.to_dedup_entry())
+    );
 }
 
 #[test]
-fn dedup_cleanup_reconstruct_failure_bumps_metric_and_keeps_index() {
+fn dedup_cleanup_does_not_reconstruct_old_pba_for_index_delete() {
     let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
@@ -883,13 +892,13 @@ fn dedup_cleanup_reconstruct_failure_bumps_metric_and_keeps_index() {
 
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_some(),
-        "failed reconstruction must leave dedup_index entry in place"
+        "allocator cleanup must leave dedup_index hints to verified repair/scrub"
     );
     assert_eq!(
         metrics
             .dedup_cleanup_reconstruct_errors
             .load(Ordering::Relaxed),
-        1
+        0
     );
     assert!(allocator.is_free(pba), "allocator cleanup still proceeds");
 }
@@ -1025,6 +1034,7 @@ fn compress_loop_bypasses_low_savings_units() {
         seq_lba_ranges: vec![(1, Lba(10_000), 8)],
         dedup_skipped: false,
         block_hashes: None,
+        dedup_stale_repairs: None,
         dedup_completion: None,
     })
     .unwrap();
@@ -1110,6 +1120,7 @@ fn dedup_worker_batches_hits_across_units() {
                 seq_lba_ranges: vec![(i, lba, 1)],
                 dedup_skipped: false,
                 block_hashes: None,
+                dedup_stale_repairs: None,
                 dedup_completion: None,
             })
             .unwrap();
@@ -2005,6 +2016,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
                             crc32: crc,
                             seq_lba_ranges: seqs,
                             block_hashes: None,
+                            dedup_stale_repairs: None,
                             dedup_skipped: false,
                             vol_created_at: 1,
                             dedup_completion: None,
@@ -2375,6 +2387,7 @@ fn packed_slot_overlapping_lba_race() {
                     crc32: crc,
                     seq_lba_ranges: seqs.clone(),
                     block_hashes: None,
+                    dedup_stale_repairs: None,
                     dedup_skipped: false,
                     vol_created_at: 1,
                     dedup_completion: None,

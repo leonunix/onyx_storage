@@ -1,22 +1,4 @@
 use super::*;
-use std::collections::hash_map::Entry;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct CleanupRawKey {
-    pba: Pba,
-    read_size: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct CleanupUnitKey {
-    pba: Pba,
-    slot_offset: u16,
-    unit_compressed_size: u32,
-    compression: u8,
-    unit_original_size: u32,
-    crc32: u32,
-}
-
 const CLEANUP_PBA_COMMIT_LIMIT: usize = 256;
 
 impl BufferFlusher {
@@ -27,25 +9,57 @@ impl BufferFlusher {
     pub(crate) fn cleanup_dead_pba_post_commit(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
-        io_engine: &IoEngine,
-        metrics: &EngineMetrics,
+        _io_engine: &IoEngine,
+        _metrics: &EngineMetrics,
         candidate: &crate::dedup::CandidateCache,
         cleanup: RemapCleanup,
         context: &'static str,
     ) {
-        Self::cleanup_old_mappings(meta, io_engine, metrics, &[cleanup.clone()], context);
         Self::free_dead_pbas(meta, allocator, candidate, &[cleanup], context);
     }
 
-    /// Batch cleanup for replaced mappings. Dedup metadata is cleaned by
-    /// recomputing the old 4 KiB payload hash and conditionally deleting the
-    /// matching forward dedup_index entry. Allocator frees only run for PBAs
-    /// whose refcount actually reached zero.
+    pub(crate) fn repair_stale_dedup_index(
+        meta: &MetaStore,
+        metrics: &EngineMetrics,
+        repairs: &[(ContentHash, DedupEntry, DedupEntry)],
+        context: &'static str,
+    ) {
+        for (hash, old_entry, new_entry) in repairs {
+            match meta.compare_put_dedup_index(hash, old_entry, new_entry) {
+                Ok(true) => {
+                    tracing::debug!(
+                        old_pba = old_entry.pba.0,
+                        new_pba = new_entry.pba.0,
+                        context,
+                        "dedup repair: replaced stale forward dedup entry"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    metrics
+                        .dedup_cleanup_delete_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        old_pba = old_entry.pba.0,
+                        new_pba = new_entry.pba.0,
+                        context,
+                        error = %e,
+                        "dedup repair: failed conditional forward dedup update"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Batch cleanup for replaced mappings. `dedup_index` is a verified cache,
+    /// so this path no longer tries to infer hashes by reading old PBAs; that
+    /// is unsafe once a freed PBA can be reused. Foreground verify mismatch
+    /// repair and the background scrubber maintain the forward cache.
     pub(crate) fn cleanup_dead_pbas_batch(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
-        io_engine: &IoEngine,
-        metrics: &EngineMetrics,
+        _io_engine: &IoEngine,
+        _metrics: &EngineMetrics,
         candidate: &crate::dedup::CandidateCache,
         cleanups: &[RemapCleanup],
         context: &'static str,
@@ -53,116 +67,7 @@ impl BufferFlusher {
         if cleanups.is_empty() {
             return;
         }
-        Self::cleanup_old_mappings(meta, io_engine, metrics, cleanups, context);
         Self::free_dead_pbas(meta, allocator, candidate, cleanups, context);
-    }
-
-    fn cleanup_old_mappings(
-        meta: &MetaStore,
-        io_engine: &IoEngine,
-        metrics: &EngineMetrics,
-        cleanups: &[RemapCleanup],
-        context: &'static str,
-    ) {
-        // Scoped to one cleanup batch so repeated fragments in the same packed
-        // slot or compression unit share one LV3 read/decode. Very large
-        // delete/discard operations filter non-freed mappings before this
-        // point; remaining batch size is bounded by writer/cleanup channel
-        // cadence rather than the full volume size.
-        let mut raw_cache: HashMap<CleanupRawKey, Vec<u8>> = HashMap::new();
-        let mut unit_cache: HashMap<CleanupUnitKey, Vec<u8>> = HashMap::new();
-        for cleanup in cleanups {
-            if !cleanup.pba_freed {
-                continue;
-            }
-            for mapping in &cleanup.mappings {
-                if mapping.is_zero() {
-                    continue;
-                }
-                let block = match Self::read_cleanup_lba_block(
-                    io_engine,
-                    metrics,
-                    &mut raw_cache,
-                    &mut unit_cache,
-                    mapping,
-                ) {
-                    Ok(block) => block,
-                    Err(e) => {
-                        metrics
-                            .dedup_cleanup_reconstruct_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            pba = mapping.pba.0,
-                            slot_offset = mapping.slot_offset,
-                            context,
-                            error = %e,
-                            "dedup cleanup: failed to reconstruct old block; forward dedup entry is not currently reclaimed"
-                        );
-                        continue;
-                    }
-                };
-                let hash = crate::meta::schema::compute_content_hash(&block);
-                match meta.delete_dedup_index_if_matches(&hash, mapping) {
-                    Ok(true) => {
-                        tracing::debug!(
-                            pba = mapping.pba.0,
-                            slot_offset = mapping.slot_offset,
-                            context,
-                            "dedup cleanup: removed matching forward dedup entry"
-                        );
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        metrics
-                            .dedup_cleanup_delete_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            pba = mapping.pba.0,
-                            slot_offset = mapping.slot_offset,
-                            context,
-                            error = %e,
-                            "dedup cleanup: failed conditional forward dedup delete"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn read_cleanup_lba_block(
-        io_engine: &IoEngine,
-        metrics: &EngineMetrics,
-        raw_cache: &mut HashMap<CleanupRawKey, Vec<u8>>,
-        unit_cache: &mut HashMap<CleanupUnitKey, Vec<u8>>,
-        mapping: &BlockmapValue,
-    ) -> OnyxResult<Vec<u8>> {
-        let read_size = mapping.compressed_read_size(BLOCK_SIZE as usize);
-        let raw_key = CleanupRawKey {
-            pba: mapping.pba,
-            read_size,
-        };
-        let raw = match raw_cache.entry(raw_key) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(io_engine.read_blocks(mapping.pba, read_size)?),
-        };
-
-        let unit_key = CleanupUnitKey {
-            pba: mapping.pba,
-            slot_offset: mapping.slot_offset,
-            unit_compressed_size: mapping.unit_compressed_size,
-            compression: mapping.compression,
-            unit_original_size: mapping.unit_original_size,
-            crc32: mapping.crc32,
-        };
-        let unit = match unit_cache.entry(unit_key) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let payload = crate::zone::read::decode_unit(raw, mapping, metrics)?;
-                entry.insert(payload.into_owned())
-            }
-        };
-        let payload = crate::zone::read::UnitPayload::Borrowed(unit.as_slice());
-        crate::zone::read::slice_lba(&payload, mapping.offset_in_unit).map(|block| block.to_vec())
     }
 
     fn free_dead_pbas(

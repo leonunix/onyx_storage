@@ -6,6 +6,7 @@ struct PackedSlotMeta {
     /// First-occurrence (hash, blockmap) pairs for the candidate
     /// cache; populated alongside batch_values.
     fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
+    stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
 }
 
 fn merge_dead_pbas(dst: &mut HashMap<Pba, RemapCleanup>, src: HashMap<Pba, RemapCleanup>) {
@@ -26,6 +27,7 @@ fn commit_packed_meta_batch(
     results: &mut [OnyxResult<()>],
     actual_old_pba_meta: &mut HashMap<Pba, RemapCleanup>,
     candidate: &crate::dedup::CandidateCache,
+    metrics: &EngineMetrics,
 ) -> bool {
     if batch_slots.is_empty() {
         return false;
@@ -34,10 +36,12 @@ fn commit_packed_meta_batch(
     let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> =
         Vec::with_capacity(*batch_lbas);
     let mut combined_fresh_dedup: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+    let mut combined_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
     for &slot_idx in batch_slots.iter() {
         if let Some(ref sm) = slot_metas[slot_idx] {
             combined_batch_values.extend_from_slice(&sm.batch_values);
             combined_fresh_dedup.extend_from_slice(&sm.fresh_dedup_pairs);
+            combined_stale_repairs.extend_from_slice(&sm.stale_repairs);
         }
     }
     match meta.atomic_batch_write_packed_with_dedup(
@@ -49,6 +53,12 @@ fn commit_packed_meta_batch(
         Ok(dead) => {
             merge_dead_pbas(actual_old_pba_meta, dead);
             candidate.insert_many(&combined_fresh_dedup);
+            BufferFlusher::repair_stale_dedup_index(
+                meta,
+                metrics,
+                &combined_stale_repairs,
+                "write_packed_slots_batch",
+            );
         }
         Err(e) => {
             for &slot_idx in batch_slots.iter() {
@@ -109,6 +119,7 @@ impl BufferFlusher {
         // moves them there only when a duplicate is later confirmed
         // by LV3 byte-compare in the dedup worker.
         let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+        let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
         let mut total_refcount: u32 = 0;
         let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
         let mut any_discarded = false;
@@ -188,6 +199,19 @@ impl BufferFlusher {
                                 ..blockmap
                             },
                         ));
+                        if let Some(repairs) = &unit.dedup_stale_repairs {
+                            if let Some(Some(old_entry)) = repairs.get(pos) {
+                                stale_repairs.push((
+                                    hash,
+                                    *old_entry,
+                                    BlockmapValue {
+                                        flags: 0,
+                                        ..blockmap
+                                    }
+                                    .to_dedup_entry(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -251,6 +275,7 @@ impl BufferFlusher {
         };
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
         candidate.insert_many(&fresh_dedup_pairs);
+        Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_packed_slot");
 
         if !actual_old_pba_meta.is_empty() {
             let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
@@ -351,6 +376,7 @@ impl BufferFlusher {
             let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
             let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
             let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
 
             for frag in &sealed.fragments {
                 let unit = &frag.unit;
@@ -385,6 +411,7 @@ impl BufferFlusher {
                         batch_values.clear();
                         all_seq_lba_ranges.clear();
                         fresh_dedup_pairs.clear();
+                        stale_repairs.clear();
                         break;
                     }
                 };
@@ -432,6 +459,19 @@ impl BufferFlusher {
                                     ..blockmap
                                 },
                             ));
+                            if let Some(repairs) = &unit.dedup_stale_repairs {
+                                if let Some(Some(old_entry)) = repairs.get(pos) {
+                                    stale_repairs.push((
+                                        hash,
+                                        *old_entry,
+                                        BlockmapValue {
+                                            flags: 0,
+                                            ..blockmap
+                                        }
+                                        .to_dedup_entry(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -450,6 +490,7 @@ impl BufferFlusher {
                 batch_values,
                 all_seq_lba_ranges,
                 fresh_dedup_pairs,
+                stale_repairs,
             });
         }
 
@@ -535,6 +576,7 @@ impl BufferFlusher {
                     &mut results,
                     &mut actual_old_pba_meta,
                     candidate,
+                    metrics,
                 ) {
                     meta_commits += 1;
                 }
@@ -553,6 +595,7 @@ impl BufferFlusher {
                     &mut results,
                     &mut actual_old_pba_meta,
                     candidate,
+                    metrics,
                 ) {
                     meta_commits += 1;
                 }
@@ -568,6 +611,7 @@ impl BufferFlusher {
             &mut results,
             &mut actual_old_pba_meta,
             candidate,
+            metrics,
         ) {
             meta_commits += 1;
         }

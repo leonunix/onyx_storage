@@ -18,6 +18,7 @@ fn make_unit(vol_id: &str, start_lba: u64, lba_count: u32, data_size: usize) -> 
         vol_created_at: 1000,
         seq_lba_ranges: vec![(1, Lba(start_lba), lba_count)],
         block_hashes: None,
+        dedup_stale_repairs: None,
         dedup_skipped: false,
         dedup_completion: None,
     }

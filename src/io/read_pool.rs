@@ -58,10 +58,20 @@ const BATCH_COALESCE_WINDOW: Duration = Duration::from_micros(8);
 /// some slack while preserving back-pressure under sustained overload.
 const REQUEST_CHANNEL_CAP: usize = 128;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadPurpose {
+    Foreground,
+    DedupVerify,
+    DedupVerifyIndex,
+    DedupVerifyCandidate,
+    DedupScanner,
+}
+
 struct ReadRequest {
     mapping: BlockmapValue,
     reply: Sender<OnyxResult<Vec<u8>>>,
     enqueued_at: Instant,
+    purpose: ReadPurpose,
     /// `false` → worker returns one 4 KB LBA at `mapping.offset_in_unit`
     /// (legacy single-LBA path). `true` → worker returns the full decoded
     /// unit payload (`unit_original_size` bytes) so the caller can fan out
@@ -173,7 +183,7 @@ impl ReadPool {
     /// Submit a mapped LV3 read and block until the worker has read + CRC
     /// verified + decompressed the requested 4 KB LBA.
     pub fn submit_read(&self, mapping: BlockmapValue) -> OnyxResult<Vec<u8>> {
-        let rx = self.enqueue(mapping, false)?;
+        let rx = self.enqueue(mapping, false, ReadPurpose::Foreground)?;
         rx.recv()
             .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool reply dropped")))?
     }
@@ -185,14 +195,22 @@ impl ReadPool {
         &self,
         mapping: BlockmapValue,
     ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
-        self.enqueue(mapping, false)
+        self.enqueue(mapping, false, ReadPurpose::Foreground)
+    }
+
+    pub fn submit_read_async_for(
+        &self,
+        mapping: BlockmapValue,
+        purpose: ReadPurpose,
+    ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
+        self.enqueue(mapping, false, purpose)
     }
 
     /// Submit a compression-unit read and block for the full decoded unit
     /// payload (`unit_original_size` bytes). Callers slice out multiple LBAs
     /// from the returned buffer via `offset_in_unit`.
     pub fn submit_unit_read(&self, mapping: BlockmapValue) -> OnyxResult<Vec<u8>> {
-        let rx = self.enqueue(mapping, true)?;
+        let rx = self.enqueue(mapping, true, ReadPurpose::Foreground)?;
         rx.recv()
             .map_err(|_| OnyxError::Io(std::io::Error::other("read-pool reply dropped")))?
     }
@@ -202,7 +220,7 @@ impl ReadPool {
         &self,
         mapping: BlockmapValue,
     ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
-        self.enqueue(mapping, true)
+        self.enqueue(mapping, true, ReadPurpose::Foreground)
     }
 
     /// Submit a contiguous raw extent read. Every mapping must be one
@@ -224,6 +242,7 @@ impl ReadPool {
         &self,
         mapping: BlockmapValue,
         return_unit: bool,
+        purpose: ReadPurpose,
     ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
         let (reply_tx, reply_rx) = bounded::<OnyxResult<Vec<u8>>>(1);
         let sender = self
@@ -235,6 +254,7 @@ impl ReadPool {
                 mapping,
                 reply: reply_tx,
                 enqueued_at: Instant::now(),
+                purpose,
                 return_unit,
                 raw_extent: None,
             })
@@ -257,6 +277,7 @@ impl ReadPool {
                 mapping: first,
                 reply: reply_tx,
                 enqueued_at: Instant::now(),
+                purpose: ReadPurpose::Foreground,
                 return_unit: true,
                 raw_extent: Some(mappings),
             })
@@ -520,6 +541,23 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         } else {
             extract_lba_from_compressed(buf.as_slice(), &req.mapping, &ctx.metrics)
         };
+        if let Err(OnyxError::CrcMismatch { expected, actual }) = &result {
+            record_purpose_crc_error(&ctx.metrics, req.purpose);
+            tracing::warn!(
+                worker = ctx.worker_idx,
+                purpose = ?req.purpose,
+                pba = req.mapping.pba.0,
+                slot_offset = req.mapping.slot_offset,
+                unit_compressed_size = req.mapping.unit_compressed_size,
+                unit_original_size = req.mapping.unit_original_size,
+                unit_lba_count = req.mapping.unit_lba_count,
+                offset_in_unit = req.mapping.offset_in_unit,
+                expected_crc = *expected,
+                actual_crc = *actual,
+                raw_extent_blocks = req.raw_extent.as_ref().map_or(0, Vec::len),
+                "read-pool: CRC mismatch"
+            );
+        }
         ctx.metrics
             .record_read_pool_decode_ns(elapsed_ns(decode_start));
         let _ = req.reply.send(result);
@@ -537,6 +575,17 @@ fn record_queue_wait(metrics: &EngineMetrics, worker_idx: usize, req: &ReadReque
             .saturating_duration_since(req.enqueued_at)
             .as_nanos() as u64,
     );
+}
+
+fn record_purpose_crc_error(metrics: &EngineMetrics, purpose: ReadPurpose) {
+    match purpose {
+        ReadPurpose::Foreground => &metrics.read_crc_errors_foreground,
+        ReadPurpose::DedupVerify
+        | ReadPurpose::DedupVerifyIndex
+        | ReadPurpose::DedupVerifyCandidate => &metrics.read_crc_errors_dedup_verify,
+        ReadPurpose::DedupScanner => &metrics.read_crc_errors_dedup_scanner,
+    }
+    .fetch_add(1, Ordering::Relaxed);
 }
 
 fn decode_raw_extent(

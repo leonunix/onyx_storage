@@ -406,6 +406,16 @@ impl MetaStore {
         self.backend.delete_dedup_index_if_matches(hash, mapping)
     }
 
+    pub fn compare_put_dedup_index(
+        &self,
+        hash: &ContentHash,
+        old_entry: &DedupEntry,
+        new_entry: &DedupEntry,
+    ) -> OnyxResult<bool> {
+        self.backend
+            .compare_put_dedup_index(hash, old_entry, new_entry)
+    }
+
     pub fn dedup_entry_is_live(&self, hash: &ContentHash, entry: &DedupEntry) -> OnyxResult<bool> {
         self.backend.dedup_entry_is_live(hash, entry)
     }

@@ -117,6 +117,7 @@ impl BufferFlusher {
                 batch_values.push((lbas[i], blockmap));
             }
             let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
             if !unit.dedup_skipped {
                 if let Some(ref hashes) = unit.block_hashes {
                     fresh_dedup_pairs.reserve(live_positions.len());
@@ -127,6 +128,11 @@ impl BufferFlusher {
                         }
                         let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
                         fresh_dedup_pairs.push((hash, blockmap));
+                        if let Some(repairs) = &unit.dedup_stale_repairs {
+                            if let Some(Some(old_entry)) = repairs.get(pos) {
+                                stale_repairs.push((hash, *old_entry, blockmap.to_dedup_entry()));
+                            }
+                        }
                     }
                 }
             }
@@ -158,6 +164,7 @@ impl BufferFlusher {
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
             candidate.insert_many(&fresh_dedup_pairs);
+            Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");
 
             if !actual_old_pba_meta.is_empty() {
@@ -366,6 +373,7 @@ impl BufferFlusher {
             /// First-occurrence (hash, blockmap) pairs for the
             /// candidate cache; populated alongside batch_values.
             fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
+            stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
         }
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
 
@@ -393,6 +401,7 @@ impl BufferFlusher {
                     batch_values: Vec::new(),
                     live_positions,
                     fresh_dedup_pairs: Vec::new(),
+                    stale_repairs: Vec::new(),
                 });
                 continue;
             }
@@ -404,6 +413,7 @@ impl BufferFlusher {
 
             let mut batch_values = Vec::with_capacity(live_positions.len());
             let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
 
             for j in 0..live_positions.len() {
                 let flags = if unit.dedup_skipped {
@@ -425,6 +435,11 @@ impl BufferFlusher {
                         }
                         let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
                         fresh_dedup_pairs.push((hash, blockmap));
+                        if let Some(repairs) = &unit.dedup_stale_repairs {
+                            if let Some(Some(old_entry)) = repairs.get(pos) {
+                                stale_repairs.push((hash, *old_entry, blockmap.to_dedup_entry()));
+                            }
+                        }
                     }
                 }
             }
@@ -432,6 +447,7 @@ impl BufferFlusher {
                 batch_values,
                 live_positions,
                 fresh_dedup_pairs,
+                stale_repairs,
             });
         }
 
@@ -466,14 +482,22 @@ impl BufferFlusher {
                 .collect();
 
             let mut all_fresh_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+            let mut all_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
             for &unit_idx in &meta_indices {
                 let um = unit_metas[unit_idx].as_ref().unwrap();
                 all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
+                all_stale_repairs.extend_from_slice(&um.stale_repairs);
             }
             match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
                 Ok(returned) => {
                     actual_old_pba_meta = returned;
                     candidate.insert_many(&all_fresh_pairs);
+                    Self::repair_stale_dedup_index(
+                        meta,
+                        metrics,
+                        &all_stale_repairs,
+                        "write_units_batch",
+                    );
                 }
                 Err(e) => {
                     // Entire batch failed — rollback all allocations.

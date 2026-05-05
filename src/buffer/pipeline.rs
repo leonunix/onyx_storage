@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::buffer::commit_log::PendingEntry;
 use crate::buffer::entry::BufferEntry;
-use crate::meta::schema::{BlockmapValue, ContentHash};
+use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry};
 use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
 
 /// Tracks completion of sub-units produced by dedup splitting.
@@ -67,6 +67,12 @@ pub struct CoalesceUnit {
     /// SHA-256 hashes per 4KB block, populated by dedup stage for miss blocks.
     /// None if dedup not yet run or skipped.
     pub block_hashes: Option<Vec<ContentHash>>,
+    /// Stale persistent dedup_index mappings seen during verify.
+    /// Indexed by LBA position within this unit. Once the fresh miss
+    /// write commits, the writer can compare-put the index from the
+    /// stale entry to the newly written entry without clobbering a
+    /// concurrent repair.
+    pub dedup_stale_repairs: Option<Vec<Option<DedupEntry>>>,
     /// When set, this sub-unit is part of a dedup split. The writer calls
     /// `decrement()` on completion; the last sub-unit to finish triggers done_tx
     /// with the original unit's full seqs. When None, the writer sends done_tx
@@ -129,6 +135,8 @@ pub struct CompressedUnit {
     /// SHA-256 hashes per 4KB block (one per LBA), populated by dedup stage.
     /// None if dedup was skipped under backpressure.
     pub block_hashes: Option<Vec<ContentHash>>,
+    /// See CoalesceUnit::dedup_stale_repairs.
+    pub dedup_stale_repairs: Option<Vec<Option<DedupEntry>>>,
     /// True if dedup was skipped under backpressure.
     pub dedup_skipped: bool,
     /// See CoalesceUnit::dedup_completion.
@@ -331,6 +339,7 @@ fn coalesce_slices(
                 seq_lba_ranges,
                 dedup_skipped: false,
                 block_hashes: None,
+                dedup_stale_repairs: None,
                 dedup_completion: None,
             });
         }

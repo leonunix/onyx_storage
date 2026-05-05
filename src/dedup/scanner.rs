@@ -13,7 +13,7 @@ use crate::dedup::config::DedupConfig;
 use crate::dedup::CandidateCache;
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
-use crate::io::read_pool::ReadPool;
+use crate::io::read_pool::{ReadPool, ReadPurpose};
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::*;
 use crate::meta::store::MetaStore;
@@ -147,6 +147,7 @@ impl DedupScanner {
         // the cursor by `cold_tail_max_per_cycle` LBAs and wraps at the
         // end of the volume.
         let mut cold_tail_cursors: HashMap<String, u64> = HashMap::new();
+        let mut index_scrub_cursor: usize = 0;
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
             thread::sleep(Duration::from_millis(cfg.rescan_interval_ms));
@@ -248,6 +249,31 @@ impl DedupScanner {
                             .dedup_cold_tail_errors
                             .fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(error = %e, "dedup scanner: cold-tail pass failed");
+                    }
+                }
+            }
+
+            if !rescan_debt && cfg.index_scrub_max_per_cycle > 0 {
+                match Self::scrub_dedup_index(
+                    meta,
+                    io_engine,
+                    metrics,
+                    &mut index_scrub_cursor,
+                    cfg.index_scrub_max_per_cycle,
+                ) {
+                    Ok(stats) => {
+                        if stats.checked > 0 || stats.deleted > 0 || stats.errors > 0 {
+                            tracing::debug!(
+                                checked = stats.checked,
+                                deleted = stats.deleted,
+                                errors = stats.errors,
+                                "dedup scanner: forward-index scrub pass"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(error = %e, "dedup scanner: forward-index scrub failed");
                     }
                 }
             }
@@ -441,7 +467,7 @@ impl DedupScanner {
             // keep multiple SQEs in flight for one drain.
             let mut receivers = Vec::with_capacity(targets.len());
             for (_lba, bv) in &targets {
-                match pool.submit_read_async(*bv) {
+                match pool.submit_read_async_for(*bv, ReadPurpose::DedupScanner) {
                     Ok(rx) => receivers.push(Some(rx)),
                     Err(e) => {
                         stats.errors += 1;
@@ -503,6 +529,80 @@ impl DedupScanner {
         Ok(stats)
     }
 
+    fn scrub_dedup_index(
+        meta: &MetaStore,
+        io_engine: &IoEngine,
+        metrics: &EngineMetrics,
+        cursor: &mut usize,
+        budget: usize,
+    ) -> OnyxResult<IndexScrubStats> {
+        let mut stats = IndexScrubStats::default();
+        if budget == 0 {
+            return Ok(stats);
+        }
+
+        let mut entries = meta.iter_dedup_entries()?;
+        if entries.is_empty() {
+            *cursor = 0;
+            return Ok(stats);
+        }
+        entries.sort_unstable_by_key(|(hash, entry)| (*hash, entry.pba.0, entry.slot_offset));
+        if *cursor >= entries.len() {
+            *cursor = 0;
+        }
+
+        let count = budget.min(entries.len());
+        for offset in 0..count {
+            let idx = (*cursor + offset) % entries.len();
+            let (hash, entry) = entries[idx];
+            let mapping = entry.to_blockmap_value();
+            let matched = match read_lba_block(io_engine, &mapping) {
+                Ok(Some(block)) => compute_content_hash(&block) == hash,
+                Ok(None) => false,
+                Err(e) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        pba = entry.pba.0,
+                        slot_offset = entry.slot_offset,
+                        error = %e,
+                        "dedup index scrub: failed to read entry"
+                    );
+                    continue;
+                }
+            };
+            stats.checked += 1;
+            if matched {
+                continue;
+            }
+
+            match meta.delete_dedup_index_if_matches(&hash, &mapping) {
+                Ok(true) => {
+                    stats.deleted += 1;
+                    tracing::debug!(
+                        pba = entry.pba.0,
+                        slot_offset = entry.slot_offset,
+                        "dedup index scrub: removed stale forward entry"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    stats.errors += 1;
+                    metrics
+                        .dedup_cleanup_delete_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        pba = entry.pba.0,
+                        slot_offset = entry.slot_offset,
+                        error = %e,
+                        "dedup index scrub: conditional delete failed"
+                    );
+                }
+            }
+        }
+        *cursor = (*cursor + count) % entries.len();
+        Ok(stats)
+    }
+
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
@@ -535,6 +635,13 @@ struct ColdTailStats {
     already_warm: usize,
     /// Entries the scanner could not warm due to ReadPool errors,
     /// short reads, or dedup-index probe failures.
+    errors: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IndexScrubStats {
+    checked: usize,
+    deleted: usize,
     errors: usize,
 }
 

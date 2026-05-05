@@ -19,6 +19,11 @@ struct PreparedDedupUnit {
     /// dedup_index-sourced hits do **not** appear here because they
     /// are already in the persistent layer.
     promote_candidates: Vec<(usize, ContentHash, DedupEntry)>,
+    /// Persistent dedup_index hits that failed byte-verify. These are
+    /// not deleted immediately: the LBA is written as a fresh miss,
+    /// and the writer compare-puts the index to the fresh mapping
+    /// only if it still points at this stale old entry.
+    stale_index_repairs: Vec<Option<DedupEntry>>,
 }
 
 impl BufferFlusher {
@@ -310,6 +315,7 @@ impl BufferFlusher {
                         seq_lba_ranges,
                         dedup_skipped,
                         block_hashes,
+                        dedup_stale_repairs,
                         dedup_completion,
                     } = unit;
 
@@ -375,6 +381,7 @@ impl BufferFlusher {
                         vol_created_at,
                         seq_lba_ranges,
                         block_hashes,
+                        dedup_stale_repairs,
                         dedup_skipped,
                         dedup_completion,
                     };
@@ -482,7 +489,7 @@ impl BufferFlusher {
             // to trust-hash mode; see BufferFlusher::start_with_metrics
             // doc comment for the trade-off).
             if let Some(rp) = read_pool {
-                Self::verify_prepared_dedup_hits(&mut prepared, rp, metrics);
+                Self::verify_prepared_dedup_hits(&mut prepared, rp, candidate, metrics);
             }
             Self::commit_prepared_dedup_hits(
                 &mut prepared,
@@ -540,6 +547,7 @@ impl BufferFlusher {
             zero_indices,
             valid_hits: Vec::new(),
             promote_candidates: Vec::new(),
+            stale_index_repairs: vec![None; lba_count],
         }
     }
 
@@ -689,26 +697,50 @@ impl BufferFlusher {
     fn verify_prepared_dedup_hits(
         prepared: &mut [PreparedDedupUnit],
         read_pool: &crate::io::read_pool::ReadPool,
+        candidate: &crate::dedup::CandidateCache,
         metrics: &EngineMetrics,
     ) {
         // Collect targets across all units. Track the (unit_idx,
         // lba_idx) for each one so we can apply the verify result
         // back to the right slot.
         let mut targets: Vec<crate::dedup::VerifyTarget<'_>> = Vec::new();
-        let mut placement: Vec<(usize, usize)> = Vec::new(); // (unit_idx, lba_idx)
+        let mut placement: Vec<(
+            usize,
+            usize,
+            ContentHash,
+            BlockmapValue,
+            crate::io::read_pool::ReadPurpose,
+        )> = Vec::new();
         for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
-            for (lba_idx, mapping, _hash) in prepared_unit.valid_hits.iter() {
+            for (lba_idx, mapping, hash) in prepared_unit.valid_hits.iter() {
+                let purpose = if prepared_unit
+                    .promote_candidates
+                    .iter()
+                    .any(|(i, _, _)| i == lba_idx)
+                {
+                    crate::io::read_pool::ReadPurpose::DedupVerifyCandidate
+                } else {
+                    crate::io::read_pool::ReadPurpose::DedupVerifyIndex
+                };
                 let Some(block) = prepared_unit.unit.raw_blocks.get(*lba_idx) else {
                     // No raw bytes available — should not happen if
                     // valid_hits was populated correctly; defensively
                     // verify against an empty buffer so we drop the
                     // hit rather than promote on bad input.
-                    targets.push(crate::dedup::VerifyTarget::new(*mapping, &[]));
-                    placement.push((unit_idx, *lba_idx));
+                    targets.push(crate::dedup::VerifyTarget::new_with_purpose(
+                        *mapping,
+                        &[],
+                        purpose,
+                    ));
+                    placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose));
                     continue;
                 };
-                targets.push(crate::dedup::VerifyTarget::new(*mapping, block.bytes()));
-                placement.push((unit_idx, *lba_idx));
+                targets.push(crate::dedup::VerifyTarget::new_with_purpose(
+                    *mapping,
+                    block.bytes(),
+                    purpose,
+                ));
+                placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose));
             }
         }
         if targets.is_empty() {
@@ -731,8 +763,27 @@ impl BufferFlusher {
         // the retain filters O(n) instead of O(n × |mismatches|).
         let mut mismatches_per_unit: HashMap<usize, std::collections::HashSet<usize>> =
             HashMap::new();
-        for ((unit_idx, lba_idx), matched) in placement.into_iter().zip(results) {
+        for ((unit_idx, lba_idx, hash, mapping, purpose), matched) in
+            placement.into_iter().zip(results)
+        {
             if !matched {
+                match purpose {
+                    crate::io::read_pool::ReadPurpose::DedupVerifyIndex
+                    | crate::io::read_pool::ReadPurpose::DedupVerify => {
+                        prepared[unit_idx].stale_index_repairs[lba_idx] =
+                            Some(mapping.to_dedup_entry());
+                        tracing::debug!(
+                            pba = mapping.pba.0,
+                            slot_offset = mapping.slot_offset,
+                            "dedup verify: queued stale forward dedup repair after mismatch"
+                        );
+                    }
+                    crate::io::read_pool::ReadPurpose::DedupVerifyCandidate => {
+                        candidate.remove_by_hash(&hash);
+                    }
+                    crate::io::read_pool::ReadPurpose::Foreground
+                    | crate::io::read_pool::ReadPurpose::DedupScanner => {}
+                }
                 mismatches_per_unit
                     .entry(unit_idx)
                     .or_default()
@@ -1088,6 +1139,7 @@ impl BufferFlusher {
             unit,
             is_hit,
             all_hashes,
+            stale_index_repairs,
             successful_hit_indices,
             ..
         } = prepared;
@@ -1142,8 +1194,14 @@ impl BufferFlusher {
             crate::buffer::pipeline::DedupCompletion::new(miss_ranges.len() as u32, all_seqs);
 
         for (start, end) in &miss_ranges {
-            let miss_unit =
-                Self::build_miss_unit(&unit, *start, *end, &all_hashes, Some(completion.clone()));
+            let miss_unit = Self::build_miss_unit(
+                &unit,
+                *start,
+                *end,
+                &all_hashes,
+                &stale_index_repairs,
+                Some(completion.clone()),
+            );
             if miss_tx.send(miss_unit).is_err() {
                 return false;
             }
@@ -1157,6 +1215,7 @@ impl BufferFlusher {
         start_idx: usize,
         end_idx: usize,
         hashes: &[ContentHash],
+        stale_repairs: &[Option<DedupEntry>],
         dedup_completion: Option<Arc<crate::buffer::pipeline::DedupCompletion>>,
     ) -> CoalesceUnit {
         let start_lba = Lba(original.start_lba.0 + start_idx as u64);
@@ -1186,6 +1245,7 @@ impl BufferFlusher {
         }
 
         let block_hashes_slice = hashes[start_idx..end_idx].to_vec();
+        let repair_slice = stale_repairs[start_idx..end_idx].to_vec();
         CoalesceUnit {
             vol_id: original.vol_id.clone(),
             start_lba,
@@ -1196,6 +1256,11 @@ impl BufferFlusher {
             seq_lba_ranges,
             dedup_skipped: false,
             block_hashes: Some(block_hashes_slice),
+            dedup_stale_repairs: if repair_slice.iter().any(Option::is_some) {
+                Some(repair_slice)
+            } else {
+                None
+            },
             dedup_completion,
         }
     }

@@ -649,7 +649,7 @@ fn overwrite_shared_dedup_pba_keeps_forward_index() {
 }
 
 #[test]
-fn delete_volume_cleans_dedup_index() {
+fn delete_volume_leaves_dedup_index_hint_for_scrub() {
     let (pool, meta, lifecycle, allocator, io_engine) = setup_dedup_env();
     register_volume(&meta, "test-vol");
 
@@ -681,8 +681,8 @@ fn delete_volume_cleans_dedup_index() {
     flusher.stop();
 
     assert!(
-        meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "dedup index should be cleaned by reading old PBA content and matching the old mapping"
+        meta.get_dedup_entry(&hash).unwrap().is_some(),
+        "delete-volume cleanup must not read old PBA content to infer the hash; stale hints are scrubbed separately"
     );
 }
 
@@ -1214,6 +1214,7 @@ fn cold_tail_pass_warms_candidate_from_live_blockmap() {
         rescan_interval_ms: 20,
         max_rescan_per_cycle: 0, // No DEDUP_SKIPPED debt on this volume; cold-tail only.
         cold_tail_max_per_cycle: 64,
+        index_scrub_max_per_cycle: 64,
         ..dedup_test_config()
     };
     let (mut scanner, candidate) = start_scanner_with_candidate_and_read_pool(

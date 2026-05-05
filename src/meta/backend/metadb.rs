@@ -602,19 +602,27 @@ impl MetadbBackend {
         hash: &ContentHash,
         mapping: &BlockmapValue,
     ) -> OnyxResult<bool> {
-        let Some(current) = self.get_dedup(hash)? else {
-            return Ok(false);
-        };
-        if current.to_blockmap_value()
-            != (BlockmapValue {
-                flags: 0,
-                ..*mapping
-            })
-        {
-            return Ok(false);
+        let entry = BlockmapValue {
+            flags: 0,
+            ..*mapping
         }
-        self.delete_dedup_index(hash)?;
-        Ok(true)
+        .to_dedup_entry();
+        Ok(self
+            .db
+            .compare_delete_dedup(*hash, to_dedup_value(&entry))?)
+    }
+
+    pub(crate) fn compare_put_dedup_index(
+        &self,
+        hash: &ContentHash,
+        old_entry: &DedupEntry,
+        new_entry: &DedupEntry,
+    ) -> OnyxResult<bool> {
+        Ok(self.db.compare_put_dedup(
+            *hash,
+            to_dedup_value(old_entry),
+            to_dedup_value(new_entry),
+        )?)
     }
 
     pub(crate) fn dedup_entry_is_live(
@@ -1296,7 +1304,6 @@ fn dedup_hit_results_from_remaps(
     for (pba, cleanup) in old_mappings.iter_mut() {
         cleanup.pba_freed = freed.contains(pba);
     }
-    old_mappings.retain(|_, cleanup| cleanup.pba_freed);
     Ok((results, old_mappings))
 }
 

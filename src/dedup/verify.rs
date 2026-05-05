@@ -35,7 +35,7 @@
 //! in the same batch.
 
 use crate::error::OnyxResult;
-use crate::io::read_pool::ReadPool;
+use crate::io::read_pool::{ReadPool, ReadPurpose};
 use crate::meta::schema::BlockmapValue;
 use crate::types::BLOCK_SIZE;
 
@@ -50,11 +50,32 @@ pub struct VerifyTarget<'a> {
     /// The new write's source 4 KiB block; verify succeeds when this
     /// matches the bytes read from LV3 byte-for-byte.
     pub expected: &'a [u8],
+    /// Which dedup source requested this verify. The aggregate
+    /// `read_crc_errors` counter stays unchanged; this only makes the
+    /// diagnostic log precise enough to separate stale persistent
+    /// index entries from stale RAM candidates.
+    pub purpose: ReadPurpose,
 }
 
 impl<'a> VerifyTarget<'a> {
     pub fn new(mapping: BlockmapValue, expected: &'a [u8]) -> Self {
-        Self { mapping, expected }
+        Self {
+            mapping,
+            expected,
+            purpose: ReadPurpose::DedupVerify,
+        }
+    }
+
+    pub fn new_with_purpose(
+        mapping: BlockmapValue,
+        expected: &'a [u8],
+        purpose: ReadPurpose,
+    ) -> Self {
+        Self {
+            mapping,
+            expected,
+            purpose,
+        }
     }
 }
 
@@ -83,7 +104,7 @@ pub fn batched_verify(read_pool: &ReadPool, targets: &[VerifyTarget<'_>]) -> Ony
     // drain.
     let mut receivers = Vec::with_capacity(targets.len());
     for target in targets {
-        match read_pool.submit_read_async(target.mapping) {
+        match read_pool.submit_read_async_for(target.mapping, target.purpose) {
             Ok(rx) => receivers.push(Some(rx)),
             // A submission failure (channel closed, etc.) collapses
             // this target to a false-match. We still record a
