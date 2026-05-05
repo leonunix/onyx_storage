@@ -1,4 +1,5 @@
 use onyx_storage::config::MetaConfig;
+use onyx_storage::meta::schema::BlockmapValue;
 use onyx_storage::meta::store::MetaStore;
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::space::extent::Extent;
@@ -6,6 +7,20 @@ use onyx_storage::types::{Lba, Pba, VolumeId, RESERVED_BLOCKS};
 
 fn ensure_blockmap_cf(store: &MetaStore, vol_id: &str) {
     store.create_blockmap_cf(vol_id).unwrap();
+}
+
+fn mapped_value(pba: Pba) -> BlockmapValue {
+    BlockmapValue {
+        pba,
+        compression: 0,
+        unit_compressed_size: 4096,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: pba.0 as u32,
+        slot_offset: 0,
+        flags: 0,
+    }
 }
 
 // --- extent tests ---
@@ -160,12 +175,14 @@ fn rebuild_from_metadata() {
         dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
+    let vol_id = VolumeId("vol-a".into());
+    ensure_blockmap_cf(&meta, "vol-a");
 
     // PBAs must be >= RESERVED_BLOCKS (8) to be in usable range
-    meta.set_refcount(Pba(8), 1).unwrap();
-    meta.set_refcount(Pba(9), 1).unwrap();
-    meta.set_refcount(Pba(13), 2).unwrap();
-    meta.set_refcount(Pba(17), 1).unwrap();
+    for (idx, pba) in [8, 9, 13, 17].into_iter().enumerate() {
+        meta.put_mapping(&vol_id, Lba(idx as u64), &mapped_value(Pba(pba)))
+            .unwrap();
+    }
 
     // 18 total blocks = 10 usable (18 - 8)
     let alloc = SpaceAllocator::new(4096 * 18, 0);
@@ -269,10 +286,13 @@ fn rebuild_fully_allocated() {
         dedup_l1_cache_entries: 256_000,
     };
     let meta = MetaStore::open(&meta_config).unwrap();
+    let vol_id = VolumeId("vol-a".into());
+    ensure_blockmap_cf(&meta, "vol-a");
 
     // 18 total = 10 usable, allocate PBAs 8..17
-    for i in RESERVED_BLOCKS..18u64 {
-        meta.set_refcount(Pba(i), 1).unwrap();
+    for (idx, pba) in (RESERVED_BLOCKS..18u64).enumerate() {
+        meta.put_mapping(&vol_id, Lba(idx as u64), &mapped_value(Pba(pba)))
+            .unwrap();
     }
 
     let alloc = SpaceAllocator::new(4096 * 18, 0);
@@ -322,7 +342,6 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
 
     meta.put_mapping(&vol_id, Lba(0), &value0).unwrap();
     meta.put_mapping(&vol_id, Lba(1), &value1).unwrap();
-    meta.set_refcount(Pba(12), 2).unwrap();
 
     // 18 total = 10 usable
     let alloc = SpaceAllocator::new(4096 * 18, 0);

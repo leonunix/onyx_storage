@@ -44,6 +44,19 @@ fn blockmap_value_roundtrip() {
 }
 
 #[test]
+fn zero_blockmap_value_roundtrip() {
+    let v = BlockmapValue::zero();
+    assert!(v.is_zero());
+    assert_eq!(v.compressed_read_size(BLOCK_SIZE as usize), 0);
+    assert_eq!(v.compressed_slice_range(), (0, 0));
+
+    let encoded = encode_blockmap_value(&v);
+    let decoded = decode_blockmap_value(&encoded).unwrap();
+    assert_eq!(decoded, v);
+    assert!(decoded.is_zero());
+}
+
+#[test]
 fn refcount_roundtrip() {
     let pba = Pba(12345);
     let key = encode_refcount_key(pba);
@@ -812,6 +825,47 @@ fn atomic_batch_write_multi_with_decrements() {
     );
     assert_eq!(store.get_refcount(Pba(60)).unwrap(), 1);
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 2); // 3 - 1 = 2
+}
+
+#[test]
+fn zero_mapping_does_not_refcount_pba_zero_and_can_be_overwritten() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol_id = VolumeId("test-vol".into());
+    ensure_blockmap_cf(&store, "test-vol");
+
+    store
+        .atomic_batch_write(&vol_id, &[(Lba(0), BlockmapValue::zero())], 0)
+        .unwrap();
+    let zero = store.get_mapping(&vol_id, Lba(0)).unwrap().unwrap();
+    assert!(zero.is_zero());
+    assert_eq!(store.get_refcount(Pba(0)).unwrap(), 0);
+    assert_eq!(store.iter_allocated_blocks().unwrap(), Vec::new());
+
+    let nonzero = BlockmapValue {
+        pba: Pba(55),
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0x1234,
+        slot_offset: 0,
+        flags: 0,
+    };
+    let freed = store
+        .atomic_batch_write(&vol_id, &[(Lba(0), nonzero)], 1)
+        .unwrap();
+    assert!(freed.is_empty());
+    assert_eq!(store.get_refcount(Pba(0)).unwrap(), 0);
+    assert_eq!(store.get_refcount(Pba(55)).unwrap(), 1);
+
+    let freed = store
+        .atomic_batch_write(&vol_id, &[(Lba(0), BlockmapValue::zero())], 0)
+        .unwrap();
+    assert_eq!(store.get_refcount(Pba(55)).unwrap(), 0);
+    assert_eq!(freed.get(&Pba(55)), Some(&(1, 1)));
+    assert_eq!(store.get_refcount(Pba(0)).unwrap(), 0);
 }
 
 #[test]

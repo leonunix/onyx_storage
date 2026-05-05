@@ -23,6 +23,9 @@ pub fn vol_id_from_blockmap_cf(cf_name: &str) -> Option<&str> {
 
 /// BlockmapValue flags
 pub const FLAG_DEDUP_SKIPPED: u8 = 0x01;
+/// Mapping is an explicit all-zero logical block. `pba` is ignored and no
+/// refcount/LV3 IO/dedup entry is associated with the value.
+pub const FLAG_ZERO: u8 = 0x02;
 
 /// Maximum volume ID length in bytes. Enforced at volume creation time.
 /// The length byte in blockmap keys is u8, so the hard ceiling is 255.
@@ -50,10 +53,31 @@ pub struct BlockmapValue {
 }
 
 impl BlockmapValue {
+    pub fn zero() -> Self {
+        Self {
+            pba: Pba(0),
+            compression: 0,
+            unit_compressed_size: 0,
+            unit_original_size: 0,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 0,
+            slot_offset: 0,
+            flags: FLAG_ZERO,
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.flags & FLAG_ZERO != 0
+    }
+
     /// On-disk read footprint for this fragment, rounded up to `block_size`.
     /// Packed fragments share a 4 KB slot, so callers always read the whole
     /// physical slot and slice the fragment out by `slot_offset`.
     pub fn compressed_read_size(&self, block_size: usize) -> usize {
+        if self.is_zero() {
+            return 0;
+        }
         if self.slot_offset > 0 {
             block_size
         } else {
@@ -66,6 +90,9 @@ impl BlockmapValue {
     /// returned by `compressed_read_size`. For unpacked fragments this starts
     /// at 0; for packed fragments it starts at `slot_offset`.
     pub fn compressed_slice_range(&self) -> (usize, usize) {
+        if self.is_zero() {
+            return (0, 0);
+        }
         let start = if self.slot_offset > 0 {
             self.slot_offset as usize
         } else {
@@ -86,6 +113,10 @@ impl BlockmapValue {
     /// BlockmapValue becomes the dedup_index payload for that
     /// fingerprint.
     pub fn to_dedup_entry(&self) -> DedupEntry {
+        debug_assert!(
+            !self.is_zero(),
+            "zero mappings must not be inserted into dedup_index"
+        );
         DedupEntry {
             pba: self.pba,
             slot_offset: self.slot_offset,

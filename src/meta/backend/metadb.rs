@@ -346,6 +346,9 @@ impl MetadbBackend {
         for item in self.db.range(ord, start.0..end.0)? {
             let (_, value) = item?;
             let value = decode_l2p_value(value)?;
+            if value.is_zero() {
+                continue;
+            }
             let blocks = freed_blocks_for_l2p_value(&value);
             pba_meta
                 .entry(value.pba)
@@ -761,6 +764,7 @@ impl MetadbBackend {
         let mut blocks: Vec<(Pba, u32)> = self
             .scan_all_blockmap_entries()?
             .into_iter()
+            .filter(|(_, _, value)| !value.is_zero())
             .map(|(_, _, value)| (value.pba, freed_blocks_for_l2p_value(&value)))
             .collect();
         blocks.sort_unstable_by_key(|(pba, _)| *pba);
@@ -1204,7 +1208,7 @@ where
             continue;
         };
         let old = decode_l2p_value(prev)?;
-        if old.pba == new_value.pba {
+        if old.is_zero() || old.pba == new_value.pba {
             continue;
         }
         let blocks = freed_blocks_for_l2p_value(&old);
@@ -1223,6 +1227,9 @@ where
 {
     let mut occurrences: HashMap<Pba, u32> = HashMap::new();
     for value in new_values {
+        if value.is_zero() {
+            continue;
+        }
         *occurrences.entry(value.pba).or_insert(0) += 1;
     }
     if occurrences.len() != 1 {
@@ -1279,7 +1286,7 @@ fn dedup_hit_results_from_remaps(
 
         if let Some(prev) = prev {
             let old = decode_l2p_value(prev)?;
-            if old.pba != new_value.pba {
+            if !old.is_zero() && old.pba != new_value.pba {
                 let blocks = freed_blocks_for_l2p_value(&old);
                 if freed_pba.is_some_and(|pba| from_metadb_pba(pba) == old.pba) {
                     newly_zeroed.insert(old.pba, blocks);

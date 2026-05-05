@@ -459,13 +459,13 @@ impl MetaStore {
     pub fn iter_allocated_blocks(&self) -> OnyxResult<Vec<Pba>> {
         let mut allocated = std::collections::BTreeSet::new();
         for (_, _, value) in self.backend.scan_all_blockmap_entries()? {
+            if value.is_zero() {
+                continue;
+            }
             let blocks = freed_blocks_for_l2p_value(&value);
             for block in 0..blocks {
                 allocated.insert(Pba(value.pba.0 + u64::from(block)));
             }
-        }
-        for (pba, _) in self.iter_refcounts()? {
-            allocated.insert(pba);
         }
         Ok(allocated.into_iter().collect())
     }

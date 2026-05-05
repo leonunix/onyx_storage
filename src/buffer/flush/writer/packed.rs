@@ -617,7 +617,7 @@ impl BufferFlusher {
             let surviving = slot_metas.iter().filter(|s| s.is_some()).count();
             match meta.memory_stats() {
                 Ok(meta_stats) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         slots = n,
                         surviving,
                         meta_commits,
@@ -651,7 +651,7 @@ impl BufferFlusher {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         slots = n,
                         surviving,
                         meta_commits,

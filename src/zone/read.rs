@@ -57,6 +57,9 @@ pub fn execute_read(
             return Ok(None);
         }
     };
+    if mapping.is_zero() {
+        return Ok(Some(vec![0u8; BLOCK_SIZE as usize]));
+    }
 
     // 3. LV3 read + CRC + decompress. Goes through the read pool when one is
     //    attached so the disk IO joins a batched io_uring submit and the
@@ -76,6 +79,9 @@ fn inline_lv3_read(
     metrics: &EngineMetrics,
     mapping: crate::meta::schema::BlockmapValue,
 ) -> OnyxResult<Option<Vec<u8>>> {
+    if mapping.is_zero() {
+        return Ok(Some(vec![0u8; BLOCK_SIZE as usize]));
+    }
     let read_size = mapping.compressed_read_size(BLOCK_SIZE as usize);
     let raw = io_engine.read_blocks(mapping.pba, read_size)?;
     extract_lba_from_compressed(&raw, &mapping, metrics).map(Some)
