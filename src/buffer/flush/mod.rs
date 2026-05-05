@@ -41,6 +41,16 @@ pub struct BufferFlusher {
     running: Arc<AtomicBool>,
     lanes: Vec<FlusherLane>,
     in_flight: Arc<FlusherInFlightTracker>,
+    /// Per-shard RAM candidate cache. The first occurrence of a
+    /// fingerprint lands here instead of dedup_index; the next
+    /// sighting (verified by LV3 read-back) is promoted into the
+    /// persistent dedup tables in the writer's atomic batch. The
+    /// writer/dedup-worker integration that actually consumes this
+    /// cache is staged as follow-up commits — this struct slot is
+    /// pre-wired so the rest of the engine can already construct a
+    /// flusher with a real cache and the integration commits don't
+    /// have to re-touch the public constructor signature.
+    candidate: crate::dedup::CandidateCache,
 }
 
 struct FlusherLane {
@@ -48,7 +58,6 @@ struct FlusherLane {
     dedup_handles: Vec<JoinHandle<()>>,
     compress_handles: Vec<JoinHandle<()>>,
     writer_handle: Option<JoinHandle<()>>,
-    dedup_register_handle: Option<JoinHandle<()>>,
     cleanup_handle: Option<JoinHandle<()>>,
 }
 
@@ -63,15 +72,6 @@ struct PackedSlotRetry {
     buffered_seqs: Vec<u64>,
     buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
     retry_at: Instant,
-}
-
-#[derive(Debug, Clone)]
-struct DedupRegistration {
-    vol_id: VolumeId,
-    lba: Lba,
-    hash: ContentHash,
-    entry: DedupEntry,
-    expected: BlockmapValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,9 +218,6 @@ impl Allocation {
 }
 
 impl BufferFlusher {
-    const DEDUP_REGISTER_BATCH_MAX: usize = 8192;
-    const DEDUP_REGISTER_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
-
     const HEAD_RETRY_AGE_THRESHOLD: Duration = Duration::from_millis(500);
     const COALESCE_READY_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
@@ -236,21 +233,6 @@ impl BufferFlusher {
 
     fn record_elapsed(counter: &std::sync::atomic::AtomicU64, start: Instant) {
         counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
-    }
-
-    fn record_max(counter: &std::sync::atomic::AtomicU64, value: u64) {
-        let mut current = counter.load(Ordering::Relaxed);
-        while value > current {
-            match counter.compare_exchange_weak(
-                current,
-                value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
     }
 
     fn is_full_raw_unit(unit: &CompressedUnit) -> bool {
@@ -451,22 +433,48 @@ impl BufferFlusher {
             lifecycle,
             allocator,
             io_engine,
+            None,
             config,
             dedup_config,
             Arc::new(EngineMetrics::default()),
         )
     }
 
+    /// `read_pool` is the LV3 read pool used for dedup verify-on-hit.
+    /// Pass `None` to run the dedup pipeline in trust-hash mode
+    /// (xxh3_64 collisions of ~1.5e-8 may produce occasional false
+    /// dedups); production deployments should always set
+    /// `read_pool_workers > 0`.
     pub fn start_with_metrics(
         pool: Arc<WriteBufferPool>,
         meta: Arc<MetaStore>,
         lifecycle: Arc<VolumeLifecycleManager>,
         allocator: Arc<SpaceAllocator>,
         io_engine: Arc<IoEngine>,
+        read_pool: Option<Arc<crate::io::read_pool::ReadPool>>,
         config: &FlushConfig,
         dedup_config: &DedupConfig,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
+        // Build a candidate cache sized from the dedup config. The
+        // shard count tracks the metadb dedup_shards routing so that a
+        // candidate hit and the eventual promote commit always land in
+        // the same metadb shard, preserving the inline-dedup commit
+        // fast path. Per-shard capacity defaults to
+        // CandidateCache::DEFAULT_PER_SHARD_CAPACITY when the dedup
+        // config does not pin a value. CandidateCache is itself an
+        // Arc<Inner> wrapper — `.clone()` is cheap and shares the
+        // same backing storage across every flusher thread that
+        // captures a copy.
+        let candidate = crate::dedup::CandidateCache::new(
+            dedup_config
+                .candidate_shards
+                .unwrap_or(8)
+                .next_power_of_two(),
+            dedup_config
+                .candidate_per_shard_capacity
+                .unwrap_or(crate::dedup::candidate::DEFAULT_PER_SHARD_CAPACITY),
+        );
         let running = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(FlusherInFlightTracker::default());
         let lane_count = pool.shard_count().max(1);
@@ -509,10 +517,6 @@ impl BufferFlusher {
             let (done_tx, done_rx) = unbounded::<Vec<u64>>();
             // Writer/dedup → cleanup thread (async dead PBA reclamation)
             let (cleanup_tx, cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-            // Writer → dedup registration thread. New dedup rows are
-            // opportunistic, so keep their WAL/apply work off the writer's
-            // critical path and batch them independently.
-            let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
             let running_c = running.clone();
             let pool_c = pool.clone();
@@ -557,6 +561,8 @@ impl BufferFlusher {
                     let done_tx_d = done_tx.clone();
                     let metrics_d = metrics.clone();
                     let cleanup_tx_d = cleanup_tx.clone();
+                    let candidate_d = candidate.clone();
+                    let read_pool_d = read_pool.clone();
                     let h = thread::Builder::new()
                         .name(format!("flusher-dedup-{}-{}", shard_idx, worker_idx))
                         .spawn(move || {
@@ -578,6 +584,8 @@ impl BufferFlusher {
                                 dedup_pending_skip_threshold,
                                 &metrics_d,
                                 &cleanup_tx_d,
+                                &candidate_d,
+                                read_pool_d.as_deref(),
                             );
                         })
                         .expect("failed to spawn dedup worker");
@@ -623,7 +631,7 @@ impl BufferFlusher {
             let io_engine_w = io_engine.clone();
             let metrics_w = metrics.clone();
             let in_flight_w = in_flight.clone();
-            let dedup_register_tx_w = dedup_register_tx.clone();
+            let candidate_w = candidate.clone();
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
@@ -643,34 +651,17 @@ impl BufferFlusher {
                         &mut packer,
                         &metrics_w,
                         &cleanup_tx,
-                        &dedup_register_tx_w,
+                        &candidate_w,
                         packed_meta_batch_max_lbas,
                     );
                 })
                 .expect("failed to spawn writer thread");
-            drop(dedup_register_tx);
-
-            let running_dr = running.clone();
-            let meta_dr = meta.clone();
-            let metrics_dr = metrics.clone();
-            let dedup_register_handle = thread::Builder::new()
-                .name(format!("flusher-dedup-register-{}", shard_idx))
-                .spawn(move || {
-                    affinity::bind_current(ThreadRole::FlusherDedupRegister, shard_idx);
-                    Self::dedup_register_loop(
-                        shard_idx,
-                        &dedup_register_rx,
-                        &meta_dr,
-                        &running_dr,
-                        &metrics_dr,
-                    );
-                })
-                .expect("failed to spawn dedup registration thread");
 
             let running_cl = running.clone();
             let meta_cl = meta.clone();
             let allocator_cl = allocator.clone();
             let metrics_cl = metrics.clone();
+            let candidate_cl = candidate.clone();
             let cleanup_handle = thread::Builder::new()
                 .name(format!("flusher-cleanup-{}", shard_idx))
                 .spawn(move || {
@@ -680,6 +671,7 @@ impl BufferFlusher {
                         &cleanup_rx,
                         &meta_cl,
                         &allocator_cl,
+                        &candidate_cl,
                         &running_cl,
                         &metrics_cl,
                     );
@@ -691,7 +683,6 @@ impl BufferFlusher {
                 dedup_handles,
                 compress_handles,
                 writer_handle: Some(writer_handle),
-                dedup_register_handle: Some(dedup_register_handle),
                 cleanup_handle: Some(cleanup_handle),
             });
         }
@@ -700,7 +691,17 @@ impl BufferFlusher {
             running,
             lanes,
             in_flight,
+            candidate,
         }
+    }
+
+    /// Handle to the per-shard RAM candidate cache. Exposed so the
+    /// engine can wire the cleanup hook (refcount→0 → candidate
+    /// remove) and the dedup scanner can warm the cache during
+    /// background rescans. Cheap clone — shares the same backing
+    /// shards.
+    pub fn candidate_cache(&self) -> crate::dedup::CandidateCache {
+        self.candidate.clone()
     }
 
     pub fn stop(&mut self) {
@@ -743,111 +744,6 @@ impl BufferFlusher {
         self.join_lanes();
     }
 
-    fn enqueue_dedup_registrations(
-        meta: &MetaStore,
-        metrics: &EngineMetrics,
-        tx: &Sender<Vec<DedupRegistration>>,
-        registrations: Vec<DedupRegistration>,
-    ) {
-        if registrations.is_empty() {
-            return;
-        }
-        let entries = registrations.len();
-        if tx.send(registrations.clone()).is_ok() {
-            metrics
-                .dedup_register_batches
-                .fetch_add(1, Ordering::Relaxed);
-            metrics
-                .dedup_register_entries
-                .fetch_add(entries as u64, Ordering::Relaxed);
-            Self::record_max(&metrics.dedup_register_batch_max_entries, entries as u64);
-            return;
-        }
-        Self::persist_dedup_registrations(meta, metrics, registrations);
-    }
-
-    fn persist_dedup_registrations(
-        meta: &MetaStore,
-        metrics: &EngineMetrics,
-        registrations: Vec<DedupRegistration>,
-    ) {
-        if registrations.is_empty() {
-            return;
-        }
-
-        let mut filtered = Vec::with_capacity(registrations.len());
-        let validate_start = Instant::now();
-        for reg in registrations {
-            match meta.dedup_registration_is_current(&reg.vol_id, reg.lba, &reg.expected) {
-                Ok(true) => filtered.push((reg.hash, reg.entry)),
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        vol = %reg.vol_id.0,
-                        lba = reg.lba.0,
-                        error = %e,
-                        "dedup register: validation failed; dropping stale registration"
-                    );
-                }
-            }
-        }
-        Self::record_elapsed(&metrics.dedup_register_validate_blockmap_ns, validate_start);
-        if filtered.is_empty() {
-            return;
-        }
-
-        let commit_start = Instant::now();
-        if let Err(e) = meta.put_dedup_entries_guarded(&filtered) {
-            tracing::warn!(
-                entries = filtered.len(),
-                error = %e,
-                "dedup register: failed to persist entries"
-            );
-        }
-        Self::record_elapsed(&metrics.dedup_register_commit_ns, commit_start);
-    }
-
-    fn dedup_register_loop(
-        shard_idx: usize,
-        rx: &Receiver<Vec<DedupRegistration>>,
-        meta: &MetaStore,
-        running: &AtomicBool,
-        metrics: &EngineMetrics,
-    ) {
-        let mut batch = Vec::new();
-        while running.load(Ordering::Relaxed) || !rx.is_empty() {
-            let first = match rx.recv_timeout(Self::DEDUP_REGISTER_DRAIN_TIMEOUT) {
-                Ok(regs) => regs,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-            };
-            batch.extend(first);
-            while batch.len() < Self::DEDUP_REGISTER_BATCH_MAX {
-                match rx.try_recv() {
-                    Ok(regs) => batch.extend(regs),
-                    Err(_) => break,
-                }
-            }
-
-            let regs = std::mem::take(&mut batch);
-            tracing::trace!(
-                lane = shard_idx,
-                entries = regs.len(),
-                "dedup register: batch"
-            );
-            Self::persist_dedup_registrations(meta, metrics, regs);
-        }
-
-        for regs in rx.try_iter() {
-            batch.extend(regs);
-            if batch.len() >= Self::DEDUP_REGISTER_BATCH_MAX {
-                let regs = std::mem::take(&mut batch);
-                Self::persist_dedup_registrations(meta, metrics, regs);
-            }
-        }
-        Self::persist_dedup_registrations(meta, metrics, batch);
-    }
-
     fn join_lanes(&mut self) {
         for lane in &mut self.lanes {
             if let Some(h) = lane.coalesce_handle.take() {
@@ -860,10 +756,6 @@ impl BufferFlusher {
                 let _ = h.join();
             }
             if let Some(h) = lane.writer_handle.take() {
-                let _ = h.join();
-            }
-            // Dedup registration drains after writer stops and drops its sender.
-            if let Some(h) = lane.dedup_register_handle.take() {
                 let _ = h.join();
             }
             // Cleanup thread drains after writer stops (writer drop closes cleanup_tx).

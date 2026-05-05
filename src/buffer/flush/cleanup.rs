@@ -10,6 +10,7 @@ impl BufferFlusher {
     pub(crate) fn cleanup_dead_pba_post_commit(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
+        candidate: &crate::dedup::CandidateCache,
         old_pba: Pba,
         old_blocks: u32,
         context: &'static str,
@@ -41,6 +42,15 @@ impl BufferFlusher {
                 return;
             }
         }
+
+        // Drop any RAM candidate-cache entries pointing at this PBA
+        // BEFORE the allocator can hand the sector to a new owner.
+        // Otherwise a future verify pass would read the new owner's
+        // bytes through a stale candidate slot, miss the byte
+        // compare, and waste the IO. Cleanup proceeds even if the
+        // metadb dedup-table cleanup later fails — the candidate
+        // entry is RAM-only and safe to drop unconditionally.
+        candidate.remove_by_pba(old_pba);
 
         if let Err(e) = meta.cleanup_dedup_for_pba_standalone(old_pba) {
             tracing::error!(
@@ -100,6 +110,7 @@ impl BufferFlusher {
     pub(super) fn cleanup_dead_pbas_batch(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
+        candidate: &crate::dedup::CandidateCache,
         dead_pbas: &[(Pba, u32)],
         context: &'static str,
     ) {
@@ -181,6 +192,15 @@ impl BufferFlusher {
                 continue;
             }
 
+            // Drop candidate-cache entries pointing at the dead PBAs
+            // BEFORE the allocator can hand any of them to a new
+            // owner (mirrors the single-PBA path above). The cache
+            // is RAM-only so the cleanup is unconditional and never
+            // fails.
+            for (pba, _) in &truly_dead {
+                candidate.remove_by_pba(*pba);
+            }
+
             let pbas: Vec<Pba> = truly_dead.iter().map(|(p, _)| *p).collect();
             if let Err(e) = meta.cleanup_dedup_for_pbas_batch(&pbas) {
                 tracing::error!(
@@ -234,6 +254,7 @@ impl BufferFlusher {
         rx: &Receiver<Vec<(Pba, u32)>>,
         meta: &MetaStore,
         allocator: &SpaceAllocator,
+        candidate: &crate::dedup::CandidateCache,
         running: &AtomicBool,
         metrics: &EngineMetrics,
     ) {
@@ -253,7 +274,7 @@ impl BufferFlusher {
 
             let count = all.len();
             let start = Instant::now();
-            Self::cleanup_dead_pbas_batch(meta, allocator, &all, "cleanup_thread");
+            Self::cleanup_dead_pbas_batch(meta, allocator, candidate, &all, "cleanup_thread");
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             metrics
                 .flush_writer_cleanup_ns
@@ -272,7 +293,13 @@ impl BufferFlusher {
             remaining.extend(batch);
         }
         if !remaining.is_empty() {
-            Self::cleanup_dead_pbas_batch(meta, allocator, &remaining, "cleanup_thread_drain");
+            Self::cleanup_dead_pbas_batch(
+                meta,
+                allocator,
+                candidate,
+                &remaining,
+                "cleanup_thread_drain",
+            );
         }
     }
 

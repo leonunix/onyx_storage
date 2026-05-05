@@ -56,11 +56,11 @@ enum QueuedIoData {
     Owned(Vec<u8>),
     /// Direct pointer into libublk's per-tag queue buffer.
     ///
-    /// Safety invariant: ublk does not reuse a tag's buffer until userspace
-    /// completes that tag, and the queue thread only completes a direct IO
-    /// after this worker returns. This removes one allocation and one memcpy
-    /// from the hot path while still letting the queue thread fetch more
-    /// commands instead of serialising the whole hardware queue.
+    /// This is only used for READ requests: the worker has to write the
+    /// response into libublk's buffer before the queue thread completes the
+    /// tag. WRITE requests are copied into [`QueuedIoData::Owned`] before
+    /// leaving the queue callback so their source bytes cannot be affected by
+    /// libublk buffer reuse after the callback returns.
     Direct {
         ptr: usize,
         len: usize,
@@ -616,15 +616,21 @@ impl OnyxUblkTarget {
                         return;
                     }
 
+                    let data = if op == sys::UBLK_IO_OP_WRITE {
+                        QueuedIoData::Owned(io_slice[..io_len].to_vec())
+                    } else {
+                        QueuedIoData::Direct {
+                            ptr: io_slice.as_mut_ptr() as usize,
+                            len: io_len,
+                        }
+                    };
+
                     let queued = QueuedIo {
                         tag,
                         op,
                         start_sector,
                         nr_sectors,
-                        data: QueuedIoData::Direct {
-                            ptr: io_slice.as_mut_ptr() as usize,
-                            len: io_len,
-                        },
+                        data,
                         queued_at,
                     };
                     drop(bufs);

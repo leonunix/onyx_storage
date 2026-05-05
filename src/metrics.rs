@@ -216,13 +216,18 @@ pub struct EngineMetrics {
     pub dedup_stale_delete_ns: AtomicU64,
     pub dedup_hit_commit_ops: AtomicU64,
     pub dedup_hit_commit_ns: AtomicU64,
-    pub dedup_register_batches: AtomicU64,
-    pub dedup_register_entries: AtomicU64,
-    pub dedup_register_batch_max_entries: AtomicU64,
-    pub dedup_register_lock_ns: AtomicU64,
-    pub dedup_register_validate_blockmap_ns: AtomicU64,
-    pub dedup_register_validate_refcount_ns: AtomicU64,
-    pub dedup_register_commit_ns: AtomicU64,
+    /// Number of candidate-cache hits that have been verified
+    /// (LV3 byte-compare passed) and successfully promoted into the
+    /// persistent dedup_index/dedup_reverse tables in the dedup
+    /// worker's atomic commit batch. Counts confirmed-duplicate
+    /// promotions only — first-occurrence inserts into the candidate
+    /// cache do not bump this counter.
+    pub dedup_promotions_committed: AtomicU64,
+    /// Promotions that were lost to a failed atomic commit (entire
+    /// chunk rolled back). The candidate cache slot stays around so
+    /// the next sighting will retry; counter helps detect persistent
+    /// commit-failure stuck states.
+    pub dedup_promotions_failed: AtomicU64,
     pub flush_units_written: AtomicU64,
     pub flush_unit_bytes: AtomicU64,
     pub flush_packed_slots_written: AtomicU64,
@@ -252,6 +257,17 @@ pub struct EngineMetrics {
     pub dedup_rescan_hits: AtomicU64,
     pub dedup_rescan_misses: AtomicU64,
     pub dedup_rescan_errors: AtomicU64,
+    /// Cold-tail rescan: live blockmap entries the scanner walked, hashed,
+    /// and inserted into the candidate cache so a future duplicate write
+    /// can verify-and-promote against an already-warmed fingerprint.
+    pub dedup_cold_tail_blocks: AtomicU64,
+    /// Cold-tail entries skipped because the scanner already had a hash
+    /// recorded for that PBA (warmed by a prior cycle or the writer).
+    pub dedup_cold_tail_already_warm: AtomicU64,
+    /// Cold-tail read/decode failures (CRC mismatch, decompress error,
+    /// LV3 IO error). The scanner moves on; the cursor still advances so
+    /// one bad block does not stall progress.
+    pub dedup_cold_tail_errors: AtomicU64,
     pub volume_discard_ops: AtomicU64,
     pub volume_discard_lbas: AtomicU64,
     pub discard_blocks_freed: AtomicU64,
@@ -428,13 +444,8 @@ impl Default for EngineMetrics {
             dedup_stale_delete_ns: AtomicU64::new(0),
             dedup_hit_commit_ops: AtomicU64::new(0),
             dedup_hit_commit_ns: AtomicU64::new(0),
-            dedup_register_batches: AtomicU64::new(0),
-            dedup_register_entries: AtomicU64::new(0),
-            dedup_register_batch_max_entries: AtomicU64::new(0),
-            dedup_register_lock_ns: AtomicU64::new(0),
-            dedup_register_validate_blockmap_ns: AtomicU64::new(0),
-            dedup_register_validate_refcount_ns: AtomicU64::new(0),
-            dedup_register_commit_ns: AtomicU64::new(0),
+            dedup_promotions_committed: AtomicU64::new(0),
+            dedup_promotions_failed: AtomicU64::new(0),
             flush_units_written: AtomicU64::new(0),
             flush_unit_bytes: AtomicU64::new(0),
             flush_packed_slots_written: AtomicU64::new(0),
@@ -464,6 +475,9 @@ impl Default for EngineMetrics {
             dedup_rescan_hits: AtomicU64::new(0),
             dedup_rescan_misses: AtomicU64::new(0),
             dedup_rescan_errors: AtomicU64::new(0),
+            dedup_cold_tail_blocks: AtomicU64::new(0),
+            dedup_cold_tail_already_warm: AtomicU64::new(0),
+            dedup_cold_tail_errors: AtomicU64::new(0),
             volume_discard_ops: AtomicU64::new(0),
             volume_discard_lbas: AtomicU64::new(0),
             discard_blocks_freed: AtomicU64::new(0),
@@ -590,13 +604,8 @@ impl EngineMetrics {
             dedup_stale_delete_ns: load(&self.dedup_stale_delete_ns),
             dedup_hit_commit_ops: load(&self.dedup_hit_commit_ops),
             dedup_hit_commit_ns: load(&self.dedup_hit_commit_ns),
-            dedup_register_batches: load(&self.dedup_register_batches),
-            dedup_register_entries: load(&self.dedup_register_entries),
-            dedup_register_batch_max_entries: load(&self.dedup_register_batch_max_entries),
-            dedup_register_lock_ns: load(&self.dedup_register_lock_ns),
-            dedup_register_validate_blockmap_ns: load(&self.dedup_register_validate_blockmap_ns),
-            dedup_register_validate_refcount_ns: load(&self.dedup_register_validate_refcount_ns),
-            dedup_register_commit_ns: load(&self.dedup_register_commit_ns),
+            dedup_promotions_committed: load(&self.dedup_promotions_committed),
+            dedup_promotions_failed: load(&self.dedup_promotions_failed),
             flush_units_written: load(&self.flush_units_written),
             flush_unit_bytes: load(&self.flush_unit_bytes),
             flush_packed_slots_written: load(&self.flush_packed_slots_written),
@@ -628,6 +637,9 @@ impl EngineMetrics {
             dedup_rescan_hits: load(&self.dedup_rescan_hits),
             dedup_rescan_misses: load(&self.dedup_rescan_misses),
             dedup_rescan_errors: load(&self.dedup_rescan_errors),
+            dedup_cold_tail_blocks: load(&self.dedup_cold_tail_blocks),
+            dedup_cold_tail_already_warm: load(&self.dedup_cold_tail_already_warm),
+            dedup_cold_tail_errors: load(&self.dedup_cold_tail_errors),
             volume_discard_ops: load(&self.volume_discard_ops),
             volume_discard_lbas: load(&self.volume_discard_lbas),
             discard_blocks_freed: load(&self.discard_blocks_freed),
@@ -740,13 +752,8 @@ pub struct EngineMetricsSnapshot {
     pub dedup_stale_delete_ns: u64,
     pub dedup_hit_commit_ops: u64,
     pub dedup_hit_commit_ns: u64,
-    pub dedup_register_batches: u64,
-    pub dedup_register_entries: u64,
-    pub dedup_register_batch_max_entries: u64,
-    pub dedup_register_lock_ns: u64,
-    pub dedup_register_validate_blockmap_ns: u64,
-    pub dedup_register_validate_refcount_ns: u64,
-    pub dedup_register_commit_ns: u64,
+    pub dedup_promotions_committed: u64,
+    pub dedup_promotions_failed: u64,
     pub flush_units_written: u64,
     pub flush_unit_bytes: u64,
     pub flush_packed_slots_written: u64,
@@ -776,6 +783,9 @@ pub struct EngineMetricsSnapshot {
     pub dedup_rescan_hits: u64,
     pub dedup_rescan_misses: u64,
     pub dedup_rescan_errors: u64,
+    pub dedup_cold_tail_blocks: u64,
+    pub dedup_cold_tail_already_warm: u64,
+    pub dedup_cold_tail_errors: u64,
     pub volume_discard_ops: u64,
     pub volume_discard_lbas: u64,
     pub discard_blocks_freed: u64,
@@ -921,13 +931,8 @@ impl EngineMetricsSnapshot {
             dedup_stale_delete_ns,
             dedup_hit_commit_ops,
             dedup_hit_commit_ns,
-            dedup_register_batches,
-            dedup_register_entries,
-            dedup_register_batch_max_entries,
-            dedup_register_lock_ns,
-            dedup_register_validate_blockmap_ns,
-            dedup_register_validate_refcount_ns,
-            dedup_register_commit_ns,
+            dedup_promotions_committed,
+            dedup_promotions_failed,
             flush_units_written,
             flush_unit_bytes,
             flush_packed_slots_written,
@@ -957,6 +962,9 @@ impl EngineMetricsSnapshot {
             dedup_rescan_hits,
             dedup_rescan_misses,
             dedup_rescan_errors,
+            dedup_cold_tail_blocks,
+            dedup_cold_tail_already_warm,
+            dedup_cold_tail_errors,
             volume_discard_ops,
             volume_discard_lbas,
             discard_blocks_freed,
@@ -2008,7 +2016,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} register_batches={} register_entries={} register_batch_max={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={}",
+            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={}",
             self.metrics.dedup_hits,
             self.metrics.dedup_misses,
             self.metrics.dedup_skipped_units,
@@ -2017,27 +2025,25 @@ impl EngineStatusSnapshot {
             self.metrics.dedup_live_check_ops,
             self.metrics.dedup_stale_index_entries,
             self.metrics.dedup_hit_commit_ops,
-            self.metrics.dedup_register_batches,
-            self.metrics.dedup_register_entries,
-            self.metrics.dedup_register_batch_max_entries,
+            self.metrics.dedup_promotions_committed,
+            self.metrics.dedup_promotions_failed,
             self.metrics.dedup_rescan_cycles,
             self.metrics.dedup_rescan_skipped_cycles,
             self.metrics.dedup_rescan_blocks,
             self.metrics.dedup_rescan_hits,
             self.metrics.dedup_rescan_misses,
-            self.metrics.dedup_rescan_errors
+            self.metrics.dedup_rescan_errors,
+            self.metrics.dedup_cold_tail_blocks,
+            self.metrics.dedup_cold_tail_already_warm,
+            self.metrics.dedup_cold_tail_errors
         );
         let _ = writeln!(
             out,
-            "dedup_ns: lookup={} live_check={} stale_delete={} hit_commit={} register_lock={} register_validate_blockmap={} register_validate_refcount={} register_commit={}",
+            "dedup_ns: lookup={} live_check={} stale_delete={} hit_commit={}",
             self.metrics.dedup_lookup_ns,
             self.metrics.dedup_live_check_ns,
             self.metrics.dedup_stale_delete_ns,
-            self.metrics.dedup_hit_commit_ns,
-            self.metrics.dedup_register_lock_ns,
-            self.metrics.dedup_register_validate_blockmap_ns,
-            self.metrics.dedup_register_validate_refcount_ns,
-            self.metrics.dedup_register_commit_ns
+            self.metrics.dedup_hit_commit_ns
         );
         let _ = writeln!(
             out,

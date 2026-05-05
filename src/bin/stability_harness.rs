@@ -53,7 +53,12 @@ fn write_and_abort(
             checkpoint_interval_ms: 5000,
             group_commit_timeout_us: 1000,
             wal_dir: None,
-            dedup_shards: 1,
+            // Must match the EngineHarness that created the metadb dir.
+            // dedup_shards is part of the on-disk layout — opening with
+            // a different value than the persisted manifest is a hard
+            // error (see metadb/src/manifest.rs). The test's harness
+            // uses the MetaConfig default (8); track it here.
+            dedup_shards: 8,
             dedup_cuckoo_buckets: 4_000_000,
             dedup_l1_cache_entries: 256_000,
         },

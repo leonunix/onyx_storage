@@ -7,7 +7,17 @@ struct PreparedDedupUnit {
     all_hashes: Vec<ContentHash>,
     lookup_indices: Vec<usize>,
     successful_hit_indices: Vec<usize>,
+    /// Hits confirmed by `lookup_dedup_hits` (dedup_index source) or
+    /// `candidate_lookup_pass` (candidate-cache source) AND surviving
+    /// `verify_prepared_dedup_hits` (LV3 byte-compare). Each entry is
+    /// `(lba_index_in_unit, blockmap_value, hash)`.
     valid_hits: Vec<(usize, BlockmapValue, ContentHash)>,
+    /// Candidate-cache-sourced hits that, after verify, need to be
+    /// promoted into the persistent `dedup_index`/`dedup_reverse`.
+    /// Each entry's `lba_index_in_unit` matches a `valid_hits` entry;
+    /// dedup_index-sourced hits do **not** appear here because they
+    /// are already in the persistent layer.
+    promote_candidates: Vec<(usize, ContentHash, DedupEntry)>,
 }
 
 impl BufferFlusher {
@@ -415,6 +425,8 @@ impl BufferFlusher {
         pending_skip_threshold_entries: u64,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        candidate: &crate::dedup::CandidateCache,
+        read_pool: Option<&crate::io::read_pool::ReadPool>,
     ) {
         while running.load(Ordering::Relaxed) {
             let first = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -461,6 +473,16 @@ impl BufferFlusher {
             }
 
             Self::lookup_dedup_hits(&mut prepared, meta, pool, metrics);
+            Self::candidate_lookup_pass(&mut prepared, candidate, pool);
+            // LV3 verify ALL hits (dedup_index- and candidate-sourced).
+            // The xxh3_64 schema does not have crypto-strength
+            // collision resistance, so verify is correctness, not
+            // optimisation. read_pool=None disables verify (degrades
+            // to trust-hash mode; see BufferFlusher::start_with_metrics
+            // doc comment for the trade-off).
+            if let Some(rp) = read_pool {
+                Self::verify_prepared_dedup_hits(&mut prepared, rp, metrics);
+            }
             Self::commit_prepared_dedup_hits(
                 &mut prepared,
                 meta,
@@ -468,6 +490,7 @@ impl BufferFlusher {
                 lifecycle,
                 metrics,
                 cleanup_tx,
+                candidate,
             );
 
             for prepared_unit in prepared {
@@ -493,10 +516,10 @@ impl BufferFlusher {
 
         for i in 0..lba_count {
             let Some(block) = unit.raw_blocks.get(i) else {
-                all_hashes.push([0u8; 32]);
+                all_hashes.push([0u8; 8]);
                 continue;
             };
-            let hash: ContentHash = *blake3::hash(block.bytes()).as_bytes();
+            let hash: ContentHash = crate::meta::schema::compute_content_hash(block.bytes());
             all_hashes.push(hash);
             lookup_indices.push(i);
         }
@@ -508,6 +531,7 @@ impl BufferFlusher {
             lookup_indices,
             successful_hit_indices: Vec::new(),
             valid_hits: Vec::new(),
+            promote_candidates: Vec::new(),
         }
     }
 
@@ -581,6 +605,146 @@ impl BufferFlusher {
         }
     }
 
+    /// After `lookup_dedup_hits` has marked persistent dedup_index
+    /// hits, walk the leftover misses and ask the in-memory
+    /// `CandidateCache`. A candidate hit means the same fingerprint
+    /// was seen recently (still in the LRU window) but never made it
+    /// into the persistent index — the perfect moment to confirm a
+    /// real duplicate via LV3 byte-compare and promote.
+    ///
+    /// Promotion candidates are recorded in
+    /// `prepared_unit.promote_candidates` — the writer feeds them
+    /// into the next `atomic_batch_write_*_with_dedup` so dedup_index
+    /// + dedup_reverse + blockmap remap + refcount land atomically.
+    /// Verify mismatches in `verify_prepared_dedup_hits` filter both
+    /// `valid_hits` and `promote_candidates` so we never promote a
+    /// fingerprint whose stored content has drifted from the new
+    /// write.
+    fn candidate_lookup_pass(
+        prepared: &mut [PreparedDedupUnit],
+        candidate: &crate::dedup::CandidateCache,
+        pool: &WriteBufferPool,
+    ) {
+        for prepared_unit in prepared.iter_mut() {
+            for &i in &prepared_unit.lookup_indices {
+                if prepared_unit.is_hit[i] {
+                    // Persistent dedup_index already claimed this
+                    // LBA; do not double-route through promote.
+                    continue;
+                }
+                let hash = prepared_unit.all_hashes[i];
+                if hash == [0u8; 8] {
+                    continue;
+                }
+                let Some(value) = candidate.lookup(&hash) else {
+                    continue;
+                };
+                let lba = Lba(prepared_unit.unit.start_lba.0 + i as u64);
+                let latest_seq = Self::latest_seq_for_lba(&prepared_unit.unit.seq_lba_ranges, lba);
+                if !pool.is_latest_lba_seq(
+                    &prepared_unit.unit.vol_id,
+                    lba,
+                    latest_seq,
+                    prepared_unit.unit.vol_created_at,
+                ) {
+                    // Stale LBA write; another write has already
+                    // superseded this one. Don't promote and don't
+                    // re-route to compress as a hit (the buffer pool
+                    // will retire the stale entry on its own).
+                    prepared_unit.successful_hit_indices.push(i);
+                    prepared_unit.is_hit[i] = true;
+                    continue;
+                }
+                prepared_unit.is_hit[i] = true;
+                prepared_unit.valid_hits.push((i, value, hash));
+                prepared_unit
+                    .promote_candidates
+                    .push((i, hash, value.to_dedup_entry()));
+            }
+        }
+    }
+
+    /// Byte-verify every entry in `valid_hits` against the source
+    /// 4 KiB block via the engine's batched io_uring read pool.
+    /// Fingerprints under xxh3_64 do not provide cryptographic
+    /// collision resistance, so this step is correctness — without
+    /// it, ~1.5e-8 per-pair collision rate × 2.7e11 unique blocks at
+    /// 1 PiB scale = ≈ 1900 collision pairs that would silently
+    /// cause data corruption.
+    ///
+    /// Mismatches are dropped from `valid_hits` *and*
+    /// `promote_candidates`. The corresponding `is_hit[i]` is cleared
+    /// so the writer routes the LBA through the fresh-write path.
+    /// IO failures collapse to mismatch (treat as miss); see
+    /// `dedup::verify::batched_verify` for the per-target failure
+    /// semantics.
+    fn verify_prepared_dedup_hits(
+        prepared: &mut [PreparedDedupUnit],
+        read_pool: &crate::io::read_pool::ReadPool,
+        metrics: &EngineMetrics,
+    ) {
+        // Collect targets across all units. Track the (unit_idx,
+        // lba_idx) for each one so we can apply the verify result
+        // back to the right slot.
+        let mut targets: Vec<crate::dedup::VerifyTarget<'_>> = Vec::new();
+        let mut placement: Vec<(usize, usize)> = Vec::new(); // (unit_idx, lba_idx)
+        for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
+            for (lba_idx, mapping, _hash) in prepared_unit.valid_hits.iter() {
+                let Some(block) = prepared_unit.unit.raw_blocks.get(*lba_idx) else {
+                    // No raw bytes available — should not happen if
+                    // valid_hits was populated correctly; defensively
+                    // verify against an empty buffer so we drop the
+                    // hit rather than promote on bad input.
+                    targets.push(crate::dedup::VerifyTarget::new(*mapping, &[]));
+                    placement.push((unit_idx, *lba_idx));
+                    continue;
+                };
+                targets.push(crate::dedup::VerifyTarget::new(*mapping, block.bytes()));
+                placement.push((unit_idx, *lba_idx));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let verify_start = Instant::now();
+        let results = match crate::dedup::batched_verify(read_pool, &targets) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dedup verify: batched_verify failed; treating all hits as mismatches"
+                );
+                vec![false; targets.len()]
+            }
+        };
+        Self::record_elapsed(&metrics.dedup_lookup_ns, verify_start);
+        // Group mismatches by unit. valid_hits / promote_candidates
+        // can hold tens of entries per unit; using a HashSet keeps
+        // the retain filters O(n) instead of O(n × |mismatches|).
+        let mut mismatches_per_unit: HashMap<usize, std::collections::HashSet<usize>> =
+            HashMap::new();
+        for ((unit_idx, lba_idx), matched) in placement.into_iter().zip(results) {
+            if !matched {
+                mismatches_per_unit
+                    .entry(unit_idx)
+                    .or_default()
+                    .insert(lba_idx);
+            }
+        }
+        for (unit_idx, mismatched_lbas) in mismatches_per_unit {
+            let prepared_unit = &mut prepared[unit_idx];
+            for lba_idx in &mismatched_lbas {
+                prepared_unit.is_hit[*lba_idx] = false;
+            }
+            prepared_unit
+                .valid_hits
+                .retain(|(i, _, _)| !mismatched_lbas.contains(i));
+            prepared_unit
+                .promote_candidates
+                .retain(|(i, _, _)| !mismatched_lbas.contains(i));
+        }
+    }
+
     fn commit_prepared_dedup_hits(
         prepared: &mut [PreparedDedupUnit],
         meta: &MetaStore,
@@ -588,6 +752,7 @@ impl BufferFlusher {
         lifecycle: &VolumeLifecycleManager,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        candidate: &crate::dedup::CandidateCache,
     ) {
         let mut by_volume: HashMap<String, Vec<usize>> = HashMap::new();
         for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
@@ -669,6 +834,7 @@ impl BufferFlusher {
                                         meta,
                                         metrics,
                                         cleanup_tx,
+                                        candidate,
                                     );
                                 }
                             } else {
@@ -688,6 +854,7 @@ impl BufferFlusher {
                         meta,
                         metrics,
                         cleanup_tx,
+                        candidate,
                     );
                 }
             });
@@ -702,6 +869,7 @@ impl BufferFlusher {
         meta: &MetaStore,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<Vec<(Pba, u32)>>,
+        candidate: &crate::dedup::CandidateCache,
     ) {
         let chunk = std::mem::take(pending);
         metrics
@@ -711,12 +879,41 @@ impl BufferFlusher {
             .iter()
             .map(|(_, _, lba, value, hash)| (*lba, *value, *hash))
             .collect();
+
+        // Collect promote_candidates from the unit_idx values present
+        // in this chunk. Each (lba_idx, hash, dedup_entry) tuple is a
+        // confirmed candidate-source hit that we want to register
+        // into dedup_index/dedup_reverse atomically with the LBA
+        // remap. Drain `promote_candidates` so we don't re-promote
+        // the same entry on a subsequent chunk.
+        let mut chunk_unit_idxs: std::collections::HashSet<usize> =
+            chunk.iter().map(|(u, _, _, _, _)| *u).collect();
+        let mut promote_entries: Vec<(ContentHash, DedupEntry)> = Vec::new();
+        for unit_idx in chunk_unit_idxs.drain() {
+            let drained = std::mem::take(&mut prepared[unit_idx].promote_candidates);
+            for (_, hash, entry) in drained {
+                promote_entries.push((hash, entry));
+            }
+        }
+
         let hit_commit_start = Instant::now();
-        let batch_result = meta.atomic_batch_dedup_hits(vol_id, &batch_input);
+        let batch_result =
+            meta.atomic_batch_dedup_hits_with_promote(vol_id, &batch_input, &promote_entries);
         Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
 
         match batch_result {
             Ok((results, newly_zeroed)) => {
+                // Promotion landed in the persistent dedup_index — drop
+                // the now-redundant candidate slot. If promote_entries
+                // was empty (no candidate hits in this chunk) this is
+                // a no-op.
+                for (hash, _) in &promote_entries {
+                    candidate.remove_by_hash(hash);
+                }
+                metrics
+                    .dedup_promotions_committed
+                    .fetch_add(promote_entries.len() as u64, Ordering::Relaxed);
+
                 for ((unit_idx, hit_idx, lba, _, _), result) in chunk.into_iter().zip(results) {
                     match result {
                         DedupHitResult::Accepted(_) => {
@@ -743,14 +940,18 @@ impl BufferFlusher {
                 metrics
                     .dedup_hit_failures
                     .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                metrics
+                    .dedup_promotions_failed
+                    .fetch_add(promote_entries.len() as u64, Ordering::Relaxed);
                 for (unit_idx, hit_idx, _, _, _) in chunk {
                     prepared[unit_idx].is_hit[hit_idx] = false;
                 }
                 tracing::error!(
                     vol = %vol_id_str,
                     count = batch_input.len(),
+                    promotes = promote_entries.len(),
                     error = %e,
-                    "dedup worker: batch hit failed, demoting all to miss"
+                    "dedup worker: batch hit + promote commit failed, demoting all to miss"
                 );
             }
         }

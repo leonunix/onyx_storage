@@ -77,6 +77,26 @@ impl BlockmapValue {
     pub fn is_uncompressed(&self) -> bool {
         self.compression == 0
     }
+
+    /// Project this blockmap entry into a `DedupEntry`. Drops the
+    /// `flags` byte (DedupEntry has no flags field — flags are
+    /// per-LBA blockmap concerns, not per-deduplicated-content
+    /// concerns). Used by the promote-on-verified-hit path: when a
+    /// candidate-cache hit is byte-confirmed, the cached
+    /// BlockmapValue becomes the dedup_index payload for that
+    /// fingerprint.
+    pub fn to_dedup_entry(&self) -> DedupEntry {
+        DedupEntry {
+            pba: self.pba,
+            slot_offset: self.slot_offset,
+            compression: self.compression,
+            unit_compressed_size: self.unit_compressed_size,
+            unit_original_size: self.unit_original_size,
+            unit_lba_count: self.unit_lba_count,
+            offset_in_unit: self.offset_in_unit,
+            crc32: self.crc32,
+        }
+    }
 }
 
 // --- Per-volume blockmap key: just lba (8B BE) ---
@@ -141,8 +161,27 @@ pub fn decode_blockmap_value(val: &[u8]) -> Option<BlockmapValue> {
     })
 }
 
-/// Content hash type for dedup (SHA-256, 32 bytes)
-pub type ContentHash = [u8; 32];
+/// Content hash type for dedup (xxh3_64, 8 bytes).
+///
+/// We do not need cryptographic strength because dedup hits are
+/// always confirmed with a bytewise read-back of the source 4 KiB
+/// block before deduplication is committed. Birthday-style collision
+/// at 1 PiB / 4 K (~ 2.7 × 10¹¹ unique blocks) is bounded to ≈ 1900
+/// pairs across the entire dataset, which the verify step makes
+/// benign.
+pub type ContentHash = [u8; 8];
+
+/// Compute the canonical 8-byte content fingerprint over a block.
+///
+/// All dedup-side code paths (flusher, dedup scanner, tests) MUST
+/// route through this helper rather than inlining a hash call so the
+/// algorithm stays consistent. Caller is responsible for passing the
+/// canonical bytes (4 KiB block payload, after decompression on the
+/// read side).
+#[inline]
+pub fn compute_content_hash(bytes: &[u8]) -> ContentHash {
+    xxhash_rust::xxh3::xxh3_64(bytes).to_be_bytes()
+}
 
 /// Dedup index value: physical location info for a deduplicated block.
 /// Stored in CF_DEDUP_INDEX with key = ContentHash.
@@ -208,22 +247,22 @@ pub fn decode_dedup_entry(val: &[u8]) -> Option<DedupEntry> {
     })
 }
 
-/// Encode dedup reverse key: pba(8B) + content_hash(32B) = 40B
-pub fn encode_dedup_reverse_key(pba: Pba, hash: &ContentHash) -> [u8; 40] {
-    let mut key = [0u8; 40];
+/// Encode dedup reverse key: pba(8B) + content_hash(8B) = 16B
+pub fn encode_dedup_reverse_key(pba: Pba, hash: &ContentHash) -> [u8; 16] {
+    let mut key = [0u8; 16];
     key[0..8].copy_from_slice(&pba.0.to_be_bytes());
-    key[8..40].copy_from_slice(hash);
+    key[8..16].copy_from_slice(hash);
     key
 }
 
-/// Decode dedup reverse key (40B) → (pba, hash)
+/// Decode dedup reverse key (16B) → (pba, hash)
 pub fn decode_dedup_reverse_key(key: &[u8]) -> Option<(Pba, ContentHash)> {
-    if key.len() != 40 {
+    if key.len() != 16 {
         return None;
     }
     let pba = Pba(u64::from_be_bytes(key[0..8].try_into().unwrap()));
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&key[8..40]);
+    let mut hash = [0u8; 8];
+    hash.copy_from_slice(&key[8..16]);
     Some((pba, hash))
 }
 

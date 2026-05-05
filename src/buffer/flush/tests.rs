@@ -150,22 +150,11 @@ fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
     }
 }
 
-fn drain_dedup_registrations(
-    meta: &MetaStore,
-    metrics: &EngineMetrics,
-    rx: &Receiver<Vec<DedupRegistration>>,
-) {
-    for registrations in rx.try_iter() {
-        BufferFlusher::persist_dedup_registrations(meta, metrics, registrations);
-    }
-}
-
 #[test]
 fn old_write_unit_can_overwrite_newer_committed_mapping() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let newer = make_unit(0x33, 2);
     pool.note_latest_lba_seq_for_test("flush-race", Lba(0), 2, 1);
@@ -179,7 +168,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -194,7 +183,7 @@ fn old_write_unit_can_overwrite_newer_committed_mapping() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -213,7 +202,6 @@ fn raw_passthrough_unit_maps_each_lba_to_its_own_pba() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let unit = make_raw_unit_at(100, 4, 0x40, 10);
     pool.note_latest_lba_seq_for_test("flush-race", Lba(100), 10, 1);
@@ -231,7 +219,7 @@ fn raw_passthrough_unit_maps_each_lba_to_its_own_pba() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -277,7 +265,6 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let unit = make_raw_unit_at(200, 4, 0x60, 20);
     pool.note_latest_lba_seq_for_test("flush-race", Lba(200), 20, 1);
@@ -295,7 +282,7 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -315,14 +302,14 @@ fn raw_passthrough_unit_frees_unreferenced_blocks() {
 }
 
 #[test]
-fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
+fn write_unit_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let payload = vec![0x5A; BLOCK_SIZE as usize];
-    let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
     let seq = pool.append("flush-race", Lba(0), 1, &payload, 1).unwrap();
     let mut unit = make_unit(0x5A, seq);
     unit.block_hashes = Some(vec![hash]);
@@ -337,7 +324,7 @@ fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &candidate,
     )
     .unwrap();
 
@@ -345,24 +332,30 @@ fn write_unit_enqueues_dedup_registration_after_mapping_commit() {
         .get_mapping(&VolumeId("flush-race".into()), Lba(0))
         .unwrap()
         .unwrap();
+    // Promote-on-verified-hit invariant: dedup_index is only written
+    // after a candidate hit is byte-confirmed by LV3 verify, so a
+    // first-occurrence write leaves dedup_index empty.
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "dedup miss registration is kept off the foreground mapping commit"
+        "first-occurrence misses must not write dedup_index"
     );
-    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
-    let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
-    assert_eq!(dedup.to_blockmap_value(), mapping);
+    // Instead, the (hash, blockmap) lands in the RAM candidate cache.
+    assert_eq!(
+        candidate.lookup(&hash),
+        Some(mapping),
+        "first occurrence must register the (hash, blockmap) pair in the candidate cache"
+    );
 }
 
 #[test]
-fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
+fn write_packed_slot_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let payload = vec![0x6B; BLOCK_SIZE as usize];
-    let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
     let seq = pool.append("flush-race", Lba(0), 1, &payload, 1).unwrap();
     let mut unit = make_packed_unit(0x6B, seq);
     unit.block_hashes = Some(vec![hash]);
@@ -387,7 +380,7 @@ fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &candidate,
     )
     .unwrap();
 
@@ -397,26 +390,28 @@ fn write_packed_slot_enqueues_dedup_registration_after_mapping_commit() {
         .unwrap();
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "packed miss registration is kept off the foreground mapping commit"
+        "packed first-occurrence misses must not write dedup_index"
     );
-    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
-    let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
-    assert_eq!(dedup.to_blockmap_value(), mapping);
+    assert_eq!(
+        candidate.lookup(&hash),
+        Some(mapping),
+        "packed first occurrence must register (hash, blockmap) in candidate cache"
+    );
 }
 
 #[test]
-fn write_packed_slots_batch_enqueues_dedup_registration_after_mapping_commit() {
+fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
 
     let mut sealed_slots = Vec::new();
     let mut expected = Vec::new();
     for (idx, lba) in [10_u64, 20_u64].into_iter().enumerate() {
         let fill = 0x70 + idx as u8;
         let payload = vec![fill; BLOCK_SIZE as usize];
-        let hash: ContentHash = *blake3::hash(&payload).as_bytes();
+        let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
         let seq = pool.append("flush-race", Lba(lba), 1, &payload, 1).unwrap();
         let mut unit = make_packed_unit_at(fill, seq, lba);
         unit.block_hashes = Some(vec![hash]);
@@ -443,26 +438,29 @@ fn write_packed_slots_batch_enqueues_dedup_registration_after_mapping_commit() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &candidate,
         DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
     );
     assert!(results.into_iter().all(|result| result.is_ok()));
 
-    for (hash, _) in &expected {
-        assert!(
-            meta.get_dedup_entry(hash).unwrap().is_none(),
-            "packed batch registration is kept off foreground mapping commits"
-        );
-    }
-    drain_dedup_registrations(&meta, &metrics, &dedup_register_rx);
-
-    for (hash, lba) in expected {
+    // Promote-on-verified-hit: dedup_index stays empty after a fresh
+    // batch; the (hash, blockmap) pairs land only in the candidate
+    // cache and are promoted later when the dedup worker confirms a
+    // duplicate via LV3 verify.
+    for (hash, lba) in &expected {
         let mapping = meta
-            .get_mapping(&VolumeId("flush-race".into()), lba)
+            .get_mapping(&VolumeId("flush-race".into()), *lba)
             .unwrap()
             .unwrap();
-        let dedup = meta.get_dedup_entry(&hash).unwrap().unwrap();
-        assert_eq!(dedup.to_blockmap_value(), mapping);
+        assert!(
+            meta.get_dedup_entry(hash).unwrap().is_none(),
+            "packed batch first-occurrence misses must not write dedup_index"
+        );
+        assert_eq!(
+            candidate.lookup(hash),
+            Some(mapping),
+            "packed batch first occurrence must register (hash, blockmap) in candidate cache"
+        );
     }
 }
 
@@ -471,7 +469,6 @@ fn write_packed_slots_batch_splits_oversized_metadata_commits() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let slot_count = 270usize;
     let lbas_per_slot = 1024u32;
@@ -522,7 +519,7 @@ fn write_packed_slots_batch_splits_oversized_metadata_commits() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
         DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
     );
     assert!(results.into_iter().all(|result| result.is_ok()));
@@ -536,11 +533,6 @@ fn write_packed_slots_batch_splits_oversized_metadata_commits() {
     assert!(
         after.wal_batch_bytes_max < 16 * 1024 * 1024,
         "split commits must stay under the WAL body hard limit"
-    );
-
-    assert!(
-        dedup_register_rx.try_recv().is_err(),
-        "this regression isolates foreground L2P commit splitting, not background dedup registration"
     );
 
     for &idx in &[0usize, 131_000, total_lbas - 1] {
@@ -562,7 +554,6 @@ fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let seq = pool
         .append("flush-race", Lba(0), 1, &vec![0x44; BLOCK_SIZE as usize], 1)
@@ -608,7 +599,7 @@ fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
         &io_engine,
         &metrics,
         &cleanup_tx,
-        &dedup_register_tx,
+        &crate::dedup::CandidateCache::new(8, 64),
     )
     .unwrap();
 
@@ -622,55 +613,6 @@ fn packed_slot_flush_survives_already_freed_old_pba_cleanup() {
     assert!(
         pool.pending_entry_arc(seq).is_none(),
         "post-commit cleanup drift must not leave the seq stuck in the buffer"
-    );
-}
-
-#[test]
-fn stale_async_dedup_registration_is_dropped() {
-    let (meta, _pool, _lifecycle, _allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
-        setup_flush_test_env();
-    let vol = VolumeId("flush-race".into());
-    let hash: ContentHash = [0xA5; 32];
-    let pba = Pba(100);
-    let expected = BlockmapValue {
-        pba,
-        compression: 0,
-        unit_compressed_size: BLOCK_SIZE,
-        unit_original_size: BLOCK_SIZE,
-        unit_lba_count: 1,
-        offset_in_unit: 0,
-        crc32: 0xCAFE_BABE,
-        slot_offset: 0,
-        flags: 0,
-    };
-
-    meta.put_mapping(&vol, Lba(0), &expected).unwrap();
-    meta.set_refcount(pba, 1).unwrap();
-    meta.put_mapping(
-        &vol,
-        Lba(0),
-        &BlockmapValue {
-            pba: Pba(101),
-            crc32: 0xDEAD_BEEF,
-            ..expected
-        },
-    )
-    .unwrap();
-
-    BufferFlusher::persist_dedup_registrations(
-        &meta,
-        &metrics,
-        vec![BufferFlusher::dedup_registration(
-            vol,
-            Lba(0),
-            hash,
-            expected,
-        )],
-    );
-
-    assert!(
-        meta.get_dedup_entry(&hash).unwrap().is_none(),
-        "background registration must not publish stale mappings"
     );
 }
 
@@ -704,9 +646,9 @@ fn dedup_hit_cleanup_deduplicates_repeated_old_pbas() {
     meta.set_refcount(new_pba, 8).unwrap();
 
     // Each LBA needs a dedup_reverse entry for the guard to accept the hit.
-    let hash_0: ContentHash = [0x01; 32];
-    let hash_1: ContentHash = [0x02; 32];
-    let hash_2: ContentHash = [0x03; 32];
+    let hash_0: ContentHash = [0x01; 8];
+    let hash_1: ContentHash = [0x02; 8];
+    let hash_2: ContentHash = [0x03; 8];
     meta.put_dedup_entries(&[
         (
             hash_0,
@@ -815,7 +757,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         setup_flush_test_env();
 
     let pba = allocator.allocate_one_for_lane(0).unwrap();
-    let hash: ContentHash = [0xAB; 32];
+    let hash: ContentHash = [0xAB; 8];
     meta.put_dedup_entries(&[(
         hash,
         DedupEntry {
@@ -845,6 +787,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         BufferFlusher::cleanup_dead_pba_post_commit(
             &meta_scanner,
             &allocator_scanner,
+            &crate::dedup::CandidateCache::new(8, 64),
             pba,
             1,
             "dedup_scanner_cleanup",
@@ -858,6 +801,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
     BufferFlusher::cleanup_dead_pba_post_commit(
         &meta,
         &allocator,
+        &crate::dedup::CandidateCache::new(8, 64),
         pba,
         1,
         "dedup_worker_hit_cleanup",
@@ -916,7 +860,6 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     let (tx, rx) = bounded::<CompressedUnit>(64);
     let (done_tx, done_rx) = unbounded::<Vec<u64>>();
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
 
     let running_w = running.clone();
     let pool_w = pool.clone();
@@ -926,7 +869,6 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     let io_engine_w = io_engine.clone();
     let metrics_w = metrics.clone();
     let cleanup_tx_w = cleanup_tx.clone();
-    let dedup_register_tx_w = dedup_register_tx.clone();
 
     let handle = thread::spawn(move || {
         let mut packer = Packer::new_with_lane(allocator_w.clone(), 0);
@@ -944,7 +886,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &mut packer,
             &metrics_w,
             &cleanup_tx_w,
-            &dedup_register_tx_w,
+            &crate::dedup::CandidateCache::new(8, 64),
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
         );
     });
@@ -1038,7 +980,7 @@ fn dedup_worker_batches_hits_across_units() {
     pool.durable_seq_handle().store(u64::MAX, Ordering::Release);
 
     let source = vec![0x7Bu8; BLOCK_SIZE as usize];
-    let hash: ContentHash = *blake3::hash(&source).as_bytes();
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&source);
     let target = BlockmapValue {
         pba: Pba(77),
         compression: 0,
@@ -1095,6 +1037,7 @@ fn dedup_worker_batches_hits_across_units() {
     }
     drop(dedup_tx);
 
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
     BufferFlusher::dedup_loop(
         0,
         &dedup_rx,
@@ -1109,6 +1052,10 @@ fn dedup_worker_batches_hits_across_units() {
         0,
         &metrics,
         &cleanup_tx,
+        &candidate,
+        // No verify in this unit-test path: hits trust hash. Tests
+        // that need verify should construct their own ReadPool.
+        None,
     );
     drop(miss_tx);
 
@@ -1470,7 +1417,7 @@ fn packed_slot_refcount_with_dedup_and_overwrite() {
 
     // --- Step 2: Dedup hits map 16 additional LBAs to the same packed PBA ---
     // Register dedup_reverse entries so the guard passes
-    let dedup_hashes: Vec<ContentHash> = (0u8..16).map(|i| [i + 100; 32]).collect();
+    let dedup_hashes: Vec<ContentHash> = (0u8..16).map(|i| [i + 100; 8]).collect();
     let dedup_entries: Vec<(ContentHash, DedupEntry)> = dedup_hashes
         .iter()
         .enumerate()
@@ -1740,7 +1687,7 @@ fn packed_slot_concurrent_dedup_refcount_drift() {
         // Register dedup entries so dedup hits work
         let hashes: Vec<ContentHash> = (0..8u8)
             .map(|i| {
-                let mut h = [0u8; 32];
+                let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
                 h
@@ -1779,7 +1726,7 @@ fn packed_slot_concurrent_dedup_refcount_drift() {
 
                 let hashes: Vec<ContentHash> = (0..4u8)
                     .map(|i| {
-                        let mut h = [0u8; 32];
+                        let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
                         h
@@ -1924,7 +1871,6 @@ fn packed_slot_full_pipeline_concurrent_drift() {
     let vol_id = "flush-race";
     let vol = VolumeId(vol_id.into());
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
     let found_drift = AtomicBool::new(false);
     let barrier = Barrier::new(2);
     let rounds = 500;
@@ -1937,7 +1883,6 @@ fn packed_slot_full_pipeline_concurrent_drift() {
         let io_engine1 = &io_engine;
         let metrics1 = &metrics;
         let cleanup_tx1 = &cleanup_tx;
-        let dedup_register_tx1 = &dedup_register_tx;
         let barrier1 = &barrier;
         let vol1 = &vol;
 
@@ -1999,7 +1944,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
                     io_engine1,
                     metrics1,
                     cleanup_tx1,
-                    dedup_register_tx1,
+                    &crate::dedup::CandidateCache::new(8, 64),
                 );
             }
         });
@@ -2203,7 +2148,7 @@ fn packed_slot_full_chain_no_premature_free() {
     assert_eq!(meta.get_refcount(packed_pba).unwrap(), 8);
 
     // Step 2: dedup hits add 4 more refs
-    let dedup_hashes: Vec<ContentHash> = (0u8..4).map(|i| [i + 50; 32]).collect();
+    let dedup_hashes: Vec<ContentHash> = (0u8..4).map(|i| [i + 50; 8]).collect();
     let dedup_entries: Vec<(ContentHash, DedupEntry)> = dedup_hashes
         .iter()
         .enumerate()
@@ -2305,7 +2250,6 @@ fn packed_slot_overlapping_lba_race() {
 
     let vol_id = "flush-race";
     let (cleanup_tx, _cleanup_rx) = unbounded::<Vec<(Pba, u32)>>();
-    let (dedup_register_tx, _dedup_register_rx) = unbounded::<Vec<DedupRegistration>>();
     let found_drift = AtomicBool::new(false);
     let rounds = 1000;
 
@@ -2394,7 +2338,7 @@ fn packed_slot_overlapping_lba_race() {
                         &io_engine,
                         &metrics,
                         &cleanup_tx,
-                        &dedup_register_tx,
+                        &crate::dedup::CandidateCache::new(8, 64),
                     );
                 });
             }
@@ -2642,7 +2586,14 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
         );
 
         // Step 4: Cleanup and free
-        BufferFlusher::cleanup_dead_pba_post_commit(&meta, &allocator, pba, 1, "recycle_test");
+        BufferFlusher::cleanup_dead_pba_post_commit(
+            &meta,
+            &allocator,
+            &crate::dedup::CandidateCache::new(8, 64),
+            pba,
+            1,
+            "recycle_test",
+        );
 
         // Step 5: Reallocate — might get the same PBA back
         let new_pba = match allocator.allocate_one_for_lane(0) {
@@ -2725,10 +2676,10 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
         // Register dedup entries
         let entries: Vec<(ContentHash, DedupEntry)> = (0..8u8)
             .map(|i| {
-                let mut h = [0u8; 32];
+                let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
-                h[31] = 0xFE; // marker
+                // marker
                 (
                     h,
                     DedupEntry {
@@ -2758,10 +2709,10 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
 
                 let hashes: Vec<ContentHash> = (0..2u8)
                     .map(|i| {
-                        let mut h = [0u8; 32];
+                        let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
-                        h[31] = 0xFE;
+
                         h
                     })
                     .collect();
@@ -2833,6 +2784,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
                             meta,
                             allocator,
+                            &crate::dedup::CandidateCache::new(8, 64),
                             *dead_pba,
                             *blocks,
                             "concurrent_test_overwrite",
@@ -2882,6 +2834,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
                             meta,
                             allocator,
+                            &crate::dedup::CandidateCache::new(8, 64),
                             *dead_pba,
                             *blocks,
                             "concurrent_test_overwrite_c",
@@ -3037,6 +2990,7 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
                                 allocator,
+                                &crate::dedup::CandidateCache::new(8, 64),
                                 *dead_pba,
                                 *blocks,
                                 "lifecycle_test",
@@ -3147,7 +3101,14 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
     );
 
     // Step 3: Cleanup frees PBA A
-    BufferFlusher::cleanup_dead_pba_post_commit(&meta, &allocator, pba_a, 1, "dup_flush_test");
+    BufferFlusher::cleanup_dead_pba_post_commit(
+        &meta,
+        &allocator,
+        &crate::dedup::CandidateCache::new(8, 64),
+        pba_a,
+        1,
+        "dup_flush_test",
+    );
     assert!(allocator.is_free(pba_a), "PBA A should be free now");
 
     // Step 4: Reallocate — should get PBA A back (FIFO-ish)
@@ -3248,10 +3209,10 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
         meta.atomic_batch_write_packed(&batch, pba, 8).unwrap();
         let entries: Vec<(ContentHash, DedupEntry)> = (0..8u8)
             .map(|i| {
-                let mut h = [0u8; 32];
+                let mut h = [0u8; 8];
                 h[0] = idx as u8;
                 h[1] = i;
-                h[31] = 0xAA;
+
                 (
                     h,
                     DedupEntry {
@@ -3347,6 +3308,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
                                 meta,
                                 allocator,
+                                &crate::dedup::CandidateCache::new(8, 64),
                                 *dead_pba,
                                 *blocks,
                                 "pressure_test",
@@ -3366,10 +3328,10 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                 let base_lba = lba_counter.fetch_add(2, Ordering::Relaxed);
                 let hashes: Vec<ContentHash> = (0..2u8)
                     .map(|i| {
-                        let mut h = [0u8; 32];
+                        let mut h = [0u8; 8];
                         h[0] = pba_idx as u8;
                         h[1] = i;
-                        h[31] = 0xAA;
+
                         h
                     })
                     .collect();

@@ -591,43 +591,6 @@ impl MetadbBackend {
         Ok(())
     }
 
-    pub(crate) fn put_dedup_entries_guarded(
-        &self,
-        entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        if entries.len() > DEDUP_PERSIST_BATCH_LIMIT {
-            for chunk in entries.chunks(DEDUP_PERSIST_BATCH_LIMIT) {
-                self.put_dedup_entries_guarded(chunk)?;
-            }
-            return Ok(());
-        }
-
-        let mut tx = self.db.begin();
-        for (hash, entry) in entries {
-            tx.put_dedup_guarded(*hash, to_dedup_value(entry), to_metadb_pba(entry.pba), 1);
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn dedup_registration_is_current(
-        &self,
-        vol_id: &VolumeId,
-        lba: Lba,
-        expected: &BlockmapValue,
-    ) -> OnyxResult<bool> {
-        let Some(current) = self.get_mapping(vol_id, lba)? else {
-            return Ok(false);
-        };
-        if current != *expected {
-            return Ok(false);
-        }
-        Ok(self.get_refcount(expected.pba)? > 0)
-    }
-
     pub(crate) fn delete_dedup_index(&self, hash: &ContentHash) -> OnyxResult<()> {
         let mut tx = self.db.begin();
         if let Some(entry) = self.db.get_dedup(hash)? {
@@ -709,6 +672,40 @@ impl MetadbBackend {
             }
             scan_result?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn scan_blockmap_range(
+        &self,
+        vol_id: &VolumeId,
+        start_lba: Lba,
+        count: u64,
+        callback: &mut dyn FnMut(Lba, BlockmapValue),
+    ) -> OnyxResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let ord = self.volume_ordinal(vol_id)?;
+        let end = start_lba.0.saturating_add(count);
+        let mut decode_error = None;
+        let scan_result =
+            self.db
+                .scan_range_unordered_chunked(ord, start_lba.0, end, count, |lba, value| {
+                    match decode_l2p_value(value) {
+                        Ok(decoded) => callback(Lba(lba), decoded),
+                        Err(err) => {
+                            decode_error = Some(err);
+                            return Err(onyx_metadb::MetaDbError::Corruption(
+                                "onyx blockmap decode failed".into(),
+                            ));
+                        }
+                    }
+                    Ok(())
+                });
+        if let Some(err) = decode_error {
+            return Err(err);
+        }
+        scan_result?;
         Ok(())
     }
 
@@ -889,7 +886,16 @@ impl MetadbBackend {
         vol_id: &VolumeId,
         hits: &[(Lba, BlockmapValue, ContentHash)],
     ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
-        if hits.is_empty() {
+        self.atomic_batch_dedup_hits_with_promote(vol_id, hits, &[])
+    }
+
+    pub(crate) fn atomic_batch_dedup_hits_with_promote(
+        &self,
+        vol_id: &VolumeId,
+        hits: &[(Lba, BlockmapValue, ContentHash)],
+        promote_entries: &[(ContentHash, DedupEntry)],
+    ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
+        if hits.is_empty() && promote_entries.is_empty() {
             return Ok((Vec::new(), HashMap::new()));
         }
         let ord = self.volume_ordinal(vol_id)?;
@@ -901,6 +907,13 @@ impl MetadbBackend {
                 to_l2p_value(value),
                 Some((to_metadb_pba(value.pba), 1)),
             );
+        }
+        // Promote candidate-cache hits into the persistent dedup
+        // tables. Atomic with the LBA remaps: if the commit succeeds,
+        // both happen; if it fails, neither.
+        for (hash, entry) in promote_entries {
+            tx.put_dedup(*hash, to_dedup_value(entry));
+            tx.register_dedup_reverse(to_metadb_pba(entry.pba), *hash);
         }
         let (_, outcomes) = tx.commit_with_outcomes()?;
         dedup_hit_results_from_remaps(hits, outcomes)
@@ -1230,7 +1243,14 @@ fn dedup_hit_results_from_remaps(
     hits: &[(Lba, BlockmapValue, ContentHash)],
     outcomes: Vec<ApplyOutcome>,
 ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, u32>)> {
-    if hits.len() != outcomes.len() {
+    // The atomic_batch_dedup_hits_with_promote tx queues `hits.len()`
+    // L2pRemap ops followed by 2 ops per promote entry (DedupPut +
+    // DedupReverseRegister). commit_with_outcomes returns one outcome
+    // per WAL op in submission order, so the L2pRemap outcomes are
+    // exactly the first `hits.len()` entries; promote-side outcomes
+    // (DedupPut, DedupReverseRegister) are not L2pRemap variants and
+    // do not feed back into the per-LBA hit-result decoder.
+    if outcomes.len() < hits.len() {
         return Err(OnyxError::Config(format!(
             "metadb dedup outcome length mismatch: {} hits, {} outcomes",
             hits.len(),
@@ -1240,7 +1260,7 @@ fn dedup_hit_results_from_remaps(
 
     let mut results = Vec::with_capacity(hits.len());
     let mut newly_zeroed = HashMap::new();
-    for ((_, new_value, _), outcome) in hits.iter().zip(outcomes.into_iter()) {
+    for ((_, new_value, _), outcome) in hits.iter().zip(outcomes.into_iter().take(hits.len())) {
         let ApplyOutcome::L2pRemap {
             applied,
             prev,
@@ -1566,7 +1586,7 @@ mod tests {
             .atomic_batch_write(&vol.id, &[(Lba(0), value)], 1)
             .unwrap();
 
-        let hash = [9u8; 32];
+        let hash = [9u8; 8];
         let dedup = DedupEntry {
             pba: value.pba,
             slot_offset: value.slot_offset,

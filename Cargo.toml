@@ -42,7 +42,10 @@ nix = { version = "0.29", features = ["mman", "fs", "signal"] }
 
 # integrity
 crc32fast = "1"
+# blake3 retained transitively for any consumer that still wants it; the
+# dedup hash now lives behind xxhash-rust (see meta::schema::ContentHash).
 blake3 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # lock-free atomic Arc swap (for engine hot-reload)
 arc-swap = "1"
@@ -51,6 +54,7 @@ arc-swap = "1"
 crossbeam-channel = "0.5"
 dashmap = "6"
 parking_lot = "0.12"
+lru = "0.12"
 
 # allocator
 tikv-jemallocator = { version = "0.6", optional = true }
