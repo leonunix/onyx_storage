@@ -671,10 +671,7 @@ fn delete_volume_leaves_dedup_index_hint_for_scrub() {
         .delete_volume(&VolumeId("test-vol".into()))
         .expect("delete volume should return old mappings for cleanup");
     flusher.cleanup_mappings_now(
-        &meta,
         &allocator,
-        &io_engine,
-        &onyx_storage::metrics::EngineMetrics::default(),
         &cleanups,
         "test_delete_volume_cleanup",
     );

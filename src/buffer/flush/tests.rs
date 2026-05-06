@@ -802,10 +802,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
     .unwrap();
     assert_eq!(meta.get_refcount(pba).unwrap(), 0);
 
-    let meta_scanner = meta.clone();
     let allocator_scanner = allocator.clone();
-    let io_engine_scanner = io_engine.clone();
-    let metrics_scanner = metrics.clone();
     let scanner_cleanup = RemapCleanup {
         mappings: vec![old_mapping],
         ..cleanup_for_pba(pba, 1)
@@ -818,10 +815,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         ready_tx.send(()).unwrap();
         resume_rx.recv().unwrap();
         BufferFlusher::cleanup_dead_pba_post_commit(
-            &meta_scanner,
             &allocator_scanner,
-            &io_engine_scanner,
-            &metrics_scanner,
             &crate::dedup::CandidateCache::new(8, 64),
             scanner_cleanup,
             "dedup_scanner_cleanup",
@@ -833,10 +827,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         .expect("scanner-style cleanup should reach allocator handoff");
 
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &meta,
         &allocator,
-        &io_engine,
-        &metrics,
         &crate::dedup::CandidateCache::new(8, 64),
         worker_cleanup,
         "dedup_worker_hit_cleanup",
@@ -881,10 +872,7 @@ fn dedup_cleanup_does_not_reconstruct_old_pba_for_index_delete() {
         .unwrap();
 
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &meta,
         &allocator,
-        &io_engine,
-        &metrics,
         &crate::dedup::CandidateCache::new(8, 64),
         RemapCleanup {
             mappings: vec![mapping],
@@ -910,8 +898,8 @@ fn dedup_cleanup_does_not_reconstruct_old_pba_for_index_delete() {
 }
 
 #[test]
-fn cleanup_skips_allocator_free_when_live_blockmap_ref_remains() {
-    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+fn retired_reclaimer_skips_allocator_free_when_live_blockmap_ref_remains() {
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
 
     let pba = allocator.allocate_one_for_lane(0).unwrap();
@@ -932,10 +920,7 @@ fn cleanup_skips_allocator_free_when_live_blockmap_ref_remains() {
     meta.set_refcount(pba, 0).unwrap();
 
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &meta,
         &allocator,
-        &io_engine,
-        &metrics,
         &crate::dedup::CandidateCache::new(8, 64),
         RemapCleanup {
             mappings: vec![mapping],
@@ -949,8 +934,23 @@ fn cleanup_skips_allocator_free_when_live_blockmap_ref_remains() {
         "cleanup must not return a live-referenced PBA to the allocator"
     );
     assert!(
-        !allocator.is_retired(pba),
-        "cleanup must not retire a PBA while blockmap still references it"
+        allocator.is_retired(pba),
+        "cleanup only retires the PBA; final verification belongs to GC"
+    );
+    assert_eq!(
+        crate::gc::runner::GcRunner::reclaim_retired_extents(
+            &metrics,
+            &meta,
+            &allocator,
+            16,
+            &AtomicBool::new(true),
+        ),
+        0,
+        "GC must refuse to reclaim while blockmap still references the PBA"
+    );
+    assert!(
+        !allocator.is_free(pba),
+        "live-referenced retired PBA must not be returned to allocator"
     );
 }
 
@@ -2730,10 +2730,7 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
 
         // Step 4: Cleanup retires the PBA; GC is responsible for making it reusable.
         BufferFlusher::cleanup_dead_pba_post_commit(
-            &meta,
             &allocator,
-            &io_engine,
-            &metrics,
             &crate::dedup::CandidateCache::new(8, 64),
             newly_zeroed
                 .get(&pba)
@@ -2937,10 +2934,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                 if let Ok(newly_zeroed) = result {
                     for cleanup in newly_zeroed.values() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
-                            meta,
                             allocator,
-                            &io_engine,
-                            &metrics,
                             &crate::dedup::CandidateCache::new(8, 64),
                             cleanup.clone(),
                             "concurrent_test_overwrite",
@@ -2988,10 +2982,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                 if let Ok(newly_zeroed) = result {
                     for cleanup in newly_zeroed.values() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
-                            meta,
                             allocator,
-                            &io_engine,
-                            &metrics,
                             &crate::dedup::CandidateCache::new(8, 64),
                             cleanup.clone(),
                             "concurrent_test_overwrite_c",
@@ -3147,10 +3138,7 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
                     if let Ok(newly_zeroed) = result {
                         for cleanup in newly_zeroed.values() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
-                                meta,
                                 allocator,
-                                &io_engine,
-                                &metrics,
                                 &crate::dedup::CandidateCache::new(8, 64),
                                 cleanup.clone(),
                                 "lifecycle_test",
@@ -3262,10 +3250,7 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
 
     // Step 3: Cleanup retires PBA A; GC verifies it before reuse.
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &meta,
         &allocator,
-        &io_engine,
-        &metrics,
         &crate::dedup::CandidateCache::new(8, 64),
         newly_zeroed
             .get(&pba_a)
@@ -3478,10 +3463,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                     if let Ok(newly_zeroed) = meta.atomic_batch_write_multi(&args) {
                         for cleanup in newly_zeroed.values() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
-                                meta,
                                 allocator,
-                                &io_engine,
-                                &metrics,
                                 &crate::dedup::CandidateCache::new(8, 64),
                                 cleanup.clone(),
                                 "pressure_test",

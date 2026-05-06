@@ -862,10 +862,7 @@ impl ZoneManager {
         // Step 3: return freed PBAs to allocator
         if let Some(allocator) = &self.allocator {
             BufferFlusher::cleanup_dead_pbas_batch(
-                &self.meta,
                 allocator,
-                &self.io_engine,
-                &self.metrics,
                 &self.candidate,
                 &cleanups,
                 "discard",

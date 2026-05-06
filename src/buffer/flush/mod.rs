@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,6 @@ use crate::space::extent::Extent;
 use crate::space::hazard::{PbaHazardGuard, PbaHazards};
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 
-type PbaLockKey = (usize, Pba);
 type CleanupBatch = Vec<RemapCleanup>;
 
 pub(crate) const DEFAULT_PACKED_META_BATCH_LBA_LIMIT: usize = 1024;
@@ -163,9 +162,6 @@ impl FlusherInFlightTracker {
         }
     }
 }
-
-static PBA_LOCKS: OnceLock<Mutex<HashMap<PbaLockKey, Arc<Mutex<()>>>>> = OnceLock::new();
-static PBA_CLEANING: OnceLock<Mutex<HashSet<PbaLockKey>>> = OnceLock::new();
 
 mod cleanup;
 mod failpoints;
@@ -649,10 +645,7 @@ impl BufferFlusher {
                 .expect("failed to spawn writer thread");
 
             let running_cl = running.clone();
-            let meta_cl = meta.clone();
             let allocator_cl = allocator.clone();
-            let io_engine_cl = io_engine.clone();
-            let metrics_cl = metrics.clone();
             let candidate_cl = candidate.clone();
             let cleanup_handle = thread::Builder::new()
                 .name(format!("flusher-cleanup-{}", shard_idx))
@@ -661,12 +654,9 @@ impl BufferFlusher {
                     Self::cleanup_loop(
                         shard_idx,
                         &cleanup_rx,
-                        &meta_cl,
                         &allocator_cl,
-                        &io_engine_cl,
                         &candidate_cl,
                         &running_cl,
-                        &metrics_cl,
                     );
                 })
                 .expect("failed to spawn cleanup thread");
@@ -699,18 +689,12 @@ impl BufferFlusher {
 
     pub fn cleanup_mappings_now(
         &self,
-        meta: &MetaStore,
         allocator: &SpaceAllocator,
-        io_engine: &IoEngine,
-        metrics: &EngineMetrics,
         cleanups: &[RemapCleanup],
         context: &'static str,
     ) {
         Self::cleanup_dead_pbas_batch(
-            meta,
             allocator,
-            io_engine,
-            metrics,
             &self.candidate,
             cleanups,
             context,

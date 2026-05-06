@@ -282,7 +282,7 @@ impl DedupScanner {
     }
 
     fn rescan_skipped_blocks(
-        metrics: &EngineMetrics,
+        _metrics: &EngineMetrics,
         meta: &MetaStore,
         io_engine: &IoEngine,
         allocator: &SpaceAllocator,
@@ -339,10 +339,7 @@ impl DedupScanner {
                                 meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash)?;
                             if let Some(cleanup) = decremented {
                                 BufferFlusher::cleanup_dead_pba_post_commit(
-                                    meta,
                                     allocator,
-                                    io_engine,
-                                    metrics,
                                     candidate,
                                     cleanup,
                                     "dedup_scanner_cleanup",

@@ -1,21 +1,13 @@
 use super::*;
-const CLEANUP_PBA_COMMIT_LIMIT: usize = 256;
 
 impl BufferFlusher {
-    fn meta_lock_id(meta: &MetaStore) -> usize {
-        meta as *const MetaStore as usize
-    }
-
     pub(crate) fn cleanup_dead_pba_post_commit(
-        meta: &MetaStore,
         allocator: &SpaceAllocator,
-        _io_engine: &IoEngine,
-        _metrics: &EngineMetrics,
         candidate: &crate::dedup::CandidateCache,
         cleanup: RemapCleanup,
         context: &'static str,
     ) {
-        Self::retire_dead_pbas(meta, allocator, candidate, &[cleanup], context);
+        Self::retire_dead_pbas(allocator, candidate, &[cleanup], context);
     }
 
     pub(crate) fn repair_stale_dedup_index(
@@ -56,10 +48,7 @@ impl BufferFlusher {
     /// is unsafe once a freed PBA can be reused. Foreground verify mismatch
     /// repair and the background scrubber maintain the forward cache.
     pub(crate) fn cleanup_dead_pbas_batch(
-        meta: &MetaStore,
         allocator: &SpaceAllocator,
-        _io_engine: &IoEngine,
-        _metrics: &EngineMetrics,
         candidate: &crate::dedup::CandidateCache,
         cleanups: &[RemapCleanup],
         context: &'static str,
@@ -67,17 +56,15 @@ impl BufferFlusher {
         if cleanups.is_empty() {
             return;
         }
-        Self::retire_dead_pbas(meta, allocator, candidate, cleanups, context);
+        Self::retire_dead_pbas(allocator, candidate, cleanups, context);
     }
 
     fn retire_dead_pbas(
-        meta: &MetaStore,
         allocator: &SpaceAllocator,
         candidate: &crate::dedup::CandidateCache,
         cleanups: &[RemapCleanup],
         context: &'static str,
     ) {
-        let meta_lock_id = Self::meta_lock_id(meta);
         let mut candidates_by_pba: HashMap<Pba, RemapCleanup> = HashMap::new();
         for cleanup in cleanups.iter().filter(|cleanup| cleanup.pba_freed) {
             candidates_by_pba
@@ -88,105 +75,33 @@ impl BufferFlusher {
         let mut candidates: Vec<RemapCleanup> = candidates_by_pba.into_values().collect();
         candidates.sort_unstable_by_key(|cleanup| cleanup.pba);
 
-        for candidate_chunk in candidates.chunks(CLEANUP_PBA_COMMIT_LIMIT) {
-            let mut locked = Vec::new();
-            for cleanup in candidate_chunk {
-                let pba = cleanup.pba;
-                let cleanup_lock = Self::cleanup_lock(meta_lock_id, pba);
-                let _cleanup_guard = cleanup_lock.lock().unwrap();
-                if Self::try_mark_pba_cleaning(meta_lock_id, pba) {
-                    locked.push(cleanup.clone());
-                }
-            }
-            if locked.is_empty() {
+        for cleanup in candidates {
+            if allocator.is_retired(cleanup.pba) {
                 continue;
             }
 
-            let pbas: Vec<Pba> = locked.iter().map(|cleanup| cleanup.pba).collect();
-            let refcounts = match meta.multi_get_refcounts(&pbas) {
-                Ok(refcounts) => refcounts,
-                Err(e) => {
-                    tracing::error!(
-                        count = pbas.len(),
-                        error = %e,
-                        context,
-                        "batch cleanup: failed to confirm dead PBAs; skipping chunk"
-                    );
-                    for pba in pbas {
-                        Self::unmark_pba_cleaning(meta_lock_id, pba);
-                    }
-                    continue;
-                }
+            candidate.remove_by_pba(cleanup.pba);
+
+            tracing::debug!(
+                pba = cleanup.pba.0,
+                blocks = cleanup.blocks,
+                context,
+                "cleanup_dead_pba: retired PBA for GC reclaim"
+            );
+
+            let retire_result = if cleanup.blocks <= 1 {
+                allocator.retire_one(cleanup.pba)
+            } else {
+                allocator.retire_extent(Extent::new(cleanup.pba, cleanup.blocks))
             };
-
-            for (cleanup, remaining) in locked.into_iter().zip(refcounts) {
-                if remaining != 0 {
-                    Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);
-                    continue;
-                }
-
-                let already_free = if cleanup.blocks <= 1 {
-                    allocator.is_free(cleanup.pba)
-                } else {
-                    allocator.is_extent_free(Extent::new(cleanup.pba, cleanup.blocks))
-                };
-                if already_free {
-                    Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);
-                    continue;
-                }
-
-                let cleanup_lock = Self::cleanup_lock(meta_lock_id, cleanup.pba);
-                let _cleanup_guard = cleanup_lock.lock().unwrap();
-
-                match meta.has_any_blockmap_ref_in_extent(cleanup.pba, cleanup.blocks) {
-                    Ok(true) => {
-                        tracing::error!(
-                            pba = cleanup.pba.0,
-                            blocks = cleanup.blocks,
-                            context,
-                            "cleanup_dead_pba: refcount is zero but live blockmap still references physical extent; skipping retire"
-                        );
-                        Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            pba = cleanup.pba.0,
-                            blocks = cleanup.blocks,
-                            context,
-                            error = %e,
-                            "cleanup_dead_pba: failed final live-reference scan; skipping retire"
-                        );
-                        Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);
-                        continue;
-                    }
-                }
-
-                candidate.remove_by_pba(cleanup.pba);
-
-                tracing::debug!(
+            if let Err(e) = retire_result {
+                tracing::warn!(
                     pba = cleanup.pba.0,
                     blocks = cleanup.blocks,
+                    error = %e,
                     context,
-                    "cleanup_dead_pba: retiring PBA for GC reclaim"
+                    "post-commit cleanup: allocator retire failed after metadata commit; continuing without retry"
                 );
-
-                let retire_result = if cleanup.blocks <= 1 {
-                    allocator.retire_one(cleanup.pba)
-                } else {
-                    allocator.retire_extent(Extent::new(cleanup.pba, cleanup.blocks))
-                };
-                if let Err(e) = retire_result {
-                    tracing::warn!(
-                        pba = cleanup.pba.0,
-                        blocks = cleanup.blocks,
-                        error = %e,
-                        context,
-                        "post-commit cleanup: allocator retire failed after metadata commit; continuing without retry"
-                    );
-                }
-                Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);
             }
         }
     }
@@ -196,12 +111,9 @@ impl BufferFlusher {
     pub(super) fn cleanup_loop(
         shard_idx: usize,
         rx: &Receiver<CleanupBatch>,
-        meta: &MetaStore,
         allocator: &SpaceAllocator,
-        io_engine: &IoEngine,
         candidate: &crate::dedup::CandidateCache,
         running: &AtomicBool,
-        metrics: &EngineMetrics,
     ) {
         while running.load(Ordering::Relaxed) {
             let first = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -218,18 +130,12 @@ impl BufferFlusher {
             let count = all.len();
             let start = Instant::now();
             Self::cleanup_dead_pbas_batch(
-                meta,
                 allocator,
-                io_engine,
-                metrics,
                 candidate,
                 &all,
                 "cleanup_thread",
             );
             let elapsed_ns = start.elapsed().as_nanos() as u64;
-            metrics
-                .flush_writer_cleanup_ns
-                .fetch_add(elapsed_ns, Ordering::Relaxed);
             tracing::debug!(
                 shard = shard_idx,
                 mappings = count,
@@ -244,53 +150,11 @@ impl BufferFlusher {
         }
         if !remaining.is_empty() {
             Self::cleanup_dead_pbas_batch(
-                meta,
                 allocator,
-                io_engine,
-                metrics,
                 candidate,
                 &remaining,
                 "cleanup_thread_drain",
             );
         }
-    }
-
-    pub(super) fn pba_lock(meta_lock_id: usize, pba: Pba) -> Arc<Mutex<()>> {
-        let mut locks = PBA_LOCKS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap();
-        // Prune stale entries where the map is the sole holder (strong_count == 1).
-        // Amortised: only prune when the map exceeds a reasonable threshold.
-        if locks.len() > 4096 {
-            locks.retain(|_, arc| Arc::strong_count(arc) > 1);
-        }
-        locks
-            .entry((meta_lock_id, pba))
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    pub(crate) fn cleanup_lock(meta_lock_id: usize, pba: Pba) -> Arc<Mutex<()>> {
-        Self::pba_lock(meta_lock_id, pba)
-    }
-
-    fn pba_cleaning_set() -> &'static Mutex<HashSet<PbaLockKey>> {
-        PBA_CLEANING.get_or_init(|| Mutex::new(HashSet::new()))
-    }
-
-    /// Returns true when this caller acquired cleanup ownership for `pba`.
-    fn try_mark_pba_cleaning(meta_lock_id: usize, pba: Pba) -> bool {
-        Self::pba_cleaning_set()
-            .lock()
-            .unwrap()
-            .insert((meta_lock_id, pba))
-    }
-
-    fn unmark_pba_cleaning(meta_lock_id: usize, pba: Pba) {
-        Self::pba_cleaning_set()
-            .lock()
-            .unwrap()
-            .remove(&(meta_lock_id, pba));
     }
 }

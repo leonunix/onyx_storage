@@ -805,7 +805,7 @@ impl OnyxEngine {
                 .map(|cleanup| cleanup.blocks as usize)
                 .sum();
 
-            if let (Some(allocator), Some(io_engine)) = (&self.allocator, &self.io_engine) {
+            if let Some(allocator) = &self.allocator {
                 let candidate = self
                     .flusher
                     .lock()
@@ -814,10 +814,7 @@ impl OnyxEngine {
                     .map(|flusher| flusher.candidate_cache());
                 if let Some(candidate) = candidate {
                     BufferFlusher::cleanup_dead_pbas_batch(
-                        &self.meta,
                         allocator,
-                        io_engine,
-                        &self.metrics,
                         &candidate,
                         &cleanups,
                         "volume_delete",
