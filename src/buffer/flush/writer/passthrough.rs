@@ -76,6 +76,8 @@ impl BufferFlusher {
                 return Err(e);
             }
 
+            allocator.wait_for_readers(pba, blocks_needed as u32);
+
             if let Err(e) = io_engine.write_blocks(pba, &unit.compressed_data) {
                 allocation.free(allocator)?;
                 Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
@@ -85,6 +87,7 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
             let meta_start = Instant::now();
+
             let commit = pool.with_l2p_commit_lock(
                 &unit.vol_id,
                 || -> OnyxResult<Option<(Vec<usize>, HashMap<Pba, RemapCleanup>)>> {
@@ -326,6 +329,7 @@ impl BufferFlusher {
                 if skip[i] {
                     continue;
                 }
+                allocator.wait_for_readers(pbas[i].unwrap(), alloc_blocks[i]);
                 ops.push(LvOp::Write {
                     pba: pbas[i].unwrap(),
                     payload: units[i].compressed_data.as_slice(),

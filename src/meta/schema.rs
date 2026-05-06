@@ -70,6 +70,23 @@ impl BlockmapValue {
         self.flags & FLAG_ZERO != 0
     }
 
+    pub fn physical_blocks(&self, block_size: u32) -> u32 {
+        if self.is_zero() {
+            return 0;
+        }
+        let block_size = block_size.max(1);
+        if self.slot_offset > 0 || self.unit_compressed_size < block_size {
+            1
+        } else {
+            self.unit_compressed_size.div_ceil(block_size)
+        }
+    }
+
+    pub fn physical_pbas(&self, block_size: u32) -> impl Iterator<Item = Pba> {
+        let start = self.pba.0;
+        (0..self.physical_blocks(block_size)).map(move |idx| Pba(start + idx as u64))
+    }
+
     /// On-disk read footprint for this fragment, rounded up to `block_size`.
     /// Packed fragments share a 4 KB slot, so callers always read the whole
     /// physical slot and slice the fragment out by `slot_offset`.

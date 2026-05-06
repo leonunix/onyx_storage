@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::store::MetaStore;
 use crate::space::extent::Extent;
+use crate::space::hazard::PbaHazards;
 use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
 /// Number of blocks to refill a lane cache from the global free list at once.
@@ -13,10 +14,11 @@ const LANE_CACHE_REFILL_SIZE: u32 = 256;
 /// Raw passthrough flushes commonly allocate 4-8 contiguous blocks per unit;
 /// serving those from a lane-local slice avoids hammering the global BTreeSet.
 const LANE_EXTENT_CACHE_REFILL_BLOCKS: u32 = 8192;
-
 pub struct SpaceAllocator {
     total_blocks: u64,
     free_extents: Mutex<BTreeSet<Extent>>,
+    retired_extents: Mutex<BTreeSet<Extent>>,
+    hazards: PbaHazards,
     allocated_blocks: AtomicU64,
     free_blocks: AtomicU64,
     /// Per-lane single-block caches. Each flush lane pops from its own cache
@@ -31,6 +33,10 @@ impl SpaceAllocator {
     /// Blocks 0..RESERVED_BLOCKS are reserved for superblock/heartbeat/HA lock.
     /// Allocatable space starts at PBA RESERVED_BLOCKS.
     pub fn new(device_size_bytes: u64, num_lanes: usize) -> Self {
+        Self::new_with_hazards(device_size_bytes, num_lanes)
+    }
+
+    pub fn new_with_hazards(device_size_bytes: u64, num_lanes: usize) -> Self {
         let total_blocks = device_size_bytes / BLOCK_SIZE as u64;
         let usable_blocks = total_blocks.saturating_sub(RESERVED_BLOCKS);
         let mut free_extents = BTreeSet::new();
@@ -45,6 +51,8 @@ impl SpaceAllocator {
         Self {
             total_blocks,
             free_extents: Mutex::new(free_extents),
+            retired_extents: Mutex::new(BTreeSet::new()),
+            hazards: PbaHazards::new(),
             allocated_blocks: AtomicU64::new(0),
             free_blocks: AtomicU64::new(usable_blocks),
             lane_caches,
@@ -104,6 +112,7 @@ impl SpaceAllocator {
         let free_count = usable_blocks - alloc_count;
 
         *self.free_extents.lock().unwrap() = free;
+        self.retired_extents.lock().unwrap().clear();
         self.clear_lane_caches();
         self.allocated_blocks.store(alloc_count, Ordering::Relaxed);
         self.free_blocks.store(free_count, Ordering::Relaxed);
@@ -117,6 +126,20 @@ impl SpaceAllocator {
         );
 
         Ok(())
+    }
+
+    pub fn hazards(&self) -> PbaHazards {
+        self.hazards.clone()
+    }
+
+    /// Wait until no in-flight reader currently pins this physical extent.
+    ///
+    /// Allocator free waits protect the hand-off back to the free list. Writers
+    /// also call this after allocation and before overwriting the physical
+    /// blocks, because a reader may have pinned a just-freed PBA after it was
+    /// reallocated but before the new payload is written.
+    pub fn wait_for_readers(&self, start: Pba, count: u32) {
+        self.hazards.wait_extent_clear(start, count);
     }
 
     /// Allocate a single block. Returns PBA.
@@ -216,54 +239,7 @@ impl SpaceAllocator {
     /// Returns error if the PBA is out of bounds, already free (in the global
     /// free list **or** a lane cache), or would underflow counters.
     pub fn free_one(&self, pba: Pba) -> OnyxResult<()> {
-        if pba.0 >= self.total_blocks {
-            return Err(OnyxError::Config(format!(
-                "free_one: PBA {} out of bounds (total {})",
-                pba.0, self.total_blocks
-            )));
-        }
-
-        // Check lane caches first (no global lock needed)
-        for (lane_idx, cache_mutex) in self.lane_caches.iter().enumerate() {
-            let cache = cache_mutex.lock().unwrap();
-            if cache.contains(&pba) {
-                return Err(OnyxError::Config(format!(
-                    "free_one: PBA {} is already free (in lane cache {})",
-                    pba.0, lane_idx
-                )));
-            }
-        }
-        for (lane_idx, cache_mutex) in self.lane_extent_caches.iter().enumerate() {
-            let cache = cache_mutex.lock().unwrap();
-            if cache.iter().any(|extent| extent.contains(pba)) {
-                return Err(OnyxError::Config(format!(
-                    "free_one: PBA {} is already free (in lane extent cache {})",
-                    pba.0, lane_idx
-                )));
-            }
-        }
-
-        let mut free = self.free_extents.lock().unwrap();
-
-        // Check not already free (contained in any existing free extent)
-        if let Some(e) = Self::covering_extent(&free, pba) {
-            return Err(OnyxError::Config(format!(
-                "free_one: PBA {} is already free (in extent {:?})",
-                pba.0, e
-            )));
-        }
-
-        let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
-        if current_alloc == 0 {
-            return Err(OnyxError::Config(
-                "free_one: allocated_blocks would underflow".into(),
-            ));
-        }
-
-        Self::coalesce_and_insert(&mut free, Extent::single(pba));
-        self.allocated_blocks.fetch_sub(1, Ordering::Relaxed);
-        self.free_blocks.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        self.free_extent_unchecked_ownership(Extent::single(pba))
     }
 
     /// Return true if the single block is free — either in the global free list
@@ -403,46 +379,147 @@ impl SpaceAllocator {
     /// Returns error if the extent is out of bounds, overlaps existing free space,
     /// or would underflow counters.
     pub fn free_extent(&self, extent: Extent) -> OnyxResult<()> {
-        if extent.count == 0 {
-            return Err(OnyxError::Config(
-                "free_extent: cannot free 0 blocks".into(),
-            ));
-        }
-        if extent.end_pba().0 > self.total_blocks {
+        self.free_extent_unchecked_ownership(extent)
+    }
+
+    /// Move a logically dead physical extent into the retired set.
+    ///
+    /// Retired extents are not allocatable. They become reusable only after
+    /// the GC reclaimer re-validates metadata and calls `reclaim_retired_extent`.
+    pub fn retire_one(&self, pba: Pba) -> OnyxResult<bool> {
+        self.retire_extent(Extent::single(pba))
+    }
+
+    pub fn retire_extent(&self, extent: Extent) -> OnyxResult<bool> {
+        self.validate_extent_shape(extent, "retire_extent")?;
+        self.ensure_not_in_lane_cache(extent, "retire_extent")?;
+
+        let free = self.free_extents.lock().unwrap();
+        if let Some(e) = Self::overlapping_extent(&free, extent) {
             return Err(OnyxError::Config(format!(
-                "free_extent: extent {:?} exceeds total blocks {}",
-                extent, self.total_blocks
+                "retire_extent: extent {:?} overlaps free extent {:?}",
+                extent, e
             )));
         }
 
-        for (lane_idx, cache_mutex) in self.lane_caches.iter().enumerate() {
-            let cache = cache_mutex.lock().unwrap();
-            if (0..extent.count).any(|i| cache.contains(&Pba(extent.start.0 + i as u64))) {
-                return Err(OnyxError::Config(format!(
-                    "free_extent: extent {:?} overlaps lane cache {}",
-                    extent, lane_idx
-                )));
-            }
+        let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
+        if (extent.count as u64) > current_alloc {
+            return Err(OnyxError::Config(format!(
+                "retire_extent: retiring {} blocks but only {} allocated",
+                extent.count, current_alloc
+            )));
         }
-        for (lane_idx, cache_mutex) in self.lane_extent_caches.iter().enumerate() {
-            let cache = cache_mutex.lock().unwrap();
-            if cache
-                .iter()
-                .any(|cached| Self::extents_overlap(extent, *cached))
-            {
-                return Err(OnyxError::Config(format!(
-                    "free_extent: extent {:?} overlaps lane extent cache {}",
-                    extent, lane_idx
-                )));
+
+        let mut retired = self.retired_extents.lock().unwrap();
+        let before_len = retired.len();
+        Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+        Ok(retired.len() != before_len || retired.contains(&extent))
+    }
+
+    /// Return a snapshot of retired extents for GC verification.
+    pub fn retired_candidates(&self, limit: usize) -> Vec<Extent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.retired_extents
+            .lock()
+            .unwrap()
+            .iter()
+            .take(limit)
+            .copied()
+            .collect()
+    }
+
+    pub fn is_retired(&self, pba: Pba) -> bool {
+        let retired = self.retired_extents.lock().unwrap();
+        Self::covering_extent(&retired, pba).is_some()
+    }
+
+    pub fn retired_block_count(&self) -> u64 {
+        self.retired_extents
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|extent| extent.count as u64)
+            .sum()
+    }
+
+    /// Release a retired extent into the free list after GC has proved it is
+    /// no longer referenced by metadata.
+    pub fn reclaim_retired_extent(&self, extent: Extent) -> OnyxResult<bool> {
+        self.validate_extent_shape(extent, "reclaim_retired_extent")?;
+
+        {
+            let mut retired = self.retired_extents.lock().unwrap();
+            if !retired.remove(&extent) {
+                return Ok(false);
             }
         }
 
+        let result = (|| -> OnyxResult<()> {
+            self.hazards.wait_extent_clear(extent.start, extent.count);
+            self.ensure_not_in_lane_cache(extent, "reclaim_retired_extent")?;
+
+            let mut free = self.free_extents.lock().unwrap();
+            if let Some(e) = Self::overlapping_extent(&free, extent) {
+                return Err(OnyxError::Config(format!(
+                    "reclaim_retired_extent: extent {:?} overlaps free extent {:?}",
+                    extent, e
+                )));
+            }
+            let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
+            if (extent.count as u64) > current_alloc {
+                return Err(OnyxError::Config(format!(
+                    "reclaim_retired_extent: freeing {} blocks but only {} allocated",
+                    extent.count, current_alloc
+                )));
+            }
+
+            Self::coalesce_and_insert(&mut free, extent);
+            self.allocated_blocks
+                .fetch_sub(extent.count as u64, Ordering::Relaxed);
+            self.free_blocks
+                .fetch_add(extent.count as u64, Ordering::Relaxed);
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.retired_extents.lock().unwrap().insert(extent);
+        }
+        result.map(|_| true)
+    }
+
+    fn free_extent_unchecked_ownership(&self, extent: Extent) -> OnyxResult<()> {
+        self.validate_free_extent(extent)?;
+
+        self.hazards.wait_extent_clear(extent.start, extent.count);
+
         let mut free = self.free_extents.lock().unwrap();
+        self.ensure_not_free_or_retired_after_wait(extent, &free)?;
+        Self::coalesce_and_insert(&mut free, extent);
+        self.allocated_blocks
+            .fetch_sub(extent.count as u64, Ordering::Relaxed);
+        self.free_blocks
+            .fetch_add(extent.count as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn validate_free_extent(&self, extent: Extent) -> OnyxResult<()> {
+        self.validate_extent_shape(extent, "free_extent")?;
+        self.ensure_not_in_lane_cache(extent, "free_extent")?;
+
+        let free = self.free_extents.lock().unwrap();
 
         // Check no overlap with existing free extents
         if let Some(e) = Self::overlapping_extent(&free, extent) {
             return Err(OnyxError::Config(format!(
                 "free_extent: extent {:?} overlaps free extent {:?}",
+                extent, e
+            )));
+        }
+        if let Some(e) = self.overlapping_retired_extent(extent) {
+            return Err(OnyxError::Config(format!(
+                "free_extent: extent {:?} overlaps retired extent {:?}",
                 extent, e
             )));
         }
@@ -454,12 +531,46 @@ impl SpaceAllocator {
                 extent.count, current_alloc
             )));
         }
+        Ok(())
+    }
 
-        Self::coalesce_and_insert(&mut free, extent);
-        self.allocated_blocks
-            .fetch_sub(extent.count as u64, Ordering::Relaxed);
-        self.free_blocks
-            .fetch_add(extent.count as u64, Ordering::Relaxed);
+    fn validate_extent_shape(&self, extent: Extent, context: &'static str) -> OnyxResult<()> {
+        if extent.count == 0 {
+            return Err(OnyxError::Config(format!(
+                "{context}: cannot cover 0 blocks"
+            )));
+        }
+        if extent.end_pba().0 > self.total_blocks {
+            return Err(OnyxError::Config(format!(
+                "{context}: extent {:?} exceeds total blocks {}",
+                extent, self.total_blocks
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_not_in_lane_cache(&self, extent: Extent, context: &'static str) -> OnyxResult<()> {
+        for (lane_idx, cache_mutex) in self.lane_caches.iter().enumerate() {
+            let cache = cache_mutex.lock().unwrap();
+            if (0..extent.count).any(|i| cache.contains(&Pba(extent.start.0 + i as u64))) {
+                return Err(OnyxError::Config(format!(
+                    "{context}: extent {:?} overlaps lane cache {}",
+                    extent, lane_idx
+                )));
+            }
+        }
+        for (lane_idx, cache_mutex) in self.lane_extent_caches.iter().enumerate() {
+            let cache = cache_mutex.lock().unwrap();
+            if cache
+                .iter()
+                .any(|cached| Self::extents_overlap(extent, *cached))
+            {
+                return Err(OnyxError::Config(format!(
+                    "{context}: extent {:?} overlaps lane extent cache {}",
+                    extent, lane_idx
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -524,6 +635,41 @@ impl SpaceAllocator {
         free.insert(Extent::new(Pba(merged_start), count));
     }
 
+    fn coalesce_and_insert_any_overlap(set: &mut BTreeSet<Extent>, new: Extent) {
+        let mut merged_start = new.start.0;
+        let mut merged_end = new.end_pba().0;
+
+        loop {
+            let probe = Extent::new(Pba(merged_start), 0);
+            let before = set.range(..=probe).next_back().copied();
+            if let Some(extent) = before {
+                if extent.end_pba().0 >= merged_start {
+                    merged_start = merged_start.min(extent.start.0);
+                    merged_end = merged_end.max(extent.end_pba().0);
+                    set.remove(&extent);
+                    continue;
+                }
+            }
+
+            let probe = Extent::new(Pba(merged_start), 0);
+            let after = set.range(probe..).next().copied();
+            if let Some(extent) = after {
+                if extent.start.0 <= merged_end {
+                    merged_start = merged_start.min(extent.start.0);
+                    merged_end = merged_end.max(extent.end_pba().0);
+                    set.remove(&extent);
+                    continue;
+                }
+            }
+            break;
+        }
+
+        set.insert(Extent::new(
+            Pba(merged_start),
+            (merged_end - merged_start) as u32,
+        ));
+    }
+
     fn clear_lane_caches(&self) {
         for cache in &self.lane_caches {
             cache.lock().unwrap().clear();
@@ -531,6 +677,26 @@ impl SpaceAllocator {
         for cache in &self.lane_extent_caches {
             cache.lock().unwrap().clear();
         }
+    }
+
+    fn ensure_not_free_or_retired_after_wait(
+        &self,
+        extent: Extent,
+        free: &BTreeSet<Extent>,
+    ) -> OnyxResult<()> {
+        if let Some(e) = Self::overlapping_extent(free, extent) {
+            return Err(OnyxError::Config(format!(
+                "free_extent: extent {:?} overlaps free extent {:?} after hazard wait",
+                extent, e
+            )));
+        }
+        if let Some(e) = self.overlapping_retired_extent(extent) {
+            return Err(OnyxError::Config(format!(
+                "free_extent: extent {:?} overlaps retired extent {:?} after hazard wait",
+                extent, e
+            )));
+        }
+        Ok(())
     }
 
     fn has_lane_cached_blocks(&self) -> bool {
@@ -604,5 +770,10 @@ impl SpaceAllocator {
 
     fn extents_overlap(a: Extent, b: Extent) -> bool {
         a.start.0 < b.end_pba().0 && a.end_pba().0 > b.start.0
+    }
+
+    fn overlapping_retired_extent(&self, extent: Extent) -> Option<Extent> {
+        let retired = self.retired_extents.lock().unwrap();
+        Self::overlapping_extent(&retired, extent)
     }
 }

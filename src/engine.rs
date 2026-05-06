@@ -592,7 +592,10 @@ impl OnyxEngine {
         let io_engine = Self::build_io_engine(data_dev, &config.storage, metrics.clone())?;
 
         // 3. Space allocator
-        let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
+        let allocator = Arc::new(SpaceAllocator::new_with_hazards(
+            device_size,
+            config.buffer.shards,
+        ));
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool (with shard migration if needed)
@@ -648,20 +651,17 @@ impl OnyxEngine {
             None
         };
 
-        // 10. GC runner (after flusher; rewrites dead blocks back to buffer)
-        let gc_runner = if config.gc.enabled {
-            Some(GcRunner::start_with_metrics(
-                metrics.clone(),
-                meta.clone(),
-                io_engine.clone(),
-                buffer_pool.clone(),
-                lifecycle.clone(),
-                allocator.clone(),
-                config.gc.clone(),
-            ))
-        } else {
-            None
-        };
+        // 10. GC runner (after flusher). It always runs the physical
+        // retired-PBA reclaimer; `gc.enabled` only gates rewrite scanning.
+        let gc_runner = Some(GcRunner::start_with_metrics(
+            metrics.clone(),
+            meta.clone(),
+            io_engine.clone(),
+            buffer_pool.clone(),
+            lifecycle.clone(),
+            allocator.clone(),
+            config.gc.clone(),
+        ));
 
         // 11. Heartbeat writer (after all other subsystems)
         let heartbeat_writer = if config.ha.enabled {
@@ -1088,7 +1088,10 @@ impl OnyxEngine {
         let io_engine = Self::build_io_engine(data_dev, &config.storage, metrics.clone())?;
 
         // Space allocator
-        let allocator = Arc::new(SpaceAllocator::new(device_size, config.buffer.shards));
+        let allocator = Arc::new(SpaceAllocator::new_with_hazards(
+            device_size,
+            config.buffer.shards,
+        ));
         allocator.rebuild_from_metadata(&meta)?;
 
         // Write buffer pool (with shard migration if needed)
@@ -1144,20 +1147,17 @@ impl OnyxEngine {
             None
         };
 
-        // GC runner
-        let gc_runner = if config.gc.enabled {
-            Some(GcRunner::start_with_metrics(
-                metrics.clone(),
-                meta.clone(),
-                io_engine.clone(),
-                buffer_pool.clone(),
-                lifecycle.clone(),
-                allocator.clone(),
-                config.gc.clone(),
-            ))
-        } else {
-            None
-        };
+        // GC runner. It always runs the physical retired-PBA reclaimer;
+        // `gc.enabled` only gates rewrite scanning.
+        let gc_runner = Some(GcRunner::start_with_metrics(
+            metrics.clone(),
+            meta.clone(),
+            io_engine.clone(),
+            buffer_pool.clone(),
+            lifecycle.clone(),
+            allocator.clone(),
+            config.gc.clone(),
+        ));
 
         // Heartbeat writer
         let heartbeat_writer = if config.ha.enabled {

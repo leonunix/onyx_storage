@@ -15,7 +15,7 @@ impl BufferFlusher {
         cleanup: RemapCleanup,
         context: &'static str,
     ) {
-        Self::free_dead_pbas(meta, allocator, candidate, &[cleanup], context);
+        Self::retire_dead_pbas(meta, allocator, candidate, &[cleanup], context);
     }
 
     pub(crate) fn repair_stale_dedup_index(
@@ -67,10 +67,10 @@ impl BufferFlusher {
         if cleanups.is_empty() {
             return;
         }
-        Self::free_dead_pbas(meta, allocator, candidate, cleanups, context);
+        Self::retire_dead_pbas(meta, allocator, candidate, cleanups, context);
     }
 
-    fn free_dead_pbas(
+    fn retire_dead_pbas(
         meta: &MetaStore,
         allocator: &SpaceAllocator,
         candidate: &crate::dedup::CandidateCache,
@@ -135,32 +135,55 @@ impl BufferFlusher {
                     continue;
                 }
 
-                candidate.remove_by_pba(cleanup.pba);
-
                 let cleanup_lock = Self::cleanup_lock(meta_lock_id, cleanup.pba);
                 let _cleanup_guard = cleanup_lock.lock().unwrap();
-                #[cfg(test)]
-                CLEANUP_FREE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+
+                match meta.has_any_blockmap_ref_in_extent(cleanup.pba, cleanup.blocks) {
+                    Ok(true) => {
+                        tracing::error!(
+                            pba = cleanup.pba.0,
+                            blocks = cleanup.blocks,
+                            context,
+                            "cleanup_dead_pba: refcount is zero but live blockmap still references physical extent; skipping retire"
+                        );
+                        Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            pba = cleanup.pba.0,
+                            blocks = cleanup.blocks,
+                            context,
+                            error = %e,
+                            "cleanup_dead_pba: failed final live-reference scan; skipping retire"
+                        );
+                        Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);
+                        continue;
+                    }
+                }
+
+                candidate.remove_by_pba(cleanup.pba);
 
                 tracing::debug!(
                     pba = cleanup.pba.0,
                     blocks = cleanup.blocks,
                     context,
-                    "cleanup_dead_pba: freeing PBA to allocator"
+                    "cleanup_dead_pba: retiring PBA for GC reclaim"
                 );
 
-                let free_result = if cleanup.blocks <= 1 {
-                    allocator.free_one(cleanup.pba)
+                let retire_result = if cleanup.blocks <= 1 {
+                    allocator.retire_one(cleanup.pba)
                 } else {
-                    allocator.free_extent(Extent::new(cleanup.pba, cleanup.blocks))
+                    allocator.retire_extent(Extent::new(cleanup.pba, cleanup.blocks))
                 };
-                if let Err(e) = free_result {
+                if let Err(e) = retire_result {
                     tracing::warn!(
                         pba = cleanup.pba.0,
                         blocks = cleanup.blocks,
                         error = %e,
                         context,
-                        "post-commit cleanup: allocator free failed after metadata commit (benign if already freed by another path); continuing without retry"
+                        "post-commit cleanup: allocator retire failed after metadata commit; continuing without retry"
                     );
                 }
                 Self::unmark_pba_cleaning(meta_lock_id, cleanup.pba);

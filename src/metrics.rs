@@ -259,6 +259,7 @@ pub struct EngineMetrics {
     pub gc_candidates_found: AtomicU64,
     pub gc_rewrite_attempts: AtomicU64,
     pub gc_blocks_rewritten: AtomicU64,
+    pub gc_retired_blocks_reclaimed: AtomicU64,
     pub gc_errors: AtomicU64,
     pub dedup_rescan_cycles: AtomicU64,
     pub dedup_rescan_skipped_cycles: AtomicU64,
@@ -482,6 +483,7 @@ impl Default for EngineMetrics {
             gc_candidates_found: AtomicU64::new(0),
             gc_rewrite_attempts: AtomicU64::new(0),
             gc_blocks_rewritten: AtomicU64::new(0),
+            gc_retired_blocks_reclaimed: AtomicU64::new(0),
             gc_errors: AtomicU64::new(0),
             dedup_rescan_cycles: AtomicU64::new(0),
             dedup_rescan_skipped_cycles: AtomicU64::new(0),
@@ -649,6 +651,7 @@ impl EngineMetrics {
             gc_candidates_found: load(&self.gc_candidates_found),
             gc_rewrite_attempts: load(&self.gc_rewrite_attempts),
             gc_blocks_rewritten: load(&self.gc_blocks_rewritten),
+            gc_retired_blocks_reclaimed: load(&self.gc_retired_blocks_reclaimed),
             gc_errors: load(&self.gc_errors),
             dedup_rescan_cycles: load(&self.dedup_rescan_cycles),
             dedup_rescan_skipped_cycles: load(&self.dedup_rescan_skipped_cycles),
@@ -800,6 +803,7 @@ pub struct EngineMetricsSnapshot {
     pub gc_candidates_found: u64,
     pub gc_rewrite_attempts: u64,
     pub gc_blocks_rewritten: u64,
+    pub gc_retired_blocks_reclaimed: u64,
     pub gc_errors: u64,
     pub dedup_rescan_cycles: u64,
     pub dedup_rescan_skipped_cycles: u64,
@@ -984,6 +988,7 @@ impl EngineMetricsSnapshot {
             gc_candidates_found,
             gc_rewrite_attempts,
             gc_blocks_rewritten,
+            gc_retired_blocks_reclaimed,
             gc_errors,
             dedup_rescan_cycles,
             dedup_rescan_skipped_cycles,
@@ -1194,6 +1199,10 @@ pub struct MetaMemorySnapshot {
     pub flush_reclaim_us: u64,
     pub flush_reclaim_max_us: u64,
     pub flush_pages_written: u64,
+    pub flush_reclaim_budget_pages: u64,
+    pub flush_reclaim_selected_pages: u64,
+    pub flush_reclaim_reclaimed_pages: u64,
+    pub flush_reclaim_blocked_pages: u64,
     // Diagnostic in-memory growth counters. Each is a `len()` of an
     // unbounded structure that should drain regularly; runaway growth
     // here is the signature of a stuck consumer / reclaim path.
@@ -1394,6 +1403,10 @@ impl MetaMemorySnapshot {
             flush_reclaim_us: sub!(flush_reclaim_us),
             flush_reclaim_max_us: self.flush_reclaim_max_us,
             flush_pages_written: sub!(flush_pages_written),
+            flush_reclaim_budget_pages: sub!(flush_reclaim_budget_pages),
+            flush_reclaim_selected_pages: sub!(flush_reclaim_selected_pages),
+            flush_reclaim_reclaimed_pages: sub!(flush_reclaim_reclaimed_pages),
+            flush_reclaim_blocked_pages: sub!(flush_reclaim_blocked_pages),
             pending_dispatch: self.pending_dispatch,
             pending_deferred_free: self.pending_deferred_free,
             pending_dedup_lane_queue: self.pending_dedup_lane_queue,
@@ -1589,6 +1602,10 @@ impl MetaMemorySnapshot {
             flush_reclaim_us: meta.flush_reclaim_us,
             flush_reclaim_max_us: meta.flush_reclaim_max_us,
             flush_pages_written: meta.flush_pages_written,
+            flush_reclaim_budget_pages: meta.flush_reclaim_budget_pages,
+            flush_reclaim_selected_pages: meta.flush_reclaim_selected_pages,
+            flush_reclaim_reclaimed_pages: meta.flush_reclaim_reclaimed_pages,
+            flush_reclaim_blocked_pages: meta.flush_reclaim_blocked_pages,
             pending_dispatch: pending.dispatch_pending as u64,
             pending_deferred_free: pending.deferred_free as u64,
             pending_dedup_lane_queue: pending.dedup_lane_queue as u64,
@@ -1721,7 +1738,7 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_flush: calls={} pages={} total_us={} max_us={} gate_us={} gate_max_us={} sample_us={} sample_max_us={} io_us={} io_max_us={} manifest_us={} manifest_max_us={} install_us={} install_max_us={} reclaim_us={} reclaim_max_us={}",
+                "metadb_flush: calls={} pages={} total_us={} max_us={} gate_us={} gate_max_us={} sample_us={} sample_max_us={} io_us={} io_max_us={} manifest_us={} manifest_max_us={} install_us={} install_max_us={} reclaim_us={} reclaim_max_us={} reclaim_budget_pages={} reclaim_selected_pages={} reclaim_reclaimed_pages={} reclaim_blocked_pages={}",
                 metadb.flush_calls,
                 metadb.flush_pages_written,
                 metadb.flush_total_us,
@@ -1737,7 +1754,11 @@ impl EngineStatusSnapshot {
                 metadb.flush_install_us,
                 metadb.flush_install_max_us,
                 metadb.flush_reclaim_us,
-                metadb.flush_reclaim_max_us
+                metadb.flush_reclaim_max_us,
+                metadb.flush_reclaim_budget_pages,
+                metadb.flush_reclaim_selected_pages,
+                metadb.flush_reclaim_reclaimed_pages,
+                metadb.flush_reclaim_blocked_pages
             );
             let _ = writeln!(
                 out,
@@ -2072,12 +2093,13 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "gc: cycles={} paused_cycles={} candidates={} rewrite_attempts={} rewritten_blocks={} errors={}",
+            "gc: cycles={} paused_cycles={} candidates={} rewrite_attempts={} rewritten_blocks={} retired_reclaimed={} errors={}",
             self.metrics.gc_cycles,
             self.metrics.gc_paused_cycles,
             self.metrics.gc_candidates_found,
             self.metrics.gc_rewrite_attempts,
             self.metrics.gc_blocks_rewritten,
+            self.metrics.gc_retired_blocks_reclaimed,
             self.metrics.gc_errors
         );
         let _ = writeln!(

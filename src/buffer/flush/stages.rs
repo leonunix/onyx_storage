@@ -1,6 +1,5 @@
 use super::*;
 
-#[derive(Debug)]
 struct PreparedDedupUnit {
     unit: CoalesceUnit,
     is_hit: Vec<bool>,
@@ -24,6 +23,10 @@ struct PreparedDedupUnit {
     /// and the writer compare-puts the index to the fresh mapping
     /// only if it still points at this stale old entry.
     stale_index_repairs: Vec<Option<DedupEntry>>,
+    /// Physical pins for dedup targets that passed byte-verify and are
+    /// waiting for the metadata remap. Without this, a verified target PBA
+    /// can be freed and reused between verify completion and hit commit.
+    verified_target_guards: Vec<PbaHazardGuard>,
 }
 
 impl BufferFlusher {
@@ -426,7 +429,7 @@ impl BufferFlusher {
         meta: &MetaStore,
         pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
-        _allocator: &SpaceAllocator,
+        allocator: &SpaceAllocator,
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
         skip_threshold_pct: u8,
@@ -489,7 +492,13 @@ impl BufferFlusher {
             // to trust-hash mode; see BufferFlusher::start_with_metrics
             // doc comment for the trade-off).
             if let Some(rp) = read_pool {
-                Self::verify_prepared_dedup_hits(&mut prepared, rp, candidate, metrics);
+                Self::verify_prepared_dedup_hits(
+                    &mut prepared,
+                    rp,
+                    allocator.hazards(),
+                    candidate,
+                    metrics,
+                );
             }
             Self::commit_prepared_dedup_hits(
                 &mut prepared,
@@ -548,6 +557,7 @@ impl BufferFlusher {
             valid_hits: Vec::new(),
             promote_candidates: Vec::new(),
             stale_index_repairs: vec![None; lba_count],
+            verified_target_guards: Vec::new(),
         }
     }
 
@@ -697,6 +707,7 @@ impl BufferFlusher {
     fn verify_prepared_dedup_hits(
         prepared: &mut [PreparedDedupUnit],
         read_pool: &crate::io::read_pool::ReadPool,
+        hazards: PbaHazards,
         candidate: &crate::dedup::CandidateCache,
         metrics: &EngineMetrics,
     ) {
@@ -710,6 +721,7 @@ impl BufferFlusher {
             ContentHash,
             BlockmapValue,
             crate::io::read_pool::ReadPurpose,
+            PbaHazardGuard,
         )> = Vec::new();
         for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
             for (lba_idx, mapping, hash) in prepared_unit.valid_hits.iter() {
@@ -722,6 +734,7 @@ impl BufferFlusher {
                 } else {
                     crate::io::read_pool::ReadPurpose::DedupVerifyIndex
                 };
+                let guard = hazards.pin_many(mapping.physical_pbas(BLOCK_SIZE));
                 let Some(block) = prepared_unit.unit.raw_blocks.get(*lba_idx) else {
                     // No raw bytes available — should not happen if
                     // valid_hits was populated correctly; defensively
@@ -732,7 +745,7 @@ impl BufferFlusher {
                         &[],
                         purpose,
                     ));
-                    placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose));
+                    placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose, guard));
                     continue;
                 };
                 targets.push(crate::dedup::VerifyTarget::new_with_purpose(
@@ -740,7 +753,7 @@ impl BufferFlusher {
                     block.bytes(),
                     purpose,
                 ));
-                placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose));
+                placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose, guard));
             }
         }
         if targets.is_empty() {
@@ -758,15 +771,18 @@ impl BufferFlusher {
             }
         };
         Self::record_elapsed(&metrics.dedup_lookup_ns, verify_start);
+        drop(targets);
         // Group mismatches by unit. valid_hits / promote_candidates
         // can hold tens of entries per unit; using a HashSet keeps
         // the retain filters O(n) instead of O(n × |mismatches|).
         let mut mismatches_per_unit: HashMap<usize, std::collections::HashSet<usize>> =
             HashMap::new();
-        for ((unit_idx, lba_idx, hash, mapping, purpose), matched) in
+        for ((unit_idx, lba_idx, hash, mapping, purpose, guard), matched) in
             placement.into_iter().zip(results)
         {
-            if !matched {
+            if matched {
+                prepared[unit_idx].verified_target_guards.push(guard);
+            } else {
                 match purpose {
                     crate::io::read_pool::ReadPurpose::DedupVerifyIndex
                     | crate::io::read_pool::ReadPurpose::DedupVerify => {
@@ -1097,7 +1113,7 @@ impl BufferFlusher {
                         DedupHitResult::Rejected => {
                             metrics.dedup_hit_failures.fetch_add(1, Ordering::Relaxed);
                             prepared[unit_idx].is_hit[hit_idx] = false;
-                            tracing::warn!(
+                            tracing::debug!(
                                 vol = %vol_id_str,
                                 lba = lba.0,
                                 "dedup worker: hit rejected (target PBA freed), demoting to miss"

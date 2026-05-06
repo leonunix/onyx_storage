@@ -287,8 +287,23 @@ fn flusher_reclaims_full_extent_for_multi_block_units() {
 
     assert_eq!(
         allocator.free_block_count(),
+        initial_free - 4,
+        "cleanup retires old physical blocks before GC returns them to the free list"
+    );
+    assert_eq!(
+        allocator.retired_block_count(),
+        2,
+        "overwriting a 2-block unit should retire the old full extent"
+    );
+
+    let retired = allocator.retired_candidates(8);
+    for extent in retired {
+        allocator.reclaim_retired_extent(extent).unwrap();
+    }
+    assert_eq!(
+        allocator.free_block_count(),
         initial_free - 2,
-        "overwriting a 2-block unit should not leak one block"
+        "GC reclaim should return the retired full extent without leaking a block"
     );
 }
 

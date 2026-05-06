@@ -108,7 +108,7 @@ metadb_wal_cpus = "92"
 metadb_l2p_apply_cpus = "64-79"
 metadb_refcount_apply_cpus = "88-91"
 metadb_dedup_apply_cpus = "88-91"
-metadb_checkpoint_cpus = "92-95"
+metadb_checkpoint_cpus = "93-95"
 background_cpus = "92-95"
 
 [service]

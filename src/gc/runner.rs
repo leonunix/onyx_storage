@@ -14,6 +14,9 @@ use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
+use crate::space::extent::Extent;
+
+const MAX_RETIRED_RECLAIM_PER_CYCLE: usize = 4096;
 
 /// Background GC runner thread.
 pub struct GcRunner {
@@ -130,6 +133,18 @@ impl GcRunner {
 
             metrics.gc_cycles.fetch_add(1, Ordering::Relaxed);
 
+            Self::reclaim_retired_extents(
+                metrics,
+                meta,
+                allocator,
+                MAX_RETIRED_RECLAIM_PER_CYCLE,
+                running,
+            );
+
+            if !cfg.enabled {
+                continue;
+            }
+
             // Back-pressure: check buffer usage
             let fill_pct = buffer_pool.fill_percentage();
             if fill_pct > cfg.buffer_usage_max_pct {
@@ -203,7 +218,14 @@ impl GcRunner {
 
                 metrics.gc_rewrite_attempts.fetch_add(1, Ordering::Relaxed);
 
-                match rewrite_candidate(candidate, io_engine, buffer_pool, meta, lifecycle) {
+                match rewrite_candidate(
+                    candidate,
+                    io_engine,
+                    buffer_pool,
+                    meta,
+                    lifecycle,
+                    Some(&allocator.hazards()),
+                ) {
                     Ok(rewritten) => {
                         metrics
                             .gc_blocks_rewritten
@@ -221,6 +243,79 @@ impl GcRunner {
                 }
             }
         }
+    }
+
+    pub(crate) fn reclaim_retired_extents(
+        metrics: &EngineMetrics,
+        meta: &MetaStore,
+        allocator: &SpaceAllocator,
+        limit: usize,
+        running: &AtomicBool,
+    ) -> usize {
+        let candidates = allocator.retired_candidates(limit);
+        let mut reclaimed = 0usize;
+
+        for extent in candidates {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            match Self::retired_extent_is_reclaimable(meta, extent) {
+                Ok(true) => match allocator.reclaim_retired_extent(extent) {
+                    Ok(true) => {
+                        reclaimed += extent.count as usize;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            pba = extent.start.0,
+                            blocks = extent.count,
+                            error = %e,
+                            "gc: failed to release retired physical extent"
+                        );
+                    }
+                },
+                Ok(false) => {}
+                Err(e) => {
+                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        pba = extent.start.0,
+                        blocks = extent.count,
+                        error = %e,
+                        "gc: failed to verify retired physical extent"
+                    );
+                }
+            }
+        }
+
+        if reclaimed > 0 {
+            metrics
+                .gc_retired_blocks_reclaimed
+                .fetch_add(reclaimed as u64, Ordering::Relaxed);
+            tracing::debug!(blocks = reclaimed, "gc: reclaimed retired physical blocks");
+        }
+        reclaimed
+    }
+
+    fn retired_extent_is_reclaimable(
+        meta: &MetaStore,
+        extent: Extent,
+    ) -> crate::error::OnyxResult<bool> {
+        let pbas: Vec<_> = (0..extent.count)
+            .map(|offset| crate::types::Pba(extent.start.0 + offset as u64))
+            .collect();
+        if meta
+            .multi_get_refcounts(&pbas)?
+            .into_iter()
+            .any(|refcount| refcount != 0)
+        {
+            return Ok(false);
+        }
+        if meta.has_any_blockmap_ref_in_extent(extent.start, extent.count)? {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub fn stop(&mut self) {

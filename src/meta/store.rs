@@ -156,6 +156,14 @@ impl MetaStore {
         self.backend.get_mapping_str(vol_id, lba)
     }
 
+    pub fn get_mapping_ord(
+        &self,
+        ord: VolumeOrdinal,
+        lba: Lba,
+    ) -> OnyxResult<Option<BlockmapValue>> {
+        self.backend.get_mapping_ord(ord, lba)
+    }
+
     pub fn multi_get_mappings(
         &self,
         vol_id: &VolumeId,
@@ -445,6 +453,10 @@ impl MetaStore {
 
     pub fn has_any_blockmap_ref(&self, target_pba: Pba) -> OnyxResult<bool> {
         self.backend.has_any_blockmap_ref(target_pba)
+    }
+
+    pub fn has_any_blockmap_ref_in_extent(&self, start: Pba, blocks: u32) -> OnyxResult<bool> {
+        self.backend.has_any_blockmap_ref_in_extent(start, blocks)
     }
 
     pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {

@@ -97,6 +97,7 @@ impl ZoneWorker {
             &self.io_engine,
             &self.metrics,
             None,
+            None,
             vol_id,
             lba,
             vol_created_at,

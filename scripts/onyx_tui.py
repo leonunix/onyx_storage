@@ -469,6 +469,10 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" avg {fmt_us(avg_time(meta, prev.status.get('metadb_memory') if prev else None, 'commit_total_us', 'commit_ops', ns_per_unit=1.0))}"
         f" max {fmt_us(num(meta, 'commit_total_max_us'))}"
         f" wal_fsync {rate(meta, prev.status.get('metadb_memory') if prev else None, 'wal_fsyncs', interval):7.1f}/s",
+        f"Reclaim budget={fmt_count(rate(meta, prev.status.get('metadb_memory') if prev else None, 'flush_reclaim_budget_pages', interval)):>8}/s"
+        f" selected={fmt_count(rate(meta, prev.status.get('metadb_memory') if prev else None, 'flush_reclaim_selected_pages', interval)):>8}/s"
+        f" freed={fmt_count(rate(meta, prev.status.get('metadb_memory') if prev else None, 'flush_reclaim_reclaimed_pages', interval)):>8}/s"
+        f" blocked={fmt_count(rate(meta, prev.status.get('metadb_memory') if prev else None, 'flush_reclaim_blocked_pages', interval)):>8}/s",
         f"Apply  l2p_q={fmt_count(num(meta, 'pending_l2p_apply_queue'))}"
         f" rc_q={fmt_count(num(meta, 'pending_rc_apply_queue'))}"
         f" dedup_q={fmt_count(num(meta, 'pending_dedup_lane_queue'))}"
@@ -755,6 +759,15 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
         "apply q",
         f"l2p {fmt_count(num(meta, 'pending_l2p_apply_queue'))}  rc {fmt_count(num(meta, 'pending_rc_apply_queue'))}  dedup {fmt_count(num(meta, 'pending_dedup_lane_queue'))}  dispatch {fmt_count(num(meta, 'pending_dispatch'))}",
         right_w - 4,
+    )
+    metric(
+        stdscr,
+        32,
+        right_x + 2,
+        "reclaim",
+        f"free {fmt_count(num(meta, 'free_list_pages'))}  deferred {fmt_count(num(meta, 'pending_deferred_free'))}  freed {fnum(rate(meta, prev_meta, 'flush_reclaim_reclaimed_pages', interval))}/s",
+        right_w - 4,
+        warn if num(meta, "pending_deferred_free") > 1_000_000 else 0,
     )
     put(stdscr, 33, right_x + 2, "commit " + spark([item["commit_ms"] for item in monitor.history], right_w - 11), accent)
 

@@ -57,6 +57,62 @@ fn zero_blockmap_value_roundtrip() {
 }
 
 #[test]
+fn physical_blocks_cover_multi_block_raw_units() {
+    let raw_32k = BlockmapValue {
+        pba: Pba(100),
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE * 8,
+        unit_original_size: BLOCK_SIZE * 8,
+        unit_lba_count: 8,
+        offset_in_unit: 0,
+        crc32: 0,
+        slot_offset: 0,
+        flags: 0,
+    };
+
+    assert_eq!(raw_32k.physical_blocks(BLOCK_SIZE), 8);
+    assert_eq!(
+        raw_32k.physical_pbas(BLOCK_SIZE).collect::<Vec<_>>(),
+        (100..108).map(Pba).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn blockmap_reference_checks_cover_tail_pbas_in_multi_block_units() {
+    let dir = tempdir().unwrap();
+    let store = MetaStore::open(&test_config(dir.path())).unwrap();
+    let vol_id = VolumeId("test-vol".into());
+    ensure_blockmap_cf(&store, "test-vol");
+
+    let mapping = BlockmapValue {
+        pba: Pba(100),
+        compression: 1,
+        unit_compressed_size: BLOCK_SIZE + 901,
+        unit_original_size: BLOCK_SIZE * 3,
+        unit_lba_count: 3,
+        offset_in_unit: 0,
+        crc32: 0x1234_5678,
+        slot_offset: 0,
+        flags: 0,
+    };
+
+    store
+        .atomic_batch_write(&vol_id, &[(Lba(0), mapping)], 1)
+        .unwrap();
+
+    assert!(store.has_any_blockmap_ref(Pba(100)).unwrap());
+    assert!(store.has_any_blockmap_ref(Pba(101)).unwrap());
+    assert!(!store.has_any_blockmap_ref(Pba(102)).unwrap());
+    assert!(store.has_any_blockmap_ref_in_extent(Pba(101), 1).unwrap());
+    assert!(store.has_any_blockmap_ref_in_extent(Pba(99), 3).unwrap());
+    assert!(!store.has_any_blockmap_ref_in_extent(Pba(102), 1).unwrap());
+    assert_eq!(
+        store.iter_allocated_blocks().unwrap(),
+        vec![Pba(100), Pba(101)]
+    );
+}
+
+#[test]
 fn refcount_roundtrip() {
     let pba = Pba(12345);
     let key = encode_refcount_key(pba);

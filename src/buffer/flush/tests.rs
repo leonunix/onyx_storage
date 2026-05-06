@@ -847,7 +847,10 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
     // `dedup_index` is a verified cache now: allocator cleanup must not
     // try to reconstruct hashes from the old PBA. Stale forward entries
     // are repaired by foreground compare-put or background scrub.
-    assert!(allocator.is_free(pba), "PBA should be freed after cleanup");
+    assert!(
+        allocator.is_retired(pba),
+        "PBA should be retired after cleanup"
+    );
     assert_eq!(
         meta.get_dedup_entry(&hash).unwrap(),
         Some(old_mapping.to_dedup_entry())
@@ -900,7 +903,55 @@ fn dedup_cleanup_does_not_reconstruct_old_pba_for_index_delete() {
             .load(Ordering::Relaxed),
         0
     );
-    assert!(allocator.is_free(pba), "allocator cleanup still proceeds");
+    assert!(
+        allocator.is_retired(pba),
+        "allocator cleanup should retire the PBA for GC reclaim"
+    );
+}
+
+#[test]
+fn cleanup_skips_allocator_free_when_live_blockmap_ref_remains() {
+    let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    let pba = allocator.allocate_one_for_lane(0).unwrap();
+    let mapping = BlockmapValue {
+        pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0x1234_5678,
+        slot_offset: 0,
+        flags: 0,
+    };
+    let vol = VolumeId("flush-race".into());
+    meta.atomic_batch_write(&vol, &[(Lba(1234), mapping)], 1)
+        .unwrap();
+    meta.set_refcount(pba, 0).unwrap();
+
+    BufferFlusher::cleanup_dead_pba_post_commit(
+        &meta,
+        &allocator,
+        &io_engine,
+        &metrics,
+        &crate::dedup::CandidateCache::new(8, 64),
+        RemapCleanup {
+            mappings: vec![mapping],
+            ..cleanup_for_pba(pba, 1)
+        },
+        "live_ref_guard_test",
+    );
+
+    assert!(
+        !allocator.is_free(pba),
+        "cleanup must not return a live-referenced PBA to the allocator"
+    );
+    assert!(
+        !allocator.is_retired(pba),
+        "cleanup must not retire a PBA while blockmap still references it"
+    );
 }
 
 #[test]
@@ -2677,7 +2728,7 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
             "cycle {cycle}: pba should be in newly_zeroed"
         );
 
-        // Step 4: Cleanup and free
+        // Step 4: Cleanup retires the PBA; GC is responsible for making it reusable.
         BufferFlusher::cleanup_dead_pba_post_commit(
             &meta,
             &allocator,
@@ -2691,7 +2742,15 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
             "recycle_test",
         );
 
-        // Step 5: Reallocate — might get the same PBA back
+        assert!(allocator.is_retired(pba));
+        assert!(
+            allocator
+                .reclaim_retired_extent(Extent::new(pba, 1))
+                .unwrap(),
+            "cycle {cycle}: retired PBA should reclaim after metadata verification"
+        );
+
+        // Step 5: Reallocate — might get the same PBA back after GC-style reclaim
         let new_pba = match allocator.allocate_one_for_lane(0) {
             Ok(p) => p,
             Err(_) => break,
@@ -3201,7 +3260,7 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
         "PBA A should be newly_zeroed"
     );
 
-    // Step 3: Cleanup frees PBA A
+    // Step 3: Cleanup retires PBA A; GC verifies it before reuse.
     BufferFlusher::cleanup_dead_pba_post_commit(
         &meta,
         &allocator,
@@ -3214,7 +3273,13 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
             .unwrap_or_else(|| cleanup_for_pba(pba_a, 1)),
         "dup_flush_test",
     );
-    assert!(allocator.is_free(pba_a), "PBA A should be free now");
+    assert!(allocator.is_retired(pba_a), "PBA A should be retired now");
+    assert!(
+        allocator
+            .reclaim_retired_extent(Extent::new(pba_a, 1))
+            .unwrap(),
+        "PBA A should reclaim after metadata verification"
+    );
 
     // Step 4: Reallocate — should get PBA A back (FIFO-ish)
     let recycled = allocator.allocate_one().unwrap();

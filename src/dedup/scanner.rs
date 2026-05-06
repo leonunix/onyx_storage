@@ -486,7 +486,7 @@ impl DedupScanner {
                 }
             }
 
-            for ((_lba, bv), rx_opt) in targets.iter().zip(receivers.into_iter()) {
+            for ((lba, bv), rx_opt) in targets.iter().zip(receivers.into_iter()) {
                 let Some(rx) = rx_opt else { continue };
                 let block = match rx.recv() {
                     Ok(Ok(buf)) if buf.len() == BLOCK_SIZE as usize => buf,
@@ -524,6 +524,24 @@ impl DedupScanner {
                 if already_in_index {
                     stats.already_warm += 1;
                     continue;
+                }
+
+                match meta.get_mapping(&vol.id, *lba) {
+                    Ok(Some(current)) if same_physical_mapping(&current, bv) => {}
+                    Ok(_) => {
+                        stats.already_warm += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        stats.errors += 1;
+                        tracing::debug!(
+                            vol = %vol.id.0,
+                            lba = lba.0,
+                            error = %e,
+                            "cold-tail: failed to revalidate mapping"
+                        );
+                        continue;
+                    }
                 }
 
                 candidate.insert(hash, BlockmapValue { flags: 0, ..*bv });
@@ -673,12 +691,12 @@ fn read_lba_block(io_engine: &IoEngine, bv: &BlockmapValue) -> OnyxResult<Option
 
     let actual_crc = crc32fast::hash(compressed);
     if actual_crc != bv.crc32 {
-        tracing::warn!(
+        tracing::debug!(
             pba = bv.pba.0,
             slot_offset = bv.slot_offset,
             expected_crc = bv.crc32,
             actual_crc,
-            "dedup scanner: CRC mismatch, skipping corrupt block"
+            "dedup scanner: stale physical mapping, skipping block"
         );
         return Ok(None);
     }
@@ -702,4 +720,15 @@ fn read_lba_block(io_engine: &IoEngine, bv: &BlockmapValue) -> OnyxResult<Option
         return Ok(None);
     }
     Ok(Some(decompressed[offset..offset + bs].to_vec()))
+}
+
+fn same_physical_mapping(a: &BlockmapValue, b: &BlockmapValue) -> bool {
+    a.pba == b.pba
+        && a.slot_offset == b.slot_offset
+        && a.unit_compressed_size == b.unit_compressed_size
+        && a.unit_original_size == b.unit_original_size
+        && a.unit_lba_count == b.unit_lba_count
+        && a.offset_in_unit == b.offset_in_unit
+        && a.compression == b.compression
+        && a.crc32 == b.crc32
 }

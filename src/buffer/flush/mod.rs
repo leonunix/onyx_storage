@@ -1,6 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -23,6 +21,7 @@ use crate::metrics::EngineMetrics;
 use crate::packer::packer::{PackResult, Packer, SealedSlot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
+use crate::space::hazard::{PbaHazardGuard, PbaHazards};
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 
 type PbaLockKey = (usize, Pba);
@@ -167,8 +166,6 @@ impl FlusherInFlightTracker {
 
 static PBA_LOCKS: OnceLock<Mutex<HashMap<PbaLockKey, Arc<Mutex<()>>>>> = OnceLock::new();
 static PBA_CLEANING: OnceLock<Mutex<HashSet<PbaLockKey>>> = OnceLock::new();
-#[cfg(test)]
-static CLEANUP_FREE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
 mod cleanup;
 mod failpoints;
@@ -200,13 +197,6 @@ impl Allocation {
         match self {
             Self::Single(pba) => *pba,
             Self::Extent(extent) => extent.start,
-        }
-    }
-
-    fn block_count(&self) -> u32 {
-        match self {
-            Self::Single(_) => 1,
-            Self::Extent(extent) => extent.count,
         }
     }
 

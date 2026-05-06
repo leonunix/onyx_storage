@@ -239,6 +239,8 @@ impl BufferFlusher {
                 return Err(e);
             }
 
+            allocator.wait_for_readers(sealed.pba, 1);
+
             if let Err(e) = io_engine.write_blocks(sealed.pba, &sealed.data) {
                 allocator.free_one(sealed.pba)?;
                 Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
@@ -521,6 +523,7 @@ impl BufferFlusher {
                     if slot_metas[i].is_none() {
                         continue;
                     }
+                    allocator.wait_for_readers(sealed_slots[i].pba, 1);
                     ops.push(LvOp::Write {
                         pba: sealed_slots[i].pba,
                         payload: sealed_slots[i].data.as_slice(),

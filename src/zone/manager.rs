@@ -11,6 +11,7 @@ use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
+use crate::space::hazard::PbaHazardGuard;
 use crate::types::{Lba, VolumeId, ZoneId, BLOCK_SIZE};
 use crate::zone::read;
 use onyx_metadb::VolumeOrdinal;
@@ -26,11 +27,24 @@ type ReadUnitKey = (u64, u16, u32);
 struct ReadUnitGroup {
     mapping: BlockmapValue,
     members: Vec<(usize, u16)>, // (out_buf slot, offset_in_unit)
+    _hazard_guards: Vec<PbaHazardGuard>,
 }
 
 struct RawExtentGroup {
     start_slot: usize,
     mappings: Vec<BlockmapValue>,
+    _hazard_guards: Vec<PbaHazardGuard>,
+}
+
+struct PinnedMapping {
+    slot: usize,
+    mapping: BlockmapValue,
+    hazard_guard: Option<PbaHazardGuard>,
+}
+
+enum ReadBatchOutcome {
+    Complete,
+    Retry(VolumeOrdinal),
 }
 
 impl RawExtentGroup {
@@ -38,6 +52,7 @@ impl RawExtentGroup {
         Self {
             start_slot: slot,
             mappings: vec![mapping],
+            _hazard_guards: Vec::new(),
         }
     }
 
@@ -66,20 +81,22 @@ fn push_read_unit_group(
     groups: &mut HashMap<ReadUnitKey, ReadUnitGroup>,
     slot: usize,
     mapping: BlockmapValue,
+    hazard_guard: Option<PbaHazardGuard>,
 ) {
     let key: ReadUnitKey = (
         mapping.pba.0,
         mapping.slot_offset,
         mapping.unit_compressed_size,
     );
-    groups
-        .entry(key)
-        .or_insert_with(|| ReadUnitGroup {
-            mapping,
-            members: Vec::new(),
-        })
-        .members
-        .push((slot, mapping.offset_in_unit));
+    let entry = groups.entry(key).or_insert_with(|| ReadUnitGroup {
+        mapping,
+        members: Vec::new(),
+        _hazard_guards: Vec::new(),
+    });
+    if let Some(guard) = hazard_guard {
+        entry._hazard_guards.push(guard);
+    }
+    entry.members.push((slot, mapping.offset_in_unit));
 }
 
 /// Routes IO across LBAs.
@@ -323,6 +340,7 @@ impl ZoneManager {
             &self.io_engine,
             &self.metrics,
             self.read_pool.as_deref(),
+            self.allocator.as_ref().map(|allocator| allocator.hazards()),
             vol_id,
             lba,
             vol_created_at,
@@ -361,10 +379,35 @@ impl ZoneManager {
         vol_created_at: u64,
         out_buf: &mut [u8],
     ) -> OnyxResult<()> {
+        let mut vol_ord = vol_ord;
+        loop {
+            match self.submit_reads_with_ordinal_once(
+                vol_id,
+                vol_ord,
+                start_lba,
+                count,
+                vol_created_at,
+                out_buf,
+            )? {
+                ReadBatchOutcome::Complete => return Ok(()),
+                ReadBatchOutcome::Retry(ord) => vol_ord = Some(ord),
+            }
+        }
+    }
+
+    fn submit_reads_with_ordinal_once(
+        &self,
+        vol_id: &str,
+        vol_ord: Option<VolumeOrdinal>,
+        start_lba: Lba,
+        count: u32,
+        vol_created_at: u64,
+        out_buf: &mut [u8],
+    ) -> OnyxResult<ReadBatchOutcome> {
         use std::sync::atomic::Ordering;
 
         if count == 0 {
-            return Ok(());
+            return Ok(ReadBatchOutcome::Complete);
         }
         let bs = BLOCK_SIZE as usize;
         let total = count as usize * bs;
@@ -442,8 +485,18 @@ impl ZoneManager {
             .fetch_add(elapsed_ns(pass1_start), Ordering::Relaxed);
 
         if pending_lbas.is_empty() {
-            return Ok(());
+            return Ok(ReadBatchOutcome::Complete);
         }
+
+        let hazards = self.allocator.as_ref().map(|allocator| allocator.hazards());
+        let lookup_ord = if hazards.is_some() {
+            match vol_ord {
+                Some(ord) => Some(ord),
+                None => Some(self.meta.volume_ordinal_str(vol_id)?),
+            }
+        } else {
+            None
+        };
 
         // Pass 3 input: mapped LBAs still keyed by output slot. We sort after
         // metadata lookup so unordered range scans can still form contiguous
@@ -546,7 +599,43 @@ impl ZoneManager {
         );
 
         if mapped_units.is_empty() {
-            return Ok(());
+            return Ok(ReadBatchOutcome::Complete);
+        }
+
+        let pinned_units = if let (Some(hazards), Some(ord)) = (hazards.as_ref(), lookup_ord) {
+            let mut pinned = Vec::with_capacity(mapped_units.len());
+            let mut stale_mapping_seen = false;
+            for (slot, mapping) in mapped_units {
+                let lba = start_lba.0 + slot as u64;
+                let guard = hazards.pin_many(mapping.physical_pbas(BLOCK_SIZE));
+                if self.meta.get_mapping_ord(ord, Lba(lba))? == Some(mapping) {
+                    pinned.push(PinnedMapping {
+                        slot,
+                        mapping,
+                        hazard_guard: Some(guard),
+                    });
+                } else {
+                    stale_mapping_seen = true;
+                    break;
+                }
+            }
+            if stale_mapping_seen {
+                return Ok(ReadBatchOutcome::Retry(ord));
+            }
+            pinned
+        } else {
+            mapped_units
+                .into_iter()
+                .map(|(slot, mapping)| PinnedMapping {
+                    slot,
+                    mapping,
+                    hazard_guard: None,
+                })
+                .collect()
+        };
+
+        if pinned_units.is_empty() {
+            return Ok(ReadBatchOutcome::Complete);
         }
 
         // Pass 3: split mapped LBAs into two shapes:
@@ -555,25 +644,35 @@ impl ZoneManager {
         // - compressed/packed units stay grouped by unit identity.
         let mut groups: HashMap<ReadUnitKey, ReadUnitGroup> = HashMap::new();
         let mut raw_extents: Vec<RawExtentGroup> = Vec::new();
-        mapped_units.sort_unstable_by_key(|(slot, _)| *slot);
+        let mut pinned_units = pinned_units;
+        pinned_units.sort_unstable_by_key(|unit| unit.slot);
         let mut current_raw: Option<RawExtentGroup> = None;
-        for (slot, mapping) in mapped_units {
+        for pinned in pinned_units {
+            let slot = pinned.slot;
+            let mapping = pinned.mapping;
             if is_single_raw_block(&mapping) {
                 if let Some(raw) = current_raw.as_mut() {
                     if raw.can_extend(slot, &mapping) {
                         raw.mappings.push(mapping);
+                        if let Some(guard) = pinned.hazard_guard {
+                            raw._hazard_guards.push(guard);
+                        }
                         continue;
                     }
                 }
                 if let Some(raw) = current_raw.take() {
                     raw_extents.push(raw);
                 }
-                current_raw = Some(RawExtentGroup::new(slot, mapping));
+                let mut raw = RawExtentGroup::new(slot, mapping);
+                if let Some(guard) = pinned.hazard_guard {
+                    raw._hazard_guards.push(guard);
+                }
+                current_raw = Some(raw);
             } else {
                 if let Some(raw) = current_raw.take() {
                     raw_extents.push(raw);
                 }
-                push_read_unit_group(&mut groups, slot, mapping);
+                push_read_unit_group(&mut groups, slot, mapping, pinned.hazard_guard);
             }
         }
         if let Some(raw) = current_raw {
@@ -588,7 +687,7 @@ impl ZoneManager {
             let mut raw_receivers = Vec::with_capacity(raw_extents.len());
             for raw in raw_extents.into_iter() {
                 let rx = pool.submit_raw_extent_read_async(raw.mappings)?;
-                raw_receivers.push((rx, raw.start_slot));
+                raw_receivers.push((rx, raw.start_slot, raw._hazard_guards));
             }
             let mut receivers = Vec::with_capacity(groups.len());
             let mut units: Vec<ReadUnitGroup> = Vec::with_capacity(groups.len());
@@ -598,7 +697,7 @@ impl ZoneManager {
                 units.push(group);
             }
             let mut result: OnyxResult<()> = Ok(());
-            for (rx, start_slot) in raw_receivers {
+            for (rx, start_slot, _hazard_guards) in raw_receivers {
                 match rx.recv().map_err(|_| {
                     crate::error::OnyxError::Io(std::io::Error::other("read-pool reply dropped"))
                 }) {
@@ -708,7 +807,7 @@ impl ZoneManager {
         };
         self.metrics
             .record_read_submit_unit_io_ns(elapsed_ns(pass4_start));
-        pass4_result
+        pass4_result.map(|_| ReadBatchOutcome::Complete)
     }
 
     /// Copy each `(slot, offset_in_unit)` member's 4 KB from the decoded unit

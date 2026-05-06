@@ -449,6 +449,7 @@ fn gc_rewrite_overwritten_blocks() {
         &env.pool,
         &env.meta,
         &env.lifecycle,
+        None,
     )
     .unwrap();
     assert_eq!(rewritten, 2);
@@ -604,6 +605,7 @@ fn gc_rewriter_skips_changed_lba() {
         &env.pool,
         &env.meta,
         &env.lifecycle,
+        None,
     )
     .unwrap();
 
@@ -945,6 +947,7 @@ fn gc_rewriter_skips_lba_when_fragment_identity_changed_with_same_pba() {
         &env.pool,
         &env.meta,
         &env.lifecycle,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1080,6 +1083,7 @@ fn gc_rewrite_packed_fragment() {
             &env.pool,
             &env.meta,
             &env.lifecycle,
+            None,
         )
         .unwrap();
         assert_eq!(rewritten, 1);

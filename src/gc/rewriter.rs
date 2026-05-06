@@ -6,6 +6,7 @@ use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
+use crate::space::hazard::PbaHazards;
 use crate::types::{CompressionAlgo, BLOCK_SIZE};
 
 fn candidate_matches_mapping(
@@ -35,6 +36,7 @@ pub fn rewrite_candidate(
     buffer_pool: &WriteBufferPool,
     meta: &MetaStore,
     lifecycle: &VolumeLifecycleManager,
+    hazards: Option<&PbaHazards>,
 ) -> OnyxResult<u32> {
     // Get volume config for created_at epoch
     let vol_created_at = lifecycle.with_read_lock(&candidate.vol_id.0, || {
@@ -83,6 +85,35 @@ pub fn rewrite_candidate(
         );
         return Ok(0);
     }
+
+    let _hazard_guard = if let Some(hazards) = hazards {
+        let guard = hazards.pin_many(
+            BlockmapValue {
+                pba: candidate.pba,
+                compression: candidate.compression,
+                unit_compressed_size: candidate.unit_compressed_size,
+                unit_original_size: candidate.unit_original_size,
+                unit_lba_count: candidate.unit_lba_count,
+                offset_in_unit: 0,
+                crc32: candidate.crc32,
+                slot_offset: candidate.slot_offset,
+                flags: 0,
+            }
+            .physical_pbas(BLOCK_SIZE),
+        );
+        let still_valid = valid_lbas.iter().any(|(lba, off)| {
+            meta.get_mapping(&candidate.vol_id, *lba)
+                .ok()
+                .flatten()
+                .is_some_and(|bv| candidate_matches_mapping(candidate, *off, &bv))
+        });
+        if !still_valid {
+            return Ok(0);
+        }
+        Some(guard)
+    } else {
+        None
+    };
 
     // Read the compressed unit from LV3
     let compressed_data = if candidate.slot_offset > 0 {

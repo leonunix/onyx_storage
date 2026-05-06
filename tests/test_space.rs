@@ -4,6 +4,9 @@ use onyx_storage::meta::store::MetaStore;
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::space::extent::Extent;
 use onyx_storage::types::{Lba, Pba, VolumeId, RESERVED_BLOCKS};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 fn ensure_blockmap_cf(store: &MetaStore, vol_id: &str) {
     store.create_blockmap_cf(vol_id).unwrap();
@@ -63,6 +66,80 @@ fn basic_allocate_free() {
 
     alloc.free_one(pba2).unwrap();
     assert_eq!(alloc.free_block_count(), usable);
+}
+
+#[test]
+fn retired_extent_is_not_reused_until_reclaimed() {
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
+    let first = alloc.allocate_one().unwrap();
+    let second = alloc.allocate_one().unwrap();
+
+    alloc.retire_one(first).unwrap();
+    assert!(!alloc.is_free(first));
+    assert!(alloc.is_retired(first));
+    assert_eq!(alloc.retired_block_count(), 1);
+
+    let next = alloc.allocate_one().unwrap();
+    assert_ne!(
+        next, first,
+        "retired PBA must not be reused before GC reclaim"
+    );
+
+    assert!(alloc.reclaim_retired_extent(Extent::single(first)).unwrap());
+    assert!(alloc.is_free(first));
+    assert_eq!(alloc.retired_block_count(), 0);
+
+    alloc.free_one(second).unwrap();
+}
+
+#[test]
+fn free_waits_for_physical_hazard_pin() {
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
+    let pba = alloc.allocate_one().unwrap();
+    let hazards = alloc.hazards();
+    let guard = hazards.pin_one(pba);
+    let (tx, rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            alloc.free_one(pba).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "free_one must wait while a read hazard is pinned"
+        );
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("free_one should finish after hazard guard drops");
+    });
+
+    assert!(alloc.is_free(pba));
+}
+
+#[test]
+fn writer_waits_for_physical_hazard_pin() {
+    let alloc = SpaceAllocator::new(4096 * 18, 0);
+    let pba = alloc.allocate_one().unwrap();
+    let hazards = alloc.hazards();
+    let guard = hazards.pin_one(pba);
+    let (tx, rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            alloc.wait_for_readers(pba, 1);
+            tx.send(()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "writer-side wait must block while a read hazard is pinned"
+        );
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("writer-side wait should finish after hazard guard drops");
+    });
 }
 
 #[test]

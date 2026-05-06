@@ -206,6 +206,14 @@ impl MetadbBackend {
         let Some(ord) = self.volume_ordinal_optional_str(vol_id) else {
             return Ok(None);
         };
+        self.get_mapping_ord(ord, lba)
+    }
+
+    pub(crate) fn get_mapping_ord(
+        &self,
+        ord: VolumeOrdinal,
+        lba: Lba,
+    ) -> OnyxResult<Option<BlockmapValue>> {
         self.db.get(ord, lba.0)?.map(decode_l2p_value).transpose()
     }
 
@@ -735,7 +743,35 @@ impl MetadbBackend {
     pub(crate) fn has_any_blockmap_ref(&self, target: Pba) -> OnyxResult<bool> {
         let mut found = false;
         self.scan_all_blockmap_entries_with(&mut |_, _, value| {
-            if value.pba == target {
+            if !value.is_zero()
+                && value
+                    .physical_pbas(crate::types::BLOCK_SIZE)
+                    .any(|pba| pba == target)
+            {
+                found = true;
+            }
+        })?;
+        Ok(found)
+    }
+
+    pub(crate) fn has_any_blockmap_ref_in_extent(
+        &self,
+        start: Pba,
+        blocks: u32,
+    ) -> OnyxResult<bool> {
+        if blocks == 0 {
+            return Ok(false);
+        }
+        let end = start.0.saturating_add(u64::from(blocks));
+        let mut found = false;
+        self.scan_all_blockmap_entries_with(&mut |_, _, value| {
+            if value.is_zero() {
+                return;
+            }
+            if value
+                .physical_pbas(crate::types::BLOCK_SIZE)
+                .any(|pba| pba.0 >= start.0 && pba.0 < end)
+            {
                 found = true;
             }
         })?;
@@ -763,12 +799,21 @@ impl MetadbBackend {
     }
 
     pub(crate) fn iter_allocated_blocks(&self) -> OnyxResult<Vec<(Pba, u32)>> {
-        let mut blocks: Vec<(Pba, u32)> = self
-            .scan_all_blockmap_entries()?
-            .into_iter()
-            .filter(|(_, _, value)| !value.is_zero())
-            .map(|(_, _, value)| (value.pba, freed_blocks_for_l2p_value(&value)))
-            .collect();
+        let mut blocks: Vec<(Pba, u32)> = Vec::new();
+        for (_, _, value) in self.scan_all_blockmap_entries()? {
+            if value.is_zero() {
+                continue;
+            }
+            let physical_blocks = freed_blocks_for_l2p_value(&value);
+            for pba in value.physical_pbas(crate::types::BLOCK_SIZE) {
+                blocks.push((pba, 1));
+            }
+            debug_assert_eq!(
+                physical_blocks as usize,
+                value.physical_pbas(crate::types::BLOCK_SIZE).count(),
+                "freed block count must match expanded physical footprint"
+            );
+        }
         blocks.sort_unstable_by_key(|(pba, _)| *pba);
         blocks.dedup_by_key(|(pba, _)| *pba);
         Ok(blocks)
@@ -915,7 +960,7 @@ impl MetadbBackend {
         // tables. Atomic with the LBA remaps: if the commit succeeds,
         // both happen; if it fails, neither.
         for (hash, entry) in promote_entries {
-            tx.put_dedup(*hash, to_dedup_value(entry));
+            tx.put_dedup_guarded(*hash, to_dedup_value(entry), to_metadb_pba(entry.pba), 1);
         }
         let (_, outcomes) = tx.commit_with_outcomes()?;
         dedup_hit_results_from_remaps(hits, outcomes)
@@ -928,50 +973,52 @@ impl AsyncCheckpoint {
         let worker_state = state.clone();
         let thread = std::thread::Builder::new()
             .name("metadb-checkpoint".into())
-            .spawn(move || loop {
+            .spawn(move || {
                 crate::affinity::bind_current(crate::affinity::ThreadRole::MetadbCheckpoint, 0);
-                let (start, target, force) = {
+                loop {
+                    let (start, target, force) = {
+                        let (lock, cvar) = &*worker_state;
+                        let mut state = lock.lock().unwrap();
+                        while state.requested == state.completed && !state.shutdown {
+                            state = cvar.wait(state).unwrap();
+                        }
+                        if state.shutdown && state.requested == state.completed {
+                            return;
+                        }
+                        (
+                            state.completed + 1,
+                            state.requested,
+                            state.force_requested > state.completed,
+                        )
+                    };
+
+                    let result = if force {
+                        db.flush().map(|_| true)
+                    } else {
+                        db.try_flush()
+                    };
                     let (lock, cvar) = &*worker_state;
                     let mut state = lock.lock().unwrap();
-                    while state.requested == state.completed && !state.shutdown {
-                        state = cvar.wait(state).unwrap();
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!(
+                                start,
+                                target,
+                                "metadb checkpoint skipped; apply gate busy"
+                            );
+                        }
+                        Err(err) => {
+                            state.failures.push(CheckpointFailure {
+                                start,
+                                end: target,
+                                message: err.to_string(),
+                            });
+                        }
                     }
-                    if state.shutdown && state.requested == state.completed {
-                        return;
-                    }
-                    (
-                        state.completed + 1,
-                        state.requested,
-                        state.force_requested > state.completed,
-                    )
-                };
-
-                let result = if force {
-                    db.flush().map(|_| true)
-                } else {
-                    db.try_flush()
-                };
-                let (lock, cvar) = &*worker_state;
-                let mut state = lock.lock().unwrap();
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::debug!(
-                            start,
-                            target,
-                            "metadb checkpoint skipped; apply gate busy"
-                        );
-                    }
-                    Err(err) => {
-                        state.failures.push(CheckpointFailure {
-                            start,
-                            end: target,
-                            message: err.to_string(),
-                        });
-                    }
+                    state.completed = state.completed.max(target);
+                    cvar.notify_all();
                 }
-                state.completed = state.completed.max(target);
-                cvar.notify_all();
             })
             .map_err(OnyxError::Io)?;
         Ok(Self {

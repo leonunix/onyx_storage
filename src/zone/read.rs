@@ -7,6 +7,7 @@ use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
+use crate::space::hazard::PbaHazards;
 use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
 
 /// Execute a read for one 4KB LBA.
@@ -25,53 +26,67 @@ pub fn execute_read(
     io_engine: &IoEngine,
     metrics: &EngineMetrics,
     read_pool: Option<&ReadPool>,
+    hazards: Option<PbaHazards>,
     vol_id: &str,
     lba: Lba,
     vol_created_at: u64,
 ) -> OnyxResult<Option<Vec<u8>>> {
     use std::sync::atomic::Ordering;
 
-    // 1. Buffer index — lock-free DashMap lookup, zero IO on hit.
-    if let Some(pending) = buffer_pool.lookup(vol_id, lba)? {
-        if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
-            if let Some(ref payload) = pending.payload {
-                let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
-                let end = offset + BLOCK_SIZE as usize;
-                if end <= payload.len() {
-                    metrics.read_buffer_hits.fetch_add(1, Ordering::Relaxed);
-                    metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
-                    metrics
-                        .buffer_read_bytes
-                        .fetch_add(BLOCK_SIZE as u64, Ordering::Relaxed);
-                    return Ok(Some(payload[offset..end].to_vec()));
+    loop {
+        // 1. Buffer index — lock-free DashMap lookup, zero IO on hit.
+        if let Some(pending) = buffer_pool.lookup(vol_id, lba)? {
+            if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
+                if let Some(ref payload) = pending.payload {
+                    let offset = (lba.0 - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
+                    let end = offset + BLOCK_SIZE as usize;
+                    if end <= payload.len() {
+                        metrics.read_buffer_hits.fetch_add(1, Ordering::Relaxed);
+                        metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .buffer_read_bytes
+                            .fetch_add(BLOCK_SIZE as u64, Ordering::Relaxed);
+                        return Ok(Some(payload[offset..end].to_vec()));
+                    }
                 }
             }
         }
-    }
 
-    // 2. Persistent blockmap — metadb point read, no IO yet.
-    let mapping = match meta.get_mapping_str(vol_id, lba)? {
-        Some(m) => m,
-        None => {
-            metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
+        // 2. Persistent blockmap — metadb point read, no IO yet.
+        let mapping = match meta.get_mapping_str(vol_id, lba)? {
+            Some(m) => m,
+            None => {
+                metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+        };
+        if mapping.is_zero() {
+            return Ok(Some(vec![0u8; BLOCK_SIZE as usize]));
         }
-    };
-    if mapping.is_zero() {
-        return Ok(Some(vec![0u8; BLOCK_SIZE as usize]));
-    }
 
-    // 3. LV3 read + CRC + decompress. Goes through the read pool when one is
-    //    attached so the disk IO joins a batched io_uring submit and the
-    //    decompression runs on the worker, freeing the caller (e.g. ublk
-    //    queue thread) to dispatch the next request.
-    if let Some(pool) = read_pool {
-        return pool.submit_read(mapping).map(Some);
-    }
+        let _hazard_guard = if let Some(hazards) = hazards.as_ref() {
+            let guard = hazards.pin_many(mapping.physical_pbas(BLOCK_SIZE));
+            if meta.get_mapping_str(vol_id, lba)? != Some(mapping) {
+                drop(guard);
+                continue;
+            }
+            Some(guard)
+        } else {
+            None
+        };
 
-    // Fallback: inline LV3 read on the caller thread (used when the pool is
-    // disabled in config or in tests that wire `IoEngine` directly).
-    inline_lv3_read(io_engine, metrics, mapping)
+        // 3. LV3 read + CRC + decompress. Goes through the read pool when one is
+        //    attached so the disk IO joins a batched io_uring submit and the
+        //    decompression runs on the worker, freeing the caller (e.g. ublk
+        //    queue thread) to dispatch the next request.
+        if let Some(pool) = read_pool {
+            return pool.submit_read(mapping).map(Some);
+        }
+
+        // Fallback: inline LV3 read on the caller thread (used when the pool is
+        // disabled in config or in tests that wire `IoEngine` directly).
+        return inline_lv3_read(io_engine, metrics, mapping);
+    }
 }
 
 fn inline_lv3_read(
@@ -403,6 +418,7 @@ pub fn execute_read_arc(
     io_engine: &Arc<IoEngine>,
     metrics: &Arc<EngineMetrics>,
     read_pool: Option<&Arc<ReadPool>>,
+    hazards: Option<PbaHazards>,
     vol_id: &str,
     lba: Lba,
     vol_created_at: u64,
@@ -413,6 +429,7 @@ pub fn execute_read_arc(
         io_engine,
         metrics,
         read_pool.map(|p| p.as_ref()),
+        hazards,
         vol_id,
         lba,
         vol_created_at,
