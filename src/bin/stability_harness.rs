@@ -61,6 +61,7 @@ fn write_and_abort(
             dedup_shards: 8,
             dedup_cuckoo_buckets: 4_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         },
         storage: StorageConfig {
             data_device: Some(data),

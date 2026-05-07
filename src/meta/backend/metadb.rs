@@ -1173,6 +1173,13 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.dedup_shards = config.dedup_shards;
     cfg.dedup_cuckoo_buckets = config.dedup_cuckoo_buckets;
     cfg.dedup_l1_cache_entries = config.dedup_l1_cache_entries;
+    cfg.refcount_drainer_enabled = config.refcount_drainer_enabled;
+    cfg.refcount_drainer_interval_ms = config.refcount_drainer_interval_ms;
+    cfg.refcount_drainer_threshold_entries = config.refcount_drainer_threshold_entries;
+    cfg.refcount_drainer_max_entries_per_cycle =
+        config.refcount_drainer_max_entries_per_cycle;
+    cfg.refcount_drainer_alloc_run_size = config.refcount_drainer_alloc_run_size;
+    cfg.refcount_drainer_backpressure_pages = config.refcount_drainer_backpressure_pages;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.
@@ -1455,6 +1462,7 @@ mod tests {
             dedup_shards: 1,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1495,6 +1503,7 @@ mod tests {
             dedup_shards: 1,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1564,6 +1573,7 @@ mod tests {
             dedup_shards: 1,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1625,6 +1635,7 @@ mod tests {
             dedup_shards: 1,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1698,6 +1709,7 @@ mod tests {
             dedup_shards: 1,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),
@@ -1762,6 +1774,7 @@ mod tests {
             dedup_shards: 1,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         };
         let vol = VolumeConfig {
             id: VolumeId("vol-a".to_string()),

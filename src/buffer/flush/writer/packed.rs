@@ -75,6 +75,35 @@ fn commit_packed_meta_batch(
             );
         }
         Err(e) => {
+            // P0 diagnostic: dump the batch composition (PBAs, LBA
+            // counts, vol_ids) so the metadb-side trace
+            // (`onyx_metadb::refcount::stage_underflow` etc.) can be
+            // tied back to the onyx batch that triggered it. Filter via
+            // `RUST_LOG=onyx_storage::buffer::flush::writer::packed=error`.
+            let mut batch_dump: Vec<(u64 /*pba*/, usize /*lbas*/, Vec<String>)> =
+                Vec::with_capacity(batch_slots.len());
+            for &slot_idx in batch_slots.iter() {
+                if let Some(ref sm) = slot_metas[slot_idx] {
+                    let mut vols: Vec<String> = sm
+                        .batch_values
+                        .iter()
+                        .map(|(v, _, _)| v.0.clone())
+                        .collect();
+                    vols.sort();
+                    vols.dedup();
+                    batch_dump.push((
+                        sealed_slots[slot_idx].pba.0,
+                        sm.batch_values.len(),
+                        vols,
+                    ));
+                }
+            }
+            tracing::error!(
+                error = %e,
+                slot_count = batch_dump.len(),
+                ?batch_dump,
+                "packed-slot batch metadata commit failed: rolling back batch"
+            );
             for &slot_idx in batch_slots.iter() {
                 if slot_metas[slot_idx].is_some() {
                     let _ = allocator.free_one(sealed_slots[slot_idx].pba);

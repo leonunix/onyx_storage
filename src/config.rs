@@ -163,6 +163,21 @@ pub struct MetaConfig {
     /// Entries in metadb's in-memory dedup L1 hot cache.
     #[serde(default = "default_metadb_dedup_l1_cache_entries")]
     pub dedup_l1_cache_entries: usize,
+    /// Enable metadb's background refcount drainer. Default stays off so
+    /// production behavior remains the priority-1 checkpoint path until soak
+    /// validation flips this explicitly.
+    #[serde(default)]
+    pub refcount_drainer_enabled: bool,
+    #[serde(default = "default_refcount_drainer_interval_ms")]
+    pub refcount_drainer_interval_ms: u64,
+    #[serde(default = "default_refcount_drainer_threshold_entries")]
+    pub refcount_drainer_threshold_entries: usize,
+    #[serde(default = "default_refcount_drainer_max_entries_per_cycle")]
+    pub refcount_drainer_max_entries_per_cycle: usize,
+    #[serde(default = "default_refcount_drainer_alloc_run_size")]
+    pub refcount_drainer_alloc_run_size: usize,
+    #[serde(default = "default_refcount_drainer_backpressure_pages")]
+    pub refcount_drainer_backpressure_pages: usize,
 }
 
 impl MetaConfig {
@@ -223,6 +238,13 @@ impl Default for MetaConfig {
             dedup_shards: default_metadb_dedup_shards(),
             dedup_cuckoo_buckets: default_metadb_dedup_cuckoo_buckets(),
             dedup_l1_cache_entries: default_metadb_dedup_l1_cache_entries(),
+            refcount_drainer_enabled: false,
+            refcount_drainer_interval_ms: default_refcount_drainer_interval_ms(),
+            refcount_drainer_threshold_entries: default_refcount_drainer_threshold_entries(),
+            refcount_drainer_max_entries_per_cycle:
+                default_refcount_drainer_max_entries_per_cycle(),
+            refcount_drainer_alloc_run_size: default_refcount_drainer_alloc_run_size(),
+            refcount_drainer_backpressure_pages: default_refcount_drainer_backpressure_pages(),
         }
     }
 }
@@ -237,6 +259,21 @@ fn default_metadb_dedup_cuckoo_buckets() -> u64 {
 
 fn default_metadb_dedup_l1_cache_entries() -> usize {
     256_000
+}
+fn default_refcount_drainer_interval_ms() -> u64 {
+    50
+}
+fn default_refcount_drainer_threshold_entries() -> usize {
+    4_096
+}
+fn default_refcount_drainer_max_entries_per_cycle() -> usize {
+    65_536
+}
+fn default_refcount_drainer_alloc_run_size() -> usize {
+    64
+}
+fn default_refcount_drainer_backpressure_pages() -> usize {
+    8_192
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

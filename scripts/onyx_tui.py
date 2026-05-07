@@ -463,12 +463,27 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f"Writer alloc {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_alloc_ns', 'flush_units_written')):>10}"
         f" io {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_io_ns', 'flush_units_written')):>10}"
         f" meta {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_meta_ns', 'flush_units_written')):>10}"
-        f" cleanup {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_cleanup_ns', 'flush_units_written')):>10}",
+        f" cleanup_w {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_cleanup_ns', 'flush_units_written')):>10}"
+        f" cleanup_th {fmt_ms(avg_time(metrics, prev_metrics, 'flush_cleanup_thread_ns', 'flush_cleanup_thread_batches')):>10}",
         "",
         f"Meta   commit {rate(meta, prev.status.get('metadb_memory') if prev else None, 'commit_ops', interval):8.1f}/s"
         f" avg {fmt_us(avg_time(meta, prev.status.get('metadb_memory') if prev else None, 'commit_total_us', 'commit_ops', ns_per_unit=1.0))}"
         f" max {fmt_us(num(meta, 'commit_total_max_us'))}"
         f" wal_fsync {rate(meta, prev.status.get('metadb_memory') if prev else None, 'wal_fsyncs', interval):7.1f}/s",
+        f"Sample steady max={fmt_us(num(meta, 'flush_sample_max_us_steady'))}"
+        f" forced max={fmt_us(num(meta, 'flush_sample_max_us_forced'))}"
+        f" calls steady={fmt_count(num(meta, 'flush_calls_steady'))} forced={fmt_count(num(meta, 'flush_calls_forced'))}",
+        f"SampleSize l2p_dirty avg={fmt_count(safe_div(num(meta, 'flush_sample_l2p_dirty_pages'), num(meta, 'flush_calls')))}"
+        f" max={fmt_count(num(meta, 'flush_sample_l2p_dirty_pages_max'))}"
+        f" rc_drained avg={fmt_count(safe_div(num(meta, 'flush_sample_rc_drained_deltas'), num(meta, 'flush_calls')))}"
+        f" max={fmt_count(num(meta, 'flush_sample_rc_drained_deltas_max'))}"
+        f" rc_fresh avg={fmt_count(safe_div(num(meta, 'flush_sample_rc_fresh_pages'), num(meta, 'flush_calls')))}"
+        f" max={fmt_count(num(meta, 'flush_sample_rc_fresh_pages_max'))}",
+        f"RcDrain cycles={fmt_count(num(meta, 'rc_drainer_cycles'))}"
+        f" drained={fmt_count(num(meta, 'rc_drainer_drained_entries'))}"
+        f" wait_max={fmt_us(num(meta, 'rc_drainer_checkpoint_wait_max_us'))}"
+        f" overlay_max={fmt_count(num(meta, 'rc_drainer_overlay_size_max_pages'))}p"
+        f" fallback={fmt_count(num(meta, 'rc_drainer_backpressure_fallbacks'))}",
         f"Reclaim budget={fmt_count(rate(meta, prev.status.get('metadb_memory') if prev else None, 'flush_reclaim_budget_pages', interval)):>8}/s"
         f" selected={fmt_count(rate(meta, prev.status.get('metadb_memory') if prev else None, 'flush_reclaim_selected_pages', interval)):>8}/s"
         f" freed={fmt_count(rate(meta, prev.status.get('metadb_memory') if prev else None, 'flush_reclaim_reclaimed_pages', interval)):>8}/s"

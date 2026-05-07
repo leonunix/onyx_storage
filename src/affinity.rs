@@ -45,6 +45,11 @@ pub fn init(config: &ThreadingConfig) {
             l2p_apply_cpus: config.metadb_l2p_apply_cpus.clone(),
             refcount_apply_cpus: config.metadb_refcount_apply_cpus.clone(),
             dedup_apply_cpus: config.metadb_dedup_apply_cpus.clone(),
+            // Refcount drainer CPU set is currently inherited from the
+            // OS — onyx ThreadingConfig doesn't surface a knob for it
+            // yet. The drainer is default-off, so this string only
+            // matters once the flag flips on.
+            refcount_drainer_cpus: String::new(),
         });
     }
 }

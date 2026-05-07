@@ -32,6 +32,7 @@ fn setup_flush_test_env() -> (
             dedup_shards: 1,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         })
         .unwrap(),
     );
@@ -977,10 +978,17 @@ fn duplicate_dead_pba_cleanup_callers_without_shared_lock_double_free() {
 
     let results = [t1.join().unwrap(), t2.join().unwrap()];
     let ok = results.iter().filter(|r| r.is_ok()).count();
+    // The losing caller hits SpaceAllocator's post-hazard-wait
+    // detection, which formats the error as "overlaps free extent
+    // ... after hazard wait". Either phrase ("overlaps free extent"
+    // or the older "already free") signals double-free was caught.
     let already_free = results
         .iter()
         .filter_map(|r| r.as_ref().err())
-        .filter(|e| e.to_string().contains("already free"))
+        .filter(|e| {
+            let msg = e.to_string();
+            msg.contains("already free") || msg.contains("overlaps free extent")
+        })
         .count();
 
     assert_eq!(ok, 1, "exactly one cleanup caller should win the free");

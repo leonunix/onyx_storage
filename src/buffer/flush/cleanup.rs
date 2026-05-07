@@ -108,12 +108,20 @@ impl BufferFlusher {
 
     /// Async cleanup thread: receives old mappings from writer via channel,
     /// accumulates batches, and processes them off the write hot path.
+    ///
+    /// Per-batch elapsed nanoseconds are accumulated into
+    /// `metrics.flush_cleanup_thread_ns` (sibling to `flush_writer_cleanup_ns`,
+    /// which records strictly the writer-inline post-commit work).
+    /// `flush_cleanup_thread_batches` increments once per batch so dashboards
+    /// can compute per-batch averages — `flush_units_written` is the wrong
+    /// denominator here because batches coalesce across many units.
     pub(super) fn cleanup_loop(
         shard_idx: usize,
         rx: &Receiver<CleanupBatch>,
         allocator: &SpaceAllocator,
         candidate: &crate::dedup::CandidateCache,
         running: &AtomicBool,
+        metrics: &EngineMetrics,
     ) {
         while running.load(Ordering::Relaxed) {
             let first = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -136,6 +144,12 @@ impl BufferFlusher {
                 "cleanup_thread",
             );
             let elapsed_ns = start.elapsed().as_nanos() as u64;
+            metrics
+                .flush_cleanup_thread_ns
+                .fetch_add(elapsed_ns, Ordering::Relaxed);
+            metrics
+                .flush_cleanup_thread_batches
+                .fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 shard = shard_idx,
                 mappings = count,
@@ -149,12 +163,20 @@ impl BufferFlusher {
             remaining.extend(batch);
         }
         if !remaining.is_empty() {
+            let start = Instant::now();
             Self::cleanup_dead_pbas_batch(
                 allocator,
                 candidate,
                 &remaining,
                 "cleanup_thread_drain",
             );
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            metrics
+                .flush_cleanup_thread_ns
+                .fetch_add(elapsed_ns, Ordering::Relaxed);
+            metrics
+                .flush_cleanup_thread_batches
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }

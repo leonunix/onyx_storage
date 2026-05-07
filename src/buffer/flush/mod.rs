@@ -647,6 +647,7 @@ impl BufferFlusher {
             let running_cl = running.clone();
             let allocator_cl = allocator.clone();
             let candidate_cl = candidate.clone();
+            let metrics_cl = metrics.clone();
             let cleanup_handle = thread::Builder::new()
                 .name(format!("flusher-cleanup-{}", shard_idx))
                 .spawn(move || {
@@ -657,6 +658,7 @@ impl BufferFlusher {
                         &allocator_cl,
                         &candidate_cl,
                         &running_cl,
+                        &metrics_cl,
                     );
                 })
                 .expect("failed to spawn cleanup thread");

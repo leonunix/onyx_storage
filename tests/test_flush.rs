@@ -59,6 +59,7 @@ fn setup_flush_env_with_backend(
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..Default::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -422,6 +423,7 @@ fn flusher_retries_recovered_entries_during_sustained_new_writes() {
             dedup_shards: 8,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..Default::default()
         })
         .unwrap(),
     );
