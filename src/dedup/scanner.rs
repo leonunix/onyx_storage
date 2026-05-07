@@ -301,7 +301,7 @@ impl DedupScanner {
             let vol_id = VolumeId(vol_id_str.clone());
 
             let result = lifecycle.with_read_lock(vol_id_str, || -> OnyxResult<bool> {
-                buffer_pool.with_l2p_commit_lock(vol_id_str, || -> OnyxResult<bool> {
+                buffer_pool.with_l2p_commit_lock_for_lba(vol_id_str, *lba, || -> OnyxResult<bool> {
                     // Re-read the mapping to ensure it's still the same
                     let current = meta.get_mapping(&vol_id, *lba)?;
                     let current = match current {

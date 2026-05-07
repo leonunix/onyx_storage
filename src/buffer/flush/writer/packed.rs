@@ -47,6 +47,7 @@ fn commit_packed_meta_batch(
         return false;
     }
 
+    let build_start = Instant::now();
     let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> =
         Vec::with_capacity(*batch_lbas);
     let mut combined_fresh_dedup: Vec<(ContentHash, BlockmapValue)> = Vec::new();
@@ -58,21 +59,41 @@ fn commit_packed_meta_batch(
             combined_stale_repairs.extend_from_slice(&sm.stale_repairs);
         }
     }
-    match meta.atomic_batch_write_packed_with_dedup(
+    BufferFlusher::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
+
+    let commit_lbas = combined_batch_values.len() as u64;
+    let commit_start = Instant::now();
+    let commit_result = meta.atomic_batch_write_packed_with_dedup(
         &combined_batch_values,
         sealed_slots[batch_slots[0]].pba,
         0,
         &[],
-    ) {
+    );
+    BufferFlusher::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
+    metrics
+        .flush_writer_meta_commits
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .flush_writer_meta_lbas
+        .fetch_add(commit_lbas, Ordering::Relaxed);
+
+    match commit_result {
         Ok(dead) => {
             merge_dead_pbas(actual_old_pba_meta, dead);
+            let candidate_start = Instant::now();
             candidate.insert_many(&combined_fresh_dedup);
+            BufferFlusher::record_elapsed(
+                &metrics.flush_writer_meta_candidate_ns,
+                candidate_start,
+            );
+            let repair_start = Instant::now();
             BufferFlusher::repair_stale_dedup_index(
                 meta,
                 metrics,
                 &combined_stale_repairs,
                 "write_packed_slots_batch",
             );
+            BufferFlusher::record_elapsed(&metrics.flush_writer_meta_repair_ns, repair_start);
         }
         Err(e) => {
             // P0 diagnostic: dump the batch composition (PBAs, LBA
@@ -151,7 +172,14 @@ impl BufferFlusher {
         let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
-        let outcome = pool.with_l2p_commit_locks(vol_ids.iter().map(String::as_str), || {
+        let commit_ranges = sealed.fragments.iter().map(|frag| {
+            (
+                frag.unit.vol_id.as_str(),
+                frag.unit.start_lba,
+                frag.unit.lba_count as u64,
+            )
+        });
+        let outcome = pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
             // Under lifecycle read locks: check generation, build batch, IO, commit
 
             // Build blockmap entries.
@@ -419,14 +447,77 @@ impl BufferFlusher {
         let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
         let mut meta_commits = 0usize;
         let mut meta_lbas = 0usize;
-        let mut io_elapsed = Duration::ZERO;
+        let io_elapsed: Duration;
         let mut meta_elapsed = Duration::ZERO;
+        let mut slot_io_ok = vec![true; n];
+        let mut io_ops_count = 0u64;
 
-        pool.with_l2p_commit_locks(vol_ids.iter().map(String::as_str), || {
+        // The sealed PBA is private until metadata commit publishes it, so
+        // the LV3 write can run before the L2P commit lock. The lock is only
+        // needed for "latest pending entry" validation through metadb commit.
+        let io_start = Instant::now();
+        {
+            use crate::io::engine::{LvOp, LvOpResult};
+            let mut ops: Vec<LvOp> = Vec::with_capacity(n);
+            let mut op_to_slot: Vec<usize> = Vec::with_capacity(n);
+            for (i, sealed) in sealed_slots.iter().enumerate() {
+                allocator.wait_for_readers(sealed.pba, 1);
+                ops.push(LvOp::Write {
+                    pba: sealed.pba,
+                    payload: sealed.data.as_slice(),
+                });
+                op_to_slot.push(i);
+            }
+            if !ops.is_empty() {
+                io_ops_count = ops.len() as u64;
+                match io_engine.submit_batch(ops, false) {
+                    Ok(write_results) => {
+                        for (idx, r) in write_results.into_iter().enumerate() {
+                            let slot_idx = op_to_slot[idx];
+                            if let LvOpResult::Write(Err(e)) = r {
+                                let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                                results[slot_idx] =
+                                    Err(crate::error::OnyxError::Io(std::io::Error::other(
+                                        format!("packed-slot batch IO write failed: {e}"),
+                                    )));
+                                slot_io_ok[slot_idx] = false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for &slot_idx in &op_to_slot {
+                            let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                            results[slot_idx] =
+                                Err(crate::error::OnyxError::Io(std::io::Error::other(
+                                    format!("packed-slot batch IO submit failed: {e}"),
+                                )));
+                            slot_io_ok[slot_idx] = false;
+                        }
+                    }
+                }
+            }
+        }
+        io_elapsed = io_start.elapsed();
+        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+
+        let commit_ranges = sealed_slots.iter().flat_map(|sealed| {
+            sealed.fragments.iter().map(|frag| {
+                (
+                    frag.unit.vol_id.as_str(),
+                    frag.unit.start_lba,
+                    frag.unit.lba_count as u64,
+                )
+            })
+        });
+        pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
             // Phase 1: per-slot validation + build batch_values + dedup registrations.
             // A slot whose every fragment is stale (volume deleted / version
             // mismatch / no live positions) is dropped here and its PBA freed.
+            let build_start = Instant::now();
             for (i, sealed) in sealed_slots.iter().enumerate() {
+                if !slot_io_ok[i] {
+                    continue;
+                }
                 let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
                 let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
                 let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
@@ -541,57 +632,7 @@ impl BufferFlusher {
                     stale_repairs,
                 });
             }
-
-            // Phase 2: batched IO writes.
-            let io_start = Instant::now();
-            {
-                use crate::io::engine::{LvOp, LvOpResult};
-                let mut ops: Vec<LvOp> = Vec::new();
-                let mut op_to_slot: Vec<usize> = Vec::new();
-                for i in 0..n {
-                    if slot_metas[i].is_none() {
-                        continue;
-                    }
-                    allocator.wait_for_readers(sealed_slots[i].pba, 1);
-                    ops.push(LvOp::Write {
-                        pba: sealed_slots[i].pba,
-                        payload: sealed_slots[i].data.as_slice(),
-                    });
-                    op_to_slot.push(i);
-                }
-                if !ops.is_empty() {
-                    match io_engine.submit_batch(ops, false) {
-                        Ok(write_results) => {
-                            for (idx, r) in write_results.into_iter().enumerate() {
-                                let slot_idx = op_to_slot[idx];
-                                if let LvOpResult::Write(Err(e)) = r {
-                                    let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                                    results[slot_idx] =
-                                        Err(crate::error::OnyxError::Io(std::io::Error::other(
-                                            format!("packed-slot batch IO write failed: {e}"),
-                                        )));
-                                    slot_metas[slot_idx] = None;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            for &slot_idx in &op_to_slot {
-                                if slot_metas[slot_idx].is_none() {
-                                    continue;
-                                }
-                                let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                                results[slot_idx] =
-                                    Err(crate::error::OnyxError::Io(std::io::Error::other(
-                                        format!("packed-slot batch IO submit failed: {e}"),
-                                    )));
-                                slot_metas[slot_idx] = None;
-                            }
-                        }
-                    }
-                }
-            }
-            io_elapsed = io_start.elapsed();
-            Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+            Self::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
 
             // Phase 3: bounded metadata batches over surviving slots.
             let meta_start = Instant::now();
@@ -664,11 +705,15 @@ impl BufferFlusher {
 
         // Phase 4: counters + mark_flushed per surviving slot.
         let mark_start = Instant::now();
+        let mut surviving_slots = 0u64;
+        let mut mark_calls = 0u64;
+        let mut mark_lbas = 0u64;
         for i in 0..n {
             let Some(sm) = slot_metas[i].as_ref() else {
                 continue;
             };
             let sealed = &sealed_slots[i];
+            surviving_slots += 1;
             metrics
                 .flush_packed_slots_written
                 .fetch_add(1, Ordering::Relaxed);
@@ -679,11 +724,47 @@ impl BufferFlusher {
                 .flush_packed_bytes
                 .fetch_add(sealed.data.len() as u64, Ordering::Relaxed);
             for (seq, lba_start, lba_count) in &sm.all_seq_lba_ranges {
+                mark_calls += 1;
+                mark_lbas += *lba_count as u64;
                 if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
                     tracing::warn!(seq, error = %e, "failed to mark entry flushed (packed batch)");
                 }
             }
         }
+        metrics
+            .flush_writer_packed_batches
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_writer_packed_batch_slots
+            .fetch_add(surviving_slots, Ordering::Relaxed);
+        metrics
+            .flush_writer_packed_batch_lbas
+            .fetch_add(meta_lbas as u64, Ordering::Relaxed);
+        metrics
+            .flush_writer_packed_batch_io_ops
+            .fetch_add(io_ops_count, Ordering::Relaxed);
+        metrics
+            .flush_writer_packed_mark_calls
+            .fetch_add(mark_calls, Ordering::Relaxed);
+        metrics
+            .flush_writer_packed_mark_lbas
+            .fetch_add(mark_lbas, Ordering::Relaxed);
+        crate::metrics::record_counter_max(
+            &metrics.flush_writer_packed_batch_slots_max,
+            surviving_slots,
+        );
+        crate::metrics::record_counter_max(
+            &metrics.flush_writer_packed_batch_lbas_max,
+            meta_lbas as u64,
+        );
+        crate::metrics::record_counter_max(
+            &metrics.flush_writer_packed_batch_io_ops_max,
+            io_ops_count,
+        );
+        crate::metrics::record_counter_max(
+            &metrics.flush_writer_packed_mark_calls_max,
+            mark_calls,
+        );
         Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
         let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);

@@ -845,7 +845,18 @@ impl BufferFlusher {
             let mut pending: Vec<(usize, usize, Lba, BlockmapValue, ContentHash)> = Vec::new();
 
             lifecycle.with_read_lock(&vol_id_str, || {
-                pool.with_l2p_commit_lock(&vol_id_str, || {
+                let commit_ranges: Vec<(&str, Lba, u64)> = unit_indices
+                    .iter()
+                    .map(|&unit_idx| {
+                    let unit = &prepared[unit_idx].unit;
+                    (
+                        vol_id_str.as_str(),
+                        unit.start_lba,
+                        unit.lba_count as u64,
+                    )
+                    })
+                    .collect();
+                pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
                     for unit_idx in unit_indices {
                         let unit = &prepared[unit_idx].unit;
                         let generation_alive = generation_cache
@@ -963,7 +974,18 @@ impl BufferFlusher {
             let vol_id = VolumeId(vol_id_str.clone());
             let mut generation_cache: HashMap<u64, OnyxResult<bool>> = HashMap::new();
             lifecycle.with_read_lock(&vol_id_str, || {
-                pool.with_l2p_commit_lock(&vol_id_str, || {
+                let commit_ranges: Vec<(&str, Lba, u64)> = unit_indices
+                    .iter()
+                    .map(|&unit_idx| {
+                    let unit = &prepared[unit_idx].unit;
+                    (
+                        vol_id_str.as_str(),
+                        unit.start_lba,
+                        unit.lba_count as u64,
+                    )
+                    })
+                    .collect();
+                pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
                     for unit_idx in unit_indices {
                         let unit = &prepared[unit_idx].unit;
                         let generation_alive = generation_cache

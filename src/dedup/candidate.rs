@@ -56,6 +56,7 @@
 //! a successful LV3 verify, which is itself crash-safe via the buffer
 //! pool flush log.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -190,13 +191,15 @@ impl CandidateCache {
                     }
                 }
             }
-            // Reverse-map updates outside the LRU lock.
+            // Reverse-map updates outside the LRU lock. Group by PBA so a
+            // packed slot with many fingerprints updates one DashMap entry
+            // once instead of once per LBA.
+            let mut reverse_by_pba: HashMap<Pba, Vec<ContentHash>> = HashMap::new();
             for (fp, value) in &shard_pairs {
-                self.inner
-                    .pba_to_hashes
-                    .entry(value.pba)
-                    .or_default()
-                    .push(*fp);
+                reverse_by_pba.entry(value.pba).or_default().push(*fp);
+            }
+            for (pba, fps) in reverse_by_pba {
+                self.inner.pba_to_hashes.entry(pba).or_default().extend(fps);
             }
             for (efp, evalue) in evicted {
                 self.drop_from_reverse(evalue.pba, &efp);

@@ -154,7 +154,11 @@ impl ServiceController {
         if let Err(e) = socket_handle.join() {
             tracing::error!("socket listener thread panicked: {:?}", e);
         }
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Do not unlink the socket path on shutdown. A previous service can
+        // still be unwinding while a new service has already bound the same
+        // pathname; unlinking here would make the new listener unreachable
+        // even though it continues to appear in `ss`. Startup already removes
+        // stale socket files before binding.
 
         // Wait for ublk device threads
         #[cfg(target_os = "linux")]

@@ -24,6 +24,7 @@ const COMMIT_LOG_SUPERBLOCK_SIZE: u64 = 4096;
 const MAX_SHARDS_ON_DISK: usize = 64;
 /// DashMap internal shard count — high value reduces contention under many writers.
 const DASHMAP_SHARDS: usize = 256;
+const L2P_COMMIT_LOCK_STRIPES: u64 = 256;
 
 const SHARD_CHECKPOINT_MAGIC: u32 = 0x5348_434B; // "SHCK"
 const SHARD_CHECKPOINT_VERSION: u32 = 1;
@@ -404,7 +405,7 @@ pub struct WriteBufferPool {
     root_device: RawDevice,
     shards: Vec<BufferShardHandle>,
     next_seq: AtomicU64,
-    /// Serializes background L2P commits. Flusher/scanner paths take this
+    /// Serializes background L2P commits by (volume, LBA stripe). Flusher/scanner paths take this
     /// while checking `is_latest_lba_seq` and updating metadb. That closes the
     /// stale-commit window where an older seq could observe "latest", then
     /// race behind a newer flush and overwrite the newer L2P mapping.
@@ -413,7 +414,7 @@ pub struct WriteBufferPool {
     /// after an older commit has already passed the latest check, the older
     /// commit may land first, but the newer buffered write remains visible and
     /// its later flush will commit after it.
-    l2p_commit_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
+    l2p_commit_locks: DashMap<(String, u64), Arc<parking_lot::Mutex<()>>>,
     routing_zone_size_blocks: u64,
     ready_rx: Receiver<u64>,
     shard_ready_rxs: Vec<Receiver<u64>>,

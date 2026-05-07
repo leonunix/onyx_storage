@@ -88,8 +88,8 @@ impl BufferFlusher {
 
             let meta_start = Instant::now();
 
-            let commit = pool.with_l2p_commit_lock(
-                &unit.vol_id,
+            let commit = pool.with_l2p_commit_locks_for_ranges(
+                std::iter::once((unit.vol_id.as_str(), unit.start_lba, unit.lba_count as u64)),
                 || -> OnyxResult<Option<(Vec<usize>, HashMap<Pba, RemapCleanup>)>> {
                     let live_positions = Self::live_positions_for_unit(unit, pool)?;
                     if live_positions.is_empty() {
@@ -254,6 +254,7 @@ impl BufferFlusher {
         let mut skip = vec![false; n]; // true = discard (stale volume)
         let mut pbas: Vec<Option<Pba>> = vec![None; n];
         let mut alloc_blocks: Vec<u32> = vec![0; n];
+        let mut io_ops_count = 0u64;
 
         // Phase 1: Validate generations.
         for (i, unit) in units.iter().enumerate() {
@@ -338,6 +339,7 @@ impl BufferFlusher {
             }
 
             if !ops.is_empty() {
+                io_ops_count = ops.len() as u64;
                 match io_engine.submit_batch(ops, false) {
                     Ok(write_results) => {
                         for (idx, r) in write_results.into_iter().enumerate() {
@@ -383,13 +385,15 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
         let meta_start = Instant::now();
-        let commit_vol_ids: Vec<&str> = units
+        let commit_ranges: Vec<(&str, Lba, u64)> = units
             .iter()
             .enumerate()
-            .filter_map(|(i, unit)| (!skip[i]).then_some(unit.vol_id.as_str()))
+            .filter_map(|(i, unit)| {
+                (!skip[i]).then_some((unit.vol_id.as_str(), unit.start_lba, unit.lba_count as u64))
+            })
             .collect();
         let (unit_metas, meta_indices, actual_old_pba_meta) =
-            pool.with_l2p_commit_locks(commit_vol_ids, || {
+            pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
                 // Phase 4: Build batch values + live positions.
                 // Refcount decrements are re-computed inside the lock by atomic_batch_write_multi.
                 struct UnitMeta {
@@ -402,6 +406,7 @@ impl BufferFlusher {
                 }
                 let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
 
+                let build_start = Instant::now();
                 for (i, unit) in units.iter().enumerate() {
                     if skip[i] {
                         continue;
@@ -498,6 +503,7 @@ impl BufferFlusher {
                     vol_ids_owned.push(VolumeId(unit.vol_id.clone()));
                     meta_indices.push(i);
                 }
+                Self::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
 
                 // actual_old_pba_meta: returned by atomic_batch_write_multi with accurate data
                 let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
@@ -524,15 +530,38 @@ impl BufferFlusher {
                         all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
                         all_stale_repairs.extend_from_slice(&um.stale_repairs);
                     }
-                    match meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]) {
+                    let commit_lbas: u64 = batch_args
+                        .iter()
+                        .map(|(_, values, _)| values.len() as u64)
+                        .sum();
+                    let commit_start = Instant::now();
+                    let commit_result = meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]);
+                    Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
+                    metrics
+                        .flush_writer_meta_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .flush_writer_meta_lbas
+                        .fetch_add(commit_lbas, Ordering::Relaxed);
+                    match commit_result {
                         Ok(returned) => {
                             actual_old_pba_meta = returned;
+                            let candidate_start = Instant::now();
                             candidate.insert_many(&all_fresh_pairs);
+                            Self::record_elapsed(
+                                &metrics.flush_writer_meta_candidate_ns,
+                                candidate_start,
+                            );
+                            let repair_start = Instant::now();
                             Self::repair_stale_dedup_index(
                                 meta,
                                 metrics,
                                 &all_stale_repairs,
                                 "write_units_batch",
+                            );
+                            Self::record_elapsed(
+                                &metrics.flush_writer_meta_repair_ns,
+                                repair_start,
                             );
                         }
                         Err(e) => {
@@ -557,6 +586,25 @@ impl BufferFlusher {
             });
         let meta_elapsed = meta_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+        let live_units = meta_indices.len() as u64;
+        let live_lbas = meta_indices
+            .iter()
+            .filter_map(|&unit_idx| unit_metas[unit_idx].as_ref())
+            .map(|um| um.live_positions.len() as u64)
+            .sum::<u64>();
+        metrics.flush_writer_pt_batches.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_writer_pt_units
+            .fetch_add(live_units, Ordering::Relaxed);
+        metrics
+            .flush_writer_pt_lbas
+            .fetch_add(live_lbas, Ordering::Relaxed);
+        metrics
+            .flush_writer_pt_io_ops
+            .fetch_add(io_ops_count, Ordering::Relaxed);
+        crate::metrics::record_counter_max(&metrics.flush_writer_pt_units_max, live_units);
+        crate::metrics::record_counter_max(&metrics.flush_writer_pt_lbas_max, live_lbas);
+        crate::metrics::record_counter_max(&metrics.flush_writer_pt_io_ops_max, io_ops_count);
 
         // Phase 6: Cleanup (free old PBAs) + dedup registration queueing.
         //
@@ -616,14 +664,28 @@ impl BufferFlusher {
 
         // Phase 7: Batch mark_flushed (memory-only, fast).
         let mark_start = Instant::now();
+        let mut mark_calls = 0u64;
+        let mut mark_lbas = 0u64;
         for (i, unit) in units.iter().enumerate() {
             if skip[i] {
                 continue;
             }
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                mark_calls += 1;
+                mark_lbas += *lba_count as u64;
                 let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
             }
         }
+        metrics
+            .flush_writer_pt_mark_calls
+            .fetch_add(mark_calls, Ordering::Relaxed);
+        metrics
+            .flush_writer_pt_mark_lbas
+            .fetch_add(mark_lbas, Ordering::Relaxed);
+        crate::metrics::record_counter_max(
+            &metrics.flush_writer_pt_mark_calls_max,
+            mark_calls,
+        );
         Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
         let _ = pool.advance_tail_for_shard(shard_idx);
 

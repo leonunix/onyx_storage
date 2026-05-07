@@ -28,7 +28,15 @@ impl BufferFlusher {
     /// decoupled by LV2. When reads are flowing, cap each writer drain so one
     /// background batch cannot monopolize LV3 IO and metadb apply for hundreds
     /// of milliseconds.
-    pub(super) const WRITER_BATCH_SIZE_READ_ACTIVE: usize = 128;
+    ///
+    /// The cap still has to be large enough to keep NVMe and metadb commits in
+    /// their efficient batched regime. A 2026-05-07 mixed 4K-32K run with the
+    /// old 128 cap held the backend around 38K flushed 4K-LBA/s while ingesting
+    /// roughly 59K 4K-LBA/s. Raising the cap to 512 lifted drain to roughly
+    /// 116K flushed 4K-LBA/s under the same workload; 1024 did not improve the
+    /// mixed-read case and made single-batch tails larger, so keep a separate
+    /// read-active throttle at the proven point.
+    pub(super) const WRITER_BATCH_SIZE_READ_ACTIVE: usize = 512;
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
     pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(200);
 
@@ -174,6 +182,20 @@ impl BufferFlusher {
                     Err(_) => break,
                 }
             }
+            let drained_units = incoming.len() as u64;
+            metrics.flush_writer_cycles.fetch_add(1, Ordering::Relaxed);
+            if read_active {
+                metrics
+                    .flush_writer_read_active_cycles
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            metrics
+                .flush_writer_drained_units
+                .fetch_add(drained_units, Ordering::Relaxed);
+            crate::metrics::record_counter_max(
+                &metrics.flush_writer_drained_units_max,
+                drained_units,
+            );
 
             // Run through packer, collect Passthrough AND SealedSlot
             // batches. Each SealedSlot's metadata commit was previously

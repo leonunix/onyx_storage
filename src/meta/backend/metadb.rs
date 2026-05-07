@@ -520,8 +520,16 @@ impl MetadbBackend {
         }
         let mut tx = self.db.begin();
         let mut new_values = Vec::with_capacity(batch_values.len());
+        let mut ordinal_cache: HashMap<&str, VolumeOrdinal> = HashMap::new();
         for (vol_id, lba, value) in batch_values {
-            let ord = self.volume_ordinal(vol_id)?;
+            let ord = match ordinal_cache.get(vol_id.0.as_str()) {
+                Some(ord) => *ord,
+                None => {
+                    let ord = self.volume_ordinal(vol_id)?;
+                    ordinal_cache.insert(vol_id.0.as_str(), ord);
+                    ord
+                }
+            };
             tx.l2p_remap(ord, lba.0, to_l2p_value(value), None);
             new_values.push(*value);
         }
