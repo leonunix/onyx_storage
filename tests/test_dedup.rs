@@ -58,6 +58,7 @@ fn setup_dedup_env_with_sizes(
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..onyx_storage::config::MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -127,6 +128,7 @@ fn setup_dedup_env_with_read_pool() -> (
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..onyx_storage::config::MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -393,6 +395,7 @@ fn dedup_index_crud() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..onyx_storage::config::MetaConfig::default()
     };
     let store = MetaStore::open(&config).unwrap();
 
@@ -439,6 +442,7 @@ fn scan_dedup_skipped() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..onyx_storage::config::MetaConfig::default()
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();
@@ -495,6 +499,7 @@ fn update_blockmap_flags_clears_dedup_skipped() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..onyx_storage::config::MetaConfig::default()
     };
     let store = MetaStore::open(&config).unwrap();
     store.create_blockmap_cf("test-vol").unwrap();

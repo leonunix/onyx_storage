@@ -250,6 +250,7 @@ fn rebuild_from_metadata() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-a".into());
@@ -334,6 +335,7 @@ fn rebuild_empty_metadata() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -361,6 +363,7 @@ fn rebuild_fully_allocated() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-a".into());
@@ -395,6 +398,7 @@ fn rebuild_from_blockmap_marks_multi_block_units() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-a".into());

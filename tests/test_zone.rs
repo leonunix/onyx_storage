@@ -26,6 +26,7 @@ fn setup_worker() -> (ZoneWorker, Arc<MetaStore>) {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -62,6 +63,7 @@ fn setup_zone_manager(zone_count: u32) -> ZoneManager {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -272,6 +274,7 @@ fn zone_manager_concurrent_reads_inline_no_serialization() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -363,6 +366,7 @@ fn zone_manager_read_pool_decompresses_concurrently() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 

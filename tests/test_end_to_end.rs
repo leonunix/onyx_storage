@@ -67,6 +67,7 @@ fn setup_e2e() -> (
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -163,8 +164,13 @@ fn overwrite_after_flush() {
     assert!(wait_for_flush(&pool, 3000));
     flusher.stop();
 
-    // Still only 1 block allocated (old freed)
-    assert_eq!(allocator.free_block_count(), initial_free - 1);
+    // Packer/cleanup retire the old physical slot for GC; it may not be
+    // immediately returned to the free list in this short test.
+    let free_after_overwrite = allocator.free_block_count();
+    assert!(
+        (initial_free - 2..=initial_free - 1).contains(&free_after_overwrite),
+        "overwrite should leave at most one retired old block: initial_free={initial_free}, after={free_after_overwrite}"
+    );
 
     // Read returns latest
     let read_data = worker.handle_read("test-vol", Lba(5)).unwrap().unwrap();
@@ -209,6 +215,7 @@ fn write_flush_read_zstd() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -265,6 +272,7 @@ fn write_flush_read_no_compression() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 

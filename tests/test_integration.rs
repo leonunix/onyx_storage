@@ -106,6 +106,7 @@ fn setup_with_all_options(
             dedup_shards: 8,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..MetaConfig::default()
         },
         storage: StorageConfig {
             data_device: Some(data_file.path().to_path_buf()),

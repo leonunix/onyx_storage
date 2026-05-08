@@ -37,6 +37,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             dedup_shards: 8,
             dedup_cuckoo_buckets: 1_000_000,
             dedup_l1_cache_entries: 256_000,
+            ..MetaConfig::default()
         },
         storage: StorageConfig {
             data_device: Some(data_tmp.path().to_path_buf()),
@@ -1009,25 +1010,29 @@ fn discard_with_flush_frees_space() {
     vol.write(0, &payload).unwrap();
     assert!(wait_for_buffer_drain(&engine, 5000), "flush timeout");
 
-    // Record free blocks before discard
-    let free_before = engine
+    // Record reclaim state before discard. Dead PBAs are retired first and
+    // returned to the free list only after GC re-validates metadata.
+    let (free_before, retired_before) = engine
         .allocator()
-        .map(|a| a.free_block_count())
-        .unwrap_or(0);
+        .map(|a| (a.free_block_count(), a.retired_block_count()))
+        .unwrap_or((0, 0));
 
     // Discard all 8 blocks
     vol.discard(0, 8 * 4096).unwrap();
 
-    // Free blocks should increase (space reclaimed)
-    let free_after = engine
+    // Space should become reclaimable immediately, even if it has not been
+    // returned to the allocator free list yet.
+    let (free_after, retired_after) = engine
         .allocator()
-        .map(|a| a.free_block_count())
-        .unwrap_or(0);
+        .map(|a| (a.free_block_count(), a.retired_block_count()))
+        .unwrap_or((0, 0));
     assert!(
-        free_after > free_before,
-        "free blocks should increase after discard: before={}, after={}",
+        free_after + retired_after > free_before + retired_before,
+        "reclaimable blocks should increase after discard: before_free={}, before_retired={}, after_free={}, after_retired={}",
         free_before,
-        free_after
+        retired_before,
+        free_after,
+        retired_after
     );
 
     // All blocks should read as zeros

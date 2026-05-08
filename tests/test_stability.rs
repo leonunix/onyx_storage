@@ -8,8 +8,10 @@ use onyx_storage::dedup::config::DedupConfig;
 use onyx_storage::gc::config::GcConfig;
 use onyx_storage::types::{CompressionAlgo, BLOCK_SIZE};
 use rand::Rng;
+use serial_test::serial;
 
 #[test]
+#[serial]
 fn randomized_lifecycle_matches_shadow_model() {
     let mut env = EngineHarness::new(HarnessOptions {
         dedup: DedupConfig {
@@ -92,6 +94,7 @@ fn randomized_lifecycle_matches_shadow_model() {
 }
 
 #[test]
+#[serial]
 fn metamorphic_workload_preserves_logical_image_across_configs() {
     let configs = [
         (
@@ -229,6 +232,7 @@ fn metamorphic_workload_preserves_logical_image_across_configs() {
 }
 
 #[test]
+#[serial]
 fn mixed_workload_with_periodic_restart_stays_consistent() {
     let mut env = EngineHarness::new(HarnessOptions {
         dedup: DedupConfig {
@@ -286,6 +290,7 @@ fn mixed_workload_with_periodic_restart_stays_consistent() {
 }
 
 #[test]
+#[serial]
 fn crash_recovery_replays_acknowledged_buffer_entries() {
     let mut env = EngineHarness::new(HarnessOptions {
         gc: GcConfig {

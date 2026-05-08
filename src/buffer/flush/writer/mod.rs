@@ -37,6 +37,11 @@ impl BufferFlusher {
     /// mixed-read case and made single-batch tails larger, so keep a separate
     /// read-active throttle at the proven point.
     pub(super) const WRITER_BATCH_SIZE_READ_ACTIVE: usize = 512;
+    /// After the first completed unit arrives, wait very briefly for the
+    /// compress/dedup pipeline to hand over adjacent work. This keeps fast LV3
+    /// writes from turning into many small metadb commits when the IO side gets
+    /// cheaper than the upstream handoff cadence.
+    pub(super) const WRITER_BATCH_COALESCE: Duration = Duration::from_micros(250);
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
     pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(200);
 
@@ -176,10 +181,20 @@ impl BufferFlusher {
 
             // Drain up to the current writer batch limit.
             let mut incoming = vec![first];
+            let drain_deadline = Instant::now() + Self::WRITER_BATCH_COALESCE;
             while incoming.len() < writer_batch_limit {
                 match rx.try_recv() {
                     Ok(unit) => incoming.push(unit),
-                    Err(_) => break,
+                    Err(_) => {
+                        let now = Instant::now();
+                        if now >= drain_deadline {
+                            break;
+                        }
+                        match rx.recv_timeout(drain_deadline.saturating_duration_since(now)) {
+                            Ok(unit) => incoming.push(unit),
+                            Err(_) => break,
+                        }
+                    }
                 }
             }
             let drained_units = incoming.len() as u64;

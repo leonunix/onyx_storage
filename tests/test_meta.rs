@@ -137,6 +137,7 @@ fn test_config(dir: &std::path::Path) -> MetaConfig {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     }
 }
 

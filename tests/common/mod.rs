@@ -77,6 +77,7 @@ impl EngineHarness {
                 dedup_shards: 8,
                 dedup_cuckoo_buckets: 1_000_000,
                 dedup_l1_cache_entries: 256_000,
+                ..MetaConfig::default()
             },
             storage: StorageConfig {
                 data_device: Some(data_file.path().to_path_buf()),
@@ -325,10 +326,24 @@ impl EngineHarness {
         if let Some(allocator) = self.engine().allocator() {
             let allocated = self.engine().meta().iter_allocated_blocks().unwrap();
             let allocated_set = allocated.iter().copied().collect::<HashSet<_>>();
+            let retired_extents = allocator.retired_candidates(usize::MAX);
+            let retired_blocks: u64 = retired_extents
+                .iter()
+                .map(|extent| extent.count as u64)
+                .sum();
+            for extent in &retired_extents {
+                for offset in 0..extent.count {
+                    let pba = Pba(extent.start.0 + offset as u64);
+                    assert!(
+                        !allocated_set.contains(&pba),
+                        "retired PBA must not have a live metadata reference"
+                    );
+                }
+            }
             assert_eq!(
                 allocator.allocated_block_count(),
-                allocated_set.len() as u64,
-                "allocator allocated count must match metadata"
+                allocated_set.len() as u64 + retired_blocks,
+                "allocator allocated count must match live metadata plus retired blocks"
             );
             assert_eq!(
                 allocator.free_block_count() + allocator.allocated_block_count(),

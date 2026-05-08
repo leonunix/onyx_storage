@@ -85,6 +85,7 @@ fn setup_gc_env() -> TestEnv {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = Arc::new(MetaStore::open(&meta_config).unwrap());
 
@@ -132,6 +133,7 @@ fn scanner_finds_candidates_with_dead_blocks() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -217,6 +219,7 @@ fn scanner_skips_below_threshold() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -277,6 +280,7 @@ fn scanner_skips_single_lba_units() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -315,6 +319,7 @@ fn scanner_sorts_by_dead_ratio_descending() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
     let vol_id = VolumeId("vol-test".into());
@@ -681,6 +686,7 @@ fn scanner_distinguishes_packed_fragments_same_pba() {
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 
@@ -771,6 +777,7 @@ fn scanner_does_not_merge_fragments_with_same_pba_offset_and_size_but_different_
         dedup_shards: 8,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
     };
     let meta = MetaStore::open(&meta_config).unwrap();
 

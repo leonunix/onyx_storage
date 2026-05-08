@@ -171,6 +171,28 @@ impl IoEngine {
         }
     }
 
+    fn record_lv3_write_batch(&self, ops: usize, bytes: usize, slab_allocated: bool) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .lv3_write_batch_calls
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .lv3_write_batch_ops
+                .fetch_add(ops as u64, Ordering::Relaxed);
+            metrics
+                .lv3_write_batch_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+            if slab_allocated {
+                metrics
+                    .lv3_write_slab_allocs
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .lv3_write_slab_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn pba_to_offset(&self, pba: Pba) -> u64 {
         (pba.0 + self.pba_offset) * self.block_size as u64
     }
@@ -374,6 +396,11 @@ impl IoEngine {
         if ops.is_empty() && !fsync_after {
             return Ok(Vec::new());
         }
+        let all_writes = !ops.is_empty() && ops.iter().all(|op| matches!(op, LvOp::Write { .. }));
+        if all_writes {
+            return self.submit_write_batch_uring(session, ops, fsync_after);
+        }
+
         let bs = self.block_size as usize;
         let fd = self.data_device.as_raw_fd();
 
@@ -514,6 +541,119 @@ impl IoEngine {
             }
         }
 
+        Ok(out
+            .into_iter()
+            .map(|s| s.expect("all slots filled"))
+            .collect())
+    }
+
+    fn submit_write_batch_uring(
+        &self,
+        session: &Arc<IoUringSession>,
+        ops: Vec<LvOp<'_>>,
+        fsync_after: bool,
+    ) -> OnyxResult<Vec<LvOpResult>> {
+        let bs = self.block_size as usize;
+        let fd = self.data_device.as_raw_fd();
+        let mut metas: Vec<(usize, u32, u64)> = Vec::with_capacity(ops.len());
+        let mut total_bytes = 0usize;
+
+        for (idx, op) in ops.iter().enumerate() {
+            let LvOp::Write { pba, payload } = op else {
+                unreachable!("submit_write_batch_uring only accepts writes");
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            let total = ((payload.len() + bs - 1) / bs) * bs;
+            total_bytes = total_bytes.checked_add(total).ok_or_else(|| {
+                OnyxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "io_uring write batch is too large",
+                ))
+            })?;
+            metas.push((idx, total as u32, self.pba_to_offset(*pba)));
+        }
+
+        let mut slab = if total_bytes > 0 {
+            Some(AlignedBuf::new(total_bytes, self.use_hugepages)?)
+        } else {
+            None
+        };
+        self.record_lv3_write_batch(metas.len(), total_bytes, slab.is_some());
+        let mut uring_ops: Vec<UringOp> =
+            Vec::with_capacity(metas.len() + usize::from(fsync_after));
+        let mut cursor = 0usize;
+
+        if let Some(slab) = slab.as_mut() {
+            for op in &ops {
+                let LvOp::Write { payload, .. } = op else {
+                    unreachable!("submit_write_batch_uring only accepts writes");
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+                let total = ((payload.len() + bs - 1) / bs) * bs;
+                slab.as_mut_slice()[cursor..cursor + payload.len()].copy_from_slice(payload);
+                uring_ops.push(UringOp::Write {
+                    fd,
+                    ptr: unsafe { slab.as_ptr().add(cursor) },
+                    len: total as u32,
+                    offset: self.data_device.base_offset() + metas[uring_ops.len()].2,
+                });
+                cursor += total;
+            }
+        }
+
+        let data_op_count = uring_ops.len();
+        if fsync_after {
+            uring_ops.push(UringOp::FsyncDataBarrier { fd });
+        }
+
+        let mut results = Vec::with_capacity(uring_ops.len());
+        if data_op_count > 0 {
+            let max_ops = (session.sq_entries() as usize).max(1);
+            for chunk in uring_ops[..data_op_count].chunks(max_ops) {
+                results.extend(unsafe { session.submit_batch(chunk)? });
+            }
+        }
+        if fsync_after {
+            results.extend(unsafe { session.submit_batch(&uring_ops[data_op_count..])? });
+        }
+
+        let mut out: Vec<Option<LvOpResult>> = (0..ops.len()).map(|_| None).collect();
+        for (idx, op) in ops.iter().enumerate() {
+            if matches!(op, LvOp::Write { payload, .. } if payload.is_empty()) {
+                out[idx] = Some(LvOpResult::Write(Ok(())));
+            }
+        }
+
+        for (result_idx, (op_idx, expected, offset)) in metas.into_iter().enumerate() {
+            let r = &results[result_idx];
+            let slot = match self.validate_uring_result("write", offset, expected, r) {
+                Ok(()) => {
+                    self.record_lv3_write(expected as usize);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            out[op_idx] = Some(LvOpResult::Write(slot));
+        }
+
+        if fsync_after {
+            let r = &results[results.len() - 1];
+            if let Some(errno) = r.errno() {
+                return Err(OnyxError::Device {
+                    path: self.data_device.path().to_path_buf(),
+                    reason: format!(
+                        "io_uring fdatasync failed: errno={errno} ({})",
+                        std::io::Error::from_raw_os_error(errno)
+                    ),
+                });
+            }
+        }
+
+        drop(slab);
         Ok(out
             .into_iter()
             .map(|s| s.expect("all slots filled"))
