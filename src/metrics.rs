@@ -277,6 +277,11 @@ pub struct EngineMetrics {
     pub flush_writer_read_active_cycles: AtomicU64,
     pub flush_writer_drained_units: AtomicU64,
     pub flush_writer_drained_units_max: AtomicU64,
+    /// `write_rx.len()` sampled at the start of each writer cycle, *before*
+    /// the drain loop pulls anything. High values mean compress/dedup is
+    /// producing faster than the writer commits — i.e. the bottleneck is
+    /// downstream of the channel (metadb commit / LV3 IO), not upstream.
+    pub flush_writer_rx_pending_max: AtomicU64,
     pub flush_writer_pt_batches: AtomicU64,
     pub flush_writer_pt_units: AtomicU64,
     pub flush_writer_pt_lbas: AtomicU64,
@@ -554,6 +559,7 @@ impl Default for EngineMetrics {
             flush_writer_read_active_cycles: AtomicU64::new(0),
             flush_writer_drained_units: AtomicU64::new(0),
             flush_writer_drained_units_max: AtomicU64::new(0),
+            flush_writer_rx_pending_max: AtomicU64::new(0),
             flush_writer_pt_batches: AtomicU64::new(0),
             flush_writer_pt_units: AtomicU64::new(0),
             flush_writer_pt_lbas: AtomicU64::new(0),
@@ -764,6 +770,7 @@ impl EngineMetrics {
             flush_writer_read_active_cycles: load(&self.flush_writer_read_active_cycles),
             flush_writer_drained_units: load(&self.flush_writer_drained_units),
             flush_writer_drained_units_max: load(&self.flush_writer_drained_units_max),
+            flush_writer_rx_pending_max: load(&self.flush_writer_rx_pending_max),
             flush_writer_pt_batches: load(&self.flush_writer_pt_batches),
             flush_writer_pt_units: load(&self.flush_writer_pt_units),
             flush_writer_pt_lbas: load(&self.flush_writer_pt_lbas),
@@ -962,6 +969,7 @@ pub struct EngineMetricsSnapshot {
     pub flush_writer_read_active_cycles: u64,
     pub flush_writer_drained_units: u64,
     pub flush_writer_drained_units_max: u64,
+    pub flush_writer_rx_pending_max: u64,
     pub flush_writer_pt_batches: u64,
     pub flush_writer_pt_units: u64,
     pub flush_writer_pt_lbas: u64,
@@ -1191,6 +1199,7 @@ impl EngineMetricsSnapshot {
             flush_writer_read_active_cycles,
             flush_writer_drained_units,
             flush_writer_drained_units_max,
+            flush_writer_rx_pending_max,
             flush_writer_pt_batches,
             flush_writer_pt_units,
             flush_writer_pt_lbas,
@@ -1552,6 +1561,12 @@ pub struct MetaMemorySnapshot {
     pub meta_io_write_uring_lock_acquires: u64,
     pub meta_io_write_uring_lock_wait_us: u64,
     pub meta_io_write_uring_lock_wait_max_us: u64,
+    pub io_submitter_iterations: u64,
+    pub io_submitter_sqes_submitted: u64,
+    pub io_submitter_channel_pending_max: u64,
+    pub io_submitter_submit_batch_size_max: u64,
+    pub io_submitter_inflight_max: u64,
+    pub commit_ops_per_tx_max: u64,
     // Diagnostic in-memory growth counters. Each is a `len()` of an
     // unbounded structure that should drain regularly; runaway growth
     // here is the signature of a stuck consumer / reclaim path.
@@ -1631,6 +1646,7 @@ impl MetaMemorySnapshot {
             commit_errors: sub!(commit_errors),
             commit_empty: sub!(commit_empty),
             commit_ops: sub!(commit_ops),
+            commit_ops_per_tx_max: self.commit_ops_per_tx_max,
             commit_wal_body_bytes: sub!(commit_wal_body_bytes),
             commit_wal_body_bytes_max: self.commit_wal_body_bytes_max,
             commit_total_us: sub!(commit_total_us),
@@ -1915,6 +1931,11 @@ impl MetaMemorySnapshot {
             meta_io_write_uring_lock_acquires: sub!(meta_io_write_uring_lock_acquires),
             meta_io_write_uring_lock_wait_us: sub!(meta_io_write_uring_lock_wait_us),
             meta_io_write_uring_lock_wait_max_us: self.meta_io_write_uring_lock_wait_max_us,
+            io_submitter_iterations: sub!(io_submitter_iterations),
+            io_submitter_sqes_submitted: sub!(io_submitter_sqes_submitted),
+            io_submitter_channel_pending_max: self.io_submitter_channel_pending_max,
+            io_submitter_submit_batch_size_max: self.io_submitter_submit_batch_size_max,
+            io_submitter_inflight_max: self.io_submitter_inflight_max,
             pending_dispatch: self.pending_dispatch,
             pending_deferred_free: self.pending_deferred_free,
             pending_dedup_lane_queue: self.pending_dedup_lane_queue,
@@ -1977,6 +1998,7 @@ impl MetaMemorySnapshot {
             commit_errors: meta.commit_errors,
             commit_empty: meta.commit_empty,
             commit_ops: meta.commit_ops,
+            commit_ops_per_tx_max: meta.commit_ops_per_tx_max,
             commit_wal_body_bytes: meta.commit_wal_body_bytes,
             commit_wal_body_bytes_max: meta.commit_wal_body_bytes_max,
             commit_total_us: meta.commit_total_us,
@@ -2227,6 +2249,11 @@ impl MetaMemorySnapshot {
             meta_io_write_uring_lock_acquires: meta.meta_io_write_uring_lock_acquires,
             meta_io_write_uring_lock_wait_us: meta.meta_io_write_uring_lock_wait_us,
             meta_io_write_uring_lock_wait_max_us: meta.meta_io_write_uring_lock_wait_max_us,
+            io_submitter_iterations: meta.io_submitter_iterations,
+            io_submitter_sqes_submitted: meta.io_submitter_sqes_submitted,
+            io_submitter_channel_pending_max: meta.io_submitter_channel_pending_max,
+            io_submitter_submit_batch_size_max: meta.io_submitter_submit_batch_size_max,
+            io_submitter_inflight_max: meta.io_submitter_inflight_max,
             pending_dispatch: pending.dispatch_pending as u64,
             pending_deferred_free: pending.deferred_free as u64,
             pending_dedup_lane_queue: pending.dedup_lane_queue as u64,
@@ -2416,6 +2443,21 @@ impl EngineStatusSnapshot {
                 metadb.meta_io_write_uring_lock_acquires,
                 metadb.meta_io_write_uring_lock_wait_us,
                 metadb.meta_io_write_uring_lock_wait_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_io_submitter: iterations={} sqes_submitted={} channel_pending_max={} submit_batch_size_max={} inflight_max={}",
+                metadb.io_submitter_iterations,
+                metadb.io_submitter_sqes_submitted,
+                metadb.io_submitter_channel_pending_max,
+                metadb.io_submitter_submit_batch_size_max,
+                metadb.io_submitter_inflight_max,
+            );
+            let _ = writeln!(
+                out,
+                "metadb_commit_ops: total={} per_tx_max={}",
+                metadb.commit_ops,
+                metadb.commit_ops_per_tx_max,
             );
             let _ = writeln!(
                 out,
@@ -2803,11 +2845,12 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "flush_writer_batch: cycles={} read_active_cycles={} drained_units={} drained_units_max={} pt_batches={} pt_units={} pt_lbas={} pt_io_ops={} pt_units_max={} pt_lbas_max={} pt_io_ops_max={} packed_batches={} packed_slots={} packed_lbas={} packed_io_ops={} packed_slots_max={} packed_lbas_max={} packed_io_ops_max={}",
+            "flush_writer_batch: cycles={} read_active_cycles={} drained_units={} drained_units_max={} rx_pending_max={} pt_batches={} pt_units={} pt_lbas={} pt_io_ops={} pt_units_max={} pt_lbas_max={} pt_io_ops_max={} packed_batches={} packed_slots={} packed_lbas={} packed_io_ops={} packed_slots_max={} packed_lbas_max={} packed_io_ops_max={}",
             self.metrics.flush_writer_cycles,
             self.metrics.flush_writer_read_active_cycles,
             self.metrics.flush_writer_drained_units,
             self.metrics.flush_writer_drained_units_max,
+            self.metrics.flush_writer_rx_pending_max,
             self.metrics.flush_writer_pt_batches,
             self.metrics.flush_writer_pt_units,
             self.metrics.flush_writer_pt_lbas,

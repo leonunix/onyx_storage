@@ -179,6 +179,16 @@ impl BufferFlusher {
                 Self::WRITER_BATCH_SIZE
             };
 
+            // Sample how much work is queued at cycle start. High values
+            // mean compress/dedup is ahead of the writer — i.e. the
+            // bottleneck is downstream (metadb commit / LV3 IO), not the
+            // upstream pipeline.
+            let rx_pending_at_start = rx.len() as u64 + 1; // +1 for `first`
+            crate::metrics::record_counter_max(
+                &metrics.flush_writer_rx_pending_max,
+                rx_pending_at_start,
+            );
+
             // Drain up to the current writer batch limit.
             let mut incoming = vec![first];
             let drain_deadline = Instant::now() + Self::WRITER_BATCH_COALESCE;
