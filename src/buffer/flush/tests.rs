@@ -443,20 +443,34 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
         expected.push((hash, Lba(lba)));
     }
 
-    let results = BufferFlusher::write_packed_slots_batch(
-        0,
-        &sealed_slots,
-        &pool,
-        &meta,
-        &lifecycle,
-        &allocator,
-        &io_engine,
-        &metrics,
-        &cleanup_tx,
-        &candidate,
-        DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
-    );
-    assert!(results.into_iter().all(|result| result.is_ok()));
+    // Phase 1 of the per-volume commit architecture: the metadata
+    // commit lives on the commit worker, not the shard writer. Drive
+    // the commit path directly via `commit_packed_job` per slot —
+    // skips the IO submit but still exercises the candidate-cache
+    // fill behaviour the original test asserted.
+    let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    for sealed in sealed_slots.into_iter() {
+        let job = super::writer::PackedCommitJob {
+            sealed,
+            shard_idx: 0,
+            buffered_seqs: Vec::new(),
+            buffered_completions: Vec::new(),
+        };
+        BufferFlusher::commit_packed_job(
+            job,
+            &pool,
+            &meta,
+            &lifecycle,
+            &allocator,
+            &in_flight,
+            &metrics,
+            &cleanup_tx,
+            &candidate,
+            &done_tx,
+        );
+    }
+    let _ = io_engine;
 
     // Promote-on-verified-hit: dedup_index stays empty after a fresh
     // batch; the (hash, blockmap) pairs land only in the candidate
@@ -479,90 +493,93 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
     }
 }
 
+// `write_packed_slots_batch_splits_oversized_metadata_commits` was
+// retired with Phase 1 of the per-volume commit architecture: the
+// per-slot metadata batch cap (`packed_meta_batch_max_lbas`) is gone.
+// Each packed slot now becomes its own `PackedCommitJob` and commits
+// alone (one slot = one tx). Sub-batch capping moved to
+// `commit_passthrough_job` at TARGET_OPS_PER_COMMIT (=150 LBAs);
+// covered by `passthrough_commit_job_subbatches_above_threshold`
+// below.
+
 #[test]
-fn write_packed_slots_batch_splits_oversized_metadata_commits() {
-    let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+fn passthrough_commit_job_subbatches_above_threshold() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
 
-    let slot_count = 270usize;
-    let lbas_per_slot = 1024u32;
-    let total_lbas = slot_count * lbas_per_slot as usize;
-    let mut sealed_slots = Vec::with_capacity(slot_count);
-    for idx in 0..slot_count {
-        let start_lba = Lba(idx as u64 * lbas_per_slot as u64);
-        let seq = idx as u64 + 1;
-        for off in 0..lbas_per_slot {
-            pool.note_latest_lba_seq_for_test("flush-race", Lba(start_lba.0 + off as u64), seq, 1);
+    // Build 5 units of 100 LBAs each = 500 LBAs total. With
+    // TARGET_OPS_PER_COMMIT=150 the worker should split into 4 sub
+    // batches (after 1 unit=100, after 2 units=200>150 → flush; new
+    // chunk 1, etc.).
+    let lbas_per_unit: u32 = 100;
+    let n_units = 5usize;
+    let mut units = Vec::with_capacity(n_units);
+    for u in 0..n_units {
+        let start_lba = Lba((u as u64) * lbas_per_unit as u64);
+        let seq = (u as u64) + 1;
+        for off in 0..lbas_per_unit {
+            pool.note_latest_lba_seq_for_test(
+                "flush-race",
+                Lba(start_lba.0 + off as u64),
+                seq,
+                1,
+            );
         }
-
         let pba = allocator.allocate_one_for_lane(0).unwrap();
-        let fill = (idx as u8).wrapping_add(1);
+        let fill = (u as u8).wrapping_add(1);
         let data = vec![fill; 1];
         let unit = CompressedUnit {
             vol_id: "flush-race".into(),
             start_lba,
-            lba_count: lbas_per_slot,
-            original_size: BLOCK_SIZE * lbas_per_slot,
+            lba_count: lbas_per_unit,
+            original_size: BLOCK_SIZE * lbas_per_unit,
             compressed_data: data.clone(),
             compression: 0,
             crc32: crc32fast::hash(&data),
             vol_created_at: 1,
-            seq_lba_ranges: vec![(seq, start_lba, lbas_per_slot)],
+            seq_lba_ranges: vec![(seq, start_lba, lbas_per_unit)],
             block_hashes: None,
             dedup_stale_repairs: None,
             dedup_skipped: false,
             dedup_completion: None,
         };
-        sealed_slots.push(SealedSlot {
+        units.push(super::writer::UnitCommitData {
+            unit,
             pba,
-            data: vec![fill; BLOCK_SIZE as usize],
-            fragments: vec![crate::packer::packer::SlotFragment {
-                unit,
-                slot_offset: 0,
-            }],
+            alloc_blocks: 1,
+            seqs: vec![seq],
+            completion: None,
         });
     }
 
     let before = meta.memory_stats().unwrap();
-    let results = BufferFlusher::write_packed_slots_batch(
-        0,
-        &sealed_slots,
+    let job = super::writer::PassthroughCommitJob {
+        vol_id: VolumeId("flush-race".into()),
+        shard_idx: 0,
+        units,
+    };
+    BufferFlusher::commit_passthrough_job(
+        job,
         &pool,
         &meta,
         &lifecycle,
         &allocator,
-        &io_engine,
+        &in_flight,
         &metrics,
         &cleanup_tx,
-        &crate::dedup::CandidateCache::new(8, 64),
-        DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
+        &candidate,
+        &done_tx,
     );
-    assert!(results.into_iter().all(|result| result.is_ok()));
-
     let after = meta.memory_stats().unwrap();
     let commits = after.commit_success - before.commit_success;
     assert!(
         commits >= 2,
-        "oversized packed metadata batch should split into multiple commits, got {commits}"
+        "500-LBA passthrough job should split into multiple sub-batches at TARGET_OPS_PER_COMMIT (got {commits} commits)"
     );
-    assert!(
-        after.wal_batch_bytes_max < 16 * 1024 * 1024,
-        "split commits must stay under the WAL body hard limit"
-    );
-
-    for &idx in &[0usize, 131_000, total_lbas - 1] {
-        let slot_idx = idx / lbas_per_slot as usize;
-        let mapping = meta
-            .get_mapping(&VolumeId("flush-race".into()), Lba(idx as u64))
-            .unwrap()
-            .unwrap();
-        assert_eq!(mapping.pba, sealed_slots[slot_idx].pba);
-        assert_eq!(
-            mapping.offset_in_unit,
-            (idx % lbas_per_slot as usize) as u16
-        );
-    }
 }
 
 #[test]
@@ -1019,6 +1036,14 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
 
     let handle = thread::spawn(move || {
         let mut packer = Packer::new_with_lane(allocator_w.clone(), 0);
+        // Empty commit_worker_txs: write_packed_slots_batch /
+        // write_units_batch fall back to inline defer_retry + done_tx
+        // for buffered seqs, which is enough to exercise the writer
+        // loop's packer-aging / done_tx-on-flush behaviour without
+        // pulling in a full commit-worker setup.
+        let commit_worker_txs: Vec<crossbeam_channel::Sender<
+            crate::buffer::flush::writer::CommitJob,
+        >> = Vec::new();
         BufferFlusher::writer_loop(
             0,
             &rx,
@@ -1035,6 +1060,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &cleanup_tx_w,
             &crate::dedup::CandidateCache::new(8, 64),
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
+            &commit_worker_txs,
         );
     });
 

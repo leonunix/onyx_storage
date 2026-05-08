@@ -1,14 +1,5 @@
 use super::*;
 
-struct PackedSlotMeta {
-    batch_values: Vec<(VolumeId, Lba, BlockmapValue)>,
-    all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
-    /// First-occurrence (hash, blockmap) pairs for the candidate
-    /// cache; populated alongside batch_values.
-    fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
-    stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
-}
-
 struct PackedSlotCommit {
     actual_old_pba_meta: HashMap<Pba, RemapCleanup>,
     fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
@@ -21,125 +12,6 @@ struct PackedSlotCommit {
 enum PackedSlotCommitOutcome {
     Discarded,
     Committed(PackedSlotCommit),
-}
-
-fn merge_dead_pbas(dst: &mut HashMap<Pba, RemapCleanup>, src: HashMap<Pba, RemapCleanup>) {
-    for (pba, cleanup) in src {
-        dst.entry(pba)
-            .and_modify(|entry| entry.merge(cleanup.clone()))
-            .or_insert(cleanup);
-    }
-}
-
-fn commit_packed_meta_batch(
-    batch_slots: &mut Vec<usize>,
-    batch_lbas: &mut usize,
-    sealed_slots: &[SealedSlot],
-    slot_metas: &mut [Option<PackedSlotMeta>],
-    meta: &MetaStore,
-    allocator: &SpaceAllocator,
-    results: &mut [OnyxResult<()>],
-    actual_old_pba_meta: &mut HashMap<Pba, RemapCleanup>,
-    candidate: &crate::dedup::CandidateCache,
-    metrics: &EngineMetrics,
-) -> bool {
-    if batch_slots.is_empty() {
-        return false;
-    }
-
-    let build_start = Instant::now();
-    let mut combined_batch_values: Vec<(VolumeId, Lba, BlockmapValue)> =
-        Vec::with_capacity(*batch_lbas);
-    let mut combined_fresh_dedup: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-    let mut combined_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-    for &slot_idx in batch_slots.iter() {
-        if let Some(ref sm) = slot_metas[slot_idx] {
-            combined_batch_values.extend_from_slice(&sm.batch_values);
-            combined_fresh_dedup.extend_from_slice(&sm.fresh_dedup_pairs);
-            combined_stale_repairs.extend_from_slice(&sm.stale_repairs);
-        }
-    }
-    BufferFlusher::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
-
-    let commit_lbas = combined_batch_values.len() as u64;
-    let commit_start = Instant::now();
-    let commit_result = meta.atomic_batch_write_packed_with_dedup(
-        &combined_batch_values,
-        sealed_slots[batch_slots[0]].pba,
-        0,
-        &[],
-    );
-    BufferFlusher::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
-    metrics
-        .flush_writer_meta_commits
-        .fetch_add(1, Ordering::Relaxed);
-    metrics
-        .flush_writer_meta_lbas
-        .fetch_add(commit_lbas, Ordering::Relaxed);
-
-    match commit_result {
-        Ok(dead) => {
-            merge_dead_pbas(actual_old_pba_meta, dead);
-            let candidate_start = Instant::now();
-            candidate.insert_many(&combined_fresh_dedup);
-            BufferFlusher::record_elapsed(
-                &metrics.flush_writer_meta_candidate_ns,
-                candidate_start,
-            );
-            let repair_start = Instant::now();
-            BufferFlusher::repair_stale_dedup_index(
-                meta,
-                metrics,
-                &combined_stale_repairs,
-                "write_packed_slots_batch",
-            );
-            BufferFlusher::record_elapsed(&metrics.flush_writer_meta_repair_ns, repair_start);
-        }
-        Err(e) => {
-            // P0 diagnostic: dump the batch composition (PBAs, LBA
-            // counts, vol_ids) so the metadb-side trace
-            // (`onyx_metadb::refcount::stage_underflow` etc.) can be
-            // tied back to the onyx batch that triggered it. Filter via
-            // `RUST_LOG=onyx_storage::buffer::flush::writer::packed=error`.
-            let mut batch_dump: Vec<(u64 /*pba*/, usize /*lbas*/, Vec<String>)> =
-                Vec::with_capacity(batch_slots.len());
-            for &slot_idx in batch_slots.iter() {
-                if let Some(ref sm) = slot_metas[slot_idx] {
-                    let mut vols: Vec<String> = sm
-                        .batch_values
-                        .iter()
-                        .map(|(v, _, _)| v.0.clone())
-                        .collect();
-                    vols.sort();
-                    vols.dedup();
-                    batch_dump.push((
-                        sealed_slots[slot_idx].pba.0,
-                        sm.batch_values.len(),
-                        vols,
-                    ));
-                }
-            }
-            tracing::error!(
-                error = %e,
-                slot_count = batch_dump.len(),
-                ?batch_dump,
-                "packed-slot batch metadata commit failed: rolling back batch"
-            );
-            for &slot_idx in batch_slots.iter() {
-                if slot_metas[slot_idx].is_some() {
-                    let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                    results[slot_idx] = Err(crate::error::OnyxError::Io(std::io::Error::other(
-                        format!("packed-slot batch metadata commit failed: {e}"),
-                    )));
-                    slot_metas[slot_idx] = None;
-                }
-            }
-        }
-    }
-
-    batch_slots.clear();
-    *batch_lbas = 0;
-    true
 }
 
 impl BufferFlusher {
@@ -388,73 +260,44 @@ impl BufferFlusher {
         Ok(())
     }
 
-    /// Batched counterpart of [`write_packed_slot`]. Folds N sealed
-    /// slots into:
-    /// - one set of lifecycle read locks (sorted union of all touched
-    ///   volumes), held across the whole batch;
-    /// - one batched IO submit (`io_engine.submit_batch`) so the device
-    ///   queue depth grows with the batch instead of one write at a time;
-    /// - **one** metadata transaction covering every surviving slot's L2P,
-    ///   refcount, and dedup index entries — the metadb tx auto-derives
-    ///   refcount deltas from the L2pRemap ops, so concatenating batches
-    ///   from different slots is equivalent to issuing them serially.
+    /// Batch IO write for sealed slots, then dispatch each slot to a
+    /// per-volume commit worker (routed by primary volume). Phase 1
+    /// of the per-volume commit architecture: the shard writer keeps
+    /// the batched IO submit so the device queue stays deep, but the
+    /// metadata commit / cleanup / mark_flushed / done_tx all run on
+    /// the commit worker.
     ///
-    /// Soak shows ~1 ms per metadb commit fixed cost (WAL fsync barrier
-    /// + per-shard apply lane scheduling); a sealed-slot batch of 10
-    /// drops 9 commits → ~10x throughput in the writer's metadata phase.
-    ///
-    /// Returns one `OnyxResult<()>` per input slot. Failure semantics
-    /// per slot:
-    /// - IO failure → that slot's PBA freed, slot dropped from the
-    ///   metadata commit, surviving slots still committed.
-    /// - Combined metadata commit failure → every surviving slot's PBA
-    ///   freed, all marked failed (caller queues whole-slot retries).
-    /// - Dedup put failure → metadata commit fails and every surviving slot's
-    ///   PBA is rolled back.
+    /// Failure semantics per slot:
+    /// - IO failure → free PBA, queue whole-slot retry inline (preserves
+    ///   the existing slot retry path).
+    /// - Commit failure → handled on the commit worker (free PBA,
+    ///   defer_retry buffered seqs). The shard writer does not see it.
     pub(in crate::buffer::flush) fn write_packed_slots_batch(
-        _shard_idx: usize,
-        sealed_slots: &[SealedSlot],
+        shard_idx: usize,
+        sealed_slots: Vec<SealedSlot>,
+        per_slot_buffers: Vec<(
+            Vec<u64>,
+            Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+        )>,
         pool: &WriteBufferPool,
-        meta: &MetaStore,
-        lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<CleanupBatch>,
-        candidate: &crate::dedup::CandidateCache,
-        packed_meta_batch_max_lbas: usize,
-    ) -> Vec<OnyxResult<()>> {
-        if sealed_slots.is_empty() {
-            return Vec::new();
-        }
-        let packed_meta_batch_max_lbas = packed_meta_batch_max_lbas.max(1);
+        in_flight_tracker: &FlusherInFlightTracker,
+        done_tx: &Sender<Vec<u64>>,
+        packed_retries: &mut VecDeque<PackedSlotRetry>,
+        commit_worker_txs: &[Sender<CommitJob>],
+    ) {
+        let _ = pool;
         let total_start = Instant::now();
         let n = sealed_slots.len();
-        let mut results: Vec<OnyxResult<()>> = (0..n).map(|_| Ok(())).collect();
-
-        // Lifecycle locks: union of every fragment's vol_id, sorted to
-        // avoid deadlock with concurrent batches.
-        let mut vol_ids: Vec<String> = sealed_slots
-            .iter()
-            .flat_map(|s| s.fragments.iter().map(|f| f.unit.vol_id.clone()))
-            .collect();
-        vol_ids.sort();
-        vol_ids.dedup();
-        let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
-        let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
-
-        let mut slot_metas: Vec<Option<PackedSlotMeta>> = (0..n).map(|_| None).collect();
-        let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
-        let mut meta_commits = 0usize;
-        let mut meta_lbas = 0usize;
-        let io_elapsed: Duration;
-        let mut meta_elapsed = Duration::ZERO;
         let mut slot_io_ok = vec![true; n];
         let mut io_ops_count = 0u64;
 
-        // The sealed PBA is private until metadata commit publishes it, so
-        // the LV3 write can run before the L2P commit lock. The lock is only
-        // needed for "latest pending entry" validation through metadb commit.
+        // The sealed PBA is private until metadata commit publishes
+        // it, so the LV3 write runs without any lock here. The commit
+        // worker re-takes lifecycle + L2P commit locks when it runs
+        // the metadata phase.
         let io_start = Instant::now();
         {
             use crate::io::engine::{LvOp, LvOpResult};
@@ -476,261 +319,99 @@ impl BufferFlusher {
                             let slot_idx = op_to_slot[idx];
                             if let LvOpResult::Write(Err(e)) = r {
                                 let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                                results[slot_idx] =
-                                    Err(crate::error::OnyxError::Io(std::io::Error::other(
-                                        format!("packed-slot batch IO write failed: {e}"),
-                                    )));
                                 slot_io_ok[slot_idx] = false;
+                                tracing::error!(
+                                    pba = sealed_slots[slot_idx].pba.0,
+                                    error = %e,
+                                    "writer: packed-slot batch IO write failed"
+                                );
                             }
                         }
                     }
                     Err(e) => {
                         for &slot_idx in &op_to_slot {
                             let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                            results[slot_idx] =
-                                Err(crate::error::OnyxError::Io(std::io::Error::other(
-                                    format!("packed-slot batch IO submit failed: {e}"),
-                                )));
                             slot_io_ok[slot_idx] = false;
                         }
+                        tracing::error!(
+                            error = %e,
+                            "writer: packed-slot batch IO submit failed"
+                        );
                     }
                 }
             }
         }
-        io_elapsed = io_start.elapsed();
+        let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
-        let commit_ranges = sealed_slots.iter().flat_map(|sealed| {
-            sealed.fragments.iter().map(|frag| {
-                (
-                    frag.unit.vol_id.as_str(),
-                    frag.unit.start_lba,
-                    frag.unit.lba_count as u64,
-                )
-            })
-        });
-        pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
-            // Phase 1: per-slot validation + build batch_values + dedup registrations.
-            // A slot whose every fragment is stale (volume deleted / version
-            // mismatch / no live positions) is dropped here and its PBA freed.
-            let build_start = Instant::now();
-            for (i, sealed) in sealed_slots.iter().enumerate() {
-                if !slot_io_ok[i] {
-                    continue;
-                }
-                let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
-                let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
-                let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-                let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-
-                for frag in &sealed.fragments {
-                    let unit = &frag.unit;
-                    let vol_id = VolumeId(unit.vol_id.clone());
-
-                    let should_discard = match meta.get_volume(&vol_id) {
-                        Ok(None) => true,
-                        Ok(Some(vc))
-                            if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
-                        {
-                            true
-                        }
-                        Ok(_) => false,
-                        Err(_) => false,
-                    };
-
-                    if should_discard {
-                        metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
-                        for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                            let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                        }
-                        continue;
-                    }
-
-                    let live_positions = match Self::live_positions_for_unit(unit, pool) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            results[i] = Err(e);
-                            batch_values.clear();
-                            all_seq_lba_ranges.clear();
-                            fresh_dedup_pairs.clear();
-                            stale_repairs.clear();
-                            break;
-                        }
-                    };
-                    if live_positions.is_empty() {
-                        for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                            let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                        }
-                        continue;
-                    }
-
-                    let frag_lbas: Vec<Lba> = live_positions
-                        .iter()
-                        .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                        .collect();
-                    let frag_flags = if unit.dedup_skipped {
-                        FLAG_DEDUP_SKIPPED
-                    } else {
-                        0
-                    };
-                    let hashes_for_promote = if !unit.dedup_skipped {
-                        unit.block_hashes.as_ref()
-                    } else {
-                        None
-                    };
-                    for (j, pos) in live_positions.iter().copied().enumerate() {
-                        let blockmap = BlockmapValue {
-                            pba: sealed.pba,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                            slot_offset: frag.slot_offset,
-                            flags: frag_flags,
-                        };
-                        batch_values.push((vol_id.clone(), frag_lbas[j], blockmap));
-                        if let Some(hashes) = hashes_for_promote {
-                            let hash = hashes[pos];
-                            if hash != [0u8; 8] {
-                                fresh_dedup_pairs.push((
-                                    hash,
-                                    BlockmapValue {
-                                        flags: 0,
-                                        ..blockmap
-                                    },
-                                ));
-                                if let Some(repairs) = &unit.dedup_stale_repairs {
-                                    if let Some(Some(old_entry)) = repairs.get(pos) {
-                                        stale_repairs.push((
-                                            hash,
-                                            *old_entry,
-                                            BlockmapValue {
-                                                flags: 0,
-                                                ..blockmap
-                                            }
-                                            .to_dedup_entry(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
-                }
-
-                if batch_values.is_empty() {
-                    let _ = allocator.free_one(sealed.pba);
-                    continue;
-                }
-
-                slot_metas[i] = Some(PackedSlotMeta {
-                    batch_values,
-                    all_seq_lba_ranges,
-                    fresh_dedup_pairs,
-                    stale_repairs,
-                });
-            }
-            Self::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
-
-            // Phase 3: bounded metadata batches over surviving slots.
-            let meta_start = Instant::now();
-            let mut batch_slots: Vec<usize> = Vec::new();
-            let mut batch_lbas = 0usize;
-
-            for i in 0..n {
-                let Some(ref sm) = slot_metas[i] else {
-                    continue;
-                };
-                let slot_lbas = sm.batch_values.len();
-                if !batch_slots.is_empty()
-                    && batch_lbas.saturating_add(slot_lbas) > packed_meta_batch_max_lbas
-                {
-                    if commit_packed_meta_batch(
-                        &mut batch_slots,
-                        &mut batch_lbas,
-                        sealed_slots,
-                        &mut slot_metas,
-                        meta,
-                        allocator,
-                        &mut results,
-                        &mut actual_old_pba_meta,
-                        candidate,
-                        metrics,
-                    ) {
-                        meta_commits += 1;
-                    }
-                }
-                batch_slots.push(i);
-                batch_lbas += slot_lbas;
-                meta_lbas += slot_lbas;
-                if slot_lbas > packed_meta_batch_max_lbas {
-                    if commit_packed_meta_batch(
-                        &mut batch_slots,
-                        &mut batch_lbas,
-                        sealed_slots,
-                        &mut slot_metas,
-                        meta,
-                        allocator,
-                        &mut results,
-                        &mut actual_old_pba_meta,
-                        candidate,
-                        metrics,
-                    ) {
-                        meta_commits += 1;
-                    }
-                }
-            }
-            if commit_packed_meta_batch(
-                &mut batch_slots,
-                &mut batch_lbas,
-                sealed_slots,
-                &mut slot_metas,
-                meta,
-                allocator,
-                &mut results,
-                &mut actual_old_pba_meta,
-                candidate,
-                metrics,
-            ) {
-                meta_commits += 1;
-            }
-            meta_elapsed = meta_start.elapsed();
-            Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-        });
-        if !actual_old_pba_meta.is_empty() {
-            let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
-        }
-
-        // Phase 4: counters + mark_flushed per surviving slot.
-        let mark_start = Instant::now();
-        let mut surviving_slots = 0u64;
-        let mut mark_calls = 0u64;
-        let mut mark_lbas = 0u64;
-        for i in 0..n {
-            let Some(sm) = slot_metas[i].as_ref() else {
+        // Dispatch each surviving slot to the per-volume commit
+        // worker (routed by primary volume = first fragment). IO
+        // failures stay on the shard writer's whole-slot retry queue,
+        // mirroring the historic packed retry path.
+        let mut surviving_slots: u64 = 0;
+        let mut total_lbas: u64 = 0;
+        let no_workers = commit_worker_txs.is_empty();
+        for (i, (sealed, (mut buffered_seqs, mut buffered_completions))) in sealed_slots
+            .into_iter()
+            .zip(per_slot_buffers.into_iter())
+            .enumerate()
+        {
+            if !slot_io_ok[i] {
+                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                Self::queue_packed_slot_retry(
+                    packed_retries,
+                    sealed,
+                    &mut buffered_seqs,
+                    &mut buffered_completions,
+                );
                 continue;
-            };
-            let sealed = &sealed_slots[i];
-            surviving_slots += 1;
-            metrics
-                .flush_packed_slots_written
-                .fetch_add(1, Ordering::Relaxed);
-            metrics
-                .flush_packed_fragments_written
-                .fetch_add(sealed.fragments.len() as u64, Ordering::Relaxed);
-            metrics
-                .flush_packed_bytes
-                .fetch_add(sealed.data.len() as u64, Ordering::Relaxed);
-            for (seq, lba_start, lba_count) in &sm.all_seq_lba_ranges {
-                mark_calls += 1;
-                mark_lbas += *lba_count as u64;
-                if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
-                    tracing::warn!(seq, error = %e, "failed to mark entry flushed (packed batch)");
-                }
             }
+
+            surviving_slots += 1;
+            total_lbas += sealed
+                .fragments
+                .iter()
+                .map(|f| f.unit.lba_count as u64)
+                .sum::<u64>();
+
+            if no_workers {
+                // Defensive: if no worker channels are available, fall
+                // back to defer_retry so seqs are not orphaned.
+                in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
+                for dc in &buffered_completions {
+                    in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
+                }
+                if !buffered_seqs.is_empty() {
+                    let _ = done_tx.send(buffered_seqs);
+                }
+                for dc in buffered_completions {
+                    if let Some(original_seqs) = dc.decrement() {
+                        let _ = done_tx.send(original_seqs);
+                    }
+                }
+                let _ = allocator.free_one(sealed.pba);
+                continue;
+            }
+
+            // Route by primary volume — first fragment's vol_id.
+            let primary_vol = sealed
+                .fragments
+                .first()
+                .map(|f| f.unit.vol_id.clone())
+                .unwrap_or_default();
+            let worker_idx = route_volume_to_worker(&primary_vol);
+            let tx_idx = worker_idx % commit_worker_txs.len();
+            let job = CommitJob::Packed(PackedCommitJob {
+                sealed,
+                shard_idx,
+                buffered_seqs,
+                buffered_completions,
+            });
+            let _ = commit_worker_txs[tx_idx].send(job);
         }
+
+        // Counters tracking the IO + dispatch phase. Metadata-phase
+        // counters are bumped on the commit worker.
         metrics
             .flush_writer_packed_batches
             .fetch_add(1, Ordering::Relaxed);
@@ -739,89 +420,32 @@ impl BufferFlusher {
             .fetch_add(surviving_slots, Ordering::Relaxed);
         metrics
             .flush_writer_packed_batch_lbas
-            .fetch_add(meta_lbas as u64, Ordering::Relaxed);
+            .fetch_add(total_lbas, Ordering::Relaxed);
         metrics
             .flush_writer_packed_batch_io_ops
             .fetch_add(io_ops_count, Ordering::Relaxed);
-        metrics
-            .flush_writer_packed_mark_calls
-            .fetch_add(mark_calls, Ordering::Relaxed);
-        metrics
-            .flush_writer_packed_mark_lbas
-            .fetch_add(mark_lbas, Ordering::Relaxed);
         crate::metrics::record_counter_max(
             &metrics.flush_writer_packed_batch_slots_max,
             surviving_slots,
         );
         crate::metrics::record_counter_max(
             &metrics.flush_writer_packed_batch_lbas_max,
-            meta_lbas as u64,
+            total_lbas,
         );
         crate::metrics::record_counter_max(
             &metrics.flush_writer_packed_batch_io_ops_max,
             io_ops_count,
         );
-        crate::metrics::record_counter_max(
-            &metrics.flush_writer_packed_mark_calls_max,
-            mark_calls,
-        );
-        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
         let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
         if total_elapsed >= Duration::from_secs(1) {
-            let surviving = slot_metas.iter().filter(|s| s.is_some()).count();
-            match meta.memory_stats() {
-                Ok(meta_stats) => {
-                    tracing::debug!(
-                        slots = n,
-                        surviving,
-                        meta_commits,
-                        meta_lbas,
-                        meta_batch_lba_limit = packed_meta_batch_max_lbas,
-                        total_ms = total_elapsed.as_millis() as u64,
-                        io_ms = io_elapsed.as_millis() as u64,
-                        meta_ms = meta_elapsed.as_millis() as u64,
-                        metadb_last_applied_lsn = meta_stats.last_applied_lsn,
-                        metadb_high_water_pages = meta_stats.high_water_pages,
-                        metadb_commit_max_ms = meta_stats.commit_total_max_us / 1_000,
-                        metadb_commit_apply_wait_max_ms =
-                            meta_stats.commit_apply_wait_max_us / 1_000,
-                        metadb_commit_apply_gate_wait_max_ms =
-                            meta_stats.commit_apply_gate_wait_max_us / 1_000,
-                        metadb_commit_apply_max_ms = meta_stats.commit_apply_max_us / 1_000,
-                        metadb_wal_write_max_ms = meta_stats.wal_write_max_us / 1_000,
-                        metadb_wal_fsync_max_ms = meta_stats.wal_fsync_max_us / 1_000,
-                        metadb_wal_batch_records_max = meta_stats.wal_batch_records_max,
-                        metadb_pending_dispatch = meta_stats.pending_dispatch,
-                        metadb_pending_dedup_lane_q = meta_stats.pending_dedup_lane_queue,
-                        metadb_pending_l2p_apply_q = meta_stats.pending_l2p_apply_queue,
-                        metadb_pending_l2p_dirty = meta_stats.pending_l2p_pagebuf_dirty,
-                        metadb_pending_rc_apply_q = meta_stats.pending_rc_apply_queue,
-                        metadb_pending_rc_dirty = meta_stats.pending_rc_pagebuf_dirty,
-                        metadb_flush_total_max_ms = meta_stats.flush_total_max_us / 1_000,
-                        metadb_flush_io_max_ms = meta_stats.flush_io_max_us / 1_000,
-                        metadb_flush_install_max_ms = meta_stats.flush_install_max_us / 1_000,
-                        metadb_flush_reclaim_max_ms = meta_stats.flush_reclaim_max_us / 1_000,
-                        "writer: slow packed-slot batch (>=1s)"
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        slots = n,
-                        surviving,
-                        meta_commits,
-                        meta_lbas,
-                        meta_batch_lba_limit = packed_meta_batch_max_lbas,
-                        total_ms = total_elapsed.as_millis() as u64,
-                        io_ms = io_elapsed.as_millis() as u64,
-                        meta_ms = meta_elapsed.as_millis() as u64,
-                        metadb_stats_error = %e,
-                        "writer: slow packed-slot batch (>=1s)"
-                    );
-                }
-            }
+            tracing::debug!(
+                slots = n,
+                surviving = surviving_slots,
+                io_ms = io_elapsed.as_millis() as u64,
+                total_ms = total_elapsed.as_millis() as u64,
+                "writer: slow packed-slot batch (>=1s) — IO + dispatch only"
+            );
         }
-
-        results
     }
 }

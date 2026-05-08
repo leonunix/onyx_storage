@@ -216,78 +216,57 @@ impl BufferFlusher {
         })
     }
 
-    /// Batch-write multiple Passthrough units in one go:
-    /// 1. Acquire lifecycle read locks for all unique volumes (sorted, no deadlock)
-    /// 2. Validate generations, discard stale units
-    /// 3. Allocate PBAs for all units
-    /// 4. Batch IO writes
-    /// 5. Batch multi_get old mappings
-    /// 6. ONE metadata batch for all blockmap + refcount updates
-    /// 7. Batch cleanup + queue dedup registration + mark_flushed
+    /// Batch a passthrough cycle and hand it off to the per-volume
+    /// commit workers. Phase 1 of the per-volume commit architecture:
+    /// the shard writer does alloc + LV3 IO synchronously (so PBA
+    /// reservation and device queueing stay shard-local), then groups
+    /// surviving units by volume and pushes one
+    /// `PassthroughCommitJob` per volume into `commit_worker_txs[hash %
+    /// N]`. The metadb commit, `actual_old_pba_meta` cleanup,
+    /// `mark_flushed`, and `done_tx` all happen on the commit worker.
+    ///
+    /// IO failures are handled inline (free PBA, defer_retry, send
+    /// `done_tx`) so the shard writer's retry path stays simple.
     pub(in crate::buffer::flush) fn write_units_batch(
         shard_idx: usize,
-        units: &[CompressedUnit],
-        pool: &WriteBufferPool,
-        meta: &MetaStore,
-        lifecycle: &VolumeLifecycleManager,
+        units: Vec<CompressedUnit>,
+        seqs_per_unit: Vec<Vec<u64>>,
+        completions_per_unit: Vec<Option<Arc<crate::buffer::pipeline::DedupCompletion>>>,
+        _pool: &WriteBufferPool,
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<CleanupBatch>,
-        candidate: &crate::dedup::CandidateCache,
-    ) -> Vec<OnyxResult<()>> {
+        in_flight_tracker: &FlusherInFlightTracker,
+        done_tx: &Sender<Vec<u64>>,
+        commit_worker_txs: &[Sender<CommitJob>],
+    ) {
         if units.is_empty() {
-            return Vec::new();
+            return;
         }
         let total_start = Instant::now();
-
-        // Acquire lifecycle read locks for all unique volumes (sorted to prevent deadlock).
-        let mut vol_ids: Vec<String> = units.iter().map(|u| u.vol_id.clone()).collect();
-        vol_ids.sort();
-        vol_ids.dedup();
-        let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
-        let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
-
-        // Per-unit state tracking.
         let n = units.len();
-        let mut results: Vec<OnyxResult<()>> = (0..n).map(|_| Ok(())).collect();
-        let mut skip = vec![false; n]; // true = discard (stale volume)
+        debug_assert_eq!(seqs_per_unit.len(), n);
+        debug_assert_eq!(completions_per_unit.len(), n);
+
+        // No lifecycle / gen check here. The commit worker re-takes
+        // the lifecycle read lock and runs the gen check under it
+        // before publishing any blockmap.
+
+        // Per-unit IO state. `failed[i]` tagges units we cannot push
+        // to the commit worker; `pbas[i]` and `alloc_blocks[i]`
+        // record what was reserved so we can free on failure or hand
+        // ownership to the worker on success.
+        let mut failed: Vec<bool> = vec![false; n];
         let mut pbas: Vec<Option<Pba>> = vec![None; n];
         let mut alloc_blocks: Vec<u32> = vec![0; n];
         let mut io_ops_count = 0u64;
 
-        // Phase 1: Validate generations.
-        for (i, unit) in units.iter().enumerate() {
-            let vol_id = VolumeId(unit.vol_id.clone());
-            let should_discard = match meta.get_volume(&vol_id) {
-                Ok(None) => true,
-                Ok(Some(vc)) if vc.created_at != unit.vol_created_at => true,
-                Ok(_) => false,
-                Err(e) => {
-                    results[i] = Err(e);
-                    skip[i] = true;
-                    continue;
-                }
-            };
-            if should_discard {
-                metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
-                skip[i] = true;
-                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                    let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                }
-            }
-        }
-
-        // Phase 2: Allocate PBAs for non-skipped units.
+        // Phase A: alloc PBAs.
         let alloc_start = Instant::now();
         for (i, unit) in units.iter().enumerate() {
-            if skip[i] {
-                continue;
-            }
             let bs = BLOCK_SIZE as usize;
             let blocks_needed = (unit.compressed_data.len() + bs - 1) / bs;
             alloc_blocks[i] = blocks_needed as u32;
-
             let allocation = if blocks_needed == 1 {
                 allocator
                     .allocate_one_for_lane(shard_idx)
@@ -305,29 +284,31 @@ impl BufferFlusher {
                     })
             };
             match allocation {
-                Ok((pba, _)) => {
-                    pbas[i] = Some(pba);
-                }
+                Ok((pba, _)) => pbas[i] = Some(pba),
                 Err(e) => {
-                    results[i] = Err(e);
-                    skip[i] = true;
+                    tracing::error!(
+                        vol = %unit.vol_id,
+                        start_lba = unit.start_lba.0,
+                        error = %e,
+                        "writer: passthrough alloc failed"
+                    );
+                    failed[i] = true;
                 }
             }
         }
         let alloc_elapsed = alloc_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
-        // Phase 3: Batched IO writes — one submit per batch.
+        // Phase B: batch IO writes — one submit per batch.
         // io_uring backend: 1 io_uring_enter + 1 wait_for_completions(N).
         // Syscall backend: scoped threads inside submit_batch keep NVMe QD > 1.
         let io_start = Instant::now();
         {
             use crate::io::engine::{LvOp, LvOpResult};
-
             let mut ops: Vec<LvOp> = Vec::with_capacity(n);
             let mut op_to_unit: Vec<usize> = Vec::with_capacity(n);
             for i in 0..n {
-                if skip[i] {
+                if failed[i] {
                     continue;
                 }
                 allocator.wait_for_readers(pbas[i].unwrap(), alloc_blocks[i]);
@@ -337,7 +318,6 @@ impl BufferFlusher {
                 });
                 op_to_unit.push(i);
             }
-
             if !ops.is_empty() {
                 io_ops_count = ops.len() as u64;
                 match io_engine.submit_batch(ops, false) {
@@ -352,17 +332,19 @@ impl BufferFlusher {
                                 } else {
                                     let _ = allocator.free_extent(Extent::new(pba, blk));
                                 }
-                                results[unit_idx] = Err(crate::error::OnyxError::Io(
-                                    std::io::Error::other(format!("IO write failed: {e}")),
-                                ));
-                                skip[unit_idx] = true;
+                                failed[unit_idx] = true;
+                                tracing::error!(
+                                    vol = units[unit_idx].vol_id,
+                                    start_lba = units[unit_idx].start_lba.0,
+                                    error = %e,
+                                    "writer: passthrough IO write failed"
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        // Whole submission failed — roll back all live units.
                         for &unit_idx in &op_to_unit {
-                            if skip[unit_idx] {
+                            if failed[unit_idx] {
                                 continue;
                             }
                             let pba = pbas[unit_idx].unwrap();
@@ -372,11 +354,9 @@ impl BufferFlusher {
                             } else {
                                 let _ = allocator.free_extent(Extent::new(pba, blk));
                             }
-                            results[unit_idx] = Err(crate::error::OnyxError::Io(
-                                std::io::Error::other(format!("IO batch submit failed: {e}")),
-                            ));
-                            skip[unit_idx] = true;
+                            failed[unit_idx] = true;
                         }
+                        tracing::error!(error = %e, "writer: passthrough IO batch submit failed");
                     }
                 }
             }
@@ -384,310 +364,101 @@ impl BufferFlusher {
         let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
 
-        let meta_start = Instant::now();
-        let commit_ranges: Vec<(&str, Lba, u64)> = units
+        // Counters for the surviving (committable) units. The actual
+        // commit happens asynchronously on the commit worker, but the
+        // shard writer's accounting matches the historic shape so
+        // dashboards stay continuous.
+        let surviving = failed.iter().filter(|f| !**f).count();
+        let surviving_lbas: u64 = units
             .iter()
             .enumerate()
-            .filter_map(|(i, unit)| {
-                (!skip[i]).then_some((unit.vol_id.as_str(), unit.start_lba, unit.lba_count as u64))
-            })
-            .collect();
-        let (unit_metas, meta_indices, actual_old_pba_meta) =
-            pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
-                // Phase 4: Build batch values + live positions.
-                // Refcount decrements are re-computed inside the lock by atomic_batch_write_multi.
-                struct UnitMeta {
-                    batch_values: Vec<(Lba, BlockmapValue)>,
-                    live_positions: Vec<usize>,
-                    /// First-occurrence (hash, blockmap) pairs for the
-                    /// candidate cache; populated alongside batch_values.
-                    fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
-                    stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
-                }
-                let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
-
-                let build_start = Instant::now();
-                for (i, unit) in units.iter().enumerate() {
-                    if skip[i] {
-                        continue;
-                    }
-                    let pba = pbas[i].unwrap();
-                    let live_positions = match Self::live_positions_for_unit(unit, pool) {
-                        Ok(positions) => positions,
-                        Err(e) => {
-                            if alloc_blocks[i] == 1 {
-                                let _ = allocator.free_one(pba);
-                            } else {
-                                let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[i]));
-                            }
-                            results[i] = Err(e);
-                            skip[i] = true;
-                            continue;
-                        }
-                    };
-
-                    if live_positions.is_empty() {
-                        unit_metas[i] = Some(UnitMeta {
-                            batch_values: Vec::new(),
-                            live_positions,
-                            fresh_dedup_pairs: Vec::new(),
-                            stale_repairs: Vec::new(),
-                        });
-                        continue;
-                    }
-
-                    let lbas: Vec<Lba> = live_positions
-                        .iter()
-                        .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                        .collect();
-
-                    let mut batch_values = Vec::with_capacity(live_positions.len());
-                    let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-                    let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-
-                    for j in 0..live_positions.len() {
-                        let flags = if unit.dedup_skipped {
-                            FLAG_DEDUP_SKIPPED
-                        } else {
-                            0
-                        };
-                        let blockmap = Self::blockmap_for_unit_position(
-                            unit,
-                            pba,
-                            live_positions[j],
-                            0,
-                            flags,
-                        );
-                        batch_values.push((lbas[j], blockmap));
-                    }
-                    if !unit.dedup_skipped {
-                        if let Some(ref hashes) = unit.block_hashes {
-                            fresh_dedup_pairs.reserve(live_positions.len());
-                            for &pos in &live_positions {
-                                let hash = hashes[pos];
-                                if hash == [0u8; 8] {
-                                    continue;
-                                }
-                                let blockmap =
-                                    Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
-                                fresh_dedup_pairs.push((hash, blockmap));
-                                if let Some(repairs) = &unit.dedup_stale_repairs {
-                                    if let Some(Some(old_entry)) = repairs.get(pos) {
-                                        stale_repairs.push((
-                                            hash,
-                                            *old_entry,
-                                            blockmap.to_dedup_entry(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    unit_metas[i] = Some(UnitMeta {
-                        batch_values,
-                        live_positions,
-                        fresh_dedup_pairs,
-                        stale_repairs,
-                    });
-                }
-
-                // Phase 5: ONE combined WriteBatch for all units.
-                // old PBA decrements are computed inside the lock by atomic_batch_write_multi.
-                let mut vol_ids_owned: Vec<VolumeId> = Vec::new();
-                let mut meta_indices: Vec<usize> = Vec::new();
-
-                for (i, unit) in units.iter().enumerate() {
-                    if skip[i] || unit_metas[i].is_none() {
-                        continue;
-                    }
-                    vol_ids_owned.push(VolumeId(unit.vol_id.clone()));
-                    meta_indices.push(i);
-                }
-                Self::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
-
-                // actual_old_pba_meta: returned by atomic_batch_write_multi with accurate data
-                let mut actual_old_pba_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
-
-                if !meta_indices.is_empty() {
-                    let batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = meta_indices
-                        .iter()
-                        .enumerate()
-                        .map(|(batch_idx, &unit_idx)| {
-                            let um = unit_metas[unit_idx].as_ref().unwrap();
-                            (
-                                &vol_ids_owned[batch_idx],
-                                um.batch_values.as_slice(),
-                                um.live_positions.len() as u32,
-                            )
-                        })
-                        .collect();
-
-                    let mut all_fresh_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-                    let mut all_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> =
-                        Vec::new();
-                    for &unit_idx in &meta_indices {
-                        let um = unit_metas[unit_idx].as_ref().unwrap();
-                        all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
-                        all_stale_repairs.extend_from_slice(&um.stale_repairs);
-                    }
-                    let commit_lbas: u64 = batch_args
-                        .iter()
-                        .map(|(_, values, _)| values.len() as u64)
-                        .sum();
-                    let commit_start = Instant::now();
-                    let commit_result = meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]);
-                    Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
-                    metrics
-                        .flush_writer_meta_commits
-                        .fetch_add(1, Ordering::Relaxed);
-                    metrics
-                        .flush_writer_meta_lbas
-                        .fetch_add(commit_lbas, Ordering::Relaxed);
-                    match commit_result {
-                        Ok(returned) => {
-                            actual_old_pba_meta = returned;
-                            let candidate_start = Instant::now();
-                            candidate.insert_many(&all_fresh_pairs);
-                            Self::record_elapsed(
-                                &metrics.flush_writer_meta_candidate_ns,
-                                candidate_start,
-                            );
-                            let repair_start = Instant::now();
-                            Self::repair_stale_dedup_index(
-                                meta,
-                                metrics,
-                                &all_stale_repairs,
-                                "write_units_batch",
-                            );
-                            Self::record_elapsed(
-                                &metrics.flush_writer_meta_repair_ns,
-                                repair_start,
-                            );
-                        }
-                        Err(e) => {
-                            // Entire batch failed — rollback all allocations.
-                            for &unit_idx in &meta_indices {
-                                let pba = pbas[unit_idx].unwrap();
-                                if alloc_blocks[unit_idx] == 1 {
-                                    let _ = allocator.free_one(pba);
-                                } else {
-                                    let _ = allocator
-                                        .free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
-                                }
-                                results[unit_idx] = Err(crate::error::OnyxError::Io(
-                                    std::io::Error::other(format!("batch write failed: {e}",)),
-                                ));
-                                skip[unit_idx] = true;
-                            }
-                        }
-                    }
-                }
-                (unit_metas, meta_indices, actual_old_pba_meta)
-            });
-        let meta_elapsed = meta_start.elapsed();
-        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-        let live_units = meta_indices.len() as u64;
-        let live_lbas = meta_indices
-            .iter()
-            .filter_map(|&unit_idx| unit_metas[unit_idx].as_ref())
-            .map(|um| um.live_positions.len() as u64)
-            .sum::<u64>();
+            .filter(|(i, _)| !failed[*i])
+            .map(|(_, u)| u.lba_count as u64)
+            .sum();
         metrics.flush_writer_pt_batches.fetch_add(1, Ordering::Relaxed);
         metrics
             .flush_writer_pt_units
-            .fetch_add(live_units, Ordering::Relaxed);
+            .fetch_add(surviving as u64, Ordering::Relaxed);
         metrics
             .flush_writer_pt_lbas
-            .fetch_add(live_lbas, Ordering::Relaxed);
+            .fetch_add(surviving_lbas, Ordering::Relaxed);
         metrics
             .flush_writer_pt_io_ops
             .fetch_add(io_ops_count, Ordering::Relaxed);
-        crate::metrics::record_counter_max(&metrics.flush_writer_pt_units_max, live_units);
-        crate::metrics::record_counter_max(&metrics.flush_writer_pt_lbas_max, live_lbas);
+        crate::metrics::record_counter_max(
+            &metrics.flush_writer_pt_units_max,
+            surviving as u64,
+        );
+        crate::metrics::record_counter_max(&metrics.flush_writer_pt_lbas_max, surviving_lbas);
         crate::metrics::record_counter_max(&metrics.flush_writer_pt_io_ops_max, io_ops_count);
 
-        // Phase 6: Cleanup (free old PBAs) + dedup registration queueing.
-        //
-        // `actual_old_pba_meta` now contains only PBAs that THIS batch actually
-        // drove to refcount 0 (current_rc > 0 before, final_rc == 0 after).
-        // PBAs that were already 0 are excluded — another batch/lane already
-        // freed them, and double-freeing after re-allocation causes corruption.
-        let cleanup_start = Instant::now();
-        let empty_live_raw_units: Vec<usize> = meta_indices
-            .iter()
-            .copied()
-            .filter(|&unit_idx| {
-                unit_metas[unit_idx]
-                    .as_ref()
-                    .is_some_and(|um| um.live_positions.is_empty())
-            })
-            .collect();
+        // Phase C: split surviving units by `vol_id` and dispatch a
+        // PassthroughCommitJob to each volume's commit worker. Failed
+        // units (alloc / IO) are handled inline below.
+        let mut units_iter = units.into_iter();
+        let mut seqs_iter = seqs_per_unit.into_iter();
+        let mut completions_iter = completions_per_unit.into_iter();
 
-        for &unit_idx in &empty_live_raw_units {
-            let pba = pbas[unit_idx].unwrap();
-            if alloc_blocks[unit_idx] == 1 {
-                let _ = allocator.free_one(pba);
-            } else {
-                let _ = allocator.free_extent(Extent::new(pba, alloc_blocks[unit_idx]));
-            }
-        }
-
-        for &unit_idx in &meta_indices {
-            if skip[unit_idx] {
+        let mut per_volume: HashMap<String, Vec<UnitCommitData>> = HashMap::new();
+        let mut failed_paylads: Vec<(Vec<u64>, Option<Arc<crate::buffer::pipeline::DedupCompletion>>)> =
+            Vec::new();
+        for i in 0..n {
+            let unit = units_iter.next().expect("units length matches n");
+            let seqs = seqs_iter.next().expect("seqs length matches n");
+            let completion = completions_iter.next().expect("completions length matches n");
+            if failed[i] {
+                failed_paylads.push((seqs, completion));
                 continue;
             }
-            let um = unit_metas[unit_idx].as_ref().unwrap();
-            let unit = &units[unit_idx];
-            let pba = pbas[unit_idx].unwrap();
-            if um.live_positions.is_empty() {
-                continue;
-            }
-
-            Self::free_unreferenced_raw_blocks(
+            let pba = pbas[i].expect("pba present for non-failed unit");
+            let blocks = alloc_blocks[i];
+            let vol = unit.vol_id.clone();
+            per_volume.entry(vol).or_default().push(UnitCommitData {
                 unit,
                 pba,
-                &um.live_positions,
-                allocator,
-                "write_units_batch",
-            );
-
-            metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .flush_unit_bytes
-                .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
+                alloc_blocks: blocks,
+                seqs,
+                completion,
+            });
         }
 
-        if !actual_old_pba_meta.is_empty() {
-            let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
-        }
-        Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
-
-        // Phase 7: Batch mark_flushed (memory-only, fast).
-        let mark_start = Instant::now();
-        let mut mark_calls = 0u64;
-        let mut mark_lbas = 0u64;
-        for (i, unit) in units.iter().enumerate() {
-            if skip[i] {
-                continue;
+        // IO failures: defer_retry + done_tx inline so the shard
+        // writer's coalesce loop can pick them up after the backoff.
+        for (seqs, completion) in failed_paylads {
+            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+            match &completion {
+                None => in_flight_tracker.defer_retry(&seqs, Self::RETRY_BACKOFF),
+                Some(dc) => in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF),
             }
-            for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                mark_calls += 1;
-                mark_lbas += *lba_count as u64;
-                let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+            match completion {
+                None => {
+                    let _ = done_tx.send(seqs);
+                }
+                Some(dc) => {
+                    if let Some(original_seqs) = dc.decrement() {
+                        let _ = done_tx.send(original_seqs);
+                    }
+                }
             }
         }
-        metrics
-            .flush_writer_pt_mark_calls
-            .fetch_add(mark_calls, Ordering::Relaxed);
-        metrics
-            .flush_writer_pt_mark_lbas
-            .fetch_add(mark_lbas, Ordering::Relaxed);
-        crate::metrics::record_counter_max(
-            &metrics.flush_writer_pt_mark_calls_max,
-            mark_calls,
-        );
-        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
-        let _ = pool.advance_tail_for_shard(shard_idx);
+
+        // Dispatch one job per volume to its routed commit worker.
+        // The `Sender::send` is bounded; if the worker queue is full
+        // the shard writer will block briefly — that is the only
+        // backpressure path in Phase 1 (per-volume admission lands in
+        // Phase 2).
+        if !commit_worker_txs.is_empty() {
+            for (vol, units_for_vol) in per_volume {
+                let worker_idx = route_volume_to_worker(&vol);
+                let tx_idx = worker_idx % commit_worker_txs.len();
+                let job = CommitJob::Passthrough(PassthroughCommitJob {
+                    vol_id: VolumeId(vol),
+                    shard_idx,
+                    units: units_for_vol,
+                });
+                let _ = commit_worker_txs[tx_idx].send(job);
+            }
+        }
 
         let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
@@ -695,14 +466,12 @@ impl BufferFlusher {
             tracing::debug!(
                 shard = shard_idx,
                 units = n,
-                live_units = meta_indices.len(),
+                surviving,
                 total_ms = total_elapsed.as_millis() as u64,
                 alloc_ms = alloc_elapsed.as_millis() as u64,
                 io_ms = io_elapsed.as_millis() as u64,
-                meta_ms = meta_elapsed.as_millis() as u64,
-                "writer: slow passthrough batch (>=1s)"
+                "writer: slow passthrough batch (>=1s) — IO + dispatch only"
             );
         }
-        results
     }
 }

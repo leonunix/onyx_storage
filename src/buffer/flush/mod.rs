@@ -50,6 +50,16 @@ pub struct BufferFlusher {
     /// flusher with a real cache and the integration commits don't
     /// have to re-touch the public constructor signature.
     candidate: crate::dedup::CandidateCache,
+    /// Per-volume commit workers. Each shard writer hands a
+    /// [`writer::CommitJob`] off to `commit_worker_handles[hash %
+    /// NUM_COMMIT_WORKERS]` after IO; the worker handles the metadb
+    /// commit, cleanup, and `mark_flushed`. See
+    /// `.claude/plans/per-volume-commit-worker.md`.
+    commit_worker_handles: Vec<JoinHandle<()>>,
+    /// Drop these on shutdown to signal commit workers their queues
+    /// are draining; sender clones held by shard writers are dropped
+    /// when the writer threads join.
+    commit_worker_txs: Vec<Sender<writer::CommitJob>>,
 }
 
 struct FlusherLane {
@@ -482,6 +492,30 @@ impl BufferFlusher {
         let dedup_pending_skip_threshold = dedup_config.pending_skip_threshold_entries;
         let mut lanes = Vec::with_capacity(lane_count);
 
+        // Per-shard `done_tx` / `cleanup_tx` channels are created
+        // below in the lane loop; we collect clones here so the
+        // commit workers can route by `CommitJob.shard_idx`. Pre-size
+        // the storage so the lane loop can `push` into stable
+        // indices.
+        let mut lane_done_txs: Vec<Sender<Vec<u64>>> = Vec::with_capacity(lane_count);
+        let mut lane_cleanup_txs: Vec<Sender<CleanupBatch>> = Vec::with_capacity(lane_count);
+
+        // Spawn N per-volume commit workers up front (channels only
+        // — actual threads are spawned after the lane loop, once we
+        // have lane_done_txs / lane_cleanup_txs filled). Shard
+        // writers get a `Vec<Sender<CommitJob>>` clone and route by
+        // `hash(vol_id) % N`. Per-worker queue is bounded so a slow
+        // worker provides backpressure to the shard writers.
+        let mut commit_worker_txs: Vec<Sender<writer::CommitJob>> =
+            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+        let mut commit_worker_rxs: Vec<Receiver<writer::CommitJob>> =
+            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+        for _ in 0..writer::NUM_COMMIT_WORKERS {
+            let (tx, rx) = bounded::<writer::CommitJob>(writer::COMMIT_WORKER_QUEUE_CAP);
+            commit_worker_txs.push(tx);
+            commit_worker_rxs.push(rx);
+        }
+
         for shard_idx in 0..lane_count {
             // Inter-stage channel sizes — sized to keep the writer's
             // per-cycle drain (Self::WRITER_BATCH_SIZE) from starving
@@ -504,6 +538,11 @@ impl BufferFlusher {
             let (done_tx, done_rx) = unbounded::<Vec<u64>>();
             // Writer/dedup → cleanup thread (async dead PBA reclamation)
             let (cleanup_tx, cleanup_rx) = unbounded::<CleanupBatch>();
+
+            // Capture lane-local senders for the commit workers (they
+            // route done_tx / cleanup_tx by `CommitJob.shard_idx`).
+            lane_done_txs.push(done_tx.clone());
+            lane_cleanup_txs.push(cleanup_tx.clone());
 
             let running_c = running.clone();
             let pool_c = pool.clone();
@@ -619,6 +658,7 @@ impl BufferFlusher {
             let metrics_w = metrics.clone();
             let in_flight_w = in_flight.clone();
             let candidate_w = candidate.clone();
+            let commit_worker_txs_w = commit_worker_txs.clone();
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
@@ -640,6 +680,7 @@ impl BufferFlusher {
                         &cleanup_tx,
                         &candidate_w,
                         packed_meta_batch_max_lbas,
+                        &commit_worker_txs_w,
                     );
                 })
                 .expect("failed to spawn writer thread");
@@ -672,11 +713,53 @@ impl BufferFlusher {
             });
         }
 
+        // Spawn the per-volume commit workers now that lane channels
+        // exist. Each worker indexes `lane_done_txs` / `lane_cleanup_txs`
+        // by `CommitJob.shard_idx` to fire `done_tx` and queue
+        // cleanup payloads back into the originating shard's lane.
+        let mut commit_worker_handles: Vec<JoinHandle<()>> =
+            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+        for (worker_idx, rx) in commit_worker_rxs.into_iter().enumerate() {
+            let pool_c = pool.clone();
+            let meta_c = meta.clone();
+            let lifecycle_c = lifecycle.clone();
+            let allocator_c = allocator.clone();
+            let in_flight_c = in_flight.clone();
+            let metrics_c = metrics.clone();
+            let candidate_c = candidate.clone();
+            let running_c = running.clone();
+            let lane_done_txs_c = lane_done_txs.clone();
+            let lane_cleanup_txs_c = lane_cleanup_txs.clone();
+            let h = thread::Builder::new()
+                .name(format!("flusher-commit-{}", worker_idx))
+                .spawn(move || {
+                    affinity::bind_current(ThreadRole::FlusherWriter, worker_idx);
+                    Self::commit_worker_loop(
+                        worker_idx,
+                        &rx,
+                        &pool_c,
+                        &meta_c,
+                        &lifecycle_c,
+                        &allocator_c,
+                        &in_flight_c,
+                        &metrics_c,
+                        &lane_cleanup_txs_c,
+                        &candidate_c,
+                        &lane_done_txs_c,
+                        &running_c,
+                    );
+                })
+                .expect("failed to spawn commit worker");
+            commit_worker_handles.push(h);
+        }
+
         Self {
             running,
             lanes,
             in_flight,
             candidate,
+            commit_worker_handles,
+            commit_worker_txs,
         }
     }
 
@@ -757,7 +840,19 @@ impl BufferFlusher {
             if let Some(h) = lane.writer_handle.take() {
                 let _ = h.join();
             }
-            // Cleanup thread drains after writer stops (writer drop closes cleanup_tx).
+        }
+        // Shard writers have stopped — drop the commit_worker_txs we
+        // hold so the worker rx sides disconnect once their per-lane
+        // sender clones (held by writer threads) drop. This signals
+        // workers to drain and exit.
+        self.commit_worker_txs.clear();
+        for h in self.commit_worker_handles.drain(..) {
+            let _ = h.join();
+        }
+        // Per-lane cleanup workers drain after the commit workers
+        // finish (commit workers may push cleanup payloads through
+        // each lane's cleanup_tx during their own drain).
+        for lane in &mut self.lanes {
             if let Some(h) = lane.cleanup_handle.take() {
                 let _ = h.join();
             }

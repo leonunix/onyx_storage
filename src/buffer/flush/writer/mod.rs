@@ -1,7 +1,13 @@
 use super::*;
 
+mod commit_worker;
 mod packed;
 mod passthrough;
+
+pub(in crate::buffer::flush) use commit_worker::{
+    route_volume_to_worker, CommitJob, PackedCommitJob, PassthroughCommitJob, UnitCommitData,
+    COMMIT_WORKER_QUEUE_CAP, NUM_COMMIT_WORKERS,
+};
 
 impl BufferFlusher {
     /// Maximum units a single writer cycle drains from `write_rx` and
@@ -60,7 +66,11 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
-        packed_meta_batch_max_lbas: usize,
+        // Retained for backward compat with the old per-batch
+        // metadata commit cap; commit workers now use
+        // TARGET_OPS_PER_COMMIT instead (per-volume sub-batch).
+        _packed_meta_batch_max_lbas: usize,
+        commit_worker_txs: &[Sender<CommitJob>],
     ) {
         let mut buffered_seqs: Vec<u64> = Vec::new();
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
@@ -69,46 +79,31 @@ impl BufferFlusher {
         let mut tail_dirty = false;
         let mut last_read_submit_calls = metrics.read_submit_calls.load(Ordering::Relaxed);
 
-        /// Helper: flush accumulated Passthrough units through write_units_batch.
+        /// Helper: hand off accumulated Passthrough units to the
+        /// per-volume commit workers. Per-unit done_tx / defer_retry
+        /// are now driven by the commit worker for successful IO and
+        /// by `write_units_batch` itself for IO failures, so this
+        /// macro only consumes the batch buffers and signals tail
+        /// advance.
         macro_rules! flush_pt_batch {
             ($batch:expr, $batch_seqs:expr, $batch_completions:expr) => {
                 if !$batch.is_empty() {
-                    let results = Self::write_units_batch(
-                        shard_idx, &$batch, pool, meta, lifecycle, allocator,
-                        io_engine, metrics, cleanup_tx, candidate,
+                    let units = std::mem::take(&mut $batch);
+                    let seqs = std::mem::take(&mut $batch_seqs);
+                    let completions = std::mem::take(&mut $batch_completions);
+                    Self::write_units_batch(
+                        shard_idx,
+                        units,
+                        seqs,
+                        completions,
+                        pool,
+                        allocator,
+                        io_engine,
+                        metrics,
+                        in_flight_tracker,
+                        done_tx,
+                        commit_worker_txs,
                     );
-                    for (idx, result) in results.into_iter().enumerate() {
-                        if let Err(e) = result {
-                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            match &$batch_completions[idx] {
-                                None => {
-                                    in_flight_tracker
-                                        .defer_retry(&$batch_seqs[idx], Self::RETRY_BACKOFF);
-                                }
-                                Some(dc) => {
-                                    in_flight_tracker
-                                        .defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
-                                }
-                            }
-                            tracing::error!(
-                                vol = $batch[idx].vol_id,
-                                start_lba = $batch[idx].start_lba.0,
-                                error = %e,
-                                "writer: failed to flush unit in batch"
-                            );
-                        }
-                        match &$batch_completions[idx] {
-                            None => { let _ = done_tx.send($batch_seqs[idx].clone()); }
-                            Some(dc) => {
-                                if let Some(original_seqs) = dc.decrement() {
-                                    let _ = done_tx.send(original_seqs);
-                                }
-                            }
-                        }
-                    }
-                    $batch.clear();
-                    $batch_seqs.clear();
-                    $batch_completions.clear();
                     tail_dirty = true;
                 }
             };
@@ -317,56 +312,27 @@ impl BufferFlusher {
                 }
             }
 
-            // Flush packed batch first so its commits land before the
-            // passthrough batch — preserves the historic ordering where a
-            // SealedSlot's metadata committed before any subsequent
-            // Passthrough unit's. The single combined metadb tx replaces
-            // N per-slot commits.
+            // Hand the packed slots off to the per-volume commit
+            // workers. IO write happens inside `write_packed_slots_batch`;
+            // on IO success the slot is routed to commit worker
+            // `route_volume_to_worker(primary_vol)`. IO failures are
+            // queued for whole-slot retry inline (preserves the
+            // historic packing optimisation across retries).
             if !packed_batch.is_empty() {
-                let slot_results = Self::write_packed_slots_batch(
+                Self::write_packed_slots_batch(
                     shard_idx,
-                    &packed_batch,
+                    packed_batch,
+                    packed_buffered_per_slot,
                     pool,
-                    meta,
-                    lifecycle,
                     allocator,
                     io_engine,
                     metrics,
-                    cleanup_tx,
-                    candidate,
-                    packed_meta_batch_max_lbas,
+                    in_flight_tracker,
+                    done_tx,
+                    &mut packed_retries,
+                    commit_worker_txs,
                 );
-                for ((sealed, result), (mut slot_seqs, mut slot_completions)) in packed_batch
-                    .into_iter()
-                    .zip(slot_results)
-                    .zip(packed_buffered_per_slot)
-                {
-                    match result {
-                        Err(e) => {
-                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            let failed_pba = sealed.pba;
-                            Self::queue_packed_slot_retry(
-                                &mut packed_retries,
-                                sealed,
-                                &mut slot_seqs,
-                                &mut slot_completions,
-                            );
-                            tracing::error!(
-                                pba = failed_pba.0,
-                                error = %e,
-                                "writer: packed slot failed in batch; queued whole-slot retry"
-                            );
-                        }
-                        Ok(()) => {
-                            Self::flush_buffered_done(
-                                &mut slot_seqs,
-                                &mut slot_completions,
-                                done_tx,
-                            );
-                            tail_dirty = true;
-                        }
-                    }
-                }
+                tail_dirty = true;
             }
 
             flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
