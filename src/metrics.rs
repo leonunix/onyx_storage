@@ -1549,6 +1549,9 @@ pub struct MetaMemorySnapshot {
     pub meta_io_fsync_calls: u64,
     pub meta_io_fsync_us: u64,
     pub meta_io_fsync_max_us: u64,
+    pub meta_io_write_uring_lock_acquires: u64,
+    pub meta_io_write_uring_lock_wait_us: u64,
+    pub meta_io_write_uring_lock_wait_max_us: u64,
     // Diagnostic in-memory growth counters. Each is a `len()` of an
     // unbounded structure that should drain regularly; runaway growth
     // here is the signature of a stuck consumer / reclaim path.
@@ -1909,6 +1912,9 @@ impl MetaMemorySnapshot {
             meta_io_fsync_calls: sub!(meta_io_fsync_calls),
             meta_io_fsync_us: sub!(meta_io_fsync_us),
             meta_io_fsync_max_us: self.meta_io_fsync_max_us,
+            meta_io_write_uring_lock_acquires: sub!(meta_io_write_uring_lock_acquires),
+            meta_io_write_uring_lock_wait_us: sub!(meta_io_write_uring_lock_wait_us),
+            meta_io_write_uring_lock_wait_max_us: self.meta_io_write_uring_lock_wait_max_us,
             pending_dispatch: self.pending_dispatch,
             pending_deferred_free: self.pending_deferred_free,
             pending_dedup_lane_queue: self.pending_dedup_lane_queue,
@@ -2218,6 +2224,9 @@ impl MetaMemorySnapshot {
             meta_io_fsync_calls: meta.meta_io_fsync_calls,
             meta_io_fsync_us: meta.meta_io_fsync_us,
             meta_io_fsync_max_us: meta.meta_io_fsync_max_us,
+            meta_io_write_uring_lock_acquires: meta.meta_io_write_uring_lock_acquires,
+            meta_io_write_uring_lock_wait_us: meta.meta_io_write_uring_lock_wait_us,
+            meta_io_write_uring_lock_wait_max_us: meta.meta_io_write_uring_lock_wait_max_us,
             pending_dispatch: pending.dispatch_pending as u64,
             pending_deferred_free: pending.deferred_free as u64,
             pending_dedup_lane_queue: pending.dedup_lane_queue as u64,
@@ -2400,6 +2409,13 @@ impl EngineStatusSnapshot {
                 metadb.meta_io_fsync_calls,
                 metadb.meta_io_fsync_us,
                 metadb.meta_io_fsync_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_write_uring_lock: acquires={} wait_us={} wait_max_us={}",
+                metadb.meta_io_write_uring_lock_acquires,
+                metadb.meta_io_write_uring_lock_wait_us,
+                metadb.meta_io_write_uring_lock_wait_max_us
             );
             let _ = writeln!(
                 out,
