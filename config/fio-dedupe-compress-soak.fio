@@ -19,6 +19,7 @@ numjobs=__JOBS__
 iodepth=__IODEPTH__
 iodepth_batch_submit=__IODEPTH__
 iodepth_batch_complete_min=1
+__FIO_CPUS__
 
 # Keep this a correctness/health soak, not a maximum-throughput run.
 rate_iops=__RATE_IOPS__

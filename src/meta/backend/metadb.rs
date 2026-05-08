@@ -1179,6 +1179,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
     cfg.dedup_shards = config.dedup_shards;
+    cfg.shards_per_partition = config.shards_per_partition;
     cfg.dedup_cuckoo_buckets = config.dedup_cuckoo_buckets;
     cfg.dedup_l1_cache_entries = config.dedup_l1_cache_entries;
     cfg.refcount_drainer_enabled = config.refcount_drainer_enabled;

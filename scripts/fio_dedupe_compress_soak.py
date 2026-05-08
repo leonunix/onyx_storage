@@ -477,6 +477,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=parse_size("64m"),
         help="Bytes to zero at the front of the configured LV2 buffer during reset",
     )
+    parser.add_argument(
+        "--fio-cpus",
+        default="",
+        help=(
+            "Optional cpus_allowed list to pin fio worker threads (e.g. "
+            "'49,51,53,55,57,59,61,63' to keep fio on node 1 and out of "
+            "engine/metadb's CPU set on a NUMA-pinned host). Empty (default) "
+            "lets the kernel scheduler decide."
+        ),
+    )
     parser.add_argument("--leave-running", action="store_true", help="Leave the engine running at the end")
     args = parser.parse_args(argv)
 
@@ -571,6 +581,11 @@ def main(argv: list[str]) -> int:
                 "DEDUPE_WORKING_SET_PERCENTAGE": args.dedupe_working_set_percentage,
                 "BUFFER_COMPRESS_PERCENTAGE": args.buffer_compress_percentage,
                 "BUFFER_COMPRESS_CHUNK": args.buffer_compress_chunk,
+                "FIO_CPUS": (
+                    f"cpus_allowed={args.fio_cpus}\ncpus_allowed_policy=split"
+                    if args.fio_cpus
+                    else ""
+                ),
             },
         )
 

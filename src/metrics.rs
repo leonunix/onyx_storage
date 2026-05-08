@@ -1407,6 +1407,22 @@ pub struct MetaMemorySnapshot {
     pub rc_apply_lane_idle_max_us: u64,
     pub rc_apply_lane_pending_set_wait_us: u64,
     pub rc_apply_lane_pending_set_wait_max_us: u64,
+    pub l2p_apply_lane_shard_tasks: Vec<u64>,
+    pub l2p_apply_lane_shard_queue_depth_max: Vec<u64>,
+    pub l2p_apply_lane_shard_queue_wait_us: Vec<u64>,
+    pub l2p_apply_lane_shard_queue_wait_max_us: Vec<u64>,
+    pub l2p_apply_lane_shard_exec_us: Vec<u64>,
+    pub l2p_apply_lane_shard_exec_max_us: Vec<u64>,
+    pub l2p_apply_lane_shard_idle_us: Vec<u64>,
+    pub rc_apply_lane_shard_tasks: Vec<u64>,
+    pub rc_apply_lane_shard_queue_depth_max: Vec<u64>,
+    pub rc_apply_lane_shard_queue_wait_us: Vec<u64>,
+    pub rc_apply_lane_shard_queue_wait_max_us: Vec<u64>,
+    pub rc_apply_lane_shard_exec_us: Vec<u64>,
+    pub rc_apply_lane_shard_exec_max_us: Vec<u64>,
+    pub rc_apply_lane_shard_idle_us: Vec<u64>,
+    pub rc_apply_lane_shard_pending_set_wait_us: Vec<u64>,
+    pub rc_apply_lane_shard_pending_set_wait_max_us: Vec<u64>,
     pub dedup_apply_guard_count: u64,
     pub dedup_apply_guard_us: u64,
     pub dedup_apply_guard_max_us: u64,
@@ -1550,6 +1566,18 @@ impl MetaMemorySnapshot {
             };
         }
 
+        // Element-wise saturating sub for per-shard counter vectors.
+        // Length difference is unexpected (snapshots come from the same
+        // running process) but we tolerate it by truncating to the
+        // shorter length and treating the missing elements as zero.
+        fn sub_vec(current: &[u64], earlier: &[u64]) -> Vec<u64> {
+            current
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| c.saturating_sub(earlier.get(i).copied().unwrap_or(0)))
+                .collect()
+        }
+
         Self {
             block_cache_capacity_bytes: self.block_cache_capacity_bytes,
             block_cache_usage_bytes: opt_sub(
@@ -1688,6 +1716,55 @@ impl MetaMemorySnapshot {
             rc_apply_lane_idle_max_us: self.rc_apply_lane_idle_max_us,
             rc_apply_lane_pending_set_wait_us: sub!(rc_apply_lane_pending_set_wait_us),
             rc_apply_lane_pending_set_wait_max_us: self.rc_apply_lane_pending_set_wait_max_us,
+            l2p_apply_lane_shard_tasks: sub_vec(
+                &self.l2p_apply_lane_shard_tasks,
+                &earlier.l2p_apply_lane_shard_tasks,
+            ),
+            l2p_apply_lane_shard_queue_depth_max: self.l2p_apply_lane_shard_queue_depth_max.clone(),
+            l2p_apply_lane_shard_queue_wait_us: sub_vec(
+                &self.l2p_apply_lane_shard_queue_wait_us,
+                &earlier.l2p_apply_lane_shard_queue_wait_us,
+            ),
+            l2p_apply_lane_shard_queue_wait_max_us: self
+                .l2p_apply_lane_shard_queue_wait_max_us
+                .clone(),
+            l2p_apply_lane_shard_exec_us: sub_vec(
+                &self.l2p_apply_lane_shard_exec_us,
+                &earlier.l2p_apply_lane_shard_exec_us,
+            ),
+            l2p_apply_lane_shard_exec_max_us: self.l2p_apply_lane_shard_exec_max_us.clone(),
+            l2p_apply_lane_shard_idle_us: sub_vec(
+                &self.l2p_apply_lane_shard_idle_us,
+                &earlier.l2p_apply_lane_shard_idle_us,
+            ),
+            rc_apply_lane_shard_tasks: sub_vec(
+                &self.rc_apply_lane_shard_tasks,
+                &earlier.rc_apply_lane_shard_tasks,
+            ),
+            rc_apply_lane_shard_queue_depth_max: self.rc_apply_lane_shard_queue_depth_max.clone(),
+            rc_apply_lane_shard_queue_wait_us: sub_vec(
+                &self.rc_apply_lane_shard_queue_wait_us,
+                &earlier.rc_apply_lane_shard_queue_wait_us,
+            ),
+            rc_apply_lane_shard_queue_wait_max_us: self
+                .rc_apply_lane_shard_queue_wait_max_us
+                .clone(),
+            rc_apply_lane_shard_exec_us: sub_vec(
+                &self.rc_apply_lane_shard_exec_us,
+                &earlier.rc_apply_lane_shard_exec_us,
+            ),
+            rc_apply_lane_shard_exec_max_us: self.rc_apply_lane_shard_exec_max_us.clone(),
+            rc_apply_lane_shard_idle_us: sub_vec(
+                &self.rc_apply_lane_shard_idle_us,
+                &earlier.rc_apply_lane_shard_idle_us,
+            ),
+            rc_apply_lane_shard_pending_set_wait_us: sub_vec(
+                &self.rc_apply_lane_shard_pending_set_wait_us,
+                &earlier.rc_apply_lane_shard_pending_set_wait_us,
+            ),
+            rc_apply_lane_shard_pending_set_wait_max_us: self
+                .rc_apply_lane_shard_pending_set_wait_max_us
+                .clone(),
             dedup_apply_guard_count: sub!(dedup_apply_guard_count),
             dedup_apply_guard_us: sub!(dedup_apply_guard_us),
             dedup_apply_guard_max_us: self.dedup_apply_guard_max_us,
@@ -1965,6 +2042,23 @@ impl MetaMemorySnapshot {
             rc_apply_lane_idle_max_us: meta.rc_apply_lane_idle_max_us,
             rc_apply_lane_pending_set_wait_us: meta.rc_apply_lane_pending_set_wait_us,
             rc_apply_lane_pending_set_wait_max_us: meta.rc_apply_lane_pending_set_wait_max_us,
+            l2p_apply_lane_shard_tasks: meta.l2p_apply_lane_shard_tasks,
+            l2p_apply_lane_shard_queue_depth_max: meta.l2p_apply_lane_shard_queue_depth_max,
+            l2p_apply_lane_shard_queue_wait_us: meta.l2p_apply_lane_shard_queue_wait_us,
+            l2p_apply_lane_shard_queue_wait_max_us: meta.l2p_apply_lane_shard_queue_wait_max_us,
+            l2p_apply_lane_shard_exec_us: meta.l2p_apply_lane_shard_exec_us,
+            l2p_apply_lane_shard_exec_max_us: meta.l2p_apply_lane_shard_exec_max_us,
+            l2p_apply_lane_shard_idle_us: meta.l2p_apply_lane_shard_idle_us,
+            rc_apply_lane_shard_tasks: meta.rc_apply_lane_shard_tasks,
+            rc_apply_lane_shard_queue_depth_max: meta.rc_apply_lane_shard_queue_depth_max,
+            rc_apply_lane_shard_queue_wait_us: meta.rc_apply_lane_shard_queue_wait_us,
+            rc_apply_lane_shard_queue_wait_max_us: meta.rc_apply_lane_shard_queue_wait_max_us,
+            rc_apply_lane_shard_exec_us: meta.rc_apply_lane_shard_exec_us,
+            rc_apply_lane_shard_exec_max_us: meta.rc_apply_lane_shard_exec_max_us,
+            rc_apply_lane_shard_idle_us: meta.rc_apply_lane_shard_idle_us,
+            rc_apply_lane_shard_pending_set_wait_us: meta.rc_apply_lane_shard_pending_set_wait_us,
+            rc_apply_lane_shard_pending_set_wait_max_us: meta
+                .rc_apply_lane_shard_pending_set_wait_max_us,
             dedup_apply_guard_count: meta.dedup_apply_guard_count,
             dedup_apply_guard_us: meta.dedup_apply_guard_us,
             dedup_apply_guard_max_us: meta.dedup_apply_guard_max_us,

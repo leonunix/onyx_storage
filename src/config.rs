@@ -155,6 +155,15 @@ pub struct MetaConfig {
     /// apply-lane ceiling without the unstable N=4 balance point.
     #[serde(default = "default_metadb_dedup_shards")]
     pub dedup_shards: u32,
+    /// Number of metadb L2P / refcount partition shards. Recorded in
+    /// the manifest at create time. Default 16 matches metadb's own
+    /// default; raise on hosts where per-shard apply-lane queue_wait
+    /// has become the bottleneck (a doubled shard count halves the
+    /// per-shard task arrival rate at the cost of more metadb apply
+    /// threads + per-shard memory). Changing this value on an existing
+    /// database is rejected at open.
+    #[serde(default = "default_metadb_shards_per_partition")]
+    pub shards_per_partition: u32,
     /// Number of buckets in metadb's cuckoo dedup index. Each data page
     /// holds 64 slots; choose enough buckets that the unique-hash working
     /// set stays well below the physical slot count. Recorded at create time.
@@ -236,6 +245,7 @@ impl Default for MetaConfig {
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
+            shards_per_partition: default_metadb_shards_per_partition(),
             dedup_cuckoo_buckets: default_metadb_dedup_cuckoo_buckets(),
             dedup_l1_cache_entries: default_metadb_dedup_l1_cache_entries(),
             refcount_drainer_enabled: false,
@@ -251,6 +261,10 @@ impl Default for MetaConfig {
 
 fn default_metadb_dedup_shards() -> u32 {
     8
+}
+
+fn default_metadb_shards_per_partition() -> u32 {
+    16
 }
 
 fn default_metadb_dedup_cuckoo_buckets() -> u64 {
