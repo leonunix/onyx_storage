@@ -469,6 +469,15 @@ pub struct FlushConfig {
     /// drain throughput. Set 0 to use the built-in default.
     #[serde(default = "default_packed_meta_batch_max_lbas")]
     pub packed_meta_batch_max_lbas: usize,
+    /// Number of commit workers a single volume may fan out to. Default 1
+    /// = strict per-volume routing (single worker per vol_id, zero LSN
+    /// dispatch contention but single-worker throughput cap). Set to 2
+    /// or 4 to let one volume use that many consecutive commit workers
+    /// (selected by `shard_idx % per_vol`) for parallel commits at the
+    /// cost of some apply-lane contention. Total commit workers stays
+    /// at NUM_COMMIT_WORKERS=16; only the per-vol fanout changes.
+    #[serde(default = "default_commit_workers_per_volume")]
+    pub commit_workers_per_volume: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -499,6 +508,7 @@ impl Default for FlushConfig {
             min_compression_savings_pct: default_min_compression_savings_pct(),
             skip_fully_superseded: default_skip_fully_superseded(),
             packed_meta_batch_max_lbas: default_packed_meta_batch_max_lbas(),
+            commit_workers_per_volume: default_commit_workers_per_volume(),
         }
     }
 }
@@ -520,6 +530,9 @@ fn default_skip_fully_superseded() -> bool {
 }
 fn default_packed_meta_batch_max_lbas() -> usize {
     DEFAULT_PACKED_META_BATCH_LBA_LIMIT
+}
+fn default_commit_workers_per_volume() -> usize {
+    1
 }
 fn default_zone_count() -> u32 {
     4

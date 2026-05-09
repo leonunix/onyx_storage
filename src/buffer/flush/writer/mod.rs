@@ -3,11 +3,13 @@ use super::*;
 mod commit_worker;
 mod packed;
 mod passthrough;
+mod post_commit;
 
 pub(in crate::buffer::flush) use commit_worker::{
     route_volume_to_worker, CommitJob, PackedCommitJob, PassthroughCommitJob, UnitCommitData,
     COMMIT_WORKER_QUEUE_CAP, NUM_COMMIT_WORKERS,
 };
+pub(in crate::buffer::flush) use post_commit::{PostCommitJob, POST_COMMIT_QUEUE_CAP};
 
 impl BufferFlusher {
     /// Maximum units a single writer cycle drains from `write_rx` and
@@ -71,6 +73,7 @@ impl BufferFlusher {
         // TARGET_OPS_PER_COMMIT instead (per-volume sub-batch).
         _packed_meta_batch_max_lbas: usize,
         commit_worker_txs: &[Sender<CommitJob>],
+        commit_workers_per_volume: usize,
     ) {
         let mut buffered_seqs: Vec<u64> = Vec::new();
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
@@ -103,6 +106,7 @@ impl BufferFlusher {
                         in_flight_tracker,
                         done_tx,
                         commit_worker_txs,
+                        commit_workers_per_volume,
                     );
                     tail_dirty = true;
                 }
@@ -331,6 +335,7 @@ impl BufferFlusher {
                     done_tx,
                     &mut packed_retries,
                     commit_worker_txs,
+                    commit_workers_per_volume,
                 );
                 tail_dirty = true;
             }

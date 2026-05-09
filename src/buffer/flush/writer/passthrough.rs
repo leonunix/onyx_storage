@@ -239,6 +239,7 @@ impl BufferFlusher {
         in_flight_tracker: &FlusherInFlightTracker,
         done_tx: &Sender<Vec<u64>>,
         commit_worker_txs: &[Sender<CommitJob>],
+        commit_workers_per_volume: usize,
     ) {
         if units.is_empty() {
             return;
@@ -449,7 +450,8 @@ impl BufferFlusher {
         // Phase 2).
         if !commit_worker_txs.is_empty() {
             for (vol, units_for_vol) in per_volume {
-                let worker_idx = route_volume_to_worker(&vol);
+                let worker_idx =
+                    route_volume_to_worker(&vol, shard_idx, commit_workers_per_volume);
                 let tx_idx = worker_idx % commit_worker_txs.len();
                 let job = CommitJob::Passthrough(PassthroughCommitJob {
                     vol_id: VolumeId(vol),

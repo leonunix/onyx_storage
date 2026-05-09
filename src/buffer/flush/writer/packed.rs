@@ -287,6 +287,7 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         packed_retries: &mut VecDeque<PackedSlotRetry>,
         commit_worker_txs: &[Sender<CommitJob>],
+        commit_workers_per_volume: usize,
     ) {
         let _ = pool;
         let total_start = Instant::now();
@@ -399,7 +400,8 @@ impl BufferFlusher {
                 .first()
                 .map(|f| f.unit.vol_id.clone())
                 .unwrap_or_default();
-            let worker_idx = route_volume_to_worker(&primary_vol);
+            let worker_idx =
+                route_volume_to_worker(&primary_vol, shard_idx, commit_workers_per_volume);
             let tx_idx = worker_idx % commit_worker_txs.len();
             let job = CommitJob::Packed(PackedCommitJob {
                 sealed,

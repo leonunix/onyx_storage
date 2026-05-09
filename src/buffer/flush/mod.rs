@@ -60,6 +60,11 @@ pub struct BufferFlusher {
     /// are draining; sender clones held by shard writers are dropped
     /// when the writer threads join.
     commit_worker_txs: Vec<Sender<writer::CommitJob>>,
+    /// Phase 2.2: per-worker post_commit threads run mark_flushed +
+    /// candidate insert + stale dedup repair off the commit_worker
+    /// hot path. Joined after commit workers (their senders drop on
+    /// commit-worker exit, signalling drain).
+    post_commit_handles: Vec<JoinHandle<()>>,
 }
 
 struct FlusherLane {
@@ -486,6 +491,10 @@ impl BufferFlusher {
         } else {
             config.packed_meta_batch_max_lbas
         };
+        let commit_workers_per_volume = config
+            .commit_workers_per_volume
+            .max(1)
+            .min(writer::NUM_COMMIT_WORKERS);
         let dedup_enabled = dedup_config.enabled;
         let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
@@ -514,6 +523,19 @@ impl BufferFlusher {
             let (tx, rx) = bounded::<writer::CommitJob>(writer::COMMIT_WORKER_QUEUE_CAP);
             commit_worker_txs.push(tx);
             commit_worker_rxs.push(rx);
+        }
+
+        // Phase 2.2 post-commit pairing. One channel per commit_worker
+        // so mark_flushed traffic for any one volume stays serialised
+        // (matches the commit_worker's per-volume FIFO).
+        let mut post_commit_txs: Vec<Sender<writer::PostCommitJob>> =
+            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+        let mut post_commit_rxs: Vec<Receiver<writer::PostCommitJob>> =
+            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+        for _ in 0..writer::NUM_COMMIT_WORKERS {
+            let (tx, rx) = bounded::<writer::PostCommitJob>(writer::POST_COMMIT_QUEUE_CAP);
+            post_commit_txs.push(tx);
+            post_commit_rxs.push(rx);
         }
 
         for shard_idx in 0..lane_count {
@@ -681,6 +703,7 @@ impl BufferFlusher {
                         &candidate_w,
                         packed_meta_batch_max_lbas,
                         &commit_worker_txs_w,
+                        commit_workers_per_volume,
                     );
                 })
                 .expect("failed to spawn writer thread");
@@ -730,6 +753,7 @@ impl BufferFlusher {
             let running_c = running.clone();
             let lane_done_txs_c = lane_done_txs.clone();
             let lane_cleanup_txs_c = lane_cleanup_txs.clone();
+            let post_commit_tx_c = post_commit_txs[worker_idx].clone();
             let h = thread::Builder::new()
                 .name(format!("flusher-commit-{}", worker_idx))
                 .spawn(move || {
@@ -746,11 +770,42 @@ impl BufferFlusher {
                         &lane_cleanup_txs_c,
                         &candidate_c,
                         &lane_done_txs_c,
+                        &post_commit_tx_c,
                         &running_c,
                     );
                 })
                 .expect("failed to spawn commit worker");
             commit_worker_handles.push(h);
+        }
+
+        // Drop our extra clones of the post_commit_txs — only the
+        // commit_workers hold senders now. When the commit workers
+        // exit on shutdown, these channels disconnect and the
+        // post_commit threads will drain and exit.
+        drop(post_commit_txs);
+
+        let mut post_commit_handles: Vec<JoinHandle<()>> =
+            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+        for (worker_idx, rx) in post_commit_rxs.into_iter().enumerate() {
+            let pool_c = pool.clone();
+            let meta_c = meta.clone();
+            let candidate_c = candidate.clone();
+            let metrics_c = metrics.clone();
+            let h = thread::Builder::new()
+                .name(format!("flusher-post-commit-{}", worker_idx))
+                .spawn(move || {
+                    affinity::bind_current(ThreadRole::FlusherCleanup, worker_idx);
+                    Self::post_commit_loop(
+                        worker_idx,
+                        &rx,
+                        &pool_c,
+                        &meta_c,
+                        &candidate_c,
+                        &metrics_c,
+                    );
+                })
+                .expect("failed to spawn post-commit worker");
+            post_commit_handles.push(h);
         }
 
         Self {
@@ -760,6 +815,7 @@ impl BufferFlusher {
             candidate,
             commit_worker_handles,
             commit_worker_txs,
+            post_commit_handles,
         }
     }
 
@@ -847,6 +903,15 @@ impl BufferFlusher {
         // workers to drain and exit.
         self.commit_worker_txs.clear();
         for h in self.commit_worker_handles.drain(..) {
+            let _ = h.join();
+        }
+        // Phase 2.2: post_commit threads exit when commit_worker
+        // post_commit_tx senders drop (the only senders are inside
+        // commit_worker stack frames, freed when the threads above
+        // joined). Join them next so mark_flushed/candidate work for
+        // the last batch of commits is durable before downstream
+        // cleanup runs.
+        for h in self.post_commit_handles.drain(..) {
             let _ = h.join();
         }
         // Per-lane cleanup workers drain after the commit workers

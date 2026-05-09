@@ -450,6 +450,16 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
     // fill behaviour the original test asserted.
     let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
     let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    // Phase 2.2: spawn a transient post_commit thread so candidate
+    // inserts + stale repairs land before the test asserts on them.
+    let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+    let pool_pc = pool.clone();
+    let meta_pc = meta.clone();
+    let candidate_pc = candidate.clone();
+    let metrics_pc = metrics.clone();
+    let post_commit_handle = std::thread::spawn(move || {
+        BufferFlusher::post_commit_loop(0, &post_commit_rx, &pool_pc, &meta_pc, &candidate_pc, &metrics_pc);
+    });
     for sealed in sealed_slots.into_iter() {
         let job = super::writer::PackedCommitJob {
             sealed,
@@ -468,8 +478,11 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
             &cleanup_tx,
             &candidate,
             &done_tx,
+            &post_commit_tx,
         );
     }
+    drop(post_commit_tx);
+    post_commit_handle.join().expect("post_commit_loop panicked");
     let _ = io_engine;
 
     // Promote-on-verified-hit: dedup_index stays empty after a fresh
@@ -562,6 +575,14 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         shard_idx: 0,
         units,
     };
+    let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+    let pool_pc = pool.clone();
+    let meta_pc = meta.clone();
+    let candidate_pc = candidate.clone();
+    let metrics_pc = metrics.clone();
+    let post_commit_handle = std::thread::spawn(move || {
+        BufferFlusher::post_commit_loop(0, &post_commit_rx, &pool_pc, &meta_pc, &candidate_pc, &metrics_pc);
+    });
     BufferFlusher::commit_passthrough_job(
         job,
         &pool,
@@ -573,7 +594,10 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         &cleanup_tx,
         &candidate,
         &done_tx,
+        &post_commit_tx,
     );
+    drop(post_commit_tx);
+    post_commit_handle.join().expect("post_commit_loop panicked");
     let after = meta.memory_stats().unwrap();
     let commits = after.commit_success - before.commit_success;
     assert!(
@@ -1061,6 +1085,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &crate::dedup::CandidateCache::new(8, 64),
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
             &commit_worker_txs,
+            1,
         );
     });
 
