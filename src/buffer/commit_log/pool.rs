@@ -1,5 +1,15 @@
 use super::*;
 
+/// Belt-and-suspenders post-write read-back verification. Re-reads the first
+/// 4 KiB block of every just-written entry to confirm the magic number landed.
+/// Originally added to catch silent write failures / DMA ordering bugs.
+///
+/// In a healthy system this generates one extra LV2 read per entry written
+/// (~150 MB/s on the nvme-box pure-randwrite soak), which can saturate the
+/// buffer device and starve the flusher pipeline. Default off; flip to true
+/// when chasing a specific corruption regression.
+const POST_WRITE_VERIFY: bool = false;
+
 impl WriteBufferPool {
     /// V2 data bytes: device - superblock.
     fn total_data_bytes(device_size: u64) -> OnyxResult<u64> {
@@ -215,8 +225,9 @@ impl WriteBufferPool {
         // Post-write verification: read back the first block of each entry
         // and check the magic number.  Catches silent write failures and
         // DMA ordering issues that would otherwise surface as mysterious
-        // hydration failures minutes later.
-        {
+        // hydration failures minutes later. Gated behind POST_WRITE_VERIFY
+        // — see the const for cost.
+        if POST_WRITE_VERIFY {
             use crate::buffer::entry::BUFFER_ENTRY_MAGIC;
             let mut verify_buf = vec![0u8; BLOCK_SIZE as usize];
             for (offset, data) in &encoded {
@@ -426,8 +437,9 @@ impl WriteBufferPool {
         Self::consume_test_sync_failpoint()?;
 
         // 8. Post-write verification — same magic check as `write_batch`. Done
-        //    via syscall reads to keep the io_uring submit path tight.
-        {
+        //    via syscall reads to keep the io_uring submit path tight. Gated
+        //    behind POST_WRITE_VERIFY.
+        if POST_WRITE_VERIFY {
             use crate::buffer::entry::BUFFER_ENTRY_MAGIC;
             let mut verify_buf = vec![0u8; BLOCK_SIZE as usize];
             for (offset, data) in &encoded {
