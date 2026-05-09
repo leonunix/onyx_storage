@@ -559,7 +559,7 @@ fn passthrough_commit_job_subbatches_above_threshold() {
     let before = meta.memory_stats().unwrap();
     let job = super::writer::PassthroughCommitJob {
         vol_id: VolumeId("flush-race".into()),
-        shard_idx: 0,
+        shard_idxes: vec![0],
         units,
     };
     BufferFlusher::commit_passthrough_job(

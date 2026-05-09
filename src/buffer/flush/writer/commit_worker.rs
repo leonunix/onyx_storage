@@ -44,7 +44,12 @@ pub(in crate::buffer::flush) struct PassthroughCommitJob {
     /// volume — write_units_batch splits multi-volume batches into
     /// one PassthroughCommitJob per volume before pushing.
     pub vol_id: VolumeId,
-    pub shard_idx: usize,
+    /// Source shards that contributed units. Phase 2.1 cross-job
+    /// coalesce in `commit_worker_loop` may merge multiple incoming
+    /// jobs (same volume, different originating shard writers) into
+    /// one larger job — this captures the union so the post-commit
+    /// `advance_tail_for_shard` runs for every contributor.
+    pub shard_idxes: Vec<usize>,
     pub units: Vec<UnitCommitData>,
 }
 
@@ -89,6 +94,23 @@ pub(in crate::buffer::flush) fn route_volume_to_worker(vol_id: &str) -> usize {
 }
 
 impl BufferFlusher {
+    /// Drain horizon: how many additional LBAs the worker will pull
+    /// off the queue before committing. Phase 2.1 cross-job coalesce
+    /// — when a single-volume workload pushes many small jobs (e.g.
+    /// 16 shard writers all funnelling to one worker), draining a
+    /// few cycles' worth and merging same-volume jobs lifts the
+    /// effective ops/commit closer to TARGET_OPS_PER_COMMIT and
+    /// amortises lifecycle / L2P lock acquisition across multiple
+    /// jobs without inflating any single tx beyond the metadb sweet
+    /// spot.
+    ///
+    /// The cap is a soft drain budget (we still respect TARGET_OPS_PER_COMMIT
+    /// when issuing each metadb tx inside `commit_passthrough_job`).
+    /// Set to 4 × TARGET_OPS_PER_COMMIT so a hot single-vol workload
+    /// can build up ~600 LBAs of work into one merged job, which then
+    /// emits 4 chunked commits sharing one set of locks.
+    const COALESCE_LBA_BUDGET: usize = TARGET_OPS_PER_COMMIT * 4;
+
     pub(in crate::buffer::flush) fn commit_worker_loop(
         worker_idx: usize,
         rx: &Receiver<CommitJob>,
@@ -111,18 +133,31 @@ impl BufferFlusher {
         // jobs before exiting.
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(job) => Self::dispatch_commit_job(
-                    job,
-                    pool,
-                    meta,
-                    lifecycle,
-                    allocator,
-                    in_flight_tracker,
-                    metrics,
-                    lane_cleanup_txs,
-                    candidate,
-                    lane_done_txs,
-                ),
+                Ok(first) => {
+                    let mut batch = vec![first];
+                    let mut total_lbas = lbas_in_job(&batch[0]);
+                    while total_lbas < Self::COALESCE_LBA_BUDGET {
+                        match rx.try_recv() {
+                            Ok(more) => {
+                                total_lbas += lbas_in_job(&more);
+                                batch.push(more);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Self::dispatch_commit_batch(
+                        batch,
+                        pool,
+                        meta,
+                        lifecycle,
+                        allocator,
+                        in_flight_tracker,
+                        metrics,
+                        lane_cleanup_txs,
+                        candidate,
+                        lane_done_txs,
+                    );
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
@@ -130,9 +165,13 @@ impl BufferFlusher {
         // Drain anything queued at shutdown. The shard writers may
         // have pushed final jobs after we observed `running == false`
         // but before they joined.
+        let mut tail_batch: Vec<CommitJob> = Vec::new();
         while let Ok(job) = rx.try_recv() {
-            Self::dispatch_commit_job(
-                job,
+            tail_batch.push(job);
+        }
+        if !tail_batch.is_empty() {
+            Self::dispatch_commit_batch(
+                tail_batch,
                 pool,
                 meta,
                 lifecycle,
@@ -146,8 +185,14 @@ impl BufferFlusher {
         }
     }
 
-    fn dispatch_commit_job(
-        job: CommitJob,
+    /// Process a drained batch of jobs. Same-volume passthrough jobs
+    /// are merged into one larger `PassthroughCommitJob` so they
+    /// share lifecycle / L2P locks and the chunked commit loop
+    /// inside `commit_passthrough_job` can pack each metadb tx up to
+    /// TARGET_OPS_PER_COMMIT. Packed jobs are not merged (each owns a
+    /// single PBA, no merge is meaningful).
+    fn dispatch_commit_batch(
+        jobs: Vec<CommitJob>,
         pool: &WriteBufferPool,
         meta: &MetaStore,
         lifecycle: &VolumeLifecycleManager,
@@ -158,52 +203,143 @@ impl BufferFlusher {
         candidate: &crate::dedup::CandidateCache,
         lane_done_txs: &[Sender<Vec<u64>>],
     ) {
-        // Pick the cleanup / done senders that match the originating
-        // shard. Falling back to lane 0 if the shard_idx is somehow
-        // out of range — defensive against future config changes.
-        let shard_idx = match &job {
-            CommitJob::Passthrough(pj) => pj.shard_idx,
-            CommitJob::Packed(pj) => pj.shard_idx,
-        };
+        let mut pt_by_vol: HashMap<String, PassthroughCommitJob> = HashMap::new();
+        let mut packed: Vec<PackedCommitJob> = Vec::new();
+        for job in jobs {
+            match job {
+                CommitJob::Passthrough(mut pj) => {
+                    let key = pj.vol_id.0.clone();
+                    pt_by_vol
+                        .entry(key)
+                        .and_modify(|existing| {
+                            existing.units.append(&mut pj.units);
+                            for s in &pj.shard_idxes {
+                                if !existing.shard_idxes.contains(s) {
+                                    existing.shard_idxes.push(*s);
+                                }
+                            }
+                        })
+                        .or_insert(pj);
+                }
+                CommitJob::Packed(pj) => packed.push(pj),
+            }
+        }
+        // Process passthrough first, packed after — preserves the
+        // historic ordering invariant where same-cycle packed slots
+        // commit in the order they sealed (we do not reorder packed).
+        for (_, pj) in pt_by_vol {
+            Self::dispatch_passthrough(
+                pj,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                in_flight_tracker,
+                metrics,
+                lane_cleanup_txs,
+                candidate,
+                lane_done_txs,
+            );
+        }
+        for pj in packed {
+            Self::dispatch_packed(
+                pj,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                in_flight_tracker,
+                metrics,
+                lane_cleanup_txs,
+                candidate,
+                lane_done_txs,
+            );
+        }
+    }
+
+    fn dispatch_passthrough(
+        pj: PassthroughCommitJob,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        in_flight_tracker: &FlusherInFlightTracker,
+        metrics: &EngineMetrics,
+        lane_cleanup_txs: &[Sender<CleanupBatch>],
+        candidate: &crate::dedup::CandidateCache,
+        lane_done_txs: &[Sender<Vec<u64>>],
+    ) {
+        // Cleanup + done senders route by the FIRST originating
+        // shard. mark_flushed runs by per-unit data so it lands in
+        // the correct lane regardless. Picking the first shard
+        // approximates "where this work started" without paying for
+        // per-shard fan-out — the per-shard tail advance below
+        // catches the rest.
+        let primary_shard = pj.shard_idxes.first().copied().unwrap_or(0);
         let cleanup_tx = lane_cleanup_txs
-            .get(shard_idx)
+            .get(primary_shard)
             .or_else(|| lane_cleanup_txs.first());
         let done_tx = lane_done_txs
-            .get(shard_idx)
+            .get(primary_shard)
             .or_else(|| lane_done_txs.first());
         let (Some(cleanup_tx), Some(done_tx)) = (cleanup_tx, done_tx) else {
             tracing::error!(
-                shard_idx,
-                "commit_worker: lane channels missing — dropping job"
+                shard_idx = primary_shard,
+                "commit_worker: lane channels missing — dropping passthrough job"
             );
             return;
         };
-        match job {
-            CommitJob::Passthrough(pj) => Self::commit_passthrough_job(
-                pj,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                in_flight_tracker,
-                metrics,
-                cleanup_tx,
-                candidate,
-                done_tx,
-            ),
-            CommitJob::Packed(pj) => Self::commit_packed_job(
-                pj,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                in_flight_tracker,
-                metrics,
-                cleanup_tx,
-                candidate,
-                done_tx,
-            ),
-        }
+        Self::commit_passthrough_job(
+            pj,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            in_flight_tracker,
+            metrics,
+            cleanup_tx,
+            candidate,
+            done_tx,
+        );
+    }
+
+    fn dispatch_packed(
+        pj: PackedCommitJob,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        in_flight_tracker: &FlusherInFlightTracker,
+        metrics: &EngineMetrics,
+        lane_cleanup_txs: &[Sender<CleanupBatch>],
+        candidate: &crate::dedup::CandidateCache,
+        lane_done_txs: &[Sender<Vec<u64>>],
+    ) {
+        let cleanup_tx = lane_cleanup_txs
+            .get(pj.shard_idx)
+            .or_else(|| lane_cleanup_txs.first());
+        let done_tx = lane_done_txs
+            .get(pj.shard_idx)
+            .or_else(|| lane_done_txs.first());
+        let (Some(cleanup_tx), Some(done_tx)) = (cleanup_tx, done_tx) else {
+            tracing::error!(
+                shard_idx = pj.shard_idx,
+                "commit_worker: lane channels missing — dropping packed job"
+            );
+            return;
+        };
+        Self::commit_packed_job(
+            pj,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            in_flight_tracker,
+            metrics,
+            cleanup_tx,
+            candidate,
+            done_tx,
+        );
     }
 
     /// Commit a single-volume passthrough batch. Acquires the volume's
@@ -226,7 +362,7 @@ impl BufferFlusher {
         let total_start = Instant::now();
         let PassthroughCommitJob {
             vol_id,
-            shard_idx,
+            shard_idxes,
             units,
         } = job;
 
@@ -510,7 +646,9 @@ impl BufferFlusher {
             }
         }
 
-        let _ = pool.advance_tail_for_shard(shard_idx);
+        for &s in &shard_idxes {
+            let _ = pool.advance_tail_for_shard(s);
+        }
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
     }
 
@@ -902,6 +1040,25 @@ impl BufferFlusher {
                 let _ = done_tx.send(original_seqs);
             }
         }
+    }
+}
+
+/// LBA count carried by a CommitJob — used by the worker's drain
+/// budget. Passthrough sums across units; packed jobs surface their
+/// fragments' total live LBAs.
+fn lbas_in_job(job: &CommitJob) -> usize {
+    match job {
+        CommitJob::Passthrough(pj) => pj
+            .units
+            .iter()
+            .map(|u| u.unit.lba_count as usize)
+            .sum(),
+        CommitJob::Packed(pj) => pj
+            .sealed
+            .fragments
+            .iter()
+            .map(|f| f.unit.lba_count as usize)
+            .sum(),
     }
 }
 
