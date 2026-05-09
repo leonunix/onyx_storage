@@ -260,18 +260,11 @@ impl BufferFlusher {
         Ok(())
     }
 
-    /// Batch IO write for sealed slots, then dispatch each slot to a
-    /// per-volume commit worker (routed by primary volume). Phase 1
-    /// of the per-volume commit architecture: the shard writer keeps
-    /// the batched IO submit so the device queue stays deep, but the
-    /// metadata commit / cleanup / mark_flushed / done_tx all run on
-    /// the commit worker.
-    ///
-    /// Failure semantics per slot:
-    /// - IO failure → free PBA, queue whole-slot retry inline (preserves
-    ///   the existing slot retry path).
-    /// - Commit failure → handled on the commit worker (free PBA,
-    ///   defer_retry buffered seqs). The shard writer does not see it.
+    /// Phase 4: dispatch each sealed slot to the per-shard
+    /// io_submitter, which handles the LV3 IO and forwards the slot
+    /// to the per-volume commit worker (routed by primary volume).
+    /// The shard writer no longer waits on `submit_batch` — its
+    /// cycle drops to alloc + dispatch only.
     pub(in crate::buffer::flush) fn write_packed_slots_batch(
         shard_idx: usize,
         sealed_slots: Vec<SealedSlot>,
@@ -280,93 +273,23 @@ impl BufferFlusher {
             Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
         )>,
         pool: &WriteBufferPool,
-        allocator: &SpaceAllocator,
-        io_engine: &IoEngine,
+        _allocator: &SpaceAllocator,
         metrics: &EngineMetrics,
-        in_flight_tracker: &FlusherInFlightTracker,
-        done_tx: &Sender<Vec<u64>>,
-        packed_retries: &mut VecDeque<PackedSlotRetry>,
-        commit_worker_txs: &[Sender<CommitJob>],
+        _in_flight_tracker: &FlusherInFlightTracker,
+        _done_tx: &Sender<Vec<u64>>,
+        _packed_retries: &mut VecDeque<PackedSlotRetry>,
+        io_submitter_tx: &Sender<IoSubmitJob>,
     ) {
         let _ = pool;
         let total_start = Instant::now();
         let n = sealed_slots.len();
-        let mut slot_io_ok = vec![true; n];
-        let mut io_ops_count = 0u64;
-
-        // The sealed PBA is private until metadata commit publishes
-        // it, so the LV3 write runs without any lock here. The commit
-        // worker re-takes lifecycle + L2P commit locks when it runs
-        // the metadata phase.
-        let io_start = Instant::now();
-        {
-            use crate::io::engine::{LvOp, LvOpResult};
-            let mut ops: Vec<LvOp> = Vec::with_capacity(n);
-            let mut op_to_slot: Vec<usize> = Vec::with_capacity(n);
-            for (i, sealed) in sealed_slots.iter().enumerate() {
-                allocator.wait_for_readers(sealed.pba, 1);
-                ops.push(LvOp::Write {
-                    pba: sealed.pba,
-                    payload: sealed.data.as_slice(),
-                });
-                op_to_slot.push(i);
-            }
-            if !ops.is_empty() {
-                io_ops_count = ops.len() as u64;
-                match io_engine.submit_batch(ops, false) {
-                    Ok(write_results) => {
-                        for (idx, r) in write_results.into_iter().enumerate() {
-                            let slot_idx = op_to_slot[idx];
-                            if let LvOpResult::Write(Err(e)) = r {
-                                let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                                slot_io_ok[slot_idx] = false;
-                                tracing::error!(
-                                    pba = sealed_slots[slot_idx].pba.0,
-                                    error = %e,
-                                    "writer: packed-slot batch IO write failed"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        for &slot_idx in &op_to_slot {
-                            let _ = allocator.free_one(sealed_slots[slot_idx].pba);
-                            slot_io_ok[slot_idx] = false;
-                        }
-                        tracing::error!(
-                            error = %e,
-                            "writer: packed-slot batch IO submit failed"
-                        );
-                    }
-                }
-            }
-        }
-        let io_elapsed = io_start.elapsed();
-        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
-
-        // Dispatch each surviving slot to the per-volume commit
-        // worker (routed by primary volume = first fragment). IO
-        // failures stay on the shard writer's whole-slot retry queue,
-        // mirroring the historic packed retry path.
         let mut surviving_slots: u64 = 0;
         let mut total_lbas: u64 = 0;
-        let no_workers = commit_worker_txs.is_empty();
-        for (i, (sealed, (mut buffered_seqs, mut buffered_completions))) in sealed_slots
+
+        for (sealed, (buffered_seqs, buffered_completions)) in sealed_slots
             .into_iter()
             .zip(per_slot_buffers.into_iter())
-            .enumerate()
         {
-            if !slot_io_ok[i] {
-                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                Self::queue_packed_slot_retry(
-                    packed_retries,
-                    sealed,
-                    &mut buffered_seqs,
-                    &mut buffered_completions,
-                );
-                continue;
-            }
-
             surviving_slots += 1;
             total_lbas += sealed
                 .fragments
@@ -374,44 +297,28 @@ impl BufferFlusher {
                 .map(|f| f.unit.lba_count as u64)
                 .sum::<u64>();
 
-            if no_workers {
-                // Defensive: if no worker channels are available, fall
-                // back to defer_retry so seqs are not orphaned.
-                in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
-                for dc in &buffered_completions {
-                    in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
-                }
-                if !buffered_seqs.is_empty() {
-                    let _ = done_tx.send(buffered_seqs);
-                }
-                for dc in buffered_completions {
-                    if let Some(original_seqs) = dc.decrement() {
-                        let _ = done_tx.send(original_seqs);
-                    }
-                }
-                let _ = allocator.free_one(sealed.pba);
-                continue;
-            }
-
             // Route by primary volume — first fragment's vol_id.
             let primary_vol = sealed
                 .fragments
                 .first()
                 .map(|f| f.unit.vol_id.clone())
                 .unwrap_or_default();
-            let worker_idx = route_volume_to_worker(&primary_vol);
-            let tx_idx = worker_idx % commit_worker_txs.len();
+            let target_worker_idx = route_volume_to_worker(&primary_vol);
             let job = CommitJob::Packed(PackedCommitJob {
                 sealed,
                 shard_idx,
                 buffered_seqs,
                 buffered_completions,
             });
-            let _ = commit_worker_txs[tx_idx].send(job);
+            let _ = io_submitter_tx.send(IoSubmitJob {
+                job,
+                target_worker_idx,
+            });
         }
 
-        // Counters tracking the IO + dispatch phase. Metadata-phase
-        // counters are bumped on the commit worker.
+        // Counters for dispatched slots. IO success and metadata
+        // commit counters are bumped on the io_submitter and commit
+        // worker respectively.
         metrics
             .flush_writer_packed_batches
             .fetch_add(1, Ordering::Relaxed);
@@ -421,9 +328,6 @@ impl BufferFlusher {
         metrics
             .flush_writer_packed_batch_lbas
             .fetch_add(total_lbas, Ordering::Relaxed);
-        metrics
-            .flush_writer_packed_batch_io_ops
-            .fetch_add(io_ops_count, Ordering::Relaxed);
         crate::metrics::record_counter_max(
             &metrics.flush_writer_packed_batch_slots_max,
             surviving_slots,
@@ -432,19 +336,14 @@ impl BufferFlusher {
             &metrics.flush_writer_packed_batch_lbas_max,
             total_lbas,
         );
-        crate::metrics::record_counter_max(
-            &metrics.flush_writer_packed_batch_io_ops_max,
-            io_ops_count,
-        );
         let total_elapsed = total_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
         if total_elapsed >= Duration::from_secs(1) {
             tracing::debug!(
                 slots = n,
                 surviving = surviving_slots,
-                io_ms = io_elapsed.as_millis() as u64,
                 total_ms = total_elapsed.as_millis() as u64,
-                "writer: slow packed-slot batch (>=1s) — IO + dispatch only"
+                "writer: slow packed-slot dispatch (>=1s) — dispatch only"
             );
         }
     }
