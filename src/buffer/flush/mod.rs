@@ -60,12 +60,6 @@ pub struct BufferFlusher {
     /// are draining; sender clones held by shard writers are dropped
     /// when the writer threads join.
     commit_worker_txs: Vec<Sender<writer::CommitJob>>,
-    /// Phase 4 per-shard async IO submitter threads. Spawned per
-    /// lane; consume `IoSubmitJob`s the shard writer hands off and
-    /// drive `io_engine.submit_batch` synchronously without blocking
-    /// the writer cycle.
-    io_submitter_handles: Vec<JoinHandle<()>>,
-    io_submitter_txs: Vec<Sender<writer::IoSubmitJob>>,
 }
 
 struct FlusherLane {
@@ -522,19 +516,6 @@ impl BufferFlusher {
             commit_worker_rxs.push(rx);
         }
 
-        // Per-shard io_submitter channels. Bounded queue so the
-        // shard writer briefly back-pressures if the submitter falls
-        // behind (rare; submit_batch is the slow part).
-        let mut io_submitter_txs: Vec<Sender<writer::IoSubmitJob>> =
-            Vec::with_capacity(lane_count);
-        let mut io_submitter_rxs: Vec<Receiver<writer::IoSubmitJob>> =
-            Vec::with_capacity(lane_count);
-        for _ in 0..lane_count {
-            let (tx, rx) = bounded::<writer::IoSubmitJob>(64);
-            io_submitter_txs.push(tx);
-            io_submitter_rxs.push(rx);
-        }
-
         for shard_idx in 0..lane_count {
             // Inter-stage channel sizes — sized to keep the writer's
             // per-cycle drain (Self::WRITER_BATCH_SIZE) from starving
@@ -678,7 +659,6 @@ impl BufferFlusher {
             let in_flight_w = in_flight.clone();
             let candidate_w = candidate.clone();
             let commit_worker_txs_w = commit_worker_txs.clone();
-            let io_submitter_tx_w = io_submitter_txs[shard_idx].clone();
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
@@ -701,7 +681,6 @@ impl BufferFlusher {
                         &candidate_w,
                         packed_meta_batch_max_lbas,
                         &commit_worker_txs_w,
-                        &io_submitter_tx_w,
                     );
                 })
                 .expect("failed to spawn writer thread");
@@ -732,39 +711,6 @@ impl BufferFlusher {
                 writer_handle: Some(writer_handle),
                 cleanup_handle: Some(cleanup_handle),
             });
-        }
-
-        // Spawn the per-shard async IO submitter threads. They sit
-        // between shard writers and commit workers: drain
-        // IoSubmitJobs, run io_engine.submit_batch, forward the
-        // surviving CommitJob to commit_worker_txs[target].
-        let mut io_submitter_handles: Vec<JoinHandle<()>> = Vec::with_capacity(lane_count);
-        for (shard_idx, rx) in io_submitter_rxs.into_iter().enumerate() {
-            let io_engine_s = io_engine.clone();
-            let allocator_s = allocator.clone();
-            let in_flight_s = in_flight.clone();
-            let metrics_s = metrics.clone();
-            let commit_worker_txs_s = commit_worker_txs.clone();
-            let lane_done_txs_s = lane_done_txs.clone();
-            let running_s = running.clone();
-            let h = thread::Builder::new()
-                .name(format!("flusher-io-submit-{}", shard_idx))
-                .spawn(move || {
-                    affinity::bind_current(ThreadRole::FlusherWriter, shard_idx);
-                    Self::io_submitter_loop(
-                        shard_idx,
-                        &rx,
-                        &io_engine_s,
-                        &allocator_s,
-                        &in_flight_s,
-                        &metrics_s,
-                        &commit_worker_txs_s,
-                        &lane_done_txs_s,
-                        &running_s,
-                    );
-                })
-                .expect("failed to spawn io submitter thread");
-            io_submitter_handles.push(h);
         }
 
         // Spawn the per-volume commit workers now that lane channels
@@ -814,8 +760,6 @@ impl BufferFlusher {
             candidate,
             commit_worker_handles,
             commit_worker_txs,
-            io_submitter_handles,
-            io_submitter_txs,
         }
     }
 
@@ -897,19 +841,10 @@ impl BufferFlusher {
                 let _ = h.join();
             }
         }
-        // Shard writers have stopped — drop the io_submitter_txs we
-        // hold so the io_submitter rx sides disconnect once their
-        // per-lane sender clones (held by writer threads) drop. This
-        // lets io_submitters drain and exit. They forward to
-        // commit_worker_txs (still alive), so order matters: io
-        // submitters must drain BEFORE commit workers, or in-flight
-        // jobs would be lost.
-        self.io_submitter_txs.clear();
-        for h in self.io_submitter_handles.drain(..) {
-            let _ = h.join();
-        }
-        // Commit workers next — drop their txs once io_submitters
-        // are done so no more jobs land.
+        // Shard writers have stopped — drop the commit_worker_txs we
+        // hold so the worker rx sides disconnect once their per-lane
+        // sender clones (held by writer threads) drop. This signals
+        // workers to drain and exit.
         self.commit_worker_txs.clear();
         for h in self.commit_worker_handles.drain(..) {
             let _ = h.join();

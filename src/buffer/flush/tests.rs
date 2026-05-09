@@ -1020,7 +1020,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     let (meta, pool, lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let running = Arc::new(AtomicBool::new(true));
-    let in_flight = Arc::new(FlusherInFlightTracker::default());
+    let in_flight = FlusherInFlightTracker::default();
     let (tx, rx) = bounded::<CompressedUnit>(64);
     let (done_tx, done_rx) = unbounded::<Vec<u64>>();
     let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
@@ -1044,34 +1044,6 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
         let commit_worker_txs: Vec<crossbeam_channel::Sender<
             crate::buffer::flush::writer::CommitJob,
         >> = Vec::new();
-        // For Phase 4 the writer hands jobs to a per-shard
-        // io_submitter. The test spawns one inline so writer_loop
-        // can hand off without dropping work — empty commit_worker_txs
-        // keeps the IO submitter from forwarding to a real worker
-        // (`forward_job` is a no-op when txs is empty).
-        let (io_submitter_tx, io_submitter_rx) =
-            bounded::<crate::buffer::flush::writer::IoSubmitJob>(64);
-        let running_io = running_w.clone();
-        let io_engine_for_submitter = io_engine_w.clone();
-        let allocator_for_submitter = allocator_w.clone();
-        let in_flight_for_submitter = in_flight.clone();
-        let metrics_for_submitter = metrics_w.clone();
-        let commit_worker_txs_for_submitter = commit_worker_txs.clone();
-        let lane_done_txs_for_submitter: Vec<crossbeam_channel::Sender<Vec<u64>>> =
-            vec![done_tx.clone()];
-        let io_handle = thread::spawn(move || {
-            BufferFlusher::io_submitter_loop(
-                0,
-                &io_submitter_rx,
-                &io_engine_for_submitter,
-                &allocator_for_submitter,
-                &in_flight_for_submitter,
-                &metrics_for_submitter,
-                &commit_worker_txs_for_submitter,
-                &lane_done_txs_for_submitter,
-                &running_io,
-            );
-        });
         BufferFlusher::writer_loop(
             0,
             &rx,
@@ -1089,10 +1061,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &crate::dedup::CandidateCache::new(8, 64),
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
             &commit_worker_txs,
-            &io_submitter_tx,
         );
-        drop(io_submitter_tx);
-        let _ = io_handle.join();
     });
 
     // Keep the lane busy with small packed fragments and never leave a

@@ -1,7 +1,6 @@
 use super::*;
 
 mod commit_worker;
-mod io_submitter;
 mod packed;
 mod passthrough;
 
@@ -9,7 +8,6 @@ pub(in crate::buffer::flush) use commit_worker::{
     route_volume_to_worker, CommitJob, PackedCommitJob, PassthroughCommitJob, UnitCommitData,
     COMMIT_WORKER_QUEUE_CAP, NUM_COMMIT_WORKERS,
 };
-pub(in crate::buffer::flush) use io_submitter::IoSubmitJob;
 
 impl BufferFlusher {
     /// Maximum units a single writer cycle drains from `write_rx` and
@@ -72,12 +70,7 @@ impl BufferFlusher {
         // metadata commit cap; commit workers now use
         // TARGET_OPS_PER_COMMIT instead (per-volume sub-batch).
         _packed_meta_batch_max_lbas: usize,
-        // Phase 4: shard writer no longer dispatches CommitJobs
-        // directly. It hands the work to the per-shard io_submitter,
-        // which drives `submit_batch` and forwards to commit_workers
-        // after IO completes.
-        _commit_worker_txs: &[Sender<CommitJob>],
-        io_submitter_tx: &Sender<IoSubmitJob>,
+        commit_worker_txs: &[Sender<CommitJob>],
     ) {
         let mut buffered_seqs: Vec<u64> = Vec::new();
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
@@ -105,12 +98,12 @@ impl BufferFlusher {
                         completions,
                         pool,
                         allocator,
+                        io_engine,
                         metrics,
                         in_flight_tracker,
                         done_tx,
-                        io_submitter_tx,
+                        commit_worker_txs,
                     );
-                    let _ = io_engine; // kept around for shutdown drain path
                     tail_dirty = true;
                 }
             };
@@ -332,11 +325,12 @@ impl BufferFlusher {
                     packed_buffered_per_slot,
                     pool,
                     allocator,
+                    io_engine,
                     metrics,
                     in_flight_tracker,
                     done_tx,
                     &mut packed_retries,
-                    io_submitter_tx,
+                    commit_worker_txs,
                 );
                 tail_dirty = true;
             }

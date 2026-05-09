@@ -216,16 +216,17 @@ impl BufferFlusher {
         })
     }
 
-    /// Batch a passthrough cycle and hand IO off to the per-shard
-    /// io_submitter, which forwards surviving CommitJobs to the
-    /// per-volume commit workers. Phase 4: the shard writer no longer
-    /// blocks on `io_engine.submit_batch`; that step runs on a
-    /// dedicated submitter thread so the writer cycle drops from
-    /// ~5 ms (alloc + IO + dispatch) to ~1 ms (alloc + dispatch).
+    /// Batch a passthrough cycle and hand it off to the per-volume
+    /// commit workers. Phase 1 of the per-volume commit architecture:
+    /// the shard writer does alloc + LV3 IO synchronously (so PBA
+    /// reservation and device queueing stay shard-local), then groups
+    /// surviving units by volume and pushes one
+    /// `PassthroughCommitJob` per volume into `commit_worker_txs[hash %
+    /// N]`. The metadb commit, `actual_old_pba_meta` cleanup,
+    /// `mark_flushed`, and `done_tx` all happen on the commit worker.
     ///
-    /// Alloc failures are handled inline (free PBA, defer_retry, send
-    /// `done_tx`); IO failures are handled on the io_submitter
-    /// thread (same semantics, just on a different thread).
+    /// IO failures are handled inline (free PBA, defer_retry, send
+    /// `done_tx`) so the shard writer's retry path stays simple.
     pub(in crate::buffer::flush) fn write_units_batch(
         shard_idx: usize,
         units: Vec<CompressedUnit>,
@@ -233,10 +234,11 @@ impl BufferFlusher {
         completions_per_unit: Vec<Option<Arc<crate::buffer::pipeline::DedupCompletion>>>,
         _pool: &WriteBufferPool,
         allocator: &SpaceAllocator,
+        io_engine: &IoEngine,
         metrics: &EngineMetrics,
         in_flight_tracker: &FlusherInFlightTracker,
         done_tx: &Sender<Vec<u64>>,
-        io_submitter_tx: &Sender<IoSubmitJob>,
+        commit_worker_txs: &[Sender<CommitJob>],
     ) {
         if units.is_empty() {
             return;
@@ -250,10 +252,14 @@ impl BufferFlusher {
         // the lifecycle read lock and runs the gen check under it
         // before publishing any blockmap.
 
-        // Per-unit alloc state.
+        // Per-unit IO state. `failed[i]` tagges units we cannot push
+        // to the commit worker; `pbas[i]` and `alloc_blocks[i]`
+        // record what was reserved so we can free on failure or hand
+        // ownership to the worker on success.
         let mut failed: Vec<bool> = vec![false; n];
         let mut pbas: Vec<Option<Pba>> = vec![None; n];
         let mut alloc_blocks: Vec<u32> = vec![0; n];
+        let mut io_ops_count = 0u64;
 
         // Phase A: alloc PBAs.
         let alloc_start = Instant::now();
@@ -293,9 +299,75 @@ impl BufferFlusher {
         let alloc_elapsed = alloc_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
 
-        // Counters for surviving (alloc-OK) units. IO success is
-        // counted on the io_submitter side once it actually drives
-        // the submit_batch.
+        // Phase B: batch IO writes — one submit per batch.
+        // io_uring backend: 1 io_uring_enter + 1 wait_for_completions(N).
+        // Syscall backend: scoped threads inside submit_batch keep NVMe QD > 1.
+        let io_start = Instant::now();
+        {
+            use crate::io::engine::{LvOp, LvOpResult};
+            let mut ops: Vec<LvOp> = Vec::with_capacity(n);
+            let mut op_to_unit: Vec<usize> = Vec::with_capacity(n);
+            for i in 0..n {
+                if failed[i] {
+                    continue;
+                }
+                allocator.wait_for_readers(pbas[i].unwrap(), alloc_blocks[i]);
+                ops.push(LvOp::Write {
+                    pba: pbas[i].unwrap(),
+                    payload: units[i].compressed_data.as_slice(),
+                });
+                op_to_unit.push(i);
+            }
+            if !ops.is_empty() {
+                io_ops_count = ops.len() as u64;
+                match io_engine.submit_batch(ops, false) {
+                    Ok(write_results) => {
+                        for (idx, r) in write_results.into_iter().enumerate() {
+                            let unit_idx = op_to_unit[idx];
+                            if let LvOpResult::Write(Err(e)) = r {
+                                let pba = pbas[unit_idx].unwrap();
+                                let blk = alloc_blocks[unit_idx];
+                                if blk == 1 {
+                                    let _ = allocator.free_one(pba);
+                                } else {
+                                    let _ = allocator.free_extent(Extent::new(pba, blk));
+                                }
+                                failed[unit_idx] = true;
+                                tracing::error!(
+                                    vol = units[unit_idx].vol_id,
+                                    start_lba = units[unit_idx].start_lba.0,
+                                    error = %e,
+                                    "writer: passthrough IO write failed"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for &unit_idx in &op_to_unit {
+                            if failed[unit_idx] {
+                                continue;
+                            }
+                            let pba = pbas[unit_idx].unwrap();
+                            let blk = alloc_blocks[unit_idx];
+                            if blk == 1 {
+                                let _ = allocator.free_one(pba);
+                            } else {
+                                let _ = allocator.free_extent(Extent::new(pba, blk));
+                            }
+                            failed[unit_idx] = true;
+                        }
+                        tracing::error!(error = %e, "writer: passthrough IO batch submit failed");
+                    }
+                }
+            }
+        }
+        let io_elapsed = io_start.elapsed();
+        Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
+
+        // Counters for the surviving (committable) units. The actual
+        // commit happens asynchronously on the commit worker, but the
+        // shard writer's accounting matches the historic shape so
+        // dashboards stay continuous.
         let surviving = failed.iter().filter(|f| !**f).count();
         let surviving_lbas: u64 = units
             .iter()
@@ -310,16 +382,19 @@ impl BufferFlusher {
         metrics
             .flush_writer_pt_lbas
             .fetch_add(surviving_lbas, Ordering::Relaxed);
+        metrics
+            .flush_writer_pt_io_ops
+            .fetch_add(io_ops_count, Ordering::Relaxed);
         crate::metrics::record_counter_max(
             &metrics.flush_writer_pt_units_max,
             surviving as u64,
         );
         crate::metrics::record_counter_max(&metrics.flush_writer_pt_lbas_max, surviving_lbas);
+        crate::metrics::record_counter_max(&metrics.flush_writer_pt_io_ops_max, io_ops_count);
 
-        // Phase B: split surviving units by `vol_id` and dispatch
-        // IoSubmitJobs to the per-shard io_submitter. Each job
-        // remembers its target commit worker (vol_id hash) so the
-        // io_submitter can forward after the IO completes.
+        // Phase C: split surviving units by `vol_id` and dispatch a
+        // PassthroughCommitJob to each volume's commit worker. Failed
+        // units (alloc / IO) are handled inline below.
         let mut units_iter = units.into_iter();
         let mut seqs_iter = seqs_per_unit.into_iter();
         let mut completions_iter = completions_per_unit.into_iter();
@@ -347,10 +422,8 @@ impl BufferFlusher {
             });
         }
 
-        // Alloc failures: defer_retry + done_tx inline so the shard
+        // IO failures: defer_retry + done_tx inline so the shard
         // writer's coalesce loop can pick them up after the backoff.
-        // IO failures are handled by the io_submitter using the same
-        // pattern.
         for (seqs, completion) in failed_paylads {
             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
             match &completion {
@@ -369,21 +442,22 @@ impl BufferFlusher {
             }
         }
 
-        // Dispatch one IoSubmitJob per volume to the per-shard
-        // io_submitter. Send is bounded; the writer briefly blocks
-        // if the submitter queue is saturated — that is the new
-        // back-pressure path in Phase 4.
-        for (vol, units_for_vol) in per_volume {
-            let target_worker_idx = route_volume_to_worker(&vol);
-            let job = CommitJob::Passthrough(PassthroughCommitJob {
-                vol_id: VolumeId(vol),
-                shard_idx,
-                units: units_for_vol,
-            });
-            let _ = io_submitter_tx.send(IoSubmitJob {
-                job,
-                target_worker_idx,
-            });
+        // Dispatch one job per volume to its routed commit worker.
+        // The `Sender::send` is bounded; if the worker queue is full
+        // the shard writer will block briefly — that is the only
+        // backpressure path in Phase 1 (per-volume admission lands in
+        // Phase 2).
+        if !commit_worker_txs.is_empty() {
+            for (vol, units_for_vol) in per_volume {
+                let worker_idx = route_volume_to_worker(&vol);
+                let tx_idx = worker_idx % commit_worker_txs.len();
+                let job = CommitJob::Passthrough(PassthroughCommitJob {
+                    vol_id: VolumeId(vol),
+                    shard_idx,
+                    units: units_for_vol,
+                });
+                let _ = commit_worker_txs[tx_idx].send(job);
+            }
         }
 
         let total_elapsed = total_start.elapsed();
@@ -395,7 +469,8 @@ impl BufferFlusher {
                 surviving,
                 total_ms = total_elapsed.as_millis() as u64,
                 alloc_ms = alloc_elapsed.as_millis() as u64,
-                "writer: slow passthrough batch (>=1s) — alloc + dispatch only"
+                io_ms = io_elapsed.as_millis() as u64,
+                "writer: slow passthrough batch (>=1s) — IO + dispatch only"
             );
         }
     }
