@@ -89,6 +89,14 @@ impl MetaStore {
         self.backend.try_request_durable_checkpoint()
     }
 
+    pub(crate) fn try_request_durable_checkpoint_token(&self) -> OnyxResult<Option<u64>> {
+        self.backend.try_request_durable_checkpoint_token()
+    }
+
+    pub(crate) fn durable_checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
+        self.backend.durable_checkpoint_outcome(token)
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         self.backend.memory_stats()
     }

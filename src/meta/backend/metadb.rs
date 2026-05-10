@@ -46,6 +46,7 @@ struct AsyncCheckpoint {
 struct CheckpointState {
     requested: u64,
     completed: u64,
+    checkpointed: u64,
     force_requested: u64,
     failures: Vec<CheckpointFailure>,
     shutdown: bool,
@@ -872,6 +873,14 @@ impl MetadbBackend {
         self.checkpoint.try_request_async()
     }
 
+    pub(crate) fn try_request_durable_checkpoint_token(&self) -> OnyxResult<Option<u64>> {
+        self.checkpoint.try_request_async_token()
+    }
+
+    pub(crate) fn durable_checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
+        self.checkpoint.checkpoint_outcome(token)
+    }
+
     pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         Ok(MetaMemorySnapshot::from_metadb(
             self.db.last_applied_lsn(),
@@ -1022,7 +1031,9 @@ impl AsyncCheckpoint {
                     let (lock, cvar) = &*worker_state;
                     let mut state = lock.lock().unwrap();
                     match result {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            state.checkpointed = state.checkpointed.max(target);
+                        }
                         Ok(false) => {
                             tracing::debug!(
                                 start,
@@ -1054,6 +1065,10 @@ impl AsyncCheckpoint {
     }
 
     fn try_request_async(&self) -> OnyxResult<bool> {
+        self.try_request_async_token().map(|token| token.is_some())
+    }
+
+    fn try_request_async_token(&self) -> OnyxResult<Option<u64>> {
         let (lock, cvar) = &*self.state;
         let mut state = lock.lock().unwrap();
         if state.shutdown {
@@ -1062,14 +1077,37 @@ impl AsyncCheckpoint {
             ));
         }
         if state.requested != state.completed {
-            return Ok(false);
+            return Ok(None);
         }
         state.requested = state
             .requested
             .checked_add(1)
             .ok_or_else(|| OnyxError::Config("metadb checkpoint token overflow".into()))?;
+        let token = state.requested;
         cvar.notify_one();
-        Ok(true)
+        Ok(Some(token))
+    }
+
+    fn checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
+        let (lock, _) = &*self.state;
+        let state = lock.lock().unwrap();
+        if let Some(failure) = state
+            .failures
+            .iter()
+            .find(|failure| failure.start <= token && token <= failure.end)
+        {
+            return Err(OnyxError::Config(format!(
+                "metadb checkpoint failed: {}",
+                failure.message
+            )));
+        }
+        if state.checkpointed >= token {
+            return Ok(Some(true));
+        }
+        if state.completed >= token {
+            return Ok(Some(false));
+        }
+        Ok(None)
     }
 
     fn sync(&self) -> OnyxResult<()> {

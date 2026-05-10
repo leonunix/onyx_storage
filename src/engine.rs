@@ -106,8 +106,37 @@ impl DurabilityWatermarkHandle {
                 affinity::bind_current(ThreadRole::Background, 0);
                 let mut last_checkpoint = std::time::Instant::now();
                 let mut last_checkpoint_request_seq = 0u64;
+                let mut pending_checkpoint: Option<(u64, u64)> = None;
                 while !stop_clone.load(Ordering::Relaxed) {
                     std::thread::sleep(RING_BUMP_INTERVAL);
+
+                    if let Some((token, seq)) = pending_checkpoint {
+                        match meta.durable_checkpoint_outcome(token) {
+                            Ok(Some(true)) => {
+                                durable_seq.fetch_max(seq, Ordering::Release);
+                                for idx in 0..shard_count {
+                                    let _ = buffer_pool_thread.advance_tail_for_shard(idx);
+                                }
+                                pending_checkpoint = None;
+                            }
+                            Ok(Some(false)) => {
+                                // The non-blocking checkpoint found the apply gate busy.
+                                // Leave durable_seq behind the unlogged commits and retry
+                                // on the next checkpoint interval.
+                                last_checkpoint_request_seq =
+                                    last_checkpoint_request_seq.min(seq.saturating_sub(1));
+                                pending_checkpoint = None;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "durability watermark checkpoint failed; WAL prune deferred to next cycle"
+                                );
+                                pending_checkpoint = None;
+                            }
+                        }
+                    }
 
                     let captured = max_flushed_seq.load(Ordering::Relaxed);
                     let bumped = if checkpoint_gates_ring_reclaim {
@@ -156,22 +185,28 @@ impl DurabilityWatermarkHandle {
                         continue;
                     }
                     if checkpoint_gates_ring_reclaim {
-                        match meta.sync_durable() {
-                            Ok(()) => {
+                        if pending_checkpoint.is_some() {
+                            continue;
+                        }
+                        match meta.try_request_durable_checkpoint_token() {
+                            Ok(Some(token)) => {
                                 last_checkpoint_request_seq = captured;
-                                durable_seq.store(captured, Ordering::Release);
-                                for idx in 0..shard_count {
-                                    let _ = buffer_pool_thread.advance_tail_for_shard(idx);
-                                }
+                                pending_checkpoint = Some((token, captured));
                                 tracing::debug!(
                                     max_flushed_seq = captured,
-                                    "durability watermark completed metadb checkpoint"
+                                    "durability watermark requested gated metadb checkpoint"
+                                );
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    max_flushed_seq = captured,
+                                    "durability watermark skipped gated metadb checkpoint; previous checkpoint still running"
                                 );
                             }
                             Err(e) => {
                                 tracing::error!(
                                     error = %e,
-                                    "durability watermark checkpoint failed; ring reclaim deferred"
+                                    "durability watermark checkpoint request failed; WAL prune deferred to next cycle"
                                 );
                             }
                         }
