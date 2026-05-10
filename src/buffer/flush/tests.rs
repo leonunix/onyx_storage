@@ -561,6 +561,7 @@ fn passthrough_commit_job_subbatches_above_threshold() {
             dedup_completion: None,
         };
         units.push(super::writer::UnitCommitData {
+            shard_idx: 0,
             unit,
             pba,
             alloc_blocks: 1,
@@ -572,7 +573,6 @@ fn passthrough_commit_job_subbatches_above_threshold() {
     let before = meta.memory_stats().unwrap();
     let job = super::writer::PassthroughCommitJob {
         vol_id: VolumeId("flush-race".into()),
-        shard_idx: 0,
         units,
     };
     let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
@@ -593,8 +593,9 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         &metrics,
         &cleanup_tx,
         &candidate,
-        &done_tx,
+        std::slice::from_ref(&done_tx),
         &post_commit_tx,
+        super::writer::TARGET_OPS_PER_COMMIT,
     );
     drop(post_commit_tx);
     post_commit_handle.join().expect("post_commit_loop panicked");
@@ -604,6 +605,131 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         commits >= 2,
         "500-LBA passthrough job should split into multiple sub-batches at TARGET_OPS_PER_COMMIT (got {commits} commits)"
     );
+}
+
+#[test]
+fn coalesced_passthrough_done_routes_to_origin_shards() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
+    let (done0_tx, done0_rx) = unbounded::<Vec<u64>>();
+    let (done1_tx, done1_rx) = unbounded::<Vec<u64>>();
+
+    let mut units = Vec::new();
+    for (shard_idx, seq, lba, fill) in [(0usize, 101u64, 10u64, 0x51), (1, 202, 20, 0x62)] {
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(lba), seq, 1);
+        let pba = allocator.allocate_one_for_lane(shard_idx).unwrap();
+        units.push(super::writer::UnitCommitData {
+            shard_idx,
+            unit: make_raw_unit_at(lba, 1, fill, seq),
+            pba,
+            alloc_blocks: 1,
+            seqs: vec![seq],
+            completion: None,
+        });
+    }
+
+    let job = super::writer::PassthroughCommitJob {
+        vol_id: VolumeId("flush-race".into()),
+        units,
+    };
+    let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+    let pool_pc = pool.clone();
+    let meta_pc = meta.clone();
+    let candidate_pc = candidate.clone();
+    let metrics_pc = metrics.clone();
+    let post_commit_handle = std::thread::spawn(move || {
+        BufferFlusher::post_commit_loop(
+            0,
+            &post_commit_rx,
+            &pool_pc,
+            &meta_pc,
+            &candidate_pc,
+            &metrics_pc,
+        );
+    });
+    BufferFlusher::commit_passthrough_job(
+        job,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &in_flight,
+        &metrics,
+        &cleanup_tx,
+        &candidate,
+        &[done0_tx, done1_tx],
+        &post_commit_tx,
+        super::writer::TARGET_OPS_PER_COMMIT,
+    );
+    drop(post_commit_tx);
+    post_commit_handle
+        .join()
+        .expect("post_commit_loop panicked");
+
+    assert_eq!(
+        done0_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        vec![101]
+    );
+    assert_eq!(
+        done1_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        vec![202]
+    );
+}
+
+#[test]
+fn commit_worker_publishes_candidates_before_post_commit() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, done_rx) = unbounded::<Vec<u64>>();
+    let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+
+    let seq = 303;
+    let lba = Lba(30);
+    let hash: ContentHash = [0xAB; 8];
+    pool.note_latest_lba_seq_for_test("flush-race", lba, seq, 1);
+    let pba = allocator.allocate_one_for_lane(0).unwrap();
+    let mut unit = make_raw_unit_at(lba.0, 1, 0x73, seq);
+    unit.block_hashes = Some(vec![hash]);
+    let job = super::writer::PassthroughCommitJob {
+        vol_id: VolumeId("flush-race".into()),
+        units: vec![super::writer::UnitCommitData {
+            shard_idx: 0,
+            unit,
+            pba,
+            alloc_blocks: 1,
+            seqs: vec![seq],
+            completion: None,
+        }],
+    };
+
+    BufferFlusher::commit_passthrough_job(
+        job,
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &in_flight,
+        &metrics,
+        &cleanup_tx,
+        &candidate,
+        std::slice::from_ref(&done_tx),
+        &post_commit_tx,
+        super::writer::TARGET_OPS_PER_COMMIT,
+    );
+
+    let published = candidate
+        .lookup(&hash)
+        .expect("candidate must be visible before post_commit drains");
+    assert_eq!(published.pba, pba);
+    assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap(), vec![seq]);
+    assert!(post_commit_rx.try_recv().is_err());
+    assert!(pool.pending_entry_arc(seq).is_none());
 }
 
 #[test]
@@ -1086,6 +1212,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT,
             &commit_worker_txs,
             1,
+            BufferFlusher::WRITER_BATCH_SIZE_READ_ACTIVE,
         );
     });
 

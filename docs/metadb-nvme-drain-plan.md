@@ -91,6 +91,65 @@ writer coalesce 1ms:
 - Keep foreground read latency visible, because backend flush and reads share
   CPU, LV3, and metadb resources even when code paths differ.
 
+## 2026-05-09 Correctness Gate: LV2/LV3 Device Isolation
+
+Root cause found during the dedup mixed-workload failures on `nvme-box`:
+
+```text
+bad config:
+  buffer.device        = /dev/md/onyx-lv2
+  storage.data_device  = /dev/nvme2n1
+
+actual topology:
+  /dev/md/onyx-lv2 = raid0(nvme1n1, nvme6n1, nvme2n1, nvme7n1)
+```
+
+So LV2 buffer log writes and LV3 data writes were sharing the same physical
+NVMe namespace. The failure signatures looked like metadb/dedup races because
+the metadata still pointed at a valid unit:
+
+```text
+mapping_crc == last_lv3_write_payload_crc
+actual_crc  != mapping_crc
+allocator duplicate tracker: no duplicate allocation
+dedup_verify_mismatches: 0
+read_pool disabled + syscall write serial: still failed
+```
+
+But the raw bytes were later overwritten by LV2 RAID traffic. This also
+explains the intermittent buffer hydration parse errors seen in the same runs.
+
+Validation after moving LV3 to a non-LV2 member disk:
+
+```text
+config: storage.data_device = /dev/nvme4n1
+
+serial/syscall diagnostic run:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-mixed-isolated-lv3-90s
+  fio_returncode         0
+  read_crc_errors        0
+  dedup_verify_mismatches 0
+  flush_errors           0
+
+default uring/read_pool run:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-mixed-fixed-default-90s
+  fio_returncode         0
+  read_crc_errors        0
+  dedup_verify_mismatches 0
+  flush_errors           0
+```
+
+Guardrail added: Linux full-mode startup now rejects configurations where
+`storage.data_device` and `buffer.device` are the same block device or overlap
+through sysfs holder/slave topology. The old `/dev/nvme2n1` config now fails
+before opening metadb:
+
+```text
+storage.data_device (/dev/nvme2n1) overlaps buffer.device (/dev/md/onyx-lv2)
+through block-device holder/slave topology; LV2 and LV3 must not share
+physical devices
+```
+
 ## Hypotheses
 
 ### H1: Metadb Commit Fixed Cost Dominates
@@ -146,6 +205,473 @@ flush_writer_meta_lbas/s increases
 pending_final decreases or stays bounded
 fio_total_iops does not materially regress
 metadb commit count/s decreases while lbas/tx increases
+```
+
+2026-05-09 codex bounded commit coalesce on nvme-box:
+
+```text
+code: commit worker has configurable commit_target_lbas_per_tx,
+      commit_coalesce_lba_budget, commit_coalesce_timeout_us.
+      Adjacent same-volume passthrough jobs can be merged while preserving
+      packed/different-volume FIFO boundaries; done/mark_flushed route back
+      to each unit's original buffer shard.
+
+workload: fio pure randwrite, jobs=8, iodepth=4, rate_iops=12500/job,
+          bs=4k-32k, dedup disabled, compression=lz4, runtime=180s,
+          config derived from config/N1-nodedup.toml on nvme-box.
+
+old nodedup-N1:
+  fio_write_iops         45.1k
+  flush_writer_meta_lbas 32.2k/s
+  pending_final          6.24M
+  commits/s              1.59k
+  lbas/commit            20.2
+  l2p_lock_hold_core     0.89
+
+new code, coalesce disabled (commit_coalesce_lba_budget=0):
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-nocoalesce-3m
+  fio_write_iops         48.3k
+  flush_writer_meta_lbas 37.9k/s
+  pending_final          6.52M
+  commits/s              1.85k
+  lbas/commit            20.5
+  l2p_lock_hold_core     0.89
+  verdict: safe baseline; slightly better drain, no foreground regression.
+
+new code, coalesce budget=600, timeout=50us:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-coalesce-3m
+  fio_write_iops         23.2k
+  flush_writer_meta_lbas 53.5k/s
+  pending_final          1.94M
+  commits/s              2.17k
+  lbas/commit            24.7
+  l2p_lock_hold_core     0.88
+  verdict: improves backend drain but halves foreground acceptance; not a
+           default. Keep as an explicit experiment knob only.
+```
+
+Default after this run: coalesce disabled (`commit_coalesce_lba_budget=0`,
+`commit_coalesce_timeout_us=0`). Next useful sweep is tiny try-drain only:
+budget 150/300 with timeout 0, then optionally 5-10us. Avoid 50us as default.
+
+Follow-up timeout=0 sweep:
+
+```text
+All rows use the same nodedup pure-randwrite workload as above.
+timeout=0 means the commit worker never waits; it only drains jobs that are
+already queued.
+
+no coalesce:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-nocoalesce-3m
+  fio_write_iops         48.3k
+  flush_writer_meta_lbas 37.9k/s
+  pending_final          6.52M
+  commits/s              1.85k
+  lbas/commit            20.5
+
+budget=150, timeout=0:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-trycoalesce-b150-t0-3m
+  fio_write_iops         42.9k
+  flush_writer_meta_lbas 49.7k/s
+  pending_final          5.25M
+  commits/s              2.23k
+  lbas/commit            22.2
+
+budget=300, timeout=0:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-trycoalesce-b300-t0-3m
+  fio_write_iops         47.6k
+  flush_writer_meta_lbas 46.5k/s
+  pending_final          6.10M
+  commits/s              2.19k
+  lbas/commit            21.2
+  verdict: best balance in this sweep; near no-coalesce foreground rate with
+           +23% metadb drain.
+
+budget=600, timeout=0:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-trycoalesce-b600-t0-3m
+  fio_write_iops         43.8k
+  flush_writer_meta_lbas 51.7k/s
+  pending_final          5.32M
+  commits/s              2.32k
+  lbas/commit            22.3
+```
+
+Mixed randrw 50/50 check:
+
+```text
+budget=300, timeout=0:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-mixed-b300-t0-3m
+  fio_total_iops         22.4k
+  fio_write_iops         11.2k
+  flush_writer_meta_lbas 45.6k/s
+  pending_final          155k
+  verdict: backend drain is excellent, but foreground mixed IOPS collapses.
+
+no coalesce:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-N1-nodedup-mixed-nocoalesce-3m
+  fio_total_iops         57.5k
+  fio_write_iops         28.7k
+  flush_writer_meta_lbas 14.3k/s
+  pending_final          4.38M
+```
+
+Conclusion: `budget=300, timeout=0` is a purewrite drain experiment, not a
+general nvme default. Mixed workload needs pressure-gated coalesce or a
+write-only/background-only trigger. Keep default and nvme config at 0/0 for now.
+
+2026-05-09 dedup pressure gate on isolated LV3:
+
+```text
+workload:
+  fio dedupe/compress mixed randrw 50/50
+  jobs=8, iodepth=4, rate_iops=12500/job
+  bs=4k-32k, compression=lz4, dedup enabled, runtime=90s
+  config base = config/nvme-detailed-numa-split.toml
+  LV2=/dev/md/onyx-lv2, LV3=/dev/nvme4n1
+
+baseline, pending_skip_threshold_entries=0:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-mixed-fixed-default-90s
+  fio_read_iops          34.8k
+  fio_write_iops         34.8k
+  write_p99/p99.9        2.3ms / 10.3ms
+  flush_writer_meta_lbas 18.2k/s
+  coalesced_lbas         30.3k/s
+  pending_final          2.35M
+
+pending_skip_threshold_entries=4096:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-pending-skip-4096-90s
+  fio_read_iops          36.7k
+  fio_write_iops         36.7k
+  write_p99/p99.9        1.7ms / 4.6ms
+  flush_writer_meta_lbas 38.0k/s
+  coalesced_lbas         40.0k/s
+  pending_final          2.30M
+
+pending_skip_threshold_entries=8192:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-pending-skip-8192-90s
+  fio_read_iops          23.1k
+  fio_write_iops         23.1k
+  write_p99/p99.9        7.5ms / 27.9ms
+  flush_writer_meta_lbas 44.1k/s
+  pending_final          1.09M
+  verdict: backend looks best because foreground accepted less work; do not
+           treat this single run as the default target.
+
+pending_skip_threshold_entries=8192, repeat:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-pending-skip-8192-r2-90s
+  fio_read_iops          36.9k
+  fio_write_iops         36.9k
+  flush_writer_meta_lbas 37.5k/s
+  pending_final          2.32M
+  verdict: 8192 is not reliably better than 16384 once foreground stays active.
+
+pending_skip_threshold_entries=16384:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-pending-skip-16384-90s
+  fio_read_iops          36.7k
+  fio_write_iops         36.7k
+  write_p99/p99.9        1.8ms / 5.5ms
+  flush_writer_meta_lbas 39.3k/s
+  coalesced_lbas         41.6k/s
+  pending_final          2.27M
+  verdict: best stable mixed-workload default in this sweep. It roughly
+           doubles backend drain with slightly better foreground tails than
+           baseline.
+
+pending_skip_threshold_entries=16384, writer_read_active_batch_size=1024:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-skip16384-wrab1024-90s
+  fio_read_iops          32.2k
+  fio_write_iops         32.3k
+  write_p99/p99.9        3.4ms / 12.6ms
+  flush_writer_meta_lbas 42.2k/s
+  pending_final          1.86M
+  verdict: useful emergency drain knob, but not the latency-safe default.
+
+pending_skip_threshold_entries=16384, writer_read_active_batch_size=768:
+  run_dir                .dev/fio-dedupe-compress-soak/codex-dedup-skip16384-wrab768-90s
+  fio_read_iops          7.4k
+  fio_write_iops         7.4k
+  write_p99/p99.9        22.9ms / 90.7ms
+  verdict: rejected; non-linear bad queue/commit shape.
+```
+
+Default after this sweep:
+
+```toml
+[dedup]
+pending_skip_threshold_entries = 16384
+
+[flush]
+writer_read_active_batch_size = 512
+commit_coalesce_lba_budget = 0
+commit_coalesce_timeout_us = 0
+```
+
+Correctness for all rows above:
+
+```text
+fio_returncode            0
+read_crc_errors           0
+dedup_verify_mismatches   0
+flush_errors              0
+```
+
+2026-05-09 payload-cache pressure A/B:
+
+Hypothesis: the foreground slowdown is not captured by
+`buffer_backpressure_events`, because that counter is not the durable payload
+cache pressure signal. With `max_memory_mb=32768`, the payload cache reaches
+its ceiling, starts evicting ready payloads, and both foreground reads and the
+coalescer rehydrate payloads from the LV2 buffer log.
+
+Instrumentation added:
+
+```text
+buffer_payload_cache_evict_entries / bytes
+buffer_coalesce_hydrate_{memory,volatile,disk}_entries
+buffer_coalesce_hydrate_ns / ops
+```
+
+Same 90s mixed dedupe/compress workload as above:
+
+```text
+max_memory_mb=32768:
+  run_dir                     .dev/fio-dedupe-compress-soak/codex-mem32-instrumented-90s
+  fio_read_iops/write_iops    35.4k / 35.4k
+  write_p99/p99.9             1.65ms / 5.15ms
+  flush_writer_meta_lbas      28.9k/s
+  coalesced_lbas              30.9k/s
+  payload_cache_final         32.0 GiB / 32.0 GiB
+  payload_cache_evict         589k entries, 10.2 GiB
+  coalesce_hydrate_disk       121,449 entries
+  coalesce_hydrate_ns         10.7s
+  read_lookup_hydrate         28,718 ops, 11.6s
+
+max_memory_mb=65536:
+  run_dir                     .dev/fio-dedupe-compress-soak/codex-mem64-instrumented-90s
+  fio_read_iops/write_iops    36.4k / 36.4k
+  write_p99/p99.9             1.61ms / 4.56ms
+  flush_writer_meta_lbas      30.1k/s
+  coalesced_lbas              32.1k/s
+  payload_cache_final         40.6 GiB / 64.0 GiB
+  payload_cache_evict         0 entries, 0 GiB
+  coalesce_hydrate_disk       38 entries
+  coalesce_hydrate_ns         0.34s
+  read_lookup_hydrate         9 ops, 0.002s
+```
+
+Conclusion: the user's suspicion was right. `buffer_backpressure_events=0`
+does not mean the buffer is healthy; the 32 GiB durable payload cache was full
+and forcing expensive LV2 rehydration. Raising the nvme-box durable payload
+cache to 64 GiB removes almost all rehydration and modestly improves both
+foreground and drain. It is not enough to eliminate pending debt, so writer /
+metadb drain remains the next bottleneck, but payload-cache pressure is a real
+secondary brake and should not be ignored.
+
+Later decision: restore nvme-box to 32 GiB. The 64 GiB run proved that
+rehydration was a secondary brake, but it did not materially change the
+sustained throughput ceiling. Treat larger payload memory as a latency/cache
+knob, not the primary fix.
+
+```toml
+[buffer]
+max_memory_mb = 32768
+```
+
+2026-05-09 packed-slot commit batching A/B:
+
+Question: after `pending_skip_threshold_entries=16384`, dedup/compress were
+still able to feed writer, but writer spent too many metadb transactions on
+single-fragment packed slots. Can we batch adjacent packed-slot metadata commits
+without changing foreground durability semantics?
+
+Implementation:
+
+```text
+new config:
+  [flush]
+  packed_commit_try_drain_lba_budget = 0
+
+default 0:
+  preserve old behavior: one packed slot per metadb commit
+
+experiment >0:
+  when the next queued commit is Packed, no-wait try-drain consecutive Packed
+  jobs up to the LBA budget, then submit one metadb transaction containing all
+  their BlockmapValue updates. Per-shard done_tx, mark_flushed, tail advance,
+  lifecycle locks, stale dedup repair, and discarded-fragment handling stay
+  attached to each original job.
+```
+
+Same 90s dedupe/compress mixed randrw 50/50 workload as above:
+
+```text
+baseline, packed_commit_try_drain_lba_budget=0:
+  run_dir                     .dev/fio-dedupe-compress-soak/codex-feed-writer-32g-90s
+  fio_read_iops/write_iops    36.0k / 36.0k
+  write_p99                   1.97ms
+  writer_lbas/s               38.2k
+  coalesced_lbas/s            40.7k
+  commits/s                   1.83k
+  lbas/commit                 20.9
+  packed_slots/fragments      143k / 143k
+  writer_cycles_full          92.3%
+  pending_final               2.24M
+  payload_cache_final         32 GiB / 32 GiB
+  payload_cache_evict         7.03 GiB
+  read LV3/buffer hits        658k / 1.72M
+
+packed_commit_try_drain_lba_budget=150:
+  run_dir                     .dev/fio-dedupe-compress-soak/codex-packed-batch-32g-90s
+  fio_read_iops/write_iops    28.9k / 28.8k
+  write_p99                   3.56ms
+  writer_lbas/s               69.5k
+  coalesced_lbas/s            78.7k
+  commits/s                   522
+  lbas/commit                 133.1
+  packed_slots/fragments      258k / 258k
+  pending_final               921k
+  verdict: metadb small-transaction bottleneck is real and this removes most
+           of it, but foreground mixed IOPS drops because hot data leaves the
+           buffer index sooner and reads hit LV3/decompress more often.
+
+packed_commit_try_drain_lba_budget=64:
+  run_dir                     .dev/fio-dedupe-compress-soak/codex-packed-batch64-32g-90s
+  fio_read_iops/write_iops    28.4k / 28.4k
+  write_p99                   9.63ms
+  writer_lbas/s               1.65k
+  coalesced_lbas/s            3.45k
+  commits/s                   13.5
+  lbas/commit                 122.0
+  pending_final               2.40M
+  verdict: rejected; this queue shape starves useful drain and hurts latency.
+
+packed_commit_try_drain_lba_budget=150, catch-up run:
+  run_dir                     .dev/fio-dedupe-compress-soak/codex-packed150-catchup-90s
+  fio_read_iops/write_iops    16.2k / 16.2k
+  read_p99/write_p99          7.96ms / 8.85ms
+  fio_end_writer_lbas         194k
+  fio_end_coalesced_lbas      362k
+  fio_end_commits             1.54k
+  fio_end_lbas/commit         126.3
+  fio_end_pending             1.41M entries
+
+  post-fio catch-up:
+    ~40s after fio end: pending 349k, writer_lbas 4.78M
+    ~60s after fio end: pending 117k, writer_lbas 5.75M
+    ~70s after fio end: pending 0,    writer_lbas 6.21M
+
+  verdict: for "background must catch up" this is the right direction. The
+           closed-loop mixed fio number is lower because read latency throttles
+           the job stream, but the backend does drain the accumulated work
+           after foreground pressure stops.
+```
+
+Correctness:
+
+```text
+fio_returncode            0
+read_crc_errors           0
+dedup_verify_mismatches   0
+flush_errors              0
+```
+
+Conclusion: packed-slot commit batching is the sharpest proof that metadb tx
+amortization was a real writer bottleneck: `lbas/commit` rose from ~21 to
+~126-133 and the backend can catch up instead of leaving a permanently growing
+pending tail. It does expose the next bottleneck: mixed fio is closed-loop, so
+read latency throttles both reads and writes once hot data falls through to
+LV3/decompress. For the current goal ("background can catch up"), keep
+`packed_commit_try_drain_lba_budget=150` in the nvme profile.
+
+2026-05-09 foreground-active drain sweep:
+
+The harder question is whether the backend can keep draining while foreground
+mixed IO is still active. The answer is not yet "yes" for the 8 jobs x iodepth
+4 x 50/50 randrw workload, but the bottleneck shape is now clear.
+
+```text
+packed=150, writer_read_active_batch_size=512:
+  run_dir          .dev/fio-dedupe-compress-soak/codex-packed150-catchup-90s
+  zone_write       ~72k LBA/s
+  writer_lbas      ~2.1k LBA/s
+  lbas/commit      126.3
+  pending_at_end   1.41M
+  verdict          read-active cap too low; writer starves while reads flow.
+
+packed=150, writer_read_active_batch_size=1024, per_vol=1:
+  run_dir          .dev/fio-dedupe-compress-soak/codex-packed150-wrab1024-90s
+  zone_write       ~180k LBA/s
+  coalesced        ~48k LBA/s
+  writer_lbas      ~46k LBA/s
+  commits          ~333/s
+  lbas/commit      137.2
+  pending_at_end   2.67M
+  verdict          1024 fixes the writer starvation but not the sustained
+                   drain gap. Dedup/compress are feeding writer; downstream is
+                   still slower than foreground.
+
+target_lbas_per_tx=600, writer_read_active=1024, per_vol=1:
+  run_dir          .dev/fio-dedupe-compress-soak/codex-target600-wrab1024-90s
+  writer_lbas      ~1.5k LBA/s
+  commits          ~3.9/s
+  lbas/commit      389.8
+  verdict          rejected; giant tx makes the commit/mark chain too lumpy.
+
+packed=150, writer_read_active=1024, per_vol=4:
+  run_dir          .dev/fio-dedupe-compress-soak/codex-pervol4-wrab1024-90s
+  zone_write       ~153k LBA/s
+  coalesced        ~61k LBA/s
+  writer_lbas      ~58k LBA/s
+  commits          ~427/s
+  lbas/commit      136.6
+  l2p_hold_core    ~2.96
+  l2p_wait_core    ~0.36
+  pending_at_end   1.86M
+  verdict          best foreground-active drain point so far. More parallel
+                   commit helps a single volume, but starts spending real CPU
+                   in L2P commit locks.
+
+packed=150, writer_read_active=1024, per_vol=8:
+  run_dir          .dev/fio-dedupe-compress-soak/codex-pervol8-wrab1024-90s
+  writer_lbas      ~42k LBA/s
+  commits          ~2.6k/s
+  lbas/commit      16.2
+  verdict          rejected; too much fanout shatters batching.
+
+writer batch cap 2048, writer_read_active=2048, per_vol=1:
+  run_dir          .dev/fio-dedupe-compress-soak/codex-wrab2048-pervol1-90s
+  writer_lbas      ~45k LBA/s
+  drained_max      2048
+  verdict          rejected as default; 1024 was not the hard wall.
+```
+
+Instrumentation added after this sweep:
+
+```text
+flush_writer_commit_send_ns
+flush_writer_commit_send_ops
+flush_writer_commit_send_len_max
+```
+
+One instrumented per_vol=1 run hit `commit_send_len_max=128` and spent 1343s
+of aggregate shard-writer time blocked on bounded commit-worker `send()`. That
+confirms the active-drain bottleneck is behind writer IO: commit-worker
+consumption / metadb publish / mark-flushed throughput, not dedup/compress
+production. A packed-batch-as-one-queue-job experiment reduced send ops but did
+not improve drain, so it was reverted. The current best nvme profile is:
+
+```toml
+[flush]
+writer_read_active_batch_size = 1024
+commit_workers_per_volume = 4
+commit_target_lbas_per_tx = 150
+packed_commit_try_drain_lba_budget = 150
+```
+
+Next useful cut: reduce the per-commit-worker post-publish work under the L2P
+lock / mark-flushed path, or add a per-volume ordered publish queue that lets
+multiple workers preserve large commit batches without fragmenting
+`lbas/commit`.
 ```
 
 ### H2: Metadb Apply Lanes Are Under-Batched Or Mis-Scheduled
@@ -518,4 +1044,3 @@ it serializes independent lanes
 it hides checkpoint/recovery cost
 it requires unbounded memory or queue growth
 ```
-

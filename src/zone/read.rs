@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
 use crate::error::{OnyxError, OnyxResult};
-use crate::io::engine::IoEngine;
+use crate::io::engine::{lookup_lv3_write_record, IoEngine};
 use crate::io::read_pool::ReadPool;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
@@ -164,6 +164,63 @@ pub(crate) fn decode_unit_with_crc_accounting<'a>(
     if actual_crc != mapping.crc32 {
         if count_crc_error {
             metrics.read_crc_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if count_crc_error {
+            tracing::warn!(
+                pba = mapping.pba.0,
+                slot_offset = mapping.slot_offset,
+                unit_compressed_size = mapping.unit_compressed_size,
+                unit_original_size = mapping.unit_original_size,
+                unit_lba_count = mapping.unit_lba_count,
+                offset_in_unit = mapping.offset_in_unit,
+                expected_crc = mapping.crc32,
+                actual_crc,
+                raw_len = raw.len(),
+                slice_start = start,
+                slice_end = end,
+                count_crc_error,
+                "inline read: CRC mismatch"
+            );
+            for covered_pba in mapping.physical_pbas(BLOCK_SIZE) {
+                if let Some(record) = lookup_lv3_write_record(covered_pba) {
+                    tracing::warn!(
+                        pba = covered_pba.0,
+                        mapping_start_pba = mapping.pba.0,
+                        write_seq = record.seq,
+                        write_start_pba = record.start_pba,
+                        write_block_offset = record.block_offset,
+                        write_payload_len = record.payload_len,
+                        write_total_size = record.total_size,
+                        write_payload_crc = record.payload_crc,
+                        write_padded_crc = record.padded_crc,
+                        mapping_crc = mapping.crc32,
+                        actual_crc,
+                        "inline read: last LV3 write record for covered PBA"
+                    );
+                } else {
+                    tracing::warn!(
+                        pba = covered_pba.0,
+                        mapping_start_pba = mapping.pba.0,
+                        "inline read: no LV3 write record for covered PBA"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                pba = mapping.pba.0,
+                slot_offset = mapping.slot_offset,
+                unit_compressed_size = mapping.unit_compressed_size,
+                unit_original_size = mapping.unit_original_size,
+                unit_lba_count = mapping.unit_lba_count,
+                offset_in_unit = mapping.offset_in_unit,
+                expected_crc = mapping.crc32,
+                actual_crc,
+                raw_len = raw.len(),
+                slice_start = start,
+                slice_end = end,
+                count_crc_error,
+                "inline read: non-fatal CRC probe mismatch"
+            );
         }
         return Err(OnyxError::CrcMismatch {
             expected: mapping.crc32,

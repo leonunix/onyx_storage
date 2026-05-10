@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::buffer::flush::DEFAULT_PACKED_META_BATCH_LBA_LIMIT;
+use crate::buffer::flush::{DEFAULT_PACKED_META_BATCH_LBA_LIMIT, TARGET_OPS_PER_COMMIT};
 use crate::dedup::config::DedupConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::config::GcConfig;
@@ -478,6 +478,33 @@ pub struct FlushConfig {
     /// at NUM_COMMIT_WORKERS=16; only the per-vol fanout changes.
     #[serde(default = "default_commit_workers_per_volume")]
     pub commit_workers_per_volume: usize,
+    /// Maximum live LBAs placed in one passthrough metadb transaction.
+    /// This replaces the built-in target in the commit worker so NVMe
+    /// experiments can sweep transaction shape without rebuilding.
+    #[serde(default = "default_commit_target_lbas_per_tx")]
+    pub commit_target_lbas_per_tx: usize,
+    /// Soft LBA budget a commit worker drains from its bounded queue
+    /// before dispatching. Adjacent same-volume passthrough jobs are
+    /// merged, then split into transactions by `commit_target_lbas_per_tx`.
+    /// Set 0 to disable cross-job coalescing.
+    #[serde(default = "default_commit_coalesce_lba_budget")]
+    pub commit_coalesce_lba_budget: usize,
+    /// Optional wait window after the first queued commit job arrives.
+    /// This lets nearby shard-writer jobs join the same coalesced batch
+    /// without making the queue unbounded. Set 0 for try_recv-only drain.
+    #[serde(default = "default_commit_coalesce_timeout_us")]
+    pub commit_coalesce_timeout_us: u64,
+    /// No-wait LBA budget for batching consecutive packed-slot metadata jobs.
+    /// Set 0 to keep one packed slot per metadb commit. Higher values reduce
+    /// commit count but can evict hot write-buffer entries sooner, hurting
+    /// mixed read/write foreground IOPS.
+    #[serde(default = "default_packed_commit_try_drain_lba_budget")]
+    pub packed_commit_try_drain_lba_budget: usize,
+    /// Maximum units a writer lane drains per cycle while foreground reads
+    /// are active. Lower values protect read tail latency; higher values
+    /// improve backend drain when the write queue is saturated.
+    #[serde(default = "default_writer_read_active_batch_size")]
+    pub writer_read_active_batch_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -509,6 +536,11 @@ impl Default for FlushConfig {
             skip_fully_superseded: default_skip_fully_superseded(),
             packed_meta_batch_max_lbas: default_packed_meta_batch_max_lbas(),
             commit_workers_per_volume: default_commit_workers_per_volume(),
+            commit_target_lbas_per_tx: default_commit_target_lbas_per_tx(),
+            commit_coalesce_lba_budget: default_commit_coalesce_lba_budget(),
+            commit_coalesce_timeout_us: default_commit_coalesce_timeout_us(),
+            packed_commit_try_drain_lba_budget: default_packed_commit_try_drain_lba_budget(),
+            writer_read_active_batch_size: default_writer_read_active_batch_size(),
         }
     }
 }
@@ -533,6 +565,21 @@ fn default_packed_meta_batch_max_lbas() -> usize {
 }
 fn default_commit_workers_per_volume() -> usize {
     1
+}
+fn default_commit_target_lbas_per_tx() -> usize {
+    TARGET_OPS_PER_COMMIT
+}
+fn default_commit_coalesce_lba_budget() -> usize {
+    0
+}
+fn default_commit_coalesce_timeout_us() -> u64 {
+    0
+}
+fn default_packed_commit_try_drain_lba_budget() -> usize {
+    0
+}
+fn default_writer_read_active_batch_size() -> usize {
+    crate::buffer::flush::BufferFlusher::WRITER_BATCH_SIZE_READ_ACTIVE
 }
 fn default_zone_count() -> u32 {
     4

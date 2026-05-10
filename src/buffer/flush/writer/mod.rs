@@ -5,6 +5,7 @@ mod packed;
 mod passthrough;
 mod post_commit;
 
+pub(crate) use commit_worker::TARGET_OPS_PER_COMMIT;
 pub(in crate::buffer::flush) use commit_worker::{
     route_volume_to_worker, CommitJob, PackedCommitJob, PassthroughCommitJob, UnitCommitData,
     COMMIT_WORKER_QUEUE_CAP, NUM_COMMIT_WORKERS,
@@ -38,13 +39,10 @@ impl BufferFlusher {
     /// of milliseconds.
     ///
     /// The cap still has to be large enough to keep NVMe and metadb commits in
-    /// their efficient batched regime. A 2026-05-07 mixed 4K-32K run with the
-    /// old 128 cap held the backend around 38K flushed 4K-LBA/s while ingesting
-    /// roughly 59K 4K-LBA/s. Raising the cap to 512 lifted drain to roughly
-    /// 116K flushed 4K-LBA/s under the same workload; 1024 did not improve the
-    /// mixed-read case and made single-batch tails larger, so keep a separate
-    /// read-active throttle at the proven point.
-    pub(super) const WRITER_BATCH_SIZE_READ_ACTIVE: usize = 512;
+    /// their efficient batched regime. A 2026-05-09 mixed NVMe run showed 512
+    /// starved background drain to ~2K LBA/s while 1024 lifted active drain
+    /// into the 46-59K LBA/s range. Keep the read-active default at 1024.
+    pub(crate) const WRITER_BATCH_SIZE_READ_ACTIVE: usize = 1024;
     /// After the first completed unit arrives, wait very briefly for the
     /// compress/dedup pipeline to hand over adjacent work. This keeps fast LV3
     /// writes from turning into many small metadb commits when the IO side gets
@@ -74,6 +72,7 @@ impl BufferFlusher {
         _packed_meta_batch_max_lbas: usize,
         commit_worker_txs: &[Sender<CommitJob>],
         commit_workers_per_volume: usize,
+        writer_read_active_batch_size: usize,
     ) {
         let mut buffered_seqs: Vec<u64> = Vec::new();
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
@@ -173,7 +172,7 @@ impl BufferFlusher {
             let read_active = read_submit_calls != last_read_submit_calls;
             last_read_submit_calls = read_submit_calls;
             let writer_batch_limit = if read_active {
-                Self::WRITER_BATCH_SIZE_READ_ACTIVE
+                writer_read_active_batch_size
             } else {
                 Self::WRITER_BATCH_SIZE
             };
@@ -208,6 +207,15 @@ impl BufferFlusher {
             }
             let drained_units = incoming.len() as u64;
             metrics.flush_writer_cycles.fetch_add(1, Ordering::Relaxed);
+            if incoming.len() == writer_batch_limit {
+                metrics
+                    .flush_writer_cycles_full
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics
+                    .flush_writer_cycles_partial
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if read_active {
                 metrics
                     .flush_writer_read_active_cycles

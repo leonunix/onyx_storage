@@ -33,6 +33,21 @@ impl BufferFlusher {
     const DEDUP_WORKER_BATCH_MAX_UNITS: usize = 64;
     const DEDUP_HIT_COMMIT_BATCH_SIZE: usize = 1024;
 
+    fn record_stage_send(
+        send_ns: &std::sync::atomic::AtomicU64,
+        send_ops: &std::sync::atomic::AtomicU64,
+        len_sum: &std::sync::atomic::AtomicU64,
+        len_max: &std::sync::atomic::AtomicU64,
+        started: Instant,
+        len_before: usize,
+    ) {
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        send_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        send_ops.fetch_add(1, Ordering::Relaxed);
+        len_sum.fetch_add(len_before as u64, Ordering::Relaxed);
+        crate::metrics::record_counter_max(len_max, len_before as u64);
+    }
+
     pub(super) fn coalesce_loop(
         shard_idx: usize,
         pool: &WriteBufferPool,
@@ -291,7 +306,18 @@ impl BufferFlusher {
             }
 
             for unit in units {
-                if tx.send(unit).is_err() {
+                let len_before = tx.len();
+                let started = Instant::now();
+                let result = tx.send(unit);
+                Self::record_stage_send(
+                    &metrics.flush_stage_coalesce_send_ns,
+                    &metrics.flush_stage_coalesce_send_ops,
+                    &metrics.flush_stage_coalesce_send_len_sum,
+                    &metrics.flush_stage_coalesce_send_len_max,
+                    started,
+                    len_before,
+                );
+                if result.is_err() {
                     return;
                 }
             }
@@ -389,7 +415,18 @@ impl BufferFlusher {
                         dedup_completion,
                     };
 
-                    if tx.send(cu).is_err() {
+                    let len_before = tx.len();
+                    let started = Instant::now();
+                    let result = tx.send(cu);
+                    Self::record_stage_send(
+                        &metrics.flush_stage_compress_send_ns,
+                        &metrics.flush_stage_compress_send_ops,
+                        &metrics.flush_stage_compress_send_len_sum,
+                        &metrics.flush_stage_compress_send_len_max,
+                        started,
+                        len_before,
+                    );
+                    if result.is_err() {
                         return;
                     }
                 }
@@ -470,7 +507,18 @@ impl BufferFlusher {
                 {
                     unit.dedup_skipped = true;
                     metrics.dedup_skipped_units.fetch_add(1, Ordering::Relaxed);
-                    if miss_tx.send(unit).is_err() {
+                    let len_before = miss_tx.len();
+                    let started = Instant::now();
+                    let result = miss_tx.send(unit);
+                    Self::record_stage_send(
+                        &metrics.flush_stage_dedup_send_ns,
+                        &metrics.flush_stage_dedup_send_ops,
+                        &metrics.flush_stage_dedup_send_len_sum,
+                        &metrics.flush_stage_dedup_send_len_max,
+                        started,
+                        len_before,
+                    );
+                    if result.is_err() {
                         return;
                     }
                     continue;
@@ -1244,7 +1292,18 @@ impl BufferFlusher {
                 &stale_index_repairs,
                 Some(completion.clone()),
             );
-            if miss_tx.send(miss_unit).is_err() {
+            let len_before = miss_tx.len();
+            let started = Instant::now();
+            let result = miss_tx.send(miss_unit);
+            Self::record_stage_send(
+                &metrics.flush_stage_dedup_send_ns,
+                &metrics.flush_stage_dedup_send_ops,
+                &metrics.flush_stage_dedup_send_len_sum,
+                &metrics.flush_stage_dedup_send_len_max,
+                started,
+                len_before,
+            );
+            if result.is_err() {
                 return false;
             }
         }

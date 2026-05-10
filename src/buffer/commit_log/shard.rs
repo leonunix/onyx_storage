@@ -162,8 +162,20 @@ impl BufferShard {
             return false;
         }
         Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), payload_len);
+        self.record_payload_cache_evict(payload_len);
         self.replace_lba_index_if_current(&pending, &evicted);
         true
+    }
+
+    fn record_payload_cache_evict(&self, payload_len: u64) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_payload_cache_evict_entries
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .buffer_payload_cache_evict_bytes
+                .fetch_add(payload_len, Ordering::Relaxed);
+        }
     }
 
     fn compact_payload_cache_order_if_needed(&self) {
@@ -1035,6 +1047,7 @@ impl BufferShard {
                 let evicted = Self::evicted_pending_entry(pending.as_ref());
                 if self.replace_pending_entry_if_current(pending, evicted.clone()) {
                     Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), payload_len);
+                    self.record_payload_cache_evict(payload_len);
                     self.replace_lba_index_if_current(pending, &evicted);
                 }
             }
@@ -1057,6 +1070,7 @@ impl BufferShard {
             let evicted = Self::evicted_pending_entry(pending.as_ref());
             if self.replace_pending_entry_if_current(&pending, evicted.clone()) {
                 Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), payload_len);
+                self.record_payload_cache_evict(payload_len);
                 self.replace_lba_index_if_current(&pending, &evicted);
             }
         }
@@ -1967,21 +1981,54 @@ impl BufferShard {
             return entries;
         }
 
+        let hydrate_started = Instant::now();
+        let total_entries = entries.len() as u64;
+        let mut memory_entries = 0u64;
+        let mut volatile_entries = 0u64;
+        let mut inflight_skips = 0u64;
         let mut payloads: HashMap<u64, Arc<[u8]>> = HashMap::with_capacity(entries.len());
         let mut missing = Vec::new();
         let mut seen_missing = HashSet::new();
         for entry in &entries {
             if let Some(payload) = entry.payload.clone() {
+                memory_entries += 1;
                 payloads.entry(entry.seq).or_insert(payload);
             } else if let Some(payload) = self.volatile_payload(entry.seq) {
+                volatile_entries += 1;
                 payloads.entry(entry.seq).or_insert(payload);
             } else if self.is_seq_inflight(entry.seq) {
+                inflight_skips += 1;
                 continue;
             } else if seen_missing.insert(entry.seq) {
                 missing.push(entry.clone());
             }
         }
+        let disk_entries = missing.len() as u64;
         payloads.extend(self.hydrate_missing_payloads_batched(&missing, false));
+
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_coalesce_hydrate_ns
+                .fetch_add(Self::elapsed_ns(hydrate_started), Ordering::Relaxed);
+            metrics
+                .buffer_coalesce_hydrate_ops
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .buffer_coalesce_hydrate_entries
+                .fetch_add(total_entries, Ordering::Relaxed);
+            metrics
+                .buffer_coalesce_hydrate_memory_entries
+                .fetch_add(memory_entries, Ordering::Relaxed);
+            metrics
+                .buffer_coalesce_hydrate_volatile_entries
+                .fetch_add(volatile_entries, Ordering::Relaxed);
+            metrics
+                .buffer_coalesce_hydrate_disk_entries
+                .fetch_add(disk_entries, Ordering::Relaxed);
+            metrics
+                .buffer_coalesce_hydrate_inflight_skips
+                .fetch_add(inflight_skips, Ordering::Relaxed);
+        }
 
         let mut hydrated = Vec::with_capacity(entries.len());
         for entry in entries {

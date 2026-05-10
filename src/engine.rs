@@ -513,10 +513,121 @@ impl OnyxEngine {
         handles.retain(|(_, flag)| Arc::strong_count(flag) > 1);
     }
 
+    #[cfg(target_os = "linux")]
+    fn validate_data_buffer_devices_disjoint(config: &OnyxConfig) -> OnyxResult<()> {
+        use std::collections::HashSet;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        use std::path::{Path, PathBuf};
+
+        #[derive(Debug)]
+        struct BlockIdentity {
+            dev: (u64, u64),
+            sysfs: PathBuf,
+        }
+
+        fn linux_major(dev: u64) -> u64 {
+            ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)
+        }
+
+        fn linux_minor(dev: u64) -> u64 {
+            (dev & 0xff) | ((dev >> 12) & !0xff)
+        }
+
+        fn block_identity(path: &Path) -> OnyxResult<Option<BlockIdentity>> {
+            let meta = std::fs::metadata(path).map_err(|e| OnyxError::Device {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+            if !meta.file_type().is_block_device() {
+                return Ok(None);
+            }
+            let major = linux_major(meta.rdev());
+            let minor = linux_minor(meta.rdev());
+            Ok(Some(BlockIdentity {
+                dev: (major, minor),
+                sysfs: PathBuf::from(format!("/sys/dev/block/{major}:{minor}")),
+            }))
+        }
+
+        fn read_sysfs_dev(path: &Path) -> Option<(u64, u64)> {
+            let text = std::fs::read_to_string(path.join("dev")).ok()?;
+            let (major, minor) = text.trim().split_once(':')?;
+            Some((major.parse().ok()?, minor.parse().ok()?))
+        }
+
+        fn collect_related(
+            sysfs: &Path,
+            dir_name: &str,
+            out: &mut HashSet<(u64, u64)>,
+        ) -> OnyxResult<()> {
+            let dir = sysfs.join(dir_name);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                return Ok(());
+            };
+            for entry in entries {
+                let entry = entry.map_err(|e| OnyxError::Config(e.to_string()))?;
+                let target = std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path());
+                if let Some(dev) = read_sysfs_dev(&target) {
+                    if out.insert(dev) {
+                        collect_related(&target, "slaves", out)?;
+                        collect_related(&target, "holders", out)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let Some(data_path) = config.storage.data_device.as_ref() else {
+            return Ok(());
+        };
+        let Some(buffer_path) = config.buffer.device.as_ref() else {
+            return Ok(());
+        };
+        let Some(data) = block_identity(data_path)? else {
+            return Ok(());
+        };
+        let Some(buffer) = block_identity(buffer_path)? else {
+            return Ok(());
+        };
+
+        if data.dev == buffer.dev {
+            return Err(OnyxError::Config(format!(
+                "storage.data_device ({}) and buffer.device ({}) resolve to the same block device",
+                data_path.display(),
+                buffer_path.display()
+            )));
+        }
+
+        let mut data_related = HashSet::new();
+        collect_related(&data.sysfs, "slaves", &mut data_related)?;
+        collect_related(&data.sysfs, "holders", &mut data_related)?;
+
+        let mut buffer_related = HashSet::new();
+        collect_related(&buffer.sysfs, "slaves", &mut buffer_related)?;
+        collect_related(&buffer.sysfs, "holders", &mut buffer_related)?;
+
+        if buffer_related.contains(&data.dev) || data_related.contains(&buffer.dev) {
+            return Err(OnyxError::Config(format!(
+                "storage.data_device ({}) overlaps buffer.device ({}) through block-device holder/slave topology; LV2 and LV3 must not share physical devices",
+                data_path.display(),
+                buffer_path.display()
+            )));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn validate_data_buffer_devices_disjoint(_config: &OnyxConfig) -> OnyxResult<()> {
+        Ok(())
+    }
+
     /// Open the engine with full IO capability (data device + buffer + flusher + zones).
     ///
     /// Compression is per-volume (stored in VolumeConfig metadata), not engine-wide.
     pub fn open(config: &OnyxConfig) -> OnyxResult<Self> {
+        Self::validate_data_buffer_devices_disjoint(config)?;
+
         // 1. MetaStore
         let meta = Arc::new(MetaStore::open(&config.meta)?);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
@@ -1049,6 +1160,7 @@ impl OnyxEngine {
         let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
             OnyxError::Config("storage.data_device is required for full mode".into())
         })?;
+        Self::validate_data_buffer_devices_disjoint(config)?;
         let data_dev = RawDevice::open(data_path)?;
         let device_size = data_dev.size();
 

@@ -376,7 +376,9 @@ impl BufferFlusher {
             .filter(|(i, _)| !failed[*i])
             .map(|(_, u)| u.lba_count as u64)
             .sum();
-        metrics.flush_writer_pt_batches.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_writer_pt_batches
+            .fetch_add(1, Ordering::Relaxed);
         metrics
             .flush_writer_pt_units
             .fetch_add(surviving as u64, Ordering::Relaxed);
@@ -386,10 +388,7 @@ impl BufferFlusher {
         metrics
             .flush_writer_pt_io_ops
             .fetch_add(io_ops_count, Ordering::Relaxed);
-        crate::metrics::record_counter_max(
-            &metrics.flush_writer_pt_units_max,
-            surviving as u64,
-        );
+        crate::metrics::record_counter_max(&metrics.flush_writer_pt_units_max, surviving as u64);
         crate::metrics::record_counter_max(&metrics.flush_writer_pt_lbas_max, surviving_lbas);
         crate::metrics::record_counter_max(&metrics.flush_writer_pt_io_ops_max, io_ops_count);
 
@@ -401,12 +400,16 @@ impl BufferFlusher {
         let mut completions_iter = completions_per_unit.into_iter();
 
         let mut per_volume: HashMap<String, Vec<UnitCommitData>> = HashMap::new();
-        let mut failed_paylads: Vec<(Vec<u64>, Option<Arc<crate::buffer::pipeline::DedupCompletion>>)> =
-            Vec::new();
+        let mut failed_paylads: Vec<(
+            Vec<u64>,
+            Option<Arc<crate::buffer::pipeline::DedupCompletion>>,
+        )> = Vec::new();
         for i in 0..n {
             let unit = units_iter.next().expect("units length matches n");
             let seqs = seqs_iter.next().expect("seqs length matches n");
-            let completion = completions_iter.next().expect("completions length matches n");
+            let completion = completions_iter
+                .next()
+                .expect("completions length matches n");
             if failed[i] {
                 failed_paylads.push((seqs, completion));
                 continue;
@@ -415,6 +418,7 @@ impl BufferFlusher {
             let blocks = alloc_blocks[i];
             let vol = unit.vol_id.clone();
             per_volume.entry(vol).or_default().push(UnitCommitData {
+                shard_idx,
                 unit,
                 pba,
                 alloc_blocks: blocks,
@@ -450,15 +454,22 @@ impl BufferFlusher {
         // Phase 2).
         if !commit_worker_txs.is_empty() {
             for (vol, units_for_vol) in per_volume {
-                let worker_idx =
-                    route_volume_to_worker(&vol, shard_idx, commit_workers_per_volume);
+                let worker_idx = route_volume_to_worker(&vol, shard_idx, commit_workers_per_volume);
                 let tx_idx = worker_idx % commit_worker_txs.len();
                 let job = CommitJob::Passthrough(PassthroughCommitJob {
                     vol_id: VolumeId(vol),
-                    shard_idx,
                     units: units_for_vol,
                 });
+                let send_start = Instant::now();
                 let _ = commit_worker_txs[tx_idx].send(job);
+                Self::record_elapsed(&metrics.flush_writer_commit_send_ns, send_start);
+                metrics
+                    .flush_writer_commit_send_ops
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::metrics::record_counter_max(
+                    &metrics.flush_writer_commit_send_len_max,
+                    commit_worker_txs[tx_idx].len() as u64,
+                );
             }
         }
 

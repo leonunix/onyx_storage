@@ -18,7 +18,7 @@
 # Expected layout:
 #   /dev/nvme0n1     -> XFS at /mnt/onyx-meta (metadb)
 #   /dev/md/onyx-lv2 -> 4x NVMe RAID0 LV2 buffer
-#   /dev/nvme2n1     -> raw LV3 data device
+#   /dev/nvme4n1     -> raw LV3 data device
 
 [meta]
 path = "/mnt/onyx-meta/metadb"
@@ -34,7 +34,7 @@ dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 
 [storage]
-data_device = "/dev/nvme2n1"
+data_device = "/dev/nvme4n1"
 block_size = 4096
 use_hugepages = false
 default_compression = "Lz4"
@@ -67,6 +67,12 @@ coalesce_max_lbas = 8
 min_compression_savings_pct = 12
 skip_fully_superseded = true
 packed_meta_batch_max_lbas = 1024
+commit_workers_per_volume = 4
+commit_target_lbas_per_tx = 150
+commit_coalesce_lba_budget = 0
+commit_coalesce_timeout_us = 0
+packed_commit_try_drain_lba_budget = 150
+writer_read_active_batch_size = 1024
 
 [engine]
 zone_count = 64
@@ -84,7 +90,7 @@ max_rewrite_per_cycle = 1024
 enabled = true
 workers = 2
 buffer_skip_threshold_pct = 90
-pending_skip_threshold_entries = 0
+pending_skip_threshold_entries = 16384
 rescan_interval_ms = 30000
 max_rescan_per_cycle = 4096
 cold_tail_max_per_cycle = 4096

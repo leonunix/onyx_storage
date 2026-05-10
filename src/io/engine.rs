@@ -1,5 +1,7 @@
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
@@ -7,6 +9,32 @@ use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, UringOp, UringOpResult};
 use crate::metrics::EngineMetrics;
 use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
+
+static VERIFY_LV3_WRITES: AtomicBool = AtomicBool::new(false);
+static VERIFY_LV3_WRITES_INIT: AtomicBool = AtomicBool::new(false);
+static SERIAL_SYSCALL_WRITES: AtomicBool = AtomicBool::new(false);
+static SERIAL_SYSCALL_WRITES_INIT: AtomicBool = AtomicBool::new(false);
+static TRACE_LV3_WRITES: AtomicBool = AtomicBool::new(false);
+static TRACE_LV3_WRITES_INIT: AtomicBool = AtomicBool::new(false);
+static LV3_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+static LV3_WRITE_RECORDS: OnceLock<Mutex<HashMap<u64, Lv3WriteRecord>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+pub struct Lv3WriteRecord {
+    pub seq: u64,
+    pub start_pba: u64,
+    pub block_offset: u32,
+    pub payload_len: u32,
+    pub total_size: u32,
+    pub payload_crc: u32,
+    pub padded_crc: u32,
+}
+
+pub fn lookup_lv3_write_record(pba: Pba) -> Option<Lv3WriteRecord> {
+    LV3_WRITE_RECORDS
+        .get()
+        .and_then(|records| records.lock().ok()?.get(&pba.0).copied())
+}
 
 /// Selects how `IoEngine` issues IO under the hood.
 ///
@@ -193,6 +221,142 @@ impl IoEngine {
         }
     }
 
+    fn verify_lv3_writes_enabled() -> bool {
+        if !VERIFY_LV3_WRITES_INIT.load(Ordering::Relaxed) {
+            let enabled = Self::env_flag("ONYX_VERIFY_LV3_WRITES");
+            VERIFY_LV3_WRITES.store(enabled, Ordering::Relaxed);
+            VERIFY_LV3_WRITES_INIT.store(true, Ordering::Relaxed);
+        }
+        VERIFY_LV3_WRITES.load(Ordering::Relaxed)
+    }
+
+    fn syscall_write_serial_enabled() -> bool {
+        if !SERIAL_SYSCALL_WRITES_INIT.load(Ordering::Relaxed) {
+            let enabled = Self::env_flag("ONYX_SYSCALL_WRITE_SERIAL");
+            SERIAL_SYSCALL_WRITES.store(enabled, Ordering::Relaxed);
+            SERIAL_SYSCALL_WRITES_INIT.store(true, Ordering::Relaxed);
+        }
+        SERIAL_SYSCALL_WRITES.load(Ordering::Relaxed)
+    }
+
+    fn trace_lv3_writes_enabled() -> bool {
+        if !TRACE_LV3_WRITES_INIT.load(Ordering::Relaxed) {
+            let enabled = Self::env_flag("ONYX_TRACE_LV3_WRITES");
+            TRACE_LV3_WRITES.store(enabled, Ordering::Relaxed);
+            TRACE_LV3_WRITES_INIT.store(true, Ordering::Relaxed);
+        }
+        TRACE_LV3_WRITES.load(Ordering::Relaxed)
+    }
+
+    fn env_flag(name: &str) -> bool {
+        std::env::var(name)
+            .map(|value| {
+                matches!(
+                    value.as_str(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn verify_write_payload(&self, pba: Pba, payload: &[u8], total_size: usize) -> OnyxResult<()> {
+        if !Self::verify_lv3_writes_enabled() {
+            return Ok(());
+        }
+
+        let offset = self.pba_to_offset(pba);
+        let mut expected = vec![0u8; total_size];
+        expected[..payload.len()].copy_from_slice(payload);
+        let mut actual = AlignedBuf::new(total_size, self.use_hugepages)?;
+        let mut first_diff = 0usize;
+        let mut recovered_after_retries = None;
+        for attempt in 0..=3 {
+            self.data_device.read_at(actual.as_mut_slice(), offset)?;
+            if actual.as_slice() == expected.as_slice() {
+                recovered_after_retries = Some(attempt);
+                break;
+            }
+            first_diff = actual
+                .as_slice()
+                .iter()
+                .zip(expected.iter())
+                .position(|(a, e)| a != e)
+                .unwrap_or(0);
+            if attempt < 3 {
+                std::thread::sleep(Duration::from_micros(100u64 << attempt));
+            }
+        }
+
+        if let Some(attempt) = recovered_after_retries {
+            if attempt > 0 {
+                tracing::warn!(
+                    pba = pba.0,
+                    offset,
+                    len = payload.len(),
+                    total_size,
+                    retry = attempt,
+                    "LV3 post-write verification recovered after retry"
+                );
+            }
+            return Ok(());
+        }
+
+        let actual_byte = actual.as_slice()[first_diff];
+        let expected_byte = expected[first_diff];
+        tracing::error!(
+            pba = pba.0,
+            offset,
+            len = payload.len(),
+            total_size,
+            first_diff,
+            actual_byte,
+            expected_byte,
+            attempts = 4,
+            actual_crc = crc32fast::hash(actual.as_slice()),
+            expected_crc = crc32fast::hash(expected.as_slice()),
+            "LV3 post-write verification failed"
+        );
+        Err(OnyxError::Device {
+            path: self.data_device.path().to_path_buf(),
+            reason: format!(
+                "LV3 post-write verification failed pba={} first_diff={} actual={} expected={}",
+                pba.0, first_diff, actual_byte, expected_byte
+            ),
+        })
+    }
+
+    fn record_lv3_write_trace(&self, pba: Pba, payload: &[u8], total_size: usize) {
+        if !Self::trace_lv3_writes_enabled() {
+            return;
+        }
+
+        let seq = LV3_WRITE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut padded = vec![0u8; total_size];
+        padded[..payload.len()].copy_from_slice(payload);
+        let record = Lv3WriteRecord {
+            seq,
+            start_pba: pba.0,
+            block_offset: 0,
+            payload_len: payload.len() as u32,
+            total_size: total_size as u32,
+            payload_crc: crc32fast::hash(payload),
+            padded_crc: crc32fast::hash(&padded),
+        };
+        let blocks = (total_size / self.block_size as usize).max(1);
+        let records = LV3_WRITE_RECORDS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut records) = records.lock() {
+            for block_offset in 0..blocks {
+                records.insert(
+                    pba.0 + block_offset as u64,
+                    Lv3WriteRecord {
+                        block_offset: block_offset as u32,
+                        ..record
+                    },
+                );
+            }
+        }
+    }
+
     fn pba_to_offset(&self, pba: Pba) -> u64 {
         (pba.0 + self.pba_offset) * self.block_size as u64
     }
@@ -280,6 +444,8 @@ impl IoEngine {
                 self.validate_uring_result("write", offset, total_size as u32, &results[0])?;
             }
         }
+        self.verify_write_payload(pba, payload, total_size)?;
+        self.record_lv3_write_trace(pba, payload, total_size);
         self.record_lv3_write(total_size);
         Ok(())
     }
@@ -339,7 +505,7 @@ impl IoEngine {
         // Mixed read/write batches stay sequential — uncommon enough that
         // parallelising is not worth the complexity.
         let all_writes = !ops.is_empty() && ops.iter().all(|op| matches!(op, LvOp::Write { .. }));
-        let parallelize = all_writes && ops.len() > 1;
+        let parallelize = all_writes && ops.len() > 1 && !Self::syscall_write_serial_enabled();
 
         let out: Vec<LvOpResult> = if parallelize {
             // Parallel pwrite via scoped threads to keep NVMe queue depth > 1

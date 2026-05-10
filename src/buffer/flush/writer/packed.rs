@@ -409,7 +409,16 @@ impl BufferFlusher {
                 buffered_seqs,
                 buffered_completions,
             });
+            let send_start = Instant::now();
             let _ = commit_worker_txs[tx_idx].send(job);
+            Self::record_elapsed(&metrics.flush_writer_commit_send_ns, send_start);
+            metrics
+                .flush_writer_commit_send_ops
+                .fetch_add(1, Ordering::Relaxed);
+            crate::metrics::record_counter_max(
+                &metrics.flush_writer_commit_send_len_max,
+                commit_worker_txs[tx_idx].len() as u64,
+            );
         }
 
         // Counters tracking the IO + dispatch phase. Metadata-phase

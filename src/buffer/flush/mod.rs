@@ -186,6 +186,8 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use writer::TARGET_OPS_PER_COMMIT;
+
 pub use failpoints::{
     clear_test_dedup_hit_failpoint, clear_test_failpoint, clear_test_packed_pause_hook,
     install_test_dedup_hit_failpoint, install_test_failpoint, install_test_packed_pause_hook,
@@ -495,6 +497,14 @@ impl BufferFlusher {
             .commit_workers_per_volume
             .max(1)
             .min(writer::NUM_COMMIT_WORKERS);
+        let writer_read_active_batch_size = config
+            .writer_read_active_batch_size
+            .max(1)
+            .min(Self::WRITER_BATCH_SIZE);
+        let commit_target_lbas_per_tx = config.commit_target_lbas_per_tx.max(1);
+        let commit_coalesce_lba_budget = config.commit_coalesce_lba_budget;
+        let commit_coalesce_timeout = Duration::from_micros(config.commit_coalesce_timeout_us);
+        let packed_commit_try_drain_lba_budget = config.packed_commit_try_drain_lba_budget;
         let dedup_enabled = dedup_config.enabled;
         let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
@@ -704,6 +714,7 @@ impl BufferFlusher {
                         packed_meta_batch_max_lbas,
                         &commit_worker_txs_w,
                         commit_workers_per_volume,
+                        writer_read_active_batch_size,
                     );
                 })
                 .expect("failed to spawn writer thread");
@@ -771,6 +782,10 @@ impl BufferFlusher {
                         &candidate_c,
                         &lane_done_txs_c,
                         &post_commit_tx_c,
+                        commit_target_lbas_per_tx,
+                        commit_coalesce_lba_budget,
+                        commit_coalesce_timeout,
+                        packed_commit_try_drain_lba_budget,
                         &running_c,
                     );
                 })

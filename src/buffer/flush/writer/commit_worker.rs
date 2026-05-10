@@ -11,7 +11,7 @@
 
 use super::*;
 
-/// Sub-batch cap inside a single `CommitJob`. New per-volume routing
+/// Default sub-batch cap inside a single `CommitJob`. New per-volume routing
 /// has 0 LSN contention, so each commit only pays its own WAL fsync
 /// + apply lane scheduling cost. metadb-onyx-soak (2026-05-08) shows
 /// the per-op amortisation sweet spot at 50–200 ops; 150 sits in the
@@ -19,8 +19,7 @@ use super::*;
 /// concurrency. Picking too small (e.g. 10) leaves WAL fsync (~100µs)
 /// un-amortised; too large (e.g. 1000+) reproduces the 22ms apply
 /// lane stall observed with `buffer.shards=1`.
-pub(in crate::buffer::flush) const TARGET_OPS_PER_COMMIT: usize = 150;
-
+pub(crate) const TARGET_OPS_PER_COMMIT: usize = 150;
 /// Number of dedicated commit workers. Per-volume routing uses
 /// `hash(vol_id) % NUM_COMMIT_WORKERS`. The buffer keeps its own 16
 /// shards for LV2/dedup/compress parallelism; this is independent.
@@ -32,6 +31,7 @@ pub(in crate::buffer::flush) const COMMIT_WORKER_QUEUE_CAP: usize = 64;
 
 /// Owned per-unit data the shard writer has staged (alloc + IO done).
 pub(in crate::buffer::flush) struct UnitCommitData {
+    pub shard_idx: usize,
     pub unit: CompressedUnit,
     pub pba: Pba,
     pub alloc_blocks: u32,
@@ -44,7 +44,6 @@ pub(in crate::buffer::flush) struct PassthroughCommitJob {
     /// volume — write_units_batch splits multi-volume batches into
     /// one PassthroughCommitJob per volume before pushing.
     pub vol_id: VolumeId,
-    pub shard_idx: usize,
     pub units: Vec<UnitCommitData>,
 }
 
@@ -117,6 +116,10 @@ impl BufferFlusher {
         candidate: &crate::dedup::CandidateCache,
         lane_done_txs: &[Sender<Vec<u64>>],
         post_commit_tx: &Sender<PostCommitJob>,
+        target_lbas_per_tx: usize,
+        coalesce_lba_budget: usize,
+        coalesce_timeout: Duration,
+        packed_try_drain_lba_budget: usize,
         running: &AtomicBool,
     ) {
         let _ = worker_idx;
@@ -127,8 +130,14 @@ impl BufferFlusher {
         // jobs before exiting.
         while running.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(job) => Self::dispatch_commit_job(
-                    job,
+                Ok(first) => Self::dispatch_commit_batch(
+                    Self::drain_commit_batch(
+                        first,
+                        rx,
+                        coalesce_lba_budget,
+                        coalesce_timeout,
+                        packed_try_drain_lba_budget,
+                    ),
                     pool,
                     meta,
                     lifecycle,
@@ -139,6 +148,7 @@ impl BufferFlusher {
                     candidate,
                     lane_done_txs,
                     post_commit_tx,
+                    target_lbas_per_tx,
                 ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -147,9 +157,172 @@ impl BufferFlusher {
         // Drain anything queued at shutdown. The shard writers may
         // have pushed final jobs after we observed `running == false`
         // but before they joined.
-        while let Ok(job) = rx.try_recv() {
-            Self::dispatch_commit_job(
-                job,
+        while let Ok(first) = rx.try_recv() {
+            Self::dispatch_commit_batch(
+                Self::drain_commit_batch(
+                    first,
+                    rx,
+                    coalesce_lba_budget,
+                    Duration::ZERO,
+                    packed_try_drain_lba_budget,
+                ),
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                in_flight_tracker,
+                metrics,
+                lane_cleanup_txs,
+                candidate,
+                lane_done_txs,
+                post_commit_tx,
+                target_lbas_per_tx,
+            );
+        }
+    }
+
+    fn drain_commit_batch(
+        first: CommitJob,
+        rx: &Receiver<CommitJob>,
+        coalesce_lba_budget: usize,
+        coalesce_timeout: Duration,
+        packed_try_drain_lba_budget: usize,
+    ) -> Vec<CommitJob> {
+        if coalesce_lba_budget == 0 {
+            let mut batch = vec![first];
+            if packed_try_drain_lba_budget > 0 && matches!(batch[0], CommitJob::Packed(_)) {
+                let mut total_lbas = lbas_in_job(&batch[0]);
+                while total_lbas < packed_try_drain_lba_budget {
+                    match rx.try_recv() {
+                        Ok(job) => {
+                            let is_packed = matches!(job, CommitJob::Packed(_));
+                            total_lbas = total_lbas.saturating_add(lbas_in_job(&job));
+                            batch.push(job);
+                            if !is_packed {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            return batch;
+        }
+        let mut batch = vec![first];
+        let mut total_lbas = lbas_in_job(&batch[0]);
+        let deadline = Instant::now() + coalesce_timeout;
+        while total_lbas < coalesce_lba_budget {
+            match rx.try_recv() {
+                Ok(job) => {
+                    total_lbas = total_lbas.saturating_add(lbas_in_job(&job));
+                    batch.push(job);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty)
+                    if coalesce_timeout > Duration::ZERO =>
+                {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                        Ok(job) => {
+                            total_lbas = total_lbas.saturating_add(lbas_in_job(&job));
+                            batch.push(job);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        batch
+    }
+
+    fn dispatch_commit_batch(
+        jobs: Vec<CommitJob>,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        in_flight_tracker: &FlusherInFlightTracker,
+        metrics: &EngineMetrics,
+        lane_cleanup_txs: &[Sender<CleanupBatch>],
+        candidate: &crate::dedup::CandidateCache,
+        lane_done_txs: &[Sender<Vec<u64>>],
+        post_commit_tx: &Sender<PostCommitJob>,
+        target_lbas_per_tx: usize,
+    ) {
+        let mut pending_pt: Option<PassthroughCommitJob> = None;
+        let mut pending_packed: Vec<PackedCommitJob> = Vec::new();
+        for job in jobs {
+            match job {
+                CommitJob::Passthrough(mut pj) => {
+                    if !pending_packed.is_empty() {
+                        let ready = std::mem::take(&mut pending_packed);
+                        Self::dispatch_packed_jobs(
+                            ready,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            in_flight_tracker,
+                            metrics,
+                            lane_cleanup_txs,
+                            candidate,
+                            lane_done_txs,
+                            post_commit_tx,
+                        );
+                    }
+                    match pending_pt.as_mut() {
+                        Some(existing) if existing.vol_id == pj.vol_id => {
+                            existing.units.append(&mut pj.units);
+                        }
+                        Some(_) => {
+                            let ready = pending_pt.take().expect("pending passthrough exists");
+                            Self::dispatch_passthrough_job(
+                                ready,
+                                pool,
+                                meta,
+                                lifecycle,
+                                allocator,
+                                in_flight_tracker,
+                                metrics,
+                                lane_cleanup_txs,
+                                candidate,
+                                lane_done_txs,
+                                post_commit_tx,
+                                target_lbas_per_tx,
+                            );
+                            pending_pt = Some(pj);
+                        }
+                        None => pending_pt = Some(pj),
+                    }
+                }
+                CommitJob::Packed(pj) => {
+                    if let Some(ready) = pending_pt.take() {
+                        Self::dispatch_passthrough_job(
+                            ready,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            in_flight_tracker,
+                            metrics,
+                            lane_cleanup_txs,
+                            candidate,
+                            lane_done_txs,
+                            post_commit_tx,
+                            target_lbas_per_tx,
+                        );
+                    }
+                    pending_packed.push(pj);
+                }
+            }
+        }
+
+        if !pending_packed.is_empty() {
+            Self::dispatch_packed_jobs(
+                pending_packed,
                 pool,
                 meta,
                 lifecycle,
@@ -162,10 +335,68 @@ impl BufferFlusher {
                 post_commit_tx,
             );
         }
+
+        if let Some(pj) = pending_pt {
+            Self::dispatch_passthrough_job(
+                pj,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                in_flight_tracker,
+                metrics,
+                lane_cleanup_txs,
+                candidate,
+                lane_done_txs,
+                post_commit_tx,
+                target_lbas_per_tx,
+            );
+        }
     }
 
-    fn dispatch_commit_job(
-        job: CommitJob,
+    fn dispatch_passthrough_job(
+        pj: PassthroughCommitJob,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        in_flight_tracker: &FlusherInFlightTracker,
+        metrics: &EngineMetrics,
+        lane_cleanup_txs: &[Sender<CleanupBatch>],
+        candidate: &crate::dedup::CandidateCache,
+        lane_done_txs: &[Sender<Vec<u64>>],
+        post_commit_tx: &Sender<PostCommitJob>,
+        target_lbas_per_tx: usize,
+    ) {
+        let primary_shard = pj.units.first().map(|u| u.shard_idx).unwrap_or(0);
+        let cleanup_tx = lane_cleanup_txs
+            .get(primary_shard)
+            .or_else(|| lane_cleanup_txs.first());
+        let (Some(cleanup_tx), true) = (cleanup_tx, !lane_done_txs.is_empty()) else {
+            tracing::error!(
+                shard_idx = primary_shard,
+                "commit_worker: lane channels missing — dropping passthrough job"
+            );
+            return;
+        };
+        Self::commit_passthrough_job(
+            pj,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            in_flight_tracker,
+            metrics,
+            cleanup_tx,
+            candidate,
+            lane_done_txs,
+            post_commit_tx,
+            target_lbas_per_tx,
+        );
+    }
+
+    fn dispatch_packed_jobs(
+        jobs: Vec<PackedCommitJob>,
         pool: &WriteBufferPool,
         meta: &MetaStore,
         lifecycle: &VolumeLifecycleManager,
@@ -177,59 +408,37 @@ impl BufferFlusher {
         lane_done_txs: &[Sender<Vec<u64>>],
         post_commit_tx: &Sender<PostCommitJob>,
     ) {
-        // Pick the cleanup / done senders that match the originating
-        // shard. Falling back to lane 0 if the shard_idx is somehow
-        // out of range — defensive against future config changes.
-        let shard_idx = match &job {
-            CommitJob::Passthrough(pj) => pj.shard_idx,
-            CommitJob::Packed(pj) => pj.shard_idx,
+        let Some(first) = jobs.first() else {
+            return;
         };
         let cleanup_tx = lane_cleanup_txs
-            .get(shard_idx)
+            .get(first.shard_idx)
             .or_else(|| lane_cleanup_txs.first());
-        let done_tx = lane_done_txs
-            .get(shard_idx)
-            .or_else(|| lane_done_txs.first());
-        let (Some(cleanup_tx), Some(done_tx)) = (cleanup_tx, done_tx) else {
+        let Some(cleanup_tx) = cleanup_tx else {
             tracing::error!(
-                shard_idx,
-                "commit_worker: lane channels missing — dropping job"
+                shard_idx = first.shard_idx,
+                "commit_worker: lane channels missing — dropping packed job"
             );
             return;
         };
-        match job {
-            CommitJob::Passthrough(pj) => Self::commit_passthrough_job(
-                pj,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                in_flight_tracker,
-                metrics,
-                cleanup_tx,
-                candidate,
-                done_tx,
-                post_commit_tx,
-            ),
-            CommitJob::Packed(pj) => Self::commit_packed_job(
-                pj,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                in_flight_tracker,
-                metrics,
-                cleanup_tx,
-                candidate,
-                done_tx,
-                post_commit_tx,
-            ),
-        }
+        Self::commit_packed_jobs_batch(
+            jobs,
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            in_flight_tracker,
+            metrics,
+            cleanup_tx,
+            candidate,
+            lane_done_txs,
+            post_commit_tx,
+        );
     }
 
     /// Commit a single-volume passthrough batch. Acquires the volume's
     /// lifecycle read lock + per-unit L2P commit locks for the whole
-    /// job, then flushes commits in sub-batches of ≤ TARGET_OPS_PER_COMMIT
+    /// job, then flushes commits in sub-batches of ≤ target_lbas_per_tx
     /// LBA ops. Same lock, multiple commits inside — no contention
     /// because this worker is the only committer for this volume.
     pub(in crate::buffer::flush) fn commit_passthrough_job(
@@ -242,15 +451,12 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
-        done_tx: &Sender<Vec<u64>>,
+        lane_done_txs: &[Sender<Vec<u64>>],
         post_commit_tx: &Sender<PostCommitJob>,
+        target_lbas_per_tx: usize,
     ) {
         let total_start = Instant::now();
-        let PassthroughCommitJob {
-            vol_id,
-            shard_idx,
-            units,
-        } = job;
+        let PassthroughCommitJob { vol_id, units } = job;
 
         // Acquire lifecycle read lock for this volume only — all units
         // in the job target the same volume by construction. Held
@@ -274,7 +480,7 @@ impl BufferFlusher {
                     units,
                     allocator,
                     in_flight_tracker,
-                    done_tx,
+                    lane_done_txs,
                     metrics,
                 );
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
@@ -295,12 +501,6 @@ impl BufferFlusher {
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
         let mut discarded: Vec<bool> = vec![false; n];
         let mut commit_failed_indices: Vec<usize> = Vec::new();
-        // Phase 2.2 post-commit accumulators. Filled inside chunked
-        // commits, drained at end-of-job into a PostCommitJob handed
-        // off to the paired post_commit thread.
-        let mut post_candidate_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-        let mut post_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-
         let actual_old_pba_meta = pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
             let build_start = Instant::now();
             for (i, ucd) in units.iter().enumerate() {
@@ -403,7 +603,7 @@ impl BufferFlusher {
                 };
                 let lbas = um.batch_values.len();
                 if !chunk.is_empty()
-                    && chunk_lbas.saturating_add(lbas) > TARGET_OPS_PER_COMMIT
+                    && chunk_lbas.saturating_add(lbas) > target_lbas_per_tx
                 {
                     Self::commit_passthrough_chunk(
                         &chunk,
@@ -413,15 +613,14 @@ impl BufferFlusher {
                         metrics,
                         &mut accum_old_meta,
                         &mut commit_failed_indices,
-                        &mut post_candidate_pairs,
-                        &mut post_stale_repairs,
+                        candidate,
                     );
                     chunk.clear();
                     chunk_lbas = 0;
                 }
                 chunk.push(i);
                 chunk_lbas += lbas;
-                if lbas > TARGET_OPS_PER_COMMIT {
+                if lbas > target_lbas_per_tx {
                     Self::commit_passthrough_chunk(
                         &chunk,
                         &vol_id,
@@ -430,8 +629,7 @@ impl BufferFlusher {
                         metrics,
                         &mut accum_old_meta,
                         &mut commit_failed_indices,
-                        &mut post_candidate_pairs,
-                        &mut post_stale_repairs,
+                        candidate,
                     );
                     chunk.clear();
                     chunk_lbas = 0;
@@ -446,25 +644,21 @@ impl BufferFlusher {
                     metrics,
                     &mut accum_old_meta,
                     &mut commit_failed_indices,
-                    &mut post_candidate_pairs,
-                    &mut post_stale_repairs,
+                    candidate,
                 );
             }
 
             accum_old_meta
         });
 
-        // Post-commit work outside the L2P commit lock. Allocator
-        // frees and metric bumps stay inline (cheap, bounded). Buffer
-        // mark_flushed calls are collected into a PostCommitJob and
-        // handed off to the paired post_commit thread so the
-        // commit_worker can immediately pick up its next job.
+        // Post-commit work outside the L2P commit lock. Keep
+        // mark_flushed ordered before done_tx so the coalescer cannot
+        // re-enqueue the same pending seq while its buffer index entry
+        // is still visible.
         let cleanup_start = Instant::now();
         let commit_failed_set: std::collections::HashSet<usize> =
             commit_failed_indices.iter().copied().collect();
-        let _ = candidate; // moved to post_commit thread
-
-        let mut post_mark_ranges: Vec<(u64, Lba, u32)> = Vec::new();
+        let mut post_mark_ranges_by_shard: HashMap<usize, Vec<(u64, Lba, u32)>> = HashMap::new();
 
         for (i, ucd) in units.iter().enumerate() {
             if discarded[i] {
@@ -473,7 +667,10 @@ impl BufferFlusher {
                 } else {
                     let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
                 }
-                post_mark_ranges.extend(ucd.unit.seq_lba_ranges.iter().cloned());
+                post_mark_ranges_by_shard
+                    .entry(ucd.shard_idx)
+                    .or_default()
+                    .extend(ucd.unit.seq_lba_ranges.iter().cloned());
                 continue;
             }
             if commit_failed_set.contains(&i) {
@@ -493,7 +690,10 @@ impl BufferFlusher {
                 } else {
                     let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
                 }
-                post_mark_ranges.extend(ucd.unit.seq_lba_ranges.iter().cloned());
+                post_mark_ranges_by_shard
+                    .entry(ucd.shard_idx)
+                    .or_default()
+                    .extend(ucd.unit.seq_lba_ranges.iter().cloned());
                 continue;
             }
             // Successful commit path.
@@ -508,7 +708,10 @@ impl BufferFlusher {
             metrics
                 .flush_unit_bytes
                 .fetch_add(ucd.unit.compressed_data.len() as u64, Ordering::Relaxed);
-            post_mark_ranges.extend(ucd.unit.seq_lba_ranges.iter().cloned());
+            post_mark_ranges_by_shard
+                .entry(ucd.shard_idx)
+                .or_default()
+                .extend(ucd.unit.seq_lba_ranges.iter().cloned());
         }
 
         if !actual_old_pba_meta.is_empty() {
@@ -516,13 +719,36 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
+        let mark_start = Instant::now();
+        let all_unit_shards: std::collections::HashSet<usize> =
+            units.iter().map(|ucd| ucd.shard_idx).collect();
+        for (shard_idx, mark_ranges) in post_mark_ranges_by_shard {
+            for (seq, lba_start, lba_count) in mark_ranges {
+                if let Err(e) = pool.mark_flushed(seq, lba_start, lba_count) {
+                    tracing::warn!(
+                        seq,
+                        shard_idx,
+                        error = %e,
+                        "commit_worker: failed to mark entry flushed"
+                    );
+                }
+            }
+            let _ = pool.advance_tail_for_shard(shard_idx);
+        }
+        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+        for shard_idx in &all_unit_shards {
+            let _ = pool.advance_tail_for_shard(*shard_idx);
+        }
+
         // done_tx: success path → just send seqs (or completion.decrement()).
-        // Failure path → defer_retry, then send. Acks fire BEFORE
-        // post_commit drains because completion semantics target the
-        // metadb commit, not the buffer ring head retention.
+        // Failure path → defer_retry, then send.
+        let mut done_by_shard: HashMap<usize, Vec<u64>> = HashMap::new();
         for (i, ucd) in units.into_iter().enumerate() {
             let UnitCommitData {
-                seqs, completion, ..
+                shard_idx,
+                seqs,
+                completion,
+                ..
             } = ucd;
             if commit_failed_set.contains(&i) {
                 match &completion {
@@ -533,34 +759,28 @@ impl BufferFlusher {
             }
             match completion {
                 None => {
-                    let _ = done_tx.send(seqs);
+                    done_by_shard.entry(shard_idx).or_default().extend(seqs);
                 }
                 Some(dc) => {
                     if let Some(original_seqs) = dc.decrement() {
-                        let _ = done_tx.send(original_seqs);
+                        done_by_shard
+                            .entry(shard_idx)
+                            .or_default()
+                            .extend(original_seqs);
                     }
                 }
             }
         }
-
-        // Hand mark_flushed + candidate insert + stale repair to the
-        // paired post_commit thread. tail advance happens there too,
-        // after mark_flushed runs and the buffer ring can release the
-        // affected blocks.
-        let post_job = PostCommitJob {
-            shard_idx,
-            mark_ranges: post_mark_ranges,
-            candidate_pairs: post_candidate_pairs,
-            stale_repairs: post_stale_repairs,
-        };
-        if !post_job.is_empty() {
-            let _ = post_commit_tx.send(post_job);
-        } else {
-            // Nothing for post_commit to do; advance the tail directly
-            // so an idle volume's buffer doesn't get stuck waiting on
-            // a phantom mark_flushed pass.
-            let _ = pool.advance_tail_for_shard(shard_idx);
+        for (shard_idx, seqs) in done_by_shard {
+            if let Some(done_tx) = lane_done_txs
+                .get(shard_idx)
+                .or_else(|| lane_done_txs.first())
+            {
+                let _ = done_tx.send(seqs);
+            }
         }
+
+        let _ = post_commit_tx;
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
     }
 
@@ -576,12 +796,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         accum_old_meta: &mut HashMap<Pba, RemapCleanup>,
         commit_failed_indices: &mut Vec<usize>,
-        // Phase 2.2: candidate inserts + stale repairs are deferred to
-        // the paired post_commit thread. Chunked commits append into
-        // these accumulators; commit_passthrough_job hands the merged
-        // list off to post_commit at end-of-job.
-        post_candidate_pairs: &mut Vec<(ContentHash, BlockmapValue)>,
-        post_stale_repairs: &mut Vec<(ContentHash, DedupEntry, DedupEntry)>,
+        candidate: &crate::dedup::CandidateCache,
     ) {
         let mut batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
             Vec::with_capacity(chunk.len());
@@ -627,12 +842,25 @@ impl BufferFlusher {
                         .and_modify(|entry| entry.merge(cleanup.clone()))
                         .or_insert(cleanup);
                 }
-                // Defer candidate cache insert + stale dedup repair to
-                // the paired post_commit thread. Both are pure RAM /
-                // best-effort metadata work and don't gate the next
-                // commit_worker job.
-                post_candidate_pairs.extend(all_fresh_pairs);
-                post_stale_repairs.extend(all_stale_repairs);
+                // These publish physical mappings into future dedup-hit
+                // lookups, so keep them ordered before any cleanup can
+                // retire/reclaim old PBAs or later overwrites can make the
+                // freshly committed mappings stale.
+                if !all_fresh_pairs.is_empty() {
+                    let cand_start = Instant::now();
+                    candidate.insert_many(&all_fresh_pairs);
+                    Self::record_elapsed(&metrics.flush_writer_meta_candidate_ns, cand_start);
+                }
+                if !all_stale_repairs.is_empty() {
+                    let repair_start = Instant::now();
+                    Self::repair_stale_dedup_index(
+                        meta,
+                        metrics,
+                        &all_stale_repairs,
+                        "commit_worker_passthrough",
+                    );
+                    Self::record_elapsed(&metrics.flush_writer_meta_repair_ns, repair_start);
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -660,7 +888,7 @@ impl BufferFlusher {
         units: Vec<UnitCommitData>,
         allocator: &SpaceAllocator,
         in_flight_tracker: &FlusherInFlightTracker,
-        done_tx: &Sender<Vec<u64>>,
+        lane_done_txs: &[Sender<Vec<u64>>],
         metrics: &EngineMetrics,
     ) {
         for ucd in units {
@@ -676,11 +904,21 @@ impl BufferFlusher {
             }
             match ucd.completion {
                 None => {
-                    let _ = done_tx.send(ucd.seqs);
+                    if let Some(done_tx) = lane_done_txs
+                        .get(ucd.shard_idx)
+                        .or_else(|| lane_done_txs.first())
+                    {
+                        let _ = done_tx.send(ucd.seqs);
+                    }
                 }
                 Some(dc) => {
                     if let Some(original_seqs) = dc.decrement() {
-                        let _ = done_tx.send(original_seqs);
+                        if let Some(done_tx) = lane_done_txs
+                            .get(ucd.shard_idx)
+                            .or_else(|| lane_done_txs.first())
+                        {
+                            let _ = done_tx.send(original_seqs);
+                        }
                     }
                 }
             }
@@ -704,21 +942,45 @@ impl BufferFlusher {
         done_tx: &Sender<Vec<u64>>,
         post_commit_tx: &Sender<PostCommitJob>,
     ) {
-        let _ = candidate; // moved to post_commit thread
+        let lane_done_txs = std::slice::from_ref(done_tx);
+        Self::commit_packed_jobs_batch(
+            vec![job],
+            pool,
+            meta,
+            lifecycle,
+            allocator,
+            in_flight_tracker,
+            metrics,
+            cleanup_tx,
+            candidate,
+            lane_done_txs,
+            post_commit_tx,
+        );
+    }
+
+    pub(in crate::buffer::flush) fn commit_packed_jobs_batch(
+        jobs: Vec<PackedCommitJob>,
+        pool: &WriteBufferPool,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        in_flight_tracker: &FlusherInFlightTracker,
+        metrics: &EngineMetrics,
+        cleanup_tx: &Sender<CleanupBatch>,
+        candidate: &crate::dedup::CandidateCache,
+        lane_done_txs: &[Sender<Vec<u64>>],
+        post_commit_tx: &Sender<PostCommitJob>,
+    ) {
+        if jobs.is_empty() {
+            return;
+        }
         let total_start = Instant::now();
-        let PackedCommitJob {
-            sealed,
-            shard_idx,
-            buffered_seqs,
-            buffered_completions,
-        } = job;
 
         // Lifecycle locks: union of every fragment's vol_id, sorted to
-        // avoid deadlock with concurrent batches on overlapping volume
-        // sets. Same as the historic write_packed_slot path.
-        let mut vol_ids: Vec<String> = sealed
-            .fragments
+        // avoid deadlock with concurrent batches on overlapping volume sets.
+        let mut vol_ids: Vec<String> = jobs
             .iter()
+            .flat_map(|job| job.sealed.fragments.iter())
             .map(|f| f.unit.vol_id.clone())
             .collect();
         vol_ids.sort();
@@ -726,15 +988,16 @@ impl BufferFlusher {
         let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
-        let commit_ranges: Vec<(&str, Lba, u64)> = sealed
-            .fragments
+        let commit_ranges: Vec<(&str, Lba, u64)> = jobs
             .iter()
-            .map(|frag| {
-                (
-                    frag.unit.vol_id.as_str(),
-                    frag.unit.start_lba,
-                    frag.unit.lba_count as u64,
-                )
+            .flat_map(|job| {
+                job.sealed.fragments.iter().map(|frag| {
+                    (
+                        frag.unit.vol_id.as_str(),
+                        frag.unit.start_lba,
+                        frag.unit.lba_count as u64,
+                    )
+                })
             })
             .collect();
 
@@ -744,111 +1007,127 @@ impl BufferFlusher {
                 let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
                 let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
                 let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-                let mut total_refcount: u32 = 0;
                 let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
+                let mut live_pbas: Vec<Pba> = Vec::new();
+                let mut discarded_pbas: Vec<Pba> = Vec::new();
                 let mut any_discarded = false;
 
-                for frag in &sealed.fragments {
-                    let unit = &frag.unit;
-                    let vol_id = VolumeId(unit.vol_id.clone());
-                    let should_discard = match meta.get_volume(&vol_id)? {
-                        None => true,
-                        Some(vc)
-                            if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    };
-                    if should_discard {
-                        metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
-                        any_discarded = true;
-                        for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                            let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                        }
-                        continue;
-                    }
-                    let live_positions = Self::live_positions_for_unit(unit, pool)?;
-                    if live_positions.is_empty() {
-                        any_discarded = true;
-                        for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                            let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
-                        }
-                        continue;
-                    }
-                    let frag_lbas: Vec<Lba> = live_positions
-                        .iter()
-                        .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                        .collect();
-                    let frag_flags = if unit.dedup_skipped {
-                        FLAG_DEDUP_SKIPPED
-                    } else {
-                        0
-                    };
-                    let hashes_for_promote = if !unit.dedup_skipped {
-                        unit.block_hashes.as_ref()
-                    } else {
-                        None
-                    };
-                    for (i, pos) in live_positions.iter().copied().enumerate() {
-                        let blockmap = BlockmapValue {
-                            pba: sealed.pba,
-                            compression: unit.compression,
-                            unit_compressed_size: unit.compressed_data.len() as u32,
-                            unit_original_size: unit.original_size,
-                            unit_lba_count: unit.lba_count as u16,
-                            offset_in_unit: pos as u16,
-                            crc32: unit.crc32,
-                            slot_offset: frag.slot_offset,
-                            flags: frag_flags,
+                for job in &jobs {
+                    let mut slot_has_live = false;
+                    for frag in &job.sealed.fragments {
+                        let unit = &frag.unit;
+                        let vol_id = VolumeId(unit.vol_id.clone());
+                        let should_discard = match meta.get_volume(&vol_id)? {
+                            None => true,
+                            Some(vc)
+                                if unit.vol_created_at != 0
+                                    && vc.created_at != unit.vol_created_at =>
+                            {
+                                true
+                            }
+                            _ => false,
                         };
-                        batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
-                        if let Some(hashes) = hashes_for_promote {
-                            let hash = hashes[pos];
-                            if hash != [0u8; 8] {
-                                fresh_dedup_pairs.push((
-                                    hash,
-                                    BlockmapValue {
-                                        flags: 0,
-                                        ..blockmap
-                                    },
-                                ));
-                                if let Some(repairs) = &unit.dedup_stale_repairs {
-                                    if let Some(Some(old_entry)) = repairs.get(pos) {
-                                        stale_repairs.push((
-                                            hash,
-                                            *old_entry,
-                                            BlockmapValue {
-                                                flags: 0,
-                                                ..blockmap
-                                            }
-                                            .to_dedup_entry(),
-                                        ));
+                        if should_discard {
+                            metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
+                            any_discarded = true;
+                            all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
+                            continue;
+                        }
+                        let live_positions = Self::live_positions_for_unit(unit, pool)?;
+                        if live_positions.is_empty() {
+                            any_discarded = true;
+                            all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
+                            continue;
+                        }
+                        let frag_lbas: Vec<Lba> = live_positions
+                            .iter()
+                            .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
+                            .collect();
+                        let frag_flags = if unit.dedup_skipped {
+                            FLAG_DEDUP_SKIPPED
+                        } else {
+                            0
+                        };
+                        let hashes_for_promote = if !unit.dedup_skipped {
+                            unit.block_hashes.as_ref()
+                        } else {
+                            None
+                        };
+                        for (i, pos) in live_positions.iter().copied().enumerate() {
+                            let blockmap = BlockmapValue {
+                                pba: job.sealed.pba,
+                                compression: unit.compression,
+                                unit_compressed_size: unit.compressed_data.len() as u32,
+                                unit_original_size: unit.original_size,
+                                unit_lba_count: unit.lba_count as u16,
+                                offset_in_unit: pos as u16,
+                                crc32: unit.crc32,
+                                slot_offset: frag.slot_offset,
+                                flags: frag_flags,
+                            };
+                            batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
+                            if let Some(hashes) = hashes_for_promote {
+                                let hash = hashes[pos];
+                                if hash != [0u8; 8] {
+                                    fresh_dedup_pairs.push((
+                                        hash,
+                                        BlockmapValue {
+                                            flags: 0,
+                                            ..blockmap
+                                        },
+                                    ));
+                                    if let Some(repairs) = &unit.dedup_stale_repairs {
+                                        if let Some(Some(old_entry)) = repairs.get(pos) {
+                                            stale_repairs.push((
+                                                hash,
+                                                *old_entry,
+                                                BlockmapValue {
+                                                    flags: 0,
+                                                    ..blockmap
+                                                }
+                                                .to_dedup_entry(),
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
+                        slot_has_live = true;
+                        all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
                     }
-                    total_refcount += live_positions.len() as u32;
-                    all_seq_lba_ranges.extend(unit.seq_lba_ranges.iter().cloned());
+                    if slot_has_live {
+                        live_pbas.push(job.sealed.pba);
+                    } else {
+                        discarded_pbas.push(job.sealed.pba);
+                    }
                 }
                 Self::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
 
+                for pba in &discarded_pbas {
+                    let _ = allocator.free_one(*pba);
+                }
+
                 if batch_values.is_empty() {
-                    let _ = allocator.free_one(sealed.pba);
-                    return Ok(PackedCommitOutcome::Discarded);
+                    return Ok(PackedCommitOutcome::Discarded {
+                        all_seq_lba_ranges,
+                    });
                 }
 
                 let meta_start = Instant::now();
+                // Packed commits carry their PBA/refcount in each BlockmapValue.
+                // The legacy new_pba/new_refcount arguments are ignored on this
+                // metadb path, which lets one tx cover multiple packed slots.
                 let actual_old_pba_meta = match meta.atomic_batch_write_packed_with_dedup(
                     &batch_values,
-                    sealed.pba,
-                    total_refcount,
+                    Pba(0),
+                    0,
                     &[],
                 ) {
                     Ok(m) => m,
                     Err(e) => {
-                        let _ = allocator.free_one(sealed.pba);
+                        for pba in &live_pbas {
+                            let _ = allocator.free_one(*pba);
+                        }
                         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                         return Err(e);
                     }
@@ -866,14 +1145,38 @@ impl BufferFlusher {
                     stale_repairs,
                     all_seq_lba_ranges,
                     any_discarded,
-                    total_refcount,
+                    slots_written: live_pbas.len() as u64,
+                    fragments_written: jobs
+                        .iter()
+                        .filter(|job| live_pbas.contains(&job.sealed.pba))
+                        .map(|job| job.sealed.fragments.len() as u64)
+                        .sum(),
+                    bytes_written: jobs
+                        .iter()
+                        .filter(|job| live_pbas.contains(&job.sealed.pba))
+                        .map(|job| job.sealed.data.len() as u64)
+                        .sum(),
+                    total_refcount: batch_values.len() as u32,
                 })
             });
 
         match outcome {
-            Ok(PackedCommitOutcome::Discarded) => {
-                Self::deliver_packed_done(buffered_seqs, buffered_completions, done_tx);
-                let _ = pool.advance_tail_for_shard(shard_idx);
+            Ok(PackedCommitOutcome::Discarded { all_seq_lba_ranges }) => {
+                let mark_start = Instant::now();
+                for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
+                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                        tracing::warn!(
+                            seq,
+                            error = %e,
+                            "commit_worker: failed to mark discarded packed entry flushed"
+                        );
+                    }
+                }
+                Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+                for shard_idx in jobs.iter().map(|job| job.shard_idx) {
+                    let _ = pool.advance_tail_for_shard(shard_idx);
+                }
+                Self::deliver_packed_batch_done(jobs, lane_done_txs);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             }
             Ok(PackedCommitOutcome::Committed {
@@ -883,57 +1186,97 @@ impl BufferFlusher {
                 all_seq_lba_ranges,
                 any_discarded,
                 total_refcount,
+                slots_written,
+                fragments_written,
+                bytes_written,
             }) => {
                 if !actual_old_pba_meta.is_empty() {
                     let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
                 }
+                if !fresh_dedup_pairs.is_empty() {
+                    let cand_start = Instant::now();
+                    candidate.insert_many(&fresh_dedup_pairs);
+                    Self::record_elapsed(&metrics.flush_writer_meta_candidate_ns, cand_start);
+                }
+                if !stale_repairs.is_empty() {
+                    let repair_start = Instant::now();
+                    Self::repair_stale_dedup_index(
+                        meta,
+                        metrics,
+                        &stale_repairs,
+                        "commit_worker_packed",
+                    );
+                    Self::record_elapsed(&metrics.flush_writer_meta_repair_ns, repair_start);
+                }
                 metrics
                     .flush_packed_slots_written
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(slots_written, Ordering::Relaxed);
                 metrics
                     .flush_packed_fragments_written
-                    .fetch_add(sealed.fragments.len() as u64, Ordering::Relaxed);
+                    .fetch_add(fragments_written, Ordering::Relaxed);
                 metrics
                     .flush_packed_bytes
-                    .fetch_add(sealed.data.len() as u64, Ordering::Relaxed);
-                Self::deliver_packed_done(buffered_seqs, buffered_completions, done_tx);
-                // Phase 2.2: defer mark_flushed + candidate insert +
-                // stale repair to the paired post_commit thread.
-                let post_job = PostCommitJob {
-                    shard_idx,
-                    mark_ranges: all_seq_lba_ranges,
-                    candidate_pairs: fresh_dedup_pairs,
-                    stale_repairs,
-                };
-                if !post_job.is_empty() {
-                    let _ = post_commit_tx.send(post_job);
-                } else {
+                    .fetch_add(bytes_written, Ordering::Relaxed);
+                let mark_start = Instant::now();
+                for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
+                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                        tracing::warn!(
+                            seq,
+                            error = %e,
+                            "commit_worker: failed to mark packed entry flushed"
+                        );
+                    }
+                }
+                Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+                for shard_idx in jobs.iter().map(|job| job.shard_idx) {
                     let _ = pool.advance_tail_for_shard(shard_idx);
                 }
+                let _ = post_commit_tx;
+                Self::deliver_packed_batch_done(jobs, lane_done_txs);
                 tracing::debug!(
-                    pba = sealed.pba.0,
-                    fragments = sealed.fragments.len(),
+                    slots = slots_written,
+                    fragments = fragments_written,
                     total_lbas = total_refcount,
                     discarded = any_discarded,
-                    "commit_worker: flushed packed slot"
+                    "commit_worker: flushed packed slot batch"
                 );
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             }
             Err(e) => {
                 metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
-                    pba = sealed.pba.0,
                     error = %e,
-                    "commit_worker: packed slot commit failed; defer_retry buffered seqs"
+                    "commit_worker: packed slot batch commit failed; defer_retry buffered seqs"
                 );
-                if !buffered_seqs.is_empty() {
-                    in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
+                for job in &jobs {
+                    let _ = allocator.free_one(job.sealed.pba);
+                    if !job.buffered_seqs.is_empty() {
+                        in_flight_tracker.defer_retry(&job.buffered_seqs, Self::RETRY_BACKOFF);
+                    }
+                    for dc in &job.buffered_completions {
+                        in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
+                    }
                 }
-                for dc in &buffered_completions {
-                    in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
-                }
-                Self::deliver_packed_done(buffered_seqs, buffered_completions, done_tx);
+                Self::deliver_packed_batch_done(jobs, lane_done_txs);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+            }
+        }
+    }
+
+    fn deliver_packed_batch_done(
+        jobs: Vec<PackedCommitJob>,
+        lane_done_txs: &[Sender<Vec<u64>>],
+    ) {
+        for job in jobs {
+            if let Some(done_tx) = lane_done_txs
+                .get(job.shard_idx)
+                .or_else(|| lane_done_txs.first())
+            {
+                Self::deliver_packed_done(
+                    job.buffered_seqs,
+                    job.buffered_completions,
+                    done_tx,
+                );
             }
         }
     }
@@ -956,7 +1299,9 @@ impl BufferFlusher {
 
 #[allow(clippy::large_enum_variant)]
 enum PackedCommitOutcome {
-    Discarded,
+    Discarded {
+        all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
+    },
     Committed {
         actual_old_pba_meta: HashMap<Pba, RemapCleanup>,
         fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
@@ -964,5 +1309,21 @@ enum PackedCommitOutcome {
         all_seq_lba_ranges: Vec<(u64, Lba, u32)>,
         any_discarded: bool,
         total_refcount: u32,
+        slots_written: u64,
+        fragments_written: u64,
+        bytes_written: u64,
     },
+}
+
+fn lbas_in_job(job: &CommitJob) -> usize {
+    match job {
+        CommitJob::Passthrough(pj) => pj.units.iter().map(|ucd| ucd.unit.lba_count as usize).sum(),
+        CommitJob::Packed(pj) => pj
+            .sealed
+            .fragments
+            .iter()
+            .map(|frag| frag.unit.lba_count as usize)
+            .sum::<usize>()
+            .saturating_add(pj.buffered_seqs.len()),
+    }
 }

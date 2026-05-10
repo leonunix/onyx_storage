@@ -26,6 +26,7 @@ pub struct SpaceAllocator {
     lane_caches: Vec<Mutex<Vec<Pba>>>,
     /// Per-lane contiguous extent caches for raw multi-block writes.
     lane_extent_caches: Vec<Mutex<Vec<Extent>>>,
+    alloc_tracker: Option<Mutex<BTreeSet<Pba>>>,
 }
 
 impl SpaceAllocator {
@@ -48,6 +49,15 @@ impl SpaceAllocator {
         }
         let lane_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
         let lane_extent_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
+        let alloc_tracker = std::env::var("ONYX_ALLOC_TRACK")
+            .map(|value| {
+                matches!(
+                    value.as_str(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
+            .unwrap_or(false)
+            .then(|| Mutex::new(BTreeSet::new()));
         Self {
             total_blocks,
             free_extents: Mutex::new(free_extents),
@@ -57,6 +67,7 @@ impl SpaceAllocator {
             free_blocks: AtomicU64::new(usable_blocks),
             lane_caches,
             lane_extent_caches,
+            alloc_tracker,
         }
     }
 
@@ -114,6 +125,13 @@ impl SpaceAllocator {
         *self.free_extents.lock().unwrap() = free;
         self.retired_extents.lock().unwrap().clear();
         self.clear_lane_caches();
+        if let Some(tracker) = &self.alloc_tracker {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.clear();
+            for &pba in &allocated {
+                tracker.insert(Pba(pba));
+            }
+        }
         self.allocated_blocks.store(alloc_count, Ordering::Relaxed);
         self.free_blocks.store(free_count, Ordering::Relaxed);
 
@@ -142,11 +160,55 @@ impl SpaceAllocator {
         self.hazards.wait_extent_clear(start, count);
     }
 
+    fn track_alloc(&self, extent: Extent, context: &'static str) -> OnyxResult<()> {
+        let Some(tracker) = &self.alloc_tracker else {
+            return Ok(());
+        };
+        let mut tracker = tracker.lock().unwrap();
+        for offset in 0..extent.count {
+            let pba = Pba(extent.start.0 + offset as u64);
+            if !tracker.insert(pba) {
+                tracing::error!(
+                    pba = pba.0,
+                    start = extent.start.0,
+                    blocks = extent.count,
+                    context,
+                    "allocator live-PBA tracker detected duplicate allocation"
+                );
+                return Err(OnyxError::Config(format!(
+                    "allocator duplicate allocation pba={} context={context}",
+                    pba.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn track_release(&self, extent: Extent, context: &'static str) {
+        let Some(tracker) = &self.alloc_tracker else {
+            return;
+        };
+        let mut tracker = tracker.lock().unwrap();
+        for offset in 0..extent.count {
+            let pba = Pba(extent.start.0 + offset as u64);
+            if !tracker.remove(&pba) {
+                tracing::warn!(
+                    pba = pba.0,
+                    start = extent.start.0,
+                    blocks = extent.count,
+                    context,
+                    "allocator live-PBA tracker released a non-live PBA"
+                );
+            }
+        }
+    }
+
     /// Allocate a single block. Returns PBA.
     pub fn allocate_one(&self) -> OnyxResult<Pba> {
         {
             let mut free = self.free_extents.lock().unwrap();
             if let Some(pba) = Self::alloc_one_from_set(&mut free) {
+                self.track_alloc(Extent::single(pba), "allocate_one")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(1, Ordering::Relaxed);
                 return Ok(pba);
@@ -157,6 +219,7 @@ impl SpaceAllocator {
             self.drain_lane_caches();
             let mut free = self.free_extents.lock().unwrap();
             if let Some(pba) = Self::alloc_one_from_set(&mut free) {
+                self.track_alloc(Extent::single(pba), "allocate_one_retry")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(1, Ordering::Relaxed);
                 return Ok(pba);
@@ -187,6 +250,7 @@ impl SpaceAllocator {
             let mut cache = self.lane_caches[lane].lock().unwrap();
             if let Some(pba) = cache.pop() {
                 // Count as allocated only when given to caller
+                self.track_alloc(Extent::single(pba), "allocate_one_for_lane_cache")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(1, Ordering::Relaxed);
                 return Ok(pba);
@@ -204,6 +268,10 @@ impl SpaceAllocator {
             }
         };
         // First block goes to caller (counted as allocated), rest into cache
+        self.track_alloc(
+            Extent::single(first_pba),
+            "allocate_one_for_lane_refill",
+        )?;
         self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
         self.free_blocks.fetch_sub(1, Ordering::Relaxed);
         if refill > 1 {
@@ -283,6 +351,7 @@ impl SpaceAllocator {
         {
             let mut cache = self.lane_extent_caches[lane].lock().unwrap();
             if let Some(extent) = Self::take_from_extent_cache(&mut cache, count) {
+                self.track_alloc(extent, "allocate_extent_for_lane_cache")?;
                 self.allocated_blocks
                     .fetch_add(count as u64, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
@@ -303,6 +372,7 @@ impl SpaceAllocator {
         };
 
         let result = Extent::new(refill.start, count);
+        self.track_alloc(result, "allocate_extent_for_lane_refill")?;
         self.allocated_blocks
             .fetch_add(count as u64, Ordering::Relaxed);
         self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
@@ -337,6 +407,7 @@ impl SpaceAllocator {
                         extent.count - count,
                     ));
                 }
+                self.track_alloc(result, "allocate_extent")?;
                 self.allocated_blocks
                     .fetch_add(count as u64, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
@@ -356,6 +427,7 @@ impl SpaceAllocator {
             let largest = free.iter().max_by_key(|e| e.count).copied();
             if let Some(extent) = largest {
                 free.remove(&extent);
+                self.track_alloc(extent, "allocate_extent_largest")?;
                 self.allocated_blocks
                     .fetch_add(extent.count as u64, Ordering::Relaxed);
                 self.free_blocks
@@ -476,6 +548,7 @@ impl SpaceAllocator {
             }
 
             Self::coalesce_and_insert(&mut free, extent);
+            self.track_release(extent, "reclaim_retired_extent");
             self.allocated_blocks
                 .fetch_sub(extent.count as u64, Ordering::Relaxed);
             self.free_blocks
@@ -497,6 +570,7 @@ impl SpaceAllocator {
         let mut free = self.free_extents.lock().unwrap();
         self.ensure_not_free_or_retired_after_wait(extent, &free)?;
         Self::coalesce_and_insert(&mut free, extent);
+        self.track_release(extent, "free_extent");
         self.allocated_blocks
             .fetch_sub(extent.count as u64, Ordering::Relaxed);
         self.free_blocks
