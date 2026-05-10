@@ -1398,8 +1398,7 @@ fn lbas_in_job(job: &CommitJob) -> usize {
             .fragments
             .iter()
             .map(|frag| frag.unit.lba_count as usize)
-            .sum::<usize>()
-            .saturating_add(pj.buffered_seqs.len()),
+            .sum(),
     }
 }
 
