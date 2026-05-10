@@ -93,6 +93,7 @@ impl DurabilityWatermarkHandle {
         max_flushed_seq: Arc<AtomicU64>,
         durable_seq: Arc<AtomicU64>,
         checkpoint_interval: std::time::Duration,
+        checkpoint_gates_ring_reclaim: bool,
     ) -> Self {
         const RING_BUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         let stop = Arc::new(AtomicBool::new(false));
@@ -108,17 +109,21 @@ impl DurabilityWatermarkHandle {
                 while !stop_clone.load(Ordering::Relaxed) {
                     std::thread::sleep(RING_BUMP_INTERVAL);
 
-                    // Cheap path (every tick): forward `durable_seq` to
-                    // wherever `max_flushed_seq` has reached. Pure atomic
-                    // load + CAS, no metadb lock acquired.
                     let captured = max_flushed_seq.load(Ordering::Relaxed);
-                    let bumped = durable_seq
-                        .fetch_update(
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                            |cur| if captured > cur { Some(captured) } else { None },
-                        )
-                        .is_ok();
+                    let bumped = if checkpoint_gates_ring_reclaim {
+                        false
+                    } else {
+                        // Cheap path (every tick): forward `durable_seq` to
+                        // wherever `max_flushed_seq` has reached. Pure atomic
+                        // load + CAS, no metadb lock acquired.
+                        durable_seq
+                            .fetch_update(
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                                |cur| if captured > cur { Some(captured) } else { None },
+                            )
+                            .is_ok()
+                    };
 
                     // After durable_seq advances, kick each shard so
                     // `reclaim_log_prefix` re-runs against the new
@@ -150,31 +155,59 @@ impl DurabilityWatermarkHandle {
                         // Nothing new to checkpoint; defer to next round.
                         continue;
                     }
-                    match meta.try_request_durable_checkpoint() {
-                        Ok(true) => {
-                            last_checkpoint_request_seq = captured;
-                            tracing::debug!(
-                                max_flushed_seq = captured,
-                                "durability watermark requested metadb checkpoint"
-                            );
+                    if checkpoint_gates_ring_reclaim {
+                        match meta.sync_durable() {
+                            Ok(()) => {
+                                last_checkpoint_request_seq = captured;
+                                durable_seq.store(captured, Ordering::Release);
+                                for idx in 0..shard_count {
+                                    let _ = buffer_pool_thread.advance_tail_for_shard(idx);
+                                }
+                                tracing::debug!(
+                                    max_flushed_seq = captured,
+                                    "durability watermark completed metadb checkpoint"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "durability watermark checkpoint failed; ring reclaim deferred"
+                                );
+                            }
                         }
-                        Ok(false) => {
-                            tracing::debug!(
-                                max_flushed_seq = captured,
-                                "durability watermark skipped metadb checkpoint; previous checkpoint still running"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "durability watermark checkpoint request failed; WAL prune deferred to next cycle"
-                            );
+                    } else {
+                        match meta.try_request_durable_checkpoint() {
+                            Ok(true) => {
+                                last_checkpoint_request_seq = captured;
+                                tracing::debug!(
+                                    max_flushed_seq = captured,
+                                    "durability watermark requested metadb checkpoint"
+                                );
+                            }
+                            Ok(false) => {
+                                tracing::debug!(
+                                    max_flushed_seq = captured,
+                                    "durability watermark skipped metadb checkpoint; previous checkpoint still running"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "durability watermark checkpoint request failed; WAL prune deferred to next cycle"
+                                );
+                            }
                         }
                     }
                 }
                 // Final checkpoint at shutdown so the WAL segment-prune
                 // catches up before the process exits.
                 let captured = max_flushed_seq.load(Ordering::Relaxed);
+                if let Err(e) = meta.sync_durable() {
+                    tracing::error!(
+                        error = %e,
+                        "durability watermark final checkpoint failed at shutdown"
+                    );
+                }
                 let _ = durable_seq.fetch_update(
                     Ordering::Release,
                     Ordering::Relaxed,
@@ -182,12 +215,6 @@ impl DurabilityWatermarkHandle {
                 );
                 for idx in 0..shard_count {
                     let _ = buffer_pool_thread.advance_tail_for_shard(idx);
-                }
-                if let Err(e) = meta.sync_durable() {
-                    tracing::error!(
-                        error = %e,
-                        "durability watermark final checkpoint failed at shutdown"
-                    );
                 }
             })
             .expect("spawn durability-watermark thread");
@@ -799,6 +826,7 @@ impl OnyxEngine {
             buffer_pool.max_flushed_seq_handle(),
             buffer_pool.durable_seq_handle(),
             config.meta.checkpoint_interval(),
+            config.meta.unlogged_flush_commits,
         );
 
         Ok(Self {
@@ -1288,6 +1316,7 @@ impl OnyxEngine {
             buffer_pool.max_flushed_seq_handle(),
             buffer_pool.durable_seq_handle(),
             std::time::Duration::from_millis(50),
+            config.meta.unlogged_flush_commits,
         );
 
         Ok(Self {

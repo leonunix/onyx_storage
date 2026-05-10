@@ -408,6 +408,7 @@ impl BufferFlusher {
                 shard_idx,
                 buffered_seqs,
                 buffered_completions,
+                enqueued_at: Instant::now(),
             });
             let send_start = Instant::now();
             let _ = commit_worker_txs[tx_idx].send(job);

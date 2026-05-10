@@ -459,6 +459,7 @@ impl BufferFlusher {
                 let job = CommitJob::Passthrough(PassthroughCommitJob {
                     vol_id: VolumeId(vol),
                     units: units_for_vol,
+                    enqueued_at: Instant::now(),
                 });
                 let send_start = Instant::now();
                 let _ = commit_worker_txs[tx_idx].send(job);

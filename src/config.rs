@@ -145,6 +145,12 @@ pub struct MetaConfig {
     /// queued commits first, so this should stay tiny on low-latency NVMe.
     #[serde(default = "default_metadb_group_commit_timeout_us")]
     pub group_commit_timeout_us: u64,
+    /// Experimental NVMe mode: ordinary flusher metadata commits bypass the
+    /// metadb WAL and rely on LV2's durable write log until the next metadb
+    /// checkpoint. Leave off unless the buffer device has enough headroom to
+    /// retain flushed entries until checkpoint durability advances.
+    #[serde(default)]
+    pub unlogged_flush_commits: bool,
     /// Optional separate WAL directory for the metadata store.
     pub wal_dir: Option<PathBuf>,
     /// Number of metadb dedup LSM shards. Must be a power of two in
@@ -243,6 +249,7 @@ impl Default for MetaConfig {
             lsm_bloom_bits_per_entry: default_lsm_bloom_bits_per_entry(),
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
+            unlogged_flush_commits: false,
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
             shards_per_partition: default_metadb_shards_per_partition(),

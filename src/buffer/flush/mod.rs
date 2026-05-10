@@ -806,6 +806,7 @@ impl BufferFlusher {
             let meta_c = meta.clone();
             let candidate_c = candidate.clone();
             let metrics_c = metrics.clone();
+            let lane_done_txs_c = lane_done_txs.clone();
             let h = thread::Builder::new()
                 .name(format!("flusher-post-commit-{}", worker_idx))
                 .spawn(move || {
@@ -817,6 +818,7 @@ impl BufferFlusher {
                         &meta_c,
                         &candidate_c,
                         &metrics_c,
+                        &lane_done_txs_c,
                     );
                 })
                 .expect("failed to spawn post-commit worker");

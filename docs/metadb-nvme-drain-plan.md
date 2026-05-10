@@ -1044,3 +1044,142 @@ it serializes independent lanes
 it hides checkpoint/recovery cost
 it requires unbounded memory or queue growth
 ```
+
+## 2026-05-10 Commit Worker Probe
+
+Workload:
+
+```text
+run_dir base          .dev/fio-dedupe-compress-soak/
+fio                  mixed randrw 50/50, jobs=8, iodepth=4
+rate_iops            12500/job
+runtime              30s
+config               config/nvme-detailed-numa-split.toml
+dedup/compression    enabled, lz4
+```
+
+Instrumentation added:
+
+```text
+flush_commit_worker_queue_wait_ns
+flush_commit_worker_service_ns
+flush_commit_worker_jobs
+flush_commit_worker_job_lbas
+flush_commit_worker_drain_batches/jobs/lbas/max
+```
+
+Baseline probe (`codex-commitworker-probe-mixed-30s`):
+
+```text
+fio read/write       29.8k / 29.8k IOPS
+flush meta drain     70.9k LBA/s
+metadb commits       426.6/s
+lbas/commit          166
+avg worker q wait    45.3ms/job
+commit send blocked  253 core-s
+CRC/errors           0 / 0
+```
+
+Rejected experiment: `COMMIT_WORKER_QUEUE_CAP=1024`.
+
+```text
+run_dir              codex-commitworker-queue1024-mixed-30s
+result               worse immediately
+5s meta_lbas         9.1k total
+avg worker q wait    ~1.5s/job
+verdict              deeper queue hides backpressure and piles jobs up;
+                     do not use unbounded/deep queue as the fix.
+```
+
+Accepted direction: move passthrough `mark_flushed` + `done_tx` to
+post_commit, preserving `mark_flushed` before `done_tx`.
+
+```text
+run_dir              codex-postcommit-done-mixed-30s
+fio read/write       35.3k / 35.3k IOPS
+flush meta drain     97.0k LBA/s
+metadb commits       191.8/s
+lbas/commit          506
+avg worker q wait    44.0ms/job
+commit send blocked  384 core-s
+CRC/errors           0 / 0
+```
+
+Interpretation:
+
+```text
+dedup/compress are not starving writer; upstream send blocks are high.
+commit_worker/metadb remains the downstream choke point.
+post_commit mark+done improves tx shape enough to raise backend drain ~37%
+and foreground mixed IOPS ~19%, but queue wait is still ~44ms/job.
+Next target: reduce commit count / raise lbas per metadb tx without deep
+queues. Focus on packed/small-unit commit shape and metadb apply fixed cost.
+```
+
+Split metrics (`codex-meta-split-mixed-30s`):
+
+```text
+fio read/write       36.7k / 36.7k IOPS
+flush meta drain     100.7k LBA/s
+metadb commits       635.6/s
+lbas/commit          158
+PT lbas/commit       276
+packed lbas/commit   10.7
+packed contribution  90k LBA, but 8461 commits (~44% of all commits)
+avg worker q wait    26.6ms/job
+CRC/errors           0 / 0
+```
+
+Interpretation:
+
+```text
+Packed fragments are only ~3% of committed LBAs, but their tiny tx shape
+burns nearly half of commit count. The writer already batches packed-slot
+LV3 IO (avg ~8.4 slots/batch, max 163), then dispatches each sealed slot as
+an individual commit job. Biggest immediate target is packed metadata tx
+shape, not compression/dedup throughput.
+```
+
+Rejected experiment: worker-level packed-first merge
+(`codex-packed-coalesce-mixed-30s`).
+
+```text
+change               collect all packed jobs in a worker drain and commit them
+                     before passthrough
+packed lbas/commit   84
+flush meta drain     9.6k LBA/s
+avg worker q wait    386ms/job
+verdict              bad. It proves packed can be coalesced, but packed-first
+                     reordering pins passthrough completions and lets in-flight
+                     work pile up.
+```
+
+Accepted experiment: PT-first, packed-tail merge
+(`codex-packed-tail-mixed-30s`).
+
+```text
+change               keep PT first inside each worker drain, then commit all
+                     packed jobs at the drain tail
+fio read/write       42.9k / 42.9k IOPS
+flush meta drain     119.6k LBA/s
+metadb commits       168.9/s
+lbas/commit          708
+PT lbas/commit       873
+packed lbas/commit   101
+packed commits       1085 (down from 8461)
+avg worker q wait    36.1ms/job
+CRC/errors           0 / 0
+```
+
+Interpretation:
+
+```text
+This is the current best run. It improves backend drain from 97.0k to
+119.6k LBA/s after post_commit, and from 70.9k to 119.6k LBA/s vs the
+initial commit-worker probe. Foreground mixed IOPS rises to ~43k/43k.
+The remaining bottleneck is still commit-worker send/queue pressure:
+commit_send_ns is high and queue wait is still tens of ms. Next cuts should
+avoid deep queues and avoid putting packed ahead of PT. Candidate directions:
+packed as an independent low-priority commit stream, post_commit for packed
+mark_flushed/done, and metadb apply fixed-cost reduction.
+```

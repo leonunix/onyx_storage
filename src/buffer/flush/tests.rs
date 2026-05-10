@@ -5,6 +5,7 @@ use crate::meta::store::{MetaStore, RemapCleanup};
 use crate::types::{VolumeConfig, ZoneId};
 use crate::zone::worker::ZoneWorker;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use tempfile::{tempdir, NamedTempFile};
 
 fn setup_flush_test_env() -> (
@@ -457,8 +458,17 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
     let meta_pc = meta.clone();
     let candidate_pc = candidate.clone();
     let metrics_pc = metrics.clone();
+    let done_txs_pc = vec![done_tx.clone()];
     let post_commit_handle = std::thread::spawn(move || {
-        BufferFlusher::post_commit_loop(0, &post_commit_rx, &pool_pc, &meta_pc, &candidate_pc, &metrics_pc);
+        BufferFlusher::post_commit_loop(
+            0,
+            &post_commit_rx,
+            &pool_pc,
+            &meta_pc,
+            &candidate_pc,
+            &metrics_pc,
+            &done_txs_pc,
+        );
     });
     for sealed in sealed_slots.into_iter() {
         let job = super::writer::PackedCommitJob {
@@ -466,6 +476,7 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
             shard_idx: 0,
             buffered_seqs: Vec::new(),
             buffered_completions: Vec::new(),
+            enqueued_at: Instant::now(),
         };
         BufferFlusher::commit_packed_job(
             job,
@@ -574,14 +585,24 @@ fn passthrough_commit_job_subbatches_above_threshold() {
     let job = super::writer::PassthroughCommitJob {
         vol_id: VolumeId("flush-race".into()),
         units,
+        enqueued_at: Instant::now(),
     };
     let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
     let pool_pc = pool.clone();
     let meta_pc = meta.clone();
     let candidate_pc = candidate.clone();
     let metrics_pc = metrics.clone();
+    let done_txs_pc = vec![done_tx.clone()];
     let post_commit_handle = std::thread::spawn(move || {
-        BufferFlusher::post_commit_loop(0, &post_commit_rx, &pool_pc, &meta_pc, &candidate_pc, &metrics_pc);
+        BufferFlusher::post_commit_loop(
+            0,
+            &post_commit_rx,
+            &pool_pc,
+            &meta_pc,
+            &candidate_pc,
+            &metrics_pc,
+            &done_txs_pc,
+        );
     });
     BufferFlusher::commit_passthrough_job(
         job,
@@ -634,12 +655,14 @@ fn coalesced_passthrough_done_routes_to_origin_shards() {
     let job = super::writer::PassthroughCommitJob {
         vol_id: VolumeId("flush-race".into()),
         units,
+        enqueued_at: Instant::now(),
     };
     let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
     let pool_pc = pool.clone();
     let meta_pc = meta.clone();
     let candidate_pc = candidate.clone();
     let metrics_pc = metrics.clone();
+    let done_txs_pc = vec![done0_tx.clone(), done1_tx.clone()];
     let post_commit_handle = std::thread::spawn(move || {
         BufferFlusher::post_commit_loop(
             0,
@@ -648,6 +671,7 @@ fn coalesced_passthrough_done_routes_to_origin_shards() {
             &meta_pc,
             &candidate_pc,
             &metrics_pc,
+            &done_txs_pc,
         );
     });
     BufferFlusher::commit_passthrough_job(
@@ -706,6 +730,7 @@ fn commit_worker_publishes_candidates_before_post_commit() {
             seqs: vec![seq],
             completion: None,
         }],
+        enqueued_at: Instant::now(),
     };
 
     BufferFlusher::commit_passthrough_job(
@@ -727,9 +752,17 @@ fn commit_worker_publishes_candidates_before_post_commit() {
         .lookup(&hash)
         .expect("candidate must be visible before post_commit drains");
     assert_eq!(published.pba, pba);
-    assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap(), vec![seq]);
-    assert!(post_commit_rx.try_recv().is_err());
-    assert!(pool.pending_entry_arc(seq).is_none());
+    let post = post_commit_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("passthrough commit should defer mark_flushed");
+    assert_eq!(post.mark_ranges, vec![(seq, lba, 1)]);
+    assert_eq!(post.done_seqs, vec![seq]);
+    assert!(
+        post.candidate_pairs.is_empty(),
+        "candidate publication stays synchronous with the commit worker"
+    );
+    assert!(post.stale_repairs.is_empty());
+    assert!(done_rx.try_recv().is_err());
 }
 
 #[test]

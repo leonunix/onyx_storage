@@ -31,6 +31,7 @@ const DEDUP_PERSIST_BATCH_LIMIT: usize = crate::dedup::config::DEDUP_PUT_BATCH_H
 pub(crate) struct MetadbBackend {
     db: Arc<Db>,
     checkpoint: AsyncCheckpoint,
+    unlogged_flush_commits: bool,
     catalog: Mutex<VolumeCatalog>,
     volume_ordinals: DashMap<String, VolumeOrdinal>,
     catalog_path: PathBuf,
@@ -101,6 +102,7 @@ impl MetadbBackend {
         Ok(Self {
             db,
             checkpoint,
+            unlogged_flush_commits: config.unlogged_flush_commits,
             catalog: Mutex::new(catalog),
             volume_ordinals,
             catalog_path,
@@ -491,7 +493,11 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        let (_, outcomes) = tx.commit_with_outcomes()?;
+        let (_, outcomes) = if self.unlogged_flush_commits {
+            tx.commit_unlogged_with_outcomes()?
+        } else {
+            tx.commit_with_outcomes()?
+        };
         newly_zeroed_from_remaps(
             batch_values.iter().map(|(_, value)| *value),
             outcomes.into_iter().take(batch_values.len()).collect(),
@@ -536,7 +542,11 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        let (_, outcomes) = tx.commit_with_outcomes()?;
+        let (_, outcomes) = if self.unlogged_flush_commits {
+            tx.commit_unlogged_with_outcomes()?
+        } else {
+            tx.commit_with_outcomes()?
+        };
         let remap_count = new_values.len();
         newly_zeroed_from_remaps(new_values, outcomes.into_iter().take(remap_count).collect())
     }
@@ -579,7 +589,11 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        let (_, outcomes) = tx.commit_with_outcomes()?;
+        let (_, outcomes) = if self.unlogged_flush_commits {
+            tx.commit_unlogged_with_outcomes()?
+        } else {
+            tx.commit_with_outcomes()?
+        };
         let remap_count = new_values.len();
         newly_zeroed_from_remaps(new_values, outcomes.into_iter().take(remap_count).collect())
     }
@@ -1178,6 +1192,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.group_commit_max_batch_bytes = 16 * 1024 * 1024;
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
+    cfg.unlogged_commits_enabled = config.unlogged_flush_commits;
     cfg.dedup_shards = config.dedup_shards;
     cfg.shards_per_partition = config.shards_per_partition;
     cfg.dedup_cuckoo_buckets = config.dedup_cuckoo_buckets;

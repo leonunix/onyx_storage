@@ -3,11 +3,11 @@
 //!
 //! Shard writer threads now do alloc + LV3 IO and hand a `CommitJob`
 //! to the worker indexed by `hash(vol_id) % NUM_COMMIT_WORKERS`. Each
-//! worker drains its FIFO queue and runs the metadb commit + cleanup
-//! + `mark_flushed` + `done_tx` chain serially. Same volume always
-//! lands on the same worker, so per-volume LSN dispatch contention
-//! drops to zero. With 16 shard writers and one volume, this collapses
-//! 16 concurrent committers to 1 — the metadb sweet spot.
+//! worker drains its FIFO queue and runs the metadb commit + cleanup.
+//! Passthrough `mark_flushed` + `done_tx` are handed to the paired
+//! post_commit worker so the commit worker can return to metadb
+//! sooner. Same volume always lands on the same worker, so per-volume
+//! LSN dispatch contention drops to zero.
 
 use super::*;
 
@@ -45,6 +45,7 @@ pub(in crate::buffer::flush) struct PassthroughCommitJob {
     /// one PassthroughCommitJob per volume before pushing.
     pub vol_id: VolumeId,
     pub units: Vec<UnitCommitData>,
+    pub enqueued_at: Instant,
 }
 
 pub(in crate::buffer::flush) struct PackedCommitJob {
@@ -55,6 +56,7 @@ pub(in crate::buffer::flush) struct PackedCommitJob {
     /// publishes the slot.
     pub buffered_seqs: Vec<u64>,
     pub buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+    pub enqueued_at: Instant,
 }
 
 pub(in crate::buffer::flush) enum CommitJob {
@@ -70,6 +72,10 @@ struct UnitMeta {
     live_positions: Vec<usize>,
     fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
     stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
+}
+
+struct PassthroughChunkOutcome {
+    old_pba_meta: HashMap<Pba, RemapCleanup>,
 }
 
 /// Stable hash + shard sub-route → worker index. With `per_vol = 1`
@@ -252,27 +258,12 @@ impl BufferFlusher {
         post_commit_tx: &Sender<PostCommitJob>,
         target_lbas_per_tx: usize,
     ) {
+        Self::record_commit_worker_drain(metrics, &jobs);
         let mut pending_pt: Option<PassthroughCommitJob> = None;
         let mut pending_packed: Vec<PackedCommitJob> = Vec::new();
         for job in jobs {
             match job {
                 CommitJob::Passthrough(mut pj) => {
-                    if !pending_packed.is_empty() {
-                        let ready = std::mem::take(&mut pending_packed);
-                        Self::dispatch_packed_jobs(
-                            ready,
-                            pool,
-                            meta,
-                            lifecycle,
-                            allocator,
-                            in_flight_tracker,
-                            metrics,
-                            lane_cleanup_txs,
-                            candidate,
-                            lane_done_txs,
-                            post_commit_tx,
-                        );
-                    }
                     match pending_pt.as_mut() {
                         Some(existing) if existing.vol_id == pj.vol_id => {
                             existing.units.append(&mut pj.units);
@@ -299,25 +290,31 @@ impl BufferFlusher {
                     }
                 }
                 CommitJob::Packed(pj) => {
-                    if let Some(ready) = pending_pt.take() {
-                        Self::dispatch_passthrough_job(
-                            ready,
-                            pool,
-                            meta,
-                            lifecycle,
-                            allocator,
-                            in_flight_tracker,
-                            metrics,
-                            lane_cleanup_txs,
-                            candidate,
-                            lane_done_txs,
-                            post_commit_tx,
-                            target_lbas_per_tx,
-                        );
-                    }
                     pending_packed.push(pj);
                 }
             }
+        }
+
+        // Keep foreground-shaped passthrough completions ahead of packed metadata
+        // work within a worker drain. NVMe mixed runs showed that globally
+        // reordering packed before passthrough improves packed lbas/commit but
+        // explodes commit-worker queue wait. Folding packed only at the drain
+        // tail keeps PT moving while still collapsing many one-slot packed txs.
+        if let Some(pj) = pending_pt {
+            Self::dispatch_passthrough_job(
+                pj,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                in_flight_tracker,
+                metrics,
+                lane_cleanup_txs,
+                candidate,
+                lane_done_txs,
+                post_commit_tx,
+                target_lbas_per_tx,
+            );
         }
 
         if !pending_packed.is_empty() {
@@ -335,23 +332,46 @@ impl BufferFlusher {
                 post_commit_tx,
             );
         }
+    }
 
-        if let Some(pj) = pending_pt {
-            Self::dispatch_passthrough_job(
-                pj,
-                pool,
-                meta,
-                lifecycle,
-                allocator,
-                in_flight_tracker,
-                metrics,
-                lane_cleanup_txs,
-                candidate,
-                lane_done_txs,
-                post_commit_tx,
-                target_lbas_per_tx,
-            );
-        }
+    fn record_commit_worker_drain(metrics: &EngineMetrics, jobs: &[CommitJob]) {
+        let now = Instant::now();
+        let drain_jobs = jobs.len() as u64;
+        let drain_lbas = jobs.iter().map(lbas_in_job).sum::<usize>() as u64;
+        let queue_wait_ns = jobs
+            .iter()
+            .map(|job| {
+                now.saturating_duration_since(enqueued_at_for_job(job))
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64
+            })
+            .sum::<u64>();
+        metrics
+            .flush_commit_worker_drain_batches
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_commit_worker_drain_jobs
+            .fetch_add(drain_jobs, Ordering::Relaxed);
+        metrics
+            .flush_commit_worker_drain_lbas
+            .fetch_add(drain_lbas, Ordering::Relaxed);
+        metrics
+            .flush_commit_worker_queue_wait_ns
+            .fetch_add(queue_wait_ns, Ordering::Relaxed);
+        metrics
+            .flush_commit_worker_jobs
+            .fetch_add(drain_jobs, Ordering::Relaxed);
+        metrics
+            .flush_commit_worker_job_lbas
+            .fetch_add(drain_lbas, Ordering::Relaxed);
+        crate::metrics::record_counter_max(
+            &metrics.flush_commit_worker_drain_jobs_max,
+            drain_jobs,
+        );
+        crate::metrics::record_counter_max(
+            &metrics.flush_commit_worker_drain_lbas_max,
+            drain_lbas,
+        );
     }
 
     fn dispatch_passthrough_job(
@@ -369,6 +389,7 @@ impl BufferFlusher {
         target_lbas_per_tx: usize,
     ) {
         let primary_shard = pj.units.first().map(|u| u.shard_idx).unwrap_or(0);
+        let service_start = Instant::now();
         let cleanup_tx = lane_cleanup_txs
             .get(primary_shard)
             .or_else(|| lane_cleanup_txs.first());
@@ -393,6 +414,7 @@ impl BufferFlusher {
             post_commit_tx,
             target_lbas_per_tx,
         );
+        Self::record_elapsed(&metrics.flush_commit_worker_service_ns, service_start);
     }
 
     fn dispatch_packed_jobs(
@@ -411,6 +433,7 @@ impl BufferFlusher {
         let Some(first) = jobs.first() else {
             return;
         };
+        let service_start = Instant::now();
         let cleanup_tx = lane_cleanup_txs
             .get(first.shard_idx)
             .or_else(|| lane_cleanup_txs.first());
@@ -434,6 +457,7 @@ impl BufferFlusher {
             lane_done_txs,
             post_commit_tx,
         );
+        Self::record_elapsed(&metrics.flush_commit_worker_service_ns, service_start);
     }
 
     /// Commit a single-volume passthrough batch. Acquires the volume's
@@ -456,7 +480,7 @@ impl BufferFlusher {
         target_lbas_per_tx: usize,
     ) {
         let total_start = Instant::now();
-        let PassthroughCommitJob { vol_id, units } = job;
+        let PassthroughCommitJob { vol_id, units, .. } = job;
 
         // Acquire lifecycle read lock for this volume only — all units
         // in the job target the same volume by construction. Held
@@ -648,7 +672,9 @@ impl BufferFlusher {
                 );
             }
 
-            accum_old_meta
+            PassthroughChunkOutcome {
+                old_pba_meta: accum_old_meta,
+            }
         });
 
         // Post-commit work outside the L2P commit lock. Keep
@@ -714,35 +740,16 @@ impl BufferFlusher {
                 .extend(ucd.unit.seq_lba_ranges.iter().cloned());
         }
 
-        if !actual_old_pba_meta.is_empty() {
-            let _ = cleanup_tx.send(actual_old_pba_meta.into_values().collect());
+        if !actual_old_pba_meta.old_pba_meta.is_empty() {
+            let _ = cleanup_tx.send(actual_old_pba_meta.old_pba_meta.into_values().collect());
         }
         Self::record_elapsed(&metrics.flush_writer_cleanup_ns, cleanup_start);
 
-        let mark_start = Instant::now();
-        let all_unit_shards: std::collections::HashSet<usize> =
-            units.iter().map(|ucd| ucd.shard_idx).collect();
-        for (shard_idx, mark_ranges) in post_mark_ranges_by_shard {
-            for (seq, lba_start, lba_count) in mark_ranges {
-                if let Err(e) = pool.mark_flushed(seq, lba_start, lba_count) {
-                    tracing::warn!(
-                        seq,
-                        shard_idx,
-                        error = %e,
-                        "commit_worker: failed to mark entry flushed"
-                    );
-                }
-            }
-            let _ = pool.advance_tail_for_shard(shard_idx);
-        }
-        Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
-        for shard_idx in &all_unit_shards {
-            let _ = pool.advance_tail_for_shard(*shard_idx);
-        }
-
-        // done_tx: success path → just send seqs (or completion.decrement()).
-        // Failure path → defer_retry, then send.
+        // done_tx: success path → send only after post_commit has
+        // run mark_flushed. Failure path → defer_retry, then send
+        // immediately because there is no successful mark to wait for.
         let mut done_by_shard: HashMap<usize, Vec<u64>> = HashMap::new();
+        let mut failed_done_by_shard: HashMap<usize, Vec<u64>> = HashMap::new();
         for (i, ucd) in units.into_iter().enumerate() {
             let UnitCommitData {
                 shard_idx,
@@ -759,18 +766,67 @@ impl BufferFlusher {
             }
             match completion {
                 None => {
-                    done_by_shard.entry(shard_idx).or_default().extend(seqs);
+                    let target = if commit_failed_set.contains(&i) {
+                        &mut failed_done_by_shard
+                    } else {
+                        &mut done_by_shard
+                    };
+                    target.entry(shard_idx).or_default().extend(seqs);
                 }
                 Some(dc) => {
                     if let Some(original_seqs) = dc.decrement() {
-                        done_by_shard
-                            .entry(shard_idx)
-                            .or_default()
-                            .extend(original_seqs);
+                        let target = if commit_failed_set.contains(&i) {
+                            &mut failed_done_by_shard
+                        } else {
+                            &mut done_by_shard
+                        };
+                        target.entry(shard_idx).or_default().extend(original_seqs);
                     }
                 }
             }
         }
+
+        let mut post_items: Vec<(usize, Vec<(u64, Lba, u32)>)> =
+            post_mark_ranges_by_shard.into_iter().collect();
+        post_items.sort_by_key(|(shard_idx, _)| *shard_idx);
+        for (shard_idx, mark_ranges) in post_items {
+            let done_seqs = done_by_shard.remove(&shard_idx).unwrap_or_default();
+            let post_job = PostCommitJob {
+                shard_idx,
+                mark_ranges,
+                candidate_pairs: Vec::new(),
+                stale_repairs: Vec::new(),
+                done_seqs,
+            };
+            if let Err(err) = post_commit_tx.send(post_job) {
+                let job = err.0;
+                tracing::warn!(
+                    shard_idx = job.shard_idx,
+                    "commit_worker: post_commit queue disconnected; falling back inline"
+                );
+                let mark_start = Instant::now();
+                for (seq, lba_start, lba_count) in &job.mark_ranges {
+                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                        tracing::warn!(
+                            seq,
+                            shard_idx = job.shard_idx,
+                            error = %e,
+                            "commit_worker: failed to mark entry flushed"
+                        );
+                    }
+                }
+                Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+                let _ = pool.advance_tail_for_shard(job.shard_idx);
+                if let Some(done_tx) = lane_done_txs
+                    .get(job.shard_idx)
+                    .or_else(|| lane_done_txs.first())
+                {
+                    let _ = done_tx.send(job.done_seqs);
+                }
+            }
+        }
+        // Any successful done seq without a mark range can be released
+        // now. This is uncommon but covers empty/live-filtered units.
         for (shard_idx, seqs) in done_by_shard {
             if let Some(done_tx) = lane_done_txs
                 .get(shard_idx)
@@ -779,8 +835,15 @@ impl BufferFlusher {
                 let _ = done_tx.send(seqs);
             }
         }
+        for (shard_idx, seqs) in failed_done_by_shard {
+            if let Some(done_tx) = lane_done_txs
+                .get(shard_idx)
+                .or_else(|| lane_done_txs.first())
+            {
+                let _ = done_tx.send(seqs);
+            }
+        }
 
-        let _ = post_commit_tx;
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
     }
 
@@ -832,6 +895,12 @@ impl BufferFlusher {
             .fetch_add(1, Ordering::Relaxed);
         metrics
             .flush_writer_meta_lbas
+            .fetch_add(sub_batch_lbas, Ordering::Relaxed);
+        metrics
+            .flush_writer_meta_pt_commits
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_writer_meta_pt_lbas
             .fetch_add(sub_batch_lbas, Ordering::Relaxed);
 
         match result {
@@ -1139,6 +1208,12 @@ impl BufferFlusher {
                 metrics
                     .flush_writer_meta_lbas
                     .fetch_add(batch_values.len() as u64, Ordering::Relaxed);
+                metrics
+                    .flush_writer_meta_packed_commits
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .flush_writer_meta_packed_lbas
+                    .fetch_add(batch_values.len() as u64, Ordering::Relaxed);
                 Ok(PackedCommitOutcome::Committed {
                     actual_old_pba_meta,
                     fresh_dedup_pairs,
@@ -1325,5 +1400,12 @@ fn lbas_in_job(job: &CommitJob) -> usize {
             .map(|frag| frag.unit.lba_count as usize)
             .sum::<usize>()
             .saturating_add(pj.buffered_seqs.len()),
+    }
+}
+
+fn enqueued_at_for_job(job: &CommitJob) -> Instant {
+    match job {
+        CommitJob::Passthrough(pj) => pj.enqueued_at,
+        CommitJob::Packed(pj) => pj.enqueued_at,
     }
 }

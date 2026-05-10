@@ -46,6 +46,11 @@ pub(in crate::buffer::flush) struct PostCommitJob {
     /// Stale dedup_index repairs (forward entries pointing at PBAs
     /// that have since moved). Replayed via metadb tx.
     pub stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
+    /// Original seqs that can be released only after mark_flushed
+    /// has run. Keeping this in post_commit preserves the historical
+    /// ordering: mark buffer entries first, then let coalescer see the
+    /// seqs as completed.
+    pub done_seqs: Vec<u64>,
 }
 
 impl PostCommitJob {
@@ -55,6 +60,7 @@ impl PostCommitJob {
             mark_ranges: Vec::new(),
             candidate_pairs: Vec::new(),
             stale_repairs: Vec::new(),
+            done_seqs: Vec::new(),
         }
     }
 
@@ -62,6 +68,7 @@ impl PostCommitJob {
         self.mark_ranges.is_empty()
             && self.candidate_pairs.is_empty()
             && self.stale_repairs.is_empty()
+            && self.done_seqs.is_empty()
     }
 }
 
@@ -78,6 +85,7 @@ impl BufferFlusher {
         meta: &MetaStore,
         candidate: &crate::dedup::CandidateCache,
         metrics: &EngineMetrics,
+        lane_done_txs: &[Sender<Vec<u64>>],
     ) {
         while let Ok(job) = rx.recv() {
             if !job.mark_ranges.is_empty() {
@@ -107,6 +115,14 @@ impl BufferFlusher {
             }
 
             let _ = pool.advance_tail_for_shard(job.shard_idx);
+            if !job.done_seqs.is_empty() {
+                if let Some(done_tx) = lane_done_txs
+                    .get(job.shard_idx)
+                    .or_else(|| lane_done_txs.first())
+                {
+                    let _ = done_tx.send(job.done_seqs);
+                }
+            }
         }
     }
 }
