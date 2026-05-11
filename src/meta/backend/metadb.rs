@@ -955,7 +955,20 @@ impl MetadbBackend {
             to_l2p_value(new_value),
             Some((to_metadb_pba(new_value.pba), 1)),
         );
-        let (_, outcomes) = tx.commit_with_outcomes()?;
+        // Dedup-hit has no LV3 write — it just remaps an LBA onto an
+        // existing PBA. Crash before the commit checkpoints rolls the
+        // state back to "pre-hit": the LBA still points to its previous
+        // PBA, refcounts unchanged. The buffer's pending entry stays
+        // visible to the flusher and will be re-hashed on the next
+        // cycle, so the worst case is a single missed dedup hit, not
+        // data loss. Logged path would force `unlogged_commit_gate.write`
+        // + `flush()` on every hit and serialise the entire writer
+        // pipeline behind a metadb checkpoint.
+        let (_, outcomes) = if self.unlogged_flush_commits {
+            tx.commit_unlogged_with_outcomes()?
+        } else {
+            tx.commit_with_outcomes()?
+        };
         let newly_zeroed = newly_zeroed_from_remaps([*new_value], outcomes)?;
         Ok(newly_zeroed.into_iter().next().map(|(_, cleanup)| cleanup))
     }
@@ -993,7 +1006,19 @@ impl MetadbBackend {
         for (hash, entry) in promote_entries {
             tx.put_dedup_guarded(*hash, to_dedup_value(entry), to_metadb_pba(entry.pba), 1);
         }
-        let (_, outcomes) = tx.commit_with_outcomes()?;
+        // Same reasoning as `atomic_dedup_hit`: no LV3 write, refcount
+        // guard inside metadb handles the race against a concurrent
+        // decref-to-zero, and crash rolls back atomically. Routing
+        // through the logged path forces a metadb `flush()` per call
+        // (the `checkpoint_unlogged_before_wal_commit` step under
+        // `unlogged_commit_gate.write`), pinning `commit_total_us` at
+        // ~300ms per hit batch under skip=0 mixed workloads — see
+        // docs/metadb-nvme-drain-plan.md for the bisect data.
+        let (_, outcomes) = if self.unlogged_flush_commits {
+            tx.commit_unlogged_with_outcomes()?
+        } else {
+            tx.commit_with_outcomes()?
+        };
         dedup_hit_results_from_remaps(hits, outcomes)
     }
 }

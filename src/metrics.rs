@@ -1526,6 +1526,8 @@ pub struct MetaMemorySnapshot {
     pub commit_apply_wait_max_us: u64,
     pub commit_apply_gate_wait_us: u64,
     pub commit_apply_gate_wait_max_us: u64,
+    pub commit_finish_global_wait_us: u64,
+    pub commit_finish_global_wait_max_us: u64,
     pub commit_apply_us: u64,
     pub commit_apply_max_us: u64,
     pub commit_apply_l2p_wait_us: u64,
@@ -1885,6 +1887,8 @@ impl MetaMemorySnapshot {
             commit_apply_wait_max_us: self.commit_apply_wait_max_us,
             commit_apply_gate_wait_us: sub!(commit_apply_gate_wait_us),
             commit_apply_gate_wait_max_us: self.commit_apply_gate_wait_max_us,
+            commit_finish_global_wait_us: sub!(commit_finish_global_wait_us),
+            commit_finish_global_wait_max_us: self.commit_finish_global_wait_max_us,
             commit_apply_us: sub!(commit_apply_us),
             commit_apply_max_us: self.commit_apply_max_us,
             commit_apply_l2p_wait_us: sub!(commit_apply_l2p_wait_us),
@@ -2278,6 +2282,8 @@ impl MetaMemorySnapshot {
             commit_apply_wait_max_us: meta.commit_apply_wait_max_us,
             commit_apply_gate_wait_us: meta.commit_apply_gate_wait_us,
             commit_apply_gate_wait_max_us: meta.commit_apply_gate_wait_max_us,
+            commit_finish_global_wait_us: meta.commit_finish_global_wait_us,
+            commit_finish_global_wait_max_us: meta.commit_finish_global_wait_max_us,
             commit_apply_us: meta.commit_apply_us,
             commit_apply_max_us: meta.commit_apply_max_us,
             commit_apply_l2p_wait_us: meta.commit_apply_l2p_wait_us,
@@ -2789,7 +2795,7 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_commit: attempts={} success={} errors={} empty={} ops={} wal_body_bytes={} wal_body_bytes_max={} total_us={} max_us={} apply_wait_us={} apply_wait_max_us={} apply_gate_wait_us={} apply_gate_wait_max_us={} apply_us={} apply_max_us={}",
+                "metadb_commit: attempts={} success={} errors={} empty={} ops={} wal_body_bytes={} wal_body_bytes_max={} total_us={} max_us={} apply_wait_us={} apply_wait_max_us={} apply_gate_wait_us={} apply_gate_wait_max_us={} finish_global_wait_us={} finish_global_wait_max_us={} apply_us={} apply_max_us={}",
                 metadb.commit_attempts,
                 metadb.commit_success,
                 metadb.commit_errors,
@@ -2803,6 +2809,8 @@ impl EngineStatusSnapshot {
                 metadb.commit_apply_wait_max_us,
                 metadb.commit_apply_gate_wait_us,
                 metadb.commit_apply_gate_wait_max_us,
+                metadb.commit_finish_global_wait_us,
+                metadb.commit_finish_global_wait_max_us,
                 metadb.commit_apply_us,
                 metadb.commit_apply_max_us
             );
