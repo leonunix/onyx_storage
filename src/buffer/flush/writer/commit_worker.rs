@@ -525,6 +525,12 @@ impl BufferFlusher {
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
         let mut discarded: Vec<bool> = vec![false; n];
         let mut commit_failed_indices: Vec<usize> = Vec::new();
+        // Accumulators owned outside the L2P stripe lock — populated by
+        // each `commit_passthrough_chunk` so candidate cache inserts and
+        // stale dedup repairs ride into the post_commit thread instead
+        // of pinning the lock for tens of milliseconds.
+        let mut accum_candidate_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+        let mut accum_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
         let actual_old_pba_meta = pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
             let build_start = Instant::now();
             for (i, ucd) in units.iter().enumerate() {
@@ -637,7 +643,8 @@ impl BufferFlusher {
                         metrics,
                         &mut accum_old_meta,
                         &mut commit_failed_indices,
-                        candidate,
+                        &mut accum_candidate_pairs,
+                        &mut accum_stale_repairs,
                     );
                     chunk.clear();
                     chunk_lbas = 0;
@@ -653,7 +660,8 @@ impl BufferFlusher {
                         metrics,
                         &mut accum_old_meta,
                         &mut commit_failed_indices,
-                        candidate,
+                        &mut accum_candidate_pairs,
+                        &mut accum_stale_repairs,
                     );
                     chunk.clear();
                     chunk_lbas = 0;
@@ -668,7 +676,8 @@ impl BufferFlusher {
                     metrics,
                     &mut accum_old_meta,
                     &mut commit_failed_indices,
-                    candidate,
+                    &mut accum_candidate_pairs,
+                    &mut accum_stale_repairs,
                 );
             }
 
@@ -786,6 +795,34 @@ impl BufferFlusher {
             }
         }
 
+        // Publish candidate cache inserts + stale dedup repairs OUTSIDE
+        // the L2P stripe lock but synchronously with the commit worker.
+        // The test `commit_worker_publishes_candidates_before_post_commit`
+        // pins candidate visibility before any post_commit drain so
+        // subsequent dedup workers can find the fresh hash; we honour
+        // that contract by inserting here on the commit_worker thread
+        // *after* the metadb commit has landed and the lock is released.
+        // Compared to the historical inline call inside
+        // `commit_passthrough_chunk` (which ran under the L2P stripe
+        // lock for the whole chunk), this shrinks the lock hold time by
+        // the candidate insert + stale repair duration — that work is
+        // not on the metadb path and never needed the lock.
+        if !accum_candidate_pairs.is_empty() {
+            let cand_start = Instant::now();
+            candidate.insert_many(&accum_candidate_pairs);
+            Self::record_elapsed(&metrics.flush_writer_meta_candidate_ns, cand_start);
+        }
+        if !accum_stale_repairs.is_empty() {
+            let repair_start = Instant::now();
+            Self::repair_stale_dedup_index(
+                meta,
+                metrics,
+                &accum_stale_repairs,
+                "commit_worker_passthrough",
+            );
+            Self::record_elapsed(&metrics.flush_writer_meta_repair_ns, repair_start);
+        }
+
         let mut post_items: Vec<(usize, Vec<(u64, Lba, u32)>)> =
             post_mark_ranges_by_shard.into_iter().collect();
         post_items.sort_by_key(|(shard_idx, _)| *shard_idx);
@@ -851,6 +888,13 @@ impl BufferFlusher {
     /// PBA metadata in `accum_old_meta`. On commit error appends each
     /// non-empty unit's index to `commit_failed_indices` so the
     /// post-commit loop frees PBAs and defer_retries seqs.
+    ///
+    /// Fresh candidate pairs and stale dedup repairs are accumulated
+    /// into the caller-supplied vecs and dispatched on the post_commit
+    /// thread, so neither stays under the L2P commit lock. The race
+    /// against `cleanup_dead_pbas_batch` is benign: cleanup removes
+    /// candidate entries by *old* PBA, while we insert against the new
+    /// PBA returned by this commit (see post_commit.rs).
     fn commit_passthrough_chunk(
         chunk: &[usize],
         vol_id: &VolumeId,
@@ -859,7 +903,8 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         accum_old_meta: &mut HashMap<Pba, RemapCleanup>,
         commit_failed_indices: &mut Vec<usize>,
-        candidate: &crate::dedup::CandidateCache,
+        accum_candidate_pairs: &mut Vec<(ContentHash, BlockmapValue)>,
+        accum_stale_repairs: &mut Vec<(ContentHash, DedupEntry, DedupEntry)>,
     ) {
         let mut batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
             Vec::with_capacity(chunk.len());
@@ -911,24 +956,18 @@ impl BufferFlusher {
                         .and_modify(|entry| entry.merge(cleanup.clone()))
                         .or_insert(cleanup);
                 }
-                // These publish physical mappings into future dedup-hit
-                // lookups, so keep them ordered before any cleanup can
-                // retire/reclaim old PBAs or later overwrites can make the
-                // freshly committed mappings stale.
+                // Defer candidate cache insertion + stale dedup repair to
+                // the post_commit thread. They no longer block PT commits
+                // queued behind us on the L2P stripe lock — the L2P remap
+                // and refcount updates already landed in the metadb tx
+                // above, so future dedup-hit lookups are immediately
+                // protected by the persistent index; candidate is a RAM
+                // optimization only.
                 if !all_fresh_pairs.is_empty() {
-                    let cand_start = Instant::now();
-                    candidate.insert_many(&all_fresh_pairs);
-                    Self::record_elapsed(&metrics.flush_writer_meta_candidate_ns, cand_start);
+                    accum_candidate_pairs.extend(all_fresh_pairs);
                 }
                 if !all_stale_repairs.is_empty() {
-                    let repair_start = Instant::now();
-                    Self::repair_stale_dedup_index(
-                        meta,
-                        metrics,
-                        &all_stale_repairs,
-                        "commit_worker_passthrough",
-                    );
-                    Self::record_elapsed(&metrics.flush_writer_meta_repair_ns, repair_start);
+                    accum_stale_repairs.extend(all_stale_repairs);
                 }
             }
             Err(e) => {
