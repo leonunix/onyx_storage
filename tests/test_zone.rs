@@ -242,6 +242,24 @@ fn zone_manager_read_after_write() {
     zm.shutdown().unwrap();
 }
 
+#[test]
+fn zone_manager_submit_reads_sees_buffered_writes_before_flush() {
+    let mut zm = setup_zone_manager(4);
+
+    let mut write = Vec::with_capacity(4 * 4096);
+    for block in 0..4u8 {
+        write.extend(std::iter::repeat_n(0xA0 | block, 4096));
+    }
+    zm.submit_write("test-vol", Lba(32), 4, &write, 0).unwrap();
+
+    let mut read = vec![0u8; write.len()];
+    zm.submit_reads("test-vol", Lba(32), 4, 0, &mut read)
+        .unwrap();
+    assert_eq!(read, write);
+
+    zm.shutdown().unwrap();
+}
+
 /// ZoneManager read of unmapped block returns None.
 #[test]
 fn zone_manager_read_unmapped() {

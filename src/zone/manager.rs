@@ -99,6 +99,31 @@ fn push_read_unit_group(
     entry.members.push((slot, mapping.offset_in_unit));
 }
 
+fn copy_pending_block(
+    pending: &crate::buffer::commit_log::PendingEntry,
+    lba: u64,
+    vol_created_at: u64,
+    dst: &mut [u8],
+) -> bool {
+    if vol_created_at != 0 && pending.vol_created_at != vol_created_at {
+        return false;
+    }
+    let entry_end = pending.start_lba.0.saturating_add(pending.lba_count as u64);
+    if lba < pending.start_lba.0 || lba >= entry_end {
+        return false;
+    }
+    let Some(payload) = pending.payload.as_ref() else {
+        return false;
+    };
+    let offset = (lba - pending.start_lba.0) as usize * BLOCK_SIZE as usize;
+    let end = offset + BLOCK_SIZE as usize;
+    if end > payload.len() {
+        return false;
+    }
+    dst.copy_from_slice(&payload[offset..end]);
+    true
+}
+
 /// Routes IO across LBAs.
 ///
 /// Both reads and writes execute inline on the caller thread:
@@ -432,52 +457,32 @@ impl ZoneManager {
         let pass1_start = Instant::now();
         let mut pending_lbas: Vec<u64> = Vec::new();
         let mut pending_slots: Vec<u32> = Vec::new();
-        if self.buffer_pool.pending_count() == 0 {
-            pending_lbas.reserve(count as usize);
-            pending_slots.reserve(count as usize);
-            for i in 0..count {
-                pending_lbas.push(start_lba.0 + i as u64);
-                pending_slots.push(i);
+        // Always consult the buffer index. `pending_count` is an aggregate
+        // diagnostic counter, not a publication barrier; append publishes the
+        // LBA index before bumping it, so using it as a read-path shortcut can
+        // make a just-acked buffered write look like a persistent hole.
+        let buffer_hits = self
+            .buffer_pool
+            .lookup_primary_range(vol_id, start_lba, count)?;
+        for (i, hit) in buffer_hits.into_iter().enumerate() {
+            let lba = start_lba.0 + i as u64;
+            let slot = i;
+            let dst = &mut out_buf[slot * bs..slot * bs + bs];
+            let hit = hit
+                .as_ref()
+                .is_some_and(|pending| copy_pending_block(pending, lba, vol_created_at, dst));
+            if hit {
+                self.metrics
+                    .read_buffer_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .buffer_read_bytes
+                    .fetch_add(bs as u64, Ordering::Relaxed);
             }
-        } else {
-            let buffer_hits = self
-                .buffer_pool
-                .lookup_primary_range(vol_id, start_lba, count)?;
-            for (i, hit) in buffer_hits.into_iter().enumerate() {
-                let lba = start_lba.0 + i as u64;
-                let slot = i;
-                let dst = &mut out_buf[slot * bs..slot * bs + bs];
-                let hit = if let Some(pending) = hit {
-                    if vol_created_at == 0 || pending.vol_created_at == vol_created_at {
-                        if let Some(ref payload) = pending.payload {
-                            let offset = (lba - pending.start_lba.0) as usize * bs;
-                            let end = offset + bs;
-                            if end <= payload.len() {
-                                dst.copy_from_slice(&payload[offset..end]);
-                                self.metrics
-                                    .read_buffer_hits
-                                    .fetch_add(1, Ordering::Relaxed);
-                                self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
-                                self.metrics
-                                    .buffer_read_bytes
-                                    .fetch_add(bs as u64, Ordering::Relaxed);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if !hit {
-                    pending_lbas.push(lba);
-                    pending_slots.push(i as u32);
-                }
+            if !hit {
+                pending_lbas.push(lba);
+                pending_slots.push(i as u32);
             }
         }
         self.metrics
@@ -525,12 +530,12 @@ impl ZoneManager {
                     .get_mappings_range_unordered_str(vol_id, start_lba, end_lba)?
             };
             meta_query_ns = elapsed_ns(query_start);
-            let mut mapped_pending = 0usize;
+            let mut mapped_slot = vec![false; count as usize];
             if pending_lbas.len() == count as usize {
                 for (lba, mapping) in mapped {
                     let slot = (lba.0 - start_lba.0) as usize;
                     if slot < count as usize {
-                        mapped_pending += 1;
+                        mapped_slot[slot] = true;
                         if mapping.is_zero() {
                             out_buf[slot * bs..slot * bs + bs].fill(0);
                         } else {
@@ -546,7 +551,7 @@ impl ZoneManager {
                 }
                 for (lba, mapping) in mapped {
                     if let Some(slot) = pending_slot_by_lba.get(&lba.0).copied() {
-                        mapped_pending += 1;
+                        mapped_slot[slot] = true;
                         if mapping.is_zero() {
                             out_buf[slot * bs..slot * bs + bs].fill(0);
                         } else {
@@ -555,10 +560,26 @@ impl ZoneManager {
                     }
                 }
             }
-            let unmapped = pending_lbas.len().saturating_sub(mapped_pending);
-            self.metrics
-                .read_unmapped
-                .fetch_add(unmapped as u64, Ordering::Relaxed);
+            for (lba, slot) in pending_lbas.iter().zip(pending_slots.iter().copied()) {
+                let slot = slot as usize;
+                if mapped_slot.get(slot).copied().unwrap_or(false) {
+                    continue;
+                }
+                let dst = &mut out_buf[slot * bs..slot * bs + bs];
+                if let Some(pending) = self.buffer_pool.lookup(vol_id, Lba(*lba))? {
+                    if copy_pending_block(&pending, *lba, vol_created_at, dst) {
+                        self.metrics
+                            .read_buffer_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .buffer_read_bytes
+                            .fetch_add(bs as u64, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             let query_start = Instant::now();
             let mappings = if let Some(ord) = vol_ord {
@@ -572,7 +593,20 @@ impl ZoneManager {
                 let slot = pending_slots[idx] as usize;
                 match mapping_opt {
                     None => {
+                        let lba = pending_lbas[idx];
                         let dst = &mut out_buf[slot * bs..slot * bs + bs];
+                        if let Some(pending) = self.buffer_pool.lookup(vol_id, Lba(lba))? {
+                            if copy_pending_block(&pending, lba, vol_created_at, dst) {
+                                self.metrics
+                                    .read_buffer_hits
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.metrics.buffer_read_ops.fetch_add(1, Ordering::Relaxed);
+                                self.metrics
+                                    .buffer_read_bytes
+                                    .fetch_add(bs as u64, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
                         dst.fill(0);
                         self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
                     }
