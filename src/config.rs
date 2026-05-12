@@ -768,6 +768,13 @@ pub struct ThreadingConfig {
     pub metadb_dedup_apply_cpus: String,
     #[serde(default)]
     pub metadb_checkpoint_cpus: String,
+    /// CPU set for the metadb io_uring submitter threads. With
+    /// `io_submitter_pool_size > 1`, each submitter pins to
+    /// `cpus[ordinal % len]` so the kernel mq-block layer routes
+    /// each submitter's IO to a distinct NVMe hardware queue. Leave
+    /// empty to inherit the OS default (only safe when pool=1).
+    #[serde(default)]
+    pub metadb_io_submitter_cpus: String,
     #[serde(default)]
     pub background_cpus: String,
 }
@@ -789,6 +796,7 @@ impl Default for ThreadingConfig {
             metadb_refcount_apply_cpus: String::new(),
             metadb_dedup_apply_cpus: String::new(),
             metadb_checkpoint_cpus: String::new(),
+            metadb_io_submitter_cpus: String::new(),
             background_cpus: String::new(),
         }
     }

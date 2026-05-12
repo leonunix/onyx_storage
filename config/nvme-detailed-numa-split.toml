@@ -112,6 +112,14 @@ metadb_refcount_apply_cpus = "64,66,68,70"
 metadb_dedup_apply_cpus    = "72,74"
 metadb_wal_cpus            = "76"
 metadb_checkpoint_cpus     = "78"
+# io_uring submitter threads. Only used when
+# DEFAULT_IO_SUBMITTER_POOL_SIZE > 1 in metadb/src/page_store.rs.
+# Pool>1 needs each thread on a distinct CPU so the kernel mq-block
+# layer routes their IO to a different NVMe hardware queue. Cross-
+# NUMA pinning (e.g. "1,3,5" while metadb data is on node 0 evens)
+# net-regresses badly — confirmed 4k LBA/s in test. Leaving empty
+# inherits OS default; pool=1 path is unaffected.
+metadb_io_submitter_cpus   = ""
 
 # flusher_writer must be NUMA-local with metadb (calls commit_ops);
 # also on node 0. cleanup runs the dedup-cleanup read-back path which

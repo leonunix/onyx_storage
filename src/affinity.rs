@@ -50,6 +50,7 @@ pub fn init(config: &ThreadingConfig) {
             // yet. The drainer is default-off, so this string only
             // matters once the flag flips on.
             refcount_drainer_cpus: String::new(),
+            io_submitter_cpus: config.metadb_io_submitter_cpus.clone(),
         });
     }
 }
