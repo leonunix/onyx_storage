@@ -4,15 +4,34 @@ use crate::meta::schema::{
 };
 use crate::types::BLOCK_SIZE;
 
-pub(crate) const L2P_VALUE_BYTES: usize = 28;
+/// Re-exports of metadb's authoritative `L2pValue` byte layout so this
+/// crate doesn't drift if metadb bumps the schema again. Bytes
+/// [0..L2P_SEQ_OFFSET] embed Onyx's `BlockmapValue`; the trailing 8 B
+/// is a big-endian u64 commit seq metadb uses for its apply-time CAS.
+pub(crate) const L2P_VALUE_BYTES: usize = onyx_metadb::paged::format::LEAF_VALUE_SIZE;
+pub(crate) const L2P_SEQ_OFFSET: usize = onyx_metadb::paged::format::L2P_SEQ_OFFSET;
+pub(crate) const BLOCKMAP_BYTES: usize = L2P_SEQ_OFFSET;
 pub(crate) const DEDUP_VALUE_BYTES: usize = 27;
 
 pub(crate) fn blockmap_to_l2p_bytes(value: &BlockmapValue) -> [u8; L2P_VALUE_BYTES] {
-    encode_blockmap_value(value)
+    blockmap_to_l2p_bytes_with_seq(value, 0)
+}
+
+pub(crate) fn blockmap_to_l2p_bytes_with_seq(
+    value: &BlockmapValue,
+    seq: u64,
+) -> [u8; L2P_VALUE_BYTES] {
+    let mut out = [0u8; L2P_VALUE_BYTES];
+    out[..BLOCKMAP_BYTES].copy_from_slice(&encode_blockmap_value(value));
+    out[L2P_SEQ_OFFSET..L2P_SEQ_OFFSET + 8].copy_from_slice(&seq.to_be_bytes());
+    out
 }
 
 pub(crate) fn blockmap_from_l2p_bytes(bytes: &[u8; L2P_VALUE_BYTES]) -> Option<BlockmapValue> {
-    decode_blockmap_value(bytes)
+    let head: &[u8; BLOCKMAP_BYTES] = bytes[..BLOCKMAP_BYTES]
+        .try_into()
+        .expect("slice has known length");
+    decode_blockmap_value(head)
 }
 
 pub(crate) fn dedup_to_value_bytes(entry: &DedupEntry) -> [u8; DEDUP_VALUE_BYTES] {
@@ -55,6 +74,23 @@ mod tests {
         let bytes = blockmap_to_l2p_bytes(&value);
 
         assert_eq!(bytes.len(), L2P_VALUE_BYTES);
+        // Trailing seq bytes default to zero (no-guard sentinel).
+        assert_eq!(&bytes[L2P_SEQ_OFFSET..], &[0u8; 8]);
+        assert_eq!(blockmap_from_l2p_bytes(&bytes), Some(value));
+    }
+
+    #[test]
+    fn blockmap_l2p_bytes_with_seq_round_trip() {
+        let value = sample_blockmap_value();
+        let seq = 0xDEAD_BEEF_CAFE_F00Du64;
+        let bytes = blockmap_to_l2p_bytes_with_seq(&value, seq);
+
+        assert_eq!(bytes.len(), L2P_VALUE_BYTES);
+        let seq_bytes: [u8; 8] = bytes[L2P_SEQ_OFFSET..L2P_SEQ_OFFSET + 8]
+            .try_into()
+            .unwrap();
+        assert_eq!(u64::from_be_bytes(seq_bytes), seq);
+        // BlockmapValue round-trips independently of seq.
         assert_eq!(blockmap_from_l2p_bytes(&bytes), Some(value));
     }
 
