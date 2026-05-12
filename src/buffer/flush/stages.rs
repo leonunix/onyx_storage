@@ -93,6 +93,8 @@ impl BufferFlusher {
         const DIAG_AGE_THRESHOLD_MS: u64 = 3000;
 
         while running.load(Ordering::Relaxed) {
+            let iter_start = Instant::now();
+            let mut this_iter_idle_ns: u64 = 0;
             // Drain completed seqs from writer feedback — decrement refcounts
             while let Ok(seqs) = done_rx.try_recv() {
                 for seq in seqs {
@@ -160,8 +162,15 @@ impl BufferFlusher {
             }
 
             if new_entries.is_empty() {
+                let recv_start = Instant::now();
                 match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
                     Ok(seq) => {
+                        let idle_ns =
+                            recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        this_iter_idle_ns = this_iter_idle_ns.saturating_add(idle_ns);
+                        metrics
+                            .flush_coalesce_idle_ns
+                            .fetch_add(idle_ns, Ordering::Relaxed);
                         let _ = Self::try_enqueue_pending_seq(
                             seq,
                             pool,
@@ -174,7 +183,14 @@ impl BufferFlusher {
                             skip_fully_superseded,
                         );
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        let idle_ns =
+                            recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        this_iter_idle_ns = this_iter_idle_ns.saturating_add(idle_ns);
+                        metrics
+                            .flush_coalesce_idle_ns
+                            .fetch_add(idle_ns, Ordering::Relaxed);
+                    }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -237,11 +253,21 @@ impl BufferFlusher {
             }
 
             if new_entries.is_empty() {
+                let iter_total = iter_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                metrics.flush_coalesce_active_ns.fetch_add(
+                    iter_total.saturating_sub(this_iter_idle_ns),
+                    Ordering::Relaxed,
+                );
                 continue;
             }
 
             new_entries = pool.hydrate_pending_entries_for_shard(shard_idx, new_entries);
             if new_entries.is_empty() {
+                let iter_total = iter_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                metrics.flush_coalesce_active_ns.fetch_add(
+                    iter_total.saturating_sub(this_iter_idle_ns),
+                    Ordering::Relaxed,
+                );
                 continue;
             }
 
@@ -321,6 +347,12 @@ impl BufferFlusher {
                     return;
                 }
             }
+
+            let iter_total = iter_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            metrics.flush_coalesce_active_ns.fetch_add(
+                iter_total.saturating_sub(this_iter_idle_ns),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -332,8 +364,14 @@ impl BufferFlusher {
         min_compression_savings_pct: u8,
     ) {
         while running.load(Ordering::Relaxed) {
+            let recv_start = Instant::now();
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => {
+                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .flush_compress_worker_idle_ns
+                        .fetch_add(idle_ns, Ordering::Relaxed);
+                    let active_start = Instant::now();
                     let CoalesceUnit {
                         vol_id,
                         start_lba,
@@ -429,8 +467,19 @@ impl BufferFlusher {
                     if result.is_err() {
                         return;
                     }
+                    let active_ns =
+                        active_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .flush_compress_worker_active_ns
+                        .fetch_add(active_ns, Ordering::Relaxed);
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .flush_compress_worker_idle_ns
+                        .fetch_add(idle_ns, Ordering::Relaxed);
+                    continue;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             }
         }
@@ -477,11 +526,28 @@ impl BufferFlusher {
         read_pool: Option<&crate::io::read_pool::ReadPool>,
     ) {
         while running.load(Ordering::Relaxed) {
+            let recv_start = Instant::now();
             let first = match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(unit) => unit,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Ok(unit) => {
+                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .flush_dedup_worker_idle_ns
+                        .fetch_add(idle_ns, Ordering::Relaxed);
+                    unit
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .flush_dedup_worker_idle_ns
+                        .fetch_add(idle_ns, Ordering::Relaxed);
+                    continue;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             };
+            let active_start = Instant::now();
+            metrics
+                .flush_dedup_worker_iters
+                .fetch_add(1, Ordering::Relaxed);
 
             let mut batch = Vec::with_capacity(Self::DEDUP_WORKER_BATCH_MAX_UNITS);
             batch.push(first);
@@ -528,6 +594,10 @@ impl BufferFlusher {
             }
 
             if prepared.is_empty() {
+                let active_ns = active_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                metrics
+                    .flush_dedup_worker_active_ns
+                    .fetch_add(active_ns, Ordering::Relaxed);
                 continue;
             }
 
@@ -570,6 +640,11 @@ impl BufferFlusher {
                     return;
                 }
             }
+
+            let active_ns = active_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            metrics
+                .flush_dedup_worker_active_ns
+                .fetch_add(active_ns, Ordering::Relaxed);
         }
     }
 

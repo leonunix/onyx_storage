@@ -135,28 +135,49 @@ impl BufferFlusher {
         // clones drop, the rx side disconnects, and we drain remaining
         // jobs before exiting.
         while running.load(Ordering::Relaxed) {
+            let recv_start = Instant::now();
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(first) => Self::dispatch_commit_batch(
-                    Self::drain_commit_batch(
-                        first,
-                        rx,
-                        coalesce_lba_budget,
-                        coalesce_timeout,
-                        packed_try_drain_lba_budget,
-                    ),
-                    pool,
-                    meta,
-                    lifecycle,
-                    allocator,
-                    in_flight_tracker,
-                    metrics,
-                    lane_cleanup_txs,
-                    candidate,
-                    lane_done_txs,
-                    post_commit_tx,
-                    target_lbas_per_tx,
-                ),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Ok(first) => {
+                    let idle_ns =
+                        recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .flush_commit_worker_rx_idle_ns
+                        .fetch_add(idle_ns, Ordering::Relaxed);
+                    metrics
+                        .flush_commit_worker_rx_idle_iters
+                        .fetch_add(1, Ordering::Relaxed);
+                    Self::dispatch_commit_batch(
+                        Self::drain_commit_batch(
+                            first,
+                            rx,
+                            coalesce_lba_budget,
+                            coalesce_timeout,
+                            packed_try_drain_lba_budget,
+                        ),
+                        pool,
+                        meta,
+                        lifecycle,
+                        allocator,
+                        in_flight_tracker,
+                        metrics,
+                        lane_cleanup_txs,
+                        candidate,
+                        lane_done_txs,
+                        post_commit_tx,
+                        target_lbas_per_tx,
+                    );
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    let idle_ns =
+                        recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .flush_commit_worker_rx_idle_ns
+                        .fetch_add(idle_ns, Ordering::Relaxed);
+                    metrics
+                        .flush_commit_worker_rx_idle_iters
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
