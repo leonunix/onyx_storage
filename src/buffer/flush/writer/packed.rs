@@ -15,6 +15,10 @@ enum PackedSlotCommitOutcome {
 }
 
 impl BufferFlusher {
+    // Production callers now route through `write_packed_slots_batch` →
+    // commit_worker dispatch. Kept for test coverage of the synchronous
+    // packed-slot path (l2p_commit_lock + atomic_batch_write_packed).
+    #[allow(dead_code)]
     pub(in crate::buffer::flush) fn write_packed_slot(
         shard_idx: usize,
         sealed: &SealedSlot,

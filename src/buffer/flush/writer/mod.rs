@@ -117,14 +117,13 @@ impl BufferFlusher {
                 shard_idx,
                 &mut packed_retries,
                 pool,
-                meta,
-                lifecycle,
                 allocator,
                 io_engine,
                 done_tx,
                 metrics,
-                cleanup_tx,
-                candidate,
+                in_flight_tracker,
+                commit_worker_txs,
+                commit_workers_per_volume,
             ) {
                 tail_dirty = true;
             }
@@ -133,31 +132,25 @@ impl BufferFlusher {
                 Ok(unit) => unit,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if let Some(sealed) = packer.flush_open_slot() {
-                        if let Err(e) = Self::write_packed_slot(
-                            shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine,
-                            metrics, cleanup_tx, candidate,
-                        ) {
-                            metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                            let failed_pba = sealed.pba;
-                            Self::queue_packed_slot_retry(
-                                &mut packed_retries,
-                                sealed,
-                                &mut buffered_seqs,
-                                &mut buffered_completions,
-                            );
-                            tracing::error!(
-                                pba = failed_pba.0,
-                                error = %e,
-                                "writer: failed to flush packed slot on idle; queued whole-slot retry"
-                            );
-                        } else {
-                            Self::flush_buffered_done(
-                                &mut buffered_seqs,
-                                &mut buffered_completions,
-                                done_tx,
-                            );
-                            tail_dirty = true;
-                        }
+                        let slot_buffers = (
+                            std::mem::take(&mut buffered_seqs),
+                            std::mem::take(&mut buffered_completions),
+                        );
+                        Self::write_packed_slots_batch(
+                            shard_idx,
+                            vec![sealed],
+                            vec![slot_buffers],
+                            pool,
+                            allocator,
+                            io_engine,
+                            metrics,
+                            in_flight_tracker,
+                            done_tx,
+                            &mut packed_retries,
+                            commit_worker_txs,
+                            commit_workers_per_volume,
+                        );
+                        tail_dirty = true;
                     }
                     if tail_dirty {
                         let _ = pool.advance_tail_for_shard(shard_idx);
@@ -365,9 +358,13 @@ impl BufferFlusher {
                 packer,
                 &mut buffered_seqs,
                 &mut buffered_completions,
+                &mut packed_retries,
+                in_flight_tracker,
                 metrics,
                 cleanup_tx,
                 candidate,
+                commit_worker_txs,
+                commit_workers_per_volume,
             );
             tail_dirty = true;
         }
@@ -376,28 +373,36 @@ impl BufferFlusher {
             shard_idx,
             &mut packed_retries,
             pool,
-            meta,
-            lifecycle,
             allocator,
             io_engine,
             done_tx,
             metrics,
-            cleanup_tx,
-            candidate,
+            in_flight_tracker,
+            commit_worker_txs,
+            commit_workers_per_volume,
         ) {
             tail_dirty = true;
         }
 
         if let Some(sealed) = packer.flush_open_slot() {
-            if let Err(e) = Self::write_packed_slot(
-                shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
-                cleanup_tx, candidate,
-            ) {
-                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(pba = sealed.pba.0, error = %e,
-                    "writer: failed to flush final packed slot on shutdown");
-            }
-            Self::flush_buffered_done(&mut buffered_seqs, &mut buffered_completions, done_tx);
+            let slot_buffers = (
+                std::mem::take(&mut buffered_seqs),
+                std::mem::take(&mut buffered_completions),
+            );
+            Self::write_packed_slots_batch(
+                shard_idx,
+                vec![sealed],
+                vec![slot_buffers],
+                pool,
+                allocator,
+                io_engine,
+                metrics,
+                in_flight_tracker,
+                done_tx,
+                &mut packed_retries,
+                commit_worker_txs,
+                commit_workers_per_volume,
+            );
             tail_dirty = true;
         }
 
@@ -444,14 +449,13 @@ impl BufferFlusher {
         shard_idx: usize,
         retries: &mut VecDeque<PackedSlotRetry>,
         pool: &WriteBufferPool,
-        meta: &MetaStore,
-        lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         done_tx: &Sender<Vec<u64>>,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<CleanupBatch>,
-        candidate: &crate::dedup::CandidateCache,
+        in_flight_tracker: &FlusherInFlightTracker,
+        commit_worker_txs: &[Sender<CommitJob>],
+        commit_workers_per_volume: usize,
     ) -> bool {
         let Some(retry_at) = retries.front().map(|retry| retry.retry_at) else {
             return false;
@@ -477,40 +481,35 @@ impl BufferFlusher {
         };
         retry.sealed.pba = new_pba;
 
-        match Self::write_packed_slot(
+        let slot_buffers = (
+            std::mem::take(&mut retry.buffered_seqs),
+            std::mem::take(&mut retry.buffered_completions),
+        );
+        // Dispatch via the per-volume commit worker. IO failures inside
+        // `write_packed_slots_batch` are re-queued on `retries` with the
+        // buffered_seqs/completions preserved, matching the old loop's
+        // semantics. IO success hands off to the commit worker which
+        // publishes done_tx after the metadata commit completes.
+        Self::write_packed_slots_batch(
             shard_idx,
-            &retry.sealed,
+            vec![retry.sealed],
+            vec![slot_buffers],
             pool,
-            meta,
-            lifecycle,
             allocator,
             io_engine,
             metrics,
-            cleanup_tx,
-            candidate,
-        ) {
-            Ok(()) => {
-                let mut buffered_seqs = retry.buffered_seqs;
-                let mut buffered_completions = retry.buffered_completions;
-                Self::flush_buffered_done(&mut buffered_seqs, &mut buffered_completions, done_tx);
-                true
-            }
-            Err(e) => {
-                metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                retry.retry_at = Instant::now() + Self::RETRY_BACKOFF;
-                retries.push_back(retry);
-                tracing::error!(
-                    lane = shard_idx,
-                    pba = new_pba.0,
-                    error = %e,
-                    "writer: packed-slot retry failed; will retry whole slot again"
-                );
-                false
-            }
-        }
+            in_flight_tracker,
+            done_tx,
+            retries,
+            commit_worker_txs,
+            commit_workers_per_volume,
+        );
+        true
     }
 
-    /// Handle a compressed unit in the writer thread.
+    /// Handle a compressed unit in the writer thread. Only called from
+    /// the shutdown drain; sealed slots get dispatched to commit workers
+    /// to keep the l2p_commit_lock acquires on a single hot path.
     pub(super) fn handle_compressed_unit(
         shard_idx: usize,
         unit: CompressedUnit,
@@ -523,9 +522,13 @@ impl BufferFlusher {
         packer: &mut Packer,
         buffered_seqs: &mut Vec<u64>,
         buffered_completions: &mut Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
+        packed_retries: &mut VecDeque<PackedSlotRetry>,
+        in_flight_tracker: &FlusherInFlightTracker,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
+        commit_worker_txs: &[Sender<CommitJob>],
+        commit_workers_per_volume: usize,
     ) {
         let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
         let completion = unit.dedup_completion.clone();
@@ -571,20 +574,27 @@ impl BufferFlusher {
                 Some(dc) => buffered_completions.push(dc.clone()),
             },
             Ok(PackResult::SealedSlot(sealed)) => {
-                if let Err(e) = Self::write_packed_slot(
-                    shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
-                    cleanup_tx, candidate,
-                ) {
-                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        pba = sealed.pba.0,
-                        fragments = sealed.fragments.len(),
-                        error = %e,
-                        "writer: failed to flush packed slot"
-                    );
-                }
-                // Flush done_tx for previously buffered units in the sealed slot
-                Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
+                // Previously buffered seqs/completions belong to the
+                // just-sealed slot; hand them to the commit worker as
+                // per-slot buffers so done_tx fires after metadata commit.
+                let slot_buffers = (
+                    std::mem::take(buffered_seqs),
+                    std::mem::take(buffered_completions),
+                );
+                Self::write_packed_slots_batch(
+                    shard_idx,
+                    vec![sealed],
+                    vec![slot_buffers],
+                    pool,
+                    allocator,
+                    io_engine,
+                    metrics,
+                    in_flight_tracker,
+                    done_tx,
+                    packed_retries,
+                    commit_worker_txs,
+                    commit_workers_per_volume,
+                );
                 // Current unit goes into the new open slot
                 match &completion {
                     None => buffered_seqs.extend(&seqs),
@@ -592,18 +602,24 @@ impl BufferFlusher {
                 }
             }
             Ok(PackResult::SealedSlotAndPassthrough(sealed, unit)) => {
-                if let Err(e) = Self::write_packed_slot(
-                    shard_idx, &sealed, pool, meta, lifecycle, allocator, io_engine, metrics,
-                    cleanup_tx, candidate,
-                ) {
-                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        pba = sealed.pba.0,
-                        error = %e,
-                        "writer: failed to flush packed slot (alloc fallback)"
-                    );
-                }
-                Self::flush_buffered_done(buffered_seqs, buffered_completions, done_tx);
+                let slot_buffers = (
+                    std::mem::take(buffered_seqs),
+                    std::mem::take(buffered_completions),
+                );
+                Self::write_packed_slots_batch(
+                    shard_idx,
+                    vec![sealed],
+                    vec![slot_buffers],
+                    pool,
+                    allocator,
+                    io_engine,
+                    metrics,
+                    in_flight_tracker,
+                    done_tx,
+                    packed_retries,
+                    commit_worker_txs,
+                    commit_workers_per_volume,
+                );
 
                 if let Err(e) = Self::write_unit(
                     shard_idx, &unit, pool, meta, lifecycle, allocator, io_engine, metrics,
