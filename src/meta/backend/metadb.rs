@@ -1267,6 +1267,16 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
         config.refcount_drainer_max_entries_per_cycle;
     cfg.refcount_drainer_alloc_run_size = config.refcount_drainer_alloc_run_size;
     cfg.refcount_drainer_backpressure_pages = config.refcount_drainer_backpressure_pages;
+    // L2P streaming writeback: continuously seal dirty L2P pages and
+    // write them through metadb's IoSubmitter outside `apply_gate.write()`.
+    // Onyx defaults this on so checkpoint sample's gate-hold stays
+    // bounded by lifecycle work, not by clone/seal of accumulated
+    // dirty pages. Mirrors the runtime knobs exposed in `[meta]` so
+    // operators can tune without rebuilding.
+    cfg.l2p_writeback_enabled = config.l2p_writeback_enabled;
+    cfg.l2p_writeback_idle_sleep_us = config.l2p_writeback_idle_sleep_us;
+    cfg.l2p_writeback_min_dirty_pages = config.l2p_writeback_min_dirty_pages;
+    cfg.l2p_writeback_max_pages_per_cycle = config.l2p_writeback_max_pages_per_cycle;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.

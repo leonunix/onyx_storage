@@ -193,6 +193,36 @@ pub struct MetaConfig {
     pub refcount_drainer_alloc_run_size: usize,
     #[serde(default = "default_refcount_drainer_backpressure_pages")]
     pub refcount_drainer_backpressure_pages: usize,
+
+    /// Enable metadb's L2P streaming writeback worker. When `true`, a
+    /// background thread continuously seals dirty L2P pages and writes
+    /// them through the centralised `IoSubmitter` outside
+    /// `apply_gate.write()`. The next `Db::flush()` then samples a
+    /// small dirty set so its gate-hold time stays in the
+    /// low-millisecond range under sustained mixed write load.
+    /// Production-on by default for Onyx; tests and bisects can flip
+    /// to `false` to recover the pre-writeback checkpoint shape.
+    #[serde(default = "default_l2p_writeback_enabled")]
+    pub l2p_writeback_enabled: bool,
+
+    /// Microseconds the writeback worker parks between idle cycles.
+    /// Active cycles run back-to-back without sleeping; this only
+    /// applies when every shard is below
+    /// `l2p_writeback_min_dirty_pages`.
+    #[serde(default = "default_l2p_writeback_idle_sleep_us")]
+    pub l2p_writeback_idle_sleep_us: u64,
+
+    /// Minimum per-shard dirty page count to trigger a writeback cycle.
+    /// Smaller values keep dirty backlog tighter at the cost of more
+    /// install-lock acquisitions.
+    #[serde(default = "default_l2p_writeback_min_dirty_pages")]
+    pub l2p_writeback_min_dirty_pages: usize,
+
+    /// Hard cap on pages written by a single writeback cycle per
+    /// shard. Caps install-lock hold time (commits on the same shard
+    /// queue on this lock for the duration of `install_writeback`).
+    #[serde(default = "default_l2p_writeback_max_pages_per_cycle")]
+    pub l2p_writeback_max_pages_per_cycle: usize,
 }
 
 impl MetaConfig {
@@ -262,6 +292,10 @@ impl Default for MetaConfig {
                 default_refcount_drainer_max_entries_per_cycle(),
             refcount_drainer_alloc_run_size: default_refcount_drainer_alloc_run_size(),
             refcount_drainer_backpressure_pages: default_refcount_drainer_backpressure_pages(),
+            l2p_writeback_enabled: default_l2p_writeback_enabled(),
+            l2p_writeback_idle_sleep_us: default_l2p_writeback_idle_sleep_us(),
+            l2p_writeback_min_dirty_pages: default_l2p_writeback_min_dirty_pages(),
+            l2p_writeback_max_pages_per_cycle: default_l2p_writeback_max_pages_per_cycle(),
         }
     }
 }
@@ -295,6 +329,28 @@ fn default_refcount_drainer_alloc_run_size() -> usize {
 }
 fn default_refcount_drainer_backpressure_pages() -> usize {
     8_192
+}
+fn default_l2p_writeback_enabled() -> bool {
+    // Default off. The streaming writeback worker correctly shrinks
+    // the checkpoint sample dirty set (validated: 558k → 1.3k pages,
+    // gate-hold 728 → 45 ms), but its writes share the metadb page
+    // store's `IoSubmitter` queue (SQ=1024) with commit-apply's own
+    // RC-delta and dirty-page writes. Under sustained writeback the
+    // submitter saturates, raising commit-apply latency and net
+    // costing more foreground IOPS than the sample-hold reduction
+    // saves on this `j8 d4` mixed workload. Once the submitter has a
+    // dedicated writeback channel (or adaptive backpressure that
+    // yields to commits), flip back to `true`.
+    false
+}
+fn default_l2p_writeback_idle_sleep_us() -> u64 {
+    500
+}
+fn default_l2p_writeback_min_dirty_pages() -> usize {
+    64
+}
+fn default_l2p_writeback_max_pages_per_cycle() -> usize {
+    512
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
