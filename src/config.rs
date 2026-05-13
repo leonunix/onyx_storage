@@ -532,13 +532,14 @@ pub struct FlushConfig {
     /// drain throughput. Set 0 to use the built-in default.
     #[serde(default = "default_packed_meta_batch_max_lbas")]
     pub packed_meta_batch_max_lbas: usize,
-    /// Number of commit workers a single volume may fan out to. Default 1
-    /// = strict per-volume routing (single worker per vol_id, zero LSN
-    /// dispatch contention but single-worker throughput cap). Set to 2
-    /// or 4 to let one volume use that many consecutive commit workers
-    /// (selected by `shard_idx % per_vol`) for parallel commits at the
-    /// cost of some apply-lane contention. Total commit workers stays
-    /// at NUM_COMMIT_WORKERS=16; only the per-vol fanout changes.
+    /// Number of commit workers a single volume may fan out to.
+    /// Default 8 — with the L2P stripe Mutex removed in B-语义路
+    /// Batch D, same-LBA serialization is delegated to metadb's
+    /// seq_guard CAS, so one volume can use up to 8 consecutive
+    /// commit workers in parallel without pinning each other on
+    /// the onyx-side lock. Selection is `shard_idx % per_vol`.
+    /// Total commit workers stays at NUM_COMMIT_WORKERS=16; only
+    /// the per-vol fanout changes.
     #[serde(default = "default_commit_workers_per_volume")]
     pub commit_workers_per_volume: usize,
     /// Maximum live LBAs placed in one passthrough metadb transaction.
@@ -627,7 +628,7 @@ fn default_packed_meta_batch_max_lbas() -> usize {
     DEFAULT_PACKED_META_BATCH_LBA_LIMIT
 }
 fn default_commit_workers_per_volume() -> usize {
-    1
+    8
 }
 fn default_commit_target_lbas_per_tx() -> usize {
     TARGET_OPS_PER_COMMIT
