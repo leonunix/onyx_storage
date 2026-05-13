@@ -902,7 +902,7 @@ impl BufferShard {
         let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
         let pending_count = AtomicU64::new(0);
         let recover_start = Instant::now();
-        let scan = if let Some(ref ckpt) = checkpoint {
+        let mut scan = if let Some(ref ckpt) = checkpoint {
             let r = Self::rebuild_indices_guided(
                 &device,
                 capacity_bytes,
@@ -939,6 +939,17 @@ impl BufferShard {
             );
             r
         };
+        // The scan's max_seq only reflects entries still on disk; once the
+        // tail advances past them, `scan.max_seq` drops back to 0. But
+        // metadb's L2P still carries the higher seqs those entries
+        // committed, and metadb's seq_guard rejects any subsequent
+        // commit with new_seq < stored_seq. Carrying `checkpoint.max_seq`
+        // forward keeps `next_seq` monotonically increasing across
+        // restarts so new commits always have a strictly greater seq
+        // than anything L2P has seen before.
+        if let Some(ref ckpt) = checkpoint {
+            scan.max_seq = scan.max_seq.max(ckpt.max_seq);
+        }
 
         let (staging_tx, staging_rx) = bounded(runtime_limits.staging_channel_capacity.max(1));
         let had_head = !scan.log_order.is_empty();

@@ -64,13 +64,19 @@ pub(in crate::buffer::flush) enum CommitJob {
     Packed(PackedCommitJob),
 }
 
-/// Per-unit decisions made under the L2P commit lock; consumed by
-/// chunked commit below. Module-scope so `commit_passthrough_chunk`
-/// can take a `&[Option<UnitMeta>]`.
+/// Per-unit decisions consumed by chunked commit below. Module-scope
+/// so `commit_passthrough_chunk` can take a `&mut [Option<UnitMeta>]`.
 struct UnitMeta {
     batch_values: Vec<(Lba, BlockmapValue)>,
     seqs: Vec<u64>,
     live_positions: Vec<usize>,
+    /// Subset of `live_positions` that survived metadb's per-LBA
+    /// seq_guard. Defaults to a clone of `live_positions`; the
+    /// chunk that returns from the tx with a partial-reject
+    /// `Vec<bool>` shrinks this so the post-commit pass releases
+    /// the per-LBA PBAs of full-raw extent positions whose remap
+    /// was refused.
+    accepted_positions: Vec<usize>,
     fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
     stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
 }
@@ -581,6 +587,7 @@ impl BufferFlusher {
                         batch_values: Vec::new(),
                         seqs: Vec::new(),
                         live_positions,
+                        accepted_positions: Vec::new(),
                         fresh_dedup_pairs: Vec::new(),
                         stale_repairs: Vec::new(),
                     });
@@ -634,10 +641,12 @@ impl BufferFlusher {
                         }
                     }
                 }
+                let accepted_positions = live_positions.clone();
                 unit_metas[i] = Some(UnitMeta {
                     batch_values,
                     seqs,
                     live_positions,
+                    accepted_positions,
                     fresh_dedup_pairs,
                     stale_repairs,
                 });
@@ -662,7 +671,7 @@ impl BufferFlusher {
                     Self::commit_passthrough_chunk(
                         &chunk,
                         &vol_id,
-                        &unit_metas,
+                        &mut unit_metas,
                         meta,
                         metrics,
                         &mut accum_old_meta,
@@ -680,7 +689,7 @@ impl BufferFlusher {
                     Self::commit_passthrough_chunk(
                         &chunk,
                         &vol_id,
-                        &unit_metas,
+                        &mut unit_metas,
                         meta,
                         metrics,
                         &mut accum_old_meta,
@@ -697,7 +706,7 @@ impl BufferFlusher {
                 Self::commit_passthrough_chunk(
                     &chunk,
                     &vol_id,
-                    &unit_metas,
+                    &mut unit_metas,
                     meta,
                     metrics,
                     &mut accum_old_meta,
@@ -775,11 +784,14 @@ impl BufferFlusher {
                     .extend(ucd.unit.seq_lba_ranges.iter().cloned());
                 continue;
             }
-            // Successful commit path.
+            // Successful commit path. Use `accepted_positions` so
+            // partial seq_guard rejects on full-raw extents release
+            // the per-LBA PBAs of refused positions instead of
+            // leaking them.
             Self::free_unreferenced_raw_blocks(
                 &ucd.unit,
                 ucd.pba,
-                &um.live_positions,
+                &um.accepted_positions,
                 allocator,
                 "commit_worker_passthrough",
             );
@@ -942,7 +954,7 @@ impl BufferFlusher {
     fn commit_passthrough_chunk(
         chunk: &[usize],
         vol_id: &VolumeId,
-        unit_metas: &[Option<UnitMeta>],
+        unit_metas: &mut [Option<UnitMeta>],
         meta: &MetaStore,
         metrics: &EngineMetrics,
         accum_old_meta: &mut HashMap<Pba, RemapCleanup>,
@@ -1003,15 +1015,40 @@ impl BufferFlusher {
                 let rejects = accepted.iter().filter(|a| !**a).count() as u64;
                 if rejects > 0 {
                     metrics.flush_seq_rejects.fetch_add(rejects, Ordering::Relaxed);
-                    // Whole-unit rejection: every L2pRemap got refused,
-                    // so refcount[pba] is still 0 and the freshly-
-                    // allocated PBA is orphaned — defer the free to the
-                    // post-commit pass (single-block or extent shape).
+                    // Two cases per unit:
+                    // - every L2pRemap rejected → mark whole-unit rejected;
+                    //   refcount[pba] is still 0 and the freshly-allocated
+                    //   PBA gets freed in the post-commit pass.
+                    // - partial reject (some accepted, some not) → shrink
+                    //   `accepted_positions` so `free_unreferenced_raw_blocks`
+                    //   reclaims the per-LBA PBAs of rejected positions in
+                    //   full-raw extents. Packed-slot fragments share one
+                    //   PBA so the shrink is a no-op there (handled
+                    //   separately in `commit_packed_jobs_batch`).
                     let mut offset = 0;
                     for (unit_idx, span) in &unit_spans {
                         let unit_accepted = &accepted[offset..offset + span];
-                        if !unit_accepted.iter().any(|a| *a) {
+                        let any_accepted = unit_accepted.iter().any(|a| *a);
+                        let any_rejected = unit_accepted.iter().any(|a| !*a);
+                        if !any_accepted {
                             seq_rejected_indices.push(*unit_idx);
+                        } else if any_rejected {
+                            if let Some(um) = unit_metas[*unit_idx].as_mut() {
+                                let kept: Vec<usize> = um
+                                    .live_positions
+                                    .iter()
+                                    .copied()
+                                    .enumerate()
+                                    .filter_map(|(k, pos)| {
+                                        unit_accepted
+                                            .get(k)
+                                            .copied()
+                                            .unwrap_or(true)
+                                            .then_some(pos)
+                                    })
+                                    .collect();
+                                um.accepted_positions = kept;
+                            }
                         }
                         offset += span;
                     }
@@ -1284,6 +1321,22 @@ impl BufferFlusher {
                     return Ok(PackedCommitOutcome::Discarded {
                         all_seq_lba_ranges,
                     });
+                }
+
+                // Test-only failpoints — fire here, after the shard
+                // writer's LV3 IO has landed but before the metadb tx
+                // commits. Mirrors the historic write order in the
+                // retired inline `write_packed_slot` path so the
+                // integration tests can still observe pre-commit
+                // states (pending entries, lifecycle locks held).
+                for job in &jobs {
+                    maybe_inject_test_failure_packed(
+                        &job.sealed.fragments,
+                        FlushFailStage::BeforeMetaWrite,
+                    )?;
+                }
+                for job in &jobs {
+                    maybe_pause_before_packed_meta_write(&job.sealed.fragments)?;
                 }
 
                 let meta_start = Instant::now();
