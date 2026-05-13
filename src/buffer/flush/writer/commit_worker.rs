@@ -69,6 +69,7 @@ pub(in crate::buffer::flush) enum CommitJob {
 /// can take a `&[Option<UnitMeta>]`.
 struct UnitMeta {
     batch_values: Vec<(Lba, BlockmapValue)>,
+    seqs: Vec<u64>,
     live_positions: Vec<usize>,
     fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
     stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
@@ -546,6 +547,11 @@ impl BufferFlusher {
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
         let mut discarded: Vec<bool> = vec![false; n];
         let mut commit_failed_indices: Vec<usize> = Vec::new();
+        // Units that committed without an Err but had every L2pRemap
+        // rejected by metadb's seq_guard. Their PBA was incref'd zero
+        // times in the tx, so we must free it back to the allocator
+        // in the post-commit pass — same shape as `discarded` units.
+        let mut seq_rejected_indices: Vec<usize> = Vec::new();
         // Accumulators owned outside the L2P stripe lock — populated by
         // each `commit_passthrough_chunk` so candidate cache inserts and
         // stale dedup repairs ride into the post_commit thread instead
@@ -580,6 +586,7 @@ impl BufferFlusher {
                 if live_positions.is_empty() {
                     unit_metas[i] = Some(UnitMeta {
                         batch_values: Vec::new(),
+                        seqs: Vec::new(),
                         live_positions,
                         fresh_dedup_pairs: Vec::new(),
                         stale_repairs: Vec::new(),
@@ -592,6 +599,7 @@ impl BufferFlusher {
                     .collect();
                 let mut batch_values: Vec<(Lba, BlockmapValue)> =
                     Vec::with_capacity(live_positions.len());
+                let mut seqs: Vec<u64> = Vec::with_capacity(live_positions.len());
                 let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
                 let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
                 let flags = if unit.dedup_skipped {
@@ -608,6 +616,7 @@ impl BufferFlusher {
                         flags,
                     );
                     batch_values.push((lbas[j], blockmap));
+                    seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, lbas[j]));
                 }
                 if !unit.dedup_skipped {
                     if let Some(ref hashes) = unit.block_hashes {
@@ -634,6 +643,7 @@ impl BufferFlusher {
                 }
                 unit_metas[i] = Some(UnitMeta {
                     batch_values,
+                    seqs,
                     live_positions,
                     fresh_dedup_pairs,
                     stale_repairs,
@@ -664,6 +674,7 @@ impl BufferFlusher {
                         metrics,
                         &mut accum_old_meta,
                         &mut commit_failed_indices,
+                        &mut seq_rejected_indices,
                         &mut accum_candidate_pairs,
                         &mut accum_stale_repairs,
                     );
@@ -681,6 +692,7 @@ impl BufferFlusher {
                         metrics,
                         &mut accum_old_meta,
                         &mut commit_failed_indices,
+                        &mut seq_rejected_indices,
                         &mut accum_candidate_pairs,
                         &mut accum_stale_repairs,
                     );
@@ -697,6 +709,7 @@ impl BufferFlusher {
                     metrics,
                     &mut accum_old_meta,
                     &mut commit_failed_indices,
+                    &mut seq_rejected_indices,
                     &mut accum_candidate_pairs,
                     &mut accum_stale_repairs,
                 );
@@ -714,6 +727,8 @@ impl BufferFlusher {
         let cleanup_start = Instant::now();
         let commit_failed_set: std::collections::HashSet<usize> =
             commit_failed_indices.iter().copied().collect();
+        let seq_rejected_set: std::collections::HashSet<usize> =
+            seq_rejected_indices.iter().copied().collect();
         let mut post_mark_ranges_by_shard: HashMap<usize, Vec<(u64, Lba, u32)>> = HashMap::new();
 
         for (i, ucd) in units.iter().enumerate() {
@@ -735,6 +750,22 @@ impl BufferFlusher {
                 } else {
                     let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
                 }
+                continue;
+            }
+            if seq_rejected_set.contains(&i) {
+                // Every L2pRemap for this unit was rejected by seq_guard;
+                // the freshly-allocated PBA is unreferenced. Mark the
+                // buffer entry as flushed (a newer commit already owns
+                // the LBAs) and return the PBA to the allocator.
+                if ucd.alloc_blocks == 1 {
+                    let _ = allocator.free_one(ucd.pba);
+                } else {
+                    let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
+                }
+                post_mark_ranges_by_shard
+                    .entry(ucd.shard_idx)
+                    .or_default()
+                    .extend(ucd.unit.seq_lba_ranges.iter().cloned());
                 continue;
             }
             let Some(um) = unit_metas[i].as_ref() else {
@@ -924,14 +955,18 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         accum_old_meta: &mut HashMap<Pba, RemapCleanup>,
         commit_failed_indices: &mut Vec<usize>,
+        seq_rejected_indices: &mut Vec<usize>,
         accum_candidate_pairs: &mut Vec<(ContentHash, BlockmapValue)>,
         accum_stale_repairs: &mut Vec<(ContentHash, DedupEntry, DedupEntry)>,
     ) {
         let mut batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
             Vec::with_capacity(chunk.len());
+        let mut all_seqs: Vec<u64> = Vec::new();
         let mut all_fresh_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
         let mut all_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
         let mut sub_batch_lbas: u64 = 0;
+        // (unit_index, len in flat accepted Vec<bool>) for each non-empty unit.
+        let mut unit_spans: Vec<(usize, usize)> = Vec::with_capacity(chunk.len());
 
         for &i in chunk {
             if let Some(um) = unit_metas[i].as_ref() {
@@ -943,9 +978,11 @@ impl BufferFlusher {
                     um.batch_values.as_slice(),
                     um.live_positions.len() as u32,
                 ));
+                all_seqs.extend_from_slice(&um.seqs);
                 sub_batch_lbas += um.batch_values.len() as u64;
                 all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
                 all_stale_repairs.extend_from_slice(&um.stale_repairs);
+                unit_spans.push((i, um.batch_values.len()));
             }
         }
 
@@ -954,7 +991,7 @@ impl BufferFlusher {
         }
 
         let commit_start = Instant::now();
-        let result = meta.atomic_batch_write_multi_with_dedup(&batch_args, &[]);
+        let result = meta.atomic_batch_write_multi_with_dedup(&batch_args, &[], &all_seqs);
         Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
         metrics
             .flush_writer_meta_commits
@@ -970,7 +1007,23 @@ impl BufferFlusher {
             .fetch_add(sub_batch_lbas, Ordering::Relaxed);
 
         match result {
-            Ok(returned) => {
+            Ok((returned, accepted)) => {
+                let rejects = accepted.iter().filter(|a| !**a).count() as u64;
+                if rejects > 0 {
+                    metrics.flush_seq_rejects.fetch_add(rejects, Ordering::Relaxed);
+                    // Whole-unit rejection: every L2pRemap got refused,
+                    // so refcount[pba] is still 0 and the freshly-
+                    // allocated PBA is orphaned — defer the free to the
+                    // post-commit pass (single-block or extent shape).
+                    let mut offset = 0;
+                    for (unit_idx, span) in &unit_spans {
+                        let unit_accepted = &accepted[offset..offset + span];
+                        if !unit_accepted.iter().any(|a| *a) {
+                            seq_rejected_indices.push(*unit_idx);
+                        }
+                        offset += span;
+                    }
+                }
                 for (pba, cleanup) in returned {
                     accum_old_meta
                         .entry(pba)
@@ -1134,15 +1187,21 @@ impl BufferFlusher {
             pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
                 let build_start = Instant::now();
                 let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+                let mut batch_seqs: Vec<u64> = Vec::new();
                 let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
                 let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
                 let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
                 let mut live_pbas: Vec<Pba> = Vec::new();
+                // Per-job span in batch_values, so we can detect a slot
+                // whose every L2pRemap was rejected by metadb's seq_guard
+                // and free its now-unreferenced PBA.
+                let mut job_spans: Vec<(Pba, usize)> = Vec::new();
                 let mut discarded_pbas: Vec<Pba> = Vec::new();
                 let mut any_discarded = false;
 
                 for job in &jobs {
                     let mut slot_has_live = false;
+                    let job_start = batch_values.len();
                     for frag in &job.sealed.fragments {
                         let unit = &frag.unit;
                         let vol_id = VolumeId(unit.vol_id.clone());
@@ -1195,6 +1254,10 @@ impl BufferFlusher {
                                 flags: frag_flags,
                             };
                             batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
+                            batch_seqs.push(Self::latest_seq_for_lba(
+                                &unit.seq_lba_ranges,
+                                frag_lbas[i],
+                            ));
                             if let Some(hashes) = hashes_for_promote {
                                 let hash = hashes[pos];
                                 if hash != [0u8; 8] {
@@ -1226,6 +1289,7 @@ impl BufferFlusher {
                     }
                     if slot_has_live {
                         live_pbas.push(job.sealed.pba);
+                        job_spans.push((job.sealed.pba, batch_values.len() - job_start));
                     } else {
                         discarded_pbas.push(job.sealed.pba);
                     }
@@ -1251,8 +1315,28 @@ impl BufferFlusher {
                     Pba(0),
                     0,
                     &[],
+                    &batch_seqs,
                 ) {
-                    Ok(m) => m,
+                    Ok((m, accepted)) => {
+                        let rejects = accepted.iter().filter(|a| !**a).count() as u64;
+                        if rejects > 0 {
+                            metrics
+                                .flush_seq_rejects
+                                .fetch_add(rejects, Ordering::Relaxed);
+                            // Free slot PBAs whose every L2pRemap was
+                            // rejected — refcount[slot.pba] never
+                            // incremented, so the slot is unreferenced.
+                            let mut offset = 0;
+                            for (pba, span) in &job_spans {
+                                let slot_accepted = &accepted[offset..offset + span];
+                                if !slot_accepted.iter().any(|a| *a) {
+                                    let _ = allocator.free_one(*pba);
+                                }
+                                offset += span;
+                            }
+                        }
+                        m
+                    }
                     Err(e) => {
                         for pba in &live_pbas {
                             let _ = allocator.free_one(*pba);

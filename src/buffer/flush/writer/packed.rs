@@ -61,6 +61,7 @@ impl BufferFlusher {
             // Build blockmap entries.
             // Refcount decrements are re-computed inside the lock by atomic_batch_write_packed.
             let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
+            let mut batch_seqs: Vec<u64> = Vec::new();
             let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
             let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
             let mut total_refcount: u32 = 0;
@@ -127,6 +128,10 @@ impl BufferFlusher {
                         flags: frag_flags,
                     };
                     batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
+                    batch_seqs.push(Self::latest_seq_for_lba(
+                        &unit.seq_lba_ranges,
+                        frag_lbas[i],
+                    ));
                     if let Some(hashes) = hashes_for_promote {
                         let hash = hashes[pos];
                         if hash != [0u8; 8] {
@@ -197,8 +202,25 @@ impl BufferFlusher {
                 sealed.pba,
                 total_refcount,
                 &[],
+                &batch_seqs,
             ) {
-                Ok(m) => m,
+                Ok((m, accepted)) => {
+                    let rejects = accepted.iter().filter(|a| !**a).count() as u64;
+                    if rejects > 0 {
+                        metrics
+                            .flush_seq_rejects
+                            .fetch_add(rejects, Ordering::Relaxed);
+                    }
+                    // Every L2pRemap rejected → slot refcount stayed at 0;
+                    // the PBA is orphaned and must be returned to the
+                    // allocator before we exit. Treat as a discarded slot.
+                    if !accepted.iter().any(|a| *a) {
+                        allocator.free_one(sealed.pba)?;
+                        Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                        return Ok(PackedSlotCommitOutcome::Discarded);
+                    }
+                    m
+                }
                 Err(e) => {
                     allocator.free_one(sealed.pba)?;
                     Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);

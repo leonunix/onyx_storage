@@ -1142,6 +1142,7 @@ impl BufferFlusher {
                         let zero_indices = prepared[unit_idx].zero_indices.clone();
                         let mut batch_values: Vec<(Lba, BlockmapValue)> =
                             Vec::with_capacity(zero_indices.len());
+                        let mut batch_seqs: Vec<u64> = Vec::with_capacity(zero_indices.len());
                         for &i in &zero_indices {
                             let lba = Lba(unit.start_lba.0 + i as u64);
                             let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
@@ -1156,22 +1157,32 @@ impl BufferFlusher {
                                 continue;
                             }
                             batch_values.push((lba, BlockmapValue::zero()));
+                            batch_seqs.push(latest_seq);
                         }
                         if batch_values.is_empty() {
                             prepared[unit_idx].zero_indices.clear();
                             continue;
                         }
 
-                        match meta.atomic_batch_write(&vol_id, &batch_values, 0) {
-                            Ok(newly_zeroed) => {
-                                let accepted: Vec<usize> = batch_values
-                                    .iter()
-                                    .map(|(lba, _)| (lba.0 - unit.start_lba.0) as usize)
-                                    .collect();
-                                for &i in &accepted {
-                                    prepared[unit_idx].is_hit[i] = true;
+                        match meta.atomic_batch_write_with_dedup(
+                            &vol_id,
+                            &batch_values,
+                            0,
+                            &[],
+                            &batch_seqs,
+                        ) {
+                            Ok((newly_zeroed, accepted_flags)) => {
+                                for (k, (lba, _)) in batch_values.iter().enumerate() {
+                                    let i = (lba.0 - unit.start_lba.0) as usize;
+                                    if accepted_flags.get(k).copied().unwrap_or(true) {
+                                        prepared[unit_idx].is_hit[i] = true;
+                                        prepared[unit_idx].successful_hit_indices.push(i);
+                                    } else {
+                                        metrics
+                                            .dedup_hit_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
-                                prepared[unit_idx].successful_hit_indices.extend(accepted);
                                 prepared[unit_idx].zero_indices.clear();
                                 if !newly_zeroed.is_empty() {
                                     let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
@@ -1213,6 +1224,12 @@ impl BufferFlusher {
             .iter()
             .map(|(_, _, lba, value, hash)| (*lba, *value, *hash))
             .collect();
+        let batch_seqs: Vec<u64> = chunk
+            .iter()
+            .map(|(unit_idx, _, lba, _, _)| {
+                Self::latest_seq_for_lba(&prepared[*unit_idx].unit.seq_lba_ranges, *lba)
+            })
+            .collect();
 
         // Collect promote_candidates from the unit_idx values present
         // in this chunk. Each (lba_idx, hash, dedup_entry) tuple is a
@@ -1231,8 +1248,12 @@ impl BufferFlusher {
         }
 
         let hit_commit_start = Instant::now();
-        let batch_result =
-            meta.atomic_batch_dedup_hits_with_promote(vol_id, &batch_input, &promote_entries);
+        let batch_result = meta.atomic_batch_dedup_hits_with_promote(
+            vol_id,
+            &batch_input,
+            &promote_entries,
+            &batch_seqs,
+        );
         Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
 
         match batch_result {

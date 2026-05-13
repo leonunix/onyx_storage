@@ -292,12 +292,14 @@ impl MetaStore {
         batch_values: &[(Lba, BlockmapValue)],
         new_refcount: u32,
         dedup_entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
+        seqs: &[u64],
+    ) -> OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)> {
         self.backend.atomic_batch_write_with_dedup(
             vol_id,
             batch_values,
             new_refcount,
             dedup_entries,
+            seqs,
         )
     }
 
@@ -317,12 +319,14 @@ impl MetaStore {
         new_pba: Pba,
         new_refcount: u32,
         dedup_entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
+        seqs: &[u64],
+    ) -> OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)> {
         self.backend.atomic_batch_write_packed_with_dedup(
             batch_values,
             new_pba,
             new_refcount,
             dedup_entries,
+            seqs,
         )
     }
 
@@ -337,9 +341,10 @@ impl MetaStore {
         &self,
         units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
         dedup_entries: &[(ContentHash, DedupEntry)],
-    ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
+        seqs: &[u64],
+    ) -> OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)> {
         self.backend
-            .atomic_batch_write_multi_with_dedup(units, dedup_entries)
+            .atomic_batch_write_multi_with_dedup(units, dedup_entries, seqs)
     }
 
     pub fn get_refcount(&self, pba: Pba) -> OnyxResult<u32> {
@@ -368,8 +373,10 @@ impl MetaStore {
         lba: Lba,
         new_value: &BlockmapValue,
         hash: &ContentHash,
+        seq: u64,
     ) -> OnyxResult<Option<RemapCleanup>> {
-        self.backend.atomic_dedup_hit(vol_id, lba, new_value, hash)
+        self.backend
+            .atomic_dedup_hit(vol_id, lba, new_value, hash, seq)
     }
 
     pub fn atomic_batch_dedup_hits(
@@ -390,9 +397,10 @@ impl MetaStore {
         vol_id: &VolumeId,
         hits: &[(Lba, BlockmapValue, ContentHash)],
         promote_entries: &[(ContentHash, DedupEntry)],
+        seqs: &[u64],
     ) -> OnyxResult<(Vec<DedupHitResult>, HashMap<Pba, RemapCleanup>)> {
         self.backend
-            .atomic_batch_dedup_hits_with_promote(vol_id, hits, promote_entries)
+            .atomic_batch_dedup_hits_with_promote(vol_id, hits, promote_entries, seqs)
     }
 
     pub fn get_dedup_entry(&self, hash: &ContentHash) -> OnyxResult<Option<DedupEntry>> {

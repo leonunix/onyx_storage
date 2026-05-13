@@ -271,6 +271,11 @@ pub struct EngineMetrics {
     pub flush_packed_fragments_written: AtomicU64,
     pub flush_packed_bytes: AtomicU64,
     pub flush_stale_discards: AtomicU64,
+    /// Per-LBA L2P remaps rejected by metadb's apply-time seq_guard
+    /// (our seq <= stored seq). Expected to stay near zero while the
+    /// onyx-side commit lock is still in place; ramps up after the
+    /// lock is removed and concurrent same-LBA commits race.
+    pub flush_seq_rejects: AtomicU64,
     pub flush_errors: AtomicU64,
     pub flush_writer_total_ns: AtomicU64,
     pub flush_writer_alloc_ns: AtomicU64,
@@ -607,6 +612,7 @@ impl Default for EngineMetrics {
             flush_packed_fragments_written: AtomicU64::new(0),
             flush_packed_bytes: AtomicU64::new(0),
             flush_stale_discards: AtomicU64::new(0),
+            flush_seq_rejects: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             flush_writer_total_ns: AtomicU64::new(0),
             flush_writer_alloc_ns: AtomicU64::new(0),
@@ -874,6 +880,7 @@ impl EngineMetrics {
             flush_packed_fragments_written: load(&self.flush_packed_fragments_written),
             flush_packed_bytes: load(&self.flush_packed_bytes),
             flush_stale_discards: load(&self.flush_stale_discards),
+            flush_seq_rejects: load(&self.flush_seq_rejects),
             flush_errors: load(&self.flush_errors),
             flush_writer_total_ns: load(&self.flush_writer_total_ns),
             flush_writer_alloc_ns: load(&self.flush_writer_alloc_ns),
@@ -1121,6 +1128,7 @@ pub struct EngineMetricsSnapshot {
     pub flush_packed_fragments_written: u64,
     pub flush_packed_bytes: u64,
     pub flush_stale_discards: u64,
+    pub flush_seq_rejects: u64,
     pub flush_errors: u64,
     pub flush_writer_total_ns: u64,
     pub flush_writer_alloc_ns: u64,
@@ -1399,6 +1407,7 @@ impl EngineMetricsSnapshot {
             flush_packed_fragments_written,
             flush_packed_bytes,
             flush_stale_discards,
+            flush_seq_rejects,
             flush_errors,
             flush_writer_total_ns,
             flush_writer_alloc_ns,
@@ -3231,7 +3240,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "flush: coalesce_runs={} units={} lbas={} raw_bytes={} superseded_entries={} superseded_lbas={} compressed_units={} compressed_in={} compressed_out={} compression_bypass_units={} compression_bypass_bytes={} written_units={} written_bytes={} packed_slots={} packed_fragments={} packed_bytes={} stale_discards={} errors={}",
+            "flush: coalesce_runs={} units={} lbas={} raw_bytes={} superseded_entries={} superseded_lbas={} compressed_units={} compressed_in={} compressed_out={} compression_bypass_units={} compression_bypass_bytes={} written_units={} written_bytes={} packed_slots={} packed_fragments={} packed_bytes={} stale_discards={} seq_rejects={} errors={}",
             self.metrics.coalesce_runs,
             self.metrics.coalesced_units,
             self.metrics.coalesced_lbas,
@@ -3249,6 +3258,7 @@ impl EngineStatusSnapshot {
             self.metrics.flush_packed_fragments_written,
             self.metrics.flush_packed_bytes,
             self.metrics.flush_stale_discards,
+            self.metrics.flush_seq_rejects,
             self.metrics.flush_errors
         );
         let _ = writeln!(

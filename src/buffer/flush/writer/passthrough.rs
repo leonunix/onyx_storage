@@ -101,6 +101,7 @@ impl BufferFlusher {
                         .collect();
 
                     let mut batch_values = Vec::with_capacity(live_positions.len());
+                    let mut batch_seqs = Vec::with_capacity(live_positions.len());
                     for i in 0..live_positions.len() {
                         let flags = if unit.dedup_skipped {
                             FLAG_DEDUP_SKIPPED
@@ -115,6 +116,7 @@ impl BufferFlusher {
                             flags,
                         );
                         batch_values.push((lbas[i], blockmap));
+                        batch_seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, lbas[i]));
                     }
                     let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
                     let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
@@ -148,12 +150,30 @@ impl BufferFlusher {
                         FlushFailStage::BeforeMetaWrite,
                     )?;
 
-                    let actual_old_pba_meta = meta.atomic_batch_write_with_dedup(
+                    let (actual_old_pba_meta, accepted) = meta.atomic_batch_write_with_dedup(
                         &vol_id,
                         &batch_values,
                         live_positions.len() as u32,
                         &[],
+                        &batch_seqs,
                     )?;
+                    // metadb seq_guard may reject some L2pRemaps. If every
+                    // remap in this unit was rejected, refcount[pba] is 0
+                    // and the freshly-allocated PBA is orphaned — surface
+                    // that as `Ok(None)` so the outer free path runs.
+                    if !accepted.iter().any(|a| *a) {
+                        let rejects = accepted.len() as u64;
+                        metrics
+                            .flush_seq_rejects
+                            .fetch_add(rejects, Ordering::Relaxed);
+                        return Ok(None);
+                    }
+                    let rejects = accepted.iter().filter(|a| !**a).count() as u64;
+                    if rejects > 0 {
+                        metrics
+                            .flush_seq_rejects
+                            .fetch_add(rejects, Ordering::Relaxed);
+                    }
                     candidate.insert_many(&fresh_dedup_pairs);
                     Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
                     Ok(Some((live_positions, actual_old_pba_meta)))

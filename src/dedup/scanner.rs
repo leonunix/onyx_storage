@@ -335,8 +335,13 @@ impl DedupScanner {
                                 flags: 0, // Clear DEDUP_SKIPPED
                                 ..existing.to_blockmap_value()
                             };
+                            // seq=0 is the legacy/no-guard sentinel: metadb's
+                            // apply-time seq_guard bypasses the CAS check, so
+                            // the scanner can overwrite a buffer commit even
+                            // when its per-LBA seq is non-zero. Scanner's
+                            // existing re-check loop catches the race.
                             let decremented =
-                                meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash)?;
+                                meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash, 0)?;
                             if let Some(cleanup) = decremented {
                                 BufferFlusher::cleanup_dead_pba_post_commit(
                                     allocator,
