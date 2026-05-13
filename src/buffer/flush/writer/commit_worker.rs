@@ -536,13 +536,6 @@ impl BufferFlusher {
         let cur_created_at = cur_vol.as_ref().map(|v| v.created_at);
         let volume_present = cur_vol.is_some();
 
-        // Commit lock ranges: every unit in the job. Sorted/deduped
-        // inside with_l2p_commit_locks_for_ranges.
-        let commit_ranges: Vec<(&str, Lba, u64)> = units
-            .iter()
-            .map(|u| (vol_id.0.as_str(), u.unit.start_lba, u.unit.lba_count as u64))
-            .collect();
-
         let n = units.len();
         let mut unit_metas: Vec<Option<UnitMeta>> = (0..n).map(|_| None).collect();
         let mut discarded: Vec<bool> = vec![false; n];
@@ -552,13 +545,13 @@ impl BufferFlusher {
         // times in the tx, so we must free it back to the allocator
         // in the post-commit pass — same shape as `discarded` units.
         let mut seq_rejected_indices: Vec<usize> = Vec::new();
-        // Accumulators owned outside the L2P stripe lock — populated by
-        // each `commit_passthrough_chunk` so candidate cache inserts and
-        // stale dedup repairs ride into the post_commit thread instead
-        // of pinning the lock for tens of milliseconds.
+        // Mutation accumulators owned outside the closure. Same-LBA
+        // concurrent commits are arbitrated by metadb's per-LBA
+        // seq_guard CAS, so we no longer take any onyx-side stripe
+        // lock here.
         let mut accum_candidate_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
         let mut accum_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-        let actual_old_pba_meta = pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
+        let actual_old_pba_meta = {
             let build_start = Instant::now();
             for (i, ucd) in units.iter().enumerate() {
                 let unit = &ucd.unit;
@@ -718,12 +711,11 @@ impl BufferFlusher {
             PassthroughChunkOutcome {
                 old_pba_meta: accum_old_meta,
             }
-        });
+        };
 
-        // Post-commit work outside the L2P commit lock. Keep
-        // mark_flushed ordered before done_tx so the coalescer cannot
-        // re-enqueue the same pending seq while its buffer index entry
-        // is still visible.
+        // Keep mark_flushed ordered before done_tx so the coalescer
+        // cannot re-enqueue the same pending seq while its buffer
+        // index entry is still visible.
         let cleanup_start = Instant::now();
         let commit_failed_set: std::collections::HashSet<usize> =
             commit_failed_indices.iter().copied().collect();
@@ -1170,21 +1162,9 @@ impl BufferFlusher {
         let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
-        let commit_ranges: Vec<(&str, Lba, u64)> = jobs
-            .iter()
-            .flat_map(|job| {
-                job.sealed.fragments.iter().map(|frag| {
-                    (
-                        frag.unit.vol_id.as_str(),
-                        frag.unit.start_lba,
-                        frag.unit.lba_count as u64,
-                    )
-                })
-            })
-            .collect();
-
-        let outcome: OnyxResult<PackedCommitOutcome> =
-            pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
+        // Same-LBA concurrent commits are arbitrated by metadb's
+        // per-LBA seq_guard CAS; no onyx-side stripe lock here.
+        let outcome: OnyxResult<PackedCommitOutcome> = (|| {
                 let build_start = Instant::now();
                 let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
                 let mut batch_seqs: Vec<u64> = Vec::new();
@@ -1377,7 +1357,7 @@ impl BufferFlusher {
                         .sum(),
                     total_refcount: batch_values.len() as u32,
                 })
-            });
+            })();
 
         match outcome {
             Ok(PackedCommitOutcome::Discarded { all_seq_lba_ranges }) => {

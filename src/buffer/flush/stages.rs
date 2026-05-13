@@ -968,17 +968,11 @@ impl BufferFlusher {
             let mut pending: Vec<(usize, usize, Lba, BlockmapValue, ContentHash)> = Vec::new();
 
             lifecycle.with_read_lock(&vol_id_str, || {
-                // Dedup-hit commits do NOT take `with_l2p_commit_locks_for_ranges`:
-                // the race against a concurrent free of the target PBA is
-                // handled inside metadb by `L2pRemap { guard: Some((pba, 1)) }`,
-                // which refuses the remap atomically when refcount < 1.
-                // Holding the onyx stripe lock for the full metadb commit
-                // serialised hit + PT commits on overlapping stripes and
-                // pinned `l2p_commit_lock_hold` at ~423 ms / acquire under
-                // skip=0 — see docs/metadb-nvme-drain-plan.md for the
-                // bisect data. Each hit chunk inside
-                // `commit_dedup_hit_chunk` is still atomic via the metadb
-                // tx; we just no longer block PT on it.
+                // Same-LBA concurrent commits are arbitrated by metadb's
+                // per-LBA seq_guard CAS; the race against a concurrent
+                // free of the target PBA is handled inside metadb by
+                // `L2pRemap { guard: Some((pba, 1)) }`, which refuses
+                // the remap atomically when refcount < 1.
                 for unit_idx in unit_indices {
                     let unit = &prepared[unit_idx].unit;
                     let generation_alive = generation_cache
@@ -1095,19 +1089,10 @@ impl BufferFlusher {
             let vol_id = VolumeId(vol_id_str.clone());
             let mut generation_cache: HashMap<u64, OnyxResult<bool>> = HashMap::new();
             lifecycle.with_read_lock(&vol_id_str, || {
-                let commit_ranges: Vec<(&str, Lba, u64)> = unit_indices
-                    .iter()
-                    .map(|&unit_idx| {
-                    let unit = &prepared[unit_idx].unit;
-                    (
-                        vol_id_str.as_str(),
-                        unit.start_lba,
-                        unit.lba_count as u64,
-                    )
-                    })
-                    .collect();
-                pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
-                    for unit_idx in unit_indices {
+                // Same-LBA concurrent commits are arbitrated by
+                // metadb's per-LBA seq_guard CAS; no onyx-side
+                // stripe lock here.
+                for unit_idx in unit_indices {
                         let unit = &prepared[unit_idx].unit;
                         let generation_alive = generation_cache
                             .entry(unit.vol_created_at)
@@ -1201,7 +1186,6 @@ impl BufferFlusher {
                             }
                         }
                     }
-                });
             });
         }
     }

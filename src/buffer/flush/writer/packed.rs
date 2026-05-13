@@ -17,7 +17,7 @@ enum PackedSlotCommitOutcome {
 impl BufferFlusher {
     // Production callers now route through `write_packed_slots_batch` →
     // commit_worker dispatch. Kept for test coverage of the synchronous
-    // packed-slot path (l2p_commit_lock + atomic_batch_write_packed).
+    // packed-slot path.
     #[allow(dead_code)]
     pub(in crate::buffer::flush) fn write_packed_slot(
         shard_idx: usize,
@@ -48,14 +48,9 @@ impl BufferFlusher {
         let locks: Vec<_> = vol_ids.iter().map(|vid| lifecycle.get_lock(vid)).collect();
         let _guards: Vec<_> = locks.iter().map(|l| l.read().unwrap()).collect();
 
-        let commit_ranges = sealed.fragments.iter().map(|frag| {
-            (
-                frag.unit.vol_id.as_str(),
-                frag.unit.start_lba,
-                frag.unit.lba_count as u64,
-            )
-        });
-        let outcome = pool.with_l2p_commit_locks_for_ranges(commit_ranges, || {
+        // Same-LBA concurrent commits are arbitrated by metadb's
+        // per-LBA seq_guard CAS; no onyx-side stripe lock here.
+        let outcome = (|| {
             // Under lifecycle read locks: check generation, build batch, IO, commit
 
             // Build blockmap entries.
@@ -236,7 +231,7 @@ impl BufferFlusher {
                 all_seq_lba_ranges,
                 any_discarded,
             }))
-        });
+        })();
         let commit = match outcome {
             Ok(PackedSlotCommitOutcome::Discarded) => {
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);

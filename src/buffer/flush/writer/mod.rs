@@ -508,8 +508,7 @@ impl BufferFlusher {
     }
 
     /// Handle a compressed unit in the writer thread. Only called from
-    /// the shutdown drain; sealed slots get dispatched to commit workers
-    /// to keep the l2p_commit_lock acquires on a single hot path.
+    /// the shutdown drain; sealed slots get dispatched to commit workers.
     pub(super) fn handle_compressed_unit(
         shard_idx: usize,
         unit: CompressedUnit,

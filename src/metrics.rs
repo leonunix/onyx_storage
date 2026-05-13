@@ -361,9 +361,6 @@ pub struct EngineMetrics {
     pub flush_writer_packed_batch_lbas_max: AtomicU64,
     pub flush_writer_packed_batch_io_ops_max: AtomicU64,
     pub flush_writer_packed_mark_calls_max: AtomicU64,
-    pub l2p_commit_lock_wait_ns: AtomicU64,
-    pub l2p_commit_lock_hold_ns: AtomicU64,
-    pub l2p_commit_lock_acquires: AtomicU64,
     pub flush_writer_cleanup_ns: AtomicU64,
     /// Async cleanup-thread time: dedup-index repair + extra PBA
     /// freelisting performed off the writer hot path. Sibling to
@@ -688,9 +685,6 @@ impl Default for EngineMetrics {
             flush_writer_packed_batch_lbas_max: AtomicU64::new(0),
             flush_writer_packed_batch_io_ops_max: AtomicU64::new(0),
             flush_writer_packed_mark_calls_max: AtomicU64::new(0),
-            l2p_commit_lock_wait_ns: AtomicU64::new(0),
-            l2p_commit_lock_hold_ns: AtomicU64::new(0),
-            l2p_commit_lock_acquires: AtomicU64::new(0),
             flush_writer_cleanup_ns: AtomicU64::new(0),
             flush_cleanup_thread_ns: AtomicU64::new(0),
             flush_cleanup_thread_batches: AtomicU64::new(0),
@@ -956,9 +950,6 @@ impl EngineMetrics {
             flush_writer_packed_batch_lbas_max: load(&self.flush_writer_packed_batch_lbas_max),
             flush_writer_packed_batch_io_ops_max: load(&self.flush_writer_packed_batch_io_ops_max),
             flush_writer_packed_mark_calls_max: load(&self.flush_writer_packed_mark_calls_max),
-            l2p_commit_lock_wait_ns: load(&self.l2p_commit_lock_wait_ns),
-            l2p_commit_lock_hold_ns: load(&self.l2p_commit_lock_hold_ns),
-            l2p_commit_lock_acquires: load(&self.l2p_commit_lock_acquires),
             flush_writer_cleanup_ns: load(&self.flush_writer_cleanup_ns),
             flush_cleanup_thread_ns: load(&self.flush_cleanup_thread_ns),
             flush_cleanup_thread_batches: load(&self.flush_cleanup_thread_batches),
@@ -1204,9 +1195,6 @@ pub struct EngineMetricsSnapshot {
     pub flush_writer_packed_batch_lbas_max: u64,
     pub flush_writer_packed_batch_io_ops_max: u64,
     pub flush_writer_packed_mark_calls_max: u64,
-    pub l2p_commit_lock_wait_ns: u64,
-    pub l2p_commit_lock_hold_ns: u64,
-    pub l2p_commit_lock_acquires: u64,
     pub flush_writer_cleanup_ns: u64,
     pub flush_cleanup_thread_ns: u64,
     pub flush_cleanup_thread_batches: u64,
@@ -1483,9 +1471,6 @@ impl EngineMetricsSnapshot {
             flush_writer_packed_batch_lbas_max,
             flush_writer_packed_batch_io_ops_max,
             flush_writer_packed_mark_calls_max,
-            l2p_commit_lock_wait_ns,
-            l2p_commit_lock_hold_ns,
-            l2p_commit_lock_acquires,
             flush_writer_cleanup_ns,
             flush_cleanup_thread_ns,
             flush_cleanup_thread_batches,
@@ -3279,16 +3264,13 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "flush_writer_meta: commits={} lbas={} pt_commits={} pt_lbas={} packed_commits={} packed_lbas={} l2p_lock_wait={} l2p_lock_hold={} l2p_lock_acquires={}",
+            "flush_writer_meta: commits={} lbas={} pt_commits={} pt_lbas={} packed_commits={} packed_lbas={}",
             self.metrics.flush_writer_meta_commits,
             self.metrics.flush_writer_meta_lbas,
             self.metrics.flush_writer_meta_pt_commits,
             self.metrics.flush_writer_meta_pt_lbas,
             self.metrics.flush_writer_meta_packed_commits,
             self.metrics.flush_writer_meta_packed_lbas,
-            self.metrics.l2p_commit_lock_wait_ns,
-            self.metrics.l2p_commit_lock_hold_ns,
-            self.metrics.l2p_commit_lock_acquires
         );
         let _ = writeln!(
             out,

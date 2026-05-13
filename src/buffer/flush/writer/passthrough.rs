@@ -88,9 +88,9 @@ impl BufferFlusher {
 
             let meta_start = Instant::now();
 
-            let commit = pool.with_l2p_commit_locks_for_ranges(
-                std::iter::once((unit.vol_id.as_str(), unit.start_lba, unit.lba_count as u64)),
-                || -> OnyxResult<Option<(Vec<usize>, HashMap<Pba, RemapCleanup>)>> {
+            // Same-LBA concurrent commits are arbitrated by metadb's
+            // per-LBA seq_guard CAS; no onyx-side stripe lock here.
+            let commit = (|| -> OnyxResult<Option<(Vec<usize>, HashMap<Pba, RemapCleanup>)>> {
                     let live_positions = Self::live_positions_for_unit(unit, pool)?;
                     if live_positions.is_empty() {
                         return Ok(None);
@@ -177,8 +177,7 @@ impl BufferFlusher {
                     candidate.insert_many(&fresh_dedup_pairs);
                     Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
                     Ok(Some((live_positions, actual_old_pba_meta)))
-                },
-            );
+                })();
             let Some((live_positions, actual_old_pba_meta)) = (match commit {
                 Ok(v) => v,
                 Err(e) => {

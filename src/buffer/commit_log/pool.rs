@@ -1097,7 +1097,6 @@ impl WriteBufferPool {
             root_device: device,
             shards,
             next_seq: AtomicU64::new(max_seq + 1),
-            l2p_commit_locks: DashMap::new(),
             routing_zone_size_blocks,
             ready_rx,
             shard_ready_rxs,
@@ -1293,95 +1292,6 @@ impl WriteBufferPool {
         self.shards[shard_idx]
             .shard
             .is_latest_lba_seq(vol_id, lba, seq, vol_created_at)
-    }
-
-    fn l2p_commit_lock_for_key(&self, key: (String, u64)) -> Arc<parking_lot::Mutex<()>> {
-        self.l2p_commit_locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-            .clone()
-    }
-
-    pub(crate) fn with_l2p_commit_lock_for_lba<R>(
-        &self,
-        vol_id: &str,
-        lba: Lba,
-        f: impl FnOnce() -> R,
-    ) -> R {
-        self.with_l2p_commit_locks_for_ranges(std::iter::once((vol_id, lba, 1)), f)
-    }
-
-    pub(crate) fn with_l2p_commit_locks_for_ranges<'a, R>(
-        &self,
-        ranges: impl IntoIterator<Item = (&'a str, Lba, u64)>,
-        f: impl FnOnce() -> R,
-    ) -> R {
-        let mut keys: Vec<(String, u64)> = Vec::new();
-        for (vol_id, start_lba, lba_count) in ranges {
-            if lba_count == u64::MAX {
-                keys.extend(
-                    (0..L2P_COMMIT_LOCK_STRIPES).map(|stripe| (vol_id.to_string(), stripe)),
-                );
-                continue;
-            }
-            let count = lba_count.max(1);
-            let first = if self.routing_zone_size_blocks == 0 {
-                0
-            } else {
-                start_lba.0 / self.routing_zone_size_blocks
-            };
-            let last_lba = start_lba.0.saturating_add(count.saturating_sub(1));
-            let last = if self.routing_zone_size_blocks == 0 {
-                0
-            } else {
-                last_lba / self.routing_zone_size_blocks
-            };
-            if last.saturating_sub(first).saturating_add(1) >= L2P_COMMIT_LOCK_STRIPES {
-                keys.extend(
-                    (0..L2P_COMMIT_LOCK_STRIPES).map(|stripe| (vol_id.to_string(), stripe)),
-                );
-            } else {
-                keys.extend(
-                    (first..=last)
-                        .map(|zone| (vol_id.to_string(), zone % L2P_COMMIT_LOCK_STRIPES)),
-                );
-            }
-        }
-        if keys.is_empty() {
-            return f();
-        }
-        keys.sort();
-        keys.dedup();
-        self.with_l2p_commit_lock_keys(keys, f)
-    }
-
-    fn with_l2p_commit_lock_keys<R>(
-        &self,
-        keys: Vec<(String, u64)>,
-        f: impl FnOnce() -> R,
-    ) -> R {
-        let locks: Vec<_> = keys
-            .into_iter()
-            .map(|key| self.l2p_commit_lock_for_key(key))
-            .collect();
-        let wait_start = std::time::Instant::now();
-        let _guards: Vec<_> = locks.iter().map(|lock| lock.lock()).collect();
-        let hold_start = std::time::Instant::now();
-        if let Some(metrics) = self.metrics.get() {
-            metrics.l2p_commit_lock_acquires.fetch_add(1, Ordering::Relaxed);
-            metrics.l2p_commit_lock_wait_ns.fetch_add(
-                wait_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
-        }
-        let result = f();
-        if let Some(metrics) = self.metrics.get() {
-            metrics.l2p_commit_lock_hold_ns.fetch_add(
-                hold_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
-        }
-        result
     }
 
     /// Check whether every LBA in this entry has been superseded by a later
