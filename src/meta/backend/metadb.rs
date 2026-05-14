@@ -955,7 +955,21 @@ impl MetadbBackend {
         let ord = self.volume_ordinal(vol_id)?;
         let mut tx = self.db.begin();
         tx.l2p_remap(ord, lba.0, to_l2p_value(&value), None);
-        tx.commit()?;
+        // Match `atomic_dedup_hit` / `atomic_batch_dedup_hits` semantics:
+        // this is a flag-bit edit on an existing mapping with no LV3
+        // write. The logged path forces `unlogged_commit_gate.write()` +
+        // `flush()` per call, which (per `phaseA-diag` 2026-05-14)
+        // serialises every concurrent unlogged writer behind a single
+        // `checkpoint_unlogged_before_wal_commit` that can take up to
+        // 17.6s. The DedupScanner calls this once per re-scanned LBA at
+        // ~3 Hz, so a logged path here stalls the entire writer
+        // pipeline. Crash safety: if this flag-clear is lost, the next
+        // scanner cycle re-processes the LBA — idempotent.
+        if self.unlogged_flush_commits {
+            tx.commit_unlogged_with_outcomes()?;
+        } else {
+            tx.commit_with_outcomes()?;
+        }
         Ok(())
     }
 
