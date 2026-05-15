@@ -173,6 +173,24 @@ pub struct MetaConfig {
     /// to sample every shard.
     #[serde(default = "default_metadb_flush_select_budget")]
     pub flush_select_budget: u64,
+    /// Move `page_store.deferred_free` draining off the
+    /// `flush_with_gate` critical path into a background worker.
+    /// 2026-05-15 nvme-box: reclaim was ~35 % of `flush_total_max`
+    /// (23 s of 67 s); detaching it lets the single-outstanding
+    /// dispatcher fire the next flush as soon as the manifest
+    /// commits. Disable to fall back to inline reclaim (debug / A/B).
+    #[serde(default = "default_metadb_async_reclaim_enabled")]
+    pub async_reclaim_enabled: bool,
+    /// Pages reclaimed per worker cycle. Caps single-cycle NVMe
+    /// burst (zero-write + punch_hole) while amortising per-page
+    /// overhead. Default 65 536 pages = 256 MiB.
+    #[serde(default = "default_metadb_async_reclaim_max_pages_per_cycle")]
+    pub async_reclaim_max_pages_per_cycle: u64,
+    /// Worker idle parking time in milliseconds. Flush
+    /// notifications cut this short via a condvar, so this only
+    /// matters on quiet systems. Default 50 ms.
+    #[serde(default = "default_metadb_async_reclaim_idle_interval_ms")]
+    pub async_reclaim_idle_interval_ms: u64,
     /// Experimental NVMe mode: ordinary flusher metadata commits bypass the
     /// metadb WAL and rely on LV2's durable write log until the next metadb
     /// checkpoint. Leave off unless the buffer device has enough headroom to
@@ -309,6 +327,11 @@ impl Default for MetaConfig {
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             flush_dirty_pages_threshold: default_metadb_flush_dirty_pages_threshold(),
             flush_select_budget: default_metadb_flush_select_budget(),
+            async_reclaim_enabled: default_metadb_async_reclaim_enabled(),
+            async_reclaim_max_pages_per_cycle:
+                default_metadb_async_reclaim_max_pages_per_cycle(),
+            async_reclaim_idle_interval_ms:
+                default_metadb_async_reclaim_idle_interval_ms(),
             unlogged_flush_commits: false,
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
@@ -702,6 +725,20 @@ fn default_metadb_flush_dirty_pages_threshold() -> u64 {
     // multi-second bursts. buffer_volatile_payload dropped 12.3 GB →
     // 0.59 GB at this threshold. Set to 0 to disable.
     100_000
+}
+fn default_metadb_async_reclaim_enabled() -> bool {
+    // OFF after 2026-05-15 nvme-box A/B. v1 tight-loop = correct
+    // but READ IOPS -26 % (NVMe contention); v2 one-cycle-per-notify =
+    // 72 967 refcount underflow errors. Infra retained but disabled
+    // until underflow root cause is identified. See memory
+    // `async_reclaim_default_off`.
+    false
+}
+fn default_metadb_async_reclaim_max_pages_per_cycle() -> u64 {
+    65_536
+}
+fn default_metadb_async_reclaim_idle_interval_ms() -> u64 {
+    50
 }
 fn default_metadb_flush_select_budget() -> u64 {
     // Default OFF — every flush samples every shard.
