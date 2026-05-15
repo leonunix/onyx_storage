@@ -1317,6 +1317,10 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_writeback_idle_sleep_us = config.l2p_writeback_idle_sleep_us;
     cfg.l2p_writeback_min_dirty_pages = config.l2p_writeback_min_dirty_pages;
     cfg.l2p_writeback_max_pages_per_cycle = config.l2p_writeback_max_pages_per_cycle;
+    cfg.l2p_buffer_enabled = config.l2p_buffer_enabled;
+    cfg.l2p_buffer_soft_entries = config.l2p_buffer_soft_entries;
+    cfg.l2p_buffer_hard_entries = config.l2p_buffer_hard_entries;
+    cfg.l2p_buffer_max_interval_ms = config.l2p_buffer_max_interval_ms;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
     cfg.async_reclaim_max_pages_per_cycle =

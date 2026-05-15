@@ -269,6 +269,30 @@ pub struct MetaConfig {
     /// queue on this lock for the duration of `install_writeback`).
     #[serde(default = "default_l2p_writeback_max_pages_per_cycle")]
     pub l2p_writeback_max_pages_per_cycle: usize,
+
+    /// Enable the B2 in-memory L2P buffer + periodic compaction path.
+    /// When `false` (default), commits mutate the paged radix tree
+    /// in-line. When `true`, commits insert into the per-shard buffer
+    /// and a background compactor folds them into the tree. See
+    /// `metadb/src/db/l2p_buffer.rs`.
+    #[serde(default = "default_l2p_buffer_enabled")]
+    pub l2p_buffer_enabled: bool,
+
+    /// Per-shard soft trigger for the compactor (in entries). When
+    /// `active.len()` crosses this the compactor wakes.
+    #[serde(default = "default_l2p_buffer_soft_entries")]
+    pub l2p_buffer_soft_entries: usize,
+
+    /// Per-shard hard trigger. Commits to a shard block on a Condvar
+    /// when its `active.len()` reaches this until the compactor swaps
+    /// the active map out.
+    #[serde(default = "default_l2p_buffer_hard_entries")]
+    pub l2p_buffer_hard_entries: usize,
+
+    /// Maximum wall time the compactor may wait between cycles when
+    /// the entry-count triggers do not fire.
+    #[serde(default = "default_l2p_buffer_max_interval_ms")]
+    pub l2p_buffer_max_interval_ms: u64,
 }
 
 impl MetaConfig {
@@ -349,6 +373,10 @@ impl Default for MetaConfig {
             l2p_writeback_idle_sleep_us: default_l2p_writeback_idle_sleep_us(),
             l2p_writeback_min_dirty_pages: default_l2p_writeback_min_dirty_pages(),
             l2p_writeback_max_pages_per_cycle: default_l2p_writeback_max_pages_per_cycle(),
+            l2p_buffer_enabled: default_l2p_buffer_enabled(),
+            l2p_buffer_soft_entries: default_l2p_buffer_soft_entries(),
+            l2p_buffer_hard_entries: default_l2p_buffer_hard_entries(),
+            l2p_buffer_max_interval_ms: default_l2p_buffer_max_interval_ms(),
         }
     }
 }
@@ -404,6 +432,22 @@ fn default_l2p_writeback_min_dirty_pages() -> usize {
 }
 fn default_l2p_writeback_max_pages_per_cycle() -> usize {
     512
+}
+fn default_l2p_buffer_enabled() -> bool {
+    // Phase 1 lands infrastructure only. Phase 3 flips behaviour
+    // (commit writes buffer instead of tree). Phase 5 may flip
+    // default to true after nvme-box A/B validation. See
+    // /root/.claude/plans/ticklish-sparking-barto.md.
+    false
+}
+fn default_l2p_buffer_soft_entries() -> usize {
+    64_000
+}
+fn default_l2p_buffer_hard_entries() -> usize {
+    512_000
+}
+fn default_l2p_buffer_max_interval_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
