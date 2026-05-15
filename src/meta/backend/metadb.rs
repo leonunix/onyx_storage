@@ -892,6 +892,10 @@ impl MetadbBackend {
         self.checkpoint.try_request_async()
     }
 
+    pub(crate) fn dirty_pages_estimate(&self) -> usize {
+        self.db.dirty_pages_estimate()
+    }
+
     pub(crate) fn try_request_durable_checkpoint_token(&self) -> OnyxResult<Option<u64>> {
         self.checkpoint.try_request_async_token()
     }

@@ -30,6 +30,12 @@ lsm_bloom_bits_per_entry = 20
 checkpoint_interval_ms = 1000
 group_commit_timeout_us = 1
 unlogged_flush_commits = true
+# 2026-05-15: cap single-flush sample size so dirty work drains
+# continuously rather than in 8 s bursts. nvme-box sweep validated
+# 100k as the sweet spot on this profile (buffer_volatile_payload
+# 12.3 GB → 0.59 GB; READ +2.7 %; READ p99 -16 %). Higher values
+# (500k / 2M) trailed the parallel-rc-drain baseline.
+flush_dirty_pages_threshold = 100000
 dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000

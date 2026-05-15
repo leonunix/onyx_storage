@@ -145,6 +145,20 @@ pub struct MetaConfig {
     /// queued commits first, so this should stay tiny on low-latency NVMe.
     #[serde(default = "default_metadb_group_commit_timeout_us")]
     pub group_commit_timeout_us: u64,
+    /// Trigger an early metadb checkpoint when the in-memory dirty
+    /// work (L2P dirty pages + RC pending deltas) exceeds this
+    /// count, instead of waiting only for the periodic checkpoint
+    /// interval. Caps single-flush sample size, smoothing the
+    /// otherwise-bursty NVMe IO + apply_gate hold pattern.
+    ///
+    /// 2026-05-15 nvme-box sweep: 100k is the sweet spot on the
+    /// configured profile (READ +2.7 %, p99 -16 %,
+    /// buffer_volatile_payload 12.3 GB → 0.59 GB = -95 %).
+    /// 500k / 2M trailed the parallel-rc-drain baseline. Set to 0
+    /// to disable the early trigger and preserve the prior
+    /// periodic-only behaviour.
+    #[serde(default = "default_metadb_flush_dirty_pages_threshold")]
+    pub flush_dirty_pages_threshold: u64,
     /// Experimental NVMe mode: ordinary flusher metadata commits bypass the
     /// metadb WAL and rely on LV2's durable write log until the next metadb
     /// checkpoint. Leave off unless the buffer device has enough headroom to
@@ -279,6 +293,7 @@ impl Default for MetaConfig {
             lsm_bloom_bits_per_entry: default_lsm_bloom_bits_per_entry(),
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
+            flush_dirty_pages_threshold: default_metadb_flush_dirty_pages_threshold(),
             unlogged_flush_commits: false,
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
@@ -665,6 +680,13 @@ fn default_metadb_checkpoint_interval_ms() -> u64 {
 }
 fn default_metadb_group_commit_timeout_us() -> u64 {
     1
+}
+fn default_metadb_flush_dirty_pages_threshold() -> u64 {
+    // 2026-05-15 nvme-box sweep: 100k caps single-flush sample size
+    // so dirty work is drained continuously rather than in
+    // multi-second bursts. buffer_volatile_payload dropped 12.3 GB →
+    // 0.59 GB at this threshold. Set to 0 to disable.
+    100_000
 }
 fn default_block_size() -> u32 {
     4096

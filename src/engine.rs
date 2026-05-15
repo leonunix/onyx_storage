@@ -94,6 +94,7 @@ impl DurabilityWatermarkHandle {
         durable_seq: Arc<AtomicU64>,
         checkpoint_interval: std::time::Duration,
         checkpoint_gates_ring_reclaim: bool,
+        dirty_pages_threshold: u64,
     ) -> Self {
         const RING_BUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         let stop = Arc::new(AtomicBool::new(false));
@@ -171,12 +172,35 @@ impl DurabilityWatermarkHandle {
                         }
                     }
 
+                    // Threshold-triggered path: when in-memory dirty
+                    // work (L2P dirty pages + RC pending deltas)
+                    // exceeds the configured cap, kick a checkpoint
+                    // early instead of waiting for the periodic tick.
+                    // The single-outstanding-request dispatcher means
+                    // this only fires effectively while no flush is
+                    // active, but in steady state the system finds a
+                    // self-balancing point where flush cadence ≈
+                    // threshold / dirty-accumulation-rate, capping
+                    // sample_max and meta_io batch_bytes_max.
+                    //
+                    // Configured via `cfg.meta.flush_dirty_pages_threshold`;
+                    // zero disables the early trigger and preserves
+                    // the original periodic-only cadence.
+                    let early_trigger = if dirty_pages_threshold > 0
+                        && pending_checkpoint.is_none()
+                        && Self::checkpoint_needed(captured, last_checkpoint_request_seq)
+                    {
+                        meta.dirty_pages_estimate() as u64 >= dirty_pages_threshold
+                    } else {
+                        false
+                    };
+
                     // Expensive path (`checkpoint_interval`): metadb
                     // checkpoint. The metadb side keeps the global
                     // apply gate only for the checkpoint-boundary sample,
                     // but the IO still costs real device time, so run it
                     // sparingly.
-                    if last_checkpoint.elapsed() < checkpoint_interval {
+                    if !early_trigger && last_checkpoint.elapsed() < checkpoint_interval {
                         continue;
                     }
                     last_checkpoint = std::time::Instant::now();
@@ -862,6 +886,7 @@ impl OnyxEngine {
             buffer_pool.durable_seq_handle(),
             config.meta.checkpoint_interval(),
             config.meta.unlogged_flush_commits,
+            config.meta.flush_dirty_pages_threshold,
         );
 
         Ok(Self {
@@ -1352,6 +1377,7 @@ impl OnyxEngine {
             buffer_pool.durable_seq_handle(),
             std::time::Duration::from_millis(50),
             config.meta.unlogged_flush_commits,
+            config.meta.flush_dirty_pages_threshold,
         );
 
         Ok(Self {

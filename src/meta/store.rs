@@ -93,6 +93,13 @@ impl MetaStore {
         self.backend.try_request_durable_checkpoint_token()
     }
 
+    /// Best-effort count of in-memory dirty work (L2P dirty page
+    /// buffer + RC pending deltas). The watermark thread uses this
+    /// to threshold-trigger an early checkpoint when configured.
+    pub fn dirty_pages_estimate(&self) -> usize {
+        self.backend.dirty_pages_estimate()
+    }
+
     pub(crate) fn durable_checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
         self.backend.durable_checkpoint_outcome(token)
     }
