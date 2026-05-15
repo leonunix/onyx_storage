@@ -159,6 +159,20 @@ pub struct MetaConfig {
     /// periodic-only behaviour.
     #[serde(default = "default_metadb_flush_dirty_pages_threshold")]
     pub flush_dirty_pages_threshold: u64,
+    /// Per-flush budget on the sum of `(dirty_l2p_pages +
+    /// pending_rc_deltas)` the sample phase will process. When the
+    /// running total crosses this cap during shard selection,
+    /// remaining shards stay unselected and their roots /
+    /// `last_flushed_lsn` carry over to the next flush. Combined
+    /// with the metadb-side round-robin cursor, partial sampling
+    /// keeps a single flush short enough to interleave with commit
+    /// apply. `manifest.checkpoint_lsn` becomes
+    /// `min(per-shard last_flushed_lsn)` so WAL prune / recovery
+    /// remain correct even when most flushes are partial.
+    /// Set to 0 to disable partial sampling and force every flush
+    /// to sample every shard.
+    #[serde(default = "default_metadb_flush_select_budget")]
+    pub flush_select_budget: u64,
     /// Experimental NVMe mode: ordinary flusher metadata commits bypass the
     /// metadb WAL and rely on LV2's durable write log until the next metadb
     /// checkpoint. Leave off unless the buffer device has enough headroom to
@@ -294,6 +308,7 @@ impl Default for MetaConfig {
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             flush_dirty_pages_threshold: default_metadb_flush_dirty_pages_threshold(),
+            flush_select_budget: default_metadb_flush_select_budget(),
             unlogged_flush_commits: false,
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
@@ -687,6 +702,30 @@ fn default_metadb_flush_dirty_pages_threshold() -> u64 {
     // multi-second bursts. buffer_volatile_payload dropped 12.3 GB →
     // 0.59 GB at this threshold. Set to 0 to disable.
     100_000
+}
+fn default_metadb_flush_select_budget() -> u64 {
+    // Default OFF — every flush samples every shard.
+    //
+    // 2026-05-15 nvme-box A/B with budget=100_000 (matching the
+    // threshold trigger): partial sample correctly capped sample /
+    // IO / reclaim max (sample_max 13.1 s → 0.6 s; meta_io
+    // batch_bytes 4.9 GB → 390 MB), but backend throughput stayed
+    // single-outstanding-dispatcher-bound at ~1.5 flushes/s and the
+    // unlogged-commit buffer reclaim path got pinned by
+    // `min(per-shard last_flushed_lsn)` not advancing (cold shards
+    // never get re-flushed, so `manifest.checkpoint_lsn` lags).
+    // Result: READ IOPS -8.5 %, buffer_volatile 0.6 GB → 32 GB.
+    // Disabling `unlogged_flush_commits` didn't help — WAL fsync
+    // became the new bottleneck (buffer 42 GB, IOPS -14 %).
+    //
+    // The infrastructure is sound (495 tests pass, 0 CRC /
+    // corruption, recovery via per-shard idempotent apply) and the
+    // knob remains exposed so configurations that DO benefit from
+    // partial sampling (e.g. workloads where most shards are cold,
+    // or where the embedder doesn't gate buffer reclaim on
+    // checkpoint LSN) can enable it. Set to a positive value to
+    // activate.
+    0
 }
 fn default_block_size() -> u32 {
     4096

@@ -36,6 +36,18 @@ unlogged_flush_commits = true
 # 12.3 GB → 0.59 GB; READ +2.7 %; READ p99 -16 %). Higher values
 # (500k / 2M) trailed the parallel-rc-drain baseline.
 flush_dirty_pages_threshold = 100000
+# Partial sample-phase budget. Default 0 (full sample every flush).
+#
+# 2026-05-15 nvme-box sweep (this file's profile): budget=100_000
+# capped per-flush sample / IO / reclaim correctly (sample_max
+# 13.1 s → 0.6 s; meta_io batch 4.9 GB → 390 MB) but pinned
+# `manifest.checkpoint_lsn = min(per-shard last_flushed_lsn)`,
+# starving the unlogged-buffer reclaim path. READ IOPS -8.5 %,
+# buffer_volatile_payload 0.6 GB → 32 GB. Disabling
+# `unlogged_flush_commits` only made it worse (buffer 42 GB, WAL
+# fsync 228 k / 600 s). Leaving partial off until a workload
+# emerges where it actually helps.
+flush_select_budget = 0
 dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000

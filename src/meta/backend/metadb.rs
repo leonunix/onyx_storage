@@ -1317,6 +1317,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_writeback_idle_sleep_us = config.l2p_writeback_idle_sleep_us;
     cfg.l2p_writeback_min_dirty_pages = config.l2p_writeback_min_dirty_pages;
     cfg.l2p_writeback_max_pages_per_cycle = config.l2p_writeback_max_pages_per_cycle;
+    cfg.flush_select_budget = config.flush_select_budget as usize;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.
