@@ -159,6 +159,26 @@ pub struct MetaConfig {
     /// periodic-only behaviour.
     #[serde(default = "default_metadb_flush_dirty_pages_threshold")]
     pub flush_dirty_pages_threshold: u64,
+    /// Background streaming-writeback target: when total dirty L2P
+    /// pages exceeds this value the writeback worker actively seals
+    /// and writes pages outside `apply_gate.write()`. Below the
+    /// target the worker idles. Pairs with
+    /// `flush_dirty_pages_threshold` as the target/trigger duality
+    /// (writeback drains the steady backlog; the threshold remains
+    /// the apply-gate-holding fallback). 0 disables the gate (worker
+    /// runs whenever per-shard `min_dirty_pages` is met). Only takes
+    /// effect when `l2p_writeback_enabled = true`.
+    #[serde(default = "default_metadb_flush_dirty_pages_target")]
+    pub flush_dirty_pages_target: u64,
+    /// Cap on background-priority ops in flight at metadb's centralised
+    /// IoSubmitter. Sync-priority ops (commit-path writes / fsync) always
+    /// admit up to SQ capacity; background ops (L2P streaming writeback)
+    /// wait in a deferred queue once `inflight_bg` reaches this cap.
+    /// Keeps writeback from displacing commits from the SQ — required
+    /// for `l2p_writeback_enabled=true` to not regress commit p99.
+    /// 0 disables the cap.
+    #[serde(default = "default_metadb_io_submitter_bg_inflight_cap")]
+    pub io_submitter_bg_inflight_cap: u64,
     /// Per-flush budget on the sum of `(dirty_l2p_pages +
     /// pending_rc_deltas)` the sample phase will process. When the
     /// running total crosses this cap during shard selection,
@@ -224,10 +244,13 @@ pub struct MetaConfig {
     /// Entries in metadb's in-memory dedup L1 hot cache.
     #[serde(default = "default_metadb_dedup_l1_cache_entries")]
     pub dedup_l1_cache_entries: usize,
-    /// Enable metadb's background refcount drainer. Default stays off so
-    /// production behavior remains the priority-1 checkpoint path until soak
-    /// validation flips this explicitly.
-    #[serde(default)]
+    /// Enable metadb's background refcount drainer. Default **on**
+    /// (Tier 1.A, `/root/.claude/plans/ticklish-sparking-barto.md`):
+    /// the drainer absorbs `RcShard.delta_active` into a sealed-page
+    /// overlay outside `apply_gate.write()`, shrinking sample-phase
+    /// `rc_drain` from seconds to sub-100 ms. Flip back to `false` to
+    /// recover the priority-1 path for bisection.
+    #[serde(default = "default_refcount_drainer_enabled")]
     pub refcount_drainer_enabled: bool,
     #[serde(default = "default_refcount_drainer_interval_ms")]
     pub refcount_drainer_interval_ms: u64,
@@ -350,6 +373,8 @@ impl Default for MetaConfig {
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             flush_dirty_pages_threshold: default_metadb_flush_dirty_pages_threshold(),
+            flush_dirty_pages_target: default_metadb_flush_dirty_pages_target(),
+            io_submitter_bg_inflight_cap: default_metadb_io_submitter_bg_inflight_cap(),
             flush_select_budget: default_metadb_flush_select_budget(),
             async_reclaim_enabled: default_metadb_async_reclaim_enabled(),
             async_reclaim_max_pages_per_cycle:
@@ -362,7 +387,7 @@ impl Default for MetaConfig {
             shards_per_partition: default_metadb_shards_per_partition(),
             dedup_cuckoo_buckets: default_metadb_dedup_cuckoo_buckets(),
             dedup_l1_cache_entries: default_metadb_dedup_l1_cache_entries(),
-            refcount_drainer_enabled: false,
+            refcount_drainer_enabled: default_refcount_drainer_enabled(),
             refcount_drainer_interval_ms: default_refcount_drainer_interval_ms(),
             refcount_drainer_threshold_entries: default_refcount_drainer_threshold_entries(),
             refcount_drainer_max_entries_per_cycle:
@@ -395,6 +420,9 @@ fn default_metadb_dedup_cuckoo_buckets() -> u64 {
 
 fn default_metadb_dedup_l1_cache_entries() -> usize {
     256_000
+}
+fn default_refcount_drainer_enabled() -> bool {
+    true
 }
 fn default_refcount_drainer_interval_ms() -> u64 {
     50
@@ -770,6 +798,23 @@ fn default_metadb_flush_dirty_pages_threshold() -> u64 {
     // 0.59 GB at this threshold. Set to 0 to disable.
     100_000
 }
+fn default_metadb_flush_dirty_pages_target() -> u64 {
+    // Default 0 = streaming writeback target gate disabled, preserves
+    // status quo (writeback worker, when enabled, runs whenever
+    // per-shard `l2p_writeback_min_dirty_pages` is met). Operators
+    // pairing this with `l2p_writeback_enabled = true` typically set
+    // target ≈ threshold / 3 (e.g. 100_000 with threshold 300_000)
+    // so the writeback worker drains the steady backlog before the
+    // apply-gate-holding checkpoint trigger fires.
+    0
+}
+fn default_metadb_io_submitter_bg_inflight_cap() -> u64 {
+    // 1024 ≈ 6 % of SQ_ENTRIES=16384 in metadb's IoSubmitter. Below
+    // this the bg admission gate is invisible (sync ops always have
+    // headroom); above it bg ops park in the submitter's deferred
+    // queue. 0 disables the cap.
+    1024
+}
 fn default_metadb_async_reclaim_enabled() -> bool {
     // OFF after 2026-05-15 nvme-box A/B. v1 tight-loop = correct
     // but READ IOPS -26 % (NVMe contention); v2 one-cycle-per-notify =
@@ -911,6 +956,23 @@ pub struct ThreadingConfig {
     pub metadb_dedup_apply_cpus: String,
     #[serde(default)]
     pub metadb_checkpoint_cpus: String,
+    /// CPU set for the metadb refcount drainer threads (one per
+    /// refcount shard). The drainer absorbs `RcShard.delta_active`
+    /// into a sealed-page overlay outside `apply_gate.write()`; pin
+    /// it to a small same-NUMA CPU set so its working set stays in
+    /// L2/L3 next to the apply lanes. Leave empty to inherit the OS
+    /// default — correctness unaffected, but the drainer can be
+    /// starved on a busy box and the in-gate fallback rises.
+    #[serde(default)]
+    pub metadb_refcount_drainer_cpus: String,
+    /// CPU set for the metadb L2P compactor (single serial thread).
+    /// Pin to 1–2 CPUs on the same NUMA node as `metadb_l2p_apply`
+    /// to keep its working set local; without pinning the kernel
+    /// scheduler can co-locate the compactor on an apply-lane CPU
+    /// during a flush window and push apply-lane exec tails up.
+    /// Leave empty to inherit the OS default.
+    #[serde(default)]
+    pub metadb_l2p_compactor_cpus: String,
     /// CPU set for the metadb io_uring submitter threads. With
     /// `io_submitter_pool_size > 1`, each submitter pins to
     /// `cpus[ordinal % len]` so the kernel mq-block layer routes
@@ -918,6 +980,17 @@ pub struct ThreadingConfig {
     /// empty to inherit the OS default (only safe when pool=1).
     #[serde(default)]
     pub metadb_io_submitter_cpus: String,
+    /// CPU set for the onyx per-volume commit workers (one channel
+    /// per `hash(vol_id) % NUM_COMMIT_WORKERS`). Each commit_worker
+    /// calls `tx.commit_with_outcomes` so it benefits from sharing
+    /// a NUMA node with `metadb_l2p_apply` / `metadb_refcount_apply`
+    /// — the previous default of borrowing `flusher_writer`'s CPUs
+    /// crossed sockets on the v4 layout and added ~0.5–1 ms /
+    /// commit of cache-line bounce. Leave empty to inherit the
+    /// previous behaviour (commit workers fall back to
+    /// `flusher_writer_cpus`).
+    #[serde(default)]
+    pub commit_worker_cpus: String,
     #[serde(default)]
     pub background_cpus: String,
 }
@@ -939,7 +1012,10 @@ impl Default for ThreadingConfig {
             metadb_refcount_apply_cpus: String::new(),
             metadb_dedup_apply_cpus: String::new(),
             metadb_checkpoint_cpus: String::new(),
+            metadb_refcount_drainer_cpus: String::new(),
+            metadb_l2p_compactor_cpus: String::new(),
             metadb_io_submitter_cpus: String::new(),
+            commit_worker_cpus: String::new(),
             background_cpus: String::new(),
         }
     }
