@@ -176,6 +176,7 @@ fn inflight_missing_volatile_payload_is_not_hydrated_from_disk() {
         sync_batch_max_entries: 1,
         sync_batch_max_bytes: usize::MAX,
         volatile_payload_memory: 0,
+        throttle: Default::default(),
     };
     let pool = WriteBufferPool::open_with_options_full_and_limits(
         dev,
@@ -593,4 +594,103 @@ fn ring_head_eq_tail_used_zero_still_allocates() {
     let o = BufferShard::reserve_log_space(&mut ring, 1, 3);
     assert_eq!(o, Some(5 * slot));
     assert_eq!(ring.used_bytes, 3 * slot);
+}
+
+#[test]
+fn throttle_resolved_disabled_when_either_knob_zero() {
+    let off = ThrottleSettings::default();
+    assert!(off.resolved().is_none());
+    let only_min = ThrottleSettings {
+        min_pct: 60,
+        ..Default::default()
+    };
+    assert!(only_min.resolved().is_none());
+    let only_scale = ThrottleSettings {
+        scale_us: 1_000,
+        ..Default::default()
+    };
+    assert!(only_scale.resolved().is_none());
+}
+
+#[test]
+fn throttle_resolved_fills_defaults() {
+    let raw = ThrottleSettings {
+        min_pct: 60,
+        max_pct: 0,
+        scale_us: 1_000,
+        cap_us: 0,
+    };
+    let r = raw.resolved().unwrap();
+    assert_eq!(r.min_pct, 60);
+    assert_eq!(r.max_pct, 100);
+    assert_eq!(r.scale_us, 1_000);
+    assert_eq!(r.cap_us, 100_000);
+}
+
+#[test]
+fn throttle_resolved_rejects_inverted_window() {
+    let bad = ThrottleSettings {
+        min_pct: 90,
+        max_pct: 80,
+        scale_us: 1_000,
+        cap_us: 0,
+    };
+    assert!(bad.resolved().is_none());
+    let equal = ThrottleSettings {
+        min_pct: 80,
+        max_pct: 80,
+        scale_us: 1_000,
+        cap_us: 0,
+    };
+    assert!(equal.resolved().is_none());
+}
+
+#[test]
+fn throttle_curve_zero_below_floor() {
+    let r = ThrottleSettings {
+        min_pct: 60,
+        max_pct: 100,
+        scale_us: 1_000,
+        cap_us: 100_000,
+    };
+    assert_eq!(r.delay_us_for_fill(0), 0);
+    assert_eq!(r.delay_us_for_fill(59), 0);
+    assert_eq!(r.delay_us_for_fill(60), 0);
+}
+
+#[test]
+fn throttle_curve_caps_at_max_pct_and_above() {
+    let r = ThrottleSettings {
+        min_pct: 60,
+        max_pct: 100,
+        scale_us: 1_000,
+        cap_us: 100_000,
+    };
+    assert_eq!(r.delay_us_for_fill(100), 100_000);
+    assert_eq!(r.delay_us_for_fill(105), 100_000);
+}
+
+#[test]
+fn throttle_curve_is_monotonic_and_below_cap() {
+    let r = ThrottleSettings {
+        min_pct: 60,
+        max_pct: 100,
+        scale_us: 333,
+        cap_us: 100_000,
+    };
+    // delay(90) = 333 * 30 / 10 = 999 us ≈ 1 ms
+    assert_eq!(r.delay_us_for_fill(90), 999);
+    // Strict monotonic non-decrease across the interior.
+    let mut prev = 0u64;
+    for fill in 61..=99 {
+        let d = r.delay_us_for_fill(fill);
+        assert!(d >= prev, "non-monotonic at fill={}", fill);
+        assert!(
+            d <= r.cap_us,
+            "delay {} exceeded cap at fill={}",
+            d,
+            fill
+        );
+        prev = d;
+    }
 }

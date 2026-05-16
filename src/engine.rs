@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::affinity::{self, ThreadRole};
 use crate::buffer::flush::BufferFlusher;
-use crate::buffer::pool::{BufferRuntimeLimits, WriteBufferPool};
+use crate::buffer::pool::{BufferRuntimeLimits, ThrottleSettings, WriteBufferPool};
 use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
@@ -558,7 +558,13 @@ impl OnyxEngine {
             config.buffer.sync_batch_max_entries,
             config.buffer.sync_batch_max_bytes_mb as usize * 1024 * 1024,
             config.buffer.volatile_memory_mb as u64 * 1024 * 1024,
-        );
+        )
+        .with_throttle(ThrottleSettings {
+            min_pct: config.buffer.throttle_min_pct,
+            max_pct: config.buffer.throttle_max_pct,
+            scale_us: config.buffer.throttle_scale_us,
+            cap_us: config.buffer.throttle_cap_us,
+        });
         let pool = Arc::new(WriteBufferPool::open_with_options_full_and_limits(
             buf_dev,
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),

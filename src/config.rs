@@ -579,6 +579,23 @@ pub struct BufferConfig {
     /// 0 = engine default.
     #[serde(default)]
     pub sync_batch_max_bytes_mb: usize,
+    /// Tier 1.B (ZFS-inspired) hyperbolic write throttle: LV2 fill percentage
+    /// at which the throttle starts paying per-append delay. 0 disables the
+    /// throttle entirely (the existing condvar-based hard backpressure at
+    /// 100% fill still applies).
+    #[serde(default)]
+    pub throttle_min_pct: u8,
+    /// LV2 fill percentage at which the hyperbolic divisor approaches zero
+    /// and per-append delay saturates to `throttle_cap_us`. 0 = use 100.
+    #[serde(default)]
+    pub throttle_max_pct: u8,
+    /// Throttle curve scale (microseconds). 0 disables the throttle.
+    /// `delay_us = scale * (fill - min_pct) / (max_pct - fill)`.
+    #[serde(default)]
+    pub throttle_scale_us: u64,
+    /// Per-append throttle delay cap (microseconds). 0 = 100_000 = 100 ms.
+    #[serde(default)]
+    pub throttle_cap_us: u64,
 }
 
 impl Default for BufferConfig {
@@ -594,6 +611,10 @@ impl Default for BufferConfig {
             staging_queue_entries: 0,
             sync_batch_max_entries: 0,
             sync_batch_max_bytes_mb: 0,
+            throttle_min_pct: 0,
+            throttle_max_pct: 0,
+            throttle_scale_us: 0,
+            throttle_cap_us: 0,
         }
     }
 }

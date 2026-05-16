@@ -53,6 +53,69 @@ pub struct BufferRuntimeLimits {
     pub sync_batch_max_entries: usize,
     pub sync_batch_max_bytes: usize,
     pub volatile_payload_memory: u64,
+    pub throttle: ThrottleSettings,
+}
+
+/// ZFS-style hyperbolic write throttle on LV2 buffer fill.
+///
+/// All zero (the `Default`) disables the throttle: append fast-paths without
+/// any clock read or atomic CAS. Activating the throttle requires both
+/// `min_pct > 0` AND `scale_us > 0`.
+///
+/// Curve: `delay_us = scale_us * (fill - min_pct) / (max_pct - fill)`, capped
+/// at `cap_us`. At `fill = max_pct` the gate falls through to the existing
+/// condvar-based hard backpressure path inside `BufferShard::append_with_seq`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThrottleSettings {
+    /// Fill % below which append pays no throttle.
+    pub min_pct: u8,
+    /// Fill % at which the hyperbolic divisor approaches zero (delay → cap).
+    /// 0 means "use 100".
+    pub max_pct: u8,
+    /// Scale coefficient (microseconds). 0 disables.
+    pub scale_us: u64,
+    /// Per-call delay cap (microseconds). 0 means "use 100_000 = 100 ms".
+    pub cap_us: u64,
+}
+
+impl ThrottleSettings {
+    /// Resolve a configured value into the runtime effective curve. Returns
+    /// `None` when the throttle is fully disabled, so callers can branch out
+    /// of the slow path early.
+    pub(crate) fn resolved(&self) -> Option<ThrottleSettings> {
+        if self.min_pct == 0 || self.scale_us == 0 {
+            return None;
+        }
+        let max_pct = if self.max_pct == 0 { 100 } else { self.max_pct };
+        if max_pct <= self.min_pct {
+            return None;
+        }
+        let cap_us = if self.cap_us == 0 {
+            100_000
+        } else {
+            self.cap_us
+        };
+        Some(ThrottleSettings {
+            min_pct: self.min_pct,
+            max_pct,
+            scale_us: self.scale_us,
+            cap_us,
+        })
+    }
+
+    /// Hyperbolic curve evaluation. Pure function for unit tests.
+    pub(crate) fn delay_us_for_fill(&self, fill_pct: u8) -> u64 {
+        if fill_pct <= self.min_pct {
+            return 0;
+        }
+        if fill_pct >= self.max_pct {
+            return self.cap_us;
+        }
+        let num = (fill_pct - self.min_pct) as u64;
+        let den = (self.max_pct - fill_pct) as u64;
+        let delay = num.saturating_mul(self.scale_us) / den.max(1);
+        delay.min(self.cap_us)
+    }
 }
 
 impl BufferRuntimeLimits {
@@ -85,7 +148,13 @@ impl BufferRuntimeLimits {
             } else {
                 volatile_payload_memory
             },
+            throttle: defaults.throttle,
         }
+    }
+
+    pub fn with_throttle(mut self, throttle: ThrottleSettings) -> Self {
+        self.throttle = throttle;
+        self
     }
 
     pub fn for_durable_payload_limit(durable_payload_limit: u64) -> Self {
@@ -100,6 +169,7 @@ impl BufferRuntimeLimits {
             sync_batch_max_entries: SYNC_BATCH_MAX_ENTRIES,
             sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
             volatile_payload_memory,
+            throttle: ThrottleSettings::default(),
         }
     }
 }
@@ -419,6 +489,23 @@ pub struct WriteBufferPool {
     volatile_payload_budget: Arc<VolatilePayloadBudget>,
     /// On-disk layout version — persisted on Drop. Must match the actual disk layout.
     disk_version: u32,
+    /// Resolved hyperbolic throttle curve (`None` = disabled). Set once at
+    /// pool open; ZFS-style absolute-wakeup queue serializes producers.
+    throttle: Option<ThrottleSettings>,
+    /// Monotonic anchor for `throttle_last_wakeup_ns`.
+    throttle_anchor: Instant,
+    /// Absolute wakeup time (ns since `throttle_anchor`) of the latest slot
+    /// claimed by a throttled producer. Each new throttle event atomically
+    /// advances this past `max(now, last) + delay`, so N concurrent producers
+    /// stack to N × delay rather than collapsing onto a single sleep window.
+    throttle_last_wakeup_ns: AtomicU64,
+    /// Cached `fill_percentage()` value, refreshed once every
+    /// `THROTTLE_SAMPLE_INTERVAL` appends. Recomputing live takes one Mutex
+    /// acquire per shard (16 by default), so caching keeps the hot path on
+    /// pure atomics when the throttle is armed but inactive.
+    throttle_cached_fill_pct: AtomicU32,
+    /// Append counter that drives `throttle_cached_fill_pct` refresh cadence.
+    throttle_sample_counter: AtomicU32,
     /// Highest seq that has ever been passed to `mark_flushed` across any shard.
     /// Updated by flusher writers when they ack a completed seq. Read by the
     /// durability-watermark background thread to decide how far `durable_seq`

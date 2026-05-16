@@ -140,6 +140,13 @@ pub struct EngineMetrics {
     pub buffer_sync_bytes_max: AtomicU64,
     pub buffer_backpressure_events: AtomicU64,
     pub buffer_backpressure_wait_ns: AtomicU64,
+    /// Tier 1.B (ZFS-inspired) hyperbolic LV2 write throttle. `count` =
+    /// number of appends that paid a non-zero sleep; `us_total` = aggregate
+    /// microseconds slept; `us_max` = largest single sleep observed.
+    /// All zero when the throttle is disabled (default).
+    pub buffer_throttle_count: AtomicU64,
+    pub buffer_throttle_us_total: AtomicU64,
+    pub buffer_throttle_us_max: AtomicU64,
     pub buffer_hydration_skipped_due_to_mem_limit: AtomicU64,
     pub buffer_hydration_head_bypass_count: AtomicU64,
     pub buffer_payload_cache_evict_entries: AtomicU64,
@@ -517,6 +524,9 @@ impl Default for EngineMetrics {
             buffer_sync_bytes_max: AtomicU64::new(0),
             buffer_backpressure_events: AtomicU64::new(0),
             buffer_backpressure_wait_ns: AtomicU64::new(0),
+            buffer_throttle_count: AtomicU64::new(0),
+            buffer_throttle_us_total: AtomicU64::new(0),
+            buffer_throttle_us_max: AtomicU64::new(0),
             buffer_hydration_skipped_due_to_mem_limit: AtomicU64::new(0),
             buffer_hydration_head_bypass_count: AtomicU64::new(0),
             buffer_payload_cache_evict_entries: AtomicU64::new(0),
@@ -762,6 +772,9 @@ impl EngineMetrics {
             buffer_sync_bytes_max: load(&self.buffer_sync_bytes_max),
             buffer_backpressure_events: load(&self.buffer_backpressure_events),
             buffer_backpressure_wait_ns: load(&self.buffer_backpressure_wait_ns),
+            buffer_throttle_count: load(&self.buffer_throttle_count),
+            buffer_throttle_us_total: load(&self.buffer_throttle_us_total),
+            buffer_throttle_us_max: load(&self.buffer_throttle_us_max),
             buffer_hydration_skipped_due_to_mem_limit: load(
                 &self.buffer_hydration_skipped_due_to_mem_limit,
             ),
@@ -1027,6 +1040,9 @@ pub struct EngineMetricsSnapshot {
     pub buffer_sync_bytes_max: u64,
     pub buffer_backpressure_events: u64,
     pub buffer_backpressure_wait_ns: u64,
+    pub buffer_throttle_count: u64,
+    pub buffer_throttle_us_total: u64,
+    pub buffer_throttle_us_max: u64,
     pub buffer_hydration_skipped_due_to_mem_limit: u64,
     pub buffer_hydration_head_bypass_count: u64,
     pub buffer_payload_cache_evict_entries: u64,
@@ -1311,6 +1327,9 @@ impl EngineMetricsSnapshot {
             buffer_sync_bytes_max,
             buffer_backpressure_events,
             buffer_backpressure_wait_ns,
+            buffer_throttle_count,
+            buffer_throttle_us_total,
+            buffer_throttle_us_max,
             buffer_hydration_skipped_due_to_mem_limit,
             buffer_hydration_head_bypass_count,
             buffer_payload_cache_evict_entries,
@@ -3187,7 +3206,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "buffer: appends={} append_bytes={} write_ops={} write_bytes={} read_ops={} read_bytes={} lookup_hits={} lookup_misses={} backpressure_events={} hydration_skips={} hydration_head_bypass={}",
+            "buffer: appends={} append_bytes={} write_ops={} write_bytes={} read_ops={} read_bytes={} lookup_hits={} lookup_misses={} backpressure_events={} throttle_count={} throttle_us_total={} throttle_us_max={} hydration_skips={} hydration_head_bypass={}",
             self.metrics.buffer_appends,
             self.metrics.buffer_append_bytes,
             self.metrics.buffer_write_ops,
@@ -3197,6 +3216,9 @@ impl EngineStatusSnapshot {
             self.metrics.buffer_lookup_hits,
             self.metrics.buffer_lookup_misses,
             self.metrics.buffer_backpressure_events,
+            self.metrics.buffer_throttle_count,
+            self.metrics.buffer_throttle_us_total,
+            self.metrics.buffer_throttle_us_max,
             self.metrics.buffer_hydration_skipped_due_to_mem_limit,
             self.metrics.buffer_hydration_head_bypass_count
         );

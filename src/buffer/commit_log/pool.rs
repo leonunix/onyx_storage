@@ -1093,6 +1093,7 @@ impl WriteBufferPool {
         } else {
             COMMIT_LOG_VERSION_V2
         };
+        let throttle = runtime_limits.throttle.resolved();
         let pool = Self {
             root_device: device,
             shards,
@@ -1107,6 +1108,11 @@ impl WriteBufferPool {
             disk_version,
             max_flushed_seq,
             durable_seq,
+            throttle,
+            throttle_anchor: Instant::now(),
+            throttle_last_wakeup_ns: AtomicU64::new(0),
+            throttle_cached_fill_pct: AtomicU32::new(0),
+            throttle_sample_counter: AtomicU32::new(0),
         };
 
         let expected_sb = GlobalSuperblock {
@@ -1143,6 +1149,76 @@ impl WriteBufferPool {
             .position(|shard| shard.shard.has_seq(seq))
     }
 
+    /// ZFS-style hyperbolic write throttle on LV2 fill. Returns immediately
+    /// when the throttle is disabled or fill is below the configured floor.
+    /// Otherwise sleeps until an atomically-claimed slot, so N concurrent
+    /// producers stack into N × delay rather than collapsing into one window
+    /// (throughput is independent of producer thread count, matching ZFS
+    /// `dmu_tx_delay`).
+    fn apply_write_throttle(&self) {
+        let Some(throttle) = self.throttle else {
+            return;
+        };
+        // Recomputing fill_percentage() acquires one Mutex per shard. Cache
+        // it; refresh only every Nth append so the hot path stays on pure
+        // atomics when the throttle is armed but inactive. The curve is
+        // continuous and the absolute-wakeup queue smooths over the sample
+        // lag, so a few-append staleness in fill_pct is invisible end-to-end.
+        const SAMPLE_INTERVAL: u32 = 32;
+        let n = self.throttle_sample_counter.fetch_add(1, Ordering::Relaxed);
+        let fill_pct = if n % SAMPLE_INTERVAL == 0 {
+            let live = self.fill_percentage();
+            self.throttle_cached_fill_pct
+                .store(live as u32, Ordering::Relaxed);
+            live
+        } else {
+            self.throttle_cached_fill_pct.load(Ordering::Relaxed) as u8
+        };
+        let delay_us = throttle.delay_us_for_fill(fill_pct);
+        if delay_us == 0 {
+            return;
+        }
+        let delay_ns = delay_us.saturating_mul(1_000);
+        let now_ns = self.throttle_anchor.elapsed().as_nanos() as u64;
+        let mut last = self.throttle_last_wakeup_ns.load(Ordering::Relaxed);
+        let wakeup_ns = loop {
+            let baseline = last.max(now_ns);
+            let candidate = baseline.saturating_add(delay_ns);
+            match self.throttle_last_wakeup_ns.compare_exchange_weak(
+                last,
+                candidate,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break candidate,
+                Err(actual) => last = actual,
+            }
+        };
+        let sleep_ns = wakeup_ns.saturating_sub(now_ns);
+        if sleep_ns > 0 {
+            std::thread::sleep(Duration::from_nanos(sleep_ns));
+            if let Some(metrics) = self.metrics.get() {
+                metrics
+                    .buffer_throttle_count
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .buffer_throttle_us_total
+                    .fetch_add(sleep_ns / 1_000, Ordering::Relaxed);
+                // Track max single throttle delay observed for tail diagnosis.
+                let cur_max = metrics.buffer_throttle_us_max.load(Ordering::Relaxed);
+                let mine = sleep_ns / 1_000;
+                if mine > cur_max {
+                    let _ = metrics.buffer_throttle_us_max.compare_exchange(
+                        cur_max,
+                        mine,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+    }
+
     pub fn append(
         &self,
         vol_id: &str,
@@ -1152,6 +1228,7 @@ impl WriteBufferPool {
         vol_created_at: u64,
     ) -> OnyxResult<u64> {
         let total_start = Instant::now();
+        self.apply_write_throttle();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let shard_idx = self.shard_for_lba(start_lba);
         let shard = &self.shards[shard_idx];
