@@ -341,11 +341,37 @@ pub struct EngineMetrics {
     /// is the upstream bottleneck feeding commit_worker.
     pub flush_coalesce_active_ns: AtomicU64,
     pub flush_coalesce_idle_ns: AtomicU64,
+    /// Sub-breakdown of coalesce CPU. `flush_coalesce_active_ns` is
+    /// the gross "time the worker thread wasn't blocked on recv" and
+    /// thus mixes pure CPU with `tx.send(unit)` blocking + hydrate.
+    /// These four counters isolate the inside-`coalesce_pending` cost
+    /// so a `coalesce 97% busy` signal can be split into "stuck on
+    /// channel send" vs "actually burning CPU in coalesce_slices".
+    /// Sum of phase2/3/4 will be smaller than `pending_ns` because
+    /// Phase 1 (LbaSlice build) and per-call overhead are not
+    /// attributed to any phase.
+    pub flush_coalesce_pending_ns: AtomicU64,
+    pub flush_coalesce_pending_ops: AtomicU64,
+    pub flush_coalesce_phase2_dedup_ns: AtomicU64,
+    pub flush_coalesce_phase3_sort_ns: AtomicU64,
+    pub flush_coalesce_phase4_merge_ns: AtomicU64,
     pub flush_dedup_worker_active_ns: AtomicU64,
     pub flush_dedup_worker_idle_ns: AtomicU64,
     pub flush_dedup_worker_iters: AtomicU64,
     pub flush_compress_worker_active_ns: AtomicU64,
     pub flush_compress_worker_idle_ns: AtomicU64,
+    /// Sub-breakdown of `flush_compress_worker_active_ns`. Helps split
+    /// "is compress slow because of LZ4 itself" vs "is it slow because
+    /// of alloc/memcpy ceremony around LZ4". `raw_build_ns` covers the
+    /// `Vec::with_capacity + extend_from_slice` loop that materialises
+    /// the unit's raw bytes; `codec_ns` covers the inner compressor
+    /// call (`lz4_flex::compress` etc.); `crc_ns` covers the final
+    /// crc32fast over the compressed (or bypass) buffer. Sum is less
+    /// than `active_ns` because the CoalesceUnit destructure, the
+    /// Vec drops, and the channel send are not attributed.
+    pub flush_compress_raw_build_ns: AtomicU64,
+    pub flush_compress_codec_ns: AtomicU64,
+    pub flush_compress_crc_ns: AtomicU64,
     pub flush_commit_worker_rx_idle_ns: AtomicU64,
     pub flush_commit_worker_rx_idle_iters: AtomicU64,
     pub flush_writer_pt_batches: AtomicU64,
@@ -668,11 +694,19 @@ impl Default for EngineMetrics {
             flush_stage_compress_send_len_max: AtomicU64::new(0),
             flush_coalesce_active_ns: AtomicU64::new(0),
             flush_coalesce_idle_ns: AtomicU64::new(0),
+            flush_coalesce_pending_ns: AtomicU64::new(0),
+            flush_coalesce_pending_ops: AtomicU64::new(0),
+            flush_coalesce_phase2_dedup_ns: AtomicU64::new(0),
+            flush_coalesce_phase3_sort_ns: AtomicU64::new(0),
+            flush_coalesce_phase4_merge_ns: AtomicU64::new(0),
             flush_dedup_worker_active_ns: AtomicU64::new(0),
             flush_dedup_worker_idle_ns: AtomicU64::new(0),
             flush_dedup_worker_iters: AtomicU64::new(0),
             flush_compress_worker_active_ns: AtomicU64::new(0),
             flush_compress_worker_idle_ns: AtomicU64::new(0),
+            flush_compress_raw_build_ns: AtomicU64::new(0),
+            flush_compress_codec_ns: AtomicU64::new(0),
+            flush_compress_crc_ns: AtomicU64::new(0),
             flush_commit_worker_rx_idle_ns: AtomicU64::new(0),
             flush_commit_worker_rx_idle_iters: AtomicU64::new(0),
             flush_writer_pt_batches: AtomicU64::new(0),
@@ -936,11 +970,19 @@ impl EngineMetrics {
             flush_stage_compress_send_len_max: load(&self.flush_stage_compress_send_len_max),
             flush_coalesce_active_ns: load(&self.flush_coalesce_active_ns),
             flush_coalesce_idle_ns: load(&self.flush_coalesce_idle_ns),
+            flush_coalesce_pending_ns: load(&self.flush_coalesce_pending_ns),
+            flush_coalesce_pending_ops: load(&self.flush_coalesce_pending_ops),
+            flush_coalesce_phase2_dedup_ns: load(&self.flush_coalesce_phase2_dedup_ns),
+            flush_coalesce_phase3_sort_ns: load(&self.flush_coalesce_phase3_sort_ns),
+            flush_coalesce_phase4_merge_ns: load(&self.flush_coalesce_phase4_merge_ns),
             flush_dedup_worker_active_ns: load(&self.flush_dedup_worker_active_ns),
             flush_dedup_worker_idle_ns: load(&self.flush_dedup_worker_idle_ns),
             flush_dedup_worker_iters: load(&self.flush_dedup_worker_iters),
             flush_compress_worker_active_ns: load(&self.flush_compress_worker_active_ns),
             flush_compress_worker_idle_ns: load(&self.flush_compress_worker_idle_ns),
+            flush_compress_raw_build_ns: load(&self.flush_compress_raw_build_ns),
+            flush_compress_codec_ns: load(&self.flush_compress_codec_ns),
+            flush_compress_crc_ns: load(&self.flush_compress_crc_ns),
             flush_commit_worker_rx_idle_ns: load(&self.flush_commit_worker_rx_idle_ns),
             flush_commit_worker_rx_idle_iters: load(&self.flush_commit_worker_rx_idle_iters),
             flush_writer_pt_batches: load(&self.flush_writer_pt_batches),
@@ -1184,11 +1226,19 @@ pub struct EngineMetricsSnapshot {
     pub flush_stage_compress_send_len_max: u64,
     pub flush_coalesce_active_ns: u64,
     pub flush_coalesce_idle_ns: u64,
+    pub flush_coalesce_pending_ns: u64,
+    pub flush_coalesce_pending_ops: u64,
+    pub flush_coalesce_phase2_dedup_ns: u64,
+    pub flush_coalesce_phase3_sort_ns: u64,
+    pub flush_coalesce_phase4_merge_ns: u64,
     pub flush_dedup_worker_active_ns: u64,
     pub flush_dedup_worker_idle_ns: u64,
     pub flush_dedup_worker_iters: u64,
     pub flush_compress_worker_active_ns: u64,
     pub flush_compress_worker_idle_ns: u64,
+    pub flush_compress_raw_build_ns: u64,
+    pub flush_compress_codec_ns: u64,
+    pub flush_compress_crc_ns: u64,
     pub flush_commit_worker_rx_idle_ns: u64,
     pub flush_commit_worker_rx_idle_iters: u64,
     pub flush_writer_pt_batches: u64,
@@ -1463,11 +1513,19 @@ impl EngineMetricsSnapshot {
             flush_stage_compress_send_len_max,
             flush_coalesce_active_ns,
             flush_coalesce_idle_ns,
+            flush_coalesce_pending_ns,
+            flush_coalesce_pending_ops,
+            flush_coalesce_phase2_dedup_ns,
+            flush_coalesce_phase3_sort_ns,
+            flush_coalesce_phase4_merge_ns,
             flush_dedup_worker_active_ns,
             flush_dedup_worker_idle_ns,
             flush_dedup_worker_iters,
             flush_compress_worker_active_ns,
             flush_compress_worker_idle_ns,
+            flush_compress_raw_build_ns,
+            flush_compress_codec_ns,
+            flush_compress_crc_ns,
             flush_commit_worker_rx_idle_ns,
             flush_commit_worker_rx_idle_iters,
             flush_writer_pt_batches,
@@ -3450,6 +3508,22 @@ impl EngineStatusSnapshot {
             self.metrics.flush_compress_worker_idle_ns,
             self.metrics.flush_commit_worker_rx_idle_ns,
             self.metrics.flush_commit_worker_rx_idle_iters
+        );
+        let _ = writeln!(
+            out,
+            "flush_coalesce_inside: pending_ns={} pending_ops={} phase2_dedup_ns={} phase3_sort_ns={} phase4_merge_ns={}",
+            self.metrics.flush_coalesce_pending_ns,
+            self.metrics.flush_coalesce_pending_ops,
+            self.metrics.flush_coalesce_phase2_dedup_ns,
+            self.metrics.flush_coalesce_phase3_sort_ns,
+            self.metrics.flush_coalesce_phase4_merge_ns,
+        );
+        let _ = writeln!(
+            out,
+            "flush_compress_inside: raw_build_ns={} codec_ns={} crc_ns={}",
+            self.metrics.flush_compress_raw_build_ns,
+            self.metrics.flush_compress_codec_ns,
+            self.metrics.flush_compress_crc_ns,
         );
         let _ = writeln!(
             out,

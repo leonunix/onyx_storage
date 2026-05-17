@@ -2072,6 +2072,57 @@ impl BufferShard {
         !self.lifecycle.lock().inflight.contains(&seq)
     }
 
+    /// Bounded variant of [`pending_entries_arc_snapshot`] that returns
+    /// up to `limit` oldest-seq pending entries that are ready to
+    /// flush, **without** walking the entire pending DashMap.
+    ///
+    /// The flusher's `coalesce_loop` calls this every 100 ms as a
+    /// safety net for "payload-less recovered entries that were
+    /// skipped once under memory pressure". The previous unbounded
+    /// snapshot did `pending_entries.iter().clone(Arc).collect().sort()`
+    /// on the entire DashMap — a 280 k-entry full-table scan + sort
+    /// per shard per 100 ms in steady state. Profiling pinned that
+    /// path as the largest single contributor (~19 G of 152 G) to the
+    /// coalesce thread's CPU; this routine drops it to O(limit).
+    ///
+    /// Implementation:
+    ///   1. take the ring lock briefly to copy the `limit * 2` oldest
+    ///      seqs from `log_order` (already in insertion / seq order)
+    ///   2. take the lifecycle lock once to filter inflight in batch
+    ///   3. resolve survivors to `Arc<PendingEntry>` via per-seq
+    ///      DashMap lookup, stopping at `limit` resolved entries
+    ///
+    /// `limit * 2` slack handles entries that fail the readiness
+    /// filter or are missing from `pending_entries` (rare: entry
+    /// retired between log_order capture and DashMap lookup).
+    pub(super) fn oldest_pending_arcs(&self, limit: usize) -> Vec<Arc<PendingEntry>> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<u64> = {
+            let ring = self.ring.lock();
+            ring.log_order
+                .iter()
+                .take(limit.saturating_mul(2))
+                .map(|r| r.seq)
+                .collect()
+        };
+        {
+            let lifecycle = self.lifecycle.lock();
+            candidates.retain(|s| !lifecycle.inflight.contains(s));
+        }
+        let mut result = Vec::with_capacity(limit);
+        for seq in candidates {
+            if let Some(entry) = self.pending_entries.get(&seq) {
+                result.push(entry.value().clone());
+                if result.len() >= limit {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
     pub(super) fn head_pending_seq_if_stuck(&self, min_age: Duration) -> Option<u64> {
         let (head_seq, head_became_at) = {
             let ring = self.ring.lock();

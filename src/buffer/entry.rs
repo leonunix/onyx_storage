@@ -253,7 +253,24 @@ impl BufferEntry {
                 buf.len()
             )));
         }
-        buf[..total_len as usize].fill(0);
+        // The header (0..40), reserved gap (40..48), vol_id and
+        // payload (48..data_end) are ALL written explicitly below.
+        // The CRC compute reads only those regions — never the
+        // padding tail. So we only need to zero `[data_end..total_len)`
+        // for stale-byte hygiene (decoder ignores it, but defensive).
+        //
+        // Old code zeroed the entire `[0..total_len)` upfront, then
+        // immediately overwrote `[0..data_end)`. Flamegraph
+        // attributed ~20 G samples on the `persistent-slot` LV2
+        // commit-log writer to that `__memset` plus its first-touch
+        // page faults — pure double work for the bulk of every
+        // entry. `data_end` is computed early so the bulk memset is
+        // gone.
+        let payload_start = FIXED_HEADER_SIZE + id_bytes.len();
+        let data_end = payload_start + payload.len();
+        if data_end < total_len as usize {
+            buf[data_end..total_len as usize].fill(0);
+        }
 
         buf[0..4].copy_from_slice(&total_len.to_le_bytes());
         buf[4..8].copy_from_slice(&BUFFER_ENTRY_MAGIC.to_le_bytes());
@@ -266,13 +283,9 @@ impl BufferEntry {
         buf[32..36].copy_from_slice(&payload_crc32.to_le_bytes());
         buf[40..48].copy_from_slice(&vol_created_at.to_le_bytes());
 
-        let vid_start = FIXED_HEADER_SIZE;
-        buf[vid_start..vid_start + id_bytes.len()].copy_from_slice(id_bytes);
+        buf[FIXED_HEADER_SIZE..payload_start].copy_from_slice(id_bytes);
+        buf[payload_start..data_end].copy_from_slice(payload);
 
-        let payload_start = vid_start + id_bytes.len();
-        buf[payload_start..payload_start + payload.len()].copy_from_slice(payload);
-
-        let data_end = payload_start + payload.len();
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&buf[0..36]);
         hasher.update(&buf[40..data_end]);
@@ -465,7 +478,18 @@ impl BufferEntry {
 
         let total_len = Self::direct_compact_total_len(payload_len);
         let slot = &mut buf.as_mut_slice()[..BLOCK_SIZE as usize];
-        slot.fill(0);
+        // Writes below cover 0..36, 40..48, FIXED_HEADER_SIZE..header_end
+        // and 36..40 (entry_crc, written last). Bytes 36..40 are
+        // overwritten before any read, so they don't need pre-zeroing.
+        // Bytes header_end..BLOCK_SIZE are unused padding within the
+        // header block and never read after `total_len` is set. Zero
+        // only those two ranges instead of memsetting the full 4 KiB
+        // slot every call — see `encode_full_into_slice` for the same
+        // optimization (~20 G samples on the persistent-slot writer).
+        slot[32..36].fill(0); // payload_crc32 field, intentionally zero for direct-compact
+        if header_end < BLOCK_SIZE as usize {
+            slot[header_end..BLOCK_SIZE as usize].fill(0);
+        }
         slot[0..4].copy_from_slice(&total_len.to_le_bytes());
         slot[4..8].copy_from_slice(&BUFFER_ENTRY_MAGIC.to_le_bytes());
         slot[8..16].copy_from_slice(&seq.to_le_bytes());
@@ -474,7 +498,7 @@ impl BufferEntry {
         slot[28..30].copy_from_slice(&(id_bytes.len() as u16).to_le_bytes());
         slot[30] = if flushed { 1 } else { 0 };
         slot[31] = DIRECT_COMPACT_HEADER_VERSION;
-        slot[32..36].fill(0);
+        // payload_crc32 field already zeroed above; vol_created_at next.
         slot[40..48].copy_from_slice(&vol_created_at.to_le_bytes());
         slot[FIXED_HEADER_SIZE..header_end].copy_from_slice(id_bytes);
 

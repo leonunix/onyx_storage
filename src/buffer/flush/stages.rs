@@ -217,17 +217,26 @@ impl BufferFlusher {
                 }
             }
 
-            // Safety net for recovered / retried entries: periodically snapshot the
-            // in-memory pending set instead of rescanning the on-disk log on every
-            // loop. This must run even while foreground writes keep producing new
-            // ready seqs, otherwise payload-less recovered entries that were skipped
-            // once under memory pressure can starve indefinitely.
+            // Safety net for recovered / retried entries: periodically
+            // sample the oldest pending seqs in case some never went
+            // through the ready channel (e.g. payload-less recovered
+            // entries that were skipped once under memory pressure).
+            //
+            // The previous unbounded `ready_pending_entries_arc_snapshot_for_shard`
+            // walked the entire pending DashMap, cloned every Arc, and
+            // sorted by seq just to take 64 of them. Under saturation
+            // (~280 k pending entries per shard) this single call was
+            // the largest contributor to coalesce-thread CPU. The
+            // bounded variant walks the ring's `log_order` head for
+            // the oldest seqs only — O(limit) instead of O(all).
             if last_retry_snapshot.elapsed() >= retry_snapshot_interval
                 && queued_bytes < Self::COALESCE_READY_WINDOW_BYTES
             {
                 last_retry_snapshot = Instant::now();
                 let mut topped_up = 0usize;
-                for entry in pool.ready_pending_entries_arc_snapshot_for_shard(shard_idx) {
+                for entry in pool
+                    .oldest_ready_pending_arcs_for_shard(shard_idx, retry_snapshot_topup_limit)
+                {
                     if topped_up >= retry_snapshot_topup_limit
                         || queued_bytes >= Self::COALESCE_READY_WINDOW_BYTES
                     {
@@ -290,13 +299,28 @@ impl BufferFlusher {
             }
 
             let cache_ref = &vol_compression_cache;
+            // Time the inside-coalesce_pending CPU separately from the
+            // outer `coalesce_active_ns` so we can distinguish "stuck on
+            // channel send" from "actually burning CPU in coalesce_slices".
+            let coalesce_pending_start = Instant::now();
             let units = coalesce_pending(
                 &new_entries,
                 max_raw,
                 max_lbas,
                 &|vid| cache_ref.get(vid).copied().unwrap_or(CompressionAlgo::None),
                 &skip_offsets,
+                Some(metrics),
             );
+            let coalesce_pending_ns = coalesce_pending_start
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            metrics
+                .flush_coalesce_pending_ns
+                .fetch_add(coalesce_pending_ns, Ordering::Relaxed);
+            metrics
+                .flush_coalesce_pending_ops
+                .fetch_add(1, Ordering::Relaxed);
 
             // Payload ownership has been moved into Arc-backed block refs inside
             // the coalesced units. Flusher hydration returns detached payload
@@ -363,6 +387,25 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         min_compression_savings_pct: u8,
     ) {
+        // Reusable per-worker compression scratch. With `coalesce_max_raw_bytes`
+        // capped at 128 KiB by config, LZ4's worst-case output is
+        // ~132 KiB; 256 KiB gives comfortable headroom. Zeroed once at
+        // thread start (one-shot ~50 µs) and reused for every unit
+        // thereafter.
+        //
+        // The flamegraph attributed ~40 % of compress-thread CPU to
+        // `_rjem_je_pages_purge_forced → madvise →
+        // smp_call_function_many_cond` — jemalloc returning the
+        // freshly-freed 30 KiB scratch allocations back to the kernel,
+        // which fired a cross-CPU IPI on every purge. Holding one
+        // long-lived `Box<[u8]>` per worker eliminates that churn:
+        // the buffer never enters jemalloc's free-list rotation, so
+        // there's no purge trigger and no IPI storm. Per-unit codec
+        // work also stops paying the `vec![0; max_out]` alloc + zero
+        // it used to do, and `lz4_flex::block::compress_into` writes
+        // in place rather than allocating its own internal Vec.
+        const COMPRESS_BUF_BYTES: usize = 256 * 1024;
+        let mut compress_buf: Box<[u8]> = vec![0u8; COMPRESS_BUF_BYTES].into_boxed_slice();
         while running.load(Ordering::Relaxed) {
             let recv_start = Instant::now();
             match rx.recv_timeout(Duration::from_millis(50)) {
@@ -386,31 +429,97 @@ impl BufferFlusher {
                         dedup_completion,
                     } = unit;
 
+                    // Phase A: materialise the unit's contiguous bytes.
+                    let raw_build_start = Instant::now();
                     let original_size = raw_blocks.len() * BLOCK_SIZE as usize;
                     let mut raw_data = Vec::with_capacity(original_size);
                     for block in &raw_blocks {
                         raw_data.extend_from_slice(block.bytes());
                     }
+                    metrics.flush_compress_raw_build_ns.fetch_add(
+                        raw_build_start
+                            .elapsed()
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
+
+                    // Phase B: codec. We deliberately bypass the
+                    // `Box<dyn Compressor>` trait + caller-supplied dst
+                    // buffer pattern. The trait implementation allocated
+                    // a zero-filled `vec![0u8; max_out]` then called
+                    // `lz4_flex::compress(src)` which itself allocated
+                    // a `Vec<u8>` internally, then memcpy'd that into
+                    // the caller's buffer. With 32 workers running this
+                    // per unit and `--refill_buffers` workloads pinning
+                    // ~100% bypass rate, the three 30 KiB allocations
+                    // per unit (raw_data + compressed_buf + lz4 internal)
+                    // plus a 30 KiB memset and a redundant memcpy were
+                    // taking ~2.5 ms per unit — i.e. compress was
+                    // running at ~12 MB/s per worker, ~40× under LZ4's
+                    // single-thread spec. Calling the codec function
+                    // directly lets it own its output Vec and skips
+                    // the intermediate buffer entirely; the bypass case
+                    // (incompressible random input) now just drops the
+                    // codec's Vec and keeps `raw_data`.
+                    let codec_start = Instant::now();
                     let mut compression_bypassed = false;
                     let (compression_byte, compressed_data) = match algo {
                         CompressionAlgo::None => (0u8, raw_data),
-                        _ => {
-                            let compressor = create_compressor(algo);
-                            let max_out = compressor.max_compressed_size(original_size);
-                            let mut compressed_buf = vec![0u8; max_out];
-                            match compressor.compress(&raw_data, &mut compressed_buf) {
-                                Some(size)
+                        CompressionAlgo::Lz4 => {
+                            let max_out =
+                                lz4_flex::block::get_maximum_output_size(original_size);
+                            if max_out <= compress_buf.len() {
+                                match lz4_flex::block::compress_into(
+                                    &raw_data,
+                                    &mut compress_buf[..max_out],
+                                ) {
+                                    Ok(size)
+                                        if Self::compression_saves_enough(
+                                            original_size,
+                                            size,
+                                            min_compression_savings_pct,
+                                        ) =>
+                                    {
+                                        // Copy compressed prefix out — this is
+                                        // the one alloc we accept on the success
+                                        // path. Bypass (incompressible random)
+                                        // input doesn't hit this branch.
+                                        (algo.to_u8(), compress_buf[..size].to_vec())
+                                    }
+                                    _ => {
+                                        compression_bypassed = true;
+                                        (0u8, raw_data)
+                                    }
+                                }
+                            } else {
+                                // Fallback for unusually large units that exceed
+                                // the reusable buffer (config violation; not
+                                // expected in steady state).
+                                let out = lz4_flex::compress(&raw_data);
+                                if Self::compression_saves_enough(
+                                    original_size,
+                                    out.len(),
+                                    min_compression_savings_pct,
+                                ) {
+                                    (algo.to_u8(), out)
+                                } else {
+                                    compression_bypassed = true;
+                                    drop(out);
+                                    (0u8, raw_data)
+                                }
+                            }
+                        }
+                        CompressionAlgo::Zstd { level } => {
+                            match zstd::encode_all(raw_data.as_slice(), level) {
+                                Ok(out)
                                     if Self::compression_saves_enough(
                                         original_size,
-                                        size,
+                                        out.len(),
                                         min_compression_savings_pct,
                                     ) =>
                                 {
-                                    (algo.to_u8(), compressed_buf[..size].to_vec())
-                                }
-                                None => {
-                                    compression_bypassed = true;
-                                    (0u8, raw_data)
+                                    (algo.to_u8(), out)
                                 }
                                 _ => {
                                     compression_bypassed = true;
@@ -419,6 +528,14 @@ impl BufferFlusher {
                             }
                         }
                     };
+                    metrics.flush_compress_codec_ns.fetch_add(
+                        codec_start
+                            .elapsed()
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
+
                     metrics.compress_units.fetch_add(1, Ordering::Relaxed);
                     metrics
                         .compress_input_bytes
@@ -435,7 +552,14 @@ impl BufferFlusher {
                             .fetch_add(original_size as u64, Ordering::Relaxed);
                     }
 
+                    // Phase C: CRC32 over the final compressed (or
+                    // bypass-raw) payload.
+                    let crc_start = Instant::now();
                     let crc32 = crc32fast::hash(&compressed_data);
+                    metrics.flush_compress_crc_ns.fetch_add(
+                        crc_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
 
                     let cu = CompressedUnit {
                         vol_id,

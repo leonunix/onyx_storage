@@ -1454,6 +1454,21 @@ impl WriteBufferPool {
             .unwrap_or_default()
     }
 
+    /// Bounded counterpart of [`ready_pending_entries_arc_snapshot_for_shard`].
+    /// Returns up to `limit` oldest-seq ready pending entries without
+    /// walking the entire shard pending set. See
+    /// [`Shard::oldest_pending_arcs`] for the cost model.
+    pub fn oldest_ready_pending_arcs_for_shard(
+        &self,
+        shard_idx: usize,
+        limit: usize,
+    ) -> Vec<Arc<PendingEntry>> {
+        self.shards
+            .get(shard_idx)
+            .map(|shard| shard.shard.oldest_pending_arcs(limit))
+            .unwrap_or_default()
+    }
+
     pub fn head_stuck_seq_for_shard(&self, shard_idx: usize, min_age: Duration) -> Option<u64> {
         self.shards
             .get(shard_idx)

@@ -9,7 +9,6 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use crate::affinity::{self, ThreadRole};
 use crate::buffer::pipeline::{coalesce_pending, CoalesceUnit, CompressedUnit};
 use crate::buffer::pool::WriteBufferPool;
-use crate::compress::codec::create_compressor;
 use crate::config::FlushConfig;
 use crate::dedup::config::DedupConfig;
 use crate::error::OnyxResult;

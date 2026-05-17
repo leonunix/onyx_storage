@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::buffer::commit_log::PendingEntry;
 use crate::buffer::entry::BufferEntry;
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry};
+use crate::metrics::EngineMetrics;
 use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
 
 /// Tracks completion of sub-units produced by dedup splitting.
@@ -208,7 +210,7 @@ pub fn coalesce(
             }
         }
     }
-    coalesce_slices(all_slices, max_raw_bytes, max_lbas, vol_compression)
+    coalesce_slices(all_slices, max_raw_bytes, max_lbas, vol_compression, None)
 }
 
 pub fn coalesce_pending(
@@ -217,6 +219,7 @@ pub fn coalesce_pending(
     max_lbas: u32,
     vol_compression: &dyn Fn(&str) -> CompressionAlgo,
     skip_offsets: &HashMap<u64, HashSet<u16>>,
+    metrics: Option<&EngineMetrics>,
 ) -> Vec<CoalesceUnit> {
     let bs = BLOCK_SIZE as usize;
 
@@ -246,7 +249,7 @@ pub fn coalesce_pending(
             }
         }
     }
-    coalesce_slices(all_slices, max_raw_bytes, max_lbas, vol_compression)
+    coalesce_slices(all_slices, max_raw_bytes, max_lbas, vol_compression, metrics)
 }
 
 fn coalesce_slices(
@@ -254,14 +257,22 @@ fn coalesce_slices(
     max_raw_bytes: usize,
     max_lbas: u32,
     vol_compression: &dyn Fn(&str) -> CompressionAlgo,
+    metrics: Option<&EngineMetrics>,
 ) -> Vec<CoalesceUnit> {
     if all_slices.is_empty() {
         return Vec::new();
     }
     let bs = BLOCK_SIZE as usize;
 
+    // Helper for recording a phase elapsed if metrics is present.
+    let record = |counter: &std::sync::atomic::AtomicU64, started: Instant| {
+        let ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        counter.fetch_add(ns, Ordering::Relaxed);
+    };
+
     // Phase 2: Dedup — keep latest (highest seq) per (vol_id, lba).
     // Collect all seqs per key for flushing.
+    let phase2_start = Instant::now();
     struct DedupSlice<'a> {
         latest: LbaSlice<'a>,
         all_seqs: Vec<u64>,
@@ -287,14 +298,22 @@ fn coalesce_slices(
             }
         }
     }
+    if let Some(m) = metrics {
+        record(&m.flush_coalesce_phase2_dedup_ns, phase2_start);
+    }
 
     // Phase 3: Sort by (vol_id, lba)
+    let phase3_start = Instant::now();
     let mut sorted: Vec<&DedupSlice> = deduped.values().collect();
     sorted.sort_by(|a, b| {
         (&a.latest.vol_id, a.latest.lba.0).cmp(&(&b.latest.vol_id, b.latest.lba.0))
     });
+    if let Some(m) = metrics {
+        record(&m.flush_coalesce_phase3_sort_ns, phase3_start);
+    }
 
     // Phase 4: Merge contiguous LBAs
+    let phase4_start = Instant::now();
     let mut units = Vec::new();
     let mut current: Option<CoalesceUnit> = None;
 
@@ -347,6 +366,10 @@ fn coalesce_slices(
 
     if let Some(unit) = current {
         units.push(unit);
+    }
+
+    if let Some(m) = metrics {
+        record(&m.flush_coalesce_phase4_merge_ns, phase4_start);
     }
 
     units
