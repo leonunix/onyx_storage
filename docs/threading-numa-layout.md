@@ -164,6 +164,48 @@ Rationale per role:
   CPUs, so the kernel scheduler isn't shuffling unrelated roles
   through the same time-slice.
 
+### Tier-1 additions (drainer / compactor / commit_worker)
+
+Three role knobs were introduced for the "smoothness" Tier-1 work
+(`/root/.claude/plans/ticklish-sparking-barto.md`). When the v4 layout
+is updated to set them, place all three on **node 0** alongside the
+metadb apply lanes — they all read/write the same PageCache state:
+
+- **`metadb_refcount_drainer_cpus`** — one drainer thread per refcount
+  shard (16 with the default `shards_per_partition=16`). Pin to ~4
+  even-numbered CPUs on node 0 next to `metadb_refcount_apply` (e.g.
+  `64,66,68,70` if shared, or a new ~`72,74,76,78`-style block when
+  carved out). The `cpus[ordinal % len]` rotation distributes the 16
+  drainers evenly. Leaving this empty is functional but the kernel can
+  starve drainers on a busy box — the symptom is rising
+  `flush_sample_breakdown.rc_drain_max_us` and an in-gate priority-1
+  fallback.
+- **`metadb_l2p_compactor_cpus`** — single serial thread. 1–2 CPUs on
+  node 0 next to `metadb_l2p_apply` (e.g. piggyback on
+  `48-62`). Pinning here removes the apply-lane exec-max tail spike
+  observed when the kernel co-locates the compactor on a busy apply CPU
+  during a flush. The compactor is intentionally serial
+  (`metadb/src/db/l2p_compactor.rs:191-201` documents the regression
+  the parallel version triggered), so more than ~2 CPUs is wasted.
+- **`commit_worker_cpus`** — the per-volume onyx commit workers (16
+  channels, `hash(vol_id) % NUM_COMMIT_WORKERS`). Each commit_worker
+  calls `tx.commit_with_outcomes`, so it should share a NUMA node with
+  `metadb_l2p_apply` / `metadb_refcount_apply`. The pre-Tier-1
+  placement re-used `flusher_writer_cpus` (~4 CPUs on node 0), which is
+  acceptable but causes the commit-worker threads to contend with
+  alloc/IO threads on the same cores. A dedicated 4-CPU set on node 0
+  is preferred. When `commit_worker_cpus` is empty, the binding
+  silently falls back to `flusher_writer_cpus` so legacy configs do not
+  silently regress to OS scheduling.
+
+The drainer + compactor binds happen inside metadb
+(`metadb/src/refcount/shard.rs::DrainerWorker` and
+`metadb/src/db/l2p_compactor.rs::run_worker`); the commit_worker bind
+happens in `src/buffer/flush/mod.rs` next to the existing
+`FlusherWriter` bind. All three are gated on `threading.enabled = true`
+in the onyx config — empty strings inherit the OS default with no
+behavioural change vs. the pre-Tier-1 build.
+
 ## Caveats / What to Verify When Workload Changes
 
 The v4 layout is validated on **`dedupe_percentage=0`,

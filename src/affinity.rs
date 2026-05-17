@@ -12,6 +12,13 @@ pub enum ThreadRole {
     FlusherCompress,
     FlusherWriter,
     FlusherCleanup,
+    /// Per-volume commit worker (`hash(vol_id) % NUM_COMMIT_WORKERS`).
+    /// Each worker calls `tx.commit_with_outcomes`, so cache-line
+    /// traffic to metadb's L2P/RC apply lanes dominates the cost —
+    /// pinning here to the same NUMA node as `metadb_l2p_apply` cuts
+    /// the per-commit cross-socket bounce of ~0.5–1 ms that the
+    /// previous "borrow flusher_writer_cpus" placement paid on v4.
+    CommitWorker,
     MetadbCheckpoint,
     Background,
 }
@@ -26,6 +33,7 @@ struct AffinityLayout {
     flusher_compress: CpuSet,
     flusher_writer: CpuSet,
     flusher_cleanup: CpuSet,
+    commit_worker: CpuSet,
     metadb_checkpoint: CpuSet,
     background: CpuSet,
 }
@@ -45,11 +53,8 @@ pub fn init(config: &ThreadingConfig) {
             l2p_apply_cpus: config.metadb_l2p_apply_cpus.clone(),
             refcount_apply_cpus: config.metadb_refcount_apply_cpus.clone(),
             dedup_apply_cpus: config.metadb_dedup_apply_cpus.clone(),
-            // Refcount drainer CPU set is currently inherited from the
-            // OS — onyx ThreadingConfig doesn't surface a knob for it
-            // yet. The drainer is default-off, so this string only
-            // matters once the flag flips on.
-            refcount_drainer_cpus: String::new(),
+            refcount_drainer_cpus: config.metadb_refcount_drainer_cpus.clone(),
+            l2p_compactor_cpus: config.metadb_l2p_compactor_cpus.clone(),
             io_submitter_cpus: config.metadb_io_submitter_cpus.clone(),
         });
     }
@@ -86,6 +91,7 @@ impl AffinityLayout {
             flusher_compress: CpuSet::parse(&config.flusher_compress_cpus),
             flusher_writer: CpuSet::parse(&config.flusher_writer_cpus),
             flusher_cleanup: CpuSet::parse(&config.flusher_cleanup_cpus),
+            commit_worker: CpuSet::parse(&config.commit_worker_cpus),
             metadb_checkpoint: CpuSet::parse(&config.metadb_checkpoint_cpus),
             background: CpuSet::parse(&config.background_cpus),
         })
@@ -101,6 +107,18 @@ impl AffinityLayout {
             ThreadRole::FlusherCompress => &self.flusher_compress,
             ThreadRole::FlusherWriter => &self.flusher_writer,
             ThreadRole::FlusherCleanup => &self.flusher_cleanup,
+            ThreadRole::CommitWorker => {
+                // Operators who haven't carved out a dedicated CPU set
+                // for the commit_worker fall back to `flusher_writer`'s
+                // CPUs — that's the pre-1.B behaviour we are replacing.
+                // Avoid a silent placement regression for configs that
+                // ship without the new knob.
+                if self.commit_worker.cpus.is_empty() {
+                    &self.flusher_writer
+                } else {
+                    &self.commit_worker
+                }
+            }
             ThreadRole::MetadbCheckpoint => &self.metadb_checkpoint,
             ThreadRole::Background => &self.background,
         }
