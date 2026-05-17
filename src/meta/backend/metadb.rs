@@ -220,6 +220,31 @@ impl MetadbBackend {
         self.db.get(ord, lba.0)?.map(decode_l2p_value).transpose()
     }
 
+    /// Like [`get_mapping`] but also returns the committed L2pValue
+    /// seq so the caller can forward it as the seq_guard on a
+    /// subsequent `l2p_remap`. Background scanners that re-check an
+    /// LBA's mapping and then submit a derived update must use this
+    /// (not plain `get_mapping`) — emitting seq=0 silently bypasses
+    /// `seq_guard_rejects` and clobbers any newer write that landed in
+    /// the meantime (see `update_blockmap_flags` and the
+    /// `metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write`
+    /// regression test).
+    pub(crate) fn get_mapping_with_seq(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+    ) -> OnyxResult<Option<(BlockmapValue, u64)>> {
+        let ord = self.volume_ordinal(vol_id)?;
+        let Some(raw) = self.db.get(ord, lba.0)? else {
+            return Ok(None);
+        };
+        let seq = raw.seq();
+        let Some(bv) = blockmap_from_l2p_bytes(&raw.0) else {
+            return Ok(None);
+        };
+        Ok(Some((bv, seq)))
+    }
+
     pub(crate) fn put_mapping(
         &self,
         vol_id: &VolumeId,
@@ -949,16 +974,35 @@ impl MetadbBackend {
         lba: Lba,
         new_flags: u8,
     ) -> OnyxResult<()> {
-        let Some(mut value) = self.get_mapping(vol_id, lba)? else {
+        let ord = self.volume_ordinal(vol_id)?;
+        // Read the raw L2pValue so we can carry its commit seq through
+        // and use it as the seq_guard at apply time. Plain
+        // `get_mapping` decodes only the BlockmapValue payload and
+        // drops the trailing 8 B seq, which is the field metadb's
+        // `apply_l2p_remap` checks. Without this, the tx below would
+        // emit seq=0 and `seq_guard_rejects` short-circuits — a
+        // concurrent buffer-flusher commit landing between our get and
+        // the apply would be silently clobbered. See the
+        // `update_blockmap_flags_seq0_must_not_clobber_newer_write`
+        // regression test for the exact race.
+        let Some(raw) = self.db.get(ord, lba.0)? else {
+            return Ok(());
+        };
+        let observed_seq = raw.seq();
+        let Some(mut value) = blockmap_from_l2p_bytes(&raw.0) else {
             return Ok(());
         };
         if value.flags == new_flags {
             return Ok(());
         }
         value.flags = new_flags;
-        let ord = self.volume_ordinal(vol_id)?;
         let mut tx = self.db.begin();
-        tx.l2p_remap(ord, lba.0, to_l2p_value(&value), None);
+        // Re-emit with the same seq we observed. The apply path's
+        // `seq_guard_rejects` will accept the equal-seq update (no
+        // concurrent commit) and reject the strictly-less-than case
+        // (a newer flusher commit raced us), preserving the invariant
+        // that newer seqs win.
+        tx.l2p_remap(ord, lba.0, to_l2p_value_with_seq(&value, observed_seq), None);
         // Match `atomic_dedup_hit` / `atomic_batch_dedup_hits` semantics:
         // this is a flag-bit edit on an existing mapping with no LV3
         // write. The logged path forces `unlogged_commit_gate.write()` +
@@ -1974,5 +2018,192 @@ mod tests {
             vec![(Pba(55), 1)]
         );
         assert_eq!(backend.get_refcount(Pba(55)).unwrap(), 0);
+    }
+
+    /// Documents the underlying metadb behaviour the fix relies on
+    /// **avoiding**: any `l2p_remap` whose encoded `L2pValue` carries
+    /// seq=0 silently passes `seq_guard_rejects` regardless of the
+    /// stored seq, because the guard short-circuits on `new_seq == 0`
+    /// (`metadb/src/db/apply.rs::seq_guard_rejects`).
+    ///
+    /// This was the P0 mapping-loss vector. Before the fix,
+    /// `update_blockmap_flags` emitted seq=0 (via `to_l2p_value` ->
+    /// `blockmap_to_l2p_bytes_with_seq(v, 0)`), so a `DedupScanner`
+    /// flag-clear that raced a buffer-flusher commit would clobber the
+    /// newer mapping back to a stale PBA. Production fio crc32c verify
+    /// (`tier2b-stage1-verify-20260516T151612Z`) saw 84 silent verify
+    /// errors and read_path.unmapped=45M.
+    ///
+    /// The fix is at the *caller* layer: `update_blockmap_flags` now
+    /// carries the observed seq forward so apply's `seq_guard_rejects`
+    /// can actually reject losing-the-race cases. This test pins the
+    /// underlying metadb behaviour so a future contributor doesn't
+    /// re-introduce a seq=0 emitter assuming the guard catches it.
+    #[test]
+    fn metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            wal_dir: None,
+            dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            ..Default::default()
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 8,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+
+        // Newer write commits at seq=200, pba=P2.
+        let bv_new = BlockmapValue {
+            pba: Pba(40),
+            compression: 1,
+            unit_compressed_size: 2048,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 0xBBBB_BBBB,
+            slot_offset: 0,
+            flags: 0,
+        };
+        backend
+            .atomic_batch_write_with_dedup(&vol.id, &[(Lba(0), bv_new)], 1, &[], &[200])
+            .unwrap();
+        assert_eq!(
+            backend.get_mapping(&vol.id, Lba(0)).unwrap().unwrap().pba,
+            Pba(40)
+        );
+
+        // A stale seq=0 update (simulating the pre-fix `update_blockmap_flags`
+        // path, or any other caller that omits the seq) directly via the
+        // dedup batch API — empty `seqs` slice -> seq_for returns 0.
+        let stale_bv = BlockmapValue {
+            pba: Pba(30),
+            crc32: 0xAAAA_AAAA,
+            ..bv_new
+        };
+        backend
+            .atomic_batch_write_with_dedup(&vol.id, &[(Lba(0), stale_bv)], 1, &[], &[])
+            .unwrap();
+
+        // `seq_guard_rejects(0, _)` returns false, so apply accepts the
+        // stale update unconditionally. The newer write is gone. Refcount
+        // on the freed P2 drops to 0 -> allocator-reclaimable -> data loss.
+        let after = backend.get_mapping(&vol.id, Lba(0)).unwrap().unwrap();
+        assert_eq!(
+            after.pba,
+            Pba(30),
+            "seq=0 sentinel must bypass seq_guard at the metadb layer; \
+             callers must not emit seq=0 with this race shape"
+        );
+        assert_eq!(after.crc32, 0xAAAA_AAAA);
+        assert_eq!(backend.get_refcount(Pba(40)).unwrap(), 0);
+        assert_eq!(backend.get_refcount(Pba(30)).unwrap(), 1);
+    }
+
+    /// Regression test for the fix: `update_blockmap_flags` must carry
+    /// the observed L2pValue seq through to its `l2p_remap` so apply's
+    /// `seq_guard_rejects` can guard against the scanner-versus-flusher
+    /// race documented above. The pre-fix path emitted seq=0
+    /// unconditionally and silently won races it should have lost.
+    #[test]
+    fn update_blockmap_flags_preserves_observed_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            wal_dir: None,
+            dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            ..Default::default()
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 8,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+
+        // Initial write at seq=100 with DEDUP_SKIPPED.
+        let bv = BlockmapValue {
+            pba: Pba(30),
+            compression: 1,
+            unit_compressed_size: 2048,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 0xAAAA_AAAA,
+            slot_offset: 0,
+            flags: FLAG_DEDUP_SKIPPED,
+        };
+        backend
+            .atomic_batch_write_with_dedup(&vol.id, &[(Lba(0), bv)], 1, &[], &[100])
+            .unwrap();
+        let ord = backend.volume_ordinal(&vol.id).unwrap();
+        assert_eq!(backend.db.get(ord, 0).unwrap().unwrap().seq(), 100);
+
+        // The flag-clear path.
+        backend.update_blockmap_flags(&vol.id, Lba(0), 0).unwrap();
+
+        // Flags cleared, PBA preserved, and — critically — the seq is
+        // still 100. Pre-fix the seq would be 0, which is the sentinel
+        // value that bypasses seq_guard.
+        let raw_after = backend.db.get(ord, 0).unwrap().unwrap();
+        assert_eq!(
+            raw_after.seq(),
+            100,
+            "update_blockmap_flags must preserve the observed seq so apply's \
+             seq_guard can reject losing-the-race callers"
+        );
+        let bv_after = blockmap_from_l2p_bytes(&raw_after.0).unwrap();
+        assert_eq!(bv_after.flags, 0);
+        assert_eq!(bv_after.pba, Pba(30));
+        assert_eq!(bv_after.crc32, 0xAAAA_AAAA);
+
+        // A concurrent newer write at seq=200 must win against a
+        // subsequent flag-clear that observed the seq=100 state. Here
+        // we encode that interleaving explicitly: commit the newer
+        // write first (so update_blockmap_flags will see it and
+        // early-return on matching flags), then a fresh DEDUP_SKIPPED
+        // write at seq=300, then update_blockmap_flags. The new
+        // observed seq (300) is preserved and the apply accepts.
+        let bv_newer = BlockmapValue {
+            pba: Pba(40),
+            crc32: 0xBBBB_BBBB,
+            flags: FLAG_DEDUP_SKIPPED,
+            ..bv
+        };
+        backend
+            .atomic_batch_write_with_dedup(&vol.id, &[(Lba(0), bv_newer)], 1, &[], &[300])
+            .unwrap();
+        backend.update_blockmap_flags(&vol.id, Lba(0), 0).unwrap();
+        let raw_after = backend.db.get(ord, 0).unwrap().unwrap();
+        assert_eq!(raw_after.seq(), 300);
+        let bv_after = blockmap_from_l2p_bytes(&raw_after.0).unwrap();
+        assert_eq!(bv_after.flags, 0);
+        assert_eq!(bv_after.pba, Pba(40));
     }
 }

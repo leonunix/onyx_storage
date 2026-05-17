@@ -304,24 +304,34 @@ impl DedupScanner {
                 // stripe lock here. The re-check below guards the
                 // scanner-versus-buffer-commit race.
                 let result_inner = (|| -> OnyxResult<bool> {
-                    // Re-read the mapping to ensure it's still the same
-                    let current = meta.get_mapping(&vol_id, *lba)?;
-                    let current = match current {
-                        Some(c)
-                            if c.pba == bv.pba
-                                && c.slot_offset == bv.slot_offset
-                                && c.unit_compressed_size == bv.unit_compressed_size
-                                && c.unit_original_size == bv.unit_original_size
-                                && c.unit_lba_count == bv.unit_lba_count
-                                && c.offset_in_unit == bv.offset_in_unit
-                                && c.compression == bv.compression
-                                && c.crc32 == bv.crc32
-                                && c.flags & FLAG_DEDUP_SKIPPED != 0 =>
-                        {
-                            c
-                        }
-                        _ => return Ok(false), // Changed or flag already cleared
+                    // Re-read the mapping to ensure it's still the same,
+                    // capturing the committed seq so we can forward it as
+                    // the seq_guard on the subsequent l2p_remap. The
+                    // re-check is NOT atomic with the apply below: read +
+                    // hash + dedup_index lookup can take hundreds of
+                    // microseconds, during which a buffer-flusher commit
+                    // can advance the L2P seq. Passing seq=0 would
+                    // silently bypass `seq_guard_rejects` and clobber the
+                    // newer write — see the
+                    // `metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write`
+                    // regression test.
+                    let Some((current, observed_seq)) =
+                        meta.get_mapping_with_seq(&vol_id, *lba)?
+                    else {
+                        return Ok(false);
                     };
+                    if !(current.pba == bv.pba
+                        && current.slot_offset == bv.slot_offset
+                        && current.unit_compressed_size == bv.unit_compressed_size
+                        && current.unit_original_size == bv.unit_original_size
+                        && current.unit_lba_count == bv.unit_lba_count
+                        && current.offset_in_unit == bv.offset_in_unit
+                        && current.compression == bv.compression
+                        && current.crc32 == bv.crc32
+                        && current.flags & FLAG_DEDUP_SKIPPED != 0)
+                    {
+                        return Ok(false); // Changed or flag already cleared
+                    }
 
                     let block = match read_lba_block(io_engine, &current)? {
                         Some(b) => b,
@@ -337,13 +347,21 @@ impl DedupScanner {
                                 flags: 0, // Clear DEDUP_SKIPPED
                                 ..existing.to_blockmap_value()
                             };
-                            // seq=0 is the legacy/no-guard sentinel: metadb's
-                            // apply-time seq_guard bypasses the CAS check, so
-                            // the scanner can overwrite a buffer commit even
-                            // when its per-LBA seq is non-zero. Scanner's
-                            // existing re-check loop catches the race.
-                            let decremented =
-                                meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash, 0)?;
+                            // Forward the observed seq so apply's
+                            // seq_guard rejects a losing race against a
+                            // concurrent buffer-flusher commit. The old
+                            // sentinel value of 0 bypassed the guard
+                            // entirely; the re-check above is not enough
+                            // because the dedup_index lookup + this
+                            // tx.commit can take >100 us during which a
+                            // newer commit may land.
+                            let decremented = meta.atomic_dedup_hit(
+                                &vol_id,
+                                *lba,
+                                &new_bv,
+                                &hash,
+                                observed_seq,
+                            )?;
                             if let Some(cleanup) = decremented {
                                 BufferFlusher::cleanup_dead_pba_post_commit(
                                     allocator,

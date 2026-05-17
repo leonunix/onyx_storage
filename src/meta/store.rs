@@ -167,6 +167,21 @@ impl MetaStore {
         self.backend.get_mapping(vol_id, lba)
     }
 
+    /// Read the L2P entry along with its committed seq. Callers that
+    /// submit a derived update (DedupScanner's flag-clear and
+    /// dedup-hit promotion paths) MUST forward this seq to the
+    /// subsequent `l2p_remap` so apply's `seq_guard_rejects` can
+    /// distinguish "I read this and nobody else has touched it" from
+    /// "a newer flusher commit landed while I was working" — emitting
+    /// seq=0 silently bypasses the guard and clobbers the newer write.
+    pub fn get_mapping_with_seq(
+        &self,
+        vol_id: &VolumeId,
+        lba: Lba,
+    ) -> OnyxResult<Option<(BlockmapValue, u64)>> {
+        self.backend.get_mapping_with_seq(vol_id, lba)
+    }
+
     pub fn get_mapping_str(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<BlockmapValue>> {
         self.backend.get_mapping_str(vol_id, lba)
     }
