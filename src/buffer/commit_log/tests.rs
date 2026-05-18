@@ -685,12 +685,7 @@ fn throttle_curve_is_monotonic_and_below_cap() {
     for fill in 61..=99 {
         let d = r.delay_us_for_fill(fill);
         assert!(d >= prev, "non-monotonic at fill={}", fill);
-        assert!(
-            d <= r.cap_us,
-            "delay {} exceeded cap at fill={}",
-            d,
-            fill
-        );
+        assert!(d <= r.cap_us, "delay {} exceeded cap at fill={}", d, fill);
         prev = d;
     }
 }

@@ -540,8 +540,13 @@ impl MetadbBackend {
         _new_pba: Pba,
         _new_refcount: u32,
     ) -> OnyxResult<HashMap<Pba, RemapCleanup>> {
-        let (cleanups, _accepted) = self
-            .atomic_batch_write_packed_with_dedup(batch_values, _new_pba, _new_refcount, &[], &[])?;
+        let (cleanups, _accepted) = self.atomic_batch_write_packed_with_dedup(
+            batch_values,
+            _new_pba,
+            _new_refcount,
+            &[],
+            &[],
+        )?;
         Ok(cleanups)
     }
 
@@ -570,7 +575,12 @@ impl MetadbBackend {
                     ord
                 }
             };
-            tx.l2p_remap(ord, lba.0, to_l2p_value_with_seq(value, seq_for(seqs, i)), None);
+            tx.l2p_remap(
+                ord,
+                lba.0,
+                to_l2p_value_with_seq(value, seq_for(seqs, i)),
+                None,
+            );
             new_values.push(*value);
         }
         for (hash, entry) in dedup_entries {
@@ -1000,7 +1010,12 @@ impl MetadbBackend {
         // concurrent commit) and reject the strictly-less-than case
         // (a newer flusher commit raced us), preserving the invariant
         // that newer seqs win.
-        tx.l2p_remap(ord, lba.0, to_l2p_value_with_seq(&value, observed_seq), None);
+        tx.l2p_remap(
+            ord,
+            lba.0,
+            to_l2p_value_with_seq(&value, observed_seq),
+            None,
+        );
         // Match `atomic_dedup_hit` / `atomic_batch_dedup_hits` semantics:
         // this is a flag-bit edit on an existing mapping with no LV3
         // write. The logged path forces `unlogged_commit_gate.write()` +
@@ -1345,8 +1360,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.refcount_drainer_enabled = config.refcount_drainer_enabled;
     cfg.refcount_drainer_interval_ms = config.refcount_drainer_interval_ms;
     cfg.refcount_drainer_threshold_entries = config.refcount_drainer_threshold_entries;
-    cfg.refcount_drainer_max_entries_per_cycle =
-        config.refcount_drainer_max_entries_per_cycle;
+    cfg.refcount_drainer_max_entries_per_cycle = config.refcount_drainer_max_entries_per_cycle;
     cfg.refcount_drainer_alloc_run_size = config.refcount_drainer_alloc_run_size;
     cfg.refcount_drainer_backpressure_pages = config.refcount_drainer_backpressure_pages;
     // L2P streaming writeback: continuously seal dirty L2P pages and
@@ -1367,8 +1381,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_buffer_max_interval_ms = config.l2p_buffer_max_interval_ms;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
-    cfg.async_reclaim_max_pages_per_cycle =
-        config.async_reclaim_max_pages_per_cycle as usize;
+    cfg.async_reclaim_max_pages_per_cycle = config.async_reclaim_max_pages_per_cycle as usize;
     cfg.async_reclaim_idle_interval_ms = config.async_reclaim_idle_interval_ms;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
@@ -1572,19 +1585,14 @@ where
         if value.is_zero() {
             continue;
         }
-        *occurrences.entry(value.pba).or_insert(0) += 1;
-    }
-    if occurrences.len() != 1 {
-        return HashMap::new();
+        for pba in value.physical_pbas(crate::types::BLOCK_SIZE) {
+            *occurrences.entry(pba).or_insert(0) += 1;
+        }
     }
     occurrences
         .into_iter()
-        .filter_map(|(pba, count)| {
-            new_refcount
-                .checked_sub(count)
-                .filter(|delta| *delta > 0)
-                .map(|delta| (pba, delta))
-        })
+        .filter_map(|(pba, count)| new_refcount.checked_sub(count).map(|delta| (pba, delta)))
+        .filter(|(_, delta)| *delta > 0)
         .collect()
 }
 
@@ -1972,9 +1980,7 @@ mod tests {
                 (Lba(i), v)
             })
             .collect();
-        backend
-            .atomic_batch_write(&vol.id, &batch, 1)
-            .unwrap();
+        backend.atomic_batch_write(&vol.id, &batch, 1).unwrap();
         for i in 0..8u64 {
             let m = backend.get_mapping(&vol.id, Lba(i)).unwrap().unwrap();
             assert_eq!(m.pba, Pba(100 + i));

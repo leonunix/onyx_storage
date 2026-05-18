@@ -377,10 +377,8 @@ impl Default for MetaConfig {
             io_submitter_bg_inflight_cap: default_metadb_io_submitter_bg_inflight_cap(),
             flush_select_budget: default_metadb_flush_select_budget(),
             async_reclaim_enabled: default_metadb_async_reclaim_enabled(),
-            async_reclaim_max_pages_per_cycle:
-                default_metadb_async_reclaim_max_pages_per_cycle(),
-            async_reclaim_idle_interval_ms:
-                default_metadb_async_reclaim_idle_interval_ms(),
+            async_reclaim_max_pages_per_cycle: default_metadb_async_reclaim_max_pages_per_cycle(),
+            async_reclaim_idle_interval_ms: default_metadb_async_reclaim_idle_interval_ms(),
             unlogged_flush_commits: false,
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
@@ -390,8 +388,8 @@ impl Default for MetaConfig {
             refcount_drainer_enabled: default_refcount_drainer_enabled(),
             refcount_drainer_interval_ms: default_refcount_drainer_interval_ms(),
             refcount_drainer_threshold_entries: default_refcount_drainer_threshold_entries(),
-            refcount_drainer_max_entries_per_cycle:
-                default_refcount_drainer_max_entries_per_cycle(),
+            refcount_drainer_max_entries_per_cycle: default_refcount_drainer_max_entries_per_cycle(
+            ),
             refcount_drainer_alloc_run_size: default_refcount_drainer_alloc_run_size(),
             refcount_drainer_backpressure_pages: default_refcount_drainer_backpressure_pages(),
             l2p_writeback_enabled: default_l2p_writeback_enabled(),
@@ -653,10 +651,10 @@ pub struct FlushConfig {
     /// Each buffer shard has its own flush lane. Total compress threads = shards × compress_workers.
     #[serde(default = "default_compress_workers")]
     pub compress_workers: usize,
-    /// Max raw bytes to coalesce before compressing (default 32KB)
+    /// Max raw bytes to coalesce before compressing (default 128KB)
     #[serde(default = "default_coalesce_max_raw_bytes")]
     pub coalesce_max_raw_bytes: usize,
-    /// Max number of LBAs to coalesce into one compression unit (default 8)
+    /// Max number of LBAs to coalesce into one compression unit (default 32)
     #[serde(default = "default_coalesce_max_lbas")]
     pub coalesce_max_lbas: u32,
     /// Minimum space saving required to keep a compressed unit after the
@@ -759,10 +757,10 @@ fn default_compress_workers() -> usize {
     2 // per flush lane (1 lane per buffer shard)
 }
 fn default_coalesce_max_raw_bytes() -> usize {
-    32768 // 32KB
+    131072 // 128KB
 }
 fn default_coalesce_max_lbas() -> u32 {
-    8
+    32
 }
 fn default_min_compression_savings_pct() -> u8 {
     12

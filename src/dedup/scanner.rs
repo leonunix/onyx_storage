@@ -315,8 +315,7 @@ impl DedupScanner {
                     // newer write — see the
                     // `metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write`
                     // regression test.
-                    let Some((current, observed_seq)) =
-                        meta.get_mapping_with_seq(&vol_id, *lba)?
+                    let Some((current, observed_seq)) = meta.get_mapping_with_seq(&vol_id, *lba)?
                     else {
                         return Ok(false);
                     };
@@ -355,13 +354,8 @@ impl DedupScanner {
                             // because the dedup_index lookup + this
                             // tx.commit can take >100 us during which a
                             // newer commit may land.
-                            let decremented = meta.atomic_dedup_hit(
-                                &vol_id,
-                                *lba,
-                                &new_bv,
-                                &hash,
-                                observed_seq,
-                            )?;
+                            let decremented =
+                                meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash, observed_seq)?;
                             if let Some(cleanup) = decremented {
                                 BufferFlusher::cleanup_dead_pba_post_commit(
                                     allocator,

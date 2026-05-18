@@ -268,10 +268,7 @@ impl SpaceAllocator {
             }
         };
         // First block goes to caller (counted as allocated), rest into cache
-        self.track_alloc(
-            Extent::single(first_pba),
-            "allocate_one_for_lane_refill",
-        )?;
+        self.track_alloc(Extent::single(first_pba), "allocate_one_for_lane_refill")?;
         self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
         self.free_blocks.fetch_sub(1, Ordering::Relaxed);
         if refill > 1 {

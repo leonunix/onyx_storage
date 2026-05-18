@@ -67,6 +67,7 @@ pub(in crate::buffer::flush) enum CommitJob {
 /// Per-unit decisions consumed by chunked commit below. Module-scope
 /// so `commit_passthrough_chunk` can take a `&mut [Option<UnitMeta>]`.
 struct UnitMeta {
+    start_lba: Lba,
     batch_values: Vec<(Lba, BlockmapValue)>,
     seqs: Vec<u64>,
     live_positions: Vec<usize>,
@@ -145,8 +146,7 @@ impl BufferFlusher {
             let recv_start = Instant::now();
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(first) => {
-                    let idle_ns =
-                        recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     metrics
                         .flush_commit_worker_rx_idle_ns
                         .fetch_add(idle_ns, Ordering::Relaxed);
@@ -175,8 +175,7 @@ impl BufferFlusher {
                     );
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    let idle_ns =
-                        recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     metrics
                         .flush_commit_worker_rx_idle_ns
                         .fetch_add(idle_ns, Ordering::Relaxed);
@@ -291,32 +290,30 @@ impl BufferFlusher {
         let mut pending_packed: Vec<PackedCommitJob> = Vec::new();
         for job in jobs {
             match job {
-                CommitJob::Passthrough(mut pj) => {
-                    match pending_pt.as_mut() {
-                        Some(existing) if existing.vol_id == pj.vol_id => {
-                            existing.units.append(&mut pj.units);
-                        }
-                        Some(_) => {
-                            let ready = pending_pt.take().expect("pending passthrough exists");
-                            Self::dispatch_passthrough_job(
-                                ready,
-                                pool,
-                                meta,
-                                lifecycle,
-                                allocator,
-                                in_flight_tracker,
-                                metrics,
-                                lane_cleanup_txs,
-                                candidate,
-                                lane_done_txs,
-                                post_commit_tx,
-                                target_lbas_per_tx,
-                            );
-                            pending_pt = Some(pj);
-                        }
-                        None => pending_pt = Some(pj),
+                CommitJob::Passthrough(mut pj) => match pending_pt.as_mut() {
+                    Some(existing) if existing.vol_id == pj.vol_id => {
+                        existing.units.append(&mut pj.units);
                     }
-                }
+                    Some(_) => {
+                        let ready = pending_pt.take().expect("pending passthrough exists");
+                        Self::dispatch_passthrough_job(
+                            ready,
+                            pool,
+                            meta,
+                            lifecycle,
+                            allocator,
+                            in_flight_tracker,
+                            metrics,
+                            lane_cleanup_txs,
+                            candidate,
+                            lane_done_txs,
+                            post_commit_tx,
+                            target_lbas_per_tx,
+                        );
+                        pending_pt = Some(pj);
+                    }
+                    None => pending_pt = Some(pj),
+                },
                 CommitJob::Packed(pj) => {
                     pending_packed.push(pj);
                 }
@@ -392,14 +389,8 @@ impl BufferFlusher {
         metrics
             .flush_commit_worker_job_lbas
             .fetch_add(drain_lbas, Ordering::Relaxed);
-        crate::metrics::record_counter_max(
-            &metrics.flush_commit_worker_drain_jobs_max,
-            drain_jobs,
-        );
-        crate::metrics::record_counter_max(
-            &metrics.flush_commit_worker_drain_lbas_max,
-            drain_lbas,
-        );
+        crate::metrics::record_counter_max(&metrics.flush_commit_worker_drain_jobs_max, drain_jobs);
+        crate::metrics::record_counter_max(&metrics.flush_commit_worker_drain_lbas_max, drain_lbas);
     }
 
     fn dispatch_passthrough_job(
@@ -562,8 +553,7 @@ impl BufferFlusher {
             for (i, ucd) in units.iter().enumerate() {
                 let unit = &ucd.unit;
                 let should_discard = !volume_present
-                    || (unit.vol_created_at != 0
-                        && cur_created_at != Some(unit.vol_created_at));
+                    || (unit.vol_created_at != 0 && cur_created_at != Some(unit.vol_created_at));
                 if should_discard {
                     metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
                     discarded[i] = true;
@@ -584,6 +574,7 @@ impl BufferFlusher {
                 };
                 if live_positions.is_empty() {
                     unit_metas[i] = Some(UnitMeta {
+                        start_lba: unit.start_lba,
                         batch_values: Vec::new(),
                         seqs: Vec::new(),
                         live_positions,
@@ -643,6 +634,7 @@ impl BufferFlusher {
                 }
                 let accepted_positions = live_positions.clone();
                 unit_metas[i] = Some(UnitMeta {
+                    start_lba: ucd.unit.start_lba,
                     batch_values,
                     seqs,
                     live_positions,
@@ -665,9 +657,7 @@ impl BufferFlusher {
                     continue;
                 };
                 let lbas = um.batch_values.len();
-                if !chunk.is_empty()
-                    && chunk_lbas.saturating_add(lbas) > target_lbas_per_tx
-                {
+                if !chunk.is_empty() && chunk_lbas.saturating_add(lbas) > target_lbas_per_tx {
                     Self::commit_passthrough_chunk(
                         &chunk,
                         &vol_id,
@@ -994,6 +984,35 @@ impl BufferFlusher {
             return;
         }
 
+        for &i in chunk {
+            if let Some(um) = unit_metas[i].as_ref() {
+                if um.batch_values.is_empty() {
+                    continue;
+                }
+                if let Err(e) = maybe_inject_test_failure(
+                    &vol_id.0,
+                    um.start_lba,
+                    FlushFailStage::BeforeMetaWrite,
+                ) {
+                    tracing::error!(
+                        vol = %vol_id.0,
+                        start_lba = um.start_lba.0,
+                        chunk_units = chunk.len(),
+                        error = %e,
+                        "commit_worker: passthrough injected metadata failure"
+                    );
+                    for &j in chunk {
+                        if let Some(failed_um) = unit_metas[j].as_ref() {
+                            if !failed_um.batch_values.is_empty() {
+                                commit_failed_indices.push(j);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         let commit_start = Instant::now();
         let result = meta.atomic_batch_write_multi_with_dedup(&batch_args, &[], &all_seqs);
         Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
@@ -1014,7 +1033,9 @@ impl BufferFlusher {
             Ok((returned, accepted)) => {
                 let rejects = accepted.iter().filter(|a| !**a).count() as u64;
                 if rejects > 0 {
-                    metrics.flush_seq_rejects.fetch_add(rejects, Ordering::Relaxed);
+                    metrics
+                        .flush_seq_rejects
+                        .fetch_add(rejects, Ordering::Relaxed);
                     // Two cases per unit:
                     // - every L2pRemap rejected → mark whole-unit rejected;
                     //   refcount[pba] is still 0 and the freshly-allocated
@@ -1040,11 +1061,7 @@ impl BufferFlusher {
                                     .copied()
                                     .enumerate()
                                     .filter_map(|(k, pos)| {
-                                        unit_accepted
-                                            .get(k)
-                                            .copied()
-                                            .unwrap_or(true)
-                                            .then_some(pos)
+                                        unit_accepted.get(k).copied().unwrap_or(true).then_some(pos)
                                     })
                                     .collect();
                                 um.accepted_positions = kept;
@@ -1201,7 +1218,9 @@ impl BufferFlusher {
 
         // Same-LBA concurrent commits are arbitrated by metadb's
         // per-LBA seq_guard CAS; no onyx-side stripe lock here.
-        let outcome: OnyxResult<PackedCommitOutcome> = (|| {
+        let jobs = jobs;
+        let outcome: OnyxResult<PackedCommitOutcome> = loop {
+            let commit_attempt: OnyxResult<PackedCommitOutcome> = (|| {
                 let build_start = Instant::now();
                 let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
                 let mut batch_seqs: Vec<u64> = Vec::new();
@@ -1271,10 +1290,8 @@ impl BufferFlusher {
                                 flags: frag_flags,
                             };
                             batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
-                            batch_seqs.push(Self::latest_seq_for_lba(
-                                &unit.seq_lba_ranges,
-                                frag_lbas[i],
-                            ));
+                            batch_seqs
+                                .push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, frag_lbas[i]));
                             if let Some(hashes) = hashes_for_promote {
                                 let hash = hashes[pos];
                                 if hash != [0u8; 8] {
@@ -1313,14 +1330,11 @@ impl BufferFlusher {
                 }
                 Self::record_elapsed(&metrics.flush_writer_meta_build_ns, build_start);
 
-                for pba in &discarded_pbas {
-                    let _ = allocator.free_one(*pba);
-                }
-
                 if batch_values.is_empty() {
-                    return Ok(PackedCommitOutcome::Discarded {
-                        all_seq_lba_ranges,
-                    });
+                    for pba in &discarded_pbas {
+                        let _ = allocator.free_one(*pba);
+                    }
+                    return Ok(PackedCommitOutcome::Discarded { all_seq_lba_ranges });
                 }
 
                 // Test-only failpoints — fire here, after the shard
@@ -1337,6 +1351,10 @@ impl BufferFlusher {
                 }
                 for job in &jobs {
                     maybe_pause_before_packed_meta_write(&job.sealed.fragments)?;
+                }
+
+                for pba in &discarded_pbas {
+                    let _ = allocator.free_one(*pba);
                 }
 
                 let meta_start = Instant::now();
@@ -1411,6 +1429,23 @@ impl BufferFlusher {
                     total_refcount: batch_values.len() as u32,
                 })
             })();
+            match commit_attempt {
+                Err(crate::error::OnyxError::Io(err))
+                    if err
+                        .to_string()
+                        .contains("injected flush failure at BeforeMetaWrite") =>
+                {
+                    metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        error = %err,
+                        "commit_worker: packed slot injected metadata failure; retrying sealed slot"
+                    );
+                    thread::sleep(Self::RETRY_BACKOFF);
+                    continue;
+                }
+                other => break other,
+            }
+        };
 
         match outcome {
             Ok(PackedCommitOutcome::Discarded { all_seq_lba_ranges }) => {
@@ -1515,20 +1550,13 @@ impl BufferFlusher {
         }
     }
 
-    fn deliver_packed_batch_done(
-        jobs: Vec<PackedCommitJob>,
-        lane_done_txs: &[Sender<Vec<u64>>],
-    ) {
+    fn deliver_packed_batch_done(jobs: Vec<PackedCommitJob>, lane_done_txs: &[Sender<Vec<u64>>]) {
         for job in jobs {
             if let Some(done_tx) = lane_done_txs
                 .get(job.shard_idx)
                 .or_else(|| lane_done_txs.first())
             {
-                Self::deliver_packed_done(
-                    job.buffered_seqs,
-                    job.buffered_completions,
-                    done_tx,
-                );
+                Self::deliver_packed_done(job.buffered_seqs, job.buffered_completions, done_tx);
             }
         }
     }

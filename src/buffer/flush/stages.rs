@@ -165,8 +165,7 @@ impl BufferFlusher {
                 let recv_start = Instant::now();
                 match pool.recv_ready_timeout_for_shard(shard_idx, ready_timeout) {
                     Ok(seq) => {
-                        let idle_ns =
-                            recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                         this_iter_idle_ns = this_iter_idle_ns.saturating_add(idle_ns);
                         metrics
                             .flush_coalesce_idle_ns
@@ -184,8 +183,7 @@ impl BufferFlusher {
                         );
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        let idle_ns =
-                            recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                         this_iter_idle_ns = this_iter_idle_ns.saturating_add(idle_ns);
                         metrics
                             .flush_coalesce_idle_ns
@@ -195,25 +193,60 @@ impl BufferFlusher {
                 }
             }
 
-            while queued_bytes < Self::COALESCE_READY_WINDOW_BYTES {
-                let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) else {
+            // Fairness for recovered / retried entries: seed each cycle with
+            // the oldest ready pending seqs before draining the unbounded ready
+            // channel. A sustained foreground writer can otherwise keep the
+            // channel non-empty forever while crash-recovered payload-less
+            // entries rely on periodic snapshots to make progress.
+            let mut queued_oldest_snapshot = false;
+            for entry in
+                pool.oldest_ready_pending_arcs_for_shard(shard_idx, retry_snapshot_topup_limit)
+            {
+                if queued_bytes >= Self::COALESCE_READY_WINDOW_BYTES {
                     break;
-                };
-                if matches!(
-                    Self::try_enqueue_pending_seq(
-                        seq,
-                        pool,
-                        &in_flight,
-                        in_flight_tracker,
-                        &mut seen,
-                        &mut queued_bytes,
-                        &mut new_entries,
-                        metrics,
-                        skip_fully_superseded,
-                    ),
-                    EnqueuePendingSeq::WindowFull
+                }
+                match Self::try_enqueue_pending_seq(
+                    entry.seq,
+                    pool,
+                    &in_flight,
+                    in_flight_tracker,
+                    &mut seen,
+                    &mut queued_bytes,
+                    &mut new_entries,
+                    metrics,
+                    skip_fully_superseded,
                 ) {
-                    break;
+                    EnqueuePendingSeq::Queued => queued_oldest_snapshot = true,
+                    EnqueuePendingSeq::WindowFull => break,
+                    EnqueuePendingSeq::Skipped(_) => {}
+                }
+            }
+
+            // If the oldest-pending snapshot produced work, keep this cycle
+            // focused on that priority batch. Otherwise a sustained foreground
+            // writer can fill the 16 MiB ready window every iteration and turn
+            // recovered/retried entries into "eventually" work again.
+            if !queued_oldest_snapshot {
+                while queued_bytes < Self::COALESCE_READY_WINDOW_BYTES {
+                    let Ok(seq) = pool.try_recv_ready_for_shard(shard_idx) else {
+                        break;
+                    };
+                    if matches!(
+                        Self::try_enqueue_pending_seq(
+                            seq,
+                            pool,
+                            &in_flight,
+                            in_flight_tracker,
+                            &mut seen,
+                            &mut queued_bytes,
+                            &mut new_entries,
+                            metrics,
+                            skip_fully_superseded,
+                        ),
+                        EnqueuePendingSeq::WindowFull
+                    ) {
+                        break;
+                    }
                 }
             }
 
@@ -234,8 +267,8 @@ impl BufferFlusher {
             {
                 last_retry_snapshot = Instant::now();
                 let mut topped_up = 0usize;
-                for entry in pool
-                    .oldest_ready_pending_arcs_for_shard(shard_idx, retry_snapshot_topup_limit)
+                for entry in
+                    pool.oldest_ready_pending_arcs_for_shard(shard_idx, retry_snapshot_topup_limit)
                 {
                     if topped_up >= retry_snapshot_topup_limit
                         || queued_bytes >= Self::COALESCE_READY_WINDOW_BYTES
@@ -437,10 +470,7 @@ impl BufferFlusher {
                         raw_data.extend_from_slice(block.bytes());
                     }
                     metrics.flush_compress_raw_build_ns.fetch_add(
-                        raw_build_start
-                            .elapsed()
-                            .as_nanos()
-                            .min(u64::MAX as u128) as u64,
+                        raw_build_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                         Ordering::Relaxed,
                     );
 
@@ -467,8 +497,7 @@ impl BufferFlusher {
                     let (compression_byte, compressed_data) = match algo {
                         CompressionAlgo::None => (0u8, raw_data),
                         CompressionAlgo::Lz4 => {
-                            let max_out =
-                                lz4_flex::block::get_maximum_output_size(original_size);
+                            let max_out = lz4_flex::block::get_maximum_output_size(original_size);
                             if max_out <= compress_buf.len() {
                                 match lz4_flex::block::compress_into(
                                     &raw_data,
@@ -529,10 +558,7 @@ impl BufferFlusher {
                         }
                     };
                     metrics.flush_compress_codec_ns.fetch_add(
-                        codec_start
-                            .elapsed()
-                            .as_nanos()
-                            .min(u64::MAX as u128) as u64,
+                        codec_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                         Ordering::Relaxed,
                     );
 
@@ -591,8 +617,7 @@ impl BufferFlusher {
                     if result.is_err() {
                         return;
                     }
-                    let active_ns =
-                        active_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    let active_ns = active_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     metrics
                         .flush_compress_worker_active_ns
                         .fetch_add(active_ns, Ordering::Relaxed);
@@ -1217,99 +1242,97 @@ impl BufferFlusher {
                 // metadb's per-LBA seq_guard CAS; no onyx-side
                 // stripe lock here.
                 for unit_idx in unit_indices {
-                        let unit = &prepared[unit_idx].unit;
-                        let generation_alive = generation_cache
-                            .entry(unit.vol_created_at)
-                            .or_insert_with(|| match meta.get_volume(&vol_id) {
-                                Ok(Some(vc)) => Ok(vc.created_at == unit.vol_created_at),
-                                Ok(None) => Ok(false),
-                                Err(e) => Err(e),
-                            })
-                            .as_ref()
-                            .copied();
+                    let unit = &prepared[unit_idx].unit;
+                    let generation_alive = generation_cache
+                        .entry(unit.vol_created_at)
+                        .or_insert_with(|| match meta.get_volume(&vol_id) {
+                            Ok(Some(vc)) => Ok(vc.created_at == unit.vol_created_at),
+                            Ok(None) => Ok(false),
+                            Err(e) => Err(e),
+                        })
+                        .as_ref()
+                        .copied();
 
-                        match generation_alive {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                let zeros = std::mem::take(&mut prepared[unit_idx].zero_indices);
-                                for &i in &zeros {
-                                    prepared[unit_idx].is_hit[i] = true;
-                                }
-                                prepared[unit_idx].successful_hit_indices.extend(zeros);
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    vol = %vol_id_str,
-                                    error = %e,
-                                    "dedup worker: failed to check volume generation for zero blocks"
-                                );
-                                continue;
-                            }
-                        }
-
-                        let zero_indices = prepared[unit_idx].zero_indices.clone();
-                        let mut batch_values: Vec<(Lba, BlockmapValue)> =
-                            Vec::with_capacity(zero_indices.len());
-                        let mut batch_seqs: Vec<u64> = Vec::with_capacity(zero_indices.len());
-                        for &i in &zero_indices {
-                            let lba = Lba(unit.start_lba.0 + i as u64);
-                            let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
-                            if !pool.is_latest_lba_seq(
-                                &unit.vol_id,
-                                lba,
-                                latest_seq,
-                                unit.vol_created_at,
-                            ) {
+                    match generation_alive {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let zeros = std::mem::take(&mut prepared[unit_idx].zero_indices);
+                            for &i in &zeros {
                                 prepared[unit_idx].is_hit[i] = true;
-                                prepared[unit_idx].successful_hit_indices.push(i);
-                                continue;
                             }
-                            batch_values.push((lba, BlockmapValue::zero()));
-                            batch_seqs.push(latest_seq);
-                        }
-                        if batch_values.is_empty() {
-                            prepared[unit_idx].zero_indices.clear();
+                            prepared[unit_idx].successful_hit_indices.extend(zeros);
                             continue;
                         }
-
-                        match meta.atomic_batch_write_with_dedup(
-                            &vol_id,
-                            &batch_values,
-                            0,
-                            &[],
-                            &batch_seqs,
-                        ) {
-                            Ok((newly_zeroed, accepted_flags)) => {
-                                for (k, (lba, _)) in batch_values.iter().enumerate() {
-                                    let i = (lba.0 - unit.start_lba.0) as usize;
-                                    if accepted_flags.get(k).copied().unwrap_or(true) {
-                                        prepared[unit_idx].is_hit[i] = true;
-                                        prepared[unit_idx].successful_hit_indices.push(i);
-                                    } else {
-                                        metrics
-                                            .dedup_hit_failures
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                                prepared[unit_idx].zero_indices.clear();
-                                if !newly_zeroed.is_empty() {
-                                    let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
-                                }
-                            }
-                            Err(e) => {
-                                metrics
-                                    .dedup_hit_failures
-                                    .fetch_add(batch_values.len() as u64, Ordering::Relaxed);
-                                tracing::error!(
-                                    vol = %vol_id_str,
-                                    count = batch_values.len(),
-                                    error = %e,
-                                    "dedup worker: zero block remap failed, demoting to miss"
-                                );
-                            }
+                        Err(e) => {
+                            tracing::warn!(
+                                vol = %vol_id_str,
+                                error = %e,
+                                "dedup worker: failed to check volume generation for zero blocks"
+                            );
+                            continue;
                         }
                     }
+
+                    let zero_indices = prepared[unit_idx].zero_indices.clone();
+                    let mut batch_values: Vec<(Lba, BlockmapValue)> =
+                        Vec::with_capacity(zero_indices.len());
+                    let mut batch_seqs: Vec<u64> = Vec::with_capacity(zero_indices.len());
+                    for &i in &zero_indices {
+                        let lba = Lba(unit.start_lba.0 + i as u64);
+                        let latest_seq = Self::latest_seq_for_lba(&unit.seq_lba_ranges, lba);
+                        if !pool.is_latest_lba_seq(
+                            &unit.vol_id,
+                            lba,
+                            latest_seq,
+                            unit.vol_created_at,
+                        ) {
+                            prepared[unit_idx].is_hit[i] = true;
+                            prepared[unit_idx].successful_hit_indices.push(i);
+                            continue;
+                        }
+                        batch_values.push((lba, BlockmapValue::zero()));
+                        batch_seqs.push(latest_seq);
+                    }
+                    if batch_values.is_empty() {
+                        prepared[unit_idx].zero_indices.clear();
+                        continue;
+                    }
+
+                    match meta.atomic_batch_write_with_dedup(
+                        &vol_id,
+                        &batch_values,
+                        0,
+                        &[],
+                        &batch_seqs,
+                    ) {
+                        Ok((newly_zeroed, accepted_flags)) => {
+                            for (k, (lba, _)) in batch_values.iter().enumerate() {
+                                let i = (lba.0 - unit.start_lba.0) as usize;
+                                if accepted_flags.get(k).copied().unwrap_or(true) {
+                                    prepared[unit_idx].is_hit[i] = true;
+                                    prepared[unit_idx].successful_hit_indices.push(i);
+                                } else {
+                                    metrics.dedup_hit_failures.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            prepared[unit_idx].zero_indices.clear();
+                            if !newly_zeroed.is_empty() {
+                                let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
+                            }
+                        }
+                        Err(e) => {
+                            metrics
+                                .dedup_hit_failures
+                                .fetch_add(batch_values.len() as u64, Ordering::Relaxed);
+                            tracing::error!(
+                                vol = %vol_id_str,
+                                count = batch_values.len(),
+                                error = %e,
+                                "dedup worker: zero block remap failed, demoting to miss"
+                            );
+                        }
+                    }
+                }
             });
         }
     }

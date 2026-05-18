@@ -91,93 +91,87 @@ impl BufferFlusher {
             // Same-LBA concurrent commits are arbitrated by metadb's
             // per-LBA seq_guard CAS; no onyx-side stripe lock here.
             let commit = (|| -> OnyxResult<Option<(Vec<usize>, HashMap<Pba, RemapCleanup>)>> {
-                    let live_positions = Self::live_positions_for_unit(unit, pool)?;
-                    if live_positions.is_empty() {
-                        return Ok(None);
-                    }
-                    let lbas: Vec<Lba> = live_positions
-                        .iter()
-                        .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
-                        .collect();
+                let live_positions = Self::live_positions_for_unit(unit, pool)?;
+                if live_positions.is_empty() {
+                    return Ok(None);
+                }
+                let lbas: Vec<Lba> = live_positions
+                    .iter()
+                    .map(|idx| Lba(unit.start_lba.0 + *idx as u64))
+                    .collect();
 
-                    let mut batch_values = Vec::with_capacity(live_positions.len());
-                    let mut batch_seqs = Vec::with_capacity(live_positions.len());
-                    for i in 0..live_positions.len() {
-                        let flags = if unit.dedup_skipped {
-                            FLAG_DEDUP_SKIPPED
-                        } else {
-                            0
-                        };
-                        let blockmap = Self::blockmap_for_unit_position(
-                            unit,
-                            pba,
-                            live_positions[i],
-                            0,
-                            flags,
-                        );
-                        batch_values.push((lbas[i], blockmap));
-                        batch_seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, lbas[i]));
-                    }
-                    let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-                    let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-                    if !unit.dedup_skipped {
-                        if let Some(ref hashes) = unit.block_hashes {
-                            fresh_dedup_pairs.reserve(live_positions.len());
-                            for &pos in &live_positions {
-                                let hash = hashes[pos];
-                                if hash == [0u8; 8] {
-                                    continue;
-                                }
-                                let blockmap =
-                                    Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
-                                fresh_dedup_pairs.push((hash, blockmap));
-                                if let Some(repairs) = &unit.dedup_stale_repairs {
-                                    if let Some(Some(old_entry)) = repairs.get(pos) {
-                                        stale_repairs.push((
-                                            hash,
-                                            *old_entry,
-                                            blockmap.to_dedup_entry(),
-                                        ));
-                                    }
+                let mut batch_values = Vec::with_capacity(live_positions.len());
+                let mut batch_seqs = Vec::with_capacity(live_positions.len());
+                for i in 0..live_positions.len() {
+                    let flags = if unit.dedup_skipped {
+                        FLAG_DEDUP_SKIPPED
+                    } else {
+                        0
+                    };
+                    let blockmap =
+                        Self::blockmap_for_unit_position(unit, pba, live_positions[i], 0, flags);
+                    batch_values.push((lbas[i], blockmap));
+                    batch_seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, lbas[i]));
+                }
+                let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
+                let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+                if !unit.dedup_skipped {
+                    if let Some(ref hashes) = unit.block_hashes {
+                        fresh_dedup_pairs.reserve(live_positions.len());
+                        for &pos in &live_positions {
+                            let hash = hashes[pos];
+                            if hash == [0u8; 8] {
+                                continue;
+                            }
+                            let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
+                            fresh_dedup_pairs.push((hash, blockmap));
+                            if let Some(repairs) = &unit.dedup_stale_repairs {
+                                if let Some(Some(old_entry)) = repairs.get(pos) {
+                                    stale_repairs.push((
+                                        hash,
+                                        *old_entry,
+                                        blockmap.to_dedup_entry(),
+                                    ));
                                 }
                             }
                         }
                     }
+                }
 
-                    maybe_inject_test_failure(
-                        &unit.vol_id,
-                        unit.start_lba,
-                        FlushFailStage::BeforeMetaWrite,
-                    )?;
+                maybe_inject_test_failure(
+                    &unit.vol_id,
+                    unit.start_lba,
+                    FlushFailStage::BeforeMetaWrite,
+                )?;
 
-                    let (actual_old_pba_meta, accepted) = meta.atomic_batch_write_with_dedup(
-                        &vol_id,
-                        &batch_values,
-                        live_positions.len() as u32,
-                        &[],
-                        &batch_seqs,
-                    )?;
-                    // metadb seq_guard may reject some L2pRemaps. If every
-                    // remap in this unit was rejected, refcount[pba] is 0
-                    // and the freshly-allocated PBA is orphaned — surface
-                    // that as `Ok(None)` so the outer free path runs.
-                    if !accepted.iter().any(|a| *a) {
-                        let rejects = accepted.len() as u64;
-                        metrics
-                            .flush_seq_rejects
-                            .fetch_add(rejects, Ordering::Relaxed);
-                        return Ok(None);
-                    }
-                    let rejects = accepted.iter().filter(|a| !**a).count() as u64;
-                    if rejects > 0 {
-                        metrics
-                            .flush_seq_rejects
-                            .fetch_add(rejects, Ordering::Relaxed);
-                    }
-                    candidate.insert_many(&fresh_dedup_pairs);
-                    Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
-                    Ok(Some((live_positions, actual_old_pba_meta)))
-                })();
+                let (actual_old_pba_meta, accepted) = meta.atomic_batch_write_with_dedup(
+                    &vol_id,
+                    &batch_values,
+                    live_positions.len() as u32,
+                    &[],
+                    &batch_seqs,
+                )?;
+                // metadb seq_guard may reject some L2pRemaps. If every
+                // remap in this unit was rejected, refcount[pba] is 0
+                // and the freshly-allocated PBA is orphaned — surface
+                // that as `Ok(None)` so the outer free path runs.
+                if !accepted.iter().any(|a| *a) {
+                    let rejects = accepted.len() as u64;
+                    metrics
+                        .flush_seq_rejects
+                        .fetch_add(rejects, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                let rejects = accepted.iter().filter(|a| !**a).count() as u64;
+                if rejects > 0 {
+                    metrics
+                        .flush_seq_rejects
+                        .fetch_add(rejects, Ordering::Relaxed);
+                }
+                candidate.insert_many(&fresh_dedup_pairs);
+                Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
+                Ok(Some((live_positions, actual_old_pba_meta)))
+            })();
             let Some((live_positions, actual_old_pba_meta)) = (match commit {
                 Ok(v) => v,
                 Err(e) => {
@@ -329,6 +323,27 @@ impl BufferFlusher {
             let mut op_to_unit: Vec<usize> = Vec::with_capacity(n);
             for i in 0..n {
                 if failed[i] {
+                    continue;
+                }
+                if let Err(e) = maybe_inject_test_failure(
+                    &units[i].vol_id,
+                    units[i].start_lba,
+                    FlushFailStage::BeforeIoWrite,
+                ) {
+                    let pba = pbas[i].unwrap();
+                    let blk = alloc_blocks[i];
+                    if blk == 1 {
+                        let _ = allocator.free_one(pba);
+                    } else {
+                        let _ = allocator.free_extent(Extent::new(pba, blk));
+                    }
+                    failed[i] = true;
+                    tracing::error!(
+                        vol = units[i].vol_id,
+                        start_lba = units[i].start_lba.0,
+                        error = %e,
+                        "writer: passthrough injected IO write failure"
+                    );
                     continue;
                 }
                 allocator.wait_for_readers(pbas[i].unwrap(), alloc_blocks[i]);

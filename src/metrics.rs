@@ -829,9 +829,7 @@ impl EngineMetrics {
             buffer_coalesce_hydrate_volatile_entries: load(
                 &self.buffer_coalesce_hydrate_volatile_entries,
             ),
-            buffer_coalesce_hydrate_disk_entries: load(
-                &self.buffer_coalesce_hydrate_disk_entries,
-            ),
+            buffer_coalesce_hydrate_disk_entries: load(&self.buffer_coalesce_hydrate_disk_entries),
             buffer_coalesce_hydrate_inflight_skips: load(
                 &self.buffer_coalesce_hydrate_inflight_skips,
             ),
@@ -2971,9 +2969,7 @@ impl EngineStatusSnapshot {
             let _ = writeln!(
                 out,
                 "metadb_meta_io_fsync: calls={} us={} max_us={}",
-                metadb.meta_io_fsync_calls,
-                metadb.meta_io_fsync_us,
-                metadb.meta_io_fsync_max_us
+                metadb.meta_io_fsync_calls, metadb.meta_io_fsync_us, metadb.meta_io_fsync_max_us
             );
             let _ = writeln!(
                 out,
@@ -2997,8 +2993,7 @@ impl EngineStatusSnapshot {
             let _ = writeln!(
                 out,
                 "metadb_commit_ops: total={} per_tx_max={}",
-                metadb.commit_ops,
-                metadb.commit_ops_per_tx_max,
+                metadb.commit_ops, metadb.commit_ops_per_tx_max,
             );
             let _ = writeln!(
                 out,

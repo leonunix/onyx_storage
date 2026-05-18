@@ -137,12 +137,7 @@ impl BufferFlusher {
 
             let count = all.len();
             let start = Instant::now();
-            Self::cleanup_dead_pbas_batch(
-                allocator,
-                candidate,
-                &all,
-                "cleanup_thread",
-            );
+            Self::cleanup_dead_pbas_batch(allocator, candidate, &all, "cleanup_thread");
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             metrics
                 .flush_cleanup_thread_ns
@@ -164,12 +159,7 @@ impl BufferFlusher {
         }
         if !remaining.is_empty() {
             let start = Instant::now();
-            Self::cleanup_dead_pbas_batch(
-                allocator,
-                candidate,
-                &remaining,
-                "cleanup_thread_drain",
-            );
+            Self::cleanup_dead_pbas_batch(allocator, candidate, &remaining, "cleanup_thread_drain");
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             metrics
                 .flush_cleanup_thread_ns

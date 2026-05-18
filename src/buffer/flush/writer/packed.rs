@@ -123,10 +123,7 @@ impl BufferFlusher {
                         flags: frag_flags,
                     };
                     batch_values.push((vol_id.clone(), frag_lbas[i], blockmap));
-                    batch_seqs.push(Self::latest_seq_for_lba(
-                        &unit.seq_lba_ranges,
-                        frag_lbas[i],
-                    ));
+                    batch_seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, frag_lbas[i]));
                     if let Some(hashes) = hashes_for_promote {
                         let hash = hashes[pos];
                         if hash != [0u8; 8] {
@@ -296,10 +293,7 @@ impl BufferFlusher {
     pub(in crate::buffer::flush) fn write_packed_slots_batch(
         shard_idx: usize,
         sealed_slots: Vec<SealedSlot>,
-        per_slot_buffers: Vec<(
-            Vec<u64>,
-            Vec<Arc<crate::buffer::pipeline::DedupCompletion>>,
-        )>,
+        per_slot_buffers: Vec<(Vec<u64>, Vec<Arc<crate::buffer::pipeline::DedupCompletion>>)>,
         pool: &WriteBufferPool,
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
@@ -326,6 +320,19 @@ impl BufferFlusher {
             let mut ops: Vec<LvOp> = Vec::with_capacity(n);
             let mut op_to_slot: Vec<usize> = Vec::with_capacity(n);
             for (i, sealed) in sealed_slots.iter().enumerate() {
+                if let Err(e) = maybe_inject_test_failure_packed(
+                    &sealed.fragments,
+                    FlushFailStage::BeforeIoWrite,
+                ) {
+                    let _ = allocator.free_one(sealed.pba);
+                    slot_io_ok[i] = false;
+                    tracing::error!(
+                        pba = sealed.pba.0,
+                        error = %e,
+                        "writer: packed-slot injected IO write failure"
+                    );
+                    continue;
+                }
                 allocator.wait_for_readers(sealed.pba, 1);
                 ops.push(LvOp::Write {
                     pba: sealed.pba,
@@ -461,10 +468,7 @@ impl BufferFlusher {
             &metrics.flush_writer_packed_batch_slots_max,
             surviving_slots,
         );
-        crate::metrics::record_counter_max(
-            &metrics.flush_writer_packed_batch_lbas_max,
-            total_lbas,
-        );
+        crate::metrics::record_counter_max(&metrics.flush_writer_packed_batch_lbas_max, total_lbas);
         crate::metrics::record_counter_max(
             &metrics.flush_writer_packed_batch_io_ops_max,
             io_ops_count,

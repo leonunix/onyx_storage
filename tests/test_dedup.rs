@@ -675,11 +675,7 @@ fn delete_volume_leaves_dedup_index_hint_for_scrub() {
     let cleanups = meta
         .delete_volume(&VolumeId("test-vol".into()))
         .expect("delete volume should return old mappings for cleanup");
-    flusher.cleanup_mappings_now(
-        &allocator,
-        &cleanups,
-        "test_delete_volume_cleanup",
-    );
+    flusher.cleanup_mappings_now(&allocator, &cleanups, "test_delete_volume_cleanup");
     flusher.stop();
 
     assert!(

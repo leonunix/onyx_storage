@@ -64,6 +64,7 @@ pub struct BufferFlusher {
     /// hot path. Joined after commit workers (their senders drop on
     /// commit-worker exit, signalling drain).
     post_commit_handles: Vec<JoinHandle<()>>,
+    watermark_handle: Option<JoinHandle<()>>,
 }
 
 struct FlusherLane {
@@ -253,34 +254,16 @@ impl BufferFlusher {
         slot_offset: u16,
         flags: u8,
     ) -> BlockmapValue {
-        if slot_offset == 0 && Self::is_full_raw_unit(unit) {
-            let bs = BLOCK_SIZE as usize;
-            let start = position * bs;
-            let end = start + bs;
-            let block = &unit.compressed_data[start..end];
-            BlockmapValue {
-                pba: Pba(base_pba.0 + position as u64),
-                compression: 0,
-                unit_compressed_size: BLOCK_SIZE,
-                unit_original_size: BLOCK_SIZE,
-                unit_lba_count: 1,
-                offset_in_unit: 0,
-                crc32: crc32fast::hash(block),
-                slot_offset: 0,
-                flags,
-            }
-        } else {
-            BlockmapValue {
-                pba: base_pba,
-                compression: unit.compression,
-                unit_compressed_size: unit.compressed_data.len() as u32,
-                unit_original_size: unit.original_size,
-                unit_lba_count: unit.lba_count as u16,
-                offset_in_unit: position as u16,
-                crc32: unit.crc32,
-                slot_offset,
-                flags,
-            }
+        BlockmapValue {
+            pba: base_pba,
+            compression: unit.compression,
+            unit_compressed_size: unit.compressed_data.len() as u32,
+            unit_original_size: unit.original_size,
+            unit_lba_count: unit.lba_count as u16,
+            offset_in_unit: position as u16,
+            crc32: unit.crc32,
+            slot_offset,
+            flags,
         }
     }
 
@@ -480,6 +463,34 @@ impl BufferFlusher {
         );
         let running = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(FlusherInFlightTracker::default());
+        let watermark_running = running.clone();
+        let watermark_pool = pool.clone();
+        let watermark_max_flushed = pool.max_flushed_seq_handle();
+        let watermark_durable = pool.durable_seq_handle();
+        let watermark_handle = thread::Builder::new()
+            .name("flusher-ring-watermark".into())
+            .spawn(move || {
+                const RING_BUMP_INTERVAL: Duration = Duration::from_millis(10);
+                while watermark_running.load(Ordering::Relaxed) {
+                    thread::sleep(RING_BUMP_INTERVAL);
+                    let captured = watermark_max_flushed.load(Ordering::Relaxed);
+                    let bumped = watermark_durable
+                        .fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+                            if captured > cur {
+                                Some(captured)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_ok();
+                    if bumped {
+                        for shard_idx in 0..watermark_pool.shard_count() {
+                            let _ = watermark_pool.advance_tail_for_shard(shard_idx);
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn flusher ring watermark thread");
         let lane_count = pool.shard_count().max(1);
         let compress_workers =
             Self::per_lane_worker_count(config.compress_workers.max(1), lane_count);
@@ -832,6 +843,7 @@ impl BufferFlusher {
             commit_worker_handles,
             commit_worker_txs,
             post_commit_handles,
+            watermark_handle: Some(watermark_handle),
         }
     }
 
@@ -850,16 +862,14 @@ impl BufferFlusher {
         cleanups: &[RemapCleanup],
         context: &'static str,
     ) {
-        Self::cleanup_dead_pbas_batch(
-            allocator,
-            &self.candidate,
-            cleanups,
-            context,
-        );
+        Self::cleanup_dead_pbas_batch(allocator, &self.candidate, cleanups, context);
     }
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.watermark_handle.take() {
+            let _ = h.join();
+        }
         self.join_lanes();
     }
 

@@ -493,7 +493,9 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
         );
     }
     drop(post_commit_tx);
-    post_commit_handle.join().expect("post_commit_loop panicked");
+    post_commit_handle
+        .join()
+        .expect("post_commit_loop panicked");
     let _ = io_engine;
 
     // Promote-on-verified-hit: dedup_index stays empty after a fresh
@@ -546,12 +548,7 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         let start_lba = Lba((u as u64) * lbas_per_unit as u64);
         let seq = (u as u64) + 1;
         for off in 0..lbas_per_unit {
-            pool.note_latest_lba_seq_for_test(
-                "flush-race",
-                Lba(start_lba.0 + off as u64),
-                seq,
-                1,
-            );
+            pool.note_latest_lba_seq_for_test("flush-race", Lba(start_lba.0 + off as u64), seq, 1);
         }
         let pba = allocator.allocate_one_for_lane(0).unwrap();
         let fill = (u as u8).wrapping_add(1);
@@ -619,7 +616,9 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         super::writer::TARGET_OPS_PER_COMMIT,
     );
     drop(post_commit_tx);
-    post_commit_handle.join().expect("post_commit_loop panicked");
+    post_commit_handle
+        .join()
+        .expect("post_commit_loop panicked");
     let after = meta.memory_stats().unwrap();
     let commits = after.commit_success - before.commit_success;
     assert!(
@@ -1224,9 +1223,9 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
         // for buffered seqs, which is enough to exercise the writer
         // loop's packer-aging / done_tx-on-flush behaviour without
         // pulling in a full commit-worker setup.
-        let commit_worker_txs: Vec<crossbeam_channel::Sender<
-            crate::buffer::flush::writer::CommitJob,
-        >> = Vec::new();
+        let commit_worker_txs: Vec<
+            crossbeam_channel::Sender<crate::buffer::flush::writer::CommitJob>,
+        > = Vec::new();
         BufferFlusher::writer_loop(
             0,
             &rx,

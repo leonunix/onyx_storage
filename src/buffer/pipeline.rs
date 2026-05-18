@@ -249,7 +249,13 @@ pub fn coalesce_pending(
             }
         }
     }
-    coalesce_slices(all_slices, max_raw_bytes, max_lbas, vol_compression, metrics)
+    coalesce_slices(
+        all_slices,
+        max_raw_bytes,
+        max_lbas,
+        vol_compression,
+        metrics,
+    )
 }
 
 fn coalesce_slices(
