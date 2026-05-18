@@ -6,10 +6,18 @@ use crate::types::BLOCK_SIZE;
 
 /// Re-exports of metadb's authoritative `L2pValue` byte layout so this
 /// crate doesn't drift if metadb bumps the schema again. Bytes
-/// [0..L2P_SEQ_OFFSET] embed Onyx's `BlockmapValue`; the trailing 8 B
-/// is a big-endian u64 commit seq metadb uses for its apply-time CAS.
+/// [0..L2P_SEQ_OFFSET] embed Onyx's `BlockmapValue`; bytes
+/// [L2P_SEQ_OFFSET..L2P_BIRTH_OFFSET] are a big-endian u64 commit seq
+/// metadb uses for its apply-time CAS; the trailing 8 B
+/// [L2P_BIRTH_OFFSET..] are a big-endian u64 `birth_lsn` — the LSN at
+/// which the PBA was first L2P-pointed. Onyx writers leave this 0;
+/// metadb apply stamps it with the current commit LSN on fresh writes
+/// (see [[no-refcount-hot-path-design]]). Promote / scanner-remap
+/// paths that need to preserve a source PBA's original birth carry it
+/// via [`blockmap_to_l2p_bytes_with_seq_and_birth`].
 pub(crate) const L2P_VALUE_BYTES: usize = onyx_metadb::paged::format::LEAF_VALUE_SIZE;
 pub(crate) const L2P_SEQ_OFFSET: usize = onyx_metadb::paged::format::L2P_SEQ_OFFSET;
+pub(crate) const L2P_BIRTH_OFFSET: usize = onyx_metadb::paged::format::L2P_BIRTH_OFFSET;
 pub(crate) const BLOCKMAP_BYTES: usize = L2P_SEQ_OFFSET;
 pub(crate) const DEDUP_VALUE_BYTES: usize = 27;
 
@@ -21,9 +29,24 @@ pub(crate) fn blockmap_to_l2p_bytes_with_seq(
     value: &BlockmapValue,
     seq: u64,
 ) -> [u8; L2P_VALUE_BYTES] {
+    blockmap_to_l2p_bytes_with_seq_and_birth(value, seq, 0)
+}
+
+/// Build an `L2pValue` carrying an explicit `birth_lsn`. Phase 4's
+/// promote / scanner-remap paths use this to preserve a source PBA's
+/// original birth_lsn across a remap; Phase 1 leaves all writer paths
+/// on `blockmap_to_l2p_bytes*` (birth=0 sentinel, apply stamps the
+/// commit lsn).
+#[allow(dead_code)] // unused until Phase 4 wires promote-with-birth
+pub(crate) fn blockmap_to_l2p_bytes_with_seq_and_birth(
+    value: &BlockmapValue,
+    seq: u64,
+    birth_lsn: u64,
+) -> [u8; L2P_VALUE_BYTES] {
     let mut out = [0u8; L2P_VALUE_BYTES];
     out[..BLOCKMAP_BYTES].copy_from_slice(&encode_blockmap_value(value));
     out[L2P_SEQ_OFFSET..L2P_SEQ_OFFSET + 8].copy_from_slice(&seq.to_be_bytes());
+    out[L2P_BIRTH_OFFSET..L2P_BIRTH_OFFSET + 8].copy_from_slice(&birth_lsn.to_be_bytes());
     out
 }
 
@@ -75,7 +98,28 @@ mod tests {
 
         assert_eq!(bytes.len(), L2P_VALUE_BYTES);
         // Trailing seq bytes default to zero (no-guard sentinel).
-        assert_eq!(&bytes[L2P_SEQ_OFFSET..], &[0u8; 8]);
+        assert_eq!(&bytes[L2P_SEQ_OFFSET..L2P_BIRTH_OFFSET], &[0u8; 8]);
+        // Trailing birth_lsn bytes default to zero (apply stamps lsn).
+        assert_eq!(&bytes[L2P_BIRTH_OFFSET..], &[0u8; 8]);
+        assert_eq!(blockmap_from_l2p_bytes(&bytes), Some(value));
+    }
+
+    #[test]
+    fn blockmap_l2p_bytes_with_seq_and_birth_round_trip() {
+        let value = sample_blockmap_value();
+        let seq = 0xDEAD_BEEF_CAFE_F00Du64;
+        let birth_lsn = 0x0102_0304_0506_0708u64;
+        let bytes = blockmap_to_l2p_bytes_with_seq_and_birth(&value, seq, birth_lsn);
+
+        assert_eq!(bytes.len(), L2P_VALUE_BYTES);
+        let seq_bytes: [u8; 8] = bytes[L2P_SEQ_OFFSET..L2P_SEQ_OFFSET + 8]
+            .try_into()
+            .unwrap();
+        assert_eq!(u64::from_be_bytes(seq_bytes), seq);
+        let birth_bytes: [u8; 8] = bytes[L2P_BIRTH_OFFSET..L2P_BIRTH_OFFSET + 8]
+            .try_into()
+            .unwrap();
+        assert_eq!(u64::from_be_bytes(birth_bytes), birth_lsn);
         assert_eq!(blockmap_from_l2p_bytes(&bytes), Some(value));
     }
 
