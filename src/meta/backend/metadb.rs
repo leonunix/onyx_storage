@@ -6,7 +6,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use dashmap::DashMap;
-use onyx_metadb::{ApplyOutcome, Config as MetaDbConfig, Db, DedupValue, L2pValue, VolumeOrdinal};
+use onyx_metadb::{
+    ApplyOutcome, Config as MetaDbConfig, Db, DedupValue, L2pValue, Transaction, VolumeOrdinal,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::MetaConfig;
@@ -512,9 +514,7 @@ impl MetadbBackend {
         }
         let ord = self.volume_ordinal(vol_id)?;
         let mut tx = self.db.begin();
-        for (i, (lba, value)) in batch_values.iter().enumerate() {
-            tx.l2p_remap(ord, lba.0, to_l2p_value_with_seq(value, seq_for(seqs, i)), None);
-        }
+        emit_l2p_remap_runs(&mut tx, ord, batch_values, seqs, 0);
         for (pba, delta) in
             extra_new_refcount_increfs(batch_values.iter().map(|(_, value)| *value), new_refcount)
         {
@@ -611,16 +611,14 @@ impl MetadbBackend {
         let mut flat_idx: usize = 0;
         for (vol_id, batch_values, new_refcount) in units {
             let ord = self.volume_ordinal(vol_id)?;
-            for (lba, value) in *batch_values {
-                tx.l2p_remap(
-                    ord,
-                    lba.0,
-                    to_l2p_value_with_seq(value, seq_for(seqs, flat_idx)),
-                    None,
-                );
+            // Each unit's batch_values is contiguous LBAs by construction
+            // (one CompressedUnit / one passthrough sub-batch); emit one
+            // range op per maximal contiguous LBA run within the unit.
+            emit_l2p_remap_runs(&mut tx, ord, batch_values, seqs, flat_idx);
+            for (_, value) in *batch_values {
                 new_values.push(*value);
-                flat_idx += 1;
             }
+            flat_idx += batch_values.len();
             for (pba, delta) in extra_new_refcount_increfs(
                 batch_values.iter().map(|(_, value)| *value),
                 *new_refcount,
@@ -1418,50 +1416,91 @@ where
     I: IntoIterator<Item = BlockmapValue>,
 {
     let new_values: Vec<BlockmapValue> = new_values.into_iter().collect();
-    if new_values.len() != outcomes.len() {
-        return Err(OnyxError::Config(format!(
-            "metadb outcome length mismatch: {} new values, {} outcomes",
-            new_values.len(),
-            outcomes.len()
-        )));
-    }
-
+    let mut new_iter = new_values.into_iter();
     let mut decrements: HashMap<Pba, RemapCleanup> = HashMap::new();
     let mut freed = std::collections::HashSet::new();
-    let mut accepted: Vec<bool> = Vec::with_capacity(new_values.len());
+    let mut accepted: Vec<bool> = Vec::new();
 
-    for (new_value, outcome) in new_values.into_iter().zip(outcomes.into_iter()) {
-        let ApplyOutcome::L2pRemap {
-            applied,
-            prev,
-            freed_pba,
-        } = outcome
-        else {
-            return Err(OnyxError::Config(
-                "metadb returned non-remap outcome for remap batch".into(),
-            ));
-        };
+    // Per-LBA handler shared by L2pRemap and L2pRemapRange outcomes —
+    // semantics are identical at the LBA level (range op is just a
+    // compact transport for the same decision table).
+    let mut handle_lba = |new_value: BlockmapValue,
+                          applied: bool,
+                          prev: Option<L2pValue>,
+                          decrements: &mut HashMap<Pba, RemapCleanup>|
+     -> OnyxResult<()> {
         accepted.push(applied);
-
-        if let Some(pba) = freed_pba {
-            freed.insert(from_metadb_pba(pba));
-        }
-
         if !applied {
-            continue;
+            return Ok(());
         }
         let Some(prev) = prev else {
-            continue;
+            return Ok(());
         };
         let old = decode_l2p_value(prev)?;
         if old.is_zero() || old.pba == new_value.pba {
-            continue;
+            return Ok(());
         }
         let blocks = freed_blocks_for_l2p_value(&old);
         decrements
             .entry(old.pba)
             .and_modify(|entry| entry.merge(RemapCleanup::new(old, blocks)))
             .or_insert_with(|| RemapCleanup::new(old, blocks));
+        Ok(())
+    };
+
+    for outcome in outcomes {
+        match outcome {
+            ApplyOutcome::L2pRemap {
+                applied,
+                prev,
+                freed_pba,
+            } => {
+                let new_value = new_iter.next().ok_or_else(|| {
+                    OnyxError::Config(
+                        "metadb outcomes consumed more values than the batch produced".into(),
+                    )
+                })?;
+                if let Some(pba) = freed_pba {
+                    freed.insert(from_metadb_pba(pba));
+                }
+                handle_lba(new_value, applied, prev, &mut decrements)?;
+            }
+            ApplyOutcome::L2pRemapRange {
+                applied,
+                prevs,
+                freed_pbas,
+            } => {
+                if applied.len() != prevs.len() {
+                    return Err(OnyxError::Config(format!(
+                        "metadb L2pRemapRange applied/prevs length mismatch: {} vs {}",
+                        applied.len(),
+                        prevs.len(),
+                    )));
+                }
+                for pba in &freed_pbas {
+                    freed.insert(from_metadb_pba(*pba));
+                }
+                for (i, app) in applied.iter().enumerate() {
+                    let new_value = new_iter.next().ok_or_else(|| {
+                        OnyxError::Config(
+                            "metadb outcomes consumed more values than the batch produced".into(),
+                        )
+                    })?;
+                    handle_lba(new_value, *app, prevs[i], &mut decrements)?;
+                }
+            }
+            _ => {
+                return Err(OnyxError::Config(
+                    "metadb returned non-remap outcome for remap batch".into(),
+                ));
+            }
+        }
+    }
+
+    if new_iter.next().is_some() {
+        return Err(OnyxError::Config(
+            "metadb outcomes consumed fewer values than the batch produced".into(),
+        ));
     }
 
     for (pba, cleanup) in decrements.iter_mut() {
@@ -1469,6 +1508,59 @@ where
     }
     decrements.retain(|_, cleanup| cleanup.pba_freed);
     Ok((decrements, accepted))
+}
+
+/// Emit `tx.l2p_remap_range` for each maximal contiguous LBA run in
+/// `batch_values`, mapping each LBA's `BlockmapValue` to its metadb
+/// `L2pValue` (with the corresponding seq from `seqs`).
+///
+/// `seq_base` is the offset of `batch_values[0]` inside the caller's
+/// flat seqs vec — used by `atomic_batch_write_multi_with_dedup` which
+/// passes a shared seqs vec spanning multiple units.
+///
+/// In the common passthrough case (`batch_values` is one CompressedUnit
+/// with strictly contiguous LBAs) this emits exactly one range op. A
+/// defensive gap or sub-range cap split produces multiple range ops.
+fn emit_l2p_remap_runs(
+    tx: &mut Transaction<'_>,
+    ord: VolumeOrdinal,
+    batch_values: &[(Lba, BlockmapValue)],
+    seqs: &[u64],
+    seq_base: usize,
+) {
+    if batch_values.is_empty() {
+        return;
+    }
+    let cap = onyx_metadb::wal::op::MAX_REMAP_RANGE_LBAS;
+    let mut i = 0;
+    while i < batch_values.len() {
+        let run_start = i;
+        let start_lba = batch_values[i].0;
+        // Extend while next LBA is contiguous and run length is below the
+        // metadb-side cap. The cap is a defensive bound (4096) far above
+        // passthrough's natural ceiling (`coalesce_max_lbas`), but enforce
+        // it here so a future caller can't trip the decoder's reject.
+        while i + 1 < batch_values.len()
+            && batch_values[i + 1].0 .0 == batch_values[i].0 .0 + 1
+            && (i + 1 - run_start) < cap
+        {
+            i += 1;
+        }
+        let run_end_inclusive = i;
+        let count = run_end_inclusive - run_start + 1;
+        let mut values: Vec<L2pValue> = Vec::with_capacity(count);
+        for (off, (_lba, value)) in batch_values[run_start..=run_end_inclusive]
+            .iter()
+            .enumerate()
+        {
+            values.push(to_l2p_value_with_seq(
+                value,
+                seq_for(seqs, seq_base + run_start + off),
+            ));
+        }
+        tx.l2p_remap_range(ord, start_lba.0, values.into_boxed_slice());
+        i += 1;
+    }
 }
 
 fn extra_new_refcount_increfs<I>(new_values: I, new_refcount: u32) -> HashMap<Pba, u32>
@@ -1825,6 +1917,139 @@ mod tests {
         assert_eq!(cleanup.decrements, 2);
         assert_eq!(cleanup.blocks, 1);
         assert!(cleanup.pba_freed);
+    }
+
+    /// Sanity check that passthrough's range-emission helper turns a
+    /// contiguous batch into one range op and persists every LBA
+    /// correctly. The metadb-side apply test
+    /// (`l2p_remap_range_writes_each_lba_and_increfs_distinct_pbas`)
+    /// already validates the apply lane; this test guards the onyx
+    /// glue: helper construction, ordinal lookup, refcount aggregation,
+    /// freed-pba decoder.
+    #[test]
+    fn atomic_batch_write_range_contiguous_lbas() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            wal_dir: None,
+            dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            ..Default::default()
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 32,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+
+        // 8 LBAs starting at LBA 0, each pointing at a distinct PBA so we
+        // can verify per-LBA writes survive the range emission.
+        let batch: Vec<(Lba, BlockmapValue)> = (0..8u64)
+            .map(|i| {
+                let v = BlockmapValue {
+                    pba: Pba(100 + i),
+                    compression: 1,
+                    unit_compressed_size: 4096,
+                    unit_original_size: 4096,
+                    unit_lba_count: 1,
+                    offset_in_unit: 0,
+                    crc32: i as u32,
+                    slot_offset: 0,
+                    flags: 0,
+                };
+                (Lba(i), v)
+            })
+            .collect();
+        backend
+            .atomic_batch_write(&vol.id, &batch, 1)
+            .unwrap();
+        for i in 0..8u64 {
+            let m = backend.get_mapping(&vol.id, Lba(i)).unwrap().unwrap();
+            assert_eq!(m.pba, Pba(100 + i));
+            assert_eq!(backend.get_refcount(Pba(100 + i)).unwrap(), 1);
+        }
+    }
+
+    /// LBAs with a gap split into two range ops. Both must commit and
+    /// the outcomes decoder must walk new_values in order across both
+    /// outcomes — a regression here would either crash on the
+    /// "outcomes consumed more/fewer values than the batch produced"
+    /// error or lose the second range's mappings.
+    #[test]
+    fn atomic_batch_write_range_with_gap_splits_into_two_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            wal_dir: None,
+            dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            ..Default::default()
+        };
+        let vol = VolumeConfig {
+            id: VolumeId("vol-a".to_string()),
+            size_bytes: 4096 * 32,
+            block_size: 4096,
+            compression: CompressionAlgo::Lz4,
+            created_at: 10,
+            zone_count: 4,
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        backend.put_volume(&vol).unwrap();
+
+        let bv = |pba: u64, crc: u32| BlockmapValue {
+            pba: Pba(pba),
+            compression: 1,
+            unit_compressed_size: 4096,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: crc,
+            slot_offset: 0,
+            flags: 0,
+        };
+
+        // Two contiguous runs separated by a gap: [0..3) and [10..12).
+        let batch = vec![
+            (Lba(0), bv(200, 0)),
+            (Lba(1), bv(201, 1)),
+            (Lba(2), bv(202, 2)),
+            (Lba(10), bv(210, 10)),
+            (Lba(11), bv(211, 11)),
+        ];
+        backend.atomic_batch_write(&vol.id, &batch, 1).unwrap();
+
+        for i in 0..3u64 {
+            assert_eq!(
+                backend.get_mapping(&vol.id, Lba(i)).unwrap().unwrap().pba,
+                Pba(200 + i),
+            );
+        }
+        for (lba, pba) in [(10u64, 210u64), (11, 211)] {
+            assert_eq!(
+                backend.get_mapping(&vol.id, Lba(lba)).unwrap().unwrap().pba,
+                Pba(pba),
+            );
+        }
+        assert!(backend.get_mapping(&vol.id, Lba(5)).unwrap().is_none());
     }
 
     #[test]
