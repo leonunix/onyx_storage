@@ -600,6 +600,7 @@ impl BufferFlusher {
                         block_hashes,
                         dedup_stale_repairs,
                         dedup_skipped,
+                        compression_bypassed,
                         dedup_completion,
                     };
 

@@ -552,8 +552,7 @@ impl BufferFlusher {
             let build_start = Instant::now();
             for (i, ucd) in units.iter().enumerate() {
                 let unit = &ucd.unit;
-                let should_discard = !volume_present
-                    || (unit.vol_created_at != 0 && cur_created_at != Some(unit.vol_created_at));
+                let should_discard = !volume_present || cur_created_at != Some(unit.vol_created_at);
                 if should_discard {
                     metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
                     discarded[i] = true;
@@ -598,13 +597,17 @@ impl BufferFlusher {
                 } else {
                     0
                 };
+                let split_full_raw_unit = unit.compression_bypassed
+                    || (Self::is_full_raw_unit(unit)
+                        && live_positions.len() < unit.lba_count as usize);
                 for j in 0..live_positions.len() {
-                    let blockmap = Self::blockmap_for_unit_position(
+                    let blockmap = Self::blockmap_for_unit_position_with_raw_split(
                         unit,
                         ucd.pba,
                         live_positions[j],
                         0,
                         flags,
+                        split_full_raw_unit,
                     );
                     batch_values.push((lbas[j], blockmap));
                     seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, lbas[j]));
@@ -617,8 +620,14 @@ impl BufferFlusher {
                             if hash == [0u8; 8] {
                                 continue;
                             }
-                            let blockmap =
-                                Self::blockmap_for_unit_position(unit, ucd.pba, pos, 0, 0);
+                            let blockmap = Self::blockmap_for_unit_position_with_raw_split(
+                                unit,
+                                ucd.pba,
+                                pos,
+                                0,
+                                0,
+                                split_full_raw_unit,
+                            );
                             fresh_dedup_pairs.push((hash, blockmap));
                             if let Some(repairs) = &unit.dedup_stale_repairs {
                                 if let Some(Some(old_entry)) = repairs.get(pos) {
@@ -1243,12 +1252,7 @@ impl BufferFlusher {
                         let vol_id = VolumeId(unit.vol_id.clone());
                         let should_discard = match meta.get_volume(&vol_id)? {
                             None => true,
-                            Some(vc)
-                                if unit.vol_created_at != 0
-                                    && vc.created_at != unit.vol_created_at =>
-                            {
-                                true
-                            }
+                            Some(vc) if vc.created_at != unit.vol_created_at => true,
                             _ => false,
                         };
                         if should_discard {

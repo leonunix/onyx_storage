@@ -1502,6 +1502,11 @@ where
                     handle_lba(new_value, *app, prevs[i], &mut decrements)?;
                 }
             }
+            // The onyx adapter may append explicit refcount ops after the
+            // remap ops to cover multi-PBA raw extents. Those outcomes do not
+            // consume a batch value; freed old mappings are already reported
+            // through the remap outcome's `freed_pba(s)` fields.
+            ApplyOutcome::RefcountNew(_) => {}
             _ => {
                 return Err(OnyxError::Config(
                     "metadb returned non-remap outcome for remap batch".into(),
@@ -1580,20 +1585,36 @@ fn extra_new_refcount_increfs<I>(new_values: I, new_refcount: u32) -> HashMap<Pb
 where
     I: IntoIterator<Item = BlockmapValue>,
 {
-    let mut occurrences: HashMap<Pba, u32> = HashMap::new();
+    let mut footprints: HashMap<Vec<Pba>, u32> = HashMap::new();
     for value in new_values {
         if value.is_zero() {
             continue;
         }
-        for pba in value.physical_pbas(crate::types::BLOCK_SIZE) {
-            *occurrences.entry(pba).or_insert(0) += 1;
+        let footprint: Vec<Pba> = value.physical_pbas(crate::types::BLOCK_SIZE).collect();
+        *footprints.entry(footprint).or_insert(0) += 1;
+    }
+
+    if footprints.len() != 1 {
+        return HashMap::new();
+    }
+
+    let (footprint, remap_increfs_for_head) = footprints.into_iter().next().expect("one footprint");
+    let Some((&head, rest)) = footprint.split_first() else {
+        return HashMap::new();
+    };
+
+    let mut deltas = HashMap::new();
+    if let Some(delta) = new_refcount.checked_sub(remap_increfs_for_head) {
+        if delta > 0 {
+            deltas.insert(head, delta);
         }
     }
-    occurrences
-        .into_iter()
-        .filter_map(|(pba, count)| new_refcount.checked_sub(count).map(|delta| (pba, delta)))
-        .filter(|(_, delta)| *delta > 0)
-        .collect()
+    if footprint.len() > 1 {
+        for &pba in rest {
+            deltas.insert(pba, new_refcount);
+        }
+    }
+    deltas
 }
 
 fn dedup_hit_results_from_remaps(

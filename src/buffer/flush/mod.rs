@@ -254,6 +254,42 @@ impl BufferFlusher {
         slot_offset: u16,
         flags: u8,
     ) -> BlockmapValue {
+        Self::blockmap_for_unit_position_with_raw_split(
+            unit,
+            base_pba,
+            position,
+            slot_offset,
+            flags,
+            false,
+        )
+    }
+
+    fn blockmap_for_unit_position_with_raw_split(
+        unit: &CompressedUnit,
+        base_pba: Pba,
+        position: usize,
+        slot_offset: u16,
+        flags: u8,
+        split_full_raw_unit: bool,
+    ) -> BlockmapValue {
+        if split_full_raw_unit && slot_offset == 0 && Self::is_full_raw_unit(unit) {
+            let bs = BLOCK_SIZE as usize;
+            let start = position * bs;
+            let end = start + bs;
+            let block = &unit.compressed_data[start..end];
+            return BlockmapValue {
+                pba: Pba(base_pba.0 + position as u64),
+                compression: 0,
+                unit_compressed_size: BLOCK_SIZE,
+                unit_original_size: BLOCK_SIZE,
+                unit_lba_count: 1,
+                offset_in_unit: 0,
+                crc32: crc32fast::hash(block),
+                slot_offset: 0,
+                flags,
+            };
+        }
+
         BlockmapValue {
             pba: base_pba,
             compression: unit.compression,

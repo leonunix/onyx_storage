@@ -69,11 +69,7 @@ impl BufferFlusher {
 
                 let should_discard = match meta.get_volume(&vol_id)? {
                     None => true,
-                    Some(vc)
-                        if unit.vol_created_at != 0 && vc.created_at != unit.vol_created_at =>
-                    {
-                        true
-                    }
+                    Some(vc) if vc.created_at != unit.vol_created_at => true,
                     _ => false,
                 };
 

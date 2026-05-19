@@ -108,8 +108,14 @@ impl BufferFlusher {
                     } else {
                         0
                     };
-                    let blockmap =
-                        Self::blockmap_for_unit_position(unit, pba, live_positions[i], 0, flags);
+                    let blockmap = Self::blockmap_for_unit_position_with_raw_split(
+                        unit,
+                        pba,
+                        live_positions[i],
+                        0,
+                        flags,
+                        true,
+                    );
                     batch_values.push((lbas[i], blockmap));
                     batch_seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, lbas[i]));
                 }
@@ -123,7 +129,9 @@ impl BufferFlusher {
                             if hash == [0u8; 8] {
                                 continue;
                             }
-                            let blockmap = Self::blockmap_for_unit_position(unit, pba, pos, 0, 0);
+                            let blockmap = Self::blockmap_for_unit_position_with_raw_split(
+                                unit, pba, pos, 0, 0, true,
+                            );
                             fresh_dedup_pairs.push((hash, blockmap));
                             if let Some(repairs) = &unit.dedup_stale_repairs {
                                 if let Some(Some(old_entry)) = repairs.get(pos) {

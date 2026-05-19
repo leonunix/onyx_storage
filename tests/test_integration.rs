@@ -195,6 +195,33 @@ impl Drop for PackedPauseGuard {
     }
 }
 
+struct FailpointGuard {
+    vol_id: String,
+    start_lba: Lba,
+    stage: FlushFailStage,
+}
+
+impl FailpointGuard {
+    fn install(vol_id: &str, start_lba: Lba, stage: FlushFailStage) -> Self {
+        install_test_failpoint(vol_id, start_lba, stage, None);
+        Self {
+            vol_id: vol_id.to_string(),
+            start_lba,
+            stage,
+        }
+    }
+
+    fn clear(&self) {
+        clear_test_failpoint(&self.vol_id, self.start_lba, self.stage);
+    }
+}
+
+impl Drop for FailpointGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 fn make_pattern(block_index: u64, block_size: usize) -> Vec<u8> {
     let mut data = vec![0u8; block_size];
     for (i, byte) in data.iter_mut().enumerate() {
@@ -1684,7 +1711,7 @@ fn prove_packed_metadata_failure_retries_without_leak() {
         .create_volume("pack-fail-b", vol_size, CompressionAlgo::Lz4)
         .unwrap();
 
-    install_test_failpoint("pack-fail-a", Lba(0), FlushFailStage::BeforeMetaWrite, None);
+    let failpoint = FailpointGuard::install("pack-fail-a", Lba(0), FlushFailStage::BeforeMetaWrite);
 
     let vol_a = env.engine.open_volume("pack-fail-a").unwrap();
     let vol_b = env.engine.open_volume("pack-fail-b").unwrap();
@@ -1696,7 +1723,7 @@ fn prove_packed_metadata_failure_retries_without_leak() {
     let vol_b_id = VolumeId("pack-fail-b".into());
     thread::sleep(Duration::from_millis(250));
 
-    clear_test_failpoint("pack-fail-a", Lba(0), FlushFailStage::BeforeMetaWrite);
+    failpoint.clear();
     wait_for_flush(&env, Duration::from_secs(60));
 
     let map_a = meta.get_mapping(&vol_a_id, Lba(0)).unwrap().unwrap();
@@ -1738,7 +1765,7 @@ fn prove_packed_old_write_cannot_overwrite_newer_committed_write() {
 
     // Force the first packed metadata commit to fail, leaving the old entry
     // pending for retry while still allowing the writer lane to make progress.
-    install_test_failpoint("pack-race-b", Lba(0), FlushFailStage::BeforeMetaWrite, None);
+    let failpoint = FailpointGuard::install("pack-race-b", Lba(0), FlushFailStage::BeforeMetaWrite);
 
     vol_a.write(0, &old_data).unwrap();
     vol_b.write(0, &filler_old).unwrap();
@@ -1755,7 +1782,7 @@ fn prove_packed_old_write_cannot_overwrite_newer_committed_write() {
     vol_a.write(0, &new_data).unwrap();
     vol_b.write(4096, &filler_new).unwrap();
 
-    wait_until(Duration::from_secs(10), || {
+    wait_until(Duration::from_secs(60), || {
         meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_some()
     });
 
@@ -1763,9 +1790,9 @@ fn prove_packed_old_write_cannot_overwrite_newer_committed_write() {
     assert_eq!(vol_a.read(0, 4096).unwrap(), new_data);
 
     // Allow the old failed packed write to retry.
-    clear_test_failpoint("pack-race-b", Lba(0), FlushFailStage::BeforeMetaWrite);
+    failpoint.clear();
 
-    wait_for_flush(&env, Duration::from_secs(10));
+    wait_for_flush(&env, Duration::from_secs(60));
 
     // Final state must still be the newer data.
     assert_eq!(

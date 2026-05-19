@@ -141,6 +141,10 @@ pub struct CompressedUnit {
     pub dedup_stale_repairs: Option<Vec<Option<DedupEntry>>>,
     /// True if dedup was skipped under backpressure.
     pub dedup_skipped: bool,
+    /// True when a configured compression codec was attempted but bypassed
+    /// because the output did not save enough space. These raw bytes should be
+    /// mapped as per-LBA 4KB blocks instead of one large raw extent.
+    pub compression_bypassed: bool,
     /// See CoalesceUnit::dedup_completion.
     pub dedup_completion: Option<Arc<DedupCompletion>>,
 }

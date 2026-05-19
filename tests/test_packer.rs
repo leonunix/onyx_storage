@@ -20,6 +20,7 @@ fn make_unit(vol_id: &str, start_lba: u64, lba_count: u32, data_size: usize) -> 
         block_hashes: None,
         dedup_stale_repairs: None,
         dedup_skipped: false,
+        compression_bypassed: false,
         dedup_completion: None,
     }
 }

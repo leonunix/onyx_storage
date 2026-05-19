@@ -102,6 +102,7 @@ fn make_unit(fill: u8, seq: u64) -> CompressedUnit {
         block_hashes: None,
         dedup_stale_repairs: None,
         dedup_skipped: false,
+        compression_bypassed: false,
         dedup_completion: None,
     }
 }
@@ -124,6 +125,7 @@ fn make_raw_unit_at(start_lba: u64, lba_count: u32, first_byte: u8, seq: u64) ->
         block_hashes: None,
         dedup_stale_repairs: None,
         dedup_skipped: false,
+        compression_bypassed: false,
         dedup_completion: None,
     }
 }
@@ -143,6 +145,7 @@ fn make_packed_unit(fill: u8, seq: u64) -> CompressedUnit {
         block_hashes: None,
         dedup_stale_repairs: None,
         dedup_skipped: false,
+        compression_bypassed: false,
         dedup_completion: None,
     }
 }
@@ -162,6 +165,7 @@ fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
         block_hashes: None,
         dedup_stale_repairs: None,
         dedup_skipped: false,
+        compression_bypassed: false,
         dedup_completion: None,
     }
 }
@@ -566,6 +570,7 @@ fn passthrough_commit_job_subbatches_above_threshold() {
             block_hashes: None,
             dedup_stale_repairs: None,
             dedup_skipped: false,
+            compression_bypassed: false,
             dedup_completion: None,
         };
         units.push(super::writer::UnitCommitData {
@@ -2287,6 +2292,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
                             block_hashes: None,
                             dedup_stale_repairs: None,
                             dedup_skipped: false,
+                            compression_bypassed: false,
                             vol_created_at: 1,
                             dedup_completion: None,
                         },
@@ -2658,6 +2664,7 @@ fn packed_slot_overlapping_lba_race() {
                     block_hashes: None,
                     dedup_stale_repairs: None,
                     dedup_skipped: false,
+                    compression_bypassed: false,
                     vol_created_at: 1,
                     dedup_completion: None,
                 },
