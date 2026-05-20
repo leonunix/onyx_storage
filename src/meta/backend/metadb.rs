@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use dashmap::DashMap;
 use onyx_metadb::{
     ApplyOutcome, Config as MetaDbConfig, Db, DedupValue, L2pValue, Transaction, VolumeOrdinal,
@@ -16,6 +17,7 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
 use crate::meta::store::{DedupHitResult, RemapCleanup};
 use crate::metrics::MetaMemorySnapshot;
+use crate::space::extent::Extent;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
 use super::codec::{
@@ -37,6 +39,18 @@ pub(crate) struct MetadbBackend {
     catalog: Mutex<VolumeCatalog>,
     volume_ordinals: DashMap<String, VolumeOrdinal>,
     catalog_path: PathBuf,
+    // Lineage GC freed-PBA signal channel.
+    //
+    // `metadb` invokes `freed_pbas_sink` synchronously on its GC driver
+    // thread. The sink does a non-blocking enqueue here so the GC thread
+    // never blocks on onyx's retire pipeline. The engine drains this
+    // channel and feeds the PBAs through the existing allocator retire
+    // path (coalesced into extents).
+    //
+    // Phase 4 keeps `lineage_gc_emit_freepbas` default OFF, so the channel
+    // stays empty unless tests or Phase 5 explicitly enable the flag.
+    lineage_freed_pbas_tx: Sender<Pba>,
+    lineage_freed_pbas_rx: Receiver<Pba>,
 }
 
 struct AsyncCheckpoint {
@@ -102,6 +116,16 @@ impl MetadbBackend {
             .collect();
         let checkpoint = AsyncCheckpoint::start(db.clone())?;
 
+        let (lineage_freed_pbas_tx, lineage_freed_pbas_rx) = unbounded::<Pba>();
+        let sink_tx = lineage_freed_pbas_tx.clone();
+        db.set_freed_pbas_sink(Arc::new(move |_vol_ord, pbas| {
+            for pba in pbas {
+                // Unbounded channel: send only fails when all receivers are
+                // dropped, which means `MetadbBackend` itself is gone.
+                let _ = sink_tx.send(from_metadb_pba(pba));
+            }
+        }));
+
         Ok(Self {
             db,
             checkpoint,
@@ -109,7 +133,26 @@ impl MetadbBackend {
             catalog: Mutex::new(catalog),
             volume_ordinals,
             catalog_path,
+            lineage_freed_pbas_tx,
+            lineage_freed_pbas_rx,
         })
+    }
+
+    /// Non-blocking drain of every PBA that lineage GC has signalled as
+    /// freed since the last call. Returns owned `Vec<Pba>`; the engine
+    /// passes this through `coalesce_free_pbas_to_extents` and retires the
+    /// resulting extents via the allocator.
+    pub(crate) fn drain_lineage_freed_pbas(&self) -> Vec<Pba> {
+        let mut out = Vec::new();
+        while let Ok(pba) = self.lineage_freed_pbas_rx.try_recv() {
+            out.push(pba);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lineage_freed_pbas_sender(&self) -> Sender<Pba> {
+        self.lineage_freed_pbas_tx.clone()
     }
 
     pub(crate) fn put_volume(&self, config: &VolumeConfig) -> OnyxResult<()> {
@@ -1684,6 +1727,33 @@ pub(crate) fn from_metadb_pba(pba: onyx_metadb::Pba) -> Pba {
     Pba(pba)
 }
 
+/// Sort + dedup + run-length compress a list of freed PBAs into the
+/// minimum set of contiguous extents the allocator's retire path
+/// expects. Input order is unconstrained; duplicates are collapsed.
+pub(crate) fn coalesce_free_pbas_to_extents(pbas: &[Pba]) -> Vec<Extent> {
+    if pbas.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<u64> = pbas.iter().map(|p| p.0).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut out = Vec::new();
+    let mut run_start = sorted[0];
+    let mut run_len: u64 = 1;
+    for &pba in &sorted[1..] {
+        if pba == run_start + run_len {
+            run_len += 1;
+        } else {
+            out.push(Extent::new(Pba(run_start), run_len as u32));
+            run_start = pba;
+            run_len = 1;
+        }
+    }
+    out.push(Extent::new(Pba(run_start), run_len as u32));
+    out
+}
+
 pub(crate) fn to_l2p_value(value: &BlockmapValue) -> L2pValue {
     L2pValue(blockmap_to_l2p_bytes(value))
 }
@@ -2457,5 +2527,116 @@ mod tests {
         let bv_after = blockmap_from_l2p_bytes(&raw_after.0).unwrap();
         assert_eq!(bv_after.flags, 0);
         assert_eq!(bv_after.pba, Pba(40));
+    }
+
+    #[test]
+    fn coalesce_free_pbas_empty_is_empty() {
+        assert!(coalesce_free_pbas_to_extents(&[]).is_empty());
+    }
+
+    #[test]
+    fn coalesce_free_pbas_merges_contiguous_runs() {
+        let pbas = vec![Pba(10), Pba(11), Pba(12), Pba(20), Pba(21), Pba(50)];
+        let extents = coalesce_free_pbas_to_extents(&pbas);
+        assert_eq!(
+            extents,
+            vec![
+                Extent::new(Pba(10), 3),
+                Extent::new(Pba(20), 2),
+                Extent::new(Pba(50), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_free_pbas_sorts_and_dedups_unsorted_input() {
+        // Reordered + duplicates: walker may emit the same PBA more than
+        // once across overlapping segments. Coalesce must collapse them.
+        let pbas = vec![
+            Pba(21),
+            Pba(10),
+            Pba(11),
+            Pba(12),
+            Pba(20),
+            Pba(10),
+            Pba(21),
+            Pba(11),
+        ];
+        let extents = coalesce_free_pbas_to_extents(&pbas);
+        assert_eq!(
+            extents,
+            vec![Extent::new(Pba(10), 3), Extent::new(Pba(20), 2)]
+        );
+    }
+
+    #[test]
+    fn coalesce_free_pbas_singleton() {
+        let extents = coalesce_free_pbas_to_extents(&[Pba(7)]);
+        assert_eq!(extents, vec![Extent::new(Pba(7), 1)]);
+    }
+
+    #[test]
+    fn drain_lineage_freed_pbas_returns_empty_when_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            wal_dir: None,
+            dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            ..Default::default()
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        assert!(backend.drain_lineage_freed_pbas().is_empty());
+    }
+
+    /// End-to-end: simulate metadb's GC dispatching a freed-PBA outcome
+    /// through the sink. The sink ingests via the cloned sender (mirrors
+    /// the path metadb's GC driver thread takes), and `drain_lineage_freed_pbas`
+    /// returns the queued PBAs in arrival order.
+    #[test]
+    fn drain_lineage_freed_pbas_returns_dispatched_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaConfig {
+            path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 64,
+            index_pin_mb: 64,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            wal_dir: None,
+            dedup_shards: 1,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            ..Default::default()
+        };
+        let backend = MetadbBackend::open(&meta).unwrap();
+        // Simulate the sink firing. In production this is invoked by the
+        // closure registered with `Db::set_freed_pbas_sink` inside
+        // `MetadbBackend::open`; here we drive the channel directly so the
+        // test does not depend on a fully wired GC cycle and the
+        // lineage_gc_emit_freepbas flag.
+        let tx = backend.lineage_freed_pbas_sender();
+        tx.send(Pba(101)).unwrap();
+        tx.send(Pba(102)).unwrap();
+        tx.send(Pba(200)).unwrap();
+
+        let drained = backend.drain_lineage_freed_pbas();
+        assert_eq!(drained, vec![Pba(101), Pba(102), Pba(200)]);
+        // Second drain is empty — channel is fully consumed.
+        assert!(backend.drain_lineage_freed_pbas().is_empty());
+
+        let extents = coalesce_free_pbas_to_extents(&drained);
+        assert_eq!(
+            extents,
+            vec![Extent::new(Pba(101), 2), Extent::new(Pba(200), 1)]
+        );
     }
 }
