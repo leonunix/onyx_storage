@@ -237,24 +237,19 @@ fn blockmap_range_query() {
     assert_eq!(range[3].0, Lba(6));
 }
 
+/// Phase 5: standalone increment_refcount / decrement_refcount were
+/// retired; rc moves only via lineage events. The remaining surface
+/// is the test-only seed helper, which routes through metadb's
+/// `incref_pba` (PromotionChunk under the hood).
 #[test]
-fn refcount_operations() {
+fn refcount_seed_helper_round_trip() {
     let dir = tempdir().unwrap();
     let store = MetaStore::open(&test_config(dir.path())).unwrap();
 
     assert_eq!(store.get_refcount(Pba(42)).unwrap(), 0);
-
-    store.set_refcount(Pba(42), 1).unwrap();
-    assert_eq!(store.get_refcount(Pba(42)).unwrap(), 1);
-
-    let new = store.increment_refcount(Pba(42)).unwrap();
-    assert_eq!(new, 2);
-
-    let new = store.decrement_refcount(Pba(42)).unwrap();
-    assert_eq!(new, 1);
-
-    let new = store.decrement_refcount(Pba(42)).unwrap();
-    assert_eq!(new, 0);
+    store.set_refcount(Pba(42), 2).unwrap();
+    assert_eq!(store.get_refcount(Pba(42)).unwrap(), 2);
+    store.set_refcount(Pba(42), 0).unwrap();
     assert_eq!(store.get_refcount(Pba(42)).unwrap(), 0);
 }
 

@@ -466,6 +466,13 @@ impl MetadbBackend {
         Ok(self.db.multi_get_refcount(&pbas)?)
     }
 
+    /// Test-only refcount seed. Phase 5 removed the per-write refcount
+    /// path; production code mutates rc only via lineage events
+    /// (PromotionChunk / FreePbas / drop_volume). This helper exists
+    /// so existing tests can prep a non-zero rc on a PBA when
+    /// exercising dedup hit / packed-slot scenarios. Routes through the
+    /// metadb test helper which itself drives a PromotionChunk.
+    #[doc(hidden)]
     pub(crate) fn set_refcount(&self, pba: Pba, count: u32) -> OnyxResult<()> {
         let current = self.get_refcount(pba)?;
         if count > current {
@@ -474,14 +481,6 @@ impl MetadbBackend {
             self.db.decref_pba(to_metadb_pba(pba), current - count)?;
         }
         Ok(())
-    }
-
-    pub(crate) fn increment_refcount(&self, pba: Pba) -> OnyxResult<u32> {
-        Ok(self.db.incref_pba(to_metadb_pba(pba), 1)?)
-    }
-
-    pub(crate) fn decrement_refcount(&self, pba: Pba) -> OnyxResult<u32> {
-        Ok(self.db.decref_pba(to_metadb_pba(pba), 1)?)
     }
 
     pub(crate) fn atomic_write_mapping(
@@ -556,13 +555,9 @@ impl MetadbBackend {
             return Ok((HashMap::new(), Vec::new()));
         }
         let ord = self.volume_ordinal(vol_id)?;
+        let _ = new_refcount;
         let mut tx = self.db.begin();
         emit_l2p_remap_runs(&mut tx, ord, batch_values, seqs, 0);
-        for (pba, delta) in
-            extra_new_refcount_increfs(batch_values.iter().map(|(_, value)| *value), new_refcount)
-        {
-            tx.incref_pba(to_metadb_pba(pba), delta);
-        }
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
@@ -660,9 +655,9 @@ impl MetadbBackend {
         }
         let mut tx = self.db.begin();
         let mut new_values = Vec::new();
-        let mut extra_increfs: HashMap<Pba, u32> = HashMap::new();
         let mut flat_idx: usize = 0;
         for (vol_id, batch_values, new_refcount) in units {
+            let _ = new_refcount;
             let ord = self.volume_ordinal(vol_id)?;
             // Each unit's batch_values is contiguous LBAs by construction
             // (one CompressedUnit / one passthrough sub-batch); emit one
@@ -672,15 +667,6 @@ impl MetadbBackend {
                 new_values.push(*value);
             }
             flat_idx += batch_values.len();
-            for (pba, delta) in extra_new_refcount_increfs(
-                batch_values.iter().map(|(_, value)| *value),
-                *new_refcount,
-            ) {
-                *extra_increfs.entry(pba).or_insert(0) += delta;
-            }
-        }
-        for (pba, delta) in extra_increfs {
-            tx.incref_pba(to_metadb_pba(pba), delta);
         }
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
@@ -935,18 +921,6 @@ impl MetadbBackend {
         blocks.sort_unstable_by_key(|(pba, _)| *pba);
         blocks.dedup_by_key(|(pba, _)| *pba);
         Ok(blocks)
-    }
-
-    pub(crate) fn cleanup_orphaned_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
-        let refs = self.iter_refcounts()?;
-        let mut orphaned = Vec::new();
-        for (pba, rc) in refs {
-            if rc > 0 && !self.has_any_blockmap_ref(pba)? {
-                self.set_refcount(pba, 0)?;
-                orphaned.push((pba, rc));
-            }
-        }
-        Ok(orphaned)
     }
 
     pub(crate) fn rebuild_refcount_from_blockmap(&self) -> OnyxResult<()> {
@@ -1624,42 +1598,6 @@ fn emit_l2p_remap_runs(
     }
 }
 
-fn extra_new_refcount_increfs<I>(new_values: I, new_refcount: u32) -> HashMap<Pba, u32>
-where
-    I: IntoIterator<Item = BlockmapValue>,
-{
-    let mut footprints: HashMap<Vec<Pba>, u32> = HashMap::new();
-    for value in new_values {
-        if value.is_zero() {
-            continue;
-        }
-        let footprint: Vec<Pba> = value.physical_pbas(crate::types::BLOCK_SIZE).collect();
-        *footprints.entry(footprint).or_insert(0) += 1;
-    }
-
-    if footprints.len() != 1 {
-        return HashMap::new();
-    }
-
-    let (footprint, remap_increfs_for_head) = footprints.into_iter().next().expect("one footprint");
-    let Some((&head, rest)) = footprint.split_first() else {
-        return HashMap::new();
-    };
-
-    let mut deltas = HashMap::new();
-    if let Some(delta) = new_refcount.checked_sub(remap_increfs_for_head) {
-        if delta > 0 {
-            deltas.insert(head, delta);
-        }
-    }
-    if footprint.len() > 1 {
-        for &pba in rest {
-            deltas.insert(pba, new_refcount);
-        }
-    }
-    deltas
-}
-
 fn dedup_hit_results_from_remaps(
     hits: &[(Lba, BlockmapValue, ContentHash)],
     outcomes: Vec<ApplyOutcome>,
@@ -1958,6 +1896,13 @@ mod tests {
 
     #[test]
     fn atomic_batch_write_updates_refcounts_and_reports_freed_pba() {
+        // Phase 5: hot-path `atomic_batch_write` no longer mutates
+        // global rc, and the L2pRemap outcome's `freed_pba` is always
+        // None. `newly_zeroed_from_remaps` filters its decrements map
+        // to only `pba_freed=true` entries — so the returned cleanups
+        // map is empty even when an old PBA was logically overwritten.
+        // The retire flow now runs via the dead-list → Lineage GC →
+        // FreePbas channel (not exercised here).
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
             path: Some(dir.path().to_path_buf()),
@@ -2004,18 +1949,21 @@ mod tests {
         backend
             .atomic_batch_write(&vol.id, &[(Lba(0), old), (Lba(1), old)], 2)
             .unwrap();
-        assert_eq!(backend.get_refcount(Pba(10)).unwrap(), 2);
+        assert_eq!(backend.get_refcount(Pba(10)).unwrap(), 0);
 
         let freed = backend
             .atomic_batch_write(&vol.id, &[(Lba(0), new), (Lba(1), new)], 2)
             .unwrap();
 
         assert_eq!(backend.get_refcount(Pba(10)).unwrap(), 0);
-        assert_eq!(backend.get_refcount(Pba(20)).unwrap(), 2);
-        let cleanup = freed.get(&Pba(10)).unwrap();
-        assert_eq!(cleanup.decrements, 2);
-        assert_eq!(cleanup.blocks, 1);
-        assert!(cleanup.pba_freed);
+        assert_eq!(backend.get_refcount(Pba(20)).unwrap(), 0);
+        assert!(
+            freed.is_empty(),
+            "Phase 5: L2pRemap surfaces no freed_pba on the hot path; cleanups map empty"
+        );
+        // L2P state moved to the new mapping.
+        let m = backend.get_mapping(&vol.id, Lba(0)).unwrap().unwrap();
+        assert_eq!(m.pba, Pba(20));
     }
 
     /// Sanity check that passthrough's range-emission helper turns a
@@ -2075,7 +2023,8 @@ mod tests {
         for i in 0..8u64 {
             let m = backend.get_mapping(&vol.id, Lba(i)).unwrap().unwrap();
             assert_eq!(m.pba, Pba(100 + i));
-            assert_eq!(backend.get_refcount(Pba(100 + i)).unwrap(), 1);
+            // Phase 5: hot-path atomic_batch_write doesn't touch rc.
+            assert_eq!(backend.get_refcount(Pba(100 + i)).unwrap(), 0);
         }
     }
 
@@ -2151,6 +2100,13 @@ mod tests {
 
     #[test]
     fn dedup_entries_and_flag_scan_round_trip() {
+        // Phase 5: `dedup_entry_is_live` checks rc(entry.pba)>0 to
+        // catch entries pointing at PBAs whose final decref already
+        // landed. Hot-path L2pRemap no longer maintains rc, so we
+        // seed rc explicitly via the test helper to mirror the
+        // production state shape (a dedup index entry is only put
+        // for a verified-shared PBA whose rc was bumped by a
+        // promotion or prior put_dedup).
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaConfig {
             path: Some(dir.path().to_path_buf()),
@@ -2191,6 +2147,7 @@ mod tests {
         backend
             .atomic_batch_write(&vol.id, &[(Lba(0), value)], 1)
             .unwrap();
+        backend.set_refcount(value.pba, 1).unwrap(); // Phase 5 rc seed
 
         let hash = [9u8; 8];
         let dedup = DedupEntry {
@@ -2220,7 +2177,8 @@ mod tests {
         backend
             .atomic_batch_write(&vol.id, &[(Lba(0), replacement)], 1)
             .unwrap();
-        assert_eq!(backend.get_refcount(value.pba).unwrap(), 0);
+        // rc(value.pba)=1 (seeded, hot-path doesn't decref).
+        assert_eq!(backend.get_refcount(value.pba).unwrap(), 1);
     }
 
     #[test]
@@ -2270,6 +2228,12 @@ mod tests {
         backend
             .atomic_batch_write(&vol.id, &[(Lba(0), a), (Lba(1), b), (Lba(2), b)], 3)
             .unwrap();
+        // Phase 5: hot-path atomic_batch_write doesn't bump rc, but
+        // delete_blockmap_range / delete_volume still decref. Seed rc
+        // to mirror the post-Phase-5 production shape (lineage events
+        // are the ones bumping rc).
+        backend.set_refcount(Pba(100), 1).unwrap();
+        backend.set_refcount(Pba(200), 2).unwrap();
 
         let freed = backend
             .delete_blockmap_range(&vol.id, Lba(1), Lba(3))
@@ -2330,15 +2294,14 @@ mod tests {
         backend
             .atomic_write_mapping(&vol.id, Lba(0), &value)
             .unwrap();
-        assert_eq!(backend.iter_refcounts().unwrap(), vec![(Pba(55), 1)]);
+        // Phase 5: exclusive PBAs (no dedup_index entry) never get
+        // their global rc bumped on write — only lineage events
+        // (clone promotion + drop_volume) touch rc.
+        assert_eq!(backend.iter_refcounts().unwrap(), Vec::<(Pba, u32)>::new());
         assert_eq!(backend.iter_allocated_blocks().unwrap(), vec![(Pba(55), 1)]);
         assert!(backend.has_any_blockmap_ref(Pba(55)).unwrap());
 
         backend.delete_mapping(&vol.id, Lba(0)).unwrap();
-        assert_eq!(
-            backend.cleanup_orphaned_refcounts().unwrap(),
-            vec![(Pba(55), 1)]
-        );
         assert_eq!(backend.get_refcount(Pba(55)).unwrap(), 0);
     }
 
@@ -2432,8 +2395,12 @@ mod tests {
              callers must not emit seq=0 with this race shape"
         );
         assert_eq!(after.crc32, 0xAAAA_AAAA);
+        // Phase 5: hot-path atomic_batch_write_with_dedup no longer
+        // moves global rc, so both PBAs are observed at 0. The L2P
+        // clobber (the actual data-loss vector under test) is still
+        // there — that's the load-bearing assertion above.
         assert_eq!(backend.get_refcount(Pba(40)).unwrap(), 0);
-        assert_eq!(backend.get_refcount(Pba(30)).unwrap(), 1);
+        assert_eq!(backend.get_refcount(Pba(30)).unwrap(), 0);
     }
 
     /// Regression test for the fix: `update_blockmap_flags` must carry

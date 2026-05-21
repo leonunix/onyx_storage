@@ -418,6 +418,11 @@ pub struct EngineMetrics {
     pub gc_blocks_rewritten: AtomicU64,
     pub gc_retired_blocks_reclaimed: AtomicU64,
     pub gc_errors: AtomicU64,
+    /// [[no-refcount-hot-path-design]] Phase 5: count of PBAs that
+    /// flowed back to the allocator via Lineage GC's `WalOp::FreePbas`
+    /// surface, drained by `LineageFreedPbaDrainHandle`. Counts blocks
+    /// (not PBAs) so it stays comparable with `gc_blocks_rewritten`.
+    pub gc_lineage_freed_blocks: AtomicU64,
     pub dedup_rescan_cycles: AtomicU64,
     pub dedup_rescan_skipped_cycles: AtomicU64,
     pub dedup_rescan_blocks: AtomicU64,
@@ -744,6 +749,7 @@ impl Default for EngineMetrics {
             gc_blocks_rewritten: AtomicU64::new(0),
             gc_retired_blocks_reclaimed: AtomicU64::new(0),
             gc_errors: AtomicU64::new(0),
+            gc_lineage_freed_blocks: AtomicU64::new(0),
             dedup_rescan_cycles: AtomicU64::new(0),
             dedup_rescan_skipped_cycles: AtomicU64::new(0),
             dedup_rescan_blocks: AtomicU64::new(0),
@@ -1020,6 +1026,7 @@ impl EngineMetrics {
             gc_blocks_rewritten: load(&self.gc_blocks_rewritten),
             gc_retired_blocks_reclaimed: load(&self.gc_retired_blocks_reclaimed),
             gc_errors: load(&self.gc_errors),
+            gc_lineage_freed_blocks: load(&self.gc_lineage_freed_blocks),
             dedup_rescan_cycles: load(&self.dedup_rescan_cycles),
             dedup_rescan_skipped_cycles: load(&self.dedup_rescan_skipped_cycles),
             dedup_rescan_blocks: load(&self.dedup_rescan_blocks),
@@ -1274,6 +1281,7 @@ pub struct EngineMetricsSnapshot {
     pub gc_blocks_rewritten: u64,
     pub gc_retired_blocks_reclaimed: u64,
     pub gc_errors: u64,
+    pub gc_lineage_freed_blocks: u64,
     pub dedup_rescan_cycles: u64,
     pub dedup_rescan_skipped_cycles: u64,
     pub dedup_rescan_blocks: u64,
@@ -1561,6 +1569,7 @@ impl EngineMetricsSnapshot {
             gc_blocks_rewritten,
             gc_retired_blocks_reclaimed,
             gc_errors,
+            gc_lineage_freed_blocks,
             dedup_rescan_cycles,
             dedup_rescan_skipped_cycles,
             dedup_rescan_blocks,

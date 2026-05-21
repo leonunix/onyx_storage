@@ -81,6 +81,16 @@ impl MetaStore {
         self.backend.sync_durable()
     }
 
+    /// [[no-refcount-hot-path-design]] Phase 5: pull every PBA that the
+    /// metadb-side Lineage GC has surfaced as freed (via
+    /// `WalOp::FreePbas`) since the last call. The engine's
+    /// [`LineageFreedPbaDrainHandle`] thread feeds these into the
+    /// allocator's free list. Non-blocking; returns `Vec::new()` when
+    /// the channel is empty.
+    pub fn drain_lineage_freed_pbas(&self) -> Vec<Pba> {
+        self.backend.drain_lineage_freed_pbas()
+    }
+
     pub fn request_durable_checkpoint(&self) -> OnyxResult<()> {
         self.backend.request_durable_checkpoint()
     }
@@ -377,16 +387,14 @@ impl MetaStore {
         self.backend.multi_get_refcounts(pbas)
     }
 
+    /// Test-only seed; see `MetadbBackend::set_refcount`. Phase 5
+    /// removed the per-write refcount path, but several tests need
+    /// to prep an existing rc value on a PBA before exercising
+    /// dedup-hit / packed-slot scenarios. Production code must not
+    /// call this.
+    #[doc(hidden)]
     pub fn set_refcount(&self, pba: Pba, count: u32) -> OnyxResult<()> {
         self.backend.set_refcount(pba, count)
-    }
-
-    pub fn increment_refcount(&self, pba: Pba) -> OnyxResult<u32> {
-        self.backend.increment_refcount(pba)
-    }
-
-    pub fn decrement_refcount(&self, pba: Pba) -> OnyxResult<u32> {
-        self.backend.decrement_refcount(pba)
     }
 
     pub fn atomic_dedup_hit(
@@ -499,10 +507,6 @@ impl MetaStore {
 
     pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {
         self.backend.count_blockmap_refs_for_pba(target_pba)
-    }
-
-    pub fn cleanup_orphaned_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {
-        self.backend.cleanup_orphaned_refcounts()
     }
 
     pub fn scan_all_blockmap_entries(

@@ -46,6 +46,11 @@ pub struct OnyxEngine {
     /// the buffer pool's `durable_seq` watermark so ring reclaim can safely
     /// proceed. Keeps the hot path at `WriteOptions::sync = false`.
     durability_watermark: Mutex<Option<DurabilityWatermarkHandle>>,
+    /// [[no-refcount-hot-path-design]] Phase 5: drains
+    /// `WalOp::FreePbas` outcomes from metadb's Lineage GC into the
+    /// allocator's free list. Started in full mode, `None` in
+    /// meta-only mode (no allocator to feed).
+    lineage_drain: Mutex<Option<LineageFreedPbaDrainHandle>>,
     #[allow(dead_code)]
     read_pool: Option<Arc<ReadPool>>,
     zone_manager: Option<Arc<ZoneManager>>,
@@ -296,6 +301,100 @@ impl DurabilityWatermarkHandle {
 }
 
 impl Drop for DurabilityWatermarkHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Handle for the lineage-freed PBA drain thread.
+///
+/// Phase 5 ([[no-refcount-hot-path-design]]) moves PBA retirement off the
+/// hot write path: the engine's commit path no longer maintains rc, so
+/// retiring an exclusive PBA happens later, when Lineage GC clears its
+/// dead-list segment past every snap_pin and emits a `WalOp::FreePbas`.
+/// The metadb backend converts those WAL outcomes into a crossbeam
+/// channel; this thread drains the channel and returns each PBA to the
+/// allocator's free list.
+///
+/// The thread parks for `interval` between drains; channel sends from the
+/// FreedPbasSink wake it implicitly when production resumes, since the
+/// next park interval expires and we re-check.
+struct LineageFreedPbaDrainHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LineageFreedPbaDrainHandle {
+    fn start(
+        meta: Arc<MetaStore>,
+        allocator: Arc<SpaceAllocator>,
+        metrics: Arc<EngineMetrics>,
+        interval: std::time::Duration,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("onyx-lineage-drain".into())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    Self::drain_once(&meta, &allocator, &metrics);
+                    std::thread::sleep(interval);
+                }
+                // Final drain so PBAs the GC emitted right before
+                // shutdown still make it back to the allocator.
+                Self::drain_once(&meta, &allocator, &metrics);
+            })
+            .expect("spawn lineage drain thread");
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn drain_once(
+        meta: &Arc<MetaStore>,
+        allocator: &Arc<SpaceAllocator>,
+        metrics: &Arc<EngineMetrics>,
+    ) {
+        let pbas = meta.drain_lineage_freed_pbas();
+        if pbas.is_empty() {
+            return;
+        }
+        let extents = crate::meta::backend::coalesce_free_pbas_to_extents(&pbas);
+        let mut freed_blocks: u64 = 0;
+        for extent in extents {
+            let result = if extent.count <= 1 {
+                allocator.free_one(extent.start)
+            } else {
+                allocator.free_extent(extent)
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    pba = extent.start.0,
+                    blocks = extent.count,
+                    error = %e,
+                    "lineage drain: allocator free failed; PBA leaked until restart",
+                );
+            } else {
+                freed_blocks += extent.count as u64;
+            }
+        }
+        if freed_blocks > 0 {
+            metrics
+                .gc_lineage_freed_blocks
+                .fetch_add(freed_blocks, Ordering::Relaxed);
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for LineageFreedPbaDrainHandle {
     fn drop(&mut self) {
         self.stop();
     }
@@ -894,6 +993,12 @@ impl OnyxEngine {
             config.meta.unlogged_flush_commits,
             config.meta.flush_dirty_pages_threshold,
         );
+        let lineage_drain = LineageFreedPbaDrainHandle::start(
+            meta.clone(),
+            allocator.clone(),
+            metrics.clone(),
+            std::time::Duration::from_millis(100),
+        );
 
         Ok(Self {
             meta,
@@ -905,6 +1010,7 @@ impl OnyxEngine {
             dedup_scanner: Mutex::new(dedup_scanner),
             heartbeat_writer: Mutex::new(heartbeat_writer),
             durability_watermark: Mutex::new(Some(watermark)),
+            lineage_drain: Mutex::new(Some(lineage_drain)),
             read_pool,
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
@@ -938,6 +1044,7 @@ impl OnyxEngine {
             dedup_scanner: Mutex::new(None),
             heartbeat_writer: Mutex::new(None),
             durability_watermark: Mutex::new(None),
+            lineage_drain: Mutex::new(None),
             read_pool: None,
             zone_manager: None,
             live_handles: Mutex::new(Vec::new()),
@@ -1065,29 +1172,10 @@ impl OnyxEngine {
             }
         }
 
-        let orphaned = self.meta.cleanup_orphaned_refcounts()?;
-        if let Some(allocator) = &self.allocator {
-            for (pba, _refcount) in &orphaned {
-                if let Err(e) = allocator.free_one(*pba) {
-                    tracing::warn!(
-                        name,
-                        generation = deleted_generation,
-                        pba = pba.0,
-                        error = %e,
-                        "failed to free orphaned packed-slot PBA after volume delete"
-                    );
-                }
-            }
-        }
-        if !orphaned.is_empty() {
-            tracing::warn!(
-                name,
-                generation = deleted_generation,
-                orphaned_pbas = orphaned.len(),
-                "cleaned orphaned refcounts after volume delete"
-            );
-        }
-
+        // Phase 5: lineage GC + FreePbas drive PBA retirement; the
+        // per-write refcount cleanup loop that used to fire here is
+        // gone. Any rc that survived `delete_volume` will be retired by
+        // the next Lineage GC pass.
         Ok(freed_blocks)
     }
 
@@ -1178,6 +1266,14 @@ impl OnyxEngine {
         // time the thread has joined, metadb is durable for all acked writes.
         if let Some(mut watermark) = self.durability_watermark.lock().unwrap().take() {
             watermark.stop();
+        }
+
+        // Stop the lineage-freed PBA drain. It runs a final drain pass
+        // before joining so any PBAs the GC surfaced between the last
+        // tick and shutdown are returned to the allocator before we
+        // checkpoint metadb durably.
+        if let Some(mut drain) = self.lineage_drain.lock().unwrap().take() {
+            drain.stop();
         }
 
         // Belt-and-suspenders: one more explicit sync in case new writes
@@ -1385,6 +1481,12 @@ impl OnyxEngine {
             config.meta.unlogged_flush_commits,
             config.meta.flush_dirty_pages_threshold,
         );
+        let lineage_drain = LineageFreedPbaDrainHandle::start(
+            meta.clone(),
+            allocator.clone(),
+            metrics.clone(),
+            std::time::Duration::from_millis(100),
+        );
 
         Ok(Self {
             meta,
@@ -1396,6 +1498,7 @@ impl OnyxEngine {
             dedup_scanner: Mutex::new(dedup_scanner),
             heartbeat_writer: Mutex::new(heartbeat_writer),
             durability_watermark: Mutex::new(Some(watermark)),
+            lineage_drain: Mutex::new(Some(lineage_drain)),
             read_pool,
             zone_manager: Some(zone_manager),
             live_handles: Mutex::new(Vec::new()),
