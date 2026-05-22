@@ -1105,20 +1105,50 @@ impl MetadbBackend {
             return Ok((Vec::new(), HashMap::new()));
         }
         let ord = self.volume_ordinal(vol_id)?;
+        // Phase 5: per-WalOp apply runs on per-shard lanes
+        // (`apply_l2p_bucket` for L2P, `apply_dedup_indices_to` for
+        // dedup), so even within a single tx the L2pRemap may execute
+        // before the paired DedupPut bumps rc. Hits whose target PBA
+        // is being promoted **must not** carry an `rc >= 1` guard:
+        // the target's rc is 0 before this tx, the lane racing the
+        // dedup lane would observe rc=0 and reject the remap, and
+        // pre-Phase-5 the hot-path L2pRemap itself drove rc so the
+        // race didn't exist.
+        //
+        // Race-safety for the unguarded promote: the dedup pipeline
+        // calls `candidate.remove_by_pba(pba)` before
+        // `allocator.free(pba)` (see [`buffer::flush::cleanup`]), so
+        // any candidate-cache hit on PBA `P` proves `P` has not yet
+        // been retired — there is no "promote to a PBA already
+        // freed" path to protect against.
+        //
+        // Non-promote hits (target already in `dedup_index`,
+        // `rc >= 1` from the prior DedupPut) keep the guard as a
+        // belt-and-suspenders defense against a concurrent
+        // FreePbas-driven decref-to-zero.
+        let promote_hashes: std::collections::HashSet<ContentHash> =
+            promote_entries.iter().map(|(h, _)| *h).collect();
         let mut tx = self.db.begin();
-        for (i, (lba, value, _)) in hits.iter().enumerate() {
+        for (i, (lba, value, hash)) in hits.iter().enumerate() {
+            let guard = if promote_hashes.contains(hash) {
+                None
+            } else {
+                Some((to_metadb_pba(value.pba), 1))
+            };
             tx.l2p_remap(
                 ord,
                 lba.0,
                 to_l2p_value_with_seq(value, seq_for(seqs, i)),
-                Some((to_metadb_pba(value.pba), 1)),
+                guard,
             );
         }
         // Promote candidate-cache hits into the persistent dedup
         // tables. Atomic with the LBA remaps: if the commit succeeds,
-        // both happen; if it fails, neither.
+        // both happen; if it fails, neither. Use unguarded `put_dedup`
+        // for the same reason the L2pRemap is unguarded above — the
+        // candidate cache eviction contract closes the race window.
         for (hash, entry) in promote_entries {
-            tx.put_dedup_guarded(*hash, to_dedup_value(entry), to_metadb_pba(entry.pba), 1);
+            tx.put_dedup(*hash, to_dedup_value(entry));
         }
         // Same reasoning as `atomic_dedup_hit`: no LV3 write, refcount
         // guard inside metadb handles the race against a concurrent
@@ -2177,8 +2207,13 @@ mod tests {
         backend
             .atomic_batch_write(&vol.id, &[(Lba(0), replacement)], 1)
             .unwrap();
-        // rc(value.pba)=1 (seeded, hot-path doesn't decref).
-        assert_eq!(backend.get_refcount(value.pba).unwrap(), 1);
+        // Phase 5: hot-path L2pRemap doesn't touch rc, so the
+        // replacement leaves rc(value.pba) at its prior value. The
+        // earlier `put_dedup_entries` issued a `WalOp::DedupPut`
+        // whose apply increfs the new head_pba by 1 (rc 1 → 2). Old
+        // mapping cleanup of the displaced PBA flows through the
+        // dead-list / Lineage GC retire path, not the hot path.
+        assert_eq!(backend.get_refcount(value.pba).unwrap(), 2);
     }
 
     #[test]

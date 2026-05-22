@@ -262,6 +262,15 @@ fn flusher_coalesces_overwrites_before_flush() {
 
 #[test]
 fn flusher_reclaims_full_extent_for_multi_block_units() {
+    // Phase 5: hot-path L2pRemap is rc-neutral, so the writer no
+    // longer surfaces freed_pba from a packed-slot overwrite.
+    // Reclaim moves to the dead-list → Lineage GC → FreePbas →
+    // `drain_lineage_freed_pbas` path, which the engine runs in
+    // production but is not wired through this minimal flush
+    // harness. The test now asserts the post-write L2P state and
+    // allocator block consumption (still synchronous), and notes
+    // that the old extent stays allocated to the writer until the
+    // background drainer retires it.
     let (pool, meta, lifecycle, allocator, io_engine) = setup_flush_env();
     register_volume(&meta, "test-vol");
     let initial_free = allocator.free_block_count();
@@ -286,26 +295,35 @@ fn flusher_reclaims_full_extent_for_multi_block_units() {
     assert!(wait_flushed(&pool, 5000), "second flush timeout");
     flusher.stop();
 
+    // Phase 5: the second flush allocates 2 fresh blocks for the new
+    // payloads but does NOT retire the old 2-block extent — the
+    // writer records them into the volume's dead-list and Lineage GC
+    // is responsible for the actual retire later. The free count
+    // therefore shows initial_free - 4 (both extents allocated, none
+    // freed yet).
     assert_eq!(
         allocator.free_block_count(),
         initial_free - 4,
-        "cleanup retires old physical blocks before GC returns them to the free list"
+        "Phase 5: both extents allocated; reclaim pending Lineage GC drain"
     );
     assert_eq!(
         allocator.retired_block_count(),
-        2,
-        "overwriting a 2-block unit should retire the old full extent"
+        0,
+        "Phase 5: writer no longer drives retire on overwrite (dead-list / Lineage GC owns it)"
     );
 
-    let retired = allocator.retired_candidates(8);
-    for extent in retired {
-        allocator.reclaim_retired_extent(extent).unwrap();
-    }
-    assert_eq!(
-        allocator.free_block_count(),
-        initial_free - 2,
-        "GC reclaim should return the retired full extent without leaking a block"
-    );
+    // L2P state is the load-bearing invariant: the new content must
+    // be observable at LBA 20 and LBA 21. The two fragments may
+    // share a packed slot (same PBA, different `slot_offset`); only
+    // the existence and freshness of the mappings matters here.
+    let _new0 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(20))
+        .unwrap()
+        .expect("LBA 20 must remap after the second flush");
+    let _new1 = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(21))
+        .unwrap()
+        .expect("LBA 21 must remap after the second flush");
 }
 
 /// Flusher stop is clean.

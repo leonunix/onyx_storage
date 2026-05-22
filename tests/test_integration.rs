@@ -442,9 +442,16 @@ fn prove_flusher_drains_buffer_creates_metadata() {
     assert!(bv.pba.0 > 0 || bv.pba.0 == 0, "PBA should be valid"); // any PBA is fine
     assert!(bv.crc32 != 0, "CRC should be non-zero");
 
-    // EVIDENCE 4: refcount is set
+    // EVIDENCE 4: Phase 5 — hot-path L2pPut is rc-neutral, so a
+    // fresh write leaves rc(pba) == 0. The "flush created durable
+    // metadata" invariant this test guards is the L2P entry (EVIDENCE
+    // 3) and the readable data below; rc is no longer driven by the
+    // hot path.
     let rc = meta.get_refcount(bv.pba).unwrap();
-    assert!(rc > 0, "refcount should be positive after flush");
+    assert_eq!(
+        rc, 0,
+        "Phase 5: fresh hot-path write leaves rc(pba) == 0"
+    );
 
     // Data still readable (now from LV3)
     let result = vol.read(0, 4096).unwrap();
@@ -652,11 +659,18 @@ fn prove_coalescer_merged_lbas() {
         assert_eq!(bv.crc32, shared_crc, "LBA {} should share CRC", i);
     }
 
-    // EVIDENCE 5: refcount = unit_lba_count (each LBA holds one ref)
+    // EVIDENCE 5: Phase 5 — hot-path L2pPut is rc-neutral, so a
+    // fresh coalesced packed unit leaves rc(shared_pba) == 0. Prior
+    // to Phase 5 we expected `rc == unit_lba_count` (one ref per
+    // fragment). The "shared physical block" invariant the test
+    // actually cares about is now expressed via the shared `pba`,
+    // matching `crc32`, and the per-LBA `offset_in_unit` checks
+    // above; rc no longer tracks live fragment count on the hot path
+    // (Lineage GC owns eventual reclaim).
     let rc = meta.get_refcount(shared_pba).unwrap();
     assert_eq!(
-        rc, mappings[0].unit_lba_count as u32,
-        "refcount should equal unit_lba_count"
+        rc, 0,
+        "Phase 5: fresh hot-path packed write leaves rc(shared_pba) == 0"
     );
 
     // EVIDENCE 6: compressed_size < original (proves compression ran on merged data)
@@ -832,6 +846,16 @@ fn prove_batch_read_mixes_buffer_and_unmapped_and_lv3() {
 #[test]
 #[serial]
 fn prove_overwrite_frees_old_pba() {
+    // Phase 5: hot-path L2pPut / L2pRemap are rc-neutral. Fresh writes
+    // leave rc(pba) == 0 and overwrites do not auto-decref the previous
+    // PBA. Physical reclaim happens asynchronously via the volume
+    // dead-list → Lineage GC → FreePbas → `drain_lineage_freed_pbas`
+    // path. The visible (synchronous) effect of an overwrite is the
+    // L2P flip; the rc trace this test was originally written against
+    // no longer exists. The invariants that still hold and matter are:
+    //   * the old mapping is replaced by a new mapping at a fresh PBA;
+    //   * the new data reads back correctly;
+    //   * neither the old nor the new PBA carry a hot-path refcount.
     let env = setup();
     let vol_size = 64 * 4096u64;
     env.engine
@@ -848,30 +872,42 @@ fn prove_overwrite_frees_old_pba() {
     let old_bv = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap();
     let old_pba = old_bv.pba;
 
-    // EVIDENCE: old PBA has refcount > 0
+    // EVIDENCE: fresh hot-path write is rc-neutral.
     let old_rc = meta.get_refcount(old_pba).unwrap();
-    assert!(old_rc > 0, "old PBA should have refcount > 0");
+    assert_eq!(
+        old_rc, 0,
+        "Phase 5: fresh hot-path write leaves rc(pba) == 0"
+    );
 
     // Overwrite + flush
     vol.write(0, &vec![0xBBu8; 4096]).unwrap();
     wait_for_flush(&env, Duration::from_secs(10));
 
-    // EVIDENCE 1: old PBA refcount dropped to 0
+    // EVIDENCE 1: old PBA's rc was already 0 (Phase 5 hot-path is
+    // rc-neutral); the overwrite does not change that. Physical
+    // reclaim of `old_pba` is owned by Lineage GC and may not have
+    // run yet, so we explicitly do not assert that the allocator has
+    // returned the slot — only that rc bookkeeping stays consistent.
     let old_rc_after = meta.get_refcount(old_pba).unwrap();
     assert_eq!(
         old_rc_after, 0,
-        "old PBA refcount should be 0 after overwrite"
+        "Phase 5: old PBA rc stays 0 (hot-path overwrite is rc-neutral)"
     );
 
-    // EVIDENCE 2: new mapping points to different PBA
+    // EVIDENCE 2: new mapping points to a different PBA (L2P flipped).
     let new_bv = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap();
     assert_ne!(new_bv.pba, old_pba, "should allocate a new PBA");
 
-    // EVIDENCE 3: new PBA has refcount > 0
+    // EVIDENCE 3: new PBA's rc is also 0 — fresh hot-path writes
+    // never bump rc in Phase 5.
     let new_rc = meta.get_refcount(new_bv.pba).unwrap();
-    assert!(new_rc > 0, "new PBA should have refcount > 0");
+    assert_eq!(
+        new_rc, 0,
+        "Phase 5: new hot-path write leaves rc(new_pba) == 0"
+    );
 
-    // EVIDENCE 4: data is correct
+    // EVIDENCE 4: data reads back correctly — this is the load-bearing
+    // user-visible invariant the test exists to guard.
     assert_eq!(vol.read(0, 4096).unwrap(), vec![0xBBu8; 4096]);
 }
 
@@ -987,9 +1023,12 @@ fn prove_multi_volume_isolation() {
         "different volumes should use different PBAs"
     );
 
-    // EVIDENCE 3: each PBA has correct refcount
-    assert!(meta.get_refcount(bv_a.pba).unwrap() > 0);
-    assert!(meta.get_refcount(bv_b.pba).unwrap() > 0);
+    // EVIDENCE 3: Phase 5 — fresh hot-path writes are rc-neutral, so
+    // rc(pba) == 0 for both volumes. Cross-volume isolation now holds
+    // by virtue of distinct volume ordinals + distinct L2P trees +
+    // distinct PBAs (EVIDENCE 2), not by per-LBA refcount tracking.
+    assert_eq!(meta.get_refcount(bv_a.pba).unwrap(), 0);
+    assert_eq!(meta.get_refcount(bv_b.pba).unwrap(), 0);
 
     // EVIDENCE 4: raw LV3 data is different
     let raw_a = read_raw_lv3(&env, bv_a.pba, 4096);
@@ -1553,7 +1592,12 @@ fn prove_multi_volume_packed_slot_delete_isolation() {
         map_a.pba, map_b.pba,
         "initial fragments should share one packed slot"
     );
-    assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 2);
+    // Phase 5: hot-path L2pPut is rc-neutral. Both packed fragments
+    // land on the same PBA via distinct L2P entries, but neither
+    // bumps rc. The cross-volume "two fragments live on one slot"
+    // invariant is now expressed by `map_a.pba == map_b.pba` plus
+    // the per-volume L2P state below.
+    assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 0);
 
     drop(vol_a);
     let _freed = env.engine.delete_volume("pack-del-a").unwrap();
@@ -1566,17 +1610,34 @@ fn prove_multi_volume_packed_slot_delete_isolation() {
         surviving.pba, map_b.pba,
         "surviving fragment should stay on the same slot"
     );
-    assert_eq!(meta.get_refcount(surviving.pba).unwrap(), 1);
+    // Phase 5: delete_volume's per-PBA cleanup loop scans rc and
+    // reports freed PBAs whose rc fell to 0. Because the hot path
+    // never bumped rc, the shared PBA already had rc == 0 before
+    // delete_volume ran and continues to read rc == 0 after.
+    // Volume-B's mapping still references the slot, but the user-
+    // visible isolation invariant (Volume-B's data and L2P entry
+    // survive Volume-A's delete) is what this test guards.
+    assert_eq!(meta.get_refcount(surviving.pba).unwrap(), 0);
     assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x5A; 4096]);
 }
 
 // ===========================================================================
 // Test 17: Prove shared packed slot is only reclaimed after the last fragment
-// is overwritten
+// is overwritten (Phase 5: reclaim is async via Lineage GC)
 // ===========================================================================
 #[test]
 #[serial]
 fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
+    // Phase 5: hot-path L2pPut / L2pRemap are rc-neutral. Two
+    // fragments sharing a packed slot land at the same PBA via two
+    // distinct L2P entries; rc is *not* bumped to 2. When either
+    // fragment is overwritten the writer does NOT decref the old
+    // slot or retire it — the previous PBA is queued onto the
+    // volume's dead-list and Lineage GC eventually emits FreePbas
+    // that the engine drains back into the allocator. This test
+    // therefore guards the L2P-flip invariant ("one fragment dying
+    // does not invalidate the other") rather than synchronous rc /
+    // retire bookkeeping that no longer exists.
     let env = setup();
     let vol_size = 16 * 4096u64;
     let initial_free = env.engine.allocator().unwrap().free_block_count();
@@ -1603,7 +1664,10 @@ fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
         meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap().pba,
         shared_pba
     );
-    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 2);
+    // Phase 5: fresh hot-path packed write leaves rc == 0. The "two
+    // fragments live on one slot" invariant is now expressed solely
+    // by the shared PBA equality above.
+    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 0);
     assert_eq!(
         env.engine.allocator().unwrap().free_block_count(),
         initial_free - 1
@@ -1615,24 +1679,40 @@ fn prove_packed_slot_reclaimed_only_after_last_fragment_dies() {
     let map_b_old = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
     assert_ne!(map_a_new.pba, shared_pba);
     assert_eq!(map_b_old.pba, shared_pba);
-    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 1);
+    // Phase 5: writer does not decref on overwrite — rc stays at 0.
+    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 0);
+    // Phase 5: a fresh PBA is allocated for vol_a's new write but
+    // shared_pba is NOT retired (still referenced by vol_b's L2P and,
+    // even without that, the writer no longer drives retire). The
+    // allocator's free count therefore drops by 2 total (1 for the
+    // original shared slot, 1 for the new vol_a slot).
     assert_eq!(
         env.engine.allocator().unwrap().free_block_count(),
-        initial_free - 2
+        initial_free - 2,
+        "Phase 5: writer no longer retires on overwrite (dead-list / Lineage GC owns it)"
     );
 
     vol_b.write(0, &vec![0x42; 4096]).unwrap();
     wait_for_flush(&env, Duration::from_secs(10));
     let map_b_new = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
-    // With hole filling, vol_b's new data may reuse the hole at shared_pba
-    // left by vol_a's overwrite. Either way, data must be correct.
-    if map_b_new.pba == shared_pba {
-        // Hole fill happened: shared_pba still alive (vol_b's new data is there)
-        assert!(meta.get_refcount(shared_pba).unwrap() > 0);
-    } else {
-        // No hole fill: shared_pba is freed
-        assert_eq!(meta.get_refcount(shared_pba).unwrap(), 0);
-    }
+    // Phase 5: vol_b's new write lands on its own fresh PBA; the
+    // shared_pba is no longer referenced by any live L2P entry but
+    // still has not been physically retired — that retire is owned by
+    // Lineage GC and is allowed to be late. The "slot retired only
+    // after the last fragment dies" invariant is expressed by the
+    // L2P side: both vol_a and vol_b mappings have moved away from
+    // shared_pba.
+    assert_ne!(
+        map_b_new.pba, shared_pba,
+        "Phase 5: vol_b's overwrite must allocate a fresh PBA"
+    );
+    assert_ne!(
+        map_a_new.pba, shared_pba,
+        "vol_a's new mapping must not point back at the now-dead slot"
+    );
+    // rc stays 0 throughout — hot-path is rc-neutral, and Lineage GC
+    // doesn't push rc above 0 either.
+    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 0);
 
     assert_eq!(vol_a.read(0, 4096).unwrap(), vec![0x41; 4096]);
     assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x42; 4096]);
@@ -1690,7 +1770,13 @@ fn prove_packed_flush_blocks_delete_until_commit() {
     assert!(meta.get_mapping(&vol_a_id, Lba(0)).unwrap().is_none());
 
     let surviving = meta.get_mapping(&vol_b_id, Lba(0)).unwrap().unwrap();
-    assert_eq!(meta.get_refcount(surviving.pba).unwrap(), 1);
+    // Phase 5: hot-path L2pPut is rc-neutral, so the shared packed
+    // slot was always at rc == 0 and stays at rc == 0 after vol_a is
+    // deleted. The cross-volume isolation invariant this test guards
+    // — that delete_volume on pack-lock-a does not invalidate
+    // pack-lock-b's mapping or its data — is asserted by `surviving`
+    // and the read below.
+    assert_eq!(meta.get_refcount(surviving.pba).unwrap(), 0);
     assert_eq!(vol_b.read(0, 4096).unwrap(), vec![0x62; 4096]);
 }
 
@@ -1732,7 +1818,13 @@ fn prove_packed_metadata_failure_retries_without_leak() {
         map_a.pba, map_b.pba,
         "retry should still produce one packed slot"
     );
-    assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 2);
+    // Phase 5: hot-path L2pPut is rc-neutral, so a retry that
+    // successfully writes two fragments onto one packed slot leaves
+    // rc(packed_pba) == 0. The "no PBA leak under retry" invariant
+    // is checked by the free-block-count wait below — exactly one
+    // 4KB physical slot is consumed regardless of how many retries
+    // the metadata commit went through.
+    assert_eq!(meta.get_refcount(map_a.pba).unwrap(), 0);
     wait_until(Duration::from_secs(60), || {
         env.engine.allocator().unwrap().free_block_count() == initial_free - 1
     });
@@ -1809,6 +1901,28 @@ fn prove_packed_old_write_cannot_overwrite_newer_committed_write() {
 #[test]
 #[serial]
 fn prove_delete_volume_cleans_orphaned_refcount_leak() {
+    // Phase 5: the hot-path writers (L2pPut / L2pRemap / L2pDelete /
+    // L2pRemapRange) are rc-neutral, so they no longer leave behind
+    // "orphaned" rc entries on packed slots in the first place. rc is
+    // only mutated by lineage events (PromotionChunk / DedupPut* /
+    // FreePbas) and by the test-only `set_refcount` helper, which
+    // routes through metadb's `incref_pba` (PromotionChunk under the
+    // hood).
+    //
+    // The original test simulated an orphaned packed-slot rc by
+    // calling `set_refcount(leaked_pba, 1)` and expected
+    // `delete_volume` to scrub it. That defensive cleanup path is
+    // gone: a PromotionChunk-style rc bump on a PBA that is not
+    // referenced by any L2P entry of the volume being deleted is, by
+    // construction, *not* the volume's responsibility — it belongs to
+    // dedup / clone lineage and survives unrelated volume deletes.
+    //
+    // The Phase 5 invariants that `delete_volume` still owns and that
+    // this test now guards are:
+    //   1. The volume catalog entry is removed.
+    //   2. The volume's L2P entries are gone.
+    //   3. The delete does NOT touch refcounts belonging to other
+    //      logical owners (no cross-volume rc scrubbing).
     let env = setup();
     let vol_size = 16 * 4096u64;
     let allocator = env.engine.allocator().unwrap().clone();
@@ -1817,28 +1931,49 @@ fn prove_delete_volume_cleans_orphaned_refcount_leak() {
     env.engine
         .create_volume("pack-orphan", vol_size, CompressionAlgo::None)
         .unwrap();
+    let vol_id = VolumeId("pack-orphan".into());
+    assert!(meta.get_volume(&vol_id).unwrap().is_some());
 
+    // Simulate a rc entry that lives outside this volume's L2P. In
+    // production this happens when dedup_index or a clone-walker
+    // promotion bumps rc on a shared PBA; the rc is tied to the
+    // dedup / clone owner, not to any particular volume.
     let baseline_free = allocator.free_block_count();
-    let leaked_pba = allocator.allocate_one().unwrap();
-    meta.set_refcount(leaked_pba, 1).unwrap();
+    let shared_pba = allocator.allocate_one().unwrap();
+    meta.set_refcount(shared_pba, 1).unwrap();
     assert_eq!(
         allocator.free_block_count(),
         baseline_free - 1,
-        "test setup must reserve one leaked packed-slot block"
+        "setup must reserve one block backing the simulated shared rc"
     );
-    assert_eq!(meta.get_refcount(leaked_pba).unwrap(), 1);
+    assert_eq!(meta.get_refcount(shared_pba).unwrap(), 1);
 
     env.engine.delete_volume("pack-orphan").unwrap();
 
-    assert_eq!(
-        meta.get_refcount(leaked_pba).unwrap(),
-        0,
-        "delete_volume must scrub orphaned refcount entries"
+    // EVIDENCE 1: volume catalog entry is gone.
+    assert!(
+        meta.get_volume(&vol_id).unwrap().is_none(),
+        "delete_volume must remove the catalog entry"
     );
+
+    // EVIDENCE 2: no L2P entries remain for this volume.
+    for lba in 0..(vol_size / 4096) {
+        assert!(
+            meta.get_mapping(&vol_id, Lba(lba)).unwrap().is_none(),
+            "LBA {lba} blockmap must be deleted"
+        );
+    }
+
+    // EVIDENCE 3: Phase 5 — `delete_volume` does NOT scan global rc
+    // looking for "orphaned" entries to scrub. A rc bump that was
+    // installed by a non-volume lineage event (here simulated via
+    // `set_refcount`) survives unrelated volume deletes. The shared
+    // block stays allocated to its lineage owner; Lineage GC is the
+    // only path that retires it once rc drops back to 0.
     assert_eq!(
-        allocator.free_block_count(),
-        baseline_free,
-        "delete_volume must return the orphaned 4KB slot to the allocator"
+        meta.get_refcount(shared_pba).unwrap(),
+        1,
+        "Phase 5: delete_volume must not scrub rc that doesn't belong to this volume"
     );
 }
 

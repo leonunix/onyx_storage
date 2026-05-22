@@ -1018,7 +1018,9 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         },
     )])
     .unwrap();
-    assert_eq!(meta.get_refcount(pba).unwrap(), 0);
+    // Phase 5: `WalOp::DedupPut` increfs the head PBA's rc by 1 to
+    // represent the "shared via dedup_index" reference.
+    assert_eq!(meta.get_refcount(pba).unwrap(), 1);
 
     let allocator_scanner = allocator.clone();
     let scanner_cleanup = RemapCleanup {

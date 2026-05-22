@@ -278,7 +278,10 @@ fn atomic_write_mapping() {
 
     let loaded = store.get_mapping(&vol_id, Lba(10)).unwrap().unwrap();
     assert_eq!(loaded.pba, Pba(50));
-    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 1);
+    // Phase 5: hot-path L2pRemap is rc-neutral. PBA reclamation moves
+    // to the dead-list / Lineage GC path; rc only tracks "shared via
+    // dedup_index" / promotion-walker references.
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 0);
 }
 
 #[test]
@@ -324,7 +327,9 @@ fn atomic_remap() {
 
     let loaded = store.get_mapping(&vol_id, Lba(5)).unwrap().unwrap();
     assert_eq!(loaded.pba, Pba(200));
-    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 1);
+    // Phase 5: hot-path L2pRemap is rc-neutral. The mapping flip
+    // succeeds but rc bookkeeping is owned by lineage events.
+    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 0);
     assert_eq!(store.get_refcount(Pba(100)).unwrap(), 0);
 }
 
@@ -356,7 +361,8 @@ fn wal_recovery() {
         let store = MetaStore::open(&test_config(dir.path())).unwrap();
         let loaded = store.get_mapping(&vol_id, Lba(42)).unwrap().unwrap();
         assert_eq!(loaded.pba, Pba(77));
-        assert_eq!(store.get_refcount(Pba(77)).unwrap(), 1);
+        // Phase 5: WAL replay of an L2pRemap is rc-neutral.
+        assert_eq!(store.get_refcount(Pba(77)).unwrap(), 0);
     }
 }
 
@@ -407,9 +413,12 @@ fn delete_volume_frees_blockmap_and_refcount() {
         store.atomic_write_mapping(vol_id, Lba(i), &val).unwrap();
     }
 
-    // Verify they exist
-    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 1);
-    assert_eq!(store.get_refcount(Pba(104)).unwrap(), 1);
+    // Phase 5: hot-path L2pRemap is rc-neutral, so fresh writes leave
+    // rc(pba) == 0. delete_volume still surfaces every mapping as a
+    // cleanup because the post-apply `multi_get_refcounts` filter
+    // includes any PBA whose rc is 0.
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 0);
+    assert_eq!(store.get_refcount(Pba(104)).unwrap(), 0);
 
     // Delete volume
     let freed = store.delete_volume(&vol.id).unwrap();
@@ -771,7 +780,9 @@ fn atomic_batch_write_multi_single_unit() {
     assert_eq!(m0.offset_in_unit, 0);
     let m1 = store.get_mapping(&vol_id, Lba(1)).unwrap().unwrap();
     assert_eq!(m1.offset_in_unit, 1);
-    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 2);
+    // Phase 5: `new_refcount` argument is accepted for backward
+    // compatibility but ignored; hot-path L2pRemap is rc-neutral.
+    assert_eq!(store.get_refcount(Pba(200)).unwrap(), 0);
 }
 
 #[test]
@@ -825,8 +836,10 @@ fn atomic_batch_write_multi_two_units_different_pbas() {
         store.get_mapping(&vol_b, Lba(0)).unwrap().unwrap().pba,
         Pba(400)
     );
-    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 1);
-    assert_eq!(store.get_refcount(Pba(400)).unwrap(), 1);
+    // Phase 5: hot-path is rc-neutral; the `new_refcount` argument is
+    // accepted but ignored.
+    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 0);
+    assert_eq!(store.get_refcount(Pba(400)).unwrap(), 0);
 }
 
 #[test]
@@ -852,10 +865,14 @@ fn atomic_batch_write_multi_with_decrements() {
         },
     )];
     store.atomic_batch_write(&vol_id, &initial, 3).unwrap();
+    // Phase 5: hot-path is rc-neutral; seed rc explicitly so the
+    // post-overwrite cleanup path has something to observe.
+    store.set_refcount(Pba(50), 3).unwrap();
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
 
-    // Overwrite Lba(0) with new PBA 60; function internally reads old mapping (PBA 50)
-    // and decrements it by 1
+    // Overwrite Lba(0) with new PBA 60. Phase 5 hot-path neither
+    // increfs new nor decrefs old; the dead-list / Lineage GC path
+    // owns retirement.
     let new_batch = vec![(
         Lba(0),
         BlockmapValue {
@@ -878,8 +895,8 @@ fn atomic_batch_write_multi_with_decrements() {
         store.get_mapping(&vol_id, Lba(0)).unwrap().unwrap().pba,
         Pba(60)
     );
-    assert_eq!(store.get_refcount(Pba(60)).unwrap(), 1);
-    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 2); // 3 - 1 = 2
+    assert_eq!(store.get_refcount(Pba(60)).unwrap(), 0);
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3); // unchanged
 }
 
 #[test]
@@ -913,16 +930,21 @@ fn zero_mapping_does_not_refcount_pba_zero_and_can_be_overwritten() {
         .unwrap();
     assert!(freed.is_empty());
     assert_eq!(store.get_refcount(Pba(0)).unwrap(), 0);
-    assert_eq!(store.get_refcount(Pba(55)).unwrap(), 1);
+    // Phase 5: hot-path is rc-neutral; `new_refcount` is ignored.
+    assert_eq!(store.get_refcount(Pba(55)).unwrap(), 0);
 
     let freed = store
         .atomic_batch_write(&vol_id, &[(Lba(0), BlockmapValue::zero())], 0)
         .unwrap();
     assert_eq!(store.get_refcount(Pba(55)).unwrap(), 0);
-    let cleanup = freed.get(&Pba(55)).expect("PBA 55 should need cleanup");
-    assert_eq!(cleanup.decrements, 1);
-    assert_eq!(cleanup.blocks, 1);
-    assert!(cleanup.pba_freed);
+    // Phase 5: hot-path L2pRemap does not surface freed PBAs in the
+    // adapter's cleanup map (apply returns `freed_pba: None`). PBA 55
+    // is captured into the volume's dead-list by `record_dead` and
+    // reclaimed via Lineage GC → `FreePbas` → `drain_lineage_freed_pbas`
+    // (exercised by `delete_volume`'s post-apply rc=0 filter and by
+    // background sweeps; no Lineage GC worker runs in this unit-test
+    // context, so the cleanup map is empty here).
+    assert!(freed.is_empty());
     assert_eq!(store.get_refcount(Pba(0)).unwrap(), 0);
 }
 
@@ -947,11 +969,15 @@ fn atomic_batch_write_multi_aggregates_decrements_across_units() {
     };
     let initial = vec![(Lba(0), bv50), (Lba(10), bv50), (Lba(20), bv50)];
     store.atomic_batch_write(&vol_id, &initial, 3).unwrap();
+    // Phase 5: seed rc explicitly because hot-path L2pRemap is
+    // rc-neutral.
+    store.set_refcount(Pba(50), 3).unwrap();
     assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
 
-    // Two units overwrite Lba(10) and Lba(20) to new PBAs.
-    // The function internally reads old mappings (PBA 50) for each LBA
-    // and decrements PBA 50 by 1 per LBA → total -2
+    // Two units overwrite Lba(10) and Lba(20) to new PBAs. Phase 5:
+    // hot path is rc-neutral, so PBA 50 is not auto-decremented by
+    // the overwrite (eventual reclaim flows via dead-list / Lineage
+    // GC).
     let batch_a = vec![(
         Lba(10),
         BlockmapValue {
@@ -987,9 +1013,9 @@ fn atomic_batch_write_multi_aggregates_decrements_across_units() {
     ];
     store.atomic_batch_write_multi(&units).unwrap();
 
-    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 1); // 3 - 1 - 1 = 1
-    assert_eq!(store.get_refcount(Pba(70)).unwrap(), 1);
-    assert_eq!(store.get_refcount(Pba(80)).unwrap(), 1);
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3); // unchanged
+    assert_eq!(store.get_refcount(Pba(70)).unwrap(), 0);
+    assert_eq!(store.get_refcount(Pba(80)).unwrap(), 0);
 }
 
 #[test]
@@ -1145,11 +1171,14 @@ fn batch_dedup_hits_rejected_target_freed() {
 
     // PBA 100 alive, PBA 200 freed (refcount 0)
     store.set_refcount(Pba(100), 2).unwrap();
-    // PBA 200 has no refcount entry → 0
     let h0 = test_hash(1);
     let h1 = test_hash(2);
     register_dedup_entries(&store, 100, &[h0]);
     register_dedup_entries(&store, 200, &[h1]);
+    // Phase 5: `put_dedup_entries` (via DedupPut) bumps rc(target) by
+    // 1. To model a *freed* PBA whose stale forward index hasn't been
+    // cleaned yet, drive rc(200) back to 0 via FreePbas.
+    store.set_refcount(Pba(200), 0).unwrap();
 
     let hits = vec![
         (Lba(0), make_bv(100, 4096, 1, 0), h0),
@@ -1165,6 +1194,7 @@ fn batch_dedup_hits_rejected_target_freed() {
         DedupHitResult::Rejected => {}
         _ => panic!("expected Rejected for freed PBA 200"),
     }
+    // Phase 5: register +1, hit on 100 is rc-neutral L2pRemap → rc=3.
     assert_eq!(store.get_refcount(Pba(100)).unwrap(), 3);
     // PBA 200 should remain 0
     assert_eq!(store.get_refcount(Pba(200)).unwrap(), 0);
@@ -1183,11 +1213,14 @@ fn batch_dedup_hits_same_pba_refresh() {
     // LBA 5 already maps to PBA 100
     let existing = make_bv(100, 4096, 1, 0);
     store.atomic_write_mapping(&vol, Lba(5), &existing).unwrap();
-    let rc_before = store.get_refcount(Pba(100)).unwrap();
 
-    // Dedup hit targets the same PBA 100 → blockmap refresh, no refcount change
+    // Dedup hit targets the same PBA 100 → blockmap refresh, no
+    // refcount change from the hit itself. Phase 5: capture rc_before
+    // AFTER register_dedup_entries because `put_dedup_entries` issues
+    // a `DedupPut` which now increfs by 1.
     let h = test_hash(1);
     register_dedup_entries(&store, 100, &[h]);
+    let rc_before = store.get_refcount(Pba(100)).unwrap();
     let hits = vec![(Lba(5), make_bv(100, 4096, 1, 0), h)];
     let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     match results[0] {
@@ -1211,7 +1244,7 @@ fn batch_dedup_hits_old_pba_decrement() {
     // Target PBA 200 with refcount 5
     store.set_refcount(Pba(200), 5).unwrap();
     let h = test_hash(1);
-    register_dedup_entries(&store, 200, &[h]);
+    register_dedup_entries(&store, 200, &[h]); // Phase 5: rc(200) 5→6
 
     let hits = vec![(Lba(5), make_bv(200, 4096, 1, 0), h)];
     let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
@@ -1220,10 +1253,11 @@ fn batch_dedup_hits_old_pba_decrement() {
         DedupHitResult::Accepted(None) => {}
         _ => panic!("expected Accepted(None)"),
     }
-    // PBA 200 should be 5 + 1 = 6
+    // PBA 200: set_refcount=5, register +1, L2pRemap rc-neutral = 6.
     assert_eq!(store.get_refcount(Pba(200)).unwrap(), 6);
-    // PBA 100 should be decremented: 3 - 1 = 2
-    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 2);
+    // Phase 5: L2pRemap is rc-neutral, so PBA 100 is NOT decremented
+    // by the hit. Lineage GC handles eventual reclaim via dead-list.
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 3);
     // Blockmap should point to PBA 200 now
     let m = store.get_mapping(&vol, Lba(5)).unwrap().unwrap();
     assert_eq!(m.pba, Pba(200));
@@ -1263,12 +1297,13 @@ fn batch_dedup_hits_multiple_decrement_same_old() {
         let bv = make_bv(100, 4096, 1, 0);
         store.atomic_write_mapping(&vol, Lba(i), &bv).unwrap();
     }
-    // Re-set refcount to 5 after atomic_write_mapping set it to 1 each time
+    // Phase 5: atomic_write_mapping is rc-neutral, so the seed
+    // set_refcount(100, 5) is still in effect here.
     store.set_refcount(Pba(100), 5).unwrap();
     // Target PBA 200 with refcount 10
     store.set_refcount(Pba(200), 10).unwrap();
     let h = [test_hash(1), test_hash(2), test_hash(3)];
-    register_dedup_entries(&store, 200, &h);
+    register_dedup_entries(&store, 200, &h); // Phase 5: rc(200) 10→13
 
     let hits = vec![
         (Lba(0), make_bv(200, 4096, 1, 0), h[0]),
@@ -1282,10 +1317,11 @@ fn batch_dedup_hits_multiple_decrement_same_old() {
             _ => panic!("expected Accepted(None) for overwrite hit"),
         }
     }
-    // PBA 200: 10 + 3 = 13
+    // PBA 200: set=10, register +3, L2pRemap rc-neutral = 13.
     assert_eq!(store.get_refcount(Pba(200)).unwrap(), 13);
-    // PBA 100: 5 - 3 = 2 (merge-based)
-    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 2);
+    // Phase 5: L2pRemap is rc-neutral; PBA 100 is NOT decremented by
+    // the hits. Stays at the seeded value (5).
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 5);
 }
 
 #[test]
@@ -1317,9 +1353,10 @@ fn batch_dedup_hits_pba_is_both_target_and_old() {
     ];
     let (results, _newly_zeroed) = store.atomic_batch_dedup_hits(&vol, &hits).unwrap();
     assert_eq!(results.len(), 2);
-    // PBA 100: base=3, +1 (hit 2 targets it), -1 (hit 1 old) = 3
-    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 3);
-    // PBA 200: base=5, +1 (hit 1 targets it) = 6
+    // Phase 5: L2pRemap (hits) is rc-neutral. Only DedupPut increfs.
+    // PBA 100: set=3, register(h1)→100 +1 = 4. Hits don't move rc.
+    assert_eq!(store.get_refcount(Pba(100)).unwrap(), 4);
+    // PBA 200: set=5, register(h0)→200 +1 = 6. Hits don't move rc.
     assert_eq!(store.get_refcount(Pba(200)).unwrap(), 6);
 }
 
@@ -1386,6 +1423,7 @@ fn batch_write_packed_merge_decrement() {
             .atomic_write_mapping(&vol, Lba(i), &make_bv(50, 4096, 1, 0))
             .unwrap();
     }
+    // Phase 5: atomic_write_mapping is rc-neutral; seed survives.
     store.set_refcount(Pba(50), 5).unwrap();
 
     // Write packed slot with PBA 300 containing LBA 0,1
@@ -1397,11 +1435,14 @@ fn batch_write_packed_merge_decrement() {
         .atomic_batch_write_packed(&batch, Pba(300), 2)
         .unwrap();
 
-    // PBA 50 should be decremented by 2 → 3 (merge-based)
-    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
-    // PBA 300 refcount = 2
-    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 2);
-    // PBA 50 remains live (5→3), so no cleanup payload is returned.
+    // Phase 5: hot-path L2pRemap is rc-neutral; PBA 50 is NOT
+    // auto-decremented by the overwrite (Lineage GC handles eventual
+    // reclaim).
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 5);
+    // Phase 5: `new_refcount` arg is ignored; PBA 300 rc stays 0.
+    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 0);
+    // No cleanup payload because PBA 50's rc is still > 0 in the
+    // post-apply filter.
     assert!(old_meta.is_empty());
 }
 
@@ -1419,15 +1460,17 @@ fn batch_write_packed_merge_decrement_to_zero() {
         .unwrap();
     store.set_refcount(Pba(50), 1).unwrap();
 
-    // Overwrite with PBA 300
+    // Overwrite with PBA 300. Phase 5: hot-path is rc-neutral, so
+    // PBA 50 is NOT auto-decremented. The seeded rc=1 persists until
+    // Lineage GC retires it.
     let batch = vec![(vol.clone(), Lba(0), make_bv(300, 2000, 1, 0))];
     store
         .atomic_batch_write_packed(&batch, Pba(300), 1)
         .unwrap();
 
-    // PBA 50: 1 - 1 = 0 (merge clamps to 0, key still exists with value 0)
-    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 0);
-    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 1);
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 1);
+    // Phase 5: `new_refcount` is ignored; PBA 300 rc stays 0.
+    assert_eq!(store.get_refcount(Pba(300)).unwrap(), 0);
 }
 
 // --- merge-based decrement tests for atomic_batch_write_multi ---
@@ -1446,15 +1489,15 @@ fn batch_write_multi_merge_decrement_only() {
         .unwrap();
     store.set_refcount(Pba(50), 3).unwrap();
 
-    // Overwrite LBA 0 with PBA 400. PBA 50 is decrement-only (not a target).
+    // Overwrite LBA 0 with PBA 400. Phase 5: hot-path L2pRemap is
+    // rc-neutral; PBA 50 is NOT decremented and PBA 400 is NOT
+    // increfed by the write.
     let batch_values = vec![(Lba(0), make_bv(400, 4096, 1, 0))];
     let units = vec![(&vol, batch_values.as_slice(), 1u32)];
     let old_meta = store.atomic_batch_write_multi(&units).unwrap();
 
-    // PBA 50 remains live (3→2), so no cleanup payload is returned.
+    // PBA 50 still has its seeded rc=3, so no cleanup payload.
     assert!(old_meta.is_empty());
-    // PBA 50: 3 - 1 = 2
-    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 2);
-    // PBA 400: 0 + 1 = 1 (new path)
-    assert_eq!(store.get_refcount(Pba(400)).unwrap(), 1);
+    assert_eq!(store.get_refcount(Pba(50)).unwrap(), 3);
+    assert_eq!(store.get_refcount(Pba(400)).unwrap(), 0);
 }

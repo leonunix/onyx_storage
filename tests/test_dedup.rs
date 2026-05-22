@@ -603,9 +603,13 @@ fn dedup_hit_reuses_pba() {
     // Both LBAs should point to the same PBA (dedup hit)
     assert_eq!(second_mapping.pba, first_pba, "dedup hit should reuse PBA");
 
-    // Refcount should be 2
+    // Phase 5: hot-path L2pRemap is rc-neutral. The dedup-promote
+    // tx's DedupPut bumps rc(first_pba) 0→1 ("shared via
+    // dedup_index" reference); the L2pRemap of the second LBA does
+    // not add another rc. Pre-Phase-5 the L2pRemap also incref'd, so
+    // this assertion was `rc == 2`.
     let rc = meta.get_refcount(first_pba).unwrap();
-    assert_eq!(rc, 2, "refcount should be 2 for dedup'd PBA");
+    assert_eq!(rc, 1, "Phase 5: dedup_index entry = 1 rc; L2pRemap rc-neutral");
 }
 
 #[test]
@@ -626,7 +630,10 @@ fn overwrite_shared_dedup_pba_keeps_forward_index() {
         .get_dedup_entry(&hash)
         .unwrap()
         .expect("verified duplicate should promote dedup index");
-    assert_eq!(meta.get_refcount(before.pba).unwrap(), 2);
+    // Phase 5: DedupPut for the verified duplicate bumps rc(before.pba)
+    // 0→1 ("shared via dedup_index" reference). The L2pRemap of LBA 1
+    // is rc-neutral. Pre-Phase 5 the per-write incref made this rc=2.
+    assert_eq!(meta.get_refcount(before.pba).unwrap(), 1);
 
     let replacement = vec![0x42; 4096];
     pool.append("test-vol", Lba(0), 1, &replacement, 1000)
@@ -634,10 +641,14 @@ fn overwrite_shared_dedup_pba_keeps_forward_index() {
     assert!(wait_flushed(&pool, 10000), "overwrite flush timeout");
     flusher.stop();
 
+    // Phase 5: overwriting LBA 0 is rc-neutral at the L2pRemap layer;
+    // the dedup_index entry for the original hash still exists with
+    // rc=1 because no FreePbas / cleanup retired the source PBA yet
+    // (LBA 1 still references it).
     assert_eq!(
         meta.get_refcount(before.pba).unwrap(),
         1,
-        "one shared reference should remain live"
+        "dedup_index entry keeps rc=1; L2pRemap rc-neutral"
     );
     assert_eq!(
         meta.get_mapping(&VolumeId("test-vol".into()), Lba(1))
@@ -706,7 +717,9 @@ fn dedup_concurrent_hits_correct_refcount() {
         .unwrap()
         .unwrap()
         .pba;
-    assert_eq!(meta.get_refcount(first_pba).unwrap(), 1);
+    // Phase 5: hot-path L2pRemap is rc-neutral; fresh miss leaves
+    // rc(first_pba)=0 until a promote bumps it.
+    assert_eq!(meta.get_refcount(first_pba).unwrap(), 0);
 
     // Write same content to 4 different LBAs — all should be dedup hits
     // With 2 dedup workers, these may be processed concurrently
@@ -732,11 +745,16 @@ fn dedup_concurrent_hits_correct_refcount() {
         );
     }
 
-    // Refcount should be exactly 5 (no lost increments from concurrent hits)
+    // Phase 5: rc tracks dedup_index entries (and PromotionChunks), not
+    // per-LBA references. The first candidate-hit on this PBA emits one
+    // DedupPut → rc(first_pba) = 1. Subsequent hits (whether through the
+    // dedup_index path or via candidate cache for the same hash) are
+    // de-duplicated by the dedup workers and do not generate additional
+    // promotes. Pre-Phase-5 this assertion was `rc == 5` (one per LBA).
     let rc = meta.get_refcount(first_pba).unwrap();
     assert_eq!(
-        rc, 5,
-        "refcount should be 5 after 4 concurrent dedup hits + 1 original"
+        rc, 1,
+        "Phase 5: single dedup_index entry → rc=1; L2pRemap rc-neutral"
     );
 }
 
@@ -1281,7 +1299,8 @@ fn dedup_miss_recovers_after_meta_write_failure() {
         .unwrap()
         .unwrap();
     assert_eq!(mapping.flags, 0);
-    assert_eq!(meta.get_refcount(mapping.pba).unwrap(), 1);
+    // Phase 5: fresh write is rc-neutral.
+    assert_eq!(meta.get_refcount(mapping.pba).unwrap(), 0);
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_none(),
         "fresh write must not publish dedup_index until a duplicate verifies"
@@ -1321,8 +1340,10 @@ fn dedup_hit_failure_demotes_to_miss() {
         second_mapping.pba, original_mapping.pba,
         "forced dedup-hit failure should demote the write to a fresh miss allocation"
     );
-    assert_eq!(meta.get_refcount(original_mapping.pba).unwrap(), 1);
-    assert_eq!(meta.get_refcount(second_mapping.pba).unwrap(), 1);
+    // Phase 5: both PBAs are fresh writes (no DedupPut, no promote);
+    // hot-path L2pRemap is rc-neutral so rc stays at 0 for each.
+    assert_eq!(meta.get_refcount(original_mapping.pba).unwrap(), 0);
+    assert_eq!(meta.get_refcount(second_mapping.pba).unwrap(), 0);
     // Promote-on-verified-hit: the demoted write is a fresh miss, so
     // it warms the candidate cache rather than publishing into
     // dedup_index. Both fresh writes leave the persistent index empty.

@@ -324,6 +324,36 @@ impl EngineHarness {
         }
 
         if let Some(allocator) = self.engine().allocator() {
+            // Phase 5 ([[no-refcount-hot-path-design]]): the writer no
+            // longer retires PBAs on overwrite. The old PBA is pushed
+            // onto the volume's dead-list; metadb's Lineage GC walks
+            // the chain, emits `WalOp::FreePbas`, and the engine's
+            // `LineageFreedPbaDrainHandle` thread pulls those PBAs
+            // through `allocator.free_one` (which decrements
+            // `allocated_block_count`).
+            //
+            // The async_reclaim worker that drives the Lineage GC
+            // pass is currently default-off (see onyx's
+            // `default_metadb_async_reclaim_enabled` — held at false
+            // pending the 2026-05-15 underflow root-cause). In this
+            // mode the dead-list grows on every overwrite and is
+            // never drained inside a test run, so the
+            // pre-Phase-5 invariant
+            //   `allocated == live_mappings + retired`
+            // becomes an inequality:
+            //   `allocated >= live_mappings + retired`.
+            // The gap is exactly the number of PBAs the writer
+            // pushed onto the dead-list but Lineage GC has not yet
+            // surfaced via FreePbas (or surfaced but the drain
+            // thread has not yet folded back into the allocator).
+            //
+            // The cross-cut invariant that *does* still hold is
+            // the structural one:
+            //   `free + allocated == usable_blocks` (total minus the
+            //   reserved superblock region). Allocator-internal
+            //   accounting is unaffected by Phase 5; we just have
+            //   fewer "live" allocations and more "dead-but-not-yet-
+            //   reclaimed" ones.
             let allocated = self.engine().meta().iter_allocated_blocks().unwrap();
             let allocated_set = allocated.iter().copied().collect::<HashSet<_>>();
             let retired_extents = allocator.retired_candidates(usize::MAX);
@@ -340,10 +370,23 @@ impl EngineHarness {
                     );
                 }
             }
-            assert_eq!(
+            // Phase 5: relaxed to `>=`. The difference
+            // `allocated - (live + retired)` is the number of PBAs
+            // sitting in the dead-list → Lineage GC → drain
+            // pipeline. They are not leaked — Lineage GC will
+            // eventually surface them as FreePbas and the drain
+            // thread will fold them back into the allocator — but
+            // they may legitimately be in transit at the moment we
+            // sample.
+            assert!(
+                allocator.allocated_block_count()
+                    >= allocated_set.len() as u64 + retired_blocks,
+                "allocator allocated count must be >= live metadata + retired \
+                 blocks (Phase 5 allows extras pending Lineage GC drain). \
+                 allocated={}, live={}, retired={}",
                 allocator.allocated_block_count(),
-                allocated_set.len() as u64 + retired_blocks,
-                "allocator allocated count must match live metadata plus retired blocks"
+                allocated_set.len(),
+                retired_blocks,
             );
             assert_eq!(
                 allocator.free_block_count() + allocator.allocated_block_count(),
