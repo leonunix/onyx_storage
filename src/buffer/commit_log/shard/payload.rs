@@ -332,7 +332,7 @@ impl BufferShard {
         hydrated
     }
 
-    pub(super) fn volatile_payload(&self, seq: u64) -> Option<Arc<[u8]>> {
+    pub(in crate::buffer::commit_log) fn volatile_payload(&self, seq: u64) -> Option<Arc<[u8]>> {
         self.volatile_payloads
             .get(&seq)
             .map(|payload| payload.value().clone())
@@ -555,7 +555,10 @@ impl BufferShard {
         Some(Self::pending_to_buffer_entry(&entry))
     }
 
-    pub(super) fn pending_entry_arc(&self, seq: u64) -> Option<Arc<PendingEntry>> {
+    pub(in crate::buffer::commit_log) fn pending_entry_arc(
+        &self,
+        seq: u64,
+    ) -> Option<Arc<PendingEntry>> {
         self.pending_entries
             .get(&seq)
             .map(|entry| entry.value().clone())

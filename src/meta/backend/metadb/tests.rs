@@ -1,4 +1,6 @@
 use super::*;
+use crate::meta::backend::metadb::values::from_dedup_value;
+use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, VolumeId};
 
 #[test]

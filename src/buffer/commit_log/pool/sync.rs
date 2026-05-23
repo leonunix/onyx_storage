@@ -138,7 +138,7 @@ impl WriteBufferPool {
     /// The failpoint-driven test injection from `sync_device_impl` is checked
     /// after CQE harvest so existing recovery tests still cover this path.
 
-    pub(super) fn write_batch_and_sync_uring(
+    pub(in crate::buffer::commit_log) fn write_batch_and_sync_uring(
         device: &RawDevice,
         shard: &BufferShard,
         ring: &Arc<IoUringSession>,
