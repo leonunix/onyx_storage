@@ -73,6 +73,10 @@ pub struct MetaMemorySnapshot {
     pub commit_finish_global_wait_max_us: u64,
     pub commit_apply_us: u64,
     pub commit_apply_max_us: u64,
+    // ZFS-TXG-clone Phase 1: direct L2P apply on commit thread.
+    pub commit_direct_apply_count: u64,
+    pub commit_direct_apply_us: u64,
+    pub commit_direct_apply_max_us: u64,
     pub commit_apply_l2p_wait_us: u64,
     pub commit_apply_l2p_wait_max_us: u64,
     pub commit_apply_rc_enqueue_us: u64,

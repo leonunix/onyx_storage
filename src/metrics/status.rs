@@ -275,6 +275,13 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
+                "metadb_commit_direct_apply: count={} us={} max_us={}",
+                metadb.commit_direct_apply_count,
+                metadb.commit_direct_apply_us,
+                metadb.commit_direct_apply_max_us,
+            );
+            let _ = writeln!(
+                out,
                 "metadb_commit_apply_split: l2p_wait_us={} l2p_wait_max_us={} rc_enqueue_us={} rc_enqueue_max_us={} rc_wait_us={} rc_wait_max_us={} dedup_enqueue_us={} dedup_enqueue_max_us={} dedup_wait_us={} dedup_wait_max_us={}",
                 metadb.commit_apply_l2p_wait_us,
                 metadb.commit_apply_l2p_wait_max_us,
