@@ -114,6 +114,19 @@ impl MetaStore {
         self.backend.durable_checkpoint_outcome(token)
     }
 
+    /// L2P-shard routing for the commit_worker pre-shard path. Flusher
+    /// uses this to bucket a passthrough chunk's `(Lba, BlockmapValue)`
+    /// pairs by L2P shard before issuing one metadb commit per shard,
+    /// so each sub-commit's dispatch footprint is `{L2p(vol, sid)}`
+    /// rather than `{L2p(vol, 0), ..., L2p(vol, N-1)}`. Combined with
+    /// the metadb-side precise rc footprint (lanes.rs::
+    /// build_lane_dispatch_plan), this lets concurrent commit_workers
+    /// on a single volume dispatch in parallel instead of serializing
+    /// on the dispatch_cvar.
+    pub fn l2p_shard_of(&self, lba: Lba) -> usize {
+        self.backend.l2p_shard_of(lba)
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         self.backend.memory_stats()
     }

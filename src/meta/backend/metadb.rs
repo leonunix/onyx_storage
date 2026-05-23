@@ -106,6 +106,16 @@ impl MetadbBackend {
     /// freed since the last call. Returns owned `Vec<Pba>`; the engine
     /// passes this through `coalesce_free_pbas_to_extents` and retires the
     /// resulting extents via the allocator.
+    /// L2P-shard routing helper for the commit_worker pre-shard path
+    /// (see `buffer/flush/writer/commit_worker/passthrough.rs::
+    /// commit_passthrough_chunk`). Delegates to metadb so the
+    /// client-side bucketing stays in lockstep with apply-side
+    /// `shard_for_key_l2p` — divergence would cause sub-commits to
+    /// claim L2P shards they don't actually touch.
+    pub(crate) fn l2p_shard_of(&self, lba: Lba) -> usize {
+        self.db.l2p_shard_for(lba.0)
+    }
+
     pub(crate) fn drain_lineage_freed_pbas(&self) -> Vec<Pba> {
         let mut out = Vec::new();
         while let Ok(pba) = self.lineage_freed_pbas_rx.try_recv() {

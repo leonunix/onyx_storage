@@ -483,17 +483,34 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
     }
 
-    /// Commit one sub-batch (chunk of unit indices). Records freed
-    /// PBA metadata in `accum_old_meta`. On commit error appends each
-    /// non-empty unit's index to `commit_failed_indices` so the
-    /// post-commit loop frees PBAs and defer_retries seqs.
+    /// Commit one chunk of unit indices.
     ///
-    /// Fresh candidate pairs and stale dedup repairs are accumulated
-    /// into the caller-supplied vecs and dispatched on the post_commit
+    /// Bucket the chunk's `(Lba, BlockmapValue)` pairs by metadb L2P
+    /// shard, then issue one `meta.atomic_batch_write_multi_with_dedup`
+    /// call per non-empty shard. Combined with the precise rc
+    /// footprint in `metadb/src/db/commit/lanes.rs::
+    /// build_lane_dispatch_plan`, each sub-commit's dispatch footprint
+    /// is `{L2p(vol, sid)}` — concurrent commit_workers writing to
+    /// disjoint L2P shards finally dispatch in parallel instead of
+    /// serialising on `mark_wal_durable_and_wait_for_dispatch`.
+    /// Component B of the commit-model overhaul (plan file:
+    /// /root/.claude/plans/golden-popping-newell.md).
+    ///
+    /// Failure policy: any sub-commit error → the entire chunk fails.
+    /// All non-empty units join `commit_failed_indices` so the
+    /// post-commit pass frees PBAs and defer_retries seqs. Rationale:
+    /// partial-unit success leaks PBAs in full-raw extents because the
+    /// per-LBA cleanup paths assume per-unit accounting; reasoning
+    /// about "which sub-positions committed before the failing
+    /// sub-batch" creates more failure modes than recovery code can
+    /// handle. Same blast radius as today's single-batch failure path.
+    ///
+    /// Fresh candidate pairs and stale dedup repairs accumulate into
+    /// the caller-supplied vecs and dispatch on the post_commit
     /// thread, so neither stays under the L2P commit lock. The race
     /// against `cleanup_dead_pbas_batch` is benign: cleanup removes
     /// candidate entries by *old* PBA, while we insert against the new
-    /// PBA returned by this commit (see post_commit.rs).
+    /// PBA returned by these commits (see post_commit.rs).
     fn commit_passthrough_chunk(
         chunk: &[usize],
         vol_id: &VolumeId,
@@ -506,157 +523,252 @@ impl BufferFlusher {
         accum_candidate_pairs: &mut Vec<(ContentHash, BlockmapValue)>,
         accum_stale_repairs: &mut Vec<(ContentHash, DedupEntry, DedupEntry)>,
     ) {
-        let mut batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
-            Vec::with_capacity(chunk.len());
-        let mut all_seqs: Vec<u64> = Vec::new();
-        let mut all_fresh_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-        let mut all_stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
-        let mut sub_batch_lbas: u64 = 0;
-        // (unit_index, len in flat accepted Vec<bool>) for each non-empty unit.
-        let mut unit_spans: Vec<(usize, usize)> = Vec::with_capacity(chunk.len());
-
-        for &i in chunk {
-            if let Some(um) = unit_metas[i].as_ref() {
-                if um.batch_values.is_empty() {
-                    continue;
-                }
-                batch_args.push((
-                    vol_id,
-                    um.batch_values.as_slice(),
-                    um.live_positions.len() as u32,
-                ));
-                all_seqs.extend_from_slice(&um.seqs);
-                sub_batch_lbas += um.batch_values.len() as u64;
-                all_fresh_pairs.extend_from_slice(&um.fresh_dedup_pairs);
-                all_stale_repairs.extend_from_slice(&um.stale_repairs);
-                unit_spans.push((i, um.batch_values.len()));
-            }
+        // Sub-batch slice for ONE unit's pairs that fall into ONE L2P
+        // shard. Multiple sub-batches across shards may exist for a
+        // single unit when its contiguous LBA range crosses leaf
+        // boundaries (rare: a unit covers <= 32 LBAs, leaves are
+        // 128-aligned, so most units land in one shard).
+        struct UnitSubBatch {
+            unit_idx: usize,
+            sub_pairs: Vec<(Lba, BlockmapValue)>,
+            sub_seqs: Vec<u64>,
+            // Original `j` indices into the unit's `batch_values`.
+            // Used to reconstruct per-LBA accepted bits in original
+            // order after all sub-commits return.
+            sub_positions: Vec<usize>,
+            // `live_positions.len()` for the parent unit, forwarded as
+            // the `new_refcount` arg. metadb currently ignores this
+            // field (atomic_batch_write_multi_with_dedup: `let _ =
+            // new_refcount`) but we keep the contract intact.
+            live_count: u32,
         }
 
-        if batch_args.is_empty() {
+        // Phase 1: bucket per-unit pairs by L2P shard.
+        let mut non_empty_units: Vec<usize> = Vec::with_capacity(chunk.len());
+        let mut per_shard: HashMap<usize, Vec<UnitSubBatch>> = HashMap::new();
+        for &i in chunk {
+            let Some(um) = unit_metas[i].as_ref() else {
+                continue;
+            };
+            if um.batch_values.is_empty() {
+                continue;
+            }
+            non_empty_units.push(i);
+            let live_count = um.live_positions.len() as u32;
+            debug_assert_eq!(
+                um.batch_values.len(),
+                um.seqs.len(),
+                "commit_worker: batch_values / seqs length mismatch"
+            );
+            for (j, (lba, bv)) in um.batch_values.iter().enumerate() {
+                let sid = meta.l2p_shard_of(*lba);
+                let bucket = per_shard.entry(sid).or_default();
+                let pos = bucket.iter().rposition(|sb| sb.unit_idx == i);
+                match pos {
+                    Some(p) => {
+                        let entry = &mut bucket[p];
+                        entry.sub_pairs.push((*lba, *bv));
+                        entry.sub_seqs.push(um.seqs[j]);
+                        entry.sub_positions.push(j);
+                    }
+                    None => {
+                        bucket.push(UnitSubBatch {
+                            unit_idx: i,
+                            sub_pairs: vec![(*lba, *bv)],
+                            sub_seqs: vec![um.seqs[j]],
+                            sub_positions: vec![j],
+                            live_count,
+                        });
+                    }
+                }
+            }
+        }
+        if non_empty_units.is_empty() {
             return;
         }
 
-        for &i in chunk {
-            if let Some(um) = unit_metas[i].as_ref() {
-                if um.batch_values.is_empty() {
-                    continue;
+        // Phase 2: fault injection check, once before any metadb work.
+        // Preserves the pre-existing semantics that injection aborts
+        // the whole chunk with no on-disk effect.
+        for &i in &non_empty_units {
+            let Some(um) = unit_metas[i].as_ref() else {
+                continue;
+            };
+            if let Err(e) = maybe_inject_test_failure(
+                &vol_id.0,
+                um.start_lba,
+                FlushFailStage::BeforeMetaWrite,
+            ) {
+                tracing::error!(
+                    vol = %vol_id.0,
+                    start_lba = um.start_lba.0,
+                    chunk_units = chunk.len(),
+                    error = %e,
+                    "commit_worker: passthrough injected metadata failure"
+                );
+                for &j in &non_empty_units {
+                    commit_failed_indices.push(j);
                 }
-                if let Err(e) = maybe_inject_test_failure(
-                    &vol_id.0,
-                    um.start_lba,
-                    FlushFailStage::BeforeMetaWrite,
-                ) {
+                return;
+            }
+        }
+
+        // Phase 3: issue one metadb commit per non-empty L2P shard.
+        // Accumulate per-LBA accepted bits per-unit (Vec<Option<bool>>
+        // sized to the unit's batch_values.len()) and merge `returned`
+        // across shards. Iterate shards in id order so metric
+        // attribution is deterministic.
+        let mut shard_ids: Vec<usize> = per_shard.keys().copied().collect();
+        shard_ids.sort_unstable();
+        let mut per_unit_accept: HashMap<usize, Vec<Option<bool>>> =
+            HashMap::with_capacity(non_empty_units.len());
+        let mut all_returned: HashMap<Pba, RemapCleanup> = HashMap::new();
+        let mut any_failure = false;
+
+        for sid in shard_ids {
+            let shard_buckets = per_shard.get(&sid).expect("shard id from keys");
+            let mut sub_batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+                Vec::with_capacity(shard_buckets.len());
+            let mut sub_seqs_flat: Vec<u64> = Vec::new();
+            let mut sub_lbas: u64 = 0;
+            for ub in shard_buckets {
+                sub_batch_args.push((vol_id, ub.sub_pairs.as_slice(), ub.live_count));
+                sub_seqs_flat.extend_from_slice(&ub.sub_seqs);
+                sub_lbas += ub.sub_pairs.len() as u64;
+            }
+
+            let commit_start = Instant::now();
+            let result =
+                meta.atomic_batch_write_multi_with_dedup(&sub_batch_args, &[], &sub_seqs_flat);
+            Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
+            metrics
+                .flush_writer_meta_commits
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .flush_writer_meta_lbas
+                .fetch_add(sub_lbas, Ordering::Relaxed);
+            metrics
+                .flush_writer_meta_pt_commits
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .flush_writer_meta_pt_lbas
+                .fetch_add(sub_lbas, Ordering::Relaxed);
+
+            match result {
+                Ok((returned, accepted)) => {
+                    let mut offset: usize = 0;
+                    for ub in shard_buckets {
+                        let span = ub.sub_pairs.len();
+                        let unit_accept_slice = &accepted[offset..offset + span];
+                        let batch_len = unit_metas[ub.unit_idx]
+                            .as_ref()
+                            .map(|um| um.batch_values.len())
+                            .unwrap_or(0);
+                        let unit_full = per_unit_accept
+                            .entry(ub.unit_idx)
+                            .or_insert_with(|| vec![None; batch_len]);
+                        for (k, accepted_bit) in unit_accept_slice.iter().enumerate() {
+                            let orig_pos = ub.sub_positions[k];
+                            unit_full[orig_pos] = Some(*accepted_bit);
+                        }
+                        offset += span;
+                    }
+                    for (pba, cleanup) in returned {
+                        all_returned
+                            .entry(pba)
+                            .and_modify(|entry| entry.merge(cleanup.clone()))
+                            .or_insert(cleanup);
+                    }
+                }
+                Err(e) => {
                     tracing::error!(
                         vol = %vol_id.0,
-                        start_lba = um.start_lba.0,
+                        shard_id = sid,
+                        sub_lbas,
                         chunk_units = chunk.len(),
                         error = %e,
-                        "commit_worker: passthrough injected metadata failure"
+                        "commit_worker: passthrough shard sub-batch commit failed"
                     );
-                    for &j in chunk {
-                        if let Some(failed_um) = unit_metas[j].as_ref() {
-                            if !failed_um.batch_values.is_empty() {
-                                commit_failed_indices.push(j);
-                            }
-                        }
-                    }
-                    return;
+                    any_failure = true;
+                    break;
                 }
             }
         }
 
-        let commit_start = Instant::now();
-        let result = meta.atomic_batch_write_multi_with_dedup(&batch_args, &[], &all_seqs);
-        Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
-        metrics
-            .flush_writer_meta_commits
-            .fetch_add(1, Ordering::Relaxed);
-        metrics
-            .flush_writer_meta_lbas
-            .fetch_add(sub_batch_lbas, Ordering::Relaxed);
-        metrics
-            .flush_writer_meta_pt_commits
-            .fetch_add(1, Ordering::Relaxed);
-        metrics
-            .flush_writer_meta_pt_lbas
-            .fetch_add(sub_batch_lbas, Ordering::Relaxed);
+        // Phase 4: failure policy - any sub-commit error fails the
+        // whole chunk. See function docstring for rationale.
+        if any_failure {
+            for &i in &non_empty_units {
+                commit_failed_indices.push(i);
+            }
+            return;
+        }
 
-        match result {
-            Ok((returned, accepted)) => {
-                let rejects = accepted.iter().filter(|a| !**a).count() as u64;
-                if rejects > 0 {
-                    metrics
-                        .flush_seq_rejects
-                        .fetch_add(rejects, Ordering::Relaxed);
-                    // Two cases per unit:
-                    // - every L2pRemap rejected → mark whole-unit rejected;
-                    //   refcount[pba] is still 0 and the freshly-allocated
-                    //   PBA gets freed in the post-commit pass.
-                    // - partial reject (some accepted, some not) → shrink
-                    //   `accepted_positions` so `free_unreferenced_raw_blocks`
-                    //   reclaims the per-LBA PBAs of rejected positions in
-                    //   full-raw extents. Packed-slot fragments share one
-                    //   PBA so the shrink is a no-op there (handled
-                    //   separately in `commit_packed_jobs_batch`).
-                    let mut offset = 0;
-                    for (unit_idx, span) in &unit_spans {
-                        let unit_accepted = &accepted[offset..offset + span];
-                        let any_accepted = unit_accepted.iter().any(|a| *a);
-                        let any_rejected = unit_accepted.iter().any(|a| !*a);
-                        if !any_accepted {
-                            seq_rejected_indices.push(*unit_idx);
-                        } else if any_rejected {
-                            if let Some(um) = unit_metas[*unit_idx].as_mut() {
-                                let kept: Vec<usize> = um
-                                    .live_positions
-                                    .iter()
-                                    .copied()
-                                    .enumerate()
-                                    .filter_map(|(k, pos)| {
-                                        unit_accepted.get(k).copied().unwrap_or(true).then_some(pos)
-                                    })
-                                    .collect();
-                                um.accepted_positions = kept;
-                            }
-                        }
-                        offset += span;
-                    }
-                }
-                for (pba, cleanup) in returned {
-                    accum_old_meta
-                        .entry(pba)
-                        .and_modify(|entry| entry.merge(cleanup.clone()))
-                        .or_insert(cleanup);
-                }
-                // Defer candidate cache insertion + stale dedup repair to
-                // the post_commit thread. They no longer block PT commits
-                // queued behind us on the L2P stripe lock — the L2P remap
-                // and refcount updates already landed in the metadb tx
-                // above, so future dedup-hit lookups are immediately
-                // protected by the persistent index; candidate is a RAM
-                // optimization only.
-                if !all_fresh_pairs.is_empty() {
-                    accum_candidate_pairs.extend(all_fresh_pairs);
-                }
-                if !all_stale_repairs.is_empty() {
-                    accum_stale_repairs.extend(all_stale_repairs);
+        // Phase 5: process per-unit acceptance + shrink
+        // `accepted_positions` for partial seq_guard rejects. Identical
+        // behaviour to the pre-Component-B single-call path, just
+        // assembled from per-shard slices.
+        let mut total_rejects: u64 = 0;
+        for &unit_idx in &non_empty_units {
+            let Some(full_accept) = per_unit_accept.remove(&unit_idx) else {
+                debug_assert!(false, "non-empty unit missing per_unit_accept entry");
+                continue;
+            };
+            let unit_accepted: Vec<bool> = full_accept
+                .iter()
+                .map(|o| {
+                    debug_assert!(
+                        o.is_some(),
+                        "commit_worker: per-LBA accept bit missing after sub-batch merge"
+                    );
+                    o.unwrap_or(true)
+                })
+                .collect();
+            let any_accepted = unit_accepted.iter().any(|a| *a);
+            let any_rejected = unit_accepted.iter().any(|a| !*a);
+            total_rejects += unit_accepted.iter().filter(|a| !**a).count() as u64;
+            if !any_accepted {
+                seq_rejected_indices.push(unit_idx);
+            } else if any_rejected {
+                if let Some(um) = unit_metas[unit_idx].as_mut() {
+                    let kept: Vec<usize> = um
+                        .live_positions
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter_map(|(k, pos)| {
+                            unit_accepted.get(k).copied().unwrap_or(true).then_some(pos)
+                        })
+                        .collect();
+                    um.accepted_positions = kept;
                 }
             }
-            Err(e) => {
-                tracing::error!(
-                    vol = %vol_id.0,
-                    chunk_units = chunk.len(),
-                    chunk_lbas = sub_batch_lbas,
-                    error = %e,
-                    "commit_worker: passthrough sub-batch commit failed"
-                );
-                for &i in chunk {
-                    if let Some(um) = unit_metas[i].as_ref() {
-                        if !um.batch_values.is_empty() {
-                            commit_failed_indices.push(i);
-                        }
-                    }
+        }
+        if total_rejects > 0 {
+            metrics
+                .flush_seq_rejects
+                .fetch_add(total_rejects, Ordering::Relaxed);
+        }
+
+        // Merge freed-PBA cleanup metadata across shards.
+        for (pba, cleanup) in all_returned {
+            accum_old_meta
+                .entry(pba)
+                .and_modify(|entry| entry.merge(cleanup.clone()))
+                .or_insert(cleanup);
+        }
+
+        // Accumulate candidate cache inserts + stale dedup repairs for
+        // the post_commit thread. dedup_index is global (not L2P-
+        // sharded), so these stay chunk-scoped and only fire on full
+        // chunk success.
+        for &unit_idx in &non_empty_units {
+            if let Some(um) = unit_metas[unit_idx].as_ref() {
+                if !um.fresh_dedup_pairs.is_empty() {
+                    accum_candidate_pairs.extend_from_slice(&um.fresh_dedup_pairs);
+                }
+                if !um.stale_repairs.is_empty() {
+                    accum_stale_repairs.extend_from_slice(&um.stale_repairs);
                 }
             }
         }
