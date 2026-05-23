@@ -29,6 +29,11 @@ group_commit_timeout_us = 1
 dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
+# ZFS-TXG-clone Phase 1: enable in-memory L2P buffer + direct-apply fast
+# path on caller thread. Direct apply requires `use_buffer = true` on
+# every target shard, which only happens when l2p_buffer_enabled is on.
+l2p_buffer_enabled = true
+commit_direct_apply_enabled = true
 
 [storage]
 data_device = "/dev/nvme2n1"

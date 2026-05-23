@@ -316,6 +316,16 @@ pub struct MetaConfig {
     /// the entry-count triggers do not fire.
     #[serde(default = "default_l2p_buffer_max_interval_ms")]
     pub l2p_buffer_max_interval_ms: u64,
+
+    /// Enable the ZFS-TXG-clone Phase 1 direct L2P apply fast path.
+    /// When `true` and every target L2P shard runs in `use_buffer`
+    /// mode (requires `l2p_buffer_enabled = true`), L2P-only commits
+    /// apply on the caller thread instead of enqueuing closures onto
+    /// per-shard apply-lane workers. Falls back to the lane path
+    /// automatically for commits that don't match the eligibility
+    /// check. See `metadb/src/config.rs::commit_direct_apply_enabled`.
+    #[serde(default = "default_commit_direct_apply_enabled")]
+    pub commit_direct_apply_enabled: bool,
 }
 
 impl MetaConfig {
@@ -400,6 +410,7 @@ impl Default for MetaConfig {
             l2p_buffer_soft_entries: default_l2p_buffer_soft_entries(),
             l2p_buffer_hard_entries: default_l2p_buffer_hard_entries(),
             l2p_buffer_max_interval_ms: default_l2p_buffer_max_interval_ms(),
+            commit_direct_apply_enabled: default_commit_direct_apply_enabled(),
         }
     }
 }
@@ -474,6 +485,13 @@ fn default_l2p_buffer_hard_entries() -> usize {
 }
 fn default_l2p_buffer_max_interval_ms() -> u64 {
     30_000
+}
+fn default_commit_direct_apply_enabled() -> bool {
+    // metadb defaults to true; safe fallback to lane path when the
+    // commit isn't eligible (touches dedup, guarded remap, lifecycle).
+    // Engages only when `l2p_buffer_enabled` is also set, since every
+    // target shard must have `use_buffer = true`.
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
