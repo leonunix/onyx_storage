@@ -3,7 +3,11 @@
 # Expected layout:
 #   /dev/nvme0n1 -> XFS filesystem mounted at /mnt/onyx-meta
 #   /dev/md/onyx-lv2 -> 4x NVMe RAID0 LV2 write buffer device
-#   /dev/nvme2n1 -> raw LV3 data device
+#   /dev/nvme5n1 -> raw LV3 data device
+#
+# Note: /dev/nvme2n1 must NOT be used — it currently participates in the
+# md127 RAID0 that backs /dev/md/onyx-lv2. Onyx will refuse to start with
+# overlapping LV2/LV3 physical devices.
 #
 # This machine is intentionally treated as a disposable perf/dev box.
 #
@@ -36,7 +40,7 @@ l2p_buffer_enabled = true
 commit_direct_apply_enabled = true
 
 [storage]
-data_device = "/dev/nvme2n1"
+data_device = "/dev/nvme5n1"
 block_size = 4096
 use_hugepages = false
 default_compression = "Lz4"
