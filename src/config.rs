@@ -326,6 +326,20 @@ pub struct MetaConfig {
     /// check. See `metadb/src/config.rs::commit_direct_apply_enabled`.
     #[serde(default = "default_commit_direct_apply_enabled")]
     pub commit_direct_apply_enabled: bool,
+
+    /// Enable the ZFS-TXG-clone Phase 2 deferred-outcome commit path
+    /// on the onyx side. When `true`, the commit_worker calls metadb's
+    /// `Db::commit_ops_deferred` and the returned outcomes are
+    /// delivered at the next L2P compactor pass (the TXG-sync
+    /// boundary) rather than synchronously on the commit thread.
+    /// This config also requires the metadb-side flag
+    /// `commit_deferred_outcomes_enabled = true`; with either flag
+    /// off the call resolves to the existing synchronous path.
+    /// Default off until the 8h `deferred_outcomes_proptest` soak
+    /// gate on nvme-box passes. See
+    /// `/root/.claude/plans/soft-doodling-snail.md`.
+    #[serde(default = "default_commit_deferred_outcomes_enabled")]
+    pub commit_deferred_outcomes_enabled: bool,
 }
 
 impl MetaConfig {
@@ -411,6 +425,7 @@ impl Default for MetaConfig {
             l2p_buffer_hard_entries: default_l2p_buffer_hard_entries(),
             l2p_buffer_max_interval_ms: default_l2p_buffer_max_interval_ms(),
             commit_direct_apply_enabled: default_commit_direct_apply_enabled(),
+            commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
         }
     }
 }
@@ -492,6 +507,13 @@ fn default_commit_direct_apply_enabled() -> bool {
     // Engages only when `l2p_buffer_enabled` is also set, since every
     // target shard must have `use_buffer = true`.
     true
+}
+fn default_commit_deferred_outcomes_enabled() -> bool {
+    // ZFS-TXG-clone Phase 2 — default off during first-month soak.
+    // Flip on after the 8h deferred_outcomes_proptest passes on
+    // nvme-box. The metadb-side flag also defaults off; both must be
+    // true for the deferred path to engage.
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

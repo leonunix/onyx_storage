@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use dashmap::DashMap;
-use onyx_metadb::{Config as MetaDbConfig, Db, DedupValue, VolumeOrdinal};
+use onyx_metadb::{
+    Config as MetaDbConfig, Db, DedupValue, DeferredOutcomeHandle, Lsn, VolumeOrdinal,
+};
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
@@ -54,6 +56,94 @@ use values::{
     from_l2p_value, from_metadb_pba, newly_zeroed_from_remaps, seq_for, to_dedup_value,
     to_l2p_value, to_l2p_value_with_seq, to_metadb_pba,
 };
+
+/// ZFS-TXG-clone Phase 2 onyx-side wrapper around a metadb
+/// [`DeferredOutcomeHandle`]. Carries the `new_values` slice the
+/// caller had buffered so that the cleanup tuple
+/// `(HashMap<Pba, RemapCleanup>, Vec<bool>)` can be assembled inside
+/// `recv()` after the deferred outcomes arrive.
+///
+/// Two construction modes:
+///   * `ready(value)` — outcome already known (empty batch / unlogged
+///     fallback). `recv` returns immediately.
+///   * `wrap(handle, new_values, remap_count)` — outcomes arrive
+///     later via the metadb compactor's per-pass drain.
+pub(crate) struct DeferredCleanupHandle {
+    state: DeferredCleanupHandleState,
+}
+
+enum DeferredCleanupHandleState {
+    Ready(OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>),
+    Pending {
+        inner: DeferredOutcomeHandle,
+        new_values: Vec<BlockmapValue>,
+        remap_count: usize,
+    },
+}
+
+impl DeferredCleanupHandle {
+    /// Build a handle whose cleanup tuple is already known. Used by
+    /// the empty-batch and unlogged-flush paths inside the metadb
+    /// adapter so all entry points can return `DeferredCleanupHandle`
+    /// uniformly.
+    pub(crate) fn ready(
+        value: OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>,
+    ) -> Self {
+        Self {
+            state: DeferredCleanupHandleState::Ready(value),
+        }
+    }
+
+    /// Wrap a metadb deferred-outcome handle plus the `new_values`
+    /// slice the caller pushed before issuing the commit. `recv()`
+    /// will block on the metadb handle, then run
+    /// `newly_zeroed_from_remaps` to materialise the cleanup tuple.
+    pub(crate) fn wrap(
+        inner: DeferredOutcomeHandle,
+        new_values: Vec<BlockmapValue>,
+        remap_count: usize,
+    ) -> Self {
+        Self {
+            state: DeferredCleanupHandleState::Pending {
+                inner,
+                new_values,
+                remap_count,
+            },
+        }
+    }
+
+    /// Resolve the cleanup tuple. Consumes the handle.
+    pub(crate) fn recv(self) -> OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)> {
+        match self.state {
+            DeferredCleanupHandleState::Ready(value) => value,
+            DeferredCleanupHandleState::Pending {
+                inner,
+                new_values,
+                remap_count,
+            } => {
+                let outcomes = inner.recv().map_err(|err| {
+                    OnyxError::Config(format!("metadb deferred outcome recv failed: {err}"))
+                })?;
+                newly_zeroed_from_remaps(
+                    new_values,
+                    outcomes.into_iter().take(remap_count).collect::<Vec<_>>(),
+                )
+            }
+        }
+    }
+
+    /// Return the metadb-side LSN this commit was assigned. Available
+    /// before `recv()` resolves so callers can sequence per-volume
+    /// FIFO without waiting for outcome delivery. `None` for `Ready`
+    /// handles whose cleanup work happened inline.
+    #[allow(dead_code)]
+    pub(crate) fn lsn(&self) -> Option<Lsn> {
+        match &self.state {
+            DeferredCleanupHandleState::Pending { inner, .. } => Some(inner.lsn()),
+            DeferredCleanupHandleState::Ready(_) => None,
+        }
+    }
+}
 
 impl MetadbBackend {
     pub(crate) fn open(config: &MetaConfig) -> OnyxResult<Self> {
@@ -621,11 +711,32 @@ impl MetadbBackend {
         dedup_entries: &[(ContentHash, DedupEntry)],
         seqs: &[u64],
     ) -> OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)> {
+        self.atomic_batch_write_multi_with_dedup_deferred(units, dedup_entries, seqs)?
+            .recv()
+    }
+
+    /// ZFS-TXG-clone Phase 2: deferred counterpart to
+    /// [`Self::atomic_batch_write_multi_with_dedup`]. Issues the
+    /// commit and returns a handle that resolves to the same
+    /// `(HashMap<Pba, RemapCleanup>, Vec<bool>)` tuple — synchronously
+    /// when the metadb-side flag is off (handle pre-populated), at
+    /// the next L2P compactor pass otherwise.
+    ///
+    /// Onyx commit_worker can pipeline multiple in-flight commits per
+    /// volume by issuing several `_deferred` calls before draining
+    /// their handles; the sync wrapper above is the back-compat
+    /// entry point (`recv()` immediately on the handle).
+    pub(crate) fn atomic_batch_write_multi_with_dedup_deferred(
+        &self,
+        units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
+        dedup_entries: &[(ContentHash, DedupEntry)],
+        seqs: &[u64],
+    ) -> OnyxResult<DeferredCleanupHandle> {
         let total_lbas: usize = units.iter().map(|(_, b, _)| b.len()).sum();
         debug_assert!(seqs.is_empty() || seqs.len() == total_lbas);
         if units.is_empty() {
             self.put_dedup_entries(dedup_entries)?;
-            return Ok((HashMap::new(), Vec::new()));
+            return Ok(DeferredCleanupHandle::ready(Ok((HashMap::new(), Vec::new()))));
         }
         let mut tx = self.db.begin();
         let mut new_values = Vec::new();
@@ -645,13 +756,22 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        let (_, outcomes) = if self.unlogged_flush_commits {
-            tx.commit_unlogged_with_outcomes()?
-        } else {
-            tx.commit_with_outcomes()?
-        };
+        // The unlogged-flush path stays sync (no metadb-side
+        // deferred-outcome support for unlogged commits today). Wrap
+        // its result inline into a `Ready` cleanup handle so call
+        // sites can route through the deferred surface uniformly.
+        if self.unlogged_flush_commits {
+            let (_, outcomes) = tx.commit_unlogged_with_outcomes()?;
+            let remap_count = new_values.len();
+            let result = newly_zeroed_from_remaps(
+                new_values,
+                outcomes.into_iter().take(remap_count).collect::<Vec<_>>(),
+            );
+            return Ok(DeferredCleanupHandle::ready(result));
+        }
+        let (_, inner_handle) = tx.commit_deferred_with_outcomes()?;
         let remap_count = new_values.len();
-        newly_zeroed_from_remaps(new_values, outcomes.into_iter().take(remap_count).collect())
+        Ok(DeferredCleanupHandle::wrap(inner_handle, new_values, remap_count))
     }
 
     pub(crate) fn put_dedup_entries(
@@ -1176,6 +1296,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_buffer_hard_entries = config.l2p_buffer_hard_entries;
     cfg.l2p_buffer_max_interval_ms = config.l2p_buffer_max_interval_ms;
     cfg.commit_direct_apply_enabled = config.commit_direct_apply_enabled;
+    cfg.commit_deferred_outcomes_enabled = config.commit_deferred_outcomes_enabled;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
     cfg.async_reclaim_max_pages_per_cycle = config.async_reclaim_max_pages_per_cycle as usize;

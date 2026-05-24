@@ -884,3 +884,120 @@ fn drain_lineage_freed_pbas_returns_dispatched_outcomes() {
         vec![Extent::new(Pba(101), 2), Extent::new(Pba(200), 1)]
     );
 }
+
+/// ZFS-TXG-clone Phase 2 onyx-adapter sanity check: with
+/// `commit_deferred_outcomes_enabled = true` the `*_deferred` entry
+/// point returns a handle whose `recv()` yields the same cleanup
+/// tuple shape as the synchronous wrapper. We don't assert on the
+/// HashMap contents (Phase 5 default keeps `pba_freed` empty for
+/// fresh writes — Lineage GC owns that flow now); only that the
+/// adapter wires the round trip end-to-end and produces
+/// `accepted = [true; N]` for fresh writes.
+#[test]
+fn atomic_batch_write_multi_with_dedup_deferred_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = MetaConfig {
+        path: Some(dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        memtable_budget_mb: 64,
+        index_pin_mb: 64,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
+        wal_dir: None,
+        dedup_shards: 1,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
+        // Phase 2 deferred mode on; pair with l2p_buffer_enabled so
+        // the L2P-buffer code path that the deferred drain piggybacks
+        // on is also active.
+        l2p_buffer_enabled: true,
+        commit_direct_apply_enabled: true,
+        commit_deferred_outcomes_enabled: true,
+        l2p_buffer_max_interval_ms: 25,
+        ..Default::default()
+    };
+    let vol = VolumeConfig {
+        id: VolumeId("vol-deferred".to_string()),
+        size_bytes: 4096 * 64,
+        block_size: 4096,
+        compression: CompressionAlgo::Lz4,
+        created_at: 10,
+        zone_count: 4,
+    };
+    let backend = MetadbBackend::open(&meta).unwrap();
+    backend.put_volume(&vol).unwrap();
+
+    let batch_values: Vec<(Lba, BlockmapValue)> = (0..8u64)
+        .map(|i| {
+            (
+                Lba(i),
+                BlockmapValue {
+                    pba: Pba(1000 + i),
+                    compression: 1,
+                    unit_compressed_size: 1234,
+                    unit_original_size: 4096,
+                    unit_lba_count: 1,
+                    offset_in_unit: 0,
+                    crc32: 0xDEAD_BEEF,
+                    slot_offset: 0,
+                    flags: 0,
+                },
+            )
+        })
+        .collect();
+
+    let units: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![
+        (&vol.id, batch_values.as_slice(), 1u32),
+    ];
+    let seqs: Vec<u64> = (1..=batch_values.len() as u64).collect();
+
+    let handle = backend
+        .atomic_batch_write_multi_with_dedup_deferred(&units, &[], &seqs)
+        .expect("deferred submit accepted");
+    // LSN is available before `recv` resolves.
+    assert!(handle.lsn().is_some());
+    let (cleanup, accepted) = handle.recv().expect("deferred recv resolves");
+    assert_eq!(accepted.len(), batch_values.len());
+    assert!(
+        accepted.iter().all(|&ok| ok),
+        "every fresh write must accept under seq_guard"
+    );
+    // Phase 5: freed PBAs flow via Lineage GC, not outcomes — so the
+    // cleanup map is empty for these fresh writes (no prior mapping
+    // to displace, no rc-decref → no freed_pba in outcomes).
+    assert!(
+        cleanup.is_empty(),
+        "fresh writes produce no displaced PBAs under Phase 5: {cleanup:?}"
+    );
+
+    // The synchronous wrapper still works and is byte-equivalent.
+    let batch_values2: Vec<(Lba, BlockmapValue)> = (8..16u64)
+        .map(|i| {
+            (
+                Lba(i),
+                BlockmapValue {
+                    pba: Pba(2000 + i),
+                    compression: 1,
+                    unit_compressed_size: 1234,
+                    unit_original_size: 4096,
+                    unit_lba_count: 1,
+                    offset_in_unit: 0,
+                    crc32: 0xCAFE_F00D,
+                    slot_offset: 0,
+                    flags: 0,
+                },
+            )
+        })
+        .collect();
+    let units2: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![
+        (&vol.id, batch_values2.as_slice(), 1u32),
+    ];
+    let seqs2: Vec<u64> = (9..9 + batch_values2.len() as u64).collect();
+    let (sync_cleanup, sync_accepted) = backend
+        .atomic_batch_write_multi_with_dedup(&units2, &[], &seqs2)
+        .expect("sync wrapper still works");
+    assert_eq!(sync_accepted.len(), batch_values2.len());
+    assert!(sync_accepted.iter().all(|&ok| ok));
+    assert!(sync_cleanup.is_empty());
+}
