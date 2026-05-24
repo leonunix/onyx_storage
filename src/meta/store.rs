@@ -392,6 +392,20 @@ impl MetaStore {
             .atomic_batch_write_multi_with_dedup(units, dedup_entries, seqs)
     }
 
+    /// ZFS-TXG-clone Phase 2: deferred-outcome surface used by the
+    /// commit_worker pipeline (see `commit_worker/passthrough.rs`).
+    /// `recv()` on the returned handle reproduces the sync tuple
+    /// returned by [`Self::atomic_batch_write_multi_with_dedup`].
+    pub fn atomic_batch_write_multi_with_dedup_deferred(
+        &self,
+        units: &[(&VolumeId, &[(Lba, BlockmapValue)], u32)],
+        dedup_entries: &[(ContentHash, DedupEntry)],
+        seqs: &[u64],
+    ) -> OnyxResult<crate::meta::backend::metadb::DeferredCleanupHandle> {
+        self.backend
+            .atomic_batch_write_multi_with_dedup_deferred(units, dedup_entries, seqs)
+    }
+
     pub fn get_refcount(&self, pba: Pba) -> OnyxResult<u32> {
         self.backend.get_refcount(pba)
     }

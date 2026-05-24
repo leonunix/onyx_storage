@@ -1,4 +1,46 @@
 use super::*;
+use crate::meta::backend::metadb::DeferredCleanupHandle;
+
+/// ZFS-TXG-clone Phase 2: one chunk's worth of in-flight metadb
+/// deferred commits parked in the commit_worker's pipeline deque.
+/// Built by [`BufferFlusher::issue_passthrough_chunk_deferred`] and
+/// consumed (in arrival order) by
+/// [`BufferFlusher::drain_passthrough_chunk`]. Per-volume FIFO is
+/// preserved because the same worker owns the deque and drains its
+/// front before issuing the next.
+struct PendingPassthroughChunk {
+    /// Snapshot of the chunk's `unit_metas` indices the issue side
+    /// observed. Replayed verbatim during drain so Phase 4 (failure
+    /// policy) and Phase 5 (`accepted_positions` shrink) operate on
+    /// exactly the units that produced the staged outcomes.
+    non_empty_units: Vec<usize>,
+    /// One entry per metadb `atomic_batch_write_multi_with_dedup_deferred`
+    /// call issued for this chunk (one per touched L2P shard).
+    shards: Vec<PendingShardCommit>,
+    /// Wall-clock when the first per-shard issue happened. The drain
+    /// adds (issue + wait) into `flush_writer_meta_commit_ns` so the
+    /// metric stays comparable with the sync path.
+    issue_started_at: Instant,
+}
+
+struct PendingShardCommit {
+    sid: usize,
+    handle: DeferredCleanupHandle,
+    /// Per-unit slice that fed this shard's sub-batch — needed to
+    /// remap the flat `accepted: Vec<bool>` back into per-unit
+    /// `per_unit_accept[unit_idx][orig_pos]` during drain.
+    sub_batches: Vec<PendingUnitSubBatch>,
+    /// Sum of `sub_pairs.len()` across this shard's sub-batches,
+    /// re-used for the post-drain LBA counters that previously fired
+    /// inline at sync-commit time.
+    sub_lbas: u64,
+}
+
+struct PendingUnitSubBatch {
+    unit_idx: usize,
+    span: usize,
+    sub_positions: Vec<usize>,
+}
 
 /// Per-unit decisions consumed by chunked commit below. Module-scope
 /// so `commit_passthrough_chunk` can take a `&mut [Option<UnitMeta>]`.
@@ -41,6 +83,7 @@ impl BufferFlusher {
         lane_done_txs: &[Sender<Vec<u64>>],
         post_commit_tx: &Sender<PostCommitJob>,
         target_lbas_per_tx: usize,
+        commit_worker_pipeline_depth: usize,
     ) {
         let total_start = Instant::now();
         let PassthroughCommitJob { vol_id, units, .. } = job;
@@ -201,18 +244,28 @@ impl BufferFlusher {
             // Sub-batch the commits to ≤ TARGET_OPS_PER_COMMIT total
             // LBAs. With 0 LSN contention each commit only pays its
             // own per-tx fixed cost; bigger sub-batches still amortise
-            // WAL fsync.
+            // WAL fsync. ZFS-TXG-clone Phase 2: each emitted chunk now
+            // issues `_deferred` metadb commits and parks them in
+            // `pending_q`. With `depth_cap = 1` the deque is drained
+            // before the next issue, reproducing the legacy sync
+            // pacing one chunk in flight at a time.
             let mut accum_old_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
             let mut chunk: Vec<usize> = Vec::new();
             let mut chunk_lbas: usize = 0;
+            let depth_cap = commit_worker_pipeline_depth.max(1);
+            let mut pending_q: VecDeque<PendingPassthroughChunk> =
+                VecDeque::with_capacity(depth_cap);
             for i in 0..n {
                 let Some(um) = unit_metas[i].as_ref() else {
                     continue;
                 };
                 let lbas = um.batch_values.len();
                 if !chunk.is_empty() && chunk_lbas.saturating_add(lbas) > target_lbas_per_tx {
-                    Self::commit_passthrough_chunk(
-                        &chunk,
+                    Self::flush_or_queue_passthrough_chunk(
+                        &mut chunk,
+                        &mut chunk_lbas,
+                        &mut pending_q,
+                        depth_cap,
                         &vol_id,
                         &mut unit_metas,
                         meta,
@@ -223,14 +276,15 @@ impl BufferFlusher {
                         &mut accum_candidate_pairs,
                         &mut accum_stale_repairs,
                     );
-                    chunk.clear();
-                    chunk_lbas = 0;
                 }
                 chunk.push(i);
                 chunk_lbas += lbas;
                 if lbas > target_lbas_per_tx {
-                    Self::commit_passthrough_chunk(
-                        &chunk,
+                    Self::flush_or_queue_passthrough_chunk(
+                        &mut chunk,
+                        &mut chunk_lbas,
+                        &mut pending_q,
+                        depth_cap,
                         &vol_id,
                         &mut unit_metas,
                         meta,
@@ -241,16 +295,32 @@ impl BufferFlusher {
                         &mut accum_candidate_pairs,
                         &mut accum_stale_repairs,
                     );
-                    chunk.clear();
-                    chunk_lbas = 0;
                 }
             }
             if !chunk.is_empty() {
-                Self::commit_passthrough_chunk(
-                    &chunk,
+                Self::flush_or_queue_passthrough_chunk(
+                    &mut chunk,
+                    &mut chunk_lbas,
+                    &mut pending_q,
+                    depth_cap,
                     &vol_id,
                     &mut unit_metas,
                     meta,
+                    metrics,
+                    &mut accum_old_meta,
+                    &mut commit_failed_indices,
+                    &mut seq_rejected_indices,
+                    &mut accum_candidate_pairs,
+                    &mut accum_stale_repairs,
+                );
+            }
+            // Drain whatever's still queued — issuing chunks left the
+            // deque non-empty when the pipeline depth was wider than
+            // the chunk count.
+            while let Some(front) = pending_q.pop_front() {
+                Self::drain_passthrough_chunk(
+                    front,
+                    &mut unit_metas,
                     metrics,
                     &mut accum_old_meta,
                     &mut commit_failed_indices,
@@ -483,36 +553,27 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
     }
 
-    /// Commit one chunk of unit indices.
+    /// ZFS-TXG-clone Phase 2 deque step. Blocks on the oldest in-
+    /// flight chunk when the deque is already at `depth_cap`, then
+    /// issues the `chunk` snapshot via
+    /// [`Self::issue_passthrough_chunk_deferred`]. The snapshot vec
+    /// is cleared on return regardless of whether the issue produced
+    /// a `PendingPassthroughChunk` (empty chunks short-circuit with
+    /// no metadb work).
     ///
-    /// Bucket the chunk's `(Lba, BlockmapValue)` pairs by metadb L2P
-    /// shard, then issue one `meta.atomic_batch_write_multi_with_dedup`
-    /// call per non-empty shard. Combined with the precise rc
-    /// footprint in `metadb/src/db/commit/lanes.rs::
-    /// build_lane_dispatch_plan`, each sub-commit's dispatch footprint
-    /// is `{L2p(vol, sid)}` — concurrent commit_workers writing to
-    /// disjoint L2P shards finally dispatch in parallel instead of
-    /// serialising on `mark_wal_durable_and_wait_for_dispatch`.
-    /// Component B of the commit-model overhaul (plan file:
-    /// /root/.claude/plans/golden-popping-newell.md).
-    ///
-    /// Failure policy: any sub-commit error → the entire chunk fails.
-    /// All non-empty units join `commit_failed_indices` so the
-    /// post-commit pass frees PBAs and defer_retries seqs. Rationale:
-    /// partial-unit success leaks PBAs in full-raw extents because the
-    /// per-LBA cleanup paths assume per-unit accounting; reasoning
-    /// about "which sub-positions committed before the failing
-    /// sub-batch" creates more failure modes than recovery code can
-    /// handle. Same blast radius as today's single-batch failure path.
-    ///
-    /// Fresh candidate pairs and stale dedup repairs accumulate into
-    /// the caller-supplied vecs and dispatch on the post_commit
-    /// thread, so neither stays under the L2P commit lock. The race
-    /// against `cleanup_dead_pbas_batch` is benign: cleanup removes
-    /// candidate entries by *old* PBA, while we insert against the new
-    /// PBA returned by these commits (see post_commit.rs).
-    fn commit_passthrough_chunk(
-        chunk: &[usize],
+    /// `depth_cap = 1` reproduces the legacy sync pacing: every
+    /// chunk drains its own outcome before the next issue, so the
+    /// only behavioural delta vs the pre-Phase-2 code is the extra
+    /// deque indirection. `depth_cap > 1` keeps up to
+    /// `depth_cap - 1` chunks in flight per volume; with metadb's
+    /// `commit_deferred_outcomes_enabled` also `true` this is the
+    /// pipeline that delivers the plan's drain win.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_or_queue_passthrough_chunk(
+        chunk: &mut Vec<usize>,
+        chunk_lbas: &mut usize,
+        pending_q: &mut VecDeque<PendingPassthroughChunk>,
+        depth_cap: usize,
         vol_id: &VolumeId,
         unit_metas: &mut [Option<UnitMeta>],
         meta: &MetaStore,
@@ -523,6 +584,72 @@ impl BufferFlusher {
         accum_candidate_pairs: &mut Vec<(ContentHash, BlockmapValue)>,
         accum_stale_repairs: &mut Vec<(ContentHash, DedupEntry, DedupEntry)>,
     ) {
+        // Step 1: if the deque is at depth cap, block on the
+        // oldest handle so issue does not exceed `depth_cap`
+        // in-flight commits per volume.
+        if pending_q.len() >= depth_cap {
+            let front = pending_q
+                .pop_front()
+                .expect("at-cap implies non-empty pending_q");
+            Self::drain_passthrough_chunk(
+                front,
+                unit_metas,
+                metrics,
+                accum_old_meta,
+                commit_failed_indices,
+                seq_rejected_indices,
+                accum_candidate_pairs,
+                accum_stale_repairs,
+            );
+        }
+        // Step 2: issue the next chunk. Empty / discarded-only
+        // chunks return None and contribute nothing to the deque.
+        if let Some(pending) = Self::issue_passthrough_chunk_deferred(
+            chunk,
+            vol_id,
+            unit_metas,
+            meta,
+            metrics,
+            commit_failed_indices,
+        ) {
+            pending_q.push_back(pending);
+        }
+        chunk.clear();
+        *chunk_lbas = 0;
+    }
+
+    /// Issue half of the legacy `commit_passthrough_chunk`.
+    ///
+    /// Bucket the chunk's `(Lba, BlockmapValue)` pairs by metadb L2P
+    /// shard, then issue one
+    /// `meta.atomic_batch_write_multi_with_dedup_deferred` call per
+    /// non-empty shard. Combined with the precise rc footprint in
+    /// `metadb/src/db/commit/lanes.rs::build_lane_dispatch_plan`,
+    /// each sub-commit's dispatch footprint is `{L2p(vol, sid)}` —
+    /// concurrent commit_workers writing to disjoint L2P shards
+    /// dispatch in parallel instead of serialising on
+    /// `mark_wal_durable_and_wait_for_dispatch`.
+    /// Component B of the commit-model overhaul (plan file:
+    /// /root/.claude/plans/golden-popping-newell.md).
+    ///
+    /// Returns `None` when the chunk is empty after Phase 1 bucketing
+    /// (every unit either discarded or live-filtered out) or when
+    /// fault injection rejected the chunk before any metadb work.
+    /// In the second case `commit_failed_indices` carries the unit
+    /// indices so the post-commit pass can free PBAs.
+    ///
+    /// Phase 4 (failure policy, partial errors) and Phase 5
+    /// (`accepted_positions` shrink) run in
+    /// [`Self::drain_passthrough_chunk`] when the staged handles
+    /// resolve, preserving the existing sync-mode semantics.
+    fn issue_passthrough_chunk_deferred(
+        chunk: &[usize],
+        vol_id: &VolumeId,
+        unit_metas: &mut [Option<UnitMeta>],
+        meta: &MetaStore,
+        metrics: &EngineMetrics,
+        commit_failed_indices: &mut Vec<usize>,
+    ) -> Option<PendingPassthroughChunk> {
         // Sub-batch slice for ONE unit's pairs that fall into ONE L2P
         // shard. Multiple sub-batches across shards may exist for a
         // single unit when its contiguous LBA range crosses leaf
@@ -584,7 +711,7 @@ impl BufferFlusher {
             }
         }
         if non_empty_units.is_empty() {
-            return;
+            return None;
         }
 
         // Phase 2: fault injection check, once before any metadb work.
@@ -609,38 +736,57 @@ impl BufferFlusher {
                 for &j in &non_empty_units {
                     commit_failed_indices.push(j);
                 }
-                return;
+                return None;
             }
         }
 
-        // Phase 3: issue one metadb commit per non-empty L2P shard.
-        // Accumulate per-LBA accepted bits per-unit (Vec<Option<bool>>
-        // sized to the unit's batch_values.len()) and merge `returned`
-        // across shards. Iterate shards in id order so metric
-        // attribution is deterministic.
+        // Phase 3 (issue half): for each non-empty L2P shard, build
+        // flat sub-batch args and issue one
+        // `atomic_batch_write_multi_with_dedup_deferred` call. Park
+        // the handle plus the per-unit slice metadata needed to
+        // re-decode the per-LBA `accepted` bits at drain time. Iterate
+        // shards in id order so metric attribution stays deterministic.
         let mut shard_ids: Vec<usize> = per_shard.keys().copied().collect();
         shard_ids.sort_unstable();
-        let mut per_unit_accept: HashMap<usize, Vec<Option<bool>>> =
-            HashMap::with_capacity(non_empty_units.len());
-        let mut all_returned: HashMap<Pba, RemapCleanup> = HashMap::new();
-        let mut any_failure = false;
-
+        let issue_started_at = Instant::now();
+        let mut pending_shards: Vec<PendingShardCommit> =
+            Vec::with_capacity(shard_ids.len());
         for sid in shard_ids {
-            let shard_buckets = per_shard.get(&sid).expect("shard id from keys");
+            let shard_buckets = per_shard.remove(&sid).expect("shard id from keys");
             let mut sub_batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
                 Vec::with_capacity(shard_buckets.len());
             let mut sub_seqs_flat: Vec<u64> = Vec::new();
             let mut sub_lbas: u64 = 0;
-            for ub in shard_buckets {
+            for ub in &shard_buckets {
                 sub_batch_args.push((vol_id, ub.sub_pairs.as_slice(), ub.live_count));
                 sub_seqs_flat.extend_from_slice(&ub.sub_seqs);
                 sub_lbas += ub.sub_pairs.len() as u64;
             }
 
-            let commit_start = Instant::now();
-            let result =
-                meta.atomic_batch_write_multi_with_dedup(&sub_batch_args, &[], &sub_seqs_flat);
-            Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, commit_start);
+            let handle = match meta.atomic_batch_write_multi_with_dedup_deferred(
+                &sub_batch_args,
+                &[],
+                &sub_seqs_flat,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(
+                        vol = %vol_id.0,
+                        shard_id = sid,
+                        sub_lbas,
+                        chunk_units = chunk.len(),
+                        error = %e,
+                        "commit_worker: passthrough deferred shard issue failed"
+                    );
+                    for &j in &non_empty_units {
+                        commit_failed_indices.push(j);
+                    }
+                    // Previously-issued shard handles for this chunk
+                    // drop here; the metadb compactor will fire into
+                    // a disconnected sender (silent no-op).
+                    return None;
+                }
+            };
             metrics
                 .flush_writer_meta_commits
                 .fetch_add(1, Ordering::Relaxed);
@@ -654,12 +800,80 @@ impl BufferFlusher {
                 .flush_writer_meta_pt_lbas
                 .fetch_add(sub_lbas, Ordering::Relaxed);
 
-            match result {
+            let sub_batches: Vec<PendingUnitSubBatch> = shard_buckets
+                .into_iter()
+                .map(|ub| PendingUnitSubBatch {
+                    unit_idx: ub.unit_idx,
+                    span: ub.sub_pairs.len(),
+                    sub_positions: ub.sub_positions,
+                })
+                .collect();
+            pending_shards.push(PendingShardCommit {
+                sid,
+                handle,
+                sub_batches,
+                sub_lbas,
+            });
+        }
+
+        Some(PendingPassthroughChunk {
+            non_empty_units,
+            shards: pending_shards,
+            issue_started_at,
+        })
+    }
+
+    /// Drain a parked `PendingPassthroughChunk` produced by
+    /// [`Self::issue_passthrough_chunk_deferred`].
+    ///
+    /// Blocks on each shard handle's `recv()` in issue order, merges
+    /// per-shard `(returned, accepted)` tuples into `per_unit_accept`
+    /// and `all_returned`, then runs the legacy Phase 4 (failure
+    /// policy) and Phase 5 (`accepted_positions` shrink) inline
+    /// against the same caller-owned accumulators as before. The
+    /// `flush_writer_meta_commit_ns` metric covers the full
+    /// issue→drain window so post-Phase-2 dashboards stay comparable
+    /// with the sync baseline.
+    ///
+    /// Failure policy preserved: any shard `recv()` error or
+    /// `Err`-returning commit promotes every `non_empty_units` index
+    /// into `commit_failed_indices` so the post-commit pass frees
+    /// PBAs and `defer_retry`s the seqs. Partial-unit success is
+    /// rejected for the same reason as the sync path — full-raw
+    /// extent cleanup assumes per-unit accounting.
+    #[allow(clippy::too_many_arguments)]
+    fn drain_passthrough_chunk(
+        pending: PendingPassthroughChunk,
+        unit_metas: &mut [Option<UnitMeta>],
+        metrics: &EngineMetrics,
+        accum_old_meta: &mut HashMap<Pba, RemapCleanup>,
+        commit_failed_indices: &mut Vec<usize>,
+        seq_rejected_indices: &mut Vec<usize>,
+        accum_candidate_pairs: &mut Vec<(ContentHash, BlockmapValue)>,
+        accum_stale_repairs: &mut Vec<(ContentHash, DedupEntry, DedupEntry)>,
+    ) {
+        let PendingPassthroughChunk {
+            non_empty_units,
+            shards,
+            issue_started_at,
+        } = pending;
+        let mut per_unit_accept: HashMap<usize, Vec<Option<bool>>> =
+            HashMap::with_capacity(non_empty_units.len());
+        let mut all_returned: HashMap<Pba, RemapCleanup> = HashMap::new();
+        let mut any_failure = false;
+
+        for ps in shards {
+            let PendingShardCommit {
+                sid,
+                handle,
+                sub_batches,
+                sub_lbas,
+            } = ps;
+            match handle.recv() {
                 Ok((returned, accepted)) => {
                     let mut offset: usize = 0;
-                    for ub in shard_buckets {
-                        let span = ub.sub_pairs.len();
-                        let unit_accept_slice = &accepted[offset..offset + span];
+                    for ub in &sub_batches {
+                        let unit_accept_slice = &accepted[offset..offset + ub.span];
                         let batch_len = unit_metas[ub.unit_idx]
                             .as_ref()
                             .map(|um| um.batch_values.len())
@@ -671,7 +885,7 @@ impl BufferFlusher {
                             let orig_pos = ub.sub_positions[k];
                             unit_full[orig_pos] = Some(*accepted_bit);
                         }
-                        offset += span;
+                        offset += ub.span;
                     }
                     for (pba, cleanup) in returned {
                         all_returned
@@ -682,21 +896,24 @@ impl BufferFlusher {
                 }
                 Err(e) => {
                     tracing::error!(
-                        vol = %vol_id.0,
                         shard_id = sid,
                         sub_lbas,
-                        chunk_units = chunk.len(),
                         error = %e,
-                        "commit_worker: passthrough shard sub-batch commit failed"
+                        "commit_worker: passthrough deferred shard recv failed"
                     );
                     any_failure = true;
+                    // Remaining handles drop with the for-loop; the
+                    // compactor's eventual send into a disconnected
+                    // receiver is silent.
                     break;
                 }
             }
         }
+        Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, issue_started_at);
 
         // Phase 4: failure policy - any sub-commit error fails the
-        // whole chunk. See function docstring for rationale.
+        // whole chunk. Same rationale as the sync path: partial-unit
+        // success would leak PBAs in full-raw extents.
         if any_failure {
             for &i in &non_empty_units {
                 commit_failed_indices.push(i);
@@ -705,9 +922,7 @@ impl BufferFlusher {
         }
 
         // Phase 5: process per-unit acceptance + shrink
-        // `accepted_positions` for partial seq_guard rejects. Identical
-        // behaviour to the pre-Component-B single-call path, just
-        // assembled from per-shard slices.
+        // `accepted_positions` for partial seq_guard rejects.
         let mut total_rejects: u64 = 0;
         for &unit_idx in &non_empty_units {
             let Some(full_accept) = per_unit_accept.remove(&unit_idx) else {

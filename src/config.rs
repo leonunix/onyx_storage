@@ -753,6 +753,24 @@ pub struct FlushConfig {
     /// improve backend drain when the write queue is saturated.
     #[serde(default = "default_writer_read_active_batch_size")]
     pub writer_read_active_batch_size: usize,
+    /// ZFS-TXG-clone Phase 2: enable the per-volume commit_worker
+    /// pipeline that issues up to `commit_worker_pipeline_depth`
+    /// metadb `atomic_batch_write_multi_with_dedup_deferred` calls
+    /// before blocking on the oldest. With `false` (default) the
+    /// commit worker drains every issued handle immediately, which
+    /// reproduces the legacy sync timing even when both this flag
+    /// and `metadb.commit_deferred_outcomes_enabled` are true. Both
+    /// flags must flip to `true` to realise the pipelining win
+    /// (see `/root/.claude/plans/soft-doodling-snail.md`).
+    #[serde(default = "default_commit_worker_deferred_outcomes")]
+    pub commit_worker_deferred_outcomes: bool,
+    /// Maximum number of in-flight deferred commits a passthrough
+    /// commit worker keeps queued before blocking on the oldest. Has
+    /// no effect when `commit_worker_deferred_outcomes = false`
+    /// (worker still issues + drains one at a time). Default 4
+    /// matches the plan's per-volume FIFO budget.
+    #[serde(default = "default_commit_worker_pipeline_depth")]
+    pub commit_worker_pipeline_depth: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -789,6 +807,8 @@ impl Default for FlushConfig {
             commit_coalesce_timeout_us: default_commit_coalesce_timeout_us(),
             packed_commit_try_drain_lba_budget: default_packed_commit_try_drain_lba_budget(),
             writer_read_active_batch_size: default_writer_read_active_batch_size(),
+            commit_worker_deferred_outcomes: default_commit_worker_deferred_outcomes(),
+            commit_worker_pipeline_depth: default_commit_worker_pipeline_depth(),
         }
     }
 }
@@ -828,6 +848,17 @@ fn default_packed_commit_try_drain_lba_budget() -> usize {
 }
 fn default_writer_read_active_batch_size() -> usize {
     crate::buffer::flush::BufferFlusher::WRITER_BATCH_SIZE_READ_ACTIVE
+}
+fn default_commit_worker_deferred_outcomes() -> bool {
+    // ZFS-TXG-clone Phase 2 first cut: opt-in until the metadb soak
+    // gate (`metadb/tests/deferred_outcomes_proptest.rs` + 8h
+    // nvme-box concurrent soak) passes. Flipping this without the
+    // metadb counterpart leaves the pipeline draining each handle
+    // inline, so the only effect is the extra deque indirection.
+    false
+}
+fn default_commit_worker_pipeline_depth() -> usize {
+    4
 }
 fn default_zone_count() -> u32 {
     4

@@ -112,6 +112,14 @@ impl BufferFlusher {
         let commit_coalesce_lba_budget = config.commit_coalesce_lba_budget;
         let commit_coalesce_timeout = Duration::from_micros(config.commit_coalesce_timeout_us);
         let packed_commit_try_drain_lba_budget = config.packed_commit_try_drain_lba_budget;
+        // ZFS-TXG-clone Phase 2: collapse onyx flag + depth knob to a
+        // single effective cap. Flag off → cap=1 (sync pacing via
+        // deque); flag on → cap=configured depth (4 by default).
+        let commit_worker_pipeline_depth = if config.commit_worker_deferred_outcomes {
+            config.commit_worker_pipeline_depth.max(1)
+        } else {
+            1
+        };
         let dedup_enabled = dedup_config.enabled;
         let dedup_workers = Self::per_lane_worker_count(dedup_config.workers.max(1), lane_count);
         let dedup_skip_threshold = dedup_config.buffer_skip_threshold_pct;
@@ -393,6 +401,7 @@ impl BufferFlusher {
                         commit_coalesce_lba_budget,
                         commit_coalesce_timeout,
                         packed_commit_try_drain_lba_budget,
+                        commit_worker_pipeline_depth,
                         &running_c,
                     );
                 })

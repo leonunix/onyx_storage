@@ -457,6 +457,7 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         std::slice::from_ref(&done_tx),
         &post_commit_tx,
         super::writer::TARGET_OPS_PER_COMMIT,
+        1,
     );
     drop(post_commit_tx);
     post_commit_handle
@@ -529,6 +530,7 @@ fn coalesced_passthrough_done_routes_to_origin_shards() {
         &[done0_tx, done1_tx],
         &post_commit_tx,
         super::writer::TARGET_OPS_PER_COMMIT,
+        1,
     );
     drop(post_commit_tx);
     post_commit_handle
@@ -588,6 +590,7 @@ fn commit_worker_publishes_candidates_before_post_commit() {
         std::slice::from_ref(&done_tx),
         &post_commit_tx,
         super::writer::TARGET_OPS_PER_COMMIT,
+        1,
     );
 
     let published = candidate

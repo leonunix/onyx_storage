@@ -115,6 +115,7 @@ impl BufferFlusher {
         coalesce_lba_budget: usize,
         coalesce_timeout: Duration,
         packed_try_drain_lba_budget: usize,
+        commit_worker_pipeline_depth: usize,
         running: &AtomicBool,
     ) {
         let _ = worker_idx;
@@ -153,6 +154,7 @@ impl BufferFlusher {
                         lane_done_txs,
                         post_commit_tx,
                         target_lbas_per_tx,
+                        commit_worker_pipeline_depth,
                     );
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -191,6 +193,7 @@ impl BufferFlusher {
                 lane_done_txs,
                 post_commit_tx,
                 target_lbas_per_tx,
+                commit_worker_pipeline_depth,
             );
         }
     }
@@ -265,6 +268,7 @@ impl BufferFlusher {
         lane_done_txs: &[Sender<Vec<u64>>],
         post_commit_tx: &Sender<PostCommitJob>,
         target_lbas_per_tx: usize,
+        commit_worker_pipeline_depth: usize,
     ) {
         Self::record_commit_worker_drain(metrics, &jobs);
         let mut pending_pt: Option<PassthroughCommitJob> = None;
@@ -290,6 +294,7 @@ impl BufferFlusher {
                             lane_done_txs,
                             post_commit_tx,
                             target_lbas_per_tx,
+                            commit_worker_pipeline_depth,
                         );
                         pending_pt = Some(pj);
                     }
@@ -320,6 +325,7 @@ impl BufferFlusher {
                 lane_done_txs,
                 post_commit_tx,
                 target_lbas_per_tx,
+                commit_worker_pipeline_depth,
             );
         }
 
@@ -387,6 +393,7 @@ impl BufferFlusher {
         lane_done_txs: &[Sender<Vec<u64>>],
         post_commit_tx: &Sender<PostCommitJob>,
         target_lbas_per_tx: usize,
+        commit_worker_pipeline_depth: usize,
     ) {
         let primary_shard = pj.units.first().map(|u| u.shard_idx).unwrap_or(0);
         let service_start = Instant::now();
@@ -413,6 +420,7 @@ impl BufferFlusher {
             lane_done_txs,
             post_commit_tx,
             target_lbas_per_tx,
+            commit_worker_pipeline_depth,
         );
         Self::record_elapsed(&metrics.flush_commit_worker_service_ns, service_start);
     }

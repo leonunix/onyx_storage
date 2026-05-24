@@ -132,6 +132,46 @@ impl DeferredCleanupHandle {
         }
     }
 
+    /// Non-blocking probe; consumes the handle on `Ok`, returns it
+    /// back on `Err(self)` if the metadb compactor has not yet
+    /// released the staged outcome. Reserved for future opportunistic
+    /// drain paths in `commit_worker/passthrough.rs`; the current
+    /// pipeline relies on `recv()` only.
+    #[allow(dead_code)]
+    pub(crate) fn try_recv(self) -> Result<OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>, Self>
+    {
+        match self.state {
+            DeferredCleanupHandleState::Ready(value) => Ok(value),
+            DeferredCleanupHandleState::Pending {
+                inner,
+                new_values,
+                remap_count,
+            } => match inner.try_recv() {
+                Ok(outcomes_result) => {
+                    let outcomes = match outcomes_result {
+                        Ok(outcomes) => outcomes,
+                        Err(err) => {
+                            return Ok(Err(OnyxError::Config(format!(
+                                "metadb deferred outcome recv failed: {err}"
+                            ))));
+                        }
+                    };
+                    Ok(newly_zeroed_from_remaps(
+                        new_values,
+                        outcomes.into_iter().take(remap_count).collect::<Vec<_>>(),
+                    ))
+                }
+                Err(inner) => Err(Self {
+                    state: DeferredCleanupHandleState::Pending {
+                        inner,
+                        new_values,
+                        remap_count,
+                    },
+                }),
+            },
+        }
+    }
+
     /// Return the metadb-side LSN this commit was assigned. Available
     /// before `recv()` resolves so callers can sequence per-volume
     /// FIFO without waiting for outcome delivery. `None` for `Ready`
