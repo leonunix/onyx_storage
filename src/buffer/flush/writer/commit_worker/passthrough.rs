@@ -588,6 +588,7 @@ impl BufferFlusher {
         // oldest handle so issue does not exceed `depth_cap`
         // in-flight commits per volume.
         if pending_q.len() >= depth_cap {
+            let block_start = Instant::now();
             let front = pending_q
                 .pop_front()
                 .expect("at-cap implies non-empty pending_q");
@@ -601,6 +602,12 @@ impl BufferFlusher {
                 accum_candidate_pairs,
                 accum_stale_repairs,
             );
+            metrics
+                .flush_commit_worker_pipeline_block_drains
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .flush_commit_worker_pipeline_block_drain_ns
+                .fetch_add(block_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         // Step 2: issue the next chunk. Empty / discarded-only
         // chunks return None and contribute nothing to the deque.
@@ -613,6 +620,13 @@ impl BufferFlusher {
             commit_failed_indices,
         ) {
             pending_q.push_back(pending);
+            metrics
+                .flush_commit_worker_pipeline_issues
+                .fetch_add(1, Ordering::Relaxed);
+            crate::metrics::record_counter_max(
+                &metrics.flush_commit_worker_pipeline_depth_max,
+                pending_q.len() as u64,
+            );
         }
         chunk.clear();
         *chunk_lbas = 0;

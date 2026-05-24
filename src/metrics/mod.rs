@@ -320,6 +320,21 @@ pub struct EngineMetrics {
     pub flush_commit_worker_drain_lbas: AtomicU64,
     pub flush_commit_worker_drain_jobs_max: AtomicU64,
     pub flush_commit_worker_drain_lbas_max: AtomicU64,
+    /// ZFS-TXG-clone Phase 2 pipeline observability. `pipeline_issues`
+    /// counts passthrough chunks fed into the per-volume deferred-outcome
+    /// deque (`flush_or_queue_passthrough_chunk` calls that produced a
+    /// `PendingPassthroughChunk`). `pipeline_depth_max` is the high-water
+    /// mark of `pending_q.len()` observed across all volumes — when
+    /// `commit_worker_deferred_outcomes=false` this stays at 1; with the
+    /// flag on it approaches `commit_worker_pipeline_depth`.
+    /// `pipeline_block_drains` counts how often the front of the deque
+    /// had to be drained inline because the deque was at `depth_cap`;
+    /// `pipeline_block_drain_ns` accumulates that wall time. Both
+    /// counters are 0 when nothing is in flight (legacy sync pacing).
+    pub flush_commit_worker_pipeline_issues: AtomicU64,
+    pub flush_commit_worker_pipeline_depth_max: AtomicU64,
+    pub flush_commit_worker_pipeline_block_drains: AtomicU64,
+    pub flush_commit_worker_pipeline_block_drain_ns: AtomicU64,
     pub flush_stage_coalesce_send_ns: AtomicU64,
     pub flush_stage_coalesce_send_ops: AtomicU64,
     pub flush_stage_coalesce_send_len_sum: AtomicU64,
