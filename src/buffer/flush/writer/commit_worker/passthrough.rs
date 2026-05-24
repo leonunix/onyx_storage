@@ -23,6 +23,18 @@ struct PendingPassthroughChunk {
     issue_started_at: Instant,
 }
 
+impl PendingPassthroughChunk {
+    /// Non-blocking readiness probe: `true` when every per-shard
+    /// handle has its staged outcome released by the metadb L2P
+    /// compactor. Used by the opportunistic forward drain so chunks
+    /// whose outcomes have already arrived are pulled off the front
+    /// of the deque before the next issue, keeping `pending_q.len()`
+    /// closer to the steady-state pipeline depth instead of the cap.
+    fn is_ready(&self) -> bool {
+        self.shards.iter().all(|ps| ps.handle.is_ready())
+    }
+}
+
 struct PendingShardCommit {
     sid: usize,
     handle: DeferredCleanupHandle,
@@ -584,7 +596,35 @@ impl BufferFlusher {
         accum_candidate_pairs: &mut Vec<(ContentHash, BlockmapValue)>,
         accum_stale_repairs: &mut Vec<(ContentHash, DedupEntry, DedupEntry)>,
     ) {
-        // Step 1: if the deque is at depth cap, block on the
+        // Step 1a: opportunistic forward-drain — pull any chunks
+        // whose handles are already ready off the front of the
+        // deque without blocking. Keeps `pending_q.len()` closer to
+        // steady-state pipeline depth instead of the cap and avoids
+        // future at-cap block drains when the metadb compactor has
+        // already released the staged outcomes.
+        while pending_q
+            .front()
+            .map(|c| c.is_ready())
+            .unwrap_or(false)
+        {
+            let front = pending_q
+                .pop_front()
+                .expect("front().is_some() guarantees a value");
+            Self::drain_passthrough_chunk(
+                front,
+                unit_metas,
+                metrics,
+                accum_old_meta,
+                commit_failed_indices,
+                seq_rejected_indices,
+                accum_candidate_pairs,
+                accum_stale_repairs,
+            );
+            metrics
+                .flush_commit_worker_pipeline_opportunistic_drains
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // Step 1b: if the deque is still at depth cap, block on the
         // oldest handle so issue does not exceed `depth_cap`
         // in-flight commits per volume.
         if pending_q.len() >= depth_cap {

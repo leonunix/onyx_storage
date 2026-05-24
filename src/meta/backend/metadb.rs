@@ -132,6 +132,17 @@ impl DeferredCleanupHandle {
         }
     }
 
+    /// Non-consuming readiness probe. `true` when `recv` would
+    /// resolve without blocking — either because the handle was
+    /// constructed via [`Self::ready`] or because the metadb
+    /// compactor has already released the staged outcome.
+    pub(crate) fn is_ready(&self) -> bool {
+        match &self.state {
+            DeferredCleanupHandleState::Ready(_) => true,
+            DeferredCleanupHandleState::Pending { inner, .. } => inner.is_ready(),
+        }
+    }
+
     /// Non-blocking probe; consumes the handle on `Ok`, returns it
     /// back on `Err(self)` if the metadb compactor has not yet
     /// released the staged outcome. Reserved for future opportunistic

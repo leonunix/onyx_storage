@@ -185,6 +185,7 @@ impl Default for EngineMetrics {
             flush_commit_worker_pipeline_depth_max: AtomicU64::new(0),
             flush_commit_worker_pipeline_block_drains: AtomicU64::new(0),
             flush_commit_worker_pipeline_block_drain_ns: AtomicU64::new(0),
+            flush_commit_worker_pipeline_opportunistic_drains: AtomicU64::new(0),
             flush_stage_coalesce_send_ns: AtomicU64::new(0),
             flush_stage_coalesce_send_ops: AtomicU64::new(0),
             flush_stage_coalesce_send_len_sum: AtomicU64::new(0),

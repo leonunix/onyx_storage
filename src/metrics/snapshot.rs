@@ -208,6 +208,9 @@ impl EngineMetrics {
             flush_commit_worker_pipeline_block_drain_ns: load(
                 &self.flush_commit_worker_pipeline_block_drain_ns,
             ),
+            flush_commit_worker_pipeline_opportunistic_drains: load(
+                &self.flush_commit_worker_pipeline_opportunistic_drains,
+            ),
             flush_stage_coalesce_send_ns: load(&self.flush_stage_coalesce_send_ns),
             flush_stage_coalesce_send_ops: load(&self.flush_stage_coalesce_send_ops),
             flush_stage_coalesce_send_len_sum: load(&self.flush_stage_coalesce_send_len_sum),
@@ -469,6 +472,7 @@ pub struct EngineMetricsSnapshot {
     pub flush_commit_worker_pipeline_depth_max: u64,
     pub flush_commit_worker_pipeline_block_drains: u64,
     pub flush_commit_worker_pipeline_block_drain_ns: u64,
+    pub flush_commit_worker_pipeline_opportunistic_drains: u64,
     pub flush_stage_coalesce_send_ns: u64,
     pub flush_stage_coalesce_send_ops: u64,
     pub flush_stage_coalesce_send_len_sum: u64,
@@ -761,6 +765,7 @@ impl EngineMetricsSnapshot {
             flush_commit_worker_pipeline_depth_max,
             flush_commit_worker_pipeline_block_drains,
             flush_commit_worker_pipeline_block_drain_ns,
+            flush_commit_worker_pipeline_opportunistic_drains,
             flush_stage_coalesce_send_ns,
             flush_stage_coalesce_send_ops,
             flush_stage_coalesce_send_len_sum,

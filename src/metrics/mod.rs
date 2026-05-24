@@ -335,6 +335,12 @@ pub struct EngineMetrics {
     pub flush_commit_worker_pipeline_depth_max: AtomicU64,
     pub flush_commit_worker_pipeline_block_drains: AtomicU64,
     pub flush_commit_worker_pipeline_block_drain_ns: AtomicU64,
+    /// Opportunistic forward-drain hits: count of pipeline chunks
+    /// whose metadb deferred-outcome handles were already ready when
+    /// `flush_or_queue_passthrough_chunk` probed the deque front
+    /// before issuing the next chunk. Each hit avoids a future
+    /// `pipeline_block_drains` event when the next issue arrives.
+    pub flush_commit_worker_pipeline_opportunistic_drains: AtomicU64,
     pub flush_stage_coalesce_send_ns: AtomicU64,
     pub flush_stage_coalesce_send_ops: AtomicU64,
     pub flush_stage_coalesce_send_len_sum: AtomicU64,
