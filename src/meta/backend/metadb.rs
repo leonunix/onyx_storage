@@ -204,12 +204,16 @@ impl MetadbBackend {
         fs::create_dir_all(path)?;
 
         let db_config = metadb_config_from_onyx(path, config);
+        // metadb's `open_with_config` / `create_with_config` return
+        // `Arc<Db>` directly (Phase 4 Step 8: needed so the
+        // `TxgSyncThread`'s `sync_work` callback can capture
+        // `Weak<Db>` without circular shutdown). No extra `Arc::new`
+        // wrap.
         let db = if path.join(METADB_PAGE_FILE).exists() {
             Db::open_with_config(db_config)?
         } else {
             Db::create_with_config(db_config)?
         };
-        let db = Arc::new(db);
 
         let catalog_path = path.join(CATALOG_FILE);
         let catalog = VolumeCatalog::load(&catalog_path)?;
