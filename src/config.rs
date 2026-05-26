@@ -509,11 +509,11 @@ fn default_commit_direct_apply_enabled() -> bool {
     true
 }
 fn default_commit_deferred_outcomes_enabled() -> bool {
-    // ZFS-TXG-clone Phase 2 — default off during first-month soak.
-    // Flip on after the 8h deferred_outcomes_proptest passes on
-    // nvme-box. The metadb-side flag also defaults off; both must be
-    // true for the deferred path to engage.
-    false
+    // ZFS-TXG-clone Phase 2 — production default.
+    // Validated by the 8h nvme-phase23-soak (verify-clean, zero
+    // underflow/panic, engine alive end-to-end). Paired with the onyx
+    // `commit_worker_deferred_outcomes` default; both engage together.
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -850,12 +850,11 @@ fn default_writer_read_active_batch_size() -> usize {
     crate::buffer::flush::BufferFlusher::WRITER_BATCH_SIZE_READ_ACTIVE
 }
 fn default_commit_worker_deferred_outcomes() -> bool {
-    // ZFS-TXG-clone Phase 2 first cut: opt-in until the metadb soak
-    // gate (`metadb/tests/deferred_outcomes_proptest.rs` + 8h
-    // nvme-box concurrent soak) passes. Flipping this without the
-    // metadb counterpart leaves the pipeline draining each handle
-    // inline, so the only effect is the extra deque indirection.
-    false
+    // ZFS-TXG-clone Phase 2 — production default. Paired with the
+    // metadb-side `commit_deferred_outcomes_enabled`; flipping either
+    // alone leaves the pipeline draining each handle inline. Validated
+    // by the 8h nvme-phase23-soak (zero verify error, no underflow).
+    true
 }
 fn default_commit_worker_pipeline_depth() -> usize {
     4
