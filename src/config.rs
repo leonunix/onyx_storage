@@ -98,6 +98,39 @@ impl OnyxConfig {
     }
 }
 
+/// Buffer-as-sole-journal Phase B / C selector. See
+/// `MetaConfig::journal_mode` for the full contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetadbJournalMode {
+    /// Legacy: WAL is the authoritative metadata journal. Default.
+    Wal,
+    /// Phase B observability: WAL still authoritative, but checkpoint
+    /// commits also persist `manifest.last_processed_buffer_seq` so a
+    /// parallel buffer-replay can be diffed against the WAL state.
+    Shadow,
+    /// Phase C cutover: commit_ops skips the WAL submit; LV2 buffer +
+    /// lifecycle-log are the only journals.
+    Buffer,
+}
+
+impl MetadbJournalMode {
+    /// Whether the hot commit path should call `wal.submit_to_*` (true
+    /// for Wal / Shadow; false for Buffer).
+    pub fn wal_authoritative(self) -> bool {
+        !matches!(self, Self::Buffer)
+    }
+
+    /// Whether checkpoint commits must populate
+    /// `manifest.last_processed_buffer_seq` from the engine's buffer
+    /// hook. True for Shadow and Buffer; the WAL-only path leaves the
+    /// field zero (the existing checkpoint_lsn watermark covers
+    /// recovery).
+    pub fn requires_buffer_watermark(self) -> bool {
+        !matches!(self, Self::Wal)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaConfig {
     /// Path to metadata directory (on LV1 / XFS). Holds blockmap, refcount,
@@ -155,6 +188,24 @@ pub struct MetaConfig {
     /// the dominant chunk of `wal_submit_us`.
     #[serde(default = "default_metadb_wal_async_group_commit_window_us")]
     pub wal_async_group_commit_window_us: u64,
+    /// Buffer-as-sole-journal Phase B / C selector. `"wal"` (default)
+    /// keeps the legacy hot-path WAL submit + fsync_all_lanes barrier.
+    /// `"buffer"` skips the WAL submit, treating the LV2 buffer as the
+    /// single intent log: metadb mutations live in memory until a
+    /// checkpoint persists them, and onyx replays buffer entries with
+    /// `seq > manifest.last_processed_buffer_seq` on open.
+    ///
+    /// `"shadow"` (Phase B observability) keeps the WAL authoritative
+    /// but additionally maintains `manifest.last_processed_buffer_seq`
+    /// on every checkpoint so a parallel buffer-replay can be compared
+    /// against the WAL-derived state. No commit-path latency cost; the
+    /// only added work is one extra atomic load + manifest field write
+    /// per checkpoint.
+    ///
+    /// See `.claude/plans/ethereal-exploring-pretzel.md` for the
+    /// migration plan.
+    #[serde(default = "default_metadb_journal_mode")]
+    pub journal_mode: MetadbJournalMode,
     /// Trigger an early metadb checkpoint when the in-memory dirty
     /// work (L2P dirty pages + RC pending deltas) exceeds this
     /// count, instead of waiting only for the periodic checkpoint
@@ -411,6 +462,7 @@ impl Default for MetaConfig {
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_async_group_commit_window_us: default_metadb_wal_async_group_commit_window_us(),
+            journal_mode: default_metadb_journal_mode(),
             flush_dirty_pages_threshold: default_metadb_flush_dirty_pages_threshold(),
             flush_dirty_pages_target: default_metadb_flush_dirty_pages_target(),
             io_submitter_bg_inflight_cap: default_metadb_io_submitter_bg_inflight_cap(),
@@ -898,6 +950,12 @@ fn default_metadb_group_commit_timeout_us() -> u64 {
 fn default_metadb_wal_async_group_commit_window_us() -> u64 {
     // Match metadb's own default; opt-in tuning lives in nvme-detailed.toml.
     1000
+}
+fn default_metadb_journal_mode() -> MetadbJournalMode {
+    // Phase B/C land progressively. Default stays on the legacy WAL
+    // path; operators opt into Shadow (observability) or Buffer
+    // (cutover) per cluster.
+    MetadbJournalMode::Wal
 }
 fn default_metadb_flush_dirty_pages_threshold() -> u64 {
     // 2026-05-15 nvme-box sweep: 100k caps single-flush sample size
