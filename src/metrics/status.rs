@@ -244,7 +244,7 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_commit: attempts={} success={} errors={} empty={} ops={} wal_body_bytes={} wal_body_bytes_max={} total_us={} max_us={} apply_wait_us={} apply_wait_max_us={} apply_gate_wait_us={} apply_gate_wait_max_us={} finish_global_wait_us={} finish_global_wait_max_us={} apply_us={} apply_max_us={} plan_us={} plan_max_us={} encode_us={} encode_max_us={} unlogged_gate_wait_us={} unlogged_gate_wait_max_us={} checkpoint_unlogged_us={} checkpoint_unlogged_max_us={} read_held_us={} read_held_max_us={}",
+                "metadb_commit: attempts={} success={} errors={} empty={} ops={} wal_body_bytes={} wal_body_bytes_max={} total_us={} max_us={} drop_gate_wait_us={} drop_gate_wait_max_us={} wal_submit_us={} wal_submit_max_us={} apply_wait_us={} apply_wait_max_us={} apply_gate_wait_us={} apply_gate_wait_max_us={} finish_global_wait_us={} finish_global_wait_max_us={} apply_us={} apply_max_us={} plan_us={} plan_max_us={} encode_us={} encode_max_us={} unlogged_gate_wait_us={} unlogged_gate_wait_max_us={} checkpoint_unlogged_us={} checkpoint_unlogged_max_us={} read_held_us={} read_held_max_us={}",
                 metadb.commit_attempts,
                 metadb.commit_success,
                 metadb.commit_errors,
@@ -254,6 +254,10 @@ impl EngineStatusSnapshot {
                 metadb.commit_wal_body_bytes_max,
                 metadb.commit_total_us,
                 metadb.commit_total_max_us,
+                metadb.commit_drop_gate_wait_us,
+                metadb.commit_drop_gate_wait_max_us,
+                metadb.commit_wal_submit_us,
+                metadb.commit_wal_submit_max_us,
                 metadb.commit_apply_wait_us,
                 metadb.commit_apply_wait_max_us,
                 metadb.commit_apply_gate_wait_us,
@@ -309,6 +313,16 @@ impl EngineStatusSnapshot {
                 metadb.wal_fsync_max_us,
                 metadb.wal_batch_records_max,
                 metadb.wal_batch_bytes_max
+            );
+            let _ = writeln!(
+                out,
+                "metadb_wal_submit_breakdown: queue_wait_us={} queue_wait_max_us={} writer_busy_us={} writer_busy_max_us={} wake_roundtrip_us={} wake_roundtrip_max_us={}",
+                metadb.wal_queue_wait_us,
+                metadb.wal_queue_wait_max_us,
+                metadb.wal_writer_busy_us,
+                metadb.wal_writer_busy_max_us,
+                metadb.wal_wake_roundtrip_us,
+                metadb.wal_wake_roundtrip_max_us
             );
             let _ = writeln!(
                 out,

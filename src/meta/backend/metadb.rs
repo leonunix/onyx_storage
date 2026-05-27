@@ -1323,6 +1323,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.group_commit_max_batch_bytes = 16 * 1024 * 1024;
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
+    cfg.wal_async_group_commit_window_us = config.wal_async_group_commit_window_us();
     cfg.unlogged_commits_enabled = config.unlogged_flush_commits;
     cfg.dedup_shards = config.dedup_shards;
     cfg.shards_per_partition = config.shards_per_partition;

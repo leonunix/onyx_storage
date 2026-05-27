@@ -100,6 +100,18 @@ pub struct MetaMemorySnapshot {
     pub wal_submit_calls: u64,
     pub wal_submit_wait_us: u64,
     pub wal_submit_wait_max_us: u64,
+    /// `wal_submit_wait_us` decomposed into three per-submit segments:
+    /// caller-to-writer queue wait, writer-side busy window, and ack
+    /// wake roundtrip. Useful for attributing the 1.73ms median we see
+    /// on randwrite workloads — wal_submit_wait_us is the only metric
+    /// observable from the commit path, but it lumps three independent
+    /// pipeline stages together.
+    pub wal_queue_wait_us: u64,
+    pub wal_queue_wait_max_us: u64,
+    pub wal_writer_busy_us: u64,
+    pub wal_writer_busy_max_us: u64,
+    pub wal_wake_roundtrip_us: u64,
+    pub wal_wake_roundtrip_max_us: u64,
     pub wal_batches: u64,
     pub wal_records: u64,
     pub wal_bytes: u64,

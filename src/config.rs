@@ -145,6 +145,16 @@ pub struct MetaConfig {
     /// queued commits first, so this should stay tiny on low-latency NVMe.
     #[serde(default = "default_metadb_group_commit_timeout_us")]
     pub group_commit_timeout_us: u64,
+    /// Async-WAL group-commit window: how long the writer holds the
+    /// batch open before acking when every submit in the batch has
+    /// `synchronous=false`. Metadb default is 1000 µs (amortises fsync
+    /// cost). With `wal_async_commits_enabled=true` plus
+    /// `commit_deferred_outcomes_enabled=true` (both default on),
+    /// fsync runs only at the TXG-sync barrier, so the window is pure
+    /// per-submit latency. 2026-05-27 instrumentation pinned this as
+    /// the dominant chunk of `wal_submit_us`.
+    #[serde(default = "default_metadb_wal_async_group_commit_window_us")]
+    pub wal_async_group_commit_window_us: u64,
     /// Trigger an early metadb checkpoint when the in-memory dirty
     /// work (L2P dirty pages + RC pending deltas) exceeds this
     /// count, instead of waiting only for the periodic checkpoint
@@ -381,6 +391,10 @@ impl MetaConfig {
         self.group_commit_timeout_us.max(1)
     }
 
+    pub fn wal_async_group_commit_window_us(&self) -> u64 {
+        self.wal_async_group_commit_window_us
+    }
+
     pub fn lsm_bloom_bits_per_entry(&self) -> u32 {
         self.lsm_bloom_bits_per_entry.clamp(1, 32)
     }
@@ -396,6 +410,7 @@ impl Default for MetaConfig {
             lsm_bloom_bits_per_entry: default_lsm_bloom_bits_per_entry(),
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
+            wal_async_group_commit_window_us: default_metadb_wal_async_group_commit_window_us(),
             flush_dirty_pages_threshold: default_metadb_flush_dirty_pages_threshold(),
             flush_dirty_pages_target: default_metadb_flush_dirty_pages_target(),
             io_submitter_bg_inflight_cap: default_metadb_io_submitter_bg_inflight_cap(),
@@ -879,6 +894,10 @@ fn default_metadb_checkpoint_interval_ms() -> u64 {
 }
 fn default_metadb_group_commit_timeout_us() -> u64 {
     1
+}
+fn default_metadb_wal_async_group_commit_window_us() -> u64 {
+    // Match metadb's own default; opt-in tuning lives in nvme-detailed.toml.
+    1000
 }
 fn default_metadb_flush_dirty_pages_threshold() -> u64 {
     // 2026-05-15 nvme-box sweep: 100k caps single-flush sample size
