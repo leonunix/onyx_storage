@@ -153,7 +153,7 @@ pub(super) fn emit_l2p_remap_runs(
     if batch_values.is_empty() {
         return;
     }
-    let cap = onyx_metadb::wal::op::MAX_REMAP_RANGE_LBAS;
+    let cap = onyx_metadb::op::MAX_REMAP_RANGE_LBAS;
     let mut i = 0;
     while i < batch_values.len() {
         let run_start = i;

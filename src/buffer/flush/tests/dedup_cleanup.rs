@@ -481,7 +481,8 @@ fn dedup_worker_batches_hits_across_units() {
     assert_eq!(snap.dedup_hit_commit_ops, 8);
     assert_eq!(
         meta.memory_stats().unwrap().commit_attempts,
-        3,
-        "setup uses set_refcount + put_dedup_entries; the 8 hits should share one commit"
+        2,
+        "setup: put_dedup_entries (set_refcount now routes via lifecycle journal, \
+         not commit_ops); the 8 hits should share one commit"
     );
 }

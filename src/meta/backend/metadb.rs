@@ -1324,6 +1324,12 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.index_pin_bytes = config.index_pin_bytes() as u64;
     cfg.group_commit_timeout_us = config.group_commit_timeout_us();
     cfg.wal_async_group_commit_window_us = config.wal_async_group_commit_window_us();
+    // Phase D.5b retired metadb's internal WAL; `Buffer` is now the
+    // only engine-side journal mode. Onyx's three-variant enum still
+    // governs onyx-side semantics (checkpoint watermark, buffer
+    // replay), but the metadb engine itself sees only Buffer.
+    let _ = config.journal_mode;
+    cfg.journal_mode = onyx_metadb::MetaDbJournalMode::Buffer;
     cfg.unlogged_commits_enabled = config.unlogged_flush_commits;
     cfg.dedup_shards = config.dedup_shards;
     cfg.shards_per_partition = config.shards_per_partition;
