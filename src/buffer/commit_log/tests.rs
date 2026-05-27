@@ -689,3 +689,84 @@ fn throttle_curve_is_monotonic_and_below_cap() {
         prev = d;
     }
 }
+
+// ── Phase A.2: mark_applied + release_below split ────────────────────
+//
+// The buffer-as-sole-journal plan needs to "apply" a buffer entry into
+// in-memory metadb state before the metadb checkpoint covers it, then
+// release the ring space later. Today's `mark_flushed` does both in one
+// shot. These tests pin the new split behaviour: `mark_applied` clears
+// the read path and accounts the entry as ring-reclaim-eligible without
+// advancing the head, and `release_below(seq_cap)` runs the reclaim pass
+// bounded by `min(durable_seq, seq_cap)`.
+
+#[test]
+fn mark_applied_clears_read_path_but_does_not_release_ring() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+
+    let seq = pool
+        .append("test-vol", Lba(7), 1, &vec![0xA5; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+
+    // Pre-state: entry is in pending + lba_index, ring slot held.
+    assert!(shard.pending_entry_arc(seq).is_some());
+    assert!(pool.lookup("test-vol", Lba(7)).unwrap().is_some());
+    let used_before = shard.ring.lock().used_bytes;
+    assert!(used_before > 0);
+
+    pool.mark_applied(seq, Lba(7), 1).unwrap();
+
+    // Read path no longer sees the entry — metadb is now authoritative
+    // for the mapping.
+    assert!(shard.pending_entry_arc(seq).is_none());
+    assert!(pool.lookup("test-vol", Lba(7)).unwrap().is_none());
+    assert_eq!(pool.payload_memory_bytes(), 0);
+
+    // Ring head HAS NOT advanced — seq is in flushed_seqs awaiting the
+    // checkpoint release.
+    let ring = shard.ring.lock();
+    assert_eq!(
+        ring.used_bytes, used_before,
+        "mark_applied must not advance the ring head"
+    );
+    assert!(ring.flushed_seqs.contains(&seq));
+}
+
+#[test]
+fn release_below_advances_ring_only_when_checkpoint_covers_seq() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+
+    let seq = pool
+        .append("test-vol", Lba(11), 1, &vec![0x5C; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+    pool.mark_applied(seq, Lba(11), 1).unwrap();
+
+    // Production wires the engine's watermark thread to advance
+    // durable_seq once the entry's payload is fsync-durable. The unit
+    // test stands in for that thread.
+    pool.durable_seq_handle()
+        .store(seq, std::sync::atomic::Ordering::Release);
+
+    let used_before = shard.ring.lock().used_bytes;
+    assert!(used_before > 0);
+
+    // Checkpoint hasn't covered this seq yet — ring stays put.
+    let advanced = pool.release_below(seq - 1).unwrap();
+    assert_eq!(advanced, 0);
+    assert_eq!(shard.ring.lock().used_bytes, used_before);
+
+    // Checkpoint covers the seq — ring advances on the next pass.
+    let advanced = pool.release_below(seq).unwrap();
+    assert_eq!(advanced, 1);
+    assert_eq!(shard.ring.lock().used_bytes, 0);
+}

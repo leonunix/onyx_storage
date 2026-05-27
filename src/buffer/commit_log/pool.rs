@@ -422,6 +422,37 @@ impl WriteBufferPool {
         Ok(advanced)
     }
 
+    /// Buffer-as-sole-journal Phase A: routes to the seq's owning shard
+    /// and runs the in-memory half of `mark_flushed` without the ring
+    /// reclaim. The ring head advances later through [`release_below`].
+    /// Dead code outside tests until Phase C wires the flusher to it.
+    pub fn mark_applied(
+        &self,
+        seq: u64,
+        flushed_lba_start: Lba,
+        flushed_lba_count: u32,
+    ) -> OnyxResult<()> {
+        let Some(shard_idx) = self.shard_for_seq(seq) else {
+            return Ok(());
+        };
+        self.shards[shard_idx]
+            .shard
+            .mark_applied(seq, flushed_lba_start, flushed_lba_count)?;
+        Ok(())
+    }
+
+    /// Buffer-as-sole-journal Phase A: drive the ring-reclaim pass on
+    /// every shard with the checkpoint watermark as an upper bound on
+    /// reclaimable seqs. Returns the total number of seqs released
+    /// across all shards this pass.
+    pub fn release_below(&self, checkpoint_seq: u64) -> OnyxResult<u64> {
+        let mut advanced = 0u64;
+        for shard in &self.shards {
+            advanced += shard.shard.release_below(checkpoint_seq)?;
+        }
+        Ok(advanced)
+    }
+
     pub fn advance_tail_for_shard(&self, shard_idx: usize) -> OnyxResult<u64> {
         let Some(shard) = self.shards.get(shard_idx) else {
             return Ok(0);

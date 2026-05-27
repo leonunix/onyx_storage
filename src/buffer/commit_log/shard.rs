@@ -1109,6 +1109,141 @@ impl BufferShard {
         Ok(())
     }
 
+    /// Buffer-as-sole-journal Phase A: in-memory bookkeeping for an
+    /// applied buffer entry, without advancing the ring head.
+    ///
+    /// Identical to [`mark_flushed`] for the in-memory parts — drops
+    /// from `lba_index`, `pending_entries`, pending buckets, volatile
+    /// payload, and accounts the released payload bytes — but **does
+    /// not** run `reclaim_log_prefix`. The ring slot stays held until
+    /// a later [`release_below`] sweep covers this seq under both the
+    /// data durability watermark and the metadb-checkpoint watermark.
+    ///
+    /// `flushed_seqs` is still populated so the eventual reclaim pass
+    /// sees this seq as eligible. Multi-LBA partial-flush handling is
+    /// mirrored from `mark_flushed` (the per-seq progress map advances
+    /// until every LBA in the entry is covered, then the entry drops).
+    ///
+    /// Wired in Phase C cutover; in Phase A this is dead code outside
+    /// tests.
+    pub(super) fn mark_applied(
+        &self,
+        seq: u64,
+        flushed_lba_start: Lba,
+        flushed_lba_count: u32,
+    ) -> OnyxResult<()> {
+        let Some(pending) = self
+            .pending_entries
+            .get(&seq)
+            .map(|e| Arc::clone(e.value()))
+        else {
+            return Ok(());
+        };
+
+        let entry_start = pending.start_lba.0;
+
+        if pending.lba_count == 1 {
+            let covers = entry_start >= flushed_lba_start.0
+                && entry_start < flushed_lba_start.0 + flushed_lba_count as u64;
+            if !covers {
+                return Ok(());
+            }
+            let vid = self.intern_vol_id(&pending.vol_id);
+            self.lba_index.remove_if(
+                &LbaKey {
+                    vol_id: vid.clone(),
+                    lba: pending.start_lba,
+                },
+                |_, value| value.seq == seq,
+            );
+            let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
+                return Ok(());
+            };
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
+            self.remove_volatile_payload(seq);
+            if let Some(ref p) = removed_pending.payload {
+                Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
+            }
+            self.note_applied(seq);
+            return Ok(());
+        }
+
+        let all_done = {
+            let mut flushed_offsets = self.flush_progress.entry(seq).or_default();
+            for i in 0..flushed_lba_count {
+                let abs_lba = flushed_lba_start.0 + i as u64;
+                if abs_lba >= entry_start {
+                    flushed_offsets.insert((abs_lba - entry_start) as u16);
+                }
+            }
+            flushed_offsets.len() >= pending.lba_count as usize
+        };
+        if !all_done {
+            return Ok(());
+        }
+
+        let vid = self.intern_vol_id(&pending.vol_id);
+        for i in 0..pending.lba_count {
+            self.lba_index.remove_if(
+                &LbaKey {
+                    vol_id: vid.clone(),
+                    lba: Lba(pending.start_lba.0 + i as u64),
+                },
+                |_, value| value.seq == seq,
+            );
+        }
+        let Some((_, removed_pending)) = self.pending_entries.remove(&seq) else {
+            return Ok(());
+        };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
+        self.remove_volatile_payload(seq);
+        if let Some(ref p) = removed_pending.payload {
+            Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
+        }
+        self.note_applied(seq);
+        Ok(())
+    }
+
+    /// Buffer-as-sole-journal Phase A: mirrors `free_seq_allocation` but
+    /// only the bookkeeping half (record the seq as ring-reclaim-eligible
+    /// without driving the reclaim pass). The ring-head advance comes
+    /// later through [`release_below`].
+    fn note_applied(&self, seq: u64) {
+        {
+            let mut lc = self.lifecycle.lock();
+            if lc.inflight.contains(&seq) {
+                lc.cancelled.insert(seq);
+            }
+        }
+        self.max_flushed_seq.fetch_max(seq, Ordering::Relaxed);
+        let mut ring = self.ring.lock();
+        ring.flushed_seqs.insert(seq);
+        self.flush_progress.remove(&seq);
+    }
+
+    /// Buffer-as-sole-journal Phase A: advance the ring head past every
+    /// already-applied seq whose checkpoint coverage is also assured.
+    ///
+    /// The reclaim cap is `min(durable_seq, checkpoint_seq)` — both data
+    /// (the LV2 fdatasync watermark) and metadb checkpoint (the manifest
+    /// commit watermark) must cover an entry before its ring bytes can
+    /// be recycled. Returns the number of seqs released this pass.
+    pub(super) fn release_below(&self, checkpoint_seq: u64) -> OnyxResult<u64> {
+        let durable_seq = self.durable_seq.load(Ordering::Acquire);
+        let cap = durable_seq.min(checkpoint_seq);
+        let mut ring = self.ring.lock();
+        let before = ring.used_bytes;
+        Self::reclaim_log_prefix(&mut ring, cap);
+        if ring.used_bytes < before {
+            self.ring_space_cv.notify_all();
+        }
+        let advanced = ring.reclaim_ready;
+        ring.reclaim_ready = 0;
+        Ok(advanced)
+    }
+
     pub(super) fn advance_tail(&self) -> OnyxResult<u64> {
         // Re-run reclaim with the LATEST durable_seq. The original
         // `mark_flushed` → `free_seq_allocation` chain runs `reclaim_log_prefix`
