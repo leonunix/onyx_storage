@@ -175,3 +175,4 @@ mod commit_path;
 mod dedup_cleanup;
 mod packed_refcount;
 mod pipeline;
+mod replay;

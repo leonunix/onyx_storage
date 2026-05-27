@@ -493,25 +493,73 @@ impl BufferFlusher {
     /// Used during graceful shutdown to ensure the buffer device is clean
     /// (e.g. before a shard count change on next startup).
     pub fn drain_and_stop(&mut self, pool: &crate::buffer::pool::WriteBufferPool) {
-        // Keep flusher running while there are pending entries
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let _ = self.drain_with_timeout(pool, std::time::Duration::from_secs(60));
+    }
+
+    /// Buffer-as-sole-journal Phase A: drive the flusher until every
+    /// pending buffer entry has been processed (or `timeout` elapses),
+    /// then stop. Returns drain statistics for callers that want to
+    /// confirm the replay actually completed before accepting client
+    /// IO or comparing shadow state.
+    ///
+    /// The "replay" semantic falls out of the existing flusher start-up
+    /// behaviour: when the buffer pool is reopened from disk, any
+    /// already-pending entries land in `pending_entries` and the
+    /// coalescer picks them up via its `head_stuck_seq_for_shard`
+    /// retry. Driving the same pipeline to quiescence is therefore
+    /// equivalent to replaying the buffer-as-journal under the current
+    /// metadb state.
+    ///
+    /// `timeout` is wall-clock; on hit we leave the flusher in a
+    /// running state-machine for the caller to observe (the caller can
+    /// retry `drain_with_timeout` or fall back to a forced stop). The
+    /// `pending_at_exit` field on [`BufferReplayStats`] distinguishes
+    /// "drained clean" (== 0) from "timed out with backlog".
+    pub fn drain_with_timeout(
+        &mut self,
+        pool: &crate::buffer::pool::WriteBufferPool,
+        timeout: std::time::Duration,
+    ) -> BufferReplayStats {
+        let started_at = std::time::Instant::now();
+        let pending_at_start = pool.pending_count();
+        let deadline = started_at + timeout;
         loop {
             let pending = pool.pending_count();
             if pending == 0 {
-                tracing::info!("flusher drain complete — buffer is clean");
-                break;
+                tracing::info!(
+                    pending_at_start,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "flusher drain complete — buffer is clean"
+                );
+                let stats = BufferReplayStats {
+                    pending_at_start,
+                    pending_at_exit: 0,
+                    elapsed: started_at.elapsed(),
+                    timed_out: false,
+                };
+                self.running.store(false, Ordering::Relaxed);
+                self.join_lanes();
+                return stats;
             }
             if std::time::Instant::now() > deadline {
                 tracing::warn!(
                     pending,
-                    "flusher drain timeout after 60s — stopping with unflushed entries"
+                    pending_at_start,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "flusher drain timed out — stopping with unflushed entries"
                 );
-                break;
+                let stats = BufferReplayStats {
+                    pending_at_start,
+                    pending_at_exit: pending,
+                    elapsed: started_at.elapsed(),
+                    timed_out: true,
+                };
+                self.running.store(false, Ordering::Relaxed);
+                self.join_lanes();
+                return stats;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        self.running.store(false, Ordering::Relaxed);
-        self.join_lanes();
     }
 
     fn join_lanes(&mut self) {

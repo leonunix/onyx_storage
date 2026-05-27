@@ -75,6 +75,77 @@ struct FlusherLane {
     cleanup_handle: Option<JoinHandle<()>>,
 }
 
+/// Buffer-as-sole-journal Phase A drain summary. Returned from
+/// [`BufferFlusher::drain_with_timeout`] and the higher-level
+/// [`replay_buffer_pending`] helper so callers can confirm replay
+/// quiescence before accepting client IO or comparing shadow state.
+#[derive(Debug, Clone)]
+pub struct BufferReplayStats {
+    /// Pending-entry count observed when the drain loop started.
+    pub pending_at_start: u64,
+    /// Pending-entry count at exit. Zero iff the drain completed
+    /// cleanly; non-zero iff `timed_out` is `true`.
+    pub pending_at_exit: u64,
+    /// Wall-clock duration spent inside the drain loop (not including
+    /// flusher startup or teardown).
+    pub elapsed: std::time::Duration,
+    /// Set if the loop hit the supplied deadline before reaching
+    /// quiescence. The caller decides whether to retry or escalate.
+    pub timed_out: bool,
+}
+
+impl BufferReplayStats {
+    /// `true` iff replay reached quiescence inside the supplied
+    /// timeout. Callers gating client IO on a successful replay use
+    /// this as the go/no-go signal.
+    pub fn drained_clean(&self) -> bool {
+        !self.timed_out && self.pending_at_exit == 0
+    }
+}
+
+/// Buffer-as-sole-journal Phase A: drive the flusher pipeline once
+/// against the buffer's currently-pending entries and stop, returning
+/// drain statistics.
+///
+/// Used:
+/// - On engine open in `metadb_journal_mode = "buffer"` (Phase C), to
+///   bring metadb in-memory state up to the buffer tail before
+///   accepting clients.
+/// - In shadow validation (Phase B), to drive the shadow metadb's
+///   in-memory state from the same buffer stream the WAL replay is
+///   reconstructing, then assert state equivalence.
+/// - In replay tests that need deterministic flusher quiescence.
+///
+/// `timeout` bounds the wait. Returns the [`BufferReplayStats`]
+/// snapshot; the caller decides what to do with a `timed_out` result
+/// (typically: retry once with a larger budget, or fail engine open).
+#[allow(clippy::too_many_arguments)]
+pub fn replay_buffer_pending(
+    pool: Arc<WriteBufferPool>,
+    meta: Arc<MetaStore>,
+    lifecycle: Arc<VolumeLifecycleManager>,
+    allocator: Arc<SpaceAllocator>,
+    io_engine: Arc<IoEngine>,
+    read_pool: Option<Arc<crate::io::read_pool::ReadPool>>,
+    config: &FlushConfig,
+    dedup_config: &DedupConfig,
+    metrics: Arc<EngineMetrics>,
+    timeout: std::time::Duration,
+) -> BufferReplayStats {
+    let mut flusher = BufferFlusher::start_with_metrics(
+        pool.clone(),
+        meta,
+        lifecycle,
+        allocator,
+        io_engine,
+        read_pool,
+        config,
+        dedup_config,
+        metrics,
+    );
+    flusher.drain_with_timeout(&pool, timeout)
+}
+
 #[derive(Debug, Clone)]
 struct ActiveSeq {
     vol_id: String,
