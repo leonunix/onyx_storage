@@ -669,7 +669,10 @@ pub struct BufferConfig {
     /// Default 0 = auto (50% of system memory, capped at 8 GiB).
     #[serde(default)]
     pub max_memory_mb: usize,
-    /// Maximum pre-sync payload bytes. 0 = derive from max_memory_mb.
+    /// Legacy: pre-sync (volatile) payload budget. Ignored — append now
+    /// blocks until the seq is fdatasync'd on LV2, so there is no
+    /// pre-sync window to budget. Retained as a `#[serde(default)]` field
+    /// for backward compatibility with existing TOML configs.
     #[serde(default)]
     pub volatile_memory_mb: usize,
     /// Per-shard staging queue length between appenders and sync thread.

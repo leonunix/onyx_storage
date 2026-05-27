@@ -115,8 +115,20 @@ impl WriteBufferPool {
         shard
             .shard
             .append_with_seq(seq, vol_id, start_lba, lba_count, payload, vol_created_at)?;
-
+        // Wake the per-shard sync thread so it drains the staging channel
+        // promptly. The sync thread will fdatasync the batch and then
+        // advance `lv2_durability.synced_seq` past our seq, which is what
+        // `wait_for_durable` parks on below.
         let _ = shard.sync_wake_tx.send(());
+
+        // Block until LV2 fdatasync covers this seq. This is the entire
+        // point of the post-volatile design: ack ⇒ durable on LV2.
+        shard.shard.wait_for_durable(seq);
+
+        // Push the seq onto the flusher's ready channels now that it is
+        // (1) durable on LV2 and (2) visible in pending_entries / lba_index.
+        shard.shard.publish_ready(seq);
+
         if let Some(metrics) = self.metrics.get() {
             BufferShard::record_metric(&metrics.buffer_append_total_ns, total_start);
         }
@@ -593,16 +605,6 @@ impl WriteBufferPool {
         self.max_payload_memory
     }
 
-    /// Bytes currently held only until the buffer sync thread fdatasyncs them.
-    pub fn volatile_payload_memory_bytes(&self) -> u64 {
-        self.volatile_payload_budget.bytes()
-    }
-
-    /// Write-admission budget for sync-before-publish payloads.
-    pub fn volatile_payload_memory_limit_bytes(&self) -> u64 {
-        self.volatile_payload_budget.limit()
-    }
-
     /// Atomic shared with every shard that tracks the highest seq to have
     /// been mark_flushed'd. Intended for the durability-watermark thread
     /// to capture before invoking `MetaStore::sync_durable`.
@@ -668,7 +670,7 @@ impl WriteBufferPool {
                     head_age_ms,
                     head_residency_ms,
                     staged_entries: s.staging_rx.len(),
-                    volatile_payloads: s.volatile_payloads.len(),
+                    volatile_payloads: 0,
                 }
             })
             .collect()

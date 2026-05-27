@@ -339,8 +339,8 @@ impl WriteBufferPool {
         wake_rx: Receiver<()>,
         shutdown: Arc<AtomicBool>,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
-        ready_tx: Sender<u64>,
-        shard_ready_tx: Sender<u64>,
+        _ready_tx: Sender<u64>,
+        _shard_ready_tx: Sender<u64>,
         uring: Option<Arc<IoUringSession>>,
     ) {
         let mut consecutive_failures = 0u32;
@@ -491,30 +491,27 @@ impl WriteBufferPool {
                     let inflight_pending: Vec<Arc<PendingEntry>> =
                         inflight.iter().map(|entry| entry.pending.clone()).collect();
                     shard.retire_superseded_by_durable_entries(&inflight_pending);
-                    let mut cache_after_sync = Vec::new();
-                    let mut publish_after_sync = Vec::new();
+                    // Strip cancellation flags for this batch — appenders
+                    // already returned errors and the indices were rolled
+                    // back via `evict_pending_entry`, so any leftover
+                    // cancellation markers are stale.
                     {
                         let mut lc = shard.lifecycle.lock();
                         for entry in &inflight {
-                            let seq = entry.pending.seq;
-                            lc.inflight.remove(&seq);
-                            let payload = shard.remove_volatile_payload(seq);
-                            if lc.cancelled.remove(&seq) {
-                                continue;
-                            }
-                            if let Some(payload) = payload {
-                                cache_after_sync.push((entry.pending.clone(), payload));
-                            }
-                            publish_after_sync.push(seq);
+                            lc.cancelled.remove(&entry.pending.seq);
                         }
                     }
-                    for (pending, payload) in cache_after_sync {
-                        shard.cache_committed_payload(&pending, payload);
-                    }
-                    for seq in publish_after_sync {
-                        let _ = ready_tx.send(seq);
-                        let _ = shard_ready_tx.send(seq);
-                    }
+                    // Advance the LV2 fdatasync watermark and wake every
+                    // parked appender whose seq is now durable. Payload
+                    // caching + ready-channel publishing both moved into
+                    // the appender (see `pool.append`); the sync thread no
+                    // longer touches index state post-fdatasync.
+                    let batch_max_durable = inflight
+                        .iter()
+                        .map(|entry| entry.pending.seq)
+                        .max()
+                        .unwrap_or(0);
+                    shard.lv2_durability.advance(batch_max_durable);
                     if let Some(metrics) = metrics.get() {
                         let batch_entries = inflight.len() as u64;
                         let batch_bytes = inflight

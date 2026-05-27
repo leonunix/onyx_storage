@@ -70,13 +70,7 @@ impl EngineMetrics {
             buffer_coalesce_hydrate_memory_entries: load(
                 &self.buffer_coalesce_hydrate_memory_entries,
             ),
-            buffer_coalesce_hydrate_volatile_entries: load(
-                &self.buffer_coalesce_hydrate_volatile_entries,
-            ),
             buffer_coalesce_hydrate_disk_entries: load(&self.buffer_coalesce_hydrate_disk_entries),
-            buffer_coalesce_hydrate_inflight_skips: load(
-                &self.buffer_coalesce_hydrate_inflight_skips,
-            ),
             buffer_read_ops: load(&self.buffer_read_ops),
             buffer_read_bytes: load(&self.buffer_read_bytes),
             read_buffer_hits: load(&self.read_buffer_hits),
@@ -354,9 +348,7 @@ pub struct EngineMetricsSnapshot {
     pub buffer_coalesce_hydrate_ops: u64,
     pub buffer_coalesce_hydrate_entries: u64,
     pub buffer_coalesce_hydrate_memory_entries: u64,
-    pub buffer_coalesce_hydrate_volatile_entries: u64,
     pub buffer_coalesce_hydrate_disk_entries: u64,
-    pub buffer_coalesce_hydrate_inflight_skips: u64,
     pub buffer_read_ops: u64,
     pub buffer_read_bytes: u64,
     pub read_buffer_hits: u64,
@@ -655,9 +647,7 @@ impl EngineMetricsSnapshot {
             buffer_coalesce_hydrate_ops,
             buffer_coalesce_hydrate_entries,
             buffer_coalesce_hydrate_memory_entries,
-            buffer_coalesce_hydrate_volatile_entries,
             buffer_coalesce_hydrate_disk_entries,
-            buffer_coalesce_hydrate_inflight_skips,
             buffer_read_ops,
             buffer_read_bytes,
             read_buffer_hits,

@@ -301,10 +301,12 @@ impl BufferShard {
         checkpoint_device: Option<RawDevice>,
         payload_bytes_in_memory: Arc<AtomicU64>,
         max_payload_memory: u64,
-        volatile_payload_budget: Arc<VolatilePayloadBudget>,
         runtime_limits: BufferRuntimeLimits,
         max_flushed_seq: Arc<AtomicU64>,
         durable_seq: Arc<AtomicU64>,
+        lv2_durability: Arc<Lv2DurabilityWaiter>,
+        ready_tx: Sender<u64>,
+        shard_ready_tx: Sender<u64>,
     ) -> OnyxResult<(Self, u64)> {
         let capacity_bytes = device.size();
         if capacity_bytes < Self::slot_size() {
@@ -399,12 +401,12 @@ impl BufferShard {
                 sync_batch_max_entries: runtime_limits.sync_batch_max_entries.max(1),
                 sync_batch_max_bytes: runtime_limits.sync_batch_max_bytes.max(BLOCK_SIZE as usize),
                 cached_payload_order: parking_lot::Mutex::new(VecDeque::with_capacity(1024)),
-                volatile_payloads: DashMap::with_shard_amount(DASHMAP_SHARDS),
-                volatile_payload_budget,
                 lifecycle: parking_lot::Mutex::new(LifecycleState {
-                    inflight: HashSet::with_capacity(256),
                     cancelled: HashSet::with_capacity(64),
                 }),
+                lv2_durability,
+                ready_tx,
+                shard_ready_tx,
                 io_lock: parking_lot::Mutex::new(()),
                 vol_id_cache: RwLock::new(Vec::with_capacity(16)),
                 metrics,
@@ -632,7 +634,6 @@ impl BufferShard {
         };
 
         let payload_len = payload.len() as u64;
-        self.volatile_payload_budget.reserve(payload_len);
 
         let payload = Arc::<[u8]>::from(payload);
         let payload_crc32 = crc32fast::hash(&payload);
@@ -654,7 +655,11 @@ impl BufferShard {
             keys.push(key);
         }
 
-        // Build the metadata-only PendingEntry stored in the buffer indices.
+        // Build PendingEntry with payload populated eagerly. This is the
+        // post-volatile design: payload lives in the in-memory cache from
+        // append time until the flusher retires it; reads consult
+        // `entry.payload` (Some) or fall back to LV2 disk for crash-recovered
+        // entries that were rebuilt with `payload: None`.
         let pending = Arc::new(PendingEntry {
             seq,
             vol_id: vol_id.to_string(),
@@ -662,32 +667,18 @@ impl BufferShard {
             lba_count,
             payload_crc32,
             vol_created_at,
-            payload: None,
+            payload: Some(payload.clone()),
             disk_offset: write_offset,
             disk_len,
             enqueued_at: Instant::now(),
             superseded_ranges,
         });
 
-        // ── Mark inflight BEFORE any index insert ──────────────────
-        // The flusher's retry-snapshot scans pending_entries and treats
-        // entries with !inflight as ready.  If pending_entries is visible
-        // before inflight is set, the flusher can race in and hydrate an
-        // entry that hasn't been written to disk yet.  Setting inflight
-        // first closes this window: by the time pending_entries.insert
-        // makes the entry visible, inflight already contains the seq.
-        {
-            let mut lc = self.lifecycle.lock();
-            lc.inflight.insert(seq);
-        }
-
-        // Publish the volatile payload before the LBA indices. Once an entry
-        // appears in lba_index, foreground reads may need this payload before
-        // the sync thread has made the ring slot durable.
-        self.volatile_payloads.insert(seq, payload.clone());
-
         // ── DashMap inserts (concurrent sharded locks) ──
-        // Interned Arc<str>: read-lock fast path, no alloc after first encounter.
+        // Entries are visible to readers immediately but their seq is
+        // strictly greater than `lv2_durability.synced_seq` until the write
+        // thread fdatasync's the batch — flusher gating is by watermark
+        // comparison (see `is_seq_ready_for_flush`), not by membership set.
         Self::add_pending_buckets(&self.pending_lba_buckets, &vid, start_lba, lba_count);
         for key in keys {
             self.lba_index.insert(key.clone(), pending.clone());
@@ -697,13 +688,26 @@ impl BufferShard {
             self.pending_count.fetch_add(1, Ordering::Relaxed);
         }
 
+        // Account payload bytes toward the in-memory cache budget. LRU
+        // eviction (`evict_payload_cache_to_budget`) will strip oldest
+        // entries' payload field if we exceed `max_payload_memory`.
+        self.payload_bytes_in_memory
+            .fetch_add(payload_len, Ordering::Relaxed);
+        self.cached_payload_order.lock().push_back(seq);
+        self.evict_payload_cache_to_budget();
+        self.compact_payload_cache_order_if_needed();
+
         // ── Channel send (lock-free MPSC, ~30ns) ──
         if self
             .staging_tx
-            .send(StagedEntry { pending, payload })
+            .send(StagedEntry {
+                pending: pending.clone(),
+                payload,
+            })
             .is_err()
         {
-            self.remove_volatile_payload(seq);
+            // Back out the index inserts and the payload accounting.
+            self.evict_pending_entry(seq, &pending);
             return Err(OnyxError::Io(std::io::Error::other(
                 "buffer sync thread is not accepting staged entries",
             )));
@@ -720,6 +724,56 @@ impl BufferShard {
                 .fetch_add(payload_len, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Block until the LV2 fdatasync watermark covers `seq`. The sync
+    /// thread advances `lv2_durability.synced_seq` after each successful
+    /// io_uring fdatasync barrier; `notify_all` then releases every parked
+    /// appender whose seq is now durable. Called by `WriteBufferPool::append`
+    /// before returning the ack to the caller.
+    pub(super) fn wait_for_durable(&self, seq: u64) {
+        let wait_elapsed = self.lv2_durability.wait_for(seq);
+        if let Some(metrics) = self.metrics.get() {
+            let ns = wait_elapsed.as_nanos().min(u64::MAX as u128) as u64;
+            metrics
+                .buffer_append_wait_durable_ns
+                .fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Push the seq onto the flusher's ready channels. Called by the
+    /// appender after `wait_for_durable` returns, so the flusher's
+    /// push-notified path sees only seqs that are already (1) past LV2
+    /// fdatasync and (2) present in `pending_entries`.
+    pub(super) fn publish_ready(&self, seq: u64) {
+        let _ = self.ready_tx.send(seq);
+        let _ = self.shard_ready_tx.send(seq);
+    }
+
+    /// Drop the indices + cache state for an entry that was inserted but
+    /// then failed to publish to the sync thread (staging channel closed
+    /// during shutdown). Idempotent.
+    fn evict_pending_entry(&self, seq: u64, pending: &Arc<PendingEntry>) {
+        let vid = self.intern_vol_id(&pending.vol_id);
+        for i in 0..pending.lba_count {
+            self.lba_index.remove_if(
+                &LbaKey {
+                    vol_id: vid.clone(),
+                    lba: Lba(pending.start_lba.0 + i as u64),
+                },
+                |_, value| value.seq == seq,
+            );
+        }
+        self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
+        if let Some((_, removed)) = self.pending_entries.remove(&seq) {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            if let Some(ref p) = removed.payload {
+                Self::release_payload_bytes(
+                    self.payload_bytes_in_memory.as_ref(),
+                    p.len() as u64,
+                );
+            }
+        }
     }
 
     pub(super) fn drain_staged_limited(&self) -> Vec<StagedEntry> {
@@ -820,7 +874,9 @@ impl BufferShard {
     }
 
     pub(super) fn is_seq_ready_for_flush(&self, seq: u64) -> bool {
-        !self.lifecycle.lock().inflight.contains(&seq)
+        // A seq becomes "ready for the flusher" once the LV2 sync thread
+        // has fdatasync'd it. Pure atomic load — no lock, no set membership.
+        seq <= self.lv2_durability.synced_seq.load(Ordering::Acquire)
     }
 
     /// Bounded variant of [`pending_entries_arc_snapshot`] that returns
@@ -858,10 +914,12 @@ impl BufferShard {
                 .map(|r| r.seq)
                 .collect()
         };
-        {
-            let lifecycle = self.lifecycle.lock();
-            candidates.retain(|s| !lifecycle.inflight.contains(s));
-        }
+        // Filter out seqs not yet covered by the LV2 fdatasync watermark.
+        // Reading the watermark once outside the loop is atomic-cheap; we
+        // tolerate a tiny staleness window (a write thread could advance
+        // mid-iteration), which only delays a few entries by one cycle.
+        let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
+        candidates.retain(|s| *s <= synced);
         let mut result = Vec::with_capacity(limit);
         for seq in candidates {
             if let Some(entry) = self.pending_entries.get(&seq) {
@@ -963,15 +1021,11 @@ impl BufferShard {
     /// durable entry cannot be physically overwritten until the engine's
     /// watermark thread has fsync'd the DB commits that back it.
     pub(super) fn free_seq_allocation(&self, seq: u64, _pending: &PendingEntry) {
-        {
-            let mut lc = self.lifecycle.lock();
-            // Only insert into cancelled if the sync thread still has this seq
-            // in-flight (pending write + fsync). If the sync thread already
-            // processed it, the insert would leak — nobody ever removes it.
-            if lc.inflight.contains(&seq) {
-                lc.cancelled.insert(seq);
-            }
-        }
+        // With ack-after-LV2-fdatasync semantics, any seq reaching this
+        // path was already ack'd to the caller (i.e. sync thread processed
+        // it). No need to flag the seq as cancelled — sync will not see it
+        // again.
+        //
         // Record that this seq has been mark_flushed'd so the durability
         // watermark thread can include it in its next sync cycle.
         self.max_flushed_seq.fetch_max(seq, Ordering::Relaxed);
@@ -1004,12 +1058,8 @@ impl BufferShard {
         seq: u64,
         pending: &PendingEntry,
     ) -> OnyxResult<()> {
-        {
-            let mut lc = self.lifecycle.lock();
-            if lc.inflight.contains(&seq) {
-                lc.cancelled.insert(seq);
-            }
-        }
+        // See `free_seq_allocation`: ack-after-LV2-fdatasync means no
+        // cancellation handshake with the sync thread is required.
         {
             let _guard = self.io_lock.lock();
             Self::mark_entry_flushed(&self.device, pending)?;
@@ -1064,7 +1114,6 @@ impl BufferShard {
             };
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
             self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
-            self.remove_volatile_payload(seq);
             if let Some(ref p) = removed_pending.payload {
                 Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
             }
@@ -1101,7 +1150,6 @@ impl BufferShard {
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
-        self.remove_volatile_payload(seq);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }
@@ -1161,7 +1209,6 @@ impl BufferShard {
             };
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
             self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
-            self.remove_volatile_payload(seq);
             if let Some(ref p) = removed_pending.payload {
                 Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
             }
@@ -1198,7 +1245,6 @@ impl BufferShard {
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
-        self.remove_volatile_payload(seq);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }
@@ -1211,12 +1257,8 @@ impl BufferShard {
     /// without driving the reclaim pass). The ring-head advance comes
     /// later through [`release_below`].
     fn note_applied(&self, seq: u64) {
-        {
-            let mut lc = self.lifecycle.lock();
-            if lc.inflight.contains(&seq) {
-                lc.cancelled.insert(seq);
-            }
-        }
+        // ack-after-fdatasync: no inflight set to consult; the seq was
+        // already durable on LV2 when the appender returned.
         self.max_flushed_seq.fetch_max(seq, Ordering::Relaxed);
         let mut ring = self.ring.lock();
         ring.flushed_seqs.insert(seq);
@@ -1321,7 +1363,6 @@ impl BufferShard {
                 self.pending_count.fetch_sub(1, Ordering::Relaxed);
                 let vid = self.intern_vol_id(&pending.vol_id);
                 self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
-                self.remove_volatile_payload(*seq);
                 if let Some(ref p) = pending.payload {
                     Self::release_payload_bytes(
                         self.payload_bytes_in_memory.as_ref(),
@@ -1361,7 +1402,6 @@ impl BufferShard {
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
-        self.remove_volatile_payload(seq);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
         }

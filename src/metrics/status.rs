@@ -15,8 +15,6 @@ pub struct EngineStatusSnapshot {
     pub buffer_fill_pct: Option<u8>,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
-    pub buffer_volatile_payload_memory_bytes: Option<u64>,
-    pub buffer_volatile_payload_memory_limit_bytes: Option<u64>,
     pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
@@ -45,14 +43,6 @@ impl EngineStatusSnapshot {
             let _ = writeln!(
                 out,
                 "buffer_payload_memory_bytes: {}/{}",
-                payload_bytes, limit
-            );
-        }
-        if let Some(payload_bytes) = self.buffer_volatile_payload_memory_bytes {
-            let limit = self.buffer_volatile_payload_memory_limit_bytes.unwrap_or(0);
-            let _ = writeln!(
-                out,
-                "buffer_volatile_payload_memory_bytes: {}/{}",
                 payload_bytes, limit
             );
         }
@@ -524,14 +514,12 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "buffer_coalesce_hydrate: ns={} ops={} entries={} memory={} volatile={} disk={} inflight_skips={}",
+            "buffer_coalesce_hydrate: ns={} ops={} entries={} memory={} disk={}",
             self.metrics.buffer_coalesce_hydrate_ns,
             self.metrics.buffer_coalesce_hydrate_ops,
             self.metrics.buffer_coalesce_hydrate_entries,
             self.metrics.buffer_coalesce_hydrate_memory_entries,
-            self.metrics.buffer_coalesce_hydrate_volatile_entries,
             self.metrics.buffer_coalesce_hydrate_disk_entries,
-            self.metrics.buffer_coalesce_hydrate_inflight_skips
         );
         let _ = writeln!(
             out,

@@ -122,6 +122,13 @@ fn flushed_entry_cannot_be_reinstalled_by_stale_eviction_state() {
 
 #[test]
 fn hydrated_payload_is_not_reinstalled_after_flush_race() {
+    // Under the ack-after-LV2-fdatasync design, append stores payload eagerly
+    // into PendingEntry.payload, so the "hydrate then flush" race window the
+    // pre-volatile design had no longer exists. This test pins the invariant
+    // anyway: once mark_flushed retires a seq, no later
+    // replace_pending_entry_if_current call can resurrect it (Arc::ptr_eq
+    // guard ensures only the original Arc would match, and the original is
+    // gone from pending_entries).
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;
 
@@ -133,117 +140,33 @@ fn hydrated_payload_is_not_reinstalled_after_flush_race() {
         seq
     );
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let pending = loop {
-        let pending = shard
-            .pending_entries
-            .get(&seq)
-            .map(|entry| entry.value().clone())
-            .unwrap();
-        if pending.payload.is_none() {
-            break pending;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "sync loop did not publish an uncached ready entry in time"
-        );
-        thread::sleep(Duration::from_millis(10));
-    };
-
-    let payload = shard.read_payload_from_disk(pending.as_ref()).unwrap();
+    let pending = shard.pending_entry_arc(seq).unwrap();
+    assert!(
+        pending.payload.is_some(),
+        "appended entry should carry payload immediately"
+    );
     shard.mark_flushed(seq, Lba(11), 1).unwrap();
     assert_eq!(pool.payload_memory_bytes(), 0);
 
-    let mut hydrated = pending.as_ref().clone();
-    hydrated.payload = Some(payload);
-    let hydrated = Arc::new(hydrated);
+    let replacement = {
+        let mut clone = pending.as_ref().clone();
+        clone.payload = Some(Arc::<[u8]>::from(vec![0xFF; BLOCK_SIZE as usize]));
+        Arc::new(clone)
+    };
     assert!(
-        !shard.replace_pending_entry_if_current(&pending, hydrated),
-        "hydration must not reinstall a seq that was already flushed"
+        !shard.replace_pending_entry_if_current(&pending, replacement),
+        "post-flush replacement must not resurrect a flushed seq"
     );
     assert!(shard.pending_entry_arc(seq).is_none());
     assert_eq!(pool.payload_memory_bytes(), 0);
 }
 
-#[test]
-fn inflight_missing_volatile_payload_is_not_hydrated_from_disk() {
-    let tmp = NamedTempFile::new().unwrap();
-    let size = 4096 + 4096 + 8 * 8192;
-    tmp.as_file().set_len(size).unwrap();
-    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
-    let runtime_limits = BufferRuntimeLimits {
-        staging_channel_capacity: 1,
-        sync_batch_max_entries: 1,
-        sync_batch_max_bytes: usize::MAX,
-        volatile_payload_memory: 0,
-        throttle: Default::default(),
-    };
-    let pool = WriteBufferPool::open_with_options_full_and_limits(
-        dev,
-        Duration::from_millis(1),
-        1,
-        256,
-        Duration::ZERO,
-        0,
-        None,
-        runtime_limits,
-    )
-    .unwrap();
-    let shard = &pool.shards[0].shard;
-    let payload = vec![0xA7; BLOCK_SIZE as usize];
-
-    let seq = pool.append("test-vol", Lba(17), 1, &payload, 0).unwrap();
-    let pending = shard.pending_entries.get(&seq).unwrap().value().clone();
-    {
-        let mut lc = shard.lifecycle.lock();
-        lc.inflight.insert(seq);
-    }
-    let _ = shard.remove_volatile_payload(seq);
-
-    assert!(
-        shard.pending_entry_arc_hydrated(seq).is_none(),
-        "flusher hydration must not parse a pre-sync ring slot"
-    );
-    assert!(
-        shard.pending_entries.contains_key(&seq),
-        "pre-sync entry must not be evicted as corrupt"
-    );
-    assert!(
-        shard.lookup_hydrated("test-vol", Lba(17)).is_err(),
-        "foreground read must fail loudly instead of falling through to stale LV3 data"
-    );
-    assert!(Arc::ptr_eq(
-        &pending,
-        &shard.pending_entries.get(&seq).unwrap().value().clone()
-    ));
-}
-
-#[test]
-fn lookup_hydrates_from_disk_without_volatile_payload() {
-    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
-    let shard = &pool.shards[0].shard;
-    let payload = vec![0x6D; BLOCK_SIZE as usize];
-
-    let seq = pool.append("test-vol", Lba(23), 1, &payload, 0).unwrap();
-    assert_eq!(
-        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
-        seq
-    );
-
-    let before = shard.pending_entry_arc(seq).unwrap();
-    assert!(before.payload.is_none());
-    assert!(
-        shard.volatile_payload(seq).is_none(),
-        "ready entries should hydrate from disk, not volatile payload"
-    );
-
-    let found = pool.lookup("test-vol", Lba(23)).unwrap().unwrap();
-    assert_eq!(found.payload.as_deref(), Some(payload.as_slice()));
-
-    let after = shard.pending_entry_arc(seq).unwrap();
-    assert!(after.payload.is_none());
-    assert!(Arc::ptr_eq(&before, &after));
-}
+// Two legacy tests removed: `inflight_missing_volatile_payload_is_not_hydrated_from_disk`
+// and `lookup_hydrates_from_disk_without_volatile_payload`. Both asserted
+// behavior of the pre-ack-after-LV2 design (volatile cache + lifecycle.inflight
+// gate). Under the current design, `pool.append()` blocks until the seq's
+// payload is fdatasync'd on LV2, so neither the volatile cache nor the inflight
+// set exists.
 
 #[test]
 fn lookup_primary_range_batches_contiguous_hydration() {
@@ -258,10 +181,6 @@ fn lookup_primary_range_batches_contiguous_hydration() {
         assert_eq!(
             pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
             seq
-        );
-        assert!(
-            pool.shards[0].shard.volatile_payload(seq).is_none(),
-            "ready entries should hydrate from disk"
         );
     }
 
@@ -278,13 +197,17 @@ fn lookup_primary_range_batches_contiguous_hydration() {
         metrics
             .buffer_lookup_hydrate_ops
             .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "contiguous one-LBA entries should hydrate with one batched LV2 read"
+        0,
+        "freshly-appended entries already have payload cached; no LV2 hydration needed"
     );
 }
 
 #[test]
-fn flusher_hydration_does_not_install_payload_into_indices() {
+fn flusher_hydration_uses_cached_payload_after_append() {
+    // In the ack-after-LV2-fdatasync design, append populates
+    // PendingEntry.payload eagerly, so flusher hydration never re-reads from
+    // disk for a freshly-appended seq. (Crash-recovered entries hydrate
+    // lazily; that path is covered elsewhere.)
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;
     let payload = vec![0x71; BLOCK_SIZE as usize];
@@ -296,16 +219,14 @@ fn flusher_hydration_does_not_install_payload_into_indices() {
     );
 
     let before = shard.pending_entry_arc(seq).unwrap();
-    assert!(before.payload.is_none());
-    assert!(shard.volatile_payload(seq).is_none());
+    assert_eq!(
+        before.payload.as_deref(),
+        Some(payload.as_slice()),
+        "appended entries carry payload from append time onward"
+    );
 
     let hydrated = shard.pending_entry_arc_hydrated(seq).unwrap();
     assert_eq!(hydrated.payload.as_deref(), Some(payload.as_slice()));
-
-    let after = shard.pending_entry_arc(seq).unwrap();
-    assert!(after.payload.is_none());
-    assert!(Arc::ptr_eq(&before, &after));
-    assert_eq!(pool.payload_memory_bytes(), 0);
 }
 
 #[test]

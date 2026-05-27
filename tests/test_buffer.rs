@@ -198,7 +198,12 @@ fn flush_and_advance() {
 }
 
 #[test]
-fn retry_snapshot_does_not_treat_pre_sync_entries_as_ready() {
+fn append_blocks_until_persisted_and_publishes_ready() {
+    // The legacy `retry_snapshot_does_not_treat_pre_sync_entries_as_ready`
+    // exercised a pre-sync visibility gate that the ack-after-LV2-fdatasync
+    // design has eliminated. The equivalent invariant now is: by the time
+    // `pool.append()` returns, the entry must already be both persisted on
+    // LV2 (durable) AND visible in the per-shard ready snapshot.
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 8 * 8192;
     tmp.as_file().set_len(size).unwrap();
@@ -211,9 +216,10 @@ fn retry_snapshot_does_not_treat_pre_sync_entries_as_ready() {
         .unwrap();
 
     let ready_snapshot = pool.ready_pending_entries_arc_snapshot_for_shard(0);
-    assert!(
-        ready_snapshot.is_empty(),
-        "staged seq {} must not appear ready before the sync thread persists it",
+    assert_eq!(
+        ready_snapshot.len(),
+        1,
+        "appended seq {} must appear in the ready snapshot post-return",
         seq
     );
 
@@ -654,7 +660,11 @@ fn concurrent_duplicate_mark_flushed_does_not_underflow_payload_memory() {
         let seq = pool
             .append("test-vol", Lba(lba), 1, &vec![0xA5; BLOCK_SIZE as usize], 0)
             .unwrap();
-        assert_eq!(pool.payload_memory_bytes(), 0);
+        // Under ack-after-LV2-fdatasync, append populates
+        // PendingEntry.payload eagerly, so memory accounting reflects the
+        // freshly-appended block. It returns to 0 once mark_flushed
+        // retires the entry below.
+        assert_eq!(pool.payload_memory_bytes(), BLOCK_SIZE as u64);
 
         let barrier = Arc::new(Barrier::new(9));
         let mut workers = Vec::new();
@@ -706,7 +716,13 @@ fn append_retries_transient_sync_failure_without_losing_pending_entry() {
 }
 
 #[test]
-fn append_is_visible_before_ready_publish() {
+fn append_is_durable_and_published_on_return() {
+    // Pre-ack-after-LV2 design had a window where the entry was visible
+    // in lba_index but the ready channel hadn't been signaled yet. Under
+    // the new design `pool.append()` blocks until both LV2 fdatasync
+    // covers the seq AND the seq has been pushed onto the ready channels,
+    // so the legacy "visible before ready" ordering is no longer
+    // observable. Both should be true the instant append returns.
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 8 * 8192;
     tmp.as_file().set_len(size).unwrap();
@@ -719,13 +735,9 @@ fn append_is_visible_before_ready_publish() {
 
     let found = pool.lookup("test-vol", Lba(9)).unwrap().unwrap();
     assert_eq!(&**found.payload.as_ref().unwrap(), &*data);
-    assert!(matches!(
-        pool.try_recv_ready(),
-        Err(crossbeam_channel::TryRecvError::Empty)
-    ));
 
-    let ready = pool.recv_ready_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(ready, seq);
+    // Append guarantees publish-before-return now.
+    assert_eq!(pool.try_recv_ready().unwrap(), seq);
 }
 
 #[test]

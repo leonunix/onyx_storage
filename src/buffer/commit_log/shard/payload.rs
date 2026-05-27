@@ -22,32 +22,14 @@ impl BufferShard {
         }
     }
 
-    pub(in crate::buffer::commit_log) fn cache_committed_payload(
-        &self,
-        pending: &Arc<PendingEntry>,
-        payload: Arc<[u8]>,
-    ) {
-        let payload_len = payload.len() as u64;
-        if self.max_payload_memory == 0 || payload_len > self.max_payload_memory {
-            return;
-        }
+    // NOTE: `cache_committed_payload` was deleted as part of the
+    // ack-after-LV2-fdatasync refactor. Payload now lives in
+    // `PendingEntry::payload` from append time onward (set eagerly in
+    // `append_with_seq`); the sync thread no longer mutates index state
+    // post-fdatasync, so the previous "swap Arc to inject payload" dance
+    // disappears entirely.
 
-        let mut cached = pending.as_ref().clone();
-        cached.payload = Some(payload);
-        let cached = Arc::new(cached);
-        if !self.replace_pending_entry_if_current(pending, cached.clone()) {
-            return;
-        }
-
-        self.payload_bytes_in_memory
-            .fetch_add(payload_len, Ordering::Relaxed);
-        self.replace_lba_index_if_current(pending, &cached);
-        self.cached_payload_order.lock().push_back(pending.seq);
-        self.evict_payload_cache_to_budget();
-        self.compact_payload_cache_order_if_needed();
-    }
-
-    fn evict_payload_cache_to_budget(&self) {
+    pub(in crate::buffer::commit_log) fn evict_payload_cache_to_budget(&self) {
         let budget = self.max_payload_memory;
         if budget == 0 {
             return;
@@ -93,7 +75,7 @@ impl BufferShard {
         }
     }
 
-    fn compact_payload_cache_order_if_needed(&self) {
+    pub(in crate::buffer::commit_log) fn compact_payload_cache_order_if_needed(&self) {
         let live_pending = self.pending_entries.len();
         let max_order_len = live_pending.saturating_mul(2).max(1024);
         let mut order = self.cached_payload_order.lock();
@@ -332,25 +314,12 @@ impl BufferShard {
         hydrated
     }
 
-    pub(in crate::buffer::commit_log) fn volatile_payload(&self, seq: u64) -> Option<Arc<[u8]>> {
-        self.volatile_payloads
-            .get(&seq)
-            .map(|payload| payload.value().clone())
-    }
-
-    pub(in crate::buffer::commit_log) fn remove_volatile_payload(
-        &self,
-        seq: u64,
-    ) -> Option<Arc<[u8]>> {
-        self.volatile_payloads.remove(&seq).map(|(_, payload)| {
-            self.volatile_payload_budget.release(payload.len() as u64);
-            payload
-        })
-    }
-
-    pub(super) fn is_seq_inflight(&self, seq: u64) -> bool {
-        self.lifecycle.lock().inflight.contains(&seq)
-    }
+    // `volatile_payload` / `remove_volatile_payload` / `is_seq_inflight`
+    // were removed. Payload now lives in `PendingEntry::payload` from append
+    // time onward; reads consult that field, falling back to LV2 disk only
+    // for crash-recovered entries (which keep `payload: None`). The flusher's
+    // readiness check is `seq <= lv2_durability.synced_seq` — see
+    // `is_seq_ready_for_flush`.
 
     /// Return a PendingEntry with payload guaranteed present. If the entry
     /// was recovered without payload (lazy), reads it from disk now.
@@ -398,18 +367,7 @@ impl BufferShard {
         if entry.payload.is_some() {
             return Ok(Some((*entry).clone()));
         }
-        if let Some(payload) = self.volatile_payload(entry.seq) {
-            let mut hydrated = (*entry).clone();
-            hydrated.payload = Some(payload);
-            return Ok(Some(hydrated));
-        }
-        if self.is_seq_inflight(entry.seq) {
-            return Err(OnyxError::Io(std::io::Error::other(format!(
-                "buffer payload for inflight seq {} is not memory-resident yet",
-                entry.seq
-            ))));
-        }
-        // Lazy hydration: read payload from buffer device.
+        // payload=None means crash-recovered entry: lazy-hydrate from LV2.
         let seq = entry.seq;
         let hydrate_started = Instant::now();
         let result = self.read_payload_from_disk(entry.as_ref());
@@ -475,23 +433,12 @@ impl BufferShard {
         let mut payloads: HashMap<u64, Arc<[u8]>> = HashMap::new();
         let mut missing = Vec::new();
         let mut seen_missing = HashSet::new();
-        let mut missing_inflight_payload = None;
         for entry in indexed.iter().flatten() {
             if let Some(payload) = entry.payload.clone() {
                 payloads.entry(entry.seq).or_insert(payload);
-            } else if let Some(payload) = self.volatile_payload(entry.seq) {
-                payloads.entry(entry.seq).or_insert(payload);
-            } else if self.is_seq_inflight(entry.seq) {
-                missing_inflight_payload = Some(entry.seq);
-                break;
             } else if seen_missing.insert(entry.seq) {
                 missing.push(entry.clone());
             }
-        }
-        if let Some(seq) = missing_inflight_payload {
-            return Err(OnyxError::Io(std::io::Error::other(format!(
-                "buffer payload for inflight seq {seq} is not memory-resident yet"
-            ))));
         }
         payloads.extend(self.hydrate_missing_payloads_batched(&missing, true));
 
@@ -549,7 +496,7 @@ impl BufferShard {
 
     pub(in crate::buffer::commit_log) fn pending_entry(&self, seq: u64) -> Option<BufferEntry> {
         let entry = self.pending_entries.get(&seq)?;
-        if let Some(payload) = entry.payload.clone().or_else(|| self.volatile_payload(seq)) {
+        if let Some(payload) = entry.payload.clone() {
             return Some(Self::pending_with_payload_to_buffer_entry(&entry, payload));
         }
         Some(Self::pending_to_buffer_entry(&entry))
@@ -625,7 +572,6 @@ impl BufferShard {
             return;
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
-        self.remove_volatile_payload(seq);
         let vid = self.intern_vol_id(&pending.vol_id);
         for i in 0..pending.lba_count {
             let key = LbaKey {
@@ -682,17 +628,9 @@ impl BufferShard {
             return Some(entry);
         }
         drop(entry_ref);
-        if let Some(payload) = self.volatile_payload(seq) {
-            let mut hydrated = (*entry).clone();
-            hydrated.payload = Some(payload);
-            return Some(Arc::new(hydrated));
-        }
-        if self.is_seq_inflight(seq) {
-            return None;
-        }
-        // Lazy hydration: read payload from disk, but keep it detached from
-        // the shared indices. Coalescer window/channel bounds cap this
-        // transient memory; persistent payload residency remains zero.
+        // payload=None means crash-recovered entry: lazy-hydrate from LV2,
+        // returning a detached PendingEntry so the indices stay payload-less
+        // and read budget is unbounded only for the call's lifetime.
         match self.read_payload_from_disk(entry.as_ref()) {
             Ok(payload) => {
                 let mut hydrated = (*entry).clone();
@@ -718,8 +656,6 @@ impl BufferShard {
         let hydrate_started = Instant::now();
         let total_entries = entries.len() as u64;
         let mut memory_entries = 0u64;
-        let mut volatile_entries = 0u64;
-        let mut inflight_skips = 0u64;
         let mut payloads: HashMap<u64, Arc<[u8]>> = HashMap::with_capacity(entries.len());
         let mut missing = Vec::new();
         let mut seen_missing = HashSet::new();
@@ -727,12 +663,6 @@ impl BufferShard {
             if let Some(payload) = entry.payload.clone() {
                 memory_entries += 1;
                 payloads.entry(entry.seq).or_insert(payload);
-            } else if let Some(payload) = self.volatile_payload(entry.seq) {
-                volatile_entries += 1;
-                payloads.entry(entry.seq).or_insert(payload);
-            } else if self.is_seq_inflight(entry.seq) {
-                inflight_skips += 1;
-                continue;
             } else if seen_missing.insert(entry.seq) {
                 missing.push(entry.clone());
             }
@@ -754,14 +684,8 @@ impl BufferShard {
                 .buffer_coalesce_hydrate_memory_entries
                 .fetch_add(memory_entries, Ordering::Relaxed);
             metrics
-                .buffer_coalesce_hydrate_volatile_entries
-                .fetch_add(volatile_entries, Ordering::Relaxed);
-            metrics
                 .buffer_coalesce_hydrate_disk_entries
                 .fetch_add(disk_entries, Ordering::Relaxed);
-            metrics
-                .buffer_coalesce_hydrate_inflight_skips
-                .fetch_add(inflight_skips, Ordering::Relaxed);
         }
 
         let mut hydrated = Vec::with_capacity(entries.len());

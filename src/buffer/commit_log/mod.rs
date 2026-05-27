@@ -35,8 +35,6 @@ const STAGING_CHANNEL_CAPACITY: usize = 32 * 1024;
 /// before the device had a chance to fsync the first batch.
 const SYNC_BATCH_MAX_ENTRIES: usize = 4096;
 const SYNC_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
-const MIN_VOLATILE_PAYLOAD_MEMORY: u64 = 64 * 1024 * 1024;
-const MAX_VOLATILE_PAYLOAD_MEMORY: u64 = 8 * 1024 * 1024 * 1024;
 /// Online payload hydration read-ahead. 128 KiB matches the common coalesce
 /// unit while keeping foreground read tail latency bounded.
 const HYDRATE_BATCH_MAX_BYTES: usize = 128 * 1024;
@@ -52,7 +50,6 @@ pub struct BufferRuntimeLimits {
     pub staging_channel_capacity: usize,
     pub sync_batch_max_entries: usize,
     pub sync_batch_max_bytes: usize,
-    pub volatile_payload_memory: u64,
     pub throttle: ThrottleSettings,
 }
 
@@ -120,13 +117,12 @@ impl ThrottleSettings {
 
 impl BufferRuntimeLimits {
     pub fn from_config(
-        durable_payload_limit: u64,
+        _durable_payload_limit: u64,
         staging_channel_capacity: usize,
         sync_batch_max_entries: usize,
         sync_batch_max_bytes: usize,
-        volatile_payload_memory: u64,
     ) -> Self {
-        let defaults = Self::for_durable_payload_limit(durable_payload_limit);
+        let defaults = Self::default();
         Self {
             staging_channel_capacity: if staging_channel_capacity == 0 {
                 defaults.staging_channel_capacity
@@ -143,11 +139,6 @@ impl BufferRuntimeLimits {
             } else {
                 sync_batch_max_bytes
             },
-            volatile_payload_memory: if volatile_payload_memory == 0 {
-                defaults.volatile_payload_memory
-            } else {
-                volatile_payload_memory
-            },
             throttle: defaults.throttle,
         }
     }
@@ -156,96 +147,61 @@ impl BufferRuntimeLimits {
         self.throttle = throttle;
         self
     }
+}
 
-    pub fn for_durable_payload_limit(durable_payload_limit: u64) -> Self {
-        let volatile_payload_memory = if durable_payload_limit == 0 {
-            0
-        } else {
-            (durable_payload_limit / 4)
-                .clamp(MIN_VOLATILE_PAYLOAD_MEMORY, MAX_VOLATILE_PAYLOAD_MEMORY)
-        };
+impl Default for BufferRuntimeLimits {
+    fn default() -> Self {
         Self {
             staging_channel_capacity: STAGING_CHANNEL_CAPACITY,
             sync_batch_max_entries: SYNC_BATCH_MAX_ENTRIES,
             sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
-            volatile_payload_memory,
             throttle: ThrottleSettings::default(),
         }
     }
 }
 
-struct VolatilePayloadBudget {
-    bytes: AtomicU64,
-    limit: u64,
-    lock: parking_lot::Mutex<()>,
-    cv: Condvar,
+/// LV2 fdatasync watermark + condvar. Producers (append) park on this until
+/// the sync thread fdatasync's their seq. One waiter per blocked `append()`;
+/// the sync thread `notify_all()` once per fdatasync batch.
+pub(crate) struct Lv2DurabilityWaiter {
+    /// Monotonic max seq whose payload is fdatasync'd on LV2 for this shard.
+    pub(crate) synced_seq: AtomicU64,
+    /// Pairs with `cv` per parking_lot Condvar contract.
+    pub(crate) lock: parking_lot::Mutex<()>,
+    pub(crate) cv: Condvar,
 }
 
-impl VolatilePayloadBudget {
-    fn new(limit: u64) -> Self {
+impl Lv2DurabilityWaiter {
+    pub(crate) fn new(initial: u64) -> Self {
         Self {
-            bytes: AtomicU64::new(0),
-            limit,
+            synced_seq: AtomicU64::new(initial),
             lock: parking_lot::Mutex::new(()),
             cv: Condvar::new(),
         }
     }
 
-    fn reserve(&self, bytes: u64) {
-        if self.limit == 0 {
-            self.bytes.fetch_add(bytes, Ordering::Relaxed);
-            return;
+    /// Block until `synced_seq >= seq`. Returns the wait duration so the
+    /// caller can attribute it to `buffer_append_wait_durable_ns`.
+    pub(crate) fn wait_for(&self, seq: u64) -> Duration {
+        if self.synced_seq.load(Ordering::Acquire) >= seq {
+            return Duration::ZERO;
         }
-
+        let start = Instant::now();
         let mut guard = self.lock.lock();
-        loop {
-            let current = self.bytes.load(Ordering::Relaxed);
-            let fits = current.saturating_add(bytes) <= self.limit;
-            let oversized_single_write = current == 0 && bytes > self.limit;
-            if fits || oversized_single_write {
-                if self
-                    .bytes
-                    .compare_exchange_weak(
-                        current,
-                        current.saturating_add(bytes),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    return;
-                }
-                continue;
-            }
-            let _ = self.cv.wait_for(&mut guard, BACKPRESSURE_POLL_INTERVAL);
+        while self.synced_seq.load(Ordering::Acquire) < seq {
+            self.cv.wait(&mut guard);
         }
+        start.elapsed()
     }
 
-    fn release(&self, bytes: u64) {
-        let mut current = self.bytes.load(Ordering::Relaxed);
-        loop {
-            let next = current.saturating_sub(bytes);
-            match self.bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.cv.notify_all();
-                    return;
-                }
-                Err(actual) => current = actual,
-            }
+    /// Advance the watermark and wake all parked appenders. Called by the
+    /// sync thread after fdatasync covers the batch.
+    pub(crate) fn advance(&self, max_seq: u64) {
+        let prev = self.synced_seq.fetch_max(max_seq, Ordering::Release);
+        if prev < max_seq {
+            let _g = self.lock.lock();
+            self.cv.notify_all();
         }
-    }
-
-    fn bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Relaxed)
-    }
-
-    fn limit(&self) -> u64 {
-        self.limit
     }
 }
 
@@ -414,10 +370,13 @@ struct RingState {
     head_became_at: Option<Instant>,
 }
 
-// ── Lifecycle: inflight/cancelled tracking ──────────────────────────
+// ── Lifecycle: cancelled tracking only ──────────────────────────────
+// "inflight" was a HashSet gating the flusher off non-durable entries
+// when append acked before LV2 fdatasync. The current design has
+// append() block until `lv2_durability.synced_seq >= seq`, so the
+// flusher's readiness check is a single atomic load — no set, no lock.
 
 struct LifecycleState {
-    inflight: HashSet<u64>,
     cancelled: HashSet<u64>,
 }
 
@@ -440,13 +399,22 @@ struct BufferShard {
     staging_rx: Receiver<StagedEntry>,
     sync_batch_max_entries: usize,
     sync_batch_max_bytes: usize,
-    /// Durable, memory-resident payload cache. `volatile_payloads` covers the
-    /// pre-fdatasync window; once sync publishes an entry as ready, payloads
-    /// move into `PendingEntry::payload` and this FIFO tracks eviction order.
+    /// FIFO tracking eviction order for the in-memory payload cache. Payloads
+    /// live in `PendingEntry::payload` (Some) and are evicted from oldest to
+    /// newest when `payload_bytes_in_memory` exceeds `max_payload_memory`.
     cached_payload_order: parking_lot::Mutex<VecDeque<u64>>,
-    volatile_payloads: DashMap<u64, Arc<[u8]>>,
-    volatile_payload_budget: Arc<VolatilePayloadBudget>,
     lifecycle: parking_lot::Mutex<LifecycleState>,
+    /// LV2 fdatasync watermark. Advanced by the sync thread after each
+    /// successful fdatasync; `append_with_seq` parks on it before returning
+    /// to the caller, so every ack implies the payload is durable on LV2.
+    pub(crate) lv2_durability: Arc<Lv2DurabilityWaiter>,
+    /// Sender for the flusher's global ready channel. Appender publishes
+    /// its own seq here after waking from the durability cvar, replacing the
+    /// previous sync-thread-driven publish.
+    pub(crate) ready_tx: Sender<u64>,
+    /// Per-shard variant of `ready_tx` (the flusher's coalesce loop picks
+    /// the shard channel for fairness).
+    pub(crate) shard_ready_tx: Sender<u64>,
     io_lock: parking_lot::Mutex<()>,
     /// Intern cache: vol_id → Arc<str>. Typically 1-10 entries.
     /// Avoids per-insert Arc::from() allocation for LbaKey.
@@ -458,8 +426,7 @@ struct BufferShard {
     /// Shared counter for total payload bytes in memory (across all shards).
     payload_bytes_in_memory: Arc<AtomicU64>,
     /// Global budget for durable in-memory buffer payload cache. 0 disables
-    /// the resident cache; the transient pre-sync `volatile_payloads` path
-    /// still serves read-after-write.
+    /// the resident cache (forces lazy hydration from LV2 on demand).
     max_payload_memory: u64,
     /// Global upper bound of seqs that have been mark_flushed'd (across all
     /// shards). Updated in `free_seq_allocation` to `max(current, seq)`.
@@ -483,10 +450,6 @@ pub struct WriteBufferPool {
     /// Maximum allowed durable in-memory payload cache bytes. 0 disables the
     /// resident cache (used by tests that need forced lazy hydration).
     max_payload_memory: u64,
-    /// Sync-before-publish payloads. These are intentionally separate from
-    /// durable cache bytes because they are write-admission pressure, not a
-    /// reusable read cache.
-    volatile_payload_budget: Arc<VolatilePayloadBudget>,
     /// On-disk layout version — persisted on Drop. Must match the actual disk layout.
     disk_version: u32,
     /// Resolved hyperbolic throttle curve (`None` = disabled). Set once at

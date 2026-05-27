@@ -63,7 +63,7 @@ impl WriteBufferPool {
         max_payload_memory: u64,
         uring_sq_entries: Option<u32>,
     ) -> OnyxResult<Self> {
-        let runtime_limits = BufferRuntimeLimits::for_durable_payload_limit(max_payload_memory);
+        let runtime_limits = BufferRuntimeLimits::default();
         Self::open_with_options_full_and_limits(
             device,
             group_commit_wait,
@@ -213,24 +213,45 @@ impl WriteBufferPool {
         // ── Parallel shard recovery ──────────────────────────────────
         let metrics = Arc::new(OnceLock::new());
         let payload_bytes_in_memory = Arc::new(AtomicU64::new(0));
-        let volatile_payload_budget = Arc::new(VolatilePayloadBudget::new(
-            runtime_limits.volatile_payload_memory,
-        ));
         // Durability-watermark atomics shared with every shard. `max_flushed_seq`
         // is bumped in free_seq_allocation; `durable_seq` is advanced by the
         // engine-owned watermark thread after MetaStore::sync_durable().
         let max_flushed_seq = Arc::new(AtomicU64::new(0));
         let durable_seq = Arc::new(AtomicU64::new(0));
+
+        // Per-shard LV2 fdatasync watermark + cvar — what `pool.append`
+        // parks on before returning to the caller. One per shard so wakes
+        // only release appenders whose write hit this shard.
+        let lv2_durability_per_shard: Vec<Arc<Lv2DurabilityWaiter>> = (0..shard_count)
+            .map(|_| Arc::new(Lv2DurabilityWaiter::new(0)))
+            .collect();
+
+        // Ready channels live up here so we can hand clones to each shard
+        // before recovery — appenders publish ready seqs through them, and
+        // we still need to feed any crash-recovered seqs into the channels
+        // post-open below.
+        let (ready_tx, ready_rx) = unbounded();
+        let mut shard_ready_txs_for_open = Vec::with_capacity(shard_count);
+        let mut shard_ready_rxs_for_pool = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (tx, rx) = unbounded();
+            shard_ready_txs_for_open.push(tx);
+            shard_ready_rxs_for_pool.push(rx);
+        }
+
         let shard_results: Vec<OnyxResult<(BufferShard, u64)>> = if shard_count > 1 {
             std::thread::scope(|s| {
                 let handles: Vec<_> = shard_configs
                     .into_iter()
-                    .map(|cfg| {
+                    .enumerate()
+                    .map(|(idx, cfg)| {
                         let m = metrics.clone();
                         let pb = payload_bytes_in_memory.clone();
-                        let vb = volatile_payload_budget.clone();
                         let mfs = max_flushed_seq.clone();
                         let ds = durable_seq.clone();
+                        let lv2 = lv2_durability_per_shard[idx].clone();
+                        let rtx = ready_tx.clone();
+                        let srtx = shard_ready_txs_for_open[idx].clone();
                         s.spawn(move || {
                             BufferShard::open(
                                 cfg.data_device,
@@ -240,10 +261,12 @@ impl WriteBufferPool {
                                 cfg.checkpoint_device,
                                 pb,
                                 max_payload_memory,
-                                vb,
                                 runtime_limits,
                                 mfs,
                                 ds,
+                                lv2,
+                                rtx,
+                                srtx,
                             )
                         })
                     })
@@ -257,7 +280,8 @@ impl WriteBufferPool {
             // Single shard — no need for thread overhead.
             shard_configs
                 .into_iter()
-                .map(|cfg| {
+                .enumerate()
+                .map(|(idx, cfg)| {
                     BufferShard::open(
                         cfg.data_device,
                         backpressure_timeout,
@@ -266,17 +290,18 @@ impl WriteBufferPool {
                         cfg.checkpoint_device,
                         payload_bytes_in_memory.clone(),
                         max_payload_memory,
-                        volatile_payload_budget.clone(),
                         runtime_limits,
                         max_flushed_seq.clone(),
                         durable_seq.clone(),
+                        lv2_durability_per_shard[idx].clone(),
+                        ready_tx.clone(),
+                        shard_ready_txs_for_open[idx].clone(),
                     )
                 })
                 .collect()
         };
 
         // ── Sequential setup: channels + sync threads ────────────────
-        let (ready_tx, ready_rx) = unbounded();
         let mut shard_ready_txs = Vec::with_capacity(shard_count);
         let mut shard_ready_rxs = Vec::with_capacity(shard_count);
         let mut shards = Vec::with_capacity(shard_count);
@@ -288,7 +313,15 @@ impl WriteBufferPool {
             let (shard, shard_max_seq) = result?;
             shard.compact_recovered_stale_ranges();
 
-            let (shard_ready_tx, shard_ready_rx) = unbounded();
+            // Recovered entries were durable on LV2 by definition, so seed
+            // the LV2 watermark with the max recovered seq before publishing
+            // them — otherwise `is_seq_ready_for_flush` would gate them off
+            // immediately after open.
+            shard
+                .lv2_durability
+                .advance(shard.lv2_durability.synced_seq.load(Ordering::Relaxed).max(shard_max_seq));
+
+            let shard_ready_tx_for_loop = shard_ready_txs_for_open[shard_idx].clone();
             let mut recovered_seqs: Vec<u64> = shard
                 .pending_entries
                 .iter()
@@ -297,7 +330,7 @@ impl WriteBufferPool {
             recovered_seqs.sort_unstable();
             for seq in recovered_seqs {
                 let _ = ready_tx.send(seq);
-                let _ = shard_ready_tx.send(seq);
+                let _ = shard_ready_tx_for_loop.send(seq);
             }
             max_seq = max_seq.max(shard_max_seq);
 
@@ -326,7 +359,7 @@ impl WriteBufferPool {
                     let shard = shard.clone();
                     let shutdown = sync_shutdown.clone();
                     let ready_tx = ready_tx.clone();
-                    let shard_ready_tx = shard_ready_tx.clone();
+                    let shard_ready_tx = shard_ready_tx_for_loop.clone();
                     let uring = shard_uring.clone();
                     move || {
                         crate::affinity::bind_current(
@@ -353,8 +386,8 @@ impl WriteBufferPool {
                     ))
                 })?;
 
-            shard_ready_txs.push(shard_ready_tx);
-            shard_ready_rxs.push(shard_ready_rx);
+            shard_ready_txs.push(shard_ready_tx_for_loop);
+            shard_ready_rxs.push(shard_ready_rxs_for_pool.remove(0));
             shards.push(BufferShardHandle {
                 shard,
                 sync_wake_tx,
@@ -379,7 +412,6 @@ impl WriteBufferPool {
             metrics,
             payload_bytes_in_memory,
             max_payload_memory,
-            volatile_payload_budget,
             disk_version,
             max_flushed_seq,
             durable_seq,
