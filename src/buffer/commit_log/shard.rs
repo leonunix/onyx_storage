@@ -939,25 +939,27 @@ impl BufferShard {
     /// filter or are missing from `pending_entries` (rare: entry
     /// retired between log_order capture and DashMap lookup).
     pub(super) fn oldest_pending_arcs(&self, limit: usize) -> Vec<Arc<PendingEntry>> {
-        if limit == 0 {
+        if limit == 0 || self.pending_count.load(Ordering::Relaxed) == 0 {
             return Vec::new();
         }
-        let mut candidates: Vec<u64> = {
+        // Snapshot the full log_order under the ring lock. Under the
+        // buffer-as-sole-journal model `mark_applied` removes the seq's
+        // pending entry but does NOT shrink `log_order` — only
+        // `release_below` (checkpoint outcome) does. So the leading
+        // prefix of `log_order` is usually dominated by already-applied
+        // seqs whose pending_entries are gone; a bounded `take(limit*2)`
+        // scan would miss the real stuck pending entries that sit deeper
+        // in `log_order` and never reach the coalesce retry path.
+        let candidates: Vec<u64> = {
             let ring = self.ring.lock();
-            ring.log_order
-                .iter()
-                .take(limit.saturating_mul(2))
-                .map(|r| r.seq)
-                .collect()
+            ring.log_order.iter().map(|r| r.seq).collect()
         };
-        // Filter out seqs not yet covered by the LV2 fdatasync watermark.
-        // Reading the watermark once outside the loop is atomic-cheap; we
-        // tolerate a tiny staleness window (a write thread could advance
-        // mid-iteration), which only delays a few entries by one cycle.
         let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
-        candidates.retain(|s| *s <= synced);
         let mut result = Vec::with_capacity(limit);
         for seq in candidates {
+            if seq > synced {
+                continue;
+            }
             if let Some(entry) = self.pending_entries.get(&seq) {
                 result.push(entry.value().clone());
                 if result.len() >= limit {
@@ -969,24 +971,39 @@ impl BufferShard {
     }
 
     pub(super) fn head_pending_seq_if_stuck(&self, min_age: Duration) -> Option<u64> {
-        let (head_seq, head_became_at) = {
+        if self.pending_count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        // Walk log_order from the front and return the first seq that
+        // still has a live pending_entry. Under buffer-as-sole-journal
+        // `mark_applied` drops the pending_entry but leaves the ring
+        // slot held until `release_below`, so the leading prefix of
+        // log_order is dominated by applied (no-longer-pending) seqs.
+        // Scanning past them is the only way to surface genuinely
+        // stuck pending entries to the coalesce retry path.
+        let (candidates, head_became_at) = {
             let ring = self.ring.lock();
             (
-                ring.log_order.front().map(|record| record.seq)?,
+                ring.log_order.iter().map(|r| r.seq).collect::<Vec<u64>>(),
                 ring.head_became_at,
             )
         };
-        if !self.is_seq_ready_for_flush(head_seq) {
-            return None;
-        }
-        let pending = self.pending_entries.get(&head_seq)?;
-        let has_partial_progress = self.flush_progress.contains_key(&head_seq);
-        drop(pending);
+        let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
         let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
-        if !has_partial_progress && !old_enough {
-            return None;
+        for seq in candidates {
+            if seq > synced {
+                continue;
+            }
+            if self.pending_entries.get(&seq).is_none() {
+                continue;
+            }
+            let has_partial_progress = self.flush_progress.contains_key(&seq);
+            if !has_partial_progress && !old_enough {
+                return None;
+            }
+            return Some(seq);
         }
-        Some(head_seq)
+        None
     }
 
     /// Cheap, non-hydrating diagnostic snapshot for a given seq. Returns
