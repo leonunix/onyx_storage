@@ -188,6 +188,11 @@ impl BufferShard {
             disk_offset: offset,
             slot_count,
         });
+        // Track in the pending-only index so coalesce lookups don't
+        // have to scan through already-applied seqs in log_order.
+        // Paired with `note_applied`'s removal; release_below doesn't
+        // need to touch this set (the seq is already absent by then).
+        ring.pending_seqs.insert(seq);
         if was_empty {
             ring.head_became_at = Some(Instant::now());
         }
@@ -384,6 +389,17 @@ impl BufferShard {
             .map(|e| e.value().disk_len as u64)
             .sum();
 
+        // Build the pending_seqs index = seqs in log_order whose
+        // pending_entries slot is still present (i.e. NOT in
+        // flushed_seqs). Matches the open-time semantics: scan
+        // hydrated `pending_entries` only for non-applied seqs;
+        // pending_seqs mirrors that key set in sorted order so the
+        // coalescer's "oldest pending" lookup is O(P) not O(L).
+        let pending_seqs: BTreeSet<u64> = log_order
+            .iter()
+            .filter(|r| !scan.flushed_seqs.contains(&r.seq))
+            .map(|r| r.seq)
+            .collect();
         Ok((
             Self {
                 device,
@@ -395,6 +411,7 @@ impl BufferShard {
                     tail_offset: scan.tail_offset,
                     log_order,
                     flushed_seqs: scan.flushed_seqs,
+                    pending_seqs,
                     head_became_at: had_head.then(Instant::now),
                 }),
                 ring_space_cv: parking_lot::Condvar::new(),
@@ -942,17 +959,19 @@ impl BufferShard {
         if limit == 0 || self.pending_count.load(Ordering::Relaxed) == 0 {
             return Vec::new();
         }
-        // Snapshot the full log_order under the ring lock. Under the
-        // buffer-as-sole-journal model `mark_applied` removes the seq's
-        // pending entry but does NOT shrink `log_order` — only
-        // `release_below` (checkpoint outcome) does. So the leading
-        // prefix of `log_order` is usually dominated by already-applied
-        // seqs whose pending_entries are gone; a bounded `take(limit*2)`
-        // scan would miss the real stuck pending entries that sit deeper
-        // in `log_order` and never reach the coalesce retry path.
+        // Walk the pending-only index in ascending seq order. Cap the
+        // brief ring-lock snapshot at `limit * 2` so a coalescer with
+        // a deep pending tail doesn't hold the lock long; the
+        // readiness filter still rejects entries above `synced_seq`,
+        // and the `limit * 2` slack handles those rejects plus the
+        // rare entry retired between snapshot and DashMap lookup.
         let candidates: Vec<u64> = {
             let ring = self.ring.lock();
-            ring.log_order.iter().map(|r| r.seq).collect()
+            ring.pending_seqs
+                .iter()
+                .take(limit * 2)
+                .copied()
+                .collect()
         };
         let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
         let mut result = Vec::with_capacity(limit);
@@ -974,36 +993,32 @@ impl BufferShard {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        // Walk log_order from the front and return the first seq that
-        // still has a live pending_entry. Under buffer-as-sole-journal
-        // `mark_applied` drops the pending_entry but leaves the ring
-        // slot held until `release_below`, so the leading prefix of
-        // log_order is dominated by applied (no-longer-pending) seqs.
-        // Scanning past them is the only way to surface genuinely
-        // stuck pending entries to the coalesce retry path.
-        let (candidates, head_became_at) = {
+        // Use the pending-only index: the smallest seq still pending
+        // is by definition the head of `log_order` that hasn't been
+        // applied yet. Cheap O(1) min plus an age check on the ring
+        // head's `head_became_at`. The DashMap probe still survives
+        // as a final liveness gate to handle the rare race where the
+        // seq is being concurrently mark_applied.
+        let (head_pending, head_became_at) = {
             let ring = self.ring.lock();
-            (
-                ring.log_order.iter().map(|r| r.seq).collect::<Vec<u64>>(),
-                ring.head_became_at,
-            )
+            (ring.pending_seqs.iter().next().copied(), ring.head_became_at)
+        };
+        let Some(seq) = head_pending else {
+            return None;
         };
         let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
-        let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
-        for seq in candidates {
-            if seq > synced {
-                continue;
-            }
-            if self.pending_entries.get(&seq).is_none() {
-                continue;
-            }
-            let has_partial_progress = self.flush_progress.contains_key(&seq);
-            if !has_partial_progress && !old_enough {
-                return None;
-            }
-            return Some(seq);
+        if seq > synced {
+            return None;
         }
-        None
+        if self.pending_entries.get(&seq).is_none() {
+            return None;
+        }
+        let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
+        let has_partial_progress = self.flush_progress.contains_key(&seq);
+        if !has_partial_progress && !old_enough {
+            return None;
+        }
+        Some(seq)
     }
 
     /// Cheap, non-hydrating diagnostic snapshot for a given seq. Returns
@@ -1326,6 +1341,10 @@ impl BufferShard {
         self.max_flushed_seq.fetch_max(seq, Ordering::Relaxed);
         let mut ring = self.ring.lock();
         ring.flushed_seqs.insert(seq);
+        // Drop the seq from the pending-only index. Coalesce lookups
+        // are then O(P) instead of O(log_order.len()) in the
+        // applied-but-not-released steady state.
+        ring.pending_seqs.remove(&seq);
         self.flush_progress.remove(&seq);
     }
 

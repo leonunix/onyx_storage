@@ -388,6 +388,7 @@ fn make_ring(capacity_slots: u32) -> RingState {
         tail_offset: 0,
         log_order: VecDeque::new(),
         flushed_seqs: HashSet::new(),
+        pending_seqs: BTreeSet::new(),
         head_became_at: None,
     }
 }

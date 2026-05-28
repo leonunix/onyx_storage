@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -10,7 +10,7 @@ use parking_lot::{Condvar, RwLock};
 
 use crate::buffer::entry::{BufferEntry, BUFFER_ENTRY_MAGIC, MAX_ENTRY_SIZE, MIN_ENTRY_SIZE};
 use crate::error::{OnyxError, OnyxResult};
-use crate::io::aligned::{round_up, AlignedBuf};
+use crate::io::aligned::{round_up, AlignedBuf, AlignedBufPool};
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, UringOp};
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
@@ -367,6 +367,22 @@ struct RingState {
     tail_offset: u64,
     log_order: VecDeque<LogRecord>,
     flushed_seqs: HashSet<u64>,
+    /// Sorted set of seqs that have been appended but not yet applied.
+    /// Maintained as a sub-index of `log_order`: append inserts, the
+    /// `mark_applied` → `note_applied` path removes. `release_below`
+    /// touches `log_order` only — by then every reclaimed seq is
+    /// already absent from this set (mark_applied precedes the
+    /// checkpoint that admits the seq into the release_below cap).
+    ///
+    /// Why this exists: under buffer-as-sole-journal, `mark_applied`
+    /// drops a seq's `pending_entries` slot but `log_order` keeps the
+    /// `LogRecord` until `release_below` advances the ring head past
+    /// it. Without this index, the coalescer's "next oldest pending
+    /// entry" lookup has to walk the entire `log_order` (which is
+    /// dominated by applied-but-not-released seqs in steady state)
+    /// and DashMap-probe each one — perf showed 15.65% of all CPU
+    /// burnt in `DashMap::_get` from that path.
+    pending_seqs: BTreeSet<u64>,
     head_became_at: Option<Instant>,
 }
 
