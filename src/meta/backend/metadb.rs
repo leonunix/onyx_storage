@@ -73,7 +73,13 @@ pub(crate) struct DeferredCleanupHandle {
 }
 
 enum DeferredCleanupHandleState {
-    Ready(OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>),
+    Ready {
+        value: OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>,
+        /// LSN assigned by metadb when the stage path resolved the
+        /// commit inline. `None` only for the empty-batch shortcut
+        /// (no LSN allocated).
+        lsn: Option<Lsn>,
+    },
     Pending {
         inner: DeferredOutcomeHandle,
         new_values: Vec<BlockmapValue>,
@@ -83,14 +89,31 @@ enum DeferredCleanupHandleState {
 
 impl DeferredCleanupHandle {
     /// Build a handle whose cleanup tuple is already known. Used by
-    /// the empty-batch and unlogged-flush paths inside the metadb
-    /// adapter so all entry points can return `DeferredCleanupHandle`
-    /// uniformly.
+    /// the empty-batch path inside the metadb adapter so all entry
+    /// points can return `DeferredCleanupHandle` uniformly. The LSN is
+    /// `None` because no metadb commit happened.
     pub(crate) fn ready(
         value: OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>,
     ) -> Self {
         Self {
-            state: DeferredCleanupHandleState::Ready(value),
+            state: DeferredCleanupHandleState::Ready { value, lsn: None },
+        }
+    }
+
+    /// Like [`Self::ready`] but carries the metadb-assigned LSN. Used
+    /// by the ZFS-TXG-clone stager path — the commit completes
+    /// synchronously on the caller thread, but downstream code (the
+    /// commit_worker per-volume sequencer) still wants `lsn()` to
+    /// return `Some(lsn)`.
+    pub(crate) fn ready_with_lsn(
+        value: OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            state: DeferredCleanupHandleState::Ready {
+                value,
+                lsn: Some(lsn),
+            },
         }
     }
 
@@ -115,7 +138,7 @@ impl DeferredCleanupHandle {
     /// Resolve the cleanup tuple. Consumes the handle.
     pub(crate) fn recv(self) -> OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)> {
         match self.state {
-            DeferredCleanupHandleState::Ready(value) => value,
+            DeferredCleanupHandleState::Ready { value, .. } => value,
             DeferredCleanupHandleState::Pending {
                 inner,
                 new_values,
@@ -134,11 +157,12 @@ impl DeferredCleanupHandle {
 
     /// Non-consuming readiness probe. `true` when `recv` would
     /// resolve without blocking — either because the handle was
-    /// constructed via [`Self::ready`] or because the metadb
-    /// compactor has already released the staged outcome.
+    /// constructed via [`Self::ready`] / [`Self::ready_with_lsn`] or
+    /// because the metadb compactor has already released the staged
+    /// outcome.
     pub(crate) fn is_ready(&self) -> bool {
         match &self.state {
-            DeferredCleanupHandleState::Ready(_) => true,
+            DeferredCleanupHandleState::Ready { .. } => true,
             DeferredCleanupHandleState::Pending { inner, .. } => inner.is_ready(),
         }
     }
@@ -152,7 +176,7 @@ impl DeferredCleanupHandle {
     pub(crate) fn try_recv(self) -> Result<OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>, Self>
     {
         match self.state {
-            DeferredCleanupHandleState::Ready(value) => Ok(value),
+            DeferredCleanupHandleState::Ready { value, .. } => Ok(value),
             DeferredCleanupHandleState::Pending {
                 inner,
                 new_values,
@@ -185,13 +209,13 @@ impl DeferredCleanupHandle {
 
     /// Return the metadb-side LSN this commit was assigned. Available
     /// before `recv()` resolves so callers can sequence per-volume
-    /// FIFO without waiting for outcome delivery. `None` for `Ready`
-    /// handles whose cleanup work happened inline.
+    /// FIFO without waiting for outcome delivery. `None` only for the
+    /// empty-batch shortcut (no metadb commit happened).
     #[allow(dead_code)]
     pub(crate) fn lsn(&self) -> Option<Lsn> {
         match &self.state {
             DeferredCleanupHandleState::Pending { inner, .. } => Some(inner.lsn()),
-            DeferredCleanupHandleState::Ready(_) => None,
+            DeferredCleanupHandleState::Ready { lsn, .. } => *lsn,
         }
     }
 }
@@ -680,11 +704,11 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        let (_, outcomes) = if self.unlogged_flush_commits {
-            tx.commit_unlogged_with_outcomes()?
-        } else {
-            tx.commit_with_outcomes()?
-        };
+        // ZFS-TXG-clone onyx-side stager: bypasses the per-commit
+        // dispatch wait (`mark_wal_durable_and_wait_for_dispatch`,
+        // ~614 µs on nvme-box). Durability is via the LV2 buffer; the
+        // metadb fold runs at the next TXG sync.
+        let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         newly_zeroed_from_remaps(
             batch_values.iter().map(|(_, value)| *value),
             outcomes.into_iter().take(batch_values.len()).collect(),
@@ -743,11 +767,8 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        let (_, outcomes) = if self.unlogged_flush_commits {
-            tx.commit_unlogged_with_outcomes()?
-        } else {
-            tx.commit_with_outcomes()?
-        };
+        // ZFS-TXG-clone onyx-side stager: see `atomic_batch_write_with_dedup`.
+        let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         let remap_count = new_values.len();
         newly_zeroed_from_remaps(new_values, outcomes.into_iter().take(remap_count).collect())
     }
@@ -811,22 +832,24 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        // The unlogged-flush path stays sync (no metadb-side
-        // deferred-outcome support for unlogged commits today). Wrap
-        // its result inline into a `Ready` cleanup handle so call
-        // sites can route through the deferred surface uniformly.
-        if self.unlogged_flush_commits {
-            let (_, outcomes) = tx.commit_unlogged_with_outcomes()?;
-            let remap_count = new_values.len();
-            let result = newly_zeroed_from_remaps(
-                new_values,
-                outcomes.into_iter().take(remap_count).collect::<Vec<_>>(),
-            );
-            return Ok(DeferredCleanupHandle::ready(result));
-        }
-        let (_, inner_handle) = tx.commit_deferred_with_outcomes()?;
+        // ZFS-TXG-clone onyx-side stager. The previous deferred-outcome
+        // surface (commit_ops_deferred -> DeferredOutcomeHandle) parked
+        // outcomes in the L2P compactor's per-pass drain so the caller
+        // could pipeline multiple in-flight commits before paying the
+        // ~614 µs per-LSN dispatch wait. stage_ops removes the wait
+        // entirely — outcomes are materialised synchronously on the
+        // caller thread — so the handle returned here is always
+        // pre-populated (`Ready`). Onyx commit_worker still drives the
+        // call site through the deferred surface, but `.recv()` returns
+        // immediately. The LSN flows through `ready_with_lsn` so the
+        // per-volume sequencer's `handle.lsn()` contract is preserved.
+        let (lsn, outcomes) = tx.commit_staged_with_outcomes()?;
         let remap_count = new_values.len();
-        Ok(DeferredCleanupHandle::wrap(inner_handle, new_values, remap_count))
+        let result = newly_zeroed_from_remaps(
+            new_values,
+            outcomes.into_iter().take(remap_count).collect::<Vec<_>>(),
+        );
+        Ok(DeferredCleanupHandle::ready_with_lsn(result, lsn))
     }
 
     pub(crate) fn put_dedup_entries(
@@ -1182,21 +1205,11 @@ impl MetadbBackend {
             to_l2p_value_with_seq(&value, observed_seq),
             None,
         );
-        // Match `atomic_dedup_hit` / `atomic_batch_dedup_hits` semantics:
-        // this is a flag-bit edit on an existing mapping with no LV3
-        // write. The logged path forces `unlogged_commit_gate.write()` +
-        // `flush()` per call, which (per `phaseA-diag` 2026-05-14)
-        // serialises every concurrent unlogged writer behind a single
-        // `checkpoint_unlogged_before_wal_commit` that can take up to
-        // 17.6s. The DedupScanner calls this once per re-scanned LBA at
-        // ~3 Hz, so a logged path here stalls the entire writer
-        // pipeline. Crash safety: if this flag-clear is lost, the next
-        // scanner cycle re-processes the LBA — idempotent.
-        if self.unlogged_flush_commits {
-            tx.commit_unlogged_with_outcomes()?;
-        } else {
-            tx.commit_with_outcomes()?;
-        }
+        // ZFS-TXG-clone onyx-side stager: see `atomic_batch_write_with_dedup`.
+        // No LV3 write; this is a flag-bit edit on an existing mapping.
+        // Crash safety: if this flag-clear is lost, the next scanner
+        // cycle re-processes the LBA — idempotent.
+        tx.commit_staged_with_outcomes()?;
         Ok(())
     }
 
@@ -1222,14 +1235,9 @@ impl MetadbBackend {
         // PBA, refcounts unchanged. The buffer's pending entry stays
         // visible to the flusher and will be re-hashed on the next
         // cycle, so the worst case is a single missed dedup hit, not
-        // data loss. Logged path would force `unlogged_commit_gate.write`
-        // + `flush()` on every hit and serialise the entire writer
-        // pipeline behind a metadb checkpoint.
-        let (_, outcomes) = if self.unlogged_flush_commits {
-            tx.commit_unlogged_with_outcomes()?
-        } else {
-            tx.commit_with_outcomes()?
-        };
+        // data loss. ZFS-TXG-clone onyx-side stager: see
+        // `atomic_batch_write_with_dedup`.
+        let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         let (newly_zeroed, _accepted) = newly_zeroed_from_remaps([*new_value], outcomes)?;
         Ok(newly_zeroed.into_iter().next().map(|(_, cleanup)| cleanup))
     }
@@ -1301,17 +1309,9 @@ impl MetadbBackend {
         }
         // Same reasoning as `atomic_dedup_hit`: no LV3 write, refcount
         // guard inside metadb handles the race against a concurrent
-        // decref-to-zero, and crash rolls back atomically. Routing
-        // through the logged path forces a metadb `flush()` per call
-        // (the `checkpoint_unlogged_before_wal_commit` step under
-        // `unlogged_commit_gate.write`), pinning `commit_total_us` at
-        // ~300ms per hit batch under skip=0 mixed workloads — see
-        // docs/metadb-nvme-drain-plan.md for the bisect data.
-        let (_, outcomes) = if self.unlogged_flush_commits {
-            tx.commit_unlogged_with_outcomes()?
-        } else {
-            tx.commit_with_outcomes()?
-        };
+        // decref-to-zero, and crash rolls back atomically.
+        // ZFS-TXG-clone onyx-side stager: see `atomic_batch_write_with_dedup`.
+        let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         dedup_hit_results_from_remaps(hits, outcomes)
     }
 }
