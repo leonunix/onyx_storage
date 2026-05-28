@@ -102,6 +102,7 @@ impl EngineHarness {
             engine: EngineConfig {
                 zone_count: 4,
                 zone_size_blocks: 128,
+                ..EngineConfig::default()
             },
             gc: options.gc,
             dedup: options.dedup,

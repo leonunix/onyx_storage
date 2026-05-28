@@ -1,24 +1,28 @@
 //! Post-commit worker — Phase 2.2 of the per-volume commit architecture.
 //!
 //! Each commit_worker hands off "deferrable" post-commit work
-//! (mark_flushed, candidate cache insert, stale dedup repairs) to its
+//! (mark_applied, candidate cache insert, stale dedup repairs) to its
 //! paired post_commit thread. The commit_worker can then immediately
 //! pick up its next job, so its hot loop becomes:
 //!
-//!     L2P lock → meta build → metadb commit → enqueue PostCommitJob
+//! ```text
+//! L2P lock → meta build → metadb commit → enqueue PostCommitJob
+//! ```
 //!
 //! instead of the original:
 //!
-//!     L2P lock → meta build → metadb commit
-//!     → candidate.insert_many → repair_stale → mark_flushed loop
-//!     → advance_tail
+//! ```text
+//! L2P lock → meta build → metadb commit
+//!   → candidate.insert_many → repair_stale → mark_applied loop
+//! ```
 //!
 //! Background semantics: the buffer's in-memory index keeps the
-//! pending entry visible until mark_flushed drains. Reads before the
+//! pending entry visible until mark_applied drains. Reads before the
 //! post_commit thread runs hit the buffer; reads after hit metadb.
 //! Both paths return the same data because metadb has already
 //! published the new mapping. The only cost of lag is buffer ring
-//! head retention, which is bounded by the post_commit_tx queue.
+//! head retention, which is bounded by the post_commit_tx queue and
+//! ultimately by the next checkpoint's `release_below`.
 
 use super::*;
 
@@ -91,11 +95,11 @@ impl BufferFlusher {
             if !job.mark_ranges.is_empty() {
                 let mark_start = Instant::now();
                 for (seq, lba_start, lba_count) in &job.mark_ranges {
-                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                    if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
                         tracing::warn!(
                             seq,
                             error = %e,
-                            "post_commit: failed to mark entry flushed"
+                            "post_commit: failed to mark entry applied"
                         );
                     }
                 }
@@ -114,7 +118,6 @@ impl BufferFlusher {
                 Self::record_elapsed(&metrics.flush_writer_meta_repair_ns, repair_start);
             }
 
-            let _ = pool.advance_tail_for_shard(job.shard_idx);
             if !job.done_seqs.is_empty() {
                 if let Some(done_tx) = lane_done_txs
                     .get(job.shard_idx)

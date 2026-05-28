@@ -78,15 +78,15 @@ impl BufferFlusher {
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
             Vec::new();
         let mut packed_retries: VecDeque<PackedSlotRetry> = VecDeque::new();
-        let mut tail_dirty = false;
         let mut last_read_submit_calls = metrics.read_submit_calls.load(Ordering::Relaxed);
 
         /// Helper: hand off accumulated Passthrough units to the
         /// per-volume commit workers. Per-unit done_tx / defer_retry
         /// are now driven by the commit worker for successful IO and
-        /// by `write_units_batch` itself for IO failures, so this
-        /// macro only consumes the batch buffers and signals tail
-        /// advance.
+        /// by `write_units_batch` itself for IO failures. Ring tail
+        /// advance is no longer the writer's responsibility — the
+        /// durability watermark thread drives `pool.release_below`
+        /// from confirmed metadb checkpoints.
         macro_rules! flush_pt_batch {
             ($batch:expr, $batch_seqs:expr, $batch_completions:expr) => {
                 if !$batch.is_empty() {
@@ -107,13 +107,12 @@ impl BufferFlusher {
                         commit_worker_txs,
                         commit_workers_per_volume,
                     );
-                    tail_dirty = true;
                 }
             };
         }
 
         while running.load(Ordering::Relaxed) {
-            if Self::retry_one_packed_slot(
+            let _ = Self::retry_one_packed_slot(
                 shard_idx,
                 &mut packed_retries,
                 pool,
@@ -124,9 +123,7 @@ impl BufferFlusher {
                 in_flight_tracker,
                 commit_worker_txs,
                 commit_workers_per_volume,
-            ) {
-                tail_dirty = true;
-            }
+            );
 
             let first = match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => unit,
@@ -150,11 +147,6 @@ impl BufferFlusher {
                             commit_worker_txs,
                             commit_workers_per_volume,
                         );
-                        tail_dirty = true;
-                    }
-                    if tail_dirty {
-                        let _ = pool.advance_tail_for_shard(shard_idx);
-                        tail_dirty = false;
                     }
                     continue;
                 }
@@ -338,7 +330,6 @@ impl BufferFlusher {
                     commit_worker_txs,
                     commit_workers_per_volume,
                 );
-                tail_dirty = true;
             }
 
             flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
@@ -366,7 +357,6 @@ impl BufferFlusher {
                 commit_worker_txs,
                 commit_workers_per_volume,
             );
-            tail_dirty = true;
         }
 
         while Self::retry_one_packed_slot(
@@ -380,9 +370,7 @@ impl BufferFlusher {
             in_flight_tracker,
             commit_worker_txs,
             commit_workers_per_volume,
-        ) {
-            tail_dirty = true;
-        }
+        ) {}
 
         if let Some(sealed) = packer.flush_open_slot() {
             let slot_buffers = (
@@ -403,11 +391,6 @@ impl BufferFlusher {
                 commit_worker_txs,
                 commit_workers_per_volume,
             );
-            tail_dirty = true;
-        }
-
-        if tail_dirty {
-            let _ = pool.advance_tail_for_shard(shard_idx);
         }
     }
 

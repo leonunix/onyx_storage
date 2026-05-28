@@ -567,6 +567,40 @@ impl OnyxEngine {
         // shared with ZoneManager for the foreground read path.
         let read_pool = Self::build_read_pool(config, metrics.clone())?;
 
+        // 5. Buffer-as-sole-journal recovery: any ring entries past the
+        //    last metadb-applied seq are the only durable record of
+        //    those commits. Drive them through a one-shot flusher
+        //    before standing up the long-lived one so clients never see
+        //    a state that contradicts the post-checkpoint buffer tail.
+        //    On a clean shutdown this is a no-op (pending == 0).
+        let recovery_stats = crate::buffer::flush::replay_buffer_pending(
+            buffer_pool.clone(),
+            meta.clone(),
+            lifecycle.clone(),
+            allocator.clone(),
+            io_engine.clone(),
+            read_pool.clone(),
+            &config.flush,
+            &config.dedup,
+            metrics.clone(),
+            std::time::Duration::from_millis(config.engine.recovery_timeout_ms),
+        );
+        if recovery_stats.timed_out {
+            return Err(OnyxError::Config(format!(
+                "buffer replay did not reach quiescence in {} ms (pending {} of {}); raise engine.recovery_timeout_ms or investigate stuck entries",
+                config.engine.recovery_timeout_ms,
+                recovery_stats.pending_at_exit,
+                recovery_stats.pending_at_start,
+            )));
+        }
+        if recovery_stats.pending_at_start > 0 {
+            tracing::info!(
+                pending_at_start = recovery_stats.pending_at_start,
+                elapsed_ms = recovery_stats.elapsed.as_millis() as u64,
+                "buffer recovery drained cleanly"
+            );
+        }
+
         // 6. Background flusher
         let flusher = BufferFlusher::start_with_metrics(
             buffer_pool.clone(),
@@ -638,16 +672,17 @@ impl OnyxEngine {
         tracing::info!("onyx engine opened (full mode)");
 
         // Start the durability watermark thread now that both meta and
-        // buffer_pool are live. It advances `durable_seq` cheaply and asks
-        // metadb for low-frequency checkpoints, unblocking the buffer ring
-        // reclaim path without forcing every tick through metadata IO.
+        // buffer_pool are live. It is the sole driver of `durable_seq`
+        // and the sole caller of `pool.release_below` — both advance
+        // only on a confirmed metadb checkpoint outcome, since the
+        // post-WAL buffer ring is the only durable record of commits
+        // until then.
         let watermark = DurabilityWatermarkHandle::start(
             meta.clone(),
             buffer_pool.clone(),
             buffer_pool.max_flushed_seq_handle(),
             buffer_pool.durable_seq_handle(),
             config.meta.checkpoint_interval(),
-            config.meta.unlogged_flush_commits,
             config.meta.flush_dirty_pages_threshold,
         );
         let lineage_drain = LineageFreedPbaDrainHandle::start(
@@ -1135,7 +1170,6 @@ impl OnyxEngine {
             buffer_pool.max_flushed_seq_handle(),
             buffer_pool.durable_seq_handle(),
             std::time::Duration::from_millis(50),
-            config.meta.unlogged_flush_commits,
             config.meta.flush_dirty_pages_threshold,
         );
         let lineage_drain = LineageFreedPbaDrainHandle::start(

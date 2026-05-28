@@ -38,9 +38,8 @@ impl BufferFlusher {
                     "write_unit: discarding unit (volume deleted or generation mismatch)"
                 );
                 for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                    let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                    let _ = pool.mark_applied(*seq, *lba_start, *lba_count);
                 }
-                let _ = pool.advance_tail_for_shard(shard_idx);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Ok(());
             }
@@ -192,12 +191,11 @@ impl BufferFlusher {
                 allocation.free(allocator)?;
                 let mark_start = Instant::now();
                 for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
-                        tracing::warn!(seq, error = %e, "failed to mark stale entry flushed");
+                    if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
+                        tracing::warn!(seq, error = %e, "failed to mark stale entry applied");
                     }
                 }
                 Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
-                let _ = pool.advance_tail_for_shard(shard_idx);
                 Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                 return Ok(());
@@ -216,8 +214,8 @@ impl BufferFlusher {
 
             let mark_start = Instant::now();
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
-                    tracing::warn!(seq, error = %e, "failed to mark entry flushed");
+                if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
+                    tracing::warn!(seq, error = %e, "failed to mark entry applied");
                 }
             }
             Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);

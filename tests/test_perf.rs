@@ -222,6 +222,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
         engine: EngineConfig {
             zone_count: 4,
             zone_size_blocks: 256,
+            ..EngineConfig::default()
         },
         gc: GcConfig {
             enabled: env::var("ONYX_PERF_GC").ok().as_deref() == Some("1"),

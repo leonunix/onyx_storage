@@ -114,22 +114,10 @@ pub enum MetadbJournalMode {
     Buffer,
 }
 
-impl MetadbJournalMode {
-    /// Whether the hot commit path should call `wal.submit_to_*` (true
-    /// for Wal / Shadow; false for Buffer).
-    pub fn wal_authoritative(self) -> bool {
-        !matches!(self, Self::Buffer)
-    }
-
-    /// Whether checkpoint commits must populate
-    /// `manifest.last_processed_buffer_seq` from the engine's buffer
-    /// hook. True for Shadow and Buffer; the WAL-only path leaves the
-    /// field zero (the existing checkpoint_lsn watermark covers
-    /// recovery).
-    pub fn requires_buffer_watermark(self) -> bool {
-        !matches!(self, Self::Wal)
-    }
-}
+// MetadbJournalMode helper methods removed post-Phase D: metadb has no
+// WAL anymore, and the metadb backend force-overrides this enum to
+// `Buffer` regardless of what the TOML file says. The enum is kept only
+// so old configuration files continue to parse.
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaConfig {
@@ -851,6 +839,14 @@ pub struct EngineConfig {
     /// Blocks per zone (default 256)
     #[serde(default = "default_zone_size_blocks")]
     pub zone_size_blocks: u64,
+    /// Max wall time `Engine::open` will spend draining any buffer
+    /// entries that exist past the last checkpoint before accepting
+    /// client IO. Post-WAL, the buffer ring is the only durable record
+    /// of commits between checkpoints, so a graceful start MUST replay
+    /// them through the flush pipeline. Default 60000 ms; bump if
+    /// you've configured a very deep ring.
+    #[serde(default = "default_recovery_timeout_ms")]
+    pub recovery_timeout_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -858,8 +854,13 @@ impl Default for EngineConfig {
         Self {
             zone_count: default_zone_count(),
             zone_size_blocks: default_zone_size_blocks(),
+            recovery_timeout_ms: default_recovery_timeout_ms(),
         }
     }
+}
+
+fn default_recovery_timeout_ms() -> u64 {
+    60_000
 }
 
 impl Default for FlushConfig {
@@ -955,10 +956,13 @@ fn default_metadb_wal_async_group_commit_window_us() -> u64 {
     1000
 }
 fn default_metadb_journal_mode() -> MetadbJournalMode {
-    // Phase B/C land progressively. Default stays on the legacy WAL
-    // path; operators opt into Shadow (observability) or Buffer
-    // (cutover) per cluster.
-    MetadbJournalMode::Wal
+    // Phase D cutover complete: metadb has no WAL of its own anymore;
+    // the LV2 buffer ring + lifecycle journal are the sole durability
+    // records. `Wal` / `Shadow` are retained in the enum so existing
+    // TOML files parse, but they are force-overridden to `Buffer` by
+    // `meta/backend/metadb.rs` since the metadb crate only supports
+    // Buffer mode.
+    MetadbJournalMode::Buffer
 }
 fn default_metadb_flush_dirty_pages_threshold() -> u64 {
     // 2026-05-15 nvme-box sweep: 100k caps single-flush sample size

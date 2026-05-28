@@ -20,7 +20,7 @@ impl BufferFlusher {
     // packed-slot path.
     #[allow(dead_code)]
     pub(in crate::buffer::flush) fn write_packed_slot(
-        shard_idx: usize,
+        _shard_idx: usize,
         sealed: &SealedSlot,
         pool: &WriteBufferPool,
         meta: &MetaStore,
@@ -77,7 +77,7 @@ impl BufferFlusher {
                     metrics.flush_stale_discards.fetch_add(1, Ordering::Relaxed);
                     any_discarded = true;
                     for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                        let _ = pool.mark_applied(*seq, *lba_start, *lba_count);
                     }
                     continue;
                 }
@@ -86,7 +86,7 @@ impl BufferFlusher {
                 if live_positions.is_empty() {
                     any_discarded = true;
                     for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                        let _ = pool.mark_flushed(*seq, *lba_start, *lba_count);
+                        let _ = pool.mark_applied(*seq, *lba_start, *lba_count);
                     }
                     continue;
                 }
@@ -152,7 +152,6 @@ impl BufferFlusher {
 
             if batch_values.is_empty() {
                 allocator.free_one(sealed.pba)?;
-                let _ = pool.advance_tail_for_shard(shard_idx);
                 return Ok(PackedSlotCommitOutcome::Discarded);
             }
 
@@ -253,11 +252,11 @@ impl BufferFlusher {
             .flush_packed_bytes
             .fetch_add(sealed.data.len() as u64, Ordering::Relaxed);
 
-        // Mark entries flushed
+        // Mark entries applied (ring release deferred until checkpoint).
         let mark_start = Instant::now();
         for (seq, lba_start, lba_count) in &commit.all_seq_lba_ranges {
-            if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
-                tracing::warn!(seq, error = %e, "failed to mark entry flushed (packed)");
+            if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
+                tracing::warn!(seq, error = %e, "failed to mark entry applied (packed)");
             }
         }
         Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);

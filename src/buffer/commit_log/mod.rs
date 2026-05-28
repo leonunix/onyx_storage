@@ -394,6 +394,17 @@ struct BufferShard {
     pending_lba_buckets: DashMap<PendingBucketKey, AtomicU32>,
     pending_entries: DashMap<u64, Arc<PendingEntry>>,
     pending_count: AtomicU64,
+    /// Bytes of ring entries that have NOT yet been mark_applied. Increments
+    /// on `reserve_log_space` by `slot_bytes(slot_count)` (== `disk_len` for
+    /// the new entry); decrements when an entry leaves `pending_entries`
+    /// (mark_applied / mark_flushed / discard / purge / supersede paths).
+    /// Distinct from `RingState.used_bytes`, which is the physical ring
+    /// occupancy and only drops on `release_below`. Drives the soft
+    /// "in-flight pressure" metric (`fill_percentage`) used by dedup
+    /// heuristics — post-Phase-D `used_bytes` only shrinks at checkpoint
+    /// cadence, which would saturate `fill_percentage` under sustained
+    /// load and starve those heuristics.
+    pending_bytes: AtomicU64,
     flush_progress: DashMap<u64, HashSet<u16>>,
     staging_tx: Sender<StagedEntry>,
     staging_rx: Receiver<StagedEntry>,

@@ -59,12 +59,11 @@ pub struct BufferFlusher {
     /// are draining; sender clones held by shard writers are dropped
     /// when the writer threads join.
     commit_worker_txs: Vec<Sender<writer::CommitJob>>,
-    /// Phase 2.2: per-worker post_commit threads run mark_flushed +
+    /// Phase 2.2: per-worker post_commit threads run mark_applied +
     /// candidate insert + stale dedup repair off the commit_worker
     /// hot path. Joined after commit workers (their senders drop on
     /// commit-worker exit, signalling drain).
     post_commit_handles: Vec<JoinHandle<()>>,
-    watermark_handle: Option<JoinHandle<()>>,
 }
 
 struct FlusherLane {
@@ -466,12 +465,12 @@ impl BufferFlusher {
                 meta.vol_created_at,
             )
         {
-            if let Err(err) = pool.mark_flushed(seq, meta.start_lba, meta.lba_count) {
+            if let Err(err) = pool.mark_applied(seq, meta.start_lba, meta.lba_count) {
                 tracing::warn!(
                     seq,
                     vol = %meta.vol_id,
                     error = %err,
-                    "mark_flushed failed for superseded entry; falling back to full flush"
+                    "mark_applied failed for superseded entry; falling back to full flush"
                 );
                 // Fall through and enqueue normally so nothing is lost.
             } else {

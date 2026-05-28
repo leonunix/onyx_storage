@@ -524,17 +524,16 @@ impl BufferFlusher {
                 );
                 let mark_start = Instant::now();
                 for (seq, lba_start, lba_count) in &job.mark_ranges {
-                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                    if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
                         tracing::warn!(
                             seq,
                             shard_idx = job.shard_idx,
                             error = %e,
-                            "commit_worker: failed to mark entry flushed"
+                            "commit_worker: failed to mark entry applied"
                         );
                     }
                 }
                 Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
-                let _ = pool.advance_tail_for_shard(job.shard_idx);
                 if let Some(done_tx) = lane_done_txs
                     .get(job.shard_idx)
                     .or_else(|| lane_done_txs.first())
@@ -681,8 +680,8 @@ impl BufferFlusher {
     /// `metadb/src/db/commit/lanes.rs::build_lane_dispatch_plan`,
     /// each sub-commit's dispatch footprint is `{L2p(vol, sid)}` —
     /// concurrent commit_workers writing to disjoint L2P shards
-    /// dispatch in parallel instead of serialising on
-    /// `mark_wal_durable_and_wait_for_dispatch`.
+    /// dispatch in parallel instead of serialising on the global
+    /// commit lane.
     /// Component B of the commit-model overhaul (plan file:
     /// /root/.claude/plans/golden-popping-newell.md).
     ///

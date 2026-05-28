@@ -818,7 +818,7 @@ impl BufferFlusher {
     }
 
     fn finish_prepared_dedup_unit(
-        shard_idx: usize,
+        _shard_idx: usize,
         prepared: PreparedDedupUnit,
         miss_tx: &Sender<CoalesceUnit>,
         pool: &WriteBufferPool,
@@ -843,11 +843,10 @@ impl BufferFlusher {
                 let lba = Lba(unit.start_lba.0 + *i as u64);
                 for (seq, range_start, range_count) in &unit.seq_lba_ranges {
                     if lba.0 >= range_start.0 && lba.0 < range_start.0 + *range_count as u64 {
-                        let _ = pool.mark_flushed(*seq, lba, 1);
+                        let _ = pool.mark_applied(*seq, lba, 1);
                     }
                 }
             }
-            let _ = pool.advance_tail_for_shard(shard_idx);
         }
 
         let has_misses = is_hit.iter().any(|h| !h);

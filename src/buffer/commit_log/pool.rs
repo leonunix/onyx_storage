@@ -411,6 +411,15 @@ impl WriteBufferPool {
             .try_recv()
     }
 
+    /// Legacy "in-memory release + immediate ring reclaim against the
+    /// current `durable_seq`" entry point. Production callers now use
+    /// `mark_applied` (in-memory only) plus `release_below` driven by
+    /// the durability-watermark thread on confirmed checkpoint
+    /// outcomes. Retained for `shard.rs` internal failure-path cleanup
+    /// and for the buffer-pool unit tests.
+    #[deprecated(
+        note = "use mark_applied + release_below; mark_flushed conflates apply with checkpoint durability"
+    )]
     pub fn mark_flushed(
         &self,
         seq: u64,
@@ -420,6 +429,7 @@ impl WriteBufferPool {
         let Some(shard_idx) = self.shard_for_seq(seq) else {
             return Ok(());
         };
+        #[allow(deprecated)]
         self.shards[shard_idx]
             .shard
             .mark_flushed(seq, flushed_lba_start, flushed_lba_count)?;
@@ -559,21 +569,30 @@ impl WriteBufferPool {
             .discard_pending_seq_durable(seq)
     }
 
+    /// Soft "work in flight" pressure as a percentage of total ring
+    /// capacity. Reflects bytes of entries that haven't been mark_applied
+    /// yet — i.e. real downstream work the flusher still owes metadb.
+    /// Post-Phase-D this is NOT the same as physical ring fill, since
+    /// applied entries linger in the ring until the next checkpoint runs
+    /// `release_below`. Heuristics (dedup skip, scanner pressure gate)
+    /// want this view; appender backpressure stays on physical ring state
+    /// inside `reserve_log_space`.
     pub fn fill_percentage(&self) -> u8 {
         let total_capacity = self.capacity();
         if total_capacity == 0 {
             return 100;
         }
-        let total_used: u64 = self
+        let total_pending: u64 = self
             .shards
             .iter()
-            .map(|shard| shard.shard.used_bytes())
+            .map(|shard| shard.shard.pending_bytes())
             .sum();
-        ((total_used * 100) / total_capacity) as u8
+        ((total_pending * 100) / total_capacity).min(100) as u8
     }
 
-    /// Per-shard fill percentage. Used by flush lane to make per-lane
-    /// backpressure decisions (e.g. dedup skip threshold).
+    /// Per-shard variant of [`fill_percentage`]. Same soft "work in
+    /// flight" semantics — see that method for the post-Phase-D
+    /// distinction from physical ring fill.
     pub fn fill_percentage_for_shard(&self, shard_idx: usize) -> u8 {
         let Some(shard) = self.shards.get(shard_idx) else {
             return 100;
@@ -582,7 +601,7 @@ impl WriteBufferPool {
         if cap == 0 {
             return 100;
         }
-        ((shard.shard.used_bytes() * 100) / cap) as u8
+        ((shard.shard.pending_bytes() * 100) / cap).min(100) as u8
     }
 
     /// Evict hydrated payloads from pending_entries for the given shard.

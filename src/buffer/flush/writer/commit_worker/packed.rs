@@ -297,18 +297,15 @@ impl BufferFlusher {
             Ok(PackedCommitOutcome::Discarded { all_seq_lba_ranges }) => {
                 let mark_start = Instant::now();
                 for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
-                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                    if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
                         tracing::warn!(
                             seq,
                             error = %e,
-                            "commit_worker: failed to mark discarded packed entry flushed"
+                            "commit_worker: failed to mark discarded packed entry applied"
                         );
                     }
                 }
                 Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
-                for shard_idx in jobs.iter().map(|job| job.shard_idx) {
-                    let _ = pool.advance_tail_for_shard(shard_idx);
-                }
                 Self::deliver_packed_batch_done(jobs, lane_done_txs);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
             }
@@ -352,18 +349,15 @@ impl BufferFlusher {
                     .fetch_add(bytes_written, Ordering::Relaxed);
                 let mark_start = Instant::now();
                 for (seq, lba_start, lba_count) in &all_seq_lba_ranges {
-                    if let Err(e) = pool.mark_flushed(*seq, *lba_start, *lba_count) {
+                    if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
                         tracing::warn!(
                             seq,
                             error = %e,
-                            "commit_worker: failed to mark packed entry flushed"
+                            "commit_worker: failed to mark packed entry applied"
                         );
                     }
                 }
                 Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
-                for shard_idx in jobs.iter().map(|job| job.shard_idx) {
-                    let _ = pool.advance_tail_for_shard(shard_idx);
-                }
                 let _ = post_commit_tx;
                 Self::deliver_packed_batch_done(jobs, lane_done_txs);
                 tracing::debug!(

@@ -60,34 +60,6 @@ impl BufferFlusher {
         );
         let running = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(FlusherInFlightTracker::default());
-        let watermark_running = running.clone();
-        let watermark_pool = pool.clone();
-        let watermark_max_flushed = pool.max_flushed_seq_handle();
-        let watermark_durable = pool.durable_seq_handle();
-        let watermark_handle = thread::Builder::new()
-            .name("flusher-ring-watermark".into())
-            .spawn(move || {
-                const RING_BUMP_INTERVAL: Duration = Duration::from_millis(10);
-                while watermark_running.load(Ordering::Relaxed) {
-                    thread::sleep(RING_BUMP_INTERVAL);
-                    let captured = watermark_max_flushed.load(Ordering::Relaxed);
-                    let bumped = watermark_durable
-                        .fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
-                            if captured > cur {
-                                Some(captured)
-                            } else {
-                                None
-                            }
-                        })
-                        .is_ok();
-                    if bumped {
-                        for shard_idx in 0..watermark_pool.shard_count() {
-                            let _ = watermark_pool.advance_tail_for_shard(shard_idx);
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn flusher ring watermark thread");
         let lane_count = pool.shard_count().max(1);
         let compress_workers =
             Self::per_lane_worker_count(config.compress_workers.max(1), lane_count);
@@ -449,7 +421,6 @@ impl BufferFlusher {
             commit_worker_handles,
             commit_worker_txs,
             post_commit_handles,
-            watermark_handle: Some(watermark_handle),
         }
     }
 
@@ -473,9 +444,6 @@ impl BufferFlusher {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(h) = self.watermark_handle.take() {
-            let _ = h.join();
-        }
         self.join_lanes();
     }
 

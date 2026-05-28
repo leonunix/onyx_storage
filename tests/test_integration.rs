@@ -131,6 +131,7 @@ fn setup_with_all_options(
         engine: EngineConfig {
             zone_count: 2,
             zone_size_blocks: 128,
+            ..EngineConfig::default()
         },
         gc,
         dedup,

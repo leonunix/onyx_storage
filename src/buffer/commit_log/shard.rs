@@ -375,6 +375,15 @@ impl BufferShard {
         let mut log_order = VecDeque::with_capacity(scan.log_order.len());
         log_order.extend(scan.log_order);
 
+        // Seed pending_bytes from recovered pending entries — recovery
+        // populated `pending_entries` with `disk_len` matching the ring
+        // log_order, so summing here mirrors what append() would have
+        // accumulated.
+        let pending_bytes_init: u64 = pending_entries
+            .iter()
+            .map(|e| e.value().disk_len as u64)
+            .sum();
+
         Ok((
             Self {
                 device,
@@ -395,6 +404,7 @@ impl BufferShard {
                 pending_lba_buckets,
                 pending_entries,
                 pending_count,
+                pending_bytes: AtomicU64::new(pending_bytes_init),
                 flush_progress: DashMap::with_shard_amount(DASHMAP_SHARDS),
                 staging_tx,
                 staging_rx,
@@ -513,7 +523,14 @@ impl BufferShard {
     pub(super) fn retire_superseded_by_durable_entries(&self, committed: &[Arc<PendingEntry>]) {
         for pending in committed {
             for (old_seq, lba_start, lba_count) in &pending.superseded_ranges {
-                if let Err(e) = self.mark_flushed(*old_seq, *lba_start, *lba_count) {
+                // Internal supersede path: the superseding seq is already
+                // committed, so the old range's in-memory state is safe
+                // to drop. Ring slot reclaim still waits for the next
+                // checkpoint's release_below — the inline prefix attempt
+                // inside mark_flushed is just an opportunistic no-op now.
+                #[allow(deprecated)]
+                let r = self.mark_flushed(*old_seq, *lba_start, *lba_count);
+                if let Err(e) = r {
                     tracing::warn!(
                         new_seq = pending.seq,
                         old_seq,
@@ -545,7 +562,13 @@ impl BufferShard {
             }
 
             for (seq, lba_start, lba_count) in stale_ranges {
-                if let Err(e) = self.mark_flushed(seq, lba_start, lba_count) {
+                // Recovery-time compaction: dropping ranges already
+                // superseded on the next-seq side. Same rationale as
+                // `retire_superseded_by_durable_entries` for using the
+                // deprecated mark_flushed path.
+                #[allow(deprecated)]
+                let r = self.mark_flushed(seq, lba_start, lba_count);
+                if let Err(e) = r {
                     tracing::warn!(
                         seq,
                         start_lba = lba_start.0,
@@ -686,6 +709,8 @@ impl BufferShard {
         }
         if self.pending_entries.insert(seq, pending.clone()).is_none() {
             self.pending_count.fetch_add(1, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_add(disk_len as u64, Ordering::Relaxed);
         }
 
         // Account payload bytes toward the in-memory cache budget. LRU
@@ -767,6 +792,8 @@ impl BufferShard {
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         if let Some((_, removed)) = self.pending_entries.remove(&seq) {
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_sub(removed.disk_len as u64, Ordering::Relaxed);
             if let Some(ref p) = removed.payload {
                 Self::release_payload_bytes(
                     self.payload_bytes_in_memory.as_ref(),
@@ -793,6 +820,15 @@ impl BufferShard {
 
     pub(super) fn used_bytes(&self) -> u64 {
         self.ring.lock().used_bytes
+    }
+
+    /// Bytes of ring entries that have not yet been mark_applied.
+    /// Distinct from physical `used_bytes` post-Phase-D: physical slots
+    /// are only released on checkpoint, so `used_bytes` overstates the
+    /// soft "work in flight" pressure. Heuristics (dedup skip thresholds,
+    /// `fill_percentage`) want this view, not the physical one.
+    pub(super) fn pending_bytes(&self) -> u64 {
+        self.pending_bytes.load(Ordering::Relaxed)
     }
 
     pub(super) fn capacity(&self) -> u64 {
@@ -1079,6 +1115,9 @@ impl BufferShard {
         Ok(())
     }
 
+    #[deprecated(
+        note = "use mark_applied + release_below; mark_flushed conflates apply with checkpoint durability"
+    )]
     pub(super) fn mark_flushed(
         &self,
         seq: u64,
@@ -1113,6 +1152,8 @@ impl BufferShard {
                 return Ok(());
             };
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_sub(removed_pending.disk_len as u64, Ordering::Relaxed);
             self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
             if let Some(ref p) = removed_pending.payload {
                 Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -1149,6 +1190,8 @@ impl BufferShard {
             return Ok(());
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.pending_bytes
+            .fetch_sub(removed_pending.disk_len as u64, Ordering::Relaxed);
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -1208,6 +1251,8 @@ impl BufferShard {
                 return Ok(());
             };
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_sub(removed_pending.disk_len as u64, Ordering::Relaxed);
             self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
             if let Some(ref p) = removed_pending.payload {
                 Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -1244,6 +1289,8 @@ impl BufferShard {
             return Ok(());
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.pending_bytes
+            .fetch_sub(removed_pending.disk_len as u64, Ordering::Relaxed);
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
@@ -1361,6 +1408,8 @@ impl BufferShard {
         for (seq, _) in &to_purge {
             if let Some((_, pending)) = self.pending_entries.remove(seq) {
                 self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                self.pending_bytes
+                    .fetch_sub(pending.disk_len as u64, Ordering::Relaxed);
                 let vid = self.intern_vol_id(&pending.vol_id);
                 self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
                 if let Some(ref p) = pending.payload {
@@ -1401,6 +1450,8 @@ impl BufferShard {
             return Ok(false);
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.pending_bytes
+            .fetch_sub(removed_pending.disk_len as u64, Ordering::Relaxed);
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);
         if let Some(ref p) = removed_pending.payload {
             Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);

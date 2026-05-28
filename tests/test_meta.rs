@@ -333,8 +333,16 @@ fn atomic_remap() {
     assert_eq!(store.get_refcount(Pba(100)).unwrap(), 0);
 }
 
+/// Crash-recovery of an L2P remap committed via the metadb commit lane.
+///
+/// Post-Phase-D metadb has no WAL of its own — data-plane ops (`atomic_*`)
+/// rely on the LV2 buffer ring + a metadb checkpoint to land on disk.
+/// Standalone `MetaStore` (no engine, no buffer) has no buffer ring, so
+/// the only path to durability is an explicit `sync_durable()` between
+/// commit and drop — that drives a checkpoint that folds the in-memory
+/// L2P state into manifest pages.
 #[test]
-fn wal_recovery() {
+fn checkpoint_recovery() {
     let dir = tempdir().unwrap();
     let vol_id = VolumeId("test-vol".into());
 
@@ -355,13 +363,15 @@ fn wal_recovery() {
             flags: 0,
         };
         store.atomic_write_mapping(&vol_id, Lba(42), &val).unwrap();
+        store.sync_durable().unwrap();
     }
 
     {
         let store = MetaStore::open(&test_config(dir.path())).unwrap();
         let loaded = store.get_mapping(&vol_id, Lba(42)).unwrap().unwrap();
         assert_eq!(loaded.pba, Pba(77));
-        // Phase 5: WAL replay of an L2pRemap is rc-neutral.
+        // Hot-path L2pRemap is rc-neutral. The mapping flip survives the
+        // checkpoint but rc bookkeeping is owned by lineage events.
         assert_eq!(store.get_refcount(Pba(77)).unwrap(), 0);
     }
 }
