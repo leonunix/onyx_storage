@@ -7,6 +7,10 @@ license = "AGPL-3.0-only"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[profile.release]
+debug = "line-tables-only"
+strip = false
+
 [dependencies]
 # metadata
 onyx_metadb = { package = "onyx-metadb", path = "metadb" }
