@@ -692,3 +692,87 @@ fn release_below_advances_ring_only_when_checkpoint_covers_seq() {
     assert_eq!(advanced, 1);
     assert_eq!(shard.ring.lock().used_bytes, 0);
 }
+
+// ── Regression: pending_seqs index must drop on every removal path ────
+//
+// cfec549 added a per-shard BTreeSet<u64> `pending_seqs` to short-circuit
+// the coalescer's bounded "oldest pending" lookup, but only wired the
+// drop into `note_applied` (mark_applied path). The non-mark_applied
+// removal paths — `free_seq_allocation` (mark_flushed / supersede
+// retire), `free_seq_allocation_durable` (purge / discard), and
+// `evict_pending_entry` (staging-send shutdown) — kept removing
+// pending_entries without touching pending_seqs, so stale-front seqs
+// accumulated and wedged the lookup the way 643548f originally fixed.
+
+#[test]
+fn mark_flushed_drops_seq_from_pending_seqs_index() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+
+    let seq1 = pool
+        .append("test-vol", Lba(0), 1, &vec![0x11; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    let seq2 = pool
+        .append("test-vol", Lba(1), 1, &vec![0x22; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    pool.recv_ready_timeout(Duration::from_secs(2)).unwrap();
+    pool.recv_ready_timeout(Duration::from_secs(2)).unwrap();
+
+    assert_eq!(
+        shard.ring.lock().pending_seqs.iter().copied().collect::<Vec<_>>(),
+        vec![seq1, seq2],
+        "both appends must land in pending_seqs"
+    );
+
+    // mark_flushed routes through free_seq_allocation — the path that
+    // the bug left without a pending_seqs.remove.
+    pool.mark_flushed(seq1, Lba(0), 1).unwrap();
+
+    let leftover: Vec<u64> = shard.ring.lock().pending_seqs.iter().copied().collect();
+    assert_eq!(
+        leftover,
+        vec![seq2],
+        "free_seq_allocation must drop seq from pending_seqs to mirror pending_entries"
+    );
+    assert!(shard.pending_entry_arc(seq1).is_none());
+}
+
+#[test]
+fn head_pending_stuck_skips_stale_pending_seqs_entries() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+
+    let seq_live = pool
+        .append("test-vol", Lba(0), 1, &vec![0xAB; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    pool.recv_ready_timeout(Duration::from_secs(2)).unwrap();
+
+    // Simulate the pre-fix bug: a stale seq at the front of pending_seqs
+    // whose pending_entries slot has already been removed. Pre-fix this
+    // permanently blocked head_pending_seq_if_stuck for *every* call.
+    {
+        let mut ring = shard.ring.lock();
+        ring.pending_seqs.insert(seq_live.saturating_sub(1).max(0));
+    }
+
+    pool.durable_seq_handle()
+        .store(seq_live, std::sync::atomic::Ordering::Release);
+    shard
+        .lv2_durability
+        .synced_seq
+        .store(seq_live, std::sync::atomic::Ordering::Release);
+
+    // min_age=0 so the age gate doesn't mask the test; the stale-front
+    // walk must still surface the live seq.
+    let head = shard.head_pending_seq_if_stuck(Duration::ZERO);
+    assert_eq!(
+        head,
+        Some(seq_live),
+        "stale-front seq must not hide the genuine pending head"
+    );
+
+    // oldest_pending_arcs must also see past the stale entry.
+    let oldest = shard.oldest_pending_arcs(4);
+    assert_eq!(oldest.len(), 1);
+    assert_eq!(oldest[0].seq, seq_live);
+}

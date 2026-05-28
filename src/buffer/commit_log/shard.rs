@@ -817,6 +817,10 @@ impl BufferShard {
                     p.len() as u64,
                 );
             }
+            // Drop the seq from the pending-only index too. `append`
+            // inserted into pending_seqs under the ring lock; failure
+            // before staging_tx.send must roll back both halves.
+            self.ring.lock().pending_seqs.remove(&seq);
         }
     }
 
@@ -959,25 +963,26 @@ impl BufferShard {
         if limit == 0 || self.pending_count.load(Ordering::Relaxed) == 0 {
             return Vec::new();
         }
-        // Walk the pending-only index in ascending seq order. Cap the
-        // brief ring-lock snapshot at `limit * 2` so a coalescer with
-        // a deep pending tail doesn't hold the lock long; the
-        // readiness filter still rejects entries above `synced_seq`,
-        // and the `limit * 2` slack handles those rejects plus the
-        // rare entry retired between snapshot and DashMap lookup.
+        // Snapshot the entire pending index under the ring lock and then
+        // walk it outside. pending_seqs.len() is bounded by the buffer's
+        // pending_count, which backpressure caps well below log_order's
+        // length, so the snapshot stays cheap. A bounded `take(limit*N)`
+        // would have to guess how many stale-front seqs to allow for —
+        // even one regression in a non-mark_applied removal path could
+        // wedge the head behind a tail of stale entries (the cfec549
+        // regression). Walking the full index turns any such regression
+        // into a few wasted DashMap probes, never a permanent stall.
         let candidates: Vec<u64> = {
             let ring = self.ring.lock();
-            ring.pending_seqs
-                .iter()
-                .take(limit * 2)
-                .copied()
-                .collect()
+            ring.pending_seqs.iter().copied().collect()
         };
         let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
         let mut result = Vec::with_capacity(limit);
         for seq in candidates {
             if seq > synced {
-                continue;
+                // pending_seqs is ascending — nothing past this point
+                // can be flush-ready either.
+                break;
             }
             if let Some(entry) = self.pending_entries.get(&seq) {
                 result.push(entry.value().clone());
@@ -993,32 +998,39 @@ impl BufferShard {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        // Use the pending-only index: the smallest seq still pending
-        // is by definition the head of `log_order` that hasn't been
-        // applied yet. Cheap O(1) min plus an age check on the ring
-        // head's `head_became_at`. The DashMap probe still survives
-        // as a final liveness gate to handle the rare race where the
-        // seq is being concurrently mark_applied.
-        let (head_pending, head_became_at) = {
+        // Walk pending_seqs from smallest seq upward. Skip seqs whose
+        // pending_entry has already been retired by a concurrent
+        // mark_applied / free_seq_allocation (the index drop happens
+        // under the ring lock, but pending_entries.remove runs outside
+        // it, so a brief stale-front window is normal). If a non-stale
+        // path EVER leaves stale entries in pending_seqs, this loop
+        // still finds the genuine head — turning a permanent stall
+        // into at most a cheap O(stale) probe per call.
+        let (snapshot, head_became_at) = {
             let ring = self.ring.lock();
-            (ring.pending_seqs.iter().next().copied(), ring.head_became_at)
-        };
-        let Some(seq) = head_pending else {
-            return None;
+            (
+                ring.pending_seqs.iter().copied().collect::<Vec<u64>>(),
+                ring.head_became_at,
+            )
         };
         let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
-        if seq > synced {
-            return None;
+        for seq in snapshot {
+            if seq > synced {
+                // pending_seqs is sorted ascending — everything beyond
+                // is also above the durable watermark.
+                return None;
+            }
+            if self.pending_entries.get(&seq).is_none() {
+                continue;
+            }
+            let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
+            let has_partial_progress = self.flush_progress.contains_key(&seq);
+            if !has_partial_progress && !old_enough {
+                return None;
+            }
+            return Some(seq);
         }
-        if self.pending_entries.get(&seq).is_none() {
-            return None;
-        }
-        let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
-        let has_partial_progress = self.flush_progress.contains_key(&seq);
-        if !has_partial_progress && !old_enough {
-            return None;
-        }
-        Some(seq)
+        None
     }
 
     /// Cheap, non-hydrating diagnostic snapshot for a given seq. Returns
@@ -1105,6 +1117,13 @@ impl BufferShard {
                 // The ring space was already reclaimed — nothing left to do.
                 return;
             }
+            // Mirror `note_applied`: pending_seqs must drop in lockstep
+            // with pending_entries. cfec549 introduced the index but only
+            // wired the mark_applied → note_applied path; supersede /
+            // purge / corrupt-evict all flow through here and would
+            // otherwise leave permanent stale seqs at the front of
+            // pending_seqs, blocking the coalescer's bounded lookups.
+            ring.pending_seqs.remove(&seq);
             let before = ring.used_bytes;
             Self::reclaim_log_prefix(&mut ring, durable_seq);
             if ring.used_bytes < before {
@@ -1137,6 +1156,10 @@ impl BufferShard {
             if !ring.flushed_seqs.insert(seq) {
                 return Ok(());
             }
+            // See `free_seq_allocation`: pending_seqs is the coalescer's
+            // bounded lookup index and must drop in lockstep with
+            // pending_entries on every path, not just mark_applied.
+            ring.pending_seqs.remove(&seq);
             let before = ring.used_bytes;
             Self::reclaim_log_prefix(&mut ring, u64::MAX);
             if ring.used_bytes < before {
