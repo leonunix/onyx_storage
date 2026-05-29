@@ -38,6 +38,9 @@ dedup_l1_cache_entries = 256000
 # every target shard, which only happens when l2p_buffer_enabled is on.
 l2p_buffer_enabled = true
 commit_direct_apply_enabled = true
+# ZFS-TXG-clone Phase 4/5: background quiesce+sync threads + per-syncing-slot
+# drain. Decouples buffer-ring reclaim from the inline checkpoint.
+txg_threads_enabled = true
 
 [storage]
 data_device = "/dev/nvme5n1"
@@ -118,6 +121,10 @@ metadb_l2p_apply_cpus = "64-79"
 metadb_refcount_apply_cpus = "88-91"
 metadb_dedup_apply_cpus = "88-91"
 metadb_checkpoint_cpus = "93-95"
+# TxgSync/TxgQuiesce background workers (threads-on). Pinned to the
+# housekeeping cores where the inline checkpoint ran in threads-off, so
+# the heavy write_dirty_pages sync never floats onto the hot ublk cores.
+metadb_l2p_compactor_cpus = "93-95"
 background_cpus = "92-95"
 
 [service]

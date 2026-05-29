@@ -389,6 +389,18 @@ pub struct MetaConfig {
     /// `/root/.claude/plans/soft-doodling-snail.md`.
     #[serde(default = "default_commit_deferred_outcomes_enabled")]
     pub commit_deferred_outcomes_enabled: bool,
+
+    /// Enable the ZFS-TXG-clone Phase 4/5 background TXG threads in
+    /// metadb. When `true`, metadb spawns the `TxgQuiesceThread` +
+    /// `TxgSyncThread`: the open TXG rolls on a ~5s timer and a
+    /// background sync drains only the frozen syncing slot per cycle,
+    /// so buffer-ring reclaim (`release_below`) runs continuously
+    /// instead of being gated behind one giant inline checkpoint.
+    /// Requires `l2p_buffer_enabled = true` (buffer mode). Default off;
+    /// enabled in the nvme configs for the A/B validation. See
+    /// `/root/.claude/plans/mellow-dazzling-thunder.md`.
+    #[serde(default = "default_txg_threads_enabled")]
+    pub txg_threads_enabled: bool,
 }
 
 impl MetaConfig {
@@ -481,6 +493,7 @@ impl Default for MetaConfig {
             l2p_buffer_max_interval_ms: default_l2p_buffer_max_interval_ms(),
             commit_direct_apply_enabled: default_commit_direct_apply_enabled(),
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
+            txg_threads_enabled: default_txg_threads_enabled(),
         }
     }
 }
@@ -569,6 +582,13 @@ fn default_commit_deferred_outcomes_enabled() -> bool {
     // underflow/panic, engine alive end-to-end). Paired with the onyx
     // `commit_worker_deferred_outcomes` default; both engage together.
     true
+}
+fn default_txg_threads_enabled() -> bool {
+    // ZFS-TXG-clone Phase 4/5: background quiesce+sync threads. Default
+    // off until the nvme-box A/B + soak gate passes; the nvme configs
+    // set it true. Pairs with metadb's per-syncing-slot drain (the
+    // threads-on path); only meaningful when `l2p_buffer_enabled = true`.
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

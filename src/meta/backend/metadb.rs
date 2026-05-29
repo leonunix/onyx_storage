@@ -1359,6 +1359,11 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_buffer_max_interval_ms = config.l2p_buffer_max_interval_ms;
     cfg.commit_direct_apply_enabled = config.commit_direct_apply_enabled;
     cfg.commit_deferred_outcomes_enabled = config.commit_deferred_outcomes_enabled;
+    // ZFS-TXG-clone Phase 4/5: spawn metadb's background quiesce+sync
+    // threads so the open TXG rolls on a timer and the sync drains only
+    // the frozen syncing slot, decoupling buffer-ring reclaim from one
+    // giant inline checkpoint. See plan mellow-dazzling-thunder.md.
+    cfg.txg_threads_enabled = config.txg_threads_enabled;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
     cfg.async_reclaim_max_pages_per_cycle = config.async_reclaim_max_pages_per_cycle as usize;
