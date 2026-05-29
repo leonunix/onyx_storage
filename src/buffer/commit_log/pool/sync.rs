@@ -2,7 +2,85 @@ use super::*;
 
 const POST_WRITE_VERIFY: bool = false;
 
+/// One coalesced, contiguous run of staged entries encoded into a single
+/// pooled `AlignedBuf`, ready for one pwrite (syscall path) or one write
+/// SQE (io_uring path). `offset` is the LV2-relative byte offset of the
+/// first entry; `len` is the exact number of valid bytes (the buffer may
+/// be rounded up larger by the allocator).
+struct CoalescedSpan {
+    buf: AlignedBuf,
+    offset: u64,
+    len: u32,
+}
+
 impl WriteBufferPool {
+    /// Encode each staged entry directly into a pooled `AlignedBuf`,
+    /// coalescing entries whose reserved disk ranges are contiguous into a
+    /// single buffer. This replaces the old "encode into a fresh
+    /// `vec![0u8; n]` per entry, then memcpy into an AlignedBuf" two-pass:
+    /// the per-entry Vec was a jemalloc large-class allocation, so freeing
+    /// it drove `madvise(MADV_DONTNEED)` → cross-core TLB-shootdown IPIs on
+    /// the LV2 sync thread (perf 2026-05-29: ~10% aggregate on-CPU, smeared
+    /// across all cores). Encoding straight into the span buffer's
+    /// sub-slice via `encode_full_into_slice` removes that allocation, the
+    /// extra memcpy, and the redundant zero-fill. The single AlignedBuf per
+    /// span hits the thread-local pool ([`AlignedBuf::new`]) and stays
+    /// resident, so no madvise churn remains.
+    fn encode_entries_into_spans(entries: &[StagedEntry]) -> OnyxResult<Vec<CoalescedSpan>> {
+        let mut spans: Vec<CoalescedSpan> = Vec::new();
+        let mut start = 0usize;
+        while start < entries.len() {
+            let mut end = start + 1;
+            let mut next_offset =
+                entries[start].pending.disk_offset + entries[start].pending.disk_len as u64;
+            while end < entries.len() && entries[end].pending.disk_offset == next_offset {
+                next_offset += entries[end].pending.disk_len as u64;
+                end += 1;
+            }
+            let span = &entries[start..end];
+            let total_len: usize = span.iter().map(|e| e.pending.disk_len as usize).sum();
+            let mut buf = AlignedBuf::new(total_len, false)?;
+            {
+                let dst = buf.as_mut_slice();
+                let mut cursor = 0usize;
+                for entry in span {
+                    let pending = &entry.pending;
+                    let payload = &entry.payload;
+                    let disk_len = pending.disk_len as usize;
+                    debug_assert_eq!(
+                        disk_len,
+                        crate::io::aligned::round_up(
+                            BufferEntry::raw_size_for(&pending.vol_id, payload.len()),
+                            BLOCK_SIZE as usize
+                        ),
+                        "disk_len must equal the rounded encoded entry size"
+                    );
+                    let payload_crc = crc32fast::hash(payload);
+                    BufferEntry::encode_full_into_slice(
+                        pending.seq,
+                        &pending.vol_id,
+                        pending.start_lba,
+                        pending.lba_count,
+                        payload_crc,
+                        false,
+                        pending.vol_created_at,
+                        payload,
+                        pending.disk_len,
+                        &mut dst[cursor..cursor + disk_len],
+                    )?;
+                    cursor += disk_len;
+                }
+            }
+            spans.push(CoalescedSpan {
+                buf,
+                offset: span[0].pending.disk_offset,
+                len: total_len as u32,
+            });
+            start = end;
+        }
+        Ok(spans)
+    }
+
     pub(super) fn sync_device_impl(device: &RawDevice) -> OnyxResult<()> {
         Self::consume_test_sync_failpoint()?;
         device.sync()
@@ -38,44 +116,12 @@ impl WriteBufferPool {
             return Ok(());
         }
 
-        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let pending = &entry.pending;
-            let payload = &entry.payload;
-            let payload_crc = crc32fast::hash(payload);
-            let data = BufferEntry::encode(
-                pending.seq,
-                &pending.vol_id,
-                pending.start_lba,
-                pending.lba_count,
-                payload_crc,
-                false,
-                pending.vol_created_at,
-                payload,
-            )?;
-            encoded.push((pending.disk_offset, data));
-        }
+        let spans = Self::encode_entries_into_spans(entries)?;
 
         let write_start = Instant::now();
         let _guard = io_lock.lock();
-        let mut start = 0usize;
-        while start < encoded.len() {
-            let mut end = start + 1;
-            let mut next_offset = encoded[start].0 + encoded[start].1.len() as u64;
-            while end < encoded.len() && encoded[end].0 == next_offset {
-                next_offset += encoded[end].1.len() as u64;
-                end += 1;
-            }
-            let span = &encoded[start..end];
-            let total_len: usize = span.iter().map(|(_, data)| data.len()).sum();
-            let mut batch = AlignedBuf::new(total_len, false)?;
-            let mut cursor = 0;
-            for (_, data) in span {
-                batch.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
-                cursor += data.len();
-            }
-            device.write_at(&batch.as_slice()[..total_len], span[0].0)?;
-            start = end;
+        for span in &spans {
+            device.write_at(&span.buf.as_slice()[..span.len as usize], span.offset)?;
         }
         if let Some(metrics) = metrics.get() {
             BufferShard::record_metric(&metrics.buffer_append_log_write_ns, write_start);
@@ -89,11 +135,9 @@ impl WriteBufferPool {
         if POST_WRITE_VERIFY {
             use crate::buffer::entry::BUFFER_ENTRY_MAGIC;
             let mut verify_buf = vec![0u8; BLOCK_SIZE as usize];
-            for (offset, data) in &encoded {
-                if data.len() < 8 {
-                    continue;
-                }
-                if let Err(e) = device.read_at(&mut verify_buf, *offset) {
+            for entry in entries {
+                let offset = entry.pending.disk_offset;
+                if let Err(e) = device.read_at(&mut verify_buf, offset) {
                     tracing::error!(
                         offset,
                         error = %e,
@@ -103,23 +147,17 @@ impl WriteBufferPool {
                 }
                 let magic = u32::from_le_bytes(verify_buf[4..8].try_into().unwrap());
                 if magic != BUFFER_ENTRY_MAGIC {
-                    let expected_magic_bytes = &data[4..8];
                     let disk_first_16: Vec<u8> = verify_buf[..16].to_vec();
-                    let encoded_first_16: Vec<u8> = data[..16.min(data.len())].to_vec();
                     let write_base = device.base_offset();
                     let write_direct_io = device.is_direct_io();
                     tracing::error!(
                         offset,
-                        data_len = data.len(),
                         disk_magic = magic,
-                        expected_magic = u32::from_le_bytes(
-                            expected_magic_bytes.try_into().unwrap()
-                        ),
+                        expected_magic = BUFFER_ENTRY_MAGIC,
                         write_base,
                         write_global = write_base + offset,
                         write_direct_io,
                         disk_first_16 = ?disk_first_16,
-                        encoded_first_16 = ?encoded_first_16,
                         "POST-WRITE VERIFICATION FAILED: entry not on disk after write_at"
                     );
                 }
@@ -152,56 +190,11 @@ impl WriteBufferPool {
             return Ok(());
         }
 
-        // 1. Encode entries (identical to write_batch).
-        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let pending = &entry.pending;
-            let payload = &entry.payload;
-            let payload_crc = crc32fast::hash(payload);
-            let data = BufferEntry::encode(
-                pending.seq,
-                &pending.vol_id,
-                pending.start_lba,
-                pending.lba_count,
-                payload_crc,
-                false,
-                pending.vol_created_at,
-                payload,
-            )?;
-            encoded.push((pending.disk_offset, data));
-        }
-
-        // 2. Coalesce contiguous entries into one AlignedBuf each, ready for
-        //    a single SQE per coalesced span.
-        struct CoalescedSpan {
-            buf: AlignedBuf,
-            offset: u64,
-            len: u32,
-        }
-        let mut spans: Vec<CoalescedSpan> = Vec::new();
-        let mut start = 0usize;
-        while start < encoded.len() {
-            let mut end = start + 1;
-            let mut next_offset = encoded[start].0 + encoded[start].1.len() as u64;
-            while end < encoded.len() && encoded[end].0 == next_offset {
-                next_offset += encoded[end].1.len() as u64;
-                end += 1;
-            }
-            let span = &encoded[start..end];
-            let total_len: usize = span.iter().map(|(_, data)| data.len()).sum();
-            let mut batch = AlignedBuf::new(total_len, false)?;
-            let mut cursor = 0;
-            for (_, data) in span {
-                batch.as_mut_slice()[cursor..cursor + data.len()].copy_from_slice(data);
-                cursor += data.len();
-            }
-            spans.push(CoalescedSpan {
-                buf: batch,
-                offset: span[0].0,
-                len: total_len as u32,
-            });
-            start = end;
-        }
+        // 1 + 2. Encode each entry directly into a pooled AlignedBuf,
+        //    coalescing contiguous reserved ranges into one buffer per span
+        //    (one write SQE each). See `encode_entries_into_spans` for why
+        //    this avoids the per-entry Vec / madvise-TLB-IPI churn.
+        let spans = Self::encode_entries_into_spans(entries)?;
 
         // 3. Optional checkpoint payload (only when the shard has a checkpoint
         //    device — same condition as `write_checkpoint`).
@@ -302,11 +295,9 @@ impl WriteBufferPool {
         if POST_WRITE_VERIFY {
             use crate::buffer::entry::BUFFER_ENTRY_MAGIC;
             let mut verify_buf = vec![0u8; BLOCK_SIZE as usize];
-            for (offset, data) in &encoded {
-                if data.len() < 8 {
-                    continue;
-                }
-                if let Err(e) = device.read_at(&mut verify_buf, *offset) {
+            for entry in entries {
+                let offset = entry.pending.disk_offset;
+                if let Err(e) = device.read_at(&mut verify_buf, offset) {
                     tracing::error!(
                         offset,
                         error = %e,
@@ -316,13 +307,10 @@ impl WriteBufferPool {
                 }
                 let magic = u32::from_le_bytes(verify_buf[4..8].try_into().unwrap());
                 if magic != BUFFER_ENTRY_MAGIC {
-                    let expected_magic_bytes = &data[4..8];
                     tracing::error!(
                         offset,
-                        data_len = data.len(),
                         disk_magic = magic,
-                        expected_magic =
-                            u32::from_le_bytes(expected_magic_bytes.try_into().unwrap()),
+                        expected_magic = BUFFER_ENTRY_MAGIC,
                         "POST-WRITE VERIFICATION FAILED (io_uring path): entry not on disk"
                     );
                 }

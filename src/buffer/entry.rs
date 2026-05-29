@@ -218,7 +218,7 @@ impl BufferEntry {
         Ok((header, total_len))
     }
 
-    fn encode_full_into_slice(
+    pub(crate) fn encode_full_into_slice(
         seq: u64,
         vol_id: &str,
         start_lba: Lba,
