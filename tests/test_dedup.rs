@@ -751,6 +751,13 @@ fn dedup_concurrent_hits_correct_refcount() {
     // dedup_index path or via candidate cache for the same hash) are
     // de-duplicated by the dedup workers and do not generate additional
     // promotes. Pre-Phase-5 this assertion was `rc == 5` (one per LBA).
+    //
+    // The promote's DedupPut applies asynchronously on a metadb dedup
+    // apply lane, so it can lag `flusher.stop()` under threads-on +
+    // heavy concurrent test load. Poll until rc settles (bounded) before
+    // asserting — a wrong/inflated rc still fails after the timeout, so
+    // this tolerates apply latency without masking a real regression.
+    wait_until(10000, || meta.get_refcount(first_pba).unwrap() == 1);
     let rc = meta.get_refcount(first_pba).unwrap();
     assert_eq!(
         rc, 1,

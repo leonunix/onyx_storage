@@ -584,11 +584,13 @@ fn default_commit_deferred_outcomes_enabled() -> bool {
     true
 }
 fn default_txg_threads_enabled() -> bool {
-    // ZFS-TXG-clone Phase 4/5: background quiesce+sync threads. Default
-    // off until the nvme-box A/B + soak gate passes; the nvme configs
-    // set it true. Pairs with metadb's per-syncing-slot drain (the
-    // threads-on path); only meaningful when `l2p_buffer_enabled = true`.
-    false
+    // ZFS-TXG-clone Phase 4/5: background quiesce+sync threads + metadb's
+    // per-syncing-slot drain. Default ON: nvme-box A/B (randwrite j16d64,
+    // workers pinned to the housekeeping cores) showed LV3 drain
+    // 307 -> 379 MB/s (+23%) with lower buffer pending and commit queue
+    // wait. Only engages when `l2p_buffer_enabled = true`. The 24h soak
+    // gate (metadb/CLAUDE.md) still precedes any push.
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
