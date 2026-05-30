@@ -714,6 +714,14 @@ pub struct BufferConfig {
     /// Per-append throttle delay cap (microseconds). 0 = 100_000 = 100 ms.
     #[serde(default)]
     pub throttle_cap_us: u64,
+    /// Number of LV2 fdatasync chains a sync thread keeps in flight at once.
+    /// 1 = legacy serial behaviour (submit → wait-all → submit-next). >1
+    /// pipelines: batch N+1's writes overlap batch N's fdatasync flush, so the
+    /// per-batch fsync stall no longer gates the front→buffer→flush pipeline.
+    /// Durability is preserved by advancing the LV2 watermark only over the
+    /// contiguous FIFO prefix of fully-fsync'd batches. 0 = engine default (2).
+    #[serde(default)]
+    pub lv2_sync_pipeline_depth: usize,
 }
 
 impl Default for BufferConfig {
@@ -733,6 +741,7 @@ impl Default for BufferConfig {
             throttle_max_pct: 0,
             throttle_scale_us: 0,
             throttle_cap_us: 0,
+            lv2_sync_pipeline_depth: 0,
         }
     }
 }

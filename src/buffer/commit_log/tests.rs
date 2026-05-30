@@ -93,6 +93,166 @@ fn uring_sync_batch_chunks_over_sq_depth() {
 }
 
 #[test]
+fn uring_pipeline_concurrent_appends_durable_and_visible() {
+    // Open a uring-backed pool (default lv2_sync_pipeline_depth = 2 via
+    // BufferRuntimeLimits::default), drive concurrent appends so multiple fsync
+    // chains are in flight, and assert: every ack'd append is read-after-write
+    // visible, the watermark advanced for all of them (append blocks until
+    // durable), and the pipelined on-disk format replays on reopen.
+    let tmp = NamedTempFile::new().unwrap();
+    let slot = BufferShard::slot_size();
+    let data_start = COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE;
+    let size = data_start + 4096 * slot;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = Arc::new(
+        WriteBufferPool::open_with_options_full(
+            dev,
+            Duration::from_millis(1),
+            1,         // shards
+            256,       // zone size blocks
+            Duration::ZERO,
+            0,
+            Some(64), // uring_sq_entries → pipelined sync path active
+        )
+        .unwrap(),
+    );
+
+    let threads = 4usize;
+    let per = 16u64;
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let pool = pool.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..per {
+                let lba = Lba(t as u64 * 1000 + i);
+                let byte = (t as u8).wrapping_add(i as u8).wrapping_add(1);
+                let data = vec![byte; BLOCK_SIZE as usize];
+                let seq = pool.append("vol", lba, 1, &data, 0).unwrap();
+                assert!(seq >= 1);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let total = threads as u64 * per;
+    assert_eq!(pool.pending_count(), total, "all appends still pending (no flusher)");
+    for t in 0..threads {
+        for i in 0..per {
+            let lba = Lba(t as u64 * 1000 + i);
+            let byte = (t as u8).wrapping_add(i as u8).wrapping_add(1);
+            let found = pool.lookup("vol", lba).unwrap().unwrap();
+            assert_eq!(
+                &**found.payload.as_ref().unwrap(),
+                &vec![byte; BLOCK_SIZE as usize][..],
+                "read-after-write mismatch at t={t} i={i}"
+            );
+        }
+    }
+    drop(pool);
+
+    // Reopen: pipelined writes use the identical on-disk entry format, so every
+    // durable entry replays.
+    let dev2 = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool2 = WriteBufferPool::open_with_options_full(
+        dev2,
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::ZERO,
+        0,
+        Some(64),
+    )
+    .unwrap();
+    assert_eq!(
+        pool2.recover().unwrap().len() as u64,
+        total,
+        "all durable entries replay on reopen"
+    );
+}
+
+#[test]
+fn uring_sync_fast_path_single_linked_chain() {
+    // Contiguous disk offsets coalesce into ONE span, and the ring is large
+    // enough that data-write + fsync (+ checkpoint) fit in a single submit —
+    // exercising the IO_LINK fast path in `write_batch_and_sync_uring`.
+    let tmp = NamedTempFile::new().unwrap();
+    let slot = BufferShard::slot_size();
+    let data_start = COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE;
+    let size = data_start + 128 * slot;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full(
+        dev,
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::ZERO,
+        0,
+        None,
+    )
+    .unwrap();
+    let shard = &pool.shards[0].shard;
+    let shard_device = pool
+        .root_device
+        .slice(data_start, size - data_start)
+        .unwrap();
+    // Big ring → fast path (single linked submit), unlike the sq=4 chunk test.
+    let ring = Arc::new(IoUringSession::new(64).unwrap());
+    let metrics = Arc::new(OnceLock::new());
+
+    // Build entries at CONTIGUOUS disk offsets so they coalesce to one span.
+    let mut entries = Vec::new();
+    let mut next_off = 0u64;
+    for i in 0..8u64 {
+        let payload: Arc<[u8]> = vec![0x40u8 + i as u8; BLOCK_SIZE as usize].into();
+        let payload_crc = crc32fast::hash(payload.as_ref());
+        let encoded =
+            BufferEntry::encode(i + 1, "fast-vol", Lba(i), 1, payload_crc, false, 9, payload.as_ref())
+                .unwrap();
+        let disk_len = encoded.len() as u32;
+        let pending = Arc::new(PendingEntry {
+            seq: i + 1,
+            vol_id: "fast-vol".to_string(),
+            start_lba: Lba(i),
+            lba_count: 1,
+            payload_crc32: payload_crc,
+            vol_created_at: 9,
+            payload: Some(payload.clone()),
+            disk_offset: next_off,
+            disk_len,
+            enqueued_at: Instant::now(),
+            superseded_ranges: Vec::new(),
+        });
+        next_off += disk_len as u64;
+        entries.push(StagedEntry { pending, payload });
+    }
+
+    WriteBufferPool::write_batch_and_sync_uring(
+        &shard_device,
+        shard,
+        &ring,
+        &shard.io_lock,
+        &entries,
+        8,
+        &metrics,
+    )
+    .unwrap();
+
+    for entry in &entries {
+        let mut buf = vec![0u8; entry.pending.disk_len as usize];
+        shard_device
+            .read_at(&mut buf, entry.pending.disk_offset)
+            .unwrap();
+        let decoded = BufferEntry::from_bytes(&buf).unwrap();
+        assert_eq!(decoded.seq, entry.pending.seq);
+        assert_eq!(decoded.payload.as_ref(), entry.payload.as_ref());
+    }
+}
+
+#[test]
 fn flushed_entry_cannot_be_reinstalled_by_stale_eviction_state() {
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;

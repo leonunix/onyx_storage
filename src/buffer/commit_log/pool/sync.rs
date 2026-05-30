@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::VecDeque;
+use std::os::fd::RawFd;
 
 const POST_WRITE_VERIFY: bool = false;
 
@@ -11,6 +13,31 @@ struct CoalescedSpan {
     buf: AlignedBuf,
     offset: u64,
     len: u32,
+}
+
+/// One LV2 fdatasync chain in flight in the pipelined sync path. Holds the
+/// encoded span buffers (and optional checkpoint buffer) alive until the
+/// kernel harvests every CQE for this batch's chain — the raw pointers in the
+/// submitted SQEs reference these allocations. `inflight_all` is the FULL
+/// drained batch (including cancelled entries) used for post-fsync retire /
+/// cancel-strip / watermark advance, exactly as the serial path does.
+///
+/// SQE layout (so a harvested `op_idx` maps to a role): data writes at
+/// `0..write_count` (IO_LINK-chained), the terminal `FsyncData` at
+/// `write_count`, the optional unlinked checkpoint write at `write_count + 1`.
+struct InflightUringBatch {
+    batch_id: u64,
+    spans: Vec<CoalescedSpan>,
+    /// Kept alive (not read) so the checkpoint write SQE's pointer stays valid.
+    _ckpt_buf: Option<AlignedBuf>,
+    inflight_all: Vec<StagedEntry>,
+    max_seq: u64,
+    write_count: usize,
+    has_ckpt: bool,
+    expected_cqes: usize,
+    seen_cqes: usize,
+    failed: bool,
+    write_start: Instant,
 }
 
 impl WriteBufferPool {
@@ -209,76 +236,142 @@ impl WriteBufferPool {
 
         let data_fd = device.as_raw_fd();
         let data_base = device.base_offset();
-
-        // 4. Build the SQE batch: writes → checkpoint → barrier fsync.
-        let mut ops: Vec<UringOp> = Vec::with_capacity(spans.len() + 2);
-        for span in &spans {
-            ops.push(UringOp::Write {
-                fd: data_fd,
-                ptr: span.buf.as_ptr(),
-                len: span.len,
-                offset: data_base + span.offset,
-            });
-        }
-        if let (Some(buf), Some((ckpt_fd, ckpt_base))) = (ckpt_aligned.as_ref(), checkpoint_target)
-        {
-            ops.push(UringOp::Write {
-                fd: ckpt_fd,
-                ptr: buf.as_ptr(),
-                len: BLOCK_SIZE,
-                offset: ckpt_base,
-            });
-        }
-        ops.push(UringOp::FsyncDataBarrier { fd: data_fd });
-
-        // 5. Submit + wait under the same io_lock that the syscall path uses,
-        //    so concurrent writers see consistent ordering. Data writes may
-        //    exceed the ring depth; checkpoint and fsync are submitted after
-        //    all data chunks complete to preserve the durability order.
-        let write_start = Instant::now();
-        let _guard = io_lock.lock();
         let span_count = spans.len();
-        let max_ops = (ring.sq_entries() as usize).max(1);
-        let mut results = Vec::with_capacity(ops.len());
-        for chunk in ops[..span_count].chunks(max_ops) {
-            results.extend(unsafe { ring.submit_batch(chunk)? });
-        }
-        if ckpt_aligned.is_some() {
-            results.extend(unsafe { ring.submit_batch(&ops[span_count..span_count + 1])? });
-        }
-        results.extend(unsafe { ring.submit_batch(&ops[ops.len() - 1..])? });
+        let has_ckpt = ckpt_aligned.is_some() && checkpoint_target.is_some();
 
-        // 6. Validate per-op CQE results.
-        for (i, span) in spans.iter().enumerate() {
-            let r = &results[i];
-            if let Some(errno) = r.errno() {
+        // Shared validation of the data-write CQEs (indices 0..span_count in
+        // both the fast and legacy result layouts).
+        let validate_span_writes = |results: &[UringOpResult]| -> OnyxResult<()> {
+            for (i, span) in spans.iter().enumerate() {
+                let r = &results[i];
+                if let Some(errno) = r.errno() {
+                    return Err(OnyxError::Io(std::io::Error::other(format!(
+                        "io_uring entry write failed at offset={} errno={}",
+                        span.offset, errno
+                    ))));
+                }
+                let bytes = r.bytes().unwrap_or(0);
+                if bytes != span.len {
+                    return Err(OnyxError::Io(std::io::Error::other(format!(
+                        "io_uring short entry write at offset={}: got {} of {}",
+                        span.offset, bytes, span.len
+                    ))));
+                }
+            }
+            Ok(())
+        };
+
+        // Fast path SQE budget: N data writes + 1 fsync + optional checkpoint.
+        let fast_path_ops = span_count + 1 + usize::from(has_ckpt);
+        let write_start = Instant::now();
+
+        if fast_path_ops as u32 <= ring.sq_entries() {
+            // ── Fast path: ONE submit ────────────────────────────────────
+            // IO_LINK-chain the data writes into a terminal plain FsyncData,
+            // so the fsync waits for exactly this batch's writes (no whole-ring
+            // IO_DRAIN). The checkpoint write is appended UNLINKED — it runs
+            // concurrently and its durability is best-effort (a recovery hint
+            // re-covered by the next batch's device-wide flush). Linking it
+            // would let a checkpoint failure -ECANCELED the fsync.
+            let mut linked: Vec<LinkedOp> = Vec::with_capacity(fast_path_ops);
+            for span in &spans {
+                linked.push(LinkedOp {
+                    op: UringOp::Write {
+                        fd: data_fd,
+                        ptr: span.buf.as_ptr(),
+                        len: span.len,
+                        offset: data_base + span.offset,
+                    },
+                    link_next: true,
+                });
+            }
+            linked.push(LinkedOp {
+                op: UringOp::FsyncData { fd: data_fd },
+                link_next: false,
+            });
+            if let (Some(buf), Some((ckpt_fd, ckpt_base))) =
+                (ckpt_aligned.as_ref(), checkpoint_target)
+            {
+                linked.push(LinkedOp {
+                    op: UringOp::Write {
+                        fd: ckpt_fd,
+                        ptr: buf.as_ptr(),
+                        len: BLOCK_SIZE,
+                        offset: ckpt_base,
+                    },
+                    link_next: false,
+                });
+            }
+
+            let results = {
+                let _guard = io_lock.lock();
+                unsafe { ring.submit_linked_wait(&linked)? }
+            };
+
+            validate_span_writes(&results)?;
+            // fsync is at span_count.
+            if let Some(errno) = results[span_count].errno() {
                 return Err(OnyxError::Io(std::io::Error::other(format!(
-                    "io_uring entry write failed at offset={} errno={}",
-                    span.offset, errno
+                    "io_uring fdatasync failed: errno={errno}"
                 ))));
             }
-            let bytes = r.bytes().unwrap_or(0);
-            if bytes != span.len {
+            // checkpoint (best-effort) is at span_count + 1.
+            if has_ckpt {
+                if let Some(errno) = results[span_count + 1].errno() {
+                    tracing::debug!(errno, "io_uring checkpoint write failed (non-fatal)");
+                }
+            }
+        } else {
+            // ── Legacy path: chain length exceeds the SQ ring ────────────
+            // Submit data writes in sq-sized chunks (each waited), then the
+            // checkpoint, then a DRAIN fsync — preserving durability order
+            // across multiple submits so group commit can grow past ring depth.
+            let mut ops: Vec<UringOp> = Vec::with_capacity(spans.len() + 2);
+            for span in &spans {
+                ops.push(UringOp::Write {
+                    fd: data_fd,
+                    ptr: span.buf.as_ptr(),
+                    len: span.len,
+                    offset: data_base + span.offset,
+                });
+            }
+            if let (Some(buf), Some((ckpt_fd, ckpt_base))) =
+                (ckpt_aligned.as_ref(), checkpoint_target)
+            {
+                ops.push(UringOp::Write {
+                    fd: ckpt_fd,
+                    ptr: buf.as_ptr(),
+                    len: BLOCK_SIZE,
+                    offset: ckpt_base,
+                });
+            }
+            ops.push(UringOp::FsyncDataBarrier { fd: data_fd });
+
+            let _guard = io_lock.lock();
+            let max_ops = (ring.sq_entries() as usize).max(1);
+            let mut results = Vec::with_capacity(ops.len());
+            for chunk in ops[..span_count].chunks(max_ops) {
+                results.extend(unsafe { ring.submit_batch(chunk)? });
+            }
+            if has_ckpt {
+                results.extend(unsafe { ring.submit_batch(&ops[span_count..span_count + 1])? });
+            }
+            results.extend(unsafe { ring.submit_batch(&ops[ops.len() - 1..])? });
+
+            validate_span_writes(&results)?;
+            let mut next_idx = span_count;
+            if has_ckpt {
+                if let Some(errno) = results[next_idx].errno() {
+                    tracing::debug!(errno, "io_uring checkpoint write failed (non-fatal)");
+                }
+                next_idx += 1;
+            }
+            // Final SQE is the fsync barrier.
+            if let Some(errno) = results[next_idx].errno() {
                 return Err(OnyxError::Io(std::io::Error::other(format!(
-                    "io_uring short entry write at offset={}: got {} of {}",
-                    span.offset, bytes, span.len
+                    "io_uring fdatasync failed: errno={errno}"
                 ))));
             }
-        }
-        let mut next_idx = span_count;
-        if ckpt_aligned.is_some() {
-            let r = &results[next_idx];
-            next_idx += 1;
-            if let Some(errno) = r.errno() {
-                tracing::debug!(errno, "io_uring checkpoint write failed (non-fatal)");
-            }
-        }
-        // Final SQE is the fsync barrier.
-        let fsync_r = &results[next_idx];
-        if let Some(errno) = fsync_r.errno() {
-            return Err(OnyxError::Io(std::io::Error::other(format!(
-                "io_uring fdatasync failed: errno={errno}"
-            ))));
         }
 
         if let Some(metrics) = metrics.get() {
@@ -320,6 +413,419 @@ impl WriteBufferPool {
         Ok(())
     }
 
+    /// Build the IO_LINK chain for one in-flight batch: data writes (each
+    /// `IOSQE_IO_LINK`) → terminal plain `FsyncData`, plus the unlinked
+    /// best-effort checkpoint write. Rebuilt on each (re)submit; cheap. The raw
+    /// pointers reference `batch.spans` / `batch._ckpt_buf`, which the batch
+    /// keeps alive until its CQEs are harvested.
+    fn chain_ops(
+        batch: &InflightUringBatch,
+        data_fd: RawFd,
+        data_base: u64,
+        ckpt_target: Option<(RawFd, u64)>,
+    ) -> Vec<LinkedOp> {
+        let mut ops = Vec::with_capacity(batch.write_count + 2);
+        for span in &batch.spans {
+            ops.push(LinkedOp {
+                op: UringOp::Write {
+                    fd: data_fd,
+                    ptr: span.buf.as_ptr(),
+                    len: span.len,
+                    offset: data_base + span.offset,
+                },
+                link_next: true,
+            });
+        }
+        ops.push(LinkedOp {
+            op: UringOp::FsyncData { fd: data_fd },
+            link_next: false,
+        });
+        if let (Some(buf), Some((ckpt_fd, ckpt_base))) = (batch._ckpt_buf.as_ref(), ckpt_target) {
+            ops.push(LinkedOp {
+                op: UringOp::Write {
+                    fd: ckpt_fd,
+                    ptr: buf.as_ptr(),
+                    len: BLOCK_SIZE,
+                    offset: ckpt_base,
+                },
+                link_next: false,
+            });
+        }
+        ops
+    }
+
+    /// Drain a batch of staged entries and encode it into an `InflightUringBatch`
+    /// ready to submit. Filters cancelled (rolled-back) appends out of the
+    /// written set but keeps the full drained set for post-fsync bookkeeping.
+    /// Returns `None` when nothing is staged.
+    fn form_uring_batch(
+        shard: &BufferShard,
+        ckpt_target: Option<(RawFd, u64)>,
+        max_chain_entries: usize,
+        next_batch_id: &mut u64,
+    ) -> Option<InflightUringBatch> {
+        // Cap entries so this batch's chain (≤ entries + fsync + ckpt SQEs)
+        // fits the SQ ring in one shot — a link chain can't span submits.
+        let drained = shard.drain_staged_capped(max_chain_entries);
+        if drained.is_empty() {
+            return None;
+        }
+        let to_persist: Vec<StagedEntry> = {
+            let lc = shard.lifecycle.lock();
+            let mut persist = Vec::with_capacity(drained.len());
+            let mut cancelled = 0usize;
+            for entry in &drained {
+                if lc.cancelled.contains(&entry.pending.seq) {
+                    cancelled += 1;
+                } else {
+                    persist.push(entry.clone());
+                }
+            }
+            if cancelled > 0 {
+                tracing::warn!(
+                    cancelled,
+                    total = drained.len(),
+                    "uring pipeline batch has cancelled entries — not written"
+                );
+            }
+            persist
+        };
+        let max_seq = drained.iter().map(|e| e.pending.seq).max().unwrap_or(0);
+
+        // Encode retries forever on allocation failure rather than dropping the
+        // drained entries (which would strand the parked appenders waiting on
+        // their seq). OOM here means the system is already collapsing; the
+        // serial path likewise retries its inflight batch indefinitely.
+        let spans = loop {
+            match Self::encode_entries_into_spans(&to_persist) {
+                Ok(s) => break s,
+                Err(e) => {
+                    tracing::error!(error = %e, "uring pipeline encode failed; retrying");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+
+        let ckpt_payload = shard.encode_checkpoint_for_uring(max_seq);
+        let ckpt_buf = match (&ckpt_payload, ckpt_target) {
+            (Some(payload), Some(_)) => match AlignedBuf::new(BLOCK_SIZE as usize, false) {
+                Ok(mut buf) => {
+                    buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
+                    Some(buf)
+                }
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        let has_ckpt = ckpt_buf.is_some();
+        let write_count = spans.len();
+        let expected_cqes = write_count + 1 + usize::from(has_ckpt);
+        let id = *next_batch_id;
+        *next_batch_id += 1;
+        Some(InflightUringBatch {
+            batch_id: id,
+            spans,
+            _ckpt_buf: ckpt_buf,
+            inflight_all: drained,
+            max_seq,
+            write_count,
+            has_ckpt,
+            expected_cqes,
+            seen_cqes: 0,
+            failed: false,
+            write_start: Instant::now(),
+        })
+    }
+
+    /// Fold harvested CQEs into their in-flight batches (matched by the
+    /// `batch_id` packed in the high 32 bits of `user_data`). A data-write or
+    /// fsync error (or short data write) marks the batch failed; a checkpoint
+    /// write error is non-fatal (best-effort recovery hint).
+    fn apply_completions(fifo: &mut VecDeque<InflightUringBatch>, comps: Vec<(u64, i32)>) {
+        for (ud, res) in comps {
+            let bid = ud >> 32;
+            let op_idx = (ud & 0xFFFF_FFFF) as usize;
+            if let Some(b) = fifo.iter_mut().find(|b| b.batch_id == bid) {
+                b.seen_cqes += 1;
+                if res < 0 {
+                    let is_ckpt = b.has_ckpt && op_idx == b.write_count + 1;
+                    if !is_ckpt {
+                        b.failed = true;
+                    }
+                } else if op_idx < b.write_count && res != b.spans[op_idx].len as i32 {
+                    // Short data write → treat as failure.
+                    b.failed = true;
+                }
+            }
+        }
+    }
+
+    /// Post-fsync work for a successfully-durable batch, in FIFO (seq) order:
+    /// retire superseded ranges, strip stale cancellation flags, advance the LV2
+    /// durability watermark (covers cancelled seqs too), record metrics. Mirrors
+    /// the serial path's post-sync block.
+    fn finish_uring_batch(
+        shard: &BufferShard,
+        batch: &InflightUringBatch,
+        metrics: &Arc<OnceLock<Arc<EngineMetrics>>>,
+    ) {
+        let pendings: Vec<Arc<PendingEntry>> = batch
+            .inflight_all
+            .iter()
+            .map(|e| e.pending.clone())
+            .collect();
+        shard.retire_superseded_by_durable_entries(&pendings);
+        {
+            let mut lc = shard.lifecycle.lock();
+            for e in &batch.inflight_all {
+                lc.cancelled.remove(&e.pending.seq);
+            }
+        }
+        shard.lv2_durability.advance(batch.max_seq);
+        if let Some(m) = metrics.get() {
+            let batch_entries = batch.inflight_all.len() as u64;
+            let batch_bytes = batch
+                .inflight_all
+                .iter()
+                .map(|e| e.payload.len() as u64)
+                .sum::<u64>();
+            m.buffer_sync_batches.fetch_add(1, Ordering::Relaxed);
+            m.buffer_sync_entries
+                .fetch_add(batch_entries, Ordering::Relaxed);
+            m.buffer_sync_bytes
+                .fetch_add(batch_bytes, Ordering::Relaxed);
+            crate::metrics::record_counter_max(&m.buffer_sync_entries_max, batch_entries);
+            crate::metrics::record_counter_max(&m.buffer_sync_bytes_max, batch_bytes);
+            m.buffer_sync_epochs_committed
+                .fetch_add(batch_entries, Ordering::Relaxed);
+            BufferShard::record_metric(&m.buffer_append_log_write_ns, batch.write_start);
+            BufferShard::record_metric(&m.buffer_sync_batch_ns, batch.write_start);
+        }
+    }
+
+    /// Recover after the FIFO front's chain failed. Quiesce the whole pipeline
+    /// (harvest every in-flight batch to completion) so no foreign CQEs remain,
+    /// then process the FIFO front-to-back: finish successful batches in order,
+    /// and re-submit failed ones serially (nothing else in flight, so each
+    /// re-submit's CQEs are unambiguous) with backoff until they succeed. This
+    /// is the rare error path; the cost of quiescing is irrelevant.
+    #[allow(clippy::too_many_arguments)]
+    fn recover_failed_front(
+        fifo: &mut VecDeque<InflightUringBatch>,
+        shard: &BufferShard,
+        ring: &Arc<IoUringSession>,
+        data_fd: RawFd,
+        data_base: u64,
+        ckpt_target: Option<(RawFd, u64)>,
+        next_batch_id: &mut u64,
+        metrics: &Arc<OnceLock<Arc<EngineMetrics>>>,
+    ) -> OnyxResult<()> {
+        // 1. Quiesce: drive every batch to full completion.
+        while fifo.iter().any(|b| b.seen_cqes < b.expected_cqes) {
+            let comps = ring.harvest(1)?;
+            Self::apply_completions(fifo, comps);
+        }
+        // 2. Process front-to-back.
+        let mut consecutive = 0u32;
+        while let Some(front) = fifo.front() {
+            if !front.failed {
+                let b = fifo.pop_front().unwrap();
+                Self::finish_uring_batch(shard, &b, metrics);
+                continue;
+            }
+            consecutive = consecutive.saturating_add(1);
+            thread::sleep(Self::sync_retry_backoff(consecutive));
+            {
+                let front = fifo.front_mut().unwrap();
+                front.batch_id = *next_batch_id;
+                *next_batch_id += 1;
+                front.seen_cqes = 0;
+                front.failed = false;
+                front.write_start = Instant::now();
+            }
+            let base_ud = fifo.front().unwrap().batch_id << 32;
+            let submitted = {
+                let ops = Self::chain_ops(fifo.front().unwrap(), data_fd, data_base, ckpt_target);
+                unsafe {
+                    let _g = shard.io_lock.lock();
+                    ring.submit_linked_nowait(&ops, base_ud)?
+                }
+            };
+            if !submitted {
+                // Post-quiesce the SQ is empty so this cannot happen; guard
+                // anyway by re-marking failed to retry on the next pass.
+                let front = fifo.front_mut().unwrap();
+                front.failed = true;
+                front.seen_cqes = front.expected_cqes;
+                continue;
+            }
+            let expected = fifo.front().unwrap().expected_cqes;
+            while fifo.front().unwrap().seen_cqes < expected {
+                let comps = ring.harvest(1)?;
+                Self::apply_completions(fifo, comps);
+            }
+            if Self::consume_test_sync_failpoint().is_err() {
+                fifo.front_mut().unwrap().failed = true;
+            }
+            if !fifo.front().unwrap().failed {
+                consecutive = 0;
+                let b = fifo.pop_front().unwrap();
+                Self::finish_uring_batch(shard, &b, metrics);
+            }
+        }
+        Ok(())
+    }
+
+    /// Pipelined LV2 fdatasync loop: keep up to `depth` fsync chains in flight so
+    /// batch N+1's writes overlap batch N's flush, removing the per-batch serial
+    /// fsync stall. Durability is preserved by advancing `lv2_durability` only
+    /// over the contiguous FIFO prefix of fully-fsync'd batches (a later batch's
+    /// fsync completing does NOT imply earlier batches' writes reached the
+    /// device). One sync thread per shard owns its ring, so the harvest/submit
+    /// have no cross-thread contention.
+    #[allow(clippy::too_many_arguments)]
+    fn uring_sync_pipeline_loop(
+        device: RawDevice,
+        shard: Arc<BufferShard>,
+        group_commit_wait: Duration,
+        wake_rx: Receiver<()>,
+        shutdown: Arc<AtomicBool>,
+        metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
+        ring: Arc<IoUringSession>,
+        depth: usize,
+    ) {
+        let batch_wait = if group_commit_wait.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            group_commit_wait
+        };
+        let data_fd = device.as_raw_fd();
+        let data_base = device.base_offset();
+        let ckpt_target = shard.checkpoint_target();
+        // Reserve 2 SQEs of every chain for the terminal fsync + checkpoint, so
+        // a formed batch's chain always fits the ring.
+        let max_chain_entries = (ring.sq_entries() as usize).saturating_sub(2).max(1);
+        let mut fifo: VecDeque<InflightUringBatch> = VecDeque::new();
+        let mut pending_submit: Option<InflightUringBatch> = None;
+        let mut next_batch_id: u64 = 1;
+
+        loop {
+            // 1. Submit a held-back batch or form new ones until depth is full.
+            while fifo.len() < depth {
+                let mut batch = if let Some(b) = pending_submit.take() {
+                    b
+                } else {
+                    // Group-commit window only when the pipeline is idle —
+                    // accumulate a first batch. Under load, staged entries pile
+                    // up while earlier fsyncs are in flight, so the next drain is
+                    // naturally larger (self-amortising the fsync).
+                    if fifo.is_empty() && shard.staging_rx.is_empty() {
+                        let _ = wake_rx.recv_timeout(Duration::from_millis(50));
+                        while wake_rx.try_recv().is_ok() {}
+                        if !batch_wait.is_zero() && !shard.staging_rx.is_empty() {
+                            let sleep_start = Instant::now();
+                            thread::sleep(batch_wait);
+                            if let Some(m) = metrics.get() {
+                                BufferShard::record_metric(&m.buffer_sync_sleep_ns, sleep_start);
+                            }
+                            while wake_rx.try_recv().is_ok() {}
+                        }
+                    }
+                    match Self::form_uring_batch(
+                        &shard,
+                        ckpt_target,
+                        max_chain_entries,
+                        &mut next_batch_id,
+                    ) {
+                        Some(b) => b,
+                        None => break,
+                    }
+                };
+
+                batch.write_start = Instant::now();
+                let base_ud = batch.batch_id << 32;
+                let submitted = {
+                    let ops = Self::chain_ops(&batch, data_fd, data_base, ckpt_target);
+                    unsafe {
+                        let _g = shard.io_lock.lock();
+                        match ring.submit_linked_nowait(&ops, base_ud) {
+                            Ok(ok) => ok,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "uring pipeline submit errored; will retry");
+                                false
+                            }
+                        }
+                    }
+                };
+                if submitted {
+                    fifo.push_back(batch);
+                } else {
+                    // SQ ring full (or transient submit error): hold the formed
+                    // batch and retry after harvesting frees space — never lose it.
+                    pending_submit = Some(batch);
+                    break;
+                }
+            }
+
+            // 2. Harvest. Block for ≥1 completion only when we cannot otherwise
+            //    make forward progress (FIFO full, or nothing left to form).
+            if !fifo.is_empty() {
+                let can_form_more =
+                    fifo.len() < depth && pending_submit.is_none() && !shard.staging_rx.is_empty();
+                let min_complete = usize::from(!can_form_more);
+                match ring.harvest(min_complete) {
+                    Ok(comps) => Self::apply_completions(&mut fifo, comps),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "uring pipeline harvest errored");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+
+            // 3. Advance the contiguous fully-fsync'd prefix from the front.
+            loop {
+                let front_done = fifo
+                    .front()
+                    .is_some_and(|f| f.seen_cqes >= f.expected_cqes);
+                if !front_done {
+                    break;
+                }
+                // Honour the test failpoint once per batch (uring-path injection).
+                if !fifo.front().unwrap().failed && Self::consume_test_sync_failpoint().is_err() {
+                    fifo.front_mut().unwrap().failed = true;
+                }
+                if fifo.front().unwrap().failed {
+                    if let Err(e) = Self::recover_failed_front(
+                        &mut fifo,
+                        &shard,
+                        &ring,
+                        data_fd,
+                        data_base,
+                        ckpt_target,
+                        &mut next_batch_id,
+                        &metrics,
+                    ) {
+                        tracing::error!(error = %e, "uring pipeline failure recovery errored");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    break; // recovery drained the FIFO
+                } else {
+                    let b = fifo.pop_front().unwrap();
+                    Self::finish_uring_batch(&shard, &b, &metrics);
+                }
+            }
+
+            // 4. Exit only when fully drained.
+            if shutdown.load(Ordering::Relaxed)
+                && fifo.is_empty()
+                && pending_submit.is_none()
+                && shard.staging_rx.is_empty()
+            {
+                return;
+            }
+        }
+    }
+
     pub(super) fn sync_loop(
         device: RawDevice,
         shard: Arc<BufferShard>,
@@ -330,7 +836,28 @@ impl WriteBufferPool {
         _ready_tx: Sender<u64>,
         _shard_ready_tx: Sender<u64>,
         uring: Option<Arc<IoUringSession>>,
+        pipeline_depth: usize,
     ) {
+        // Pipelined LV2 fdatasync path: keep `pipeline_depth` fsync chains in
+        // flight so batch N+1's writes overlap batch N's flush. Only the
+        // io_uring backend supports it; depth 1 (or syscall) falls through to
+        // the legacy submit→wait-all→submit-next loop below.
+        if pipeline_depth >= 2 {
+            if let Some(ref ring) = uring {
+                Self::uring_sync_pipeline_loop(
+                    device,
+                    shard,
+                    group_commit_wait,
+                    wake_rx,
+                    shutdown,
+                    metrics,
+                    ring.clone(),
+                    pipeline_depth,
+                );
+                return;
+            }
+        }
+
         let mut consecutive_failures = 0u32;
         let mut retry_after: Option<Instant> = None;
         let mut inflight: Vec<StagedEntry> = Vec::new();

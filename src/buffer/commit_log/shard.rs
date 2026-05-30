@@ -825,14 +825,22 @@ impl BufferShard {
     }
 
     pub(super) fn drain_staged_limited(&self) -> Vec<StagedEntry> {
+        self.drain_staged_capped(self.sync_batch_max_entries)
+    }
+
+    /// Like `drain_staged_limited` but also bounds the entry count at
+    /// `max_entries` (clamped to the configured `sync_batch_max_entries`). The
+    /// pipelined uring sync path uses this to keep one batch's IO_LINK chain
+    /// (≤ `entries + 2` SQEs) within the ring's SQ depth — a chain cannot be
+    /// split across submits without dangling the trailing LINK.
+    pub(super) fn drain_staged_capped(&self, max_entries: usize) -> Vec<StagedEntry> {
+        let cap = max_entries.min(self.sync_batch_max_entries).max(1);
         let mut batch = Vec::new();
         let mut batch_bytes = 0usize;
         while let Ok(entry) = self.staging_rx.try_recv() {
             batch_bytes = batch_bytes.saturating_add(entry.payload.len());
             batch.push(entry);
-            if batch.len() >= self.sync_batch_max_entries
-                || batch_bytes >= self.sync_batch_max_bytes
-            {
+            if batch.len() >= cap || batch_bytes >= self.sync_batch_max_bytes {
                 break;
             }
         }

@@ -314,6 +314,7 @@ impl OnyxEngine {
             config.buffer.staging_queue_entries,
             config.buffer.sync_batch_max_entries,
             config.buffer.sync_batch_max_bytes_mb as usize * 1024 * 1024,
+            config.buffer.lv2_sync_pipeline_depth,
         )
         .with_throttle(ThrottleSettings {
             min_pct: config.buffer.throttle_min_pct,
