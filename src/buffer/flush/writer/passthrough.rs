@@ -254,6 +254,7 @@ impl BufferFlusher {
         _pool: &WriteBufferPool,
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
+        write_session: Option<&Arc<crate::io::uring::IoUringSession>>,
         metrics: &EngineMetrics,
         in_flight_tracker: &FlusherInFlightTracker,
         done_tx: &Sender<Vec<u64>>,
@@ -361,7 +362,7 @@ impl BufferFlusher {
             }
             if !ops.is_empty() {
                 io_ops_count = ops.len() as u64;
-                match io_engine.submit_batch(ops, false) {
+                match io_engine.submit_batch_on(write_session, ops, false) {
                     Ok(write_results) => {
                         for (idx, r) in write_results.into_iter().enumerate() {
                             let unit_idx = op_to_unit[idx];

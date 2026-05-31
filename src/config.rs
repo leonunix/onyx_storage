@@ -634,6 +634,13 @@ pub struct StorageConfig {
     /// the pool and execute reads inline on the caller thread.
     #[serde(default = "default_read_pool_workers")]
     pub read_pool_workers: usize,
+    /// Give each flusher writer shard its own io_uring ring for LV3 writes
+    /// (default true). Removes the engine-wide serialization where all writers
+    /// contend on one shared `Mutex<IoUring>` held across `submit_and_wait`.
+    /// Set false to reproduce the legacy single-shared-ring behavior (A/B
+    /// baseline). No effect on the syscall backend.
+    #[serde(default = "default_lv3_per_shard_write_rings")]
+    pub lv3_per_shard_write_rings: bool,
 }
 
 impl Default for StorageConfig {
@@ -646,12 +653,17 @@ impl Default for StorageConfig {
             io_backend: IoBackend::default(),
             uring_sq_entries: default_uring_sq_entries(),
             read_pool_workers: default_read_pool_workers(),
+            lv3_per_shard_write_rings: default_lv3_per_shard_write_rings(),
         }
     }
 }
 
 fn default_uring_sq_entries() -> u32 {
     128
+}
+
+fn default_lv3_per_shard_write_rings() -> bool {
+    true
 }
 
 fn default_read_pool_workers() -> usize {

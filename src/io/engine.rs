@@ -73,6 +73,11 @@ pub struct IoEngine {
     pba_offset: u64,
     metrics: Option<Arc<EngineMetrics>>,
     backend: IoBackend,
+    /// When true (and backend is `Uring`), `new_write_session` hands each flusher
+    /// writer its own LV3 io_uring ring instead of the shared `backend` ring.
+    /// Set from `storage.lv3_per_shard_write_rings`; false reproduces the legacy
+    /// single-shared-ring behavior.
+    per_shard_write_sessions: bool,
 }
 
 /// One operation in a batched LV3 IO submission.
@@ -110,6 +115,37 @@ impl IoEngine {
             pba_offset,
             metrics,
             backend,
+            per_shard_write_sessions: false,
+        }
+    }
+
+    /// Enable/disable handing each flusher writer its own LV3 write ring.
+    /// Builder style so existing constructors stay unchanged.
+    pub fn with_per_shard_write_sessions(mut self, enabled: bool) -> Self {
+        self.per_shard_write_sessions = enabled;
+        self
+    }
+
+    /// Create a fresh, dedicated io_uring session for one flusher writer shard's
+    /// LV3 writes, sized like the engine's shared backend ring. Returns `None`
+    /// for the syscall backend. Each writer owns its own ring so that writers no
+    /// longer serialize on the single shared `backend` ring mutex held across
+    /// `submit_and_wait` (off-CPU profiling pinned ~38% of writer off-CPU time to
+    /// that lock). Mirrors the per-worker session design the read path already
+    /// uses (`io::read_pool`).
+    ///
+    /// IMPORTANT: call this from *inside* the writer thread (after the NUMA
+    /// affinity bind) so the ring's pages fault in NUMA-local to that writer —
+    /// do not cross NUMA nodes by creating all rings up front on the init thread.
+    pub fn new_write_session(&self) -> OnyxResult<Option<Arc<IoUringSession>>> {
+        if !self.per_shard_write_sessions {
+            return Ok(None);
+        }
+        match &self.backend {
+            IoBackend::Syscall => Ok(None),
+            IoBackend::Uring(default) => {
+                Ok(Some(Arc::new(IoUringSession::new(default.sq_entries())?)))
+            }
         }
     }
 
@@ -494,6 +530,25 @@ impl IoEngine {
         match &self.backend {
             IoBackend::Syscall => self.submit_batch_syscall(ops, fsync_after),
             IoBackend::Uring(session) => self.submit_batch_uring(session, ops, fsync_after),
+        }
+    }
+
+    /// Like [`submit_batch`], but when `session` is `Some` (a writer's own
+    /// per-shard ring from [`new_write_session`]) and the backend is `Uring`,
+    /// submits the batch on that dedicated ring instead of the single shared
+    /// `backend` ring. This removes the engine-wide serialization where all
+    /// flusher writers contend on one `Mutex<IoUring>` held across
+    /// `submit_and_wait`. Falls back to [`submit_batch`] when `session` is `None`
+    /// (syscall backend / single-ring A/B baseline / non-writer callers).
+    pub fn submit_batch_on(
+        &self,
+        session: Option<&Arc<IoUringSession>>,
+        ops: Vec<LvOp<'_>>,
+        fsync_after: bool,
+    ) -> OnyxResult<Vec<LvOpResult>> {
+        match (&self.backend, session) {
+            (IoBackend::Uring(_), Some(s)) => self.submit_batch_uring(s, ops, fsync_after),
+            _ => self.submit_batch(ops, fsync_after),
         }
     }
 

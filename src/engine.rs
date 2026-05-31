@@ -170,12 +170,15 @@ impl OnyxEngine {
                     sq_entries = storage.uring_sq_entries,
                     "LV3 IoEngine using io_uring backend"
                 );
-                Ok(Arc::new(IoEngine::new_with_metrics_uring(
-                    data_dev,
-                    storage.use_hugepages,
-                    metrics,
-                    session,
-                )))
+                Ok(Arc::new(
+                    IoEngine::new_with_metrics_uring(
+                        data_dev,
+                        storage.use_hugepages,
+                        metrics,
+                        session,
+                    )
+                    .with_per_shard_write_sessions(storage.lv3_per_shard_write_rings),
+                ))
             }
         }
     }

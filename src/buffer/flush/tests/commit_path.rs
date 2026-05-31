@@ -719,6 +719,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &lifecycle_w,
             &allocator_w,
             &io_engine_w,
+            None,
             &done_tx,
             &running_w,
             &in_flight,

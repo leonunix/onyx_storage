@@ -282,6 +282,22 @@ impl BufferFlusher {
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
                     affinity::bind_current(ThreadRole::FlusherWriter, shard_idx);
+                    // Create this writer's own LV3 io_uring ring AFTER the NUMA
+                    // affinity bind so the ring's pages fault in NUMA-local to the
+                    // writer (don't cross NUMA). Returns None for the syscall
+                    // backend or when per-shard rings are disabled — the writer
+                    // then falls back to the shared backend ring.
+                    let write_session = match io_engine_w.new_write_session() {
+                        Ok(session) => session,
+                        Err(e) => {
+                            tracing::warn!(
+                                shard = shard_idx,
+                                error = %e,
+                                "failed to create per-shard LV3 write ring; using shared ring"
+                            );
+                            None
+                        }
+                    };
                     let mut packer = Packer::new_with_lane(allocator_w.clone(), shard_idx);
                     Self::writer_loop(
                         shard_idx,
@@ -291,6 +307,7 @@ impl BufferFlusher {
                         &lifecycle_w,
                         &allocator_w,
                         &io_engine_w,
+                        write_session.as_ref(),
                         &done_tx,
                         &running_w,
                         &in_flight_w,

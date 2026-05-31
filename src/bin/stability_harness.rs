@@ -71,6 +71,7 @@ fn write_and_abort(
             io_backend: Default::default(),
             uring_sq_entries: 128,
             read_pool_workers: 4,
+            lv3_per_shard_write_rings: true,
         },
         buffer: BufferConfig {
             device: Some(buffer),
