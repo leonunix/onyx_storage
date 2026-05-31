@@ -401,6 +401,13 @@ pub struct MetaConfig {
     /// `/root/.claude/plans/mellow-dazzling-thunder.md`.
     #[serde(default = "default_txg_threads_enabled")]
     pub txg_threads_enabled: bool,
+
+    /// Fan the per-TXG L2P syncing-slot drain out across shards instead of
+    /// folding them serially on the single `metadb-txg-sync` thread (which
+    /// was the drain bottleneck capping single-volume write throughput).
+    /// Default on; set false for the legacy serial fold (A/B, fallback).
+    #[serde(default = "default_parallel_l2p_drain_enabled")]
+    pub parallel_l2p_drain_enabled: bool,
 }
 
 impl MetaConfig {
@@ -494,6 +501,7 @@ impl Default for MetaConfig {
             commit_direct_apply_enabled: default_commit_direct_apply_enabled(),
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
             txg_threads_enabled: default_txg_threads_enabled(),
+            parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
         }
     }
 }
@@ -591,6 +599,14 @@ fn default_txg_threads_enabled() -> bool {
     // wait. Only engages when `l2p_buffer_enabled = true`. The 24h soak
     // gate (metadb/CLAUDE.md) still precedes any push.
     true
+}
+fn default_parallel_l2p_drain_enabled() -> bool {
+    // DISPROVEN (2026-05-31): the spawn-per-cycle parallel drain is a 3-4×
+    // regression (spawned threads inherit the txg-sync CPU pinning; and the
+    // drain isn't the binding gate in a healthy-disk window — serial keeps the
+    // L2P buffer well under cap). Default OFF; kept behind the flag as a
+    // documented dead-end. See memory parallel_l2p_drain_impl.
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

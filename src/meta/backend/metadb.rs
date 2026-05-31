@@ -1364,6 +1364,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     // the frozen syncing slot, decoupling buffer-ring reclaim from one
     // giant inline checkpoint. See plan mellow-dazzling-thunder.md.
     cfg.txg_threads_enabled = config.txg_threads_enabled;
+    cfg.parallel_l2p_drain_enabled = config.parallel_l2p_drain_enabled;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
     cfg.async_reclaim_max_pages_per_cycle = config.async_reclaim_max_pages_per_cycle as usize;
