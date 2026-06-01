@@ -936,3 +936,123 @@ fn head_pending_stuck_skips_stale_pending_seqs_entries() {
     assert_eq!(oldest.len(), 1);
     assert_eq!(oldest[0].seq, seq_live);
 }
+
+// ── Lv2DurabilityWaiter targeted-wakeup tests ────────────────────────────
+// The waiter wakes only the appenders whose seq is now durable; later-seq
+// waiters stay parked. These guard the durability/lost-wakeup invariants the
+// targeted unpark relies on (replacing the old shared-condvar notify_all).
+
+#[test]
+fn durability_waiter_fast_path_when_already_synced() {
+    let w = Lv2DurabilityWaiter::new(0);
+    w.advance(10);
+    // seq <= synced returns immediately with zero registration.
+    assert_eq!(w.wait_for(5), Duration::ZERO);
+    assert_eq!(w.wait_for(10), Duration::ZERO);
+}
+
+#[test]
+fn durability_waiter_wakes_parked_appender() {
+    let w = Arc::new(Lv2DurabilityWaiter::new(0));
+    let w2 = w.clone();
+    let h = std::thread::spawn(move || {
+        w2.wait_for(5);
+    });
+    // Give the waiter time to park, then advance past it.
+    std::thread::sleep(Duration::from_millis(20));
+    w.advance(5);
+    h.join().unwrap();
+    assert!(w.synced_seq.load(Ordering::Acquire) >= 5);
+}
+
+#[test]
+fn durability_waiter_selective_wake_leaves_later_seq_parked() {
+    let w = Arc::new(Lv2DurabilityWaiter::new(0));
+    let early_done = Arc::new(AtomicBool::new(false));
+    let late_done = Arc::new(AtomicBool::new(false));
+
+    let (we, ee) = (w.clone(), early_done.clone());
+    let early = std::thread::spawn(move || {
+        we.wait_for(5);
+        ee.store(true, Ordering::Release);
+    });
+    let (wl, el) = (w.clone(), late_done.clone());
+    let late = std::thread::spawn(move || {
+        wl.wait_for(10);
+        el.store(true, Ordering::Release);
+    });
+
+    std::thread::sleep(Duration::from_millis(20));
+    // Advance to 7: only the seq-5 waiter is durable.
+    w.advance(7);
+    early.join().unwrap();
+    assert!(early_done.load(Ordering::Acquire), "seq-5 appender must wake");
+    // The seq-10 waiter must still be parked (advance(7) < 10).
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !late_done.load(Ordering::Acquire),
+        "seq-10 appender must stay parked until advance covers it"
+    );
+    // Now cover it.
+    w.advance(12);
+    late.join().unwrap();
+    assert!(late_done.load(Ordering::Acquire));
+}
+
+#[test]
+fn durability_waiter_advance_over_gap_wakes_lower_seqs() {
+    // A batch's max_seq need not equal any waiter's seq (cancelled/coalesced
+    // gaps). advance(max) must still wake every waiter with seq <= max.
+    let w = Arc::new(Lv2DurabilityWaiter::new(0));
+    let mut handles = Vec::new();
+    for seq in [3u64, 6, 9] {
+        let wc = w.clone();
+        handles.push(std::thread::spawn(move || wc.wait_for(seq)));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    // max_seq=11 matches no waiter exactly but covers all three.
+    w.advance(11);
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[test]
+fn durability_waiter_no_lost_wakeup_under_race() {
+    // Hammer the register-vs-advance race: each appender's seq is advanced
+    // concurrently from another thread. If the lock re-check / unpark ordering
+    // were wrong, some join would hang (the harness would time out).
+    for _ in 0..200 {
+        let w = Arc::new(Lv2DurabilityWaiter::new(0));
+        let seq = 1u64;
+        let wc = w.clone();
+        let waiter = std::thread::spawn(move || wc.wait_for(seq));
+        let wa = w.clone();
+        let advancer = std::thread::spawn(move || wa.advance(seq));
+        waiter.join().unwrap();
+        advancer.join().unwrap();
+        assert!(w.synced_seq.load(Ordering::Acquire) >= seq);
+    }
+}
+
+#[test]
+fn durability_waiter_many_appenders_all_wake() {
+    // Convoy analog: many appenders park, one advance covers them all.
+    let w = Arc::new(Lv2DurabilityWaiter::new(0));
+    let woke = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for seq in 1..=64u64 {
+        let wc = w.clone();
+        let woke = woke.clone();
+        handles.push(std::thread::spawn(move || {
+            wc.wait_for(seq);
+            woke.fetch_add(1, Ordering::Relaxed);
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    w.advance(64);
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(woke.load(Ordering::Relaxed), 64);
+}

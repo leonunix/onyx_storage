@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use dashmap::DashMap;
-use parking_lot::{Condvar, RwLock};
+use parking_lot::RwLock;
 
 use crate::buffer::entry::{BufferEntry, BUFFER_ENTRY_MAGIC, MAX_ENTRY_SIZE, MIN_ENTRY_SIZE};
 use crate::error::{OnyxError, OnyxResult};
@@ -188,47 +188,111 @@ impl Default for BufferRuntimeLimits {
     }
 }
 
-/// LV2 fdatasync watermark + condvar. Producers (append) park on this until
-/// the sync thread fdatasync's their seq. One waiter per blocked `append()`;
-/// the sync thread `notify_all()` once per fdatasync batch.
+/// LV2 fdatasync watermark + targeted wakeup registry. Producers (`append`)
+/// park here until the sync thread fdatasync's their seq.
+///
+/// `advance` wakes ONLY the appenders whose seq is now durable; the ones still
+/// waiting on a later (in-flight or still-OPEN) batch stay parked and
+/// untouched. This mirrors ZFS's per-`zil_commit_waiter` cv signalling
+/// (`zil_lwb_flush_vdevs_done` signals just the completed lwb's waiters). A
+/// shared `notify_all` instead woke EVERY parked appender on the shard on every
+/// fdatasync (with ~16 appenders/shard and a ~4-6 batch, ~60-75% of wakeups
+/// were spurious re-parks), and forced them all to re-acquire one mutex to
+/// re-check the predicate — a serialized herd per cycle. Worse, `notify_all`
+/// synchronized the appenders into a lockstep convoy (wake-together →
+/// IO-together → stage-together → park-together), the bursty sawtooth that
+/// starved the sync thread between bursts. Targeted unpark removes both.
 pub(crate) struct Lv2DurabilityWaiter {
     /// Monotonic max seq whose payload is fdatasync'd on LV2 for this shard.
     pub(crate) synced_seq: AtomicU64,
-    /// Pairs with `cv` per parking_lot Condvar contract.
-    pub(crate) lock: parking_lot::Mutex<()>,
-    pub(crate) cv: Condvar,
+    /// Parked appenders, each tagged with the seq it waits for. Locked only for
+    /// the brief register / drain critical sections, never across a `park()`.
+    waiters: parking_lot::Mutex<Vec<SeqWaiter>>,
+}
+
+/// One parked appender, tagged with the seq it is waiting for.
+struct SeqWaiter {
+    seq: u64,
+    parker: Arc<DurabilityParker>,
+}
+
+/// A parked appender's wake handle. `done` is set (Release) before `unpark` so a
+/// spurious `park()` return can't strand the appender after `advance` has
+/// removed it from the registry; the appender's Acquire load pairs with it.
+struct DurabilityParker {
+    done: AtomicBool,
+    thread: thread::Thread,
 }
 
 impl Lv2DurabilityWaiter {
     pub(crate) fn new(initial: u64) -> Self {
         Self {
             synced_seq: AtomicU64::new(initial),
-            lock: parking_lot::Mutex::new(()),
-            cv: Condvar::new(),
+            waiters: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
     /// Block until `synced_seq >= seq`. Returns the wait duration so the
     /// caller can attribute it to `buffer_append_wait_durable_ns`.
     pub(crate) fn wait_for(&self, seq: u64) -> Duration {
+        // Fast path: already durable — no registration, no lock, no park.
         if self.synced_seq.load(Ordering::Acquire) >= seq {
             return Duration::ZERO;
         }
         let start = Instant::now();
-        let mut guard = self.lock.lock();
-        while self.synced_seq.load(Ordering::Acquire) < seq {
-            self.cv.wait(&mut guard);
+        let parker = Arc::new(DurabilityParker {
+            done: AtomicBool::new(false),
+            thread: thread::current(),
+        });
+        {
+            let mut waiters = self.waiters.lock();
+            // Re-check under the lock: `advance` takes this same lock to drain,
+            // so if it advanced past `seq` before we registered we observe the
+            // new watermark here and skip parking. Closes the lost-wakeup race.
+            if self.synced_seq.load(Ordering::Acquire) >= seq {
+                return start.elapsed();
+            }
+            waiters.push(SeqWaiter {
+                seq,
+                parker: parker.clone(),
+            });
+        }
+        // Park until `advance` unparks us. The re-check defends against a
+        // spurious `park()` return, which leaves us registered so we re-park.
+        loop {
+            thread::park();
+            if parker.done.load(Ordering::Acquire) || self.synced_seq.load(Ordering::Acquire) >= seq
+            {
+                break;
+            }
         }
         start.elapsed()
     }
 
-    /// Advance the watermark and wake all parked appenders. Called by the
-    /// sync thread after fdatasync covers the batch.
+    /// Advance the watermark and wake exactly the appenders whose seq is now
+    /// durable. Called by the sync thread after fdatasync covers the batch.
     pub(crate) fn advance(&self, max_seq: u64) {
         let prev = self.synced_seq.fetch_max(max_seq, Ordering::Release);
-        if prev < max_seq {
-            let _g = self.lock.lock();
-            self.cv.notify_all();
+        if prev >= max_seq {
+            return;
+        }
+        // Collect the now-durable waiters under the lock; unpark AFTER releasing
+        // it so woken appenders never touch this lock on their way out.
+        let mut wake: Vec<Arc<DurabilityParker>> = Vec::new();
+        {
+            let mut waiters = self.waiters.lock();
+            let mut i = 0;
+            while i < waiters.len() {
+                if waiters[i].seq <= max_seq {
+                    wake.push(waiters.swap_remove(i).parker);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for parker in wake {
+            parker.done.store(true, Ordering::Release);
+            parker.thread.unpark();
         }
     }
 }
