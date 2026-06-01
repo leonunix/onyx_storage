@@ -66,6 +66,14 @@ struct Cli {
 
     #[arg(long, default_value_t = 120)]
     drain_timeout_secs: u64,
+
+    /// Comma/range CPU list to pin bench job threads to (e.g.
+    /// "32,34,36,38,40,42,44,46,80,82,84,86,88,90,92,94"). Empty = inherit the
+    /// process affinity mask. Used for core-isolation: keep the load generator
+    /// on a disjoint node0 core set from the engine's internal threads so the
+    /// test never competes with the sync/commit threads for scheduling.
+    #[arg(long, default_value = "")]
+    job_cpus: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -304,17 +312,80 @@ fn prefill(volume: &onyx_storage::volume::OnyxVolume, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Parse a comma/range CPU spec (same grammar as the engine's affinity config:
+/// "0-3,8,10-12"). Ranges expand to every integer in [start,end]; pass explicit
+/// even-only lists when targeting one NUMA node on an interleaved topology.
+fn parse_cpu_list(spec: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(start), Ok(end)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
+                if start <= end {
+                    cpus.extend(start..=end);
+                }
+            }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            cpus.push(cpu);
+        }
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    cpus
+}
+
+/// Pin the calling thread to the given CPU set via sched_setaffinity. A thread
+/// may move itself onto CPUs outside the mask it inherited from the process
+/// (e.g. one set by `numactl --physcpubind`), so this is how the bench job
+/// threads escape the engine's core set A onto the load-gen core set B.
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to(cpus: &[usize]) -> std::io::Result<()> {
+    if cpus.is_empty() {
+        return Ok(());
+    }
+    const CPU_SETSIZE: usize = 1024;
+    const BITS_PER_WORD: usize = 8 * std::mem::size_of::<libc::c_ulong>();
+    let mut set = [0 as libc::c_ulong; CPU_SETSIZE / BITS_PER_WORD];
+    for &cpu in cpus {
+        if cpu < CPU_SETSIZE {
+            set[cpu / BITS_PER_WORD] |= (1 as libc::c_ulong) << (cpu % BITS_PER_WORD);
+        }
+    }
+    let rc = unsafe {
+        libc::sched_setaffinity(
+            0,
+            std::mem::size_of_val(&set),
+            set.as_ptr().cast::<libc::cpu_set_t>(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to(_cpus: &[usize]) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<(BenchStats, LatencySamples)> {
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(cli.jobs + 1));
     let samples = Arc::new(Mutex::new(LatencySamples::default()));
     let mut handles = Vec::with_capacity(cli.jobs);
 
+    let job_cpus = Arc::new(parse_cpu_list(&cli.job_cpus));
+    if !job_cpus.is_empty() {
+        eprintln!("pinning {} bench job threads to CPUs {:?}", cli.jobs, job_cpus);
+    }
+
     for job in 0..cli.jobs {
         let volume = engine.open_volume(&cli.volume)?;
         let stop = stop.clone();
         let barrier = barrier.clone();
         let samples = samples.clone();
+        let job_cpus = job_cpus.clone();
         let pattern = cli.pattern;
         let rwmixread = cli.rwmixread;
         let min_blocks = cli.min_bs / BLOCK_SIZE as u64;
@@ -323,6 +394,9 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<(BenchStats, LatencySampl
         let handle = thread::Builder::new()
             .name(format!("engine-bench-{job}"))
             .spawn(move || -> Result<BenchStats> {
+                if let Err(err) = pin_current_thread_to(&job_cpus) {
+                    eprintln!("warn: failed to pin bench job {job} to {job_cpus:?}: {err}");
+                }
                 let mut rng = XorShift64::seed(0x9e37_79b9_7f4a_7c15 ^ job as u64);
                 let mut write_buf = vec![0u8; (max_blocks * BLOCK_SIZE as u64) as usize];
                 let mut read_buf = vec![0u8; (max_blocks * BLOCK_SIZE as u64) as usize];

@@ -1,0 +1,122 @@
+# NUMA single-node profile (Tier 0 fix for the bimodal single-vol throttle).
+#
+# ROOT CAUSE (verified 2026-05-31): nvme-box NUMA nodes are INTERLEAVED
+# (node0 = even CPUs 0,2,..,94; node1 = odd CPUs 1,3,..,95). Every contiguous
+# `*_cpus` range in the as-is profile therefore straddles BOTH nodes, and
+# affinity `pick(ordinal)=cpus[ordinal%len]` scatters each pipeline role 50/50
+# across sockets while the big shared buffers first-touch on a random node.
+# The cross-socket tax throttles the front-end into a bimodal stall (most runs
+# ~100-170 MiB/s, occasionally ~580; run-to-run, steady-within-run). numa_balancing
+# on/off makes no difference -> it is the static scatter, not balancer thrash.
+#
+# THIS PROFILE confines the whole engine to ONE NUMA node. It MUST be launched
+# under numactl so both CPU placement AND memory first-touch stay node-local:
+#
+#   numactl --cpunodebind=0 --membind=0 \
+#     target/release/onyx-storage -c config/nvme-numa0.toml start -v fio-volume
+#
+# Bind the client (fio) to the same node too:
+#   fio ... --numa_cpu_nodes=0 --numa_mem_policy=bind:0
+#
+# `threading.enabled = false` is INTENTIONAL: with it on, the engine's own
+# sched_setaffinity re-scatters threads back across both nodes (the explicit
+# pins override numactl). With it off, numactl --cpunodebind=0 confines every
+# thread to node 0 and --membind=0 forces all allocations node-local.
+#
+# Measured (j16 qd64 4k-32k randwrite, refill_buffers): stable ~1080 MiB/s
+# (1092/1071/1073, ~1% stdev), NEVER stuck -- vs the both-nodes profile's
+# bimodal 113-578. ~1.9x the both-nodes best and ~9x the stuck mode, on HALF
+# the cores. This is the Tier-0 safety net AND the clean low-variance baseline
+# for Tier-1 (NUMA-partitioned, dual-socket) A/B comparison.
+#
+# Disk layout (same as config/nvme-lv3raid.toml):
+#   /dev/nvme1n1            -> XFS, /mnt/onyx-meta (metadb)
+#   /dev/md/onyx-lv2_0 (md127) -> LV2 write buffer RAID0
+#   /dev/md/onyx-lv3   (md126) -> LV3 data device RAID0
+
+[meta]
+path = "/mnt/onyx-meta/metadb"
+wal_dir = "/mnt/onyx-meta/wal"
+block_cache_mb = 65536
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 5000
+group_commit_timeout_us = 1
+dedup_shards = 8
+dedup_cuckoo_buckets = 64000000
+dedup_l1_cache_entries = 256000
+l2p_buffer_enabled = true
+commit_direct_apply_enabled = true
+txg_threads_enabled = true
+parallel_l2p_drain_enabled = false
+
+[storage]
+data_device = "/dev/md/onyx-lv3"
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 16
+
+[buffer]
+device = "/dev/md/onyx-lv2_0"
+capacity_mb = 1048576
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+shards = 16
+max_memory_mb = 32768
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+
+[dedup]
+enabled = true
+workers = 2
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 0
+rescan_interval_ms = 30000
+max_rescan_per_cycle = 4096
+cold_tail_max_per_cycle = 4096
+
+# Intentionally disabled: see header. numactl does the node-0 confinement so the
+# engine must NOT re-pin threads across both interleaved nodes.
+[threading]
+enabled = false
+
+[service]
+socket_path = "/tmp/onyx-storage-nvme.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30
