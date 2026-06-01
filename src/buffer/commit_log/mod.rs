@@ -50,12 +50,19 @@ const PENDING_LBA_BUCKET_BLOCKS: u64 = 256;
 /// pressure; deeper is opt-in via `buffer.lv2_sync_pipeline_depth`.
 const LV2_SYNC_PIPELINE_DEPTH: usize = 2;
 
+/// Default ZFS `zfs_commit_timeout_pct` analog: the LV2 OPEN batch seals after
+/// `ema_write_latency * pct/100` (floored) of accumulation. 10% matches ZFS.
+const LV2_COMMIT_TIMEOUT_PCT: u64 = 10;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BufferRuntimeLimits {
     pub staging_channel_capacity: usize,
     pub sync_batch_max_entries: usize,
     pub sync_batch_max_bytes: usize,
     pub throttle: ThrottleSettings,
+    /// Resolved ZFS-style adaptive commit-window percent for the LV2 sync
+    /// pipeline (>= 1). See `LV2_COMMIT_TIMEOUT_PCT`.
+    pub lv2_commit_timeout_pct: u64,
     /// Resolved LV2 sync pipeline depth (>= 1). See `LV2_SYNC_PIPELINE_DEPTH`.
     pub lv2_sync_pipeline_depth: usize,
 }
@@ -129,6 +136,7 @@ impl BufferRuntimeLimits {
         sync_batch_max_entries: usize,
         sync_batch_max_bytes: usize,
         lv2_sync_pipeline_depth: usize,
+        lv2_commit_timeout_pct: u64,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -148,6 +156,11 @@ impl BufferRuntimeLimits {
                 sync_batch_max_bytes
             },
             throttle: defaults.throttle,
+            lv2_commit_timeout_pct: if lv2_commit_timeout_pct == 0 {
+                defaults.lv2_commit_timeout_pct
+            } else {
+                lv2_commit_timeout_pct
+            },
             lv2_sync_pipeline_depth: if lv2_sync_pipeline_depth == 0 {
                 defaults.lv2_sync_pipeline_depth
             } else {
@@ -169,6 +182,7 @@ impl Default for BufferRuntimeLimits {
             sync_batch_max_entries: SYNC_BATCH_MAX_ENTRIES,
             sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
             throttle: ThrottleSettings::default(),
+            lv2_commit_timeout_pct: LV2_COMMIT_TIMEOUT_PCT,
             lv2_sync_pipeline_depth: LV2_SYNC_PIPELINE_DEPTH,
         }
     }

@@ -362,6 +362,7 @@ impl WriteBufferPool {
                     let shard_ready_tx = shard_ready_tx_for_loop.clone();
                     let uring = shard_uring.clone();
                     let pipeline_depth = runtime_limits.lv2_sync_pipeline_depth;
+                    let commit_timeout_pct = runtime_limits.lv2_commit_timeout_pct;
                     move || {
                         crate::affinity::bind_current(
                             crate::affinity::ThreadRole::BufferSync,
@@ -378,6 +379,7 @@ impl WriteBufferPool {
                             shard_ready_tx,
                             uring,
                             pipeline_depth,
+                            commit_timeout_pct,
                         );
                     }
                 })

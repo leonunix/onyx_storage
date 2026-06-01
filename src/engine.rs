@@ -318,6 +318,7 @@ impl OnyxEngine {
             config.buffer.sync_batch_max_entries,
             config.buffer.sync_batch_max_bytes_mb as usize * 1024 * 1024,
             config.buffer.lv2_sync_pipeline_depth,
+            config.buffer.lv2_commit_timeout_pct,
         )
         .with_throttle(ThrottleSettings {
             min_pct: config.buffer.throttle_min_pct,

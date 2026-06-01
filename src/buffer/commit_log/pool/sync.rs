@@ -4,6 +4,12 @@ use std::os::fd::RawFd;
 
 const POST_WRITE_VERIFY: bool = false;
 
+/// ZFS `zil_commit_waiter` floor: even with a cold/zero EMA (or a pathologically
+/// fast device) the OPEN batch accumulates at least this long before sealing, so
+/// the loop never busy-seals empty/tiny batches. The adaptive close window is
+/// `max(ema_write_latency * commit_timeout_pct/100, this)`.
+const LV2_COMMIT_TIMEOUT_FLOOR: Duration = Duration::from_micros(25);
+
 /// One coalesced, contiguous run of staged entries encoded into a single
 /// pooled `AlignedBuf`, ready for one pwrite (syscall path) or one write
 /// SQE (io_uring path). `offset` is the LV2-relative byte offset of the
@@ -38,6 +44,18 @@ struct InflightUringBatch {
     seen_cqes: usize,
     failed: bool,
     write_start: Instant,
+}
+
+/// A not-yet-sealed accumulation of staged entries — the ZFS "OPENED lwb"
+/// analog. Entries are drained from `staging_rx` and held here across loop
+/// iterations while prior batches' writes are in flight, so the accumulation
+/// window OVERLAPS the in-flight fdatasync (≈free) and grows the batch under
+/// load. Closed (sealed into an `InflightUringBatch`) on full-or-adaptive-
+/// timeout. Holds raw entries only; encoding/checkpoint happen at seal time.
+struct OpenBatch {
+    entries: Vec<StagedEntry>,
+    bytes: usize,
+    opened_at: Instant,
 }
 
 impl WriteBufferPool {
@@ -454,22 +472,44 @@ impl WriteBufferPool {
         ops
     }
 
-    /// Drain a batch of staged entries and encode it into an `InflightUringBatch`
+    /// Submit a sealed batch's IO_LINK chain (data writes + terminal fdatasync +
+    /// optional checkpoint) without waiting for completion. Returns true if the
+    /// chain was accepted into the SQ ring, false if the ring was full (caller
+    /// holds the batch and retries after harvesting frees space).
+    fn submit_batch_nowait(
+        ring: &IoUringSession,
+        shard: &BufferShard,
+        batch: &InflightUringBatch,
+        data_fd: RawFd,
+        data_base: u64,
+        ckpt_target: Option<(RawFd, u64)>,
+    ) -> bool {
+        let base_ud = batch.batch_id << 32;
+        let ops = Self::chain_ops(batch, data_fd, data_base, ckpt_target);
+        unsafe {
+            let _g = shard.io_lock.lock();
+            match ring.submit_linked_nowait(&ops, base_ud) {
+                Ok(ok) => ok,
+                Err(e) => {
+                    tracing::warn!(error = %e, "uring pipeline submit errored; will retry");
+                    false
+                }
+            }
+        }
+    }
+
+    /// Seal an already-drained set of staged entries into an `InflightUringBatch`
     /// ready to submit. Filters cancelled (rolled-back) appends out of the
     /// written set but keeps the full drained set for post-fsync bookkeeping.
-    /// Returns `None` when nothing is staged.
-    fn form_uring_batch(
+    /// Cancel filtering happens HERE (at seal), so a cancel that lands while an
+    /// entry sits in the OPEN batch is still honoured. Caller guarantees
+    /// `drained` is non-empty.
+    fn seal_uring_batch(
         shard: &BufferShard,
         ckpt_target: Option<(RawFd, u64)>,
-        max_chain_entries: usize,
+        drained: Vec<StagedEntry>,
         next_batch_id: &mut u64,
-    ) -> Option<InflightUringBatch> {
-        // Cap entries so this batch's chain (≤ entries + fsync + ckpt SQEs)
-        // fits the SQ ring in one shot — a link chain can't span submits.
-        let drained = shard.drain_staged_capped(max_chain_entries);
-        if drained.is_empty() {
-            return None;
-        }
+    ) -> InflightUringBatch {
         let to_persist: Vec<StagedEntry> = {
             let lc = shard.lifecycle.lock();
             let mut persist = Vec::with_capacity(drained.len());
@@ -522,7 +562,7 @@ impl WriteBufferPool {
         let expected_cqes = write_count + 1 + usize::from(has_ckpt);
         let id = *next_batch_id;
         *next_batch_id += 1;
-        Some(InflightUringBatch {
+        InflightUringBatch {
             batch_id: id,
             spans,
             _ckpt_buf: ckpt_buf,
@@ -534,7 +574,7 @@ impl WriteBufferPool {
             seen_cqes: 0,
             failed: false,
             write_start: Instant::now(),
-        })
+        }
     }
 
     /// Fold harvested CQEs into their in-flight batches (matched by the
@@ -693,86 +733,133 @@ impl WriteBufferPool {
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
         ring: Arc<IoUringSession>,
         depth: usize,
+        commit_timeout_pct: u64,
     ) {
-        let batch_wait = if group_commit_wait.is_zero() {
-            Duration::from_millis(1)
-        } else {
-            group_commit_wait
-        };
+        // The pipeline path replaces the serial path's fixed group-commit sleep
+        // with the ZFS self-clocked adaptive window (see `window` below), so the
+        // serial `group_commit_wait` knob is intentionally unused here.
+        let _ = group_commit_wait;
         let data_fd = device.as_raw_fd();
         let data_base = device.base_offset();
         let ckpt_target = shard.checkpoint_target();
         // Reserve 2 SQEs of every chain for the terminal fsync + checkpoint, so
-        // a formed batch's chain always fits the ring.
+        // a sealed batch's chain always fits the ring in one submit.
         let max_chain_entries = (ring.sq_entries() as usize).saturating_sub(2).max(1);
+        // Per-batch "full" caps = SQ-fit ∩ configured batch caps.
+        let entry_cap = max_chain_entries.min(shard.sync_batch_max_entries.max(1));
+        let byte_cap = shard.sync_batch_max_bytes.max(1);
+        let pct = commit_timeout_pct.max(1);
+        // ZFS `zl_last_lwb_latency`: EMA of submit→fully-durable latency, sized
+        // from real completions; drives the OPEN batch's adaptive close window.
+        let window = |ema: Duration| -> Duration {
+            let w = Duration::from_nanos((ema.as_nanos() as u64).saturating_mul(pct) / 100);
+            w.max(LV2_COMMIT_TIMEOUT_FLOOR)
+        };
         let mut fifo: VecDeque<InflightUringBatch> = VecDeque::new();
         let mut pending_submit: Option<InflightUringBatch> = None;
+        let mut open: Option<OpenBatch> = None;
         let mut next_batch_id: u64 = 1;
+        let mut ema_write = Duration::ZERO;
 
         loop {
-            // 1. Submit a held-back batch or form new ones until depth is full.
-            while fifo.len() < depth {
-                let mut batch = if let Some(b) = pending_submit.take() {
-                    b
-                } else {
-                    // Group-commit window only when the pipeline is idle —
-                    // accumulate a first batch. Under load, staged entries pile
-                    // up while earlier fsyncs are in flight, so the next drain is
-                    // naturally larger (self-amortising the fsync).
-                    if fifo.is_empty() && shard.staging_rx.is_empty() {
-                        let _ = wake_rx.recv_timeout(Duration::from_millis(50));
-                        while wake_rx.try_recv().is_ok() {}
-                        if !batch_wait.is_zero() && !shard.staging_rx.is_empty() {
-                            let sleep_start = Instant::now();
-                            thread::sleep(batch_wait);
-                            if let Some(m) = metrics.get() {
-                                BufferShard::record_metric(&m.buffer_sync_sleep_ns, sleep_start);
-                            }
-                            while wake_rx.try_recv().is_ok() {}
-                        }
-                    }
-                    match Self::form_uring_batch(
+            // 1. Submit a held-back batch (SQ was full) once a FIFO slot frees.
+            if let Some(mut batch) = pending_submit.take() {
+                if fifo.len() < depth {
+                    batch.write_start = Instant::now();
+                    if Self::submit_batch_nowait(
+                        &ring,
                         &shard,
+                        &batch,
+                        data_fd,
+                        data_base,
                         ckpt_target,
-                        max_chain_entries,
-                        &mut next_batch_id,
                     ) {
-                        Some(b) => b,
-                        None => break,
+                        fifo.push_back(batch);
+                    } else {
+                        pending_submit = Some(batch);
                     }
-                };
-
-                batch.write_start = Instant::now();
-                let base_ud = batch.batch_id << 32;
-                let submitted = {
-                    let ops = Self::chain_ops(&batch, data_fd, data_base, ckpt_target);
-                    unsafe {
-                        let _g = shard.io_lock.lock();
-                        match ring.submit_linked_nowait(&ops, base_ud) {
-                            Ok(ok) => ok,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "uring pipeline submit errored; will retry");
-                                false
-                            }
-                        }
-                    }
-                };
-                if submitted {
-                    fifo.push_back(batch);
                 } else {
-                    // SQ ring full (or transient submit error): hold the formed
-                    // batch and retry after harvesting frees space — never lose it.
                     pending_submit = Some(batch);
-                    break;
                 }
             }
 
-            // 2. Harvest. Block for ≥1 completion only when we cannot otherwise
-            //    make forward progress (FIFO full, or nothing left to form).
-            if !fifo.is_empty() {
-                let can_form_more =
-                    fifo.len() < depth && pending_submit.is_none() && !shard.staging_rx.is_empty();
-                let min_complete = usize::from(!can_form_more);
+            // 2. Accumulate newly-staged entries into the OPEN batch. Runs even
+            //    while the FIFO is full, so the batch grows DURING the in-flight
+            //    fdatasync — the ZFS "keep the next lwb open" overlap.
+            if pending_submit.is_none() {
+                let ob = open.get_or_insert_with(|| OpenBatch {
+                    entries: Vec::new(),
+                    bytes: 0,
+                    opened_at: Instant::now(),
+                });
+                let room = entry_cap.saturating_sub(ob.entries.len());
+                if room > 0 && ob.bytes < byte_cap {
+                    let more = shard.drain_staged_capped(room);
+                    if !more.is_empty() {
+                        if ob.entries.is_empty() {
+                            ob.opened_at = Instant::now();
+                        }
+                        ob.bytes = ob
+                            .bytes
+                            .saturating_add(more.iter().map(|e| e.payload.len()).sum::<usize>());
+                        ob.entries.extend(more);
+                    }
+                }
+                if open.as_ref().is_some_and(|o| o.entries.is_empty()) {
+                    open = None;
+                }
+            }
+
+            // 3. Seal+submit the OPEN batch when full OR its adaptive window has
+            //    elapsed, if a FIFO slot is free and nothing is held back. Do NOT
+            //    issue a partially-full batch early just because staging
+            //    momentarily drained (ZFS policy) — the window bounds the wait.
+            if pending_submit.is_none() && fifo.len() < depth {
+                let should_seal = open.as_ref().is_some_and(|ob| {
+                    ob.entries.len() >= entry_cap
+                        || ob.bytes >= byte_cap
+                        || ob.opened_at.elapsed() >= window(ema_write)
+                });
+                if should_seal {
+                    let ob = open.take().unwrap();
+                    let mut batch =
+                        Self::seal_uring_batch(&shard, ckpt_target, ob.entries, &mut next_batch_id);
+                    batch.write_start = Instant::now();
+                    if Self::submit_batch_nowait(
+                        &ring,
+                        &shard,
+                        &batch,
+                        data_fd,
+                        data_base,
+                        ckpt_target,
+                    ) {
+                        fifo.push_back(batch);
+                    } else {
+                        pending_submit = Some(batch);
+                    }
+                }
+            }
+
+            // 4. Make progress. With writes in flight, block for ≥1 completion
+            //    unless we can still grow the OPEN batch right now; when idle,
+            //    park bounded by the OPEN batch's remaining window so a lone
+            //    entry still seals on time.
+            if fifo.is_empty() {
+                let wait = match open.as_ref() {
+                    Some(ob) => window(ema_write)
+                        .saturating_sub(ob.opened_at.elapsed())
+                        .max(Duration::from_micros(1)),
+                    None => Duration::from_millis(50),
+                };
+                let _ = wake_rx.recv_timeout(wait);
+                while wake_rx.try_recv().is_ok() {}
+            } else {
+                let can_accumulate = !shard.staging_rx.is_empty()
+                    && pending_submit.is_none()
+                    && open
+                        .as_ref()
+                        .map_or(true, |o| o.entries.len() < entry_cap && o.bytes < byte_cap);
+                let min_complete = usize::from(!can_accumulate);
                 match ring.harvest(min_complete) {
                     Ok(comps) => Self::apply_completions(&mut fifo, comps),
                     Err(e) => {
@@ -782,7 +869,7 @@ impl WriteBufferPool {
                 }
             }
 
-            // 3. Advance the contiguous fully-fsync'd prefix from the front.
+            // 5. Advance the contiguous fully-fsync'd prefix from the front.
             loop {
                 let front_done = fifo
                     .front()
@@ -811,14 +898,24 @@ impl WriteBufferPool {
                     break; // recovery drained the FIFO
                 } else {
                     let b = fifo.pop_front().unwrap();
+                    let measured = b.write_start.elapsed();
                     Self::finish_uring_batch(&shard, &b, &metrics);
+                    // Fold the real submit→durable latency into the EMA (ZFS
+                    // `zl_last_lwb_latency = (old*7 + new)/8`); normal completions
+                    // only, never error-recovered batches.
+                    ema_write = if ema_write.is_zero() {
+                        measured
+                    } else {
+                        (ema_write * 7 + measured) / 8
+                    };
                 }
             }
 
-            // 4. Exit only when fully drained.
+            // 6. Exit only when fully drained (including the OPEN batch).
             if shutdown.load(Ordering::Relaxed)
                 && fifo.is_empty()
                 && pending_submit.is_none()
+                && open.is_none()
                 && shard.staging_rx.is_empty()
             {
                 return;
@@ -837,11 +934,13 @@ impl WriteBufferPool {
         _shard_ready_tx: Sender<u64>,
         uring: Option<Arc<IoUringSession>>,
         pipeline_depth: usize,
+        commit_timeout_pct: u64,
     ) {
         // Pipelined LV2 fdatasync path: keep `pipeline_depth` fsync chains in
-        // flight so batch N+1's writes overlap batch N's flush. Only the
-        // io_uring backend supports it; depth 1 (or syscall) falls through to
-        // the legacy submit→wait-all→submit-next loop below.
+        // flight so batch N+1's writes overlap batch N's flush, with a ZFS
+        // self-clocked adaptive accumulation window. Only the io_uring backend
+        // supports it; depth 1 (or syscall) falls through to the legacy
+        // submit→wait-all→submit-next loop below.
         if pipeline_depth >= 2 {
             if let Some(ref ring) = uring {
                 Self::uring_sync_pipeline_loop(
@@ -853,6 +952,7 @@ impl WriteBufferPool {
                     metrics,
                     ring.clone(),
                     pipeline_depth,
+                    commit_timeout_pct,
                 );
                 return;
             }

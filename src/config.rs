@@ -750,6 +750,14 @@ pub struct BufferConfig {
     /// contiguous FIFO prefix of fully-fsync'd batches. 0 = engine default (2).
     #[serde(default)]
     pub lv2_sync_pipeline_depth: usize,
+    /// ZFS `zfs_commit_timeout_pct` analog for the LV2 sync pipeline. The OPEN
+    /// (accumulating) batch is sealed when full OR after
+    /// `ema_lv2_write_latency * pct/100` (floored) of accumulation, so the
+    /// window self-clocks to device latency and overlaps in-flight fdatasyncs.
+    /// Larger = bigger batches / higher latency; smaller = lower latency.
+    /// 0 = engine default (10).
+    #[serde(default)]
+    pub lv2_commit_timeout_pct: u64,
 }
 
 impl Default for BufferConfig {
@@ -770,6 +778,7 @@ impl Default for BufferConfig {
             throttle_scale_us: 0,
             throttle_cap_us: 0,
             lv2_sync_pipeline_depth: 0,
+            lv2_commit_timeout_pct: 0,
         }
     }
 }
