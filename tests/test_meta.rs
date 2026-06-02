@@ -103,9 +103,12 @@ fn blockmap_reference_checks_cover_tail_pbas_in_multi_block_units() {
     assert!(store.has_any_blockmap_ref(Pba(100)).unwrap());
     assert!(store.has_any_blockmap_ref(Pba(101)).unwrap());
     assert!(!store.has_any_blockmap_ref(Pba(102)).unwrap());
-    assert!(store.has_any_blockmap_ref_in_extent(Pba(101), 1).unwrap());
-    assert!(store.has_any_blockmap_ref_in_extent(Pba(99), 3).unwrap());
-    assert!(!store.has_any_blockmap_ref_in_extent(Pba(102), 1).unwrap());
+    assert_eq!(
+        store
+            .referenced_extents(&[(Pba(101), 1), (Pba(99), 3), (Pba(102), 1)])
+            .unwrap(),
+        vec![true, true, false],
+    );
     assert_eq!(
         store.iter_allocated_blocks().unwrap(),
         vec![Pba(100), Pba(101)]

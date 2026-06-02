@@ -531,6 +531,85 @@ fn delete_range_and_volume_report_freed_extents() {
 }
 
 #[test]
+fn referenced_extents_batches_and_matches_per_pba_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = MetaConfig {
+        path: Some(dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        memtable_budget_mb: 64,
+        index_pin_mb: 64,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
+        wal_dir: None,
+        dedup_shards: 1,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
+        ..Default::default()
+    };
+    let vol = VolumeConfig {
+        id: VolumeId("vol-a".to_string()),
+        size_bytes: 4096 * 8,
+        block_size: 4096,
+        compression: CompressionAlgo::Lz4,
+        created_at: 10,
+        zone_count: 4,
+    };
+    let backend = MetadbBackend::open(&meta).unwrap();
+    backend.put_volume(&vol).unwrap();
+
+    let mk = |pba: u64| BlockmapValue {
+        pba: Pba(pba),
+        compression: 1,
+        unit_compressed_size: 2048,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 1,
+        slot_offset: 0,
+        flags: 0,
+    };
+    // Live mappings reference PBAs 100, 101 and 300.
+    backend.atomic_write_mapping(&vol.id, Lba(0), &mk(100)).unwrap();
+    backend.atomic_write_mapping(&vol.id, Lba(1), &mk(101)).unwrap();
+    backend.atomic_write_mapping(&vol.id, Lba(2), &mk(300)).unwrap();
+
+    // Mix of referenced and unreferenced candidate extents, in arbitrary order.
+    let extents = [
+        (Pba(100), 1u32), // covers live 100  -> referenced
+        (Pba(200), 4u32), // 200..204 unused  -> not referenced
+        (Pba(101), 1u32), // covers live 101  -> referenced
+        (Pba(298), 4u32), // 298..302 covers live 300 -> referenced
+        (Pba(400), 2u32), // 400..402 unused  -> not referenced
+    ];
+    let got = backend.referenced_extents(&extents).unwrap();
+    assert_eq!(got, vec![true, false, true, true, false]);
+
+    // Each batched answer must equal a brute-force per-PBA probe.
+    for (i, &(start, blocks)) in extents.iter().enumerate() {
+        let brute = (0..u64::from(blocks))
+            .any(|off| backend.has_any_blockmap_ref(Pba(start.0 + off)).unwrap());
+        assert_eq!(got[i], brute, "extent {i} ({start:?}, {blocks}) mismatch");
+    }
+
+    // Empty input is a no-op.
+    assert!(backend.referenced_extents(&[]).unwrap().is_empty());
+
+    // All-referenced input exercises the early-stop path (remaining hits 0
+    // before the scan finishes); correctness is what we assert.
+    let all_referenced = backend
+        .referenced_extents(&[(Pba(100), 1), (Pba(101), 1), (Pba(300), 1)])
+        .unwrap();
+    assert_eq!(all_referenced, vec![true, true, true]);
+
+    // Zero-length candidates are never referenced and don't perturb others.
+    let with_zero = backend
+        .referenced_extents(&[(Pba(100), 0), (Pba(100), 1)])
+        .unwrap();
+    assert_eq!(with_zero, vec![false, true]);
+}
+
+#[test]
 fn diagnostic_helpers_track_refs_and_allocated_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let meta = MetaConfig {

@@ -253,29 +253,75 @@ impl GcRunner {
         running: &AtomicBool,
     ) -> usize {
         let candidates = allocator.retired_candidates(limit);
-        let mut reclaimed = 0usize;
+        if candidates.is_empty() {
+            return 0;
+        }
 
+        // Gate 1 (refcount): keep only candidates whose every PBA has rc==0.
+        // Cheap per-extent paged-array / overlay lookups, no volume scan.
+        let mut survivors: Vec<Extent> = Vec::with_capacity(candidates.len());
         for extent in candidates {
             if !running.load(Ordering::Relaxed) {
                 break;
             }
+            let pbas: Vec<crate::types::Pba> = (0..extent.count)
+                .map(|offset| crate::types::Pba(extent.start.0 + offset as u64))
+                .collect();
+            match meta.multi_get_refcounts(&pbas) {
+                Ok(refcounts) => {
+                    if refcounts.into_iter().all(|refcount| refcount == 0) {
+                        survivors.push(extent);
+                    }
+                }
+                Err(e) => {
+                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        pba = extent.start.0,
+                        blocks = extent.count,
+                        error = %e,
+                        "gc: failed to read refcount for retired physical extent"
+                    );
+                }
+            }
+        }
+        if survivors.is_empty() {
+            return 0;
+        }
 
-            match Self::retired_extent_is_reclaimable(meta, extent) {
-                Ok(true) => match allocator.reclaim_retired_extent(extent) {
-                    Ok(true) => {
-                        reclaimed += extent.count as usize;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            pba = extent.start.0,
-                            blocks = extent.count,
-                            error = %e,
-                            "gc: failed to release retired physical extent"
-                        );
-                    }
-                },
+        // Gate 2 (blockmap): ONE batched all-volume L2P scan for every survivor,
+        // replacing the per-extent full scan (was O(retired × all_L2P)). A
+        // survivor is reclaimable iff no live blockmap entry references any PBA
+        // inside it.
+        let extents: Vec<(crate::types::Pba, u32)> =
+            survivors.iter().map(|e| (e.start, e.count)).collect();
+        metrics
+            .gc_reclaim_blockmap_scans
+            .fetch_add(1, Ordering::Relaxed);
+        let referenced = match meta.referenced_extents(&extents) {
+            Ok(referenced) => referenced,
+            Err(e) => {
+                metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    candidates = survivors.len(),
+                    error = %e,
+                    "gc: failed to scan blockmap for retired physical extents"
+                );
+                return 0;
+            }
+        };
+
+        let mut reclaimed = 0usize;
+        for (extent, is_referenced) in survivors.into_iter().zip(referenced) {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+            if is_referenced {
+                continue;
+            }
+            match allocator.reclaim_retired_extent(extent) {
+                Ok(true) => {
+                    reclaimed += extent.count as usize;
+                }
                 Ok(false) => {}
                 Err(e) => {
                     metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
@@ -283,7 +329,7 @@ impl GcRunner {
                         pba = extent.start.0,
                         blocks = extent.count,
                         error = %e,
-                        "gc: failed to verify retired physical extent"
+                        "gc: failed to release retired physical extent"
                     );
                 }
             }
@@ -296,26 +342,6 @@ impl GcRunner {
             tracing::debug!(blocks = reclaimed, "gc: reclaimed retired physical blocks");
         }
         reclaimed
-    }
-
-    fn retired_extent_is_reclaimable(
-        meta: &MetaStore,
-        extent: Extent,
-    ) -> crate::error::OnyxResult<bool> {
-        let pbas: Vec<_> = (0..extent.count)
-            .map(|offset| crate::types::Pba(extent.start.0 + offset as u64))
-            .collect();
-        if meta
-            .multi_get_refcounts(&pbas)?
-            .into_iter()
-            .any(|refcount| refcount != 0)
-        {
-            return Ok(false);
-        }
-        if meta.has_any_blockmap_ref_in_extent(extent.start, extent.count)? {
-            return Ok(false);
-        }
-        Ok(true)
     }
 
     pub fn stop(&mut self) {

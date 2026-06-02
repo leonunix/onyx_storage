@@ -1030,28 +1030,91 @@ impl MetadbBackend {
         Ok(found)
     }
 
-    pub(crate) fn has_any_blockmap_ref_in_extent(
-        &self,
-        start: Pba,
-        blocks: u32,
-    ) -> OnyxResult<bool> {
-        if blocks == 0 {
-            return Ok(false);
+    /// Batched counterpart to the old single-extent blockmap-reference check:
+    /// given candidate extents as `(start_pba, blocks)`, perform ONE all-volume
+    /// L2P scan and return, per candidate (input order), whether any live
+    /// blockmap entry references a PBA inside it. Early-exits the scan once
+    /// every candidate has been marked referenced.
+    ///
+    /// This collapses GC retired-extent reclaim from `O(retired × all_L2P)`
+    /// (one full scan per extent) to a single scan per cycle. Retired extents
+    /// handed in by the reclaim path are coalesced and non-overlapping, so each
+    /// PBA is covered by at most one candidate; the covering lookup is a binary
+    /// search over candidates sorted by start.
+    pub(crate) fn referenced_extents(&self, extents: &[(Pba, u32)]) -> OnyxResult<Vec<bool>> {
+        if extents.is_empty() {
+            return Ok(Vec::new());
         }
-        let end = start.0.saturating_add(u64::from(blocks));
-        let mut found = false;
-        self.scan_all_blockmap_entries_with(&mut |_, _, value| {
-            if value.is_zero() {
-                return;
+        // Indices sorted by start PBA (skipping zero-length candidates) for the
+        // O(log n) covering lookup inside the scan callback.
+        let mut order: Vec<usize> = (0..extents.len()).filter(|&i| extents[i].1 != 0).collect();
+        order.sort_unstable_by_key(|&i| extents[i].0 .0);
+
+        let mut referenced = vec![false; extents.len()];
+        let mut remaining = order.len();
+        if remaining == 0 {
+            return Ok(referenced);
+        }
+
+        // Set once every candidate is marked, to swallow the abort sentinel the
+        // scan callback returns (the `decode_error` idiom below distinguishes a
+        // real corruption error from this control-flow early stop).
+        let mut early = false;
+        let volumes = self.list_volumes()?;
+        'volumes: for volume in volumes {
+            let ord = self.volume_ordinal(&volume.id)?;
+            let lba_count = volume.size_bytes / u64::from(volume.block_size);
+            let mut decode_error = None;
+            let scan_result = self.db.scan_range_unordered_chunked(
+                ord,
+                0,
+                lba_count,
+                BLOCKMAP_SCAN_CHUNK_LBAS,
+                |_lba, value| {
+                    let decoded = match decode_l2p_value(value) {
+                        Ok(decoded) => decoded,
+                        Err(err) => {
+                            decode_error = Some(err);
+                            return Err(onyx_metadb::MetaDbError::Corruption(
+                                "onyx blockmap decode failed".into(),
+                            ));
+                        }
+                    };
+                    if decoded.is_zero() {
+                        return Ok(());
+                    }
+                    for pba in decoded.physical_pbas(crate::types::BLOCK_SIZE) {
+                        // Rightmost candidate whose start <= pba is the only one
+                        // that can cover it (candidates are non-overlapping).
+                        let pos = order.partition_point(|&i| extents[i].0 .0 <= pba.0);
+                        if pos == 0 {
+                            continue;
+                        }
+                        let idx = order[pos - 1];
+                        let (start, blocks) = extents[idx];
+                        if pba.0 < start.0 + u64::from(blocks) && !referenced[idx] {
+                            referenced[idx] = true;
+                            remaining -= 1;
+                            if remaining == 0 {
+                                early = true;
+                                return Err(onyx_metadb::MetaDbError::Corruption(
+                                    "referenced_extents: all candidates marked (early stop)".into(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            if let Some(err) = decode_error {
+                return Err(err);
             }
-            if value
-                .physical_pbas(crate::types::BLOCK_SIZE)
-                .any(|pba| pba.0 >= start.0 && pba.0 < end)
-            {
-                found = true;
+            if early {
+                break 'volumes;
             }
-        })?;
-        Ok(found)
+            scan_result?;
+        }
+        Ok(referenced)
     }
 
     pub(crate) fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {

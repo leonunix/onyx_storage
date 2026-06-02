@@ -528,8 +528,12 @@ impl MetaStore {
         self.backend.has_any_blockmap_ref(target_pba)
     }
 
-    pub fn has_any_blockmap_ref_in_extent(&self, start: Pba, blocks: u32) -> OnyxResult<bool> {
-        self.backend.has_any_blockmap_ref_in_extent(start, blocks)
+    /// Batched blockmap-reference check for GC retired-extent reclaim: one
+    /// all-volume L2P scan answers all `(start_pba, blocks)` candidates at once.
+    /// Returns one bool per candidate (input order): true iff some live
+    /// blockmap entry references a PBA inside it.
+    pub fn referenced_extents(&self, extents: &[(Pba, u32)]) -> OnyxResult<Vec<bool>> {
+        self.backend.referenced_extents(extents)
     }
 
     pub fn count_blockmap_refs_for_pba(&self, target_pba: Pba) -> OnyxResult<u32> {

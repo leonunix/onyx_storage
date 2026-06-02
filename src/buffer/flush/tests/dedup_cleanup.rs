@@ -326,6 +326,69 @@ fn retired_reclaimer_skips_allocator_free_when_live_blockmap_ref_remains() {
 }
 
 #[test]
+fn retired_reclaimer_batches_one_scan_and_frees_only_unreferenced() {
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    // Two rc==0 retired PBAs, kept non-adjacent by an allocated gap block so
+    // the allocator does not coalesce them into one extent: one is still
+    // referenced by a live blockmap entry, the other is not. Batched reclaim
+    // must free exactly the unreferenced one, in a SINGLE all-volume scan.
+    let referenced_pba = allocator.allocate_one_for_lane(0).unwrap();
+    let _gap = allocator.allocate_one_for_lane(0).unwrap();
+    let free_pba = allocator.allocate_one_for_lane(0).unwrap();
+    assert_ne!(referenced_pba.0 + 1, free_pba.0, "test needs a non-adjacent gap");
+
+    let mapping = BlockmapValue {
+        pba: referenced_pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0x1234_5678,
+        slot_offset: 0,
+        flags: 0,
+    };
+    let vol = VolumeId("flush-race".into());
+    meta.atomic_batch_write(&vol, &[(Lba(7), mapping)], 1).unwrap();
+    meta.set_refcount(referenced_pba, 0).unwrap();
+    meta.set_refcount(free_pba, 0).unwrap();
+
+    allocator.retire_one(referenced_pba).unwrap();
+    allocator.retire_one(free_pba).unwrap();
+
+    let scans_before = metrics
+        .gc_reclaim_blockmap_scans
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let reclaimed = crate::gc::runner::GcRunner::reclaim_retired_extents(
+        &metrics,
+        &meta,
+        &allocator,
+        64,
+        &AtomicBool::new(true),
+    );
+
+    assert_eq!(reclaimed, 1, "only the unreferenced rc==0 extent is reclaimed");
+    assert!(
+        allocator.is_free(free_pba),
+        "unreferenced rc==0 PBA returned to allocator"
+    );
+    assert!(
+        !allocator.is_free(referenced_pba) && allocator.is_retired(referenced_pba),
+        "live-referenced PBA must stay retired, not freed"
+    );
+    assert_eq!(
+        metrics
+            .gc_reclaim_blockmap_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - scans_before,
+        1,
+        "all survivors checked in a single batched all-volume scan"
+    );
+}
+
+#[test]
 fn duplicate_dead_pba_cleanup_callers_without_shared_lock_double_free() {
     let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();

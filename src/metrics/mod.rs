@@ -444,6 +444,10 @@ pub struct EngineMetrics {
     pub gc_blocks_rewritten: AtomicU64,
     pub gc_retired_blocks_reclaimed: AtomicU64,
     pub gc_errors: AtomicU64,
+    /// Number of batched all-volume L2P scans the retired-extent reclaim path
+    /// has run. With batching this is ~1 per GC cycle (was up to
+    /// `MAX_RETIRED_RECLAIM_PER_CYCLE` per cycle, one full scan per extent).
+    pub gc_reclaim_blockmap_scans: AtomicU64,
     /// [[no-refcount-hot-path-design]] Phase 5: count of PBAs that
     /// flowed back to the allocator via Lineage GC's `WalOp::FreePbas`
     /// surface, drained by `LineageFreedPbaDrainHandle`. Counts blocks
