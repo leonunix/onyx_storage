@@ -169,6 +169,22 @@ fn register_volume(meta: &MetaStore, name: &str) {
     register_volume_with(meta, name, CompressionAlgo::None, 1000);
 }
 
+/// Register a small volume sized to an exact LBA count. Cold-tail tests
+/// use this so a full random-phase lap covers the whole volume within
+/// the wait window (the cold-tail walk starts at a random LBA, so a
+/// large volume could take many cycles to reach LBA 0/1/2).
+fn register_small_volume(meta: &MetaStore, name: &str, lba_count: u64) {
+    meta.put_volume(&VolumeConfig {
+        id: VolumeId(name.to_string()),
+        size_bytes: lba_count * 4096,
+        block_size: 4096,
+        compression: CompressionAlgo::None,
+        created_at: 1000,
+        zone_count: 4,
+    })
+    .unwrap();
+}
+
 fn register_volume_with(
     meta: &MetaStore,
     name: &str,
@@ -1218,7 +1234,9 @@ fn cold_tail_pass_warms_candidate_from_live_blockmap() {
     // cold-tail pass runs the cache must contain the fingerprint for
     // the live entry without any duplicate write driving it.
     let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
-    register_volume(&meta, "test-vol");
+    // Small volume so a full random-phase cold-tail lap covers LBA 0
+    // well within the wait window.
+    register_small_volume(&meta, "test-vol", 64);
 
     let data = vec![0xC1; 4096];
     let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
@@ -1266,6 +1284,128 @@ fn cold_tail_pass_warms_candidate_from_live_blockmap() {
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_none(),
         "cold-tail must not publish to dedup_index; promote stays gated on verified hits"
+    );
+}
+
+#[test]
+fn cold_tail_remaps_dedup_index_hit_and_decrefs_old() {
+    // Cold-tail's backend safety-net role: an "evicted-window"
+    // duplicate is a live block whose content was already promoted into
+    // the persistent dedup_index, but whose candidate slot was evicted
+    // before the duplicate write arrived — so it landed un-deduped on
+    // its own fresh PBA (flags=0). The cold-tail pass must reclaim it by
+    // remapping the LBA onto the existing dedup target and decref'ing
+    // the orphaned old PBA, NOT merely warm the candidate cache (which
+    // would only help a future write, leaving this block un-deduped).
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    // Small volume so a full random-phase cold-tail lap covers LBA 1
+    // (the evicted-window duplicate) well within the wait window.
+    register_small_volume(&meta, "test-vol", 64);
+
+    let data = vec![0x5A; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
+
+    // Promote the fingerprint into the persistent dedup_index via two
+    // matching writes (promote-on-verified-hit). Lba(0) is the canonical
+    // PBA P that the index points at.
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "initial flush timeout");
+    pool.append("test-vol", Lba(2), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "promote flush timeout");
+    flusher.stop();
+
+    let canonical_pba = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap()
+        .pba;
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
+        canonical_pba,
+        "second matching write should promote the fingerprint into dedup_index"
+    );
+
+    // Manufacture the evicted-window duplicate: write the same content
+    // at Lba(1) with dedup *disabled* so the coalescer bypasses the
+    // dedup workers entirely and lands a fresh PBA Q with flags=0 — an
+    // un-deduped live block whose content hash is already in
+    // dedup_index (Q != P). This is the state a promote-gate
+    // racing-loser fallback (or a dedup toggle) leaves behind, and it
+    // is NOT flagged FLAG_DEDUP_SKIPPED, so only the cold-tail pass can
+    // reclaim it (the DEDUP_SKIPPED rescan never sees it).
+    let mut fresh_flusher = start_flusher_custom(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        DedupConfig {
+            enabled: false,
+            ..dedup_test_config()
+        },
+    );
+    pool.append("test-vol", Lba(1), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "fresh write flush timeout");
+    fresh_flusher.stop();
+
+    let dup_mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        dup_mapping.pba, canonical_pba,
+        "dedup-disabled duplicate should land on a fresh PBA"
+    );
+    assert_eq!(
+        dup_mapping.flags, 0,
+        "dedup-disabled write is un-deduped but not FLAG_DEDUP_SKIPPED"
+    );
+
+    // Cold-tail-only scanner: no DEDUP_SKIPPED debt (max_rescan=0), no
+    // index scrub, cold-tail enabled.
+    let cold_cfg = DedupConfig {
+        rescan_interval_ms: 20,
+        max_rescan_per_cycle: 0,
+        cold_tail_max_per_cycle: 64,
+        index_scrub_max_per_cycle: 0,
+        ..dedup_test_config()
+    };
+    let (mut scanner, _candidate) = start_scanner_with_candidate_and_read_pool(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        cold_cfg,
+    );
+
+    // The cold-tail pass remaps Lba(1) onto the canonical PBA and clears
+    // any residual flags.
+    assert!(
+        wait_until(3000, || {
+            let mapping = meta
+                .get_mapping(&VolumeId("test-vol".into()), Lba(1))
+                .unwrap()
+                .unwrap();
+            mapping.flags == 0 && mapping.pba == canonical_pba
+        }),
+        "cold-tail should remap the evicted-window duplicate onto the existing dedup PBA"
+    );
+    scanner.stop();
+
+    // The orphaned fresh PBA Q is decref'd to zero, and the dedup_index
+    // entry is unchanged (rc-neutral remap onto the canonical PBA).
+    assert_eq!(
+        meta.get_refcount(dup_mapping.pba).unwrap(),
+        0,
+        "remapped duplicate's old PBA should drop to refcount 0"
+    );
+    assert_eq!(
+        meta.get_dedup_entry(&hash).unwrap().unwrap().pba,
+        canonical_pba,
+        "remap must not disturb the persistent dedup_index entry"
     );
 }
 

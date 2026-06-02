@@ -470,6 +470,13 @@ pub struct EngineMetrics {
     /// LV3 IO error). The scanner moves on; the cursor still advances so
     /// one bad block does not stall progress.
     pub dedup_cold_tail_errors: AtomicU64,
+    /// Cold-tail rescan: live blockmap entries whose content hash was
+    /// already a live dedup_index entry pointing at a different PBA, so
+    /// the scanner remapped the LBA onto the existing dedup target and
+    /// decref'd the now-orphaned old PBA. These are "evicted-window"
+    /// duplicates the candidate cache lost before the 2nd write arrived;
+    /// reclaiming them is the cold-tail pass's backend safety-net role.
+    pub dedup_cold_tail_remaps: AtomicU64,
     pub volume_discard_ops: AtomicU64,
     pub volume_discard_lbas: AtomicU64,
     pub discard_blocks_freed: AtomicU64,

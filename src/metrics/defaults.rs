@@ -260,6 +260,7 @@ impl Default for EngineMetrics {
             dedup_cold_tail_blocks: AtomicU64::new(0),
             dedup_cold_tail_already_warm: AtomicU64::new(0),
             dedup_cold_tail_errors: AtomicU64::new(0),
+            dedup_cold_tail_remaps: AtomicU64::new(0),
             volume_discard_ops: AtomicU64::new(0),
             volume_discard_lbas: AtomicU64::new(0),
             discard_blocks_freed: AtomicU64::new(0),

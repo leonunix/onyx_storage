@@ -142,11 +142,12 @@ impl DedupScanner {
         // move. This covers scanner restarts and tests that inject skipped
         // mappings before the scanner shares runtime metrics with the flusher.
         let mut rescan_debt = true;
-        // Per-volume LBA cursor for cold-tail warming. The scanner walks
-        // live blockmap entries in chunked passes; each cycle advances
-        // the cursor by `cold_tail_max_per_cycle` LBAs and wraps at the
-        // end of the volume.
-        let mut cold_tail_cursors: HashMap<String, u64> = HashMap::new();
+        // Per-volume lap state for cold-tail warming. The scanner walks
+        // live blockmap entries in chunked passes; each lap starts at a
+        // random phase and advances `cold_tail_max_per_cycle` LBAs per
+        // cycle, wrapping the volume, then re-randomizes (see
+        // `ColdTailCursor`).
+        let mut cold_tail_cursors: HashMap<String, ColdTailCursor> = HashMap::new();
         let mut index_scrub_cursor: usize = 0;
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
@@ -220,6 +221,8 @@ impl DedupScanner {
             if !rescan_debt && cfg.cold_tail_max_per_cycle > 0 {
                 match Self::cold_tail_rescan(
                     meta,
+                    allocator,
+                    lifecycle,
                     candidate,
                     read_pool,
                     &mut cold_tail_cursors,
@@ -230,14 +233,18 @@ impl DedupScanner {
                             .dedup_cold_tail_blocks
                             .fetch_add(stats.warmed as u64, Ordering::Relaxed);
                         metrics
+                            .dedup_cold_tail_remaps
+                            .fetch_add(stats.remapped as u64, Ordering::Relaxed);
+                        metrics
                             .dedup_cold_tail_already_warm
                             .fetch_add(stats.already_warm as u64, Ordering::Relaxed);
                         metrics
                             .dedup_cold_tail_errors
                             .fetch_add(stats.errors as u64, Ordering::Relaxed);
-                        if stats.warmed > 0 || stats.already_warm > 0 {
+                        if stats.warmed > 0 || stats.remapped > 0 || stats.already_warm > 0 {
                             tracing::debug!(
                                 warmed = stats.warmed,
+                                remapped = stats.remapped,
                                 already_warm = stats.already_warm,
                                 errors = stats.errors,
                                 "dedup scanner: cold-tail pass"
@@ -400,19 +407,27 @@ impl DedupScanner {
     }
 
     /// Cold-tail warming pass: walk a chunk of live blockmap entries
-    /// per cycle, hash the content, and warm the candidate cache. The
-    /// cursor advances `chunk` LBAs each cycle; when it reaches the
-    /// end of a volume it wraps to 0.
+    /// per cycle, hash the content, and either remap evicted-window
+    /// duplicates onto their existing dedup PBA or warm the candidate
+    /// cache for true misses. Each volume is walked one *lap* at a time
+    /// (a full pass over its LBA space); the lap starts at a random
+    /// phase and advances linearly, wrapping the volume, then
+    /// re-randomizes — so coverage order varies run-to-run instead of
+    /// always sweeping `0..N` (which starved the tail of huge volumes
+    /// and re-scanned the head after every restart).
     ///
     /// LV3 reads go through the engine's `ReadPool` so the cycle's IO
     /// is fanned out via io_uring at high queue depth. When no
     /// `ReadPool` is configured the pass is skipped — serial blocking
     /// reads would dominate scanner runtime and squander budget.
+    #[allow(clippy::too_many_arguments)]
     fn cold_tail_rescan(
         meta: &MetaStore,
+        allocator: &SpaceAllocator,
+        lifecycle: &VolumeLifecycleManager,
         candidate: &CandidateCache,
         read_pool: Option<&ReadPool>,
-        cursors: &mut HashMap<String, u64>,
+        cursors: &mut HashMap<String, ColdTailCursor>,
         budget: usize,
     ) -> OnyxResult<ColdTailStats> {
         let mut stats = ColdTailStats::default();
@@ -444,26 +459,53 @@ impl DedupScanner {
             if total_lbas == 0 {
                 continue;
             }
-            let cursor = cursors.entry(vol.id.0.clone()).or_insert(0);
-            if *cursor >= total_lbas {
-                *cursor = 0;
+            // Pick this cycle's contiguous physical range from the
+            // per-volume lap state. A lap starts at a random phase and
+            // advances linearly (wrapping the volume) until it has
+            // covered `total_lbas`, then re-randomizes. `phys_start` is
+            // the lap phase advanced by what we've already scanned,
+            // wrapped into `[0, total_lbas)`; `chunk` is clamped so the
+            // scan never crosses the volume's end boundary in one range.
+            let (phys_start, chunk) = {
+                let cur = cursors.entry(vol.id.0.clone()).or_insert_with(|| {
+                    let mut rng = cold_tail_seed(&vol.id.0);
+                    let lap_start = splitmix64(&mut rng) % total_lbas;
+                    ColdTailCursor {
+                        lap_start,
+                        scanned_in_lap: 0,
+                        rng,
+                    }
+                });
+                if cur.scanned_in_lap >= total_lbas {
+                    cur.lap_start = splitmix64(&mut cur.rng) % total_lbas;
+                    cur.scanned_in_lap = 0;
+                }
+                let phys_start = (cur.lap_start + cur.scanned_in_lap) % total_lbas;
+                let lap_remaining = total_lbas - cur.scanned_in_lap;
+                let chunk = (remaining as u64)
+                    .min(lap_remaining)
+                    .min(total_lbas - phys_start);
+                cur.scanned_in_lap += chunk;
+                (phys_start, chunk)
+            };
+            remaining = remaining.saturating_sub(chunk as usize);
+            if chunk == 0 {
+                continue;
             }
 
-            let chunk = (remaining as u64).min(total_lbas - *cursor);
-
-            // Collect candidate entries to warm in this chunk. We
+            // Collect candidate entries to process in this chunk. We
             // reject entries that:
             //  - are flagged DEDUP_SKIPPED (the rescan_skipped path
             //    handles those — their hashes are not yet known so we
             //    do not want a duplicate read here),
             //  - already have a candidate cache entry pointing at
-            //    their PBA (warmed by the writer or a previous cycle),
-            //  - already live in the persistent dedup_index (a future
-            //    duplicate would hit the index directly without need
-            //    of a candidate slot).
+            //    their PBA (warmed by the writer or a previous cycle).
+            // dedup_index membership is decided per-entry below (a hit
+            // is *remapped*, a miss is *warmed*), so it is not a filter
+            // here.
             let mut targets: Vec<(Lba, BlockmapValue)> = Vec::new();
             let mut already_warm = 0usize;
-            meta.scan_blockmap_range(&vol.id, Lba(*cursor), chunk, &mut |lba, value| {
+            meta.scan_blockmap_range(&vol.id, Lba(phys_start), chunk, &mut |lba, value| {
                 if value.is_zero() {
                     return;
                 }
@@ -478,8 +520,6 @@ impl DedupScanner {
             })?;
 
             stats.already_warm += already_warm;
-            *cursor = cursor.saturating_add(chunk);
-            remaining = remaining.saturating_sub(chunk as usize);
 
             if targets.is_empty() {
                 continue;
@@ -531,18 +571,110 @@ impl DedupScanner {
                 };
                 let hash = compute_content_hash(&block);
 
-                // If the hash is already in the persistent dedup
-                // index, warming the candidate cache is wasted: future
-                // duplicate writes hit dedup_index directly without
-                // probing the candidate cache. Count as already_warm
-                // and skip the insert so we do not push useful entries
-                // out of the LRU.
-                let already_in_index = matches!(meta.get_dedup_entry(&hash), Ok(Some(_)));
-                if already_in_index {
-                    stats.already_warm += 1;
+                // If the hash is already a *live* entry in the
+                // persistent dedup index, this live block is an
+                // evicted-window duplicate: its content was promoted
+                // earlier, but its candidate slot was evicted before
+                // the duplicate write arrived, so it was written
+                // un-deduped against its own fresh PBA. Reclaim it by
+                // remapping the LBA onto the existing dedup target and
+                // decref'ing the orphaned old PBA — the same action the
+                // FLAG_DEDUP_SKIPPED rescan path already takes. Warming
+                // the candidate would only help a *future* write; it
+                // does nothing for this already-written block.
+                let index_entry = match meta.get_dedup_entry(&hash) {
+                    Ok(Some(existing)) => match meta.dedup_entry_is_live(&hash, &existing) {
+                        Ok(true) => Some(existing),
+                        Ok(false) => None,
+                        Err(e) => {
+                            stats.errors += 1;
+                            tracing::debug!(
+                                vol = %vol.id.0,
+                                lba = lba.0,
+                                error = %e,
+                                "cold-tail: dedup_index liveness check failed"
+                            );
+                            continue;
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(e) => {
+                        stats.errors += 1;
+                        tracing::debug!(
+                            vol = %vol.id.0,
+                            lba = lba.0,
+                            error = %e,
+                            "cold-tail: dedup_index probe failed"
+                        );
+                        continue;
+                    }
+                };
+
+                if let Some(existing) = index_entry {
+                    // The live block already points at the dedup target
+                    // (it may even *be* the canonical copy). Nothing to
+                    // reclaim — do not self-remap.
+                    if existing.pba == bv.pba {
+                        stats.already_warm += 1;
+                        continue;
+                    }
+
+                    // Remap under the volume read lock so the volume
+                    // cannot be dropped mid-tx, mirroring
+                    // `rescan_skipped_blocks`. Re-read the mapping with
+                    // its committed seq and forward it to the
+                    // seq_guard: the async LV3 read + hash above is not
+                    // atomic with this commit, so a foreground write may
+                    // have landed. seq=0 would silently clobber it (see
+                    // the
+                    // `metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write`
+                    // regression test).
+                    let outcome = lifecycle.with_read_lock(&vol.id.0, || -> OnyxResult<u8> {
+                        let Some((current, observed_seq)) =
+                            meta.get_mapping_with_seq(&vol.id, *lba)?
+                        else {
+                            return Ok(0); // gone
+                        };
+                        if !same_physical_mapping(&current, bv) {
+                            return Ok(0); // changed under us
+                        }
+                        let new_bv = BlockmapValue {
+                            flags: 0,
+                            ..existing.to_blockmap_value()
+                        };
+                        let decremented =
+                            meta.atomic_dedup_hit(&vol.id, *lba, &new_bv, &hash, observed_seq)?;
+                        if let Some(cleanup) = decremented {
+                            BufferFlusher::cleanup_dead_pba_post_commit(
+                                allocator,
+                                candidate,
+                                cleanup,
+                                "dedup_cold_tail_cleanup",
+                            );
+                        }
+                        Ok(1) // remapped
+                    });
+
+                    match outcome {
+                        Ok(1) => stats.remapped += 1,
+                        Ok(_) => stats.already_warm += 1,
+                        Err(e) => {
+                            stats.errors += 1;
+                            tracing::debug!(
+                                vol = %vol.id.0,
+                                lba = lba.0,
+                                error = %e,
+                                "cold-tail: dedup_index-hit remap failed"
+                            );
+                        }
+                    }
                     continue;
                 }
 
+                // True miss: warm the candidate cache so a *future*
+                // duplicate write can verify-and-promote against this
+                // fingerprint. Re-validate the mapping first so we do
+                // not cache a stale (vol, lba) -> pba pair.
                 match meta.get_mapping(&vol.id, *lba) {
                     Ok(Some(current)) if same_physical_mapping(&current, bv) => {}
                     Ok(_) => {
@@ -667,13 +799,19 @@ struct RescanStats {
 #[derive(Debug, Clone, Copy, Default)]
 struct ColdTailStats {
     /// Entries the scanner read, hashed, and inserted into the
-    /// candidate cache.
+    /// candidate cache (true misses against the persistent index).
     warmed: usize,
-    /// Entries the scanner skipped because either the candidate cache
-    /// already had a fingerprint for the PBA or the persistent dedup
-    /// index already had an entry for the hash.
+    /// Entries the scanner remapped onto an existing live dedup_index
+    /// PBA: an evicted-window duplicate whose content was already in
+    /// the persistent index but whose live block still pointed at its
+    /// own fresh PBA. The remap decrefs the now-orphaned old PBA.
+    remapped: usize,
+    /// Entries the scanner left as-is because either the candidate
+    /// cache already had a fingerprint for the PBA, the live block
+    /// already pointed at the dedup target, or the mapping changed
+    /// under us before the remap/warm.
     already_warm: usize,
-    /// Entries the scanner could not warm due to ReadPool errors,
+    /// Entries the scanner could not process due to ReadPool errors,
     /// short reads, or dedup-index probe failures.
     errors: usize,
 }
@@ -683,6 +821,49 @@ struct IndexScrubStats {
     checked: usize,
     deleted: usize,
     errors: usize,
+}
+
+/// Per-volume cold-tail walk state. A "lap" is one full pass over the
+/// volume's LBA space. Each lap starts at a fresh pseudo-random phase
+/// (`lap_start`) and advances linearly, wrapping around the volume,
+/// until `scanned_in_lap` reaches `total_lbas` — at which point the
+/// next lap re-randomizes. The old behaviour always swept `0..N` in the
+/// same order, which on a huge volume (or across process restarts that
+/// reset the cursor to 0) re-scanned the head while starving the tail.
+/// A random phase per lap gives every region a fair chance regardless
+/// of how far a single run gets through a lap.
+#[derive(Debug, Clone, Copy)]
+struct ColdTailCursor {
+    lap_start: u64,
+    scanned_in_lap: u64,
+    rng: u64,
+}
+
+/// splitmix64: a tiny, fast, self-contained PRNG. The cold-tail phase
+/// only needs decorrelated coverage order, not crypto strength, so we
+/// avoid pulling `rand` into the runtime dependency set.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Seed a per-volume PRNG from wall-clock time mixed with the volume id
+/// (FNV-1a), so different volumes — and different process runs — pick
+/// different cold-tail phases.
+fn cold_tail_seed(vol_id: &str) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in vol_id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    nanos ^ h
 }
 
 /// Read the 4 KiB physical block backing one blockmap entry. Handles
