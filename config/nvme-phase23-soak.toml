@@ -1,0 +1,135 @@
+# 8h Phase 2 + Phase 3 deferred-outcomes / async-WAL soak.
+#
+# Derived from nvme-detailed-numa-split.toml (v4 NUMA layout). All
+# differences from the blueprint are tagged "# soak:" so the deltas
+# are easy to audit.
+#
+# Expected layout:
+#   /dev/nvme0n1     -> XFS at /mnt/onyx-meta (metadb)
+#   /dev/md/onyx-lv2 -> 4x NVMe RAID0 LV2 buffer
+#   /dev/nvme4n1     -> raw LV3 data device
+
+[meta]
+path = "/mnt/onyx-meta/metadb"
+wal_dir = "/mnt/onyx-meta/wal"
+block_cache_mb = 65536
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 1000
+group_commit_timeout_us = 1
+unlogged_flush_commits = true
+flush_dirty_pages_threshold = 100000
+flush_select_budget = 0
+dedup_shards = 8
+dedup_cuckoo_buckets = 64000000
+dedup_l1_cache_entries = 256000
+# soak: Phase 1 (already production-default on this profile).
+l2p_buffer_enabled = true
+commit_direct_apply_enabled = true
+# soak: Phase 2 metadb side - stage outcomes via L2P compactor boundary.
+commit_deferred_outcomes_enabled = true
+# soak: Phase 3 metadb side - async WAL + TXG-aligned fsync.
+# Requires commit_deferred_outcomes_enabled = true (enforced).
+wal_async_commits_enabled = true
+wal_async_group_commit_window_us = 1000
+
+[storage]
+data_device = "/dev/nvme4n1"
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 16
+
+[buffer]
+device = "/dev/md/onyx-lv2"
+capacity_mb = 1048576
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+shards = 16
+max_memory_mb = 32768
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+commit_workers_per_volume = 8
+commit_target_lbas_per_tx = 1024
+commit_coalesce_lba_budget = 4096
+commit_coalesce_timeout_us = 2000
+packed_commit_try_drain_lba_budget = 1024
+writer_read_active_batch_size = 1024
+# soak: Phase 2 onyx side - per-volume commit_worker pipeline.
+commit_worker_deferred_outcomes = true
+commit_worker_pipeline_depth = 4
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+
+[dedup]
+enabled = true
+workers = 2
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 16384
+rescan_interval_ms = 30000
+max_rescan_per_cycle = 4096
+cold_tail_max_per_cycle = 4096
+
+[threading]
+enabled = true
+ublk_cpus      = "0-31"
+read_pool_cpus = "32-47"
+
+metadb_l2p_apply_cpus      = "48,50,52,54,56,58,60,62"
+metadb_refcount_apply_cpus = "64,66,68,70"
+metadb_dedup_apply_cpus    = "72,74"
+metadb_wal_cpus            = "76"
+metadb_checkpoint_cpus     = "78"
+metadb_refcount_drainer_cpus = ""
+metadb_l2p_compactor_cpus    = ""
+metadb_io_submitter_cpus   = ""
+
+flusher_writer_cpus  = "80,82,84,86"
+flusher_cleanup_cpus = "88,90"
+commit_worker_cpus   = ""
+background_cpus      = "92,94"
+
+buffer_sync_cpus      = "49,51,53,55"
+flusher_coalesce_cpus = "57,59,61,63"
+flusher_dedup_cpus    = "65,67,69,71,73,75,77,79"
+flusher_compress_cpus = "81,83,85,87,89,91,93,95"
+
+[service]
+# soak: distinct socket so an old onyx instance can co-exist while we
+# debug stuck-cleanup state.
+socket_path = "/tmp/onyx-storage-phase23-soak.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30

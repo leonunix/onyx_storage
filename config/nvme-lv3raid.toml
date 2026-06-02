@@ -1,0 +1,118 @@
+# Session profile 2026-05-28: LV3 backend-drain investigation.
+#
+# Layout for this session (post-reboot, array recreated 05:15):
+#   /dev/nvme1n1            -> XFS, mounted /mnt/onyx-meta (metadb)
+#   /dev/md/onyx-lv2_0 (md127, nvme0+5+7+9) -> LV2 write buffer RAID0
+#   /dev/md/onyx-lv3   (md126, nvme4+6+8)    -> LV3 data device RAID0
+#
+# Derived from config/nvme-detailed.toml with ONLY the two device paths
+# changed (data_device + buffer.device). Everything else is the production
+# profile so the baseline reflects what we actually ship (dedup ON).
+
+[meta]
+path = "/mnt/onyx-meta/metadb"
+wal_dir = "/mnt/onyx-meta/wal"
+block_cache_mb = 65536
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 5000
+group_commit_timeout_us = 1
+dedup_shards = 8
+dedup_cuckoo_buckets = 64000000
+dedup_l1_cache_entries = 256000
+l2p_buffer_enabled = true
+commit_direct_apply_enabled = true
+# ZFS-TXG-clone Phase 4/5: background quiesce+sync threads + per-syncing-slot
+# drain. Decouples buffer-ring reclaim from the inline checkpoint.
+txg_threads_enabled = true
+# Parallel per-TXG L2P drain UNDER TEST (v2: workers unbind the inherited
+# single-CPU txg-sync pin so they spread across cores, ZFS dp_sync_taskq-style).
+# v1 spawn-per-cycle-pinned was a 3-4× regression. Code default stays false.
+parallel_l2p_drain_enabled = true
+
+[storage]
+data_device = "/dev/md/onyx-lv3"
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 16
+
+[buffer]
+device = "/dev/md/onyx-lv2_0"
+capacity_mb = 1048576
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+shards = 16
+max_memory_mb = 32768
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+
+[dedup]
+enabled = true
+workers = 2
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 0
+rescan_interval_ms = 30000
+max_rescan_per_cycle = 4096
+cold_tail_max_per_cycle = 4096
+
+[threading]
+enabled = true
+ublk_cpus = "0-31"
+read_pool_cpus = "32-47"
+buffer_sync_cpus = "48-55"
+flusher_coalesce_cpus = "56-63"
+flusher_dedup_cpus = "64-79"
+flusher_compress_cpus = "80-87"
+flusher_writer_cpus = "88-91"
+flusher_cleanup_cpus = "92-95"
+metadb_wal_cpus = "92"
+metadb_l2p_apply_cpus = "64-79"
+metadb_refcount_apply_cpus = "88-91"
+metadb_dedup_apply_cpus = "88-91"
+metadb_checkpoint_cpus = "93-95"
+# TxgSync/TxgQuiesce background workers (threads-on). Pinned to the
+# housekeeping cores where the inline checkpoint ran in threads-off, so
+# the heavy write_dirty_pages sync never floats onto the hot ublk cores.
+metadb_l2p_compactor_cpus = "93-95"
+background_cpus = "92-95"
+
+[service]
+socket_path = "/tmp/onyx-storage-nvme.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30
