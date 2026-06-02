@@ -1200,3 +1200,140 @@ fn no_blockmap_overlap_after_packed_slot_recycling() {
         }
     }
 }
+
+// ---------- Adaptive reclaim heat-map (Stage A, observe-only) ----------
+
+use onyx_storage::gc::heatmap::HeatMap;
+use onyx_storage::gc::runner::GcRunner;
+use onyx_storage::metrics::EngineMetrics;
+
+/// Put a live blockmap mapping (helper for the heat tests).
+fn put_live(meta: &MetaStore, vol: &VolumeId, lba: u64, pba: u64) {
+    let bv = BlockmapValue {
+        pba: Pba(pba),
+        compression: 0,
+        unit_compressed_size: 4096,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0,
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.put_mapping(vol, Lba(lba), &bv).unwrap();
+}
+
+/// The background refresh walks live L2P and accumulates per-region counts; a
+/// completed sweep advances the epoch. End-to-end through the real GcRunner.
+#[test]
+fn heat_refresh_counts_live_mappings_and_advances_epoch() {
+    let env = setup_gc_env();
+    let vol = VolumeId("heat-vol".into());
+    register_volume(&env.meta, "heat-vol", CompressionAlgo::None, 1);
+    env.meta.create_blockmap_cf("heat-vol").unwrap();
+
+    // Three LBAs share heat bucket for PBA ~100; one LBA lands far away.
+    put_live(&env.meta, &vol, 0, 100);
+    put_live(&env.meta, &vol, 1, 101);
+    put_live(&env.meta, &vol, 2, 102);
+    put_live(&env.meta, &vol, 10, 5000);
+
+    let metrics = Arc::new(EngineMetrics::default());
+    let bucket_blocks = 64;
+    let heat = HeatMap::new(env.allocator.total_block_count(), bucket_blocks);
+    let cfg = GcConfig {
+        enabled: false, // only reclaim + heat refresh run, no rewrite scan
+        scan_interval_ms: 30,
+        heat_enabled: true,
+        heat_bucket_size_blocks: bucket_blocks,
+        heat_refresh_max_lbas_per_cycle: 1000, // one full sweep of the 1000-LBA volume per cycle
+        ..Default::default()
+    };
+    let mut gc = GcRunner::start_with_metrics(
+        metrics.clone(),
+        env.meta.clone(),
+        env.io_engine.clone(),
+        env.pool.clone(),
+        env.lifecycle.clone(),
+        env.allocator.clone(),
+        heat.clone(),
+        cfg,
+    );
+
+    // ~8 cycles at 30 ms; wait for at least one completed sweep.
+    let mut sweeps = 0;
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(20));
+        sweeps = metrics.heat_sweeps_completed.load(std::sync::atomic::Ordering::Relaxed);
+        if sweeps >= 1 {
+            break;
+        }
+    }
+    gc.stop();
+
+    assert!(sweeps >= 1, "expected >=1 completed sweep, got {sweeps}");
+    assert!(
+        metrics.heat_bumps.load(std::sync::atomic::Ordering::Relaxed) >= 4,
+        "expected >=4 region bumps for 4 live mappings"
+    );
+    let summary = heat.summary();
+    assert!(
+        summary.nonzero_buckets >= 2,
+        "expected the two distinct PBA regions to be counted, got {}",
+        summary.nonzero_buckets
+    );
+    assert!(summary.current_epoch >= 2, "epoch should advance past the initial 1");
+    // The bucket covering PBA 100..102 saw the three live mappings. Bounded
+    // 1..=3 (a stop caught mid-sweep may show a partial count) — the key point
+    // is it is counted and never accumulates past one sweep's worth (the 300×
+    // runaway the per-sweep epoch advance fixes). Exact reset arithmetic is
+    // covered by the heatmap unit tests.
+    let c100 = heat.region(Pba(100)).1;
+    assert!((1..=3).contains(&c100), "PBA 100 region count {c100} out of 1..=3");
+    let c5000 = heat.region(Pba(5000)).1;
+    assert!((1..=1).contains(&c5000), "PBA 5000 region count {c5000} out of 1..=1");
+    // A region with no live mapping was never scanned to a non-zero count.
+    assert_eq!(heat.region(Pba(9000)).1, 0);
+}
+
+/// With the refresh budget at 0 the heat map stays untouched and no heat
+/// metrics move — the Stage-A observe-only / disabled no-op guarantee.
+#[test]
+fn heat_refresh_budget_zero_is_noop() {
+    let env = setup_gc_env();
+    let vol = VolumeId("heat-noop".into());
+    register_volume(&env.meta, "heat-noop", CompressionAlgo::None, 1);
+    env.meta.create_blockmap_cf("heat-noop").unwrap();
+    put_live(&env.meta, &vol, 0, 100);
+    put_live(&env.meta, &vol, 1, 101);
+
+    let metrics = Arc::new(EngineMetrics::default());
+    let heat = HeatMap::new(env.allocator.total_block_count(), 64);
+    let cfg = GcConfig {
+        enabled: false,
+        scan_interval_ms: 20,
+        heat_enabled: true,
+        heat_bucket_size_blocks: 64,
+        heat_refresh_max_lbas_per_cycle: 0, // disabled — gate skips the step
+        ..Default::default()
+    };
+    let mut gc = GcRunner::start_with_metrics(
+        metrics.clone(),
+        env.meta.clone(),
+        env.io_engine.clone(),
+        env.pool.clone(),
+        env.lifecycle.clone(),
+        env.allocator.clone(),
+        heat.clone(),
+        cfg,
+    );
+    thread::sleep(Duration::from_millis(120)); // several cycles
+    gc.stop();
+
+    use std::sync::atomic::Ordering;
+    assert_eq!(metrics.heat_refresh_cycles.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.heat_bumps.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.heat_sweeps_completed.load(Ordering::Relaxed), 0);
+    assert_eq!(heat.summary().nonzero_buckets, 0);
+    assert_eq!(heat.current_epoch(), 1); // unchanged
+}

@@ -7,6 +7,7 @@ use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::runner::GcRunner;
+use crate::gc::HeatMap;
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
@@ -66,6 +67,10 @@ pub struct OnyxEngine {
     live_handles: Mutex<Vec<(String, VolumeAliveFlag)>>,
     lifecycle: Arc<VolumeLifecycleManager>,
     metrics: Arc<EngineMetrics>,
+    /// Adaptive reclaim heat map (observe-only, Stage A). Shared with the GC
+    /// runner (writer) and read by the status path. `None` in standby /
+    /// meta-only mode or when the heat refresh is disabled.
+    heat: Option<HeatMap>,
     generation_clock: AtomicU64,
     config: OnyxConfig,
     shutdown_done: Mutex<bool>,
@@ -651,6 +656,10 @@ impl OnyxEngine {
 
         // 10. GC runner (after flusher). It always runs the physical
         // retired-PBA reclaimer; `gc.enabled` only gates rewrite scanning.
+        // Build the adaptive-reclaim heat map first so the runner can refresh
+        // it (observe-only in Stage A). When disabled, hand the runner a
+        // minimal 1-bucket map (allocates nothing; the refresh is gated off).
+        let heat = build_heat_map(&config.gc, &allocator);
         let gc_runner = Some(GcRunner::start_with_metrics(
             metrics.clone(),
             meta.clone(),
@@ -658,8 +667,10 @@ impl OnyxEngine {
             buffer_pool.clone(),
             lifecycle.clone(),
             allocator.clone(),
+            heat.clone(),
             config.gc.clone(),
         ));
+        let heat = config.gc.heat_enabled.then_some(heat);
 
         // 11. Heartbeat writer (after all other subsystems)
         let heartbeat_writer = if config.ha.enabled {
@@ -713,6 +724,7 @@ impl OnyxEngine {
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
             metrics,
+            heat,
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
@@ -747,6 +759,7 @@ impl OnyxEngine {
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
             metrics,
+            heat: None,
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
@@ -1145,6 +1158,7 @@ impl OnyxEngine {
 
         // GC runner. It always runs the physical retired-PBA reclaimer;
         // `gc.enabled` only gates rewrite scanning.
+        let heat = build_heat_map(&config.gc, &allocator);
         let gc_runner = Some(GcRunner::start_with_metrics(
             metrics.clone(),
             meta.clone(),
@@ -1152,8 +1166,10 @@ impl OnyxEngine {
             buffer_pool.clone(),
             lifecycle.clone(),
             allocator.clone(),
+            heat.clone(),
             config.gc.clone(),
         ));
+        let heat = config.gc.heat_enabled.then_some(heat);
 
         // Heartbeat writer
         let heartbeat_writer = if config.ha.enabled {
@@ -1200,6 +1216,7 @@ impl OnyxEngine {
             live_handles: Mutex::new(Vec::new()),
             lifecycle,
             metrics,
+            heat,
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
@@ -1298,6 +1315,7 @@ impl OnyxEngine {
                 .allocator
                 .as_ref()
                 .map(|alloc| alloc.total_block_count()),
+            heat: self.heat.as_ref().map(|h| h.summary()),
             metrics: self.metrics.snapshot(),
         })
     }
@@ -1311,4 +1329,23 @@ impl Drop for OnyxEngine {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
+}
+
+/// Build the adaptive-reclaim heat map for the GC runner. When the refresh is
+/// disabled we still hand the runner a valid handle, but size it to a single
+/// bucket so it allocates essentially nothing (the refresh step is gated off at
+/// runtime, and the engine stores `None` so status reports no heat section).
+fn build_heat_map(gc: &crate::gc::config::GcConfig, allocator: &Arc<SpaceAllocator>) -> HeatMap {
+    if !gc.heat_enabled {
+        return HeatMap::new(0, gc.heat_bucket_size_blocks);
+    }
+    let hm = HeatMap::new(allocator.total_block_count(), gc.heat_bucket_size_blocks);
+    tracing::info!(
+        buckets = hm.n_buckets(),
+        memory_mib = hm.memory_bytes() / (1024 * 1024),
+        bucket_blocks = hm.bucket_size_blocks(),
+        total_pbas = hm.total_pbas(),
+        "heat map: adaptive-reclaim refresh enabled (observe-only)"
+    );
+    hm
 }

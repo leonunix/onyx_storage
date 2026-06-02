@@ -453,6 +453,15 @@ pub struct EngineMetrics {
     /// surface, drained by `LineageFreedPbaDrainHandle`. Counts blocks
     /// (not PBAs) so it stays comparable with `gc_blocks_rewritten`.
     pub gc_lineage_freed_blocks: AtomicU64,
+    /// Adaptive reclaim heat map (observe-only, Stage A). `heat_refresh_cycles`
+    /// = GC cycles that ran a heat-refresh step; `heat_refresh_lbas_scanned` =
+    /// live blockmap entries walked (≈ budget × cycles, the "no silent
+    /// truncation" signal); `heat_bumps` = per-PBA region increments;
+    /// `heat_sweeps_completed` = full sweeps over the volume set (epoch ticks).
+    pub heat_refresh_cycles: AtomicU64,
+    pub heat_refresh_lbas_scanned: AtomicU64,
+    pub heat_bumps: AtomicU64,
+    pub heat_sweeps_completed: AtomicU64,
     pub dedup_rescan_cycles: AtomicU64,
     pub dedup_rescan_skipped_cycles: AtomicU64,
     pub dedup_rescan_blocks: AtomicU64,

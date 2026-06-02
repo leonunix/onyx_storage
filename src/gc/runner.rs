@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -7,6 +8,7 @@ use arc_swap::ArcSwap;
 
 use crate::buffer::pool::WriteBufferPool;
 use crate::gc::config::GcConfig;
+use crate::gc::heatmap::HeatMap;
 use crate::gc::rewriter::rewrite_candidate;
 use crate::gc::scanner::scan_gc_candidates;
 use crate::io::engine::IoEngine;
@@ -15,6 +17,7 @@ use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
+use crate::types::{Lba, BLOCK_SIZE};
 
 const MAX_RETIRED_RECLAIM_PER_CYCLE: usize = 4096;
 
@@ -26,12 +29,14 @@ pub struct GcRunner {
 }
 
 impl GcRunner {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         meta: Arc<MetaStore>,
         io_engine: Arc<IoEngine>,
         buffer_pool: Arc<WriteBufferPool>,
         lifecycle: Arc<VolumeLifecycleManager>,
         allocator: Arc<SpaceAllocator>,
+        heat: HeatMap,
         config: GcConfig,
     ) -> Self {
         Self::start_with_metrics(
@@ -41,10 +46,12 @@ impl GcRunner {
             buffer_pool,
             lifecycle,
             allocator,
+            heat,
             config,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_metrics(
         metrics: Arc<EngineMetrics>,
         meta: Arc<MetaStore>,
@@ -52,6 +59,7 @@ impl GcRunner {
         buffer_pool: Arc<WriteBufferPool>,
         lifecycle: Arc<VolumeLifecycleManager>,
         allocator: Arc<SpaceAllocator>,
+        heat: HeatMap,
         config: GcConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -70,6 +78,7 @@ impl GcRunner {
                     &buffer_pool,
                     &lifecycle,
                     &allocator,
+                    &heat,
                     &config_clone,
                     &running_clone,
                 );
@@ -111,6 +120,7 @@ impl GcRunner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gc_loop(
         metrics: &EngineMetrics,
         meta: &MetaStore,
@@ -118,10 +128,12 @@ impl GcRunner {
         buffer_pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
+        heat: &HeatMap,
         config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
     ) {
         let mut paused = false;
+        let mut heat_cursor = HeatCursor::default();
 
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
@@ -140,6 +152,22 @@ impl GcRunner {
                 MAX_RETIRED_RECLAIM_PER_CYCLE,
                 running,
             );
+
+            // Standing background heat-map refresh (observe-only, Stage A):
+            // a bounded, lock-free-per-chunk slow scan that accumulates a
+            // per-PBA-region live-mapping count. Runs even when rewrite GC is
+            // disabled and even when reclaim found nothing — it is decoupled
+            // from reclaim having work. Front-end IO never pays for it.
+            if cfg.heat_enabled && cfg.heat_refresh_max_lbas_per_cycle > 0 {
+                Self::heat_refresh_step(
+                    heat,
+                    metrics,
+                    meta,
+                    &mut heat_cursor,
+                    cfg.heat_refresh_max_lbas_per_cycle,
+                    running,
+                );
+            }
 
             if !cfg.enabled {
                 continue;
@@ -344,6 +372,143 @@ impl GcRunner {
         reclaimed
     }
 
+    /// Background heat-map refresh step (observe-only, Stage A). Walks up to
+    /// `budget` live blockmap entries this cycle, round-robin across the volume
+    /// set, bumping the covering PBA region for each physical block. When the
+    /// per-cycle budgets have together covered the volume set's total LBA span
+    /// (one full sweep), advances the heat epoch.
+    ///
+    /// Cost model: pure metadb decode + atomic bump, **no LV3 reads** — cheaper
+    /// than the dedup cold-tail pass. Bounded per cycle, honors `running`, and
+    /// holds no lock across the walk (`scan_blockmap_range` chunks internally).
+    fn heat_refresh_step(
+        heat: &HeatMap,
+        metrics: &EngineMetrics,
+        meta: &MetaStore,
+        cursor: &mut HeatCursor,
+        budget: u64,
+        running: &AtomicBool,
+    ) {
+        if budget == 0 {
+            return;
+        }
+        let volumes = match meta.list_volumes() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "heat refresh: list_volumes failed");
+                return;
+            }
+        };
+        if volumes.is_empty() {
+            return;
+        }
+
+        // A "sweep" is `target` LBAs worth of walking — the total live LBA span
+        // across the current volume set. Recomputed each call so mid-sweep
+        // create/drop degrades gracefully (this is a prior, not exact
+        // accounting). The odometer (`sweep_lbas_done`) persists across calls.
+        let target: u64 = volumes
+            .iter()
+            .map(|v| v.size_bytes / u64::from(v.block_size.max(1)))
+            .sum();
+        if target == 0 {
+            return;
+        }
+        // Drop cursor state for volumes that no longer exist.
+        let live: HashSet<&str> = volumes.iter().map(|v| v.id.0.as_str()).collect();
+        cursor.per_vol.retain(|k, _| live.contains(k.as_str()));
+
+        metrics.heat_refresh_cycles.fetch_add(1, Ordering::Relaxed);
+
+        // Walk at most one full sweep's worth of LBAs per cycle. When the
+        // budget exceeds the whole volume set (small datasets), re-lapping the
+        // same live mappings many times in one cycle is pure waste and would
+        // hammer metadb read locks, starving the flusher/rewriter. In
+        // production `target` (billions of LBAs) dwarfs the budget, so this cap
+        // is inert and a sweep spans many cycles.
+        let mut remaining = budget.min(target);
+        let mut scanned_total = 0u64;
+        let mut bumps_total = 0u64;
+        let mut consecutive_empty = 0usize;
+        while remaining > 0 && running.load(Ordering::Relaxed) {
+            let vol = volumes[cursor.vol_idx % volumes.len()].clone();
+            let total_lbas = vol.size_bytes / u64::from(vol.block_size.max(1));
+            if total_lbas == 0 {
+                cursor.vol_idx = cursor.vol_idx.wrapping_add(1);
+                consecutive_empty += 1;
+                if consecutive_empty >= volumes.len() {
+                    break; // every volume empty this cycle
+                }
+                continue;
+            }
+            consecutive_empty = 0;
+
+            // Pick this cycle's contiguous physical range from the per-volume
+            // lap (random phase, linear advance, wrap, re-randomize — mirrors
+            // the dedup cold-tail cursor so coverage order varies run-to-run).
+            let (phys_start, chunk) = {
+                let lap = cursor.per_vol.entry(vol.id.0.clone()).or_insert_with(|| {
+                    let mut rng = heat_lap_seed(&vol.id.0);
+                    let lap_start = splitmix64(&mut rng) % total_lbas;
+                    HeatLap {
+                        lap_start,
+                        scanned_in_lap: 0,
+                        rng,
+                    }
+                });
+                if lap.scanned_in_lap >= total_lbas {
+                    lap.lap_start = splitmix64(&mut lap.rng) % total_lbas;
+                    lap.scanned_in_lap = 0;
+                }
+                let phys_start = (lap.lap_start + lap.scanned_in_lap) % total_lbas;
+                let lap_remaining = total_lbas - lap.scanned_in_lap;
+                let chunk = remaining.min(lap_remaining).min(total_lbas - phys_start);
+                lap.scanned_in_lap += chunk;
+                (phys_start, chunk)
+            };
+            cursor.vol_idx = cursor.vol_idx.wrapping_add(1);
+            if chunk == 0 {
+                continue;
+            }
+
+            let mut bumps = 0u64;
+            let scan = meta.scan_blockmap_range(&vol.id, Lba(phys_start), chunk, &mut |_lba, value| {
+                if value.is_zero() {
+                    return;
+                }
+                for pba in value.physical_pbas(BLOCK_SIZE) {
+                    heat.bump(pba);
+                    bumps += 1;
+                }
+            });
+            if let Err(e) = scan {
+                tracing::debug!(vol = %vol.id.0, error = %e, "heat refresh: scan_blockmap_range failed");
+                // Still advance the odometer below so a flaky volume cannot
+                // wedge the sweep from ever completing.
+            }
+            remaining = remaining.saturating_sub(chunk);
+            scanned_total += chunk;
+            bumps_total += bumps;
+            cursor.sweep_lbas_done += chunk;
+
+            // A full sweep's worth of LBAs has been walked: publish it by
+            // advancing the epoch (which makes the next pass self-reset each
+            // bucket on first touch). Done *inside* the loop so a budget larger
+            // than the volume set still produces one epoch per sweep instead of
+            // accumulating counts across laps.
+            while cursor.sweep_lbas_done >= target {
+                heat.advance_epoch();
+                metrics.heat_sweeps_completed.fetch_add(1, Ordering::Relaxed);
+                cursor.sweep_lbas_done -= target;
+            }
+        }
+
+        metrics
+            .heat_refresh_lbas_scanned
+            .fetch_add(scanned_total, Ordering::Relaxed);
+        metrics.heat_bumps.fetch_add(bumps_total, Ordering::Relaxed);
+    }
+
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
@@ -356,4 +521,55 @@ impl Drop for GcRunner {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Per-volume lap state for the heat refresh (mirrors the dedup scanner's
+/// `ColdTailCursor`): a lap is one full pass over the volume's LBA space,
+/// starting at a random phase and advancing linearly, wrapping, then
+/// re-randomizing — so coverage order varies run-to-run instead of always
+/// sweeping `0..N`.
+#[derive(Debug, Clone, Copy)]
+struct HeatLap {
+    lap_start: u64,
+    scanned_in_lap: u64,
+    rng: u64,
+}
+
+/// Global cross-volume cursor + sweep odometer for the heat refresh. Lives on
+/// the GC thread stack (single-writer), so the heat-map epoch tick and all
+/// bumps are serialized.
+#[derive(Default)]
+struct HeatCursor {
+    per_vol: HashMap<String, HeatLap>,
+    vol_idx: usize,
+    /// LBAs walked toward the current sweep; laps the sweep `target` each time
+    /// it reaches it (carrying the remainder).
+    sweep_lbas_done: u64,
+}
+
+/// splitmix64: a tiny, self-contained PRNG. The heat lap phase only needs
+/// decorrelated coverage order, not crypto strength. (Kept local rather than
+/// shared with the dedup scanner's private copy.)
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Seed a per-volume PRNG from wall-clock time mixed with the volume id
+/// (FNV-1a), so different volumes and different process runs pick different
+/// lap phases.
+fn heat_lap_seed(vol_id: &str) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in vol_id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    nanos ^ h
 }

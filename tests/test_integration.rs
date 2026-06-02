@@ -2006,6 +2006,7 @@ fn prove_background_gc_runner_reclaims_old_units() {
             buffer_usage_max_pct: 90,
             buffer_usage_resume_pct: 50,
             max_rewrite_per_cycle: 64,
+            ..Default::default()
         },
         onyx_storage::dedup::config::DedupConfig {
             enabled: false,

@@ -3,6 +3,7 @@ use std::fmt::Write;
 use serde::Serialize;
 
 use super::{BufferShardSnapshot, EngineMetricsSnapshot, MetaMemorySnapshot};
+use crate::gc::heatmap::HeatSummary;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EngineStatusSnapshot {
@@ -19,6 +20,9 @@ pub struct EngineStatusSnapshot {
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
     pub allocator_total_blocks: Option<u64>,
+    /// Adaptive reclaim heat-map summary (None when the map is disabled or in
+    /// standby). Observe-only in Stage A.
+    pub heat: Option<HeatSummary>,
     pub metrics: EngineMetricsSnapshot,
 }
 
@@ -809,6 +813,22 @@ impl EngineStatusSnapshot {
             self.metrics.gc_retired_blocks_reclaimed,
             self.metrics.gc_errors
         );
+        if let Some(h) = &self.heat {
+            let _ = writeln!(
+                out,
+                "heat: buckets={} nonzero={} never_scanned={} epoch={} max_count={} bucket_blocks={} refresh_cycles={} lbas_scanned={} bumps={} sweeps={}",
+                h.n_buckets,
+                h.nonzero_buckets,
+                h.never_scanned_buckets,
+                h.current_epoch,
+                h.max_count,
+                h.bucket_size_blocks,
+                self.metrics.heat_refresh_cycles,
+                self.metrics.heat_refresh_lbas_scanned,
+                self.metrics.heat_bumps,
+                self.metrics.heat_sweeps_completed
+            );
+        }
         let _ = writeln!(
             out,
             "discard: ops={} lbas={} blocks_freed={}",
