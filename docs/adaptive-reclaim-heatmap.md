@@ -1,8 +1,12 @@
 # Adaptive reclaim + background heat-map refcount
 
-Status: **design / not implemented.** Foundation landed: batched retired-extent
-reclaim scan (`0c792a9 gc: batch retired-extent reclaim scan`). This doc is the
-next step on top of it.
+Status: **Stage A + Stage B landed** (observe-only heat map + reclaim consumes it,
+default-OFF). Foundation: batched retired-extent reclaim scan (`0c792a9`). Stage A
+= the observe-only heat histogram (`1c1f980`), proven on nvme-box (converges, zero
+front-end cost). Stage B = reclaim *consumes* the map to defer the confirm scan of
+hot regions (`heat_reclaim_enabled`, default false). Remaining: Stage B2 (adaptive
+*refresh* cadence — scan hot regions less), Stage 4 (decouple refresh / fold
+cold-tail), Stage 5 (optional exact per-PBA tier).
 
 > **Guiding principle.** Dedup is a feature that *earns* space and speed — it must
 > never become a write-path tax. All of dedup's accounting and reclaim stays **off
@@ -142,10 +146,18 @@ skipped counts are the "no silent truncation" signal.
 ## Phasing
 
 1. **(landed)** Batch the reclaim scan — `0c792a9`.
-2. Heat histogram built during the reclaim scan + surfaced in status/metrics
-   (observe-only; no behavior change). Proves the model converges and is cheap.
-3. Adaptive cadence: use the heat map to make the scan partial (skip hot regions,
-   prioritize cold), with the staleness-floor.
+2. **(landed — Stage A, `1c1f980`)** Heat histogram, built by a *standing decoupled*
+   background refresh (not piggybacked on the conditional/early-exiting reclaim scan)
+   + surfaced in status/metrics (observe-only; no behavior change). Proven on nvme-box:
+   converges, ~167 MiB for a 21 TiB device, zero measurable front-end cost.
+3. **(landed — Stage B)** Reclaim *consumes* the heat map: defer the confirm scan of a
+   retired rc==0 extent whose whole region is hot+fresh (stays retired, re-presented
+   later); skip the all-volume scan entirely when every survivor is deferred. Guarded
+   by a periodic force-confirm pass so nothing is starved. `heat_reclaim_enabled`
+   default-OFF; free decision bit-for-bit unchanged (heat only changes *whether* we
+   scan). **Deferred: Stage B2** = adaptive *refresh* cadence (scan hot regions less /
+   cold more) — needs the staleness-floor applied to the refresh, so it is split out
+   to keep the uniform-refresh staleness model simple here.
 4. Decouple refresh from reclaim; fold dedup cold-tail into the same pass.
 5. (optional) exact per-PBA count tier if a true O(1) `count==0` reclaim oracle is
    wanted over confirm-by-scan.

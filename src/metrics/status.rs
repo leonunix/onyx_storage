@@ -816,7 +816,7 @@ impl EngineStatusSnapshot {
         if let Some(h) = &self.heat {
             let _ = writeln!(
                 out,
-                "heat: buckets={} nonzero={} never_scanned={} epoch={} max_count={} bucket_blocks={} refresh_cycles={} lbas_scanned={} bumps={} sweeps={}",
+                "heat: buckets={} nonzero={} never_scanned={} epoch={} max_count={} bucket_blocks={} refresh_cycles={} lbas_scanned={} bumps={} sweeps={} reclaim_deferred={} reclaim_confirmed={} scans_skipped={} force_confirm={}",
                 h.n_buckets,
                 h.nonzero_buckets,
                 h.never_scanned_buckets,
@@ -826,7 +826,11 @@ impl EngineStatusSnapshot {
                 self.metrics.heat_refresh_cycles,
                 self.metrics.heat_refresh_lbas_scanned,
                 self.metrics.heat_bumps,
-                self.metrics.heat_sweeps_completed
+                self.metrics.heat_sweeps_completed,
+                self.metrics.gc_heat_deferred_extents,
+                self.metrics.gc_heat_confirmed_extents,
+                self.metrics.gc_heat_scans_skipped,
+                self.metrics.gc_heat_force_confirm_passes
             );
         }
         let _ = writeln!(

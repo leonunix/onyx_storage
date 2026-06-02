@@ -462,6 +462,19 @@ pub struct EngineMetrics {
     pub heat_refresh_lbas_scanned: AtomicU64,
     pub heat_bumps: AtomicU64,
     pub heat_sweeps_completed: AtomicU64,
+    /// Stage-B reclaim consumption of the heat map (only move when
+    /// `heat_reclaim_enabled`). `gc_heat_deferred_extents` = retired rc==0
+    /// extents whose hot+fresh region let reclaim skip the confirm scan this
+    /// cycle (stay retired, re-presented later); `gc_heat_confirmed_extents` =
+    /// extents sent to the confirm scan; `gc_heat_scans_skipped` = cycles where
+    /// every survivor was deferred so the whole all-volume scan was skipped
+    /// (the headline win); `gc_heat_force_confirm_passes` = periodic
+    /// belt-and-suspenders cycles that confirmed all survivors regardless of
+    /// heat.
+    pub gc_heat_deferred_extents: AtomicU64,
+    pub gc_heat_confirmed_extents: AtomicU64,
+    pub gc_heat_scans_skipped: AtomicU64,
+    pub gc_heat_force_confirm_passes: AtomicU64,
     pub dedup_rescan_cycles: AtomicU64,
     pub dedup_rescan_skipped_cycles: AtomicU64,
     pub dedup_rescan_blocks: AtomicU64,

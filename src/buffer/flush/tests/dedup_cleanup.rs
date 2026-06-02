@@ -315,6 +315,7 @@ fn retired_reclaimer_skips_allocator_free_when_live_blockmap_ref_remains() {
             &allocator,
             16,
             &AtomicBool::new(true),
+            None,
         ),
         0,
         "GC must refuse to reclaim while blockmap still references the PBA"
@@ -367,6 +368,7 @@ fn retired_reclaimer_batches_one_scan_and_frees_only_unreferenced() {
         &allocator,
         64,
         &AtomicBool::new(true),
+        None,
     );
 
     assert_eq!(reclaimed, 1, "only the unreferenced rc==0 extent is reclaimed");
@@ -547,5 +549,109 @@ fn dedup_worker_batches_hits_across_units() {
         2,
         "setup: put_dedup_entries (set_refcount now routes via lifecycle journal, \
          not commit_ops); the 8 hits should share one commit"
+    );
+}
+
+// ---------- Stage-B: reclaim consumes the heat map ----------
+
+/// A retired rc==0 extent whose region the heat map marks hot+fresh is
+/// DEFERRED — the confirm scan is skipped entirely this cycle and the extent
+/// stays retired. A later force-confirm cycle reclaims it regardless of heat.
+#[test]
+fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    // An unreferenced rc==0 retired PBA that reclaim would normally free.
+    let free_pba = allocator.allocate_one_for_lane(0).unwrap();
+    meta.set_refcount(free_pba, 0).unwrap();
+    allocator.retire_one(free_pba).unwrap();
+
+    // Mark its region hot+fresh (epoch 1, count 1, age 0).
+    let heat = crate::gc::HeatMap::new(allocator.total_block_count(), 64);
+    heat.bump(free_pba);
+
+    let scans_before = metrics.gc_reclaim_blockmap_scans.load(Relaxed);
+    let ctx = crate::gc::runner::HeatReclaimCtx {
+        heat: &heat,
+        fresh_max_age: 1,
+        force_confirm_interval: 1000, // not a forced cycle
+        cycle: 1,
+    };
+    let reclaimed = crate::gc::runner::GcRunner::reclaim_retired_extents(
+        &metrics,
+        &meta,
+        &allocator,
+        64,
+        &AtomicBool::new(true),
+        Some(ctx),
+    );
+    assert_eq!(reclaimed, 0, "hot+fresh region defers reclaim");
+    assert!(allocator.is_retired(free_pba), "deferred extent stays retired");
+    assert!(!allocator.is_free(free_pba), "deferred extent not freed");
+    assert_eq!(metrics.gc_heat_deferred_extents.load(Relaxed), 1);
+    assert_eq!(metrics.gc_heat_scans_skipped.load(Relaxed), 1);
+    assert_eq!(
+        metrics.gc_reclaim_blockmap_scans.load(Relaxed),
+        scans_before,
+        "no confirm scan ran while everything was deferred"
+    );
+
+    // A force-confirm cycle (cycle % interval == 0) confirms regardless of heat.
+    let ctx2 = crate::gc::runner::HeatReclaimCtx {
+        heat: &heat,
+        fresh_max_age: 1,
+        force_confirm_interval: 4,
+        cycle: 4,
+    };
+    let reclaimed2 = crate::gc::runner::GcRunner::reclaim_retired_extents(
+        &metrics,
+        &meta,
+        &allocator,
+        64,
+        &AtomicBool::new(true),
+        Some(ctx2),
+    );
+    assert_eq!(reclaimed2, 1, "force-confirm cycle reclaims the deferred extent");
+    assert!(allocator.is_free(free_pba), "force-confirmed extent returned to allocator");
+    assert_eq!(metrics.gc_heat_force_confirm_passes.load(Relaxed), 1);
+}
+
+/// A retired rc==0 extent in a COLD (never-counted) region is not deferred:
+/// reclaim confirms-by-scan and frees it, exactly as with heat off.
+#[test]
+fn heat_cold_region_confirms_and_frees() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    let free_pba = allocator.allocate_one_for_lane(0).unwrap();
+    meta.set_refcount(free_pba, 0).unwrap();
+    allocator.retire_one(free_pba).unwrap();
+
+    // Heat map present but the covering bucket was never scanned (cold).
+    let heat = crate::gc::HeatMap::new(allocator.total_block_count(), 64);
+    let ctx = crate::gc::runner::HeatReclaimCtx {
+        heat: &heat,
+        fresh_max_age: 1,
+        force_confirm_interval: 1000,
+        cycle: 1,
+    };
+    let reclaimed = crate::gc::runner::GcRunner::reclaim_retired_extents(
+        &metrics,
+        &meta,
+        &allocator,
+        64,
+        &AtomicBool::new(true),
+        Some(ctx),
+    );
+    assert_eq!(reclaimed, 1, "cold region is confirmed and freed");
+    assert!(allocator.is_free(free_pba));
+    assert_eq!(metrics.gc_heat_deferred_extents.load(Relaxed), 0);
+    assert_eq!(metrics.gc_heat_confirmed_extents.load(Relaxed), 1);
+    assert!(
+        metrics.gc_reclaim_blockmap_scans.load(Relaxed) >= 1,
+        "confirm scan ran for the cold extent"
     );
 }

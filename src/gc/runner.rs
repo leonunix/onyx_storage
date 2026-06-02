@@ -143,7 +143,21 @@ impl GcRunner {
                 break;
             }
 
-            metrics.gc_cycles.fetch_add(1, Ordering::Relaxed);
+            let cycle = metrics.gc_cycles.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Stage-B: reclaim consumes the heat map only when both the refresh
+            // (so the map is real + current) and the consumption flag are on.
+            // Default-OFF — behavior is identical to today until flipped.
+            let heat_ctx = if cfg.heat_enabled && cfg.heat_reclaim_enabled {
+                Some(HeatReclaimCtx {
+                    heat,
+                    fresh_max_age: cfg.heat_fresh_max_age,
+                    force_confirm_interval: cfg.heat_force_confirm_interval_cycles,
+                    cycle,
+                })
+            } else {
+                None
+            };
 
             Self::reclaim_retired_extents(
                 metrics,
@@ -151,6 +165,7 @@ impl GcRunner {
                 allocator,
                 MAX_RETIRED_RECLAIM_PER_CYCLE,
                 running,
+                heat_ctx,
             );
 
             // Standing background heat-map refresh (observe-only, Stage A):
@@ -279,6 +294,7 @@ impl GcRunner {
         allocator: &SpaceAllocator,
         limit: usize,
         running: &AtomicBool,
+        heat_ctx: Option<HeatReclaimCtx<'_>>,
     ) -> usize {
         let candidates = allocator.retired_candidates(limit);
         if candidates.is_empty() {
@@ -314,6 +330,60 @@ impl GcRunner {
         }
         if survivors.is_empty() {
             return 0;
+        }
+
+        // Stage-B heat pre-filter (between Gate 1 and Gate 2): when reclaim
+        // consumes the heat map, defer the confirm scan of any survivor whose
+        // whole region still looks hot+fresh — it is very likely still
+        // referenced, so a confirm scan would only say "referenced". Deferring
+        // = simply not reclaiming it this cycle; it stays in the allocator's
+        // retired set and is re-presented next cycle. The free decision is
+        // unchanged (a block is still freed iff the confirm scan says no live
+        // ref AND the rc/retire gate allows it) — heat only changes *whether we
+        // bother to scan*, so staleness can only ever delay reclaim.
+        let survivors = if let Some(ctx) = &heat_ctx {
+            let forced = ctx.force_confirm_interval != 0
+                && ctx.cycle % ctx.force_confirm_interval == 0;
+            if forced {
+                // Periodic belt-and-suspenders: confirm everything regardless
+                // of heat so no deferred extent is starved.
+                metrics
+                    .gc_heat_force_confirm_passes
+                    .fetch_add(1, Ordering::Relaxed);
+                survivors
+            } else {
+                let mut to_confirm = Vec::with_capacity(survivors.len());
+                let mut deferred = 0u64;
+                for e in survivors {
+                    if ctx
+                        .heat
+                        .extent_hot_and_fresh(e.start, e.count, ctx.fresh_max_age)
+                    {
+                        deferred += 1; // stays retired, re-presented later
+                    } else {
+                        to_confirm.push(e);
+                    }
+                }
+                if deferred > 0 {
+                    metrics
+                        .gc_heat_deferred_extents
+                        .fetch_add(deferred, Ordering::Relaxed);
+                }
+                to_confirm
+            }
+        } else {
+            survivors
+        };
+        if heat_ctx.is_some() {
+            metrics
+                .gc_heat_confirmed_extents
+                .fetch_add(survivors.len() as u64, Ordering::Relaxed);
+            if survivors.is_empty() {
+                // Every survivor deferred → skip the all-volume scan entirely
+                // (the headline Stage-B win).
+                metrics.gc_heat_scans_skipped.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
         }
 
         // Gate 2 (blockmap): ONE batched all-volume L2P scan for every survivor,
@@ -521,6 +591,19 @@ impl Drop for GcRunner {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Context handed to `reclaim_retired_extents` when Stage-B heat consumption is
+/// enabled. Built once per GC cycle from the live `GcConfig`; `None` means
+/// reclaim behaves exactly as before (no heat filtering).
+pub(crate) struct HeatReclaimCtx<'a> {
+    pub heat: &'a HeatMap,
+    /// Max region age (sweeps) still trusted as "hot" enough to defer.
+    pub fresh_max_age: u32,
+    /// Force-confirm every Nth cycle (0 = never force).
+    pub force_confirm_interval: u64,
+    /// Current GC cycle number (drives the periodic force-confirm).
+    pub cycle: u64,
 }
 
 /// Per-volume lap state for the heat refresh (mirrors the dedup scanner's

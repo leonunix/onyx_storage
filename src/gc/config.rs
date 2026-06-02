@@ -40,20 +40,31 @@ pub struct GcConfig {
     #[serde(default = "default_heat_refresh_max_lbas_per_cycle")]
     pub heat_refresh_max_lbas_per_cycle: u64,
 
-    // --- Stage-B knobs (parsed now, consumed when reclaim reads the heat) ---
-    /// A region is trusted as "hot, skip the confirm scan" only while its
-    /// staleness age is below this many sweeps; at/after it, reclaim force-
-    /// confirms so a hot→cold flip (mass discard) is never starved (default 4).
-    #[serde(default = "default_heat_staleness_floor_sweeps")]
-    pub heat_staleness_floor_sweeps: u32,
+    // --- Stage-B: reclaim consumes the heat map (behavior change) ---
+    /// Master switch for reclaim *consuming* the heat map as a prior to defer
+    /// the confirm scan of retired extents whose region still looks hot
+    /// (default FALSE — Stage B is a behavior change, A/B-prove before flip).
+    /// Requires `heat_enabled` (a real, refreshed map) to have any effect.
+    #[serde(default = "default_heat_reclaim_enabled")]
+    pub heat_reclaim_enabled: bool,
     /// Max region age (completed sweeps since last counted) still considered
-    /// "fresh" enough to defer reclaim on (default 1 = only this/last sweep).
+    /// "fresh" enough to defer a retired extent on (default 1 = only this/last
+    /// sweep). A region older than this is confirmed-by-scan, so a mass-discard
+    /// that stops bumping a region drains it within a sweep or two.
     #[serde(default = "default_heat_fresh_max_age")]
     pub heat_fresh_max_age: u32,
-    /// Every Nth GC cycle, reclaim force-confirms regardless of heat — a
-    /// belt-and-suspenders periodic full check (default 64).
+    /// Every Nth GC cycle, reclaim force-confirms ALL retired survivors
+    /// regardless of heat — a belt-and-suspenders periodic full check so no
+    /// deferred extent is starved (default 64; 0 disables the periodic pass).
     #[serde(default = "default_heat_force_confirm_interval_cycles")]
     pub heat_force_confirm_interval_cycles: u64,
+    /// Reserved for Stage-B2 adaptive refresh cadence (refresh scans hot
+    /// regions less often): the hard revisit floor that forces a rescan of a
+    /// region not counted in this many sweeps. Unused while the refresh is
+    /// uniform (every region is counted every sweep, so age never grows for a
+    /// live region) — kept so the knob is stable across the B→B2 step.
+    #[serde(default = "default_heat_staleness_floor_sweeps")]
+    pub heat_staleness_floor_sweeps: u32,
 }
 
 impl Default for GcConfig {
@@ -68,9 +79,10 @@ impl Default for GcConfig {
             heat_enabled: default_heat_enabled(),
             heat_bucket_size_blocks: default_heat_bucket_size_blocks(),
             heat_refresh_max_lbas_per_cycle: default_heat_refresh_max_lbas_per_cycle(),
-            heat_staleness_floor_sweeps: default_heat_staleness_floor_sweeps(),
+            heat_reclaim_enabled: default_heat_reclaim_enabled(),
             heat_fresh_max_age: default_heat_fresh_max_age(),
             heat_force_confirm_interval_cycles: default_heat_force_confirm_interval_cycles(),
+            heat_staleness_floor_sweeps: default_heat_staleness_floor_sweeps(),
         }
     }
 }
@@ -101,6 +113,9 @@ fn default_heat_bucket_size_blocks() -> u64 {
 }
 fn default_heat_refresh_max_lbas_per_cycle() -> u64 {
     1_000_000
+}
+fn default_heat_reclaim_enabled() -> bool {
+    false
 }
 fn default_heat_staleness_floor_sweeps() -> u32 {
     4

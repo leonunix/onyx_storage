@@ -203,6 +203,34 @@ impl HeatMap {
         self.inner.current_epoch.load(Ordering::Relaxed)
     }
 
+    /// Stage-B reclaim prior: is EVERY bucket covering the physical extent
+    /// `[start, start+count)` both hot (count > 0) and fresh (age ≤
+    /// `fresh_max_age`)? Used to *defer* the confirm scan of a retired extent
+    /// whose whole region still looks live. A never-scanned, cold, or stale
+    /// covering bucket returns `false` → the caller confirms-by-scan (the
+    /// conservative direction). This is only a prior: the actual free still
+    /// goes through the confirm scan + rc/retire gate, so a false "hot" only
+    /// ever *delays* reclaim, never frees a live block.
+    pub fn extent_hot_and_fresh(&self, start: Pba, count: u32, fresh_max_age: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let epoch = self.inner.current_epoch.load(Ordering::Relaxed);
+        let first = self.bucket_index(start);
+        let last = self.bucket_index(Pba(start.0 + u64::from(count) - 1));
+        for b in first..=last {
+            let (bucket_epoch, c) = unpack(self.inner.buckets[b].load(Ordering::Relaxed));
+            if bucket_epoch == NEVER_SCANNED_EPOCH {
+                return false; // never counted → cannot trust as hot
+            }
+            let age = epoch.wrapping_sub(bucket_epoch);
+            if c == 0 || age > fresh_max_age {
+                return false; // cold or stale → confirm
+            }
+        }
+        true
+    }
+
     /// Advance to the next epoch (a full sweep completed). Single-writer.
     /// Returns the new epoch. Skips the `NEVER_SCANNED_EPOCH` sentinel on
     /// wraparound so `0` always means "never scanned".
@@ -363,6 +391,29 @@ mod tests {
         assert_eq!(s.never_scanned_buckets, 2);
         assert_eq!(s.max_count, 2);
         assert_eq!(s.bucket_size_blocks, 256);
+    }
+
+    #[test]
+    fn extent_hot_and_fresh_predicate() {
+        let hm = map(8 + 1024, 256); // 4 buckets, 256 blocks each
+        let base = RESERVED_BLOCKS; // bucket 0 starts here
+        // Empty extent never qualifies.
+        assert!(!hm.extent_hot_and_fresh(Pba(base), 0, 1));
+        // Never-scanned region → not hot.
+        assert!(!hm.extent_hot_and_fresh(Pba(base), 4, 1));
+        // Make bucket 0 hot+fresh.
+        hm.bump(Pba(base));
+        hm.bump(Pba(base + 5));
+        assert!(hm.extent_hot_and_fresh(Pba(base), 4, 1)); // within bucket 0, fresh
+        // An extent spanning bucket 0 (hot) into bucket 1 (cold) → not all hot.
+        assert!(!hm.extent_hot_and_fresh(Pba(base + 254), 4, 1));
+        // Age it out: two epoch advances without revisiting → age 2 > fresh 1.
+        hm.advance_epoch();
+        assert!(hm.extent_hot_and_fresh(Pba(base), 4, 1)); // age 1 still ≤ 1
+        hm.advance_epoch();
+        assert!(!hm.extent_hot_and_fresh(Pba(base), 4, 1)); // age 2 > 1 → stale
+        // A larger fresh_max_age tolerates the staleness.
+        assert!(hm.extent_hot_and_fresh(Pba(base), 4, 2));
     }
 
     #[test]
