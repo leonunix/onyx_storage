@@ -96,6 +96,15 @@ struct Inner {
     /// listed here) are tolerated — `remove_by_pba` simply finds no
     /// matching shard slot for those and moves on.
     pba_to_hashes: DashMap<Pba, Vec<ContentHash>>,
+    /// In-flight promote gate: content hashes currently being promoted
+    /// (`DedupPut`) by some dedup worker. Serialises same-hash promotes
+    /// across the per-lane workers so two concurrent promotes never both
+    /// resolve + decref the same old PBA — which underflowed the global
+    /// refcount (nvme-box dedup_drainer A/B 2026-06-01; the race is the
+    /// one documented in metadb `tx.rs::resolve_dedup_old_pbas`, fixed
+    /// here on the onyx side where dedup serialization belongs).
+    /// Membership-only.
+    promote_inflight: dashmap::DashSet<ContentHash>,
     shard_mask: usize,
 }
 
@@ -114,9 +123,32 @@ impl CandidateCache {
             inner: Arc::new(Inner {
                 shards,
                 pba_to_hashes: DashMap::new(),
+                promote_inflight: dashmap::DashSet::new(),
                 shard_mask: num_shards - 1,
             }),
         }
+    }
+
+    /// Try to claim `hash` for an in-flight promote. Returns `true` if
+    /// this caller now owns the in-flight slot (it MUST call
+    /// [`Self::release_promote`] after its commit, success or failure),
+    /// or `false` if another worker is already promoting this hash — in
+    /// which case the caller must drop the `DedupPut` for `hash` from
+    /// its batch. The rc-neutral `L2pRemap` for the hit is kept
+    /// regardless (it lands once the owning promote has incref'd the
+    /// target PBA, or self-heals to a miss via its rc guard otherwise),
+    /// so dropping the duplicate `DedupPut` costs at most a momentary
+    /// dedup-ratio dip, never correctness. This is the onyx-side
+    /// serialization the metadb `resolve_dedup_old_pbas` note calls for:
+    /// two concurrent same-hash promotes would otherwise both capture
+    /// and decref the same old PBA → rc underflow.
+    pub fn try_claim_promote(&self, hash: &ContentHash) -> bool {
+        self.inner.promote_inflight.insert(*hash)
+    }
+
+    /// Release a promote claim taken by [`Self::try_claim_promote`].
+    pub fn release_promote(&self, hash: &ContentHash) {
+        self.inner.promote_inflight.remove(hash);
     }
 
     /// Lookup the [`BlockmapValue`] recorded for `fp`. Returns `None`
@@ -323,6 +355,21 @@ mod tests {
         let mut h = [0u8; 8];
         h[0] = byte;
         h
+    }
+
+    #[test]
+    fn promote_gate_serialises_same_hash() {
+        let c = CandidateCache::new(8, 64);
+        let h = fp(0xAB);
+        // First claim wins; a concurrent claim of the same hash is
+        // rejected (its DedupPut must be dropped by the caller).
+        assert!(c.try_claim_promote(&h), "first claim must win");
+        assert!(!c.try_claim_promote(&h), "second concurrent claim must be rejected");
+        // A different hash is independent.
+        assert!(c.try_claim_promote(&fp(0xCD)), "distinct hash claims independently");
+        // After release, the hash is claimable again.
+        c.release_promote(&h);
+        assert!(c.try_claim_promote(&h), "claimable again after release");
     }
 
     fn bv(pba: u64) -> BlockmapValue {

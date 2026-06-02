@@ -136,6 +136,7 @@ impl Default for EngineMetrics {
             dedup_hit_commit_ns: AtomicU64::new(0),
             dedup_promotions_committed: AtomicU64::new(0),
             dedup_promotions_failed: AtomicU64::new(0),
+            dedup_promote_skipped_inflight: AtomicU64::new(0),
             dedup_cleanup_reconstruct_errors: AtomicU64::new(0),
             dedup_cleanup_delete_errors: AtomicU64::new(0),
             flush_units_written: AtomicU64::new(0),

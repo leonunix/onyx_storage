@@ -263,6 +263,14 @@ pub struct EngineMetrics {
     /// the next sighting will retry; counter helps detect persistent
     /// commit-failure stuck states.
     pub dedup_promotions_failed: AtomicU64,
+    /// `DedupPut`s dropped because another lane was already promoting the
+    /// same content hash (the in-flight promote gate fired). The hit's
+    /// rc-neutral L2pRemap still applies; only the duplicate registration
+    /// is skipped. A high rate means concurrent same-content writes are
+    /// common (e.g. dedupe-heavy benchmarks) — a small dedup-ratio dip,
+    /// not a correctness issue. Prevents the concurrent double-decref rc
+    /// underflow.
+    pub dedup_promote_skipped_inflight: AtomicU64,
     /// Old-mapping cleanup failed to reconstruct a freed block from LV3, so
     /// the corresponding forward dedup_index entry was left in place.
     pub dedup_cleanup_reconstruct_errors: AtomicU64,

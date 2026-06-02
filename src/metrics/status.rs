@@ -765,7 +765,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} cleanup_reconstruct_errors={} cleanup_delete_errors={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={}",
+            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} promote_skipped_inflight={} cleanup_reconstruct_errors={} cleanup_delete_errors={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={}",
             self.metrics.dedup_hits,
             self.metrics.dedup_misses,
             self.metrics.dedup_skipped_units,
@@ -776,6 +776,7 @@ impl EngineStatusSnapshot {
             self.metrics.dedup_hit_commit_ops,
             self.metrics.dedup_promotions_committed,
             self.metrics.dedup_promotions_failed,
+            self.metrics.dedup_promote_skipped_inflight,
             self.metrics.dedup_cleanup_reconstruct_errors,
             self.metrics.dedup_cleanup_delete_errors,
             self.metrics.dedup_rescan_cycles,

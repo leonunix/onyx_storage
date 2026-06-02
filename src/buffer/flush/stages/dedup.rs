@@ -753,6 +753,43 @@ impl BufferFlusher {
             }
         }
 
+        // Serialise same-hash promotes across the per-lane dedup workers.
+        // Two workers can verify a candidate hit for the SAME content
+        // hash concurrently; each `DedupPut`'s commit-time `old_pba`
+        // resolution can then capture the same old PBA → both decref it →
+        // global refcount underflow (metadb `resolve_dedup_old_pbas`
+        // note; nvme-box dedup_drainer A/B 2026-06-01). Claim each hash
+        // in the cross-lane in-flight gate and drop the `DedupPut` for any
+        // hash already owned by another lane. Intra-batch duplicates are
+        // kept — they are serialized within this single tx by
+        // `resolve_dedup_old_pbas` and chained correctly. A dropped hash's
+        // rc-neutral L2pRemap stays in `batch_input`: it lands once the
+        // owning promote incref's the target, or self-heals to a miss via
+        // its rc guard.
+        let mut claimed_promotes: Vec<ContentHash> = Vec::new();
+        {
+            let mut this_batch: std::collections::HashSet<ContentHash> =
+                std::collections::HashSet::new();
+            let mut skipped = 0u64;
+            promote_entries.retain(|(hash, _)| {
+                if this_batch.contains(hash) {
+                    true
+                } else if candidate.try_claim_promote(hash) {
+                    this_batch.insert(*hash);
+                    claimed_promotes.push(*hash);
+                    true
+                } else {
+                    skipped += 1;
+                    false
+                }
+            });
+            if skipped > 0 {
+                metrics
+                    .dedup_promote_skipped_inflight
+                    .fetch_add(skipped, Ordering::Relaxed);
+            }
+        }
+
         let hit_commit_start = Instant::now();
         let batch_result = meta.atomic_batch_dedup_hits_with_promote(
             vol_id,
@@ -814,6 +851,13 @@ impl BufferFlusher {
                     "dedup worker: batch hit + promote commit failed, demoting all to miss"
                 );
             }
+        }
+
+        // Release the in-flight promote claims taken above (covers both
+        // the Ok and Err arms). A leaked claim would permanently block
+        // future promotes of that hash, so this must run on every path.
+        for hash in &claimed_promotes {
+            candidate.release_promote(hash);
         }
     }
 
