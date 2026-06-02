@@ -312,6 +312,23 @@ pub struct MetaConfig {
     #[serde(default = "default_refcount_drainer_backpressure_pages")]
     pub refcount_drainer_backpressure_pages: usize,
 
+    /// Move the dedup-index cuckoo insert off the commit/apply critical
+    /// path: a per-dedup-shard background drainer absorbs staged
+    /// `(hash → value)` mutations into the on-disk cuckoo table. Ships
+    /// default-off (behind a flag, like `parallel_l2p_drain_enabled`)
+    /// until the soak gate passes — flag off is byte-identical to the
+    /// eager path. The paired `rc.stage(±1)` stays inline regardless.
+    #[serde(default = "default_dedup_drainer_enabled")]
+    pub dedup_drainer_enabled: bool,
+    #[serde(default = "default_dedup_drainer_interval_ms")]
+    pub dedup_drainer_interval_ms: u64,
+    #[serde(default = "default_dedup_drainer_threshold_entries")]
+    pub dedup_drainer_threshold_entries: usize,
+    #[serde(default = "default_dedup_drainer_max_entries_per_cycle")]
+    pub dedup_drainer_max_entries_per_cycle: usize,
+    #[serde(default = "default_dedup_drainer_backpressure_entries")]
+    pub dedup_drainer_backpressure_entries: usize,
+
     /// Enable metadb's L2P streaming writeback worker. When `true`, a
     /// background thread continuously seals dirty L2P pages and writes
     /// them through the centralised `IoSubmitter` outside
@@ -490,6 +507,11 @@ impl Default for MetaConfig {
             ),
             refcount_drainer_alloc_run_size: default_refcount_drainer_alloc_run_size(),
             refcount_drainer_backpressure_pages: default_refcount_drainer_backpressure_pages(),
+            dedup_drainer_enabled: default_dedup_drainer_enabled(),
+            dedup_drainer_interval_ms: default_dedup_drainer_interval_ms(),
+            dedup_drainer_threshold_entries: default_dedup_drainer_threshold_entries(),
+            dedup_drainer_max_entries_per_cycle: default_dedup_drainer_max_entries_per_cycle(),
+            dedup_drainer_backpressure_entries: default_dedup_drainer_backpressure_entries(),
             l2p_writeback_enabled: default_l2p_writeback_enabled(),
             l2p_writeback_idle_sleep_us: default_l2p_writeback_idle_sleep_us(),
             l2p_writeback_min_dirty_pages: default_l2p_writeback_min_dirty_pages(),
@@ -538,6 +560,22 @@ fn default_refcount_drainer_alloc_run_size() -> usize {
 }
 fn default_refcount_drainer_backpressure_pages() -> usize {
     8_192
+}
+fn default_dedup_drainer_enabled() -> bool {
+    // Default-off behind a flag (see field doc); flip on after soak.
+    false
+}
+fn default_dedup_drainer_interval_ms() -> u64 {
+    50
+}
+fn default_dedup_drainer_threshold_entries() -> usize {
+    4_096
+}
+fn default_dedup_drainer_max_entries_per_cycle() -> usize {
+    65_536
+}
+fn default_dedup_drainer_backpressure_entries() -> usize {
+    16_384
 }
 fn default_l2p_writeback_enabled() -> bool {
     // Default off. The streaming writeback worker correctly shrinks

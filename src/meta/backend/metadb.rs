@@ -1341,6 +1341,11 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.refcount_drainer_max_entries_per_cycle = config.refcount_drainer_max_entries_per_cycle;
     cfg.refcount_drainer_alloc_run_size = config.refcount_drainer_alloc_run_size;
     cfg.refcount_drainer_backpressure_pages = config.refcount_drainer_backpressure_pages;
+    cfg.dedup_drainer_enabled = config.dedup_drainer_enabled;
+    cfg.dedup_drainer_interval_ms = config.dedup_drainer_interval_ms;
+    cfg.dedup_drainer_threshold_entries = config.dedup_drainer_threshold_entries;
+    cfg.dedup_drainer_max_entries_per_cycle = config.dedup_drainer_max_entries_per_cycle;
+    cfg.dedup_drainer_backpressure_entries = config.dedup_drainer_backpressure_entries;
     // L2P streaming writeback: continuously seal dirty L2P pages and
     // write them through metadb's IoSubmitter outside `apply_gate.write()`.
     // Onyx defaults this on so checkpoint sample's gate-hold stays
