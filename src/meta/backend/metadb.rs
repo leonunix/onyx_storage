@@ -38,8 +38,8 @@ pub(crate) struct MetadbBackend {
     // channel and feeds the PBAs through the existing allocator retire
     // path (coalesced into extents).
     //
-    // Phase 4 keeps `lineage_gc_emit_freepbas` default OFF, so the channel
-    // stays empty unless tests or Phase 5 explicitly enable the flag.
+    // Phase 5 requires `lineage_gc_emit_freepbas=true`, so this channel is
+    // the normal Lineage-GC retire signal path.
     lineage_freed_pbas_tx: Sender<Pba>,
     lineage_freed_pbas_rx: Receiver<Pba>,
 }
@@ -92,9 +92,7 @@ impl DeferredCleanupHandle {
     /// the empty-batch path inside the metadb adapter so all entry
     /// points can return `DeferredCleanupHandle` uniformly. The LSN is
     /// `None` because no metadb commit happened.
-    pub(crate) fn ready(
-        value: OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>,
-    ) -> Self {
+    pub(crate) fn ready(value: OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>) -> Self {
         Self {
             state: DeferredCleanupHandleState::Ready { value, lsn: None },
         }
@@ -173,8 +171,9 @@ impl DeferredCleanupHandle {
     /// drain paths in `commit_worker/passthrough.rs`; the current
     /// pipeline relies on `recv()` only.
     #[allow(dead_code)]
-    pub(crate) fn try_recv(self) -> Result<OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>, Self>
-    {
+    pub(crate) fn try_recv(
+        self,
+    ) -> Result<OnyxResult<(HashMap<Pba, RemapCleanup>, Vec<bool>)>, Self> {
         match self.state {
             DeferredCleanupHandleState::Ready { value, .. } => Ok(value),
             DeferredCleanupHandleState::Pending {
@@ -812,7 +811,10 @@ impl MetadbBackend {
         debug_assert!(seqs.is_empty() || seqs.len() == total_lbas);
         if units.is_empty() {
             self.put_dedup_entries(dedup_entries)?;
-            return Ok(DeferredCleanupHandle::ready(Ok((HashMap::new(), Vec::new()))));
+            return Ok(DeferredCleanupHandle::ready(Ok((
+                HashMap::new(),
+                Vec::new(),
+            ))));
         }
         let mut tx = self.db.begin();
         let mut new_values = Vec::new();

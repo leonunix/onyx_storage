@@ -506,27 +506,29 @@ fn delete_range_and_volume_report_freed_extents() {
     backend
         .atomic_batch_write(&vol.id, &[(Lba(0), a), (Lba(1), b), (Lba(2), b)], 3)
         .unwrap();
-    // Phase 5: hot-path atomic_batch_write doesn't bump rc, but
-    // delete_blockmap_range / delete_volume still decref. Seed rc
-    // to mirror the post-Phase-5 production shape (lineage events
-    // are the ones bumping rc).
+    // Phase 5: hot-path atomic_batch_write, delete_blockmap_range, and
+    // delete_volume are all rc-neutral for ordinary PBA refs. Seed rc to
+    // mirror a shared/dedup PBA and verify logical deletes do not drive it
+    // to zero.
     backend.set_refcount(Pba(100), 1).unwrap();
     backend.set_refcount(Pba(200), 2).unwrap();
 
     let freed = backend
         .delete_blockmap_range(&vol.id, Lba(1), Lba(3))
         .unwrap();
-    assert_eq!(freed.len(), 1);
-    assert_eq!(freed[0].pba, Pba(200));
-    assert_eq!(freed[0].blocks, 1);
-    assert!(freed[0].pba_freed);
+    assert!(
+        freed.is_empty(),
+        "range delete must not free shared rc-positive PBA: {freed:?}"
+    );
     assert_eq!(backend.count_blockmap_refs_for_pba(Pba(100)).unwrap(), 1);
+    assert_eq!(backend.get_refcount(Pba(200)).unwrap(), 2);
 
     let freed = backend.delete_volume(&vol.id).unwrap();
-    assert_eq!(freed.len(), 1);
-    assert_eq!(freed[0].pba, Pba(100));
-    assert_eq!(freed[0].blocks, 1);
-    assert!(freed[0].pba_freed);
+    assert!(
+        freed.is_empty(),
+        "delete volume must not free rc-positive PBA by per-LBA decref: {freed:?}"
+    );
+    assert_eq!(backend.get_refcount(Pba(100)).unwrap(), 1);
     assert!(backend.get_volume(&vol.id).unwrap().is_none());
 }
 
@@ -570,9 +572,15 @@ fn referenced_extents_batches_and_matches_per_pba_probe() {
         flags: 0,
     };
     // Live mappings reference PBAs 100, 101 and 300.
-    backend.atomic_write_mapping(&vol.id, Lba(0), &mk(100)).unwrap();
-    backend.atomic_write_mapping(&vol.id, Lba(1), &mk(101)).unwrap();
-    backend.atomic_write_mapping(&vol.id, Lba(2), &mk(300)).unwrap();
+    backend
+        .atomic_write_mapping(&vol.id, Lba(0), &mk(100))
+        .unwrap();
+    backend
+        .atomic_write_mapping(&vol.id, Lba(1), &mk(101))
+        .unwrap();
+    backend
+        .atomic_write_mapping(&vol.id, Lba(2), &mk(300))
+        .unwrap();
 
     // Mix of referenced and unreferenced candidate extents, in arbitrary order.
     let extents = [
@@ -1026,9 +1034,8 @@ fn atomic_batch_write_multi_with_dedup_deferred_round_trip() {
         })
         .collect();
 
-    let units: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![
-        (&vol.id, batch_values.as_slice(), 1u32),
-    ];
+    let units: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+        vec![(&vol.id, batch_values.as_slice(), 1u32)];
     let seqs: Vec<u64> = (1..=batch_values.len() as u64).collect();
 
     let handle = backend
@@ -1069,9 +1076,8 @@ fn atomic_batch_write_multi_with_dedup_deferred_round_trip() {
             )
         })
         .collect();
-    let units2: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> = vec![
-        (&vol.id, batch_values2.as_slice(), 1u32),
-    ];
+    let units2: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+        vec![(&vol.id, batch_values2.as_slice(), 1u32)];
     let seqs2: Vec<u64> = (9..9 + batch_values2.len() as u64).collect();
     let (sync_cleanup, sync_accepted) = backend
         .atomic_batch_write_multi_with_dedup(&units2, &[], &seqs2)
