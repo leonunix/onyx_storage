@@ -450,10 +450,7 @@ fn prove_flusher_drains_buffer_creates_metadata() {
     // 3) and the readable data below; rc is no longer driven by the
     // hot path.
     let rc = meta.get_refcount(bv.pba).unwrap();
-    assert_eq!(
-        rc, 0,
-        "Phase 5: fresh hot-path write leaves rc(pba) == 0"
-    );
+    assert_eq!(rc, 0, "Phase 5: fresh hot-path write leaves rc(pba) == 0");
 
     // Data still readable (now from LV3)
     let result = vol.read(0, 4096).unwrap();

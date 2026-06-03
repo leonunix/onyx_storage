@@ -462,6 +462,10 @@ pub struct EngineMetrics {
     pub heat_refresh_lbas_scanned: AtomicU64,
     pub heat_bumps: AtomicU64,
     pub heat_sweeps_completed: AtomicU64,
+    /// Stage-B2: cycles where the adaptive (per-volume churn-weighted) refresh
+    /// budget split was applied (only when `heat_adaptive_refresh_enabled` and
+    /// >1 volume). 0 means the refresh ran uniform/round-robin.
+    pub heat_refresh_adaptive_cycles: AtomicU64,
     /// Stage-B reclaim consumption of the heat map (only move when
     /// `heat_reclaim_enabled`). `gc_heat_deferred_extents` = retired rc==0
     /// extents whose hot+fresh region let reclaim skip the confirm scan this
@@ -475,6 +479,18 @@ pub struct EngineMetrics {
     pub gc_heat_confirmed_extents: AtomicU64,
     pub gc_heat_scans_skipped: AtomicU64,
     pub gc_heat_force_confirm_passes: AtomicU64,
+    /// Cycles where the yield gate SUPPRESSED deferral (confirm-all) because a
+    /// recent confirm scan was productive, free space was tight, or it was a
+    /// periodic recalibration — deferring was judged not worth it. Excludes the
+    /// anti-starvation force-confirm pass (`gc_heat_force_confirm_passes`).
+    pub gc_heat_defer_suppressed: AtomicU64,
+    /// Stage-4 fold: cold candidates the heat-refresh walk emitted into the
+    /// cold-tail channel for the dedup scanner to warm (`gc_heat_cold_tail_pushed`),
+    /// and ones it had to drop because the channel was full or the consumer had
+    /// gone away (`gc_heat_cold_tail_dropped`). The dropped count is the
+    /// "no silent truncation" signal for the fold.
+    pub gc_heat_cold_tail_pushed: AtomicU64,
+    pub gc_heat_cold_tail_dropped: AtomicU64,
     pub dedup_rescan_cycles: AtomicU64,
     pub dedup_rescan_skipped_cycles: AtomicU64,
     pub dedup_rescan_blocks: AtomicU64,
@@ -499,6 +515,10 @@ pub struct EngineMetrics {
     /// duplicates the candidate cache lost before the 2nd write arrived;
     /// reclaiming them is the cold-tail pass's backend safety-net role.
     pub dedup_cold_tail_remaps: AtomicU64,
+    /// Stage-4 fold: cold candidates the dedup scanner drained from the fold
+    /// channel and fed to the ReadPool this cycle (the consumer-side analog of
+    /// `gc_heat_cold_tail_pushed`). Zero when the fold is off (legacy scan path).
+    pub dedup_cold_tail_drained: AtomicU64,
     pub volume_discard_ops: AtomicU64,
     pub volume_discard_lbas: AtomicU64,
     pub discard_blocks_freed: AtomicU64,

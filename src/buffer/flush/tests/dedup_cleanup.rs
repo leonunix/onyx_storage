@@ -338,7 +338,11 @@ fn retired_reclaimer_batches_one_scan_and_frees_only_unreferenced() {
     let referenced_pba = allocator.allocate_one_for_lane(0).unwrap();
     let _gap = allocator.allocate_one_for_lane(0).unwrap();
     let free_pba = allocator.allocate_one_for_lane(0).unwrap();
-    assert_ne!(referenced_pba.0 + 1, free_pba.0, "test needs a non-adjacent gap");
+    assert_ne!(
+        referenced_pba.0 + 1,
+        free_pba.0,
+        "test needs a non-adjacent gap"
+    );
 
     let mapping = BlockmapValue {
         pba: referenced_pba,
@@ -352,7 +356,8 @@ fn retired_reclaimer_batches_one_scan_and_frees_only_unreferenced() {
         flags: 0,
     };
     let vol = VolumeId("flush-race".into());
-    meta.atomic_batch_write(&vol, &[(Lba(7), mapping)], 1).unwrap();
+    meta.atomic_batch_write(&vol, &[(Lba(7), mapping)], 1)
+        .unwrap();
     meta.set_refcount(referenced_pba, 0).unwrap();
     meta.set_refcount(free_pba, 0).unwrap();
 
@@ -371,7 +376,10 @@ fn retired_reclaimer_batches_one_scan_and_frees_only_unreferenced() {
         None,
     );
 
-    assert_eq!(reclaimed, 1, "only the unreferenced rc==0 extent is reclaimed");
+    assert_eq!(
+        reclaimed, 1,
+        "only the unreferenced rc==0 extent is reclaimed"
+    );
     assert!(
         allocator.is_free(free_pba),
         "unreferenced rc==0 PBA returned to allocator"
@@ -578,6 +586,9 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         fresh_max_age: 1,
         force_confirm_interval: 1000, // not a forced cycle
         cycle: 1,
+        yield_suppress_milli: 250,
+        recalibrate_interval: 0,
+        min_free_pct: 0,
     };
     let reclaimed = crate::gc::runner::GcRunner::reclaim_retired_extents(
         &metrics,
@@ -588,7 +599,10 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         Some(ctx),
     );
     assert_eq!(reclaimed, 0, "hot+fresh region defers reclaim");
-    assert!(allocator.is_retired(free_pba), "deferred extent stays retired");
+    assert!(
+        allocator.is_retired(free_pba),
+        "deferred extent stays retired"
+    );
     assert!(!allocator.is_free(free_pba), "deferred extent not freed");
     assert_eq!(metrics.gc_heat_deferred_extents.load(Relaxed), 1);
     assert_eq!(metrics.gc_heat_scans_skipped.load(Relaxed), 1);
@@ -604,6 +618,9 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         fresh_max_age: 1,
         force_confirm_interval: 4,
         cycle: 4,
+        yield_suppress_milli: 250,
+        recalibrate_interval: 0,
+        min_free_pct: 0,
     };
     let reclaimed2 = crate::gc::runner::GcRunner::reclaim_retired_extents(
         &metrics,
@@ -613,8 +630,14 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         &AtomicBool::new(true),
         Some(ctx2),
     );
-    assert_eq!(reclaimed2, 1, "force-confirm cycle reclaims the deferred extent");
-    assert!(allocator.is_free(free_pba), "force-confirmed extent returned to allocator");
+    assert_eq!(
+        reclaimed2, 1,
+        "force-confirm cycle reclaims the deferred extent"
+    );
+    assert!(
+        allocator.is_free(free_pba),
+        "force-confirmed extent returned to allocator"
+    );
     assert_eq!(metrics.gc_heat_force_confirm_passes.load(Relaxed), 1);
 }
 
@@ -637,6 +660,9 @@ fn heat_cold_region_confirms_and_frees() {
         fresh_max_age: 1,
         force_confirm_interval: 1000,
         cycle: 1,
+        yield_suppress_milli: 250,
+        recalibrate_interval: 0,
+        min_free_pct: 0,
     };
     let reclaimed = crate::gc::runner::GcRunner::reclaim_retired_extents(
         &metrics,
@@ -654,4 +680,95 @@ fn heat_cold_region_confirms_and_frees() {
         metrics.gc_reclaim_blockmap_scans.load(Relaxed) >= 1,
         "confirm scan ran for the cold extent"
     );
+}
+
+/// Yield gate: when a recent confirm scan was PRODUCTIVE (high measured yield),
+/// deferral is suppressed — a hot+fresh retired extent is confirmed and freed
+/// instead of deferred. This is the self-correction that avoids the discard-churn
+/// over-deferral (the confirm scan was not wasted, so skipping it loses reclaim).
+#[test]
+fn heat_high_yield_suppresses_defer() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    let free_pba = allocator.allocate_one_for_lane(0).unwrap();
+    meta.set_refcount(free_pba, 0).unwrap();
+    allocator.retire_one(free_pba).unwrap();
+
+    let heat = crate::gc::HeatMap::new(allocator.total_block_count(), 64);
+    heat.bump(free_pba); // region hot+fresh — would normally defer
+    heat.record_confirm_yield(8, 8); // a prior scan reclaimed everything it scanned
+    assert!(heat.confirm_yield_milli().unwrap() >= 250);
+
+    let ctx = crate::gc::runner::HeatReclaimCtx {
+        heat: &heat,
+        fresh_max_age: 1,
+        force_confirm_interval: 1000, // not a forced cycle
+        cycle: 1,
+        yield_suppress_milli: 250,
+        recalibrate_interval: 0, // isolate the yield path
+        min_free_pct: 0,
+    };
+    let reclaimed = crate::gc::runner::GcRunner::reclaim_retired_extents(
+        &metrics,
+        &meta,
+        &allocator,
+        64,
+        &AtomicBool::new(true),
+        Some(ctx),
+    );
+    assert_eq!(
+        reclaimed, 1,
+        "high yield suppresses defer → hot extent confirmed + freed"
+    );
+    assert!(allocator.is_free(free_pba));
+    assert_eq!(
+        metrics.gc_heat_deferred_extents.load(Relaxed),
+        0,
+        "not deferred"
+    );
+    assert_eq!(
+        metrics.gc_heat_defer_suppressed.load(Relaxed),
+        1,
+        "suppression recorded"
+    );
+}
+
+/// Free-space pressure gate: under low free%, deferral is suppressed regardless
+/// of heat or yield — reclaim is not delayed when space is tight.
+#[test]
+fn heat_pressure_suppresses_defer() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    let free_pba = allocator.allocate_one_for_lane(0).unwrap();
+    meta.set_refcount(free_pba, 0).unwrap();
+    allocator.retire_one(free_pba).unwrap();
+
+    let heat = crate::gc::HeatMap::new(allocator.total_block_count(), 64);
+    heat.bump(free_pba); // hot+fresh
+
+    // min_free_pct = 100 ⇒ free% (always ≤ 100) satisfies pressure ⇒ confirm-all.
+    let ctx = crate::gc::runner::HeatReclaimCtx {
+        heat: &heat,
+        fresh_max_age: 1,
+        force_confirm_interval: 1000,
+        cycle: 1,
+        yield_suppress_milli: 1001, // never suppress by yield
+        recalibrate_interval: 0,
+        min_free_pct: 100,
+    };
+    let reclaimed = crate::gc::runner::GcRunner::reclaim_retired_extents(
+        &metrics,
+        &meta,
+        &allocator,
+        64,
+        &AtomicBool::new(true),
+        Some(ctx),
+    );
+    assert_eq!(reclaimed, 1, "pressure suppresses defer → freed");
+    assert!(allocator.is_free(free_pba));
+    assert_eq!(metrics.gc_heat_defer_suppressed.load(Relaxed), 1);
 }

@@ -601,11 +601,7 @@ impl BufferFlusher {
         // steady-state pipeline depth instead of the cap and avoids
         // future at-cap block drains when the metadb compactor has
         // already released the staged outcomes.
-        while pending_q
-            .front()
-            .map(|c| c.is_ready())
-            .unwrap_or(false)
-        {
+        while pending_q.front().map(|c| c.is_ready()).unwrap_or(false) {
             let front = pending_q
                 .pop_front()
                 .expect("front().is_some() guarantees a value");
@@ -774,11 +770,9 @@ impl BufferFlusher {
             let Some(um) = unit_metas[i].as_ref() else {
                 continue;
             };
-            if let Err(e) = maybe_inject_test_failure(
-                &vol_id.0,
-                um.start_lba,
-                FlushFailStage::BeforeMetaWrite,
-            ) {
+            if let Err(e) =
+                maybe_inject_test_failure(&vol_id.0, um.start_lba, FlushFailStage::BeforeMetaWrite)
+            {
                 tracing::error!(
                     vol = %vol_id.0,
                     start_lba = um.start_lba.0,
@@ -802,8 +796,7 @@ impl BufferFlusher {
         let mut shard_ids: Vec<usize> = per_shard.keys().copied().collect();
         shard_ids.sort_unstable();
         let issue_started_at = Instant::now();
-        let mut pending_shards: Vec<PendingShardCommit> =
-            Vec::with_capacity(shard_ids.len());
+        let mut pending_shards: Vec<PendingShardCommit> = Vec::with_capacity(shard_ids.len());
         for sid in shard_ids {
             let shard_buckets = per_shard.remove(&sid).expect("shard id from keys");
             let mut sub_batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =

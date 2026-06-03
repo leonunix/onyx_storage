@@ -637,6 +637,11 @@ impl OnyxEngine {
             read_pool.clone(),
         )?);
 
+        // Stage-4 fold: when enabled, the GC heat walk feeds cold candidates
+        // to the dedup scanner over this channel instead of the scanner
+        // running its own live-L2P traversal. (None, None) ⇒ legacy paths.
+        let (cold_tail_tx, cold_tail_rx) = build_cold_tail_fold_channel(&config, &read_pool);
+
         // 9. Dedup scanner (after flusher; re-processes skipped blocks)
         let dedup_scanner = if config.dedup.enabled {
             Some(DedupScanner::start_with_metrics(
@@ -648,6 +653,7 @@ impl OnyxEngine {
                 buffer_pool.clone(),
                 flusher.candidate_cache(),
                 read_pool.clone(),
+                cold_tail_rx,
                 config.dedup.clone(),
             ))
         } else {
@@ -668,6 +674,7 @@ impl OnyxEngine {
             lifecycle.clone(),
             allocator.clone(),
             heat.clone(),
+            cold_tail_tx,
             config.gc.clone(),
         ));
         let heat = config.gc.heat_enabled.then_some(heat);
@@ -1139,6 +1146,10 @@ impl OnyxEngine {
             read_pool.clone(),
         )?);
 
+        // Stage-4 fold: cold-tail channel (see the full-open path). (None,
+        // None) ⇒ legacy paths.
+        let (cold_tail_tx, cold_tail_rx) = build_cold_tail_fold_channel(&config, &read_pool);
+
         // Dedup scanner
         let dedup_scanner = if config.dedup.enabled {
             Some(DedupScanner::start_with_metrics(
@@ -1150,6 +1161,7 @@ impl OnyxEngine {
                 buffer_pool.clone(),
                 flusher.candidate_cache(),
                 read_pool.clone(),
+                cold_tail_rx,
                 config.dedup.clone(),
             ))
         } else {
@@ -1167,6 +1179,7 @@ impl OnyxEngine {
             lifecycle.clone(),
             allocator.clone(),
             heat.clone(),
+            cold_tail_tx,
             config.gc.clone(),
         ));
         let heat = config.gc.heat_enabled.then_some(heat);
@@ -1315,7 +1328,7 @@ impl OnyxEngine {
                 .allocator
                 .as_ref()
                 .map(|alloc| alloc.total_block_count()),
-            heat: self.heat.as_ref().map(|h| h.summary()),
+            heat: self.heat.as_ref().map(|h| h.cached_summary()),
             metrics: self.metrics.snapshot(),
         })
     }
@@ -1348,4 +1361,46 @@ fn build_heat_map(gc: &crate::gc::config::GcConfig, allocator: &Arc<SpaceAllocat
         "heat map: adaptive-reclaim refresh enabled (observe-only)"
     );
     hm
+}
+
+/// Stage-4 fold: build the cold-tail channel that lets the GC heat-refresh
+/// walk feed cold candidates to the dedup scanner, eliminating the scanner's
+/// own duplicate live-L2P traversal (`docs/adaptive-reclaim-heatmap.md`
+/// Stage 4). Returns `(producer, consumer)` endpoints when the fold is
+/// enabled, else `(None, None)` — which leaves both subsystems on their
+/// legacy paths (zero behavior change). The fold requires:
+///   - `gc.heat_fold_cold_tail_enabled` (the flag),
+///   - `gc.heat_enabled` (there must be a heat walk to ride),
+///   - a configured `ReadPool` (cold-tail's LV3 reads are batched through it),
+///   - `dedup.enabled` (there is a scanner to consume the channel).
+fn build_cold_tail_fold_channel(
+    config: &OnyxConfig,
+    read_pool: &Option<Arc<ReadPool>>,
+) -> (
+    Option<crossbeam_channel::Sender<crate::dedup::ColdTailTarget>>,
+    Option<crossbeam_channel::Receiver<crate::dedup::ColdTailTarget>>,
+) {
+    let enabled = config.gc.heat_fold_cold_tail_enabled
+        && config.gc.heat_enabled
+        && config.dedup.enabled
+        && read_pool.is_some();
+    if !enabled {
+        if config.gc.heat_fold_cold_tail_enabled {
+            tracing::info!(
+                heat_enabled = config.gc.heat_enabled,
+                dedup_enabled = config.dedup.enabled,
+                read_pool = read_pool.is_some(),
+                "cold-tail fold requested but a prerequisite is off; running legacy paths"
+            );
+        }
+        return (None, None);
+    }
+    let cap = config.gc.heat_fold_channel_capacity.max(1);
+    let (tx, rx) = crossbeam_channel::bounded(cap);
+    tracing::info!(
+        capacity = cap,
+        push_max_per_cycle = config.gc.heat_fold_push_max_per_cycle,
+        "cold-tail fold enabled: dedup scanner drains the GC heat-refresh walk"
+    );
+    (Some(tx), Some(rx))
 }

@@ -769,7 +769,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} promote_skipped_inflight={} cleanup_reconstruct_errors={} cleanup_delete_errors={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={} cold_tail_remaps={}",
+            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} promote_skipped_inflight={} cleanup_reconstruct_errors={} cleanup_delete_errors={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={} cold_tail_remaps={} cold_tail_drained={}",
             self.metrics.dedup_hits,
             self.metrics.dedup_misses,
             self.metrics.dedup_skipped_units,
@@ -792,7 +792,8 @@ impl EngineStatusSnapshot {
             self.metrics.dedup_cold_tail_blocks,
             self.metrics.dedup_cold_tail_already_warm,
             self.metrics.dedup_cold_tail_errors,
-            self.metrics.dedup_cold_tail_remaps
+            self.metrics.dedup_cold_tail_remaps,
+            self.metrics.dedup_cold_tail_drained
         );
         let _ = writeln!(
             out,
@@ -816,7 +817,7 @@ impl EngineStatusSnapshot {
         if let Some(h) = &self.heat {
             let _ = writeln!(
                 out,
-                "heat: buckets={} nonzero={} never_scanned={} epoch={} max_count={} bucket_blocks={} refresh_cycles={} lbas_scanned={} bumps={} sweeps={} reclaim_deferred={} reclaim_confirmed={} scans_skipped={} force_confirm={}",
+                "heat: buckets={} nonzero={} never_scanned={} epoch={} max_count={} bucket_blocks={} refresh_cycles={} lbas_scanned={} bumps={} sweeps={} adaptive_cycles={} reclaim_deferred={} reclaim_confirmed={} scans_skipped={} force_confirm={} defer_suppressed={} yield_milli={} cold_tail_pushed={} cold_tail_dropped={}",
                 h.n_buckets,
                 h.nonzero_buckets,
                 h.never_scanned_buckets,
@@ -827,10 +828,15 @@ impl EngineStatusSnapshot {
                 self.metrics.heat_refresh_lbas_scanned,
                 self.metrics.heat_bumps,
                 self.metrics.heat_sweeps_completed,
+                self.metrics.heat_refresh_adaptive_cycles,
                 self.metrics.gc_heat_deferred_extents,
                 self.metrics.gc_heat_confirmed_extents,
                 self.metrics.gc_heat_scans_skipped,
-                self.metrics.gc_heat_force_confirm_passes
+                self.metrics.gc_heat_force_confirm_passes,
+                self.metrics.gc_heat_defer_suppressed,
+                h.confirm_yield_milli,
+                self.metrics.gc_heat_cold_tail_pushed,
+                self.metrics.gc_heat_cold_tail_dropped
             );
         }
         let _ = writeln!(

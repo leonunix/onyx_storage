@@ -317,9 +317,13 @@ impl WriteBufferPool {
             // the LV2 watermark with the max recovered seq before publishing
             // them — otherwise `is_seq_ready_for_flush` would gate them off
             // immediately after open.
-            shard
-                .lv2_durability
-                .advance(shard.lv2_durability.synced_seq.load(Ordering::Relaxed).max(shard_max_seq));
+            shard.lv2_durability.advance(
+                shard
+                    .lv2_durability
+                    .synced_seq
+                    .load(Ordering::Relaxed)
+                    .max(shard_max_seq),
+            );
 
             let shard_ready_tx_for_loop = shard_ready_txs_for_open[shard_idx].clone();
             let mut recovered_seqs: Vec<u64> = shard

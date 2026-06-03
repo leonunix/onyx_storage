@@ -5,12 +5,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use crossbeam_channel::Receiver;
 
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::WriteBufferPool;
 use crate::compress::codec::create_compressor;
 use crate::dedup::config::DedupConfig;
-use crate::dedup::CandidateCache;
+use crate::dedup::{CandidateCache, ColdTailTarget};
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::{ReadPool, ReadPurpose};
@@ -60,6 +61,7 @@ impl DedupScanner {
         buffer_pool: Arc<WriteBufferPool>,
         candidate: CandidateCache,
         read_pool: Option<Arc<ReadPool>>,
+        cold_rx: Option<Receiver<ColdTailTarget>>,
         config: DedupConfig,
     ) -> Self {
         Self::start_with_metrics(
@@ -71,6 +73,7 @@ impl DedupScanner {
             buffer_pool,
             candidate,
             read_pool,
+            cold_rx,
             config,
         )
     }
@@ -85,6 +88,7 @@ impl DedupScanner {
         buffer_pool: Arc<WriteBufferPool>,
         candidate: CandidateCache,
         read_pool: Option<Arc<ReadPool>>,
+        cold_rx: Option<Receiver<ColdTailTarget>>,
         config: DedupConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -105,6 +109,7 @@ impl DedupScanner {
                     &buffer_pool,
                     &candidate,
                     read_pool.as_deref(),
+                    cold_rx.as_ref(),
                     &config_clone,
                     &running_clone,
                 );
@@ -134,6 +139,7 @@ impl DedupScanner {
         buffer_pool: &WriteBufferPool,
         candidate: &CandidateCache,
         read_pool: Option<&ReadPool>,
+        cold_rx: Option<&Receiver<ColdTailTarget>>,
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
@@ -219,15 +225,33 @@ impl DedupScanner {
             // background sweep that recovers ratio for entries warmed
             // by prior runs of the engine.
             if !rescan_debt && cfg.cold_tail_max_per_cycle > 0 {
-                match Self::cold_tail_rescan(
-                    meta,
-                    allocator,
-                    lifecycle,
-                    candidate,
-                    read_pool,
-                    &mut cold_tail_cursors,
-                    cfg.cold_tail_max_per_cycle,
-                ) {
+                // Stage-4 fold: when the GC heat-refresh walk feeds cold
+                // candidates over `cold_rx`, drain that channel instead of
+                // running our own independent `scan_blockmap_range` traversal.
+                // The expensive LV3 read + hash + remap/warm tail
+                // (`process_cold_tail_targets`) is identical either way.
+                let result = if let Some(rx) = cold_rx {
+                    Self::cold_tail_drain(
+                        meta,
+                        allocator,
+                        lifecycle,
+                        candidate,
+                        read_pool,
+                        rx,
+                        cfg.cold_tail_max_per_cycle,
+                    )
+                } else {
+                    Self::cold_tail_rescan(
+                        meta,
+                        allocator,
+                        lifecycle,
+                        candidate,
+                        read_pool,
+                        &mut cold_tail_cursors,
+                        cfg.cold_tail_max_per_cycle,
+                    )
+                };
+                match result {
                     Ok(stats) => {
                         metrics
                             .dedup_cold_tail_blocks
@@ -241,11 +265,15 @@ impl DedupScanner {
                         metrics
                             .dedup_cold_tail_errors
                             .fetch_add(stats.errors as u64, Ordering::Relaxed);
+                        metrics
+                            .dedup_cold_tail_drained
+                            .fetch_add(stats.drained as u64, Ordering::Relaxed);
                         if stats.warmed > 0 || stats.remapped > 0 || stats.already_warm > 0 {
                             tracing::debug!(
                                 warmed = stats.warmed,
                                 remapped = stats.remapped,
                                 already_warm = stats.already_warm,
+                                drained = stats.drained,
                                 errors = stats.errors,
                                 "dedup scanner: cold-tail pass"
                             );
@@ -525,177 +553,284 @@ impl DedupScanner {
                 continue;
             }
 
-            // Fan out the LV3 reads through ReadPool so io_uring can
-            // keep multiple SQEs in flight for one drain.
-            let mut receivers = Vec::with_capacity(targets.len());
-            for (_lba, bv) in &targets {
-                match pool.submit_read_async_for(*bv, ReadPurpose::DedupScanner) {
-                    Ok(rx) => receivers.push(Some(rx)),
-                    Err(e) => {
-                        stats.errors += 1;
-                        tracing::debug!(
-                            pba = bv.pba.0,
-                            error = %e,
-                            "cold-tail: failed to enqueue ReadPool request"
-                        );
-                        receivers.push(None);
-                    }
+            // Read + hash + remap/warm the collected targets. Shared with
+            // the Stage-4 fold drain path (`cold_tail_drain`) so the verified
+            // ReadPool batch + dedup_index remap + candidate warm + dead-PBA
+            // cleanup logic lives in exactly one place.
+            Self::process_cold_tail_targets(
+                meta,
+                allocator,
+                lifecycle,
+                candidate,
+                pool,
+                &vol.id,
+                &targets,
+                &mut stats,
+            );
+        }
+
+        Ok(stats)
+    }
+
+    /// Read each collected `(lba, BlockmapValue)` target through the
+    /// `ReadPool`, hash the 4 KiB content, and either remap an
+    /// evicted-window duplicate onto its existing live dedup_index PBA or
+    /// warm the candidate cache for a true miss. Shared by the legacy
+    /// `cold_tail_rescan` (target discovery via its own
+    /// `scan_blockmap_range`) and the Stage-4 `cold_tail_drain` (targets
+    /// arrive over the fold channel from the GC heat walk). All re-validation
+    /// (`get_mapping_with_seq` / `same_physical_mapping`) and lifecycle
+    /// read-locking is unchanged from the original cold-tail pass — callers
+    /// differ only in how `targets` is sourced.
+    #[allow(clippy::too_many_arguments)]
+    fn process_cold_tail_targets(
+        meta: &MetaStore,
+        allocator: &SpaceAllocator,
+        lifecycle: &VolumeLifecycleManager,
+        candidate: &CandidateCache,
+        pool: &ReadPool,
+        vol_id: &VolumeId,
+        targets: &[(Lba, BlockmapValue)],
+        stats: &mut ColdTailStats,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+
+        // Fan out the LV3 reads through ReadPool so io_uring can
+        // keep multiple SQEs in flight for one drain.
+        let mut receivers = Vec::with_capacity(targets.len());
+        for (_lba, bv) in targets {
+            match pool.submit_read_async_for(*bv, ReadPurpose::DedupScanner) {
+                Ok(rx) => receivers.push(Some(rx)),
+                Err(e) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        pba = bv.pba.0,
+                        error = %e,
+                        "cold-tail: failed to enqueue ReadPool request"
+                    );
+                    receivers.push(None);
                 }
             }
+        }
 
-            for ((lba, bv), rx_opt) in targets.iter().zip(receivers.into_iter()) {
-                let Some(rx) = rx_opt else { continue };
-                let block = match rx.recv() {
-                    Ok(Ok(buf)) if buf.len() == BLOCK_SIZE as usize => buf,
-                    Ok(Ok(_)) => {
-                        stats.errors += 1;
-                        continue;
-                    }
-                    Ok(Err(e)) => {
-                        stats.errors += 1;
-                        tracing::debug!(
-                            pba = bv.pba.0,
-                            error = %e,
-                            "cold-tail: ReadPool returned error"
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        stats.errors += 1;
-                        tracing::debug!(
-                            pba = bv.pba.0,
-                            "cold-tail: ReadPool reply channel dropped"
-                        );
-                        continue;
-                    }
-                };
-                let hash = compute_content_hash(&block);
+        for ((lba, bv), rx_opt) in targets.iter().zip(receivers.into_iter()) {
+            let Some(rx) = rx_opt else { continue };
+            let block = match rx.recv() {
+                Ok(Ok(buf)) if buf.len() == BLOCK_SIZE as usize => buf,
+                Ok(Ok(_)) => {
+                    stats.errors += 1;
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        pba = bv.pba.0,
+                        error = %e,
+                        "cold-tail: ReadPool returned error"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        pba = bv.pba.0,
+                        "cold-tail: ReadPool reply channel dropped"
+                    );
+                    continue;
+                }
+            };
+            let hash = compute_content_hash(&block);
 
-                // If the hash is already a *live* entry in the
-                // persistent dedup index, this live block is an
-                // evicted-window duplicate: its content was promoted
-                // earlier, but its candidate slot was evicted before
-                // the duplicate write arrived, so it was written
-                // un-deduped against its own fresh PBA. Reclaim it by
-                // remapping the LBA onto the existing dedup target and
-                // decref'ing the orphaned old PBA — the same action the
-                // FLAG_DEDUP_SKIPPED rescan path already takes. Warming
-                // the candidate would only help a *future* write; it
-                // does nothing for this already-written block.
-                let index_entry = match meta.get_dedup_entry(&hash) {
-                    Ok(Some(existing)) => match meta.dedup_entry_is_live(&hash, &existing) {
-                        Ok(true) => Some(existing),
-                        Ok(false) => None,
-                        Err(e) => {
-                            stats.errors += 1;
-                            tracing::debug!(
-                                vol = %vol.id.0,
-                                lba = lba.0,
-                                error = %e,
-                                "cold-tail: dedup_index liveness check failed"
-                            );
-                            continue;
-                        }
-                    },
-                    Ok(None) => None,
+            // If the hash is already a *live* entry in the
+            // persistent dedup index, this live block is an
+            // evicted-window duplicate: its content was promoted
+            // earlier, but its candidate slot was evicted before
+            // the duplicate write arrived, so it was written
+            // un-deduped against its own fresh PBA. Reclaim it by
+            // remapping the LBA onto the existing dedup target and
+            // decref'ing the orphaned old PBA — the same action the
+            // FLAG_DEDUP_SKIPPED rescan path already takes. Warming
+            // the candidate would only help a *future* write; it
+            // does nothing for this already-written block.
+            let index_entry = match meta.get_dedup_entry(&hash) {
+                Ok(Some(existing)) => match meta.dedup_entry_is_live(&hash, &existing) {
+                    Ok(true) => Some(existing),
+                    Ok(false) => None,
                     Err(e) => {
                         stats.errors += 1;
                         tracing::debug!(
-                            vol = %vol.id.0,
+                            vol = %vol_id.0,
                             lba = lba.0,
                             error = %e,
-                            "cold-tail: dedup_index probe failed"
+                            "cold-tail: dedup_index liveness check failed"
                         );
                         continue;
                     }
-                };
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        vol = %vol_id.0,
+                        lba = lba.0,
+                        error = %e,
+                        "cold-tail: dedup_index probe failed"
+                    );
+                    continue;
+                }
+            };
 
-                if let Some(existing) = index_entry {
-                    // The live block already points at the dedup target
-                    // (it may even *be* the canonical copy). Nothing to
-                    // reclaim — do not self-remap.
-                    if existing.pba == bv.pba {
-                        stats.already_warm += 1;
-                        continue;
-                    }
-
-                    // Remap under the volume read lock so the volume
-                    // cannot be dropped mid-tx, mirroring
-                    // `rescan_skipped_blocks`. Re-read the mapping with
-                    // its committed seq and forward it to the
-                    // seq_guard: the async LV3 read + hash above is not
-                    // atomic with this commit, so a foreground write may
-                    // have landed. seq=0 would silently clobber it (see
-                    // the
-                    // `metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write`
-                    // regression test).
-                    let outcome = lifecycle.with_read_lock(&vol.id.0, || -> OnyxResult<u8> {
-                        let Some((current, observed_seq)) =
-                            meta.get_mapping_with_seq(&vol.id, *lba)?
-                        else {
-                            return Ok(0); // gone
-                        };
-                        if !same_physical_mapping(&current, bv) {
-                            return Ok(0); // changed under us
-                        }
-                        let new_bv = BlockmapValue {
-                            flags: 0,
-                            ..existing.to_blockmap_value()
-                        };
-                        let decremented =
-                            meta.atomic_dedup_hit(&vol.id, *lba, &new_bv, &hash, observed_seq)?;
-                        if let Some(cleanup) = decremented {
-                            BufferFlusher::cleanup_dead_pba_post_commit(
-                                allocator,
-                                candidate,
-                                cleanup,
-                                "dedup_cold_tail_cleanup",
-                            );
-                        }
-                        Ok(1) // remapped
-                    });
-
-                    match outcome {
-                        Ok(1) => stats.remapped += 1,
-                        Ok(_) => stats.already_warm += 1,
-                        Err(e) => {
-                            stats.errors += 1;
-                            tracing::debug!(
-                                vol = %vol.id.0,
-                                lba = lba.0,
-                                error = %e,
-                                "cold-tail: dedup_index-hit remap failed"
-                            );
-                        }
-                    }
+            if let Some(existing) = index_entry {
+                // The live block already points at the dedup target
+                // (it may even *be* the canonical copy). Nothing to
+                // reclaim — do not self-remap.
+                if existing.pba == bv.pba {
+                    stats.already_warm += 1;
                     continue;
                 }
 
-                // True miss: warm the candidate cache so a *future*
-                // duplicate write can verify-and-promote against this
-                // fingerprint. Re-validate the mapping first so we do
-                // not cache a stale (vol, lba) -> pba pair.
-                match meta.get_mapping(&vol.id, *lba) {
-                    Ok(Some(current)) if same_physical_mapping(&current, bv) => {}
-                    Ok(_) => {
-                        stats.already_warm += 1;
-                        continue;
+                // Remap under the volume read lock so the volume
+                // cannot be dropped mid-tx, mirroring
+                // `rescan_skipped_blocks`. Re-read the mapping with
+                // its committed seq and forward it to the
+                // seq_guard: the async LV3 read + hash above is not
+                // atomic with this commit, so a foreground write may
+                // have landed. seq=0 would silently clobber it (see
+                // the
+                // `metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write`
+                // regression test).
+                let outcome = lifecycle.with_read_lock(&vol_id.0, || -> OnyxResult<u8> {
+                    let Some((current, observed_seq)) = meta.get_mapping_with_seq(vol_id, *lba)?
+                    else {
+                        return Ok(0); // gone
+                    };
+                    if !same_physical_mapping(&current, bv) {
+                        return Ok(0); // changed under us
                     }
+                    let new_bv = BlockmapValue {
+                        flags: 0,
+                        ..existing.to_blockmap_value()
+                    };
+                    let decremented =
+                        meta.atomic_dedup_hit(vol_id, *lba, &new_bv, &hash, observed_seq)?;
+                    if let Some(cleanup) = decremented {
+                        BufferFlusher::cleanup_dead_pba_post_commit(
+                            allocator,
+                            candidate,
+                            cleanup,
+                            "dedup_cold_tail_cleanup",
+                        );
+                    }
+                    Ok(1) // remapped
+                });
+
+                match outcome {
+                    Ok(1) => stats.remapped += 1,
+                    Ok(_) => stats.already_warm += 1,
                     Err(e) => {
                         stats.errors += 1;
                         tracing::debug!(
-                            vol = %vol.id.0,
+                            vol = %vol_id.0,
                             lba = lba.0,
                             error = %e,
-                            "cold-tail: failed to revalidate mapping"
+                            "cold-tail: dedup_index-hit remap failed"
                         );
-                        continue;
                     }
                 }
-
-                candidate.insert(hash, BlockmapValue { flags: 0, ..*bv });
-                stats.warmed += 1;
+                continue;
             }
+
+            // True miss: warm the candidate cache so a *future*
+            // duplicate write can verify-and-promote against this
+            // fingerprint. Re-validate the mapping first so we do
+            // not cache a stale (vol, lba) -> pba pair.
+            match meta.get_mapping(vol_id, *lba) {
+                Ok(Some(current)) if same_physical_mapping(&current, bv) => {}
+                Ok(_) => {
+                    stats.already_warm += 1;
+                    continue;
+                }
+                Err(e) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        vol = %vol_id.0,
+                        lba = lba.0,
+                        error = %e,
+                        "cold-tail: failed to revalidate mapping"
+                    );
+                    continue;
+                }
+            }
+
+            candidate.insert(hash, BlockmapValue { flags: 0, ..*bv });
+            stats.warmed += 1;
+        }
+    }
+
+    /// Stage-4 fold consumer: drain cold candidates fed by the GC
+    /// heat-refresh walk over `rx` (instead of running our own
+    /// `scan_blockmap_range`), then process them through the shared
+    /// `process_cold_tail_targets`. Drains up to `budget` *real* targets
+    /// (not-already-warm) so the LV3 read IO stays bounded exactly as the
+    /// legacy pass; already-warm entries are rejected cheaply here (clearing
+    /// them from the channel) without counting toward the read budget. The
+    /// producer re-sends fresh cold entries every heat cycle, so a stale or
+    /// dropped target only costs dedup ratio, never correctness.
+    fn cold_tail_drain(
+        meta: &MetaStore,
+        allocator: &SpaceAllocator,
+        lifecycle: &VolumeLifecycleManager,
+        candidate: &CandidateCache,
+        read_pool: Option<&ReadPool>,
+        rx: &Receiver<ColdTailTarget>,
+        budget: usize,
+    ) -> OnyxResult<ColdTailStats> {
+        let mut stats = ColdTailStats::default();
+        let Some(pool) = read_pool else {
+            return Ok(stats);
+        };
+        if budget == 0 {
+            return Ok(stats);
+        }
+
+        // Group drained targets by volume so each group shares one lifecycle
+        // read lock + ReadPool batch in `process_cold_tail_targets`, matching
+        // the legacy per-volume pass.
+        let mut by_vol: HashMap<String, Vec<(Lba, BlockmapValue)>> = HashMap::new();
+        let mut collected = 0usize;
+        while collected < budget {
+            match rx.try_recv() {
+                Ok(t) => {
+                    if candidate.has_pba(t.bv.pba) {
+                        // Already warmed (writer or a prior cycle) — drop it
+                        // cheaply, do not spend a read on it.
+                        stats.already_warm += 1;
+                        continue;
+                    }
+                    by_vol.entry(t.vol_id.0).or_default().push((t.lba, t.bv));
+                    collected += 1;
+                }
+                // Empty (caught up) or Disconnected (producer gone, e.g. GC
+                // stopped at shutdown) — either way, nothing more to drain.
+                Err(_) => break,
+            }
+        }
+        stats.drained = collected;
+
+        for (vol_id_str, targets) in &by_vol {
+            let vol_id = VolumeId(vol_id_str.clone());
+            Self::process_cold_tail_targets(
+                meta,
+                allocator,
+                lifecycle,
+                candidate,
+                pool,
+                &vol_id,
+                targets,
+                &mut stats,
+            );
         }
 
         Ok(stats)
@@ -814,6 +949,10 @@ struct ColdTailStats {
     /// Entries the scanner could not process due to ReadPool errors,
     /// short reads, or dedup-index probe failures.
     errors: usize,
+    /// Stage-4 fold only: real (not-already-warm) targets drained from the
+    /// fold channel and fed to the ReadPool this cycle. Always 0 on the
+    /// legacy `cold_tail_rescan` path.
+    drained: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

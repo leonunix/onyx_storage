@@ -1257,6 +1257,7 @@ fn heat_refresh_counts_live_mappings_and_advances_epoch() {
         env.lifecycle.clone(),
         env.allocator.clone(),
         heat.clone(),
+        None, // cold_tail_tx: Stage-4 fold off in this test
         cfg,
     );
 
@@ -1264,7 +1265,9 @@ fn heat_refresh_counts_live_mappings_and_advances_epoch() {
     let mut sweeps = 0;
     for _ in 0..50 {
         thread::sleep(Duration::from_millis(20));
-        sweeps = metrics.heat_sweeps_completed.load(std::sync::atomic::Ordering::Relaxed);
+        sweeps = metrics
+            .heat_sweeps_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
         if sweeps >= 1 {
             break;
         }
@@ -1273,7 +1276,10 @@ fn heat_refresh_counts_live_mappings_and_advances_epoch() {
 
     assert!(sweeps >= 1, "expected >=1 completed sweep, got {sweeps}");
     assert!(
-        metrics.heat_bumps.load(std::sync::atomic::Ordering::Relaxed) >= 4,
+        metrics
+            .heat_bumps
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 4,
         "expected >=4 region bumps for 4 live mappings"
     );
     let summary = heat.summary();
@@ -1282,18 +1288,96 @@ fn heat_refresh_counts_live_mappings_and_advances_epoch() {
         "expected the two distinct PBA regions to be counted, got {}",
         summary.nonzero_buckets
     );
-    assert!(summary.current_epoch >= 2, "epoch should advance past the initial 1");
+    assert!(
+        summary.current_epoch >= 2,
+        "epoch should advance past the initial 1"
+    );
     // The bucket covering PBA 100..102 saw the three live mappings. Bounded
     // 1..=3 (a stop caught mid-sweep may show a partial count) — the key point
     // is it is counted and never accumulates past one sweep's worth (the 300×
     // runaway the per-sweep epoch advance fixes). Exact reset arithmetic is
     // covered by the heatmap unit tests.
     let c100 = heat.region(Pba(100)).1;
-    assert!((1..=3).contains(&c100), "PBA 100 region count {c100} out of 1..=3");
+    assert!(
+        (1..=3).contains(&c100),
+        "PBA 100 region count {c100} out of 1..=3"
+    );
     let c5000 = heat.region(Pba(5000)).1;
-    assert!((1..=1).contains(&c5000), "PBA 5000 region count {c5000} out of 1..=1");
+    assert!(
+        (1..=1).contains(&c5000),
+        "PBA 5000 region count {c5000} out of 1..=1"
+    );
     // A region with no live mapping was never scanned to a non-zero count.
     assert_eq!(heat.region(Pba(9000)).1, 0);
+}
+
+/// Stage-4 fold producer: with `cold_tx` wired and a non-zero push budget,
+/// the heat-refresh walk emits each non-zero live L2P entry it decodes as a
+/// cold candidate over the channel (in addition to bumping heat), bounded by
+/// `heat_fold_push_max_per_cycle`. This is the producer half the dedup
+/// scanner's `cold_tail_drain` consumes — proving the duplicate scan is gone
+/// (one walk feeds both heat + cold-tail).
+#[test]
+fn heat_refresh_fold_pushes_cold_candidates() {
+    use crossbeam_channel::bounded;
+    use std::sync::atomic::Ordering;
+
+    let env = setup_gc_env();
+    let vol = VolumeId("fold-vol".into());
+    register_volume(&env.meta, "fold-vol", CompressionAlgo::None, 1);
+    env.meta.create_blockmap_cf("fold-vol").unwrap();
+    put_live(&env.meta, &vol, 0, 100);
+    put_live(&env.meta, &vol, 1, 101);
+    put_live(&env.meta, &vol, 2, 102);
+
+    let metrics = Arc::new(EngineMetrics::default());
+    let bucket_blocks = 64;
+    let heat = HeatMap::new(env.allocator.total_block_count(), bucket_blocks);
+    let (tx, rx) = bounded::<onyx_storage::dedup::ColdTailTarget>(64);
+    let cfg = GcConfig {
+        enabled: false,
+        scan_interval_ms: 30,
+        heat_enabled: true,
+        heat_bucket_size_blocks: bucket_blocks,
+        heat_refresh_max_lbas_per_cycle: 1000,
+        heat_fold_cold_tail_enabled: true,
+        heat_fold_push_max_per_cycle: 64,
+        ..Default::default()
+    };
+    let mut gc = GcRunner::start_with_metrics(
+        metrics.clone(),
+        env.meta.clone(),
+        env.io_engine.clone(),
+        env.pool.clone(),
+        env.lifecycle.clone(),
+        env.allocator.clone(),
+        heat.clone(),
+        Some(tx),
+        cfg,
+    );
+
+    // Within a few cycles the heat walk should emit our 3 live entries.
+    let mut got = 0usize;
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(20));
+        while let Ok(t) = rx.try_recv() {
+            assert_eq!(t.vol_id.0, "fold-vol");
+            got += 1;
+        }
+        if got >= 3 {
+            break;
+        }
+    }
+    gc.stop();
+
+    assert!(
+        got >= 3,
+        "fold producer should emit >=3 cold candidates from 3 live mappings, got {got}"
+    );
+    assert!(
+        metrics.gc_heat_cold_tail_pushed.load(Ordering::Relaxed) >= 3,
+        "gc_heat_cold_tail_pushed should count the emitted candidates"
+    );
 }
 
 /// With the refresh budget at 0 the heat map stays untouched and no heat
@@ -1325,6 +1409,7 @@ fn heat_refresh_budget_zero_is_noop() {
         env.lifecycle.clone(),
         env.allocator.clone(),
         heat.clone(),
+        None, // cold_tail_tx: Stage-4 fold off in this test
         cfg,
     );
     thread::sleep(Duration::from_millis(120)); // several cycles

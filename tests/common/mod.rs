@@ -381,8 +381,7 @@ impl EngineHarness {
             // they may legitimately be in transit at the moment we
             // sample.
             assert!(
-                allocator.allocated_block_count()
-                    >= allocated_set.len() as u64 + retired_blocks,
+                allocator.allocated_block_count() >= allocated_set.len() as u64 + retired_blocks,
                 "allocator allocated count must be >= live metadata + retired \
                  blocks (Phase 5 allows extras pending Lineage GC drain). \
                  allocated={}, live={}, retired={}",

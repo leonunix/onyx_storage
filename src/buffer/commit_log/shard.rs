@@ -812,10 +812,7 @@ impl BufferShard {
             self.pending_bytes
                 .fetch_sub(removed.disk_len as u64, Ordering::Relaxed);
             if let Some(ref p) = removed.payload {
-                Self::release_payload_bytes(
-                    self.payload_bytes_in_memory.as_ref(),
-                    p.len() as u64,
-                );
+                Self::release_payload_bytes(self.payload_bytes_in_memory.as_ref(), p.len() as u64);
             }
             // Drop the seq from the pending-only index too. `append`
             // inserted into pending_seqs under the ring lock; failure

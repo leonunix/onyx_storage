@@ -364,9 +364,15 @@ mod tests {
         // First claim wins; a concurrent claim of the same hash is
         // rejected (its DedupPut must be dropped by the caller).
         assert!(c.try_claim_promote(&h), "first claim must win");
-        assert!(!c.try_claim_promote(&h), "second concurrent claim must be rejected");
+        assert!(
+            !c.try_claim_promote(&h),
+            "second concurrent claim must be rejected"
+        );
         // A different hash is independent.
-        assert!(c.try_claim_promote(&fp(0xCD)), "distinct hash claims independently");
+        assert!(
+            c.try_claim_promote(&fp(0xCD)),
+            "distinct hash claims independently"
+        );
         // After release, the hash is claimable again.
         c.release_promote(&h);
         assert!(c.try_claim_promote(&h), "claimable again after release");

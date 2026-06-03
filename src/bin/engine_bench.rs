@@ -319,7 +319,9 @@ fn parse_cpu_list(spec: &str) -> Vec<usize> {
     let mut cpus = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         if let Some((start, end)) = part.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
+            if let (Ok(start), Ok(end)) =
+                (start.trim().parse::<usize>(), end.trim().parse::<usize>())
+            {
                 if start <= end {
                     cpus.extend(start..=end);
                 }
@@ -377,7 +379,10 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<(BenchStats, LatencySampl
 
     let job_cpus = Arc::new(parse_cpu_list(&cli.job_cpus));
     if !job_cpus.is_empty() {
-        eprintln!("pinning {} bench job threads to CPUs {:?}", cli.jobs, job_cpus);
+        eprintln!(
+            "pinning {} bench job threads to CPUs {:?}",
+            cli.jobs, job_cpus
+        );
     }
 
     for job in 0..cli.jobs {

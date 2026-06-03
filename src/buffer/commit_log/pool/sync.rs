@@ -871,9 +871,7 @@ impl WriteBufferPool {
 
             // 5. Advance the contiguous fully-fsync'd prefix from the front.
             loop {
-                let front_done = fifo
-                    .front()
-                    .is_some_and(|f| f.seen_cqes >= f.expected_cqes);
+                let front_done = fifo.front().is_some_and(|f| f.seen_cqes >= f.expected_cqes);
                 if !front_done {
                     break;
                 }

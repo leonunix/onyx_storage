@@ -298,6 +298,22 @@ fn start_scanner_with_candidate_and_read_pool(
     read_pool: Option<Arc<ReadPool>>,
     config: DedupConfig,
 ) -> (DedupScanner, onyx_storage::dedup::CandidateCache) {
+    start_scanner_with_candidate_read_pool_cold_rx(
+        pool, meta, lifecycle, allocator, io_engine, read_pool, None, config,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_scanner_with_candidate_read_pool_cold_rx(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+    read_pool: Option<Arc<ReadPool>>,
+    cold_rx: Option<crossbeam_channel::Receiver<onyx_storage::dedup::ColdTailTarget>>,
+    config: DedupConfig,
+) -> (DedupScanner, onyx_storage::dedup::CandidateCache) {
     let candidate = onyx_storage::dedup::CandidateCache::new(8, 64);
     let scanner = DedupScanner::start(
         meta.clone(),
@@ -307,6 +323,7 @@ fn start_scanner_with_candidate_and_read_pool(
         pool.clone(),
         candidate.clone(),
         read_pool,
+        cold_rx,
         config,
     );
     (scanner, candidate)
@@ -625,7 +642,10 @@ fn dedup_hit_reuses_pba() {
     // not add another rc. Pre-Phase-5 the L2pRemap also incref'd, so
     // this assertion was `rc == 2`.
     let rc = meta.get_refcount(first_pba).unwrap();
-    assert_eq!(rc, 1, "Phase 5: dedup_index entry = 1 rc; L2pRemap rc-neutral");
+    assert_eq!(
+        rc, 1,
+        "Phase 5: dedup_index entry = 1 rc; L2pRemap rc-neutral"
+    );
 }
 
 #[test]
@@ -1284,6 +1304,152 @@ fn cold_tail_pass_warms_candidate_from_live_blockmap() {
     assert!(
         meta.get_dedup_entry(&hash).unwrap().is_none(),
         "cold-tail must not publish to dedup_index; promote stays gated on verified hits"
+    );
+}
+
+#[test]
+fn cold_tail_fold_drain_warms_candidate_from_channel() {
+    // Stage-4 fold: with `cold_rx` wired, the dedup scanner does NOT run its
+    // own `scan_blockmap_range` — it drains cold candidates fed (here, by the
+    // test standing in for the GC heat walk) over the channel, then runs the
+    // same read + hash + warm tail. Sending the live entry must warm the
+    // candidate cache exactly like the legacy scan path, and must still NOT
+    // publish to dedup_index (promote-on-verified-hit invariant).
+    use crossbeam_channel::bounded;
+    use onyx_storage::dedup::ColdTailTarget;
+
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let data = vec![0xD7; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
+
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "flush timeout");
+    flusher.stop();
+
+    let mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+
+    let (tx, rx) = bounded::<ColdTailTarget>(64);
+
+    let cold_cfg = DedupConfig {
+        rescan_interval_ms: 20,
+        max_rescan_per_cycle: 0, // no DEDUP_SKIPPED debt — cold-tail drain only
+        cold_tail_max_per_cycle: 64,
+        index_scrub_max_per_cycle: 0,
+        ..dedup_test_config()
+    };
+    let (mut scanner, candidate) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        Some(rx),
+        cold_cfg,
+    );
+
+    // Stand in for the GC heat-refresh walk: emit the live entry as a cold
+    // candidate. (Re-send each loop so a drop on an early empty cycle can't
+    // wedge the test.)
+    assert!(
+        wait_until(3000, || {
+            let _ = tx.try_send(ColdTailTarget {
+                vol_id: VolumeId("test-vol".into()),
+                lba: Lba(0),
+                bv: mapping,
+            });
+            candidate
+                .lookup(&hash)
+                .map(|v| v.pba == mapping.pba)
+                .unwrap_or(false)
+        }),
+        "fold drain should hash the channel-fed live entry and warm the candidate cache"
+    );
+    scanner.stop();
+
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "fold drain must not publish to dedup_index; promote stays gated on verified hits"
+    );
+}
+
+#[test]
+fn cold_tail_fold_drain_skips_already_warm_target() {
+    // The drain rejects targets whose PBA is already in the candidate cache
+    // BEFORE spending a read on them (the cheap `has_pba` filter the consumer
+    // owns). Pre-warming the candidate then feeding the same entry must leave
+    // the cache entry untouched (no spurious re-insert / churn) and emit no
+    // dedup_index entry.
+    use crossbeam_channel::bounded;
+    use onyx_storage::dedup::ColdTailTarget;
+
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let data = vec![0xE3; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&data);
+
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    pool.append("test-vol", Lba(0), 1, &data, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "flush timeout");
+    flusher.stop();
+
+    let mapping = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+
+    let (tx, rx) = bounded::<ColdTailTarget>(64);
+    let cold_cfg = DedupConfig {
+        rescan_interval_ms: 20,
+        max_rescan_per_cycle: 0,
+        cold_tail_max_per_cycle: 64,
+        index_scrub_max_per_cycle: 0,
+        ..dedup_test_config()
+    };
+    let (mut scanner, candidate) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        Some(rx),
+        cold_cfg,
+    );
+
+    // Pre-warm the candidate for this PBA so the drain must skip it.
+    candidate.insert(hash, mapping);
+    assert!(candidate.has_pba(mapping.pba));
+
+    // Feed the (already-warm) entry for several cycles, then confirm the
+    // cache still resolves the same mapping and dedup_index stays empty.
+    for _ in 0..20 {
+        let _ = tx.try_send(ColdTailTarget {
+            vol_id: VolumeId("test-vol".into()),
+            lba: Lba(0),
+            bv: mapping,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    scanner.stop();
+
+    assert!(
+        candidate
+            .lookup(&hash)
+            .map(|v| v.pba == mapping.pba)
+            .unwrap_or(false),
+        "already-warm candidate entry must survive the drain unchanged"
+    );
+    assert!(
+        meta.get_dedup_entry(&hash).unwrap().is_none(),
+        "skipping an already-warm target must not touch dedup_index"
     );
 }
 

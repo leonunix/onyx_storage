@@ -53,6 +53,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+
 use crate::types::{Pba, RESERVED_BLOCKS};
 
 /// Reserved bucket-epoch value meaning "this region has never been scanned".
@@ -91,6 +93,22 @@ struct Inner {
     current_epoch: AtomicU32,
     /// Total PBA count the map was sized for (`allocator.total_block_count()`).
     total_pbas: u64,
+    /// Last summary published by the GC refresh thread. Status reads this
+    /// (`cached_summary`, O(1)) instead of paying the O(n_buckets) scan on
+    /// every poll — that scan touches the whole ~176 MiB bucket array, evicting
+    /// the IO threads' working set from cache and burning memory bandwidth, so
+    /// a frequently-polled status endpoint shows up as periodic latency hitches.
+    /// Refreshed once per GC refresh cycle by the single writer (no extra lock);
+    /// at most one cycle stale, which is fine for an observe-only convergence
+    /// signal. Seeded with the true initial all-never-scanned state.
+    summary_cache: ArcSwap<HeatSummary>,
+    /// EMA of recent confirm-scan reclaim yield (reclaimed extents / scanned
+    /// extents), fixed-point ×1000. Single-writer (GC thread). Drives the
+    /// yield gate: high yield ⇒ the "hot ⇒ defer" premise is false for this
+    /// workload ⇒ stop deferring. `confirm_yield_samples == 0` means "no scan
+    /// has been measured yet" (cold start → trust the heat prior, keep deferring).
+    confirm_yield_ema_milli: AtomicU32,
+    confirm_yield_samples: AtomicU64,
 }
 
 /// Cheap snapshot of the heat map for status/metrics. Computing it scans every
@@ -105,6 +123,9 @@ pub struct HeatSummary {
     pub current_epoch: u32,
     pub max_count: u32,
     pub bucket_size_blocks: u64,
+    /// Confirm-scan reclaim-yield EMA in ‰ (0..=1000), or `-1` if no scan has
+    /// been measured yet. Drives the reclaim yield gate; surfaced for tuning.
+    pub confirm_yield_milli: i32,
 }
 
 impl HeatMap {
@@ -120,6 +141,18 @@ impl HeatMap {
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        // Seed the cache with the true initial state (every bucket never-scanned)
+        // so status is correct before the first GC refresh publishes a summary —
+        // no startup scan needed.
+        let init_summary = HeatSummary {
+            n_buckets: n_buckets as u64,
+            nonzero_buckets: 0,
+            never_scanned_buckets: n_buckets as u64,
+            current_epoch: FIRST_EPOCH,
+            max_count: 0,
+            bucket_size_blocks,
+            confirm_yield_milli: -1,
+        };
         Self {
             inner: Arc::new(Inner {
                 buckets,
@@ -128,6 +161,9 @@ impl HeatMap {
                 reserved: RESERVED_BLOCKS,
                 current_epoch: AtomicU32::new(FIRST_EPOCH),
                 total_pbas,
+                summary_cache: ArcSwap::from_pointee(init_summary),
+                confirm_yield_ema_milli: AtomicU32::new(0),
+                confirm_yield_samples: AtomicU64::new(0),
             }),
         }
     }
@@ -188,7 +224,8 @@ impl HeatMap {
     /// A never-scanned bucket reads `(u32::MAX, 0)`.
     pub fn region(&self, pba: Pba) -> (u32, u32) {
         let epoch = self.inner.current_epoch.load(Ordering::Relaxed);
-        let (bucket_epoch, count) = unpack(self.inner.buckets[self.bucket_index(pba)].load(Ordering::Relaxed));
+        let (bucket_epoch, count) =
+            unpack(self.inner.buckets[self.bucket_index(pba)].load(Ordering::Relaxed));
         if bucket_epoch == NEVER_SCANNED_EPOCH {
             return (u32::MAX, count);
         }
@@ -245,7 +282,65 @@ impl HeatMap {
         next
     }
 
-    /// Scan every bucket for a status/metrics snapshot. `O(n_buckets)`.
+    /// Read the cached convergence summary (`O(1)`). This is what status/metrics
+    /// should call: it returns the last summary the GC refresh thread published
+    /// via [`Self::refresh_summary_cache`], avoiding the `O(n_buckets)` scan
+    /// (and the ~176 MiB cache-thrash) on every poll. At most one GC refresh
+    /// cycle stale.
+    pub fn cached_summary(&self) -> HeatSummary {
+        *self.inner.summary_cache.load_full()
+    }
+
+    /// Recompute the summary (one `O(n_buckets)` scan) and publish it to the
+    /// cache. Called by the single GC refresh thread once per cycle, so the
+    /// scan stays on a background thread at a bounded cadence instead of firing
+    /// on every (unbounded-frequency, foreground) status poll.
+    pub fn refresh_summary_cache(&self) {
+        let s = self.summary();
+        self.inner.summary_cache.store(Arc::new(s));
+    }
+
+    /// Record a confirm-scan outcome for the yield gate: `confirmed` extents
+    /// were scanned, `reclaimed` of them freed. Updates the yield EMA (×1000),
+    /// single-writer (GC thread). Only call on cycles that scanned the FULL
+    /// survivor set (incl. hot regions) — a pure-defer cycle only confirms cold
+    /// extents and would bias the EMA high. No-op when `confirmed == 0`.
+    pub fn record_confirm_yield(&self, confirmed: usize, reclaimed: usize) {
+        if confirmed == 0 {
+            return;
+        }
+        let sample = ((reclaimed as u64 * 1000) / confirmed as u64).min(1000) as u32;
+        let n = self
+            .inner
+            .confirm_yield_samples
+            .fetch_add(1, Ordering::Relaxed);
+        // Seed with the first sample, then EMA with alpha = 1/4 (responsive to
+        // workload changes while smoothing per-cycle noise).
+        let next = if n == 0 {
+            sample
+        } else {
+            let prev = self.inner.confirm_yield_ema_milli.load(Ordering::Relaxed);
+            (prev * 3 + sample) / 4
+        };
+        self.inner
+            .confirm_yield_ema_milli
+            .store(next, Ordering::Relaxed);
+    }
+
+    /// Current confirm-scan reclaim-yield EMA in ‰ (0..=1000), or `None` if no
+    /// scan has been measured yet (cold start). Read by the reclaim yield gate
+    /// and surfaced in status.
+    pub fn confirm_yield_milli(&self) -> Option<u32> {
+        if self.inner.confirm_yield_samples.load(Ordering::Relaxed) == 0 {
+            None
+        } else {
+            Some(self.inner.confirm_yield_ema_milli.load(Ordering::Relaxed))
+        }
+    }
+
+    /// Scan every bucket for a status/metrics snapshot. `O(n_buckets)` — do NOT
+    /// call on the status hot path; use [`Self::cached_summary`]. Kept public
+    /// for the GC refresh (`refresh_summary_cache`) and tests.
     pub fn summary(&self) -> HeatSummary {
         let mut nonzero = 0u64;
         let mut never = 0u64;
@@ -267,6 +362,7 @@ impl HeatMap {
             current_epoch: self.current_epoch(),
             max_count,
             bucket_size_blocks: self.inner.bucket_size_blocks,
+            confirm_yield_milli: self.confirm_yield_milli().map_or(-1, |y| y as i32),
         }
     }
 }
@@ -281,7 +377,13 @@ mod tests {
 
     #[test]
     fn pack_unpack_roundtrip() {
-        for &(e, c) in &[(0u32, 0u32), (1, 1), (7, 4096), (u32::MAX, u32::MAX), (3, 0)] {
+        for &(e, c) in &[
+            (0u32, 0u32),
+            (1, 1),
+            (7, 4096),
+            (u32::MAX, u32::MAX),
+            (3, 0),
+        ] {
             assert_eq!(unpack(pack(e, c)), (e, c));
         }
     }
@@ -394,10 +496,36 @@ mod tests {
     }
 
     #[test]
+    fn cached_summary_seeds_then_tracks_refresh() {
+        let hm = map(8 + 1024, 256); // 4 buckets
+                                     // Before any refresh, the cache reflects the true initial state
+                                     // (all never-scanned) without scanning.
+        let c = hm.cached_summary();
+        assert_eq!(c.n_buckets, 4);
+        assert_eq!(c.never_scanned_buckets, 4);
+        assert_eq!(c.nonzero_buckets, 0);
+        // Bumps alone do NOT update the cache (status must not see live scans).
+        hm.bump(Pba(RESERVED_BLOCKS)); // bucket 0
+        hm.bump(Pba(RESERVED_BLOCKS + 256)); // bucket 1
+        assert_eq!(
+            hm.cached_summary().nonzero_buckets,
+            0,
+            "cache stale until refresh"
+        );
+        // The fresh scan still reflects reality on demand.
+        assert_eq!(hm.summary().nonzero_buckets, 2);
+        // A refresh (what the GC thread does each cycle) publishes it.
+        hm.refresh_summary_cache();
+        let c = hm.cached_summary();
+        assert_eq!(c.nonzero_buckets, 2);
+        assert_eq!(c.never_scanned_buckets, 2);
+    }
+
+    #[test]
     fn extent_hot_and_fresh_predicate() {
         let hm = map(8 + 1024, 256); // 4 buckets, 256 blocks each
         let base = RESERVED_BLOCKS; // bucket 0 starts here
-        // Empty extent never qualifies.
+                                    // Empty extent never qualifies.
         assert!(!hm.extent_hot_and_fresh(Pba(base), 0, 1));
         // Never-scanned region → not hot.
         assert!(!hm.extent_hot_and_fresh(Pba(base), 4, 1));
@@ -405,14 +533,14 @@ mod tests {
         hm.bump(Pba(base));
         hm.bump(Pba(base + 5));
         assert!(hm.extent_hot_and_fresh(Pba(base), 4, 1)); // within bucket 0, fresh
-        // An extent spanning bucket 0 (hot) into bucket 1 (cold) → not all hot.
+                                                           // An extent spanning bucket 0 (hot) into bucket 1 (cold) → not all hot.
         assert!(!hm.extent_hot_and_fresh(Pba(base + 254), 4, 1));
         // Age it out: two epoch advances without revisiting → age 2 > fresh 1.
         hm.advance_epoch();
         assert!(hm.extent_hot_and_fresh(Pba(base), 4, 1)); // age 1 still ≤ 1
         hm.advance_epoch();
         assert!(!hm.extent_hot_and_fresh(Pba(base), 4, 1)); // age 2 > 1 → stale
-        // A larger fresh_max_age tolerates the staleness.
+                                                            // A larger fresh_max_age tolerates the staleness.
         assert!(hm.extent_hot_and_fresh(Pba(base), 4, 2));
     }
 
@@ -422,7 +550,11 @@ mod tests {
         // yields one per spanned block, and each lands in its own bucket here.
         let hm = map(8 + 1024, 256);
         // Span PBAs at the boundary of bucket 0 and 1.
-        for pba in [Pba(RESERVED_BLOCKS + 254), Pba(RESERVED_BLOCKS + 255), Pba(RESERVED_BLOCKS + 256)] {
+        for pba in [
+            Pba(RESERVED_BLOCKS + 254),
+            Pba(RESERVED_BLOCKS + 255),
+            Pba(RESERVED_BLOCKS + 256),
+        ] {
             hm.bump(pba);
         }
         assert_eq!(hm.region(Pba(RESERVED_BLOCKS)).1, 2); // two in bucket 0

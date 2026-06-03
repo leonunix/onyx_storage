@@ -5,19 +5,22 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use crossbeam_channel::Sender;
 
 use crate::buffer::pool::WriteBufferPool;
+use crate::dedup::ColdTailTarget;
 use crate::gc::config::GcConfig;
 use crate::gc::heatmap::HeatMap;
 use crate::gc::rewriter::rewrite_candidate;
 use crate::gc::scanner::scan_gc_candidates;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
+use crate::meta::schema::{BlockmapValue, FLAG_DEDUP_SKIPPED};
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
-use crate::types::{Lba, BLOCK_SIZE};
+use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 
 const MAX_RETIRED_RECLAIM_PER_CYCLE: usize = 4096;
 
@@ -47,6 +50,7 @@ impl GcRunner {
             lifecycle,
             allocator,
             heat,
+            None,
             config,
         )
     }
@@ -60,6 +64,7 @@ impl GcRunner {
         lifecycle: Arc<VolumeLifecycleManager>,
         allocator: Arc<SpaceAllocator>,
         heat: HeatMap,
+        cold_tx: Option<Sender<ColdTailTarget>>,
         config: GcConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -79,6 +84,7 @@ impl GcRunner {
                     &lifecycle,
                     &allocator,
                     &heat,
+                    cold_tx.as_ref(),
                     &config_clone,
                     &running_clone,
                 );
@@ -129,6 +135,7 @@ impl GcRunner {
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
         heat: &HeatMap,
+        cold_tx: Option<&Sender<ColdTailTarget>>,
         config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
     ) {
@@ -154,6 +161,10 @@ impl GcRunner {
                     fresh_max_age: cfg.heat_fresh_max_age,
                     force_confirm_interval: cfg.heat_force_confirm_interval_cycles,
                     cycle,
+                    yield_suppress_milli: u32::from(cfg.heat_defer_yield_suppress_pct.min(100))
+                        * 10,
+                    recalibrate_interval: cfg.heat_defer_recalibrate_interval_cycles,
+                    min_free_pct: u64::from(cfg.heat_defer_min_free_pct),
                 })
             } else {
                 None
@@ -174,6 +185,10 @@ impl GcRunner {
             // disabled and even when reclaim found nothing — it is decoupled
             // from reclaim having work. Front-end IO never pays for it.
             if cfg.heat_enabled && cfg.heat_refresh_max_lbas_per_cycle > 0 {
+                // Stage-4 fold: when `cold_tx` is wired (fold enabled), the
+                // heat walk also emits cold candidates for the dedup scanner,
+                // bounded by `heat_fold_push_max_per_cycle`. `cold_tx` is None
+                // when the fold is off ⇒ pure observe-only heat refresh.
                 Self::heat_refresh_step(
                     heat,
                     metrics,
@@ -181,6 +196,10 @@ impl GcRunner {
                     &mut heat_cursor,
                     cfg.heat_refresh_max_lbas_per_cycle,
                     running,
+                    cfg.heat_adaptive_refresh_enabled,
+                    cfg.heat_staleness_floor_sweeps,
+                    cold_tx,
+                    cfg.heat_fold_push_max_per_cycle,
                 );
             }
 
@@ -334,43 +353,70 @@ impl GcRunner {
 
         // Stage-B heat pre-filter (between Gate 1 and Gate 2): when reclaim
         // consumes the heat map, defer the confirm scan of any survivor whose
-        // whole region still looks hot+fresh — it is very likely still
-        // referenced, so a confirm scan would only say "referenced". Deferring
-        // = simply not reclaiming it this cycle; it stays in the allocator's
-        // retired set and is re-presented next cycle. The free decision is
-        // unchanged (a block is still freed iff the confirm scan says no live
-        // ref AND the rc/retire gate allows it) — heat only changes *whether we
-        // bother to scan*, so staleness can only ever delay reclaim.
-        let survivors = if let Some(ctx) = &heat_ctx {
-            let forced = ctx.force_confirm_interval != 0
-                && ctx.cycle % ctx.force_confirm_interval == 0;
+        // whole region still looks hot+fresh — *if* deferring actually pays.
+        //
+        // The premise "hot region ⇒ extent still referenced ⇒ confirm scan
+        // wasted" only holds when retired rc==0 extents are often still
+        // referenced (dedup-heavy: a re-share incref not yet drained). Under
+        // unique/discard churn the retired extents are genuinely dead, the
+        // confirm scan is PRODUCTIVE, and deferring only loses real reclaim. The
+        // yield gate self-corrects: confirm-all (no defer) whenever a recent
+        // confirm scan reclaimed a high fraction of what it scanned (`yield_high`),
+        // whenever free space is tight (`pressure`), periodically to recalibrate,
+        // and on the force-confirm pass. Cold start (no measurement) trusts the
+        // heat prior and defers. The free decision at the scan is unchanged —
+        // heat only changes *whether* we scan, so staleness can only ever delay
+        // reclaim, never free a live block.
+        let confirm_all = if let Some(ctx) = &heat_ctx {
+            let forced =
+                ctx.force_confirm_interval != 0 && ctx.cycle % ctx.force_confirm_interval == 0;
+            let recalibrate =
+                ctx.recalibrate_interval != 0 && ctx.cycle % ctx.recalibrate_interval == 0;
+            let pressure = ctx.min_free_pct > 0 && {
+                let total = allocator.total_block_count();
+                total > 0 && allocator.free_block_count() * 100 / total <= ctx.min_free_pct
+            };
+            let yield_high = ctx
+                .heat
+                .confirm_yield_milli()
+                .is_some_and(|y| y >= ctx.yield_suppress_milli);
             if forced {
-                // Periodic belt-and-suspenders: confirm everything regardless
-                // of heat so no deferred extent is starved.
                 metrics
                     .gc_heat_force_confirm_passes
                     .fetch_add(1, Ordering::Relaxed);
-                survivors
-            } else {
-                let mut to_confirm = Vec::with_capacity(survivors.len());
-                let mut deferred = 0u64;
-                for e in survivors {
-                    if ctx
-                        .heat
-                        .extent_hot_and_fresh(e.start, e.count, ctx.fresh_max_age)
-                    {
-                        deferred += 1; // stays retired, re-presented later
-                    } else {
-                        to_confirm.push(e);
-                    }
-                }
-                if deferred > 0 {
-                    metrics
-                        .gc_heat_deferred_extents
-                        .fetch_add(deferred, Ordering::Relaxed);
-                }
-                to_confirm
             }
+            let ca = forced || recalibrate || pressure || yield_high;
+            if ca && !forced {
+                // Defer suppressed by the gate (recalibrate / pressure / a
+                // productive recent scan) — not the anti-starvation force pass.
+                metrics
+                    .gc_heat_defer_suppressed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ca
+        } else {
+            false
+        };
+
+        let survivors = if let (Some(ctx), false) = (&heat_ctx, confirm_all) {
+            let mut to_confirm = Vec::with_capacity(survivors.len());
+            let mut deferred = 0u64;
+            for e in survivors {
+                if ctx
+                    .heat
+                    .extent_hot_and_fresh(e.start, e.count, ctx.fresh_max_age)
+                {
+                    deferred += 1; // stays retired, re-presented later
+                } else {
+                    to_confirm.push(e);
+                }
+            }
+            if deferred > 0 {
+                metrics
+                    .gc_heat_deferred_extents
+                    .fetch_add(deferred, Ordering::Relaxed);
+            }
+            to_confirm
         } else {
             survivors
         };
@@ -381,10 +427,18 @@ impl GcRunner {
             if survivors.is_empty() {
                 // Every survivor deferred → skip the all-volume scan entirely
                 // (the headline Stage-B win).
-                metrics.gc_heat_scans_skipped.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .gc_heat_scans_skipped
+                    .fetch_add(1, Ordering::Relaxed);
                 return 0;
             }
         }
+        // Did this cycle scan the FULL survivor set (incl. hot regions)? Only
+        // then is its reclaim yield a valid measurement of "is deferring worth
+        // it" — a pure-defer cycle confirms only cold extents and would bias the
+        // yield high.
+        let measured_all = heat_ctx.is_some() && confirm_all;
+        let scanned_extents = survivors.len();
 
         // Gate 2 (blockmap): ONE batched all-volume L2P scan for every survivor,
         // replacing the per-extent full scan (was O(retired × all_L2P)). A
@@ -409,6 +463,7 @@ impl GcRunner {
         };
 
         let mut reclaimed = 0usize;
+        let mut reclaimed_extents = 0usize;
         for (extent, is_referenced) in survivors.into_iter().zip(referenced) {
             if !running.load(Ordering::Relaxed) {
                 break;
@@ -419,6 +474,7 @@ impl GcRunner {
             match allocator.reclaim_retired_extent(extent) {
                 Ok(true) => {
                     reclaimed += extent.count as usize;
+                    reclaimed_extents += 1;
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -430,6 +486,16 @@ impl GcRunner {
                         "gc: failed to release retired physical extent"
                     );
                 }
+            }
+        }
+
+        // Feed the yield gate only from a full-survivor (confirm-all) scan: how
+        // productive was the scan we just paid for? High yield ⇒ deferring would
+        // lose real reclaim ⇒ suppress defer next cycles.
+        if measured_all {
+            if let Some(ctx) = &heat_ctx {
+                ctx.heat
+                    .record_confirm_yield(scanned_extents, reclaimed_extents);
             }
         }
 
@@ -451,6 +517,7 @@ impl GcRunner {
     /// Cost model: pure metadb decode + atomic bump, **no LV3 reads** — cheaper
     /// than the dedup cold-tail pass. Bounded per cycle, honors `running`, and
     /// holds no lock across the walk (`scan_blockmap_range` chunks internally).
+    #[allow(clippy::too_many_arguments)]
     fn heat_refresh_step(
         heat: &HeatMap,
         metrics: &EngineMetrics,
@@ -458,6 +525,10 @@ impl GcRunner {
         cursor: &mut HeatCursor,
         budget: u64,
         running: &AtomicBool,
+        adaptive: bool,
+        staleness_floor: u32,
+        cold_tx: Option<&Sender<ColdTailTarget>>,
+        push_budget: usize,
     ) {
         if budget == 0 {
             return;
@@ -499,8 +570,114 @@ impl GcRunner {
         let mut remaining = budget.min(target);
         let mut scanned_total = 0u64;
         let mut bumps_total = 0u64;
+        // Stage-4 fold: cold candidates emitted to the dedup scanner this
+        // cycle, capped at `push_budget` across all volumes (shared between
+        // the adaptive and uniform branches; only one runs per cycle).
+        let mut pushed = 0usize;
+
+        // Stage-B2: when adaptive refresh is on AND there is more than one volume
+        // to differentiate, split this cycle's budget across volumes weighted by
+        // recent write churn (more budget to changing volumes), with
+        // `staleness_floor` guaranteeing each volume is fully covered at least
+        // that often regardless of churn. A single volume can't be
+        // differentiated, so it falls through to the uniform round-robin path.
+        let use_adaptive = adaptive && volumes.len() > 1;
+        if use_adaptive {
+            metrics
+                .heat_refresh_adaptive_cycles
+                .fetch_add(1, Ordering::Relaxed);
+            let vol_lbas: Vec<u64> = volumes
+                .iter()
+                .map(|v| v.size_bytes / u64::from(v.block_size.max(1)))
+                .collect();
+            let churn: Vec<u64> = volumes
+                .iter()
+                .map(|v| {
+                    let cur = metrics
+                        .get_volume_metrics(&v.id.0)
+                        .write_bytes
+                        .load(Ordering::Relaxed);
+                    // delta since last adaptive cycle = recent write churn
+                    let prev = cursor.last_write_bytes.insert(v.id.0.clone(), cur);
+                    cur.saturating_sub(prev.unwrap_or(cur))
+                })
+                .collect();
+            let sub = split_refresh_budget(&vol_lbas, &churn, remaining, staleness_floor);
+            for (i, vol) in volumes.iter().enumerate() {
+                if !running.load(Ordering::Relaxed) || remaining == 0 {
+                    break;
+                }
+                let total_lbas = vol_lbas[i];
+                let want = sub[i].min(remaining);
+                if total_lbas == 0 || want == 0 {
+                    continue;
+                }
+                let (phys_start, chunk) = {
+                    let lap = cursor.per_vol.entry(vol.id.0.clone()).or_insert_with(|| {
+                        let mut rng = heat_lap_seed(&vol.id.0);
+                        let lap_start = splitmix64(&mut rng) % total_lbas;
+                        HeatLap {
+                            lap_start,
+                            scanned_in_lap: 0,
+                            rng,
+                        }
+                    });
+                    if lap.scanned_in_lap >= total_lbas {
+                        lap.lap_start = splitmix64(&mut lap.rng) % total_lbas;
+                        lap.scanned_in_lap = 0;
+                    }
+                    let phys_start = (lap.lap_start + lap.scanned_in_lap) % total_lbas;
+                    let lap_remaining = total_lbas - lap.scanned_in_lap;
+                    let chunk = want.min(lap_remaining).min(total_lbas - phys_start);
+                    lap.scanned_in_lap += chunk;
+                    (phys_start, chunk)
+                };
+                if chunk == 0 {
+                    continue;
+                }
+                let mut bumps = 0u64;
+                let scan = meta.scan_blockmap_range(
+                    &vol.id,
+                    Lba(phys_start),
+                    chunk,
+                    &mut |lba, value| {
+                        if value.is_zero() {
+                            return;
+                        }
+                        for pba in value.physical_pbas(BLOCK_SIZE) {
+                            heat.bump(pba);
+                            bumps += 1;
+                        }
+                        try_push_cold_tail(
+                            cold_tx,
+                            push_budget,
+                            &mut pushed,
+                            metrics,
+                            &vol.id,
+                            lba,
+                            &value,
+                        );
+                    },
+                );
+                if let Err(e) = scan {
+                    tracing::debug!(vol = %vol.id.0, error = %e, "heat refresh (adaptive): scan_blockmap_range failed");
+                }
+                remaining = remaining.saturating_sub(chunk);
+                scanned_total += chunk;
+                bumps_total += bumps;
+                cursor.sweep_lbas_done += chunk;
+                while cursor.sweep_lbas_done >= target {
+                    heat.advance_epoch();
+                    metrics
+                        .heat_sweeps_completed
+                        .fetch_add(1, Ordering::Relaxed);
+                    cursor.sweep_lbas_done -= target;
+                }
+            }
+        }
+
         let mut consecutive_empty = 0usize;
-        while remaining > 0 && running.load(Ordering::Relaxed) {
+        while !use_adaptive && remaining > 0 && running.load(Ordering::Relaxed) {
             let vol = volumes[cursor.vol_idx % volumes.len()].clone();
             let total_lbas = vol.size_bytes / u64::from(vol.block_size.max(1));
             if total_lbas == 0 {
@@ -542,15 +719,25 @@ impl GcRunner {
             }
 
             let mut bumps = 0u64;
-            let scan = meta.scan_blockmap_range(&vol.id, Lba(phys_start), chunk, &mut |_lba, value| {
-                if value.is_zero() {
-                    return;
-                }
-                for pba in value.physical_pbas(BLOCK_SIZE) {
-                    heat.bump(pba);
-                    bumps += 1;
-                }
-            });
+            let scan =
+                meta.scan_blockmap_range(&vol.id, Lba(phys_start), chunk, &mut |lba, value| {
+                    if value.is_zero() {
+                        return;
+                    }
+                    for pba in value.physical_pbas(BLOCK_SIZE) {
+                        heat.bump(pba);
+                        bumps += 1;
+                    }
+                    try_push_cold_tail(
+                        cold_tx,
+                        push_budget,
+                        &mut pushed,
+                        metrics,
+                        &vol.id,
+                        lba,
+                        &value,
+                    );
+                });
             if let Err(e) = scan {
                 tracing::debug!(vol = %vol.id.0, error = %e, "heat refresh: scan_blockmap_range failed");
                 // Still advance the odometer below so a flaky volume cannot
@@ -568,7 +755,9 @@ impl GcRunner {
             // accumulating counts across laps.
             while cursor.sweep_lbas_done >= target {
                 heat.advance_epoch();
-                metrics.heat_sweeps_completed.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .heat_sweeps_completed
+                    .fetch_add(1, Ordering::Relaxed);
                 cursor.sweep_lbas_done -= target;
             }
         }
@@ -577,6 +766,11 @@ impl GcRunner {
             .heat_refresh_lbas_scanned
             .fetch_add(scanned_total, Ordering::Relaxed);
         metrics.heat_bumps.fetch_add(bumps_total, Ordering::Relaxed);
+
+        // Publish a fresh summary for status to read O(1). Done here on the
+        // single GC refresh thread (bounded 1×/cycle) so the O(n_buckets) scan
+        // never fires on a foreground status poll.
+        heat.refresh_summary_cache();
     }
 
     pub fn stop(&mut self) {
@@ -604,6 +798,15 @@ pub(crate) struct HeatReclaimCtx<'a> {
     pub force_confirm_interval: u64,
     /// Current GC cycle number (drives the periodic force-confirm).
     pub cycle: u64,
+    /// Yield gate: if the measured confirm-scan reclaim yield (‰) is ≥ this,
+    /// stop deferring (the scan is productive, not wasted). 0..=1000.
+    pub yield_suppress_milli: u32,
+    /// Confirm-all every Nth cycle to (re)measure yield even while deferring
+    /// (0 = never recalibrate beyond the force-confirm pass).
+    pub recalibrate_interval: u64,
+    /// Free-space pressure gate: if allocator free% ≤ this, stop deferring
+    /// (0 = no pressure gate).
+    pub min_free_pct: u64,
 }
 
 /// Per-volume lap state for the heat refresh (mirrors the dedup scanner's
@@ -628,6 +831,51 @@ struct HeatCursor {
     /// LBAs walked toward the current sweep; laps the sweep `target` each time
     /// it reaches it (carrying the remainder).
     sweep_lbas_done: u64,
+    /// Stage-B2: per-volume `write_bytes` at the previous adaptive cycle, so the
+    /// churn weight is the *delta* (recent write activity), not the lifetime sum.
+    last_write_bytes: HashMap<String, u64>,
+}
+
+/// Stage-B2 adaptive refresh budget split. Each volume gets a guaranteed floor
+/// (its size-proportional share divided by `staleness_floor`, so it is fully
+/// covered at least every `staleness_floor` sweeps even at zero churn) plus a
+/// bonus from the remaining budget proportional to its recent write churn.
+/// Falls back to size-proportional (uniform) when no volume churned. Returns one
+/// sub-budget (LBAs) per input volume; the sum is ≈ `budget` (integer-rounding
+/// may drop a few LBAs, harmless for a prior).
+fn split_refresh_budget(
+    vol_lbas: &[u64],
+    churn: &[u64],
+    budget: u64,
+    staleness_floor: u32,
+) -> Vec<u64> {
+    let n = vol_lbas.len();
+    let total_lbas: u128 = vol_lbas.iter().map(|&l| l as u128).sum();
+    if n == 0 || total_lbas == 0 || budget == 0 {
+        return vec![0; n];
+    }
+    let budget = budget as u128;
+    // Reserve `budget / staleness_floor` for guaranteed coverage; the rest is the
+    // churn bonus pool. floor>=1 keeps the whole budget as bonus when no floor.
+    let floor_div = u128::from(staleness_floor.max(1));
+    let floor_pool = budget / floor_div;
+    let bonus_pool = budget - floor_pool;
+    let churn_sum: u128 = churn.iter().map(|&c| c as u128).sum();
+    (0..n)
+        .map(|i| {
+            let lbas = vol_lbas[i] as u128;
+            if lbas == 0 {
+                return 0;
+            }
+            let floor_i = floor_pool * lbas / total_lbas;
+            let bonus_i = if churn_sum > 0 {
+                bonus_pool * churn[i] as u128 / churn_sum
+            } else {
+                bonus_pool * lbas / total_lbas
+            };
+            (floor_i + bonus_i) as u64
+        })
+        .collect()
 }
 
 /// splitmix64: a tiny, self-contained PRNG. The heat lap phase only needs
@@ -655,4 +903,105 @@ fn heat_lap_seed(vol_id: &str) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01B3);
     }
     nanos ^ h
+}
+
+/// Stage-4 fold producer: emit one cold candidate from the heat walk into the
+/// fold channel, bounded by `push_budget` per cycle. No-op when the fold is
+/// off (`cold_tx` is None) or the per-cycle budget is spent. `try_send` never
+/// blocks the GC cycle; a full or disconnected channel just drops the
+/// candidate (counted in `gc_heat_cold_tail_dropped`) — dropping only costs
+/// dedup ratio, never correctness, because the consumer re-validates every
+/// target before acting and the producer re-emits fresh cold entries each
+/// cycle.
+#[inline]
+fn try_push_cold_tail(
+    cold_tx: Option<&Sender<ColdTailTarget>>,
+    push_budget: usize,
+    pushed: &mut usize,
+    metrics: &EngineMetrics,
+    vol_id: &VolumeId,
+    lba: Lba,
+    value: &BlockmapValue,
+) {
+    let Some(tx) = cold_tx else {
+        return;
+    };
+    if *pushed >= push_budget {
+        return;
+    }
+    // FLAG_DEDUP_SKIPPED entries are owned by the dedup scanner's
+    // DEDUP_SKIPPED backfill path (their content hashes are not yet known);
+    // the legacy cold-tail scan skips them too, so the fold must match.
+    if value.flags & FLAG_DEDUP_SKIPPED != 0 {
+        return;
+    }
+    match tx.try_send(ColdTailTarget {
+        vol_id: vol_id.clone(),
+        lba,
+        bv: *value,
+    }) {
+        Ok(()) => {
+            *pushed += 1;
+            metrics
+                .gc_heat_cold_tail_pushed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+            metrics
+                .gc_heat_cold_tail_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_refresh_budget;
+
+    #[test]
+    fn split_budget_no_churn_is_uniform() {
+        // Equal sizes, no churn → ~equal split summing to ≈ budget.
+        let sub = split_refresh_budget(&[1000, 1000], &[0, 0], 1000, 4);
+        assert!(
+            sub[0].abs_diff(sub[1]) <= 1,
+            "uniform when no churn: {sub:?}"
+        );
+        let s: u64 = sub.iter().sum();
+        assert!((990..=1000).contains(&s), "≈ budget: {sub:?}");
+    }
+
+    #[test]
+    fn split_budget_biases_to_churn_but_keeps_floor() {
+        // Equal sizes; only vol1 churned. floor pool = 1000/4 = 250 (125 each by
+        // size); bonus pool 750 → all to vol1. Idle vol0 still gets its floor.
+        let sub = split_refresh_budget(&[1000, 1000], &[0, 1_000_000], 1000, 4);
+        assert!(sub[1] > sub[0], "churning volume gets more: {sub:?}");
+        assert!(
+            (100..=150).contains(&sub[0]),
+            "idle volume keeps its staleness floor (~125): {sub:?}"
+        );
+    }
+
+    #[test]
+    fn split_budget_floor_scales_with_staleness() {
+        // staleness_floor=1 → floor pool = whole budget → pure size-proportional
+        // (idle vol gets half); larger floor divisor shrinks the guaranteed floor.
+        let s4 = split_refresh_budget(&[1000, 1000], &[0, 1_000_000], 1000, 4);
+        let s1 = split_refresh_budget(&[1000, 1000], &[0, 1_000_000], 1000, 1);
+        assert_eq!(
+            s1,
+            vec![500, 500],
+            "floor=1 ignores churn (all floor): {s1:?}"
+        );
+        assert!(s1[0] > s4[0], "smaller divisor → bigger guaranteed floor");
+    }
+
+    #[test]
+    fn split_budget_handles_zero_size_and_empty() {
+        assert_eq!(split_refresh_budget(&[], &[], 1000, 4), Vec::<u64>::new());
+        assert_eq!(split_refresh_budget(&[0, 0], &[5, 5], 1000, 4), vec![0, 0]);
+        let sub = split_refresh_budget(&[0, 1000], &[0, 0], 1000, 4);
+        assert_eq!(sub[0], 0, "zero-size volume gets no budget");
+        assert!(sub[1] >= 990, "the live volume gets ≈ all of it: {sub:?}");
+    }
 }

@@ -719,7 +719,8 @@ mod tests {
         for (ud, res) in &got {
             assert!(*res >= 0, "op ud={ud} failed res={res}");
         }
-        let batch_ids: std::collections::HashSet<u64> = got.iter().map(|(ud, _)| ud >> 32).collect();
+        let batch_ids: std::collections::HashSet<u64> =
+            got.iter().map(|(ud, _)| ud >> 32).collect();
         assert!(batch_ids.contains(&0) && batch_ids.contains(&1));
 
         for (off, val) in [(0u64, 0xA1u8), (4096, 0xB2)] {

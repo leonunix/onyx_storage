@@ -109,8 +109,8 @@ fn uring_pipeline_concurrent_appends_durable_and_visible() {
         WriteBufferPool::open_with_options_full(
             dev,
             Duration::from_millis(1),
-            1,         // shards
-            256,       // zone size blocks
+            1,   // shards
+            256, // zone size blocks
             Duration::ZERO,
             0,
             Some(64), // uring_sq_entries → pipelined sync path active
@@ -138,7 +138,11 @@ fn uring_pipeline_concurrent_appends_durable_and_visible() {
     }
 
     let total = threads as u64 * per;
-    assert_eq!(pool.pending_count(), total, "all appends still pending (no flusher)");
+    assert_eq!(
+        pool.pending_count(),
+        total,
+        "all appends still pending (no flusher)"
+    );
     for t in 0..threads {
         for i in 0..per {
             let lba = Lba(t as u64 * 1000 + i);
@@ -209,9 +213,17 @@ fn uring_sync_fast_path_single_linked_chain() {
     for i in 0..8u64 {
         let payload: Arc<[u8]> = vec![0x40u8 + i as u8; BLOCK_SIZE as usize].into();
         let payload_crc = crc32fast::hash(payload.as_ref());
-        let encoded =
-            BufferEntry::encode(i + 1, "fast-vol", Lba(i), 1, payload_crc, false, 9, payload.as_ref())
-                .unwrap();
+        let encoded = BufferEntry::encode(
+            i + 1,
+            "fast-vol",
+            Lba(i),
+            1,
+            payload_crc,
+            false,
+            9,
+            payload.as_ref(),
+        )
+        .unwrap();
         let disk_len = encoded.len() as u32;
         let pending = Arc::new(PendingEntry {
             seq: i + 1,
@@ -879,7 +891,13 @@ fn mark_flushed_drops_seq_from_pending_seqs_index() {
     pool.recv_ready_timeout(Duration::from_secs(2)).unwrap();
 
     assert_eq!(
-        shard.ring.lock().pending_seqs.iter().copied().collect::<Vec<_>>(),
+        shard
+            .ring
+            .lock()
+            .pending_seqs
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
         vec![seq1, seq2],
         "both appends must land in pending_seqs"
     );
@@ -986,7 +1004,10 @@ fn durability_waiter_selective_wake_leaves_later_seq_parked() {
     // Advance to 7: only the seq-5 waiter is durable.
     w.advance(7);
     early.join().unwrap();
-    assert!(early_done.load(Ordering::Acquire), "seq-5 appender must wake");
+    assert!(
+        early_done.load(Ordering::Acquire),
+        "seq-5 appender must wake"
+    );
     // The seq-10 waiter must still be parked (advance(7) < 10).
     std::thread::sleep(Duration::from_millis(20));
     assert!(

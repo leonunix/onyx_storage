@@ -65,6 +65,67 @@ pub struct GcConfig {
     /// live region) — kept so the knob is stable across the B→B2 step.
     #[serde(default = "default_heat_staleness_floor_sweeps")]
     pub heat_staleness_floor_sweeps: u32,
+
+    // --- Stage-B yield gate (self-correct the "hot ⇒ defer" heuristic) ---
+    /// If the recent confirm-scan reclaim YIELD (reclaimed extents / scanned
+    /// extents, EMA) is ≥ this percent, STOP deferring hot regions this window:
+    /// a productive scan means the "hot region ⇒ extent still referenced ⇒ scan
+    /// wasted" premise is FALSE for this workload (e.g. unique/discard churn,
+    /// where retired extents are genuinely dead), so deferring would only lose
+    /// real reclaim. Low yield (e.g. dedup-heavy, where retired rc==0 extents
+    /// are often still referenced via an un-drained re-share) keeps deferring —
+    /// that is where skipping the scan actually pays. Default 25.
+    #[serde(default = "default_heat_defer_yield_suppress_pct")]
+    pub heat_defer_yield_suppress_pct: u8,
+    /// Every Nth cycle, confirm-all to (re)measure the confirm-scan yield even
+    /// while deferring — bounds the cold-start / workload-change blind-defer
+    /// window to this many cycles (default 8; 0 disables periodic recalibration,
+    /// leaving only the force-confirm pass to sample yield). Distinct from
+    /// `heat_force_confirm_interval_cycles` (anti-starvation, coarser).
+    #[serde(default = "default_heat_defer_recalibrate_interval_cycles")]
+    pub heat_defer_recalibrate_interval_cycles: u64,
+    /// If allocator free-space ≤ this percent, STOP deferring (confirm-all) so
+    /// reclaim is not delayed under space pressure — the retired-reclaim analog
+    /// of the rewrite-GC `dynamic_threshold`. Default 10; 0 disables the gate.
+    #[serde(default = "default_heat_defer_min_free_pct")]
+    pub heat_defer_min_free_pct: u8,
+
+    // --- Stage-B2: adaptive (per-volume) refresh budget ---
+    /// Master switch for biasing the heat-refresh budget toward high-churn
+    /// volumes (scan changing volumes more, stable ones less), with
+    /// `heat_staleness_floor_sweeps` guaranteeing every volume is fully covered
+    /// at least that often regardless of churn. Default FALSE — behavior change,
+    /// A/B before flip; no effect with a single volume (degrades to uniform).
+    #[serde(default = "default_heat_adaptive_refresh_enabled")]
+    pub heat_adaptive_refresh_enabled: bool,
+
+    // --- Stage-4: fold dedup cold-tail warming into the heat-refresh walk ---
+    /// Master switch for folding the dedup cold-tail scan into the GC
+    /// heat-refresh walk (`docs/adaptive-reclaim-heatmap.md` Stage 4). When ON,
+    /// the heat walk (already decoding every non-zero `BlockmapValue`) also
+    /// emits cold candidates over a bounded channel; the dedup scanner drains
+    /// that channel instead of running its own independent
+    /// `scan_blockmap_range` traversal. Eliminates the duplicate live-L2P walk
+    /// and lets cold-tail warming ride the heat walk's fast, churn-weighted
+    /// coverage at unchanged LV3 read IO. Default FALSE — behavior change,
+    /// A/B before flip. Requires `heat_enabled` (the walk must exist) AND a
+    /// configured `ReadPool` AND `dedup.enabled`; otherwise the fold is inert
+    /// and both subsystems run their legacy paths. Read once at engine open
+    /// (toggling needs a restart).
+    #[serde(default = "default_heat_fold_cold_tail_enabled")]
+    pub heat_fold_cold_tail_enabled: bool,
+    /// Bounded capacity of the cold-tail fold channel (default 2048). Producer
+    /// `try_send`s and drops on full, so this only bounds how many recent cold
+    /// candidates the consumer can choose from; dropping costs dedup ratio,
+    /// never correctness.
+    #[serde(default = "default_heat_fold_channel_capacity")]
+    pub heat_fold_channel_capacity: usize,
+    /// Max cold candidates the heat walk pushes per refresh cycle (default
+    /// 256). Bounds producer work + channel refill rate. The consumer's own
+    /// `dedup.cold_tail_max_per_cycle` still bounds the (unchanged) LV3 read
+    /// IO independently. `0` disables pushing (heat walk runs, no fold).
+    #[serde(default = "default_heat_fold_push_max_per_cycle")]
+    pub heat_fold_push_max_per_cycle: usize,
 }
 
 impl Default for GcConfig {
@@ -83,6 +144,14 @@ impl Default for GcConfig {
             heat_fresh_max_age: default_heat_fresh_max_age(),
             heat_force_confirm_interval_cycles: default_heat_force_confirm_interval_cycles(),
             heat_staleness_floor_sweeps: default_heat_staleness_floor_sweeps(),
+            heat_defer_yield_suppress_pct: default_heat_defer_yield_suppress_pct(),
+            heat_defer_recalibrate_interval_cycles: default_heat_defer_recalibrate_interval_cycles(
+            ),
+            heat_defer_min_free_pct: default_heat_defer_min_free_pct(),
+            heat_adaptive_refresh_enabled: default_heat_adaptive_refresh_enabled(),
+            heat_fold_cold_tail_enabled: default_heat_fold_cold_tail_enabled(),
+            heat_fold_channel_capacity: default_heat_fold_channel_capacity(),
+            heat_fold_push_max_per_cycle: default_heat_fold_push_max_per_cycle(),
         }
     }
 }
@@ -125,4 +194,25 @@ fn default_heat_fresh_max_age() -> u32 {
 }
 fn default_heat_force_confirm_interval_cycles() -> u64 {
     64
+}
+fn default_heat_defer_yield_suppress_pct() -> u8 {
+    25
+}
+fn default_heat_defer_recalibrate_interval_cycles() -> u64 {
+    8
+}
+fn default_heat_defer_min_free_pct() -> u8 {
+    10
+}
+fn default_heat_adaptive_refresh_enabled() -> bool {
+    false
+}
+fn default_heat_fold_cold_tail_enabled() -> bool {
+    false
+}
+fn default_heat_fold_channel_capacity() -> usize {
+    2048
+}
+fn default_heat_fold_push_max_per_cycle() -> usize {
+    256
 }

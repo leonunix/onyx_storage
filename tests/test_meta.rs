@@ -533,8 +533,12 @@ fn range_query_empty() {
     assert!(range.is_empty());
 }
 
-/// Fix: delete_volume with multiple LBAs pointing to same PBA (dedup scenario).
-/// Refcount must be decremented by total count, not just 1.
+/// Phase 5: delete_volume with multiple LBAs pointing to the same PBA (dedup
+/// scenario) is PBA **rc-neutral** — it drains the L2P mappings but does NOT
+/// decref the (dedup-membership) refcount. A PBA whose rc stays > 0 is not
+/// freed by delete; physical reclaim of a stale-positive dedup PBA is the
+/// reclaim scan's job (docs/reclaim-architecture-map.md §3c). Mirrors the
+/// metadb-side fix in commit 7c80fc1 (`b2_buffer_range_delete_drains_buffer`).
 #[test]
 fn delete_volume_shared_pba_refcount() {
     let dir = tempdir().unwrap();
@@ -566,16 +570,17 @@ fn delete_volume_shared_pba_refcount() {
 
     let freed = store.delete_volume(&vol.id).unwrap();
 
-    // All 3 decrements aggregated: 3 - 3 = 0, PBA freed
-    assert_eq!(freed.len(), 1);
-    assert_eq!(freed[0].pba, shared_pba);
-    assert_eq!(freed[0].decrements, 3);
-    assert!(freed[0].pba_freed);
-    assert_eq!(store.get_refcount(shared_pba).unwrap(), 0);
+    // Phase 5: rc-neutral delete. rc was seeded to 3 (simulating a
+    // dedup-shared PBA); the rc-neutral delete leaves it at 3, so the PBA is
+    // NOT freed and no cleanup payload is returned. (Pre-Phase-5 this
+    // expected 3 - 3 = 0 with the PBA freed.)
+    assert!(freed.is_empty());
+    assert_eq!(store.get_refcount(shared_pba).unwrap(), 3);
 }
 
-/// Fix: delete_volume with shared PBA but refcount > volume's mapping count.
-/// PBA should NOT be freed if other volumes still reference it.
+/// Phase 5: delete_volume is PBA rc-neutral, so a shared PBA's refcount is
+/// left untouched (not decremented by the volume's mapping count) and the PBA
+/// stays live. PBA should NOT be freed.
 #[test]
 fn delete_volume_shared_pba_partial_decrement() {
     let dir = tempdir().unwrap();
@@ -607,10 +612,12 @@ fn delete_volume_shared_pba_partial_decrement() {
 
     let freed = store.delete_volume(&vol.id).unwrap();
 
-    // 5 - 2 = 3, so the PBA is still live and no cleanup payload should
-    // be returned to the post-commit cleanup channel.
+    // Phase 5: rc-neutral delete. The 2 deleted mappings do NOT decref; rc
+    // stays at the seeded 5, so the PBA is still live and no cleanup payload
+    // is returned to the post-commit cleanup channel. (Pre-Phase-5 this
+    // expected 5 - 2 = 3.)
     assert!(freed.is_empty());
-    assert_eq!(store.get_refcount(shared_pba).unwrap(), 3);
+    assert_eq!(store.get_refcount(shared_pba).unwrap(), 5);
 }
 
 /// Fix: volume ID too long is rejected at creation.
