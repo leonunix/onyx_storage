@@ -349,28 +349,43 @@ impl DedupScanner {
             // Needs the relevant structure refreshed; default-OFF via
             // `orphan_reclaim_max_per_cycle == 0` / `orphan_reclaim_enabled`.
             if !rescan_debt && cfg.orphan_reclaim_enabled && cfg.orphan_reclaim_max_per_cycle > 0 {
+                let budget = cfg.orphan_reclaim_max_per_cycle;
+                // Both modes run the SAME bounded scan + retire path
+                // (`orphan_reclaim_scan`); only the per-entry orphan predicate and
+                // the convergence gate differ. `None` ⇒ the relevant structure is
+                // absent or not yet converged → skip (no cursor advance).
                 let result = if cfg.orphan_reclaim_per_pba {
-                    ref_bitmap.map(|rb| {
-                        Self::orphan_reclaim_dedup_index_per_pba(
-                            meta,
-                            candidate,
-                            allocator,
-                            rb,
-                            &mut orphan_cursor,
-                            cfg.orphan_reclaim_max_per_cycle,
-                            cfg.orphan_reclaim_clean_sweeps.clamp(1, 4) as usize,
-                        )
-                    })
+                    // Per-PBA: unreferenced across the last K completed barriers.
+                    // `recent_view` is the convergence gate (None until K) AND
+                    // hoists the snapshot load out of the per-entry loop.
+                    let k = cfg.orphan_reclaim_clean_sweeps.clamp(1, 4) as usize;
+                    ref_bitmap
+                        .and_then(|rb| rb.recent_view(k))
+                        .map(|view| {
+                            Self::orphan_reclaim_scan(
+                                meta,
+                                candidate,
+                                allocator,
+                                &mut orphan_cursor,
+                                budget,
+                                |entry| view.is_unreferenced(entry.pba),
+                            )
+                        })
                 } else {
-                    heat.map(|h| {
-                        Self::orphan_reclaim_dedup_index(
+                    // §6 region: a STALE region (was live, now cold for
+                    // > fresh_max_age sweeps). Convergence gate: heat epoch >= 2.
+                    let fresh_max_age = cfg.orphan_reclaim_fresh_max_age;
+                    heat.filter(|h| h.current_epoch() >= 2).map(|h| {
+                        Self::orphan_reclaim_scan(
                             meta,
                             candidate,
                             allocator,
-                            h,
                             &mut orphan_cursor,
-                            cfg.orphan_reclaim_max_per_cycle,
-                            cfg.orphan_reclaim_fresh_max_age,
+                            budget,
+                            |entry| {
+                                let (age, region_count) = h.region(entry.pba);
+                                region_count > 0 && age != u32::MAX && age > fresh_max_age
+                            },
                         )
                     })
                 };
@@ -1050,57 +1065,38 @@ impl DedupScanner {
         })
     }
 
-    /// Orphan dedup-PBA reclaim (§6): walk a budgeted slice of the dedup_index
-    /// and demote entries whose PBA region the heat map reports as COLD (no
-    /// live L2P entry references the whole 1 MiB region → the entry is very
-    /// likely orphaned). Demote = delete the index entry + retire the now-rc==0
-    /// PBA via [`Self::delete_dedup_entry_and_retire`]; the GC confirm scan does
-    /// the safe free. The heat map is only a *selector* (skip hot/shared
-    /// regions to avoid dedup-ratio churn) — correctness is the Gate-2 scan, so
-    /// a stale/wrong heat read can never free a live PBA, only cost a
-    /// re-promote. Runs only with a refreshed heat map present.
-    fn orphan_reclaim_dedup_index(
+    /// Orphan dedup-PBA reclaim: scan a budgeted, resumable slice of the
+    /// dedup_index and demote every entry the `is_orphan` selector flags as
+    /// having no live L2P reference. Demote = delete the index entry + retire the
+    /// now-rc==0 PBA via [`Self::delete_dedup_entry_and_retire`]; the GC confirm
+    /// scan does the safe free.
+    ///
+    /// `is_orphan` is the ONLY thing that differs between the §6 region selector
+    /// (cold 1 MiB heat region) and the Stage-5 per-PBA selector (unreferenced
+    /// across the last K lap-barriers). It is only a *selector* — correctness is
+    /// the GC Gate-2 `referenced_extents` scan, so a wrong selector read can
+    /// never free a live PBA, only cost a re-promote. The caller owns the
+    /// convergence gate (skips this entirely until its structure is trustworthy).
+    fn orphan_reclaim_scan<F>(
         meta: &MetaStore,
         candidate: &CandidateCache,
         allocator: &SpaceAllocator,
-        heat: &HeatMap,
         cursor: &mut DedupScanCursor,
         budget: usize,
-        fresh_max_age: u32,
-    ) -> OnyxResult<OrphanReclaimStats> {
+        mut is_orphan: F,
+    ) -> OnyxResult<OrphanReclaimStats>
+    where
+        F: FnMut(&DedupEntry) -> bool,
+    {
         let mut stats = OrphanReclaimStats::default();
         if budget == 0 {
-            return Ok(stats);
-        }
-        // Convergence floor: don't trust the heat map until it has completed at
-        // least one full sweep (FIRST_EPOCH==1, so epoch>=2). Before that every
-        // region looks cold (nothing swept yet) and we'd churn dedup ratio for
-        // not-yet-swept live entries (safe via the Gate-2 confirm scan, but
-        // wasteful). The `fresh_max_age` staleness window in the selector below
-        // adds further delay before a freshly-orphaned region is demoted.
-        if heat.current_epoch() < 2 {
             return Ok(stats);
         }
         // Bounded, resumable page-cursor scan (O(budget), no full materialise).
         let (entries, next, _wrapped) = meta.scan_dedup_from(*cursor, budget)?;
         *cursor = next;
         for (hash, entry) in entries {
-            // Selector: demote ONLY a STALE region — one that WAS live (count>0,
-            // the heat refresh bumped it while the dedup PBA was referenced) but
-            // has NOT been bumped for > fresh_max_age completed sweeps. That is
-            // the overwrite-orphaned signature: every referrer was overwritten,
-            // so the heat bucket keeps its stale count while its age grows.
-            //
-            // A NEVER_SCANNED region (count==0) is deliberately NOT demoted: it
-            // has no PROOF of going cold (it may simply not have been swept yet,
-            // e.g. before the heat map converges or right after a restart), so
-            // demoting it would churn dedup ratio for live-but-unswept entries.
-            // Requiring a prior bump makes cold-start churn impossible. (Safety
-            // is the Gate-2 confirm scan regardless — this selector only governs
-            // *which* entries we bother to demote, never whether a free is safe.)
-            let (age, region_count) = heat.region(entry.pba);
-            let stale = region_count > 0 && age != u32::MAX && age > fresh_max_age;
-            if !stale {
+            if !is_orphan(&entry) {
                 stats.skipped_hot += 1;
                 continue;
             }
@@ -1119,79 +1115,6 @@ impl DedupScanner {
                         pba = entry.pba.0,
                         error = %e,
                         "orphan dedup reclaim: demote failed"
-                    );
-                }
-            }
-        }
-        Ok(stats)
-    }
-
-    /// Stage-5 per-PBA orphan reclaim: like [`Self::orphan_reclaim_dedup_index`]
-    /// but the selector is the per-PBA referenced bitmap instead of the 1 MiB
-    /// heat region. A dedup entry is demoted when its PBA reads unreferenced
-    /// (bit==0) across the last `clean_sweeps` completed lap-barriers — so
-    /// orphans *interleaved* with live data (which the region selector skips
-    /// because the shared 1 MiB region still counts live) are reclaimed too.
-    ///
-    /// Safety is identical to §6: the bitmap is only a *selector*; the GC Gate-2
-    /// `referenced_extents` exact scan authorizes every free, so a wrong bit can
-    /// only cost a re-promote, never data. Reuses the same
-    /// [`Self::delete_dedup_entry_and_retire`] helper and retire→free path.
-    fn orphan_reclaim_dedup_index_per_pba(
-        meta: &MetaStore,
-        candidate: &CandidateCache,
-        allocator: &SpaceAllocator,
-        ref_bitmap: &RefBitmap,
-        cursor: &mut DedupScanCursor,
-        budget: usize,
-        clean_sweeps: usize,
-    ) -> OnyxResult<OrphanReclaimStats> {
-        let mut stats = OrphanReclaimStats::default();
-        if budget == 0 {
-            return Ok(stats);
-        }
-        // Convergence floor: need at least `clean_sweeps` completed lap-barriers
-        // before any 0 bit is trustworthy. Before that the bitmap can't tell
-        // "unreferenced" from "not yet covered", so demoting would churn dedup
-        // ratio for live-but-uncovered entries (Gate-2-safe, but wasteful).
-        if ref_bitmap.published_count() < clean_sweeps {
-            return Ok(stats);
-        }
-        // Bounded, resumable page-cursor scan (O(budget), no full materialise).
-        let (entries, next, _wrapped) = meta.scan_dedup_from(*cursor, budget)?;
-        *cursor = next;
-        for (hash, entry) in entries {
-            // Selector: demote ONLY a PBA that read unreferenced (bit==0) in
-            // EVERY one of the last `clean_sweeps` completed lap-barriers.
-            //   None        → not yet converged → skip.
-            //   Some(false) → referenced in a recent barrier (or out of range) → skip.
-            //   Some(true)  → unreferenced across all K barriers → demote candidate.
-            // Requiring K consecutive clean barriers absorbs the in-flight-write
-            // race (a write landing after a referrer-LBA was walked but before
-            // the PBA was orphaned). Gate-2 remains the only safety authority.
-            let orphan = matches!(
-                ref_bitmap.unreferenced_in_recent(entry.pba, clean_sweeps),
-                Some(true)
-            );
-            if !orphan {
-                stats.skipped_hot += 1;
-                continue;
-            }
-            let mapping = entry.to_blockmap_value();
-            match Self::delete_dedup_entry_and_retire(meta, candidate, allocator, &hash, &mapping) {
-                Ok(out) if out.deleted => {
-                    stats.demoted += 1;
-                    if out.retired {
-                        stats.retired += 1;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    stats.errors += 1;
-                    tracing::debug!(
-                        pba = entry.pba.0,
-                        error = %e,
-                        "orphan dedup reclaim (per-PBA): demote failed"
                     );
                 }
             }

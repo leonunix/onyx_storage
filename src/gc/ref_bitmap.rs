@@ -161,23 +161,20 @@ impl RefBitmap {
         let mut snaps = prev.snaps.clone();
         snaps.push_back(Arc::new(Snapshot { bits: filled }));
 
-        // Evict the oldest if the window now exceeds K, and try to recycle its
-        // buffer for the next fill.
-        let mut recycled: Option<Box<[u64]>> = None;
-        while snaps.len() > self.inner.k {
-            if let Some(evicted) = snaps.pop_front() {
-                if recycled.is_none() {
-                    if let Some(snap) = Arc::into_inner(evicted) {
-                        let mut buf = snap.bits;
-                        buf.fill(0);
-                        debug_assert_eq!(buf.len(), self.inner.n_words);
-                        recycled = Some(buf);
-                    }
-                    // try_unwrap failed (a reader still holds it) → leave it to
-                    // drop when the reader releases; fall through to fresh alloc.
-                }
-            }
-        }
+        // We pushed exactly one, so the window is over-full by at most one: evict
+        // the oldest and recycle its buffer for the next fill — but ONLY when no
+        // reader still holds it (`Arc::into_inner` fails → drop it, the reader
+        // frees it later, and we fall back to a fresh buffer).
+        let recycled = if snaps.len() > self.inner.k {
+            snaps.pop_front().and_then(Arc::into_inner).map(|snap| {
+                let mut buf = snap.bits;
+                debug_assert_eq!(buf.len(), self.inner.n_words);
+                buf.fill(0);
+                buf
+            })
+        } else {
+            None
+        };
 
         self.inner.snapshots.store(Arc::new(Snapshots {
             snaps,
@@ -210,36 +207,64 @@ impl RefBitmap {
         (self.inner.k + 1) * self.inner.n_words * std::mem::size_of::<u64>()
     }
 
-    /// Has `pba` been **unreferenced** (bit == 0) across **all** of the `k` most
-    /// recent completed snapshots?
-    ///
-    /// - `None` — fewer than `k` snapshots have been published (not converged);
-    ///   the caller skips (treats as not-yet-decidable).
-    /// - `Some(true)` — bit `0` in every one of the last `k` snapshots → a
-    ///   Stage-5 orphan candidate (still subject to the GC Gate-2 confirm scan).
-    /// - `Some(false)` — referenced in at least one of the last `k` snapshots, or
-    ///   `pba` is out of range → skip (conservative).
-    pub fn unreferenced_in_recent(&self, pba: Pba, k: usize) -> Option<bool> {
-        let snapshots = self.inner.snapshots.load();
-        let have = snapshots.snaps.len();
-        if k == 0 || have < k {
+    /// Load the most-recent `k` completed snapshots once, for a batch of
+    /// `is_unreferenced` queries — hoisting the `ArcSwap` load out of a
+    /// per-entry loop (the orphan sweep tests up to `budget` PBAs per cycle).
+    /// Returns `None` (not converged → caller skips) until `k` barriers have
+    /// been published.
+    pub fn recent_view(&self, k: usize) -> Option<RecentRefView> {
+        if k == 0 {
             return None;
         }
+        let snaps = self.inner.snapshots.load_full();
+        if snaps.snaps.len() < k {
+            return None;
+        }
+        Some(RecentRefView {
+            snaps,
+            k,
+            total_pbas: self.inner.total_pbas,
+        })
+    }
+
+    /// Has `pba` been **unreferenced** (bit == 0) across **all** of the `k` most
+    /// recent completed snapshots? `None` if fewer than `k` snapshots exist (not
+    /// converged); `Some(false)` if referenced in any of them or out of range.
+    /// Convenience over [`Self::recent_view`] for single-PBA / test callers.
+    pub fn unreferenced_in_recent(&self, pba: Pba, k: usize) -> Option<bool> {
+        self.recent_view(k).map(|v| v.is_unreferenced(pba))
+    }
+}
+
+/// A loaded snapshot of the most-recent `k` completed barriers (see
+/// [`RefBitmap::recent_view`]). Holds one `ArcSwap` load so a sweep can test
+/// many PBAs without re-loading per entry.
+pub struct RecentRefView {
+    snaps: Arc<Snapshots>,
+    k: usize,
+    total_pbas: u64,
+}
+
+impl RecentRefView {
+    /// True iff `pba` read unreferenced (bit == 0) in every one of the `k`
+    /// snapshots. Out-of-range PBAs (never dedup PBAs) read as referenced, so
+    /// they are never selected for demotion.
+    #[inline]
+    pub fn is_unreferenced(&self, pba: Pba) -> bool {
         let i = pba.0;
-        if i >= self.inner.total_pbas {
-            // Out of range — never a dedup PBA; treat as "referenced" so it is
-            // never selected for demotion.
-            return Some(false);
+        if i >= self.total_pbas {
+            return false;
         }
         let word = (i / BITS_PER_WORD) as usize;
         let bit = 1u64 << (i % BITS_PER_WORD);
+        let have = self.snaps.snaps.len();
         // Walk only the k most-recent snapshots (the back of the deque).
-        for snap in snapshots.snaps.iter().skip(have - k) {
+        for snap in self.snaps.snaps.iter().skip(have - self.k) {
             if snap.bits[word] & bit != 0 {
-                return Some(false);
+                return false;
             }
         }
-        Some(true)
+        true
     }
 }
 
