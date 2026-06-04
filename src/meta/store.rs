@@ -581,6 +581,17 @@ impl MetaStore {
         self.backend.iter_dedup_entries()
     }
 
+    /// Resumable, bounded scan over the dedup forward index (the scalable
+    /// alternative to [`Self::iter_dedup_entries`] for background sweeps): up to
+    /// `limit` entries from `cursor`, plus the resume cursor and `wrapped`.
+    pub fn scan_dedup_from(
+        &self,
+        cursor: onyx_metadb::DedupScanCursor,
+        limit: usize,
+    ) -> OnyxResult<(Vec<(ContentHash, DedupEntry)>, onyx_metadb::DedupScanCursor, bool)> {
+        self.backend.scan_dedup_from(cursor, limit)
+    }
+
     pub fn iter_allocated_blocks(&self) -> OnyxResult<Vec<Pba>> {
         let mut allocated = std::collections::BTreeSet::new();
         for (_, _, value) in self.backend.scan_all_blockmap_entries()? {

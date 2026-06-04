@@ -1139,6 +1139,26 @@ impl MetadbBackend {
             .collect()
     }
 
+    /// Resumable, bounded scan over the dedup forward index — the scalable
+    /// alternative to [`Self::iter_dedup_entries`] for background sweeps. Returns
+    /// up to `limit` decoded entries from `cursor`, plus the resume cursor and a
+    /// `wrapped` flag (a full pass completed). O(`limit`) — does not materialise
+    /// the whole index, so it scales to a multi-billion-entry index where
+    /// `iter_dedup_entries` would allocate hundreds of GiB.
+    pub(crate) fn scan_dedup_from(
+        &self,
+        cursor: onyx_metadb::DedupScanCursor,
+        limit: usize,
+    ) -> OnyxResult<(Vec<(ContentHash, DedupEntry)>, onyx_metadb::DedupScanCursor, bool)> {
+        let batch = self.db.scan_dedup_from(cursor, limit)?;
+        let entries = batch
+            .entries
+            .into_iter()
+            .map(|(hash, value)| Ok((hash, decode_dedup_value(value)?)))
+            .collect::<OnyxResult<Vec<_>>>()?;
+        Ok((entries, batch.next, batch.wrapped))
+    }
+
     pub(crate) fn iter_allocated_blocks(&self) -> OnyxResult<Vec<(Pba, u32)>> {
         let mut blocks: Vec<(Pba, u32)> = Vec::new();
         for (_, _, value) in self.scan_all_blockmap_entries()? {

@@ -23,6 +23,7 @@ use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
 use crate::types::{Lba, VolumeId, BLOCK_SIZE};
+use onyx_metadb::DedupScanCursor;
 
 /// Background dedup scanner.
 ///
@@ -168,8 +169,12 @@ impl DedupScanner {
         // cycle, wrapping the volume, then re-randomizes (see
         // `ColdTailCursor`).
         let mut cold_tail_cursors: HashMap<String, ColdTailCursor> = HashMap::new();
-        let mut index_scrub_cursor: usize = 0;
-        let mut orphan_cursor: usize = 0;
+        // Resumable page cursors over the dedup index for the bounded,
+        // O(budget)-per-cycle background sweeps (scrub + orphan reclaim). These
+        // replace the old "materialise + sort the whole index every cycle"
+        // approach, which does not scale to a multi-billion-entry index.
+        let mut index_scrub_cursor = DedupScanCursor::default();
+        let mut orphan_cursor = DedupScanCursor::default();
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
             thread::sleep(Duration::from_millis(cfg.rescan_interval_ms));
@@ -929,7 +934,7 @@ impl DedupScanner {
         candidate: &CandidateCache,
         allocator: &SpaceAllocator,
         metrics: &EngineMetrics,
-        cursor: &mut usize,
+        cursor: &mut DedupScanCursor,
         budget: usize,
     ) -> OnyxResult<IndexScrubStats> {
         let mut stats = IndexScrubStats::default();
@@ -937,20 +942,10 @@ impl DedupScanner {
             return Ok(stats);
         }
 
-        let mut entries = meta.iter_dedup_entries()?;
-        if entries.is_empty() {
-            *cursor = 0;
-            return Ok(stats);
-        }
-        entries.sort_unstable_by_key(|(hash, entry)| (*hash, entry.pba.0, entry.slot_offset));
-        if *cursor >= entries.len() {
-            *cursor = 0;
-        }
-
-        let count = budget.min(entries.len());
-        for offset in 0..count {
-            let idx = (*cursor + offset) % entries.len();
-            let (hash, entry) = entries[idx];
+        // Bounded, resumable page-cursor scan (O(budget), no full materialise).
+        let (entries, next, _wrapped) = meta.scan_dedup_from(*cursor, budget)?;
+        *cursor = next;
+        for (hash, entry) in entries {
             let mapping = entry.to_blockmap_value();
             let matched = match read_lba_block(io_engine, &mapping) {
                 Ok(Some(block)) => compute_content_hash(&block) == hash,
@@ -1001,7 +996,6 @@ impl DedupScanner {
                 }
             }
         }
-        *cursor = (*cursor + count) % entries.len();
         Ok(stats)
     }
 
@@ -1070,7 +1064,7 @@ impl DedupScanner {
         candidate: &CandidateCache,
         allocator: &SpaceAllocator,
         heat: &HeatMap,
-        cursor: &mut usize,
+        cursor: &mut DedupScanCursor,
         budget: usize,
         fresh_max_age: u32,
     ) -> OnyxResult<OrphanReclaimStats> {
@@ -1087,19 +1081,10 @@ impl DedupScanner {
         if heat.current_epoch() < 2 {
             return Ok(stats);
         }
-        let mut entries = meta.iter_dedup_entries()?;
-        if entries.is_empty() {
-            *cursor = 0;
-            return Ok(stats);
-        }
-        entries.sort_unstable_by_key(|(hash, entry)| (*hash, entry.pba.0, entry.slot_offset));
-        if *cursor >= entries.len() {
-            *cursor = 0;
-        }
-        let count = budget.min(entries.len());
-        for offset in 0..count {
-            let idx = (*cursor + offset) % entries.len();
-            let (hash, entry) = entries[idx];
+        // Bounded, resumable page-cursor scan (O(budget), no full materialise).
+        let (entries, next, _wrapped) = meta.scan_dedup_from(*cursor, budget)?;
+        *cursor = next;
+        for (hash, entry) in entries {
             // Selector: demote ONLY a STALE region — one that WAS live (count>0,
             // the heat refresh bumped it while the dedup PBA was referenced) but
             // has NOT been bumped for > fresh_max_age completed sweeps. That is
@@ -1138,7 +1123,6 @@ impl DedupScanner {
                 }
             }
         }
-        *cursor = (*cursor + count) % entries.len();
         Ok(stats)
     }
 
@@ -1158,7 +1142,7 @@ impl DedupScanner {
         candidate: &CandidateCache,
         allocator: &SpaceAllocator,
         ref_bitmap: &RefBitmap,
-        cursor: &mut usize,
+        cursor: &mut DedupScanCursor,
         budget: usize,
         clean_sweeps: usize,
     ) -> OnyxResult<OrphanReclaimStats> {
@@ -1173,19 +1157,10 @@ impl DedupScanner {
         if ref_bitmap.published_count() < clean_sweeps {
             return Ok(stats);
         }
-        let mut entries = meta.iter_dedup_entries()?;
-        if entries.is_empty() {
-            *cursor = 0;
-            return Ok(stats);
-        }
-        entries.sort_unstable_by_key(|(hash, entry)| (*hash, entry.pba.0, entry.slot_offset));
-        if *cursor >= entries.len() {
-            *cursor = 0;
-        }
-        let count = budget.min(entries.len());
-        for offset in 0..count {
-            let idx = (*cursor + offset) % entries.len();
-            let (hash, entry) = entries[idx];
+        // Bounded, resumable page-cursor scan (O(budget), no full materialise).
+        let (entries, next, _wrapped) = meta.scan_dedup_from(*cursor, budget)?;
+        *cursor = next;
+        for (hash, entry) in entries {
             // Selector: demote ONLY a PBA that read unreferenced (bit==0) in
             // EVERY one of the last `clean_sweeps` completed lap-barriers.
             //   None        → not yet converged → skip.
@@ -1221,7 +1196,6 @@ impl DedupScanner {
                 }
             }
         }
-        *cursor = (*cursor + count) % entries.len();
         Ok(stats)
     }
 

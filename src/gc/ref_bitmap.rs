@@ -65,8 +65,8 @@ struct Snapshot {
 /// as a unit via `ArcSwap` so a reader always sees a consistent window.
 struct Snapshots {
     snaps: VecDeque<Arc<Snapshot>>,
-    /// Increments on every `publish`; the dedup scanner keys its
-    /// `iter_dedup_entries` cache on this so it rebuilds once per new barrier.
+    /// Increments on every `publish` (one completed lap-barrier). A monotonic
+    /// progress counter for observability / tests; not on any hot path.
     barrier_gen: u64,
 }
 
@@ -187,8 +187,8 @@ impl RefBitmap {
         recycled.unwrap_or_else(|| self.fresh_fill_buffer())
     }
 
-    /// Monotonic generation counter, incremented on every [`Self::publish`].
-    /// The dedup scanner keys its `iter_dedup_entries` cache on this.
+    /// Monotonic generation counter, incremented on every [`Self::publish`]
+    /// (one completed lap-barrier). Exposed for observability / tests.
     pub fn barrier_gen(&self) -> u64 {
         self.inner.snapshots.load().barrier_gen
     }
