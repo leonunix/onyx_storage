@@ -13,6 +13,7 @@ use crate::compress::codec::create_compressor;
 use crate::dedup::config::DedupConfig;
 use crate::dedup::{CandidateCache, ColdTailTarget};
 use crate::error::OnyxResult;
+use crate::gc::heatmap::HeatMap;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::{ReadPool, ReadPurpose};
 use crate::lifecycle::VolumeLifecycleManager;
@@ -62,6 +63,7 @@ impl DedupScanner {
         candidate: CandidateCache,
         read_pool: Option<Arc<ReadPool>>,
         cold_rx: Option<Receiver<ColdTailTarget>>,
+        heat: Option<HeatMap>,
         config: DedupConfig,
     ) -> Self {
         Self::start_with_metrics(
@@ -74,6 +76,7 @@ impl DedupScanner {
             candidate,
             read_pool,
             cold_rx,
+            heat,
             config,
         )
     }
@@ -89,6 +92,7 @@ impl DedupScanner {
         candidate: CandidateCache,
         read_pool: Option<Arc<ReadPool>>,
         cold_rx: Option<Receiver<ColdTailTarget>>,
+        heat: Option<HeatMap>,
         config: DedupConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -110,6 +114,7 @@ impl DedupScanner {
                     &candidate,
                     read_pool.as_deref(),
                     cold_rx.as_ref(),
+                    heat.as_ref(),
                     &config_clone,
                     &running_clone,
                 );
@@ -140,6 +145,7 @@ impl DedupScanner {
         candidate: &CandidateCache,
         read_pool: Option<&ReadPool>,
         cold_rx: Option<&Receiver<ColdTailTarget>>,
+        heat: Option<&HeatMap>,
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
@@ -155,6 +161,7 @@ impl DedupScanner {
         // `ColdTailCursor`).
         let mut cold_tail_cursors: HashMap<String, ColdTailCursor> = HashMap::new();
         let mut index_scrub_cursor: usize = 0;
+        let mut orphan_cursor: usize = 0;
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
             thread::sleep(Duration::from_millis(cfg.rescan_interval_ms));
@@ -292,11 +299,16 @@ impl DedupScanner {
                 match Self::scrub_dedup_index(
                     meta,
                     io_engine,
+                    candidate,
+                    allocator,
                     metrics,
                     &mut index_scrub_cursor,
                     cfg.index_scrub_max_per_cycle,
                 ) {
                     Ok(stats) => {
+                        metrics
+                            .dedup_scrub_retired
+                            .fetch_add(stats.retired as u64, Ordering::Relaxed);
                         if stats.checked > 0 || stats.deleted > 0 || stats.errors > 0 {
                             tracing::debug!(
                                 checked = stats.checked,
@@ -309,6 +321,49 @@ impl DedupScanner {
                     Err(e) => {
                         metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(error = %e, "dedup scanner: forward-index scrub failed");
+                    }
+                }
+            }
+
+            // §6 orphan dedup-PBA reclaim: demote dedup entries whose PBA
+            // region the heat map reports cold (no live L2P references), then
+            // let the GC confirm scan free them. Needs a refreshed heat map;
+            // default-OFF via `orphan_reclaim_max_per_cycle == 0`.
+            if !rescan_debt && cfg.orphan_reclaim_enabled && cfg.orphan_reclaim_max_per_cycle > 0 {
+                if let Some(h) = heat {
+                    match Self::orphan_reclaim_dedup_index(
+                        meta,
+                        candidate,
+                        allocator,
+                        h,
+                        &mut orphan_cursor,
+                        cfg.orphan_reclaim_max_per_cycle,
+                        cfg.orphan_reclaim_fresh_max_age,
+                    ) {
+                        Ok(stats) => {
+                            metrics
+                                .dedup_orphan_demoted
+                                .fetch_add(stats.demoted as u64, Ordering::Relaxed);
+                            metrics
+                                .dedup_orphan_retired
+                                .fetch_add(stats.retired as u64, Ordering::Relaxed);
+                            metrics
+                                .dedup_orphan_skipped_hot
+                                .fetch_add(stats.skipped_hot as u64, Ordering::Relaxed);
+                            if stats.demoted > 0 || stats.errors > 0 {
+                                tracing::debug!(
+                                    demoted = stats.demoted,
+                                    retired = stats.retired,
+                                    skipped_hot = stats.skipped_hot,
+                                    errors = stats.errors,
+                                    "dedup scanner: orphan reclaim pass"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(error = %e, "dedup scanner: orphan reclaim failed");
+                        }
                     }
                 }
             }
@@ -839,6 +894,8 @@ impl DedupScanner {
     fn scrub_dedup_index(
         meta: &MetaStore,
         io_engine: &IoEngine,
+        candidate: &CandidateCache,
+        allocator: &SpaceAllocator,
         metrics: &EngineMetrics,
         cursor: &mut usize,
         budget: usize,
@@ -882,16 +939,22 @@ impl DedupScanner {
                 continue;
             }
 
-            match meta.delete_dedup_index_if_matches(&hash, &mapping) {
-                Ok(true) => {
+            // Route through the shared helper so a stale entry whose now-rc==0
+            // PBA used to leak is retired for GC reclaim.
+            match Self::delete_dedup_entry_and_retire(meta, candidate, allocator, &hash, &mapping) {
+                Ok(out) if out.deleted => {
                     stats.deleted += 1;
+                    if out.retired {
+                        stats.retired += 1;
+                    }
                     tracing::debug!(
                         pba = entry.pba.0,
                         slot_offset = entry.slot_offset,
+                        retired = out.retired,
                         "dedup index scrub: removed stale forward entry"
                     );
                 }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(e) => {
                     stats.errors += 1;
                     metrics
@@ -902,6 +965,143 @@ impl DedupScanner {
                         slot_offset = entry.slot_offset,
                         error = %e,
                         "dedup index scrub: conditional delete failed"
+                    );
+                }
+            }
+        }
+        *cursor = (*cursor + count) % entries.len();
+        Ok(stats)
+    }
+
+    /// Delete a dedup_index entry and, when that drops the PBA's refcount to 0,
+    /// retire the now-orphaned PBA so the GC confirm scan reclaims it.
+    ///
+    /// Phase 5: a dedup PBA's refcount is pure dedup-index *membership* (==1 in
+    /// the index, independent of how many live LBAs reference it). So deleting
+    /// the entry decrefs rc to 0 *iff* no other dedup/clone/snapshot account
+    /// holds it — and `P` becomes an ordinary "rc==0, maybe-still-referenced"
+    /// PBA, exactly the case `reclaim_retired_extents` already handles: its
+    /// `referenced_extents` Gate-2 scan is the EXACT authority that frees `P`
+    /// only if no live blockmap entry references it. So demoting a
+    /// still-referenced entry is never data loss — `P` stays retired (not
+    /// freed), losing only its dedup membership (recoverable via re-promote).
+    ///
+    /// Ordering: clear the candidate cache for `P` FIRST so a concurrent
+    /// verifier cannot byte-verify against it and re-promote (re-referencing a
+    /// PBA we are about to retire), mirroring `cleanup.rs`'s
+    /// candidate-before-retire invariant. Shared by the orphan-reclaim pass and
+    /// the stale-entry scrub (so scrub-freed PBAs are reclaimed too, closing a
+    /// latent leak where a `DedupCompareDelete` decref's freed PBA was dropped).
+    fn delete_dedup_entry_and_retire(
+        meta: &MetaStore,
+        candidate: &CandidateCache,
+        allocator: &SpaceAllocator,
+        hash: &ContentHash,
+        mapping: &BlockmapValue,
+    ) -> OnyxResult<DemoteOutcome> {
+        let pba = mapping.pba;
+        candidate.remove_by_pba(pba);
+        let deleted = meta.delete_dedup_index_if_matches(hash, mapping)?;
+        if !deleted {
+            return Ok(DemoteOutcome {
+                deleted: false,
+                retired: false,
+            });
+        }
+        let mut retired = false;
+        if meta.get_refcount(pba)? == 0 && !allocator.is_retired(pba) {
+            match allocator.retire_one(pba) {
+                Ok(true) => retired = true,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(pba = pba.0, error = %e, "orphan dedup reclaim: retire_one failed");
+                }
+            }
+        }
+        Ok(DemoteOutcome {
+            deleted: true,
+            retired,
+        })
+    }
+
+    /// Orphan dedup-PBA reclaim (§6): walk a budgeted slice of the dedup_index
+    /// and demote entries whose PBA region the heat map reports as COLD (no
+    /// live L2P entry references the whole 1 MiB region → the entry is very
+    /// likely orphaned). Demote = delete the index entry + retire the now-rc==0
+    /// PBA via [`Self::delete_dedup_entry_and_retire`]; the GC confirm scan does
+    /// the safe free. The heat map is only a *selector* (skip hot/shared
+    /// regions to avoid dedup-ratio churn) — correctness is the Gate-2 scan, so
+    /// a stale/wrong heat read can never free a live PBA, only cost a
+    /// re-promote. Runs only with a refreshed heat map present.
+    fn orphan_reclaim_dedup_index(
+        meta: &MetaStore,
+        candidate: &CandidateCache,
+        allocator: &SpaceAllocator,
+        heat: &HeatMap,
+        cursor: &mut usize,
+        budget: usize,
+        fresh_max_age: u32,
+    ) -> OnyxResult<OrphanReclaimStats> {
+        let mut stats = OrphanReclaimStats::default();
+        if budget == 0 {
+            return Ok(stats);
+        }
+        // Convergence floor: don't trust the heat map until it has completed at
+        // least one full sweep (FIRST_EPOCH==1, so epoch>=2). Before that every
+        // region looks cold (nothing swept yet) and we'd churn dedup ratio for
+        // not-yet-swept live entries (safe via the Gate-2 confirm scan, but
+        // wasteful). The `fresh_max_age` staleness window in the selector below
+        // adds further delay before a freshly-orphaned region is demoted.
+        if heat.current_epoch() < 2 {
+            return Ok(stats);
+        }
+        let mut entries = meta.iter_dedup_entries()?;
+        if entries.is_empty() {
+            *cursor = 0;
+            return Ok(stats);
+        }
+        entries.sort_unstable_by_key(|(hash, entry)| (*hash, entry.pba.0, entry.slot_offset));
+        if *cursor >= entries.len() {
+            *cursor = 0;
+        }
+        let count = budget.min(entries.len());
+        for offset in 0..count {
+            let idx = (*cursor + offset) % entries.len();
+            let (hash, entry) = entries[idx];
+            // Selector: demote ONLY a STALE region — one that WAS live (count>0,
+            // the heat refresh bumped it while the dedup PBA was referenced) but
+            // has NOT been bumped for > fresh_max_age completed sweeps. That is
+            // the overwrite-orphaned signature: every referrer was overwritten,
+            // so the heat bucket keeps its stale count while its age grows.
+            //
+            // A NEVER_SCANNED region (count==0) is deliberately NOT demoted: it
+            // has no PROOF of going cold (it may simply not have been swept yet,
+            // e.g. before the heat map converges or right after a restart), so
+            // demoting it would churn dedup ratio for live-but-unswept entries.
+            // Requiring a prior bump makes cold-start churn impossible. (Safety
+            // is the Gate-2 confirm scan regardless — this selector only governs
+            // *which* entries we bother to demote, never whether a free is safe.)
+            let (age, region_count) = heat.region(entry.pba);
+            let stale = region_count > 0 && age != u32::MAX && age > fresh_max_age;
+            if !stale {
+                stats.skipped_hot += 1;
+                continue;
+            }
+            let mapping = entry.to_blockmap_value();
+            match Self::delete_dedup_entry_and_retire(meta, candidate, allocator, &hash, &mapping) {
+                Ok(out) if out.deleted => {
+                    stats.demoted += 1;
+                    if out.retired {
+                        stats.retired += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        pba = entry.pba.0,
+                        error = %e,
+                        "orphan dedup reclaim: demote failed"
                     );
                 }
             }
@@ -959,6 +1159,30 @@ struct ColdTailStats {
 struct IndexScrubStats {
     checked: usize,
     deleted: usize,
+    /// Stale entries whose now-rc==0 PBA was retired for GC reclaim (was
+    /// previously leaked — the `DedupCompareDelete` decref's freed PBA was
+    /// dropped on the floor).
+    retired: usize,
+    errors: usize,
+}
+
+/// Outcome of [`DedupScanner::delete_dedup_entry_and_retire`].
+#[derive(Debug, Clone, Copy, Default)]
+struct DemoteOutcome {
+    /// The guarded `delete_dedup_index_if_matches` applied (entry removed).
+    deleted: bool,
+    /// The now-rc==0 PBA was retired into the allocator's retired set.
+    retired: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OrphanReclaimStats {
+    /// Cold-region dedup entries deleted from the index.
+    demoted: usize,
+    /// Of those, PBAs that dropped to rc==0 and were retired for GC reclaim.
+    retired: usize,
+    /// Entries skipped because their region was hot / never-scanned (selector).
+    skipped_hot: usize,
     errors: usize,
 }
 

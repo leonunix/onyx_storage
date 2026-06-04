@@ -519,6 +519,16 @@ pub struct EngineMetrics {
     /// channel and fed to the ReadPool this cycle (the consumer-side analog of
     /// `gc_heat_cold_tail_pushed`). Zero when the fold is off (legacy scan path).
     pub dedup_cold_tail_drained: AtomicU64,
+    /// §6 orphan dedup-PBA reclaim: cold-region dedup entries deleted from the
+    /// index (`demoted`); of those, PBAs that dropped to rc==0 and were retired
+    /// for the GC confirm scan to free (`retired`); entries skipped because
+    /// their region was hot / never-scanned (`skipped_hot`, the selector).
+    pub dedup_orphan_demoted: AtomicU64,
+    pub dedup_orphan_retired: AtomicU64,
+    pub dedup_orphan_skipped_hot: AtomicU64,
+    /// Stale (hash-mismatch) scrub entries whose now-rc==0 PBA was retired for
+    /// reclaim (previously leaked — the decref's freed PBA was dropped).
+    pub dedup_scrub_retired: AtomicU64,
     pub volume_discard_ops: AtomicU64,
     pub volume_discard_lbas: AtomicU64,
     pub discard_blocks_freed: AtomicU64,

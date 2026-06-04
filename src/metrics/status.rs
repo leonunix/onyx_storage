@@ -769,7 +769,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} promote_skipped_inflight={} cleanup_reconstruct_errors={} cleanup_delete_errors={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={} cold_tail_remaps={} cold_tail_drained={}",
+            "dedup: hits={} misses={} skipped_units={} hit_failures={} lookups={} live_checks={} stale_entries={} hit_commits={} promotions_committed={} promotions_failed={} promote_skipped_inflight={} cleanup_reconstruct_errors={} cleanup_delete_errors={} rescan_cycles={} rescan_skipped_cycles={} rescan_blocks={} rescan_hits={} rescan_misses={} rescan_errors={} cold_tail_blocks={} cold_tail_already_warm={} cold_tail_errors={} cold_tail_remaps={} cold_tail_drained={} orphan_demoted={} orphan_retired={} orphan_skipped_hot={} scrub_retired={}",
             self.metrics.dedup_hits,
             self.metrics.dedup_misses,
             self.metrics.dedup_skipped_units,
@@ -793,7 +793,11 @@ impl EngineStatusSnapshot {
             self.metrics.dedup_cold_tail_already_warm,
             self.metrics.dedup_cold_tail_errors,
             self.metrics.dedup_cold_tail_remaps,
-            self.metrics.dedup_cold_tail_drained
+            self.metrics.dedup_cold_tail_drained,
+            self.metrics.dedup_orphan_demoted,
+            self.metrics.dedup_orphan_retired,
+            self.metrics.dedup_orphan_skipped_hot,
+            self.metrics.dedup_scrub_retired
         );
         let _ = writeln!(
             out,

@@ -1,0 +1,97 @@
+# B2.2 Stage-4 fold A/B — ARM B (fold ON). Derived from nvme-numa0.toml.
+# IDENTICAL to ab-foldoff.toml except [gc] heat_fold_cold_tail_enabled.
+# Launch node-0 confined:
+#   numactl --cpunodebind=0 --membind=0 \
+#     target/release/onyx-storage -c config/ab-foldon.toml start -v fio-volume
+# Disk: nvme1n1 -> /mnt/onyx-meta ; md127 -> LV2 ; md126 -> LV3
+
+[meta]
+path = "/mnt/onyx-meta/metadb"
+wal_dir = "/mnt/onyx-meta/wal"
+block_cache_mb = 65536
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 5000
+group_commit_timeout_us = 1
+dedup_shards = 8
+dedup_cuckoo_buckets = 64000000
+dedup_l1_cache_entries = 256000
+l2p_buffer_enabled = true
+commit_direct_apply_enabled = true
+txg_threads_enabled = true
+parallel_l2p_drain_enabled = false
+
+[storage]
+data_device = "/dev/md/onyx-lv3"
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 16
+
+[buffer]
+device = "/dev/md/onyx-lv2_0"
+capacity_mb = 1048576
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+shards = 16
+max_memory_mb = 32768
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+
+[gc]
+enabled = true
+scan_interval_ms = 2000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+heat_enabled = true
+heat_bucket_size_blocks = 256
+heat_refresh_max_lbas_per_cycle = 2000000
+heat_fold_cold_tail_enabled = true
+heat_fold_channel_capacity = 16384
+heat_fold_push_max_per_cycle = 4096
+
+[dedup]
+enabled = true
+workers = 2
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 0
+rescan_interval_ms = 3000
+max_rescan_per_cycle = 4096
+cold_tail_max_per_cycle = 4096
+
+[threading]
+enabled = false
+
+[service]
+socket_path = "/tmp/onyx-storage-nvme.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30

@@ -299,7 +299,7 @@ fn start_scanner_with_candidate_and_read_pool(
     config: DedupConfig,
 ) -> (DedupScanner, onyx_storage::dedup::CandidateCache) {
     start_scanner_with_candidate_read_pool_cold_rx(
-        pool, meta, lifecycle, allocator, io_engine, read_pool, None, config,
+        pool, meta, lifecycle, allocator, io_engine, read_pool, None, None, config,
     )
 }
 
@@ -312,6 +312,7 @@ fn start_scanner_with_candidate_read_pool_cold_rx(
     io_engine: &Arc<IoEngine>,
     read_pool: Option<Arc<ReadPool>>,
     cold_rx: Option<crossbeam_channel::Receiver<onyx_storage::dedup::ColdTailTarget>>,
+    heat: Option<onyx_storage::gc::heatmap::HeatMap>,
     config: DedupConfig,
 ) -> (DedupScanner, onyx_storage::dedup::CandidateCache) {
     let candidate = onyx_storage::dedup::CandidateCache::new(8, 64);
@@ -324,6 +325,7 @@ fn start_scanner_with_candidate_read_pool_cold_rx(
         candidate.clone(),
         read_pool,
         cold_rx,
+        heat,
         config,
     );
     (scanner, candidate)
@@ -1351,6 +1353,7 @@ fn cold_tail_fold_drain_warms_candidate_from_channel() {
         &io_engine,
         Some(read_pool.clone()),
         Some(rx),
+        None, // heat: §6 orphan reclaim off in cold-tail tests
         cold_cfg,
     );
 
@@ -1421,6 +1424,7 @@ fn cold_tail_fold_drain_skips_already_warm_target() {
         &io_engine,
         Some(read_pool.clone()),
         Some(rx),
+        None, // heat: §6 orphan reclaim off in cold-tail tests
         cold_cfg,
     );
 
@@ -1664,4 +1668,324 @@ fn dedup_hit_failure_demotes_to_miss() {
         meta.get_dedup_entry(&hash).unwrap().is_none(),
         "demoted miss must not publish to dedup_index"
     );
+}
+
+// ----- §6 orphan dedup-PBA reclaim -----
+
+/// Promote H->P via two matching writes, returning the canonical PBA `P`.
+fn promote_dedup_entry(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+    vol: &str,
+    lba_a: u64,
+    lba_b: u64,
+    content: &[u8],
+) -> Pba {
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(content);
+    let mut flusher = start_flusher_with_dedup(pool, meta, lifecycle, allocator, io_engine);
+    pool.append(vol, Lba(lba_a), 1, content, 1000).unwrap();
+    assert!(wait_flushed(pool, 10000), "first flush timeout");
+    pool.append(vol, Lba(lba_b), 1, content, 1000).unwrap();
+    assert!(wait_flushed(pool, 10000), "promote flush timeout");
+    flusher.stop();
+    meta.get_dedup_entry(&hash)
+        .unwrap()
+        .expect("second matching write should promote into dedup_index")
+        .pba
+}
+
+/// Start a reclaim-only GC runner (no rewrite scan, no heat refresh) — just the
+/// retired-extent confirm scan that frees rc==0, unreferenced PBAs.
+fn start_reclaim_gc(
+    meta: &Arc<MetaStore>,
+    io_engine: &Arc<IoEngine>,
+    pool: &Arc<WriteBufferPool>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+) -> onyx_storage::gc::runner::GcRunner {
+    let heat = onyx_storage::gc::heatmap::HeatMap::new(allocator.total_block_count(), 256);
+    let cfg = onyx_storage::gc::config::GcConfig {
+        enabled: false,
+        heat_enabled: false,
+        scan_interval_ms: 20,
+        ..Default::default()
+    };
+    onyx_storage::gc::runner::GcRunner::start_with_metrics(
+        Arc::new(onyx_storage::metrics::EngineMetrics::default()),
+        meta.clone(),
+        io_engine.clone(),
+        pool.clone(),
+        lifecycle.clone(),
+        allocator.clone(),
+        heat,
+        None,
+        cfg,
+    )
+}
+
+fn orphan_scanner_config() -> DedupConfig {
+    DedupConfig {
+        rescan_interval_ms: 20,
+        max_rescan_per_cycle: 0,    // no DEDUP_SKIPPED debt
+        cold_tail_max_per_cycle: 0, // no cold-tail
+        index_scrub_max_per_cycle: 0,
+        orphan_reclaim_enabled: true,
+        orphan_reclaim_max_per_cycle: 256,
+        orphan_reclaim_fresh_max_age: 1,
+        ..dedup_test_config()
+    }
+}
+
+/// A converged heat map (epoch >= 2) for the hot-region test (then bump P).
+fn converged_heat(allocator: &Arc<SpaceAllocator>) -> onyx_storage::gc::heatmap::HeatMap {
+    let heat = onyx_storage::gc::heatmap::HeatMap::new(allocator.total_block_count(), 256);
+    heat.advance_epoch(); // FIRST_EPOCH(1) -> 2 (>= convergence gate)
+    heat
+}
+
+/// A heat map where P's region is STALE (was live, then not bumped for
+/// > fresh_max_age(1) sweeps) — the overwrite-orphaned signature the orphan
+/// selector demotes. (A never-scanned region is intentionally NOT demoted.)
+fn stale_heat(allocator: &Arc<SpaceAllocator>, p: Pba) -> onyx_storage::gc::heatmap::HeatMap {
+    let heat = onyx_storage::gc::heatmap::HeatMap::new(allocator.total_block_count(), 256);
+    heat.advance_epoch(); // -> epoch 2
+    heat.bump(p); // region (epoch 2, count 1) — was live
+    heat.advance_epoch(); // -> 3
+    heat.advance_epoch(); // -> 4  (age = 4 - 2 = 2 > fresh_max_age = 1)
+    heat
+}
+
+#[test]
+fn orphan_reclaim_demotes_cold_entry_retires_and_frees() {
+    // The headline §6 case: an orphaned-but-valid dedup PBA (every live LBA
+    // referencing it overwritten, rc stays 1 in the index, GC Gate-1 filters
+    // it) used to leak forever. The orphan pass demotes it (delete index entry,
+    // rc 1->0, retire the PBA) and the existing GC confirm scan frees it.
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0x11u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // Orphan it: overwrite BOTH referrers with UNIQUE content (each a miss, no
+    // new dedup), so no live LBA references P. rc-neutral -> P stays rc==1.
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut d0 = vec![0x22u8; 4096];
+    d0[0] = 1;
+    let mut d1 = vec![0x33u8; 4096];
+    d1[0] = 2;
+    pool.append("test-vol", Lba(0), 1, &d0, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    pool.append("test-vol", Lba(2), 1, &d1, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    flusher.stop();
+    assert_eq!(
+        meta.get_refcount(p).unwrap(),
+        1,
+        "orphaned dedup PBA keeps its membership rc==1 (overwrite is rc-neutral)"
+    );
+
+    // Stale heat for P's region (was live, then went cold == overwrite-orphaned).
+    let heat = stale_heat(&allocator, p);
+    let (mut scanner, _cand) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(heat.clone()),
+        orphan_scanner_config(),
+    );
+    assert!(
+        wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
+            && allocator.is_retired(p)),
+        "orphan pass should delete the dedup entry and retire the now-rc==0 PBA"
+    );
+    assert_eq!(meta.get_refcount(p).unwrap(), 0, "delete drops membership rc to 0");
+    scanner.stop();
+
+    // The existing GC confirm scan frees the unreferenced retired PBA.
+    let mut gc = start_reclaim_gc(&meta, &io_engine, &pool, &lifecycle, &allocator);
+    assert!(
+        wait_until(3000, || !allocator.is_retired(p)),
+        "GC confirm scan should free the orphaned dedup PBA (leak closed)"
+    );
+    gc.stop();
+}
+
+#[test]
+fn orphan_reclaim_still_referenced_pba_is_never_freed() {
+    // Safety on the data-loss-critical path: even if the heat selector is WRONG
+    // (cold region but the dedup PBA is actually still referenced — e.g. heat
+    // staleness), the demote never loses data. The exact Gate-2
+    // `referenced_extents` scan keeps a still-referenced PBA retired (not
+    // freed), and the live LBA's mapping + data stay intact. Only dedup
+    // membership is lost (re-promotable).
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0x44u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // Overwrite ONLY Lba(0); Lba(2) STILL references P (a live referrer).
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut d0 = vec![0x55u8; 4096];
+    d0[0] = 9;
+    pool.append("test-vol", Lba(0), 1, &d0, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    flusher.stop();
+    assert_eq!(
+        meta.get_mapping(&VolumeId("test-vol".into()), Lba(2))
+            .unwrap()
+            .unwrap()
+            .pba,
+        p,
+        "Lba(2) still references P"
+    );
+
+    // Stale heat (wrong selector) -> the pass demotes the still-referenced entry.
+    let heat = stale_heat(&allocator, p);
+    let (mut scanner, _cand) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(heat.clone()),
+        orphan_scanner_config(),
+    );
+    assert!(
+        wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
+            && allocator.is_retired(p)),
+        "the pass demotes + retires even a (wrongly-selected) referenced entry"
+    );
+    scanner.stop();
+
+    // GC confirm scan must NOT free P — Lba(2) still references it.
+    let mut gc = start_reclaim_gc(&meta, &io_engine, &pool, &lifecycle, &allocator);
+    // Give the GC several cycles; P must stay retired (referenced), never freed.
+    assert!(
+        !wait_until(800, || !allocator.is_retired(p)),
+        "Gate-2 must keep a still-referenced PBA retired (never free it)"
+    );
+    gc.stop();
+    // Data integrity: Lba(2)'s mapping still points at P (intact, not freed).
+    assert_eq!(
+        meta.get_mapping(&VolumeId("test-vol".into()), Lba(2))
+            .unwrap()
+            .unwrap()
+            .pba,
+        p,
+        "still-referenced data must survive the demote unchanged"
+    );
+}
+
+#[test]
+fn orphan_reclaim_skips_hot_region() {
+    // Selector: a dedup entry whose PBA region is HOT (a live mapping bumped it)
+    // is left alone — demoting it would only churn dedup ratio.
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0x66u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // Heat: converged AND P's region HOT (a live mapping references it).
+    let heat = converged_heat(&allocator);
+    heat.bump(p);
+
+    let (mut scanner, _cand) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(heat.clone()),
+        orphan_scanner_config(),
+    );
+    // Give the pass several cycles; the hot entry must survive.
+    assert!(
+        !wait_until(800, || meta.get_dedup_entry(&hash).unwrap().is_none()),
+        "orphan pass must not demote a dedup entry in a hot region"
+    );
+    assert!(!allocator.is_retired(p), "hot-region PBA must not be retired");
+    scanner.stop();
+}
+
+#[test]
+fn orphan_reclaim_demotes_stale_overwrite_orphaned_region() {
+    // The REAL orphan case: the region was LIVE (heat bumped it at promote
+    // time), then every referrer was overwritten. The heat bucket KEEPS its
+    // stale count>0 — it does not become count==0 — but its age grows each
+    // sweep. A `count==0`-only selector would miss this; the `fresh_max_age`
+    // staleness check catches it.
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0x77u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // Orphan it: overwrite both referrers with unique content.
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut d0 = vec![0x88u8; 4096];
+    d0[0] = 3;
+    let mut d1 = vec![0x99u8; 4096];
+    d1[0] = 4;
+    pool.append("test-vol", Lba(0), 1, &d0, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    pool.append("test-vol", Lba(2), 1, &d1, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    flusher.stop();
+
+    // Heat: P's region was HOT (bumped while live), then went STALE (not bumped
+    // for > fresh_max_age=1 sweeps) — the overwrite-orphaned signature.
+    let heat = onyx_storage::gc::heatmap::HeatMap::new(allocator.total_block_count(), 256);
+    heat.advance_epoch(); // -> epoch 2
+    heat.bump(p); // region = (epoch 2, count 1) — simulate it was live
+    heat.advance_epoch(); // -> 3
+    heat.advance_epoch(); // -> 4  (age = 4 - 2 = 2 > fresh_max_age=1)
+    let (age, count) = heat.region(p);
+    assert!(
+        count > 0 && age > 1,
+        "region must be STALE (count>0, age>fresh), not count==0: ({age},{count})"
+    );
+
+    let (mut scanner, _cand) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(heat.clone()),
+        orphan_scanner_config(),
+    );
+    assert!(
+        wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
+            && allocator.is_retired(p)),
+        "orphan pass must demote a STALE (overwrite-orphaned) region, not just count==0"
+    );
+    scanner.stop();
 }

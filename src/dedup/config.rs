@@ -49,6 +49,26 @@ pub struct DedupConfig {
     /// and conditionally delete stale entries. Set 0 to disable.
     #[serde(default = "default_index_scrub_max_per_cycle")]
     pub index_scrub_max_per_cycle: usize,
+    /// §6 orphan dedup-PBA reclaim (default FALSE — behavior change, A/B before
+    /// flip). When on, the scanner walks the dedup_index and DEMOTES entries
+    /// whose PBA region the heat map reports cold (no live L2P references):
+    /// delete the index entry (decref the membership rc to 0) and retire the
+    /// PBA so the GC confirm scan frees it. Safety rests on the exact
+    /// `referenced_extents` Gate-2 scan, not the heat map, so a wrong heat read
+    /// only costs a re-promote, never data. Requires a refreshed heat map
+    /// (`gc.heat_enabled`).
+    #[serde(default = "default_orphan_reclaim_enabled")]
+    pub orphan_reclaim_enabled: bool,
+    /// Max dedup_index entries the orphan-reclaim pass examines per cycle
+    /// (default 256). `0` disables the pass.
+    #[serde(default = "default_orphan_reclaim_max_per_cycle")]
+    pub orphan_reclaim_max_per_cycle: usize,
+    /// A dedup entry is demoted only when its PBA region has NOT been bumped by
+    /// the heat refresh for more than this many completed sweeps (i.e. it is no
+    /// longer hot+fresh). Larger = more conservative (wait longer before
+    /// reclaiming a freshly-orphaned region). Default 2.
+    #[serde(default = "default_orphan_reclaim_fresh_max_age")]
+    pub orphan_reclaim_fresh_max_age: u32,
 }
 
 impl Default for DedupConfig {
@@ -64,6 +84,9 @@ impl Default for DedupConfig {
             candidate_per_shard_capacity: None,
             cold_tail_max_per_cycle: default_cold_tail_max_per_cycle(),
             index_scrub_max_per_cycle: default_index_scrub_max_per_cycle(),
+            orphan_reclaim_enabled: default_orphan_reclaim_enabled(),
+            orphan_reclaim_max_per_cycle: default_orphan_reclaim_max_per_cycle(),
+            orphan_reclaim_fresh_max_age: default_orphan_reclaim_fresh_max_age(),
         }
     }
 }
@@ -88,4 +111,13 @@ fn default_cold_tail_max_per_cycle() -> usize {
 }
 fn default_index_scrub_max_per_cycle() -> usize {
     64
+}
+fn default_orphan_reclaim_enabled() -> bool {
+    false
+}
+fn default_orphan_reclaim_max_per_cycle() -> usize {
+    256
+}
+fn default_orphan_reclaim_fresh_max_age() -> u32 {
+    2
 }

@@ -642,6 +642,14 @@ impl OnyxEngine {
         // running its own live-L2P traversal. (None, None) ⇒ legacy paths.
         let (cold_tail_tx, cold_tail_rx) = build_cold_tail_fold_channel(&config, &read_pool);
 
+        // Build the adaptive-reclaim heat map first so BOTH the GC runner (which
+        // refreshes it) and the dedup scanner (§6 orphan reclaim reads it as a
+        // cold-region selector) share the same map. When disabled, this is a
+        // minimal 1-bucket map (allocates nothing; refresh + orphan reclaim gated
+        // off). The scanner only gets a usable map when `heat_enabled`.
+        let heat = build_heat_map(&config.gc, &allocator);
+        let scanner_heat = config.gc.heat_enabled.then(|| heat.clone());
+
         // 9. Dedup scanner (after flusher; re-processes skipped blocks)
         let dedup_scanner = if config.dedup.enabled {
             Some(DedupScanner::start_with_metrics(
@@ -654,6 +662,7 @@ impl OnyxEngine {
                 flusher.candidate_cache(),
                 read_pool.clone(),
                 cold_tail_rx,
+                scanner_heat,
                 config.dedup.clone(),
             ))
         } else {
@@ -662,10 +671,6 @@ impl OnyxEngine {
 
         // 10. GC runner (after flusher). It always runs the physical
         // retired-PBA reclaimer; `gc.enabled` only gates rewrite scanning.
-        // Build the adaptive-reclaim heat map first so the runner can refresh
-        // it (observe-only in Stage A). When disabled, hand the runner a
-        // minimal 1-bucket map (allocates nothing; the refresh is gated off).
-        let heat = build_heat_map(&config.gc, &allocator);
         let gc_runner = Some(GcRunner::start_with_metrics(
             metrics.clone(),
             meta.clone(),
@@ -1150,6 +1155,11 @@ impl OnyxEngine {
         // None) ⇒ legacy paths.
         let (cold_tail_tx, cold_tail_rx) = build_cold_tail_fold_channel(&config, &read_pool);
 
+        // Shared heat map (GC refreshes it; dedup scanner reads it for §6 orphan
+        // reclaim). See the full-open path.
+        let heat = build_heat_map(&config.gc, &allocator);
+        let scanner_heat = config.gc.heat_enabled.then(|| heat.clone());
+
         // Dedup scanner
         let dedup_scanner = if config.dedup.enabled {
             Some(DedupScanner::start_with_metrics(
@@ -1162,6 +1172,7 @@ impl OnyxEngine {
                 flusher.candidate_cache(),
                 read_pool.clone(),
                 cold_tail_rx,
+                scanner_heat,
                 config.dedup.clone(),
             ))
         } else {
@@ -1170,7 +1181,6 @@ impl OnyxEngine {
 
         // GC runner. It always runs the physical retired-PBA reclaimer;
         // `gc.enabled` only gates rewrite scanning.
-        let heat = build_heat_map(&config.gc, &allocator);
         let gc_runner = Some(GcRunner::start_with_metrics(
             metrics.clone(),
             meta.clone(),
