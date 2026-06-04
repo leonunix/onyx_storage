@@ -1737,6 +1737,7 @@ fn orphan_scanner_config() -> DedupConfig {
         orphan_reclaim_enabled: true,
         orphan_reclaim_max_per_cycle: 256,
         orphan_reclaim_fresh_max_age: 1,
+        orphan_reclaim_per_pba: false, // §6 region-mode tests (per-PBA default is now true)
         ..dedup_test_config()
     }
 }
