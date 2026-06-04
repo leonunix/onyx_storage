@@ -278,6 +278,7 @@ impl Default for EngineMetrics {
             dedup_orphan_retired: AtomicU64::new(0),
             dedup_orphan_skipped_hot: AtomicU64::new(0),
             dedup_scrub_retired: AtomicU64::new(0),
+            dedup_ref_bitmap_published: AtomicU64::new(0),
             volume_discard_ops: AtomicU64::new(0),
             volume_discard_lbas: AtomicU64::new(0),
             discard_blocks_freed: AtomicU64::new(0),

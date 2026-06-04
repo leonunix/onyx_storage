@@ -11,6 +11,7 @@ use crate::buffer::pool::WriteBufferPool;
 use crate::dedup::ColdTailTarget;
 use crate::gc::config::GcConfig;
 use crate::gc::heatmap::HeatMap;
+use crate::gc::ref_bitmap::RefBitmap;
 use crate::gc::rewriter::rewrite_candidate;
 use crate::gc::scanner::scan_gc_candidates;
 use crate::io::engine::IoEngine;
@@ -51,6 +52,7 @@ impl GcRunner {
             allocator,
             heat,
             None,
+            None,
             config,
         )
     }
@@ -64,6 +66,9 @@ impl GcRunner {
         lifecycle: Arc<VolumeLifecycleManager>,
         allocator: Arc<SpaceAllocator>,
         heat: HeatMap,
+        // Stage-5: per-PBA referenced bitmap the heat sweep fills (None unless
+        // per-PBA orphan reclaim is on). Filled here; read by the dedup scanner.
+        ref_bitmap: Option<RefBitmap>,
         cold_tx: Option<Sender<ColdTailTarget>>,
         config: GcConfig,
     ) -> Self {
@@ -84,6 +89,7 @@ impl GcRunner {
                     &lifecycle,
                     &allocator,
                     &heat,
+                    ref_bitmap.as_ref(),
                     cold_tx.as_ref(),
                     &config_clone,
                     &running_clone,
@@ -135,6 +141,7 @@ impl GcRunner {
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
         heat: &HeatMap,
+        ref_bitmap: Option<&RefBitmap>,
         cold_tx: Option<&Sender<ColdTailTarget>>,
         config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
@@ -191,6 +198,7 @@ impl GcRunner {
                 // when the fold is off ⇒ pure observe-only heat refresh.
                 Self::heat_refresh_step(
                     heat,
+                    ref_bitmap,
                     metrics,
                     meta,
                     &mut heat_cursor,
@@ -518,8 +526,10 @@ impl GcRunner {
     /// than the dedup cold-tail pass. Bounded per cycle, honors `running`, and
     /// holds no lock across the walk (`scan_blockmap_range` chunks internally).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn heat_refresh_step(
         heat: &HeatMap,
+        ref_bitmap: Option<&RefBitmap>,
         metrics: &EngineMetrics,
         meta: &MetaStore,
         cursor: &mut HeatCursor,
@@ -560,6 +570,18 @@ impl GcRunner {
         cursor.per_vol.retain(|k, _| live.contains(k.as_str()));
 
         metrics.heat_refresh_cycles.fetch_add(1, Ordering::Relaxed);
+
+        // Stage-5: take the per-PBA fill buffer out of the cursor for the
+        // duration of this cycle's walk so the scan closures can borrow it
+        // mutably without conflicting with `cursor.per_vol` / `sweep_lbas_done`.
+        // It is put back (or published) after the walk. `None` ⇒ per-PBA orphan
+        // reclaim is off and nothing below touches the bitmap (zero-cost).
+        let mut ref_fill: Option<Box<[u64]>> = ref_bitmap.map(|rb| {
+            cursor
+                .ref_fill
+                .take()
+                .unwrap_or_else(|| rb.fresh_fill_buffer())
+        });
 
         // Walk at most one full sweep's worth of LBAs per cycle. When the
         // budget exceeds the whole volume set (small datasets), re-lapping the
@@ -620,11 +642,15 @@ impl GcRunner {
                             lap_start,
                             scanned_in_lap: 0,
                             rng,
+                            ref_lapped: false,
                         }
                     });
                     if lap.scanned_in_lap >= total_lbas {
                         lap.lap_start = splitmix64(&mut lap.rng) % total_lbas;
                         lap.scanned_in_lap = 0;
+                        // Stage-5: a full lap into the current fill buffer
+                        // completed → this volume satisfies the lap-barrier.
+                        lap.ref_lapped = true;
                     }
                     let phys_start = (lap.lap_start + lap.scanned_in_lap) % total_lbas;
                     let lap_remaining = total_lbas - lap.scanned_in_lap;
@@ -646,6 +672,9 @@ impl GcRunner {
                         }
                         for pba in value.physical_pbas(BLOCK_SIZE) {
                             heat.bump(pba);
+                            if let Some(buf) = ref_fill.as_deref_mut() {
+                                RefBitmap::mark(buf, pba);
+                            }
                             bumps += 1;
                         }
                         try_push_cold_tail(
@@ -701,11 +730,15 @@ impl GcRunner {
                         lap_start,
                         scanned_in_lap: 0,
                         rng,
+                        ref_lapped: false,
                     }
                 });
                 if lap.scanned_in_lap >= total_lbas {
                     lap.lap_start = splitmix64(&mut lap.rng) % total_lbas;
                     lap.scanned_in_lap = 0;
+                    // Stage-5: a full lap into the current fill buffer completed
+                    // → this volume satisfies the lap-barrier.
+                    lap.ref_lapped = true;
                 }
                 let phys_start = (lap.lap_start + lap.scanned_in_lap) % total_lbas;
                 let lap_remaining = total_lbas - lap.scanned_in_lap;
@@ -726,6 +759,9 @@ impl GcRunner {
                     }
                     for pba in value.physical_pbas(BLOCK_SIZE) {
                         heat.bump(pba);
+                        if let Some(buf) = ref_fill.as_deref_mut() {
+                            RefBitmap::mark(buf, pba);
+                        }
                         bumps += 1;
                     }
                     try_push_cold_tail(
@@ -759,6 +795,39 @@ impl GcRunner {
                     .heat_sweeps_completed
                     .fetch_add(1, Ordering::Relaxed);
                 cursor.sweep_lbas_done -= target;
+            }
+        }
+
+        // Stage-5 lap-barrier publish. A per-PBA fill buffer is a *complete*
+        // cover — every 0 bit provably means "no live mapping was seen" — only
+        // once EVERY live volume has completed a full lap into it. The heat
+        // epoch is only approximate coverage, so the bitmap rotates on this
+        // barrier, NOT on `advance_epoch`. At most one publish per cycle (the
+        // check runs once, after the walk). On publish, recycle the buffer and
+        // restart every volume's lap so the next fill is covered from scratch (a
+        // lap straddling the publish boundary would only partially cover it). A
+        // newly-created volume has no `ref_lapped` entry yet → blocks the
+        // barrier until it laps; a dropped volume was already removed from
+        // `per_vol` above → never blocks. Out-of-window staleness from either is
+        // absorbed by requiring K consecutive clean barriers + the Gate-2 scan.
+        if let (Some(rb), Some(buf)) = (ref_bitmap, ref_fill.take()) {
+            let all_lapped = lap_barrier_satisfied(
+                volumes
+                    .iter()
+                    .map(|v| (v.id.0.as_str(), v.size_bytes / u64::from(v.block_size.max(1)))),
+                &cursor.per_vol,
+            );
+            if all_lapped {
+                cursor.ref_fill = Some(rb.publish(buf));
+                metrics
+                    .dedup_ref_bitmap_published
+                    .fetch_add(1, Ordering::Relaxed);
+                for lap in cursor.per_vol.values_mut() {
+                    lap.scanned_in_lap = 0;
+                    lap.ref_lapped = false;
+                }
+            } else {
+                cursor.ref_fill = Some(buf);
             }
         }
 
@@ -819,6 +888,25 @@ struct HeatLap {
     lap_start: u64,
     scanned_in_lap: u64,
     rng: u64,
+    /// Stage-5 lap-barrier: set when this volume completes a full lap *into the
+    /// current per-PBA fill buffer*. Reset on every publish so the next barrier
+    /// requires a fresh full lap (a lap straddling a publish would only
+    /// partially cover the new buffer). Unused / always-false when per-PBA
+    /// orphan reclaim is off.
+    ref_lapped: bool,
+}
+
+/// Stage-5 lap-barrier predicate: has every live volume completed a full lap
+/// into the current per-PBA fill buffer? Each item is `(volume_id, total_lbas)`.
+/// A zero-length volume is trivially covered; a volume with no lap entry (never
+/// walked into this fill — e.g. just created) is NOT covered → blocks the
+/// barrier until it laps. A dropped volume is simply absent from `vols`.
+fn lap_barrier_satisfied<'a>(
+    vols: impl Iterator<Item = (&'a str, u64)>,
+    per_vol: &HashMap<String, HeatLap>,
+) -> bool {
+    vols.into_iter()
+        .all(|(id, total)| total == 0 || per_vol.get(id).is_some_and(|l| l.ref_lapped))
 }
 
 /// Global cross-volume cursor + sweep odometer for the heat refresh. Lives on
@@ -834,6 +922,11 @@ struct HeatCursor {
     /// Stage-B2: per-volume `write_bytes` at the previous adaptive cycle, so the
     /// churn weight is the *delta* (recent write activity), not the lifetime sum.
     last_write_bytes: HashMap<String, u64>,
+    /// Stage-5: the in-progress per-PBA referenced fill buffer (GC-thread-local,
+    /// single-writer). Accumulates referenced bits across cycles until the
+    /// lap-barrier fires, then is handed to `RefBitmap::publish`. `None` when
+    /// per-PBA orphan reclaim is off, or transiently while taken out for a walk.
+    ref_fill: Option<Box<[u64]>>,
 }
 
 /// Stage-B2 adaptive refresh budget split. Each volume gets a guaranteed floor
@@ -956,7 +1049,49 @@ fn try_push_cold_tail(
 
 #[cfg(test)]
 mod tests {
-    use super::split_refresh_budget;
+    use super::{lap_barrier_satisfied, split_refresh_budget, HeatLap};
+    use std::collections::HashMap;
+
+    fn lap(ref_lapped: bool) -> HeatLap {
+        HeatLap {
+            lap_start: 0,
+            scanned_in_lap: 0,
+            rng: 1,
+            ref_lapped,
+        }
+    }
+
+    #[test]
+    fn lap_barrier_waits_for_all_volumes() {
+        let mut per_vol: HashMap<String, HeatLap> = HashMap::new();
+        per_vol.insert("a".into(), lap(true));
+        // "b" present but not yet lapped → barrier NOT satisfied.
+        per_vol.insert("b".into(), lap(false));
+        let vols = || [("a", 100u64), ("b", 100u64)].into_iter();
+        assert!(!lap_barrier_satisfied(vols(), &per_vol));
+        // Both lapped → satisfied.
+        per_vol.insert("b".into(), lap(true));
+        assert!(lap_barrier_satisfied(vols(), &per_vol));
+    }
+
+    #[test]
+    fn lap_barrier_missing_volume_blocks() {
+        // A volume with no lap entry yet (e.g. just created, never walked into
+        // this fill) must block the barrier until it laps.
+        let mut per_vol: HashMap<String, HeatLap> = HashMap::new();
+        per_vol.insert("a".into(), lap(true));
+        let vols = [("a", 100u64), ("new", 100u64)];
+        assert!(!lap_barrier_satisfied(vols.into_iter(), &per_vol));
+    }
+
+    #[test]
+    fn lap_barrier_zero_length_volume_is_trivially_covered() {
+        let mut per_vol: HashMap<String, HeatLap> = HashMap::new();
+        per_vol.insert("a".into(), lap(true));
+        // "z" has zero LBAs → no live mappings possible → does not block.
+        let vols = [("a", 100u64), ("z", 0u64)];
+        assert!(lap_barrier_satisfied(vols.into_iter(), &per_vol));
+    }
 
     #[test]
     fn split_budget_no_churn_is_uniform() {

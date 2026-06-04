@@ -1257,6 +1257,7 @@ fn heat_refresh_counts_live_mappings_and_advances_epoch() {
         env.lifecycle.clone(),
         env.allocator.clone(),
         heat.clone(),
+        None, // ref_bitmap: Stage-5 per-PBA orphan reclaim off in this test
         None, // cold_tail_tx: Stage-4 fold off in this test
         cfg,
     );
@@ -1352,6 +1353,7 @@ fn heat_refresh_fold_pushes_cold_candidates() {
         env.lifecycle.clone(),
         env.allocator.clone(),
         heat.clone(),
+        None, // ref_bitmap: Stage-5 per-PBA orphan reclaim off in this test
         Some(tx),
         cfg,
     );
@@ -1409,6 +1411,7 @@ fn heat_refresh_budget_zero_is_noop() {
         env.lifecycle.clone(),
         env.allocator.clone(),
         heat.clone(),
+        None, // ref_bitmap: Stage-5 per-PBA orphan reclaim off in this test
         None, // cold_tail_tx: Stage-4 fold off in this test
         cfg,
     );

@@ -529,6 +529,10 @@ pub struct EngineMetrics {
     /// Stale (hash-mismatch) scrub entries whose now-rc==0 PBA was retired for
     /// reclaim (previously leaked — the decref's freed PBA was dropped).
     pub dedup_scrub_retired: AtomicU64,
+    /// Stage-5 per-PBA orphan reclaim: completed lap-barriers published into the
+    /// referenced bitmap (one per full cover of the live volume set). Zero when
+    /// per-PBA mode is off; rising confirms the barrier is producing snapshots.
+    pub dedup_ref_bitmap_published: AtomicU64,
     pub volume_discard_ops: AtomicU64,
     pub volume_discard_lbas: AtomicU64,
     pub discard_blocks_freed: AtomicU64,

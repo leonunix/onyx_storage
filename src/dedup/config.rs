@@ -66,9 +66,29 @@ pub struct DedupConfig {
     /// A dedup entry is demoted only when its PBA region has NOT been bumped by
     /// the heat refresh for more than this many completed sweeps (i.e. it is no
     /// longer hot+fresh). Larger = more conservative (wait longer before
-    /// reclaiming a freshly-orphaned region). Default 2.
+    /// reclaiming a freshly-orphaned region). Default 2. (Region-selector mode
+    /// only; ignored when `orphan_reclaim_per_pba` is on.)
     #[serde(default = "default_orphan_reclaim_fresh_max_age")]
     pub orphan_reclaim_fresh_max_age: u32,
+    /// Stage-5 per-PBA-precision orphan reclaim (default FALSE). When on (and
+    /// `orphan_reclaim_enabled` + `gc.heat_enabled`), the orphan-reclaim pass
+    /// selects entries with a per-PBA "referenced" bitmap filled by the heat
+    /// sweep instead of the coarse 1 MiB heat region — so orphans *interleaved*
+    /// with live data (which the region selector skips because `region_count>0`)
+    /// get reclaimed too. Safety is unchanged: the bitmap is only a selector;
+    /// the GC Gate-2 `referenced_extents` scan still authorizes every free.
+    /// Allocates a per-PBA bitmap (~`(clean_sweeps+1) × device_blocks/8` bytes,
+    /// see startup log) only when this is on.
+    #[serde(default)]
+    pub orphan_reclaim_per_pba: bool,
+    /// Stage-5: number of consecutive *completed lap-barriers* a PBA must read
+    /// unreferenced before it is demoted (the per-PBA analog of
+    /// `orphan_reclaim_fresh_max_age`). ≥2 absorbs the in-flight-write race (a
+    /// write landing after a referrer-LBA was walked but before the PBA was
+    /// orphaned). Clamped to 1..=4 (each barrier retains one bitmap snapshot).
+    /// Default 2.
+    #[serde(default = "default_orphan_reclaim_clean_sweeps")]
+    pub orphan_reclaim_clean_sweeps: u32,
 }
 
 impl Default for DedupConfig {
@@ -87,6 +107,8 @@ impl Default for DedupConfig {
             orphan_reclaim_enabled: default_orphan_reclaim_enabled(),
             orphan_reclaim_max_per_cycle: default_orphan_reclaim_max_per_cycle(),
             orphan_reclaim_fresh_max_age: default_orphan_reclaim_fresh_max_age(),
+            orphan_reclaim_per_pba: false,
+            orphan_reclaim_clean_sweeps: default_orphan_reclaim_clean_sweeps(),
         }
     }
 }
@@ -119,5 +141,8 @@ fn default_orphan_reclaim_max_per_cycle() -> usize {
     256
 }
 fn default_orphan_reclaim_fresh_max_age() -> u32 {
+    2
+}
+fn default_orphan_reclaim_clean_sweeps() -> u32 {
     2
 }

@@ -7,7 +7,7 @@ use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::runner::GcRunner;
-use crate::gc::HeatMap;
+use crate::gc::{HeatMap, RefBitmap};
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
@@ -649,6 +649,9 @@ impl OnyxEngine {
         // off). The scanner only gets a usable map when `heat_enabled`.
         let heat = build_heat_map(&config.gc, &allocator);
         let scanner_heat = config.gc.heat_enabled.then(|| heat.clone());
+        // Stage-5 per-PBA orphan-reclaim bitmap (None unless per-PBA mode on):
+        // GC fills it on the heat sweep, the dedup scanner reads it.
+        let ref_bitmap = build_ref_bitmap(&config.gc, &config.dedup, &allocator);
 
         // 9. Dedup scanner (after flusher; re-processes skipped blocks)
         let dedup_scanner = if config.dedup.enabled {
@@ -663,6 +666,7 @@ impl OnyxEngine {
                 read_pool.clone(),
                 cold_tail_rx,
                 scanner_heat,
+                ref_bitmap.clone(),
                 config.dedup.clone(),
             ))
         } else {
@@ -679,6 +683,7 @@ impl OnyxEngine {
             lifecycle.clone(),
             allocator.clone(),
             heat.clone(),
+            ref_bitmap,
             cold_tail_tx,
             config.gc.clone(),
         ));
@@ -1159,6 +1164,8 @@ impl OnyxEngine {
         // reclaim). See the full-open path.
         let heat = build_heat_map(&config.gc, &allocator);
         let scanner_heat = config.gc.heat_enabled.then(|| heat.clone());
+        // Stage-5 per-PBA orphan-reclaim bitmap (None unless per-PBA mode on).
+        let ref_bitmap = build_ref_bitmap(&config.gc, &config.dedup, &allocator);
 
         // Dedup scanner
         let dedup_scanner = if config.dedup.enabled {
@@ -1173,6 +1180,7 @@ impl OnyxEngine {
                 read_pool.clone(),
                 cold_tail_rx,
                 scanner_heat,
+                ref_bitmap.clone(),
                 config.dedup.clone(),
             ))
         } else {
@@ -1189,6 +1197,7 @@ impl OnyxEngine {
             lifecycle.clone(),
             allocator.clone(),
             heat.clone(),
+            ref_bitmap,
             cold_tail_tx,
             config.gc.clone(),
         ));
@@ -1371,6 +1380,32 @@ fn build_heat_map(gc: &crate::gc::config::GcConfig, allocator: &Arc<SpaceAllocat
         "heat map: adaptive-reclaim refresh enabled (observe-only)"
     );
     hm
+}
+
+/// Build the Stage-5 per-PBA referenced bitmap, or `None` when per-PBA orphan
+/// reclaim is off. Returning `None` allocates nothing — the GC writer and dedup
+/// reader stay on the §6 region-selector path. Only built when the heat refresh
+/// is on (the bitmap rides the heat sweep's live-L2P walk), orphan reclaim is
+/// enabled, and the per-PBA selector flag is set. Sized from device capacity ×
+/// (K+1) snapshots; logs the projected resident footprint like `build_heat_map`.
+fn build_ref_bitmap(
+    gc: &crate::gc::config::GcConfig,
+    dedup: &crate::dedup::config::DedupConfig,
+    allocator: &Arc<SpaceAllocator>,
+) -> Option<RefBitmap> {
+    if !(gc.heat_enabled && dedup.orphan_reclaim_enabled && dedup.orphan_reclaim_per_pba) {
+        return None;
+    }
+    let k = dedup.orphan_reclaim_clean_sweeps.clamp(1, 4) as usize;
+    let rb = RefBitmap::new(allocator.total_block_count(), k);
+    tracing::info!(
+        total_pbas = rb.total_pbas(),
+        clean_sweeps = rb.k(),
+        snapshot_mib = (rb.n_words() * 8) / (1024 * 1024),
+        projected_resident_mib = rb.projected_resident_bytes() / (1024 * 1024),
+        "dedup: Stage-5 per-PBA orphan-reclaim bitmap enabled"
+    );
+    Some(rb)
 }
 
 /// Stage-4 fold: build the cold-tail channel that lets the GC heat-refresh

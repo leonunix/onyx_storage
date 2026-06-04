@@ -326,6 +326,7 @@ fn start_scanner_with_candidate_read_pool_cold_rx(
         read_pool,
         cold_rx,
         heat,
+        None, // ref_bitmap: §6 region-mode helper; per-PBA tests use their own
         config,
     );
     (scanner, candidate)
@@ -1721,7 +1722,8 @@ fn start_reclaim_gc(
         lifecycle.clone(),
         allocator.clone(),
         heat,
-        None,
+        None, // ref_bitmap (Stage-5; off here)
+        None, // cold_tx
         cfg,
     )
 }
@@ -1986,6 +1988,298 @@ fn orphan_reclaim_demotes_stale_overwrite_orphaned_region() {
         wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
             && allocator.is_retired(p)),
         "orphan pass must demote a STALE (overwrite-orphaned) region, not just count==0"
+    );
+    scanner.stop();
+}
+
+// ---- Stage-5 per-PBA orphan reclaim -----------------------------------------
+
+/// Build a `RefBitmap` (retaining `k` snapshots) by publishing one lap-barrier
+/// per slice in `barriers`, marking the listed PBAs referenced in that barrier.
+/// Everything not listed reads unreferenced. Mirrors `stale_heat`/`converged_heat`
+/// for the per-PBA selector.
+fn ref_bitmap_with(
+    allocator: &Arc<SpaceAllocator>,
+    k: usize,
+    barriers: &[&[Pba]],
+) -> onyx_storage::gc::ref_bitmap::RefBitmap {
+    let rb = onyx_storage::gc::ref_bitmap::RefBitmap::new(allocator.total_block_count(), k);
+    for marked in barriers {
+        let mut buf = rb.fresh_fill_buffer();
+        for &p in *marked {
+            onyx_storage::gc::ref_bitmap::RefBitmap::mark(&mut buf, p);
+        }
+        let _ = rb.publish(buf);
+    }
+    rb
+}
+
+/// Dedup config for the per-PBA orphan-reclaim pass.
+fn orphan_scanner_config_per_pba(clean_sweeps: u32) -> DedupConfig {
+    DedupConfig {
+        orphan_reclaim_per_pba: true,
+        orphan_reclaim_clean_sweeps: clean_sweeps,
+        ..orphan_scanner_config()
+    }
+}
+
+/// Start a dedup scanner with a per-PBA `RefBitmap` selector (cold_rx off).
+#[allow(clippy::too_many_arguments)]
+fn start_scanner_with_ref_bitmap(
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    io_engine: &Arc<IoEngine>,
+    read_pool: Option<Arc<ReadPool>>,
+    heat: Option<onyx_storage::gc::heatmap::HeatMap>,
+    ref_bitmap: Option<onyx_storage::gc::ref_bitmap::RefBitmap>,
+    config: DedupConfig,
+) -> (DedupScanner, onyx_storage::dedup::CandidateCache) {
+    let candidate = onyx_storage::dedup::CandidateCache::new(8, 64);
+    let scanner = DedupScanner::start(
+        meta.clone(),
+        io_engine.clone(),
+        allocator.clone(),
+        lifecycle.clone(),
+        pool.clone(),
+        candidate.clone(),
+        read_pool,
+        None, // cold_rx
+        heat,
+        ref_bitmap,
+        config,
+    );
+    (scanner, candidate)
+}
+
+#[test]
+fn orphan_reclaim_per_pba_demotes_interleaved_orphan_in_hot_region() {
+    // The Stage-5 headline win: an orphaned dedup PBA `P` that shares its 1 MiB
+    // heat region with LIVE data (a neighbour PBA keeps the region count > 0, so
+    // the §6 region selector would skip P) is still reclaimed, because the
+    // per-PBA bitmap shows P itself unreferenced across K=2 barriers.
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0x11u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // Orphan P: overwrite both referrers with unique content (rc-neutral → P
+    // stays rc==1, no live LBA references it).
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut d0 = vec![0x22u8; 4096];
+    d0[0] = 1;
+    let mut d1 = vec![0x33u8; 4096];
+    d1[0] = 2;
+    pool.append("test-vol", Lba(0), 1, &d0, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    pool.append("test-vol", Lba(2), 1, &d1, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    flusher.stop();
+    assert_eq!(meta.get_refcount(p).unwrap(), 1, "orphaned dedup PBA keeps rc==1");
+
+    // HOT heat region for P (neighbour live) → §6 region mode would skip P.
+    let heat = converged_heat(&allocator);
+    heat.bump(p);
+    let (region_age, region_count) = heat.region(p);
+    assert!(
+        region_count > 0 && region_age == 0,
+        "region must look HOT to §6 (count>0, fresh): ({region_age},{region_count})"
+    );
+
+    // Per-PBA bitmap: a neighbour in P's region is referenced across both
+    // barriers, but P itself is NOT — the interleaved-orphan signature.
+    let neighbour = Pba(p.0 + 1);
+    let rb = ref_bitmap_with(&allocator, 2, &[&[neighbour], &[neighbour]]);
+
+    let (mut scanner, _cand) = start_scanner_with_ref_bitmap(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        Some(heat.clone()),
+        Some(rb),
+        orphan_scanner_config_per_pba(2),
+    );
+    assert!(
+        wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
+            && allocator.is_retired(p)),
+        "per-PBA pass must demote+retire the interleaved orphan despite the hot region"
+    );
+    assert_eq!(meta.get_refcount(p).unwrap(), 0, "delete drops membership rc to 0");
+    scanner.stop();
+
+    // GC confirm scan frees the unreferenced retired PBA end-to-end.
+    let mut gc = start_reclaim_gc(&meta, &io_engine, &pool, &lifecycle, &allocator);
+    assert!(
+        wait_until(3000, || !allocator.is_retired(p)),
+        "GC confirm scan should free the interleaved orphan (Stage-5 leak closed)"
+    );
+    gc.stop();
+}
+
+#[test]
+fn orphan_reclaim_per_pba_still_referenced_pba_is_never_freed() {
+    // Safety: even if the bitmap is WRONG (P reads unreferenced though Lba(2)
+    // still references it), the demote never loses data — the Gate-2
+    // `referenced_extents` scan keeps P retired (not freed) and the mapping +
+    // data survive. Only dedup membership is lost (re-promotable).
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0x44u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // Overwrite ONLY Lba(0); Lba(2) STILL references P.
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut d0 = vec![0x55u8; 4096];
+    d0[0] = 9;
+    pool.append("test-vol", Lba(0), 1, &d0, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    flusher.stop();
+    assert_eq!(
+        meta.get_mapping(&VolumeId("test-vol".into()), Lba(2))
+            .unwrap()
+            .unwrap()
+            .pba,
+        p,
+        "Lba(2) still references P"
+    );
+
+    // Wrong bitmap: P unreferenced across both barriers though it IS referenced.
+    let rb = ref_bitmap_with(&allocator, 2, &[&[], &[]]);
+    let (mut scanner, _cand) = start_scanner_with_ref_bitmap(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(rb),
+        orphan_scanner_config_per_pba(2),
+    );
+    assert!(
+        wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
+            && allocator.is_retired(p)),
+        "the pass demotes + retires even a (wrongly-selected) referenced entry"
+    );
+    scanner.stop();
+
+    // GC confirm scan must NOT free P — Lba(2) still references it.
+    let mut gc = start_reclaim_gc(&meta, &io_engine, &pool, &lifecycle, &allocator);
+    assert!(
+        !wait_until(800, || !allocator.is_retired(p)),
+        "Gate-2 must keep a still-referenced PBA retired (never free it)"
+    );
+    gc.stop();
+    assert_eq!(
+        meta.get_mapping(&VolumeId("test-vol".into()), Lba(2))
+            .unwrap()
+            .unwrap()
+            .pba,
+        p,
+        "still-referenced data must survive the demote unchanged"
+    );
+}
+
+#[test]
+fn orphan_reclaim_per_pba_skips_referenced_pba() {
+    // Selector: a PBA referenced in a recent barrier (bit==1) →
+    // `unreferenced_in_recent` is Some(false) → never demoted.
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0x66u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // P referenced in the most recent barrier (and the prior one) → not an orphan.
+    let rb = ref_bitmap_with(&allocator, 2, &[&[p], &[p]]);
+    let (mut scanner, _cand) = start_scanner_with_ref_bitmap(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(rb),
+        orphan_scanner_config_per_pba(2),
+    );
+    assert!(
+        !wait_until(800, || meta.get_dedup_entry(&hash).unwrap().is_none()),
+        "per-PBA pass must not demote a PBA referenced in a recent barrier"
+    );
+    assert!(!allocator.is_retired(p), "referenced PBA must not be retired");
+    scanner.stop();
+}
+
+#[test]
+fn orphan_reclaim_per_pba_waits_for_k_barriers() {
+    // Convergence: with fewer than K=2 published barriers,
+    // `unreferenced_in_recent` returns None → nothing demoted (a 0 bit is not yet
+    // trustworthy). Publishing the K-th barrier then unblocks the demote — no
+    // pre-convergence churn.
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let c = vec![0xABu8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+
+    // Orphan P (overwrite both referrers).
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut d0 = vec![0xCCu8; 4096];
+    d0[0] = 5;
+    let mut d1 = vec![0xDDu8; 4096];
+    d1[0] = 6;
+    pool.append("test-vol", Lba(0), 1, &d0, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    pool.append("test-vol", Lba(2), 1, &d1, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    flusher.stop();
+
+    // Only ONE barrier published (K=2 required, P unmarked) → not converged.
+    let rb = ref_bitmap_with(&allocator, 2, &[&[]]);
+    assert_eq!(rb.published_count(), 1);
+    let (mut scanner, _cand) = start_scanner_with_ref_bitmap(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(rb.clone()),
+        orphan_scanner_config_per_pba(2),
+    );
+    assert!(
+        !wait_until(600, || meta.get_dedup_entry(&hash).unwrap().is_none()),
+        "below K barriers, the per-PBA pass must demote nothing"
+    );
+
+    // Publish the K-th barrier (P still unmarked) → now converged → demote.
+    let buf = rb.fresh_fill_buffer();
+    let _ = rb.publish(buf);
+    assert_eq!(rb.published_count(), 2);
+    assert!(
+        wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
+            && allocator.is_retired(p)),
+        "after the K-th clean barrier, the orphan is demoted+retired"
     );
     scanner.stop();
 }
