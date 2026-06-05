@@ -480,11 +480,35 @@ impl OnyxEngine {
         Ok(())
     }
 
+    /// Reject configs that enable dedup with no LV3 read pool.
+    ///
+    /// With `storage.read_pool_workers == 0` the dedup pipeline runs in
+    /// trust-hash mode — it skips the LV3 byte-compare that turns an
+    /// `xxh3_64` fingerprint match into a *proven* duplicate (see
+    /// `BufferFlusher::start_with_metrics` / `stages::dedup`). `xxh3_64`
+    /// is not collision-resistant, so a single 64-bit collision would
+    /// silently share two unrelated 4 KiB blocks → data corruption. Verify
+    /// is correctness, not optimisation, so this combination is refused at
+    /// startup rather than silently degraded.
+    fn validate_dedup_read_pool(config: &OnyxConfig) -> OnyxResult<()> {
+        if config.dedup.enabled && config.storage.read_pool_workers == 0 {
+            return Err(OnyxError::Config(
+                "dedup.enabled=true requires storage.read_pool_workers > 0: with no read pool the \
+                 dedup verify step is skipped (trust-hash mode), and xxh3_64 is not \
+                 collision-resistant, so a hash collision would silently share unrelated blocks. \
+                 Set storage.read_pool_workers >= 1, or set dedup.enabled = false."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Open the engine with full IO capability (data device + buffer + flusher + zones).
     ///
     /// Compression is per-volume (stored in VolumeConfig metadata), not engine-wide.
     pub fn open(config: &OnyxConfig) -> OnyxResult<Self> {
         Self::validate_data_buffer_devices_disjoint(config)?;
+        Self::validate_dedup_read_pool(config)?;
 
         // 1. MetaStore
         let meta = Arc::new(MetaStore::open(&config.meta)?);
@@ -535,20 +559,22 @@ impl OnyxEngine {
         };
 
         // 2b. Recovery branch based on clean/dirty shutdown marker.
+        //
+        // Refcount durability is owned by metadb's WAL/TXG recovery (the
+        // refcount paged-array + per-shard deltas are replayed when
+        // `MetaStore::open` brings metadb up). There is no separate
+        // blockmap-walking rebuild on the onyx side — historically this
+        // branch logged "rebuilding refcount" and called a no-op stub,
+        // which was misleading. We now just record that recovery already
+        // happened and (cheaply) validate it.
         if superblock.is_clean_shutdown() {
-            tracing::info!("clean shutdown marker present — skipping refcount rebuild");
+            tracing::info!("clean shutdown marker present");
         } else {
-            tracing::warn!(
-                "dirty startup detected — rebuilding refcount CF from per-volume blockmap CFs"
-            );
-            let summary = meta.rebuild_refcount_from_blockmap()?;
             tracing::info!(
-                referenced_pbas = summary.referenced_pbas,
-                fixed_entries = summary.fixed_entries,
-                orphan_entries_removed = summary.orphan_entries_removed,
-                total_set = summary.total_set,
-                "refcount CF rebuilt"
+                "dirty startup detected — refcount was restored by metadb WAL/TXG recovery \
+                 (no separate onyx-side rebuild)"
             );
+            meta.recover_or_validate_refcount()?;
         }
 
         // 2c. Mark dirty before serving IO. The bit is cleared again only on
@@ -624,6 +650,12 @@ impl OnyxEngine {
             metrics.clone(),
         );
 
+        // Single unified PBA lifecycle layer (candidate-evict-before-free +
+        // retire retry queue + lineage proof free), owned by the flusher and
+        // shared with the lineage drain / GC reclaim / dedup scanner / zone
+        // discard so they all use one retry queue + `pba_reclaim_stuck` gauge.
+        let pba_lifecycle = flusher.pba_lifecycle();
+
         // 9. Zone manager
         let zone_manager = Arc::new(ZoneManager::new_full(
             config.engine.zone_count,
@@ -633,7 +665,7 @@ impl OnyxEngine {
             io_engine.clone(),
             metrics.clone(),
             Some(allocator.clone()),
-            flusher.candidate_cache(),
+            Some(pba_lifecycle.clone()),
             read_pool.clone(),
         )?);
 
@@ -667,6 +699,7 @@ impl OnyxEngine {
                 cold_tail_rx,
                 scanner_heat,
                 ref_bitmap.clone(),
+                pba_lifecycle.clone(),
                 config.dedup.clone(),
             ))
         } else {
@@ -685,6 +718,7 @@ impl OnyxEngine {
             heat.clone(),
             ref_bitmap,
             cold_tail_tx,
+            pba_lifecycle.clone(),
             config.gc.clone(),
         ));
         let heat = config.gc.heat_enabled.then_some(heat);
@@ -720,8 +754,7 @@ impl OnyxEngine {
         );
         let lineage_drain = LineageFreedPbaDrainHandle::start(
             meta.clone(),
-            allocator.clone(),
-            metrics.clone(),
+            pba_lifecycle.clone(),
             std::time::Duration::from_millis(100),
         );
 
@@ -844,21 +877,14 @@ impl OnyxEngine {
                 .map(|cleanup| cleanup.blocks as usize)
                 .sum();
 
-            if let Some(allocator) = &self.allocator {
-                let candidate = self
-                    .flusher
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|flusher| flusher.candidate_cache());
-                if let Some(candidate) = candidate {
-                    BufferFlusher::cleanup_dead_pbas_batch(
-                        allocator,
-                        &candidate,
-                        &cleanups,
-                        "volume_delete",
-                    );
-                }
+            let pba_lifecycle = self
+                .flusher
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|flusher| flusher.pba_lifecycle());
+            if let Some(pba_lifecycle) = pba_lifecycle {
+                BufferFlusher::cleanup_dead_pbas_batch(&pba_lifecycle, &cleanups, "volume_delete");
             } else if cleanups.iter().any(|cleanup| cleanup.pba_freed) {
                 tracing::warn!(
                     name,
@@ -1142,6 +1168,8 @@ impl OnyxEngine {
             metrics.clone(),
         );
 
+        let pba_lifecycle = flusher.pba_lifecycle();
+
         // Zone manager — reuses the read_pool built above for the
         // flusher's dedup verify path.
         let zone_manager = Arc::new(ZoneManager::new_full(
@@ -1152,7 +1180,7 @@ impl OnyxEngine {
             io_engine.clone(),
             metrics.clone(),
             Some(allocator.clone()),
-            flusher.candidate_cache(),
+            Some(pba_lifecycle.clone()),
             read_pool.clone(),
         )?);
 
@@ -1181,6 +1209,7 @@ impl OnyxEngine {
                 cold_tail_rx,
                 scanner_heat,
                 ref_bitmap.clone(),
+                pba_lifecycle.clone(),
                 config.dedup.clone(),
             ))
         } else {
@@ -1199,6 +1228,7 @@ impl OnyxEngine {
             heat.clone(),
             ref_bitmap,
             cold_tail_tx,
+            pba_lifecycle.clone(),
             config.gc.clone(),
         ));
         let heat = config.gc.heat_enabled.then_some(heat);
@@ -1227,8 +1257,7 @@ impl OnyxEngine {
         );
         let lineage_drain = LineageFreedPbaDrainHandle::start(
             meta.clone(),
-            allocator.clone(),
-            metrics.clone(),
+            pba_lifecycle.clone(),
             std::time::Duration::from_millis(100),
         );
 
@@ -1448,4 +1477,42 @@ fn build_cold_tail_fold_channel(
         "cold-tail fold enabled: dedup scanner drains the GC heat-refresh walk"
     );
     (Some(tx), Some(rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> OnyxConfig {
+        // Every OnyxConfig field is `#[serde(default)]`, so an empty document
+        // yields the all-defaults config.
+        toml::from_str("").expect("empty toml -> all serde defaults")
+    }
+
+    #[test]
+    fn dedup_enabled_without_read_pool_is_rejected() {
+        let mut cfg = default_config();
+        cfg.dedup.enabled = true;
+        cfg.storage.read_pool_workers = 0;
+        assert!(
+            OnyxEngine::validate_dedup_read_pool(&cfg).is_err(),
+            "dedup + no read pool must be refused (trust-hash mode is unsafe)"
+        );
+    }
+
+    #[test]
+    fn dedup_enabled_with_read_pool_is_ok() {
+        let mut cfg = default_config();
+        cfg.dedup.enabled = true;
+        cfg.storage.read_pool_workers = 4;
+        assert!(OnyxEngine::validate_dedup_read_pool(&cfg).is_ok());
+    }
+
+    #[test]
+    fn dedup_disabled_without_read_pool_is_ok() {
+        let mut cfg = default_config();
+        cfg.dedup.enabled = false;
+        cfg.storage.read_pool_workers = 0;
+        assert!(OnyxEngine::validate_dedup_read_pool(&cfg).is_ok());
+    }
 }

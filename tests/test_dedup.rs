@@ -725,7 +725,7 @@ fn delete_volume_leaves_dedup_index_hint_for_scrub() {
     let cleanups = meta
         .delete_volume(&VolumeId("test-vol".into()))
         .expect("delete volume should return old mappings for cleanup");
-    flusher.cleanup_mappings_now(&allocator, &cleanups, "test_delete_volume_cleanup");
+    flusher.cleanup_mappings_now(&cleanups, "test_delete_volume_cleanup");
     flusher.stop();
 
     assert!(
@@ -1724,6 +1724,11 @@ fn start_reclaim_gc(
         heat,
         None, // ref_bitmap (Stage-5; off here)
         None, // cold_tx
+        onyx_storage::space::pba_lifecycle::PbaLifecycle::new(
+            allocator.clone(),
+            onyx_storage::dedup::CandidateCache::new(1, 1),
+            Arc::new(onyx_storage::metrics::EngineMetrics::default()),
+        ),
         cfg,
     )
 }

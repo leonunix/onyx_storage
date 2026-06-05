@@ -57,15 +57,6 @@ pub enum DedupHitResult {
     Rejected,
 }
 
-/// Summary of a [`MetaStore::rebuild_refcount_from_blockmap`] run.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RebuildSummary {
-    pub referenced_pbas: u64,
-    pub fixed_entries: u64,
-    pub orphan_entries_removed: u64,
-    pub total_set: u64,
-}
-
 pub struct MetaStore {
     backend: MetadbBackend,
 }
@@ -569,8 +560,15 @@ impl MetaStore {
             .scan_blockmap_range(vol_id, start_lba, count, callback)
     }
 
-    pub fn rebuild_refcount_from_blockmap(&self) -> OnyxResult<RebuildSummary> {
-        Ok(RebuildSummary::default())
+    /// Refcount recovery is owned by metadb's WAL/TXG replay (performed during
+    /// [`MetaStore::open`]); there is no separate onyx-side rebuild that walks
+    /// the per-volume blockmaps. This is intentionally a validation/no-op hook
+    /// the dirty-startup path calls so the recovery contract has a named home
+    /// and a place to add cheap assertions later. Do NOT reintroduce a
+    /// "rebuild" that re-derives refcount from L2P — that double-counts against
+    /// metadb's authoritative ledger.
+    pub fn recover_or_validate_refcount(&self) -> OnyxResult<()> {
+        Ok(())
     }
 
     pub fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {

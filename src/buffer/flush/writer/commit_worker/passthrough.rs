@@ -360,9 +360,9 @@ impl BufferFlusher {
         for (i, ucd) in units.iter().enumerate() {
             if discarded[i] {
                 if ucd.alloc_blocks == 1 {
-                    let _ = allocator.free_one(ucd.pba);
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
                 } else {
-                    let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
                 }
                 post_mark_ranges_by_shard
                     .entry(ucd.shard_idx)
@@ -372,9 +372,9 @@ impl BufferFlusher {
             }
             if commit_failed_set.contains(&i) {
                 if ucd.alloc_blocks == 1 {
-                    let _ = allocator.free_one(ucd.pba);
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
                 } else {
-                    let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
                 }
                 continue;
             }
@@ -384,9 +384,9 @@ impl BufferFlusher {
                 // buffer entry as flushed (a newer commit already owns
                 // the LBAs) and return the PBA to the allocator.
                 if ucd.alloc_blocks == 1 {
-                    let _ = allocator.free_one(ucd.pba);
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
                 } else {
-                    let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
                 }
                 post_mark_ranges_by_shard
                     .entry(ucd.shard_idx)
@@ -399,9 +399,9 @@ impl BufferFlusher {
             };
             if um.live_positions.is_empty() {
                 if ucd.alloc_blocks == 1 {
-                    let _ = allocator.free_one(ucd.pba);
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
                 } else {
-                    let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
                 }
                 post_mark_ranges_by_shard
                     .entry(ucd.shard_idx)
@@ -1047,9 +1047,9 @@ impl BufferFlusher {
     ) {
         for ucd in units {
             if ucd.alloc_blocks == 1 {
-                let _ = allocator.free_one(ucd.pba);
+                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
             } else {
-                let _ = allocator.free_extent(Extent::new(ucd.pba, ucd.alloc_blocks));
+                let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
             }
             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
             match &ucd.completion {

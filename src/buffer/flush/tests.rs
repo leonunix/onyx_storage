@@ -77,6 +77,20 @@ fn setup_flush_test_env() -> (
     )
 }
 
+/// Build a `PbaLifecycle` for tests that exercise the cleanup/retire path
+/// directly. Each call gets a fresh candidate cache (matching the old
+/// per-call `CandidateCache::new` behaviour these tests relied on).
+fn test_lifecycle(
+    allocator: &Arc<SpaceAllocator>,
+    metrics: &Arc<EngineMetrics>,
+) -> crate::space::pba_lifecycle::PbaLifecycle {
+    crate::space::pba_lifecycle::PbaLifecycle::new(
+        allocator.clone(),
+        crate::dedup::CandidateCache::new(8, 64),
+        metrics.clone(),
+    )
+}
+
 fn cleanup_for_pba(pba: Pba, blocks: u32) -> RemapCleanup {
     RemapCleanup {
         pba,

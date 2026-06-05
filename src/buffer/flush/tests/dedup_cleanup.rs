@@ -174,6 +174,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
     assert_eq!(meta.get_refcount(pba).unwrap(), 1);
 
     let allocator_scanner = allocator.clone();
+    let metrics_scanner = metrics.clone();
     let scanner_cleanup = RemapCleanup {
         mappings: vec![old_mapping],
         ..cleanup_for_pba(pba, 1)
@@ -186,8 +187,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         ready_tx.send(()).unwrap();
         resume_rx.recv().unwrap();
         BufferFlusher::cleanup_dead_pba_post_commit(
-            &allocator_scanner,
-            &crate::dedup::CandidateCache::new(8, 64),
+            &test_lifecycle(&allocator_scanner, &metrics_scanner),
             scanner_cleanup,
             "dedup_scanner_cleanup",
         );
@@ -198,8 +198,7 @@ fn dedup_worker_cleanup_can_race_with_scanner_cleanup_on_same_dead_pba() {
         .expect("scanner-style cleanup should reach allocator handoff");
 
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &allocator,
-        &crate::dedup::CandidateCache::new(8, 64),
+        &test_lifecycle(&allocator, &metrics),
         worker_cleanup,
         "dedup_worker_hit_cleanup",
     );
@@ -243,8 +242,7 @@ fn dedup_cleanup_does_not_reconstruct_old_pba_for_index_delete() {
         .unwrap();
 
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &allocator,
-        &crate::dedup::CandidateCache::new(8, 64),
+        &test_lifecycle(&allocator, &metrics),
         RemapCleanup {
             mappings: vec![mapping],
             ..cleanup_for_pba(pba, 1)
@@ -291,8 +289,7 @@ fn retired_reclaimer_skips_allocator_free_when_live_blockmap_ref_remains() {
     meta.set_refcount(pba, 0).unwrap();
 
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &allocator,
-        &crate::dedup::CandidateCache::new(8, 64),
+        &test_lifecycle(&allocator, &metrics),
         RemapCleanup {
             mappings: vec![mapping],
             ..cleanup_for_pba(pba, 1)
@@ -313,6 +310,7 @@ fn retired_reclaimer_skips_allocator_free_when_live_blockmap_ref_remains() {
             &metrics,
             &meta,
             &allocator,
+            &test_lifecycle(&allocator, &metrics),
             16,
             &AtomicBool::new(true),
             None,
@@ -371,6 +369,7 @@ fn retired_reclaimer_batches_one_scan_and_frees_only_unreferenced() {
         &metrics,
         &meta,
         &allocator,
+        &test_lifecycle(&allocator, &metrics),
         64,
         &AtomicBool::new(true),
         None,
@@ -594,6 +593,7 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         &metrics,
         &meta,
         &allocator,
+        &test_lifecycle(&allocator, &metrics),
         64,
         &AtomicBool::new(true),
         Some(ctx),
@@ -626,6 +626,7 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         &metrics,
         &meta,
         &allocator,
+        &test_lifecycle(&allocator, &metrics),
         64,
         &AtomicBool::new(true),
         Some(ctx2),
@@ -668,6 +669,7 @@ fn heat_cold_region_confirms_and_frees() {
         &metrics,
         &meta,
         &allocator,
+        &test_lifecycle(&allocator, &metrics),
         64,
         &AtomicBool::new(true),
         Some(ctx),
@@ -714,6 +716,7 @@ fn heat_high_yield_suppresses_defer() {
         &metrics,
         &meta,
         &allocator,
+        &test_lifecycle(&allocator, &metrics),
         64,
         &AtomicBool::new(true),
         Some(ctx),
@@ -764,6 +767,7 @@ fn heat_pressure_suppresses_defer() {
         &metrics,
         &meta,
         &allocator,
+        &test_lifecycle(&allocator, &metrics),
         64,
         &AtomicBool::new(true),
         Some(ctx),

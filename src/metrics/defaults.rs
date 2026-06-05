@@ -251,6 +251,8 @@ impl Default for EngineMetrics {
             gc_errors: AtomicU64::new(0),
             gc_reclaim_blockmap_scans: AtomicU64::new(0),
             gc_lineage_freed_blocks: AtomicU64::new(0),
+            gc_lineage_idempotent_frees: AtomicU64::new(0),
+            pba_reclaim_stuck: AtomicU64::new(0),
             heat_refresh_cycles: AtomicU64::new(0),
             heat_refresh_lbas_scanned: AtomicU64::new(0),
             heat_bumps: AtomicU64::new(0),

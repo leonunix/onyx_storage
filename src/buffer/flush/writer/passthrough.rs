@@ -1,6 +1,13 @@
 use super::*;
 
 impl BufferFlusher {
+    /// Legacy single-unit write path. NOT the steady-state hot path — that runs
+    /// through the commit-worker pipeline (`write_units_batch` →
+    /// `commit_worker/passthrough.rs`). `write_unit` survives as the
+    /// **shutdown-drain** path: `handle_compressed_unit` calls it while draining
+    /// the flusher on stop, when the commit workers are no longer accepting
+    /// jobs. Keep it in sync with the commit-worker path's invariants
+    /// (lifecycle read-lock coverage, rollback on IO/meta failure).
     pub(in crate::buffer::flush) fn write_unit(
         shard_idx: usize,
         unit: &CompressedUnit,
@@ -53,7 +60,7 @@ impl BufferFlusher {
             } else {
                 let extent = allocator.allocate_extent_for_lane(shard_idx, blocks_needed as u32)?;
                 if (extent.count as usize) < blocks_needed {
-                    allocator.free_extent(extent)?;
+                    crate::space::pba_lifecycle::rollback_uncommitted(allocator, extent)?;
                     Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
                     Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                     return Err(crate::error::OnyxError::SpaceExhausted);
@@ -297,7 +304,7 @@ impl BufferFlusher {
                     .allocate_extent_for_lane(shard_idx, blocks_needed as u32)
                     .and_then(|ext| {
                         if (ext.count as usize) < blocks_needed {
-                            allocator.free_extent(ext)?;
+                            crate::space::pba_lifecycle::rollback_uncommitted(allocator, ext)?;
                             Err(crate::error::OnyxError::SpaceExhausted)
                         } else {
                             Ok((ext.start, ext.count))
@@ -340,9 +347,9 @@ impl BufferFlusher {
                     let pba = pbas[i].unwrap();
                     let blk = alloc_blocks[i];
                     if blk == 1 {
-                        let _ = allocator.free_one(pba);
+                        let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
                     } else {
-                        let _ = allocator.free_extent(Extent::new(pba, blk));
+                        let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blk));
                     }
                     failed[i] = true;
                     tracing::error!(
@@ -370,9 +377,9 @@ impl BufferFlusher {
                                 let pba = pbas[unit_idx].unwrap();
                                 let blk = alloc_blocks[unit_idx];
                                 if blk == 1 {
-                                    let _ = allocator.free_one(pba);
+                                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
                                 } else {
-                                    let _ = allocator.free_extent(Extent::new(pba, blk));
+                                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blk));
                                 }
                                 failed[unit_idx] = true;
                                 tracing::error!(
@@ -392,9 +399,9 @@ impl BufferFlusher {
                             let pba = pbas[unit_idx].unwrap();
                             let blk = alloc_blocks[unit_idx];
                             if blk == 1 {
-                                let _ = allocator.free_one(pba);
+                                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
                             } else {
-                                let _ = allocator.free_extent(Extent::new(pba, blk));
+                                let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blk));
                             }
                             failed[unit_idx] = true;
                         }

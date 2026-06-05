@@ -22,6 +22,7 @@ use crate::meta::schema::*;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
+use crate::space::pba_lifecycle::PbaLifecycle;
 use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 use onyx_metadb::DedupScanCursor;
 
@@ -69,8 +70,11 @@ impl DedupScanner {
         ref_bitmap: Option<RefBitmap>,
         config: DedupConfig,
     ) -> Self {
+        let metrics = Arc::new(EngineMetrics::default());
+        let pba_lifecycle =
+            PbaLifecycle::new(allocator.clone(), candidate.clone(), metrics.clone());
         Self::start_with_metrics(
-            Arc::new(EngineMetrics::default()),
+            metrics,
             meta,
             io_engine,
             allocator,
@@ -81,6 +85,7 @@ impl DedupScanner {
             cold_rx,
             heat,
             ref_bitmap,
+            pba_lifecycle,
             config,
         )
     }
@@ -100,6 +105,7 @@ impl DedupScanner {
         // Stage-5: per-PBA referenced bitmap the GC heat sweep fills (None unless
         // per-PBA orphan reclaim is on). Read here as the orphan selector.
         ref_bitmap: Option<RefBitmap>,
+        pba_lifecycle: PbaLifecycle,
         config: DedupConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -123,6 +129,7 @@ impl DedupScanner {
                     cold_rx.as_ref(),
                     heat.as_ref(),
                     ref_bitmap.as_ref(),
+                    &pba_lifecycle,
                     &config_clone,
                     &running_clone,
                 );
@@ -155,6 +162,7 @@ impl DedupScanner {
         cold_rx: Option<&Receiver<ColdTailTarget>>,
         heat: Option<&HeatMap>,
         ref_bitmap: Option<&RefBitmap>,
+        pba_lifecycle: &PbaLifecycle,
         config: &ArcSwap<DedupConfig>,
         running: &AtomicBool,
     ) {
@@ -199,9 +207,9 @@ impl DedupScanner {
                     metrics,
                     meta,
                     io_engine,
-                    allocator,
                     lifecycle,
                     candidate,
+                    pba_lifecycle,
                     cfg.max_rescan_per_cycle,
                 ) {
                     Ok(stats) => {
@@ -253,9 +261,9 @@ impl DedupScanner {
                 let result = if let Some(rx) = cold_rx {
                     Self::cold_tail_drain(
                         meta,
-                        allocator,
                         lifecycle,
                         candidate,
+                        pba_lifecycle,
                         read_pool,
                         rx,
                         cfg.cold_tail_max_per_cycle,
@@ -263,9 +271,9 @@ impl DedupScanner {
                 } else {
                     Self::cold_tail_rescan(
                         meta,
-                        allocator,
                         lifecycle,
                         candidate,
+                        pba_lifecycle,
                         read_pool,
                         &mut cold_tail_cursors,
                         cfg.cold_tail_max_per_cycle,
@@ -426,9 +434,9 @@ impl DedupScanner {
         _metrics: &EngineMetrics,
         meta: &MetaStore,
         io_engine: &IoEngine,
-        allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         candidate: &CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         max_per_cycle: usize,
     ) -> OnyxResult<RescanStats> {
         let skipped = meta.scan_dedup_skipped(max_per_cycle)?;
@@ -500,8 +508,7 @@ impl DedupScanner {
                                 meta.atomic_dedup_hit(&vol_id, *lba, &new_bv, &hash, observed_seq)?;
                             if let Some(cleanup) = decremented {
                                 BufferFlusher::cleanup_dead_pba_post_commit(
-                                    allocator,
-                                    candidate,
+                                    pba_lifecycle,
                                     cleanup,
                                     "dedup_scanner_cleanup",
                                 );
@@ -558,9 +565,9 @@ impl DedupScanner {
     #[allow(clippy::too_many_arguments)]
     fn cold_tail_rescan(
         meta: &MetaStore,
-        allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         candidate: &CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         read_pool: Option<&ReadPool>,
         cursors: &mut HashMap<String, ColdTailCursor>,
         budget: usize,
@@ -666,9 +673,9 @@ impl DedupScanner {
             // cleanup logic lives in exactly one place.
             Self::process_cold_tail_targets(
                 meta,
-                allocator,
                 lifecycle,
                 candidate,
+                pba_lifecycle,
                 pool,
                 &vol.id,
                 &targets,
@@ -692,9 +699,9 @@ impl DedupScanner {
     #[allow(clippy::too_many_arguments)]
     fn process_cold_tail_targets(
         meta: &MetaStore,
-        allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         candidate: &CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         pool: &ReadPool,
         vol_id: &VolumeId,
         targets: &[(Lba, BlockmapValue)],
@@ -824,8 +831,7 @@ impl DedupScanner {
                         meta.atomic_dedup_hit(vol_id, *lba, &new_bv, &hash, observed_seq)?;
                     if let Some(cleanup) = decremented {
                         BufferFlusher::cleanup_dead_pba_post_commit(
-                            allocator,
-                            candidate,
+                            pba_lifecycle,
                             cleanup,
                             "dedup_cold_tail_cleanup",
                         );
@@ -887,9 +893,9 @@ impl DedupScanner {
     /// dropped target only costs dedup ratio, never correctness.
     fn cold_tail_drain(
         meta: &MetaStore,
-        allocator: &SpaceAllocator,
         lifecycle: &VolumeLifecycleManager,
         candidate: &CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         read_pool: Option<&ReadPool>,
         rx: &Receiver<ColdTailTarget>,
         budget: usize,
@@ -930,9 +936,9 @@ impl DedupScanner {
             let vol_id = VolumeId(vol_id_str.clone());
             Self::process_cold_tail_targets(
                 meta,
-                allocator,
                 lifecycle,
                 candidate,
+                pba_lifecycle,
                 pool,
                 &vol_id,
                 targets,

@@ -1,13 +1,13 @@
 use super::*;
+use crate::space::pba_lifecycle::PbaLifecycle;
 
 impl BufferFlusher {
     pub(crate) fn cleanup_dead_pba_post_commit(
-        allocator: &SpaceAllocator,
-        candidate: &crate::dedup::CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         cleanup: RemapCleanup,
         context: &'static str,
     ) {
-        Self::retire_dead_pbas(allocator, candidate, &[cleanup], context);
+        Self::retire_dead_pbas(pba_lifecycle, &[cleanup], context);
     }
 
     pub(crate) fn repair_stale_dedup_index(
@@ -48,20 +48,21 @@ impl BufferFlusher {
     /// is unsafe once a freed PBA can be reused. Foreground verify mismatch
     /// repair and the background scrubber maintain the forward cache.
     pub(crate) fn cleanup_dead_pbas_batch(
-        allocator: &SpaceAllocator,
-        candidate: &crate::dedup::CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         cleanups: &[RemapCleanup],
         context: &'static str,
     ) {
+        // Re-drive any deferred retire retries even when this batch is empty,
+        // so a transient retire failure does not leak space until restart.
+        pba_lifecycle.drive_retire_retries();
         if cleanups.is_empty() {
             return;
         }
-        Self::retire_dead_pbas(allocator, candidate, cleanups, context);
+        Self::retire_dead_pbas(pba_lifecycle, cleanups, context);
     }
 
     fn retire_dead_pbas(
-        allocator: &SpaceAllocator,
-        candidate: &crate::dedup::CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         cleanups: &[RemapCleanup],
         context: &'static str,
     ) {
@@ -76,33 +77,14 @@ impl BufferFlusher {
         candidates.sort_unstable_by_key(|cleanup| cleanup.pba);
 
         for cleanup in candidates {
-            if allocator.is_retired(cleanup.pba) {
-                continue;
-            }
-
-            candidate.remove_by_pba(cleanup.pba);
-
-            tracing::debug!(
-                pba = cleanup.pba.0,
-                blocks = cleanup.blocks,
-                context,
-                "cleanup_dead_pba: retired PBA for GC reclaim"
-            );
-
-            let retire_result = if cleanup.blocks <= 1 {
-                allocator.retire_one(cleanup.pba)
+            // candidate-evict → retire → defer-on-failure (with retry queue)
+            // all live in PbaLifecycle::retire_committed now.
+            let extent = if cleanup.blocks <= 1 {
+                Extent::single(cleanup.pba)
             } else {
-                allocator.retire_extent(Extent::new(cleanup.pba, cleanup.blocks))
+                Extent::new(cleanup.pba, cleanup.blocks)
             };
-            if let Err(e) = retire_result {
-                tracing::warn!(
-                    pba = cleanup.pba.0,
-                    blocks = cleanup.blocks,
-                    error = %e,
-                    context,
-                    "post-commit cleanup: allocator retire failed after metadata commit; continuing without retry"
-                );
-            }
+            pba_lifecycle.retire_committed(context, extent);
         }
     }
 
@@ -118,15 +100,19 @@ impl BufferFlusher {
     pub(super) fn cleanup_loop(
         shard_idx: usize,
         rx: &Receiver<CleanupBatch>,
-        allocator: &SpaceAllocator,
-        candidate: &crate::dedup::CandidateCache,
+        pba_lifecycle: &PbaLifecycle,
         running: &AtomicBool,
         metrics: &EngineMetrics,
     ) {
         while running.load(Ordering::Relaxed) {
             let first = match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(items) => items,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Idle tick: re-drive deferred retire retries so a
+                    // transient failure does not leak space indefinitely.
+                    pba_lifecycle.drive_retire_retries();
+                    continue;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
 
@@ -137,7 +123,7 @@ impl BufferFlusher {
 
             let count = all.len();
             let start = Instant::now();
-            Self::cleanup_dead_pbas_batch(allocator, candidate, &all, "cleanup_thread");
+            Self::cleanup_dead_pbas_batch(pba_lifecycle, &all, "cleanup_thread");
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             metrics
                 .flush_cleanup_thread_ns
@@ -159,7 +145,7 @@ impl BufferFlusher {
         }
         if !remaining.is_empty() {
             let start = Instant::now();
-            Self::cleanup_dead_pbas_batch(allocator, candidate, &remaining, "cleanup_thread_drain");
+            Self::cleanup_dead_pbas_batch(pba_lifecycle, &remaining, "cleanup_thread_drain");
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             metrics
                 .flush_cleanup_thread_ns

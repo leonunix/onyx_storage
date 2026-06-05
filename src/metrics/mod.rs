@@ -453,6 +453,17 @@ pub struct EngineMetrics {
     /// surface, drained by `LineageFreedPbaDrainHandle`. Counts blocks
     /// (not PBAs) so it stays comparable with `gc_blocks_rewritten`.
     pub gc_lineage_freed_blocks: AtomicU64,
+    /// Lineage GC `FreePbas` extents that were already free/retired when the
+    /// drain tried to free them (duplicate surface absorbed idempotently —
+    /// counter + debug, not a warn). A persistently rising value means metadb
+    /// is re-surfacing the same dead-list segment; see
+    /// `space::pba_lifecycle::PbaLifecycle::free_lineage_gc_proven`.
+    pub gc_lineage_idempotent_frees: AtomicU64,
+    /// Current depth of the committed-PBA retire retry queue. A committed dead
+    /// PBA whose `allocator.retire_*` failed after its metadata commit is
+    /// deferred here and re-driven with backoff; a non-zero steady value means
+    /// space is stuck un-reclaimable. See `space::pba_lifecycle`.
+    pub pba_reclaim_stuck: AtomicU64,
     /// Adaptive reclaim heat map (observe-only, Stage A). `heat_refresh_cycles`
     /// = GC cycles that ran a heat-refresh step; `heat_refresh_lbas_scanned` =
     /// live blockmap entries walked (≈ budget × cycles, the "no silent

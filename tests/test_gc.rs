@@ -1259,6 +1259,11 @@ fn heat_refresh_counts_live_mappings_and_advances_epoch() {
         heat.clone(),
         None, // ref_bitmap: Stage-5 per-PBA orphan reclaim off in this test
         None, // cold_tail_tx: Stage-4 fold off in this test
+        onyx_storage::space::pba_lifecycle::PbaLifecycle::new(
+            env.allocator.clone(),
+            onyx_storage::dedup::CandidateCache::new(1, 1),
+            metrics.clone(),
+        ),
         cfg,
     );
 
@@ -1355,6 +1360,11 @@ fn heat_refresh_fold_pushes_cold_candidates() {
         heat.clone(),
         None, // ref_bitmap: Stage-5 per-PBA orphan reclaim off in this test
         Some(tx),
+        onyx_storage::space::pba_lifecycle::PbaLifecycle::new(
+            env.allocator.clone(),
+            onyx_storage::dedup::CandidateCache::new(1, 1),
+            metrics.clone(),
+        ),
         cfg,
     );
 
@@ -1413,6 +1423,11 @@ fn heat_refresh_budget_zero_is_noop() {
         heat.clone(),
         None, // ref_bitmap: Stage-5 per-PBA orphan reclaim off in this test
         None, // cold_tail_tx: Stage-4 fold off in this test
+        onyx_storage::space::pba_lifecycle::PbaLifecycle::new(
+            env.allocator.clone(),
+            onyx_storage::dedup::CandidateCache::new(1, 1),
+            metrics.clone(),
+        ),
         cfg,
     );
     thread::sleep(Duration::from_millis(120)); // several cycles

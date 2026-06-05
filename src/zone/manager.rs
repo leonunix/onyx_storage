@@ -143,7 +143,11 @@ pub struct ZoneManager {
     buffer_pool: Arc<WriteBufferPool>,
     meta: Arc<MetaStore>,
     allocator: Option<Arc<SpaceAllocator>>,
-    candidate: crate::dedup::CandidateCache,
+    /// PBA lifecycle layer for discard cleanup (candidate-evict → retire →
+    /// retry). `None` in meta-only / test setups with no allocator. Shares the
+    /// flusher's instance in full mode so discard retire failures join the same
+    /// retry queue + `pba_reclaim_stuck` gauge.
+    pba_lifecycle: Option<crate::space::pba_lifecycle::PbaLifecycle>,
     metrics: Arc<EngineMetrics>,
     /// Optional LV3 read pool. When present, mapped reads dispatch here for
     /// batched io_uring submission + parallel decompression. When absent,
@@ -194,7 +198,7 @@ impl ZoneManager {
             io_engine,
             Arc::new(EngineMetrics::default()),
             None,
-            crate::dedup::CandidateCache::new(1, 1),
+            None,
         )
     }
 
@@ -206,7 +210,7 @@ impl ZoneManager {
         io_engine: Arc<IoEngine>,
         metrics: Arc<EngineMetrics>,
         allocator: Option<Arc<SpaceAllocator>>,
-        candidate: crate::dedup::CandidateCache,
+        pba_lifecycle: Option<crate::space::pba_lifecycle::PbaLifecycle>,
     ) -> OnyxResult<Self> {
         Self::new_full(
             zone_count,
@@ -216,7 +220,7 @@ impl ZoneManager {
             io_engine,
             metrics,
             allocator,
-            candidate,
+            pba_lifecycle,
             None,
         )
     }
@@ -233,7 +237,7 @@ impl ZoneManager {
         io_engine: Arc<IoEngine>,
         metrics: Arc<EngineMetrics>,
         allocator: Option<Arc<SpaceAllocator>>,
-        candidate: crate::dedup::CandidateCache,
+        pba_lifecycle: Option<crate::space::pba_lifecycle::PbaLifecycle>,
         read_pool: Option<Arc<ReadPool>>,
     ) -> OnyxResult<Self> {
         tracing::info!(
@@ -250,7 +254,7 @@ impl ZoneManager {
             buffer_pool,
             meta,
             allocator,
-            candidate,
+            pba_lifecycle,
             metrics,
             read_pool,
         })
@@ -894,13 +898,8 @@ impl ZoneManager {
             .delete_blockmap_range(&vol_id_obj, start_lba, end_lba)?;
 
         // Step 3: return freed PBAs to allocator
-        if let Some(allocator) = &self.allocator {
-            BufferFlusher::cleanup_dead_pbas_batch(
-                allocator,
-                &self.candidate,
-                &cleanups,
-                "discard",
-            );
+        if let Some(pba_lifecycle) = &self.pba_lifecycle {
+            BufferFlusher::cleanup_dead_pbas_batch(pba_lifecycle, &cleanups, "discard");
             let mut blocks_freed = 0u64;
             for cleanup in &cleanups {
                 if cleanup.pba_freed {

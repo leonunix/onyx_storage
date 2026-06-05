@@ -49,6 +49,12 @@ pub struct BufferFlusher {
     /// flusher with a real cache and the integration commits don't
     /// have to re-touch the public constructor signature.
     candidate: crate::dedup::CandidateCache,
+    /// Unified PBA lifecycle layer. The flusher's cleanup thread retires
+    /// committed-dead PBAs through it (candidate-evict → retire → retry queue);
+    /// the engine clones it via [`BufferFlusher::pba_lifecycle`] so the lineage
+    /// drain, GC reclaim, and dedup scanner share the same retire-retry queue
+    /// and `pba_reclaim_stuck` gauge.
+    pba_lifecycle: crate::space::pba_lifecycle::PbaLifecycle,
     /// Per-volume commit workers. Each shard writer hands a
     /// [`writer::CommitJob`] off to `commit_worker_handles[hash %
     /// NUM_COMMIT_WORKERS]` after IO; the worker handles the metadb
@@ -286,8 +292,8 @@ impl Allocation {
 
     fn free(&self, allocator: &SpaceAllocator) -> OnyxResult<()> {
         match self {
-            Self::Single(pba) => allocator.free_one(*pba),
-            Self::Extent(extent) => allocator.free_extent(*extent),
+            Self::Single(pba) => crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, *pba),
+            Self::Extent(extent) => crate::space::pba_lifecycle::rollback_uncommitted(allocator, *extent),
         }
     }
 }
@@ -397,7 +403,7 @@ impl BufferFlusher {
                 continue;
             }
             let pba = Pba(base_pba.0 + pos as u64);
-            if let Err(e) = allocator.free_one(pba) {
+            if let Err(e) = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba) {
                 tracing::warn!(
                     pba = pba.0,
                     context,

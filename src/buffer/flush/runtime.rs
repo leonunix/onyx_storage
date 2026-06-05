@@ -58,6 +58,15 @@ impl BufferFlusher {
                 .candidate_per_shard_capacity
                 .unwrap_or(crate::dedup::candidate::DEFAULT_PER_SHARD_CAPACITY),
         );
+        // Single PBA lifecycle layer shared by the flusher's cleanup path and,
+        // via `pba_lifecycle()`, by the engine's lineage drain / GC reclaim /
+        // dedup scanner. One instance ⇒ one retire-retry queue + one
+        // `pba_reclaim_stuck` gauge.
+        let pba_lifecycle = crate::space::pba_lifecycle::PbaLifecycle::new(
+            allocator.clone(),
+            candidate.clone(),
+            metrics.clone(),
+        );
         let running = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(FlusherInFlightTracker::default());
         let lane_count = pool.shard_count().max(1);
@@ -324,8 +333,7 @@ impl BufferFlusher {
                 .expect("failed to spawn writer thread");
 
             let running_cl = running.clone();
-            let allocator_cl = allocator.clone();
-            let candidate_cl = candidate.clone();
+            let pba_lifecycle_cl = pba_lifecycle.clone();
             let metrics_cl = metrics.clone();
             let cleanup_handle = thread::Builder::new()
                 .name(format!("flusher-cleanup-{}", shard_idx))
@@ -334,8 +342,7 @@ impl BufferFlusher {
                     Self::cleanup_loop(
                         shard_idx,
                         &cleanup_rx,
-                        &allocator_cl,
-                        &candidate_cl,
+                        &pba_lifecycle_cl,
                         &running_cl,
                         &metrics_cl,
                     );
@@ -435,6 +442,7 @@ impl BufferFlusher {
             lanes,
             in_flight,
             candidate,
+            pba_lifecycle,
             commit_worker_handles,
             commit_worker_txs,
             post_commit_handles,
@@ -450,13 +458,15 @@ impl BufferFlusher {
         self.candidate.clone()
     }
 
-    pub fn cleanup_mappings_now(
-        &self,
-        allocator: &SpaceAllocator,
-        cleanups: &[RemapCleanup],
-        context: &'static str,
-    ) {
-        Self::cleanup_dead_pbas_batch(allocator, &self.candidate, cleanups, context);
+    /// Clone of the flusher's [`PbaLifecycle`]. The engine wires the lineage
+    /// drain, GC reclaim, and dedup scanner to this single instance so they all
+    /// share its retire-retry queue and `pba_reclaim_stuck` gauge.
+    pub fn pba_lifecycle(&self) -> crate::space::pba_lifecycle::PbaLifecycle {
+        self.pba_lifecycle.clone()
+    }
+
+    pub fn cleanup_mappings_now(&self, cleanups: &[RemapCleanup], context: &'static str) {
+        Self::cleanup_dead_pbas_batch(&self.pba_lifecycle, cleanups, context);
     }
 
     pub fn stop(&mut self) {

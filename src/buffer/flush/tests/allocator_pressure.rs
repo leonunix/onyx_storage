@@ -138,8 +138,9 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
     // Phase 5: rc no longer reflects per-LBA references; the
     // load-bearing invariant is that recycled PBAs come back with
     // zero live blockmap entries (no ghost refs).
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
+    let pba_lifecycle = test_lifecycle(&allocator, &metrics);
     let vol = VolumeId("flush-race".into());
     let mut ghost_found = false;
 
@@ -207,8 +208,7 @@ fn rapid_pba_recycle_no_ghost_blockmap_refs() {
         assert!(!meta.has_any_blockmap_ref(pba).unwrap());
 
         BufferFlusher::cleanup_dead_pba_post_commit(
-            &allocator,
-            &crate::dedup::CandidateCache::new(8, 64),
+            &pba_lifecycle,
             cleanup_for_pba(pba, 1),
             "recycle_test",
         );
@@ -258,6 +258,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
 
     let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
+    let pba_lifecycle = test_lifecycle(&allocator, &metrics);
     let vol = VolumeId("flush-race".into());
     let meta = &*meta;
     let allocator = &*allocator;
@@ -404,8 +405,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                 if let Ok(newly_zeroed) = result {
                     for cleanup in newly_zeroed.values() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
-                            allocator,
-                            &crate::dedup::CandidateCache::new(8, 64),
+                            &pba_lifecycle,
                             cleanup.clone(),
                             "concurrent_test_overwrite",
                         );
@@ -452,8 +452,7 @@ fn concurrent_overwrite_dedup_cleanup_refcount_integrity() {
                 if let Ok(newly_zeroed) = result {
                     for cleanup in newly_zeroed.values() {
                         BufferFlusher::cleanup_dead_pba_post_commit(
-                            allocator,
-                            &crate::dedup::CandidateCache::new(8, 64),
+                            &pba_lifecycle,
                             cleanup.clone(),
                             "concurrent_test_overwrite_c",
                         );
@@ -500,6 +499,7 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
 
     let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
+    let pba_lifecycle = test_lifecycle(&allocator, &metrics);
     let vol = VolumeId("flush-race".into());
     let meta = &*meta;
     let allocator = &*allocator;
@@ -516,6 +516,7 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
             let found_stale = &found_stale;
             let io_engine = io_engine.clone();
             let metrics = metrics.clone();
+            let pba_lifecycle = pba_lifecycle.clone();
 
             s.spawn(move || {
                 barrier.wait();
@@ -585,8 +586,7 @@ fn concurrent_pba_lifecycle_no_stale_refcount_on_realloc() {
                     if let Ok(newly_zeroed) = result {
                         for cleanup in newly_zeroed.values() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
-                                allocator,
-                                &crate::dedup::CandidateCache::new(8, 64),
+                                &pba_lifecycle,
                                 cleanup.clone(),
                                 "lifecycle_test",
                             );
@@ -639,8 +639,9 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
     // path. The blockmap-ref gate (`has_any_blockmap_ref`) is the
     // load-bearing invariant — allocator reclamation may not happen
     // while live mappings still point at the PBA.
-    let (meta, _pool, _lifecycle, allocator, _io_engine, _metrics, _meta_dir, _buf_tmp, _data_tmp) =
+    let (meta, _pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
+    let pba_lifecycle = test_lifecycle(&allocator, &metrics);
     let vol = VolumeId("flush-race".into());
 
     // Step 1: First write — maps LBAs 0-7 → PBA A
@@ -697,8 +698,7 @@ fn duplicate_flush_entry_causes_premature_pba_free() {
 
     // Step 3: Cleanup retires PBA A; GC verifies it before reuse.
     BufferFlusher::cleanup_dead_pba_post_commit(
-        &allocator,
-        &crate::dedup::CandidateCache::new(8, 64),
+        &pba_lifecycle,
         cleanup_for_pba(pba_a, 1),
         "dup_flush_test",
     );
@@ -754,6 +754,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
 
     let (meta, _pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
+    let pba_lifecycle = test_lifecycle(&allocator, &metrics);
     let vol = VolumeId("flush-race".into());
     let meta = &*meta;
     let allocator = &*allocator;
@@ -857,6 +858,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
             let barrier = &barrier;
             let io_engine = io_engine.clone();
             let metrics = metrics.clone();
+            let pba_lifecycle = pba_lifecycle.clone();
             s.spawn(move || {
                 barrier.wait();
                 for round in 0..150u64 {
@@ -890,8 +892,7 @@ fn full_pressure_multi_lane_no_drift_anywhere() {
                     if let Ok(newly_zeroed) = meta.atomic_batch_write_multi(&args) {
                         for cleanup in newly_zeroed.values() {
                             BufferFlusher::cleanup_dead_pba_post_commit(
-                                allocator,
-                                &crate::dedup::CandidateCache::new(8, 64),
+                                &pba_lifecycle,
                                 cleanup.clone(),
                                 "pressure_test",
                             );

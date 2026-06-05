@@ -20,6 +20,7 @@ use crate::meta::schema::{BlockmapValue, FLAG_DEDUP_SKIPPED};
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
+use crate::space::pba_lifecycle::PbaLifecycle;
 use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 
@@ -43,8 +44,14 @@ impl GcRunner {
         heat: HeatMap,
         config: GcConfig,
     ) -> Self {
+        let metrics = Arc::new(EngineMetrics::default());
+        let pba_lifecycle = PbaLifecycle::new(
+            allocator.clone(),
+            crate::dedup::CandidateCache::new(1, 1),
+            metrics.clone(),
+        );
         Self::start_with_metrics(
-            Arc::new(EngineMetrics::default()),
+            metrics,
             meta,
             io_engine,
             buffer_pool,
@@ -53,6 +60,7 @@ impl GcRunner {
             heat,
             None,
             None,
+            pba_lifecycle,
             config,
         )
     }
@@ -70,6 +78,7 @@ impl GcRunner {
         // per-PBA orphan reclaim is on). Filled here; read by the dedup scanner.
         ref_bitmap: Option<RefBitmap>,
         cold_tx: Option<Sender<ColdTailTarget>>,
+        pba_lifecycle: PbaLifecycle,
         config: GcConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -91,6 +100,7 @@ impl GcRunner {
                     &heat,
                     ref_bitmap.as_ref(),
                     cold_tx.as_ref(),
+                    &pba_lifecycle,
                     &config_clone,
                     &running_clone,
                 );
@@ -143,6 +153,7 @@ impl GcRunner {
         heat: &HeatMap,
         ref_bitmap: Option<&RefBitmap>,
         cold_tx: Option<&Sender<ColdTailTarget>>,
+        pba_lifecycle: &PbaLifecycle,
         config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
     ) {
@@ -181,6 +192,7 @@ impl GcRunner {
                 metrics,
                 meta,
                 allocator,
+                pba_lifecycle,
                 MAX_RETIRED_RECLAIM_PER_CYCLE,
                 running,
                 heat_ctx,
@@ -319,6 +331,7 @@ impl GcRunner {
         metrics: &EngineMetrics,
         meta: &MetaStore,
         allocator: &SpaceAllocator,
+        pba_lifecycle: &PbaLifecycle,
         limit: usize,
         running: &AtomicBool,
         heat_ctx: Option<HeatReclaimCtx<'_>>,
@@ -504,7 +517,7 @@ impl GcRunner {
             if is_referenced {
                 continue;
             }
-            match allocator.reclaim_retired_extent(extent) {
+            match pba_lifecycle.confirm_and_reclaim(extent) {
                 Ok(true) => {
                     reclaimed += extent.count as usize;
                     reclaimed_extents += 1;

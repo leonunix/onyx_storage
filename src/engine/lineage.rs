@@ -2,8 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::meta::store::MetaStore;
-use crate::metrics::EngineMetrics;
-use crate::space::allocator::SpaceAllocator;
+use crate::space::pba_lifecycle::PbaLifecycle;
 
 /// Handle for the lineage-freed PBA drain thread.
 ///
@@ -13,7 +12,9 @@ use crate::space::allocator::SpaceAllocator;
 /// dead-list segment past every snap_pin and emits a `WalOp::FreePbas`.
 /// The metadb backend converts those WAL outcomes into a crossbeam
 /// channel; this thread drains the channel and returns each PBA to the
-/// allocator's free list.
+/// allocator's free list — via [`PbaLifecycle::free_lineage_gc_proven`], so
+/// the RAM candidate cache is evicted before the allocator can reissue the
+/// PBA and duplicate `FreePbas` surfaces are absorbed idempotently.
 ///
 /// The thread parks for `interval` between drains; channel sends from the
 /// FreedPbasSink wake it implicitly when production resumes, since the
@@ -26,8 +27,7 @@ pub(super) struct LineageFreedPbaDrainHandle {
 impl LineageFreedPbaDrainHandle {
     pub(super) fn start(
         meta: Arc<MetaStore>,
-        allocator: Arc<SpaceAllocator>,
-        metrics: Arc<EngineMetrics>,
+        pba_lifecycle: PbaLifecycle,
         interval: std::time::Duration,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -36,12 +36,12 @@ impl LineageFreedPbaDrainHandle {
             .name("onyx-lineage-drain".into())
             .spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    Self::drain_once(&meta, &allocator, &metrics);
+                    Self::drain_once(&meta, &pba_lifecycle);
                     std::thread::sleep(interval);
                 }
                 // Final drain so PBAs the GC emitted right before
                 // shutdown still make it back to the allocator.
-                Self::drain_once(&meta, &allocator, &metrics);
+                Self::drain_once(&meta, &pba_lifecycle);
             })
             .expect("spawn lineage drain thread");
         Self {
@@ -50,38 +50,16 @@ impl LineageFreedPbaDrainHandle {
         }
     }
 
-    fn drain_once(
-        meta: &Arc<MetaStore>,
-        allocator: &Arc<SpaceAllocator>,
-        metrics: &Arc<EngineMetrics>,
-    ) {
+    fn drain_once(meta: &Arc<MetaStore>, pba_lifecycle: &PbaLifecycle) {
         let pbas = meta.drain_lineage_freed_pbas();
         if pbas.is_empty() {
             return;
         }
+        // Within-batch duplicate PBAs are folded here; cross-batch / cross-crash
+        // duplicates are absorbed idempotently inside free_lineage_gc_proven.
         let extents = crate::meta::backend::coalesce_free_pbas_to_extents(&pbas);
-        let mut freed_blocks: u64 = 0;
         for extent in extents {
-            let result = if extent.count <= 1 {
-                allocator.free_one(extent.start)
-            } else {
-                allocator.free_extent(extent)
-            };
-            if let Err(e) = result {
-                tracing::warn!(
-                    pba = extent.start.0,
-                    blocks = extent.count,
-                    error = %e,
-                    "lineage drain: allocator free failed; PBA leaked until restart",
-                );
-            } else {
-                freed_blocks += extent.count as u64;
-            }
-        }
-        if freed_blocks > 0 {
-            metrics
-                .gc_lineage_freed_blocks
-                .fetch_add(freed_blocks, Ordering::Relaxed);
+            pba_lifecycle.free_lineage_gc_proven(extent);
         }
     }
 

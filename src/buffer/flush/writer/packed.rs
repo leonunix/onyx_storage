@@ -15,9 +15,12 @@ enum PackedSlotCommitOutcome {
 }
 
 impl BufferFlusher {
-    // Production callers now route through `write_packed_slots_batch` →
-    // commit_worker dispatch. Kept for test coverage of the synchronous
-    // packed-slot path.
+    // Legacy synchronous packed-slot write. Production callers route through
+    // `write_packed_slots_batch` → commit_worker dispatch; that batch path also
+    // owns the degraded fallback (when no commit-worker channel is available it
+    // `defer_retry`s the seqs rather than calling this). `write_packed_slot`
+    // itself is now exercised only by tests of the synchronous path — hence
+    // `dead_code`. Do not wire it back into the hot path.
     #[allow(dead_code)]
     pub(in crate::buffer::flush) fn write_packed_slot(
         _shard_idx: usize,
@@ -151,7 +154,7 @@ impl BufferFlusher {
             }
 
             if batch_values.is_empty() {
-                allocator.free_one(sealed.pba)?;
+                crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba)?;
                 return Ok(PackedSlotCommitOutcome::Discarded);
             }
 
@@ -159,7 +162,7 @@ impl BufferFlusher {
             if let Err(e) =
                 maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeIoWrite)
             {
-                allocator.free_one(sealed.pba)?;
+                crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba)?;
                 Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
                 return Err(e);
             }
@@ -167,7 +170,7 @@ impl BufferFlusher {
             allocator.wait_for_readers(sealed.pba, 1);
 
             if let Err(e) = io_engine.write_blocks(sealed.pba, &sealed.data) {
-                allocator.free_one(sealed.pba)?;
+                crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba)?;
                 Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
                 return Err(e);
             }
@@ -178,7 +181,7 @@ impl BufferFlusher {
             if let Err(e) =
                 maybe_inject_test_failure_packed(&sealed.fragments, FlushFailStage::BeforeMetaWrite)
             {
-                allocator.free_one(sealed.pba)?;
+                crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba)?;
                 Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                 return Err(e);
             }
@@ -202,14 +205,14 @@ impl BufferFlusher {
                     // the PBA is orphaned and must be returned to the
                     // allocator before we exit. Treat as a discarded slot.
                     if !accepted.iter().any(|a| *a) {
-                        allocator.free_one(sealed.pba)?;
+                        crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba)?;
                         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                         return Ok(PackedSlotCommitOutcome::Discarded);
                     }
                     m
                 }
                 Err(e) => {
-                    allocator.free_one(sealed.pba)?;
+                    crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba)?;
                     Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                     return Err(e);
                 }
@@ -320,7 +323,7 @@ impl BufferFlusher {
                     &sealed.fragments,
                     FlushFailStage::BeforeIoWrite,
                 ) {
-                    let _ = allocator.free_one(sealed.pba);
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
                     slot_io_ok[i] = false;
                     tracing::error!(
                         pba = sealed.pba.0,
@@ -343,7 +346,7 @@ impl BufferFlusher {
                         for (idx, r) in write_results.into_iter().enumerate() {
                             let slot_idx = op_to_slot[idx];
                             if let LvOpResult::Write(Err(e)) = r {
-                                let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed_slots[slot_idx].pba);
                                 slot_io_ok[slot_idx] = false;
                                 tracing::error!(
                                     pba = sealed_slots[slot_idx].pba.0,
@@ -355,7 +358,7 @@ impl BufferFlusher {
                     }
                     Err(e) => {
                         for &slot_idx in &op_to_slot {
-                            let _ = allocator.free_one(sealed_slots[slot_idx].pba);
+                            let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed_slots[slot_idx].pba);
                             slot_io_ok[slot_idx] = false;
                         }
                         tracing::error!(
@@ -414,7 +417,7 @@ impl BufferFlusher {
                         let _ = done_tx.send(original_seqs);
                     }
                 }
-                let _ = allocator.free_one(sealed.pba);
+                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
                 continue;
             }
 

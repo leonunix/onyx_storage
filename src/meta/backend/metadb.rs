@@ -1262,13 +1262,6 @@ impl MetadbBackend {
         Ok(blocks)
     }
 
-    pub(crate) fn rebuild_refcount_from_blockmap(&self) -> OnyxResult<()> {
-        Err(OnyxError::Config(
-            "refcount rebuild is not supported by metadb backend; WAL recovery owns refcount"
-                .into(),
-        ))
-    }
-
     pub(crate) fn sync_durable(&self) -> OnyxResult<()> {
         self.checkpoint.sync()
     }
