@@ -448,6 +448,31 @@ impl GcRunner {
         let measured_all = heat_ctx.is_some() && confirm_all;
         let scanned_extents = survivors.len();
 
+        // Hazard barrier BEFORE the Gate-2 scan (P0 premature-free fix).
+        //
+        // An unguarded candidate-promote (`atomic_batch_dedup_hits_with_promote`
+        // with `guard=None`) can commit `L2pRemap L→P` for a survivor P that was
+        // just demoted/retired, re-referencing it. Its hazard pin (taken in the
+        // dedup worker's verify path and held across the remap commit) is the
+        // only signal that such a remap is in flight. Draining those pins here —
+        // *before* `referenced_extents` — guarantees the scan observes any
+        // committed `L→P`, so a resurrected PBA is marked referenced and left
+        // retired instead of being freed out from under the live mapping.
+        //
+        // Without this, the scan ran first and `reclaim_retired_extent`'s own
+        // `wait_extent_clear` only delayed the free until *after* the promote
+        // committed, then freed P anyway (no post-wait re-validation) → the
+        // freed PBA was reused while `L→P` was live → foreground-read CRC
+        // mismatch. Cold/background path: zero front-end cost. The dedup pin is
+        // also extended to candidate-lookup time (see `candidate_lookup_pass`)
+        // so the lookup→pin gap can't slip a promote past this barrier.
+        for extent in &survivors {
+            if !running.load(Ordering::Relaxed) {
+                return 0;
+            }
+            allocator.wait_for_readers(extent.start, extent.count);
+        }
+
         // Gate 2 (blockmap): ONE batched all-volume L2P scan for every survivor,
         // replacing the per-extent full scan (was O(retired × all_L2P)). A
         // survivor is reclaimable iff no live blockmap entry references any PBA

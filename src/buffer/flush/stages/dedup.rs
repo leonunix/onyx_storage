@@ -27,6 +27,16 @@ struct PreparedDedupUnit {
     /// waiting for the metadata remap. Without this, a verified target PBA
     /// can be freed and reused between verify completion and hit commit.
     verified_target_guards: Vec<PbaHazardGuard>,
+    /// Physical pins for candidate-cache promote targets, taken the moment
+    /// the mapping is copied out of the cache in `candidate_lookup_pass`
+    /// (i.e. earlier than `verified_target_guards`, which pin at verify).
+    /// The promote's `L2pRemap` is unguarded, so this pin is what tells the
+    /// GC reclaim path a remap onto the target may be in flight; pinning at
+    /// lookup (not verify) closes the lookup→pin gap so a promote cannot be
+    /// freed out from under by `reclaim_retired_extents`' hazard barrier.
+    /// Held until the unit is dropped in `finish_prepared_dedup_unit`,
+    /// after the commit.
+    candidate_target_guards: Vec<PbaHazardGuard>,
 }
 
 impl BufferFlusher {
@@ -124,7 +134,7 @@ impl BufferFlusher {
             }
 
             Self::lookup_dedup_hits(&mut prepared, meta, pool, metrics);
-            Self::candidate_lookup_pass(&mut prepared, candidate, pool);
+            Self::candidate_lookup_pass(&mut prepared, candidate, pool, &allocator.hazards());
             // LV3 verify ALL hits (dedup_index- and candidate-sourced).
             // The xxh3_64 schema does not have crypto-strength
             // collision resistance, so verify is correctness, not
@@ -203,6 +213,7 @@ impl BufferFlusher {
             promote_candidates: Vec::new(),
             stale_index_repairs: vec![None; lba_count],
             verified_target_guards: Vec::new(),
+            candidate_target_guards: Vec::new(),
         }
     }
 
@@ -296,6 +307,7 @@ impl BufferFlusher {
         prepared: &mut [PreparedDedupUnit],
         candidate: &crate::dedup::CandidateCache,
         pool: &WriteBufferPool,
+        hazards: &PbaHazards,
     ) {
         for prepared_unit in prepared.iter_mut() {
             for &i in &prepared_unit.lookup_indices {
@@ -311,6 +323,16 @@ impl BufferFlusher {
                 let Some(value) = candidate.lookup(&hash) else {
                     continue;
                 };
+                // Pin the candidate target the instant its mapping leaves the
+                // cache, before any further checks (P0 premature-free fix). The
+                // promote's `L2pRemap` is unguarded, so this pin is the only
+                // signal to the GC reclaim path that a remap onto this PBA may
+                // be in flight. Pinning here (not at verify) shrinks the
+                // lookup→pin gap to nothing so `reclaim_retired_extents`' hazard
+                // barrier always observes an about-to-promote target. On the
+                // stale-write early-out below the guard simply drops (no
+                // promote, pin released immediately).
+                let guard = hazards.pin_many(value.physical_pbas(BLOCK_SIZE));
                 let lba = Lba(prepared_unit.unit.start_lba.0 + i as u64);
                 let latest_seq = Self::latest_seq_for_lba(&prepared_unit.unit.seq_lba_ranges, lba);
                 if !pool.is_latest_lba_seq(
@@ -332,6 +354,7 @@ impl BufferFlusher {
                 prepared_unit
                     .promote_candidates
                     .push((i, hash, value.to_dedup_entry()));
+                prepared_unit.candidate_target_guards.push(guard);
             }
         }
     }

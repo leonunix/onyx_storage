@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use dashmap::DashMap;
 use onyx_metadb::{
-    Config as MetaDbConfig, Db, DedupValue, DeferredOutcomeHandle, Lsn, VolumeOrdinal,
+    Config as MetaDbConfig, Db, DedupValue, DeferredOutcomeHandle, L2pValue, Lsn, VolumeOrdinal,
 };
 
 use crate::config::MetaConfig;
@@ -22,6 +23,20 @@ const METADB_DEDUP_VALUE_BYTES: usize = 28;
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
 const BLOCKMAP_SCAN_CHUNK_LBAS: u64 = 262_144; // 1 GiB of 4 KiB LBAs.
 const DEDUP_PERSIST_BATCH_LIMIT: usize = crate::dedup::config::DEDUP_PUT_BATCH_HARD_MAX_ENTRIES;
+
+/// Count of retired extents that `referenced_extents`' folded read-view
+/// scan reported as UNreferenced but the l2p_buffer pass found a live
+/// (committed-but-unfolded) reference for — i.e. premature frees averted
+/// by the buffer-aware reference check. Nonzero proves the
+/// read-view-only scan would have freed a still-referenced PBA.
+static BUFFER_ONLY_REFERENCED_SAVED: AtomicU64 = AtomicU64::new(0);
+
+/// Total premature frees averted by the buffer-aware `referenced_extents`
+/// pass since process start. Surfaced in onyx status for the P0
+/// premature-free diagnosis.
+pub fn buffer_only_referenced_saved_total() -> u64 {
+    BUFFER_ONLY_REFERENCED_SAVED.load(Ordering::Relaxed)
+}
 
 pub(crate) struct MetadbBackend {
     db: Arc<Db>,
@@ -1062,61 +1077,128 @@ impl MetadbBackend {
         // scan callback returns (the `decode_error` idiom below distinguishes a
         // real corruption error from this control-flow early stop).
         let mut early = false;
+        let mut buffer_only_saved: u64 = 0;
         let volumes = self.list_volumes()?;
         'volumes: for volume in volumes {
             let ord = self.volume_ordinal(&volume.id)?;
             let lba_count = volume.size_bytes / u64::from(volume.block_size);
+
+            // Pass 1: the folded read view.
             let mut decode_error = None;
             let scan_result = self.db.scan_range_unordered_chunked(
                 ord,
                 0,
                 lba_count,
                 BLOCKMAP_SCAN_CHUNK_LBAS,
-                |_lba, value| {
-                    let decoded = match decode_l2p_value(value) {
-                        Ok(decoded) => decoded,
-                        Err(err) => {
-                            decode_error = Some(err);
-                            return Err(onyx_metadb::MetaDbError::Corruption(
-                                "onyx blockmap decode failed".into(),
-                            ));
-                        }
-                    };
-                    if decoded.is_zero() {
-                        return Ok(());
+                |_lba, value| match Self::cover_referenced(
+                    value,
+                    &order,
+                    extents,
+                    &mut referenced,
+                    &mut remaining,
+                ) {
+                    Ok(true) => Err(onyx_metadb::MetaDbError::Corruption(
+                        "referenced_extents: all candidates marked (early stop)".into(),
+                    )),
+                    Ok(false) => Ok(()),
+                    Err(err) => {
+                        decode_error = Some(err);
+                        Err(onyx_metadb::MetaDbError::Corruption(
+                            "onyx blockmap decode failed".into(),
+                        ))
                     }
-                    for pba in decoded.physical_pbas(crate::types::BLOCK_SIZE) {
-                        // Rightmost candidate whose start <= pba is the only one
-                        // that can cover it (candidates are non-overlapping).
-                        let pos = order.partition_point(|&i| extents[i].0 .0 <= pba.0);
-                        if pos == 0 {
-                            continue;
-                        }
-                        let idx = order[pos - 1];
-                        let (start, blocks) = extents[idx];
-                        if pba.0 < start.0 + u64::from(blocks) && !referenced[idx] {
-                            referenced[idx] = true;
-                            remaining -= 1;
-                            if remaining == 0 {
-                                early = true;
-                                return Err(onyx_metadb::MetaDbError::Corruption(
-                                    "referenced_extents: all candidates marked (early stop)".into(),
-                                ));
-                            }
-                        }
-                    }
-                    Ok(())
                 },
             );
             if let Some(err) = decode_error {
                 return Err(err);
             }
+            if remaining == 0 {
+                early = true;
+            } else {
+                scan_result?;
+            }
+
+            // Pass 2: buffer-aware. A dedup remap that has COMMITTED into
+            // the l2p_buffer but whose TXG hasn't folded into the read view
+            // yet is invisible to pass 1. Freeing a retired PBA on the
+            // read-view scan alone drops it out from under such a remap →
+            // foreground-read CRC mismatch. OR the buffer view in
+            // conservatively: a superseded buffer entry only delays reclaim
+            // one cycle, never frees a live PBA. The count of references
+            // ONLY the buffer caught is the premature-free tripwire.
+            if !early && remaining > 0 {
+                let before = remaining;
+                let mut buf_decode_error = None;
+                self.db.scan_l2p_buffer_values(ord, |_lba, value| {
+                    if remaining == 0 || buf_decode_error.is_some() {
+                        return;
+                    }
+                    if let Err(err) =
+                        Self::cover_referenced(value, &order, extents, &mut referenced, &mut remaining)
+                    {
+                        buf_decode_error = Some(err);
+                    }
+                })?;
+                if let Some(err) = buf_decode_error {
+                    return Err(err);
+                }
+                let saved = before - remaining;
+                if saved > 0 {
+                    buffer_only_saved += saved as u64;
+                    tracing::warn!(
+                        volume = %volume.id.0,
+                        buffer_saved = saved,
+                        "referenced_extents: l2p_buffer references an extent the folded \
+                         read view missed — premature free averted (committed-but-unfolded remap)"
+                    );
+                }
+                if remaining == 0 {
+                    early = true;
+                }
+            }
+
             if early {
                 break 'volumes;
             }
-            scan_result?;
+        }
+        if buffer_only_saved > 0 {
+            BUFFER_ONLY_REFERENCED_SAVED.fetch_add(buffer_only_saved, Ordering::Relaxed);
         }
         Ok(referenced)
+    }
+
+    /// Mark every candidate extent covered by one decoded L2pValue. Returns
+    /// `Ok(true)` once every candidate is marked (early-stop signal), shared
+    /// by the read-view scan and the l2p_buffer scan in `referenced_extents`.
+    fn cover_referenced(
+        value: L2pValue,
+        order: &[usize],
+        extents: &[(Pba, u32)],
+        referenced: &mut [bool],
+        remaining: &mut usize,
+    ) -> OnyxResult<bool> {
+        let decoded = decode_l2p_value(value)?;
+        if decoded.is_zero() {
+            return Ok(false);
+        }
+        for pba in decoded.physical_pbas(crate::types::BLOCK_SIZE) {
+            // Rightmost candidate whose start <= pba is the only one that can
+            // cover it (candidates are non-overlapping).
+            let pos = order.partition_point(|&i| extents[i].0 .0 <= pba.0);
+            if pos == 0 {
+                continue;
+            }
+            let idx = order[pos - 1];
+            let (start, blocks) = extents[idx];
+            if pba.0 < start.0 + u64::from(blocks) && !referenced[idx] {
+                referenced[idx] = true;
+                *remaining -= 1;
+                if *remaining == 0 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn iter_refcounts(&self) -> OnyxResult<Vec<(Pba, u32)>> {

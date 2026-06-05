@@ -1897,6 +1897,132 @@ fn orphan_reclaim_still_referenced_pba_is_never_freed() {
 }
 
 #[test]
+fn reclaim_does_not_free_pba_re_referenced_during_hazard_wait() {
+    // P0 premature-free / resurrection regression.
+    //
+    // An unguarded candidate-promote (`atomic_batch_dedup_hits_with_promote`)
+    // can commit `L2pRemap L->P` for a PBA P that was just demoted + retired.
+    // Its hazard pin (taken at candidate-lookup, held across the remap commit)
+    // is the only signal that such a remap is in flight. The fix has GC drain
+    // those pins BEFORE its Gate-2 `referenced_extents` scan, so the scan
+    // observes the committed `L->P` and leaves P retired instead of freeing it
+    // out from under the live mapping.
+    //
+    // This reproduces the race deterministically with the hazard pin standing
+    // in for the in-flight promote's pin:
+    //   1. hold a pin on a retired, unreferenced P,
+    //   2. start GC -> it parks at the pre-scan hazard barrier,
+    //   3. commit the promote that re-references P,
+    //   4. release the pin -> GC's scan runs and now sees `L->P`.
+    // With the barrier P stays retired. Without it, GC scanned P as
+    // unreferenced and freed it after the per-extent wait => P freed while
+    // `L->P` live (the crc_fg corruption).
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+    let vol = VolumeId("test-vol".into());
+
+    // P as a dedup target: Lba(0) + Lba(2) -> P, content C, dedup entry H->P.
+    let c = vec![0x66u8; 4096];
+    let hash: ContentHash = onyx_storage::meta::schema::compute_content_hash(&c);
+    let p = promote_dedup_entry(
+        &pool, &meta, &lifecycle, &allocator, &io_engine, "test-vol", 0, 2, &c,
+    );
+    // Snapshot P's mapping + dedup entry now, to replay as the in-flight
+    // promote after P is orphaned/demoted.
+    let blockmap_p = meta.get_mapping(&vol, Lba(2)).unwrap().unwrap();
+    assert_eq!(blockmap_p.pba, p);
+    let entry_p = meta.get_dedup_entry(&hash).unwrap().unwrap();
+
+    // Orphan P: overwrite BOTH referrers with unique content (rc-neutral; P
+    // keeps membership rc==1 but no live LBA references it).
+    let mut flusher = start_flusher_with_dedup(&pool, &meta, &lifecycle, &allocator, &io_engine);
+    let mut d0 = vec![0x77u8; 4096];
+    d0[0] = 1;
+    let mut d2 = vec![0x88u8; 4096];
+    d2[0] = 2;
+    pool.append("test-vol", Lba(0), 1, &d0, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    pool.append("test-vol", Lba(2), 1, &d2, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000));
+    flusher.stop();
+
+    // Demote P: delete H->P (rc -> 0) + retire P. Now P is retired, rc==0,
+    // unreferenced — a free candidate for the GC confirm scan.
+    let heat = stale_heat(&allocator, p);
+    let (mut scanner, _cand) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool.clone()),
+        None,
+        Some(heat.clone()),
+        orphan_scanner_config(),
+    );
+    assert!(
+        wait_until(3000, || meta.get_dedup_entry(&hash).unwrap().is_none()
+            && allocator.is_retired(p)),
+        "orphan pass should delete the dedup entry and retire P"
+    );
+    scanner.stop();
+    assert_eq!(meta.get_refcount(p).unwrap(), 0);
+
+    // Control: an unreferenced, unpinned retired PBA the GC will definitely
+    // free. Its release proves the reclaim pass actually ran this cycle, so
+    // P's survival can't be a false pass from GC simply never processing
+    // anything (both P and Q are scanned together by the one Gate-2 scan).
+    let q = allocator.allocate_one().unwrap();
+    assert!(allocator.retire_one(q).unwrap());
+
+    // Model the in-flight promote's hazard pin (taken at candidate-lookup,
+    // held across the remap commit). With P pinned, GC parks at the pre-scan
+    // hazard barrier before its Gate-2 scan.
+    let guard = allocator.hazards().pin_one(p);
+    let mut gc = start_reclaim_gc(&meta, &io_engine, &pool, &lifecycle, &allocator);
+
+    // The in-flight promote commits while GC is parked: unguarded remap
+    // Lba(10) -> P + re-put H->P, exactly what the candidate-promote path does.
+    let _ = meta
+        .atomic_batch_dedup_hits_with_promote(
+            &vol,
+            &[(Lba(10), blockmap_p, hash)],
+            &[(hash, entry_p)],
+            &[2000u64],
+        )
+        .unwrap();
+    assert_eq!(
+        meta.get_mapping(&vol, Lba(10)).unwrap().unwrap().pba,
+        p,
+        "promote re-referenced P at Lba(10)"
+    );
+
+    // Release the pin -> GC's barrier passes -> its Gate-2 scan now observes the
+    // promote (Lba(10) -> P) committed during the wait. (Drop before the
+    // assertions so a failure panics cleanly instead of deadlocking on gc's
+    // join, which would block on the still-held pin.)
+    drop(guard);
+
+    // The reclaim pass ran (control Q freed) but P, re-referenced during the
+    // hazard wait, is NOT freed.
+    assert!(
+        wait_until(2000, || !allocator.is_retired(q)),
+        "GC reclaim must run and free the unreferenced control PBA"
+    );
+    assert!(
+        !wait_until(500, || !allocator.is_retired(p)),
+        "Gate-2 must observe the promote that committed during the hazard wait \
+         and keep P retired (never free a re-referenced PBA)"
+    );
+    gc.stop();
+    assert_eq!(
+        meta.get_mapping(&vol, Lba(10)).unwrap().unwrap().pba,
+        p,
+        "re-referenced mapping survives — P was not freed/reused"
+    );
+}
+
+#[test]
 fn orphan_reclaim_skips_hot_region() {
     // Selector: a dedup entry whose PBA region is HOT (a live mapping bumped it)
     // is left alone — demoting it would only churn dedup ratio.
