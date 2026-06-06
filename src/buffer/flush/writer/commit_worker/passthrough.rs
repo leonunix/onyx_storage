@@ -196,9 +196,20 @@ impl BufferFlusher {
                 } else {
                     0
                 };
-                let split_full_raw_unit = unit.compression_bypassed
-                    || (Self::is_full_raw_unit(unit)
-                        && live_positions.len() < unit.lba_count as usize);
+                // Always split a full-raw (uncompressed) unit into per-LBA
+                // PBAs. A shared base PBA across N member LBAs is unsafe under
+                // Phase 5 rc-neutral writes: overwriting one member records the
+                // shared base dead at rc==0 while the others still reference it,
+                // so lineage GC prematurely frees a still-live extent → CRC
+                // corruption (observed under compression=none). The sync
+                // `write_unit` path already passes `true` unconditionally; this
+                // matches it. The split is gated inside
+                // `blockmap_for_unit_position_with_raw_split` on
+                // `is_full_raw_unit && slot_offset == 0`, so non-raw / packed
+                // units are unaffected. (Previously only split when partially
+                // live — fresh fully-live raw units slipped through and shared a
+                // base, the root cause of the premature-free P0.)
+                let split_full_raw_unit = true;
                 for j in 0..live_positions.len() {
                     let blockmap = Self::blockmap_for_unit_position_with_raw_split(
                         unit,

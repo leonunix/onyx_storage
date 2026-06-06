@@ -12,9 +12,14 @@ use crate::space::pba_lifecycle::PbaLifecycle;
 /// dead-list segment past every snap_pin and emits a `WalOp::FreePbas`.
 /// The metadb backend converts those WAL outcomes into a crossbeam
 /// channel; this thread drains the channel and returns each PBA to the
-/// allocator's free list — via [`PbaLifecycle::free_lineage_gc_proven`], so
-/// the RAM candidate cache is evicted before the allocator can reissue the
-/// PBA and duplicate `FreePbas` surfaces are absorbed idempotently.
+/// allocator's free list. Because the metadb rc==0 proof does NOT cover
+/// rc-untracked L2P sharing (compressed/packed units whose member LBAs share
+/// one base PBA), the drain re-verifies every surfaced extent against the
+/// live L2P (hazard barrier + all-volume `referenced_extents`) before acting:
+/// truly-unreferenced extents go to [`PbaLifecycle::free_lineage_gc_proven`]
+/// (candidate-cache evicted, duplicate surfaces absorbed idempotently); any
+/// still-referenced extent is retired for `GcRunner` to reclaim once its last
+/// reference dies.
 ///
 /// The thread parks for `interval` between drains; channel sends from the
 /// FreedPbasSink wake it implicitly when production resumes, since the
@@ -58,8 +63,53 @@ impl LineageFreedPbaDrainHandle {
         // Within-batch duplicate PBAs are folded here; cross-batch / cross-crash
         // duplicates are absorbed idempotently inside free_lineage_gc_proven.
         let extents = crate::meta::backend::coalesce_free_pbas_to_extents(&pbas);
-        for extent in extents {
-            pba_lifecycle.free_lineage_gc_proven(extent);
+        if extents.is_empty() {
+            return;
+        }
+
+        // The metadb lineage proof (rc==0 + no snap/descendant pin) is NOT
+        // sufficient on its own. Under Phase 5 rc-neutral writes a PBA can be
+        // referenced by multiple live L2P entries WITHOUT bumping rc: the member
+        // LBAs of a compressed / packed unit share one base PBA, so overwriting
+        // one member records that base dead at rc==0 while siblings still point
+        // at it. Direct-freeing it then corrupts the siblings' reads (observed
+        // under compression=none; masked but still racy with compression). So
+        // mirror the GC retired-extent Gate 2 here before freeing:
+        //   1. hazard barrier — drain in-flight dedup-promote readers so a
+        //      committed `L→P` is observable by the scan below;
+        //   2. ONE all-volume, buffer-aware `referenced_extents` scan.
+        // Truly-unreferenced extents take the fast direct-free; any extent still
+        // referenced is retired and left to `GcRunner::reclaim_retired_extents`
+        // to re-confirm and reclaim once its last reference dies.
+        for extent in &extents {
+            pba_lifecycle
+                .allocator()
+                .wait_for_readers(extent.start, extent.count);
+        }
+        let pairs: Vec<(crate::types::Pba, u32)> =
+            extents.iter().map(|e| (e.start, e.count)).collect();
+        let referenced = match meta.referenced_extents(&pairs) {
+            Ok(referenced) => referenced,
+            Err(e) => {
+                // Conservative on scan failure: retire (never free unverified);
+                // GcRunner re-confirms on its next cycle.
+                tracing::warn!(
+                    error = %e,
+                    extents = extents.len(),
+                    "lineage drain: referenced_extents scan failed; retiring surfaced extents"
+                );
+                for extent in extents {
+                    pba_lifecycle.retire_committed("lineage_gc_scan_err", extent);
+                }
+                return;
+            }
+        };
+        for (extent, is_referenced) in extents.into_iter().zip(referenced) {
+            if is_referenced {
+                pba_lifecycle.retire_committed("lineage_gc_referenced", extent);
+            } else {
+                pba_lifecycle.free_lineage_gc_proven(extent);
+            }
         }
     }
 

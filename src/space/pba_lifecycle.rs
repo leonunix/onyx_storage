@@ -256,15 +256,47 @@ impl PbaLifecycle {
                     .gc_lineage_freed_blocks
                     .fetch_add(extent.count as u64, Ordering::Relaxed);
             }
-            Err(e) => {
-                // Past the precheck this is a genuinely unexpected outcome
-                // (e.g. out-of-bounds / counter underflow), so it stays a warn.
-                tracing::warn!(
-                    pba = extent.start.0,
-                    blocks = extent.count,
-                    error = %e,
-                    "pba_lifecycle: lineage FreePbas free failed unexpectedly; PBA leaked until restart"
-                );
+            Err(_) => {
+                // The whole-extent precheck passed (extent not entirely
+                // free/retired) but `free_extent` still failed — almost always
+                // a PARTIAL overlap with an already-free/retired region: the
+                // same shared base PBA can surface across more than one drain
+                // batch as overlapping extents, so a later coalesced extent
+                // straddles PBAs a previous surface already freed. Fall back to
+                // per-PBA: free the still-allocated PBAs, absorb the
+                // already-free/retired ones idempotently. (Caller has already
+                // confirmed the whole extent is unreferenced via
+                // `referenced_extents`, so every still-allocated PBA here is
+                // genuinely dead.)
+                let mut freed = 0u64;
+                let mut absorbed = 0u64;
+                for off in 0..extent.count {
+                    let pba = Pba(extent.start.0 + off as u64);
+                    if self.allocator.is_free(pba) || self.allocator.is_retired(pba) {
+                        absorbed += 1;
+                        continue;
+                    }
+                    match self.allocator.free_one(pba) {
+                        Ok(()) => freed += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                pba = pba.0,
+                                error = %e,
+                                "pba_lifecycle: lineage FreePbas per-PBA free failed unexpectedly; PBA leaked until restart"
+                            );
+                        }
+                    }
+                }
+                if freed > 0 {
+                    self.metrics
+                        .gc_lineage_freed_blocks
+                        .fetch_add(freed, Ordering::Relaxed);
+                }
+                if absorbed > 0 {
+                    self.metrics
+                        .gc_lineage_idempotent_frees
+                        .fetch_add(absorbed, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -398,6 +430,39 @@ mod tests {
         assert!(
             candidate.has_pba(pba),
             "rollback_uncommitted must not evict candidate slots"
+        );
+    }
+
+    #[test]
+    fn lineage_free_tolerates_partial_overlap_with_already_free() {
+        // A multi-block lineage extent can partially overlap PBAs a prior
+        // surface already freed (the same shared base re-coalesced across drain
+        // batches). `free_extent` rejects the whole extent on overlap; the
+        // per-PBA fallback must free the still-allocated PBAs and absorb the
+        // already-free one without leaking.
+        let (allocator, _candidate, metrics, lc) = lifecycle();
+        let p0 = allocator.allocate_one().unwrap();
+        let p1 = allocator.allocate_one().unwrap();
+        let p2 = allocator.allocate_one().unwrap();
+        assert_eq!(p1.0, p0.0 + 1);
+        assert_eq!(p2.0, p0.0 + 2);
+        // Pre-free the middle PBA so the extent [p0, 3] partially overlaps.
+        allocator.free_one(p1).unwrap();
+
+        lc.free_lineage_gc_proven(Extent::new(p0, 3));
+
+        assert!(allocator.is_free(p0), "p0 freed via fallback");
+        assert!(allocator.is_free(p1), "p1 stays free");
+        assert!(allocator.is_free(p2), "p2 freed via fallback");
+        assert_eq!(
+            metrics.gc_lineage_freed_blocks.load(Ordering::Relaxed),
+            2,
+            "two still-allocated PBAs freed by the per-PBA fallback"
+        );
+        assert_eq!(
+            metrics.gc_lineage_idempotent_frees.load(Ordering::Relaxed),
+            1,
+            "the already-free PBA is absorbed idempotently, not leaked"
         );
     }
 }

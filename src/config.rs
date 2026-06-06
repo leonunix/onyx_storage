@@ -260,6 +260,23 @@ pub struct MetaConfig {
     /// matters on quiet systems. Default 50 ms.
     #[serde(default = "default_metadb_async_reclaim_idle_interval_ms")]
     pub async_reclaim_idle_interval_ms: u64,
+    /// Run metadb's background Lineage GC driver — the **only** trigger
+    /// that surfaces dead LV3 PBAs (`FreePbas`) so onyx can free them.
+    /// Without it dead-list chains grow without bound and no reclaim ever
+    /// happens (`gc_lineage_freed_blocks` stays 0). Defaults ON; disable
+    /// only for A/B or debugging. (metadb's own `Config::new` defaults
+    /// this OFF — onyx overrides it here.)
+    #[serde(default = "default_metadb_lineage_gc_enabled")]
+    pub lineage_gc_enabled: bool,
+    /// Idle park (ms) between Lineage GC wakes once nothing more can
+    /// advance. Default 1000 ms.
+    #[serde(default = "default_metadb_lineage_gc_interval_ms")]
+    pub lineage_gc_interval_ms: u64,
+    /// Per-wake budget: GC cycles (each advances ≤1 dead-list segment per
+    /// volume) driven before parking. Bounds `apply_gate.write()` pressure
+    /// on the commit path while letting a backlog drain. Default 256.
+    #[serde(default = "default_metadb_lineage_gc_max_cycles_per_wake")]
+    pub lineage_gc_max_cycles_per_wake: usize,
     /// Experimental NVMe mode: ordinary flusher metadata commits bypass the
     /// metadb WAL and rely on LV2's durable write log until the next metadb
     /// checkpoint. Leave off unless the buffer device has enough headroom to
@@ -494,6 +511,9 @@ impl Default for MetaConfig {
             async_reclaim_enabled: default_metadb_async_reclaim_enabled(),
             async_reclaim_max_pages_per_cycle: default_metadb_async_reclaim_max_pages_per_cycle(),
             async_reclaim_idle_interval_ms: default_metadb_async_reclaim_idle_interval_ms(),
+            lineage_gc_enabled: default_metadb_lineage_gc_enabled(),
+            lineage_gc_interval_ms: default_metadb_lineage_gc_interval_ms(),
+            lineage_gc_max_cycles_per_wake: default_metadb_lineage_gc_max_cycles_per_wake(),
             unlogged_flush_commits: false,
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
@@ -1107,6 +1127,21 @@ fn default_metadb_async_reclaim_max_pages_per_cycle() -> u64 {
 }
 fn default_metadb_async_reclaim_idle_interval_ms() -> u64 {
     50
+}
+fn default_metadb_lineage_gc_enabled() -> bool {
+    // ON. The FreePbas-emitting Lineage GC driver is the sole production
+    // trigger for PBA reclaim under Phase 5 rc-neutral writes; without it
+    // dead-list chains grow without bound (gc_lineage_freed_blocks=0,
+    // allocator slowly exhausts). Independent of async_reclaim_enabled,
+    // which gates a different worker (page_store deferred_free) that is OFF
+    // for an unrelated refcount-underflow reason.
+    true
+}
+fn default_metadb_lineage_gc_interval_ms() -> u64 {
+    1000
+}
+fn default_metadb_lineage_gc_max_cycles_per_wake() -> usize {
+    256
 }
 fn default_metadb_flush_select_budget() -> u64 {
     // Default OFF — every flush samples every shard.

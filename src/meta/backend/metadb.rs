@@ -1534,6 +1534,11 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
     cfg.async_reclaim_max_pages_per_cycle = config.async_reclaim_max_pages_per_cycle as usize;
     cfg.async_reclaim_idle_interval_ms = config.async_reclaim_idle_interval_ms;
+    // Lineage GC driver — the production trigger for FreePbas-emitting PBA
+    // reclaim. metadb defaults this OFF; onyx turns it ON (default).
+    cfg.lineage_gc_enabled = config.lineage_gc_enabled;
+    cfg.lineage_gc_interval_ms = config.lineage_gc_interval_ms;
+    cfg.lineage_gc_max_cycles_per_wake = config.lineage_gc_max_cycles_per_wake;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.

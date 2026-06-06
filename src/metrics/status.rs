@@ -810,13 +810,16 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "gc: cycles={} paused_cycles={} candidates={} rewrite_attempts={} rewritten_blocks={} retired_reclaimed={} errors={}",
+            "gc: cycles={} paused_cycles={} candidates={} rewrite_attempts={} rewritten_blocks={} retired_reclaimed={} lineage_freed={} lineage_idempotent={} reclaim_stuck={} errors={}",
             self.metrics.gc_cycles,
             self.metrics.gc_paused_cycles,
             self.metrics.gc_candidates_found,
             self.metrics.gc_rewrite_attempts,
             self.metrics.gc_blocks_rewritten,
             self.metrics.gc_retired_blocks_reclaimed,
+            self.metrics.gc_lineage_freed_blocks,
+            self.metrics.gc_lineage_idempotent_frees,
+            self.metrics.pba_reclaim_stuck,
             self.metrics.gc_errors
         );
         if let Some(h) = &self.heat {
