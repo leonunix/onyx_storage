@@ -61,55 +61,45 @@ impl LineageFreedPbaDrainHandle {
             return;
         }
         // Within-batch duplicate PBAs are folded here; cross-batch / cross-crash
-        // duplicates are absorbed idempotently inside free_lineage_gc_proven.
+        // duplicates are absorbed idempotently by `retire_committed`.
         let extents = crate::meta::backend::coalesce_free_pbas_to_extents(&pbas);
         if extents.is_empty() {
             return;
         }
 
-        // The metadb lineage proof (rc==0 + no snap/descendant pin) is NOT
-        // sufficient on its own. Under Phase 5 rc-neutral writes a PBA can be
-        // referenced by multiple live L2P entries WITHOUT bumping rc: the member
-        // LBAs of a compressed / packed unit share one base PBA, so overwriting
-        // one member records that base dead at rc==0 while siblings still point
-        // at it. Direct-freeing it then corrupts the siblings' reads (observed
-        // under compression=none; masked but still racy with compression). So
-        // mirror the GC retired-extent Gate 2 here before freeing:
-        //   1. hazard barrier — drain in-flight dedup-promote readers so a
-        //      committed `L→P` is observable by the scan below;
-        //   2. ONE all-volume, buffer-aware `referenced_extents` scan.
-        // Truly-unreferenced extents take the fast direct-free; any extent still
-        // referenced is retired and left to `GcRunner::reclaim_retired_extents`
-        // to re-confirm and reclaim once its last reference dies.
-        for extent in &extents {
-            pba_lifecycle
-                .allocator()
-                .wait_for_readers(extent.start, extent.count);
-        }
-        let pairs: Vec<(crate::types::Pba, u32)> =
-            extents.iter().map(|e| (e.start, e.count)).collect();
-        let referenced = match meta.referenced_extents(&pairs) {
-            Ok(referenced) => referenced,
-            Err(e) => {
-                // Conservative on scan failure: retire (never free unverified);
-                // GcRunner re-confirms on its next cycle.
-                tracing::warn!(
-                    error = %e,
-                    extents = extents.len(),
-                    "lineage drain: referenced_extents scan failed; retiring surfaced extents"
-                );
-                for extent in extents {
-                    pba_lifecycle.retire_committed("lineage_gc_scan_err", extent);
-                }
-                return;
+        // Phase 5 lineage surfaces rc==0 dead PBAs as free CANDIDATES. We do NOT
+        // direct-free them here. The metadb rc==0 proof does NOT cover
+        // rc-untracked L2P sharing (compressed / packed multi-LBA units share
+        // one base PBA), so freeing requires a live-L2P reverify — and a reverify
+        // done HERE, immediately on surfacing, raced the metadata pipeline: a
+        // sibling reference already committed to LV2 but whose metadb L2P apply
+        // was still in flight was transiently invisible to the scan, so a direct
+        // free corrupted the sibling's reads (CRC; see
+        // fixb_soak_exposed_referenced_extents_race).
+        //
+        // Instead RETIRE every surfaced extent and let the unified
+        // `GcRunner::reclaim_retired_extents` (Gate-1 rc==0 + hazard barrier +
+        // buffer-aware `referenced_extents` + reclaim-age grace) be the SOLE
+        // committed→free path — the same retire→reclaim path the writer's
+        // post-commit cleanup uses, which has soaked clean for hours. A retired
+        // PBA is not in the allocator free list (so it cannot be reused under
+        // us), and the reclaim path's delay + age grace lets any in-flight
+        // sibling reference settle into the L2P before the reverify decides.
+        // `retire_committed` evicts the candidate cache.
+        for extent in extents {
+            // Idempotent duplicate-surface absorb (mirrors the old
+            // free_lineage_gc_proven precheck): metadb legitimately re-surfaces
+            // the same PBA across GC cycles (documented duplicate FreePbas). If a
+            // prior surface already retired+reclaimed it, the PBA is now free /
+            // still retired — `retire_committed` would otherwise hit
+            // "retire_extent overlaps free extent" and churn the retry queue.
+            // Skip it. (Harmless even without this — grace + GcRunner Gate-2
+            // prevent any bad free — but this keeps the log + retry queue clean.)
+            let allocator = pba_lifecycle.allocator();
+            if allocator.is_extent_free(extent) || allocator.is_retired(extent.start) {
+                continue;
             }
-        };
-        for (extent, is_referenced) in extents.into_iter().zip(referenced) {
-            if is_referenced {
-                pba_lifecycle.retire_committed("lineage_gc_referenced", extent);
-            } else {
-                pba_lifecycle.free_lineage_gc_proven(extent);
-            }
+            pba_lifecycle.retire_committed("lineage_gc_surfaced", extent);
         }
     }
 

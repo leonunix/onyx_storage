@@ -1712,6 +1712,7 @@ fn start_reclaim_gc(
         enabled: false,
         heat_enabled: false,
         scan_interval_ms: 20,
+        reclaim_grace_secs: 0, // tests need deterministic immediate reclaim
         ..Default::default()
     };
     onyx_storage::gc::runner::GcRunner::start_with_metrics(

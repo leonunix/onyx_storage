@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -23,20 +22,6 @@ const METADB_DEDUP_VALUE_BYTES: usize = 28;
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
 const BLOCKMAP_SCAN_CHUNK_LBAS: u64 = 262_144; // 1 GiB of 4 KiB LBAs.
 const DEDUP_PERSIST_BATCH_LIMIT: usize = crate::dedup::config::DEDUP_PUT_BATCH_HARD_MAX_ENTRIES;
-
-/// Count of retired extents that `referenced_extents`' folded read-view
-/// scan reported as UNreferenced but the l2p_buffer pass found a live
-/// (committed-but-unfolded) reference for — i.e. premature frees averted
-/// by the buffer-aware reference check. Nonzero proves the
-/// read-view-only scan would have freed a still-referenced PBA.
-static BUFFER_ONLY_REFERENCED_SAVED: AtomicU64 = AtomicU64::new(0);
-
-/// Total premature frees averted by the buffer-aware `referenced_extents`
-/// pass since process start. Surfaced in onyx status for the P0
-/// premature-free diagnosis.
-pub fn buffer_only_referenced_saved_total() -> u64 {
-    BUFFER_ONLY_REFERENCED_SAVED.load(Ordering::Relaxed)
-}
 
 pub(crate) struct MetadbBackend {
     db: Arc<Db>,
@@ -1077,20 +1062,21 @@ impl MetadbBackend {
         // scan callback returns (the `decode_error` idiom below distinguishes a
         // real corruption error from this control-flow early stop).
         let mut early = false;
-        let mut buffer_only_saved: u64 = 0;
         let volumes = self.list_volumes()?;
         'volumes: for volume in volumes {
             let ord = self.volume_ordinal(&volume.id)?;
-            let lba_count = volume.size_bytes / u64::from(volume.block_size);
 
-            // Pass 1: the folded read view.
+            // ONE fold-consistent scan per volume: metadb holds `tree.read()`
+            // per shard across BOTH the folded read-view scan AND the l2p_buffer
+            // scan, so a concurrent TXG fold can't make a migrating reference
+            // (e.g. a packed-slot sibling mid-fold) transiently invisible
+            // between two unsynchronised passes. This is LOAD-BEARING: a plain
+            // two-pass reverify (even paired with the reclaim-age grace) let the
+            // premature-free CRC back in (soak-proven). See
+            // `Db::scan_l2p_live_consistent` / fixb_soak_exposed_referenced_extents_race.
             let mut decode_error = None;
-            let scan_result = self.db.scan_range_unordered_chunked(
-                ord,
-                0,
-                lba_count,
-                BLOCKMAP_SCAN_CHUNK_LBAS,
-                |_lba, value| match Self::cover_referenced(
+            let scan_result = self.db.scan_l2p_live_consistent(ord, |_lba, value| {
+                match Self::cover_referenced(
                     value,
                     &order,
                     extents,
@@ -1107,8 +1093,8 @@ impl MetadbBackend {
                             "onyx blockmap decode failed".into(),
                         ))
                     }
-                },
-            );
+                }
+            });
             if let Some(err) = decode_error {
                 return Err(err);
             }
@@ -1118,58 +1104,16 @@ impl MetadbBackend {
                 scan_result?;
             }
 
-            // Pass 2: buffer-aware. A dedup remap that has COMMITTED into
-            // the l2p_buffer but whose TXG hasn't folded into the read view
-            // yet is invisible to pass 1. Freeing a retired PBA on the
-            // read-view scan alone drops it out from under such a remap →
-            // foreground-read CRC mismatch. OR the buffer view in
-            // conservatively: a superseded buffer entry only delays reclaim
-            // one cycle, never frees a live PBA. The count of references
-            // ONLY the buffer caught is the premature-free tripwire.
-            if !early && remaining > 0 {
-                let before = remaining;
-                let mut buf_decode_error = None;
-                self.db.scan_l2p_buffer_values(ord, |_lba, value| {
-                    if remaining == 0 || buf_decode_error.is_some() {
-                        return;
-                    }
-                    if let Err(err) =
-                        Self::cover_referenced(value, &order, extents, &mut referenced, &mut remaining)
-                    {
-                        buf_decode_error = Some(err);
-                    }
-                })?;
-                if let Some(err) = buf_decode_error {
-                    return Err(err);
-                }
-                let saved = before - remaining;
-                if saved > 0 {
-                    buffer_only_saved += saved as u64;
-                    tracing::warn!(
-                        volume = %volume.id.0,
-                        buffer_saved = saved,
-                        "referenced_extents: l2p_buffer references an extent the folded \
-                         read view missed — premature free averted (committed-but-unfolded remap)"
-                    );
-                }
-                if remaining == 0 {
-                    early = true;
-                }
-            }
-
             if early {
                 break 'volumes;
             }
-        }
-        if buffer_only_saved > 0 {
-            BUFFER_ONLY_REFERENCED_SAVED.fetch_add(buffer_only_saved, Ordering::Relaxed);
         }
         Ok(referenced)
     }
 
     /// Mark every candidate extent covered by one decoded L2pValue. Returns
-    /// `Ok(true)` once every candidate is marked (early-stop signal), shared
-    /// by the read-view scan and the l2p_buffer scan in `referenced_extents`.
+    /// `Ok(true)` once every candidate is marked (early-stop signal), invoked
+    /// for each live entry by the fold-consistent scan in `referenced_extents`.
     fn cover_referenced(
         value: L2pValue,
         order: &[usize],
@@ -1539,6 +1483,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.lineage_gc_enabled = config.lineage_gc_enabled;
     cfg.lineage_gc_interval_ms = config.lineage_gc_interval_ms;
     cfg.lineage_gc_max_cycles_per_wake = config.lineage_gc_max_cycles_per_wake;
+    cfg.lineage_gc_drop_dedup_shared = config.lineage_gc_drop_dedup_shared;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.

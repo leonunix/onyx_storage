@@ -314,6 +314,7 @@ fn retired_reclaimer_skips_allocator_free_when_live_blockmap_ref_remains() {
             16,
             &AtomicBool::new(true),
             None,
+            None,
         ),
         0,
         "GC must refuse to reclaim while blockmap still references the PBA"
@@ -372,6 +373,7 @@ fn retired_reclaimer_batches_one_scan_and_frees_only_unreferenced() {
         &test_lifecycle(&allocator, &metrics),
         64,
         &AtomicBool::new(true),
+        None,
         None,
     );
 
@@ -597,6 +599,7 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         64,
         &AtomicBool::new(true),
         Some(ctx),
+        None,
     );
     assert_eq!(reclaimed, 0, "hot+fresh region defers reclaim");
     assert!(
@@ -630,6 +633,7 @@ fn heat_hot_region_defers_reclaim_then_force_confirm_frees() {
         64,
         &AtomicBool::new(true),
         Some(ctx2),
+        None,
     );
     assert_eq!(
         reclaimed2, 1,
@@ -673,6 +677,7 @@ fn heat_cold_region_confirms_and_frees() {
         64,
         &AtomicBool::new(true),
         Some(ctx),
+        None,
     );
     assert_eq!(reclaimed, 1, "cold region is confirmed and freed");
     assert!(allocator.is_free(free_pba));
@@ -720,6 +725,7 @@ fn heat_high_yield_suppresses_defer() {
         64,
         &AtomicBool::new(true),
         Some(ctx),
+        None,
     );
     assert_eq!(
         reclaimed, 1,
@@ -771,6 +777,7 @@ fn heat_pressure_suppresses_defer() {
         64,
         &AtomicBool::new(true),
         Some(ctx),
+        None,
     );
     assert_eq!(reclaimed, 1, "pressure suppresses defer → freed");
     assert!(allocator.is_free(free_pba));

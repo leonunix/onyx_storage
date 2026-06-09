@@ -128,6 +128,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.lineage_gc_enabled = config.lineage_gc_enabled;
     cfg.lineage_gc_interval_ms = config.lineage_gc_interval_ms;
     cfg.lineage_gc_max_cycles_per_wake = config.lineage_gc_max_cycles_per_wake;
+    cfg.lineage_gc_drop_dedup_shared = config.lineage_gc_drop_dedup_shared;
     // Onyx treats startup as a data-plane path. Full page-file scans are
     // available through offline metadb-verify, but should not gate service
     // restart on large metadata files.

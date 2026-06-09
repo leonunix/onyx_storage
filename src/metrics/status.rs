@@ -138,6 +138,17 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
+                "metadb_lineage_gc: advanced={} dead_pbas={} dropped_dedup_shared={} skipped_rc={} skipped_snap={} skipped_descendant={} blocked_rc0_pbas={}",
+                metadb.lineage_gc_head_advanced,
+                metadb.lineage_gc_head_dead_pbas,
+                metadb.lineage_gc_head_dropped_dedup_shared,
+                metadb.lineage_gc_head_skipped_rc,
+                metadb.lineage_gc_head_skipped_snap,
+                metadb.lineage_gc_head_skipped_descendant,
+                metadb.lineage_gc_head_blocked_rc0_pbas
+            );
+            let _ = writeln!(
+                out,
                 "metadb_meta_io_write: calls={} ops={} bytes={} us={} max_us={} batch_ops_max={} batch_bytes_max={}",
                 metadb.meta_io_write_calls,
                 metadb.meta_io_write_ops,

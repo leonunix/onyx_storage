@@ -21,6 +21,16 @@ pub struct GcConfig {
     /// Max candidates to rewrite per scan cycle (default 64).
     #[serde(default = "default_max_rewrite_per_cycle")]
     pub max_rewrite_per_cycle: usize,
+    /// Reclaim grace: a retired extent is not freed until it has been seen in
+    /// the retired set for at least this many seconds (default 300 = 5 min).
+    /// This guarantees the settle window the retire→reclaim path otherwise gets
+    /// only incidentally from the GC cycle cadence: a reference committed to the
+    /// LV2 log but whose metadb L2P apply is still in flight (or mid-TXG-fold)
+    /// is transiently invisible to the reclaim reverify; waiting the grace lets
+    /// it land before the free decision, closing the premature-free race that
+    /// corrupted reads. `0` disables the grace (incidental cycle delay only).
+    #[serde(default = "default_reclaim_grace_secs")]
+    pub reclaim_grace_secs: u64,
 
     // --- Adaptive reclaim heat map (Stage A: observe-only) ---
     /// Master switch for the background PBA heat-map refresh (default true).
@@ -137,6 +147,7 @@ impl Default for GcConfig {
             buffer_usage_max_pct: default_buffer_usage_max_pct(),
             buffer_usage_resume_pct: default_buffer_usage_resume_pct(),
             max_rewrite_per_cycle: default_max_rewrite_per_cycle(),
+            reclaim_grace_secs: default_reclaim_grace_secs(),
             heat_enabled: default_heat_enabled(),
             heat_bucket_size_blocks: default_heat_bucket_size_blocks(),
             heat_refresh_max_lbas_per_cycle: default_heat_refresh_max_lbas_per_cycle(),
@@ -173,6 +184,9 @@ fn default_buffer_usage_resume_pct() -> u8 {
 }
 fn default_max_rewrite_per_cycle() -> usize {
     64
+}
+fn default_reclaim_grace_secs() -> u64 {
+    300
 }
 fn default_heat_enabled() -> bool {
     true

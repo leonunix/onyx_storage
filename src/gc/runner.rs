@@ -159,6 +159,14 @@ impl GcRunner {
     ) {
         let mut paused = false;
         let mut heat_cursor = HeatCursor::default();
+        // Reclaim-age grace state: first time each retired extent was observed,
+        // so a retired PBA isn't freed until it has settled for
+        // `cfg.reclaim_grace_secs` (closes the premature-free race where an
+        // in-flight / mid-fold reference is transiently invisible to the
+        // reverify). Persists across cycles; pruned each cycle by
+        // `reclaim_retired_extents`.
+        let mut retired_first_seen: std::collections::BTreeMap<Extent, std::time::Instant> =
+            std::collections::BTreeMap::new();
 
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
@@ -196,6 +204,10 @@ impl GcRunner {
                 MAX_RETIRED_RECLAIM_PER_CYCLE,
                 running,
                 heat_ctx,
+                Some((
+                    &mut retired_first_seen,
+                    Duration::from_secs(cfg.reclaim_grace_secs),
+                )),
             );
 
             // Standing background heat-map refresh (observe-only, Stage A):
@@ -327,6 +339,7 @@ impl GcRunner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reclaim_retired_extents(
         metrics: &EngineMetrics,
         meta: &MetaStore,
@@ -335,8 +348,43 @@ impl GcRunner {
         limit: usize,
         running: &AtomicBool,
         heat_ctx: Option<HeatReclaimCtx<'_>>,
+        // Reclaim grace: when `Some((first_seen, grace))` and `grace > 0`, an
+        // extent is only eligible once it has been observed in the retired set
+        // for `>= grace` (first-seen age, tracked across cycles by the caller).
+        // Guarantees the in-flight/mid-fold settle window before the reverify so
+        // a still-landing reference can't be missed → no premature free. `None`
+        // (tests) keeps the legacy immediate behaviour.
+        grace: Option<(&mut std::collections::BTreeMap<Extent, std::time::Instant>, std::time::Duration)>,
     ) -> usize {
         let candidates = allocator.retired_candidates(limit);
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Apply the reclaim-age grace: record first-seen for new candidates,
+        // prune entries that left the retired set, and keep only those aged past
+        // the grace. A coalesced extent is a new key → it re-ages (conservative,
+        // safe). Skipped entirely when grace is None / 0.
+        let candidates: Vec<Extent> = match grace {
+            Some((first_seen, grace)) if !grace.is_zero() => {
+                let now = std::time::Instant::now();
+                for extent in &candidates {
+                    first_seen.entry(*extent).or_insert(now);
+                }
+                let live: std::collections::BTreeSet<Extent> =
+                    candidates.iter().copied().collect();
+                first_seen.retain(|extent, _| live.contains(extent));
+                candidates
+                    .into_iter()
+                    .filter(|extent| {
+                        first_seen
+                            .get(extent)
+                            .is_some_and(|t| now.duration_since(*t) >= grace)
+                    })
+                    .collect()
+            }
+            _ => candidates,
+        };
         if candidates.is_empty() {
             return 0;
         }

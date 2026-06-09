@@ -277,6 +277,22 @@ pub struct MetaConfig {
     /// on the commit path while letting a backlog drain. Default 256.
     #[serde(default = "default_metadb_lineage_gc_max_cycles_per_wake")]
     pub lineage_gc_max_cycles_per_wake: usize,
+    /// Lineage GC head-advance: DROP `rc > 0` (dedup-membership) dead-list
+    /// records and advance the head past them, surfacing only the `rc == 0`
+    /// exclusive records — instead of bailing the whole segment on the first
+    /// `rc > 0`. This is the reclaim-lag fix: under sustained dedup overwrite
+    /// the old whole-segment bail left every rc==0 exclusive PBA stranded
+    /// behind a dedup-shared sibling, so `gc_lineage_freed_blocks` stayed ~0
+    /// and a 320 GiB volume grew to multiples of its logical size.
+    ///
+    /// Safe for onyx because onyx exposes NO snapshot/clone (CLI + meta layer
+    /// both lack it), so every `rc > 0` PBA is a dedup target whose reclaim is
+    /// owned by the dedup orphan-reclaim path — dropping the redundant dead-list
+    /// record cannot leak. Defaults ON. **Must stay OFF if onyx ever gains
+    /// snapshot/clone** (a clone-promotion-shared PBA has no dedup entry and
+    /// would then leak). metadb standalone defaults this OFF.
+    #[serde(default = "default_metadb_lineage_gc_drop_dedup_shared")]
+    pub lineage_gc_drop_dedup_shared: bool,
     /// Experimental NVMe mode: ordinary flusher metadata commits bypass the
     /// metadb WAL and rely on LV2's durable write log until the next metadb
     /// checkpoint. Leave off unless the buffer device has enough headroom to
@@ -514,6 +530,7 @@ impl Default for MetaConfig {
             lineage_gc_enabled: default_metadb_lineage_gc_enabled(),
             lineage_gc_interval_ms: default_metadb_lineage_gc_interval_ms(),
             lineage_gc_max_cycles_per_wake: default_metadb_lineage_gc_max_cycles_per_wake(),
+            lineage_gc_drop_dedup_shared: default_metadb_lineage_gc_drop_dedup_shared(),
             unlogged_flush_commits: false,
             wal_dir: None,
             dedup_shards: default_metadb_dedup_shards(),
@@ -1142,6 +1159,14 @@ fn default_metadb_lineage_gc_interval_ms() -> u64 {
 }
 fn default_metadb_lineage_gc_max_cycles_per_wake() -> usize {
     256
+}
+fn default_metadb_lineage_gc_drop_dedup_shared() -> bool {
+    // ON for onyx. onyx exposes no snapshot/clone, so every rc>0 dead-list
+    // record is a dedup-membership PBA reclaimed by the dedup orphan-reclaim
+    // path; dropping the redundant record lets lineage GC advance the head and
+    // surface the rc==0 exclusive siblings (the reclaim-lag fix). Set to false
+    // only if onyx ever gains snapshot/clone.
+    true
 }
 fn default_metadb_flush_select_budget() -> u64 {
     // Default OFF — every flush samples every shard.

@@ -351,6 +351,22 @@ pub struct MetaMemorySnapshot {
     pub flush_reclaim_selected_pages: u64,
     pub flush_reclaim_reclaimed_pages: u64,
     pub flush_reclaim_blocked_pages: u64,
+    // metadb Lineage GC head-advance attribution ([[no-refcount-hot-path]]
+    // Phase 5). Surfaces WHY FreePbas stops being emitted under sustained
+    // overwrite: `skipped_rc` (a dead record's PBA still has rc>0, bailing
+    // the whole head segment) vs `skipped_snap` / `skipped_descendant`.
+    // `blocked_rc0_pbas` is the rc==0 reclaim debt stuck behind those rc>0
+    // siblings — the quantity Fix B targets.
+    pub lineage_gc_head_advanced: u64,
+    pub lineage_gc_head_dead_pbas: u64,
+    pub lineage_gc_head_skipped_snap: u64,
+    pub lineage_gc_head_skipped_descendant: u64,
+    pub lineage_gc_head_skipped_rc: u64,
+    pub lineage_gc_head_blocked_rc0_pbas: u64,
+    // Under `lineage_gc_drop_dedup_shared`, rc>0 (dedup-membership) records
+    // dropped so the head advances past them. Rising with `*_advanced` =
+    // reclaim-lag fix working.
+    pub lineage_gc_head_dropped_dedup_shared: u64,
     pub meta_io_write_calls: u64,
     pub meta_io_write_ops: u64,
     pub meta_io_write_bytes: u64,
