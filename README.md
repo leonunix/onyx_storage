@@ -21,7 +21,7 @@ For the current functional audit and PBA/dedup mechanism map, see [docs/onyx-fun
 - **Purpose-built metadata engine** &mdash; in-tree [onyx-metadb](metadb/) (paged COW radix L2P + paged-array refcount + cuckoo dedup_index) sharing one WAL with group commit
 - **Crash consistency** &mdash; LV2 write-buffer sync-before-ack; metadb commits publish L2P remaps and verified dedup promotes atomically, with checkpoint/watermark based ring release
 - **High-performance write path** &mdash; staging channel + write thread batch (encode/CRC off hot path), jemalloc, DashMap 256-shard indices, per-shard backpressure
-- **Retired PBA reclaim** &mdash; committed dead PBAs are retired first, then reclaimed only after refcount, hazard, and blockmap/l2p-buffer confirmation gates
+- **Retired PBA reclaim** &mdash; committed dead PBAs are retired first, then reclaimed only after refcount, hazard, and a fold-consistent blockmap/l2p-buffer confirmation scan plus a reclaim-age grace; metadb lineage `FreePbas` are surfaced as `rc == 0` candidates and routed through the same retire&rarr;reclaim path (not direct-freed), since the `rc == 0` proof does not cover rc-untracked packed/multi-LBA L2P sharing
 - **Zone-based parallelism** &mdash; LBA space partitioned into zones, each served by a dedicated worker thread
 - **ublk frontend** (Linux) &mdash; expose volumes as `/dev/ublkbN` block devices with 512B sector alignment
 - **Service mode** &mdash; multi-volume serving in a single process, Unix socket IPC for online management and graceful shutdown
@@ -40,7 +40,7 @@ Dedup Workers --> Compress Workers --> Commit Workers
   |
 IoEngine (O_DIRECT --> LV3) + MetaStore (metadb tx: L2P remap + verified DedupPut/repair)
   |
-SpaceAllocator (free -> allocated -> retired -> reclaimed)
+SpaceAllocator (free -> allocated -> retired -> reclaimed; lineage FreePbas join the retire path)
   |
 dm-raid + LVM --> NVMe SSD x N
 
@@ -233,14 +233,14 @@ User-perceived latency = ring lock + memcpy + channel send. Encoding, CRC, disk 
 - **Two-stage L0**: `dedup_index` lookups go through L1 hot cache &rarr; cuckoo filter (16-bit fingerprint, 4 slots/bucket, packed u64) &rarr; on-disk cuckoo. The filter avoids reading cold cuckoo pages on every miss; FPR ~0.006%, lossless degradation when saturated.
 - **Cold-tail rescan** (in `DedupScanner`): a per-volume LBA cursor walks live blockmap entries one chunk per cycle, fans LV3 reads through the `ReadPool`, computes xxh3, and warms the candidate cache. This recovers dedup ratio after process restart (the cache is RAM-only) and on long-running engines whose dedup window has moved past entries the writer originally cached. Tunable via `dedup.cold_tail_max_per_cycle`.
 - Under per-shard buffer pressure (>90 %), foreground dedup is skipped and blocks are flagged `DEDUP_SKIPPED`; the same scanner drains them later, hashing in the background and warming the candidate cache (still no direct dedup_index write &mdash; promote stays gated on a verified second sighting).
-- Dedup index cleanup avoids a persistent reverse table. Post-commit cleanup removes candidate-cache entries for dead PBAs and retires committed physical space; persistent forward-index maintenance is handled by verify-mismatch compare-put repair, bounded dedup-index scrub, and orphan reclaim/demote. A retired PBA is not reusable until GC confirms `refcount == 0`, waits out hazards, and verifies that neither folded L2P nor the metadb L2P buffer references it.
+- Dedup index cleanup avoids a persistent reverse table. Post-commit cleanup removes candidate-cache entries for dead PBAs and retires committed physical space; persistent forward-index maintenance is handled by verify-mismatch compare-put repair, bounded dedup-index scrub, and orphan reclaim/demote. A retired PBA is not reusable until GC confirms `refcount == 0`, waits out hazards, and (fold-consistently, under the L2P shard read lock) verifies that neither folded L2P nor the metadb L2P buffer references it. Lineage `FreePbas` surfaced by metadb are retired through this same path rather than direct-freed, because the `rc == 0` proof does not cover rc-untracked packed/multi-LBA L2P sharing; the Onyx consumer still clears RAM candidate-cache entries and absorbs duplicate surfaces idempotently.
 - `dedup_shards` (default 8) drives per-shard apply lanes inside metadb so concurrent flush lanes don't serialise on a single dedup hot lock; the candidate cache shards on the same routing so a hit and the eventual promote land in the same metadb shard.
 
 ### Garbage Collection
 
 - Background scanner identifies compression units with high dead-block ratio (>25% by default)
 - Rewriter extracts live blocks, writes them back through the buffer (reusing the normal write path)
-- Old committed PBAs are retired first; GC reclaim then checks refcount, waits for in-flight readers/promotes, scans blockmap/l2p-buffer for references, and only then returns space to the allocator
+- Old committed PBAs are retired first; GC reclaim then checks refcount, waits for in-flight readers/promotes, runs a fold-consistent blockmap/l2p-buffer reference scan, honors a reclaim-age grace, and only then returns space to the allocator. Lineage GC `FreePbas` are surfaced as `rc == 0` candidates and retired through this same path (not direct-freed).
 - Back-pressure: GC pauses when buffer utilization exceeds 80%
 
 ## metadb Metadata Tables
@@ -256,7 +256,7 @@ Onyx's logical "tables" map onto four purpose-built structures inside [onyx-meta
 
 Cross-table atomicity comes from metadb transactions: writer commits publish L2P remaps, and verified candidate promotes add `DedupPut` in the same transaction as their LBA remap (`atomic_batch_dedup_hits_with_promote`). First-occurrence misses live in the RAM `CandidateCache` and never touch the persistent dedup table. There is no RocksDB, no column families, and no `WriteBatch` &mdash; the engine no longer has a `rocksdb` dependency at all.
 
-Committed PBA reclamation is intentionally two-stage. Remap/delete/dedup demote paths retire dead physical space after removing candidate-cache references; `GcRunner::reclaim_retired_extents` later releases it only after refcount, hazard, and exact blockmap/l2p-buffer checks. Volume deletion follows the same retired-PBA model.
+Committed PBA reclamation is intentionally two-stage. Remap/delete/dedup demote paths retire dead physical space after removing candidate-cache references; `GcRunner::reclaim_retired_extents` later releases it only after refcount, hazard, and an exact fold-consistent blockmap/l2p-buffer check plus a reclaim-age grace. Volume deletion follows the same retired-PBA model. metadb Lineage GC `FreePbas` surfaces exclusive `rc == 0` candidates, but Onyx retires them through this same reclaim path rather than direct-freeing &mdash; the `rc == 0` proof does not cover rc-untracked packed/multi-LBA L2P sharing &mdash; with candidate-cache invalidation, hazard wait, fold-consistent reference scan, and duplicate-surface idempotency.
 
 ## Roadmap
 

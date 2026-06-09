@@ -120,14 +120,14 @@ onyx-storage -c config/default.toml delete-volume -n myvolume
 - **两级 L0**：`dedup_index` 查询走 L1 hot cache &rarr; cuckoo filter（16-bit fp, 4 slots/bucket, packed u64）&rarr; on-disk cuckoo。filter 让 cold miss 不必触盘；FPR 约 0.006%，饱和后无损降级（contains 永远返回 true）。
 - **Cold-tail 扫描**（在 `DedupScanner` 内）：每 cycle 用 per-volume LBA 游标扫一段 live blockmap，通过 `ReadPool` 批量读 LV3，xxh3 后插入候选缓存。这能在进程重启后（candidate 是 RAM-only）和长跑场景下恢复 dedup 率。`dedup.cold_tail_max_per_cycle` 控制 cycle 预算。
 - per-shard buffer > 90% 时前台 dedup 跳过、标记 `DEDUP_SKIPPED`；同一个 scanner 后续把这些块拉出来 hash 后塞进候选缓存（仍**不**写 dedup_index，promote 永远靠 verified second sighting）。
-- dedup index 清理不再依赖持久 reverse 表：post-commit cleanup 会先清除指向 dead PBA 的 candidate-cache 条目，再把 committed PBA 放入 retired 集合；持久 forward index 由 verify mismatch 的 compare-put repair、后台 scrub、orphan reclaim/demote 维护。retired PBA 只有在 GC 确认 `refcount == 0`、hazard 清空、folded L2P 与 l2p_buffer 都无引用后才会真正回到 allocator。
+- dedup index 清理不再依赖持久 reverse 表：post-commit cleanup 会先清除指向 dead PBA 的 candidate-cache 条目，再把 committed PBA 放入 retired 集合；持久 forward index 由 verify mismatch 的 compare-put repair、后台 scrub、orphan reclaim/demote 维护。retired PBA 只有在 GC 确认 `refcount == 0`、hazard 清空、且 fold-consistent 地（持 L2P shard 读锁）确认 folded L2P 与 l2p_buffer 都无引用后才会真正回到 allocator。metadb 的 lineage `FreePbas` 会被 surface 成 `rc == 0` 候选，但 Onyx 把它们和普通 dead PBA 一样走 retire→reclaim 路径（不再 direct-free）——因为 `rc == 0` proof 覆盖不了 rc-untracked 的 packed/multi-LBA L2P 共享；Onyx 消费端仍要清 RAM candidate-cache，并幂等吸收重复 surface。
 - `dedup_shards`（默认 8）驱动 metadb 内每 shard 的 apply lane；候选缓存复用同一套 shard 路由，hit 与 promote commit 永远落在同一个 metadb shard。
 
 ### 垃圾回收
 
 - 后台扫描识别 dead block 比例高的压缩单元（默认阈值 25%）
 - 回写器提取有效块，通过缓冲重新写入（复用正常写路径）
-- 旧 committed PBA 先进入 retired；GC reclaim 再检查 refcount、等待 hazard、扫描 blockmap/l2p_buffer，无引用后才释放空间
+- 旧 committed PBA 先进入 retired；GC reclaim 再检查 refcount、等待 hazard、做 fold-consistent 的 blockmap/l2p_buffer 引用扫描、遵守 reclaim-age grace，无引用后才释放空间。Lineage GC `FreePbas` 会被 surface 成 `rc == 0` 候选，同样走这条 retire→reclaim 路径（不再 direct-free）。
 - 背压：缓冲利用率超过 80% 时暂停 GC
 
 ## metadb 元数据表
@@ -146,7 +146,7 @@ Per-volume blockmap（每个 volume 一个命名空间）：
 |------------------------|-----------|------------------|-----------------------|
 | `blockmap:{volume_id}` | `lba(BE)` | 28B BlockmapValue| LBA &rarr; PBA 映射   |
 
-每个 volume 独立 L2P 命名空间。删卷会删除该命名空间并让 dead PBA 进入 cleanup/retire 路径；持久 dedup_index 由 repair、scrub 和 orphan reclaim 维护，真正释放空间统一走 retired PBA 的 GC confirm scan。
+每个 volume 独立 L2P 命名空间。删卷会删除该命名空间并让 dead PBA 进入 cleanup/retire 路径；持久 dedup_index 由 repair、scrub 和 orphan reclaim 维护，释放空间统一走 retired PBA 的 GC confirm scan。metadb Lineage GC `FreePbas` 会 surface exclusive `rc == 0` 候选，但 Onyx 把它们也走同一条 retire→reclaim 路径（不再 direct-free）——`rc == 0` proof 覆盖不了 rc-untracked 的 packed/multi-LBA 共享；仍需 candidate-cache 失效、hazard wait、fold-consistent 引用扫描和重复 surface 幂等。
 
 ## 演进路线
 
