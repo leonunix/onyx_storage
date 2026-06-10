@@ -458,6 +458,15 @@ pub struct MetaConfig {
     /// Default on; set false for the legacy serial fold (A/B, fallback).
     #[serde(default = "default_parallel_l2p_drain_enabled")]
     pub parallel_l2p_drain_enabled: bool,
+
+    /// Make PBA refcount authoritative for ALL live L2P references so GC
+    /// reclaim is a pure `rc==0` check and the full-volume `referenced_extents`
+    /// reverify scan (which stalled the TXG fold/checkpoint → multi-second
+    /// commit spikes) is eliminated. Default `false`. ⚠ Requires a FRESH
+    /// metadb — turning this on against an existing store is refused at open
+    /// (existing `rc==0` exclusive PBAs would be mass-premature-freed).
+    #[serde(default = "default_rc_authoritative_reclaim")]
+    pub rc_authoritative_reclaim: bool,
 }
 
 impl MetaConfig {
@@ -561,6 +570,7 @@ impl Default for MetaConfig {
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
             txg_threads_enabled: default_txg_threads_enabled(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
+            rc_authoritative_reclaim: default_rc_authoritative_reclaim(),
         }
     }
 }
@@ -681,6 +691,13 @@ fn default_parallel_l2p_drain_enabled() -> bool {
     // drain isn't the binding gate in a healthy-disk window — serial keeps the
     // L2P buffer well under cap). Default OFF; kept behind the flag as a
     // documented dead-end. See memory parallel_l2p_drain_impl.
+    false
+}
+fn default_rc_authoritative_reclaim() -> bool {
+    // Default OFF (Phase-5 rc-neutral). Turning it on eliminates the reclaim
+    // reverify scan + the commit-latency spike, but requires a FRESH metadb
+    // (refused at open against an existing store). See memory
+    // commit_spike_rc_authoritative_reclaim.
     false
 }
 

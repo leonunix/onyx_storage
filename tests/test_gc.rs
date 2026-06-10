@@ -9,7 +9,7 @@ use onyx_storage::compress::codec::create_compressor;
 use onyx_storage::config::{FlushConfig, MetaConfig};
 use onyx_storage::gc::config::GcConfig;
 use onyx_storage::gc::rewriter::rewrite_candidate;
-use onyx_storage::gc::scanner::{scan_gc_candidates, GcCandidate};
+use onyx_storage::gc::scanner::{scan_gc_candidates, scan_gc_candidates_window, GcCandidate};
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::engine::IoEngine;
 use onyx_storage::lifecycle::VolumeLifecycleManager;
@@ -446,6 +446,22 @@ fn gc_rewrite_overwritten_blocks() {
     let candidate = candidates.iter().find(|c| c.pba == old_pba).unwrap();
     assert_eq!(candidate.live_lbas.len(), 2);
     assert!((candidate.dead_ratio - 0.75).abs() < 0.01);
+
+    // Windowed scan (resident compactor path): a window covering the whole
+    // volume must surface the SAME candidate and report a nonzero compactable
+    // dead-block estimate (the 6 dead members of the old unit).
+    let (win_candidates, dead_estimate) =
+        scan_gc_candidates_window(&env.meta, &vid, Lba(0), 64, 0.25, 100).unwrap();
+    let win = win_candidates
+        .iter()
+        .find(|c| c.pba == old_pba)
+        .expect("windowed scan should find the same candidate as the full scan");
+    assert_eq!(win.live_lbas.len(), 2);
+    assert!((win.dead_ratio - 0.75).abs() < 0.01);
+    assert!(
+        dead_estimate >= 6,
+        "debt estimate should count the 6 dead members, got {dead_estimate}"
+    );
 
     // Rewrite the candidate — live blocks go back to buffer
     let rewritten = rewrite_candidate(

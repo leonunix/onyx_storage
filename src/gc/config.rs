@@ -12,13 +12,22 @@ pub struct GcConfig {
     /// Dead ratio threshold to trigger repack (default 0.25).
     #[serde(default = "default_dead_ratio_threshold")]
     pub dead_ratio_threshold: f64,
-    /// Skip GC if buffer usage exceeds this percentage (default 80).
+    /// Buffer-fill percentage at which the compactor's idle pacing reaches zero
+    /// effort (default 80). The resident compactor scales its per-cycle scan +
+    /// rewrite budget by `idle_factor = (max_pct - fill_pct)/max_pct`, so at
+    /// `fill >= buffer_usage_max_pct` it does no compaction work UNLESS space
+    /// pressure (low free%) overrides the idle backoff. Replaces the old hard
+    /// on/off pause.
     #[serde(default = "default_buffer_usage_max_pct")]
     pub buffer_usage_max_pct: u8,
-    /// Resume GC when buffer usage drops below this percentage (default 50).
+    /// Legacy hysteresis floor for the old on/off GC pause. Unused by the
+    /// resident idle-paced compactor (pacing is now the continuous `idle_factor`
+    /// ramp against `buffer_usage_max_pct`); kept for config/wire stability.
     #[serde(default = "default_buffer_usage_resume_pct")]
     pub buffer_usage_resume_pct: u8,
-    /// Max candidates to rewrite per scan cycle (default 64).
+    /// Max candidates to rewrite per scan cycle (default 64). Scaled by the
+    /// compactor's per-cycle `effort` (idle/urgency); `effort>0` always yields
+    /// at least one rewrite.
     #[serde(default = "default_max_rewrite_per_cycle")]
     pub max_rewrite_per_cycle: usize,
     /// Reclaim grace: a retired extent is not freed until it has been seen in
@@ -31,6 +40,24 @@ pub struct GcConfig {
     /// corrupted reads. `0` disables the grace (incidental cycle delay only).
     #[serde(default = "default_reclaim_grace_secs")]
     pub reclaim_grace_secs: u64,
+
+    /// Resident-compactor dead-ratio threshold used when free space is plentiful
+    /// (free% > 50, default 0.85). The compactor is ALWAYS resident — `free_pct`
+    /// only tunes how aggressive it is, it is no longer an on/off switch. At
+    /// plentiful space only clearly-dead units (>= this ratio) are compacted:
+    /// cheap, high-yield, and enough to keep packing-slack debt bounded instead
+    /// of letting it grow forever on a large/thin device. As free% drops the
+    /// threshold lowers (0.50 / 0.30 / `dead_ratio_threshold`).
+    #[serde(default = "default_compactor_resident_threshold")]
+    pub compactor_resident_threshold: f64,
+    /// Per-cycle bound on the resident compactor's candidate scan, in LBAs
+    /// (default 1_000_000). Each GC cycle scans ONE ~1M-LBA window of one volume
+    /// via a lap cursor instead of the full ~80M-entry blockmap, sweeping the
+    /// whole L2P over many cycles. Scaled down by the per-cycle `effort`.
+    /// **`0` is a kill-switch**: the compactor scan is skipped entirely (no
+    /// background compaction; retire→reclaim of fully-dead extents still runs).
+    #[serde(default = "default_compactor_scan_max_lbas_per_cycle")]
+    pub compactor_scan_max_lbas_per_cycle: u64,
 
     // --- Adaptive reclaim heat map (Stage A: observe-only) ---
     /// Master switch for the background PBA heat-map refresh (default true).
@@ -148,6 +175,8 @@ impl Default for GcConfig {
             buffer_usage_resume_pct: default_buffer_usage_resume_pct(),
             max_rewrite_per_cycle: default_max_rewrite_per_cycle(),
             reclaim_grace_secs: default_reclaim_grace_secs(),
+            compactor_resident_threshold: default_compactor_resident_threshold(),
+            compactor_scan_max_lbas_per_cycle: default_compactor_scan_max_lbas_per_cycle(),
             heat_enabled: default_heat_enabled(),
             heat_bucket_size_blocks: default_heat_bucket_size_blocks(),
             heat_refresh_max_lbas_per_cycle: default_heat_refresh_max_lbas_per_cycle(),
@@ -187,6 +216,12 @@ fn default_max_rewrite_per_cycle() -> usize {
 }
 fn default_reclaim_grace_secs() -> u64 {
     300
+}
+fn default_compactor_resident_threshold() -> f64 {
+    0.85
+}
+fn default_compactor_scan_max_lbas_per_cycle() -> u64 {
+    1_000_000
 }
 fn default_heat_enabled() -> bool {
     true

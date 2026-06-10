@@ -624,6 +624,24 @@ impl WriteBufferPool {
         self.max_payload_memory
     }
 
+    /// Resident-payload depth as a percentage of the configured ceiling
+    /// (`payload_memory_bytes / payload_memory_limit_bytes`). Unlike
+    /// [`fill_percentage`] (soft "work in flight" vs ring capacity, which reads
+    /// ~0 even when the payload cache has ballooned to multiple GB because a
+    /// throttled downstream is holding payloads resident), this directly tracks
+    /// how full the durable payload cache is. Background pacing
+    /// (the GC compactor's self-throttle) takes the max of the two so EITHER
+    /// pressure source backs it off. Returns 0 when resident caching is
+    /// disabled (`limit == 0`) so the caller falls back to the ring signal.
+    pub fn payload_fill_percentage(&self) -> u8 {
+        let limit = self.max_payload_memory;
+        if limit == 0 {
+            return 0;
+        }
+        let used = self.payload_bytes_in_memory.load(Ordering::Relaxed);
+        ((used.saturating_mul(100)) / limit).min(100) as u8
+    }
+
     /// Atomic shared with every shard that tracks the highest seq to have
     /// been mark_flushed'd. Intended for the durability-watermark thread
     /// to capture before invoking `MetaStore::sync_durable`.

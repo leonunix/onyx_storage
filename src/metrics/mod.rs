@@ -443,6 +443,12 @@ pub struct EngineMetrics {
     pub gc_rewrite_attempts: AtomicU64,
     pub gc_blocks_rewritten: AtomicU64,
     pub gc_retired_blocks_reclaimed: AtomicU64,
+    /// Resident-compactor debt gauge: estimated compactable dead blocks across
+    /// the volume set, published once per full compactor sweep (sum of
+    /// `unit_lba_count - live_count` over multi-LBA units). Rising = packing
+    /// slack accumulating faster than the compactor reclaims it; flat/falling =
+    /// the resident compactor is keeping debt bounded.
+    pub gc_compactable_dead_blocks: AtomicU64,
     pub gc_errors: AtomicU64,
     /// Number of batched all-volume L2P scans the retired-extent reclaim path
     /// has run. With batching this is ~1 per GC cycle (was up to

@@ -13,7 +13,7 @@ use crate::gc::config::GcConfig;
 use crate::gc::heatmap::HeatMap;
 use crate::gc::ref_bitmap::RefBitmap;
 use crate::gc::rewriter::rewrite_candidate;
-use crate::gc::scanner::scan_gc_candidates;
+use crate::gc::scanner::scan_gc_candidates_window;
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::{BlockmapValue, FLAG_DEDUP_SKIPPED};
@@ -25,6 +25,17 @@ use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 
 const MAX_RETIRED_RECLAIM_PER_CYCLE: usize = 4096;
+
+/// Free-space percentage at/below which the resident compactor's `urgency`
+/// reaches full and overrides the idle backoff (compact even under foreground
+/// load to keep the device from filling). Above this, pacing is purely
+/// idle-driven. Mirrors the old `dynamic_threshold` ladder's pressure region.
+const URGENCY_FREE_PCT: u64 = 50;
+
+/// Floor for the per-cycle compactor scan window (LBAs). A window must hold at
+/// least one whole compression unit (units span ≤ `coalesce_max_lbas`, default
+/// 32) so a non-zero `effort` always makes real progress; 64 > 32 with margin.
+const COMPACTOR_MIN_WINDOW_LBAS: u64 = 64;
 
 /// Background GC runner thread.
 pub struct GcRunner {
@@ -120,25 +131,23 @@ impl GcRunner {
         self.config.store(Arc::new(new_config));
     }
 
-    /// Compute dynamic dead_ratio_threshold based on space pressure.
+    /// Compute the dead_ratio threshold from space pressure.
     ///
-    /// When space is plentiful, only reclaim heavily fragmented slots.
-    /// As space gets tighter, lower the threshold to reclaim more aggressively.
-    fn dynamic_threshold(cfg: &GcConfig, allocator: &SpaceAllocator) -> Option<f64> {
-        let total = allocator.total_block_count();
-        if total == 0 {
-            return Some(cfg.dead_ratio_threshold);
-        }
-        let free_pct = (allocator.free_block_count() * 100) / total;
-
+    /// The compactor is ALWAYS resident; `free_pct` only tunes how aggressive it
+    /// is, it is no longer an on/off switch. When space is plentiful only
+    /// clearly-dead units (`compactor_resident_threshold`, default 0.85) are
+    /// compacted — cheap, high-yield, and enough to keep packing-slack debt
+    /// bounded instead of letting it grow forever. As space tightens the
+    /// threshold lowers so more partially-dead units get reclaimed.
+    fn dynamic_threshold(cfg: &GcConfig, free_pct: u64) -> f64 {
         if free_pct > 50 {
-            None // Plentiful — do not scan the whole blockmap just to compact.
+            cfg.compactor_resident_threshold // Plentiful — only clearly-dead units (debt-bounding).
         } else if free_pct > 30 {
-            Some(0.50) // Moderate pressure
+            0.50 // Moderate pressure
         } else if free_pct > 10 {
-            Some(0.30) // Getting tight
+            0.30 // Getting tight
         } else {
-            Some(cfg.dead_ratio_threshold) // Critical — use configured minimum (default 0.25)
+            cfg.dead_ratio_threshold // Critical — configured minimum (default 0.25)
         }
     }
 
@@ -157,7 +166,7 @@ impl GcRunner {
         config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
     ) {
-        let mut paused = false;
+        let mut compactor_cursor = CompactorCursor::default();
         let mut heat_cursor = HeatCursor::default();
         // Reclaim-age grace state: first time each retired extent was observed,
         // so a retired PBA isn't freed until it has settled for
@@ -235,105 +244,203 @@ impl GcRunner {
                 );
             }
 
-            if !cfg.enabled {
-                continue;
+            if !cfg.enabled || cfg.compactor_scan_max_lbas_per_cycle == 0 {
+                continue; // GC off, or compactor kill-switch (reclaim+heat above still run)
             }
 
-            // Back-pressure: check buffer usage
-            let fill_pct = buffer_pool.fill_percentage();
-            if fill_pct > cfg.buffer_usage_max_pct {
-                metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
-                if !paused {
-                    tracing::debug!(
-                        fill_pct,
-                        max = cfg.buffer_usage_max_pct,
-                        "gc: pausing due to high buffer usage"
-                    );
-                    paused = true;
-                }
-                continue;
-            }
-            if paused && fill_pct <= cfg.buffer_usage_resume_pct {
-                tracing::debug!(
-                    fill_pct,
-                    resume = cfg.buffer_usage_resume_pct,
-                    "gc: resuming"
-                );
-                paused = false;
-            }
-            if paused {
-                continue;
-            }
-
-            // Smart GC: dynamic dead_ratio_threshold based on space pressure.
-            // More aggressive reclamation when space is tight.
-            let Some(threshold) = Self::dynamic_threshold(&cfg, allocator) else {
-                metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("gc: skipping scan while free space is plentiful");
-                continue;
+            // Resident, idle-paced compaction. Unlike the old free_pct on/off
+            // gate (which never ran on a large/thin device, letting packing-slack
+            // debt grow forever), the compactor ALWAYS runs; per-cycle `effort`
+            // scales with how idle the write pipeline is, and space pressure
+            // (low free%) overrides the idle backoff so the device cannot
+            // silently fill. The candidate scan is bounded to one ~1M-LBA window
+            // per cycle (a lap cursor sweeps the whole L2P over many cycles)
+            // instead of a full ~80M-entry scan.
+            let total_blocks = allocator.total_block_count();
+            let free_pct = if total_blocks == 0 {
+                100
+            } else {
+                allocator.free_block_count() * 100 / total_blocks
             };
+            // Backpressure signal for the self-throttle. `fill_percentage()` is
+            // "soft work in flight" vs ring capacity and reads ~0 even when the
+            // durable payload cache has ballooned to several GB — which is
+            // exactly the symptom of a throttled commit-apply (the flusher
+            // can't drain, payloads stay resident). Using it alone left the
+            // compactor pinned at effort=1.0 while it was itself the cause of
+            // the balloon. Take the MAX with the resident payload depth so
+            // either pressure source backs the compactor off, closing the
+            // feedback loop (compactor scan throttles commit → buffer grows →
+            // effort drops → commit recovers → buffer drains).
+            let fill_pct = buffer_pool
+                .fill_percentage()
+                .max(buffer_pool.payload_fill_percentage());
+            let effort = compute_effort(fill_pct, free_pct, cfg.buffer_usage_max_pct);
+            if effort < 0.01 {
+                // Busy AND plenty of space → idle the compactor; cursor untouched
+                // so it resumes exactly where it left off when load drops.
+                metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
 
-            // Scan for GC rewrite candidates
-            let candidates = match scan_gc_candidates(meta, threshold, cfg.max_rewrite_per_cycle) {
-                Ok(c) => c,
+            let threshold = Self::dynamic_threshold(&cfg, free_pct);
+            let scan_budget = std::cmp::max(
+                (cfg.compactor_scan_max_lbas_per_cycle as f64 * effort) as u64,
+                COMPACTOR_MIN_WINDOW_LBAS,
+            );
+            // `.ceil()` so any effort > 0 yields at least one rewrite (else tiny
+            // effort would starve forward progress).
+            let rewrite_budget = (cfg.max_rewrite_per_cycle as f64 * effort).ceil() as usize;
+
+            Self::compactor_step(
+                metrics,
+                meta,
+                io_engine,
+                buffer_pool,
+                lifecycle,
+                allocator,
+                &mut compactor_cursor,
+                threshold,
+                scan_budget,
+                rewrite_budget,
+                running,
+            );
+        }
+    }
+
+    /// One resident-compactor step: scan a single bounded LBA window of the next
+    /// volume (lap cursor), turn high-dead-ratio units into rewrite candidates,
+    /// and rewrite up to `rewrite_budget` of them (live blocks go back through
+    /// the buffer; the flusher remaps and the retire→reclaim path frees the old
+    /// PBAs). Also accumulates the compactable-dead-block (debt) estimate and
+    /// publishes it once per full sweep.
+    #[allow(clippy::too_many_arguments)]
+    fn compactor_step(
+        metrics: &EngineMetrics,
+        meta: &MetaStore,
+        io_engine: &IoEngine,
+        buffer_pool: &WriteBufferPool,
+        lifecycle: &VolumeLifecycleManager,
+        allocator: &SpaceAllocator,
+        cursor: &mut CompactorCursor,
+        threshold: f64,
+        scan_budget: u64,
+        rewrite_budget: usize,
+        running: &AtomicBool,
+    ) {
+        if scan_budget == 0 || rewrite_budget == 0 {
+            return;
+        }
+        let volumes = match meta.list_volumes() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "compactor: list_volumes failed");
+                return;
+            }
+        };
+        if volumes.is_empty() {
+            return;
+        }
+        // Sweep target = total live LBA span across the volume set (a prior,
+        // recomputed each cycle so create/drop degrades gracefully).
+        let target: u64 = volumes
+            .iter()
+            .map(|v| v.size_bytes / u64::from(v.block_size.max(1)))
+            .sum();
+        if target == 0 {
+            return;
+        }
+        // Drop cursor state for volumes that no longer exist.
+        let live: HashSet<&str> = volumes.iter().map(|v| v.id.0.as_str()).collect();
+        cursor.per_vol.retain(|k, _| live.contains(k.as_str()));
+
+        // Pick the next non-empty volume (one window per cycle, round-robin).
+        let mut picked = None;
+        for _ in 0..volumes.len() {
+            let cand = &volumes[cursor.vol_idx % volumes.len()];
+            cursor.vol_idx = cursor.vol_idx.wrapping_add(1);
+            let total_lbas = cand.size_bytes / u64::from(cand.block_size.max(1));
+            if total_lbas > 0 {
+                picked = Some((cand.clone(), total_lbas));
+                break;
+            }
+        }
+        let Some((vol, total_lbas)) = picked else {
+            return; // every volume empty this cycle
+        };
+
+        // This cycle's contiguous LBA window from the volume's lap.
+        let (phys_start, chunk) = {
+            let lap = cursor.per_vol.entry(vol.id.0.clone()).or_insert_with(|| {
+                let mut rng = heat_lap_seed(&vol.id.0);
+                let lap_start = splitmix64(&mut rng) % total_lbas;
+                CompactorLap {
+                    lap_start,
+                    scanned_in_lap: 0,
+                    rng,
+                }
+            });
+            next_compactor_window(lap, total_lbas, scan_budget)
+        };
+        if chunk == 0 {
+            return;
+        }
+
+        let (candidates, dead_estimate) = match scan_gc_candidates_window(
+            meta,
+            &vol.id,
+            Lba(phys_start),
+            chunk,
+            threshold,
+            rewrite_budget,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(vol = %vol.id.0, error = %e, "compactor: window scan failed");
+                return;
+            }
+        };
+        cursor.dead_estimate_acc = cursor.dead_estimate_acc.saturating_add(dead_estimate);
+
+        // Sweep odometer: publish the debt estimate once a full sweep completes,
+        // then reset for the next sweep.
+        if let Some(published) = advance_sweep(cursor, chunk, target) {
+            metrics
+                .gc_compactable_dead_blocks
+                .store(published, Ordering::Relaxed);
+        }
+
+        metrics
+            .gc_candidates_found
+            .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+
+        for candidate in &candidates {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+            metrics.gc_rewrite_attempts.fetch_add(1, Ordering::Relaxed);
+            match rewrite_candidate(
+                candidate,
+                io_engine,
+                buffer_pool,
+                meta,
+                lifecycle,
+                Some(&allocator.hazards()),
+            ) {
+                Ok(rewritten) => {
+                    metrics
+                        .gc_blocks_rewritten
+                        .fetch_add(rewritten as u64, Ordering::Relaxed);
+                }
                 Err(e) => {
                     metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(error = %e, "gc: scan failed");
-                    continue;
-                }
-            };
-
-            metrics
-                .gc_candidates_found
-                .fetch_add(candidates.len() as u64, Ordering::Relaxed);
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            tracing::debug!(
-                candidates = candidates.len(),
-                "gc: found candidates for reclamation"
-            );
-
-            for candidate in &candidates {
-                if !running.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // Re-check back-pressure before each candidate (re-load config for latest thresholds)
-                let cfg = config.load();
-                if buffer_pool.fill_percentage() > cfg.buffer_usage_max_pct {
-                    metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("gc: pausing mid-cycle due to buffer pressure");
-                    paused = true;
-                    break;
-                }
-
-                metrics.gc_rewrite_attempts.fetch_add(1, Ordering::Relaxed);
-
-                match rewrite_candidate(
-                    candidate,
-                    io_engine,
-                    buffer_pool,
-                    meta,
-                    lifecycle,
-                    Some(&allocator.hazards()),
-                ) {
-                    Ok(rewritten) => {
-                        metrics
-                            .gc_blocks_rewritten
-                            .fetch_add(rewritten as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            pba = candidate.pba.0,
-                            vol = %candidate.vol_id,
-                            error = %e,
-                            "gc: failed to rewrite candidate"
-                        );
-                    }
+                    tracing::warn!(
+                        pba = candidate.pba.0,
+                        vol = %candidate.vol_id,
+                        error = %e,
+                        "compactor: failed to rewrite candidate"
+                    );
                 }
             }
         }
@@ -534,25 +641,38 @@ impl GcRunner {
             allocator.wait_for_readers(extent.start, extent.count);
         }
 
-        // Gate 2 (blockmap): ONE batched all-volume L2P scan for every survivor,
-        // replacing the per-extent full scan (was O(retired × all_L2P)). A
-        // survivor is reclaimable iff no live blockmap entry references any PBA
-        // inside it.
-        let extents: Vec<(crate::types::Pba, u32)> =
-            survivors.iter().map(|e| (e.start, e.count)).collect();
-        metrics
-            .gc_reclaim_blockmap_scans
-            .fetch_add(1, Ordering::Relaxed);
-        let referenced = match meta.referenced_extents(&extents) {
-            Ok(referenced) => referenced,
-            Err(e) => {
-                metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    candidates = survivors.len(),
-                    error = %e,
-                    "gc: failed to scan blockmap for retired physical extents"
-                );
-                return 0;
+        // Gate 2 (blockmap): a survivor is reclaimable iff no live blockmap
+        // entry references any PBA inside it.
+        //
+        // rc-authoritative mode: refcount counts every live L2P reference, so
+        // Gate-1's `rc==0` is already proof of no reference — the full-volume
+        // `referenced_extents` reverify scan (which held metadb's per-shard
+        // `tree.read()` across the whole volume and stalled the TXG
+        // fold/checkpoint → multi-second commit spikes) is unnecessary and
+        // skipped. The grace + hazard barrier above still cover the
+        // un-drained-incref / in-flight-promote windows.
+        let referenced: Vec<bool> = if meta.rc_authoritative_reclaim() {
+            vec![false; survivors.len()]
+        } else {
+            // Phase-5 fallback: rc is NOT authoritative for L2P references, so
+            // ONE batched all-volume L2P scan is required to catch rc-untracked
+            // (packed/multi-LBA shared-base) references.
+            let extents: Vec<(crate::types::Pba, u32)> =
+                survivors.iter().map(|e| (e.start, e.count)).collect();
+            metrics
+                .gc_reclaim_blockmap_scans
+                .fetch_add(1, Ordering::Relaxed);
+            match meta.referenced_extents(&extents) {
+                Ok(referenced) => referenced,
+                Err(e) => {
+                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        candidates = survivors.len(),
+                        error = %e,
+                        "gc: failed to scan blockmap for retired physical extents"
+                    );
+                    return 0;
+                }
             }
         };
 
@@ -1015,6 +1135,88 @@ struct HeatCursor {
     ref_fill: Option<Box<[u64]>>,
 }
 
+/// Per-volume lap state for the resident compactor scan (mirrors `HeatLap`):
+/// a random-phase linear sweep across the volume's LBA space, wrapping and
+/// re-randomizing the phase each lap so coverage order varies run-to-run.
+#[derive(Debug, Clone, Copy)]
+struct CompactorLap {
+    lap_start: u64,
+    scanned_in_lap: u64,
+    rng: u64,
+}
+
+/// Cross-volume cursor + sweep odometer + debt accumulator for the resident
+/// compactor. Lives on the GC thread stack (single writer), persists across
+/// cycles so the bounded per-cycle window sweeps the whole L2P over time.
+#[derive(Default)]
+struct CompactorCursor {
+    per_vol: HashMap<String, CompactorLap>,
+    vol_idx: usize,
+    /// LBAs walked toward the current full sweep; laps the sweep `target`.
+    sweep_lbas_done: u64,
+    /// Compactable-dead-block estimate accumulated over the in-progress sweep;
+    /// published to `gc_compactable_dead_blocks` and reset on sweep completion.
+    dead_estimate_acc: u64,
+}
+
+/// Per-cycle compactor effort in `[0,1]`: `max(idle_factor, urgency)`.
+///
+/// `idle_factor = (max_pct - fill_pct)/max_pct` — 1.0 when the buffer is empty,
+/// ramping to 0 at `fill_pct >= buffer_usage_max_pct` (back off under foreground
+/// load). `urgency = (URGENCY_FREE_PCT - free_pct)/URGENCY_FREE_PCT` — 0 when
+/// space is plentiful, ramping to 1 as free space drops. Taking the `max` lets
+/// space pressure override the idle backoff so the device cannot silently fill.
+/// `buffer_usage_max_pct == 0` disables the buffer throttle (idle_factor = 1).
+fn compute_effort(fill_pct: u8, free_pct: u64, buffer_usage_max_pct: u8) -> f64 {
+    let max = f64::from(buffer_usage_max_pct);
+    let idle_factor = if max <= 0.0 {
+        1.0
+    } else {
+        ((max - f64::from(fill_pct)) / max).clamp(0.0, 1.0)
+    };
+    let floor = URGENCY_FREE_PCT as f64;
+    let urgency = ((floor - free_pct as f64) / floor).clamp(0.0, 1.0);
+    idle_factor.max(urgency)
+}
+
+/// Advance the compactor sweep odometer by `chunk`. When a full sweep
+/// (`target` LBAs) is crossed, return the accumulated debt estimate to publish
+/// and reset the accumulator (so the gauge reflects the just-finished sweep,
+/// not a running sum). `target == 0` never publishes. Multiple wraps in one call
+/// publish once (the accumulated value), then zero for the rest of that call.
+fn advance_sweep(cursor: &mut CompactorCursor, chunk: u64, target: u64) -> Option<u64> {
+    if target == 0 {
+        return None;
+    }
+    cursor.sweep_lbas_done += chunk;
+    let mut published = None;
+    while cursor.sweep_lbas_done >= target {
+        published = Some(cursor.dead_estimate_acc);
+        cursor.dead_estimate_acc = 0;
+        cursor.sweep_lbas_done -= target;
+    }
+    published
+}
+
+/// Pick this cycle's contiguous LBA window from a compactor lap: random-phase
+/// linear sweep, wrapping at the volume end, re-randomizing the phase when a
+/// full lap completes. Mirrors the heat-refresh lap. Returns `(phys_start,
+/// chunk)`; `chunk == 0` only when `total_lbas == 0`. Advances the lap.
+fn next_compactor_window(lap: &mut CompactorLap, total_lbas: u64, budget: u64) -> (u64, u64) {
+    if total_lbas == 0 {
+        return (0, 0);
+    }
+    if lap.scanned_in_lap >= total_lbas {
+        lap.lap_start = splitmix64(&mut lap.rng) % total_lbas;
+        lap.scanned_in_lap = 0;
+    }
+    let phys_start = (lap.lap_start + lap.scanned_in_lap) % total_lbas;
+    let lap_remaining = total_lbas - lap.scanned_in_lap;
+    let chunk = budget.min(lap_remaining).min(total_lbas - phys_start);
+    lap.scanned_in_lap += chunk;
+    (phys_start, chunk)
+}
+
 /// Stage-B2 adaptive refresh budget split. Each volume gets a guaranteed floor
 /// (its size-proportional share divided by `staleness_floor`, so it is fully
 /// covered at least every `staleness_floor` sweeps even at zero churn) plus a
@@ -1135,8 +1337,139 @@ fn try_push_cold_tail(
 
 #[cfg(test)]
 mod tests {
-    use super::{lap_barrier_satisfied, split_refresh_budget, HeatLap};
+    use super::{
+        advance_sweep, compute_effort, lap_barrier_satisfied, next_compactor_window,
+        split_refresh_budget, CompactorCursor, CompactorLap, HeatLap,
+    };
     use std::collections::HashMap;
+
+    // ---- resident compactor: effort pacing ----
+
+    #[test]
+    fn effort_idle_plentiful_is_full() {
+        // Empty buffer (fill 0), tons of free space → full effort.
+        assert!((compute_effort(0, 99, 80) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effort_busy_plentiful_is_zero() {
+        // Buffer at/above the max-pct, plenty of space → no compaction.
+        assert_eq!(compute_effort(80, 99, 80), 0.0);
+        assert_eq!(compute_effort(100, 99, 80), 0.0);
+    }
+
+    #[test]
+    fn effort_busy_but_tight_is_urgency_driven() {
+        // Buffer full but space critical → urgency overrides the idle backoff.
+        // free_pct=0 → urgency=1.0 regardless of fill.
+        assert!((compute_effort(100, 0, 80) - 1.0).abs() < 1e-9);
+        // free_pct=25 → urgency=(50-25)/50=0.5; idle_factor=0 at fill=100 → 0.5.
+        assert!((compute_effort(100, 25, 80) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effort_partial_idle_ramps() {
+        // fill=40, max=80 → idle_factor=0.5; plentiful → urgency 0 → 0.5.
+        assert!((compute_effort(40, 99, 80) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effort_zero_max_disables_buffer_throttle() {
+        // buffer_usage_max_pct==0 → idle_factor pinned to 1.0 (never throttle on buffer).
+        assert!((compute_effort(100, 99, 0) - 1.0).abs() < 1e-9);
+    }
+
+    // ---- resident compactor: dynamic threshold curve ----
+
+    #[test]
+    fn dynamic_threshold_curve() {
+        let mut cfg = crate::gc::config::GcConfig::default();
+        cfg.compactor_resident_threshold = 0.85;
+        cfg.dead_ratio_threshold = 0.25;
+        // Resident tier (plentiful): only clearly-dead units.
+        assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 99), 0.85);
+        assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 51), 0.85);
+        // Pressure ladder.
+        assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 40), 0.50);
+        assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 20), 0.30);
+        assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 5), 0.25);
+    }
+
+    // ---- resident compactor: lap window ----
+
+    fn clap() -> CompactorLap {
+        CompactorLap {
+            lap_start: 0,
+            scanned_in_lap: 0,
+            rng: 0x1234_5678,
+        }
+    }
+
+    #[test]
+    fn next_window_zero_volume_is_empty() {
+        let mut lap = clap();
+        assert_eq!(next_compactor_window(&mut lap, 0, 1000), (0, 0));
+    }
+
+    #[test]
+    fn next_window_linear_advance_and_wrap() {
+        let total = 1000u64;
+        let budget = 400u64;
+        let mut lap = clap();
+        lap.lap_start = 0; // deterministic start for the assert
+        let (s1, c1) = next_compactor_window(&mut lap, total, budget);
+        assert_eq!((s1, c1), (0, 400));
+        let (s2, c2) = next_compactor_window(&mut lap, total, budget);
+        assert_eq!((s2, c2), (400, 400));
+        // Third window clamps to the lap remainder (1000 - 800 = 200).
+        let (s3, c3) = next_compactor_window(&mut lap, total, budget);
+        assert_eq!((s3, c3), (800, 200));
+        // Lap complete → next call re-randomizes the phase and resets.
+        let before = lap.lap_start;
+        let (_s4, c4) = next_compactor_window(&mut lap, total, budget);
+        assert!(c4 > 0);
+        assert_eq!(lap.scanned_in_lap, c4, "lap restarted");
+        // Phase moved (re-randomized) — overwhelmingly likely with splitmix64.
+        assert_ne!(lap.lap_start, before + 800);
+    }
+
+    #[test]
+    fn next_window_phase_always_in_range() {
+        let total = 777u64;
+        let mut lap = clap();
+        let mut scanned = 0u64;
+        for _ in 0..50 {
+            let (start, chunk) = next_compactor_window(&mut lap, total, 100);
+            assert!(start < total, "phase {start} must be < {total}");
+            assert!(chunk <= total);
+            scanned += chunk;
+        }
+        assert!(scanned > 0);
+    }
+
+    // ---- resident compactor: debt odometer ----
+
+    #[test]
+    fn advance_sweep_publishes_and_resets_on_wrap() {
+        let mut cur = CompactorCursor::default();
+        cur.dead_estimate_acc = 1234;
+        // Below target → no publish, accumulator intact.
+        assert_eq!(advance_sweep(&mut cur, 300, 1000), None);
+        assert_eq!(cur.dead_estimate_acc, 1234);
+        assert_eq!(cur.sweep_lbas_done, 300);
+        // Crossing target → publish the accumulated value, reset to 0.
+        assert_eq!(advance_sweep(&mut cur, 800, 1000), Some(1234));
+        assert_eq!(cur.dead_estimate_acc, 0);
+        assert_eq!(cur.sweep_lbas_done, 100); // 1100 - 1000 carried
+    }
+
+    #[test]
+    fn advance_sweep_target_zero_never_publishes() {
+        let mut cur = CompactorCursor::default();
+        cur.dead_estimate_acc = 5;
+        assert_eq!(advance_sweep(&mut cur, 1_000_000, 0), None);
+        assert_eq!(cur.dead_estimate_acc, 5);
+    }
 
     fn lap(ref_lapped: bool) -> HeatLap {
         HeatLap {

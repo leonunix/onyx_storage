@@ -248,6 +248,7 @@ impl Default for EngineMetrics {
             gc_rewrite_attempts: AtomicU64::new(0),
             gc_blocks_rewritten: AtomicU64::new(0),
             gc_retired_blocks_reclaimed: AtomicU64::new(0),
+            gc_compactable_dead_blocks: AtomicU64::new(0),
             gc_errors: AtomicU64::new(0),
             gc_reclaim_blockmap_scans: AtomicU64::new(0),
             gc_lineage_freed_blocks: AtomicU64::new(0),

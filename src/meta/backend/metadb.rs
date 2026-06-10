@@ -21,6 +21,24 @@ use super::codec::{blockmap_from_l2p_bytes, freed_blocks_for_l2p_value};
 const METADB_DEDUP_VALUE_BYTES: usize = 28;
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
 const BLOCKMAP_SCAN_CHUNK_LBAS: u64 = 262_144; // 1 GiB of 4 KiB LBAs.
+
+/// Internal chunk size for the *windowed* background scan (`scan_blockmap_range`,
+/// used by the resident GC compactor, the heat refresh, and the dedup cold-tail
+/// scanner). The chunk is the granularity at which metadb's
+/// `scan_range_unordered_chunked` acquires/releases a shard's L2P read view
+/// (`active_readers`): while a shard is being walked, concurrent commit-apply to
+/// that shard cannot take its empty-overlay fast path and falls to the COW-clone
+/// slow path. Passing the caller's whole window (up to ~1M LBAs) as one chunk
+/// pinned each shard for milliseconds, near-constantly forcing commits onto the
+/// slow path (~180× commit-apply collapse observed with the compactor on). A
+/// small chunk keeps each per-shard hold to ~tens of µs with frequent
+/// `active_readers == 0` gaps, so commits keep hitting the fast path. The chunk
+/// is purely a lock-granularity knob — the callback still fires for every entry
+/// in the window, so aggregation results are unchanged (a unit straddling a
+/// chunk boundary is still seen whole by the caller's accumulator). Smaller =
+/// shorter holds but more acquire overhead; 8192 LBAs ≈ a few hundred entries
+/// per shard per hold.
+const BACKGROUND_SCAN_CHUNK_LBAS: u64 = 8_192;
 const DEDUP_PERSIST_BATCH_LIMIT: usize = crate::dedup::config::DEDUP_PUT_BATCH_HARD_MAX_ENTRIES;
 
 pub(crate) struct MetadbBackend {
@@ -282,6 +300,10 @@ impl MetadbBackend {
     /// claim L2P shards they don't actually touch.
     pub(crate) fn l2p_shard_of(&self, lba: Lba) -> usize {
         self.db.l2p_shard_for(lba.0)
+    }
+
+    pub(crate) fn rc_authoritative_reclaim(&self) -> bool {
+        self.db.rc_authoritative_reclaim()
     }
 
     pub(crate) fn drain_lineage_freed_pbas(&self) -> Vec<Pba> {
@@ -989,7 +1011,7 @@ impl MetadbBackend {
         let mut decode_error = None;
         let scan_result =
             self.db
-                .scan_range_unordered_chunked(ord, start_lba.0, end, count, |lba, value| {
+                .scan_range_unordered_chunked(ord, start_lba.0, end, BACKGROUND_SCAN_CHUNK_LBAS, |lba, value| {
                     match decode_l2p_value(value) {
                         Ok(decoded) => callback(Lba(lba), decoded),
                         Err(err) => {
@@ -1071,9 +1093,13 @@ impl MetadbBackend {
             // scan, so a concurrent TXG fold can't make a migrating reference
             // (e.g. a packed-slot sibling mid-fold) transiently invisible
             // between two unsynchronised passes. This is LOAD-BEARING: a plain
-            // two-pass reverify (even paired with the reclaim-age grace) let the
-            // premature-free CRC back in (soak-proven). See
-            // `Db::scan_l2p_live_consistent` / fixb_soak_exposed_referenced_extents_race.
+            // two-pass reverify (even buffer-first + publish-before-clear, even
+            // paired with the reclaim-age grace) let the premature-free CRC back
+            // in (soak-proven 2026-06-08 AND 2026-06-09). ⚠ The `tree.read()`
+            // blocks the fold/checkpoint `tree.write()` for the whole walk →
+            // multi-second commit-apply spikes; a latency fix must keep this
+            // consistency, not drop it. See `Db::scan_l2p_live_consistent` /
+            // fixb_soak_exposed_referenced_extents_race.
             let mut decode_error = None;
             let scan_result = self.db.scan_l2p_live_consistent(ord, |_lba, value| {
                 match Self::cover_referenced(
@@ -1474,6 +1500,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     // giant inline checkpoint. See plan mellow-dazzling-thunder.md.
     cfg.txg_threads_enabled = config.txg_threads_enabled;
     cfg.parallel_l2p_drain_enabled = config.parallel_l2p_drain_enabled;
+    cfg.rc_authoritative_reclaim = config.rc_authoritative_reclaim;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
     cfg.async_reclaim_max_pages_per_cycle = config.async_reclaim_max_pages_per_cycle as usize;

@@ -118,6 +118,13 @@ impl MetaStore {
         self.backend.l2p_shard_of(lba)
     }
 
+    /// Whether PBA refcount is authoritative for all live L2P references. When
+    /// true, GC reclaim frees on `rc==0` alone (Gate 1) and skips the
+    /// full-volume `referenced_extents` reverify scan (Gate 2).
+    pub fn rc_authoritative_reclaim(&self) -> bool {
+        self.backend.rc_authoritative_reclaim()
+    }
+
     pub fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         self.backend.memory_stats()
     }

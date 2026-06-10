@@ -2017,9 +2017,11 @@ fn prove_background_gc_runner_reclaims_old_units() {
         .unwrap();
     let vol = env.engine.open_volume("gc-bg").unwrap();
 
-    // The GC runner now deliberately skips full blockmap scans while free
-    // space is plentiful. Reserve enough allocator space to put this test in
-    // the "moderate pressure" band so the runner is expected to scan.
+    // The resident compactor only compacts clearly-dead units
+    // (`compactor_resident_threshold`, 0.85) while free space is plentiful.
+    // Reserve enough allocator space to drop into the "moderate pressure" band
+    // (free% <= 50), where the dead-ratio threshold lowers to 0.50 so this
+    // test's 75%-dead unit qualifies as a compaction candidate.
     let allocator = env.engine.allocator().unwrap();
     let mut _pressure_reservations = Vec::new();
     while allocator.free_block_count() * 100 / allocator.total_block_count() > 50 {
@@ -2044,8 +2046,14 @@ fn prove_background_gc_runner_reclaims_old_units() {
     vol.write(2 * 4096, &overwrite).unwrap();
     wait_for_flush(&env, Duration::from_secs(10));
 
+    // Wait for the background compactor to rewrite the two surviving live
+    // blocks (LBA 0,1) off the 75%-dead unit onto fresh PBAs. Wait on the remap
+    // directly: in Phase 5 an exclusive unit PBA is rc-neutral (rc==0 from the
+    // start with dedup off), so waiting on `refcount == 0` would be vacuous and
+    // not actually wait for GC.
     wait_until(Duration::from_secs(15), || {
-        meta.get_refcount(old_pba).unwrap() == 0
+        meta.get_mapping(&vol_id, Lba(0)).unwrap().map(|m| m.pba) != Some(old_pba)
+            && meta.get_mapping(&vol_id, Lba(1)).unwrap().map(|m| m.pba) != Some(old_pba)
     });
 
     let map0 = meta.get_mapping(&vol_id, Lba(0)).unwrap().unwrap();
