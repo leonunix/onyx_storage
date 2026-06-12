@@ -68,8 +68,15 @@ struct UnitMeta {
     /// the per-LBA PBAs of full-raw extent positions whose remap
     /// was refused.
     accepted_positions: Vec<usize>,
-    fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)>,
-    stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)>,
+    /// Candidate / repair pairs tagged with their unit position so a
+    /// per-LBA seq_guard reject drops them alongside the position. A
+    /// rejected position's mapping was never published — and an
+    /// all-rejected unit's PBA is freed back to the allocator — so
+    /// inserting its (hash → pba) into the candidate cache /
+    /// dedup_index would let a later verify byte-match a free-listed
+    /// PBA and promote a live mapping onto it (premature-free CRC).
+    fresh_dedup_pairs: Vec<(usize, ContentHash, BlockmapValue)>,
+    stale_repairs: Vec<(usize, ContentHash, DedupEntry, DedupEntry)>,
 }
 
 struct PassthroughChunkOutcome {
@@ -189,8 +196,9 @@ impl BufferFlusher {
                 let mut batch_values: Vec<(Lba, BlockmapValue)> =
                     Vec::with_capacity(live_positions.len());
                 let mut seqs: Vec<u64> = Vec::with_capacity(live_positions.len());
-                let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-                let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+                let mut fresh_dedup_pairs: Vec<(usize, ContentHash, BlockmapValue)> = Vec::new();
+                let mut stale_repairs: Vec<(usize, ContentHash, DedupEntry, DedupEntry)> =
+                    Vec::new();
                 let flags = if unit.dedup_skipped {
                     FLAG_DEDUP_SKIPPED
                 } else {
@@ -238,10 +246,11 @@ impl BufferFlusher {
                                 0,
                                 split_full_raw_unit,
                             );
-                            fresh_dedup_pairs.push((hash, blockmap));
+                            fresh_dedup_pairs.push((pos, hash, blockmap));
                             if let Some(repairs) = &unit.dedup_stale_repairs {
                                 if let Some(Some(old_entry)) = repairs.get(pos) {
                                     stale_repairs.push((
+                                        pos,
                                         hash,
                                         *old_entry,
                                         blockmap.to_dedup_entry(),
@@ -391,14 +400,11 @@ impl BufferFlusher {
             }
             if seq_rejected_set.contains(&i) {
                 // Every L2pRemap for this unit was rejected by seq_guard;
-                // the freshly-allocated PBA is unreferenced. Mark the
-                // buffer entry as flushed (a newer commit already owns
-                // the LBAs) and return the PBA to the allocator.
-                if ucd.alloc_blocks == 1 {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
-                } else {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
-                }
+                // the freshly-allocated PBA is unreferenced but its payload
+                // is on LV3 — retire instead of direct-free (see
+                // `retire_rejected_extent`). Mark the buffer entry as
+                // flushed (a newer commit already owns the LBAs).
+                Self::retire_rejected_extent(cleanup_tx, ucd.pba, ucd.alloc_blocks);
                 post_mark_ranges_by_shard
                     .entry(ucd.shard_idx)
                     .or_default()
@@ -420,17 +426,27 @@ impl BufferFlusher {
                     .extend(ucd.unit.seq_lba_ranges.iter().cloned());
                 continue;
             }
-            // Successful commit path. Use `accepted_positions` so
-            // partial seq_guard rejects on full-raw extents release
-            // the per-LBA PBAs of refused positions instead of
-            // leaking them.
+            // Successful commit path. Positions superseded before the
+            // commit (never in any tx) are direct-freed; positions whose
+            // remap was seq_guard-rejected have payload on LV3 and are
+            // retired instead (see `retire_rejected_extent`). Per-LBA
+            // PBAs only exist for raw-split units.
             Self::free_unreferenced_raw_blocks(
                 &ucd.unit,
                 ucd.pba,
-                &um.accepted_positions,
+                &um.live_positions,
                 allocator,
                 "commit_worker_passthrough",
             );
+            if um.accepted_positions.len() != um.live_positions.len()
+                && Self::is_full_raw_unit(&ucd.unit)
+            {
+                let accepted: std::collections::HashSet<usize> =
+                    um.accepted_positions.iter().copied().collect();
+                for &pos in um.live_positions.iter().filter(|p| !accepted.contains(p)) {
+                    Self::retire_rejected_extent(cleanup_tx, Pba(ucd.pba.0 + pos as u64), 1);
+                }
+            }
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
                 .flush_unit_bytes
@@ -1001,6 +1017,13 @@ impl BufferFlusher {
             total_rejects += unit_accepted.iter().filter(|a| !**a).count() as u64;
             if !any_accepted {
                 seq_rejected_indices.push(unit_idx);
+                // The unit's PBA is freed in the post-commit pass; none of
+                // its candidate/repair pairs may reach the caches (see the
+                // UnitMeta field comment).
+                if let Some(um) = unit_metas[unit_idx].as_mut() {
+                    um.fresh_dedup_pairs.clear();
+                    um.stale_repairs.clear();
+                }
             } else if any_rejected {
                 if let Some(um) = unit_metas[unit_idx].as_mut() {
                     let kept: Vec<usize> = um
@@ -1012,6 +1035,12 @@ impl BufferFlusher {
                             unit_accepted.get(k).copied().unwrap_or(true).then_some(pos)
                         })
                         .collect();
+                    let kept_set: std::collections::HashSet<usize> =
+                        kept.iter().copied().collect();
+                    um.fresh_dedup_pairs
+                        .retain(|(pos, _, _)| kept_set.contains(pos));
+                    um.stale_repairs
+                        .retain(|(pos, _, _, _)| kept_set.contains(pos));
                     um.accepted_positions = kept;
                 }
             }
@@ -1036,12 +1065,10 @@ impl BufferFlusher {
         // chunk success.
         for &unit_idx in &non_empty_units {
             if let Some(um) = unit_metas[unit_idx].as_ref() {
-                if !um.fresh_dedup_pairs.is_empty() {
-                    accum_candidate_pairs.extend_from_slice(&um.fresh_dedup_pairs);
-                }
-                if !um.stale_repairs.is_empty() {
-                    accum_stale_repairs.extend_from_slice(&um.stale_repairs);
-                }
+                accum_candidate_pairs
+                    .extend(um.fresh_dedup_pairs.iter().map(|&(_, h, v)| (h, v)));
+                accum_stale_repairs
+                    .extend(um.stale_repairs.iter().map(|&(_, h, old, new)| (h, old, new)));
             }
         }
     }

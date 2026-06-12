@@ -96,10 +96,20 @@ impl BufferFlusher {
 
             // Same-LBA concurrent commits are arbitrated by metadb's
             // per-LBA seq_guard CAS; no onyx-side stripe lock here.
-            let commit = (|| -> OnyxResult<Option<(Vec<usize>, HashMap<Pba, RemapCleanup>)>> {
+            enum UnitDisposition {
+                /// Every position superseded before the commit — the PBA was
+                /// never written into any tx; direct free is safe.
+                Stale,
+                /// Tx committed but every L2pRemap was seq_guard-rejected —
+                /// payload is on LV3; retire instead of direct-free (see
+                /// `retire_rejected_extent`).
+                Rejected,
+                Committed(Vec<usize>, HashMap<Pba, RemapCleanup>),
+            }
+            let commit = (|| -> OnyxResult<UnitDisposition> {
                 let live_positions = Self::live_positions_for_unit(unit, pool)?;
                 if live_positions.is_empty() {
-                    return Ok(None);
+                    return Ok(UnitDisposition::Stale);
                 }
                 let lbas: Vec<Lba> = live_positions
                     .iter()
@@ -125,8 +135,15 @@ impl BufferFlusher {
                     batch_values.push((lbas[i], blockmap));
                     batch_seqs.push(Self::latest_seq_for_lba(&unit.seq_lba_ranges, lbas[i]));
                 }
-                let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-                let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+                // Position-tagged so seq_guard-rejected positions' pairs are
+                // dropped before the candidate/index inserts: a rejected
+                // position's mapping was never published, and for raw-split
+                // units its per-LBA PBA is freed — inserting its (hash → pba)
+                // would let a later verify byte-match a free-listed PBA and
+                // promote a live mapping onto it (premature-free CRC class).
+                let mut fresh_dedup_pairs: Vec<(usize, ContentHash, BlockmapValue)> = Vec::new();
+                let mut stale_repairs: Vec<(usize, ContentHash, DedupEntry, DedupEntry)> =
+                    Vec::new();
                 if !unit.dedup_skipped {
                     if let Some(ref hashes) = unit.block_hashes {
                         fresh_dedup_pairs.reserve(live_positions.len());
@@ -138,10 +155,11 @@ impl BufferFlusher {
                             let blockmap = Self::blockmap_for_unit_position_with_raw_split(
                                 unit, pba, pos, 0, 0, true,
                             );
-                            fresh_dedup_pairs.push((hash, blockmap));
+                            fresh_dedup_pairs.push((pos, hash, blockmap));
                             if let Some(repairs) = &unit.dedup_stale_repairs {
                                 if let Some(Some(old_entry)) = repairs.get(pos) {
                                     stale_repairs.push((
+                                        pos,
                                         hash,
                                         *old_entry,
                                         blockmap.to_dedup_entry(),
@@ -168,44 +186,70 @@ impl BufferFlusher {
                 // metadb seq_guard may reject some L2pRemaps. If every
                 // remap in this unit was rejected, refcount[pba] is 0
                 // and the freshly-allocated PBA is orphaned — surface
-                // that as `Ok(None)` so the outer free path runs.
+                // that so the outer retire path runs.
                 if !accepted.iter().any(|a| *a) {
                     let rejects = accepted.len() as u64;
                     metrics
                         .flush_seq_rejects
                         .fetch_add(rejects, Ordering::Relaxed);
-                    return Ok(None);
+                    return Ok(UnitDisposition::Rejected);
                 }
                 let rejects = accepted.iter().filter(|a| !**a).count() as u64;
                 if rejects > 0 {
                     metrics
                         .flush_seq_rejects
                         .fetch_add(rejects, Ordering::Relaxed);
+                    let accepted_pos: std::collections::HashSet<usize> = live_positions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &pos)| {
+                            accepted.get(i).copied().unwrap_or(false).then_some(pos)
+                        })
+                        .collect();
+                    fresh_dedup_pairs.retain(|(pos, _, _)| accepted_pos.contains(pos));
+                    stale_repairs.retain(|(pos, _, _, _)| accepted_pos.contains(pos));
                 }
+                let fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = fresh_dedup_pairs
+                    .into_iter()
+                    .map(|(_, h, v)| (h, v))
+                    .collect();
+                let stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = stale_repairs
+                    .into_iter()
+                    .map(|(_, h, old, new)| (h, old, new))
+                    .collect();
                 candidate.insert_many(&fresh_dedup_pairs);
                 Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
-                Ok(Some((live_positions, actual_old_pba_meta)))
+                Ok(UnitDisposition::Committed(live_positions, actual_old_pba_meta))
             })();
-            let Some((live_positions, actual_old_pba_meta)) = (match commit {
-                Ok(v) => v,
+            let (live_positions, actual_old_pba_meta) = match commit {
+                Ok(UnitDisposition::Committed(lp, m)) => (lp, m),
                 Err(e) => {
                     allocation.free(allocator)?;
                     Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                     Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
                     return Err(e);
                 }
-            }) else {
-                allocation.free(allocator)?;
-                let mark_start = Instant::now();
-                for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
-                    if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
-                        tracing::warn!(seq, error = %e, "failed to mark stale entry applied");
+                Ok(disposition) => {
+                    match disposition {
+                        UnitDisposition::Stale => allocation.free(allocator)?,
+                        UnitDisposition::Rejected => Self::retire_rejected_extent(
+                            cleanup_tx,
+                            pba,
+                            blocks_needed as u32,
+                        ),
+                        UnitDisposition::Committed(..) => unreachable!(),
                     }
+                    let mark_start = Instant::now();
+                    for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
+                        if let Err(e) = pool.mark_applied(*seq, *lba_start, *lba_count) {
+                            tracing::warn!(seq, error = %e, "failed to mark stale entry applied");
+                        }
+                    }
+                    Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
+                    Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
+                    Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
+                    return Ok(());
                 }
-                Self::record_elapsed(&metrics.flush_writer_mark_flushed_ns, mark_start);
-                Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
-                Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                return Ok(());
             };
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
             Self::free_unreferenced_raw_blocks(unit, pba, &live_positions, allocator, "write_unit");

@@ -380,6 +380,46 @@ impl BufferFlusher {
         }
     }
 
+    /// Route a seq-guard-rejected PBA extent through the unified
+    /// retire → grace → Gate-1 reclaim path instead of a direct free.
+    ///
+    /// A rejected fragment's payload is already on LV3 and its content
+    /// hashes were computed before the commit, so the "never committed ⇒
+    /// nothing can reference it" premise behind `rollback_uncommitted` is
+    /// weaker here than for pre-IO failures: if a `(hash → pba)` pair ever
+    /// leaks past the accepted-filtering (or a dedup verify races the
+    /// reject), a direct free lets the next allocation clobber a byte-range
+    /// something still trusts — the premature-free CRC class. The retire
+    /// path evicts candidate-cache slots, waits out the reclaim grace, and
+    /// re-checks rc==0 at Gate-1, turning any such leak into a visible
+    /// retired-leak instead of corruption. Rejects are rare (a handful per
+    /// hour under overwrite churn), so the grace-delayed space return has
+    /// no hot-path or capacity cost.
+    fn retire_rejected_extent(cleanup_tx: &Sender<CleanupBatch>, pba: Pba, blocks: u32) {
+        let mut cleanup = RemapCleanup::new(
+            BlockmapValue {
+                pba,
+                compression: 0,
+                unit_compressed_size: 0,
+                unit_original_size: 0,
+                unit_lba_count: 0,
+                offset_in_unit: 0,
+                crc32: 0,
+                slot_offset: 0,
+                flags: 0,
+            },
+            blocks,
+        );
+        cleanup.pba_freed = true;
+        if cleanup_tx.send(vec![cleanup]).is_err() {
+            tracing::warn!(
+                pba = pba.0,
+                blocks,
+                "flush: cleanup channel closed; rejected PBA leaked until restart"
+            );
+        }
+    }
+
     fn free_unreferenced_raw_blocks(
         unit: &CompressedUnit,
         base_pba: Pba,

@@ -755,3 +755,219 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
     drop(tx);
     handle.join().unwrap();
 }
+
+#[test]
+fn seq_rejected_packed_slot_keeps_candidate_clean_and_retires_pba() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, cleanup_rx) = unbounded::<CleanupBatch>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    let vol = VolumeId("flush-race".into());
+
+    // The buffer pool believes seq 1 is the latest write for LBA 30, but a
+    // concurrent commit (seq 2) already landed in metadb — the window where
+    // the unit passes the pool staleness gate and metadb's per-LBA
+    // seq_guard rejects every remap in the slot.
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(30), 1, 1);
+    let winner_pba = allocator.allocate_one_for_lane(0).unwrap();
+    let winner_payload = vec![0x22u8; BLOCK_SIZE as usize];
+    let winner = BlockmapValue {
+        pba: winner_pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&winner_payload),
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.atomic_batch_write_packed_with_dedup(
+        &[(vol.clone(), Lba(30), winner)],
+        winner_pba,
+        1,
+        &[],
+        &[2],
+    )
+    .unwrap();
+
+    let payload = vec![0x7Fu8; BLOCK_SIZE as usize];
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
+    let mut unit = make_packed_unit_at(0x7F, 1, 30);
+    unit.block_hashes = Some(vec![hash]);
+    let slot_pba = allocator.allocate_one_for_lane(0).unwrap();
+    let sealed = SealedSlot {
+        pba: slot_pba,
+        data: payload,
+        fragments: vec![crate::packer::packer::SlotFragment {
+            unit,
+            slot_offset: 0,
+        }],
+    };
+
+    let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (post_commit_tx, _post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+    let rejects_before = metrics.flush_seq_rejects.load(Ordering::Relaxed);
+    BufferFlusher::commit_packed_job(
+        super::writer::PackedCommitJob {
+            sealed,
+            shard_idx: 0,
+            buffered_seqs: Vec::new(),
+            buffered_completions: Vec::new(),
+            enqueued_at: Instant::now(),
+        },
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &in_flight,
+        &metrics,
+        &cleanup_tx,
+        &candidate,
+        &done_tx,
+        &post_commit_tx,
+    );
+    assert!(
+        metrics.flush_seq_rejects.load(Ordering::Relaxed) > rejects_before,
+        "test must actually exercise the seq_guard reject path"
+    );
+
+    // The winning mapping is untouched.
+    let mapping = meta.get_mapping(&vol, Lba(30)).unwrap().unwrap();
+    assert_eq!(mapping.pba, winner_pba);
+
+    // Regression for the candidate-cache poisoning premature-free CRC P0:
+    // the rejected fragment's (hash → pba) pair must NOT reach the
+    // candidate cache — a later same-content write would byte-verify
+    // against the slot's still-intact LV3 bytes and promote a live
+    // mapping onto a PBA the allocator can hand out again.
+    assert!(
+        candidate.lookup(&hash).is_none(),
+        "rejected fragment's pair must not poison the candidate cache"
+    );
+
+    // The all-rejected slot PBA is routed through the retire cleanup
+    // channel (candidate evict + grace + Gate-1), not direct-freed.
+    assert!(
+        !allocator.is_free(slot_pba),
+        "all-rejected slot must not return straight to the free list"
+    );
+    let batch = cleanup_rx
+        .try_recv()
+        .expect("all-rejected slot must surface on the retire cleanup channel");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].pba, slot_pba);
+    assert!(batch[0].pba_freed);
+
+    let pba_lifecycle = crate::space::pba_lifecycle::PbaLifecycle::new(
+        allocator.clone(),
+        candidate.clone(),
+        metrics.clone(),
+    );
+    BufferFlusher::cleanup_dead_pbas_batch(&pba_lifecycle, &batch, "test_seq_reject");
+    assert!(allocator.is_retired(slot_pba));
+    assert!(!allocator.is_free(slot_pba));
+}
+
+#[test]
+fn seq_rejected_passthrough_unit_keeps_candidate_clean_and_retires_pba() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let (cleanup_tx, cleanup_rx) = unbounded::<CleanupBatch>();
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    let vol = VolumeId("flush-race".into());
+
+    // Same window as the packed variant: pool says seq 1 is latest, but
+    // metadb already holds seq 2 for the LBA.
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(50), 1, 1);
+    let winner_pba = allocator.allocate_one_for_lane(0).unwrap();
+    let winner_payload = vec![0x22u8; BLOCK_SIZE as usize];
+    let winner = BlockmapValue {
+        pba: winner_pba,
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&winner_payload),
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.atomic_batch_write_packed_with_dedup(
+        &[(vol.clone(), Lba(50), winner)],
+        winner_pba,
+        1,
+        &[],
+        &[2],
+    )
+    .unwrap();
+
+    let payload = vec![0x5Cu8; BLOCK_SIZE as usize];
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&payload);
+    let mut unit = make_packed_unit_at(0x5C, 1, 50);
+    unit.block_hashes = Some(vec![hash]);
+    let unit_pba = allocator.allocate_one_for_lane(0).unwrap();
+
+    let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (post_commit_tx, _post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+    let rejects_before = metrics.flush_seq_rejects.load(Ordering::Relaxed);
+    BufferFlusher::commit_passthrough_job(
+        super::writer::PassthroughCommitJob {
+            vol_id: vol.clone(),
+            units: vec![super::writer::UnitCommitData {
+                shard_idx: 0,
+                unit,
+                pba: unit_pba,
+                alloc_blocks: 1,
+                seqs: vec![1],
+                completion: None,
+            }],
+            enqueued_at: Instant::now(),
+        },
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &in_flight,
+        &metrics,
+        &cleanup_tx,
+        &candidate,
+        std::slice::from_ref(&done_tx),
+        &post_commit_tx,
+        super::writer::TARGET_OPS_PER_COMMIT,
+        1,
+    );
+    assert!(
+        metrics.flush_seq_rejects.load(Ordering::Relaxed) > rejects_before,
+        "test must actually exercise the seq_guard reject path"
+    );
+
+    let mapping = meta.get_mapping(&vol, Lba(50)).unwrap().unwrap();
+    assert_eq!(mapping.pba, winner_pba);
+
+    assert!(
+        candidate.lookup(&hash).is_none(),
+        "rejected unit's pair must not poison the candidate cache"
+    );
+    assert!(
+        !allocator.is_free(unit_pba),
+        "all-rejected unit must not return straight to the free list"
+    );
+    let batch = cleanup_rx
+        .try_recv()
+        .expect("all-rejected unit must surface on the retire cleanup channel");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].pba, unit_pba);
+    assert!(batch[0].pba_freed);
+
+    let pba_lifecycle = crate::space::pba_lifecycle::PbaLifecycle::new(
+        allocator.clone(),
+        candidate.clone(),
+        metrics.clone(),
+    );
+    BufferFlusher::cleanup_dead_pbas_batch(&pba_lifecycle, &batch, "test_seq_reject_pt");
+    assert!(allocator.is_retired(unit_pba));
+    assert!(!allocator.is_free(unit_pba));
+}

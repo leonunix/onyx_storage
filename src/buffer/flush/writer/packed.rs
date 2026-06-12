@@ -60,8 +60,11 @@ impl BufferFlusher {
             // Refcount decrements are re-computed inside the lock by atomic_batch_write_packed.
             let mut batch_values: Vec<(VolumeId, Lba, BlockmapValue)> = Vec::new();
             let mut batch_seqs: Vec<u64> = Vec::new();
-            let mut fresh_dedup_pairs: Vec<(ContentHash, BlockmapValue)> = Vec::new();
-            let mut stale_repairs: Vec<(ContentHash, DedupEntry, DedupEntry)> = Vec::new();
+            // Index-tagged so seq_guard-rejected fragments' pairs are dropped
+            // before the candidate/index inserts — a rejected fragment's
+            // mapping was never published (see commit_worker/packed.rs).
+            let mut fresh_dedup_pairs: Vec<(usize, ContentHash, BlockmapValue)> = Vec::new();
+            let mut stale_repairs: Vec<(usize, ContentHash, DedupEntry, DedupEntry)> = Vec::new();
             let mut total_refcount: u32 = 0;
             let mut all_seq_lba_ranges: Vec<(u64, Lba, u32)> = Vec::new();
             let mut any_discarded = false;
@@ -126,7 +129,9 @@ impl BufferFlusher {
                     if let Some(hashes) = hashes_for_promote {
                         let hash = hashes[pos];
                         if hash != [0u8; 8] {
+                            let batch_idx = batch_values.len() - 1;
                             fresh_dedup_pairs.push((
+                                batch_idx,
                                 hash,
                                 BlockmapValue {
                                     flags: 0,
@@ -136,6 +141,7 @@ impl BufferFlusher {
                             if let Some(repairs) = &unit.dedup_stale_repairs {
                                 if let Some(Some(old_entry)) = repairs.get(pos) {
                                     stale_repairs.push((
+                                        batch_idx,
                                         hash,
                                         *old_entry,
                                         BlockmapValue {
@@ -200,12 +206,17 @@ impl BufferFlusher {
                         metrics
                             .flush_seq_rejects
                             .fetch_add(rejects, Ordering::Relaxed);
+                        fresh_dedup_pairs
+                            .retain(|(idx, _, _)| accepted.get(*idx).copied().unwrap_or(false));
+                        stale_repairs
+                            .retain(|(idx, _, _, _)| accepted.get(*idx).copied().unwrap_or(false));
                     }
-                    // Every L2pRemap rejected → slot refcount stayed at 0;
-                    // the PBA is orphaned and must be returned to the
-                    // allocator before we exit. Treat as a discarded slot.
+                    // Every L2pRemap rejected → slot refcount stayed at 0 and
+                    // nothing references it, but its payload is on LV3 —
+                    // retire instead of direct-free (see
+                    // `retire_rejected_extent`). Treat as a discarded slot.
                     if !accepted.iter().any(|a| *a) {
-                        crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba)?;
+                        Self::retire_rejected_extent(cleanup_tx, sealed.pba, 1);
                         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                         return Ok(PackedSlotCommitOutcome::Discarded);
                     }
@@ -220,8 +231,14 @@ impl BufferFlusher {
             Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
             Ok(PackedSlotCommitOutcome::Committed(PackedSlotCommit {
                 actual_old_pba_meta,
-                fresh_dedup_pairs,
-                stale_repairs,
+                fresh_dedup_pairs: fresh_dedup_pairs
+                    .into_iter()
+                    .map(|(_, h, v)| (h, v))
+                    .collect(),
+                stale_repairs: stale_repairs
+                    .into_iter()
+                    .map(|(_, h, old, new)| (h, old, new))
+                    .collect(),
                 total_refcount,
                 all_seq_lba_ranges,
                 any_discarded,
