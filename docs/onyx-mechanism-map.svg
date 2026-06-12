@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="980" viewBox="0 0 1440 980">
+  <defs>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #172033; }
+      .sub { font: 16px Arial, sans-serif; fill: #526070; }
+      .h { font: 700 17px Arial, sans-serif; fill: #172033; }
+      .t { font: 14px Arial, sans-serif; fill: #273244; }
+      .small { font: 12px Arial, sans-serif; fill: #526070; }
+      .box { fill: #ffffff; stroke: #b8c2d1; stroke-width: 1.4; rx: 8; }
+      .hot { fill: #fff6e7; stroke: #e2a349; }
+      .meta { fill: #edf7ff; stroke: #4f9acb; }
+      .bg { fill: #f3f7ee; stroke: #7aa35a; }
+      .risk { fill: #fff0f0; stroke: #d86969; }
+      .free { fill: #f4f0ff; stroke: #8e77c8; }
+      .line { stroke: #6b7788; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .hotline { stroke: #cc7a1a; stroke-width: 2.4; fill: none; marker-end: url(#arrowHot); }
+      .redline { stroke: #c74444; stroke-width: 2.6; fill: none; marker-end: url(#arrowRed); stroke-dasharray: 7 5; }
+      .dash { stroke-dasharray: 7 5; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7788"/>
+    </marker>
+    <marker id="arrowHot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#cc7a1a"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c74444"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1440" height="980" fill="#f8fafc"/>
+  <text x="44" y="54" class="title">Onyx 当前机制图：写入、去重、PBA 回收</text>
+  <text x="44" y="82" class="sub">橙色是前台可见写入路径，绿色是后台维护，紫色是 allocator 状态，红色是需要收敛的 direct-free 风险边。</text>
+
+  <!-- Hot write path -->
+  <rect x="48" y="130" width="210" height="92" class="box hot"/>
+  <text x="70" y="162" class="h">前台写入</text>
+  <text x="70" y="188" class="t">ZoneWorker</text>
+  <text x="70" y="210" class="small">append LV2 buffer + sync 后 ack</text>
+
+  <rect x="318" y="130" width="240" height="92" class="box hot"/>
+  <text x="340" y="162" class="h">BufferFlusher</text>
+  <text x="340" y="188" class="t">coalesce 连续 LBA</text>
+  <text x="340" y="210" class="small">pending seq 仍由 buffer index 提供 RAW</text>
+
+  <rect x="618" y="116" width="262" height="122" class="box hot"/>
+  <text x="640" y="148" class="h">Dedup hot path</text>
+  <text x="640" y="174" class="t">xxh3_64 hash</text>
+  <text x="640" y="196" class="t">dedup_index / candidate lookup</text>
+  <text x="640" y="218" class="small">ReadPool byte-verify 是 correctness 边界</text>
+
+  <rect x="940" y="116" width="230" height="122" class="box hot"/>
+  <text x="962" y="148" class="h">Miss path</text>
+  <text x="962" y="174" class="t">compress + packer</text>
+  <text x="962" y="196" class="t">LV3 IO 写新 PBA</text>
+  <text x="962" y="218" class="small">失败/未提交时 direct free</text>
+
+  <rect x="1230" y="116" width="170" height="122" class="box meta"/>
+  <text x="1250" y="148" class="h">metadb commit</text>
+  <text x="1250" y="174" class="t">L2P remap</text>
+  <text x="1250" y="196" class="t">DedupPut/repair</text>
+  <text x="1250" y="218" class="small">seq_guard 仲裁同 LBA</text>
+
+  <path d="M258 176 H318" class="hotline"/>
+  <path d="M558 176 H618" class="hotline"/>
+  <path d="M880 176 H940" class="hotline"/>
+  <path d="M1170 176 H1230" class="hotline"/>
+
+  <!-- Hit branch -->
+  <rect x="940" y="286" width="230" height="112" class="box meta"/>
+  <text x="962" y="318" class="h">Hit / Promote</text>
+  <text x="962" y="344" class="t">byte-verified hit remap</text>
+  <text x="962" y="366" class="t">candidate promote 可无 rc guard</text>
+  <text x="962" y="388" class="small">依赖 hazard pin + remove-before-retire</text>
+
+  <path d="M780 238 C820 292 876 330 940 342" class="line"/>
+  <path d="M1170 342 C1210 326 1230 286 1280 238" class="line"/>
+
+  <!-- Metadata truths -->
+  <rect x="54" y="292" width="230" height="138" class="box meta"/>
+  <text x="76" y="324" class="h">metadb: L2P</text>
+  <text x="76" y="350" class="t">volume ordinal + LBA -> BlockmapValue</text>
+  <text x="76" y="372" class="small">含 pba / compression / slot_offset / flags</text>
+  <text x="76" y="396" class="small">l2p_buffer 未 fold 也要参与 reclaim confirm</text>
+
+  <rect x="334" y="292" width="220" height="138" class="box meta"/>
+  <text x="356" y="324" class="h">metadb: refcount</text>
+  <text x="356" y="350" class="t">Phase 5 非传统热路径 rc</text>
+  <text x="356" y="372" class="small">dedup membership / lineage 事件影响</text>
+  <text x="356" y="396" class="small">Gate 1 只接受 rc==0 survivor</text>
+
+  <rect x="604" y="292" width="232" height="138" class="box meta"/>
+  <text x="626" y="324" class="h">dedup_index</text>
+  <text x="626" y="350" class="t">hash8 -> DedupEntry</text>
+  <text x="626" y="372" class="small">verified cache，不是所有首写都持久注册</text>
+  <text x="626" y="396" class="small">scrub / repair / orphan demote 维护</text>
+
+  <rect x="886" y="292" width="234" height="138" class="box meta"/>
+  <text x="908" y="324" class="h">CandidateCache</text>
+  <text x="908" y="350" class="t">RAM-only first occurrence window</text>
+  <text x="908" y="372" class="small">promote 前先 verify</text>
+  <text x="908" y="396" class="small">retire 前 remove_by_pba</text>
+
+  <path d="M1230 216 C1110 272 1020 296 1120 342" class="line dash"/>
+  <path d="M1230 226 C1040 268 780 282 720 292" class="line dash"/>
+
+  <!-- Background scanner -->
+  <rect x="56" y="500" width="276" height="170" class="box bg"/>
+  <text x="78" y="532" class="h">DedupScanner</text>
+  <text x="78" y="560" class="t">1. DEDUP_SKIPPED 补扫</text>
+  <text x="78" y="584" class="t">2. cold-tail warm/remap</text>
+  <text x="78" y="608" class="t">3. dedup_index scrub</text>
+  <text x="78" y="632" class="t">4. orphan reclaim selector</text>
+  <text x="78" y="656" class="small">建议拆模块：职责太多</text>
+
+  <rect x="382" y="500" width="250" height="170" class="box bg"/>
+  <text x="404" y="532" class="h">GC Runner</text>
+  <text x="404" y="560" class="t">rewrite fragmented units</text>
+  <text x="404" y="584" class="t">heat/ref_bitmap refresh</text>
+  <text x="404" y="608" class="t">retired extent reclaim</text>
+  <text x="404" y="632" class="small">free 决策只在 confirm scan 后成立</text>
+
+  <rect x="682" y="500" width="250" height="170" class="box free"/>
+  <text x="704" y="532" class="h">Allocator state</text>
+  <text x="704" y="560" class="t">Free</text>
+  <text x="704" y="584" class="t">AllocatedTransient</text>
+  <text x="704" y="608" class="t">Retired</text>
+  <text x="704" y="632" class="t">ReclaimedFree</text>
+  <text x="704" y="656" class="small">另有 lineage proof direct-free 例外</text>
+
+  <rect x="982" y="500" width="292" height="170" class="box bg"/>
+  <text x="1004" y="532" class="h">GC reclaim gates</text>
+  <text x="1004" y="560" class="t">Gate 1: every PBA rc == 0</text>
+  <text x="1004" y="584" class="t">Hazard wait before scan</text>
+  <text x="1004" y="608" class="t">Gate 2: L2P + l2p_buffer no refs</text>
+  <text x="1004" y="632" class="small">通过后 reclaim_retired_extent</text>
+
+  <path d="M332 585 H382" class="line"/>
+  <path d="M632 585 H682" class="line"/>
+  <path d="M932 585 H982" class="line"/>
+  <path d="M1128 500 C1100 450 980 430 836 410" class="line dash"/>
+  <path d="M1128 500 C1080 454 750 440 554 410" class="line dash"/>
+  <path d="M1128 670 C1040 730 844 730 808 670" class="line"/>
+
+  <!-- Risk lineage -->
+  <rect x="78" y="744" width="320" height="126" class="box risk"/>
+  <text x="100" y="776" class="h">Lineage FreePbas drain</text>
+  <text x="100" y="804" class="t">metadb-proven exclusive/final-zero</text>
+  <text x="100" y="828" class="small">direct free 是 lineage 专用例外</text>
+  <text x="100" y="852" class="small">建议：清 candidate + replay 测试钉住</text>
+
+  <path d="M398 807 C520 760 638 700 744 670" class="redline"/>
+
+  <!-- Legend -->
+  <rect x="1040" y="756" width="312" height="132" class="box"/>
+  <text x="1062" y="788" class="h">图例</text>
+  <rect x="1062" y="808" width="24" height="16" class="hot"/>
+  <text x="1096" y="821" class="small">前台/flush 热路径</text>
+  <rect x="1062" y="834" width="24" height="16" class="bg"/>
+  <text x="1096" y="847" class="small">后台维护路径</text>
+  <rect x="1062" y="860" width="24" height="16" class="risk"/>
+  <text x="1096" y="873" class="small">需要审计收敛的风险边</text>
+</svg>
