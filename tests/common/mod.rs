@@ -110,6 +110,7 @@ impl EngineHarness {
             service: Default::default(),
             ha: Default::default(),
             threading: Default::default(),
+            numa: Default::default(),
         };
 
         let engine = OnyxEngine::open(&config).unwrap();

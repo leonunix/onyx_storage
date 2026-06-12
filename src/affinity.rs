@@ -19,6 +19,11 @@ pub enum ThreadRole {
     /// the per-commit cross-socket bounce of ~0.5–1 ms that the
     /// previous "borrow flusher_writer_cpus" placement paid on v4.
     CommitWorker,
+    /// Post-commit cleanup workers (fixed pool, `hash`-routed like
+    /// CommitWorker). Distinct from `FlusherCleanup` so NUMA partition can
+    /// home them with the commit workers; legacy `[threading]` configs fall
+    /// back to `flusher_cleanup_cpus`.
+    FlusherPostCommit,
     MetadbCheckpoint,
     Background,
 }
@@ -43,10 +48,104 @@ struct CpuSet {
     cpus: Vec<usize>,
 }
 
-static LAYOUT: OnceLock<Option<AffinityLayout>> = OnceLock::new();
+enum LayoutKind {
+    /// Legacy `[threading]` per-role single-CPU pinning.
+    PerRole(AffinityLayout),
+    /// `[numa] mode = "confine"`: every role binds to the same CPU *set*
+    /// (the home node minus reserved cores), keeping scheduler freedom
+    /// inside the node — the in-engine equivalent of
+    /// `numactl --cpunodebind`, but it also covers libublk's per-queue
+    /// threads because the per-thread `bind_current` runs after libublk's
+    /// own affinity call and overrides it.
+    WholeSet(Vec<usize>),
+    /// `[numa] mode = "partition"`: sharded roles bind to their shard's pod
+    /// (one pod per data node), singletons bind to the home pod. Threads
+    /// also set their own memory policy to prefer the pod's node so Tier A
+    /// per-shard allocations first-touch locally.
+    Partition(PartitionTopo),
+}
+
+/// One pod = one NUMA data node's engine CPU pool.
+#[derive(Clone, Debug)]
+pub struct PodCpus {
+    pub node: usize,
+    pub cpus: Vec<usize>,
+}
+
+/// Everything needed to map `(role, ordinal)` → pod under partition mode.
+/// Ordinal conventions (must match the spawn sites):
+/// - per-shard roles pass `shard_idx`
+/// - FlusherDedup/FlusherCompress pass `shard_idx * workers + worker_idx`
+/// - Ublk passes `qid * queue_workers + worker_idx` (queue daemon threads
+///   pass `qid * queue_workers`)
+/// - ReadPool passes `worker_idx`
+#[derive(Clone, Debug)]
+pub struct PartitionTopo {
+    pub pods: Vec<PodCpus>,
+    pub home_pod: usize,
+    pub shards: usize,
+    pub dedup_workers: usize,
+    pub compress_workers: usize,
+    pub queue_workers: usize,
+    pub nr_queues: usize,
+    pub read_pool_workers: usize,
+}
+
+impl PartitionTopo {
+    /// Compute-offload model (2026-06-11, third partition iteration — see
+    /// docs/numa-aware-design.md §field-notes): the front-end (ublk), the
+    /// metadata path (LSN-ordered apply chain), and the shared md devices
+    /// form ONE latency domain that cannot span sockets — every variant
+    /// that split them capped the flush drain at ~13-16k remap/s
+    /// (cross-socket hop per LSN ≈ 70µs ⇒ ~14k ceiling; md fsync 64µs →
+    /// 334-540µs from the far socket; far-socket reads 5-8ms vs 1.65ms).
+    /// The throughput-shaped compute stages (dedup hash/verify, compress)
+    /// work in 128KB units that amortize one cross-socket hop, and they are
+    /// exactly what crowds the home socket under confine (32 threads;
+    /// node0 was 93% busy in the confine baseline) — so they move to the
+    /// non-home pod(s) and everything else stays home.
+    pub fn pod_index(&self, role: ThreadRole, ordinal: usize) -> usize {
+        match role {
+            // Compress is pure streaming CPU over 128KB units — the ideal
+            // offload. Dedup looked similar but is NOT: its hot loop is
+            // pointer-chasing home-socket metadata (cuckoo, candidate
+            // cache, L2P) plus ReadPool verify round-trips, and offloading
+            // it capped the drain at ~15k remap/s while the front-end ran
+            // at 20k (2026-06-11 fourth iteration).
+            ThreadRole::FlusherCompress => {
+                self.non_home_pod(ordinal / self.compress_workers.max(1))
+            }
+            _ => self.home_pod,
+        }
+    }
+
+    /// Spread `idx` across the pods that are NOT home (single-pod topologies
+    /// degenerate to home).
+    fn non_home_pod(&self, idx: usize) -> usize {
+        let others: Vec<usize> = (0..self.pods.len())
+            .filter(|&p| p != self.home_pod)
+            .collect();
+        if others.is_empty() {
+            self.home_pod
+        } else {
+            others[idx % others.len()]
+        }
+    }
+
+    /// Union of all pods' CPUs (the partition-mode "anywhere in the engine"
+    /// set, used by the stray-thread enforcer).
+    pub fn all_cpus(&self) -> Vec<usize> {
+        let mut all: Vec<usize> = self.pods.iter().flat_map(|p| p.cpus.iter().copied()).collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+}
+
+static LAYOUT: OnceLock<Option<LayoutKind>> = OnceLock::new();
 
 pub fn init(config: &ThreadingConfig) {
-    let _ = LAYOUT.set(AffinityLayout::from_config(config));
+    let _ = LAYOUT.set(AffinityLayout::from_config(config).map(LayoutKind::PerRole));
     if config.enabled {
         onyx_metadb::affinity::configure(onyx_metadb::affinity::AffinityConfig {
             wal_cpus: config.metadb_wal_cpus.clone(),
@@ -60,21 +159,58 @@ pub fn init(config: &ThreadingConfig) {
     }
 }
 
+/// Confine-mode layout: all onyx roles bind to `cpus`. metadb threads are
+/// deliberately NOT configured (`onyx_metadb::affinity` stays unset): they
+/// inherit the caller's node-wide mask, which matches the proven
+/// "numactl + threading.enabled=false" profile where metadb runs unpinned
+/// inside the node.
+pub fn init_confine(cpus: Vec<usize>) {
+    let _ = LAYOUT.set(Some(LayoutKind::WholeSet(cpus)));
+}
+
+/// Partition-mode layout (see `PartitionTopo`).
+pub fn init_partition(topo: PartitionTopo) {
+    let _ = LAYOUT.set(Some(LayoutKind::Partition(topo)));
+}
+
 pub fn bind_current(role: ThreadRole, ordinal: usize) {
     let Some(Some(layout)) = LAYOUT.get() else {
         return;
     };
-    let Some(cpu) = layout.cpus_for(role).pick(ordinal) else {
-        return;
+    let result = match layout {
+        LayoutKind::PerRole(layout) => {
+            let Some(cpu) = layout.cpus_for(role).pick(ordinal) else {
+                return;
+            };
+            set_current_cpus(&[cpu])
+        }
+        LayoutKind::WholeSet(cpus) => set_current_cpus(cpus),
+        LayoutKind::Partition(topo) => {
+            let pod = &topo.pods[topo.pod_index(role, ordinal)];
+            // Tier A first-touch locality: this thread's future allocations
+            // prefer its pod's node (spill, never stall, when full).
+            if let Err(err) = crate::numa::set_thread_preferred_node(pod.node) {
+                tracing::warn!(?role, ordinal, node = pod.node, error = %err,
+                    "failed to set thread memory policy");
+            }
+            set_current_cpus(&pod.cpus)
+        }
     };
-    if let Err(err) = set_current_cpu(cpu) {
+    if let Err(err) = result {
         tracing::warn!(
             ?role,
-            cpu,
+            ordinal,
             error = %err,
             "failed to set thread CPU affinity"
         );
     }
+}
+
+/// Bind the *calling* thread to `cpus`. Used by `numa::setup` on the main
+/// thread before any engine thread exists, so every later spawn — including
+/// metadb internals and libublk parents — inherits node confinement.
+pub fn bind_current_thread_to(cpus: &[usize]) -> std::io::Result<()> {
+    set_current_cpus(cpus)
 }
 
 impl AffinityLayout {
@@ -118,6 +254,12 @@ impl AffinityLayout {
                 } else {
                     &self.commit_worker
                 }
+            }
+            ThreadRole::FlusherPostCommit => {
+                // Pre-partition behaviour: post-commit threads shared the
+                // FlusherCleanup role; keep that placement for legacy
+                // configs.
+                &self.flusher_cleanup
             }
             ThreadRole::MetadbCheckpoint => &self.metadb_checkpoint,
             ThreadRole::Background => &self.background,
@@ -163,20 +305,93 @@ impl CpuSet {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn topo2() -> PartitionTopo {
+        PartitionTopo {
+            pods: vec![
+                PodCpus { node: 0, cpus: vec![0, 2, 4, 6] },
+                PodCpus { node: 1, cpus: vec![1, 3, 5, 7] },
+            ],
+            home_pod: 0,
+            shards: 16,
+            dedup_workers: 2,
+            compress_workers: 2,
+            queue_workers: 4,
+            nr_queues: 32,
+            read_pool_workers: 16,
+        }
+    }
+
+    #[test]
+    fn latency_domain_roles_stay_home() {
+        let t = topo2();
+        for ord in [0usize, 7, 8, 15, 31, 127] {
+            assert_eq!(t.pod_index(ThreadRole::FlusherWriter, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::BufferSync, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::FlusherCoalesce, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::FlusherCleanup, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::Ublk, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::ReadPool, ord), 0);
+        }
+    }
+
+    #[test]
+    fn compute_roles_offload_to_non_home() {
+        let t = topo2();
+        // All compress workers land on the non-home pod regardless of shard
+        // (2-node: everything on pod 1); dedup stays home (metadata-coupled).
+        for ord in [0usize, 1, 7 * 2 + 1, 8 * 2, 15 * 2 + 1] {
+            assert_eq!(t.pod_index(ThreadRole::FlusherDedup, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::FlusherCompress, ord), 1);
+        }
+        // Single-pod topology degenerates to home.
+        let mut single = topo2();
+        single.pods.truncate(1);
+        assert_eq!(single.pod_index(ThreadRole::FlusherDedup, 3), 0);
+    }
+
+    #[test]
+    fn partition_singletons_go_home() {
+        let t = topo2();
+        for ord in [0usize, 5, 15] {
+            assert_eq!(t.pod_index(ThreadRole::CommitWorker, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::FlusherPostCommit, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::Background, ord), 0);
+            assert_eq!(t.pod_index(ThreadRole::MetadbCheckpoint, ord), 0);
+        }
+    }
+
+    #[test]
+    fn partition_all_cpus_union() {
+        assert_eq!(topo2().all_cpus(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn set_current_cpu(cpu: usize) -> std::io::Result<()> {
+fn set_current_cpus(cpus: &[usize]) -> std::io::Result<()> {
     // Keep the implementation local and tiny: CPU_SETSIZE is 1024 in glibc,
     // which is plenty for the machines this profile targets.
     const CPU_SETSIZE: usize = 1024;
     const BITS_PER_WORD: usize = 8 * std::mem::size_of::<libc::c_ulong>();
-    let mut set = [0 as libc::c_ulong; CPU_SETSIZE / BITS_PER_WORD];
-    if cpu >= CPU_SETSIZE {
+    if cpus.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("cpu {cpu} >= CPU_SETSIZE {CPU_SETSIZE}"),
+            "empty cpu set",
         ));
     }
-    set[cpu / BITS_PER_WORD] |= (1 as libc::c_ulong) << (cpu % BITS_PER_WORD);
+    let mut set = [0 as libc::c_ulong; CPU_SETSIZE / BITS_PER_WORD];
+    for &cpu in cpus {
+        if cpu >= CPU_SETSIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cpu {cpu} >= CPU_SETSIZE {CPU_SETSIZE}"),
+            ));
+        }
+        set[cpu / BITS_PER_WORD] |= (1 as libc::c_ulong) << (cpu % BITS_PER_WORD);
+    }
     let rc = unsafe {
         libc::sched_setaffinity(
             0,
@@ -192,6 +407,6 @@ fn set_current_cpu(cpu: usize) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_current_cpu(_cpu: usize) -> std::io::Result<()> {
+fn set_current_cpus(_cpus: &[usize]) -> std::io::Result<()> {
     Ok(())
 }

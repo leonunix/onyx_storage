@@ -422,7 +422,7 @@ impl BufferFlusher {
             let h = thread::Builder::new()
                 .name(format!("flusher-post-commit-{}", worker_idx))
                 .spawn(move || {
-                    affinity::bind_current(ThreadRole::FlusherCleanup, worker_idx);
+                    affinity::bind_current(ThreadRole::FlusherPostCommit, worker_idx);
                     Self::post_commit_loop(
                         worker_idx,
                         &rx,

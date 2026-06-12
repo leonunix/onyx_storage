@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = OnyxConfig::load(&cli.config)?;
-    onyx_storage::affinity::init(&config.threading);
+    onyx_storage::numa::setup(&config)?;
 
     match cli.command {
         Command::Start { volume } => {

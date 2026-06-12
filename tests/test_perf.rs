@@ -241,6 +241,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
         service: Default::default(),
         ha: Default::default(),
         threading: Default::default(),
+        numa: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

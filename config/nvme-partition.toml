@@ -1,4 +1,7 @@
-# NUMA single-node profile (Tier 0 fix for the bimodal single-vol throttle).
+# NUMA dual-socket PARTITION profile (design Phase 1, docs/numa-aware-design.md).
+# Cloned from nvme-numa0.toml; the ONLY intended difference is
+# [numa] mode = "partition" + data_nodes — keep the rest in lockstep for
+# clean partition-vs-confine A/B.
 #
 # ROOT CAUSE (verified 2026-05-31): nvme-box NUMA nodes are INTERLEAVED
 # (node0 = even CPUs 0,2,..,94; node1 = odd CPUs 1,3,..,95). Every contiguous
@@ -9,32 +12,23 @@
 # ~100-170 MiB/s, occasionally ~580; run-to-run, steady-within-run). numa_balancing
 # on/off makes no difference -> it is the static scatter, not balancer thrash.
 #
-# THIS PROFILE confines the whole engine to ONE NUMA node via the in-engine
-# `[numa] mode = "confine"` (docs/numa-aware-design.md Phase 0). No numactl
-# prefix needed any more:
+# THIS PROFILE partitions the engine across BOTH NUMA nodes (pod per node):
+# buffer shards 0-7 + their flush lanes + metadb lanes 0-7 on node0,
+# shards 8-15 on node1; control-plane singletons (WAL, txg-sync, commit
+# workers, GC) homed on node0. Tier A per-shard memory first-touches its
+# pod; Tier B caches interleave across both nodes. No numactl prefix:
 #
-#   target/release/onyx-storage -c config/nvme-numa0.toml start -v fio-volume
+#   target/release/onyx-storage -c config/nvme-partition.toml start -v fio-volume
 #
-# Compared to the old "numactl --cpunodebind=0 --membind=0 +
-# threading.enabled=false" recipe this additionally (a) re-binds the libublk
-# per-queue threads that used to ESCAPE numactl to node1, (b) reserves
-# `reserve_cores_per_node` physical cores for the OS/SSH (soaks used to
-# freeze interactive logins by saturating every node-0 core), and (c) prints
-# a startup memory plan and refuses configs whose hot-path (Tier A) memory
-# cannot fit the node (capacity caches spill by policy, not kernel accident).
-#
-# Bind the client (fio) to node-0 cores NOT used by ublk queue threads, or
-# leave it unpinned. NEVER pin fio to all of node1: libublk queue threads
-# live there in legacy setups and time-sharing with them blows up front-end
-# p99 (16ms -> 135ms measured 2026-06-11).
-#
-# Measured baseline under numactl confinement (j16 qd64 4k-32k randwrite,
-# refill_buffers): stable ~1080 MiB/s (1092/1071/1073, ~1% stdev), NEVER
-# stuck -- vs the both-nodes profile's bimodal 113-578. Phase-0 exit gate:
-# this profile must reproduce that baseline within ±5% WITHOUT numactl.
+# A/B discipline (design §4 Phase 1 exit gate): compare against
+# config/nvme-numa0.toml (confine) with >=3 runs per arm; target is
+# partition > confine +40% on the UNCAPPED randwrite throughput recipe
+# (j16 qd64 4k-32k randwrite refill_buffers; confine baseline ~1080 MiB/s).
+# Leave fio unpinned or on reserve cores; NEVER pin fio to all of node1.
 
 [numa]
-mode = "confine"
+mode = "partition"
+data_nodes = [0, 1]
 home_node = 0
 reserve_cores_per_node = 2
 cold_cache_policy = "auto"
@@ -47,11 +41,7 @@ cold_cache_policy = "auto"
 [meta]
 path = "/mnt/onyx-meta/metadb"
 wal_dir = "/mnt/onyx-meta/wal"
-# Shrunk 64G->32G for single-node confinement: the 2026-06-11 2h soaks
-# proved the old 144G budget collapses node0 regardless of mempolicy
-# (PREFERRED spills hot allocations, BIND pays reclaim tax). Tier A 32G +
-# Tier B 32.4G (x1.1 = 71G) leaves ~50G page-cache headroom on the 125G node.
-block_cache_mb = 32768
+block_cache_mb = 32768  # home node hosts all metadata (see nvme-numa0.toml note)
 memtable_budget_mb = 8192
 index_pin_mb = 8192
 lsm_bloom_bits_per_entry = 20
@@ -61,13 +51,27 @@ dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
-# rc==0-gated reclaim (d39b398): without it the legacy referenced_extents
-# reverify scan stalls the TXG fold minutes into any sustained run (the
-# 2026-06-11 "degrades at minute 5" signature). ⚠ Requires a FRESH metadb.
-rc_authoritative_reclaim = true
+# Direct apply stays ON: metadb now lives whole on the home pod (lanes,
+# drain, devices), so the home commit workers applying directly is
+# node-local. (Lane-apply across pods was tried and capped the drain at
+# ~13k remap/s — the LSN-ordered apply chain can't span sockets.)
 commit_direct_apply_enabled = true
+# rc==0-gated reclaim (d39b398): WITHOUT this the legacy referenced_extents
+# full-volume reverify scan holds tree.read() and stalls the TXG fold a few
+# minutes into ANY sustained run — the exact degradation chased through six
+# NUMA variants on 2026-06-11. Requires a FRESH metadb (the soak harness
+# wipes meta.path each run).
+rc_authoritative_reclaim = true
+# Async dedup drainer: cuckoo DedupPut off the commit critical path (15x
+# commit-tail win in the 2026-06-01 A/B); its per-dedup-shard threads bind
+# pod-local under partition.
+dedup_drainer_enabled = false  # bisect 2026-06-11: suspect in the t~6min degradation
 txg_threads_enabled = true
-parallel_l2p_drain_enabled = false
+# Partition requires the parallel drain: the serial fold runs on the
+# home-node txg-sync thread and would re-introduce cross-socket folds for
+# the node1 pod's shards; the parallel workers bind per-shard-pod
+# (metadb affinity::bind_for_l2p_drain).
+parallel_l2p_drain_enabled = false  # bisect: back to baseline metadb flags
 
 [storage]
 data_device = "/dev/md/onyx-lv3"
@@ -84,7 +88,7 @@ capacity_mb = 1048576
 flush_watermark_pct = 80
 group_commit_wait_us = 100
 shards = 16
-max_memory_mb = 16384  # payload cache 32G->16G, see block_cache_mb note
+max_memory_mb = 16384
 volatile_memory_mb = 49152
 staging_queue_entries = 1048576
 sync_batch_max_entries = 131072

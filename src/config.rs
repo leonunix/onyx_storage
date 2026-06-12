@@ -8,7 +8,7 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::gc::config::GcConfig;
 use crate::types::CompressionAlgo;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct OnyxConfig {
     #[serde(default)]
     pub meta: MetaConfig,
@@ -32,6 +32,81 @@ pub struct OnyxConfig {
     pub ha: HaConfig,
     #[serde(default)]
     pub threading: ThreadingConfig,
+    #[serde(default)]
+    pub numa: NumaConfig,
+}
+
+/// NUMA awareness mode (docs/numa-aware-design.md §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NumaMode {
+    /// Legacy behaviour: `[threading]` governs affinity, memory placement is
+    /// the OS default (use external numactl if desired).
+    #[default]
+    Off,
+    /// Single-node confinement implemented in-engine: every role binds to
+    /// `home_node` (minus reserved cores, ublk queue threads included) and
+    /// the process memory policy prefers `home_node`, with Tier B caches
+    /// allowed to spill per `cold_cache_policy`. Replaces the
+    /// "numactl --cpunodebind --membind + threading.enabled=false" recipe.
+    Confine,
+    /// Dual-socket pod partition (design Phase 1). Parsing is accepted so
+    /// configs can be staged, but startup refuses until implemented.
+    Partition,
+}
+
+/// Tier B (capacity cache) placement policy under `mode = "confine"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColdCachePolicy {
+    /// Budget-driven: keep Tier B on the home node when the memory plan
+    /// fits, otherwise let it spill across nodes.
+    #[default]
+    Auto,
+    Home,
+    Interleave,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NumaConfig {
+    #[serde(default)]
+    pub mode: NumaMode,
+    /// Node hosting the control-plane singletons; the confinement target in
+    /// `confine` mode.
+    #[serde(default)]
+    pub home_node: usize,
+    /// Nodes participating in `partition` mode. Empty = all detected nodes.
+    #[serde(default)]
+    pub data_nodes: Vec<usize>,
+    /// Physical cores (both HT siblings) left out of every engine CPU set,
+    /// per node, for the OS / IRQs / interactive shells. The highest-numbered
+    /// cores are reserved; capped so at least one core remains.
+    #[serde(default = "default_numa_reserve_cores")]
+    pub reserve_cores_per_node: usize,
+    #[serde(default)]
+    pub cold_cache_policy: ColdCachePolicy,
+    /// Permit startup even when the memory plan does not fit the home node
+    /// (the kernel will pick what spills — see design §3.5 for why that is
+    /// normally refused).
+    #[serde(default)]
+    pub allow_overcommit: bool,
+}
+
+fn default_numa_reserve_cores() -> usize {
+    2
+}
+
+impl Default for NumaConfig {
+    fn default() -> Self {
+        Self {
+            mode: NumaMode::Off,
+            home_node: 0,
+            data_nodes: Vec::new(),
+            reserve_cores_per_node: default_numa_reserve_cores(),
+            cold_cache_policy: ColdCachePolicy::Auto,
+            allow_overcommit: false,
+        }
+    }
 }
 
 /// What the engine can do given the current configuration.

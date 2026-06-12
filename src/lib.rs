@@ -11,6 +11,7 @@ pub mod types;
 
 pub mod affinity;
 pub mod buffer;
+pub mod numa;
 pub mod compress;
 pub mod dedup;
 pub mod frontend;

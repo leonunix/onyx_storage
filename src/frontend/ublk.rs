@@ -392,9 +392,11 @@ fn spawn_queue_workers(
             thread::Builder::new()
                 .name(format!("ublk-q{qid}-worker-{worker_idx}"))
                 .spawn(move || {
+                    // qid * workers + worker_idx: decodable back to qid for
+                    // NUMA pod routing (a plain sum is lossy).
                     crate::affinity::bind_current(
                         crate::affinity::ThreadRole::Ublk,
-                        qid as usize + worker_idx,
+                        qid as usize * workers + worker_idx,
                     );
                     while let Ok(mut req) = rx.recv() {
                         let worker_start = Instant::now();
@@ -519,7 +521,10 @@ impl OnyxUblkTarget {
         let queue_workers = self.config.queue_workers.max(1);
 
         let q_handler = move |qid: u16, dev: &UblkDev| {
-            crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
+            crate::affinity::bind_current(
+                crate::affinity::ThreadRole::Ublk,
+                qid as usize * queue_workers,
+            );
             let bufs = Rc::new(RefCell::new(dev.alloc_queue_io_bufs()));
             let io_bufs = bufs.clone();
             let queue_thread_bound = Rc::new(Cell::new(false));
@@ -545,7 +550,10 @@ impl OnyxUblkTarget {
             let submit_tx = request_tx.clone();
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 if !queue_thread_bound.get() {
-                    crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
+                    crate::affinity::bind_current(
+                        crate::affinity::ThreadRole::Ublk,
+                        qid as usize * queue_workers,
+                    );
                     queue_thread_bound.set(true);
                 }
 

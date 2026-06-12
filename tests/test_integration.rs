@@ -139,6 +139,7 @@ fn setup_with_all_options(
         service: Default::default(),
         ha: Default::default(),
         threading: Default::default(),
+        numa: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();
