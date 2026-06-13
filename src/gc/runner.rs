@@ -645,14 +645,63 @@ impl GcRunner {
         // entry references any PBA inside it.
         //
         // rc-authoritative mode: refcount counts every live L2P reference, so
-        // Gate-1's `rc==0` is already proof of no reference — the full-volume
+        // a `rc==0` reading is proof of no reference — the full-volume
         // `referenced_extents` reverify scan (which held metadb's per-shard
         // `tree.read()` across the whole volume and stalled the TXG
         // fold/checkpoint → multi-second commit spikes) is unnecessary and
-        // skipped. The grace + hazard barrier above still cover the
+        // skipped. BUT Gate-1 above used the cheap, fold-RACY
+        // `multi_get_refcounts`, which can transiently floor a still-live
+        // rc to a spurious 0 when it straddles a refcount fold's
+        // publish-before-clear window (see metadb `merge_read_or_floor` /
+        // `RcShard::get_consistent`). Freeing on that spurious 0 is the
+        // rc_authoritative premature-free CRC (2026-06-12 r2 soak). So before
+        // the irreversible free, re-read each survivor's rc CONSISTENTLY
+        // (fold-coherent, post-barrier, survivors-only → bounded) and treat a
+        // now-nonzero rc as "still referenced" — leave it retired for a later
+        // cycle. This is the bounded backstop the skipped blockmap scan used
+        // to provide. The grace + hazard barrier above still cover the
         // un-drained-incref / in-flight-promote windows.
         let referenced: Vec<bool> = if meta.rc_authoritative_reclaim() {
-            vec![false; survivors.len()]
+            survivors
+                .iter()
+                .map(|extent| {
+                    let pbas: Vec<crate::types::Pba> = (0..extent.count)
+                        .map(|offset| crate::types::Pba(extent.start.0 + offset as u64))
+                        .collect();
+                    match meta.multi_get_refcounts_consistent(&pbas) {
+                        Ok(refcounts) => {
+                            let still_referenced =
+                                refcounts.into_iter().any(|refcount| refcount != 0);
+                            if still_referenced {
+                                // Gate-1 passed it (raced rc==0) but the
+                                // consistent read caught a live ref → a
+                                // premature free averted.
+                                metrics
+                                    .gc_reclaim_premature_free_averted
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    pba = extent.start.0,
+                                    blocks = extent.count,
+                                    "gc: premature free averted — consistent rc recheck found a \
+                                     live reference the Gate-1 fold-racy read floored to 0"
+                                );
+                            }
+                            still_referenced
+                        }
+                        Err(e) => {
+                            metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                pba = extent.start.0,
+                                blocks = extent.count,
+                                error = %e,
+                                "gc: consistent refcount recheck failed; leaving extent retired"
+                            );
+                            // Conservative: a read error must NOT free the PBA.
+                            true
+                        }
+                    }
+                })
+                .collect()
         } else {
             // Phase-5 fallback: rc is NOT authoritative for L2P references, so
             // ONE batched all-volume L2P scan is required to catch rc-untracked
@@ -1557,5 +1606,133 @@ mod tests {
         let sub = split_refresh_budget(&[0, 1000], &[0, 0], 1000, 4);
         assert_eq!(sub[0], 0, "zero-size volume gets no budget");
         assert!(sub[1] >= 990, "the live volume gets ≈ all of it: {sub:?}");
+    }
+}
+
+// Heavy-setup integration-style unit tests that need a real MetaStore live in
+// their own module so the imports don't leak into the pure-function tests.
+#[cfg(test)]
+mod reclaim_consistency_tests {
+    use super::GcRunner;
+    use crate::config::MetaConfig;
+    use crate::dedup::CandidateCache;
+    use crate::meta::store::MetaStore;
+    use crate::metrics::EngineMetrics;
+    use crate::space::allocator::SpaceAllocator;
+    use crate::space::extent::Extent;
+    use crate::space::pba_lifecycle::PbaLifecycle;
+    use crate::types::Pba;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn rc_auth_meta() -> (tempfile::TempDir, Arc<MetaStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MetaConfig {
+            path: Some(dir.path().to_path_buf()),
+            block_cache_mb: 8,
+            memtable_budget_mb: 0,
+            index_pin_mb: 0,
+            lsm_bloom_bits_per_entry: 10,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            wal_dir: None,
+            dedup_shards: 8,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            rc_authoritative_reclaim: true,
+            ..MetaConfig::default()
+        };
+        let meta = Arc::new(MetaStore::open(&cfg).unwrap());
+        assert!(
+            meta.rc_authoritative_reclaim(),
+            "test requires rc_authoritative mode"
+        );
+        (dir, meta)
+    }
+
+    #[test]
+    fn rc_auth_reclaim_frees_rc_zero_but_never_referenced_extent() {
+        let (_dir, meta) = rc_auth_meta();
+        let allocator = Arc::new(SpaceAllocator::new(4096 * 4096, 0));
+        let metrics = Arc::new(EngineMetrics::default());
+        let candidate = CandidateCache::new(1, 1);
+        let lifecycle = PbaLifecycle::new(allocator.clone(), candidate, metrics.clone());
+
+        // Allocate a run and pick two NON-adjacent PBAs so the retired set
+        // does not coalesce them into one mixed-rc extent.
+        let pbas: Vec<Pba> = (0..6).map(|_| allocator.allocate_one().unwrap()).collect();
+        let q = pbas[0]; // genuinely unreferenced (rc stays 0)
+        let p = pbas[5]; // referenced (rc=2)
+        assert!(p.0 - q.0 >= 2, "q and p must be non-adjacent");
+        meta.set_refcount(p, 2).unwrap();
+        assert_eq!(meta.multi_get_refcounts_consistent(&[q, p]).unwrap(), vec![0, 2]);
+
+        // Retire both into the allocator's retired set (non-adjacent → two
+        // distinct retired extents).
+        assert!(allocator.retire_one(q).unwrap());
+        assert!(allocator.retire_one(p).unwrap());
+        assert!(allocator.is_retired(q) && allocator.is_retired(p));
+
+        let running = AtomicBool::new(true);
+        let reclaimed = GcRunner::reclaim_retired_extents(
+            &metrics,
+            &meta,
+            &allocator,
+            &lifecycle,
+            64,
+            &running,
+            None, // heat_ctx
+            None, // grace: immediate (test)
+        );
+
+        // Q (rc==0) freed via the consistent read; P (rc>0) left retired.
+        assert_eq!(reclaimed, 1, "exactly the rc==0 extent reclaimed");
+        assert!(allocator.is_free(q), "rc==0 retired extent must be reclaimed");
+        assert!(
+            allocator.is_retired(p),
+            "rc>0 extent must NOT be freed under rc_authoritative reclaim"
+        );
+        assert!(
+            !allocator.is_free(p),
+            "referenced PBA must never return to the free list (premature-free CRC)"
+        );
+        assert_eq!(
+            metrics
+                .gc_retired_blocks_reclaimed
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// A retired extent whose every PBA reads rc==0 consistently is freed even
+    /// when the batch mixes shards (multi_get_refcounts_consistent groups by
+    /// shard and takes each shard's fold_lock).
+    #[test]
+    fn rc_auth_reclaim_multi_block_extent_all_zero_is_freed() {
+        let (_dir, meta) = rc_auth_meta();
+        let allocator = Arc::new(SpaceAllocator::new(4096 * 4096, 0));
+        let metrics = Arc::new(EngineMetrics::default());
+        let candidate = CandidateCache::new(1, 1);
+        let lifecycle = PbaLifecycle::new(allocator.clone(), candidate, metrics.clone());
+
+        // A contiguous 4-block extent, all rc==0.
+        let base = allocator.allocate_one().unwrap();
+        for _ in 0..3 {
+            allocator.allocate_one().unwrap();
+        }
+        let extent = Extent {
+            start: base,
+            count: 4,
+        };
+        assert!(allocator.retire_extent(extent).unwrap());
+
+        let running = AtomicBool::new(true);
+        let reclaimed = GcRunner::reclaim_retired_extents(
+            &metrics, &meta, &allocator, &lifecycle, 64, &running, None, None,
+        );
+        assert_eq!(reclaimed, 4);
+        for off in 0..4 {
+            assert!(allocator.is_free(Pba(base.0 + off)));
+        }
     }
 }

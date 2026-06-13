@@ -412,6 +412,15 @@ impl MetaStore {
         self.backend.multi_get_refcounts(pbas)
     }
 
+    /// Fold-consistent refcount read for the GC reclaim path. See
+    /// `MetadbBackend::multi_get_refcounts_consistent`: the plain read can
+    /// transiently floor a live rc to 0 across a refcount fold, which under
+    /// `rc_authoritative_reclaim` would free a still-referenced PBA. The
+    /// irreversible reclaim decision MUST use this.
+    pub fn multi_get_refcounts_consistent(&self, pbas: &[Pba]) -> OnyxResult<Vec<u32>> {
+        self.backend.multi_get_refcounts_consistent(pbas)
+    }
+
     /// Test-only seed; see `MetadbBackend::set_refcount`. Phase 5
     /// removed the per-write refcount path, but several tests need
     /// to prep an existing rc value on a PBA before exercising

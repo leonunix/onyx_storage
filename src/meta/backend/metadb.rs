@@ -630,6 +630,20 @@ impl MetadbBackend {
         Ok(self.db.multi_get_refcount(&pbas)?)
     }
 
+    /// Fold-consistent refcount read (see metadb
+    /// `Db::multi_get_refcount_consistent`). The plain `multi_get_refcounts`
+    /// can transiently read a live PBA's rc as a spurious 0 when it straddles
+    /// a refcount fold's publish-before-clear window. That is harmless for the
+    /// dedup-hit guard (reversible demote-to-miss) but, under
+    /// `rc_authoritative_reclaim`, fatal for the GC reclaim gate: it skips the
+    /// Gate-2 blockmap reverify and frees the PBA on rc==0 alone, so a
+    /// spurious 0 frees a still-referenced PBA → reuse → read CRC. Reclaim
+    /// uses THIS for the irreversible free decision.
+    pub(crate) fn multi_get_refcounts_consistent(&self, pbas: &[Pba]) -> OnyxResult<Vec<u32>> {
+        let pbas: Vec<onyx_metadb::Pba> = pbas.iter().map(|pba| to_metadb_pba(*pba)).collect();
+        Ok(self.db.multi_get_refcount_consistent(&pbas)?)
+    }
+
     /// Test-only refcount seed. Phase 5 removed the per-write refcount
     /// path; production code mutates rc only via lineage events
     /// (PromotionChunk / FreePbas / drop_volume). This helper exists
@@ -1500,6 +1514,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     // giant inline checkpoint. See plan mellow-dazzling-thunder.md.
     cfg.txg_threads_enabled = config.txg_threads_enabled;
     cfg.parallel_l2p_drain_enabled = config.parallel_l2p_drain_enabled;
+    cfg.l2p_drain_chunk_entries = config.l2p_drain_chunk_entries;
     cfg.rc_authoritative_reclaim = config.rc_authoritative_reclaim;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;

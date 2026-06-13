@@ -454,6 +454,16 @@ pub struct EngineMetrics {
     /// has run. With batching this is ~1 per GC cycle (was up to
     /// `MAX_RETIRED_RECLAIM_PER_CYCLE` per cycle, one full scan per extent).
     pub gc_reclaim_blockmap_scans: AtomicU64,
+    /// Tripwire: retired extents that passed the cheap Gate-1 rc==0 filter
+    /// (a plain, fold-racy `multi_get_refcounts`) but were caught still
+    /// referenced by the post-barrier FOLD-CONSISTENT rc recheck under
+    /// `rc_authoritative_reclaim`. Each one is a premature free (→ reuse →
+    /// read CRC) averted: the Gate-1 read had transiently floored a live
+    /// rc to a spurious 0 across a refcount fold's publish-before-clear
+    /// window. Should be small but NONZERO under dedup-heavy load (it firing
+    /// is proof the consistent recheck is load-bearing); a sustained 0 across
+    /// a known-racy workload means the recheck isn't engaging.
+    pub gc_reclaim_premature_free_averted: AtomicU64,
     /// [[no-refcount-hot-path-design]] Phase 5: count of PBAs that
     /// flowed back to the allocator via Lineage GC's `WalOp::FreePbas`
     /// surface, drained by `LineageFreedPbaDrainHandle`. Counts blocks
