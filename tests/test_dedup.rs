@@ -1979,7 +1979,7 @@ fn reclaim_does_not_free_pba_re_referenced_during_hazard_wait() {
     // P's survival can't be a false pass from GC simply never processing
     // anything (both P and Q are scanned together by the one Gate-2 scan).
     let q = allocator.allocate_one().unwrap();
-    assert!(allocator.retire_one(q).unwrap());
+    assert!(allocator.retire_one(q).unwrap() > 0);
 
     // Model the in-flight promote's hazard pin (taken at candidate-lookup,
     // held across the remap commit). With P pinned, GC parks at the pre-scan

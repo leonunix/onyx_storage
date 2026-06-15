@@ -9,7 +9,9 @@ use onyx_storage::compress::codec::create_compressor;
 use onyx_storage::config::{FlushConfig, MetaConfig};
 use onyx_storage::gc::config::GcConfig;
 use onyx_storage::gc::rewriter::rewrite_candidate;
-use onyx_storage::gc::scanner::{scan_gc_candidates, scan_gc_candidates_window, GcCandidate};
+use onyx_storage::gc::scanner::{
+    scan_gc_candidates, scan_gc_candidates_window, GcCandidate, SlotEvacParams,
+};
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::engine::IoEngine;
 use onyx_storage::lifecycle::VolumeLifecycleManager;
@@ -450,8 +452,16 @@ fn gc_rewrite_overwritten_blocks() {
     // Windowed scan (resident compactor path): a window covering the whole
     // volume must surface the SAME candidate and report a nonzero compactable
     // dead-block estimate (the 6 dead members of the old unit).
-    let (win_candidates, dead_estimate) =
-        scan_gc_candidates_window(&env.meta, &vid, Lba(0), 64, 0.25, 100).unwrap();
+    let (win_candidates, dead_estimate, _slot_stats) = scan_gc_candidates_window(
+        &env.meta,
+        &vid,
+        Lba(0),
+        64,
+        0.25,
+        100,
+        onyx_storage::gc::scanner::SlotEvacParams::disabled(),
+    )
+    .unwrap();
     let win = win_candidates
         .iter()
         .find(|c| c.pba == old_pba)
@@ -1455,4 +1465,226 @@ fn heat_refresh_budget_zero_is_noop() {
     assert_eq!(metrics.heat_sweeps_completed.load(Ordering::Relaxed), 0);
     assert_eq!(heat.summary().nonzero_buckets, 0);
     assert_eq!(heat.current_epoch(), 1); // unchanged
+}
+
+// ---------- Slot-aware compaction (slot-evac) selection tests ----------
+//
+// These prove the SELECTION logic only (the rewriter and the retire/free path
+// are unchanged and covered by gc_rewrite_packed_fragment +
+// prove_background_gc_runner_reclaims_old_units). The scanner reads rc via
+// multi_get_refcounts; set_refcount seeds it deterministically. The slot-evac
+// path is driven by the SlotEvacParams.enabled flag passed here directly — the
+// runtime `&& rc_authoritative_reclaim()` gate lives in the GcRunner, not the
+// scanner.
+
+fn slot_evac_meta() -> (tempfile::TempDir, MetaStore) {
+    let dir = tempdir().unwrap();
+    let meta_config = MetaConfig {
+        path: Some(dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        memtable_budget_mb: 0,
+        index_pin_mb: 0,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
+        wal_dir: None,
+        dedup_shards: 8,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
+        ..MetaConfig::default()
+    };
+    let meta = MetaStore::open(&meta_config).unwrap();
+    (dir, meta)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_frag(
+    meta: &MetaStore,
+    vol: &VolumeId,
+    lba: u64,
+    pba: Pba,
+    slot_offset: u16,
+    comp_size: u32,
+    lba_count: u16,
+    offset_in_unit: u16,
+    crc: u32,
+) {
+    meta.put_mapping(
+        vol,
+        Lba(lba),
+        &BlockmapValue {
+            pba,
+            compression: 1,
+            unit_compressed_size: comp_size,
+            // metadb v5 leaf compaction requires unit_original_size == lba_count * 4096.
+            unit_original_size: u32::from(lba_count) * 4096,
+            unit_lba_count: lba_count,
+            offset_in_unit,
+            crc32: crc,
+            slot_offset,
+            flags: 0,
+        },
+    )
+    .unwrap();
+}
+
+fn se_params(max_live: u16) -> SlotEvacParams {
+    SlotEvacParams {
+        enabled: true,
+        max_live,
+        block_size: 4096,
+    }
+}
+
+/// Invisibility fix + happy path: a mostly-byte-dead packed slot pinned by a
+/// single-LBA live fragment is invisible to the legacy path but promoted by
+/// slot-evac when the window sees all live refs (rc == visible).
+#[test]
+fn slot_evac_promotes_single_lba_packed_slot_when_rc_matches() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-se".into());
+    meta.create_blockmap_cf("vol-se").unwrap();
+    let pba = Pba(200);
+    // one live single-LBA fragment, 300 compressed bytes → ~93% byte-dead slot
+    put_frag(&meta, &vol, 0, pba, 0, 300, 1, 0, 0x1111);
+    meta.set_refcount(pba, 1).unwrap();
+
+    // Slot-evac OFF: single-LBA fragment is invisible to compaction.
+    let (cands_off, _de, stats_off) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, SlotEvacParams::disabled())
+            .unwrap();
+    assert!(
+        cands_off.is_empty(),
+        "single-LBA fragment must be invisible when slot-evac is off"
+    );
+    assert_eq!(stats_off.candidates, 0);
+
+    // Slot-evac ON: the slot is promoted (rc==visible==1, byte-dead >= 0.25).
+    let (cands_on, _de2, stats_on) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    assert_eq!(cands_on.len(), 1, "slot-evac promotes the pinning fragment");
+    assert_eq!(cands_on[0].pba, pba);
+    assert_eq!(stats_on.candidates, 1);
+    assert_eq!(stats_on.blocks, 1);
+    assert_eq!(stats_on.incomplete_skips, 0);
+}
+
+/// Completeness gate: if rc(P) > the live refs seen in this window (a sibling
+/// fragment lives elsewhere), the slot is deferred, not evacuated.
+#[test]
+fn slot_evac_defers_when_window_misses_live_siblings() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-se".into());
+    meta.create_blockmap_cf("vol-se").unwrap();
+    let pba = Pba(201);
+    put_frag(&meta, &vol, 0, pba, 0, 300, 1, 0, 0x2222);
+    // rc=3 simulates two live siblings outside this window/volume.
+    meta.set_refcount(pba, 3).unwrap();
+
+    let (cands, _de, stats) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    assert!(cands.is_empty(), "incomplete view must not evacuate");
+    assert_eq!(stats.candidates, 0);
+    assert_eq!(stats.incomplete_skips, 1);
+}
+
+/// ROI gate: a byte-full slot (live data nearly fills the 4 KiB) is not
+/// evacuated even with rc==visible — relocating it would gain ~nothing.
+#[test]
+fn slot_evac_skips_byte_full_slot() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-se".into());
+    meta.create_blockmap_cf("vol-se").unwrap();
+    let pba = Pba(202);
+    // 4000 / 4096 bytes live → only ~2% byte-dead.
+    put_frag(&meta, &vol, 0, pba, 0, 4000, 1, 0, 0x3333);
+    meta.set_refcount(pba, 1).unwrap();
+
+    let (cands, _de, stats) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    assert!(cands.is_empty(), "byte-full slot must not be evacuated");
+    assert_eq!(stats.candidates, 0);
+    // Failed the byte-deadness gate, not the completeness gate.
+    assert_eq!(stats.incomplete_skips, 0);
+}
+
+/// Multi-fragment slot promoted whole, and a fragment that ALSO qualifies under
+/// the per-fragment dead-ratio path is emitted exactly once (dedup).
+#[test]
+fn slot_evac_whole_slot_promote_dedups_against_per_fragment() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-se".into());
+    meta.create_blockmap_cf("vol-se").unwrap();
+    let pba = Pba(203);
+    // Frag A: 4-LBA unit, 1 live → dead_ratio 0.75 (also a per-fragment candidate).
+    put_frag(&meta, &vol, 0, pba, 0, 300, 4, 0, 0xAAAA);
+    // Frag B: single-LBA, 1 live → dead_ratio 0 (per-fragment never picks it).
+    put_frag(&meta, &vol, 10, pba, 300, 200, 1, 0, 0xBBBB);
+    // visible_live = 2, visible_bytes = 500 → ~88% byte-dead.
+    meta.set_refcount(pba, 2).unwrap();
+
+    let (cands, _de, stats) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    assert_eq!(cands.len(), 2, "whole slot promoted, no duplicate fragment");
+    assert_eq!(
+        cands.iter().filter(|c| c.slot_offset == 0).count(),
+        1,
+        "fragment A appears exactly once"
+    );
+    assert_eq!(
+        cands.iter().filter(|c| c.slot_offset == 300).count(),
+        1,
+        "fragment B appears exactly once"
+    );
+    assert_eq!(stats.candidates, 2);
+    assert_eq!(stats.blocks, 2);
+}
+
+/// Whole-slot atomicity: a slot whose fragment count exceeds the remaining
+/// budget is deferred entirely, never partially evacuated (a partial evac never
+/// reaches rc→0, so it would be wasted IO).
+#[test]
+fn slot_evac_does_not_partially_evacuate_a_slot_over_budget() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-se".into());
+    meta.create_blockmap_cf("vol-se").unwrap();
+    let pba = Pba(204);
+    // 3 single-LBA fragments in one byte-sparse slot (300 bytes each → ~78% dead).
+    put_frag(&meta, &vol, 0, pba, 0, 300, 1, 0, 0xC001);
+    put_frag(&meta, &vol, 1, pba, 300, 300, 1, 0, 0xC002);
+    put_frag(&meta, &vol, 2, pba, 600, 300, 1, 0, 0xC003);
+    meta.set_refcount(pba, 3).unwrap();
+
+    // Budget of 2 < the slot's 3 fragments → must NOT partially evacuate.
+    let (cands, _de, stats) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 2, se_params(16)).unwrap();
+    assert!(cands.is_empty(), "a slot is all-or-nothing within the budget");
+    assert_eq!(stats.candidates, 0);
+    // Passed completeness + byte-deadness; only the budget blocked it, so it is
+    // NOT counted as an incomplete skip — it retries next cycle.
+    assert_eq!(stats.incomplete_skips, 0);
+}
+
+/// Cost cap: a slot pinned by more live blocks than `max_live` is not evacuated
+/// (too expensive to relocate), and that is a completeness-distinct skip.
+#[test]
+fn slot_evac_skips_slot_over_max_live() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-se".into());
+    meta.create_blockmap_cf("vol-se").unwrap();
+    let pba = Pba(205);
+    // 3 single-LBA live fragments, byte-sparse slot, rc==visible==3.
+    put_frag(&meta, &vol, 0, pba, 0, 300, 1, 0, 0xD001);
+    put_frag(&meta, &vol, 1, pba, 300, 300, 1, 0, 0xD002);
+    put_frag(&meta, &vol, 2, pba, 600, 300, 1, 0, 0xD003);
+    meta.set_refcount(pba, 3).unwrap();
+
+    // max_live = 2 < 3 live → complete view (rc==visible==3) but too costly →
+    // a COST-CAP skip, NOT a completeness/incomplete skip.
+    let (cands, _de, stats) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(2)).unwrap();
+    assert!(cands.is_empty(), "slot exceeding max_live must not be evacuated");
+    assert_eq!(stats.candidates, 0);
+    assert_eq!(stats.cost_cap_skips, 1, "complete-but-too-costly is a cost-cap skip");
+    assert_eq!(stats.incomplete_skips, 0, "not an incomplete-view skip");
 }

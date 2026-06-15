@@ -449,6 +449,22 @@ pub struct EngineMetrics {
     /// slack accumulating faster than the compactor reclaims it; flat/falling =
     /// the resident compactor is keeping debt bounded.
     pub gc_compactable_dead_blocks: AtomicU64,
+    /// Slot-aware compaction (`compactor_slot_evac_enabled`). `candidates` =
+    /// fragments promoted because their whole packed slot is mostly dead by
+    /// bytes (so the slot can be evacuated and freed); `blocks` = live blocks
+    /// selected for that evacuation (the rewrite cost — pair with
+    /// `gc_retired_blocks_reclaimed` to watch efficiency; rewritten ≫ reclaimed
+    /// means the byte-deadness heuristic is churning); `incomplete_skips` =
+    /// slots that passed the byte-deadness gate but whose window did NOT see all
+    /// of the slot's live references (`rc != visible_live`), so evacuating now
+    /// would be wasted — a large value sizes the Phase-2 sweep-accumulator.
+    /// `cost_cap_skips` is the COMPLEMENT: byte-dead slots seen completely
+    /// (`rc == visible_live`) but pinned by more than `compactor_slot_evac_max_live`
+    /// live blocks — too expensive to relocate; Phase 2 does NOT help these.
+    pub gc_slot_evac_candidates: AtomicU64,
+    pub gc_slot_evac_blocks: AtomicU64,
+    pub gc_slot_evac_incomplete_skips: AtomicU64,
+    pub gc_slot_evac_cost_cap_skips: AtomicU64,
     pub gc_errors: AtomicU64,
     /// Number of batched all-volume L2P scans the retired-extent reclaim path
     /// has run. With batching this is ~1 per GC cycle (was up to
@@ -480,6 +496,29 @@ pub struct EngineMetrics {
     /// deferred here and re-driven with backoff; a non-zero steady value means
     /// space is stuck un-reclaimable. See `space::pba_lifecycle`.
     pub pba_reclaim_stuck: AtomicU64,
+    /// Cumulative blocks newly moved into the allocator's retired set via the
+    /// committed-PBA retire path (`PbaLifecycle::retire_committed`) — the INPUT
+    /// to the GC reclaim Gate. Pair with `gc_retired_blocks_reclaimed` (the
+    /// OUTPUT): if `pba_blocks_retired − gc_retired_blocks_reclaimed` grows
+    /// without bound the reclaim Gate is the bottleneck; if input ≈ output yet
+    /// the device keeps filling, dead PBAs are never reaching retire at all
+    /// (e.g. packed/shared slots staying rc>0 behind a live sibling fragment).
+    /// Excludes the lineage direct-free path (see `gc_lineage_freed_blocks`).
+    pub pba_blocks_retired: AtomicU64,
+    /// Reclaim-stage diagnostics (localize why `gc_retired_blocks_reclaimed`
+    /// lags `pba_blocks_retired`). All per-cycle block counts, re-counted each
+    /// cycle for still-stuck extents, so the RATIO between them is the signal:
+    /// - `gc_reclaim_grace_deferred`: rc==0 blocks held back by the reclaim-age
+    ///   grace (not yet aged). Dominant ⇒ the grace (re-aging when retired
+    ///   extents coalesce) is the bottleneck.
+    /// - `gc_reclaim_rc_rejected`: grace-aged blocks rejected by Gate-1 because a
+    ///   PBA is still referenced (rc>0). Dominant ⇒ rc>0 zombies (e.g. dedup
+    ///   re-reference of a retired PBA) wedge the retired set.
+    /// - `gc_retired_blocks_depth`: gauge of the current full retired-set block
+    ///   count (the live backlog; rising = reclaim losing to retire).
+    pub gc_reclaim_grace_deferred: AtomicU64,
+    pub gc_reclaim_rc_rejected: AtomicU64,
+    pub gc_retired_blocks_depth: AtomicU64,
     /// Adaptive reclaim heat map (observe-only, Stage A). `heat_refresh_cycles`
     /// = GC cycles that ran a heat-refresh step; `heat_refresh_lbas_scanned` =
     /// live blockmap entries walked (≈ budget × cycles, the "no silent

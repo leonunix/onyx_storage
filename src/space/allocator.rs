@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::store::MetaStore;
@@ -14,10 +15,28 @@ const LANE_CACHE_REFILL_SIZE: u32 = 256;
 /// Raw passthrough flushes commonly allocate 4-8 contiguous blocks per unit;
 /// serving those from a lane-local slice avoids hammering the global BTreeSet.
 const LANE_EXTENT_CACHE_REFILL_BLOCKS: u32 = 8192;
+
+/// One original retire operation's age, tracked at retire granularity in the
+/// `retired_age` log so coalescing the `retired_extents` set can never re-age it.
+#[derive(Debug, Clone, Copy)]
+struct RetiredRun {
+    count: u32,
+    retired_at: Instant,
+}
+
 pub struct SpaceAllocator {
     total_blocks: u64,
     free_extents: Mutex<BTreeSet<Extent>>,
+    /// Coalesced retired set — authority for containment/overlap (`is_retired`,
+    /// `overlapping_retired_extent`, `retired_block_count`). NEVER carries age.
     retired_extents: Mutex<BTreeSet<Extent>>,
+    /// Advisory young-age log (start pba → run), holds ONLY entries younger than
+    /// the reclaim grace (time-windowed → memory bounded to grace × retire-rate).
+    /// Gates reclaim eligibility only: a retired sub-range is reclaimable iff it
+    /// is NOT covered by a young entry here. Per-entry `retired_at` is fixed at
+    /// retire time and never refreshed, so coalescing the set above cannot
+    /// re-age it. Lock order: `retired_extents` BEFORE `retired_age`.
+    retired_age: Mutex<BTreeMap<u64, RetiredRun>>,
     hazards: PbaHazards,
     allocated_blocks: AtomicU64,
     free_blocks: AtomicU64,
@@ -62,6 +81,7 @@ impl SpaceAllocator {
             total_blocks,
             free_extents: Mutex::new(free_extents),
             retired_extents: Mutex::new(BTreeSet::new()),
+            retired_age: Mutex::new(BTreeMap::new()),
             hazards: PbaHazards::new(),
             allocated_blocks: AtomicU64::new(0),
             free_blocks: AtomicU64::new(usable_blocks),
@@ -124,6 +144,7 @@ impl SpaceAllocator {
 
         *self.free_extents.lock().unwrap() = free;
         self.retired_extents.lock().unwrap().clear();
+        self.retired_age.lock().unwrap().clear();
         self.clear_lane_caches();
         if let Some(tracker) = &self.alloc_tracker {
             let mut tracker = tracker.lock().unwrap();
@@ -455,11 +476,21 @@ impl SpaceAllocator {
     ///
     /// Retired extents are not allocatable. They become reusable only after
     /// the GC reclaimer re-validates metadata and calls `reclaim_retired_extent`.
-    pub fn retire_one(&self, pba: Pba) -> OnyxResult<bool> {
+    ///
+    /// Returns the number of blocks that NEWLY entered the retired set (0 = the
+    /// extent was already fully retired — idempotent re-retire). Per-block
+    /// idempotency replaces the old caller-side `is_retired(start)` precheck.
+    pub fn retire_one(&self, pba: Pba) -> OnyxResult<u32> {
         self.retire_extent(Extent::single(pba))
     }
 
-    pub fn retire_extent(&self, extent: Extent) -> OnyxResult<bool> {
+    pub fn retire_extent(&self, extent: Extent) -> OnyxResult<u32> {
+        self.retire_extent_at(extent, Instant::now())
+    }
+
+    /// `retire_extent` with an injectable retire timestamp (so age-mechanism
+    /// tests can control settle ages deterministically without sleeping).
+    pub(crate) fn retire_extent_at(&self, extent: Extent, now: Instant) -> OnyxResult<u32> {
         self.validate_extent_shape(extent, "retire_extent")?;
         self.ensure_not_in_lane_cache(extent, "retire_extent")?;
 
@@ -479,13 +510,75 @@ impl SpaceAllocator {
             )));
         }
 
+        // Lock order: retired_extents (set) BEFORE retired_age. Free held across
+        // (outermost) so the overlap check can't race a concurrent free.
         let mut retired = self.retired_extents.lock().unwrap();
-        let before_len = retired.len();
+        // Sub-ranges of `extent` not already covered by the coalesced set = the
+        // genuinely-new blocks. Computed BEFORE coalescing so already-retired
+        // sub-ranges keep their original age (never refreshed).
+        let gaps = Self::uncovered_subranges(&retired, extent);
+        let newly: u32 = gaps.iter().map(|g| g.count).sum();
         Self::coalesce_and_insert_any_overlap(&mut retired, extent);
-        Ok(retired.len() != before_len || retired.contains(&extent))
+        if newly > 0 {
+            let mut age = self.retired_age.lock().unwrap();
+            for g in gaps {
+                age.insert(
+                    g.start.0,
+                    RetiredRun {
+                        count: g.count,
+                        retired_at: now,
+                    },
+                );
+            }
+        }
+        Ok(newly)
     }
 
-    /// Return a snapshot of retired extents for GC verification.
+    /// Sub-ranges of `extent` NOT covered by any extent in the coalesced `set`
+    /// (the genuinely-new portions of a retire). `set` is non-overlapping and
+    /// sorted by start, so this is a single ordered walk.
+    fn uncovered_subranges(set: &BTreeSet<Extent>, extent: Extent) -> Vec<Extent> {
+        let mut gaps = Vec::new();
+        let end = extent.end_pba().0;
+        let mut cursor = extent.start.0;
+        // Predecessor extent that may cover the start.
+        if let Some(before) = set
+            .range(..=Extent::single(extent.start))
+            .next_back()
+            .copied()
+        {
+            if before.end_pba().0 > cursor {
+                cursor = before.end_pba().0.min(end);
+            }
+        }
+        for e in set.range(Extent::single(extent.start)..) {
+            if e.start.0 >= end {
+                break;
+            }
+            if e.start.0 > cursor {
+                let gap_end = e.start.0.min(end);
+                if gap_end > cursor {
+                    gaps.push(Extent::new(Pba(cursor), (gap_end - cursor) as u32));
+                }
+                cursor = gap_end;
+            }
+            let e_end = e.end_pba().0.min(end);
+            if e_end > cursor {
+                cursor = e_end;
+            }
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            gaps.push(Extent::new(Pba(cursor), (end - cursor) as u32));
+        }
+        gaps
+    }
+
+    /// Return a snapshot of ALL coalesced retired extents (audit / accounting
+    /// invariant `allocated >= live + retired`). NOT grace-filtered — use
+    /// [`Self::aged_candidates`] for the reclaim path.
     pub fn retired_candidates(&self, limit: usize) -> Vec<Extent> {
         if limit == 0 {
             return Vec::new();
@@ -497,6 +590,104 @@ impl SpaceAllocator {
             .take(limit)
             .copied()
             .collect()
+    }
+
+    /// Reclaim candidates: retired sub-ranges that have settled ≥ `grace` (i.e.
+    /// are NOT covered by a young `retired_age` entry), emitted as coalesced
+    /// extents (fat where retires were contiguous → throughput) up to a
+    /// `limit_blocks` BLOCK budget (NOT an extent count — a per-extent cap would
+    /// collapse throughput under fragmented retires). Prunes aged-out entries
+    /// from the age log as it scans (the time-window that bounds its memory).
+    /// Every emitted block individually satisfies the grace, so freeing it
+    /// honors the settle-window safety invariant.
+    /// Returns `(candidates, deferred_blocks)` where `deferred_blocks` is the
+    /// total retired-but-still-young block count (held back by the grace) — the
+    /// diagnostic that, vs rc-rejected, localized the re-aging bottleneck.
+    pub fn aged_candidates(
+        &self,
+        limit_blocks: usize,
+        grace: Duration,
+        now: Instant,
+    ) -> (Vec<Extent>, u64) {
+        if limit_blocks == 0 {
+            return (Vec::new(), 0);
+        }
+        let retired = self.retired_extents.lock().unwrap();
+        let mut age = self.retired_age.lock().unwrap();
+        // Time-window: drop entries that have aged past the grace — they no
+        // longer gate anything (their covering retired extent is fully eligible).
+        age.retain(|_, run| now.duration_since(run.retired_at) < grace);
+        let deferred_blocks: u64 = age.values().map(|run| run.count as u64).sum();
+
+        let mut out = Vec::new();
+        let mut emitted: usize = 0;
+        for ext in retired.iter() {
+            if emitted >= limit_blocks {
+                break;
+            }
+            for aged in Self::aged_subranges(&age, *ext) {
+                if emitted >= limit_blocks {
+                    break;
+                }
+                let take = (aged.count as usize).min(limit_blocks - emitted);
+                if take == 0 {
+                    continue;
+                }
+                out.push(Extent::new(aged.start, take as u32));
+                emitted += take;
+            }
+        }
+        (out, deferred_blocks)
+    }
+
+    /// Sub-ranges of coalesced retired extent `ext` NOT covered by any young
+    /// entry in `age` (= the grace-satisfied, reclaimable parts). Same ordered
+    /// walk as [`Self::uncovered_subranges`] but over the age log.
+    fn aged_subranges(age: &BTreeMap<u64, RetiredRun>, ext: Extent) -> Vec<Extent> {
+        let mut aged = Vec::new();
+        let end = ext.end_pba().0;
+        let mut cursor = ext.start.0;
+        if let Some((&ks, run)) = age.range(..=ext.start.0).next_back() {
+            let ke = ks + run.count as u64;
+            if ke > cursor {
+                cursor = ke.min(end);
+            }
+        }
+        for (&ks, run) in age.range(ext.start.0..) {
+            if ks >= end {
+                break;
+            }
+            if ks > cursor {
+                let gap_end = ks.min(end);
+                if gap_end > cursor {
+                    aged.push(Extent::new(Pba(cursor), (gap_end - cursor) as u32));
+                }
+                cursor = gap_end;
+            }
+            let ke = (ks + run.count as u64).min(end);
+            if ke > cursor {
+                cursor = ke;
+            }
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            aged.push(Extent::new(Pba(cursor), (end - cursor) as u32));
+        }
+        aged
+    }
+
+    /// Remove young age-log entries whose start lies within `[ext.start,
+    /// ext.end)`. Aged candidates are carved between young entries so this is
+    /// normally a no-op; kept defensive for the failure/reclaim paths.
+    fn purge_age_range(age: &mut BTreeMap<u64, RetiredRun>, ext: Extent) {
+        let s = ext.start.0;
+        let e = ext.end_pba().0;
+        let keys: Vec<u64> = age.range(s..e).map(|(&k, _)| k).collect();
+        for k in keys {
+            age.remove(&k);
+        }
     }
 
     pub fn is_retired(&self, pba: Pba) -> bool {
@@ -514,15 +705,38 @@ impl SpaceAllocator {
     }
 
     /// Release a retired extent into the free list after GC has proved it is
-    /// no longer referenced by metadata.
+    /// no longer referenced by metadata. `extent` may be a SUB-RANGE of a larger
+    /// coalesced retired extent (the reclaim path frees aged sub-prefixes); the
+    /// covering extent is split and the non-reclaimed remainders kept retired.
     pub fn reclaim_retired_extent(&self, extent: Extent) -> OnyxResult<bool> {
         self.validate_extent_shape(extent, "reclaim_retired_extent")?;
 
         {
             let mut retired = self.retired_extents.lock().unwrap();
-            if !retired.remove(&extent) {
-                return Ok(false);
+            // The candidate must be fully contained in one coalesced retired
+            // extent. Fail closed (Ok(false)) if it is no longer (fully) retired
+            // — a raced reclaim / re-alloc — never free a span we didn't verify.
+            let cover = match Self::covering_extent(&retired, extent.start) {
+                Some(c) if c.end_pba().0 >= extent.end_pba().0 => c,
+                _ => return Ok(false),
+            };
+            retired.remove(&cover);
+            if extent.start.0 > cover.start.0 {
+                retired.insert(Extent::new(
+                    cover.start,
+                    (extent.start.0 - cover.start.0) as u32,
+                ));
             }
+            if cover.end_pba().0 > extent.end_pba().0 {
+                retired.insert(Extent::new(
+                    extent.end_pba(),
+                    (cover.end_pba().0 - extent.end_pba().0) as u32,
+                ));
+            }
+            // Defensive: drop any young age entries inside the reclaimed range
+            // (aged candidates are carved between young entries, so normally none).
+            let mut age = self.retired_age.lock().unwrap();
+            Self::purge_age_range(&mut age, extent);
         }
 
         let result = (|| -> OnyxResult<()> {
@@ -554,7 +768,12 @@ impl SpaceAllocator {
         })();
 
         if result.is_err() {
-            self.retired_extents.lock().unwrap().insert(extent);
+            // Re-insert the extent, COALESCING it back with the split remainders
+            // (plain insert would leave adjacent fragments). The age log is NOT
+            // touched: `extent` was already aged, so it stays immediately
+            // eligible next cycle — no re-aging on the error path.
+            let mut retired = self.retired_extents.lock().unwrap();
+            Self::coalesce_and_insert_any_overlap(&mut retired, extent);
         }
         result.map(|_| true)
     }
@@ -846,5 +1065,143 @@ impl SpaceAllocator {
     fn overlapping_retired_extent(&self, extent: Extent) -> Option<Extent> {
         let retired = self.retired_extents.lock().unwrap();
         Self::overlapping_extent(&retired, extent)
+    }
+}
+
+#[cfg(test)]
+mod age_tests {
+    //! Reclaim-grace age mechanism: the fix for the re-aging bottleneck where a
+    //! contiguous retired region perpetually absorbing fresh neighbors never
+    //! satisfied the grace. Per-original-retire `retired_at` (injected here via
+    //! `retire_extent_at`) is fixed and never refreshed by coalescing.
+    use super::*;
+
+    fn alloc_first(a: &SpaceAllocator, n: usize) -> u64 {
+        let first = a.allocate_one().unwrap();
+        for _ in 1..n {
+            a.allocate_one().unwrap();
+        }
+        first.0
+    }
+
+    fn new_alloc(blocks: u64) -> SpaceAllocator {
+        SpaceAllocator::new(blocks * BLOCK_SIZE as u64, 0)
+    }
+
+    const GRACE: Duration = Duration::from_secs(10);
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    /// HEADLINE: an aged block reclaims even while an adjacent younger block keeps
+    /// arriving — the exact scenario the old coalesced-key grace map starved.
+    #[test]
+    fn no_reaging_under_adjacent_retire() {
+        let a = new_alloc(8192);
+        let n = alloc_first(&a, 2);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::single(Pba(n)), t0).unwrap();
+        a.retire_extent_at(Extent::single(Pba(n + 1)), t0 + secs(5)).unwrap();
+        // t0+11s: N aged (11≥10), N+1 still young (age 6<10).
+        let (cands, deferred) = a.aged_candidates(64, GRACE, t0 + secs(11));
+        assert_eq!(cands, vec![Extent::new(Pba(n), 1)]);
+        assert_eq!(deferred, 1, "young neighbor deferred, NOT re-aging N");
+        // Later both age in and (adjacent) merge into one fat candidate.
+        let (cands2, deferred2) = a.aged_candidates(64, GRACE, t0 + secs(20));
+        assert_eq!(cands2, vec![Extent::new(Pba(n), 2)]);
+        assert_eq!(deferred2, 0);
+    }
+
+    /// Safety: a just-retired block is never a candidate before its grace.
+    #[test]
+    fn young_block_not_emitted_before_grace() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 1);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::single(Pba(n)), t0).unwrap();
+        let (cands, deferred) = a.aged_candidates(64, GRACE, t0 + secs(5));
+        assert!(cands.is_empty());
+        assert_eq!(deferred, 1);
+    }
+
+    /// Idempotent re-retire does not refresh the original age (no re-aging).
+    #[test]
+    fn reretire_does_not_refresh_age() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 1);
+        let t0 = Instant::now();
+        assert_eq!(a.retire_extent_at(Extent::single(Pba(n)), t0).unwrap(), 1);
+        // Re-retire much later → newly==0, and the age must STILL be t0.
+        assert_eq!(
+            a.retire_extent_at(Extent::single(Pba(n)), t0 + secs(8))
+                .unwrap(),
+            0,
+            "already-retired → no new blocks"
+        );
+        assert_eq!(a.retired_block_count(), 1);
+        // At t0+11s it is eligible (age 11≥10). If the re-retire had refreshed to
+        // t0+8s it would still be young (age 3<10) and NOT emitted.
+        let (cands, _) = a.aged_candidates(64, GRACE, t0 + secs(11));
+        assert_eq!(cands, vec![Extent::new(Pba(n), 1)]);
+    }
+
+    /// Partial-overlap retire records only the genuinely-new tail with a newer
+    /// age; the already-retired prefix keeps its original (older) age.
+    #[test]
+    fn partial_overlap_ages_only_new_tail() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 6);
+        let t0 = Instant::now();
+        assert_eq!(a.retire_extent_at(Extent::new(Pba(n), 3), t0).unwrap(), 3);
+        // [N+1,3) overlaps N+1,N+2 (already retired) → only N+3 is new.
+        assert_eq!(
+            a.retire_extent_at(Extent::new(Pba(n + 1), 3), t0 + secs(5))
+                .unwrap(),
+            1
+        );
+        assert_eq!(a.retired_block_count(), 4);
+        // t0+11s: N..N+2 aged (t0), N+3 young (t5, age 6) → emit [N,3] only.
+        let (cands, deferred) = a.aged_candidates(64, GRACE, t0 + secs(11));
+        assert_eq!(cands, vec![Extent::new(Pba(n), 3)]);
+        assert_eq!(deferred, 1);
+    }
+
+    /// Throughput: contiguous aged retires emit as one fat extent, and the budget
+    /// is in BLOCKS (a per-extent cap would collapse throughput).
+    #[test]
+    fn aged_candidates_merge_and_block_budget() {
+        let a = new_alloc(4096);
+        let n = alloc_first(&a, 1000);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::new(Pba(n), 1000), t0).unwrap();
+        // Whole contiguous run as ONE extent.
+        let (cands, _) = a.aged_candidates(10_000, GRACE, t0 + secs(11));
+        assert_eq!(cands, vec![Extent::new(Pba(n), 1000)]);
+        // Block budget truncates to exactly 400 blocks (not 1 extent).
+        let (capped, _) = a.aged_candidates(400, GRACE, t0 + secs(11));
+        assert_eq!(capped, vec![Extent::new(Pba(n), 400)]);
+    }
+
+    /// Sub-extent reclaim splits a coalesced extent: free the aged prefix, keep
+    /// the younger suffix retired.
+    #[test]
+    fn reclaim_splits_coalesced_extent() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 6);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::new(Pba(n), 3), t0).unwrap();
+        a.retire_extent_at(Extent::new(Pba(n + 3), 3), t0 + secs(5))
+            .unwrap(); // adjacent → set coalesces to [N,6]
+        let (cands, _) = a.aged_candidates(64, GRACE, t0 + secs(11));
+        assert_eq!(cands, vec![Extent::new(Pba(n), 3)]);
+        assert!(a.reclaim_retired_extent(Extent::new(Pba(n), 3)).unwrap());
+        for off in 0..3 {
+            assert!(a.is_free(Pba(n + off)), "aged prefix freed");
+        }
+        for off in 3..6 {
+            assert!(a.is_retired(Pba(n + off)), "younger suffix stays retired");
+            assert!(!a.is_free(Pba(n + off)));
+        }
+        assert_eq!(a.retired_block_count(), 3);
     }
 }

@@ -59,6 +59,30 @@ pub struct GcConfig {
     #[serde(default = "default_compactor_scan_max_lbas_per_cycle")]
     pub compactor_scan_max_lbas_per_cycle: u64,
 
+    // --- Slot-aware compaction (evacuate live fragments pinning mostly-dead
+    //     packed slots; the per-fragment dead-ratio path can never free these) ---
+    /// Master switch for slot-aware compaction selection (default FALSE —
+    /// behavior change, A/B before flip). When ON, the compactor scan also
+    /// targets *whole packed 4 KiB slots that are mostly dead by bytes*,
+    /// promoting their few live fragments for rewrite so the slot reaches rc→0 →
+    /// retire → reclaim. The per-fragment dead-ratio path selects the *dead*
+    /// fragment (which frees nothing — the slot is pinned by a live sibling);
+    /// this selects the *live* fragment that actually pins the slot. Selection
+    /// only — the rewriter and the retire/free path are unchanged.
+    ///
+    /// Relies on rc being authoritative (rc(P) == live-LBA count for slot P) to
+    /// cheaply prove a window saw all of a slot's live references, so it is
+    /// inert unless `rc_authoritative_reclaim` is also on (checked at runtime).
+    #[serde(default = "default_compactor_slot_evac_enabled")]
+    pub compactor_slot_evac_enabled: bool,
+    /// Max live blocks a packed slot may hold and still be evacuated (default
+    /// 16). Bounds the rewrite/IO cost paid to free one slot — only slots pinned
+    /// by few live blocks are cheap enough to relocate. The compactor
+    /// additionally clamps this to the per-cycle `rewrite_budget` so a single
+    /// slot can never exceed the budget (whole-slot evacuation is atomic).
+    #[serde(default = "default_compactor_slot_evac_max_live")]
+    pub compactor_slot_evac_max_live: u16,
+
     // --- Adaptive reclaim heat map (Stage A: observe-only) ---
     /// Master switch for the background PBA heat-map refresh (default true).
     /// Observe-only in Stage A: builds the map but changes no reclaim
@@ -177,6 +201,8 @@ impl Default for GcConfig {
             reclaim_grace_secs: default_reclaim_grace_secs(),
             compactor_resident_threshold: default_compactor_resident_threshold(),
             compactor_scan_max_lbas_per_cycle: default_compactor_scan_max_lbas_per_cycle(),
+            compactor_slot_evac_enabled: default_compactor_slot_evac_enabled(),
+            compactor_slot_evac_max_live: default_compactor_slot_evac_max_live(),
             heat_enabled: default_heat_enabled(),
             heat_bucket_size_blocks: default_heat_bucket_size_blocks(),
             heat_refresh_max_lbas_per_cycle: default_heat_refresh_max_lbas_per_cycle(),
@@ -215,13 +241,26 @@ fn default_max_rewrite_per_cycle() -> usize {
     64
 }
 fn default_reclaim_grace_secs() -> u64 {
-    300
+    // 30s settle window. The hazard barrier + Gate-2 fold-consistent rc recheck
+    // are the real premature-free safety; the grace is a belt-and-suspenders
+    // window (the actual race is microseconds). 300s was overkill and, combined
+    // with the old coalesce re-aging, starved reclaim (hardware: grace 300→10
+    // lifted reclaim conversion 0.4%→16.5%, crc=0). The per-original-retire age
+    // log makes any grace value safe from re-aging; 30s keeps a comfortable
+    // margin without holding the retired backlog hostage.
+    30
 }
 fn default_compactor_resident_threshold() -> f64 {
     0.85
 }
 fn default_compactor_scan_max_lbas_per_cycle() -> u64 {
     1_000_000
+}
+fn default_compactor_slot_evac_enabled() -> bool {
+    false
+}
+fn default_compactor_slot_evac_max_live() -> u16 {
+    16
 }
 fn default_heat_enabled() -> bool {
     true

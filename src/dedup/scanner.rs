@@ -1058,8 +1058,7 @@ impl DedupScanner {
         let mut retired = false;
         if meta.get_refcount(pba)? == 0 && !allocator.is_retired(pba) {
             match allocator.retire_one(pba) {
-                Ok(true) => retired = true,
-                Ok(false) => {}
+                Ok(newly) => retired = newly > 0,
                 Err(e) => {
                     tracing::warn!(pba = pba.0, error = %e, "orphan dedup reclaim: retire_one failed");
                 }

@@ -137,9 +137,11 @@ impl PbaLifecycle {
     }
 
     fn retire_committed_inner(&self, reason: &'static str, extent: Extent, prior_attempts: u32) {
-        if self.allocator.is_retired(extent.start) {
-            return;
-        }
+        // No `is_retired(start)` precheck: that `.start`-only proxy would skip a
+        // partially-new extent's tail (→ tail freed before its own grace, and no
+        // age-log entry). `retire_extent` is now idempotent per-block and reports
+        // the newly-retired count, so re-retires are absorbed there.
+        //
         // Candidate eviction MUST precede the allocator handoff so a verifier /
         // promote can never pick up a PBA that is on its way out.
         self.evict_candidates(extent);
@@ -149,16 +151,29 @@ impl PbaLifecycle {
         } else {
             self.allocator.retire_extent(extent)
         };
-        if let Err(e) = retire_result {
-            self.defer_retire(extent, reason, prior_attempts + 1);
-            tracing::warn!(
-                pba = extent.start.0,
-                blocks = extent.count,
-                error = %e,
-                reason,
-                attempts = prior_attempts + 1,
-                "pba_lifecycle: retire failed after metadata commit; deferred for retry"
-            );
+        match retire_result {
+            Ok(newly) => {
+                if newly > 0 {
+                    // Retire INPUT counter: blocks NEWLY entering the retired set
+                    // (the GC reclaim Gate's input). Excludes idempotent re-entries
+                    // (already-retired sub-ranges → newly==0) and the lineage
+                    // direct-free path. Paired with `gc_retired_blocks_reclaimed`.
+                    self.metrics
+                        .pba_blocks_retired
+                        .fetch_add(u64::from(newly), Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                self.defer_retire(extent, reason, prior_attempts + 1);
+                tracing::warn!(
+                    pba = extent.start.0,
+                    blocks = extent.count,
+                    error = %e,
+                    reason,
+                    attempts = prior_attempts + 1,
+                    "pba_lifecycle: retire failed after metadata commit; deferred for retry"
+                );
+            }
         }
     }
 
@@ -383,7 +398,7 @@ mod tests {
 
     #[test]
     fn retire_committed_evicts_candidate_and_retires_live_pba() {
-        let (allocator, candidate, _metrics, lc) = lifecycle();
+        let (allocator, candidate, metrics, lc) = lifecycle();
         let pba = allocator.allocate_one().unwrap();
         let fp: ContentHash = [9, 9, 9, 9, 9, 9, 9, 9];
         candidate.insert(fp, bv(pba));
@@ -391,6 +406,19 @@ mod tests {
         lc.retire_committed("test", Extent::single(pba));
         assert!(!candidate.has_pba(pba), "candidate evicted before retire");
         assert!(allocator.is_retired(pba), "live PBA retired");
+        assert_eq!(
+            metrics.pba_blocks_retired.load(Ordering::Relaxed),
+            1,
+            "retire INPUT counter counts the newly-retired block"
+        );
+
+        // Idempotent re-entry must NOT double-count the retire input.
+        lc.retire_committed("test", Extent::single(pba));
+        assert_eq!(
+            metrics.pba_blocks_retired.load(Ordering::Relaxed),
+            1,
+            "already-retired re-entry must not re-count"
+        );
     }
 
     #[test]
@@ -407,6 +435,11 @@ mod tests {
             "failed retire must be deferred and surfaced on the stuck gauge"
         );
         assert!(!allocator.is_retired(pba));
+        assert_eq!(
+            metrics.pba_blocks_retired.load(Ordering::Relaxed),
+            0,
+            "a deferred (failed) retire must not count as retire input yet"
+        );
 
         // Re-allocate the same lowest PBA so it is live again, then force a
         // retry: the deferred retire now succeeds and the gauge drains.
@@ -415,6 +448,11 @@ mod tests {
         lc.drive_retire_retries_force();
         assert!(allocator.is_retired(pba), "deferred retire retried to success");
         assert_eq!(metrics.pba_reclaim_stuck.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.pba_blocks_retired.load(Ordering::Relaxed),
+            1,
+            "retire input is counted once the deferred retire finally succeeds"
+        );
     }
 
     #[test]

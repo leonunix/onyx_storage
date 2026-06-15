@@ -13,7 +13,7 @@ use crate::gc::config::GcConfig;
 use crate::gc::heatmap::HeatMap;
 use crate::gc::ref_bitmap::RefBitmap;
 use crate::gc::rewriter::rewrite_candidate;
-use crate::gc::scanner::scan_gc_candidates_window;
+use crate::gc::scanner::{scan_gc_candidates_window, SlotEvacParams};
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::{BlockmapValue, FLAG_DEDUP_SKIPPED};
@@ -24,7 +24,11 @@ use crate::space::pba_lifecycle::PbaLifecycle;
 use crate::space::extent::Extent;
 use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 
-const MAX_RETIRED_RECLAIM_PER_CYCLE: usize = 4096;
+/// Per-cycle reclaim budget in BLOCKS (not extents). A per-extent cap collapsed
+/// throughput under fragmented retires once the grace re-aging bug was fixed; a
+/// block budget keeps reclaim able to keep up with the retire rate. Bounded so a
+/// single cycle's Gate-2 fold-consistent rc rechecks (per-PBA) stay cheap.
+const MAX_RETIRED_RECLAIM_BLOCKS_PER_CYCLE: usize = 262_144;
 
 /// Free-space percentage at/below which the resident compactor's `urgency`
 /// reaches full and overrides the idle backoff (compact even under foreground
@@ -168,14 +172,10 @@ impl GcRunner {
     ) {
         let mut compactor_cursor = CompactorCursor::default();
         let mut heat_cursor = HeatCursor::default();
-        // Reclaim-age grace state: first time each retired extent was observed,
-        // so a retired PBA isn't freed until it has settled for
-        // `cfg.reclaim_grace_secs` (closes the premature-free race where an
-        // in-flight / mid-fold reference is transiently invisible to the
-        // reverify). Persists across cycles; pruned each cycle by
-        // `reclaim_retired_extents`.
-        let mut retired_first_seen: std::collections::BTreeMap<Extent, std::time::Instant> =
-            std::collections::BTreeMap::new();
+        // Reclaim-age grace now lives in the allocator's per-original-retire age
+        // log (`aged_candidates`), which is immune to the coalesce re-aging the
+        // old runner-side `retired_first_seen: BTreeMap<Extent, Instant>` map
+        // suffered (a coalesced extent re-keyed → re-aged → starved reclaim).
 
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
@@ -210,13 +210,10 @@ impl GcRunner {
                 meta,
                 allocator,
                 pba_lifecycle,
-                MAX_RETIRED_RECLAIM_PER_CYCLE,
+                MAX_RETIRED_RECLAIM_BLOCKS_PER_CYCLE,
                 running,
                 heat_ctx,
-                Some((
-                    &mut retired_first_seen,
-                    Duration::from_secs(cfg.reclaim_grace_secs),
-                )),
+                Some(Duration::from_secs(cfg.reclaim_grace_secs)),
             );
 
             // Standing background heat-map refresh (observe-only, Stage A):
@@ -292,6 +289,19 @@ impl GcRunner {
             // effort would starve forward progress).
             let rewrite_budget = (cfg.max_rewrite_per_cycle as f64 * effort).ceil() as usize;
 
+            // Slot-aware compaction: inert unless the flag is on AND rc is
+            // authoritative (the completeness check relies on rc(P) == the
+            // slot's live-LBA count). `max_live` is clamped to `rewrite_budget`
+            // so a single slot can never exceed the per-cycle budget.
+            let slot_evac = SlotEvacParams {
+                enabled: cfg.compactor_slot_evac_enabled && meta.rc_authoritative_reclaim(),
+                max_live: std::cmp::min(
+                    cfg.compactor_slot_evac_max_live as usize,
+                    rewrite_budget,
+                ) as u16,
+                block_size: BLOCK_SIZE,
+            };
+
             Self::compactor_step(
                 metrics,
                 meta,
@@ -303,6 +313,7 @@ impl GcRunner {
                 threshold,
                 scan_budget,
                 rewrite_budget,
+                slot_evac,
                 running,
             );
         }
@@ -326,6 +337,7 @@ impl GcRunner {
         threshold: f64,
         scan_budget: u64,
         rewrite_budget: usize,
+        slot_evac: SlotEvacParams,
         running: &AtomicBool,
     ) {
         if scan_budget == 0 || rewrite_budget == 0 {
@@ -386,13 +398,14 @@ impl GcRunner {
             return;
         }
 
-        let (candidates, dead_estimate) = match scan_gc_candidates_window(
+        let (candidates, dead_estimate, slot_stats) = match scan_gc_candidates_window(
             meta,
             &vol.id,
             Lba(phys_start),
             chunk,
             threshold,
             rewrite_budget,
+            slot_evac,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -402,6 +415,26 @@ impl GcRunner {
             }
         };
         cursor.dead_estimate_acc = cursor.dead_estimate_acc.saturating_add(dead_estimate);
+
+        // Slot-aware compaction selection stats (no-op when slot-evac is off).
+        if slot_stats.candidates > 0 {
+            metrics
+                .gc_slot_evac_candidates
+                .fetch_add(slot_stats.candidates, Ordering::Relaxed);
+            metrics
+                .gc_slot_evac_blocks
+                .fetch_add(slot_stats.blocks, Ordering::Relaxed);
+        }
+        if slot_stats.incomplete_skips > 0 {
+            metrics
+                .gc_slot_evac_incomplete_skips
+                .fetch_add(slot_stats.incomplete_skips, Ordering::Relaxed);
+        }
+        if slot_stats.cost_cap_skips > 0 {
+            metrics
+                .gc_slot_evac_cost_cap_skips
+                .fetch_add(slot_stats.cost_cap_skips, Ordering::Relaxed);
+        }
 
         // Sweep odometer: publish the debt estimate once a full sweep completes,
         // then reset for the next sweep.
@@ -452,46 +485,36 @@ impl GcRunner {
         meta: &MetaStore,
         allocator: &SpaceAllocator,
         pba_lifecycle: &PbaLifecycle,
-        limit: usize,
+        limit_blocks: usize,
         running: &AtomicBool,
         heat_ctx: Option<HeatReclaimCtx<'_>>,
-        // Reclaim grace: when `Some((first_seen, grace))` and `grace > 0`, an
-        // extent is only eligible once it has been observed in the retired set
-        // for `>= grace` (first-seen age, tracked across cycles by the caller).
-        // Guarantees the in-flight/mid-fold settle window before the reverify so
-        // a still-landing reference can't be missed → no premature free. `None`
-        // (tests) keeps the legacy immediate behaviour.
-        grace: Option<(&mut std::collections::BTreeMap<Extent, std::time::Instant>, std::time::Duration)>,
+        // Reclaim grace: a retired PBA is only eligible once it has settled in
+        // the retired set for `>= grace`, guaranteeing the in-flight/mid-fold
+        // settle window before the reverify (no premature free). The age is now
+        // tracked per-original-retire in the allocator (`aged_candidates`), so
+        // coalescing the retired set can no longer re-age it (the old
+        // runner-side `BTreeMap<Extent, Instant>` re-aged on every coalesce →
+        // starved reclaim). `None` = immediate (tests).
+        grace: Option<Duration>,
     ) -> usize {
-        let candidates = allocator.retired_candidates(limit);
-        if candidates.is_empty() {
-            return 0;
-        }
+        let grace = grace.unwrap_or(Duration::ZERO);
+        // Backlog gauge: the full retired-set depth (NOT just this cycle's
+        // budget). O(retired extents) under one lock, once per GC cycle — cheap
+        // at the 5 s cadence, and the direct signal for "draining or filling".
+        metrics
+            .gc_retired_blocks_depth
+            .store(allocator.retired_block_count(), Ordering::Relaxed);
 
-        // Apply the reclaim-age grace: record first-seen for new candidates,
-        // prune entries that left the retired set, and keep only those aged past
-        // the grace. A coalesced extent is a new key → it re-ages (conservative,
-        // safe). Skipped entirely when grace is None / 0.
-        let candidates: Vec<Extent> = match grace {
-            Some((first_seen, grace)) if !grace.is_zero() => {
-                let now = std::time::Instant::now();
-                for extent in &candidates {
-                    first_seen.entry(*extent).or_insert(now);
-                }
-                let live: std::collections::BTreeSet<Extent> =
-                    candidates.iter().copied().collect();
-                first_seen.retain(|extent, _| live.contains(extent));
-                candidates
-                    .into_iter()
-                    .filter(|extent| {
-                        first_seen
-                            .get(extent)
-                            .is_some_and(|t| now.duration_since(*t) >= grace)
-                    })
-                    .collect()
-            }
-            _ => candidates,
-        };
+        // Grace-satisfied (settled ≥ grace) retired sub-ranges, block-budgeted.
+        let (candidates, deferred_blocks) =
+            allocator.aged_candidates(limit_blocks, grace, std::time::Instant::now());
+        // Diagnostic: retired-but-still-young blocks held back by the grace. Once
+        // the re-aging fix is in this is small (only the last `grace` window of
+        // retires); its dominance vs `gc_reclaim_rc_rejected` is how the
+        // re-aging bottleneck was localized.
+        metrics
+            .gc_reclaim_grace_deferred
+            .fetch_add(deferred_blocks, Ordering::Relaxed);
         if candidates.is_empty() {
             return 0;
         }
@@ -510,6 +533,14 @@ impl GcRunner {
                 Ok(refcounts) => {
                     if refcounts.into_iter().all(|refcount| refcount == 0) {
                         survivors.push(extent);
+                    } else {
+                        // Diagnostic: grace-aged blocks still rejected because a
+                        // PBA is referenced (rc>0) — e.g. a dedup hit re-referenced
+                        // a retired PBA. High vs `gc_reclaim_grace_deferred` means
+                        // rc>0 zombies (not grace) wedge the retired set.
+                        metrics
+                            .gc_reclaim_rc_rejected
+                            .fetch_add(u64::from(extent.count), Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
@@ -1669,8 +1700,8 @@ mod reclaim_consistency_tests {
 
         // Retire both into the allocator's retired set (non-adjacent → two
         // distinct retired extents).
-        assert!(allocator.retire_one(q).unwrap());
-        assert!(allocator.retire_one(p).unwrap());
+        assert!(allocator.retire_one(q).unwrap() > 0);
+        assert!(allocator.retire_one(p).unwrap() > 0);
         assert!(allocator.is_retired(q) && allocator.is_retired(p));
 
         let running = AtomicBool::new(true);
@@ -1724,7 +1755,7 @@ mod reclaim_consistency_tests {
             start: base,
             count: 4,
         };
-        assert!(allocator.retire_extent(extent).unwrap());
+        assert!(allocator.retire_extent(extent).unwrap() > 0);
 
         let running = AtomicBool::new(true);
         let reclaimed = GcRunner::reclaim_retired_extents(
