@@ -481,11 +481,11 @@ impl ServiceController {
 
     fn socket_loop(
         listener: &UnixListener,
-        shutdown: &AtomicBool,
-        dev_ids: &Mutex<Vec<u32>>,
+        shutdown: &Arc<AtomicBool>,
+        dev_ids: &Arc<Mutex<Vec<u32>>>,
         _socket_path: &Path,
         engine: &Arc<ArcSwap<Option<OnyxEngine>>>,
-        reload_signal: &AtomicBool,
+        reload_signal: &Arc<AtomicBool>,
     ) {
         for stream in listener.incoming() {
             if shutdown.load(Ordering::Relaxed) {
@@ -493,7 +493,25 @@ impl ServiceController {
             }
             match stream {
                 Ok(stream) => {
-                    Self::handle_client(stream, shutdown, dev_ids, engine, reload_signal);
+                    let shutdown = Arc::clone(shutdown);
+                    let dev_ids = Arc::clone(dev_ids);
+                    let engine = Arc::clone(engine);
+                    let reload_signal = Arc::clone(reload_signal);
+                    if let Err(err) =
+                        thread::Builder::new()
+                            .name("ipc-client".into())
+                            .spawn(move || {
+                                Self::handle_client(
+                                    stream,
+                                    &shutdown,
+                                    &dev_ids,
+                                    &engine,
+                                    &reload_signal,
+                                );
+                            })
+                    {
+                        tracing::warn!(error = %err, "failed to spawn IPC client handler");
+                    }
                 }
                 Err(e) => {
                     if shutdown.load(Ordering::Relaxed) {

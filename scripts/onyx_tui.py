@@ -273,28 +273,53 @@ class Sample:
 
 
 class Monitor:
-    def __init__(self, socket_path: pathlib.Path, timeout: float) -> None:
+    def __init__(
+        self,
+        socket_path: pathlib.Path,
+        timeout: float,
+        status_timeout: float,
+        status_interval: float,
+        no_status: bool,
+    ) -> None:
         self.socket_path = socket_path
         self.timeout = timeout
+        self.status_timeout = status_timeout
+        self.status_interval = status_interval
+        self.no_status = no_status
         self.prev: Optional[Sample] = None
         self.cur: Optional[Sample] = None
         self.error: Optional[str] = None
+        self.status_error: Optional[str] = None
+        self.status: dict[str, Any] = {"mode": "status-off"} if no_status else {}
+        self.next_status_poll = 0.0
         self.history: deque[dict[str, float]] = deque(maxlen=120)
 
-    def poll(self) -> None:
+    def poll(self, force_status: bool = False) -> None:
+        now = time.time()
         try:
-            raw_status = send_socket_cmd(self.socket_path, "status-json", self.timeout)
             metrics = send_socket_cmd(self.socket_path, "metrics-json", self.timeout)
         except Exception as exc:
             self.error = str(exc)
             return
-        status = raw_status.get("status", raw_status)
-        if isinstance(status, dict) and "mode" not in status and "mode" in raw_status:
-            status = {**status, "mode": raw_status.get("mode")}
+
+        self.error = None
+        if not self.no_status and (force_status or now >= self.next_status_poll):
+            self.next_status_poll = now + max(0.2, self.status_interval)
+            try:
+                raw_status = send_socket_cmd(self.socket_path, "status-json", self.status_timeout)
+                status = raw_status.get("status", raw_status)
+                if isinstance(status, dict) and "mode" not in status and "mode" in raw_status:
+                    status = {**status, "mode": raw_status.get("mode")}
+                if isinstance(status, dict):
+                    self.status = status
+                    self.status_error = None
+            except Exception as exc:
+                self.status_error = str(exc)
+
         self.error = None
         if self.cur is not None:
             self.prev = self.cur
-        self.cur = Sample(time.time(), status, metrics, read_system_snapshot())
+        self.cur = Sample(now, self.status, metrics, read_system_snapshot())
         self._record_history()
 
     def interval(self) -> float:
@@ -846,13 +871,16 @@ def draw(stdscr: Any, monitor: Monitor, interval: float) -> None:
                     stdscr.addnstr(y, 0, line, width - 1, line_attr)
                 footer = "q quit | r refresh | t dashboard/text | Ctrl-C exit"
                 if monitor.error:
-                    footer += f" | last error: {monitor.error}"
+                    footer += f" | metrics error: {monitor.error}"
+                if monitor.status_error:
+                    footer += f" | status error: {monitor.status_error}"
                 stdscr.addnstr(height - 1, 0, footer, width - 1, curses.A_DIM)
         stdscr.refresh()
         ch = stdscr.getch()
         if ch in (ord("q"), ord("Q")):
             return
         if ch in (ord("r"), ord("R")):
+            monitor.next_status_poll = 0.0
             next_poll = 0.0
         if ch in (ord("t"), ord("T")):
             text_mode = not text_mode
@@ -864,6 +892,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--socket-path")
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=2.0)
+    parser.add_argument(
+        "--status-interval",
+        type=float,
+        default=10.0,
+        help="Seconds between status-json polls; metrics-json still uses --interval",
+    )
+    parser.add_argument(
+        "--status-timeout",
+        type=float,
+        default=0.5,
+        help="Timeout for status-json polls; keep short during performance tests",
+    )
+    parser.add_argument(
+        "--no-status",
+        action="store_true",
+        help="Do not poll status-json/metadb_memory; display metrics-json only",
+    )
     parser.add_argument("--once", action="store_true", help="Print one text snapshot instead of opening curses")
     return parser.parse_args()
 
@@ -872,8 +917,14 @@ def main() -> int:
     args = parse_args()
     config_path = pathlib.Path(args.config)
     socket_path = load_socket_path(config_path, args.socket_path)
-    monitor = Monitor(socket_path, args.timeout)
-    monitor.poll()
+    monitor = Monitor(
+        socket_path,
+        args.timeout,
+        args.status_timeout,
+        args.status_interval,
+        args.no_status,
+    )
+    monitor.poll(force_status=True)
     if args.once:
         time.sleep(max(0.2, args.interval))
         monitor.poll()

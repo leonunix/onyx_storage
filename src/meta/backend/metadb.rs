@@ -1023,20 +1023,24 @@ impl MetadbBackend {
         let ord = self.volume_ordinal(vol_id)?;
         let end = start_lba.0.saturating_add(count);
         let mut decode_error = None;
-        let scan_result =
-            self.db
-                .scan_range_unordered_chunked(ord, start_lba.0, end, BACKGROUND_SCAN_CHUNK_LBAS, |lba, value| {
-                    match decode_l2p_value(value) {
-                        Ok(decoded) => callback(Lba(lba), decoded),
-                        Err(err) => {
-                            decode_error = Some(err);
-                            return Err(onyx_metadb::MetaDbError::Corruption(
-                                "onyx blockmap decode failed".into(),
-                            ));
-                        }
+        let scan_result = self.db.scan_range_unordered_chunked(
+            ord,
+            start_lba.0,
+            end,
+            BACKGROUND_SCAN_CHUNK_LBAS,
+            |lba, value| {
+                match decode_l2p_value(value) {
+                    Ok(decoded) => callback(Lba(lba), decoded),
+                    Err(err) => {
+                        decode_error = Some(err);
+                        return Err(onyx_metadb::MetaDbError::Corruption(
+                            "onyx blockmap decode failed".into(),
+                        ));
                     }
-                    Ok(())
-                });
+                }
+                Ok(())
+            },
+        );
         if let Some(err) = decode_error {
             return Err(err);
         }
@@ -1215,7 +1219,11 @@ impl MetadbBackend {
         &self,
         cursor: onyx_metadb::DedupScanCursor,
         limit: usize,
-    ) -> OnyxResult<(Vec<(ContentHash, DedupEntry)>, onyx_metadb::DedupScanCursor, bool)> {
+    ) -> OnyxResult<(
+        Vec<(ContentHash, DedupEntry)>,
+        onyx_metadb::DedupScanCursor,
+        bool,
+    )> {
         let batch = self.db.scan_dedup_from(cursor, limit)?;
         let entries = batch
             .entries
@@ -1272,13 +1280,13 @@ impl MetadbBackend {
 
     pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         Ok(MetaMemorySnapshot::from_metadb(
-            self.db.last_applied_lsn(),
+            self.db.last_applied_lsn_best_effort(),
             self.db.high_water(),
             self.db.free_list_len() as u64,
-            self.db.dedup_tier_sizes(),
+            self.db.dedup_tier_sizes_best_effort(),
             self.db.cache_stats(),
             self.db.metrics_snapshot(),
-            self.db.pending_state(),
+            self.db.pending_state_best_effort(),
         ))
     }
 
