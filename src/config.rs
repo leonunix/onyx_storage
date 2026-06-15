@@ -534,6 +534,14 @@ pub struct MetaConfig {
     #[serde(default = "default_parallel_l2p_drain_enabled")]
     pub parallel_l2p_drain_enabled: bool,
 
+    /// Bound on buffered entries the TXG syncing-slot drain folds per
+    /// `tree.write()` hold. The one-shot fold parked every commit worker
+    /// (`apply_l2p_remap` takes the same write lock) and dedup/read
+    /// lookup (read lock) on the shard for the fold's full multi-second
+    /// duration. `0` = legacy unbounded hold (A/B fallback). Default 4096.
+    #[serde(default = "default_l2p_drain_chunk_entries")]
+    pub l2p_drain_chunk_entries: usize,
+
     /// Make PBA refcount authoritative for ALL live L2P references so GC
     /// reclaim is a pure `rc==0` check and the full-volume `referenced_extents`
     /// reverify scan (which stalled the TXG fold/checkpoint → multi-second
@@ -645,6 +653,7 @@ impl Default for MetaConfig {
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
             txg_threads_enabled: default_txg_threads_enabled(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
+            l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
             rc_authoritative_reclaim: default_rc_authoritative_reclaim(),
         }
     }
@@ -767,6 +776,13 @@ fn default_parallel_l2p_drain_enabled() -> bool {
     // L2P buffer well under cap). Default OFF; kept behind the flag as a
     // documented dead-end. See memory parallel_l2p_drain_impl.
     false
+}
+fn default_l2p_drain_chunk_entries() -> usize {
+    // Bounded fold lock-holds default-ON (semantics-preserving: same lock,
+    // same op order, same publish-before-clear point). 0 restores the
+    // one-shot hold for A/B. Root-caused 2026-06-12: the unbounded hold
+    // parked all commit workers + dedup lookups for multi-second folds.
+    4096
 }
 fn default_rc_authoritative_reclaim() -> bool {
     // Default OFF (Phase-5 rc-neutral). Turning it on eliminates the reclaim
