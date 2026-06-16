@@ -12,7 +12,7 @@ use onyx_metadb::{
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
-use crate::meta::store::{DedupHitResult, RemapCleanup, SnapshotInfo};
+use crate::meta::store::{DedupHitResult, RemapCleanup, SnapshotInfo, SnapshotRestoreStats};
 use crate::metrics::MetaMemorySnapshot;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
@@ -588,6 +588,30 @@ impl MetadbBackend {
             .insert(new_name.to_string(), new_ordinal);
         catalog.persist(&self.catalog_path)?;
         Ok(new_config)
+    }
+
+    pub(crate) fn restore_snapshot(
+        &self,
+        vol_id: &VolumeId,
+        snap_name: &str,
+    ) -> OnyxResult<SnapshotRestoreStats> {
+        let snapshot_id = {
+            let catalog = self.catalog.lock().unwrap();
+            catalog
+                .find_snapshot(&vol_id.0, snap_name)
+                .ok_or_else(|| {
+                    OnyxError::Config(format!(
+                        "snapshot '{}' not found for volume '{}'",
+                        snap_name, vol_id.0
+                    ))
+                })?
+                .snapshot_id
+        };
+        let report = self.db.restore_volume_to_snapshot(snapshot_id)?;
+        Ok(SnapshotRestoreStats {
+            lbas_remapped: report.lbas_remapped,
+            lbas_deleted: report.lbas_deleted,
+        })
     }
 
     pub(crate) fn get_mapping(

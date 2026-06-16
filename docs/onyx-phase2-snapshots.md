@@ -34,16 +34,30 @@ Gate 1/2. Reuse the exact pattern in `src/engine/lineage.rs::drain_once`. Direct
 re-introduces the premature-free CRC (rc==0 proof does not cover rc-untracked
 packed/multi-LBA L2P sharing).
 
-### Restore has NO metadb primitive — two semantics requested
+### Restore — two semantics, both shipped
 
 1. **Clone-to-new-volume** (`snapshot-clone`): `clone_volume(snap_id)` → register the
    new ordinal under a new volume name in the onyx catalog. Original untouched.
-2. **In-place rollback** (`snapshot-restore`): rewind the *same* volume to the
-   snapshot. Needs a NEW metadb primitive `Db::restore_volume_to_snapshot(vol_ord,
-   snap_id)` (root-swap: incref snapshot shard roots → install as the volume's live
-   roots → decref/retire old live roots, emit freed PBAs, single lifecycle-WAL op).
-   onyx must quiesce the volume first (stop ublk, `purge_volume`, drain flusher).
-   Until the primitive lands, `snapshot-restore` returns `error: not yet implemented`.
+2. **In-place rollback** (`snapshot-restore`): rewind the *same* volume to the snapshot
+   via metadb's `Db::restore_volume_to_snapshot(snap_id)` (`metadb/src/db/snapshot.rs`).
+   A root-swap was rejected: `drop_snapshot` surfaces zero PBAs (Phase 5 hands physical
+   reclaim to the dead-list / lineage GC), so a root-swap would **leak** the diverged
+   data PBAs (live now, never dead-listed). Instead restore = `diff_with_current` →
+   replay the inverse (changed LBAs back to their snapshot value, post-snapshot adds
+   deleted) in **one atomic transaction** through the soaked `commit_ops` remap path;
+   the diverged PBAs dead-list and reclaim exactly like an overwrite. Three subtleties
+   the implementation handles (each has a regression test in `metadb/tests/db_restore.rs`):
+   - **Forced sync before diff**: `diff_with_current` reads the committed `tree.root()`;
+     onyx commits via the *staged* path (tree fold deferred to TXG sync), so restore
+     does `flush_with_gate(Forced)` first or the diff misses the writes and no-ops.
+   - **Seq-strip on the rollback remap**: the snapshot value carries an old commit seq;
+     `seq_guard_rejects` would drop it over a higher-seq overwrite, so restore re-stamps
+     each value with `with_seq(0)` (the guard-bypass sentinel) to apply unconditionally.
+   - **Buffer read-cache invalidation**: a flushed onyx buffer entry stays read-serving
+     until its ring slot is reclaimed; `WriteBufferPool::purge_volume` now clears the
+     volume's `lba_index` unconditionally so post-restore reads fall through to metadb.
+   onyx quiesces the volume first (must be **stopped**: reject if a live handle is open,
+   `purge_volume`, drain the flusher, `sync_durable`).
 
 ## Onyx-side identity model
 
@@ -96,38 +110,17 @@ Per-volume dedup/compress are inherently approximate (dedup is cross-volume glob
 attribute to the volume that issued the write; surface the global numbers as the
 authoritative reduction.
 
-## A4 blueprint — `Db::restore_volume_to_snapshot` (in-place rollback)
+## A4 — `Db::restore_volume_to_snapshot` (in-place rollback): SHIPPED
 
-Status: **designed, not implemented.** onyx plumbing is already in place
-(`engine.restore_snapshot` returns "not yet implemented"; CLI `snapshot-restore`
-and IPC `snapshot-restore` wired). This is a metadb internals change and per
-`metadb/CLAUDE.md` is **soak-gated** (touches snapshot + manifest swap + page
-refcount + lifecycle WAL) — it needs a fault-injection test + hours of standalone
-soak before merge. Do it as its own change, not bundled.
-
-Shape (compose `clone_volume`'s incref half with `drop_snapshot`'s decref half,
-targeting an existing volume's roots — mirror `clone_volume` in `db/volume.rs:432`):
-
-1. `drop_gate.write()` → `flush_with_gate(Forced)` → `txg.enter()` → `apply_gate.write()`
-   (same quiesce sequence as clone/drop, so no concurrent `cow_for_write`).
-2. Under `manifest_state`: resolve snapshot entry (its `l2p_shard_roots`) and the
-   target `VolumeEntry`. Probe-encode the manifest with the volume's roots replaced
-   by the snapshot roots (capacity guard before any irreversible WAL/refcount work).
-3. New `LifecycleOp::RestoreVolume { vol_ord, snap_id, old_roots, new_roots }`;
-   `submit_lifecycle_op` → record LSN → `wait_for_global_apply_turn`.
-4. Apply (idempotent via `page.generation >= lsn`): incref each new (snapshot) root,
-   then decref each old live root subtree, collecting freed leaf values + `freed_pbas`.
-   Reuse `apply_clone_volume_incref` + the `drop_subtree`/decref-cascade machinery.
-5. Manifest swap: install snapshot roots as the volume's `l2p_shard_roots` (write new
-   → manifest commit → free old page chain). Invalidate the affected pids in the page
-   cache and every volume's `PagedL2p` (same sweep as clone).
-6. Return freed PBAs to the adapter; onyx retires them via the existing
-   `engine.retire_freed_pbas` path (already factored out).
-
-onyx side (already factored, just swap the stub body): quiesce the volume first —
-the volume must be **stopped** (no live ublk), `WriteBufferPool::purge_volume`,
-drain the flusher generation — then call `meta.restore_snapshot(...)` and retire the
-returned PBAs. Bump `metrics.snapshot_restore_ops`.
+Implemented as a diff-replay over the soaked `commit_ops` path (see "Restore — two
+semantics, both shipped" above), **not** a root-swap. metadb method
+`restore_volume_to_snapshot(snap_id)` (`metadb/src/db/snapshot.rs`) =
+`flush_with_gate(Forced)` → `diff_with_current` → one transaction of
+`l2p_remap(value.with_seq(0))` / `delete` (chunked at `RESTORE_MAX_OPS_PER_TX=16384`
+for huge diffs). onyx: `MetadbBackend/MetaStore::restore_snapshot` resolve the catalog
+`snapshot_id`; `engine.restore_snapshot` quiesces (reject-if-open + `purge_volume` +
+flusher-idle + `sync_durable`), then restores and bumps `snapshot_restore_ops`. Tests:
+`metadb/tests/db_restore.rs` (7) + `tests/test_engine.rs::full_engine_restore_snapshot_rolls_back`.
 
 ## Dashboard surface (track B)
 

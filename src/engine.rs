@@ -1102,18 +1102,68 @@ impl OnyxEngine {
         })
     }
 
-    /// Restore a volume in place to a named snapshot (destructive rollback).
+    /// Restore a volume in place to a named snapshot (destructive rollback):
+    /// every write made since the snapshot is discarded. Backed by metadb's
+    /// atomic `restore_volume_to_snapshot` (snapshot→current diff replayed
+    /// through the remap path); the diverged PBAs are reclaimed by the usual
+    /// lineage path.
     ///
-    /// Not yet implemented: metadb has no in-place root-swap primitive yet
-    /// (`Db::restore_volume_to_snapshot`). Until it lands, callers who want
-    /// snapshot-state data should `clone_snapshot` into a fresh volume. Tracked
-    /// as Track A4 in docs/onyx-phase2-snapshots.md.
-    pub fn restore_snapshot(&self, _volume: &str, _snap_name: &str) -> OnyxResult<()> {
-        Err(OnyxError::Config(
-            "snapshot restore (in-place rollback) not yet implemented; \
-             use snapshot-clone to materialise the snapshot into a new volume"
-                .into(),
-        ))
+    /// The volume must be **stopped** (no live IO handle) — restore rewrites the
+    /// L2P out from under any reader. The engine quiesces residual buffered
+    /// writes and folds the metadb L2P buffer before diffing.
+    pub fn restore_snapshot(&self, volume: &str, snap_name: &str) -> OnyxResult<()> {
+        if self.has_active_handle(volume) {
+            return Err(OnyxError::Config(format!(
+                "cannot restore volume '{}' while it is open/served — stop it first",
+                volume
+            )));
+        }
+
+        // Quiesce so the snapshot→current diff sees fully-settled state: drop any
+        // residual pending buffer entries, drain in-flight flush work for this
+        // volume, then fold the metadb L2P buffer to disk.
+        if let Some(pool) = &self.buffer_pool {
+            pool.purge_volume(volume)?;
+        }
+        let vol_id = VolumeId(volume.to_string());
+        if let Some(cfg) = self.meta.get_volume(&vol_id)? {
+            if let Some(flusher) = self.flusher.lock().unwrap().as_ref() {
+                flusher.wait_volume_generation_idle(
+                    volume,
+                    cfg.created_at,
+                    std::time::Duration::from_secs(60),
+                );
+            }
+        }
+        self.meta.sync_durable()?;
+
+        let stats = self
+            .lifecycle
+            .with_write_lock(volume, || self.meta.restore_snapshot(&vol_id, snap_name))?;
+
+        self.metrics
+            .snapshot_restore_ops
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            volume,
+            snapshot = snap_name,
+            lbas_remapped = stats.lbas_remapped,
+            lbas_deleted = stats.lbas_deleted,
+            "volume restored to snapshot"
+        );
+        // The restore remaps dead-listed the diverged PBAs; nudge a checkpoint so
+        // lineage GC surfaces them for the drain thread to retire.
+        let _ = self.meta.request_durable_checkpoint();
+        Ok(())
+    }
+
+    /// Whether `name` currently has a live, served IO handle (an `OnyxVolume`
+    /// is open). Restore and other L2P-rewriting ops must refuse while true.
+    fn has_active_handle(&self, name: &str) -> bool {
+        let handles = self.live_handles.lock().unwrap();
+        handles.iter().any(|(vol_name, flag)| {
+            vol_name == name && Arc::strong_count(flag) > 1 && flag.load(Ordering::Acquire)
+        })
     }
 
     /// Retire PBAs surfaced as freed by a snapshot drop. Mirrors the

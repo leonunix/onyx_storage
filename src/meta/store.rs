@@ -87,6 +87,15 @@ pub struct VolumeUsage {
     pub computed_at: u64,
 }
 
+/// Outcome of an in-place snapshot restore: how many LBAs were rolled back.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotRestoreStats {
+    /// LBAs re-pointed back to their snapshot value (overwrites + re-added deletes).
+    pub lbas_remapped: u64,
+    /// LBAs deleted (written after the snapshot, absent in it).
+    pub lbas_deleted: u64,
+}
+
 /// Result for each dedup hit in a batched `atomic_batch_dedup_hits` call.
 #[derive(Debug, Clone, Copy)]
 pub enum DedupHitResult {
@@ -254,6 +263,18 @@ impl MetaStore {
     ) -> OnyxResult<VolumeConfig> {
         self.backend
             .clone_snapshot(vol_id, snap_name, new_name, created_at)
+    }
+
+    /// Restore `vol_id` in place to a named snapshot (destructive rollback).
+    /// Replays the snapshot→current diff through metadb's atomic remap path;
+    /// the caller MUST have quiesced the volume (stopped, buffer drained,
+    /// metadb synced) first. Diverged PBAs are reclaimed by the lineage path.
+    pub fn restore_snapshot(
+        &self,
+        vol_id: &VolumeId,
+        snap_name: &str,
+    ) -> OnyxResult<SnapshotRestoreStats> {
+        self.backend.restore_snapshot(vol_id, snap_name)
     }
 
     pub fn put_mapping(

@@ -1462,12 +1462,19 @@ impl BufferShard {
                 .collect()
         };
 
+        // Drop the volume's resident read-cache (lba_index + latest_lba_seq)
+        // unconditionally — even when nothing is pending. A flushed entry stays
+        // resident (and read-serving) until its ring slot is reclaimed; after an
+        // in-place snapshot restore or a delete, those stale entries must not
+        // keep masking the rewritten metadb L2P. The pending-entry freeing below
+        // still only runs for entries actually in `pending_entries`.
+        self.lba_index.retain(|key, _| &*key.vol_id != vol_id);
+        self.latest_lba_seq.retain(|key, _| &*key.vol_id != vol_id);
+
         if to_purge.is_empty() {
             return Ok(Vec::new());
         }
 
-        self.lba_index.retain(|key, _| &*key.vol_id != vol_id);
-        self.latest_lba_seq.retain(|key, _| &*key.vol_id != vol_id);
         let mut removed_entries = Vec::with_capacity(to_purge.len());
         for (seq, _) in &to_purge {
             if let Some((_, pending)) = self.pending_entries.remove(seq) {

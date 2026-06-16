@@ -12,6 +12,16 @@ use onyx_storage::types::{CompressionAlgo, Lba, VolumeId};
 use serial_test::serial;
 use tempfile::{tempdir, NamedTempFile};
 
+fn wait_for_flush(pool: &WriteBufferPool, timeout_ms: u64) -> bool {
+    for _ in 0..(timeout_ms / 10) {
+        if pool.pending_count() == 0 {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    pool.pending_count() == 0
+}
+
 fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile) {
     let meta_dir = tempdir().unwrap();
     let buf_tmp = NamedTempFile::new().unwrap();
@@ -175,8 +185,8 @@ fn meta_only_snapshot_lifecycle() {
     // Cloning onto an existing volume name fails.
     assert!(engine.clone_snapshot("vol-a", "snap1", "vol-clone").is_err());
 
-    // Restore is not yet implemented (Track A4).
-    assert!(engine.restore_snapshot("vol-a", "snap1").is_err());
+    // Restore of an unchanged volume to its snapshot is a successful no-op.
+    engine.restore_snapshot("vol-a", "snap1").unwrap();
 
     // Drop the snapshot; the live clone is unaffected.
     engine.delete_snapshot("vol-a", "snap1").unwrap();
@@ -313,6 +323,73 @@ fn shutdown_drains_pending_flush_retries_before_exit() {
     );
     let reopened_vol = reopened.open_volume("vol-shutdown-drain").unwrap();
     assert_eq!(reopened_vol.read(0, 4096).unwrap(), data);
+}
+
+#[test]
+fn full_engine_restore_snapshot_rolls_back() {
+    let (mut config, _md, _bf, _df) = make_config();
+    config.dedup.enabled = false;
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-restore", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+
+    // Snapshot-era content: LBAs 0..8 = pattern A.
+    let pat_a = |i: u64| vec![0x10 + i as u8; 4096];
+    {
+        let vol = engine.open_volume("vol-restore").unwrap();
+        for i in 0u64..8 {
+            vol.write(i * 4096, &pat_a(i)).unwrap();
+        }
+    }
+    assert!(
+        wait_for_flush(&engine.buffer_pool().unwrap(), 5000),
+        "flush before snapshot"
+    );
+    engine.create_snapshot("vol-restore", "s1").unwrap();
+
+    // Diverge: overwrite 0..4, add new LBAs 8..12.
+    {
+        let vol = engine.open_volume("vol-restore").unwrap();
+        for i in 0u64..4 {
+            vol.write(i * 4096, &vec![0xF0 + i as u8; 4096]).unwrap();
+        }
+        for i in 8u64..12 {
+            vol.write(i * 4096, &vec![0xC0 + i as u8; 4096]).unwrap();
+        }
+    }
+    assert!(
+        wait_for_flush(&engine.buffer_pool().unwrap(), 5000),
+        "flush before restore"
+    );
+
+    // Volume handle dropped above => not active; restore in place.
+    engine.restore_snapshot("vol-restore", "s1").unwrap();
+
+    // Restoring while the volume is open/served must be refused.
+    {
+        let _open = engine.open_volume("vol-restore").unwrap();
+        assert!(engine.restore_snapshot("vol-restore", "s1").is_err());
+    }
+
+    // Reopen the engine so the read comes straight from durable metadb/LV3,
+    // with no in-memory buffer state in play.
+    engine.shutdown().unwrap();
+    drop(engine);
+    let engine = OnyxEngine::open(&config).unwrap();
+    let vol = engine.open_volume("vol-restore").unwrap();
+    // Overwrites reverted + untouched snapshot LBAs intact.
+    for i in 0u64..8 {
+        assert_eq!(vol.read(i * 4096, 4096).unwrap(), pat_a(i), "lba {i} restored");
+    }
+    // Post-snapshot adds are gone (unmapped => zero-filled).
+    for i in 8u64..12 {
+        assert_eq!(
+            vol.read(i * 4096, 4096).unwrap(),
+            vec![0u8; 4096],
+            "post-snapshot lba {i} removed"
+        );
+    }
 }
 
 #[test]
