@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::Sender;
@@ -205,6 +205,12 @@ impl GcRunner {
                 None
             };
 
+            // Per-phase cycle timing (debug-level): reclaim vs heat vs compactor.
+            // This is what localized the reclaim-latency runaway (per-extent
+            // metadb verification + per-extent retire/free lock contention) to
+            // `reclaim_ms`; kept at debug for regression diagnosis. GC cadence is
+            // ~5s+ so even at debug the volume is low.
+            let t_reclaim = Instant::now();
             Self::reclaim_retired_extents(
                 metrics,
                 meta,
@@ -215,12 +221,14 @@ impl GcRunner {
                 heat_ctx,
                 Some(Duration::from_secs(cfg.reclaim_grace_secs)),
             );
+            let reclaim_ms = t_reclaim.elapsed().as_millis();
 
             // Standing background heat-map refresh (observe-only, Stage A):
             // a bounded, lock-free-per-chunk slow scan that accumulates a
             // per-PBA-region live-mapping count. Runs even when rewrite GC is
             // disabled and even when reclaim found nothing — it is decoupled
             // from reclaim having work. Front-end IO never pays for it.
+            let t_heat = Instant::now();
             if cfg.heat_enabled && cfg.heat_refresh_max_lbas_per_cycle > 0 {
                 // Stage-4 fold: when `cold_tx` is wired (fold enabled), the
                 // heat walk also emits cold candidates for the dedup scanner,
@@ -241,7 +249,14 @@ impl GcRunner {
                 );
             }
 
+            let heat_ms = t_heat.elapsed().as_millis();
+
             if !cfg.enabled || cfg.compactor_scan_max_lbas_per_cycle == 0 {
+                tracing::debug!(
+                    cycle, reclaim_ms, heat_ms, compactor_ms = 0u128,
+                    depth = allocator.retired_block_count(),
+                    "gc cycle timing (compactor skipped)"
+                );
                 continue; // GC off, or compactor kill-switch (reclaim+heat above still run)
             }
 
@@ -277,6 +292,11 @@ impl GcRunner {
                 // Busy AND plenty of space → idle the compactor; cursor untouched
                 // so it resumes exactly where it left off when load drops.
                 metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    cycle, reclaim_ms, heat_ms, compactor_ms = 0u128, effort,
+                    depth = allocator.retired_block_count(),
+                    "gc cycle timing (compactor idled)"
+                );
                 continue;
             }
 
@@ -302,6 +322,7 @@ impl GcRunner {
                 block_size: BLOCK_SIZE,
             };
 
+            let t_comp = Instant::now();
             Self::compactor_step(
                 metrics,
                 meta,
@@ -315,6 +336,13 @@ impl GcRunner {
                 rewrite_budget,
                 slot_evac,
                 running,
+            );
+            tracing::debug!(
+                cycle, reclaim_ms, heat_ms,
+                compactor_ms = t_comp.elapsed().as_millis(),
+                effort, scan_budget, rewrite_budget,
+                depth = allocator.retired_block_count(),
+                "gc cycle timing"
             );
         }
     }
@@ -506,6 +534,7 @@ impl GcRunner {
             .store(allocator.retired_block_count(), Ordering::Relaxed);
 
         // Grace-satisfied (settled ≥ grace) retired sub-ranges, block-budgeted.
+        let t_select = Instant::now();
         let (candidates, deferred_blocks) =
             allocator.aged_candidates(limit_blocks, grace, std::time::Instant::now());
         // Diagnostic: retired-but-still-young blocks held back by the grace. Once
@@ -518,42 +547,55 @@ impl GcRunner {
         if candidates.is_empty() {
             return 0;
         }
+        let n_candidates = candidates.len();
+        let select_ms = t_select.elapsed().as_millis();
 
         // Gate 1 (refcount): keep only candidates whose every PBA has rc==0.
-        // Cheap per-extent paged-array / overlay lookups, no volume scan.
+        //
+        // BATCHED: flatten every candidate PBA into ONE `multi_get_refcounts`
+        // and re-group per extent. The old per-extent call issued one metadb
+        // round-trip per candidate extent; under scattered-overwrite churn the
+        // retired set fragments into ~single-block extents, so a block-budgeted
+        // cycle made up to `limit_blocks` separate calls → reclaim cost grew
+        // super-linearly with retired depth (the capacity runaway). One batched
+        // read makes the cost O(budget blocks) instead of O(#extents).
+        let t_gate1 = Instant::now();
+        let cand_pbas = Self::flatten_extent_pbas(&candidates);
+        let cand_rcs = match meta.multi_get_refcounts(&cand_pbas) {
+            Ok(v) => v,
+            Err(e) => {
+                metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    candidates = n_candidates,
+                    blocks = cand_pbas.len(),
+                    error = %e,
+                    "gc: batched Gate-1 refcount read failed; skipping cycle"
+                );
+                return 0;
+            }
+        };
         let mut survivors: Vec<Extent> = Vec::with_capacity(candidates.len());
+        let mut cursor = 0usize;
         for extent in candidates {
+            let n = extent.count as usize;
+            let slice = &cand_rcs[cursor..cursor + n];
+            cursor += n;
             if !running.load(Ordering::Relaxed) {
                 break;
             }
-            let pbas: Vec<crate::types::Pba> = (0..extent.count)
-                .map(|offset| crate::types::Pba(extent.start.0 + offset as u64))
-                .collect();
-            match meta.multi_get_refcounts(&pbas) {
-                Ok(refcounts) => {
-                    if refcounts.into_iter().all(|refcount| refcount == 0) {
-                        survivors.push(extent);
-                    } else {
-                        // Diagnostic: grace-aged blocks still rejected because a
-                        // PBA is referenced (rc>0) — e.g. a dedup hit re-referenced
-                        // a retired PBA. High vs `gc_reclaim_grace_deferred` means
-                        // rc>0 zombies (not grace) wedge the retired set.
-                        metrics
-                            .gc_reclaim_rc_rejected
-                            .fetch_add(u64::from(extent.count), Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        pba = extent.start.0,
-                        blocks = extent.count,
-                        error = %e,
-                        "gc: failed to read refcount for retired physical extent"
-                    );
-                }
+            if slice.iter().all(|&refcount| refcount == 0) {
+                survivors.push(extent);
+            } else {
+                // Diagnostic: grace-aged blocks still rejected because a PBA is
+                // referenced (rc>0) — e.g. a dedup hit re-referenced a retired
+                // PBA. High vs `gc_reclaim_grace_deferred` means rc>0 zombies
+                // (not grace) wedge the retired set.
+                metrics
+                    .gc_reclaim_rc_rejected
+                    .fetch_add(u64::from(extent.count), Ordering::Relaxed);
             }
         }
+        let gate1_ms = t_gate1.elapsed().as_millis();
         if survivors.is_empty() {
             return 0;
         }
@@ -692,47 +734,53 @@ impl GcRunner {
         // cycle. This is the bounded backstop the skipped blockmap scan used
         // to provide. The grace + hazard barrier above still cover the
         // un-drained-incref / in-flight-promote windows.
+        let t_gate2 = Instant::now();
         let referenced: Vec<bool> = if meta.rc_authoritative_reclaim() {
-            survivors
-                .iter()
-                .map(|extent| {
-                    let pbas: Vec<crate::types::Pba> = (0..extent.count)
-                        .map(|offset| crate::types::Pba(extent.start.0 + offset as u64))
-                        .collect();
-                    match meta.multi_get_refcounts_consistent(&pbas) {
-                        Ok(refcounts) => {
-                            let still_referenced =
-                                refcounts.into_iter().any(|refcount| refcount != 0);
-                            if still_referenced {
-                                // Gate-1 passed it (raced rc==0) but the
-                                // consistent read caught a live ref → a
-                                // premature free averted.
-                                metrics
-                                    .gc_reclaim_premature_free_averted
-                                    .fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    pba = extent.start.0,
-                                    blocks = extent.count,
-                                    "gc: premature free averted — consistent rc recheck found a \
-                                     live reference the Gate-1 fold-racy read floored to 0"
-                                );
-                            }
-                            still_referenced
-                        }
-                        Err(e) => {
-                            metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
+            // BATCHED consistent recheck: flatten survivor PBAs into ONE
+            // `multi_get_refcounts_consistent`, which amortizes the per-shard
+            // `fold_lock` (see metadb `get_consistent_into`). The old per-extent
+            // call took `fold_lock` once PER PBA, contending the TXG fold under
+            // sustained reclaim — the super-linear term in reclaim cost. Results
+            // are re-grouped per extent; referenced iff ANY PBA rc != 0.
+            let surv_pbas = Self::flatten_extent_pbas(&survivors);
+            match meta.multi_get_refcounts_consistent(&surv_pbas) {
+                Ok(refcounts) => {
+                    let mut out = Vec::with_capacity(survivors.len());
+                    let mut cur = 0usize;
+                    for extent in &survivors {
+                        let n = extent.count as usize;
+                        let still_referenced =
+                            refcounts[cur..cur + n].iter().any(|&refcount| refcount != 0);
+                        cur += n;
+                        if still_referenced {
+                            // Gate-1 passed it (raced rc==0) but the consistent
+                            // read caught a live ref → a premature free averted.
+                            metrics
+                                .gc_reclaim_premature_free_averted
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(
                                 pba = extent.start.0,
                                 blocks = extent.count,
-                                error = %e,
-                                "gc: consistent refcount recheck failed; leaving extent retired"
+                                "gc: premature free averted — consistent rc recheck found a \
+                                 live reference the Gate-1 fold-racy read floored to 0"
                             );
-                            // Conservative: a read error must NOT free the PBA.
-                            true
                         }
+                        out.push(still_referenced);
                     }
-                })
-                .collect()
+                    out
+                }
+                Err(e) => {
+                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        candidates = survivors.len(),
+                        error = %e,
+                        "gc: batched consistent refcount recheck failed; leaving extents retired"
+                    );
+                    // Conservative: a read error must NOT free any PBA → skip the
+                    // whole cycle (same net effect as the old per-extent `true`).
+                    return 0;
+                }
+            }
         } else {
             // Phase-5 fallback: rc is NOT authoritative for L2P references, so
             // ONE batched all-volume L2P scan is required to catch rc-untracked
@@ -755,33 +803,30 @@ impl GcRunner {
                 }
             }
         };
+        let gate2_ms = t_gate2.elapsed().as_millis();
 
-        let mut reclaimed = 0usize;
-        let mut reclaimed_extents = 0usize;
-        for (extent, is_referenced) in survivors.into_iter().zip(referenced) {
-            if !running.load(Ordering::Relaxed) {
-                break;
-            }
-            if is_referenced {
-                continue;
-            }
-            match pba_lifecycle.confirm_and_reclaim(extent) {
-                Ok(true) => {
-                    reclaimed += extent.count as usize;
-                    reclaimed_extents += 1;
-                }
-                Ok(false) => {}
+        let t_free = Instant::now();
+        let n_survivors = survivors.len();
+        // Collect the Gate-2-confirmed (unreferenced) survivors and free them in
+        // ONE batched, lock-amortized call. The old per-extent
+        // `confirm_and_reclaim` loop paid ~2×num_lanes lane-cache mutex locks +
+        // 3 contended allocator locks PER extent, which dominated reclaim under
+        // sustained churn (the second O(depth) term in the capacity runaway).
+        let to_reclaim: Vec<Extent> = survivors
+            .into_iter()
+            .zip(referenced)
+            .filter_map(|(extent, is_referenced)| (!is_referenced).then_some(extent))
+            .collect();
+        let (reclaimed, reclaimed_extents) =
+            match pba_lifecycle.confirm_and_reclaim_batch(&to_reclaim, running) {
+                Ok((blocks, extents)) => (blocks as usize, extents),
                 Err(e) => {
                     metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        pba = extent.start.0,
-                        blocks = extent.count,
-                        error = %e,
-                        "gc: failed to release retired physical extent"
-                    );
+                    tracing::warn!(error = %e, "gc: batched retired reclaim failed");
+                    (0, 0)
                 }
-            }
-        }
+            };
+        let free_ms = t_free.elapsed().as_millis();
 
         // Feed the yield gate only from a full-survivor (confirm-all) scan: how
         // productive was the scan we just paid for? High yield ⇒ deferring would
@@ -799,7 +844,33 @@ impl GcRunner {
                 .fetch_add(reclaimed as u64, Ordering::Relaxed);
             tracing::debug!(blocks = reclaimed, "gc: reclaimed retired physical blocks");
         }
+        // Reclaim sub-phase breakdown (debug-level observability): select =
+        // aged_candidates+gauge, gate1/gate2 = batched refcount reads, free =
+        // batched confirm_and_reclaim. The batching keeps each phase ~flat as
+        // retired depth grows; this is how a regression would be spotted. Only
+        // emitted when a cycle did non-trivial reclaim work.
+        if select_ms + gate1_ms + gate2_ms + free_ms >= 50 {
+            tracing::debug!(
+                select_ms, gate1_ms, gate2_ms, free_ms,
+                n_candidates, n_survivors, reclaimed,
+                "gc reclaim phase timing"
+            );
+        }
         reclaimed
+    }
+
+    /// Flatten a list of physical extents into their constituent PBAs, in
+    /// extent order — the input for a single batched `multi_get_refcounts*`
+    /// (one metadb round-trip instead of one per extent; see the reclaim gates).
+    fn flatten_extent_pbas(extents: &[Extent]) -> Vec<crate::types::Pba> {
+        let total: usize = extents.iter().map(|e| e.count as usize).sum();
+        let mut pbas = Vec::with_capacity(total);
+        for extent in extents {
+            for offset in 0..extent.count {
+                pbas.push(crate::types::Pba(extent.start.0 + offset as u64));
+            }
+        }
+        pbas
     }
 
     /// Background heat-map refresh step (observe-only, Stage A). Walks up to

@@ -22,7 +22,7 @@
 //! allocator primitives in isolation.
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,40 @@ impl PbaLifecycle {
     pub fn retire_committed(&self, reason: &'static str, extent: Extent) {
         self.drive_retire_retries();
         self.retire_committed_inner(reason, extent, 0);
+    }
+
+    /// Batch form of [`Self::retire_committed`] for the foreground cleanup path.
+    /// Evicts every candidate slot FIRST (a verifier/promote must not pick up a
+    /// PBA on its way out — same ordering as the single path), then hands the
+    /// whole set to the allocator's lock-amortized [`SpaceAllocator::
+    /// retire_extents_batch`]. The per-extent locking the single path paid (and
+    /// the contention it caused with GC reclaim) is collapsed to a few
+    /// chunk-holds. Failed extents are deferred to the retry queue, exactly as
+    /// the single path does on error.
+    pub fn retire_committed_batch(&self, reason: &'static str, extents: &[Extent]) {
+        self.drive_retire_retries();
+        if extents.is_empty() {
+            return;
+        }
+        // Candidate eviction MUST precede the allocator handoff.
+        for &extent in extents {
+            self.evict_candidates(extent);
+        }
+        let (total_newly, failed) = self.allocator.retire_extents_batch(extents, Instant::now());
+        if total_newly > 0 {
+            self.metrics
+                .pba_blocks_retired
+                .fetch_add(total_newly, Ordering::Relaxed);
+        }
+        for extent in failed {
+            self.defer_retire(extent, reason, 1);
+            tracing::warn!(
+                pba = extent.start.0,
+                blocks = extent.count,
+                reason,
+                "pba_lifecycle: batched retire failed after metadata commit; deferred for retry"
+            );
+        }
     }
 
     fn retire_committed_inner(&self, reason: &'static str, extent: Extent, prior_attempts: u32) {
@@ -336,6 +370,17 @@ impl PbaLifecycle {
     /// it was no longer retired.
     pub fn confirm_and_reclaim(&self, extent: Extent) -> OnyxResult<bool> {
         self.allocator.reclaim_retired_extent(extent)
+    }
+
+    /// Batch form of [`Self::confirm_and_reclaim`] for the GC reclaim free-loop:
+    /// hands the whole GC-proven survivor set to the allocator's chunked,
+    /// lock-amortized reclaim. Returns `(freed_blocks, freed_extents)`.
+    pub fn confirm_and_reclaim_batch(
+        &self,
+        extents: &[Extent],
+        running: &AtomicBool,
+    ) -> OnyxResult<(u64, usize)> {
+        self.allocator.reclaim_retired_extents_batch(extents, running)
     }
 }
 

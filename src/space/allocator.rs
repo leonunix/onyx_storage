@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,12 @@ const LANE_CACHE_REFILL_SIZE: u32 = 256;
 /// Raw passthrough flushes commonly allocate 4-8 contiguous blocks per unit;
 /// serving those from a lane-local slice avoids hammering the global BTreeSet.
 const LANE_EXTENT_CACHE_REFILL_BLOCKS: u32 = 8192;
+/// Per-chunk extent cap for the batched retire/reclaim paths
+/// (`retire_extents_batch`, `reclaim_retired_extents_batch`). Bounds each
+/// `retired`/`free`/lane lock hold to a small slice of in-memory BTree work
+/// (~sub-millisecond) so the foreground alloc/retire path interleaves between
+/// chunks instead of stalling on a single large hold.
+const BATCH_LOCK_CHUNK: usize = 4096;
 
 /// One original retire operation's age, tracked at retire granularity in the
 /// `retired_age` log so coalescing the `retired_extents` set can never re-age it.
@@ -37,6 +43,13 @@ pub struct SpaceAllocator {
     /// retire time and never refreshed, so coalescing the set above cannot
     /// re-age it. Lock order: `retired_extents` BEFORE `retired_age`.
     retired_age: Mutex<BTreeMap<u64, RetiredRun>>,
+    /// O(1) running total of blocks in `retired_extents`. The depth gauge is
+    /// read once per GC cycle; summing the (potentially millions of) coalesced
+    /// extents under the set lock was ~360 ms/cycle at 60M-deep AND contended
+    /// the lock with the foreground retire path. This atomic is advisory (feeds
+    /// only the `gc_retired_blocks_depth` metric, never a free decision), kept
+    /// in lockstep with the set in `retire_extent_at`/`reclaim_retired_extent`.
+    retired_blocks: AtomicU64,
     hazards: PbaHazards,
     allocated_blocks: AtomicU64,
     free_blocks: AtomicU64,
@@ -82,6 +95,7 @@ impl SpaceAllocator {
             free_extents: Mutex::new(free_extents),
             retired_extents: Mutex::new(BTreeSet::new()),
             retired_age: Mutex::new(BTreeMap::new()),
+            retired_blocks: AtomicU64::new(0),
             hazards: PbaHazards::new(),
             allocated_blocks: AtomicU64::new(0),
             free_blocks: AtomicU64::new(usable_blocks),
@@ -145,6 +159,7 @@ impl SpaceAllocator {
         *self.free_extents.lock().unwrap() = free;
         self.retired_extents.lock().unwrap().clear();
         self.retired_age.lock().unwrap().clear();
+        self.retired_blocks.store(0, Ordering::Relaxed);
         self.clear_lane_caches();
         if let Some(tracker) = &self.alloc_tracker {
             let mut tracker = tracker.lock().unwrap();
@@ -530,8 +545,86 @@ impl SpaceAllocator {
                     },
                 );
             }
+            // Keep the O(1) depth gauge in lockstep with the set (only the
+            // genuinely-new blocks; idempotent re-retire adds nothing).
+            self.retired_blocks
+                .fetch_add(u64::from(newly), Ordering::Relaxed);
         }
         Ok(newly)
+    }
+
+    /// Batch analogue of [`Self::retire_extent_at`] for the foreground cleanup
+    /// path (`retire_dead_pbas`). The single-extent retire pays, PER extent,
+    /// `ensure_not_in_lane_cache` (~2×num_lanes mutexes) + the `free`,
+    /// `retired` and `retired_age` locks — and the cleanup threads run it at
+    /// ~the foreground overwrite rate (~11K/s system-wide), hammering the exact
+    /// global locks the GC reclaim path needs. That mutual contention is the
+    /// residual reclaim-latency floor. This amortizes the lane snapshot + every
+    /// lock over a bounded `chunk`, collapsing ~11K per-extent acquisitions/s
+    /// into a handful of chunk-holds/s.
+    ///
+    /// Returns `(total_newly_blocks, failed_extents)`. Lock order matches the
+    /// single path exactly — `free` (outermost, held across) → `retired` →
+    /// `retired_age` — so a concurrent free cannot race the overlap check, and
+    /// there is no inversion with the reclaim batch (which never holds `free`
+    /// and `retired` at the same time).
+    pub fn retire_extents_batch(&self, extents: &[Extent], now: Instant) -> (u64, Vec<Extent>) {
+        let mut total_newly: u64 = 0;
+        let mut failed: Vec<Extent> = Vec::new();
+        for chunk in extents.chunks(BATCH_LOCK_CHUNK) {
+            let (lane_pbas, lane_exts) = self.snapshot_lane_caches();
+            let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
+            let mut chunk_newly: u64 = 0;
+            // Lock order: free (outermost) → retired → retired_age, held across
+            // the chunk (matches `retire_extent_at`).
+            let free = self.free_extents.lock().unwrap();
+            let mut retired = self.retired_extents.lock().unwrap();
+            let mut age = self.retired_age.lock().unwrap();
+            for &extent in chunk {
+                if self.validate_extent_shape(extent, "retire_extents_batch").is_err() {
+                    failed.push(extent);
+                    continue;
+                }
+                let in_lane = (0..extent.count)
+                    .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
+                    || lane_exts
+                        .iter()
+                        .any(|cached| Self::extents_overlap(extent, *cached));
+                if in_lane
+                    || Self::overlapping_extent(&free, extent).is_some()
+                    || u64::from(extent.count) > current_alloc
+                {
+                    failed.push(extent);
+                    continue;
+                }
+                // Genuinely-new sub-ranges (computed before coalescing so
+                // already-retired sub-ranges keep their original age).
+                let gaps = Self::uncovered_subranges(&retired, extent);
+                let newly: u32 = gaps.iter().map(|g| g.count).sum();
+                Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+                if newly > 0 {
+                    for g in gaps {
+                        age.insert(
+                            g.start.0,
+                            RetiredRun {
+                                count: g.count,
+                                retired_at: now,
+                            },
+                        );
+                    }
+                    chunk_newly += u64::from(newly);
+                }
+            }
+            drop(age);
+            drop(retired);
+            drop(free);
+            if chunk_newly > 0 {
+                self.retired_blocks
+                    .fetch_add(chunk_newly, Ordering::Relaxed);
+                total_newly += chunk_newly;
+            }
+        }
+        (total_newly, failed)
     }
 
     /// Sub-ranges of `extent` NOT covered by any extent in the coalesced `set`
@@ -695,7 +788,18 @@ impl SpaceAllocator {
         Self::covering_extent(&retired, pba).is_some()
     }
 
+    /// O(1) total of retired blocks (advisory gauge). Maintained in lockstep
+    /// with `retired_extents` by `retire_extent_at`/`reclaim_retired_extent`;
+    /// see [`Self::retired_block_count_exact`] for the audit-grade walk.
     pub fn retired_block_count(&self) -> u64 {
+        self.retired_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Audit-grade exact retired-block total by walking the coalesced set
+    /// (O(#extents)). The cheap [`Self::retired_block_count`] gauge should equal
+    /// this; tests assert the two agree.
+    #[cfg(test)]
+    pub fn retired_block_count_exact(&self) -> u64 {
         self.retired_extents
             .lock()
             .unwrap()
@@ -775,7 +879,162 @@ impl SpaceAllocator {
             let mut retired = self.retired_extents.lock().unwrap();
             Self::coalesce_and_insert_any_overlap(&mut retired, extent);
         }
+        if result.is_ok() {
+            // `extent` left the retired set for the free list — decrement the
+            // O(1) gauge. Failure re-inserted it above, so leave the gauge.
+            self.retired_blocks
+                .fetch_sub(u64::from(extent.count), Ordering::Relaxed);
+        }
         result.map(|_| true)
+    }
+
+    /// Batch analogue of [`Self::reclaim_retired_extent`] for the GC reclaim
+    /// free-loop. The single-extent path paid, PER extent, ~`2 × num_lanes`
+    /// lane-cache mutex locks (`ensure_not_in_lane_cache`) + the `retired`,
+    /// `retired_age` and `free` locks — all contending the foreground at
+    /// 11-13K/s, ~138 µs/extent. Under scattered churn the retired set
+    /// fragments into ~single-block extents, so a block-budgeted cycle reclaimed
+    /// up to `MAX_RETIRED_RECLAIM_BLOCKS_PER_CYCLE` *extents* → reclaim cost grew
+    /// super-linearly with retired depth (the capacity runaway). This amortizes
+    /// every per-extent lock and the lane-cache scan over a bounded `chunk`, so
+    /// the cost is O(blocks) with a small constant.
+    ///
+    /// `extents` must already be GC-proven (Gate-1 rc==0 + pre-Gate-2 hazard
+    /// barrier + Gate-2 consistent recheck) by the caller. Returns
+    /// `(freed_blocks, freed_extents)`. Lock discipline matches the single path:
+    /// never holds `free` and `retired` at the same time (Phase A removes under
+    /// `retired`, Phase B inserts under `free`), and lane caches are snapshotted
+    /// with neither held.
+    pub fn reclaim_retired_extents_batch(
+        &self,
+        extents: &[Extent],
+        running: &AtomicBool,
+    ) -> OnyxResult<(u64, usize)> {
+        let mut freed_blocks: u64 = 0;
+        let mut freed_extents: usize = 0;
+        for chunk in extents.chunks(BATCH_LOCK_CHUNK) {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+            // Snapshot the lane caches ONCE per chunk (vs once per extent). Same
+            // mutexes/contents the single-extent `ensure_not_in_lane_cache`
+            // checks; taken with neither `free` nor `retired` held, as today.
+            let (lane_pbas, lane_exts) = self.snapshot_lane_caches();
+
+            // Hazard barrier over the chunk. The caller already drained readers
+            // for all survivors before Gate-2; this re-check matches the
+            // single-extent path's `wait_extent_clear` (cheap when unpinned).
+            for extent in chunk {
+                self.hazards.wait_extent_clear(extent.start, extent.count);
+            }
+
+            // Phase A — `retired` (+ `retired_age`) lock ONCE: validate
+            // containment, split out the covering coalesced extent, keep the
+            // remainders retired. Collect the validated extents for Phase B.
+            let mut removed: Vec<Extent> = Vec::with_capacity(chunk.len());
+            {
+                let mut retired = self.retired_extents.lock().unwrap();
+                let mut age = self.retired_age.lock().unwrap();
+                for &extent in chunk {
+                    if self
+                        .validate_extent_shape(extent, "reclaim_retired_extents_batch")
+                        .is_err()
+                    {
+                        continue; // defensive: GC candidates are always well-formed
+                    }
+                    // Fail closed if no longer fully retired (raced reclaim/realloc).
+                    let cover = match Self::covering_extent(&retired, extent.start) {
+                        Some(c) if c.end_pba().0 >= extent.end_pba().0 => c,
+                        _ => continue,
+                    };
+                    retired.remove(&cover);
+                    if extent.start.0 > cover.start.0 {
+                        retired.insert(Extent::new(
+                            cover.start,
+                            (extent.start.0 - cover.start.0) as u32,
+                        ));
+                    }
+                    if cover.end_pba().0 > extent.end_pba().0 {
+                        retired.insert(Extent::new(
+                            extent.end_pba(),
+                            (cover.end_pba().0 - extent.end_pba().0) as u32,
+                        ));
+                    }
+                    Self::purge_age_range(&mut age, extent);
+                    removed.push(extent);
+                }
+            }
+
+            // Phase B — `free` lock ONCE: re-validate against the lane snapshot +
+            // free-list overlap (double-free guard), free the clean ones, defer
+            // conflicts. `chunk_freed` tracks the not-yet-applied allocated debit
+            // so the underflow guard stays honest within the chunk.
+            let mut conflicts: Vec<Extent> = Vec::new();
+            let mut chunk_freed: u64 = 0;
+            {
+                let mut free = self.free_extents.lock().unwrap();
+                for &extent in &removed {
+                    let in_lane = (0..extent.count)
+                        .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
+                        || lane_exts
+                            .iter()
+                            .any(|cached| Self::extents_overlap(extent, *cached));
+                    if in_lane || Self::overlapping_extent(&free, extent).is_some() {
+                        conflicts.push(extent);
+                        continue;
+                    }
+                    let avail = self
+                        .allocated_blocks
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(chunk_freed);
+                    if u64::from(extent.count) > avail {
+                        conflicts.push(extent);
+                        continue;
+                    }
+                    Self::coalesce_and_insert(&mut free, extent);
+                    self.track_release(extent, "reclaim_retired_extents_batch");
+                    chunk_freed += u64::from(extent.count);
+                    freed_extents += 1;
+                }
+            }
+
+            // Counter debits ONCE per chunk (Relaxed gauges; same end state as
+            // the single-extent per-op debit).
+            if chunk_freed > 0 {
+                self.allocated_blocks
+                    .fetch_sub(chunk_freed, Ordering::Relaxed);
+                self.free_blocks.fetch_add(chunk_freed, Ordering::Relaxed);
+                self.retired_blocks
+                    .fetch_sub(chunk_freed, Ordering::Relaxed);
+                freed_blocks += chunk_freed;
+            }
+
+            // Re-insert conflicts: they stay retired (coalescing back with the
+            // remainders), age untouched — matches the single path's error path.
+            if !conflicts.is_empty() {
+                let mut retired = self.retired_extents.lock().unwrap();
+                for extent in conflicts {
+                    Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+                }
+            }
+        }
+        Ok((freed_blocks, freed_extents))
+    }
+
+    /// Snapshot the per-lane block + extent caches into owned collections so the
+    /// batch reclaim can check membership without re-locking per extent. Each
+    /// lane mutex is taken briefly and independently (no `free`/`retired` held),
+    /// matching `ensure_not_in_lane_cache`'s lock discipline.
+    fn snapshot_lane_caches(&self) -> (HashSet<Pba>, Vec<Extent>) {
+        let mut pbas = HashSet::new();
+        for cache in &self.lane_caches {
+            pbas.extend(cache.lock().unwrap().iter().copied());
+        }
+        let mut exts = Vec::new();
+        for cache in &self.lane_extent_caches {
+            exts.extend(cache.lock().unwrap().iter().copied());
+        }
+        (pbas, exts)
     }
 
     fn free_extent_unchecked_ownership(&self, extent: Extent) -> OnyxResult<()> {
@@ -1182,6 +1441,75 @@ mod age_tests {
         assert_eq!(capped, vec![Extent::new(Pba(n), 400)]);
     }
 
+    /// PERF microbench (NOT a correctness gate): isolate the two per-GC-cycle
+    /// reclaim-SELECTION costs that scale with retired-set depth —
+    /// `retired_block_count()` (O(#retired extents), called once/cycle purely
+    /// for the depth gauge) and `aged_candidates()` (walks the set + prunes the
+    /// age log). Directly populates the private structures to model the prod
+    /// steady state (60M-deep, heavily fragmented) without the alloc/free
+    /// machinery. Run: `cargo test --release -p onyx-storage --lib
+    /// bench_reclaim_selection_scaling -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_reclaim_selection_scaling() {
+        let base = Instant::now();
+        let now = base + Duration::from_secs(100);
+        let grace = Duration::from_secs(30);
+        // Young front modelled as one grace-window of retires (the only entries
+        // the age log holds in steady state — aged_candidates prunes the rest
+        // each cycle). `aged_only`=age log already empty (best case: walk emits
+        // budget off the front and stops). `all_in_age`=degenerate worst case
+        // where a slow cycle let the age log accumulate to full depth before a
+        // prune (bounds the retain()/sum() cost).
+        for &n in &[1_000_000u64, 10_000_000, 30_000_000, 60_000_000] {
+            for mode in ["aged_only", "front_young", "all_in_age"] {
+                let dev = (2 * n + RESERVED_BLOCKS + 16) * BLOCK_SIZE as u64;
+                let a = SpaceAllocator::new(dev, 0);
+                let young_front = 400_000u64.min(n);
+                {
+                    let mut retired = a.retired_extents.lock().unwrap();
+                    let mut age = a.retired_age.lock().unwrap();
+                    for i in 0..n {
+                        let pba = RESERVED_BLOCKS + 2 * i; // stride 2 → N separate extents (max frag)
+                        retired.insert(Extent::new(Pba(pba), 1));
+                        match mode {
+                            "aged_only" => {}
+                            "front_young" => {
+                                if i < young_front {
+                                    age.insert(pba, RetiredRun { count: 1, retired_at: now });
+                                }
+                            }
+                            "all_in_age" => {
+                                let retired_at = if i < young_front { now } else { base };
+                                age.insert(pba, RetiredRun { count: 1, retired_at });
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                a.allocated_blocks.store(2 * n, Ordering::Relaxed);
+                a.retired_blocks.store(n, Ordering::Relaxed); // direct-insert bypassed the gauge
+
+                // Times the OLD O(#extents) walk we replaced with the O(1) gauge.
+                let t = Instant::now();
+                let depth = a.retired_block_count_exact();
+                let d_rbc = t.elapsed().as_secs_f64() * 1e3;
+                debug_assert_eq!(depth, a.retired_block_count());
+
+                let t = Instant::now();
+                let (cands, deferred) = a.aged_candidates(262_144, grace, now);
+                let d_aged = t.elapsed().as_secs_f64() * 1e3;
+                let emitted: u64 = cands.iter().map(|e| e.count as u64).sum();
+
+                println!(
+                    "N={:>10} mode={:<11} depth={:>10} | retired_block_count={:>8.1}ms | \
+                     aged_candidates={:>8.1}ms emitted={:>7} deferred={:>9} cands={}",
+                    n, mode, depth, d_rbc, d_aged, emitted, deferred, cands.len()
+                );
+            }
+        }
+    }
+
     /// Sub-extent reclaim splits a coalesced extent: free the aged prefix, keep
     /// the younger suffix retired.
     #[test]
@@ -1203,5 +1531,233 @@ mod age_tests {
             assert!(!a.is_free(Pba(n + off)));
         }
         assert_eq!(a.retired_block_count(), 3);
+        // The O(1) gauge must agree with the exact walk through retire + the
+        // sub-extent split reclaim (drift guard for the atomic).
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+
+    fn run_flag() -> AtomicBool {
+        AtomicBool::new(true)
+    }
+
+    /// The batched reclaim must leave identical allocator state to reclaiming the
+    /// same extents one-by-one through the single-extent path.
+    #[test]
+    fn batch_reclaim_equals_sequence() {
+        let mk = || {
+            let a = new_alloc(4096);
+            let n = alloc_first(&a, 100);
+            let t0 = Instant::now();
+            for i in 0..100u64 {
+                a.retire_extent_at(Extent::single(Pba(n + i)), t0).unwrap();
+            }
+            (a, n)
+        };
+        let extents: Vec<Extent> = {
+            let (_, n) = mk();
+            (0..100u64).map(|i| Extent::single(Pba(n + i))).collect()
+        };
+        let (a_seq, _) = mk();
+        for e in &extents {
+            assert!(a_seq.reclaim_retired_extent(*e).unwrap());
+        }
+        let (a_batch, n) = mk();
+        let (blocks, cnt) = a_batch
+            .reclaim_retired_extents_batch(&extents, &run_flag())
+            .unwrap();
+        assert_eq!(blocks, 100);
+        assert_eq!(cnt, 100);
+        assert_eq!(a_seq.free_block_count(), a_batch.free_block_count());
+        assert_eq!(a_seq.retired_block_count(), a_batch.retired_block_count());
+        assert_eq!(a_batch.retired_block_count(), 0);
+        assert_eq!(a_batch.retired_block_count(), a_batch.retired_block_count_exact());
+        for i in 0..100u64 {
+            assert!(a_batch.is_free(Pba(n + i)));
+        }
+    }
+
+    /// A batch entry that is a sub-range of a coalesced retired extent splits it:
+    /// free the named sub-range, keep the rest retired.
+    #[test]
+    fn batch_reclaim_splits_sub_extent() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 6);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::new(Pba(n), 6), t0).unwrap(); // one coalesced [n,6]
+        let (blocks, cnt) = a
+            .reclaim_retired_extents_batch(&[Extent::new(Pba(n), 3)], &run_flag())
+            .unwrap();
+        assert_eq!((blocks, cnt), (3, 1));
+        for off in 0..3 {
+            assert!(a.is_free(Pba(n + off)));
+        }
+        for off in 3..6 {
+            assert!(a.is_retired(Pba(n + off)));
+        }
+        assert_eq!(a.retired_block_count(), 3);
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+
+    /// An extent that is no longer (fully) retired — e.g. raced realloc — is
+    /// skipped (fail closed); the rest of the batch still reclaims.
+    #[test]
+    fn batch_reclaim_fail_closed_on_non_retired() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 12);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::single(Pba(n)), t0).unwrap();
+        // n+10 is allocated but never retired → not reclaimable.
+        let batch = [Extent::single(Pba(n)), Extent::single(Pba(n + 10))];
+        let (blocks, cnt) = a.reclaim_retired_extents_batch(&batch, &run_flag()).unwrap();
+        assert_eq!((blocks, cnt), (1, 1));
+        assert!(a.is_free(Pba(n)));
+        assert!(!a.is_free(Pba(n + 10)), "non-retired entry untouched");
+        assert!(!a.is_retired(Pba(n + 10)));
+        assert_eq!(a.retired_block_count(), 0);
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+
+    /// An extent removed from the retired set in Phase A but found to overlap the
+    /// free list in Phase B (a should-never-happen inconsistency) is NOT
+    /// double-freed: it is re-inserted and stays retired.
+    #[test]
+    fn batch_reclaim_conflict_reinserts() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 4);
+        let p = Pba(n);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::single(p), t0).unwrap();
+        // Inject the inconsistency: the same PBA is also in the free list.
+        a.free_extents.lock().unwrap().insert(Extent::single(p));
+        let (blocks, cnt) = a
+            .reclaim_retired_extents_batch(&[Extent::single(p)], &run_flag())
+            .unwrap();
+        assert_eq!((blocks, cnt), (0, 0), "free-overlap conflict not freed");
+        assert!(a.is_retired(p), "conflict re-inserted, stays retired");
+        assert_eq!(a.retired_block_count(), 1);
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+
+    /// A batch larger than `BATCH_LOCK_CHUNK` reclaims every extent across chunks.
+    #[test]
+    fn batch_reclaim_spans_chunks() {
+        let count = BATCH_LOCK_CHUNK + 50;
+        let a = new_alloc((4 * count as u64) + 256);
+        let base = alloc_first(&a, 2 * count); // 2× so stride-2 retires stay separate
+        let t0 = Instant::now();
+        let extents: Vec<Extent> = (0..count as u64)
+            .map(|i| Extent::single(Pba(base + 2 * i)))
+            .collect();
+        for e in &extents {
+            a.retire_extent_at(*e, t0).unwrap();
+        }
+        assert_eq!(a.retired_block_count(), count as u64);
+        let (blocks, cnt) = a
+            .reclaim_retired_extents_batch(&extents, &run_flag())
+            .unwrap();
+        assert_eq!(blocks, count as u64);
+        assert_eq!(cnt, count);
+        assert_eq!(a.retired_block_count(), 0);
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+        for i in 0..count as u64 {
+            assert!(a.is_free(Pba(base + 2 * i)));
+        }
+    }
+
+    /// Mixed batch (some freed, one non-retired skip, one free-overlap conflict)
+    /// keeps the O(1) gauge in lockstep with the exact walk.
+    #[test]
+    fn batch_reclaim_gauge_stays_consistent() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 12);
+        let t0 = Instant::now();
+        a.retire_extent_at(Extent::new(Pba(n), 4), t0).unwrap();
+        a.retire_extent_at(Extent::single(Pba(n + 8)), t0).unwrap();
+        a.free_extents
+            .lock()
+            .unwrap()
+            .insert(Extent::single(Pba(n + 8))); // conflict on n+8
+        let batch = [
+            Extent::new(Pba(n), 2),         // freed (sub-extent of [n,4])
+            Extent::single(Pba(n + 10)),    // skip (never retired)
+            Extent::single(Pba(n + 8)),     // conflict → stays retired
+        ];
+        let (blocks, _) = a.reclaim_retired_extents_batch(&batch, &run_flag()).unwrap();
+        assert_eq!(blocks, 2);
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+        assert_eq!(a.retired_block_count(), 3); // [n+2,2] remainder + n+8
+    }
+
+    /// The batched retire must leave identical retired state to retiring the
+    /// same extents one-by-one through the single-extent path.
+    #[test]
+    fn batch_retire_equals_sequence() {
+        let a_seq = new_alloc(4096);
+        let n = alloc_first(&a_seq, 100);
+        let t0 = Instant::now();
+        for i in 0..100u64 {
+            a_seq.retire_extent_at(Extent::single(Pba(n + i)), t0).unwrap();
+        }
+        let a_batch = new_alloc(4096);
+        let nb = alloc_first(&a_batch, 100);
+        assert_eq!(n, nb); // fresh allocators start at the same PBA
+        let extents: Vec<Extent> = (0..100u64).map(|i| Extent::single(Pba(n + i))).collect();
+        let (newly, failed) = a_batch.retire_extents_batch(&extents, t0);
+        assert_eq!(newly, 100);
+        assert!(failed.is_empty());
+        assert_eq!(a_seq.retired_block_count(), a_batch.retired_block_count());
+        assert_eq!(a_batch.retired_block_count(), 100);
+        assert_eq!(a_batch.retired_block_count(), a_batch.retired_block_count_exact());
+        for i in 0..100u64 {
+            assert!(a_batch.is_retired(Pba(n + i)));
+        }
+    }
+
+    /// Idempotent re-retire inside a batch counts only genuinely-new blocks.
+    #[test]
+    fn batch_retire_idempotent_recounts() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 4);
+        let t0 = Instant::now();
+        let (newly1, f1) = a.retire_extents_batch(&[Extent::new(Pba(n), 2)], t0);
+        assert_eq!((newly1, f1.len()), (2, 0));
+        // Re-retire [n,2] (idempotent → 0 new) plus a fresh [n+2,1].
+        let (newly2, f2) =
+            a.retire_extents_batch(&[Extent::new(Pba(n), 2), Extent::single(Pba(n + 2))], t0);
+        assert_eq!((newly2, f2.len()), (1, 0));
+        assert_eq!(a.retired_block_count(), 3);
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+
+    /// An extent overlapping the free list is rejected (returned in `failed`),
+    /// the rest of the batch still retires.
+    #[test]
+    fn batch_retire_rejects_free_overlap() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 4); // allocates n..n+3; n+10 is free
+        let t0 = Instant::now();
+        let (newly, failed) =
+            a.retire_extents_batch(&[Extent::single(Pba(n)), Extent::single(Pba(n + 10))], t0);
+        assert_eq!(newly, 1);
+        assert_eq!(failed, vec![Extent::single(Pba(n + 10))]);
+        assert!(a.is_retired(Pba(n)));
+        assert!(!a.is_retired(Pba(n + 10)));
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+
+    /// A batch larger than `BATCH_LOCK_CHUNK` retires every extent across chunks.
+    #[test]
+    fn batch_retire_spans_chunks() {
+        let count = BATCH_LOCK_CHUNK + 30;
+        let a = new_alloc((4 * count as u64) + 256);
+        let base = alloc_first(&a, 2 * count);
+        let extents: Vec<Extent> = (0..count as u64)
+            .map(|i| Extent::single(Pba(base + 2 * i)))
+            .collect();
+        let (newly, failed) = a.retire_extents_batch(&extents, Instant::now());
+        assert_eq!(newly, count as u64);
+        assert!(failed.is_empty());
+        assert_eq!(a.retired_block_count(), count as u64);
+        assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
     }
 }

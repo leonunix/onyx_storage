@@ -76,16 +76,21 @@ impl BufferFlusher {
         let mut candidates: Vec<RemapCleanup> = candidates_by_pba.into_values().collect();
         candidates.sort_unstable_by_key(|cleanup| cleanup.pba);
 
-        for cleanup in candidates {
-            // candidate-evict → retire → defer-on-failure (with retry queue)
-            // all live in PbaLifecycle::retire_committed now.
-            let extent = if cleanup.blocks <= 1 {
-                Extent::single(cleanup.pba)
-            } else {
-                Extent::new(cleanup.pba, cleanup.blocks)
-            };
-            pba_lifecycle.retire_committed(context, extent);
-        }
+        // One lock-amortized batch (candidate-evict → retire → defer-on-failure
+        // all live in PbaLifecycle::retire_committed_batch). The old per-extent
+        // `retire_committed` loop hammered the global allocator locks at the
+        // overwrite rate, contending with GC reclaim — the reclaim-latency floor.
+        let extents: Vec<Extent> = candidates
+            .iter()
+            .map(|cleanup| {
+                if cleanup.blocks <= 1 {
+                    Extent::single(cleanup.pba)
+                } else {
+                    Extent::new(cleanup.pba, cleanup.blocks)
+                }
+            })
+            .collect();
+        pba_lifecycle.retire_committed_batch(context, &extents);
     }
 
     /// Async cleanup thread: receives old mappings from writer via channel,
