@@ -1120,8 +1120,10 @@ impl OnyxEngine {
         }
 
         // Quiesce so the snapshot→current diff sees fully-settled state: drop any
-        // residual pending buffer entries, drain in-flight flush work for this
-        // volume, then fold the metadb L2P buffer to disk.
+        // residual pending buffer entries and drain in-flight flush work for this
+        // volume. metadb's `restore_volume_to_snapshot` does a forced TXG sync
+        // itself (to fold staged commits + the L2P buffer for the diff), so no
+        // onyx-side `sync_durable` is needed here.
         if let Some(pool) = &self.buffer_pool {
             pool.purge_volume(volume)?;
         }
@@ -1135,12 +1137,14 @@ impl OnyxEngine {
                 );
             }
         }
-        self.meta.sync_durable()?;
 
         let stats = self
             .lifecycle
             .with_write_lock(volume, || self.meta.restore_snapshot(&vol_id, snap_name))?;
 
+        // Restore rewrote the L2P wholesale; drop any cached usage so a read
+        // within the TTL recomputes against the rolled-back state.
+        self.usage_cache.remove(volume);
         self.metrics
             .snapshot_restore_ops
             .fetch_add(1, Ordering::Relaxed);
@@ -1166,9 +1170,10 @@ impl OnyxEngine {
         })
     }
 
-    /// Retire PBAs surfaced as freed by a snapshot drop. Mirrors the
-    /// lineage-freed-PBA drain (`engine/lineage.rs::drain_once`): coalesce →
-    /// idempotent skip of already-free/retired → `retire_committed`.
+    /// Retire PBAs surfaced as freed by a snapshot drop. These are one-shot
+    /// (a snapshot drops once, unlike lineage GC's re-surfacing), so they go
+    /// straight through the lock-amortized batch retire — the same path
+    /// `delete_volume`'s freed PBAs take via `cleanup_dead_pbas_batch`.
     fn retire_freed_pbas(&self, pbas: Vec<Pba>, reason: &'static str) {
         if pbas.is_empty() {
             return;
@@ -1188,13 +1193,7 @@ impl OnyxEngine {
             return;
         };
         let extents = crate::meta::backend::coalesce_free_pbas_to_extents(&pbas);
-        for extent in extents {
-            let allocator = pba_lifecycle.allocator();
-            if allocator.is_extent_free(extent) || allocator.is_retired(extent.start) {
-                continue;
-            }
-            pba_lifecycle.retire_committed(reason, extent);
-        }
+        pba_lifecycle.retire_committed_batch(reason, &extents);
     }
 
     /// Open a volume for IO. Requires full engine mode.

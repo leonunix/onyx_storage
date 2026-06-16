@@ -405,26 +405,30 @@ impl MetadbBackend {
         // drop every named snapshot of this volume first. Their refcount-zeroed
         // PBAs are surfaced to the caller as `pba_freed` cleanups (blocks=1,
         // empty mappings) so the engine retires them through the same
-        // PbaLifecycle path as overwrite cleanups.
-        let snap_names: Vec<String> = {
+        // PbaLifecycle path as overwrite cleanups. The catalog entries are
+        // removed in one shot by the `retain` + single `persist` below, so the
+        // metadb drops here run without per-snapshot catalog writes.
+        let snap_ids: Vec<u64> = {
             let catalog = self.catalog.lock().unwrap();
             catalog
                 .snapshots
                 .iter()
                 .filter(|s| s.volume == id.0)
-                .map(|s| s.name.clone())
+                .map(|s| s.snapshot_id)
                 .collect()
         };
         let mut snapshot_cleanups = Vec::new();
-        for name in snap_names {
-            for pba in self.delete_snapshot(id, &name)? {
-                snapshot_cleanups.push(RemapCleanup {
-                    pba,
-                    decrements: 1,
-                    blocks: 1,
-                    pba_freed: true,
-                    mappings: Vec::new(),
-                });
+        for snapshot_id in snap_ids {
+            if let Some(report) = self.db.drop_snapshot(snapshot_id)? {
+                for pba in report.freed_pbas {
+                    snapshot_cleanups.push(RemapCleanup {
+                        pba: from_metadb_pba(pba),
+                        decrements: 1,
+                        blocks: 1,
+                        pba_freed: true,
+                        mappings: Vec::new(),
+                    });
+                }
             }
         }
 

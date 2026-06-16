@@ -879,19 +879,9 @@ impl ServiceController {
                             }
                             match eng.volume_usage(parts[1]) {
                                 Ok(u) => {
-                                    let payload = serde_json::json!({
-                                        "volume": u.volume,
-                                        "logical_size_bytes": u.logical_size_bytes,
-                                        "mapped_lbas": u.mapped_lbas,
-                                        "mapped_bytes": u.mapped_bytes,
-                                        "physical_bytes": u.physical_bytes,
-                                        "unique_blocks": u.unique_blocks,
-                                        "dedup_ratio": u.dedup_ratio,
-                                        "compress_ratio": u.compress_ratio,
-                                        "data_reduction_ratio": u.data_reduction_ratio,
-                                        "computed_at": u.computed_at,
-                                    });
-                                    let _ = stream.write_all(payload.to_string().as_bytes());
+                                    let payload = serde_json::to_string(&u)
+                                        .unwrap_or_else(|_| "{}".into());
+                                    let _ = stream.write_all(payload.as_bytes());
                                     let _ = stream.write_all(b"\nok\n");
                                 }
                                 Err(e) => {

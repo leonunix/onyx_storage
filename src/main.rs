@@ -401,45 +401,32 @@ fn main() -> anyhow::Result<()> {
             .map(|_| println!("Volume '{}' restored to snapshot '{}'", volume, name))?;
         }
         Command::VolumeUsage { volume } => {
-            let json = with_engine_or_ipc(
+            let u = with_engine_or_ipc(
                 &config,
-                |sock| service::send_volume_usage(sock, &volume),
-                |engine| {
-                    let u = engine.volume_usage(&volume)?;
-                    Ok(serde_json::json!({
-                        "volume": u.volume,
-                        "logical_size_bytes": u.logical_size_bytes,
-                        "mapped_lbas": u.mapped_lbas,
-                        "mapped_bytes": u.mapped_bytes,
-                        "physical_bytes": u.physical_bytes,
-                        "unique_blocks": u.unique_blocks,
-                        "dedup_ratio": u.dedup_ratio,
-                        "compress_ratio": u.compress_ratio,
-                        "data_reduction_ratio": u.data_reduction_ratio,
-                        "computed_at": u.computed_at,
-                    })
-                    .to_string())
+                |sock| {
+                    let json = service::send_volume_usage(sock, &volume)?;
+                    serde_json::from_str::<onyx_storage::meta::store::VolumeUsage>(&json)
+                        .map_err(|e| OnyxError::Config(format!("invalid volume-usage reply: {e}")))
                 },
+                |engine| engine.volume_usage(&volume),
             )?;
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
-            let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-            let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
             println!("Volume '{}' usage:", volume);
-            println!("  logical size : {} bytes", g("logical_size_bytes"));
+            println!("  logical size : {} bytes", u.logical_size_bytes);
             println!(
                 "  mapped/used  : {} bytes ({} LBAs)",
-                g("mapped_bytes"),
-                g("mapped_lbas")
+                u.mapped_bytes, u.mapped_lbas
             );
             println!(
                 "  physical     : {} bytes ({} unique units)",
-                g("physical_bytes"),
-                g("unique_blocks")
+                u.physical_bytes, u.unique_blocks
             );
-            println!("  dedup        : {:.2}x", f("dedup_ratio"));
-            println!("  compression  : {:.2}x", f("compress_ratio"));
-            println!("  reduction    : {:.2}x", f("data_reduction_ratio"));
-            println!("  computed_at  : {} (epoch s; cold cache, TTL 60s)", g("computed_at"));
+            println!("  dedup        : {:.2}x", u.dedup_ratio);
+            println!("  compression  : {:.2}x", u.compress_ratio);
+            println!("  reduction    : {:.2}x", u.data_reduction_ratio);
+            println!(
+                "  computed_at  : {} (epoch s; cold cache, TTL 60s)",
+                u.computed_at
+            );
         }
         Command::Status => {
             let sock = &config.service.socket_path;

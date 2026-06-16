@@ -71,7 +71,7 @@ pub struct SnapshotInfo {
 /// `physical_bytes` is the LV3 footprint attributable to this volume (each
 /// compressed unit counted once); it is approximate where a unit is shared
 /// across volumes by global dedup.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct VolumeUsage {
     pub volume: String,
     pub logical_size_bytes: u64,
