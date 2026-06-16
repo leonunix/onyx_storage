@@ -61,8 +61,59 @@ enum Command {
     },
     /// List volumes
     ListVolumes,
+    /// Create a point-in-time snapshot of a volume
+    SnapshotCreate {
+        /// Source volume name
+        #[arg(short, long)]
+        volume: String,
+        /// Snapshot name
+        #[arg(short, long)]
+        name: String,
+    },
+    /// Delete a snapshot
+    SnapshotDelete {
+        /// Source volume name
+        #[arg(short, long)]
+        volume: String,
+        /// Snapshot name
+        #[arg(short, long)]
+        name: String,
+    },
+    /// List snapshots (optionally for one volume)
+    SnapshotList {
+        /// Restrict to one volume
+        #[arg(short, long)]
+        volume: Option<String>,
+    },
+    /// Clone a snapshot into a new writable volume
+    SnapshotClone {
+        /// Source volume name
+        #[arg(short, long)]
+        volume: String,
+        /// Snapshot name
+        #[arg(short, long)]
+        name: String,
+        /// New volume name to create from the snapshot
+        #[arg(long)]
+        to: String,
+    },
+    /// Restore a volume in place to a snapshot (destructive rollback; volume must be stopped)
+    SnapshotRestore {
+        /// Volume to roll back
+        #[arg(short, long)]
+        volume: String,
+        /// Snapshot name to roll back to
+        #[arg(short, long)]
+        name: String,
+    },
     /// Show engine status
     Status,
+    /// Show capacity / dedup / compression usage for a volume
+    VolumeUsage {
+        /// Volume name
+        #[arg(short, long)]
+        volume: String,
+    },
     /// Kill stale Linux ublk devices left behind after abnormal exit
     CleanupUblk,
 }
@@ -78,6 +129,34 @@ fn parse_compression(s: &str) -> CompressionAlgo {
 
 fn is_stale_socket_error(err: &OnyxError) -> bool {
     matches!(err, OnyxError::Config(msg) if msg.contains("cannot connect to"))
+}
+
+/// Run a control-plane action against a running engine via IPC when the socket
+/// is live, else open a metadata-only engine directly. Mirrors the IPC-first +
+/// stale-socket fallback used by create-volume/delete-volume.
+fn with_engine_or_ipc<T>(
+    config: &OnyxConfig,
+    via_ipc: impl FnOnce(&std::path::Path) -> Result<T, OnyxError>,
+    via_engine: impl FnOnce(&OnyxEngine) -> Result<T, OnyxError>,
+) -> anyhow::Result<T> {
+    let sock = &config.service.socket_path;
+    if sock.exists() {
+        match via_ipc(sock) {
+            Ok(v) => Ok(v),
+            Err(err) if is_stale_socket_error(&err) => {
+                eprintln!(
+                    "stale socket {:?} detected, falling back to metadata-only path",
+                    sock
+                );
+                let engine = OnyxEngine::open_meta_only(config)?;
+                Ok(via_engine(&engine)?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    } else {
+        let engine = OnyxEngine::open_meta_only(config)?;
+        Ok(via_engine(&engine)?)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -256,6 +335,111 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Command::SnapshotCreate { volume, name } => {
+            with_engine_or_ipc(
+                &config,
+                |sock| service::send_snapshot_create(sock, &volume, &name),
+                |engine| engine.create_snapshot(&volume, &name).map(|info| info.snapshot_id),
+            )
+            .map(|id| println!("Snapshot '{}@{}' created (id {})", volume, name, id))?;
+        }
+        Command::SnapshotDelete { volume, name } => {
+            with_engine_or_ipc(
+                &config,
+                |sock| service::send_snapshot_delete(sock, &volume, &name),
+                |engine| engine.delete_snapshot(&volume, &name).map(|n| n as u64),
+            )
+            .map(|freed| {
+                println!(
+                    "Snapshot '{}@{}' deleted ({} physical blocks freed)",
+                    volume, name, freed
+                )
+            })?;
+        }
+        Command::SnapshotList { volume } => {
+            let lines = with_engine_or_ipc(
+                &config,
+                |sock| service::send_snapshot_list(sock, volume.as_deref()),
+                |engine| {
+                    Ok(engine
+                        .list_snapshots(volume.as_deref())?
+                        .into_iter()
+                        .map(|s| {
+                            format!(
+                                "{}@{} id={} created_lsn={} size={}",
+                                s.volume, s.name, s.snapshot_id, s.created_lsn, s.size_bytes
+                            )
+                        })
+                        .collect::<Vec<_>>())
+                },
+            )?;
+            if lines.is_empty() {
+                println!("No snapshots");
+            } else {
+                for line in &lines {
+                    println!("  {}", line);
+                }
+            }
+        }
+        Command::SnapshotClone { volume, name, to } => {
+            with_engine_or_ipc(
+                &config,
+                |sock| service::send_snapshot_clone(sock, &volume, &name, &to),
+                |engine| engine.clone_snapshot(&volume, &name, &to).map(|cfg| cfg.id.0),
+            )
+            .map(|new_vol| {
+                println!("Snapshot '{}@{}' cloned into new volume '{}'", volume, name, new_vol)
+            })?;
+        }
+        Command::SnapshotRestore { volume, name } => {
+            with_engine_or_ipc(
+                &config,
+                |sock| service::send_snapshot_restore(sock, &volume, &name),
+                |engine| engine.restore_snapshot(&volume, &name),
+            )
+            .map(|_| println!("Volume '{}' restored to snapshot '{}'", volume, name))?;
+        }
+        Command::VolumeUsage { volume } => {
+            let json = with_engine_or_ipc(
+                &config,
+                |sock| service::send_volume_usage(sock, &volume),
+                |engine| {
+                    let u = engine.volume_usage(&volume)?;
+                    Ok(serde_json::json!({
+                        "volume": u.volume,
+                        "logical_size_bytes": u.logical_size_bytes,
+                        "mapped_lbas": u.mapped_lbas,
+                        "mapped_bytes": u.mapped_bytes,
+                        "physical_bytes": u.physical_bytes,
+                        "unique_blocks": u.unique_blocks,
+                        "dedup_ratio": u.dedup_ratio,
+                        "compress_ratio": u.compress_ratio,
+                        "data_reduction_ratio": u.data_reduction_ratio,
+                        "computed_at": u.computed_at,
+                    })
+                    .to_string())
+                },
+            )?;
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+            let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+            println!("Volume '{}' usage:", volume);
+            println!("  logical size : {} bytes", g("logical_size_bytes"));
+            println!(
+                "  mapped/used  : {} bytes ({} LBAs)",
+                g("mapped_bytes"),
+                g("mapped_lbas")
+            );
+            println!(
+                "  physical     : {} bytes ({} unique units)",
+                g("physical_bytes"),
+                g("unique_blocks")
+            );
+            println!("  dedup        : {:.2}x", f("dedup_ratio"));
+            println!("  compression  : {:.2}x", f("compress_ratio"));
+            println!("  reduction    : {:.2}x", f("data_reduction_ratio"));
+            println!("  computed_at  : {} (epoch s; cold cache, TTL 60s)", g("computed_at"));
         }
         Command::Status => {
             let sock = &config.service.socket_path;

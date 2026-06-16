@@ -47,6 +47,46 @@ impl RemapCleanup {
     }
 }
 
+/// A named snapshot as tracked by the onyx snapshot catalog. `(volume, name)` is
+/// the user-facing identity; `snapshot_id` is the metadb `SnapshotId` the COW
+/// primitives operate on. `created_lsn` is metadb's LSN at capture time;
+/// `created_at` is the engine generation stamp (nanos) for human display.
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    pub volume: String,
+    pub name: String,
+    pub snapshot_id: u64,
+    pub created_lsn: u64,
+    pub created_at: u64,
+    pub size_bytes: u64,
+}
+
+/// At-a-glance capacity accounting for one volume, derived from an on-demand
+/// L2P scan. Ratios are internally consistent: `data_reduction = dedup × compress`.
+///
+/// - `dedup_ratio`     = mapped logical bytes / unique-unit original bytes
+/// - `compress_ratio`  = unique-unit original bytes / unique-unit compressed bytes
+/// - `data_reduction_ratio` = mapped logical bytes / physical bytes
+///
+/// `physical_bytes` is the LV3 footprint attributable to this volume (each
+/// compressed unit counted once); it is approximate where a unit is shared
+/// across volumes by global dedup.
+#[derive(Debug, Clone, Default)]
+pub struct VolumeUsage {
+    pub volume: String,
+    pub logical_size_bytes: u64,
+    pub mapped_lbas: u64,
+    pub mapped_bytes: u64,
+    pub physical_bytes: u64,
+    pub unique_blocks: u64,
+    pub dedup_ratio: f64,
+    pub compress_ratio: f64,
+    pub data_reduction_ratio: f64,
+    /// Epoch seconds when this was computed. Usage is cold data served from a
+    /// TTL cache, so callers should treat it as "as of" rather than live.
+    pub computed_at: u64,
+}
+
 /// Result for each dedup hit in a batched `atomic_batch_dedup_hits` call.
 #[derive(Debug, Clone, Copy)]
 pub enum DedupHitResult {
@@ -173,6 +213,47 @@ impl MetaStore {
 
     pub fn delete_volume(&self, id: &VolumeId) -> OnyxResult<Vec<RemapCleanup>> {
         self.backend.delete_volume(id)
+    }
+
+    // ── Snapshot lifecycle (see docs/onyx-phase2-snapshots.md) ──────────────
+
+    /// Take a named point-in-time snapshot of `vol_id`. `created_at` is the
+    /// engine generation stamp recorded for display. Rejects a duplicate
+    /// `(volume, name)`.
+    pub fn create_snapshot(
+        &self,
+        vol_id: &VolumeId,
+        snap_name: &str,
+        created_at: u64,
+    ) -> OnyxResult<SnapshotInfo> {
+        self.backend.create_snapshot(vol_id, snap_name, created_at)
+    }
+
+    /// List snapshots, optionally filtered to one volume.
+    pub fn list_snapshots(&self, volume: Option<&str>) -> OnyxResult<Vec<SnapshotInfo>> {
+        self.backend.list_snapshots(volume)
+    }
+
+    /// Drop a named snapshot. Returns the PBAs whose refcount hit zero as a
+    /// result — the caller MUST retire (not direct-free) these via the
+    /// `PbaLifecycle` retire path so `GcRunner` Gate 1/2 reclaims them (same
+    /// contract as lineage-GC-surfaced freed PBAs).
+    pub fn delete_snapshot(&self, vol_id: &VolumeId, snap_name: &str) -> OnyxResult<Vec<Pba>> {
+        self.backend.delete_snapshot(vol_id, snap_name)
+    }
+
+    /// Clone a snapshot into a new writable volume `new_name`. The clone shares
+    /// the snapshot's L2P pages copy-on-write; the source volume is untouched.
+    /// Returns the new volume's config.
+    pub fn clone_snapshot(
+        &self,
+        vol_id: &VolumeId,
+        snap_name: &str,
+        new_name: &str,
+        created_at: u64,
+    ) -> OnyxResult<VolumeConfig> {
+        self.backend
+            .clone_snapshot(vol_id, snap_name, new_name, created_at)
     }
 
     pub fn put_mapping(

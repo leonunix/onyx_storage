@@ -138,6 +138,109 @@ fn meta_only_create_list_delete() {
 }
 
 #[test]
+fn meta_only_snapshot_lifecycle() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open_meta_only(&config).unwrap();
+
+    engine
+        .create_volume("vol-a", 1024 * 1024, CompressionAlgo::Lz4)
+        .unwrap();
+
+    // Create a named snapshot.
+    let info = engine.create_snapshot("vol-a", "snap1").unwrap();
+    assert_eq!(info.volume, "vol-a");
+    assert_eq!(info.name, "snap1");
+    assert_eq!(info.size_bytes, 1024 * 1024);
+
+    // It shows up in the per-volume and global listings.
+    assert_eq!(engine.list_snapshots(Some("vol-a")).unwrap().len(), 1);
+    assert_eq!(engine.list_snapshots(None).unwrap().len(), 1);
+
+    // Duplicate (volume, name) is rejected.
+    assert!(engine.create_snapshot("vol-a", "snap1").is_err());
+
+    // Clone the snapshot into a new writable volume.
+    let cloned = engine.clone_snapshot("vol-a", "snap1", "vol-clone").unwrap();
+    assert_eq!(cloned.id.0, "vol-clone");
+    assert_eq!(cloned.size_bytes, 1024 * 1024);
+    let vols: Vec<String> = engine
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .map(|v| v.id.0)
+        .collect();
+    assert!(vols.contains(&"vol-a".to_string()));
+    assert!(vols.contains(&"vol-clone".to_string()));
+
+    // Cloning onto an existing volume name fails.
+    assert!(engine.clone_snapshot("vol-a", "snap1", "vol-clone").is_err());
+
+    // Restore is not yet implemented (Track A4).
+    assert!(engine.restore_snapshot("vol-a", "snap1").is_err());
+
+    // Drop the snapshot; the live clone is unaffected.
+    engine.delete_snapshot("vol-a", "snap1").unwrap();
+    assert!(engine.list_snapshots(Some("vol-a")).unwrap().is_empty());
+    assert!(engine
+        .list_volumes()
+        .unwrap()
+        .iter()
+        .any(|v| v.id.0 == "vol-clone"));
+
+    // Deleting a snapshot that does not exist is a no-op.
+    engine.delete_snapshot("vol-a", "missing").unwrap();
+
+    // Tear down: drop the clone (leaf) before the parent.
+    engine.delete_volume("vol-clone").unwrap();
+    engine.delete_volume("vol-a").unwrap();
+}
+
+#[test]
+fn meta_only_volume_usage_empty() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open_meta_only(&config).unwrap();
+    engine
+        .create_volume("vol-a", 4096 * 100, CompressionAlgo::Lz4)
+        .unwrap();
+    let usage = engine.volume_usage("vol-a").unwrap();
+    assert_eq!(usage.volume, "vol-a");
+    assert_eq!(usage.logical_size_bytes, 4096 * 100);
+    // Nothing written yet: no mapped blocks, ratios default to 0.
+    assert_eq!(usage.mapped_lbas, 0);
+    assert_eq!(usage.mapped_bytes, 0);
+    assert_eq!(usage.physical_bytes, 0);
+    assert_eq!(usage.unique_blocks, 0);
+    assert_eq!(usage.dedup_ratio, 0.0);
+    assert!(usage.computed_at > 0, "usage carries an as-of stamp");
+    // Second call within the TTL is served from the cold cache (same stamp).
+    let again = engine.volume_usage("vol-a").unwrap();
+    assert_eq!(again.computed_at, usage.computed_at);
+    // Unknown volume errors.
+    assert!(engine.volume_usage("nope").is_err());
+}
+
+#[test]
+fn meta_only_snapshots_survive_reopen() {
+    let (config, _md, _bf, _df) = make_config();
+    {
+        let engine = OnyxEngine::open_meta_only(&config).unwrap();
+        engine
+            .create_volume("vol-a", 1024 * 1024, CompressionAlgo::None)
+            .unwrap();
+        engine.create_snapshot("vol-a", "snap1").unwrap();
+        engine.create_snapshot("vol-a", "snap2").unwrap();
+        engine.shutdown().unwrap();
+    }
+    // Reopen: the snapshot catalog (v2) must persist across restart.
+    let engine = OnyxEngine::open_meta_only(&config).unwrap();
+    let snaps = engine.list_snapshots(Some("vol-a")).unwrap();
+    assert_eq!(snaps.len(), 2);
+    let names: Vec<String> = snaps.into_iter().map(|s| s.name).collect();
+    assert!(names.contains(&"snap1".to_string()));
+    assert!(names.contains(&"snap2".to_string()));
+}
+
+#[test]
 fn meta_only_open_volume_fails() {
     let (config, _md, _bf, _df) = make_config();
     let engine = OnyxEngine::open_meta_only(&config).unwrap();

@@ -12,7 +12,7 @@ use onyx_metadb::{
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry, FLAG_DEDUP_SKIPPED};
-use crate::meta::store::{DedupHitResult, RemapCleanup};
+use crate::meta::store::{DedupHitResult, RemapCleanup, SnapshotInfo};
 use crate::metrics::MetaMemorySnapshot;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
@@ -66,7 +66,7 @@ mod catalog;
 mod checkpoint;
 mod values;
 
-use catalog::{VolumeCatalog, VolumeCatalogEntry, CATALOG_FILE};
+use catalog::{SnapshotCatalogEntry, VolumeCatalog, VolumeCatalogEntry, CATALOG_FILE};
 use checkpoint::AsyncCheckpoint;
 pub(crate) use values::coalesce_free_pbas_to_extents;
 use values::{
@@ -237,6 +237,17 @@ impl DeferredCleanupHandle {
     }
 }
 
+fn snapshot_info_from_entry(entry: &SnapshotCatalogEntry) -> SnapshotInfo {
+    SnapshotInfo {
+        volume: entry.volume.clone(),
+        name: entry.name.clone(),
+        snapshot_id: entry.snapshot_id,
+        created_lsn: entry.created_lsn,
+        created_at: entry.created_at,
+        size_bytes: entry.size_bytes,
+    }
+}
+
 impl MetadbBackend {
     pub(crate) fn open(config: &MetaConfig) -> OnyxResult<Self> {
         let path = config.path().ok_or_else(|| {
@@ -390,16 +401,193 @@ impl MetadbBackend {
             (entry.ordinal, entry.config.clone())
         };
 
+        // metadb refuses `drop_volume` while live snapshots pin the volume, so
+        // drop every named snapshot of this volume first. Their refcount-zeroed
+        // PBAs are surfaced to the caller as `pba_freed` cleanups (blocks=1,
+        // empty mappings) so the engine retires them through the same
+        // PbaLifecycle path as overwrite cleanups.
+        let snap_names: Vec<String> = {
+            let catalog = self.catalog.lock().unwrap();
+            catalog
+                .snapshots
+                .iter()
+                .filter(|s| s.volume == id.0)
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        let mut snapshot_cleanups = Vec::new();
+        for name in snap_names {
+            for pba in self.delete_snapshot(id, &name)? {
+                snapshot_cleanups.push(RemapCleanup {
+                    pba,
+                    decrements: 1,
+                    blocks: 1,
+                    pba_freed: true,
+                    mappings: Vec::new(),
+                });
+            }
+        }
+
         let end = Lba(config.size_bytes / u64::from(config.block_size));
-        let cleanups = self.delete_blockmap_range(id, Lba(0), end)?;
+        let mut cleanups = self.delete_blockmap_range(id, Lba(0), end)?;
         self.db.drop_volume(ordinal)?;
 
         let mut catalog = self.catalog.lock().unwrap();
         catalog.by_id.remove(&id.0);
+        catalog.snapshots.retain(|s| s.volume != id.0);
         self.volume_ordinals.remove(&id.0);
         catalog.persist(&self.catalog_path)?;
 
+        cleanups.extend(snapshot_cleanups);
         Ok(cleanups)
+    }
+
+    // ── Snapshot lifecycle ──────────────────────────────────────────────────
+
+    pub(crate) fn create_snapshot(
+        &self,
+        vol_id: &VolumeId,
+        snap_name: &str,
+        created_at: u64,
+    ) -> OnyxResult<SnapshotInfo> {
+        if snap_name.is_empty() {
+            return Err(OnyxError::Config("snapshot name must not be empty".into()));
+        }
+        let (ordinal, size_bytes) = {
+            let catalog = self.catalog.lock().unwrap();
+            let entry = catalog
+                .by_id
+                .get(&vol_id.0)
+                .ok_or_else(|| OnyxError::VolumeNotFound(vol_id.0.clone()))?;
+            if catalog.find_snapshot(&vol_id.0, snap_name).is_some() {
+                return Err(OnyxError::Config(format!(
+                    "snapshot '{}' already exists for volume '{}'",
+                    snap_name, vol_id.0
+                )));
+            }
+            (entry.ordinal, entry.config.size_bytes)
+        };
+
+        let snapshot_id = self.db.take_snapshot(ordinal)?;
+        // Recover the capture LSN from the manifest entry metadb just wrote.
+        let created_lsn = self
+            .db
+            .snapshots_for(ordinal)
+            .into_iter()
+            .find(|s| s.id == snapshot_id)
+            .map(|s| s.created_lsn)
+            .unwrap_or(0);
+
+        let entry = SnapshotCatalogEntry {
+            volume: vol_id.0.clone(),
+            name: snap_name.to_string(),
+            snapshot_id,
+            vol_ord: ordinal,
+            created_lsn,
+            created_at,
+            size_bytes,
+        };
+        let info = snapshot_info_from_entry(&entry);
+        let mut catalog = self.catalog.lock().unwrap();
+        catalog.snapshots.push(entry);
+        catalog.persist(&self.catalog_path)?;
+        Ok(info)
+    }
+
+    pub(crate) fn list_snapshots(&self, volume: Option<&str>) -> OnyxResult<Vec<SnapshotInfo>> {
+        let catalog = self.catalog.lock().unwrap();
+        let mut out: Vec<SnapshotInfo> = catalog
+            .snapshots
+            .iter()
+            .filter(|s| volume.map_or(true, |v| s.volume == v))
+            .map(snapshot_info_from_entry)
+            .collect();
+        out.sort_by(|a, b| {
+            a.volume
+                .cmp(&b.volume)
+                .then(a.created_at.cmp(&b.created_at))
+                .then(a.name.cmp(&b.name))
+        });
+        Ok(out)
+    }
+
+    pub(crate) fn delete_snapshot(
+        &self,
+        vol_id: &VolumeId,
+        snap_name: &str,
+    ) -> OnyxResult<Vec<Pba>> {
+        let snapshot_id = {
+            let catalog = self.catalog.lock().unwrap();
+            match catalog.find_snapshot(&vol_id.0, snap_name) {
+                Some(s) => s.snapshot_id,
+                None => return Ok(Vec::new()),
+            }
+        };
+
+        let freed = match self.db.drop_snapshot(snapshot_id)? {
+            Some(report) => report
+                .freed_pbas
+                .into_iter()
+                .map(from_metadb_pba)
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let mut catalog = self.catalog.lock().unwrap();
+        catalog.remove_snapshot(&vol_id.0, snap_name);
+        catalog.persist(&self.catalog_path)?;
+        Ok(freed)
+    }
+
+    pub(crate) fn clone_snapshot(
+        &self,
+        vol_id: &VolumeId,
+        snap_name: &str,
+        new_name: &str,
+        created_at: u64,
+    ) -> OnyxResult<VolumeConfig> {
+        if new_name.is_empty() {
+            return Err(OnyxError::Config(
+                "clone target volume name must not be empty".into(),
+            ));
+        }
+        let (snapshot_id, mut new_config) = {
+            let catalog = self.catalog.lock().unwrap();
+            if catalog.by_id.contains_key(new_name) {
+                return Err(OnyxError::Config(format!(
+                    "volume '{}' already exists",
+                    new_name
+                )));
+            }
+            let snap = catalog
+                .find_snapshot(&vol_id.0, snap_name)
+                .ok_or_else(|| OnyxError::Config(format!(
+                    "snapshot '{}' not found for volume '{}'",
+                    snap_name, vol_id.0
+                )))?;
+            let src = catalog
+                .by_id
+                .get(&vol_id.0)
+                .ok_or_else(|| OnyxError::VolumeNotFound(vol_id.0.clone()))?;
+            (snap.snapshot_id, src.config.clone())
+        };
+        new_config.id = VolumeId(new_name.to_string());
+        new_config.created_at = created_at;
+
+        let new_ordinal = self.db.clone_volume(snapshot_id)?;
+
+        let mut catalog = self.catalog.lock().unwrap();
+        catalog.by_id.insert(
+            new_name.to_string(),
+            VolumeCatalogEntry {
+                ordinal: new_ordinal,
+                config: new_config.clone(),
+            },
+        );
+        self.volume_ordinals
+            .insert(new_name.to_string(), new_ordinal);
+        catalog.persist(&self.catalog_path)?;
+        Ok(new_config)
     }
 
     pub(crate) fn get_mapping(

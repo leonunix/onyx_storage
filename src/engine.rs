@@ -14,10 +14,10 @@ use crate::io::read_pool::ReadPool;
 use crate::io::superblock::{self, HeartbeatWriter};
 use crate::io::uring::IoUringSession;
 use crate::lifecycle::VolumeLifecycleManager;
-use crate::meta::store::MetaStore;
+use crate::meta::store::{MetaStore, SnapshotInfo};
 use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, EngineStatusSnapshot};
 use crate::space::allocator::SpaceAllocator;
-use crate::types::{CompressionAlgo, VolumeConfig, VolumeId};
+use crate::types::{CompressionAlgo, Pba, VolumeConfig, VolumeId};
 use crate::volume::OnyxVolume;
 use crate::zone::manager::ZoneManager;
 
@@ -26,6 +26,11 @@ mod lineage;
 
 use durability::DurabilityWatermarkHandle;
 use lineage::LineageFreedPbaDrainHandle;
+
+/// TTL for the per-volume usage cache. Usage is cold capacity data derived from
+/// an O(live-entries) L2P scan, so it is recomputed at most once per TTL per
+/// volume rather than on every request.
+const USAGE_CACHE_TTL_SECS: u64 = 60;
 
 /// A per-handle "alive" flag. Set to false when the volume is deleted.
 /// Each OnyxVolume holds its own Arc to this flag. The engine keeps Weak
@@ -67,6 +72,9 @@ pub struct OnyxEngine {
     live_handles: Mutex<Vec<(String, VolumeAliveFlag)>>,
     lifecycle: Arc<VolumeLifecycleManager>,
     metrics: Arc<EngineMetrics>,
+    /// Cold-data cache of per-volume capacity usage, keyed by volume name.
+    /// Recomputed lazily on read when older than [`USAGE_CACHE_TTL_SECS`].
+    usage_cache: dashmap::DashMap<String, crate::meta::store::VolumeUsage>,
     /// Adaptive reclaim heat map (observe-only, Stage A). Shared with the GC
     /// runner (writer) and read by the status path. `None` in standby /
     /// meta-only mode or when the heat refresh is disabled.
@@ -775,6 +783,7 @@ impl OnyxEngine {
             lifecycle,
             metrics,
             heat,
+            usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
@@ -810,6 +819,7 @@ impl OnyxEngine {
             lifecycle,
             metrics,
             heat: None,
+            usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),
@@ -895,6 +905,7 @@ impl OnyxEngine {
 
             self.invalidate_live_handles(name);
             self.metrics.remove_volume_metrics(name);
+            self.usage_cache.remove(name);
             self.metrics
                 .volume_delete_ops
                 .fetch_add(1, Ordering::Relaxed);
@@ -935,6 +946,205 @@ impl OnyxEngine {
     /// List all volumes.
     pub fn list_volumes(&self) -> OnyxResult<Vec<VolumeConfig>> {
         self.meta.list_volumes()
+    }
+
+    // ── Snapshot lifecycle (see docs/onyx-phase2-snapshots.md) ──────────────
+
+    /// Take a named point-in-time snapshot of `volume`. O(1) in metadb: the COW
+    /// L2P roots are ref-counted, no data is copied.
+    pub fn create_snapshot(&self, volume: &str, snap_name: &str) -> OnyxResult<SnapshotInfo> {
+        self.lifecycle.with_write_lock(volume, || {
+            let created_at = self.next_volume_generation();
+            let info = self
+                .meta
+                .create_snapshot(&VolumeId(volume.to_string()), snap_name, created_at)?;
+            self.metrics
+                .snapshot_create_ops
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                volume,
+                snapshot = snap_name,
+                snapshot_id = info.snapshot_id,
+                "snapshot created"
+            );
+            Ok(info)
+        })
+    }
+
+    /// List snapshots, optionally filtered to one volume.
+    pub fn list_snapshots(&self, volume: Option<&str>) -> OnyxResult<Vec<SnapshotInfo>> {
+        self.meta.list_snapshots(volume)
+    }
+
+    /// Capacity accounting for one volume. Usage is **cold data**: an L2P scan is
+    /// O(live entries) (seconds on a large volume), so results are served from a
+    /// per-volume TTL cache ([`USAGE_CACHE_TTL_SECS`]) and only recomputed when
+    /// stale or missing. The returned `computed_at` tells callers how fresh it is.
+    pub fn volume_usage(&self, volume: &str) -> OnyxResult<crate::meta::store::VolumeUsage> {
+        let now = Self::current_time_nanos() / 1_000_000_000;
+        if let Some(cached) = self.usage_cache.get(volume) {
+            if now.saturating_sub(cached.computed_at) < USAGE_CACHE_TTL_SECS {
+                return Ok(cached.clone());
+            }
+        }
+        let usage = self.compute_volume_usage(volume, now)?;
+        self.usage_cache
+            .insert(volume.to_string(), usage.clone());
+        Ok(usage)
+    }
+
+    /// Uncached L2P scan that produces a fresh [`VolumeUsage`]. See
+    /// [`Self::volume_usage`] for the caching wrapper.
+    fn compute_volume_usage(
+        &self,
+        volume: &str,
+        now_secs: u64,
+    ) -> OnyxResult<crate::meta::store::VolumeUsage> {
+        use std::collections::HashSet;
+        let vol_id = VolumeId(volume.to_string());
+        let cfg = self
+            .meta
+            .get_volume(&vol_id)?
+            .ok_or_else(|| OnyxError::VolumeNotFound(volume.to_string()))?;
+        let block_size = u64::from(cfg.block_size);
+        let lba_count = if block_size == 0 {
+            0
+        } else {
+            cfg.size_bytes / block_size
+        };
+
+        let mut mapped_lbas: u64 = 0;
+        // Each compressed unit (identified by base PBA + packer slot offset) is
+        // counted once for the physical/original tallies even though every member
+        // LBA carries the same unit fields.
+        let mut seen_units: HashSet<(u64, u16)> = HashSet::new();
+        let mut orig_bytes: u64 = 0;
+        let mut phys_bytes: u64 = 0;
+        self.meta
+            .scan_blockmap_range(&vol_id, crate::types::Lba(0), lba_count, &mut |_lba, v| {
+                if v.is_zero() {
+                    return;
+                }
+                mapped_lbas += 1;
+                if seen_units.insert((v.pba.0, v.slot_offset)) {
+                    orig_bytes += u64::from(v.unit_original_size);
+                    phys_bytes += u64::from(v.unit_compressed_size);
+                }
+            })?;
+
+        let mapped_bytes = mapped_lbas.saturating_mul(block_size);
+        let ratio = |num: u64, den: u64| -> f64 {
+            if den == 0 {
+                0.0
+            } else {
+                num as f64 / den as f64
+            }
+        };
+        Ok(crate::meta::store::VolumeUsage {
+            volume: volume.to_string(),
+            logical_size_bytes: cfg.size_bytes,
+            mapped_lbas,
+            mapped_bytes,
+            physical_bytes: phys_bytes,
+            unique_blocks: seen_units.len() as u64,
+            dedup_ratio: ratio(mapped_bytes, orig_bytes),
+            compress_ratio: ratio(orig_bytes, phys_bytes),
+            data_reduction_ratio: ratio(mapped_bytes, phys_bytes),
+            computed_at: now_secs,
+        })
+    }
+
+    /// Drop a named snapshot and retire the PBAs its drop freed (rc hit zero).
+    /// Returns the number of freed physical blocks. The freed PBAs are RETIRED
+    /// (not direct-freed) so `GcRunner` Gate 1/2 reclaims them — same contract
+    /// as lineage-GC-surfaced PBAs (avoids the premature-free CRC).
+    pub fn delete_snapshot(&self, volume: &str, snap_name: &str) -> OnyxResult<usize> {
+        let freed = self.lifecycle.with_write_lock(volume, || {
+            self.meta
+                .delete_snapshot(&VolumeId(volume.to_string()), snap_name)
+        })?;
+        let freed_blocks = freed.len();
+        self.retire_freed_pbas(freed, "snapshot_drop_surfaced");
+        self.metrics
+            .snapshot_delete_ops
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::info!(volume, snapshot = snap_name, freed_blocks, "snapshot deleted");
+        Ok(freed_blocks)
+    }
+
+    /// Clone a snapshot into a new writable volume `new_name`. The clone shares
+    /// the snapshot's L2P pages copy-on-write; the source volume is untouched.
+    /// The new volume is created but not opened — `start -v <new_name>` to serve.
+    pub fn clone_snapshot(
+        &self,
+        volume: &str,
+        snap_name: &str,
+        new_name: &str,
+    ) -> OnyxResult<VolumeConfig> {
+        self.lifecycle.with_write_lock(new_name, || {
+            let created_at = self.next_volume_generation();
+            let cfg = self.meta.clone_snapshot(
+                &VolumeId(volume.to_string()),
+                snap_name,
+                new_name,
+                created_at,
+            )?;
+            self.metrics
+                .snapshot_clone_ops
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                source = volume,
+                snapshot = snap_name,
+                clone = new_name,
+                "snapshot cloned into new volume"
+            );
+            Ok(cfg)
+        })
+    }
+
+    /// Restore a volume in place to a named snapshot (destructive rollback).
+    ///
+    /// Not yet implemented: metadb has no in-place root-swap primitive yet
+    /// (`Db::restore_volume_to_snapshot`). Until it lands, callers who want
+    /// snapshot-state data should `clone_snapshot` into a fresh volume. Tracked
+    /// as Track A4 in docs/onyx-phase2-snapshots.md.
+    pub fn restore_snapshot(&self, _volume: &str, _snap_name: &str) -> OnyxResult<()> {
+        Err(OnyxError::Config(
+            "snapshot restore (in-place rollback) not yet implemented; \
+             use snapshot-clone to materialise the snapshot into a new volume"
+                .into(),
+        ))
+    }
+
+    /// Retire PBAs surfaced as freed by a snapshot drop. Mirrors the
+    /// lineage-freed-PBA drain (`engine/lineage.rs::drain_once`): coalesce →
+    /// idempotent skip of already-free/retired → `retire_committed`.
+    fn retire_freed_pbas(&self, pbas: Vec<Pba>, reason: &'static str) {
+        if pbas.is_empty() {
+            return;
+        }
+        let pba_lifecycle = self
+            .flusher
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|flusher| flusher.pba_lifecycle());
+        let Some(pba_lifecycle) = pba_lifecycle else {
+            tracing::warn!(
+                count = pbas.len(),
+                reason,
+                "cannot retire snapshot-freed PBAs in meta-only mode; left for next GC pass"
+            );
+            return;
+        };
+        let extents = crate::meta::backend::coalesce_free_pbas_to_extents(&pbas);
+        for extent in extents {
+            let allocator = pba_lifecycle.allocator();
+            if allocator.is_extent_free(extent) || allocator.is_retired(extent.start) {
+                continue;
+            }
+            pba_lifecycle.retire_committed(reason, extent);
+        }
     }
 
     /// Open a volume for IO. Requires full engine mode.
@@ -1278,6 +1488,7 @@ impl OnyxEngine {
             lifecycle,
             metrics,
             heat,
+            usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
             config: config.clone(),
             shutdown_done: Mutex::new(false),

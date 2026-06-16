@@ -704,6 +704,206 @@ impl ServiceController {
                     }
                     let _ = stream.flush();
                 }
+                // ── Snapshot lifecycle commands ──────────────────
+                "snapshot-create" => {
+                    require_engine!(engine, stream);
+                    if parts.len() < 3 {
+                        let _ = stream
+                            .write_all(b"error: usage: snapshot-create <volume> <name>\n");
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.create_snapshot(parts[1], parts[2]) {
+                        Ok(info) => {
+                            let _ = stream
+                                .write_all(format!("ok {}\n", info.snapshot_id).as_bytes());
+                        }
+                        Err(e) => {
+                            let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                "snapshot-delete" => {
+                    require_engine!(engine, stream);
+                    if parts.len() < 3 {
+                        let _ = stream
+                            .write_all(b"error: usage: snapshot-delete <volume> <name>\n");
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.delete_snapshot(parts[1], parts[2]) {
+                        Ok(freed) => {
+                            let _ = stream.write_all(format!("ok {}\n", freed).as_bytes());
+                        }
+                        Err(e) => {
+                            let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                "snapshot-list" => {
+                    require_engine!(engine, stream);
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    let volume = parts.get(1).copied().filter(|s| !s.is_empty());
+                    match eng.list_snapshots(volume) {
+                        Ok(snaps) => {
+                            for s in &snaps {
+                                let _ = stream.write_all(
+                                    format!(
+                                        "{}@{} id={} created_lsn={} created_at={} size={}\n",
+                                        s.volume,
+                                        s.name,
+                                        s.snapshot_id,
+                                        s.created_lsn,
+                                        s.created_at,
+                                        s.size_bytes
+                                    )
+                                    .as_bytes(),
+                                );
+                            }
+                            let _ = stream.write_all(b"ok\n");
+                        }
+                        Err(e) => {
+                            let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                "snapshot-clone" => {
+                    require_engine!(engine, stream);
+                    if parts.len() < 4 {
+                        let _ = stream.write_all(
+                            b"error: usage: snapshot-clone <volume> <name> <new_volume>\n",
+                        );
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.clone_snapshot(parts[1], parts[2], parts[3]) {
+                        Ok(cfg) => {
+                            let _ = stream.write_all(format!("ok {}\n", cfg.id.0).as_bytes());
+                        }
+                        Err(e) => {
+                            let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                "snapshot-restore" => {
+                    require_engine!(engine, stream);
+                    if parts.len() < 3 {
+                        let _ = stream
+                            .write_all(b"error: usage: snapshot-restore <volume> <name>\n");
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.restore_snapshot(parts[1], parts[2]) {
+                        Ok(()) => {
+                            let _ = stream.write_all(b"ok\n");
+                        }
+                        Err(e) => {
+                            let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                "snapshots-json" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    match opt.as_ref() {
+                        None => {
+                            let _ = stream.write_all(b"[]\nok\n");
+                        }
+                        Some(eng) => {
+                            let volume = parts.get(1).copied().filter(|s| !s.is_empty());
+                            match eng.list_snapshots(volume) {
+                                Ok(snaps) => {
+                                    let arr: Vec<serde_json::Value> = snaps
+                                        .iter()
+                                        .map(|s| {
+                                            serde_json::json!({
+                                                "volume": s.volume,
+                                                "name": s.name,
+                                                "snapshot_id": s.snapshot_id,
+                                                // created_at is stored as epoch nanos
+                                                // (matches volume.created_at); emit
+                                                // epoch seconds for the dashboard.
+                                                "created_at": s.created_at / 1_000_000_000,
+                                                "created_lsn": s.created_lsn,
+                                                "size_bytes": s.size_bytes,
+                                            })
+                                        })
+                                        .collect();
+                                    let json = serde_json::to_string(&arr)
+                                        .unwrap_or_else(|_| "[]".into());
+                                    let _ = stream.write_all(json.as_bytes());
+                                    let _ = stream.write_all(b"\nok\n");
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                }
+                            }
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+
+                "volume-usage" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    match opt.as_ref() {
+                        None => {
+                            let _ = stream.write_all(b"error: engine not initialised\n");
+                        }
+                        Some(eng) => {
+                            if parts.len() < 2 {
+                                let _ =
+                                    stream.write_all(b"error: usage: volume-usage <volume>\n");
+                                let _ = stream.flush();
+                                continue;
+                            }
+                            match eng.volume_usage(parts[1]) {
+                                Ok(u) => {
+                                    let payload = serde_json::json!({
+                                        "volume": u.volume,
+                                        "logical_size_bytes": u.logical_size_bytes,
+                                        "mapped_lbas": u.mapped_lbas,
+                                        "mapped_bytes": u.mapped_bytes,
+                                        "physical_bytes": u.physical_bytes,
+                                        "unique_blocks": u.unique_blocks,
+                                        "dedup_ratio": u.dedup_ratio,
+                                        "compress_ratio": u.compress_ratio,
+                                        "data_reduction_ratio": u.data_reduction_ratio,
+                                        "computed_at": u.computed_at,
+                                    });
+                                    let _ = stream.write_all(payload.to_string().as_bytes());
+                                    let _ = stream.write_all(b"\nok\n");
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                }
+                            }
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+
                 // ── JSON IPC commands (for dashboard) ────────────
                 "status-json" => {
                     let guard = engine.load();
@@ -874,6 +1074,63 @@ pub fn send_list_volumes(socket_path: &Path) -> OnyxResult<Vec<String>> {
 pub fn send_status_command(socket_path: &Path) -> OnyxResult<Vec<String>> {
     let lines = send_ipc_command(socket_path, "status")?;
     Ok(lines.into_iter().filter(|l| l != "ok").collect())
+}
+
+/// Parse the `ok <value>` terminator from an IPC reply.
+fn ok_suffix(lines: &[String]) -> Option<&str> {
+    lines.iter().find_map(|l| l.strip_prefix("ok "))
+}
+
+pub fn send_snapshot_create(socket_path: &Path, volume: &str, name: &str) -> OnyxResult<u64> {
+    let lines =
+        send_ipc_command(socket_path, &format!("snapshot-create {} {}", volume, name))?;
+    ok_suffix(&lines)
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| OnyxError::Config("snapshot-create: missing snapshot id in reply".into()))
+}
+
+pub fn send_snapshot_delete(socket_path: &Path, volume: &str, name: &str) -> OnyxResult<u64> {
+    let lines =
+        send_ipc_command(socket_path, &format!("snapshot-delete {} {}", volume, name))?;
+    Ok(ok_suffix(&lines).and_then(|s| s.trim().parse().ok()).unwrap_or(0))
+}
+
+pub fn send_snapshot_list(socket_path: &Path, volume: Option<&str>) -> OnyxResult<Vec<String>> {
+    let cmd = match volume {
+        Some(v) => format!("snapshot-list {}", v),
+        None => "snapshot-list".to_string(),
+    };
+    let lines = send_ipc_command(socket_path, &cmd)?;
+    Ok(lines.into_iter().filter(|l| l != "ok").collect())
+}
+
+pub fn send_snapshot_clone(
+    socket_path: &Path,
+    volume: &str,
+    name: &str,
+    to: &str,
+) -> OnyxResult<String> {
+    let lines = send_ipc_command(
+        socket_path,
+        &format!("snapshot-clone {} {} {}", volume, name, to),
+    )?;
+    ok_suffix(&lines)
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| OnyxError::Config("snapshot-clone: missing new volume in reply".into()))
+}
+
+pub fn send_snapshot_restore(socket_path: &Path, volume: &str, name: &str) -> OnyxResult<()> {
+    send_ipc_command(socket_path, &format!("snapshot-restore {} {}", volume, name))?;
+    Ok(())
+}
+
+/// Returns the `volume-usage` JSON payload line from a running engine.
+pub fn send_volume_usage(socket_path: &Path, volume: &str) -> OnyxResult<String> {
+    let lines = send_ipc_command(socket_path, &format!("volume-usage {}", volume))?;
+    lines
+        .into_iter()
+        .find(|l| l != "ok" && l.starts_with('{'))
+        .ok_or_else(|| OnyxError::Config("volume-usage: empty reply".into()))
 }
 
 pub fn send_mode_command(socket_path: &Path) -> OnyxResult<String> {

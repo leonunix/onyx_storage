@@ -11,10 +11,21 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::types::VolumeConfig;
 
 pub(super) const CATALOG_FILE: &str = "onyx-volume-catalog.bin";
-const CATALOG_VERSION: u32 = 1;
+// v1: volumes only. v2: adds the snapshot registry (name → metadb SnapshotId).
+// v1 files load with an empty snapshot set; persist always writes v2.
+const CATALOG_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct VolumeCatalogFile {
+    version: u32,
+    volumes: Vec<VolumeCatalogEntry>,
+    snapshots: Vec<SnapshotCatalogEntry>,
+}
+
+/// v1 on-disk shape (no snapshot registry), kept for backward-compatible read.
+#[derive(Clone, Debug, Deserialize)]
+struct VolumeCatalogFileV1 {
+    #[allow(dead_code)]
     version: u32,
     volumes: Vec<VolumeCatalogEntry>,
 }
@@ -25,9 +36,23 @@ pub(super) struct VolumeCatalogEntry {
     pub(super) config: VolumeConfig,
 }
 
+/// One named snapshot. `(volume, name)` is the user-facing identity; `snapshot_id`
+/// is the metadb `SnapshotId` (u64) the COW primitives operate on.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct SnapshotCatalogEntry {
+    pub(super) volume: String,
+    pub(super) name: String,
+    pub(super) snapshot_id: u64,
+    pub(super) vol_ord: VolumeOrdinal,
+    pub(super) created_lsn: u64,
+    pub(super) created_at: u64,
+    pub(super) size_bytes: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct VolumeCatalog {
     pub(super) by_id: HashMap<String, VolumeCatalogEntry>,
+    pub(super) snapshots: Vec<SnapshotCatalogEntry>,
 }
 impl VolumeCatalog {
     pub(super) fn load(path: &Path) -> OnyxResult<Self> {
@@ -36,17 +61,36 @@ impl VolumeCatalog {
         }
 
         let bytes = fs::read(path)?;
-        let file: VolumeCatalogFile =
-            bincode::deserialize(&bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
-        if file.version != CATALOG_VERSION {
-            return Err(OnyxError::Config(format!(
-                "unsupported metadb volume catalog version {}, expected {}",
-                file.version, CATALOG_VERSION
-            )));
+        // bincode 1.x encodes the leading `version: u32` as a 4-byte LE fixint, so
+        // we can branch on the on-disk version without committing to a struct shape
+        // that would mis-parse an older file (or reject its trailing-byte layout).
+        if bytes.len() < 4 {
+            return Err(OnyxError::Config(
+                "metadb volume catalog file is truncated".into(),
+            ));
         }
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let (volumes, snapshots) = match version {
+            1 => {
+                let file: VolumeCatalogFileV1 =
+                    bincode::deserialize(&bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
+                (file.volumes, Vec::new())
+            }
+            2 => {
+                let file: VolumeCatalogFile =
+                    bincode::deserialize(&bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
+                (file.volumes, file.snapshots)
+            }
+            other => {
+                return Err(OnyxError::Config(format!(
+                    "unsupported metadb volume catalog version {}, expected <= {}",
+                    other, CATALOG_VERSION
+                )));
+            }
+        };
 
-        let mut by_id = HashMap::with_capacity(file.volumes.len());
-        for entry in file.volumes {
+        let mut by_id = HashMap::with_capacity(volumes.len());
+        for entry in volumes {
             let id = entry.config.id.0.clone();
             if by_id.insert(id.clone(), entry).is_some() {
                 return Err(OnyxError::Config(format!(
@@ -54,18 +98,41 @@ impl VolumeCatalog {
                 )));
             }
         }
-        Ok(Self { by_id })
+        Ok(Self { by_id, snapshots })
     }
 
     pub(super) fn persist(&self, path: &Path) -> OnyxResult<()> {
         let mut volumes: Vec<VolumeCatalogEntry> = self.by_id.values().cloned().collect();
         volumes.sort_by_key(|entry| entry.ordinal);
+        let mut snapshots = self.snapshots.clone();
+        snapshots.sort_by(|a, b| (a.vol_ord, a.snapshot_id).cmp(&(b.vol_ord, b.snapshot_id)));
         let file = VolumeCatalogFile {
             version: CATALOG_VERSION,
             volumes,
+            snapshots,
         };
         let bytes = bincode::serialize(&file).map_err(|e| OnyxError::Config(e.to_string()))?;
         atomic_write(path, &bytes)
+    }
+
+    /// Find a named snapshot by `(volume, name)`.
+    pub(super) fn find_snapshot(&self, volume: &str, name: &str) -> Option<&SnapshotCatalogEntry> {
+        self.snapshots
+            .iter()
+            .find(|s| s.volume == volume && s.name == name)
+    }
+
+    /// Remove and return a named snapshot, if present.
+    pub(super) fn remove_snapshot(
+        &mut self,
+        volume: &str,
+        name: &str,
+    ) -> Option<SnapshotCatalogEntry> {
+        let pos = self
+            .snapshots
+            .iter()
+            .position(|s| s.volume == volume && s.name == name)?;
+        Some(self.snapshots.remove(pos))
     }
 
     pub(super) fn validate_against_db(&self, db: &Db) -> OnyxResult<()> {
