@@ -18,9 +18,13 @@ Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用
 - **内容寻址去重** &mdash; xxh3_64 指纹、首次出现的 miss 进 RAM 候选缓存（CandidateCache）、第二次命中走 LV3 字节比对验证后再 promote 到 dedup_index、cuckoo-filter L0、后台 DEDUP_SKIPPED 补扫 + cold-tail 扫描恢复重启后的去重率
 - **Fragment 打包** &mdash; VDO 风格 bin-packing，多个 < 4KB 压缩 fragment 共享物理 slot
 - **垃圾回收** &mdash; 后台 dead block 扫描与回写，带背压控制
-- **崩溃一致性** &mdash; metadb 原子提交；写缓冲 sync 后才 ack
+- **定制元数据引擎** &mdash; in-tree [onyx-metadb](metadb/)（paged COW radix L2P + paged-array refcount + cuckoo dedup_index），共享一条 WAL + group commit
+- **崩溃一致性** &mdash; 写缓冲 sync 后才 ack；metadb 提交原子发布 L2P remap 与 verified dedup promote，配合 checkpoint/watermark 释放环形日志
+- **高性能写路径** &mdash; staging channel + write thread batch（encode/CRC 移出热路径）、jemalloc、DashMap 256 分片索引、per-shard 背压
+- **Retired PBA 回收** &mdash; committed dead PBA 先 retire，再在 refcount、hazard、fold-consistent 引用扫描和 reclaim-age grace 全部通过后才回收；metadb lineage `FreePbas` 也走同一条 retire→reclaim 路径
 - **Zone 并发** &mdash; LBA 空间分区为多个 zone，每个 zone 由独立工作线程服务
 - **ublk 前端**（仅 Linux）&mdash; 将卷暴露为 `/dev/ublkbN` 块设备，512B 扇区对齐
+- **服务模式** &mdash; 单进程多卷服务，Unix socket IPC 在线管理与优雅关停
 
 ## 架构
 
@@ -29,16 +33,22 @@ ublk (Linux) / stdin (macOS 开发)
   |
 ZoneManager --> ZoneWorker x N（每 zone 单线程，crossbeam channel 调度）
   |
-WriteBufferPool（LV2 上 O_DIRECT 环形日志，8KB slot，sync 后 ack）
-  |  后台 BufferFlusher
+WriteBufferPool（LV2 上 O_DIRECT 环形日志，staging channel + write thread batch，jemalloc）
+  |  后台 BufferFlusher（每 shard 一条 lane）
   v
-Dedup Workers --> Compress Workers --> Packer（bin-pack fragments）
+Dedup Workers --> Compress Workers --> Packer（bin-pack）--> Commit Workers
   |
-IoEngine（O_DIRECT --> LV3）+ MetaStore（metadb 原子提交）
+IoEngine（O_DIRECT --> LV3）+ MetaStore（metadb tx：L2P remap + verified DedupPut/repair）
   |
-SpaceAllocator（BTreeSet 空闲链表，strip 对齐分配）
+SpaceAllocator（free -> allocated -> retired -> reclaimed；lineage FreePbas 并入 retire 路径）
   |
 dm-raid + LVM --> NVMe SSD x N
+
+onyx-metadb (in-tree)
+  paged COW radix L2P（per-volume，可 snapshot）
+  paged-array refcount + per-shard delta（dedup membership / lineage aware）
+  cuckoo dedup_index（4 slots/bucket）+ cuckoo-filter L0 + L1 hot cache
+  共享 WAL + group commit + per-shard apply lane
 ```
 
 ## 快速开始
@@ -153,6 +163,10 @@ Per-volume blockmap（每个 volume 一个命名空间）：
 - [x] MVP：ublk + metadb + 压缩 + 空间管理
 - [x] Packer + GC：fragment bin-packing、GC 扫描/回写、背压控制、hole map 复用
 - [x] 去重：工作线程池、dedup_index、分级跳过策略、DEDUP_SKIPPED 补扫、RAM 候选缓存 + LV3 字节验证 promote、candidate-before-retire cleanup、scrub/orphan 维护、cold-tail blockmap 扫描、cuckoo-filter L0
+- [x] 高性能前台：staging channel + write thread batch、jemalloc、DashMap 256 分片索引、ring 背压
+- [x] 高性能后台：batch writer（drain 32 units → 1 metadb tx）、multi_get 旧 mapping、批量 dedup cleanup、sharded dedup apply lane
+- [x] 换元数据引擎：用 in-tree onyx-metadb 替换 RocksDB（paged COW radix L2P、paged-array refcount + delta、cuckoo dedup_index、共享 WAL + group commit）
+- [x] 服务模式：多卷启动、Unix socket IPC（stop/create/delete/list）、信号处理（SIGTERM/SIGINT）
 - [ ] RAID 感知：strip 对齐写出、strip 粒度分配
 - [ ] 生产化：iSCSI 前端、HA（双控 active-standby）、Prometheus 监控
 - [ ] 高性能：NVMe-oF over RDMA
