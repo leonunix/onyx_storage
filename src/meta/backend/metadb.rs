@@ -434,7 +434,22 @@ impl MetadbBackend {
 
         let end = Lba(config.size_bytes / u64::from(config.block_size));
         let mut cleanups = self.delete_blockmap_range(id, Lba(0), end)?;
-        self.db.drop_volume(ordinal)?;
+        // ZFS port Phase 4 Step 4 (S0): a dropped clone surfaces the promotion
+        // over-pin PBAs whose global rc reached 0 (and that no surviving root
+        // maps). Retire them through the same PbaLifecycle path as the snapshot
+        // / overwrite cleanups; the by-PBA HashMap merge downstream absorbs any
+        // duplicate FreePbas idempotently.
+        if let Some(report) = self.db.drop_volume(ordinal)? {
+            for pba in report.freed_pbas {
+                cleanups.push(RemapCleanup {
+                    pba: from_metadb_pba(pba),
+                    decrements: 1,
+                    blocks: 1,
+                    pba_freed: true,
+                    mappings: Vec::new(),
+                });
+            }
+        }
 
         let mut catalog = self.catalog.lock().unwrap();
         catalog.by_id.remove(&id.0);
