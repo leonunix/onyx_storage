@@ -330,7 +330,7 @@ pub struct EngineMetrics {
     pub flush_commit_worker_drain_lbas: AtomicU64,
     pub flush_commit_worker_drain_jobs_max: AtomicU64,
     pub flush_commit_worker_drain_lbas_max: AtomicU64,
-    /// ZFS-TXG-clone Phase 2 pipeline observability. `pipeline_issues`
+    /// Deferred commit pipeline observability. `pipeline_issues`
     /// counts passthrough chunks fed into the per-volume deferred-outcome
     /// deque (`flush_or_queue_passthrough_chunk` calls that produced a
     /// `PendingPassthroughChunk`). `pipeline_depth_max` is the high-water
@@ -377,9 +377,9 @@ pub struct EngineMetrics {
     /// These four counters isolate the inside-`coalesce_pending` cost
     /// so a `coalesce 97% busy` signal can be split into "stuck on
     /// channel send" vs "actually burning CPU in coalesce_slices".
-    /// Sum of phase2/3/4 will be smaller than `pending_ns` because
-    /// Phase 1 (LbaSlice build) and per-call overhead are not
-    /// attributed to any phase.
+    /// Sum of the dedup/sort/merge timers will be smaller than `pending_ns`
+    /// because LbaSlice build time and per-call overhead are not attributed
+    /// to any of those timers.
     pub flush_coalesce_pending_ns: AtomicU64,
     pub flush_coalesce_pending_ops: AtomicU64,
     pub flush_coalesce_phase2_dedup_ns: AtomicU64,
@@ -461,10 +461,11 @@ pub struct EngineMetrics {
     /// means the byte-deadness heuristic is churning); `incomplete_skips` =
     /// slots that passed the byte-deadness gate but whose window did NOT see all
     /// of the slot's live references (`rc != visible_live`), so evacuating now
-    /// would be wasted — a large value sizes the Phase-2 sweep-accumulator.
+    /// would be wasted — a large value sizes the sweep accumulator.
     /// `cost_cap_skips` is the COMPLEMENT: byte-dead slots seen completely
     /// (`rc == visible_live`) but pinned by more than `compactor_slot_evac_max_live`
-    /// live blocks — too expensive to relocate; Phase 2 does NOT help these.
+    /// live blocks — too expensive to relocate; the sweep accumulator does
+    /// not help these.
     pub gc_slot_evac_candidates: AtomicU64,
     pub gc_slot_evac_blocks: AtomicU64,
     pub gc_slot_evac_incomplete_skips: AtomicU64,
@@ -484,7 +485,7 @@ pub struct EngineMetrics {
     /// is proof the consistent recheck is load-bearing); a sustained 0 across
     /// a known-racy workload means the recheck isn't engaging.
     pub gc_reclaim_premature_free_averted: AtomicU64,
-    /// [[no-refcount-hot-path-design]] Phase 5: count of PBAs that
+    /// [[no-refcount-hot-path-design]] Rc-neutral path: count of PBAs that
     /// flowed back to the allocator via Lineage GC's `WalOp::FreePbas`
     /// surface, drained by `LineageFreedPbaDrainHandle`. Counts blocks
     /// (not PBAs) so it stays comparable with `gc_blocks_rewritten`.

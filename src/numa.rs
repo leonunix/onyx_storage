@@ -587,7 +587,7 @@ fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResu
         tracing::warn!(error = %err, "set_mempolicy(MPOL_BIND) failed; \
              memory placement falls back to the OS default");
     }
-    // Main thread lives on the home pod: metadb singletons (WAL/txg-sync/
+    // Main thread lives on the home pod: metadb singletons (WAL/BFG sync/
     // manifest workers without explicit binds) and libublk parents inherit
     // home placement.
     if let Err(err) = crate::affinity::bind_current_thread_to(&pods[home_pod].cpus) {
@@ -612,7 +612,7 @@ fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResu
     crate::affinity::init_partition(topo_part);
 
     // metadb stays WHOLE on the home pod — measured 2026-06-11: splitting
-    // the apply lanes / TXG drain across pods caps the flush drain at
+    // the apply lanes / BFG drain across pods caps the flush drain at
     // ~13k remap/s regardless of variant, because the LSN-ordered apply
     // chain (last_applied_lsn + cvar) then includes a cross-socket hop per
     // LSN (~70µs ⇒ ~14k/s ceiling), and the shared md devices pay a

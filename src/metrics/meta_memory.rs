@@ -73,7 +73,7 @@ pub struct MetaMemorySnapshot {
     pub commit_finish_global_wait_max_us: u64,
     pub commit_apply_us: u64,
     pub commit_apply_max_us: u64,
-    // ZFS-TXG-clone Phase 1: direct L2P apply on commit thread.
+    // Direct L2P apply on the commit thread.
     pub commit_direct_apply_count: u64,
     pub commit_direct_apply_us: u64,
     pub commit_direct_apply_max_us: u64,
@@ -352,7 +352,7 @@ pub struct MetaMemorySnapshot {
     pub flush_reclaim_reclaimed_pages: u64,
     pub flush_reclaim_blocked_pages: u64,
     // metadb Lineage GC head-advance attribution ([[no-refcount-hot-path]]
-    // Phase 5). Surfaces WHY FreePbas stops being emitted under sustained
+    // rc-neutral mode). Surfaces WHY FreePbas stops being emitted under sustained
     // overwrite: `skipped_rc` (a dead record's PBA still has rc>0, bailing
     // the whole head segment) vs `skipped_snap` / `skipped_descendant`.
     // `blocked_rc0_pbas` is the rc==0 reclaim debt stuck behind those rc>0

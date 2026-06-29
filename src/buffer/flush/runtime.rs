@@ -93,8 +93,8 @@ impl BufferFlusher {
         let commit_coalesce_lba_budget = config.commit_coalesce_lba_budget;
         let commit_coalesce_timeout = Duration::from_micros(config.commit_coalesce_timeout_us);
         let packed_commit_try_drain_lba_budget = config.packed_commit_try_drain_lba_budget;
-        // ZFS-TXG-clone Phase 2: collapse onyx flag + depth knob to a
-        // single effective cap. Flag off → cap=1 (sync pacing via
+        // Collapse the onyx flag + depth knob to a single effective cap.
+        // Flag off → cap=1 (sync pacing via
         // deque); flag on → cap=configured depth (4 by default).
         let commit_worker_pipeline_depth = if config.commit_worker_deferred_outcomes {
             config.commit_worker_pipeline_depth.max(1)
@@ -131,8 +131,8 @@ impl BufferFlusher {
             commit_worker_rxs.push(rx);
         }
 
-        // Phase 2.2 post-commit pairing. One channel per commit_worker
-        // so mark_flushed traffic for any one volume stays serialised
+        // Post-commit pairing. One channel per commit_worker so
+        // mark_flushed traffic for any one volume stays serialised
         // (matches the commit_worker's per-volume FIFO).
         let mut post_commit_txs: Vec<Sender<writer::PostCommitJob>> =
             Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
@@ -580,8 +580,8 @@ impl BufferFlusher {
         for h in self.commit_worker_handles.drain(..) {
             let _ = h.join();
         }
-        // Phase 2.2: post_commit threads exit when commit_worker
-        // post_commit_tx senders drop (the only senders are inside
+        // post_commit threads exit when commit_worker post_commit_tx
+        // senders drop (the only senders are inside
         // commit_worker stack frames, freed when the threads above
         // joined). Join them next so mark_flushed/candidate work for
         // the last batch of commits is durable before downstream

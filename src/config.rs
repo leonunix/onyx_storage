@@ -50,7 +50,7 @@ pub enum NumaMode {
     /// allowed to spill per `cold_cache_policy`. Replaces the
     /// "numactl --cpunodebind --membind + threading.enabled=false" recipe.
     Confine,
-    /// Dual-socket pod partition (design Phase 1). Parsing is accepted so
+    /// Dual-socket pod partition mode. Parsing is accepted so
     /// configs can be staged, but startup refuses until implemented.
     Partition,
 }
@@ -246,7 +246,7 @@ pub struct MetaConfig {
     /// `synchronous=false`. Metadb default is 1000 µs (amortises fsync
     /// cost). With `wal_async_commits_enabled=true` plus
     /// `commit_deferred_outcomes_enabled=true` (both default on),
-    /// fsync runs only at the TXG-sync barrier, so the window is pure
+    /// fsync runs only at the BFG-sync barrier, so the window is pure
     /// per-submit latency. 2026-05-27 instrumentation pinned this as
     /// the dominant chunk of `wal_submit_us`.
     #[serde(default = "default_metadb_wal_async_group_commit_window_us")]
@@ -491,7 +491,7 @@ pub struct MetaConfig {
     #[serde(default = "default_l2p_buffer_max_interval_ms")]
     pub l2p_buffer_max_interval_ms: u64,
 
-    /// Enable the ZFS-TXG-clone Phase 1 direct L2P apply fast path.
+    /// Enable the direct L2P apply fast path.
     /// When `true` and every target L2P shard runs in `use_buffer`
     /// mode (requires `l2p_buffer_enabled = true`), L2P-only commits
     /// apply on the caller thread instead of enqueuing closures onto
@@ -501,40 +501,37 @@ pub struct MetaConfig {
     #[serde(default = "default_commit_direct_apply_enabled")]
     pub commit_direct_apply_enabled: bool,
 
-    /// Enable the ZFS-TXG-clone Phase 2 deferred-outcome commit path
-    /// on the onyx side. When `true`, the commit_worker calls metadb's
+    /// Enable deferred commit outcomes on the onyx side. When `true`,
+    /// the commit_worker calls metadb's
     /// `Db::commit_ops_deferred` and the returned outcomes are
-    /// delivered at the next L2P compactor pass (the TXG-sync
-    /// boundary) rather than synchronously on the commit thread.
+    /// delivered at the next BFG sync boundary rather than
+    /// synchronously on the commit thread.
     /// This config also requires the metadb-side flag
     /// `commit_deferred_outcomes_enabled = true`; with either flag
     /// off the call resolves to the existing synchronous path.
-    /// Default off until the 8h `deferred_outcomes_proptest` soak
-    /// gate on nvme-box passes. See
-    /// `/root/.claude/plans/soft-doodling-snail.md`.
+    /// This lets each per-volume commit worker pipeline multiple
+    /// metadata commits instead of waiting for each one inline.
     #[serde(default = "default_commit_deferred_outcomes_enabled")]
     pub commit_deferred_outcomes_enabled: bool,
 
-    /// Enable the ZFS-TXG-clone Phase 4/5 background TXG threads in
-    /// metadb. When `true`, metadb spawns the `TxgQuiesceThread` +
-    /// `TxgSyncThread`: the open TXG rolls on a ~5s timer and a
+    /// Enable the BFG background workers in metadb. When `true`,
+    /// metadb spawns the `BfgQuiesceThread` + `BfgSyncThread`: the
+    /// open BFG rolls on a timer and a
     /// background sync drains only the frozen syncing slot per cycle,
     /// so buffer-ring reclaim (`release_below`) runs continuously
     /// instead of being gated behind one giant inline checkpoint.
-    /// Requires `l2p_buffer_enabled = true` (buffer mode). Default off;
-    /// enabled in the nvme configs for the A/B validation. See
-    /// `/root/.claude/plans/mellow-dazzling-thunder.md`.
-    #[serde(default = "default_txg_threads_enabled")]
-    pub txg_threads_enabled: bool,
+    /// Requires `l2p_buffer_enabled = true` (buffer mode).
+    #[serde(default = "default_bfg_threads_enabled")]
+    pub bfg_threads_enabled: bool,
 
-    /// Fan the per-TXG L2P syncing-slot drain out across shards instead of
-    /// folding them serially on the single `metadb-txg-sync` thread (which
+    /// Fan the per-BFG L2P syncing-slot drain out across shards instead of
+    /// folding them serially on the single `metadb-bfg-sync` thread (which
     /// was the drain bottleneck capping single-volume write throughput).
     /// Default on; set false for the legacy serial fold (A/B, fallback).
     #[serde(default = "default_parallel_l2p_drain_enabled")]
     pub parallel_l2p_drain_enabled: bool,
 
-    /// Bound on buffered entries the TXG syncing-slot drain folds per
+    /// Bound on buffered entries the BFG syncing-slot drain folds per
     /// `tree.write()` hold. The one-shot fold parked every commit worker
     /// (`apply_l2p_remap` takes the same write lock) and dedup/read
     /// lookup (read lock) on the shard for the fold's full multi-second
@@ -544,7 +541,7 @@ pub struct MetaConfig {
 
     /// Make PBA refcount authoritative for ALL live L2P references so GC
     /// reclaim is a pure `rc==0` check and the full-volume `referenced_extents`
-    /// reverify scan (which stalled the TXG fold/checkpoint → multi-second
+    /// reverify scan (which stalled the BFG fold/checkpoint → multi-second
     /// commit spikes) is eliminated. Default `false`. ⚠ Requires a FRESH
     /// metadb — turning this on against an existing store is refused at open
     /// (existing `rc==0` exclusive PBAs would be mass-premature-freed).
@@ -651,7 +648,7 @@ impl Default for MetaConfig {
             l2p_buffer_max_interval_ms: default_l2p_buffer_max_interval_ms(),
             commit_direct_apply_enabled: default_commit_direct_apply_enabled(),
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
-            txg_threads_enabled: default_txg_threads_enabled(),
+            bfg_threads_enabled: default_bfg_threads_enabled(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
             l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
             rc_authoritative_reclaim: default_rc_authoritative_reclaim(),
@@ -731,10 +728,9 @@ fn default_l2p_writeback_max_pages_per_cycle() -> usize {
     512
 }
 fn default_l2p_buffer_enabled() -> bool {
-    // Phase 1 lands infrastructure only. Phase 3 flips behaviour
-    // (commit writes buffer instead of tree). Phase 5 may flip
-    // default to true after nvme-box A/B validation. See
-    // /root/.claude/plans/ticklish-sparking-barto.md.
+    // Default off until every production profile is ready for buffered L2P
+    // commits. Enabling this makes commits write the per-shard buffer first;
+    // the compactor folds entries into the tree later.
     false
 }
 fn default_l2p_buffer_soft_entries() -> usize {
@@ -754,24 +750,20 @@ fn default_commit_direct_apply_enabled() -> bool {
     true
 }
 fn default_commit_deferred_outcomes_enabled() -> bool {
-    // ZFS-TXG-clone Phase 2 — production default.
-    // Validated by the 8h nvme-phase23-soak (verify-clean, zero
-    // underflow/panic, engine alive end-to-end). Paired with the onyx
-    // `commit_worker_deferred_outcomes` default; both engage together.
+    // Production default. Paired with the onyx
+    // `commit_worker_deferred_outcomes` default so both sides engage
+    // together.
     true
 }
-fn default_txg_threads_enabled() -> bool {
-    // ZFS-TXG-clone Phase 4/5: background quiesce+sync threads + metadb's
-    // per-syncing-slot drain. Default ON: nvme-box A/B (randwrite j16d64,
-    // workers pinned to the housekeeping cores) showed LV3 drain
-    // 307 -> 379 MB/s (+23%) with lower buffer pending and commit queue
-    // wait. Only engages when `l2p_buffer_enabled = true`. The 24h soak
-    // gate (metadb/CLAUDE.md) still precedes any push.
+fn default_bfg_threads_enabled() -> bool {
+    // Default ON: the BFG quiesce/sync workers keep metadata draining in
+    // the background, which keeps buffer reclaim moving during sustained
+    // write load. Only engages when `l2p_buffer_enabled = true`.
     true
 }
 fn default_parallel_l2p_drain_enabled() -> bool {
-    // DISPROVEN (2026-05-31): the spawn-per-cycle parallel drain is a 3-4×
-    // regression (spawned threads inherit the txg-sync CPU pinning; and the
+    // DISPROVEN (2026-05-31): the spawn-per-cycle parallel drain is a 3-4x
+    // regression (spawned threads inherit the BFG sync CPU pinning; and the
     // drain isn't the binding gate in a healthy-disk window — serial keeps the
     // L2P buffer well under cap). Default OFF; kept behind the flag as a
     // documented dead-end. See memory parallel_l2p_drain_impl.
@@ -785,7 +777,7 @@ fn default_l2p_drain_chunk_entries() -> usize {
     4096
 }
 fn default_rc_authoritative_reclaim() -> bool {
-    // Default OFF (Phase-5 rc-neutral). Turning it on eliminates the reclaim
+    // Default OFF. Turning it on eliminates the reclaim
     // reverify scan + the commit-latency spike, but requires a FRESH metadb
     // (refused at open against an existing store). See memory
     // commit_spike_rc_authoritative_reclaim.
@@ -1062,15 +1054,13 @@ pub struct FlushConfig {
     /// improve backend drain when the write queue is saturated.
     #[serde(default = "default_writer_read_active_batch_size")]
     pub writer_read_active_batch_size: usize,
-    /// ZFS-TXG-clone Phase 2: enable the per-volume commit_worker
-    /// pipeline that issues up to `commit_worker_pipeline_depth`
-    /// metadb `atomic_batch_write_multi_with_dedup_deferred` calls
-    /// before blocking on the oldest. With `false` (default) the
-    /// commit worker drains every issued handle immediately, which
-    /// reproduces the legacy sync timing even when both this flag
-    /// and `metadb.commit_deferred_outcomes_enabled` are true. Both
-    /// flags must flip to `true` to realise the pipelining win
-    /// (see `/root/.claude/plans/soft-doodling-snail.md`).
+    /// Enable the per-volume commit_worker pipeline. When enabled, a
+    /// worker can issue up to `commit_worker_pipeline_depth` metadb
+    /// `atomic_batch_write_multi_with_dedup_deferred` calls before
+    /// blocking on the oldest handle. When disabled, the worker drains
+    /// every issued handle immediately, preserving synchronous pacing.
+    /// This flag and `metadb.commit_deferred_outcomes_enabled` must
+    /// both be true before pipelining changes runtime behavior.
     #[serde(default = "default_commit_worker_deferred_outcomes")]
     pub commit_worker_deferred_outcomes: bool,
     /// Maximum number of in-flight deferred commits a passthrough
@@ -1172,10 +1162,9 @@ fn default_writer_read_active_batch_size() -> usize {
     crate::buffer::flush::BufferFlusher::WRITER_BATCH_SIZE_READ_ACTIVE
 }
 fn default_commit_worker_deferred_outcomes() -> bool {
-    // ZFS-TXG-clone Phase 2 — production default. Paired with the
-    // metadb-side `commit_deferred_outcomes_enabled`; flipping either
-    // alone leaves the pipeline draining each handle inline. Validated
-    // by the 8h nvme-phase23-soak (zero verify error, no underflow).
+    // Production default. Paired with the metadb-side
+    // `commit_deferred_outcomes_enabled`; flipping either alone leaves
+    // the pipeline draining each handle inline.
     true
 }
 fn default_commit_worker_pipeline_depth() -> usize {
@@ -1255,7 +1244,7 @@ fn default_metadb_async_reclaim_idle_interval_ms() -> u64 {
 }
 fn default_metadb_lineage_gc_enabled() -> bool {
     // ON. The FreePbas-emitting Lineage GC driver is the sole production
-    // trigger for PBA reclaim under Phase 5 rc-neutral writes; without it
+    // trigger for PBA reclaim under rc-neutral writes; without it
     // dead-list chains grow without bound (gc_lineage_freed_blocks=0,
     // allocator slowly exhausts). Independent of async_reclaim_enabled,
     // which gates a different worker (page_store deferred_free) that is OFF

@@ -56,7 +56,7 @@ pub(crate) struct MetadbBackend {
     // channel and feeds the PBAs through the existing allocator retire
     // path (coalesced into extents).
     //
-    // Phase 5 requires `lineage_gc_emit_freepbas=true`, so this channel is
+    // Rc-neutral mode requires `lineage_gc_emit_freepbas=true`, so this channel is
     // the normal Lineage-GC retire signal path.
     lineage_freed_pbas_tx: Sender<Pba>,
     lineage_freed_pbas_rx: Receiver<Pba>,
@@ -75,9 +75,9 @@ use values::{
     to_l2p_value, to_l2p_value_with_seq, to_metadb_pba,
 };
 
-/// ZFS-TXG-clone Phase 2 onyx-side wrapper around a metadb
-/// [`DeferredOutcomeHandle`]. Carries the `new_values` slice the
-/// caller had buffered so that the cleanup tuple
+/// Onyx-side wrapper around a metadb [`DeferredOutcomeHandle`].
+/// Carries the `new_values` slice the caller had buffered so that
+/// the cleanup tuple
 /// `(HashMap<Pba, RemapCleanup>, Vec<bool>)` can be assembled inside
 /// `recv()` after the deferred outcomes arrive.
 ///
@@ -117,7 +117,7 @@ impl DeferredCleanupHandle {
     }
 
     /// Like [`Self::ready`] but carries the metadb-assigned LSN. Used
-    /// by the ZFS-TXG-clone stager path — the commit completes
+    /// by the staged metadb commit path. The commit completes
     /// synchronously on the caller thread, but downstream code (the
     /// commit_worker per-volume sequencer) still wants `lsn()` to
     /// return `Some(lsn)`.
@@ -257,10 +257,8 @@ impl MetadbBackend {
 
         let db_config = metadb_config_from_onyx(path, config);
         // metadb's `open_with_config` / `create_with_config` return
-        // `Arc<Db>` directly (Phase 4 Step 8: needed so the
-        // `TxgSyncThread`'s `sync_work` callback can capture
-        // `Weak<Db>` without circular shutdown). No extra `Arc::new`
-        // wrap.
+        // `Arc<Db>` directly so `BfgSyncThread` can hold a `Weak<Db>`
+        // without creating a shutdown cycle. No extra `Arc::new` wrap.
         let db = if path.join(METADB_PAGE_FILE).exists() {
             Db::open_with_config(db_config)?
         } else {
@@ -434,11 +432,11 @@ impl MetadbBackend {
 
         let end = Lba(config.size_bytes / u64::from(config.block_size));
         let mut cleanups = self.delete_blockmap_range(id, Lba(0), end)?;
-        // ZFS port Phase 4 Step 4 (S0): a dropped clone surfaces the promotion
-        // over-pin PBAs whose global rc reached 0 (and that no surviving root
-        // maps). Retire them through the same PbaLifecycle path as the snapshot
-        // / overwrite cleanups; the by-PBA HashMap merge downstream absorbs any
-        // duplicate FreePbas idempotently.
+        // Dropping a clone can reveal promotion over-pin PBAs whose global
+        // refcount reached 0 and that no surviving root maps. Retire them
+        // through the same PbaLifecycle path as snapshot / overwrite
+        // cleanups; the by-PBA HashMap merge downstream absorbs duplicate
+        // FreePbas idempotently.
         if let Some(report) = self.db.drop_volume(ordinal)? {
             for pba in report.freed_pbas {
                 cleanups.push(RemapCleanup {
@@ -875,7 +873,7 @@ impl MetadbBackend {
         Ok(self.db.multi_get_refcount_consistent(&pbas)?)
     }
 
-    /// Test-only refcount seed. Phase 5 removed the per-write refcount
+    /// Test-only refcount seed. Rc-neutral mode removed the per-write refcount
     /// path; production code mutates rc only via lineage events
     /// (PromotionChunk / FreePbas / drop_volume). This helper exists
     /// so existing tests can prep a non-zero rc on a PBA when
@@ -970,10 +968,9 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        // ZFS-TXG-clone onyx-side stager: bypasses the per-commit
-        // dispatch wait (`mark_wal_durable_and_wait_for_dispatch`,
-        // ~614 µs on nvme-box). Durability is via the LV2 buffer; the
-        // metadb fold runs at the next TXG sync.
+        // Stage the metadb update without waiting for the old per-LSN
+        // dispatch path. Durability is via the LV2 buffer; the metadb
+        // fold runs at the next BFG sync.
         let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         newly_zeroed_from_remaps(
             batch_values.iter().map(|(_, value)| *value),
@@ -1033,7 +1030,7 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        // ZFS-TXG-clone onyx-side stager: see `atomic_batch_write_with_dedup`.
+        // Same staged metadb commit path as `atomic_batch_write_with_dedup`.
         let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         let remap_count = new_values.len();
         newly_zeroed_from_remaps(new_values, outcomes.into_iter().take(remap_count).collect())
@@ -1057,9 +1054,8 @@ impl MetadbBackend {
             .recv()
     }
 
-    /// ZFS-TXG-clone Phase 2: deferred counterpart to
-    /// [`Self::atomic_batch_write_multi_with_dedup`]. Issues the
-    /// commit and returns a handle that resolves to the same
+    /// Deferred counterpart to [`Self::atomic_batch_write_multi_with_dedup`].
+    /// Issues the commit and returns a handle that resolves to the same
     /// `(HashMap<Pba, RemapCleanup>, Vec<bool>)` tuple — synchronously
     /// when the metadb-side flag is off (handle pre-populated), at
     /// the next L2P compactor pass otherwise.
@@ -1101,17 +1097,16 @@ impl MetadbBackend {
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
-        // ZFS-TXG-clone onyx-side stager. The previous deferred-outcome
-        // surface (commit_ops_deferred -> DeferredOutcomeHandle) parked
-        // outcomes in the L2P compactor's per-pass drain so the caller
-        // could pipeline multiple in-flight commits before paying the
-        // ~614 µs per-LSN dispatch wait. stage_ops removes the wait
-        // entirely — outcomes are materialised synchronously on the
-        // caller thread — so the handle returned here is always
-        // pre-populated (`Ready`). Onyx commit_worker still drives the
-        // call site through the deferred surface, but `.recv()` returns
-        // immediately. The LSN flows through `ready_with_lsn` so the
-        // per-volume sequencer's `handle.lsn()` contract is preserved.
+        // The old deferred-outcome surface parked outcomes in the L2P
+        // compactor's per-pass drain so the caller could pipeline
+        // multiple in-flight commits before paying the per-LSN dispatch
+        // wait. The staged path removes that wait entirely: outcomes
+        // are materialised synchronously on the caller thread, so the
+        // handle returned here is always pre-populated (`Ready`). Onyx
+        // commit_worker still drives the call site through the deferred
+        // surface, but `.recv()` returns immediately. The LSN flows
+        // through `ready_with_lsn` so the per-volume sequencer's
+        // `handle.lsn()` contract is preserved.
         let (lsn, outcomes) = tx.commit_staged_with_outcomes()?;
         let remap_count = new_values.len();
         let result = newly_zeroed_from_remaps(
@@ -1339,7 +1334,7 @@ impl MetadbBackend {
 
             // ONE fold-consistent scan per volume: metadb holds `tree.read()`
             // per shard across BOTH the folded read-view scan AND the l2p_buffer
-            // scan, so a concurrent TXG fold can't make a migrating reference
+            // scan, so a concurrent BFG fold can't make a migrating reference
             // (e.g. a packed-slot sibling mid-fold) transiently invisible
             // between two unsynchronised passes. This is LOAD-BEARING: a plain
             // two-pass reverify (even buffer-first + publish-before-clear, even
@@ -1588,7 +1583,7 @@ impl MetadbBackend {
             to_l2p_value_with_seq(&value, observed_seq),
             None,
         );
-        // ZFS-TXG-clone onyx-side stager: see `atomic_batch_write_with_dedup`.
+        // Same staged metadb commit path as `atomic_batch_write_with_dedup`.
         // No LV3 write; this is a flag-bit edit on an existing mapping.
         // Crash safety: if this flag-clear is lost, the next scanner
         // cycle re-processes the LBA — idempotent.
@@ -1618,7 +1613,7 @@ impl MetadbBackend {
         // PBA, refcounts unchanged. The buffer's pending entry stays
         // visible to the flusher and will be re-hashed on the next
         // cycle, so the worst case is a single missed dedup hit, not
-        // data loss. ZFS-TXG-clone onyx-side stager: see
+        // data loss. Uses the same staged metadb commit path as
         // `atomic_batch_write_with_dedup`.
         let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         let (newly_zeroed, _accepted) = newly_zeroed_from_remaps([*new_value], outcomes)?;
@@ -1645,14 +1640,14 @@ impl MetadbBackend {
             return Ok((Vec::new(), HashMap::new()));
         }
         let ord = self.volume_ordinal(vol_id)?;
-        // Phase 5: per-WalOp apply runs on per-shard lanes
+        // Rc-neutral path: per-WalOp apply runs on per-shard lanes
         // (`apply_l2p_bucket` for L2P, `apply_dedup_indices_to` for
         // dedup), so even within a single tx the L2pRemap may execute
         // before the paired DedupPut bumps rc. Hits whose target PBA
         // is being promoted **must not** carry an `rc >= 1` guard:
         // the target's rc is 0 before this tx, the lane racing the
         // dedup lane would observe rc=0 and reject the remap, and
-        // pre-Phase-5 the hot-path L2pRemap itself drove rc so the
+        // pre-rc-neutral the hot-path L2pRemap itself drove rc so the
         // race didn't exist.
         //
         // Race-safety for the unguarded promote: the dedup pipeline
@@ -1693,7 +1688,7 @@ impl MetadbBackend {
         // Same reasoning as `atomic_dedup_hit`: no LV3 write, refcount
         // guard inside metadb handles the race against a concurrent
         // decref-to-zero, and crash rolls back atomically.
-        // ZFS-TXG-clone onyx-side stager: see `atomic_batch_write_with_dedup`.
+        // Same staged metadb commit path as `atomic_batch_write_with_dedup`.
         let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         dedup_hit_results_from_remaps(hits, outcomes)
     }
@@ -1747,11 +1742,11 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_buffer_max_interval_ms = config.l2p_buffer_max_interval_ms;
     cfg.commit_direct_apply_enabled = config.commit_direct_apply_enabled;
     cfg.commit_deferred_outcomes_enabled = config.commit_deferred_outcomes_enabled;
-    // ZFS-TXG-clone Phase 4/5: spawn metadb's background quiesce+sync
-    // threads so the open TXG rolls on a timer and the sync drains only
-    // the frozen syncing slot, decoupling buffer-ring reclaim from one
-    // giant inline checkpoint. See plan mellow-dazzling-thunder.md.
-    cfg.txg_threads_enabled = config.txg_threads_enabled;
+    // Spawn metadb's background BFG quiesce/sync workers so the open BFG
+    // rolls on a timer and sync drains only the frozen slot. That keeps
+    // buffer-ring reclaim moving instead of tying it to one giant inline
+    // checkpoint.
+    cfg.bfg_threads_enabled = config.bfg_threads_enabled;
     cfg.parallel_l2p_drain_enabled = config.parallel_l2p_drain_enabled;
     cfg.l2p_drain_chunk_entries = config.l2p_drain_chunk_entries;
     cfg.rc_authoritative_reclaim = config.rc_authoritative_reclaim;

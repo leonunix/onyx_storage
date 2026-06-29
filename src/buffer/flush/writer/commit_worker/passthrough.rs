@@ -1,18 +1,18 @@
 use super::*;
 use crate::meta::backend::metadb::DeferredCleanupHandle;
 
-/// ZFS-TXG-clone Phase 2: one chunk's worth of in-flight metadb
-/// deferred commits parked in the commit_worker's pipeline deque.
-/// Built by [`BufferFlusher::issue_passthrough_chunk_deferred`] and
-/// consumed (in arrival order) by
+/// One chunk's worth of in-flight metadb deferred commits parked in
+/// the commit_worker's pipeline deque. Built by
+/// [`BufferFlusher::issue_passthrough_chunk_deferred`] and consumed
+/// in arrival order by
 /// [`BufferFlusher::drain_passthrough_chunk`]. Per-volume FIFO is
 /// preserved because the same worker owns the deque and drains its
 /// front before issuing the next.
 struct PendingPassthroughChunk {
     /// Snapshot of the chunk's `unit_metas` indices the issue side
-    /// observed. Replayed verbatim during drain so Phase 4 (failure
-    /// policy) and Phase 5 (`accepted_positions` shrink) operate on
-    /// exactly the units that produced the staged outcomes.
+    /// observed. Replayed verbatim during drain so failure handling
+    /// and `accepted_positions` shrinkage operate on exactly the units
+    /// that produced the staged outcomes.
     non_empty_units: Vec<usize>,
     /// One entry per metadb `atomic_batch_write_multi_with_dedup_deferred`
     /// call issued for this chunk (one per touched L2P shard).
@@ -206,7 +206,7 @@ impl BufferFlusher {
                 };
                 // Always split a full-raw (uncompressed) unit into per-LBA
                 // PBAs. A shared base PBA across N member LBAs is unsafe under
-                // Phase 5 rc-neutral writes: overwriting one member records the
+            // Rc-neutral writes: overwriting one member records the
                 // shared base dead at rc==0 while the others still reference it,
                 // so lineage GC prematurely frees a still-live extent → CRC
                 // corruption (observed under compression=none). The sync
@@ -276,11 +276,11 @@ impl BufferFlusher {
             // Sub-batch the commits to ≤ TARGET_OPS_PER_COMMIT total
             // LBAs. With 0 LSN contention each commit only pays its
             // own per-tx fixed cost; bigger sub-batches still amortise
-            // WAL fsync. ZFS-TXG-clone Phase 2: each emitted chunk now
-            // issues `_deferred` metadb commits and parks them in
-            // `pending_q`. With `depth_cap = 1` the deque is drained
-            // before the next issue, reproducing the legacy sync
-            // pacing one chunk in flight at a time.
+            // WAL fsync. Each emitted chunk issues `_deferred` metadb
+            // commits and parks them in `pending_q`. With
+            // `depth_cap = 1` the deque is drained before the next
+            // issue, reproducing the legacy sync pacing one chunk in
+            // flight at a time.
             let mut accum_old_meta: HashMap<Pba, RemapCleanup> = HashMap::new();
             let mut chunk: Vec<usize> = Vec::new();
             let mut chunk_lbas: usize = 0;
@@ -591,9 +591,9 @@ impl BufferFlusher {
         Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
     }
 
-    /// ZFS-TXG-clone Phase 2 deque step. Blocks on the oldest in-
-    /// flight chunk when the deque is already at `depth_cap`, then
-    /// issues the `chunk` snapshot via
+    /// Pipeline queue step. Blocks on the oldest in-flight chunk when
+    /// the deque is already at `depth_cap`, then issues the `chunk`
+    /// snapshot via
     /// [`Self::issue_passthrough_chunk_deferred`]. The snapshot vec
     /// is cleared on return regardless of whether the issue produced
     /// a `PendingPassthroughChunk` (empty chunks short-circuit with
@@ -601,7 +601,7 @@ impl BufferFlusher {
     ///
     /// `depth_cap = 1` reproduces the legacy sync pacing: every
     /// chunk drains its own outcome before the next issue, so the
-    /// only behavioural delta vs the pre-Phase-2 code is the extra
+    /// only behavioural delta vs the synchronous path is the extra
     /// deque indirection. `depth_cap > 1` keeps up to
     /// `depth_cap - 1` chunks in flight per volume; with metadb's
     /// `commit_deferred_outcomes_enabled` also `true` this is the
@@ -708,14 +708,13 @@ impl BufferFlusher {
     /// Component B of the commit-model overhaul (plan file:
     /// /root/.claude/plans/golden-popping-newell.md).
     ///
-    /// Returns `None` when the chunk is empty after Phase 1 bucketing
+    /// Returns `None` when the chunk is empty after shard bucketing
     /// (every unit either discarded or live-filtered out) or when
     /// fault injection rejected the chunk before any metadb work.
     /// In the second case `commit_failed_indices` carries the unit
     /// indices so the post-commit pass can free PBAs.
     ///
-    /// Phase 4 (failure policy, partial errors) and Phase 5
-    /// (`accepted_positions` shrink) run in
+    /// Failure handling and `accepted_positions` shrinkage run in
     /// [`Self::drain_passthrough_chunk`] when the staged handles
     /// resolve, preserving the existing sync-mode semantics.
     fn issue_passthrough_chunk_deferred(
@@ -746,7 +745,7 @@ impl BufferFlusher {
             live_count: u32,
         }
 
-        // Phase 1: bucket per-unit pairs by L2P shard.
+        // Bucket per-unit pairs by L2P shard.
         let mut non_empty_units: Vec<usize> = Vec::with_capacity(chunk.len());
         let mut per_shard: HashMap<usize, Vec<UnitSubBatch>> = HashMap::new();
         for &i in chunk {
@@ -790,7 +789,7 @@ impl BufferFlusher {
             return None;
         }
 
-        // Phase 2: fault injection check, once before any metadb work.
+        // Fault injection check, once before any metadb work.
         // Preserves the pre-existing semantics that injection aborts
         // the whole chunk with no on-disk effect.
         for &i in &non_empty_units {
@@ -814,8 +813,8 @@ impl BufferFlusher {
             }
         }
 
-        // Phase 3 (issue half): for each non-empty L2P shard, build
-        // flat sub-batch args and issue one
+        // Issue half: for each non-empty L2P shard, build flat
+        // sub-batch args and issue one
         // `atomic_batch_write_multi_with_dedup_deferred` call. Park
         // the handle plus the per-unit slice metadata needed to
         // re-decode the per-LBA `accepted` bits at drain time. Iterate
@@ -901,12 +900,12 @@ impl BufferFlusher {
     ///
     /// Blocks on each shard handle's `recv()` in issue order, merges
     /// per-shard `(returned, accepted)` tuples into `per_unit_accept`
-    /// and `all_returned`, then runs the legacy Phase 4 (failure
-    /// policy) and Phase 5 (`accepted_positions` shrink) inline
-    /// against the same caller-owned accumulators as before. The
+    /// and `all_returned`, then applies the same failure policy and
+    /// `accepted_positions` shrinkage against the caller-owned
+    /// accumulators as the synchronous path. The
     /// `flush_writer_meta_commit_ns` metric covers the full
-    /// issue→drain window so post-Phase-2 dashboards stay comparable
-    /// with the sync baseline.
+    /// issue→drain window so deferred-commit dashboards stay
+    /// comparable with the sync baseline.
     ///
     /// Failure policy preserved: any shard `recv()` error or
     /// `Err`-returning commit promotes every `non_empty_units` index
@@ -984,7 +983,7 @@ impl BufferFlusher {
         }
         Self::record_elapsed(&metrics.flush_writer_meta_commit_ns, issue_started_at);
 
-        // Phase 4: failure policy - any sub-commit error fails the
+        // Failure policy: any sub-commit error fails the
         // whole chunk. Same rationale as the sync path: partial-unit
         // success would leak PBAs in full-raw extents.
         if any_failure {
@@ -994,8 +993,8 @@ impl BufferFlusher {
             return;
         }
 
-        // Phase 5: process per-unit acceptance + shrink
-        // `accepted_positions` for partial seq_guard rejects.
+        // Process per-unit acceptance and shrink `accepted_positions`
+        // for partial seq_guard rejects.
         let mut total_rejects: u64 = 0;
         for &unit_idx in &non_empty_units {
             let Some(full_accept) = per_unit_accept.remove(&unit_idx) else {

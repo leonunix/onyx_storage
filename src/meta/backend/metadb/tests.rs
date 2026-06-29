@@ -169,7 +169,7 @@ fn backend_reads_l2p_values_by_volume_id() {
 
 #[test]
 fn atomic_batch_write_updates_refcounts_and_reports_freed_pba() {
-    // Phase 5: hot-path `atomic_batch_write` no longer mutates
+    // Rc-neutral path: hot-path `atomic_batch_write` no longer mutates
     // global rc, and the L2pRemap outcome's `freed_pba` is always
     // None. `newly_zeroed_from_remaps` filters its decrements map
     // to only `pba_freed=true` entries — so the returned cleanups
@@ -232,7 +232,7 @@ fn atomic_batch_write_updates_refcounts_and_reports_freed_pba() {
     assert_eq!(backend.get_refcount(Pba(20)).unwrap(), 0);
     assert!(
         freed.is_empty(),
-        "Phase 5: L2pRemap surfaces no freed_pba on the hot path; cleanups map empty"
+        "Rc-neutral path: L2pRemap surfaces no freed_pba on the hot path; cleanups map empty"
     );
     // L2P state moved to the new mapping.
     let m = backend.get_mapping(&vol.id, Lba(0)).unwrap().unwrap();
@@ -296,7 +296,7 @@ fn atomic_batch_write_range_contiguous_lbas() {
     for i in 0..8u64 {
         let m = backend.get_mapping(&vol.id, Lba(i)).unwrap().unwrap();
         assert_eq!(m.pba, Pba(100 + i));
-        // Phase 5: hot-path atomic_batch_write doesn't touch rc.
+        // Rc-neutral path: hot-path atomic_batch_write doesn't touch rc.
         assert_eq!(backend.get_refcount(Pba(100 + i)).unwrap(), 0);
     }
 }
@@ -373,7 +373,7 @@ fn atomic_batch_write_range_with_gap_splits_into_two_ops() {
 
 #[test]
 fn dedup_entries_and_flag_scan_round_trip() {
-    // Phase 5: `dedup_entry_is_live` checks rc(entry.pba)>0 to
+    // Rc-neutral path: `dedup_entry_is_live` checks rc(entry.pba)>0 to
     // catch entries pointing at PBAs whose final decref already
     // landed. Hot-path L2pRemap no longer maintains rc, so we
     // seed rc explicitly via the test helper to mirror the
@@ -420,7 +420,7 @@ fn dedup_entries_and_flag_scan_round_trip() {
     backend
         .atomic_batch_write(&vol.id, &[(Lba(0), value)], 1)
         .unwrap();
-    backend.set_refcount(value.pba, 1).unwrap(); // Phase 5 rc seed
+    backend.set_refcount(value.pba, 1).unwrap(); // Rc-neutral mode rc seed
 
     let hash = [9u8; 8];
     let dedup = DedupEntry {
@@ -450,7 +450,7 @@ fn dedup_entries_and_flag_scan_round_trip() {
     backend
         .atomic_batch_write(&vol.id, &[(Lba(0), replacement)], 1)
         .unwrap();
-    // Phase 5: hot-path L2pRemap doesn't touch rc, so the
+    // Rc-neutral path: hot-path L2pRemap doesn't touch rc, so the
     // replacement leaves rc(value.pba) at its prior value. The
     // earlier `put_dedup_entries` issued a `WalOp::DedupPut`
     // whose apply increfs the new head_pba by 1 (rc 1 → 2). Old
@@ -506,7 +506,7 @@ fn delete_range_and_volume_report_freed_extents() {
     backend
         .atomic_batch_write(&vol.id, &[(Lba(0), a), (Lba(1), b), (Lba(2), b)], 3)
         .unwrap();
-    // Phase 5: hot-path atomic_batch_write, delete_blockmap_range, and
+    // Rc-neutral path: hot-path atomic_batch_write, delete_blockmap_range, and
     // delete_volume are all rc-neutral for ordinary PBA refs. Seed rc to
     // mirror a shared/dedup PBA and verify logical deletes do not drive it
     // to zero.
@@ -659,7 +659,7 @@ fn diagnostic_helpers_track_refs_and_allocated_blocks() {
     backend
         .atomic_write_mapping(&vol.id, Lba(0), &value)
         .unwrap();
-    // Phase 5: exclusive PBAs (no dedup_index entry) never get
+    // Rc-neutral path: exclusive PBAs (no dedup_index entry) never get
     // their global rc bumped on write — only lineage events
     // (clone promotion + drop_volume) touch rc.
     assert_eq!(backend.iter_refcounts().unwrap(), Vec::<(Pba, u32)>::new());
@@ -760,7 +760,7 @@ fn metadb_seq0_in_l2p_remap_bypasses_guard_and_clobbers_newer_write() {
          callers must not emit seq=0 with this race shape"
     );
     assert_eq!(after.crc32, 0xAAAA_AAAA);
-    // Phase 5: hot-path atomic_batch_write_with_dedup no longer
+    // Rc-neutral path: hot-path atomic_batch_write_with_dedup no longer
     // moves global rc, so both PBAs are observed at 0. The L2P
     // clobber (the actual data-loss vector under test) is still
     // there — that's the load-bearing assertion above.
@@ -972,11 +972,11 @@ fn drain_lineage_freed_pbas_returns_dispatched_outcomes() {
     );
 }
 
-/// ZFS-TXG-clone Phase 2 onyx-adapter sanity check: with
-/// `commit_deferred_outcomes_enabled = true` the `*_deferred` entry
-/// point returns a handle whose `recv()` yields the same cleanup
-/// tuple shape as the synchronous wrapper. We don't assert on the
-/// HashMap contents (Phase 5 default keeps `pba_freed` empty for
+/// Onyx-adapter sanity check: with `commit_deferred_outcomes_enabled =
+/// true` the `*_deferred` entry point returns a handle whose `recv()`
+/// yields the same cleanup tuple shape as the synchronous wrapper.
+/// We don't assert on the
+/// HashMap contents (Rc-neutral mode default keeps `pba_freed` empty for
 /// fresh writes — Lineage GC owns that flow now); only that the
 /// adapter wires the round trip end-to-end and produces
 /// `accepted = [true; N]` for fresh writes.
@@ -995,7 +995,7 @@ fn atomic_batch_write_multi_with_dedup_deferred_round_trip() {
         dedup_shards: 1,
         dedup_cuckoo_buckets: 1_000_000,
         dedup_l1_cache_entries: 256_000,
-        // Phase 2 deferred mode on; pair with l2p_buffer_enabled so
+        // Deferred-outcome mode on; pair with l2p_buffer_enabled so
         // the L2P-buffer code path that the deferred drain piggybacks
         // on is also active.
         l2p_buffer_enabled: true,
@@ -1049,12 +1049,12 @@ fn atomic_batch_write_multi_with_dedup_deferred_round_trip() {
         accepted.iter().all(|&ok| ok),
         "every fresh write must accept under seq_guard"
     );
-    // Phase 5: freed PBAs flow via Lineage GC, not outcomes — so the
+    // Rc-neutral path: freed PBAs flow via Lineage GC, not outcomes — so the
     // cleanup map is empty for these fresh writes (no prior mapping
     // to displace, no rc-decref → no freed_pba in outcomes).
     assert!(
         cleanup.is_empty(),
-        "fresh writes produce no displaced PBAs under Phase 5: {cleanup:?}"
+        "fresh writes produce no displaced PBAs under Rc-neutral path: {cleanup:?}"
     );
 
     // The synchronous wrapper still works and is byte-equivalent.

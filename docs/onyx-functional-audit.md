@@ -145,7 +145,7 @@ refcount ledger 为 0；`apply_free_pbas()` 也只 surface exclusive `rc==0`，�
 
 dirty startup 分支打印 rebuilding refcount，但 `MetaStore::rebuild_refcount_from_blockmap()` 当前返回 default summary。若 metadb recovery 是唯一正确来源，日志和 API 应改名；若不是，当前缺少真实 rebuild。
 
-建议：改成 `meta.recover_or_validate_refcount()`，并在日志里说明由 metadb WAL/TXG recovery 负责；不要显示 “rebuilt”。
+建议：改成 `meta.recover_or_validate_refcount()`，并在日志里说明由 metadb WAL/BFG recovery 负责；不要显示 “rebuilt”。
 
 ### P2：cleanup retire 失败无重试
 

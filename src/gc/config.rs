@@ -34,7 +34,7 @@ pub struct GcConfig {
     /// the retired set for at least this many seconds (default 300 = 5 min).
     /// This guarantees the settle window the retire→reclaim path otherwise gets
     /// only incidentally from the GC cycle cadence: a reference committed to the
-    /// LV2 log but whose metadb L2P apply is still in flight (or mid-TXG-fold)
+    /// LV2 log but whose metadb L2P apply is still in flight (or mid-BFG fold)
     /// is transiently invisible to the reclaim reverify; waiting the grace lets
     /// it land before the free decision, closing the premature-free race that
     /// corrupted reads. `0` disables the grace (incidental cycle delay only).

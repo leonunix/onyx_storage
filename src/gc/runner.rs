@@ -720,7 +720,7 @@ impl GcRunner {
         // rc-authoritative mode: refcount counts every live L2P reference, so
         // a `rc==0` reading is proof of no reference — the full-volume
         // `referenced_extents` reverify scan (which held metadb's per-shard
-        // `tree.read()` across the whole volume and stalled the TXG
+        // `tree.read()` across the whole volume and stalled the BFG
         // fold/checkpoint → multi-second commit spikes) is unnecessary and
         // skipped. BUT Gate-1 above used the cheap, fold-RACY
         // `multi_get_refcounts`, which can transiently floor a still-live
@@ -739,7 +739,7 @@ impl GcRunner {
             // BATCHED consistent recheck: flatten survivor PBAs into ONE
             // `multi_get_refcounts_consistent`, which amortizes the per-shard
             // `fold_lock` (see metadb `get_consistent_into`). The old per-extent
-            // call took `fold_lock` once PER PBA, contending the TXG fold under
+            // call took `fold_lock` once PER PBA, contending the BFG fold under
             // sustained reclaim — the super-linear term in reclaim cost. Results
             // are re-grouped per extent; referenced iff ANY PBA rc != 0.
             let surv_pbas = Self::flatten_extent_pbas(&survivors);

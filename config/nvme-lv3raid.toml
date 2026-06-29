@@ -23,12 +23,11 @@ dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
 commit_direct_apply_enabled = true
-# ZFS-TXG-clone Phase 4/5: background quiesce+sync threads + per-syncing-slot
-# drain. Decouples buffer-ring reclaim from the inline checkpoint.
-txg_threads_enabled = true
-# Parallel per-TXG L2P drain UNDER TEST (v2: workers unbind the inherited
-# single-CPU txg-sync pin so they spread across cores, ZFS dp_sync_taskq-style).
-# v1 spawn-per-cycle-pinned was a 3-4× regression. Code default stays false.
+# BFG background workers roll the open group and drain the frozen slot
+# outside the foreground checkpoint path.
+bfg_threads_enabled = true
+# Parallel per-BFG L2P drain under test. Workers spread across cores instead
+# of inheriting the single BFG sync CPU pin. Default stays false in code.
 parallel_l2p_drain_enabled = true
 
 [storage]
@@ -102,9 +101,8 @@ metadb_l2p_apply_cpus = "64-79"
 metadb_refcount_apply_cpus = "88-91"
 metadb_dedup_apply_cpus = "88-91"
 metadb_checkpoint_cpus = "93-95"
-# TxgSync/TxgQuiesce background workers (threads-on). Pinned to the
-# housekeeping cores where the inline checkpoint ran in threads-off, so
-# the heavy write_dirty_pages sync never floats onto the hot ublk cores.
+# BFG sync/quiesce workers stay on housekeeping cores so metadata sync
+# does not float onto the hot ublk cores.
 metadb_l2p_compactor_cpus = "93-95"
 background_cpus = "92-95"
 

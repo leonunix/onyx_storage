@@ -57,7 +57,7 @@ pub struct OnyxEngine {
     /// the buffer pool's `durable_seq` watermark so ring reclaim can safely
     /// proceed. Keeps the hot path at `WriteOptions::sync = false`.
     durability_watermark: Mutex<Option<DurabilityWatermarkHandle>>,
-    /// [[no-refcount-hot-path-design]] Phase 5: drains
+    /// [[no-refcount-hot-path-design]] Rc-neutral path: drains
     /// `WalOp::FreePbas` outcomes from metadb's Lineage GC into the
     /// allocator's free list. Started in full mode, `None` in
     /// meta-only mode (no allocator to feed).
@@ -568,7 +568,7 @@ impl OnyxEngine {
 
         // 2b. Recovery branch based on clean/dirty shutdown marker.
         //
-        // Refcount durability is owned by metadb's WAL/TXG recovery (the
+        // Refcount durability is owned by metadb's WAL/BFG recovery (the
         // refcount paged-array + per-shard deltas are replayed when
         // `MetaStore::open` brings metadb up). There is no separate
         // blockmap-walking rebuild on the onyx side — historically this
@@ -579,7 +579,7 @@ impl OnyxEngine {
             tracing::info!("clean shutdown marker present");
         } else {
             tracing::info!(
-                "dirty startup detected — refcount was restored by metadb WAL/TXG recovery \
+                "dirty startup detected — refcount was restored by metadb WAL/BFG recovery \
                  (no separate onyx-side rebuild)"
             );
             meta.recover_or_validate_refcount()?;
@@ -936,7 +936,7 @@ impl OnyxEngine {
             }
         }
 
-        // Phase 5: lineage GC + FreePbas drive PBA retirement; the
+        // Rc-neutral path: lineage GC + FreePbas drive PBA retirement; the
         // per-write refcount cleanup loop that used to fire here is
         // gone. Any rc that survived `delete_volume` will be retired by
         // the next Lineage GC pass.
@@ -1121,7 +1121,7 @@ impl OnyxEngine {
 
         // Quiesce so the snapshot→current diff sees fully-settled state: drop any
         // residual pending buffer entries and drain in-flight flush work for this
-        // volume. metadb's `restore_volume_to_snapshot` does a forced TXG sync
+        // volume. metadb's `restore_volume_to_snapshot` does a forced BFG sync
         // itself (to fold staged commits + the L2P buffer for the diff), so no
         // onyx-side `sync_durable` is needed here.
         if let Some(pool) = &self.buffer_pool {

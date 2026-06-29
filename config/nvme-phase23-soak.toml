@@ -1,4 +1,4 @@
-# 8h Phase 2 + Phase 3 deferred-outcomes / async-WAL soak.
+# 8h deferred-outcomes / async-WAL soak.
 #
 # Derived from nvme-detailed-numa-split.toml (v4 NUMA layout). All
 # differences from the blueprint are tagged "# soak:" so the deltas
@@ -24,12 +24,12 @@ flush_select_budget = 0
 dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
-# soak: Phase 1 (already production-default on this profile).
+# Keep L2P updates buffered and apply eligible commits on the caller thread.
 l2p_buffer_enabled = true
 commit_direct_apply_enabled = true
-# soak: Phase 2 metadb side - stage outcomes via L2P compactor boundary.
+# Stage outcomes through the L2P compactor boundary.
 commit_deferred_outcomes_enabled = true
-# soak: Phase 3 metadb side - async WAL + TXG-aligned fsync.
+# Async WAL with fsync aligned to the BFG sync boundary.
 # Requires commit_deferred_outcomes_enabled = true (enforced).
 wal_async_commits_enabled = true
 wal_async_group_commit_window_us = 1000
@@ -74,7 +74,7 @@ commit_coalesce_lba_budget = 4096
 commit_coalesce_timeout_us = 2000
 packed_commit_try_drain_lba_budget = 1024
 writer_read_active_batch_size = 1024
-# soak: Phase 2 onyx side - per-volume commit_worker pipeline.
+# Per-volume commit_worker pipeline.
 commit_worker_deferred_outcomes = true
 commit_worker_pipeline_depth = 4
 

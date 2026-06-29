@@ -121,7 +121,7 @@ impl MetaStore {
         self.backend.sync_durable()
     }
 
-    /// [[no-refcount-hot-path-design]] Phase 5: pull every PBA that the
+    /// [[no-refcount-hot-path-design]] Rc-neutral path: pull every PBA that the
     /// metadb-side Lineage GC has surfaced as freed (via
     /// `WalOp::FreePbas`) since the last call. The engine's
     /// [`LineageFreedPbaDrainHandle`] thread feeds these into the
@@ -492,8 +492,8 @@ impl MetaStore {
             .atomic_batch_write_multi_with_dedup(units, dedup_entries, seqs)
     }
 
-    /// ZFS-TXG-clone Phase 2: deferred-outcome surface used by the
-    /// commit_worker pipeline (see `commit_worker/passthrough.rs`).
+    /// Deferred-outcome surface used by the commit_worker pipeline
+    /// (see `commit_worker/passthrough.rs`).
     /// `recv()` on the returned handle reproduces the sync tuple
     /// returned by [`Self::atomic_batch_write_multi_with_dedup`].
     pub fn atomic_batch_write_multi_with_dedup_deferred(
@@ -523,8 +523,8 @@ impl MetaStore {
         self.backend.multi_get_refcounts_consistent(pbas)
     }
 
-    /// Test-only seed; see `MetadbBackend::set_refcount`. Phase 5
-    /// removed the per-write refcount path, but several tests need
+    /// Test-only seed; see `MetadbBackend::set_refcount`. Rc-neutral
+    /// writes removed the per-write refcount path, but several tests need
     /// to prep an existing rc value on a PBA before exercising
     /// dedup-hit / packed-slot scenarios. Production code must not
     /// call this.
@@ -678,7 +678,7 @@ impl MetaStore {
             .scan_blockmap_range(vol_id, start_lba, count, callback)
     }
 
-    /// Refcount recovery is owned by metadb's WAL/TXG replay (performed during
+    /// Refcount recovery is owned by metadb's WAL/BFG replay (performed during
     /// [`MetaStore::open`]); there is no separate onyx-side rebuild that walks
     /// the per-volume blockmaps. This is intentionally a validation/no-op hook
     /// the dirty-startup path calls so the recovery contract has a named home

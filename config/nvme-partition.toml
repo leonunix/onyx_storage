@@ -14,7 +14,7 @@
 #
 # THIS PROFILE partitions the engine across BOTH NUMA nodes (pod per node):
 # buffer shards 0-7 + their flush lanes + metadb lanes 0-7 on node0,
-# shards 8-15 on node1; control-plane singletons (WAL, txg-sync, commit
+# shards 8-15 on node1; control-plane singletons (WAL, BFG sync, commit
 # workers, GC) homed on node0. Tier A per-shard memory first-touches its
 # pod; Tier B caches interleave across both nodes. No numactl prefix:
 #
@@ -57,7 +57,7 @@ l2p_buffer_enabled = true
 # ~13k remap/s — the LSN-ordered apply chain can't span sockets.)
 commit_direct_apply_enabled = true
 # rc==0-gated reclaim (d39b398): WITHOUT this the legacy referenced_extents
-# full-volume reverify scan holds tree.read() and stalls the TXG fold a few
+# full-volume reverify scan holds tree.read() and stalls the BFG fold a few
 # minutes into ANY sustained run — the exact degradation chased through six
 # NUMA variants on 2026-06-11. Requires a FRESH metadb (the soak harness
 # wipes meta.path each run).
@@ -66,9 +66,9 @@ rc_authoritative_reclaim = true
 # commit-tail win in the 2026-06-01 A/B); its per-dedup-shard threads bind
 # pod-local under partition.
 dedup_drainer_enabled = false  # bisect 2026-06-11: suspect in the t~6min degradation
-txg_threads_enabled = true
+bfg_threads_enabled = true
 # Partition requires the parallel drain: the serial fold runs on the
-# home-node txg-sync thread and would re-introduce cross-socket folds for
+# home-node BFG sync thread and would re-introduce cross-socket folds for
 # the node1 pod's shards; the parallel workers bind per-shard-pod
 # (metadb affinity::bind_for_l2p_drain).
 parallel_l2p_drain_enabled = false  # bisect: back to baseline metadb flags

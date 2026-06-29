@@ -48,7 +48,7 @@ packed/multi-LBA L2P sharing).
    the diverged PBAs dead-list and reclaim exactly like an overwrite. Three subtleties
    the implementation handles (each has a regression test in `metadb/tests/db_restore.rs`):
    - **Forced sync before diff**: `diff_with_current` reads the committed `tree.root()`;
-     onyx commits via the *staged* path (tree fold deferred to TXG sync), so restore
+     onyx commits via the *staged* path (tree fold deferred to BFG sync), so restore
      does `flush_with_gate(Forced)` first or the diff misses the writes and no-ops.
    - **Seq-strip on the rollback remap**: the snapshot value carries an old commit seq;
      `seq_guard_rejects` would drop it over a higher-seq overwrite, so restore re-stamps

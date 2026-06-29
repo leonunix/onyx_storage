@@ -50,7 +50,7 @@ nvme-box(2× Xeon Gold 5318Y,96 逻辑核,**node0=偶数核 0-94,node1=奇数核
 | read pool(LV3 读) | `storage.read_pool_workers`(16),每 worker 独立 ring | `ReadPool` | `src/io/read_pool.rs:144` |
 | GC runner / dedup scanner | 各 1 | `Background` | `src/gc/runner.rs:100`, `src/dedup/scanner.rs:116` |
 | metadb apply lane | `16 shards × 4 lane 类`=64 | `L2pApply/RefcountApply/DedupApply` | `metadb/src/db.rs:574` |
-| metadb txg-sync / quiesce | 各 1 | `TxgSync` ordinal 0/1 | `metadb/src/db/txg_sync.rs:203` |
+| metadb BFG sync / quiesce | 各 1 | `BfgSync` ordinal 0/1 | `metadb/src/db/bfg_sync.rs:203` |
 | metadb WAL writer | 1 | `Wal` | wal/ |
 | metadb dedup drainer | `dedup_shards`(8) | `DedupDrainer` | `metadb/src/dedup/index.rs:524` |
 | metadb io-submitter / writeback / async-reclaim / lineage-gc / page-read | 1+1+1+1+N | 部分无绑定 | 各模块 |
@@ -105,7 +105,7 @@ nvme-box(2× Xeon Gold 5318Y,96 逻辑核,**node0=偶数核 0-94,node1=奇数核
 
   home node = node0(可配):
     commit workers(16,单卷时实际 1 个热)
-    metadb WAL writer、txg-sync、quiesce、io-submitter、
+    metadb WAL writer、BFG sync、quiesce、io-submitter、
     manifest/checkpoint、writeback、async-reclaim、lineage-gc
     GC runner、dedup scanner、heartbeat、IPC
   reserve:每 node 预留 N 个物理核给 OS/IRQ/交互(默认 2)
@@ -117,7 +117,7 @@ nvme-box(2× Xeon Gold 5318Y,96 逻辑核,**node0=偶数核 0-94,node1=奇数核
   dedup → compress → writer → cleanup)+ 它对应的 metadb L2P/RC/Dedup apply lane
   全部钉在同一 node。shard→node 映射:`node = shard_idx * nodes / shards`
   (前半后半,不取模——避免奇偶交错把相邻 shard 拆开)。
-- **控制面单例集中 home node**:WAL fsync 流、txg-sync fold、manifest swap 是全局
+- **控制面单例集中 home node**:WAL fsync 流、BFG sync fold、manifest swap 是全局
   串行点,拆不开;集中一处使"singleton 间"通信零跨界,代价是另一个 pod 的 lane
   与 home node 的通信跨 socket(channel send + WAL 提交),这是模型里**预算内**
   的跨界(消息级,不是 cache-line 级乒乓)。
@@ -185,7 +185,7 @@ allow_overcommit = false     # 内存计划表超出 node 容量时是否仍允�
    - singleton 角色 → home node 池。
    - ublk:`qid → node = qid * nodes / nr_queues`,worker 绑该 node 池。
 2. **绑定语义从"钉单核"放宽为"钉核集"**:`set_current_cpu(cpu)` 改为
-   `set_current_cpuset(&[usize])`。除少数确需独核的角色(metadb WAL、txg-sync
+   `set_current_cpuset(&[usize])`。除少数确需独核的角色(metadb WAL、BFG sync
    维持现状),其余角色绑到"本 pod 该角色的核子集"——保留调度弹性,避免
    128 个 ublk 线程 1:1 钉死导致的排队不均。这同时消除 parallel-drain v1 的
    "继承单核 pin"事故类别:scope.spawn 的子线程改为 `bind_pod(node)`(绑全
