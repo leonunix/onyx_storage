@@ -145,6 +145,13 @@ impl OnyxConfig {
             return ConfiguredMode::Bare;
         }
 
+        // Chunklet provides BOTH LV3 (data) and LV2 (buffer) from its pool, so
+        // when it is enabled with a PD list the engine is fully configured —
+        // storage.data_device / buffer.device are intentionally absent.
+        if self.chunklet.enabled && !self.chunklet.devices.is_empty() {
+            return ConfiguredMode::Active;
+        }
+
         // Check data + buffer devices
         let data_ok = self
             .storage

@@ -1,0 +1,141 @@
+# Chunklet RAID backend profile (Phase 2): LV3 (RAID6) + LV2 (RAID10) both live
+# on chunklet LogicalDisks carved from ONE pool over the raw NVMe. metadb still
+# lives on its own XFS mount (Phase 3 will move it).
+#
+# Disk plan (verify with `lsblk` first — NEVER touch sda = DELLBOSS system disk):
+#   nvme0n1..nvme7n1, nvme9n1  -> chunklet pool (9 PDs)
+#   nvme8n1                    -> XFS /mnt/onyx-meta (metadb)
+# md126 (old LV3 RAID0) + md127 (old LV2 RAID0) are torn down; their member PDs
+# (nvme2,3,4,5,6,7,9) are zeroed and handed to chunklet.
+#
+# Run:
+#   target/release/onyx-storage -c config/nvme-chunklet.toml chunklet-init --force
+#   # copy the printed lv3/lv2/meta ld ids into [chunklet] below, then:
+#   target/release/onyx-storage -c config/nvme-chunklet.toml create-volume -n fio-volume -s 274877906944 --compression lz4
+#   RUST_LOG=info target/release/onyx-storage -c config/nvme-chunklet.toml start -v fio-volume
+
+[numa]
+mode = "confine"
+home_node = 0
+reserve_cores_per_node = 2
+cold_cache_policy = "auto"
+
+[chunklet]
+enabled = true
+# 9 raw NVMe PDs (nvme8 is metadb, excluded). RAID6 set width = 8, so the 9th PD
+# leaves one-PD rebuild headroom.
+devices = [
+    "/dev/nvme0n1",
+    "/dev/nvme1n1",
+    "/dev/nvme2n1",
+    "/dev/nvme3n1",
+    "/dev/nvme4n1",
+    "/dev/nvme5n1",
+    "/dev/nvme6n1",
+    "/dev/nvme7n1",
+    "/dev/nvme9n1",
+]
+io_backend = "uring"
+spare_pct = 5
+# NOTE: chunklet's on-disk superblock encodes every 1 GiB chunklet placement
+# explicitly in one 4028-byte slot (~21 B/chunklet → ~178 chunklets max across
+# all LDs). Production-size LDs need a chained/extent manifest (chunklet TODO).
+# Smoke geometry below stays under that wall (~92 chunklets total).
+#
+# LV3 = RAID6 (6 data + 2 parity), 8 rows, 256 KiB strip -> ~48 GiB usable (64 chunklets).
+lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 8, strip_kib = 256 }
+# LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable (24 chunklets).
+lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
+# metadb LD (created but unused until Phase 3) -> ~2 GiB (4 chunklets).
+meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 1, strip_kib = 0 }
+# Filled in after `chunklet-init --force` printed them:
+lv3_ld_id = "69103442-1049-4c6b-9fb0-3d236b38141f"
+lv2_ld_id = "b27c033b-e5ff-4e22-9d37-7e0d122f04e8"
+meta_ld_id = "4b1c4da3-fb4e-4c93-91a4-bbe6b51673d0"
+
+[meta]
+path = "/mnt/onyx-meta/metadb"
+wal_dir = "/mnt/onyx-meta/wal"
+block_cache_mb = 32768
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 5000
+group_commit_timeout_us = 1
+dedup_shards = 8
+dedup_cuckoo_buckets = 64000000
+dedup_l1_cache_entries = 256000
+l2p_buffer_enabled = true
+rc_authoritative_reclaim = true
+commit_direct_apply_enabled = true
+bfg_threads_enabled = true
+parallel_l2p_drain_enabled = false
+
+[storage]
+# data_device omitted: LV3 comes from the chunklet pool.
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 16
+
+[buffer]
+# device omitted: LV2 comes from the chunklet pool. capacity_mb is ignored in
+# the chunklet path (the ring sizes from the LD capacity).
+capacity_mb = 32768
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+shards = 16
+max_memory_mb = 16384
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 32768
+coalesce_max_lbas = 8
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+
+[dedup]
+enabled = true
+workers = 2
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 0
+rescan_interval_ms = 30000
+max_rescan_per_cycle = 4096
+cold_tail_max_per_cycle = 4096
+
+[threading]
+enabled = false
+
+[service]
+socket_path = "/tmp/onyx-storage-nvme.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30
