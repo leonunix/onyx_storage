@@ -34,6 +34,8 @@ pub struct OnyxConfig {
     pub threading: ThreadingConfig,
     #[serde(default)]
     pub numa: NumaConfig,
+    #[serde(default)]
+    pub chunklet: ChunkletConfig,
 }
 
 /// NUMA awareness mode (docs/numa-aware-design.md §3.3).
@@ -859,6 +861,135 @@ fn default_lv3_per_shard_write_rings() -> bool {
 
 fn default_read_pool_workers() -> usize {
     4
+}
+
+/// chunklet RAID backend wiring (roadmap ③ RAID-aware / Phase 8 integration).
+/// When `enabled`, LV3 (and later LV2 / metadb) sit on chunklet `LogicalDisk`s
+/// carved from one Pool over `devices`, replacing the single-device paths.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChunkletConfig {
+    /// Master switch. `false` (default) keeps the legacy single-device paths.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Raw PD block devices forming the pool (count ≥ the widest LD set size).
+    #[serde(default)]
+    pub devices: Vec<PathBuf>,
+    /// Cross-PD IO backend inside chunklet: `uring` (default) or `sync`.
+    #[serde(default)]
+    pub io_backend: ChunkletIoBackend,
+    /// Per-PD free chunklets reserved for rebuild (percent, default 5).
+    #[serde(default = "default_chunklet_spare_pct")]
+    pub spare_pct: u8,
+    /// LV3 data LD geometry (RAID6). Used by `chunklet-init`; id resolved after.
+    #[serde(default = "ChunkletLdGeom::lv3_default")]
+    pub lv3: ChunkletLdGeom,
+    /// LV2 write-buffer LD geometry (RAID10). Phase 2.
+    #[serde(default = "ChunkletLdGeom::lv2_default")]
+    pub lv2: ChunkletLdGeom,
+    /// metadb LD geometry (RAID10). Phase 3.
+    #[serde(default = "ChunkletLdGeom::meta_default")]
+    pub meta: ChunkletLdGeom,
+    /// LD ids (UUID strings) resolved by `chunklet-init` and written back here.
+    /// When a role's id is unset but exactly one LD exists in the pool, onyx
+    /// falls back to that single LD.
+    #[serde(default)]
+    pub lv3_ld_id: Option<String>,
+    #[serde(default)]
+    pub lv2_ld_id: Option<String>,
+    #[serde(default)]
+    pub meta_ld_id: Option<String>,
+}
+
+impl Default for ChunkletConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            devices: Vec::new(),
+            io_backend: ChunkletIoBackend::default(),
+            spare_pct: default_chunklet_spare_pct(),
+            lv3: ChunkletLdGeom::lv3_default(),
+            lv2: ChunkletLdGeom::lv2_default(),
+            meta: ChunkletLdGeom::meta_default(),
+            lv3_ld_id: None,
+            lv2_ld_id: None,
+            meta_ld_id: None,
+        }
+    }
+}
+
+fn default_chunklet_spare_pct() -> u8 {
+    5
+}
+
+/// Cross-PD IO submission backend selector inside chunklet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkletIoBackend {
+    #[default]
+    Uring,
+    Sync,
+}
+
+/// LD geometry for `chunklet-init`, mirroring chunklet's `LdSpec` constructors.
+/// `raid` selects the level; the remaining fields map onto that constructor's
+/// parameters (see chunklet `pool::LdSpec`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChunkletLdGeom {
+    /// `raid6` | `raid10` | `raid5` | `raid0` | `plain`.
+    pub raid: String,
+    /// raid5/6: data chunklets per set (K). raid10/mirror: mirror copies.
+    /// raid0: stripe width. plain: chunklet count.
+    #[serde(default = "default_geom_set")]
+    pub set_size: u8,
+    /// Rows of sets striped together (1 = no striping above the set).
+    #[serde(default = "default_geom_one")]
+    pub row_size: u16,
+    /// Rows chained for capacity.
+    #[serde(default = "default_geom_one")]
+    pub num_rows: u16,
+    /// Strip size in KiB; 0 = one 4 KiB block. Must be a power of two.
+    #[serde(default)]
+    pub strip_kib: u32,
+}
+
+impl ChunkletLdGeom {
+    fn lv3_default() -> Self {
+        // RAID6 over 6 data + 2 parity = 8 PDs; 256 KiB strip for big sequential.
+        Self {
+            raid: "raid6".to_string(),
+            set_size: 6,
+            row_size: 1,
+            num_rows: 1,
+            strip_kib: 256,
+        }
+    }
+    fn lv2_default() -> Self {
+        // RAID10: 2-way mirror striped 2 wide.
+        Self {
+            raid: "raid10".to_string(),
+            set_size: 2,
+            row_size: 2,
+            num_rows: 1,
+            strip_kib: 0,
+        }
+    }
+    fn meta_default() -> Self {
+        Self {
+            raid: "raid10".to_string(),
+            set_size: 2,
+            row_size: 2,
+            num_rows: 1,
+            strip_kib: 0,
+        }
+    }
+}
+
+fn default_geom_set() -> u8 {
+    6
+}
+
+fn default_geom_one() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]

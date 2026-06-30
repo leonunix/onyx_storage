@@ -140,6 +140,7 @@ fn setup_with_all_options(
         ha: Default::default(),
         threading: Default::default(),
         numa: Default::default(),
+        chunklet: Default::default(),
     };
 
     let engine = OnyxEngine::open(&config).unwrap();

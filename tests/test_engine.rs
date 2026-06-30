@@ -84,6 +84,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
         ha: Default::default(),
         threading: Default::default(),
         numa: Default::default(),
+        chunklet: Default::default(),
     };
 
     (config, meta_dir, buf_tmp, data_tmp)
