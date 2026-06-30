@@ -5,6 +5,9 @@ pub enum OnyxError {
     #[error("metadb error: {0}")]
     MetaDb(#[from] onyx_metadb::MetaDbError),
 
+    #[error("chunklet error: {0}")]
+    Chunklet(#[from] onyx_chunklet::ChunkletError),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
