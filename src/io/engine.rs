@@ -630,11 +630,28 @@ impl IoEngine {
         // Mixed read/write batches stay sequential — uncommon enough that
         // parallelising is not worth the complexity.
         let all_writes = !ops.is_empty() && ops.iter().all(|op| matches!(op, LvOp::Write { .. }));
+
+        // A striped backend (chunklet LD: no single fd → `uring_target` is None)
+        // owns its own cross-PD io_uring batching, so the whole write batch must
+        // go through ONE `write_many_at`. The thread-per-op `thread::scope`
+        // fan-out below is a single-fd-RawDevice optimisation (keep NVMe QD > 1
+        // with plain pwrite) — running it against chunklet spawns an unbounded
+        // thread storm that each pins a chunklet thread-local ring (the nvme-box
+        // EMFILE + flusher-writer thread explosion). Route chunklet here instead.
+        if all_writes && self.device.uring_target().is_none() {
+            let out = self.write_batch_many(&ops)?;
+            if fsync_after {
+                self.device.flush()?;
+            }
+            return Ok(out);
+        }
+
         let parallelize = all_writes && ops.len() > 1 && !Self::syscall_write_serial_enabled();
 
         let out: Vec<LvOpResult> = if parallelize {
             // Parallel pwrite via scoped threads to keep NVMe queue depth > 1
-            // on the syscall backend. Mirrors the pre-io_uring passthrough path.
+            // on the single-fd syscall backend. Mirrors the pre-io_uring
+            // passthrough path. (Chunklet took the batched path above.)
             std::thread::scope(|s| {
                 let handles: Vec<_> = ops
                     .iter()
@@ -676,6 +693,54 @@ impl IoEngine {
             self.device.flush()?;
         }
         Ok(out)
+    }
+
+    /// Encode every write op into a pooled `AlignedBuf` and submit the whole
+    /// batch through `BlockBackend::write_many_at` in one call. Used for striped
+    /// (chunklet) backends, which fan the batch across their member PDs in a
+    /// single internal io_uring submit — no per-op thread spawn, no per-thread
+    /// ring. Durability is the caller's `flush` (mirrors `write_blocks`).
+    fn write_batch_many(&self, ops: &[LvOp<'_>]) -> OnyxResult<Vec<LvOpResult>> {
+        let bs = self.block_size as usize;
+        // Hold the aligned buffers alive across the whole batched submit; the
+        // `(offset, &[u8])` ops borrow into them.
+        let mut bufs: Vec<AlignedBuf> = Vec::with_capacity(ops.len());
+        // (pba, payload, offset, total_size) kept for post-write verify/metrics.
+        let mut metas: Vec<(Pba, &[u8], u64, usize)> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let (pba, payload) = match op {
+                LvOp::Write { pba, payload } => (*pba, *payload),
+                _ => unreachable!("write_batch_many is writes-only"),
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            let total = payload.len().div_ceil(bs) * bs;
+            let offset = self.pba_to_offset(pba);
+            let mut buf = AlignedBuf::new(total, self.use_hugepages)?;
+            buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
+            // padding already zero
+            bufs.push(buf);
+            metas.push((pba, payload, offset, total));
+        }
+
+        if !bufs.is_empty() {
+            let write_ops: Vec<(u64, &[u8])> = bufs
+                .iter()
+                .zip(metas.iter())
+                .map(|(buf, (_, _, offset, total))| (*offset, &buf.as_slice()[..*total]))
+                .collect();
+            self.device.write_many_at(&write_ops)?;
+        }
+
+        // Post-write verify + LV3 metrics, per op (matches write_blocks).
+        for (pba, payload, _offset, total) in &metas {
+            self.verify_write_payload(*pba, payload, *total)?;
+            self.record_lv3_write_trace(*pba, payload, *total);
+            self.record_lv3_write(*total);
+        }
+        // write_many_at is all-or-first-error; a returned Ok means every op landed.
+        Ok(ops.iter().map(|_| LvOpResult::Write(Ok(()))).collect())
     }
 
     fn submit_batch_uring(
