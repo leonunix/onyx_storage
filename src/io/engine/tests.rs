@@ -24,7 +24,7 @@ fn uring_round_trip() {
     let dir = TempDir::new().unwrap();
     let dev = fresh_device(&dir, "lv3", 1024 * 1024);
     let session = Arc::new(IoUringSession::new(16).unwrap());
-    let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
+    let engine = IoEngine::with_options(Arc::new(dev), false, 0, None, IoBackend::Uring(session));
 
     let payload = vec![0xCDu8; 4096];
     engine.write_blocks(Pba(2), &payload).unwrap();
@@ -37,7 +37,7 @@ fn uring_batch_writes_then_reads() {
     let dir = TempDir::new().unwrap();
     let dev = fresh_device(&dir, "lv3", 1024 * 1024);
     let session = Arc::new(IoUringSession::new(64).unwrap());
-    let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
+    let engine = IoEngine::with_options(Arc::new(dev), false, 0, None, IoBackend::Uring(session));
 
     let payloads: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; 4096]).collect();
     let writes: Vec<LvOp> = payloads
@@ -79,7 +79,7 @@ fn uring_batch_chunks_when_ops_exceed_sq_entries() {
     let dir = TempDir::new().unwrap();
     let dev = fresh_device(&dir, "lv3", 1024 * 1024);
     let session = Arc::new(IoUringSession::new(4).unwrap());
-    let engine = IoEngine::with_options(dev, false, 0, None, IoBackend::Uring(session));
+    let engine = IoEngine::with_options(Arc::new(dev), false, 0, None, IoBackend::Uring(session));
 
     let payloads: Vec<Vec<u8>> = (0..10).map(|i| vec![(i + 1) as u8; 4096]).collect();
     let writes: Vec<LvOp> = payloads

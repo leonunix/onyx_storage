@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
-use crate::io::device::RawDevice;
+use crate::io::block_backend::BlockBackend;
 use crate::io::uring::{IoUringSession, UringOp};
 use crate::types::{BLOCK_SIZE, RESERVED_BLOCKS};
 
@@ -376,7 +376,7 @@ impl HaLockBlock {
 
 /// Read and validate the DataSuperblock from block 0.
 /// Returns `Ok(None)` if block 0 is all zeros (fresh device) or has invalid magic/CRC.
-pub fn read_superblock(device: &RawDevice) -> OnyxResult<Option<DataSuperblock>> {
+pub fn read_superblock(device: &dyn BlockBackend) -> OnyxResult<Option<DataSuperblock>> {
     let min_size = RESERVED_BLOCKS * BLOCK_SIZE as u64;
     if device.size() < min_size {
         return Err(OnyxError::Config(format!(
@@ -393,17 +393,17 @@ pub fn read_superblock(device: &RawDevice) -> OnyxResult<Option<DataSuperblock>>
 }
 
 /// Write a DataSuperblock to block 0.
-pub fn write_superblock(device: &RawDevice, sb: &DataSuperblock) -> OnyxResult<()> {
+pub fn write_superblock(device: &dyn BlockBackend, sb: &DataSuperblock) -> OnyxResult<()> {
     let bytes = sb.to_bytes();
     let mut aligned = AlignedBuf::new(BLOCK_SIZE as usize, false)?;
     aligned.as_mut_slice().copy_from_slice(&bytes);
     device.write_at(aligned.as_slice(), 0)?;
-    device.sync()?;
+    device.flush()?;
     Ok(())
 }
 
 /// Format a fresh LV3 device: write superblock to block 0, zero blocks 1-7.
-pub fn format_device(device: &RawDevice) -> OnyxResult<DataSuperblock> {
+pub fn format_device(device: &dyn BlockBackend) -> OnyxResult<DataSuperblock> {
     let sb = DataSuperblock::new(device.size());
 
     // Write superblock (block 0)
@@ -415,7 +415,7 @@ pub fn format_device(device: &RawDevice) -> OnyxResult<DataSuperblock> {
     // AlignedBuf is already zeroed
     let _ = zeros.as_mut_slice(); // ensure mutable access
     device.write_at(zeros.as_slice(), BLOCK_SIZE as u64)?;
-    device.sync()?;
+    device.flush()?;
 
     tracing::info!(
         uuid = sb.uuid_string(),
@@ -428,26 +428,26 @@ pub fn format_device(device: &RawDevice) -> OnyxResult<DataSuperblock> {
 }
 
 /// Read the heartbeat block from block 1.
-pub fn read_heartbeat(device: &RawDevice) -> OnyxResult<Option<HeartbeatBlock>> {
+pub fn read_heartbeat(device: &dyn BlockBackend) -> OnyxResult<Option<HeartbeatBlock>> {
     let mut buf = [0u8; 4096];
     device.read_at(&mut buf, BLOCK_SIZE as u64)?;
     Ok(HeartbeatBlock::from_bytes(&buf))
 }
 
 /// Read the HA lock block from block 2.
-pub fn read_ha_lock(device: &RawDevice) -> OnyxResult<Option<HaLockBlock>> {
+pub fn read_ha_lock(device: &dyn BlockBackend) -> OnyxResult<Option<HaLockBlock>> {
     let mut buf = [0u8; 4096];
     device.read_at(&mut buf, 2 * BLOCK_SIZE as u64)?;
     Ok(HaLockBlock::from_bytes(&buf))
 }
 
 /// Write the HA lock block to block 2.
-pub fn write_ha_lock(device: &RawDevice, lock: &HaLockBlock) -> OnyxResult<()> {
+pub fn write_ha_lock(device: &dyn BlockBackend, lock: &HaLockBlock) -> OnyxResult<()> {
     let bytes = lock.to_bytes();
     let mut aligned = AlignedBuf::new(BLOCK_SIZE as usize, false)?;
     aligned.as_mut_slice().copy_from_slice(&bytes);
     device.write_at(aligned.as_slice(), 2 * BLOCK_SIZE as u64)?;
-    device.sync()?;
+    device.flush()?;
     Ok(())
 }
 
@@ -461,13 +461,13 @@ pub struct HeartbeatWriter {
 
 impl HeartbeatWriter {
     /// Start a heartbeat writer that uses classic pwrite + fsync.
-    pub fn start(device: RawDevice, node_id: u64, interval: Duration) -> Self {
+    pub fn start(device: Arc<dyn BlockBackend>, node_id: u64, interval: Duration) -> Self {
         Self::start_inner(device, node_id, interval, None)
     }
 
     /// Start a heartbeat writer that submits write+fdatasync as one io_uring batch.
     pub fn start_uring(
-        device: RawDevice,
+        device: Arc<dyn BlockBackend>,
         node_id: u64,
         interval: Duration,
         session: Arc<IoUringSession>,
@@ -476,7 +476,7 @@ impl HeartbeatWriter {
     }
 
     fn start_inner(
-        device: RawDevice,
+        device: Arc<dyn BlockBackend>,
         node_id: u64,
         interval: Duration,
         session: Option<Arc<IoUringSession>>,
@@ -487,7 +487,13 @@ impl HeartbeatWriter {
         let handle = thread::Builder::new()
             .name("heartbeat-writer".into())
             .spawn(move || {
-                Self::heartbeat_loop(&device, node_id, interval, &running_clone, session.as_ref());
+                Self::heartbeat_loop(
+                    device.as_ref(),
+                    node_id,
+                    interval,
+                    &running_clone,
+                    session.as_ref(),
+                );
             })
             .expect("failed to spawn heartbeat writer thread");
 
@@ -498,7 +504,7 @@ impl HeartbeatWriter {
     }
 
     fn heartbeat_loop(
-        device: &RawDevice,
+        device: &dyn BlockBackend,
         node_id: u64,
         interval: Duration,
         running: &AtomicBool,
@@ -521,9 +527,13 @@ impl HeartbeatWriter {
             let bytes = hb.to_bytes();
             aligned.as_mut_slice().copy_from_slice(&bytes);
 
-            if let Some(session) = session {
-                let fd = device.as_raw_fd();
-                let offset = device.base_offset() + BLOCK_SIZE as u64;
+            // io_uring path only when we have both a session and a single-fd
+            // device. A chunklet backend exposes no fd (uring_target == None);
+            // build_heartbeat_writer never pairs it with a session, so this
+            // falls through to the plain write below.
+            let uring = session.and_then(|s| device.uring_target().map(|t| (s, t)));
+            if let Some((session, (fd, base))) = uring {
+                let offset = base + BLOCK_SIZE as u64;
                 let ops = [
                     UringOp::Write {
                         fd,
@@ -552,7 +562,7 @@ impl HeartbeatWriter {
                 }
             } else if let Err(e) = device.write_at(aligned.as_slice(), BLOCK_SIZE as u64) {
                 tracing::warn!(error = %e, "heartbeat: write failed");
-            } else if let Err(e) = device.sync() {
+            } else if let Err(e) = device.flush() {
                 tracing::warn!(error = %e, "heartbeat: sync failed");
             }
 

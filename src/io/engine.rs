@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::os::fd::RawFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
+use crate::io::block_backend::BlockBackend;
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, UringOp, UringOpResult};
 use crate::metrics::EngineMetrics;
@@ -67,7 +70,11 @@ impl std::fmt::Debug for IoBackend {
 /// so that PBA 0 from the allocator maps to device offset `pba_offset * BLOCK_SIZE`.
 /// Blocks 0..pba_offset are reserved for superblock, heartbeat, and HA lock.
 pub struct IoEngine {
-    data_device: RawDevice,
+    /// LV3 device seam. A `RawDeviceBackend` (file/blockdev, exposes a fd for
+    /// the io_uring hot path) or a `ChunkletBackend` (RAID over PDs, no fd —
+    /// `IoBackend::Syscall` routes its read_at/write_at/flush, while chunklet
+    /// owns the cross-PD io_uring internally).
+    device: Arc<dyn BlockBackend>,
     use_hugepages: bool,
     block_size: u32,
     pba_offset: u64,
@@ -102,14 +109,14 @@ pub enum LvOpResult {
 
 impl IoEngine {
     fn with_options(
-        data_device: RawDevice,
+        device: Arc<dyn BlockBackend>,
         use_hugepages: bool,
         pba_offset: u64,
         metrics: Option<Arc<EngineMetrics>>,
         backend: IoBackend,
     ) -> Self {
         Self {
-            data_device,
+            device,
             use_hugepages,
             block_size: BLOCK_SIZE,
             pba_offset,
@@ -117,6 +124,55 @@ impl IoEngine {
             backend,
             per_shard_write_sessions: false,
         }
+    }
+
+    /// Funnel for every existing `RawDevice`-taking constructor: `RawDevice`
+    /// itself implements `BlockBackend`, so we just wrap it in an `Arc`. Keeps
+    /// those constructor signatures and all their call sites unchanged.
+    fn with_raw_device(
+        data_device: RawDevice,
+        use_hugepages: bool,
+        pba_offset: u64,
+        metrics: Option<Arc<EngineMetrics>>,
+        backend: IoBackend,
+    ) -> Self {
+        Self::with_options(
+            Arc::new(data_device),
+            use_hugepages,
+            pba_offset,
+            metrics,
+            backend,
+        )
+    }
+
+    /// Build an IoEngine over an arbitrary `BlockBackend` — the chunklet LV3
+    /// path. Uses the `Syscall` submission mode: chunklet has no single fd, so
+    /// io_uring lives inside the chunklet LD, and `Syscall` simply routes
+    /// `read_at`/`write_at`/`flush` through the backend.
+    pub fn new_chunklet(
+        device: Arc<dyn BlockBackend>,
+        use_hugepages: bool,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
+        Self::with_options(
+            device,
+            use_hugepages,
+            RESERVED_BLOCKS,
+            Some(metrics),
+            IoBackend::Syscall,
+        )
+    }
+
+    /// `(fd, base_offset)` for io_uring SQE construction. Only valid when the
+    /// backend is a single-fd device; the `Uring` submission mode is only ever
+    /// paired with such a backend, so this is infallible in practice.
+    fn uring_fd_base(&self) -> OnyxResult<(RawFd, u64)> {
+        self.device.uring_target().ok_or_else(|| {
+            OnyxError::Config(
+                "io_uring backend requires a single-fd device; chunklet uses the syscall path"
+                    .into(),
+            )
+        })
     }
 
     /// Enable/disable handing each flusher writer its own LV3 write ring.
@@ -152,7 +208,7 @@ impl IoEngine {
     /// Create an IoEngine with standard PBA offset (RESERVED_BLOCKS) and the
     /// classic syscall backend (pread/pwrite).
     pub fn new(data_device: RawDevice, use_hugepages: bool) -> Self {
-        Self::with_options(
+        Self::with_raw_device(
             data_device,
             use_hugepages,
             RESERVED_BLOCKS,
@@ -167,7 +223,7 @@ impl IoEngine {
         use_hugepages: bool,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
-        Self::with_options(
+        Self::with_raw_device(
             data_device,
             use_hugepages,
             RESERVED_BLOCKS,
@@ -182,7 +238,7 @@ impl IoEngine {
         use_hugepages: bool,
         ring: Arc<IoUringSession>,
     ) -> Self {
-        Self::with_options(
+        Self::with_raw_device(
             data_device,
             use_hugepages,
             RESERVED_BLOCKS,
@@ -198,7 +254,7 @@ impl IoEngine {
         metrics: Arc<EngineMetrics>,
         ring: Arc<IoUringSession>,
     ) -> Self {
-        Self::with_options(
+        Self::with_raw_device(
             data_device,
             use_hugepages,
             RESERVED_BLOCKS,
@@ -210,7 +266,7 @@ impl IoEngine {
     /// Create an IoEngine without PBA offset (PBA 0 = device offset 0).
     /// For testing only — production code should use `new()`.
     pub fn new_raw(data_device: RawDevice, use_hugepages: bool) -> Self {
-        Self::with_options(data_device, use_hugepages, 0, None, IoBackend::Syscall)
+        Self::with_raw_device(data_device, use_hugepages, 0, None, IoBackend::Syscall)
     }
 
     pub fn backend(&self) -> &IoBackend {
@@ -307,7 +363,7 @@ impl IoEngine {
         let mut first_diff = 0usize;
         let mut recovered_after_retries = None;
         for attempt in 0..=3 {
-            self.data_device.read_at(actual.as_mut_slice(), offset)?;
+            self.device.read_at(actual.as_mut_slice(), offset)?;
             if actual.as_slice() == expected.as_slice() {
                 recovered_after_retries = Some(attempt);
                 break;
@@ -353,7 +409,7 @@ impl IoEngine {
             "LV3 post-write verification failed"
         );
         Err(OnyxError::Device {
-            path: self.data_device.path().to_path_buf(),
+            path: PathBuf::from(self.device.label()),
             reason: format!(
                 "LV3 post-write verification failed pba={} first_diff={} actual={} expected={}",
                 pba.0, first_diff, actual_byte, expected_byte
@@ -406,7 +462,7 @@ impl IoEngine {
     ) -> OnyxResult<()> {
         if let Some(errno) = result.errno() {
             return Err(OnyxError::Device {
-                path: self.data_device.path().to_path_buf(),
+                path: PathBuf::from(self.device.label()),
                 reason: format!(
                     "io_uring {op} failed at offset={offset}: errno={errno} ({})",
                     std::io::Error::from_raw_os_error(errno)
@@ -416,7 +472,7 @@ impl IoEngine {
         let bytes = result.bytes().unwrap_or(0);
         if bytes != expected {
             return Err(OnyxError::Device {
-                path: self.data_device.path().to_path_buf(),
+                path: PathBuf::from(self.device.label()),
                 reason: format!(
                     "io_uring {op} short transfer at offset={offset}: got {bytes} of {expected}"
                 ),
@@ -467,14 +523,15 @@ impl IoEngine {
 
         match &self.backend {
             IoBackend::Syscall => {
-                self.data_device.write_at(buf.as_slice(), offset)?;
+                self.device.write_at(buf.as_slice(), offset)?;
             }
             IoBackend::Uring(session) => {
+                let (fd, base) = self.uring_fd_base()?;
                 let op = UringOp::Write {
-                    fd: self.data_device.as_raw_fd(),
+                    fd,
                     ptr: buf.as_ptr(),
                     len: total_size as u32,
-                    offset: self.data_device.base_offset() + offset,
+                    offset: base + offset,
                 };
                 let results = unsafe { session.submit_batch(std::slice::from_ref(&op))? };
                 self.validate_uring_result("write", offset, total_size as u32, &results[0])?;
@@ -498,14 +555,15 @@ impl IoEngine {
         let mut buf = AlignedBuf::new(read_size, self.use_hugepages)?;
         match &self.backend {
             IoBackend::Syscall => {
-                self.data_device.read_at(buf.as_mut_slice(), offset)?;
+                self.device.read_at(buf.as_mut_slice(), offset)?;
             }
             IoBackend::Uring(session) => {
+                let (fd, base) = self.uring_fd_base()?;
                 let op = UringOp::Read {
-                    fd: self.data_device.as_raw_fd(),
+                    fd,
                     ptr: buf.as_mut_ptr(),
                     len: read_size as u32,
-                    offset: self.data_device.base_offset() + offset,
+                    offset: base + offset,
                 };
                 let results = unsafe { session.submit_batch(std::slice::from_ref(&op))? };
                 self.validate_uring_result("read", offset, read_size as u32, &results[0])?;
@@ -603,7 +661,7 @@ impl IoEngine {
         };
 
         if fsync_after {
-            self.data_device.sync()?;
+            self.device.flush()?;
         }
         Ok(out)
     }
@@ -623,7 +681,7 @@ impl IoEngine {
         }
 
         let bs = self.block_size as usize;
-        let fd = self.data_device.as_raw_fd();
+        let (fd, base) = self.uring_fd_base()?;
 
         // Allocate AlignedBuf for each op upfront, holding them through submit.
         // Read ops keep their target buffer here; write ops copy their payload
@@ -650,7 +708,7 @@ impl IoEngine {
                         fd,
                         ptr,
                         len: read_size as u32,
-                        offset: self.data_device.base_offset() + offset,
+                        offset: base + offset,
                     });
                     metas.push((i, read_size as u32, offset, true));
                 }
@@ -669,7 +727,7 @@ impl IoEngine {
                         fd,
                         ptr,
                         len: total as u32,
-                        offset: self.data_device.base_offset() + offset,
+                        offset: base + offset,
                     });
                     metas.push((i, total as u32, offset, false));
                 }
@@ -753,7 +811,7 @@ impl IoEngine {
             let r = &results[fsync_offset];
             if let Some(errno) = r.errno() {
                 return Err(OnyxError::Device {
-                    path: self.data_device.path().to_path_buf(),
+                    path: PathBuf::from(self.device.label()),
                     reason: format!(
                         "io_uring fdatasync failed: errno={errno} ({})",
                         std::io::Error::from_raw_os_error(errno)
@@ -775,7 +833,7 @@ impl IoEngine {
         fsync_after: bool,
     ) -> OnyxResult<Vec<LvOpResult>> {
         let bs = self.block_size as usize;
-        let fd = self.data_device.as_raw_fd();
+        let (fd, base) = self.uring_fd_base()?;
         let mut metas: Vec<(usize, u32, u64)> = Vec::with_capacity(ops.len());
         let mut total_bytes = 0usize;
 
@@ -820,7 +878,7 @@ impl IoEngine {
                     fd,
                     ptr: unsafe { slab.as_ptr().add(cursor) },
                     len: total as u32,
-                    offset: self.data_device.base_offset() + metas[uring_ops.len()].2,
+                    offset: base + metas[uring_ops.len()].2,
                 });
                 cursor += total;
             }
@@ -865,7 +923,7 @@ impl IoEngine {
             let r = &results[results.len() - 1];
             if let Some(errno) = r.errno() {
                 return Err(OnyxError::Device {
-                    path: self.data_device.path().to_path_buf(),
+                    path: PathBuf::from(self.device.label()),
                     reason: format!(
                         "io_uring fdatasync failed: errno={errno} ({})",
                         std::io::Error::from_raw_os_error(errno)
@@ -881,31 +939,30 @@ impl IoEngine {
             .collect())
     }
 
-    /// Borrow the underlying data device. Used by the engine shutdown path
-    /// to stamp the `FLAG_CLEAN_SHUTDOWN` bit in the LV3 superblock.
-    pub fn data_device(&self) -> &RawDevice {
-        &self.data_device
+    /// Borrow the LV3 device seam. Used by the engine shutdown path to stamp
+    /// the `FLAG_CLEAN_SHUTDOWN` bit in the LV3 superblock.
+    pub fn device(&self) -> &Arc<dyn BlockBackend> {
+        &self.device
     }
 
     pub fn device_size(&self) -> u64 {
-        self.data_device.size()
+        self.device.size()
     }
 
     pub fn total_blocks(&self) -> u64 {
-        self.data_device.size() / self.block_size as u64 - self.pba_offset
+        self.device.size() / self.block_size as u64 - self.pba_offset
     }
 
     pub fn sync(&self) -> OnyxResult<()> {
         match &self.backend {
-            IoBackend::Syscall => self.data_device.sync(),
+            IoBackend::Syscall => self.device.flush(),
             IoBackend::Uring(session) => {
-                let op = UringOp::FsyncData {
-                    fd: self.data_device.as_raw_fd(),
-                };
+                let (fd, _base) = self.uring_fd_base()?;
+                let op = UringOp::FsyncData { fd };
                 let results = unsafe { session.submit_batch(std::slice::from_ref(&op))? };
                 if let Some(errno) = results[0].errno() {
                     return Err(OnyxError::Device {
-                        path: self.data_device.path().to_path_buf(),
+                        path: PathBuf::from(self.device.label()),
                         reason: format!(
                             "io_uring fdatasync failed: errno={errno} ({})",
                             std::io::Error::from_raw_os_error(errno)

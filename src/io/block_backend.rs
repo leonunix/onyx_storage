@@ -82,47 +82,43 @@ pub trait BlockBackend: Send + Sync {
     fn uring_target(&self) -> Option<(RawFd, u64)> {
         None
     }
-}
 
-/// `BlockBackend` over a single OS file or block device. Preserves today's
-/// behaviour for non-chunklet deployments (sparse-file tests, single-disk dev,
-/// kernel md/LVM): `uring_target` exposes the fd, so the existing onyx
-/// `io_uring` LV2/LV3 hot paths are untouched.
-pub struct RawDeviceBackend {
-    dev: RawDevice,
-}
-
-impl RawDeviceBackend {
-    pub fn new(dev: RawDevice) -> Self {
-        Self { dev }
-    }
-
-    /// Borrow the wrapped device (e.g. for superblock formatting that still
-    /// works against the concrete `RawDevice`).
-    pub fn device(&self) -> &RawDevice {
-        &self.dev
+    /// Human-readable identifier for error/log messages (a device path for a
+    /// `RawDevice`, an LD label for chunklet).
+    fn label(&self) -> String {
+        "block-device".to_string()
     }
 }
 
-impl BlockBackend for RawDeviceBackend {
+/// `RawDevice` *is* a `BlockBackend`: a single OS file or block device. This
+/// preserves today's behaviour for non-chunklet deployments (sparse-file
+/// tests, single-disk dev, kernel md/LVM) and lets `&RawDevice` coerce to
+/// `&dyn BlockBackend` at the many superblock / startup call sites. Because it
+/// is a single fd, `uring_target` returns `Some`, keeping the existing onyx
+/// `io_uring` LV2/LV3 hot paths untouched.
+impl BlockBackend for RawDevice {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
-        self.dev.read_at(buf, offset)
+        RawDevice::read_at(self, buf, offset)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
-        self.dev.write_at(buf, offset)
+        RawDevice::write_at(self, buf, offset)
     }
 
     fn flush(&self) -> OnyxResult<()> {
-        self.dev.sync()
+        self.sync()
     }
 
     fn size(&self) -> u64 {
-        self.dev.size()
+        RawDevice::size(self)
     }
 
     fn uring_target(&self) -> Option<(RawFd, u64)> {
-        Some((self.dev.as_raw_fd(), self.dev.base_offset()))
+        Some((self.as_raw_fd(), self.base_offset()))
+    }
+
+    fn label(&self) -> String {
+        self.path().display().to_string()
     }
 }
 
@@ -184,6 +180,10 @@ impl BlockBackend for ChunkletBackend {
         self.capacity
     }
     // uring_target defaults to None: striped across PDs, no single fd.
+
+    fn label(&self) -> String {
+        format!("chunklet-ld:{:?}", self.ld.id())
+    }
 }
 
 #[cfg(test)]
@@ -191,10 +191,10 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn backend(size: u64) -> (RawDeviceBackend, NamedTempFile) {
+    fn backend(size: u64) -> (RawDevice, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();
         let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
-        (RawDeviceBackend::new(dev), tmp)
+        (dev, tmp)
     }
 
     #[test]

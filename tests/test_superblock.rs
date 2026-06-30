@@ -237,7 +237,7 @@ fn heartbeat_writer_writes_periodically() {
 
     // Start heartbeat writer with short interval
     let hb_dev = RawDevice::open(_tmp.path()).unwrap();
-    let mut writer = HeartbeatWriter::start(hb_dev, 42, Duration::from_millis(100));
+    let mut writer = HeartbeatWriter::start(Arc::new(hb_dev), 42, Duration::from_millis(100));
 
     // Wait for at least 2 heartbeats
     std::thread::sleep(Duration::from_millis(350));
@@ -259,7 +259,7 @@ fn heartbeat_writer_writes_periodically() {
 fn heartbeat_writer_stop_is_idempotent() {
     let (_dev, tmp) = create_test_device(100);
     let hb_dev = RawDevice::open(tmp.path()).unwrap();
-    let mut writer = HeartbeatWriter::start(hb_dev, 1, Duration::from_secs(1));
+    let mut writer = HeartbeatWriter::start(Arc::new(hb_dev), 1, Duration::from_secs(1));
     writer.stop();
     writer.stop(); // Should not panic
 }
@@ -271,7 +271,8 @@ fn heartbeat_writer_uring_writes_periodically() {
 
     let session = Arc::new(IoUringSession::new(8).unwrap());
     let hb_dev = RawDevice::open(_tmp.path()).unwrap();
-    let mut writer = HeartbeatWriter::start_uring(hb_dev, 99, Duration::from_millis(80), session);
+    let mut writer =
+        HeartbeatWriter::start_uring(Arc::new(hb_dev), 99, Duration::from_millis(80), session);
 
     std::thread::sleep(Duration::from_millis(300));
     writer.stop();

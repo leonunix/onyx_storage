@@ -155,6 +155,7 @@ impl OnyxEngine {
         interval: std::time::Duration,
         storage: &StorageConfig,
     ) -> OnyxResult<HeartbeatWriter> {
+        let device: Arc<dyn crate::io::block_backend::BlockBackend> = Arc::new(device);
         match storage.io_backend {
             IoBackendConfig::Syscall => Ok(HeartbeatWriter::start(device, node_id, interval)),
             IoBackendConfig::Uring => {
@@ -1323,11 +1324,11 @@ impl OnyxEngine {
         // engine — by this point flusher has drained, cleanup_tx is idle, and
         // the refcount CF is consistent with the per-volume blockmap CFs.
         if let Some(ref io_engine) = self.io_engine {
-            match superblock::read_superblock(io_engine.data_device()) {
+            match superblock::read_superblock(io_engine.device().as_ref()) {
                 Ok(Some(mut sb)) => {
                     sb.set_clean_shutdown(true);
                     sb.update_crc();
-                    if let Err(e) = superblock::write_superblock(io_engine.data_device(), &sb) {
+                    if let Err(e) = superblock::write_superblock(io_engine.device().as_ref(), &sb) {
                         tracing::error!(
                             error = %e,
                             "failed to write clean-shutdown superblock — next boot will do dirty recovery"
@@ -1495,6 +1496,7 @@ impl OnyxEngine {
         // Heartbeat writer
         let heartbeat_writer = if config.ha.enabled {
             let hb_dev = RawDevice::open(data_path)?;
+            let hb_dev: Arc<dyn crate::io::block_backend::BlockBackend> = Arc::new(hb_dev);
             Some(HeartbeatWriter::start(
                 hb_dev,
                 config.ha.node_id,
