@@ -194,6 +194,58 @@ fn cleanup_stale_ublk_devices() -> anyhow::Result<usize> {
     Ok(cleaned)
 }
 
+/// Raise `RLIMIT_NOFILE` to the hard limit and, under chunklet, warn if it is
+/// still low. chunklet's io_uring backend pins one ring (≈1 fd) per onyx IO
+/// thread (read-pool + per-shard flush writers + metadb writers) on top of
+/// ublk's per-queue fds and the PD handles; the common 1024 soft default is
+/// easily overrun. As of chunklet f0395a8 a ring that hits EMFILE degrades to
+/// the syscall path instead of failing the write, so a low limit only costs
+/// throughput — hence we warn (and point at `LimitNOFILE`) rather than refuse.
+fn ensure_fd_limit(config: &OnyxConfig) {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    let effective = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) => {
+            if soft < hard {
+                match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+                    Ok(()) => {
+                        tracing::info!(old_soft = soft, new_soft = hard, hard, "raised RLIMIT_NOFILE to hard limit");
+                        hard
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, soft, hard, "failed to raise RLIMIT_NOFILE; using current soft limit");
+                        soft
+                    }
+                }
+            } else {
+                soft
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "getrlimit(RLIMIT_NOFILE) failed; cannot tune fd limit");
+            return;
+        }
+    };
+
+    if config.chunklet.enabled {
+        // Rough working-set: one ring per read-pool worker + per buffer shard,
+        // a few ublk fds per queue, plus headroom for PDs/metadb/sockets.
+        let recommended = 8 * (config.storage.read_pool_workers as u64
+            + config.buffer.shards as u64)
+            + 4 * config.ublk.nr_queues as u64
+            + 4096;
+        if effective < recommended.max(65536) {
+            tracing::warn!(
+                effective,
+                recommended = recommended.max(65536),
+                "RLIMIT_NOFILE is low for chunklet + ublk; io_uring will degrade to the \
+                 syscall path under load (correct but slower). Raise it via systemd \
+                 LimitNOFILE=1048576 (or `ulimit -n`) to keep the io_uring fast path"
+            );
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -204,6 +256,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = OnyxConfig::load(&cli.config)?;
+    ensure_fd_limit(&config);
     onyx_storage::numa::setup(&config)?;
 
     match cli.command {
