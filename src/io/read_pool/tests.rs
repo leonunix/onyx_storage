@@ -240,3 +240,43 @@ fn dedup_verify_mismatch_is_not_counted_as_crc_error() {
     );
     assert_eq!(metrics.dedup_verify_mismatches.load(Ordering::Relaxed), 1);
 }
+
+/// `start_backend` round-trips an uncompressed block through a real chunklet
+/// RAID6 LV3 LD — the worker reads via `read_many_at` (no per-worker fd/uring),
+/// then the shared decode path validates CRC and returns the LBA.
+#[test]
+fn read_pool_backend_round_trip_raid6() {
+    use crate::chunklet_pool::{self, LdRoleSel};
+    use crate::config::{ChunkletConfig, ChunkletIoBackend};
+    use crate::io::block_backend::BlockBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let devices: Vec<_> = (0..8).map(|i| dir.path().join(format!("pd{i}"))).collect();
+    for p in &devices {
+        onyx_chunklet::io::RawDevice::open_or_create(p, 4 << 30).unwrap();
+    }
+    let mut cfg = ChunkletConfig {
+        enabled: true,
+        devices,
+        io_backend: ChunkletIoBackend::Sync,
+        spare_pct: 0,
+        ..Default::default()
+    };
+    let (pool, lv3, _lv2, _meta) = chunklet_pool::init_pool(&cfg).unwrap();
+    drop(pool);
+    cfg.lv3_ld_id = Some(lv3.to_string());
+    let (_pool2, backend) = chunklet_pool::open_role_backend(&cfg, LdRoleSel::Lv3).unwrap();
+
+    // Write an uncompressed 4 KiB block at PBA 0 (pba_offset = 0).
+    let payload = vec![0xC3u8; BLOCK_SIZE as usize];
+    backend.write_at(&payload, 0).unwrap();
+    backend.flush().unwrap();
+    let crc = crc32fast::hash(&payload);
+
+    let metrics = Arc::new(EngineMetrics::default());
+    let pool = ReadPool::start_backend(2, backend, 0, BLOCK_SIZE, false, metrics).unwrap();
+    let got = pool
+        .submit_read(make_mapping(Pba(0), BLOCK_SIZE, crc))
+        .unwrap();
+    assert_eq!(got, payload);
+}

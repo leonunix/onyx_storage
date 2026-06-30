@@ -34,6 +34,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use crate::affinity::{self, ThreadRole};
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::AlignedBuf;
+use crate::io::block_backend::BlockBackend;
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, UringOp};
 use crate::meta::schema::BlockmapValue;
@@ -148,15 +149,17 @@ impl ReadPool {
                     let fd = worker_device.as_raw_fd();
                     let ctx = WorkerCtx {
                         worker_idx,
-                        ring: session,
-                        fd,
-                        base_offset,
+                        io: WorkerIo::Uring {
+                            ring: session,
+                            fd,
+                            base_offset,
+                            _device: worker_device,
+                        },
                         pba_offset,
                         block_size,
                         use_hugepages,
                         metrics,
                         device_path: device_path_clone,
-                        _device: worker_device,
                     };
                     worker_loop(ctx, rx);
                 })
@@ -175,6 +178,66 @@ impl ReadPool {
             channel_cap,
             "read pool started with shared queue"
         );
+
+        Ok(Self {
+            sender: Some(tx),
+            workers: handles,
+        })
+    }
+
+    /// Spawn `workers` reader threads sharing one chunklet `BlockBackend`. There
+    /// is no per-worker fd or `io_uring` — chunklet owns the cross-PD io_uring,
+    /// so each worker issues its coalesced batch via `read_many_at`. Workers
+    /// still run in parallel for CRC + decompress and to keep multiple batches
+    /// in flight to the LD.
+    pub fn start_backend(
+        workers: usize,
+        backend: Arc<dyn BlockBackend>,
+        pba_offset: u64,
+        block_size: u32,
+        use_hugepages: bool,
+        metrics: Arc<EngineMetrics>,
+    ) -> OnyxResult<Self> {
+        if workers == 0 {
+            return Err(OnyxError::Config(
+                "ReadPool requires at least 1 worker (set read_pool_workers >= 1)".into(),
+            ));
+        }
+        let channel_cap = workers
+            .saturating_mul(REQUEST_CHANNEL_CAP)
+            .max(REQUEST_CHANNEL_CAP);
+        let (tx, rx) = bounded::<ReadRequest>(channel_cap);
+
+        let mut handles = Vec::with_capacity(workers);
+        for worker_idx in 0..workers {
+            let rx = rx.clone();
+            let metrics = metrics.clone();
+            let backend = backend.clone();
+            let join = thread::Builder::new()
+                .name(format!("read-pool-{}", worker_idx))
+                .spawn(move || {
+                    affinity::bind_current(ThreadRole::ReadPool, worker_idx);
+                    let ctx = WorkerCtx {
+                        worker_idx,
+                        io: WorkerIo::Backend { backend },
+                        pba_offset,
+                        block_size,
+                        use_hugepages,
+                        metrics,
+                        device_path: std::path::PathBuf::from("chunklet"),
+                    };
+                    worker_loop(ctx, rx);
+                })
+                .map_err(|e| {
+                    OnyxError::Config(format!(
+                        "failed to spawn read-pool worker {}: {}",
+                        worker_idx, e
+                    ))
+                })?;
+            handles.push(WorkerHandle { join: Some(join) });
+        }
+
+        tracing::info!(workers, channel_cap, "read pool started (chunklet backend)");
 
         Ok(Self {
             sender: Some(tx),
@@ -309,19 +372,44 @@ impl Drop for ReadPool {
     }
 }
 
+/// How a read-pool worker issues IO. `Uring` is the single-fd file/blockdev
+/// path (per-worker `io_uring` + fd). `Backend` is a chunklet LD shared across
+/// workers — chunklet owns the cross-PD io_uring, so the worker just calls the
+/// synchronous batched `read_many_at`.
+enum WorkerIo {
+    Uring {
+        ring: IoUringSession,
+        fd: RawFd,
+        base_offset: u64,
+        /// Keeps the `RawDevice` alive as long as the worker runs; `fd` is only
+        /// valid while this field exists.
+        _device: RawDevice,
+    },
+    Backend {
+        backend: Arc<dyn BlockBackend>,
+    },
+}
+
 struct WorkerCtx {
     worker_idx: usize,
-    ring: IoUringSession,
-    fd: RawFd,
-    base_offset: u64,
+    io: WorkerIo,
     pba_offset: u64,
     block_size: u32,
     use_hugepages: bool,
     metrics: Arc<EngineMetrics>,
+    /// Label for error messages (device path, or "chunklet" for a backend).
     device_path: std::path::PathBuf,
-    /// Keeps the `RawDevice` alive as long as the worker is running; the fd
-    /// stored above is only valid while this field exists.
-    _device: RawDevice,
+}
+
+impl WorkerCtx {
+    /// Device byte offset added before the PBA mapping. A chunklet LD owns the
+    /// whole linear space from 0, so its base is 0.
+    fn base_offset(&self) -> u64 {
+        match &self.io {
+            WorkerIo::Uring { base_offset, .. } => *base_offset,
+            WorkerIo::Backend { .. } => 0,
+        }
+    }
 }
 
 /// Per-batch scratch state — kept on the worker stack across iterations and
@@ -447,40 +535,55 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
             continue;
         }
         let pba = req.start_pba();
-        let offset = ctx.base_offset + (pba.0 + ctx.pba_offset) * ctx.block_size as u64;
+        let offset = ctx.base_offset() + (pba.0 + ctx.pba_offset) * ctx.block_size as u64;
 
         let slot = scratch.requests.len();
         let alloc_start = Instant::now();
-        let buf = match scratch.prepare_buffer(slot, read_size, ctx.use_hugepages) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = req.reply.send(Err(e));
-                continue;
-            }
-        };
+        if let Err(e) = scratch.prepare_buffer(slot, read_size, ctx.use_hugepages) {
+            let _ = req.reply.send(Err(e));
+            continue;
+        }
         ctx.metrics
             .read_pool_alloc_ns
             .fetch_add(elapsed_ns(alloc_start), Ordering::Relaxed);
-        let ptr = buf.as_mut_ptr();
-        scratch.ops.push(UringOp::Read {
-            fd: ctx.fd,
-            ptr,
-            len: read_size as u32,
-            offset,
-        });
         scratch.expected.push(read_size as u32);
         scratch.offsets.push(offset);
         scratch.requests.push(req);
     }
 
-    if scratch.ops.is_empty() {
+    if scratch.requests.is_empty() {
         return;
     }
 
-    // Single io_uring_enter for the whole batch — kernel processes the SQEs
-    // in parallel, the worker waits for every CQE before harvesting.
+    // The SQE / read_many_at op is built per IO mode so no fd is baked in here.
+    match &ctx.io {
+        WorkerIo::Uring { ring, fd, .. } => process_uring_submit(ctx, scratch, ring, *fd),
+        WorkerIo::Backend { backend } => process_backend_submit(ctx, scratch, backend),
+    }
+}
+
+/// io_uring submission + harvest for the file/blockdev path: one SQE per
+/// prepared buffer, a single `io_uring_enter` for the batch, then decode each
+/// completed read.
+fn process_uring_submit(
+    ctx: &WorkerCtx,
+    scratch: &mut BatchScratch,
+    ring: &IoUringSession,
+    fd: RawFd,
+) {
+    scratch.ops.clear();
+    for i in 0..scratch.requests.len() {
+        let ptr = scratch.bufs[i].buf.as_mut_ptr();
+        scratch.ops.push(UringOp::Read {
+            fd,
+            ptr,
+            len: scratch.expected[i],
+            offset: scratch.offsets[i],
+        });
+    }
+
     let submit_start = Instant::now();
-    let cqes = match unsafe { ctx.ring.submit_batch(&scratch.ops) } {
+    let cqes = match unsafe { ring.submit_batch(&scratch.ops) } {
         Ok(c) => c,
         Err(e) => {
             ctx.metrics
@@ -498,17 +601,12 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
     ctx.metrics
         .record_read_pool_submit_wait_ns(ctx.worker_idx, elapsed_ns(submit_start));
 
-    for (i, (req, exp_bytes)) in scratch
-        .requests
-        .iter()
-        .zip(scratch.expected.iter().copied())
-        .enumerate()
-    {
-        let buf = &scratch.bufs[i].buf;
-        let cqe = &cqes[i];
+    for i in 0..scratch.requests.len() {
+        let exp_bytes = scratch.expected[i];
         let offset = scratch.offsets[i];
+        let cqe = &cqes[i];
         if let Some(errno) = cqe.errno() {
-            let _ = req.reply.send(Err(OnyxError::Device {
+            let _ = scratch.requests[i].reply.send(Err(OnyxError::Device {
                 path: ctx.device_path.clone(),
                 reason: format!("io_uring read failed at offset={offset}: errno={errno}"),
             }));
@@ -516,7 +614,7 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         }
         let bytes = cqe.bytes().unwrap_or(0);
         if bytes != exp_bytes {
-            let _ = req.reply.send(Err(OnyxError::Device {
+            let _ = scratch.requests[i].reply.send(Err(OnyxError::Device {
                 path: ctx.device_path.clone(),
                 reason: format!(
                     "io_uring short read at offset={offset}: got {bytes} of {exp_bytes}"
@@ -524,60 +622,110 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
             }));
             continue;
         }
+        finish_request(
+            ctx,
+            &scratch.requests[i],
+            scratch.bufs[i].buf.as_slice(),
+            exp_bytes,
+        );
+    }
+}
 
-        ctx.metrics.lv3_read_ops.fetch_add(1, Ordering::Relaxed);
-        ctx.metrics
-            .lv3_read_compressed_bytes
-            .fetch_add(exp_bytes as u64, Ordering::Relaxed);
+/// Synchronous batched read for the chunklet path: hand the whole coalesced
+/// batch to `read_many_at` (chunklet fans it across PDs in one submit), then
+/// decode each buffer. A batch-level error fails every request in the batch.
+fn process_backend_submit(
+    ctx: &WorkerCtx,
+    scratch: &mut BatchScratch,
+    backend: &Arc<dyn BlockBackend>,
+) {
+    let n = scratch.requests.len();
+    let offsets: Vec<u64> = scratch.offsets[..n].to_vec();
+    let expected: Vec<u32> = scratch.expected[..n].to_vec();
 
-        // Two output modes — both share the same CRC + decompress path:
-        //   return_unit=false: slice out a single 4 KB LBA (legacy).
-        //   return_unit=true:  hand back the full decoded unit so the caller
-        //                      can fan out multiple LBAs from one IO.
-        let decode_start = Instant::now();
-        let count_crc_error = counts_as_crc_error(req.purpose);
-        let result = if let Some(mappings) = req.raw_extent.as_ref() {
-            decode_raw_extent(buf.as_slice(), mappings, &ctx.metrics)
-        } else if req.return_unit {
-            decode_unit_with_crc_accounting(
-                buf.as_slice(),
-                &req.mapping,
-                &ctx.metrics,
-                count_crc_error,
-            )
+    let submit_start = Instant::now();
+    let res = {
+        let mut ops: Vec<(u64, &mut [u8])> = scratch.bufs[..n]
+            .iter_mut()
+            .enumerate()
+            .map(|(i, rb)| (offsets[i], &mut rb.buf.as_mut_slice()[..expected[i] as usize]))
+            .collect();
+        backend.read_many_at(&mut ops)
+    };
+    ctx.metrics
+        .record_read_pool_submit_wait_ns(ctx.worker_idx, elapsed_ns(submit_start));
+
+    if let Err(e) = res {
+        for req in &scratch.requests {
+            let _ = req.reply.send(Err(OnyxError::Device {
+                path: ctx.device_path.clone(),
+                reason: format!("chunklet read_many_at failed: {e}"),
+            }));
+        }
+        return;
+    }
+
+    for i in 0..n {
+        finish_request(
+            ctx,
+            &scratch.requests[i],
+            scratch.bufs[i].buf.as_slice(),
+            expected[i],
+        );
+    }
+}
+
+/// Shared CRC + decompress + reply for one successfully-read buffer. Identical
+/// for the io_uring and chunklet paths once the bytes are in `buf`.
+fn finish_request(ctx: &WorkerCtx, req: &ReadRequest, buf: &[u8], exp_bytes: u32) {
+    ctx.metrics.lv3_read_ops.fetch_add(1, Ordering::Relaxed);
+    ctx.metrics
+        .lv3_read_compressed_bytes
+        .fetch_add(exp_bytes as u64, Ordering::Relaxed);
+
+    // Two output modes — both share the same CRC + decompress path:
+    //   return_unit=false: slice out a single 4 KB LBA (legacy).
+    //   return_unit=true:  hand back the full decoded unit so the caller can
+    //                      fan out multiple LBAs from one IO.
+    let decode_start = Instant::now();
+    let count_crc_error = counts_as_crc_error(req.purpose);
+    let result = if let Some(mappings) = req.raw_extent.as_ref() {
+        decode_raw_extent(buf, mappings, &ctx.metrics)
+    } else if req.return_unit {
+        decode_unit_with_crc_accounting(buf, &req.mapping, &ctx.metrics, count_crc_error)
             .map(|payload| payload.into_owned())
+    } else {
+        extract_lba_from_compressed_with_crc_accounting(
+            buf,
+            &req.mapping,
+            &ctx.metrics,
+            count_crc_error,
+        )
+    };
+    if let Err(OnyxError::CrcMismatch { expected, actual }) = &result {
+        record_purpose_mismatch(&ctx.metrics, req.purpose);
+        if matches!(
+            req.purpose,
+            ReadPurpose::DedupVerify
+                | ReadPurpose::DedupVerifyIndex
+                | ReadPurpose::DedupVerifyCandidate
+        ) {
+            tracing::debug!(
+                worker = ctx.worker_idx,
+                purpose = ?req.purpose,
+                pba = req.mapping.pba.0,
+                slot_offset = req.mapping.slot_offset,
+                unit_compressed_size = req.mapping.unit_compressed_size,
+                unit_original_size = req.mapping.unit_original_size,
+                unit_lba_count = req.mapping.unit_lba_count,
+                offset_in_unit = req.mapping.offset_in_unit,
+                expected_crc = *expected,
+                actual_crc = *actual,
+                raw_extent_blocks = req.raw_extent.as_ref().map_or(0, Vec::len),
+                "read-pool: dedup verify mismatch"
+            );
         } else {
-            extract_lba_from_compressed_with_crc_accounting(
-                buf.as_slice(),
-                &req.mapping,
-                &ctx.metrics,
-                count_crc_error,
-            )
-        };
-        if let Err(OnyxError::CrcMismatch { expected, actual }) = &result {
-            record_purpose_mismatch(&ctx.metrics, req.purpose);
-            if matches!(
-                req.purpose,
-                ReadPurpose::DedupVerify
-                    | ReadPurpose::DedupVerifyIndex
-                    | ReadPurpose::DedupVerifyCandidate
-            ) {
-                tracing::debug!(
-                    worker = ctx.worker_idx,
-                    purpose = ?req.purpose,
-                    pba = req.mapping.pba.0,
-                    slot_offset = req.mapping.slot_offset,
-                    unit_compressed_size = req.mapping.unit_compressed_size,
-                    unit_original_size = req.mapping.unit_original_size,
-                    unit_lba_count = req.mapping.unit_lba_count,
-                    offset_in_unit = req.mapping.offset_in_unit,
-                    expected_crc = *expected,
-                    actual_crc = *actual,
-                    raw_extent_blocks = req.raw_extent.as_ref().map_or(0, Vec::len),
-                    "read-pool: dedup verify mismatch"
-                );
-            } else {
-                tracing::warn!(
+            tracing::warn!(
                 worker = ctx.worker_idx,
                 purpose = ?req.purpose,
                 pba = req.mapping.pba.0,
@@ -590,13 +738,11 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
                 actual_crc = *actual,
                 raw_extent_blocks = req.raw_extent.as_ref().map_or(0, Vec::len),
                 "read-pool: CRC mismatch"
-                );
-            }
+            );
         }
-        ctx.metrics
-            .record_read_pool_decode_ns(elapsed_ns(decode_start));
-        let _ = req.reply.send(result);
     }
+    ctx.metrics.record_read_pool_decode_ns(elapsed_ns(decode_start));
+    let _ = req.reply.send(result);
 }
 
 fn elapsed_ns(start: Instant) -> u64 {
