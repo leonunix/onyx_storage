@@ -133,18 +133,40 @@ impl BlockBackend for RawDevice {
 pub struct ChunkletBackend {
     ld: Arc<dyn LogicalDisk>,
     capacity: u64,
+    /// Keeps the owning `Pool` alive for the backend's lifetime (the LD holds
+    /// its member PD `Arc`s, but the Pool owns background/management state and
+    /// is the handle the Phase-4 ops surface needs). `None` when the caller
+    /// manages the pool lifetime itself (tests).
+    pool: Option<Arc<onyx_chunklet::Pool>>,
 }
 
 impl ChunkletBackend {
     pub fn new(ld: Arc<dyn LogicalDisk>) -> Self {
         let capacity = ld.capacity_bytes();
-        Self { ld, capacity }
+        Self {
+            ld,
+            capacity,
+            pool: None,
+        }
+    }
+
+    /// Build a backend that also keeps its owning `Pool` alive.
+    pub fn with_pool(ld: Arc<dyn LogicalDisk>, pool: Arc<onyx_chunklet::Pool>) -> Self {
+        let mut b = Self::new(ld);
+        b.pool = Some(pool);
+        b
     }
 
     /// Borrow the underlying logical disk (e.g. to read `strip_size()` for
     /// packer alignment).
     pub fn logical_disk(&self) -> &Arc<dyn LogicalDisk> {
         &self.ld
+    }
+
+    /// The owning pool, when this backend keeps it alive. The Phase-4 ops
+    /// surface (status / rebuild / scrub / replace-disk) routes through here.
+    pub fn pool(&self) -> Option<&Arc<onyx_chunklet::Pool>> {
+        self.pool.as_ref()
     }
 }
 

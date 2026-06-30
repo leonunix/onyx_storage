@@ -145,22 +145,34 @@ impl IoEngine {
         )
     }
 
-    /// Build an IoEngine over an arbitrary `BlockBackend` — the chunklet LV3
-    /// path. Uses the `Syscall` submission mode: chunklet has no single fd, so
-    /// io_uring lives inside the chunklet LD, and `Syscall` simply routes
-    /// `read_at`/`write_at`/`flush` through the backend.
-    pub fn new_chunklet(
+    /// Build an IoEngine over an arbitrary `BlockBackend` with an explicit
+    /// submission mode. Used by the engine startup to construct over either a
+    /// `RawDevice`-backed Arc (Syscall/Uring) or a chunklet backend (Syscall).
+    pub fn new_block(
         device: Arc<dyn BlockBackend>,
         use_hugepages: bool,
         metrics: Arc<EngineMetrics>,
+        backend: IoBackend,
     ) -> Self {
         Self::with_options(
             device,
             use_hugepages,
             RESERVED_BLOCKS,
             Some(metrics),
-            IoBackend::Syscall,
+            backend,
         )
+    }
+
+    /// Build an IoEngine over a chunklet `BlockBackend`. Uses the `Syscall`
+    /// submission mode: chunklet has no single fd, so io_uring lives inside the
+    /// chunklet LD, and `Syscall` simply routes `read_at`/`write_at`/`flush`
+    /// through the backend.
+    pub fn new_chunklet(
+        device: Arc<dyn BlockBackend>,
+        use_hugepages: bool,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
+        Self::new_block(device, use_hugepages, metrics, IoBackend::Syscall)
     }
 
     /// `(fd, base_offset)` for io_uring SQE construction. Only valid when the

@@ -116,6 +116,14 @@ enum Command {
     },
     /// Kill stale Linux ublk devices left behind after abnormal exit
     CleanupUblk,
+    /// Initialize the chunklet RAID pool over `[chunklet].devices` and create
+    /// the LV3/LV2/meta LDs. WIPES any existing pool state on those disks —
+    /// verify the device list first, then re-run with `--force`.
+    ChunkletInit {
+        /// Acknowledge that `[chunklet].devices` will be wiped.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn parse_compression(s: &str) -> CompressionAlgo {
@@ -487,6 +495,25 @@ fn main() -> anyhow::Result<()> {
             {
                 println!("cleanup-ublk is only supported on Linux");
             }
+        }
+        Command::ChunkletInit { force } => {
+            let ck = &config.chunklet;
+            if ck.devices.is_empty() {
+                anyhow::bail!("[chunklet].devices is empty — configure the PD disk list first");
+            }
+            if !force {
+                eprintln!("chunklet-init will WIPE pool state on these devices:");
+                for d in &ck.devices {
+                    eprintln!("  {}", d.display());
+                }
+                anyhow::bail!("refusing without --force (verify the disks, then re-run with --force)");
+            }
+            let (_pool, lv3, lv2, meta) = onyx_storage::chunklet_pool::init_pool(ck)?;
+            println!("chunklet pool initialized over {} PDs", ck.devices.len());
+            println!("add these LD ids under [chunklet] in your config:");
+            println!("  lv3_ld_id = \"{lv3}\"");
+            println!("  lv2_ld_id = \"{lv2}\"");
+            println!("  meta_ld_id = \"{meta}\"");
         }
     }
 

@@ -121,7 +121,9 @@ pub fn open_role_backend(
 ) -> OnyxResult<(Arc<Pool>, Arc<ChunkletBackend>)> {
     let pool = open_pool(cfg)?;
     let ld = resolve_ld(&pool, cfg, role)?;
-    let backend = Arc::new(ChunkletBackend::new(ld));
+    // Fold the pool into the backend so it stays alive even if the caller drops
+    // the returned pool Arc.
+    let backend = Arc::new(ChunkletBackend::with_pool(ld, pool.clone()));
     Ok((pool, backend))
 }
 

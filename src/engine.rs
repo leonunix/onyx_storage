@@ -122,6 +122,7 @@ impl OnyxEngine {
 
     fn build_read_pool(
         config: &OnyxConfig,
+        lv3: &Arc<dyn crate::io::block_backend::BlockBackend>,
         metrics: Arc<EngineMetrics>,
     ) -> OnyxResult<Option<Arc<ReadPool>>> {
         let workers = config.storage.read_pool_workers;
@@ -129,6 +130,21 @@ impl OnyxEngine {
             tracing::info!("read pool disabled (read_pool_workers=0) — LV3 reads run inline");
             return Ok(None);
         }
+        // Chunklet: workers share the one LD backend (chunklet owns the cross-PD
+        // io_uring); no per-worker fd.
+        if config.chunklet.enabled {
+            let pool = ReadPool::start_backend(
+                workers,
+                lv3.clone(),
+                crate::types::RESERVED_BLOCKS,
+                config.storage.block_size,
+                config.storage.use_hugepages,
+                metrics,
+            )?;
+            return Ok(Some(Arc::new(pool)));
+        }
+        // RawDevice: each worker opens its own fd + io_uring from the device
+        // path, so the template handle is only needed for path + base_offset.
         let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
             OnyxError::Config("storage.data_device is required to build the read pool".into())
         })?;
@@ -142,41 +158,51 @@ impl OnyxEngine {
             config.storage.use_hugepages,
             metrics,
         )?;
-        // Each worker opens its own io_uring; the `device` handle itself is
-        // only needed for fd + base_offset, so drop it once the pool has
-        // captured what it needs.
         drop(device);
         Ok(Some(Arc::new(pool)))
     }
 
     fn build_heartbeat_writer(
-        device: RawDevice,
+        device: Arc<dyn crate::io::block_backend::BlockBackend>,
         node_id: u64,
         interval: std::time::Duration,
         storage: &StorageConfig,
     ) -> OnyxResult<HeartbeatWriter> {
-        let device: Arc<dyn crate::io::block_backend::BlockBackend> = Arc::new(device);
+        // io_uring heartbeat only when the device exposes a fd; a chunklet LD
+        // (uring_target == None) falls back to the syscall write+flush path.
         match storage.io_backend {
-            IoBackendConfig::Syscall => Ok(HeartbeatWriter::start(device, node_id, interval)),
-            IoBackendConfig::Uring => {
+            IoBackendConfig::Uring if device.uring_target().is_some() => {
                 let session = Arc::new(IoUringSession::new(8)?);
                 Ok(HeartbeatWriter::start_uring(
                     device, node_id, interval, session,
                 ))
             }
+            _ => Ok(HeartbeatWriter::start(device, node_id, interval)),
         }
     }
 
     fn build_io_engine(
-        data_dev: RawDevice,
+        device: Arc<dyn crate::io::block_backend::BlockBackend>,
         storage: &StorageConfig,
         metrics: Arc<EngineMetrics>,
     ) -> OnyxResult<Arc<IoEngine>> {
-        match storage.io_backend {
-            IoBackendConfig::Syscall => Ok(Arc::new(IoEngine::new_with_metrics(
-                data_dev,
+        use crate::io::engine::IoBackend;
+        // A chunklet backend exposes no single fd — it owns io_uring internally,
+        // so we always drive it via the Syscall submission mode regardless of
+        // storage.io_backend.
+        if device.uring_target().is_none() {
+            return Ok(Arc::new(IoEngine::new_chunklet(
+                device,
                 storage.use_hugepages,
                 metrics,
+            )));
+        }
+        match storage.io_backend {
+            IoBackendConfig::Syscall => Ok(Arc::new(IoEngine::new_block(
+                device,
+                storage.use_hugepages,
+                metrics,
+                IoBackend::Syscall,
             ))),
             IoBackendConfig::Uring => {
                 let session = Arc::new(IoUringSession::new(storage.uring_sq_entries)?);
@@ -185,15 +211,39 @@ impl OnyxEngine {
                     "LV3 IoEngine using io_uring backend"
                 );
                 Ok(Arc::new(
-                    IoEngine::new_with_metrics_uring(
-                        data_dev,
+                    IoEngine::new_block(
+                        device,
                         storage.use_hugepages,
                         metrics,
-                        session,
+                        IoBackend::Uring(session),
                     )
                     .with_per_shard_write_sessions(storage.lv3_per_shard_write_rings),
                 ))
             }
+        }
+    }
+
+    /// Acquire the LV3 device backend for both full-mode startup paths. With
+    /// `[chunklet].enabled`, this opens the RAID Pool and resolves the LV3 LD
+    /// (the returned `ChunkletBackend` keeps the Pool alive); otherwise it opens
+    /// the single `storage.data_device` as a `RawDevice`. Either way the result
+    /// is a `BlockBackend` the rest of startup treats uniformly.
+    fn acquire_lv3_device(
+        config: &OnyxConfig,
+    ) -> OnyxResult<Arc<dyn crate::io::block_backend::BlockBackend>> {
+        if config.chunklet.enabled {
+            let (_pool, backend) = crate::chunklet_pool::open_role_backend(
+                &config.chunklet,
+                crate::chunklet_pool::LdRoleSel::Lv3,
+            )?;
+            let device: Arc<dyn crate::io::block_backend::BlockBackend> = backend;
+            tracing::info!(capacity_bytes = device.size(), "LV3 on chunklet RAID LD");
+            Ok(device)
+        } else {
+            let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
+                OnyxError::Config("storage.data_device is required for full mode".into())
+            })?;
+            Ok(Arc::new(RawDevice::open(data_path)?))
         }
     }
 
@@ -382,6 +432,12 @@ impl OnyxEngine {
 
     #[cfg(target_os = "linux")]
     fn validate_data_buffer_devices_disjoint(config: &OnyxConfig) -> OnyxResult<()> {
+        // With chunklet, LV3 is a RAID LD (not storage.data_device) carved from
+        // the chunklet pool; LV2 still lives on buffer.device. The data/buffer
+        // single-device disjointness check does not apply.
+        if config.chunklet.enabled {
+            return Ok(());
+        }
         use std::collections::HashSet;
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         use std::path::{Path, PathBuf};
@@ -527,15 +583,12 @@ impl OnyxEngine {
 
         // (no shared deletion state needed — per-handle alive flags are used)
 
-        // 2. Data device + IO engine
-        let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
-            OnyxError::Config("storage.data_device is required for full mode".into())
-        })?;
-        let data_dev = RawDevice::open(data_path)?;
-        let device_size = data_dev.size();
+        // 2. LV3 device (RawDevice or chunklet RAID LD) + IO engine
+        let device = Self::acquire_lv3_device(config)?;
+        let device_size = device.size();
 
         // 2a. Validate / format LV3 superblock
-        let mut superblock = match superblock::read_superblock(&data_dev)? {
+        let mut superblock = match superblock::read_superblock(device.as_ref())? {
             Some(sb) => {
                 if sb.device_size_bytes != device_size {
                     return Err(OnyxError::Config(format!(
@@ -554,10 +607,10 @@ impl OnyxEngine {
             None => {
                 // Check if the device is fresh (all zeros in block 0)
                 let mut block0 = [0u8; 4096];
-                data_dev.read_at(&mut block0, 0)?;
+                device.read_at(&mut block0, 0)?;
                 if block0.iter().all(|&b| b == 0) {
                     tracing::info!("fresh LV3 device — formatting");
-                    superblock::format_device(&data_dev)?
+                    superblock::format_device(device.as_ref())?
                 } else {
                     return Err(OnyxError::Config(
                         "LV3 block 0 has data but invalid superblock (magic/CRC/version failed)"
@@ -591,9 +644,9 @@ impl OnyxEngine {
         //     dirty recovery on the next boot.
         superblock.set_clean_shutdown(false);
         superblock.update_crc();
-        superblock::write_superblock(&data_dev, &superblock)?;
+        superblock::write_superblock(device.as_ref(), &superblock)?;
 
-        let io_engine = Self::build_io_engine(data_dev, &config.storage, metrics.clone())?;
+        let io_engine = Self::build_io_engine(device.clone(), &config.storage, metrics.clone())?;
 
         // 3. Space allocator
         let allocator = Arc::new(SpaceAllocator::new_with_hazards(
@@ -610,7 +663,7 @@ impl OnyxEngine {
         // workers can route candidate-hit / dedup_index-hit verifies
         // through it (`dedup::verify::batched_verify`). Also still
         // shared with ZoneManager for the foreground read path.
-        let read_pool = Self::build_read_pool(config, metrics.clone())?;
+        let read_pool = Self::build_read_pool(config, &device, metrics.clone())?;
 
         // 5. Buffer-as-sole-journal recovery: any ring entries past the
         //    last metadb-applied seq are the only durable record of
@@ -734,9 +787,8 @@ impl OnyxEngine {
 
         // 11. Heartbeat writer (after all other subsystems)
         let heartbeat_writer = if config.ha.enabled {
-            let hb_dev = RawDevice::open(data_path)?;
             Some(Self::build_heartbeat_writer(
-                hb_dev,
+                device.clone(),
                 config.ha.node_id,
                 std::time::Duration::from_millis(config.ha.heartbeat_interval_ms),
                 &config.storage,
@@ -1359,16 +1411,13 @@ impl OnyxEngine {
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
 
-        // Data device + IO engine
-        let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
-            OnyxError::Config("storage.data_device is required for full mode".into())
-        })?;
+        // LV3 device (RawDevice or chunklet RAID LD) + IO engine
         Self::validate_data_buffer_devices_disjoint(config)?;
-        let data_dev = RawDevice::open(data_path)?;
-        let device_size = data_dev.size();
+        let device = Self::acquire_lv3_device(config)?;
+        let device_size = device.size();
 
         // Validate / format LV3 superblock
-        match superblock::read_superblock(&data_dev)? {
+        match superblock::read_superblock(device.as_ref())? {
             Some(sb) => {
                 if sb.device_size_bytes != device_size {
                     return Err(OnyxError::Config(format!(
@@ -1384,10 +1433,10 @@ impl OnyxEngine {
             }
             None => {
                 let mut block0 = [0u8; 4096];
-                data_dev.read_at(&mut block0, 0)?;
+                device.read_at(&mut block0, 0)?;
                 if block0.iter().all(|&b| b == 0) {
                     tracing::info!("fresh LV3 device — formatting (upgrade)");
-                    superblock::format_device(&data_dev)?;
+                    superblock::format_device(device.as_ref())?;
                 } else {
                     return Err(OnyxError::Config(
                         "LV3 block 0 has data but invalid superblock (magic/CRC/version failed)"
@@ -1397,7 +1446,7 @@ impl OnyxEngine {
             }
         }
 
-        let io_engine = Self::build_io_engine(data_dev, &config.storage, metrics.clone())?;
+        let io_engine = Self::build_io_engine(device.clone(), &config.storage, metrics.clone())?;
 
         // Space allocator
         let allocator = Arc::new(SpaceAllocator::new_with_hazards(
@@ -1413,7 +1462,7 @@ impl OnyxEngine {
         // LV3 read pool — needed by the flusher's dedup verify-on-hit
         // path. Built before the flusher so the read pool is wired up
         // by the time the dedup workers spawn.
-        let read_pool = Self::build_read_pool(config, metrics.clone())?;
+        let read_pool = Self::build_read_pool(config, &device, metrics.clone())?;
 
         // Background flusher
         let flusher = BufferFlusher::start_with_metrics(
@@ -1495,13 +1544,12 @@ impl OnyxEngine {
 
         // Heartbeat writer
         let heartbeat_writer = if config.ha.enabled {
-            let hb_dev = RawDevice::open(data_path)?;
-            let hb_dev: Arc<dyn crate::io::block_backend::BlockBackend> = Arc::new(hb_dev);
-            Some(HeartbeatWriter::start(
-                hb_dev,
+            Some(Self::build_heartbeat_writer(
+                device.clone(),
                 config.ha.node_id,
                 std::time::Duration::from_millis(config.ha.heartbeat_interval_ms),
-            ))
+                &config.storage,
+            )?)
         } else {
             None
         };
