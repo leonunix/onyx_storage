@@ -223,16 +223,36 @@ impl OnyxEngine {
         }
     }
 
+    /// Open the chunklet RAID Pool ONCE per engine startup when
+    /// `[chunklet].enabled`. Both LV3 and LV2 derive their LDs from this single
+    /// pool (a second in-process `Pool::open` over the same PDs would be a
+    /// distinct in-memory pool — two writers to one superblock). Returns `None`
+    /// in the non-chunklet deployment so callers keep the `RawDevice` paths.
+    fn acquire_chunklet_pool(
+        config: &OnyxConfig,
+    ) -> OnyxResult<Option<Arc<onyx_chunklet::Pool>>> {
+        if config.chunklet.enabled {
+            Ok(Some(crate::chunklet_pool::open_pool(&config.chunklet)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Acquire the LV3 device backend for both full-mode startup paths. With
-    /// `[chunklet].enabled`, this opens the RAID Pool and resolves the LV3 LD
-    /// (the returned `ChunkletBackend` keeps the Pool alive); otherwise it opens
-    /// the single `storage.data_device` as a `RawDevice`. Either way the result
-    /// is a `BlockBackend` the rest of startup treats uniformly.
+    /// `[chunklet].enabled`, this resolves the LV3 LD from the shared pool (the
+    /// returned `ChunkletBackend` keeps the Pool alive); otherwise it opens the
+    /// single `storage.data_device` as a `RawDevice`. Either way the result is a
+    /// `BlockBackend` the rest of startup treats uniformly.
     fn acquire_lv3_device(
         config: &OnyxConfig,
+        chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
     ) -> OnyxResult<Arc<dyn crate::io::block_backend::BlockBackend>> {
         if config.chunklet.enabled {
-            let (_pool, backend) = crate::chunklet_pool::open_role_backend(
+            let pool = chunklet_pool.as_ref().ok_or_else(|| {
+                OnyxError::Config("chunklet.enabled but pool not opened (internal)".into())
+            })?;
+            let backend = crate::chunklet_pool::role_backend_from_pool(
+                pool,
                 &config.chunklet,
                 crate::chunklet_pool::LdRoleSel::Lv3,
             )?;
@@ -283,98 +303,17 @@ impl OnyxEngine {
     /// Open buffer pool, handling shard count migration at startup if needed.
     fn open_buffer_pool(
         config: &OnyxConfig,
+        chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
         meta: &Arc<MetaStore>,
         lifecycle: &Arc<VolumeLifecycleManager>,
         allocator: &Arc<SpaceAllocator>,
         io_engine: &Arc<IoEngine>,
         metrics: &Arc<EngineMetrics>,
     ) -> OnyxResult<Arc<WriteBufferPool>> {
-        let buf_path =
-            config.buffer.device.as_ref().ok_or_else(|| {
-                OnyxError::Config("buffer.device is required for full mode".into())
-            })?;
-
-        // Detect shard count change and migrate if needed
-        let probe_dev = RawDevice::open(buf_path)?;
-        let disk_shards = WriteBufferPool::read_disk_shard_count(&probe_dev)?;
-        drop(probe_dev);
-
-        if let Some(old_count) = disk_shards {
-            if old_count != config.buffer.shards {
-                tracing::info!(
-                    old_shards = old_count,
-                    new_shards = config.buffer.shards,
-                    "shard count changed — attempting online migration"
-                );
-                // Try direct open (auto-reinit if buffer already clean)
-                let try_dev = RawDevice::open(buf_path)?;
-                let direct = WriteBufferPool::open_with_options(
-                    try_dev,
-                    std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
-                    config.buffer.shards,
-                    config.engine.zone_size_blocks,
-                    Self::buffer_backpressure_timeout(),
-                );
-                match direct {
-                    Ok(pool) => drop(pool), // clean, will reopen below
-                    Err(_) => {
-                        // Drain unflushed entries with old shard layout
-                        tracing::info!(
-                            old_shards = old_count,
-                            "opening buffer with old shard count to drain"
-                        );
-                        let old_dev = RawDevice::open(buf_path)?;
-                        let old_pool = Arc::new(WriteBufferPool::open_with_options(
-                            old_dev,
-                            std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
-                            old_count,
-                            config.engine.zone_size_blocks,
-                            Self::buffer_backpressure_timeout(),
-                        )?);
-                        old_pool.attach_metrics(metrics.clone());
-                        let old_pending = old_pool.pending_count();
-                        if old_pending > 0 {
-                            tracing::info!(
-                                count = old_pending,
-                                "draining unflushed entries before shard migration"
-                            );
-                        }
-                        let mut temp_flusher = BufferFlusher::start_with_metrics(
-                            old_pool.clone(),
-                            meta.clone(),
-                            lifecycle.clone(),
-                            allocator.clone(),
-                            io_engine.clone(),
-                            // Drain-and-stop helper: no read pool
-                            // available here, drop verify (the flusher
-                            // is short-lived and writes through the
-                            // existing trust-hash path).
-                            None,
-                            &config.flush,
-                            &config.dedup,
-                            metrics.clone(),
-                        );
-                        temp_flusher.drain_and_stop(&old_pool);
-                        drop(old_pool);
-                        tracing::info!(
-                            new_shards = config.buffer.shards,
-                            "buffer drained — reinitializing with new shard layout"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Open buffer pool (auto-reinit if drained above, or normal open)
-        let buf_dev = RawDevice::open(buf_path)?;
         let max_payload_memory = if config.buffer.max_memory_mb > 0 {
             config.buffer.max_memory_mb as u64 * 1024 * 1024
         } else {
             Self::auto_detect_max_payload_memory()
-        };
-        let buffer_uring_entries = match config.storage.io_backend {
-            IoBackendConfig::Uring => Some(config.storage.uring_sq_entries),
-            IoBackendConfig::Syscall => None,
         };
         let buffer_runtime_limits = BufferRuntimeLimits::from_config(
             max_payload_memory,
@@ -390,8 +329,119 @@ impl OnyxEngine {
             scale_us: config.buffer.throttle_scale_us,
             cap_us: config.buffer.throttle_cap_us,
         });
+
+        // Resolve the LV2 backend + whether onyx drives its own device-level
+        // io_uring. A chunklet LD owns its cross-PD io_uring internally, so the
+        // sync thread takes the write_many_at + flush path (uring_entries=None);
+        // a `RawDevice` keeps the existing io_uring hot path.
+        let (device, buffer_uring_entries): (
+            Arc<dyn crate::io::block_backend::BlockBackend>,
+            Option<u32>,
+        ) = if config.chunklet.enabled {
+            // LV2 = a chunklet RAID10 LD from the shared pool. It is a fresh
+            // fixed-size region, so there is no RawDevice-style shard-count
+            // migration probe (a dirty shard-count change surfaces as a
+            // buffer-open error — online LV2 reshape is a Phase-4 concern).
+            let pool = chunklet_pool.as_ref().ok_or_else(|| {
+                OnyxError::Config("chunklet.enabled but pool not opened (internal)".into())
+            })?;
+            let backend: Arc<dyn crate::io::block_backend::BlockBackend> =
+                crate::chunklet_pool::role_backend_from_pool(
+                    pool,
+                    &config.chunklet,
+                    crate::chunklet_pool::LdRoleSel::Lv2,
+                )?;
+            tracing::info!(capacity_bytes = backend.size(), "LV2 on chunklet RAID LD");
+            (backend, None)
+        } else {
+            let buf_path = config.buffer.device.as_ref().ok_or_else(|| {
+                OnyxError::Config("buffer.device is required for full mode".into())
+            })?;
+
+            // Detect shard count change and migrate if needed
+            let probe_dev = RawDevice::open(buf_path)?;
+            let disk_shards = WriteBufferPool::read_disk_shard_count(&probe_dev)?;
+            drop(probe_dev);
+
+            if let Some(old_count) = disk_shards {
+                if old_count != config.buffer.shards {
+                    tracing::info!(
+                        old_shards = old_count,
+                        new_shards = config.buffer.shards,
+                        "shard count changed — attempting online migration"
+                    );
+                    // Try direct open (auto-reinit if buffer already clean)
+                    let try_dev = RawDevice::open(buf_path)?;
+                    let direct = WriteBufferPool::open_with_options(
+                        try_dev,
+                        std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
+                        config.buffer.shards,
+                        config.engine.zone_size_blocks,
+                        Self::buffer_backpressure_timeout(),
+                    );
+                    match direct {
+                        Ok(pool) => drop(pool), // clean, will reopen below
+                        Err(_) => {
+                            // Drain unflushed entries with old shard layout
+                            tracing::info!(
+                                old_shards = old_count,
+                                "opening buffer with old shard count to drain"
+                            );
+                            let old_dev = RawDevice::open(buf_path)?;
+                            let old_pool = Arc::new(WriteBufferPool::open_with_options(
+                                old_dev,
+                                std::time::Duration::from_micros(
+                                    config.buffer.group_commit_wait_us,
+                                ),
+                                old_count,
+                                config.engine.zone_size_blocks,
+                                Self::buffer_backpressure_timeout(),
+                            )?);
+                            old_pool.attach_metrics(metrics.clone());
+                            let old_pending = old_pool.pending_count();
+                            if old_pending > 0 {
+                                tracing::info!(
+                                    count = old_pending,
+                                    "draining unflushed entries before shard migration"
+                                );
+                            }
+                            let mut temp_flusher = BufferFlusher::start_with_metrics(
+                                old_pool.clone(),
+                                meta.clone(),
+                                lifecycle.clone(),
+                                allocator.clone(),
+                                io_engine.clone(),
+                                // Drain-and-stop helper: no read pool
+                                // available here, drop verify (the flusher
+                                // is short-lived and writes through the
+                                // existing trust-hash path).
+                                None,
+                                &config.flush,
+                                &config.dedup,
+                                metrics.clone(),
+                            );
+                            temp_flusher.drain_and_stop(&old_pool);
+                            drop(old_pool);
+                            tracing::info!(
+                                new_shards = config.buffer.shards,
+                                "buffer drained — reinitializing with new shard layout"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Open buffer pool (auto-reinit if drained above, or normal open)
+            let buf_dev = RawDevice::open(buf_path)?;
+            let uring = match config.storage.io_backend {
+                IoBackendConfig::Uring => Some(config.storage.uring_sq_entries),
+                IoBackendConfig::Syscall => None,
+            };
+            (Arc::new(buf_dev), uring)
+        };
+
         let pool = Arc::new(WriteBufferPool::open_with_options_full_and_limits(
-            buf_dev,
+            device,
             std::time::Duration::from_micros(config.buffer.group_commit_wait_us),
             config.buffer.shards,
             config.engine.zone_size_blocks,
@@ -583,8 +633,12 @@ impl OnyxEngine {
 
         // (no shared deletion state needed — per-handle alive flags are used)
 
+        // 2. Chunklet RAID Pool (opened once; LV3 + LV2 share it) — None when
+        //    [chunklet] is disabled.
+        let chunklet_pool = Self::acquire_chunklet_pool(config)?;
+
         // 2. LV3 device (RawDevice or chunklet RAID LD) + IO engine
-        let device = Self::acquire_lv3_device(config)?;
+        let device = Self::acquire_lv3_device(config, &chunklet_pool)?;
         let device_size = device.size();
 
         // 2a. Validate / format LV3 superblock
@@ -656,8 +710,15 @@ impl OnyxEngine {
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool (with shard migration if needed)
-        let buffer_pool =
-            Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
+        let buffer_pool = Self::open_buffer_pool(
+            config,
+            &chunklet_pool,
+            &meta,
+            &lifecycle,
+            &allocator,
+            &io_engine,
+            &metrics,
+        )?;
 
         // LV3 read pool — built BEFORE the flusher so the dedup
         // workers can route candidate-hit / dedup_index-hit verifies
@@ -1411,9 +1472,10 @@ impl OnyxEngine {
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
 
-        // LV3 device (RawDevice or chunklet RAID LD) + IO engine
+        // Chunklet RAID Pool (opened once; LV3 + LV2 share it) + LV3 device.
         Self::validate_data_buffer_devices_disjoint(config)?;
-        let device = Self::acquire_lv3_device(config)?;
+        let chunklet_pool = Self::acquire_chunklet_pool(config)?;
+        let device = Self::acquire_lv3_device(config, &chunklet_pool)?;
         let device_size = device.size();
 
         // Validate / format LV3 superblock
@@ -1456,8 +1518,15 @@ impl OnyxEngine {
         allocator.rebuild_from_metadata(&meta)?;
 
         // Write buffer pool (with shard migration if needed)
-        let buffer_pool =
-            Self::open_buffer_pool(config, &meta, &lifecycle, &allocator, &io_engine, &metrics)?;
+        let buffer_pool = Self::open_buffer_pool(
+            config,
+            &chunklet_pool,
+            &meta,
+            &lifecycle,
+            &allocator,
+            &io_engine,
+            &metrics,
+        )?;
 
         // LV3 read pool — needed by the flusher's dedup verify-on-hit
         // path. Built before the flusher so the read pool is wired up

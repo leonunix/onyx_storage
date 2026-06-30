@@ -113,18 +113,33 @@ pub fn resolve_ld(
 }
 
 /// Open the pool and build a `ChunkletBackend` for the given role in one step —
-/// the engine startup convenience. Returns the pool (keep it alive for the
-/// process lifetime) and the backend.
+/// the single-role convenience (tests, `chunklet-init` verification). Returns
+/// the pool (keep it alive for the process lifetime) and the backend.
+///
+/// The engine startup uses [`role_backend_from_pool`] instead so LV3 and LV2
+/// share ONE `Pool::open` (a second in-process open over the same PDs would be
+/// a separate in-memory pool state — two writers to one superblock).
 pub fn open_role_backend(
     cfg: &ChunkletConfig,
     role: LdRoleSel,
 ) -> OnyxResult<(Arc<Pool>, Arc<ChunkletBackend>)> {
     let pool = open_pool(cfg)?;
-    let ld = resolve_ld(&pool, cfg, role)?;
-    // Fold the pool into the backend so it stays alive even if the caller drops
-    // the returned pool Arc.
-    let backend = Arc::new(ChunkletBackend::with_pool(ld, pool.clone()));
+    let backend = role_backend_from_pool(&pool, cfg, role)?;
     Ok((pool, backend))
+}
+
+/// Build a `ChunkletBackend` for `role` from an already-open pool. The engine
+/// opens the pool ONCE (step-0) and derives the LV3 + LV2 backends from it, so
+/// both roles' IO funnels through the same `Pool` (and its single manifest /
+/// superblock writer). The returned backend keeps the pool alive (Phase-4 ops
+/// surface reaches it through `ChunkletBackend::pool`).
+pub fn role_backend_from_pool(
+    pool: &Arc<Pool>,
+    cfg: &ChunkletConfig,
+    role: LdRoleSel,
+) -> OnyxResult<Arc<ChunkletBackend>> {
+    let ld = resolve_ld(pool, cfg, role)?;
+    Ok(Arc::new(ChunkletBackend::with_pool(ld, pool.clone())))
 }
 
 /// Translate `strip_kib` into chunklet's `strip_size_log2`. 0 → 0 (one 4 KiB

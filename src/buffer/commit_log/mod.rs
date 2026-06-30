@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use crate::buffer::entry::{BufferEntry, BUFFER_ENTRY_MAGIC, MAX_ENTRY_SIZE, MIN_ENTRY_SIZE};
 use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::{round_up, AlignedBuf, AlignedBufPool};
+use crate::io::block_backend::{slice_backend, BlockBackend};
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, LinkedOp, UringOp, UringOpResult};
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
@@ -491,7 +492,7 @@ struct LifecycleState {
 // ── BufferShard ─────────────────────────────────────────────────────
 
 struct BufferShard {
-    device: RawDevice,
+    device: Arc<dyn BlockBackend>,
     ring: parking_lot::Mutex<RingState>,
     /// Signaled when ring space is freed (reclaim_log_prefix).
     ring_space_cv: parking_lot::Condvar,
@@ -541,7 +542,7 @@ struct BufferShard {
     metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
     /// V3 checkpoint device — covers the 4KB checkpoint block preceding this
     /// shard's data area. None for v2 layout (no checkpoint).
-    checkpoint_device: Option<RawDevice>,
+    checkpoint_device: Option<Arc<dyn BlockBackend>>,
     /// Shared counter for total payload bytes in memory (across all shards).
     payload_bytes_in_memory: Arc<AtomicU64>,
     /// Global budget for durable in-memory buffer payload cache. 0 disables
@@ -557,7 +558,7 @@ struct BufferShard {
 }
 
 pub struct WriteBufferPool {
-    root_device: RawDevice,
+    root_device: Arc<dyn BlockBackend>,
     shards: Vec<BufferShardHandle>,
     next_seq: AtomicU64,
     routing_zone_size_blocks: u64,

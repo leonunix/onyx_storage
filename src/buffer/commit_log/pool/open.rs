@@ -64,8 +64,12 @@ impl WriteBufferPool {
         uring_sq_entries: Option<u32>,
     ) -> OnyxResult<Self> {
         let runtime_limits = BufferRuntimeLimits::default();
+        // A single file/blockdev root backend (the non-chunklet path). Tests and
+        // the migration helpers reach the pool through these `RawDevice`-taking
+        // wrappers; chunklet callers go straight to `_and_limits` with their LD
+        // backend.
         Self::open_with_options_full_and_limits(
-            device,
+            Arc::new(device),
             group_commit_wait,
             shard_count,
             routing_zone_size_blocks,
@@ -77,7 +81,7 @@ impl WriteBufferPool {
     }
 
     pub fn open_with_options_full_and_limits(
-        device: RawDevice,
+        device: Arc<dyn BlockBackend>,
         group_commit_wait: Duration,
         shard_count: usize,
         routing_zone_size_blocks: u64,
@@ -106,9 +110,9 @@ impl WriteBufferPool {
                 if is_clean {
                     tracing::info!("buffer is clean — upgrading v2 → v3 layout");
                     let new_sb = GlobalSuperblock::new(shard_count);
-                    Self::init_checkpoint_blocks(&device, shard_count)?;
+                    Self::init_checkpoint_blocks(device.as_ref(), shard_count)?;
                     device.write_at(&new_sb.encode(), 0)?;
-                    device.sync()?;
+                    device.flush()?;
                     (true, new_sb)
                 } else {
                     tracing::info!(
@@ -128,9 +132,9 @@ impl WriteBufferPool {
                         "buffer is clean — reinitializing with new shard layout (v3)"
                     );
                     let new_sb = GlobalSuperblock::new(shard_count);
-                    Self::init_checkpoint_blocks(&device, shard_count)?;
+                    Self::init_checkpoint_blocks(device.as_ref(), shard_count)?;
                     device.write_at(&new_sb.encode(), 0)?;
-                    device.sync()?;
+                    device.flush()?;
                     (true, new_sb)
                 } else {
                     return Err(OnyxError::Config(format!(
@@ -142,9 +146,9 @@ impl WriteBufferPool {
             None => {
                 // Fresh device — initialize as v3.
                 let sb = GlobalSuperblock::new(shard_count);
-                Self::init_checkpoint_blocks(&device, shard_count)?;
+                Self::init_checkpoint_blocks(device.as_ref(), shard_count)?;
                 device.write_at(&sb.encode(), 0)?;
-                device.sync()?;
+                device.flush()?;
                 (true, sb)
             }
         };
@@ -175,9 +179,9 @@ impl WriteBufferPool {
 
         // Build per-shard config for parallel open.
         struct ShardOpenConfig {
-            data_device: RawDevice,
+            data_device: Arc<dyn BlockBackend>,
             checkpoint: Option<ShardCheckpoint>,
-            checkpoint_device: Option<RawDevice>,
+            checkpoint_device: Option<Arc<dyn BlockBackend>>,
         }
 
         let mut shard_configs = Vec::with_capacity(shard_count);
@@ -191,12 +195,12 @@ impl WriteBufferPool {
             let shard_offset = data_area_start + consumed;
             consumed += shard_bytes;
 
-            let data_device = device.slice(shard_offset, shard_bytes)?;
+            let data_device = slice_backend(device.clone(), shard_offset, shard_bytes)?;
             let (checkpoint, checkpoint_device) = if use_v3 {
-                let ckpt = Self::read_shard_checkpoint(&device, shard_idx)?;
+                let ckpt = Self::read_shard_checkpoint(device.as_ref(), shard_idx)?;
                 let ckpt_offset =
                     COMMIT_LOG_SUPERBLOCK_SIZE + shard_idx as u64 * SHARD_CHECKPOINT_SIZE;
-                let ckpt_dev = device.slice(ckpt_offset, SHARD_CHECKPOINT_SIZE)?;
+                let ckpt_dev = slice_backend(device.clone(), ckpt_offset, SHARD_CHECKPOINT_SIZE)?;
                 // Valid checkpoint → guided recovery.
                 // Invalid/corrupt → None → full scan fallback.
                 (ckpt, Some(ckpt_dev))
@@ -346,7 +350,7 @@ impl WriteBufferPool {
             let shard_offset = data_area_start + consumed;
             consumed += shard_bytes;
 
-            let sync_device = device.slice(shard_offset, shard_bytes)?;
+            let sync_device = slice_backend(device.clone(), shard_offset, shard_bytes)?;
             let shard = Arc::new(shard);
             let (sync_wake_tx, sync_wake_rx) = unbounded();
             let sync_shutdown = Arc::new(AtomicBool::new(false));

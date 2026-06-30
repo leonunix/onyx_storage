@@ -12,7 +12,7 @@ const SCAN_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// cursor (so the next entry is always fully buffered unless we have truly
 /// hit the end of the ring).
 struct ChunkReader<'a> {
-    device: &'a RawDevice,
+    device: &'a dyn BlockBackend,
     buf: AlignedBuf,
     buf_disk_start: u64,
     buf_valid_bytes: usize,
@@ -20,7 +20,7 @@ struct ChunkReader<'a> {
 }
 
 impl<'a> ChunkReader<'a> {
-    fn new(device: &'a RawDevice, capacity_bytes: u64) -> OnyxResult<Self> {
+    fn new(device: &'a dyn BlockBackend, capacity_bytes: u64) -> OnyxResult<Self> {
         let block = BLOCK_SIZE as usize;
         let cap_usize = usize::try_from(capacity_bytes).unwrap_or(usize::MAX);
         let mut chunk = SCAN_CHUNK_BYTES.min(cap_usize);
@@ -117,7 +117,7 @@ impl BufferShard {
     }
 
     pub(in crate::buffer::commit_log) fn rebuild_indices(
-        device: &RawDevice,
+        device: &dyn BlockBackend,
         capacity_bytes: u64,
         lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,
         latest_lba_seq: &DashMap<LbaKey, (u64, u64)>,
@@ -253,7 +253,7 @@ impl BufferShard {
     /// Falls back to full scan if no entries are found in the guided region.
 
     pub(in crate::buffer::commit_log) fn rebuild_indices_guided(
-        device: &RawDevice,
+        device: &dyn BlockBackend,
         capacity_bytes: u64,
         checkpoint: &ShardCheckpoint,
         lba_index: &DashMap<LbaKey, Arc<PendingEntry>>,

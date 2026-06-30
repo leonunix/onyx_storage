@@ -31,10 +31,8 @@ fn uring_sync_batch_chunks_over_sq_depth() {
     )
     .unwrap();
     let shard = &pool.shards[0].shard;
-    let shard_device = pool
-        .root_device
-        .slice(data_start, size - data_start)
-        .unwrap();
+    let shard_device =
+        slice_backend(pool.root_device.clone(), data_start, size - data_start).unwrap();
     let ring = Arc::new(IoUringSession::new(4).unwrap());
     let metrics = Arc::new(OnceLock::new());
 
@@ -71,7 +69,7 @@ fn uring_sync_batch_chunks_over_sq_depth() {
     }
 
     WriteBufferPool::write_batch_and_sync_uring(
-        &shard_device,
+        shard_device.as_ref(),
         shard,
         &ring,
         &shard.io_lock,
@@ -199,10 +197,8 @@ fn uring_sync_fast_path_single_linked_chain() {
     )
     .unwrap();
     let shard = &pool.shards[0].shard;
-    let shard_device = pool
-        .root_device
-        .slice(data_start, size - data_start)
-        .unwrap();
+    let shard_device =
+        slice_backend(pool.root_device.clone(), data_start, size - data_start).unwrap();
     // Big ring → fast path (single linked submit), unlike the sq=4 chunk test.
     let ring = Arc::new(IoUringSession::new(64).unwrap());
     let metrics = Arc::new(OnceLock::new());
@@ -243,7 +239,7 @@ fn uring_sync_fast_path_single_linked_chain() {
     }
 
     WriteBufferPool::write_batch_and_sync_uring(
-        &shard_device,
+        shard_device.as_ref(),
         shard,
         &ring,
         &shard.io_lock,

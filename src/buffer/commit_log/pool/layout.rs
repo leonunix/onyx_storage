@@ -26,7 +26,7 @@ impl WriteBufferPool {
     /// Read the on-disk shard count from the superblock. Returns None if the
     /// device has no valid superblock (first use).
 
-    pub fn read_disk_shard_count(device: &RawDevice) -> OnyxResult<Option<usize>> {
+    pub fn read_disk_shard_count(device: &dyn BlockBackend) -> OnyxResult<Option<usize>> {
         let mut buf = [0u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize];
         device.read_at(&mut buf, 0)?;
         Ok(GlobalSuperblock::decode(&buf).map(|sb| sb.shard_count as usize))
@@ -45,7 +45,7 @@ impl WriteBufferPool {
     /// Read shard checkpoint from disk. Returns None if invalid.
 
     pub(super) fn read_shard_checkpoint(
-        device: &RawDevice,
+        device: &dyn BlockBackend,
         shard_idx: usize,
     ) -> OnyxResult<Option<ShardCheckpoint>> {
         let offset = COMMIT_LOG_SUPERBLOCK_SIZE + shard_idx as u64 * SHARD_CHECKPOINT_SIZE;
@@ -56,7 +56,10 @@ impl WriteBufferPool {
 
     /// Initialize checkpoint blocks to zero (used during v2→v3 migration).
 
-    pub(super) fn init_checkpoint_blocks(device: &RawDevice, shard_count: usize) -> OnyxResult<()> {
+    pub(super) fn init_checkpoint_blocks(
+        device: &dyn BlockBackend,
+        shard_count: usize,
+    ) -> OnyxResult<()> {
         let empty = ShardCheckpoint {
             head_offset: 0,
             tail_offset: 0,
@@ -76,7 +79,7 @@ impl WriteBufferPool {
     /// shard count (or migrate to v3).
 
     pub(super) fn check_old_layout_empty(
-        device: &RawDevice,
+        device: &Arc<dyn BlockBackend>,
         sb: &GlobalSuperblock,
     ) -> OnyxResult<bool> {
         let old_shards = sb.shard_count as usize;
@@ -103,14 +106,14 @@ impl WriteBufferPool {
             let shard_offset = data_area_start + consumed;
             consumed += shard_bytes;
 
-            let shard_dev = device.slice(shard_offset, shard_bytes)?;
+            let shard_dev = slice_backend(device.clone(), shard_offset, shard_bytes)?;
             let lba_index = DashMap::with_shard_amount(4);
             let latest_lba_seq = DashMap::with_shard_amount(4);
             let pending_lba_buckets = DashMap::with_shard_amount(4);
             let pending = DashMap::with_shard_amount(4);
             let pending_count = AtomicU64::new(0);
             BufferShard::rebuild_indices(
-                &shard_dev,
+                shard_dev.as_ref(),
                 shard_bytes,
                 &lba_index,
                 &latest_lba_seq,
@@ -139,7 +142,7 @@ impl WriteBufferPool {
         let bytes = sb.encode();
         self.root_device.write_at(&bytes, 0)?;
         if sync {
-            Self::sync_device_impl(&self.root_device)?;
+            Self::sync_device_impl(self.root_device.as_ref())?;
         }
         Ok(())
     }

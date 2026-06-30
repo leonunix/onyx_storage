@@ -1,7 +1,9 @@
-//! Engine-level integration: boot OnyxEngine with LV3 on a chunklet RAID6 LD,
-//! then create a volume and round-trip data through the full write/read stack
-//! (buffer → flush → IoEngine over ChunkletBackend → metadb → ReadPool over the
-//! chunklet backend). LV2 + metadb stay on their own files (Phase 1 scope).
+//! Engine-level integration: boot OnyxEngine with LV3 on a chunklet RAID6 LD
+//! AND LV2 on a chunklet RAID10 LD (both carved from one shared pool), then
+//! create a volume and round-trip data through the full write/read stack
+//! (buffer over the chunklet LV2 backend → flush → IoEngine over the chunklet
+//! LV3 backend → metadb → ReadPool over the chunklet backend). metadb still
+//! lives on its own file (Phase 3 scope).
 
 use onyx_storage::config::{
     BufferConfig, ChunkletConfig, ChunkletIoBackend, EngineConfig, FlushConfig, MetaConfig,
@@ -29,10 +31,13 @@ fn engine_boots_lv3_on_chunklet_raid6_and_round_trips() {
         spare_pct: 0,
         ..Default::default()
     };
-    // Create the pool + LDs, then pin the LV3 id like `chunklet-init` would.
-    let (pool, lv3, _lv2, _meta) = onyx_storage::chunklet_pool::init_pool(&chunklet).unwrap();
+    // Create the pool + LDs, then pin the LV3 + LV2 ids like `chunklet-init`
+    // would. With chunklet enabled both LV3 (RAID6) and LV2 (RAID10) are served
+    // from the shared pool, so the buffer pool needs its LD id too.
+    let (pool, lv3, lv2, _meta) = onyx_storage::chunklet_pool::init_pool(&chunklet).unwrap();
     drop(pool);
     chunklet.lv3_ld_id = Some(lv3.to_string());
+    chunklet.lv2_ld_id = Some(lv2.to_string());
 
     let meta_dir = tempdir().unwrap();
     let buffer_file = NamedTempFile::new().unwrap();

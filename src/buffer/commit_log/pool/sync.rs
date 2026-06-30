@@ -126,9 +126,9 @@ impl WriteBufferPool {
         Ok(spans)
     }
 
-    pub(super) fn sync_device_impl(device: &RawDevice) -> OnyxResult<()> {
+    pub(super) fn sync_device_impl(device: &dyn BlockBackend) -> OnyxResult<()> {
         Self::consume_test_sync_failpoint()?;
-        device.sync()
+        device.flush()
     }
 
     /// Pull one hit off the failpoint counter; returns Err if it was armed.
@@ -152,7 +152,7 @@ impl WriteBufferPool {
     }
 
     fn write_batch(
-        device: &RawDevice,
+        device: &dyn BlockBackend,
         io_lock: &parking_lot::Mutex<()>,
         entries: &[StagedEntry],
         metrics: &Arc<OnceLock<Arc<EngineMetrics>>>,
@@ -165,9 +165,16 @@ impl WriteBufferPool {
 
         let write_start = Instant::now();
         let _guard = io_lock.lock();
-        for span in &spans {
-            device.write_at(&span.buf.as_slice()[..span.len as usize], span.offset)?;
-        }
+        // One batched submit for the whole coalesced run. On a chunklet LD this
+        // fans the spans across the RAID member PDs in a single submit (the
+        // RAID10 LV2 win); on a `RawDevice` it loops pwrite internally — same
+        // result as the old per-span `write_at`. Durability still requires the
+        // following `flush` (see the sync_loop's syscall branch).
+        let ops: Vec<(u64, &[u8])> = spans
+            .iter()
+            .map(|s| (s.offset, &s.buf.as_slice()[..s.len as usize]))
+            .collect();
+        device.write_many_at(&ops)?;
         if let Some(metrics) = metrics.get() {
             BufferShard::record_metric(&metrics.buffer_append_log_write_ns, write_start);
         }
@@ -193,8 +200,8 @@ impl WriteBufferPool {
                 let magic = u32::from_le_bytes(verify_buf[4..8].try_into().unwrap());
                 if magic != BUFFER_ENTRY_MAGIC {
                     let disk_first_16: Vec<u8> = verify_buf[..16].to_vec();
-                    let write_base = device.base_offset();
-                    let write_direct_io = device.is_direct_io();
+                    let write_base = device.uring_target().map(|(_, b)| b).unwrap_or(0);
+                    let write_direct_io = device.direct_io();
                     tracing::error!(
                         offset,
                         disk_magic = magic,
@@ -222,7 +229,7 @@ impl WriteBufferPool {
     /// after CQE harvest so existing recovery tests still cover this path.
 
     pub(in crate::buffer::commit_log) fn write_batch_and_sync_uring(
-        device: &RawDevice,
+        device: &dyn BlockBackend,
         shard: &BufferShard,
         ring: &Arc<IoUringSession>,
         io_lock: &parking_lot::Mutex<()>,
@@ -234,6 +241,14 @@ impl WriteBufferPool {
             // No entries → nothing to fsync either; mirrors syscall fast-path.
             return Ok(());
         }
+
+        // This path only runs for a single-fd backend (`RawDevice`); the
+        // sync_loop dispatch guarantees a uring target exists here.
+        let (data_fd, data_base) = device.uring_target().ok_or_else(|| {
+            OnyxError::Io(std::io::Error::other(
+                "io_uring LV2 sync path requires a fd-backed device",
+            ))
+        })?;
 
         // 1 + 2. Encode each entry directly into a pooled AlignedBuf,
         //    coalescing contiguous reserved ranges into one buffer per span
@@ -252,8 +267,6 @@ impl WriteBufferPool {
             ckpt_aligned = Some(buf);
         }
 
-        let data_fd = device.as_raw_fd();
-        let data_base = device.base_offset();
         let span_count = spans.len();
         let has_ckpt = ckpt_aligned.is_some() && checkpoint_target.is_some();
 
@@ -725,7 +738,7 @@ impl WriteBufferPool {
     /// have no cross-thread contention.
     #[allow(clippy::too_many_arguments)]
     fn uring_sync_pipeline_loop(
-        device: RawDevice,
+        device: Arc<dyn BlockBackend>,
         shard: Arc<BufferShard>,
         group_commit_wait: Duration,
         wake_rx: Receiver<()>,
@@ -739,8 +752,12 @@ impl WriteBufferPool {
         // with the ZFS self-clocked adaptive window (see `window` below), so the
         // serial `group_commit_wait` knob is intentionally unused here.
         let _ = group_commit_wait;
-        let data_fd = device.as_raw_fd();
-        let data_base = device.base_offset();
+        // The dispatch in `sync_loop` only routes a fd-backed device here, so
+        // the uring target is always present. `device` is kept alive (the Arc)
+        // for the loop's lifetime so the fd stays valid behind the SQEs.
+        let (data_fd, data_base) = device
+            .uring_target()
+            .expect("uring pipeline requires a fd-backed device");
         let ckpt_target = shard.checkpoint_target();
         // Reserve 2 SQEs of every chain for the terminal fsync + checkpoint, so
         // a sealed batch's chain always fits the ring in one submit.
@@ -922,7 +939,7 @@ impl WriteBufferPool {
     }
 
     pub(super) fn sync_loop(
-        device: RawDevice,
+        device: Arc<dyn BlockBackend>,
         shard: Arc<BufferShard>,
         group_commit_wait: Duration,
         wake_rx: Receiver<()>,
@@ -934,12 +951,18 @@ impl WriteBufferPool {
         pipeline_depth: usize,
         commit_timeout_pct: u64,
     ) {
+        // A chunklet LD has no single fd — it owns its cross-PD io_uring
+        // internally — so it never takes either onyx-side io_uring path. The
+        // sync session (`uring`) is only constructed for a fd-backed device, but
+        // gate on the device's own discriminator too so the two can never drift.
+        let has_uring_target = device.uring_target().is_some();
+
         // Pipelined LV2 fdatasync path: keep `pipeline_depth` fsync chains in
         // flight so batch N+1's writes overlap batch N's flush, with a ZFS
         // self-clocked adaptive accumulation window. Only the io_uring backend
-        // supports it; depth 1 (or syscall) falls through to the legacy
+        // supports it; depth 1 (or syscall/chunklet) falls through to the legacy
         // submit→wait-all→submit-next loop below.
-        if pipeline_depth >= 2 {
+        if pipeline_depth >= 2 && has_uring_target {
             if let Some(ref ring) = uring {
                 Self::uring_sync_pipeline_loop(
                     device,
@@ -1044,20 +1067,29 @@ impl WriteBufferPool {
                     .max()
                     .unwrap_or(0);
 
-                let result = if let Some(ref ring) = uring {
-                    // Batched io_uring path: N entry writes + 1 checkpoint write
-                    // + 1 DRAIN-flagged fdatasync — all in one submit.
-                    Self::write_batch_and_sync_uring(
-                        &device,
-                        &shard,
-                        ring,
+                let result = match (uring.as_ref(), has_uring_target) {
+                    (Some(ring), true) => {
+                        // Batched io_uring path: N entry writes + 1 checkpoint
+                        // write + 1 DRAIN-flagged fdatasync — all in one submit.
+                        Self::write_batch_and_sync_uring(
+                            device.as_ref(),
+                            &shard,
+                            ring,
+                            &shard.io_lock,
+                            &writes_to_persist,
+                            batch_max_seq_pre,
+                            &metrics,
+                        )
+                    }
+                    // Syscall / chunklet path: one batched `write_many_at`
+                    // (chunklet fans across PDs), then checkpoint + `flush`
+                    // below provide the ack-after-durable barrier.
+                    _ => Self::write_batch(
+                        device.as_ref(),
                         &shard.io_lock,
                         &writes_to_persist,
-                        batch_max_seq_pre,
                         &metrics,
-                    )
-                } else {
-                    Self::write_batch(&device, &shard.io_lock, &writes_to_persist, &metrics)
+                    ),
                 };
 
                 match result {
@@ -1089,12 +1121,15 @@ impl WriteBufferPool {
                 .unwrap_or(0);
 
             // The uring path already checkpointed + fsynced inside
-            // write_batch_and_sync_uring. The syscall path still needs both.
-            let sync_result = if uring.is_some() {
+            // write_batch_and_sync_uring. The syscall / chunklet path still
+            // needs both: write the checkpoint hint, then one `flush` makes the
+            // batch payload AND the checkpoint durable in a single barrier
+            // (chunklet's flush fans `sync()` across every member PD).
+            let sync_result = if uring.is_some() && has_uring_target {
                 Ok(())
             } else {
                 shard.write_checkpoint(batch_max_seq);
-                Self::sync_device_impl(&device)
+                Self::sync_device_impl(device.as_ref())
             };
 
             match sync_result {

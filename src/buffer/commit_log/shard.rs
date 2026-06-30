@@ -262,9 +262,12 @@ impl BufferShard {
         }
     }
 
-    pub(super) fn mark_entry_flushed(device: &RawDevice, pending: &PendingEntry) -> OnyxResult<()> {
+    pub(super) fn mark_entry_flushed(
+        device: &dyn BlockBackend,
+        pending: &PendingEntry,
+    ) -> OnyxResult<()> {
         let payload_len = pending.lba_count as usize * BLOCK_SIZE as usize;
-        if device.is_direct_io() {
+        if device.direct_io() {
             let bytes = BufferEntry::encode_direct_compact_header(
                 pending.seq,
                 &pending.vol_id,
@@ -299,11 +302,11 @@ impl BufferShard {
     }
 
     pub(super) fn open(
-        device: RawDevice,
+        device: Arc<dyn BlockBackend>,
         backpressure_timeout: Duration,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
         checkpoint: Option<ShardCheckpoint>,
-        checkpoint_device: Option<RawDevice>,
+        checkpoint_device: Option<Arc<dyn BlockBackend>>,
         payload_bytes_in_memory: Arc<AtomicU64>,
         max_payload_memory: u64,
         runtime_limits: BufferRuntimeLimits,
@@ -328,7 +331,7 @@ impl BufferShard {
         let recover_start = Instant::now();
         let mut scan = if let Some(ref ckpt) = checkpoint {
             let r = Self::rebuild_indices_guided(
-                &device,
+                device.as_ref(),
                 capacity_bytes,
                 ckpt,
                 &lba_index,
@@ -347,7 +350,7 @@ impl BufferShard {
             r
         } else {
             let r = Self::rebuild_indices(
-                &device,
+                device.as_ref(),
                 capacity_bytes,
                 &lba_index,
                 &latest_lba_seq,
@@ -489,8 +492,12 @@ impl BufferShard {
     /// piggyback the checkpoint write onto the same submit_batch as the entry
     /// writes + fsync. Returns None when no checkpoint device is attached.
     pub(super) fn checkpoint_target(&self) -> Option<(std::os::fd::RawFd, u64)> {
+        // Only the io_uring path consumes this (to piggyback the checkpoint
+        // write onto the entry-writes+fsync submit). A chunklet-backed
+        // checkpoint device has no fd → None, and the chunklet sync path
+        // persists the checkpoint through `write_checkpoint` + `flush` instead.
         let dev = self.checkpoint_device.as_ref()?;
-        Some((dev.as_raw_fd(), dev.base_offset()))
+        dev.uring_target()
     }
 
     /// Evict in-memory payloads from committed entries. The normal sync path
@@ -1154,7 +1161,7 @@ impl BufferShard {
         // cancellation handshake with the sync thread is required.
         {
             let _guard = self.io_lock.lock();
-            Self::mark_entry_flushed(&self.device, pending)?;
+            Self::mark_entry_flushed(self.device.as_ref(), pending)?;
         }
         {
             let mut ring = self.ring.lock();
