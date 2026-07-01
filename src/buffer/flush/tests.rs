@@ -77,6 +77,48 @@ fn setup_flush_test_env() -> (
     )
 }
 
+/// A `BlockBackend` that forwards all IO to an inner `RawDevice` but reports a
+/// RAID stripe width of `stripe` blocks and (via the default `uring_target` =
+/// None) routes writes through the syscall / `write_many_at` path — i.e. it
+/// stands in for a chunklet RAID6 LD for the flush writer's full-stripe
+/// grouping while still storing bytes, so grouped writes are round-trippable.
+struct StripeMockDevice {
+    inner: RawDevice,
+    stripe: u32,
+}
+
+impl crate::io::block_backend::BlockBackend for StripeMockDevice {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::error::OnyxResult<()> {
+        RawDevice::read_at(&self.inner, buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> crate::error::OnyxResult<()> {
+        RawDevice::write_at(&self.inner, buf, offset)
+    }
+    fn flush(&self) -> crate::error::OnyxResult<()> {
+        self.inner.sync()
+    }
+    fn size(&self) -> u64 {
+        RawDevice::size(&self.inner)
+    }
+    fn stripe_blocks(&self) -> u32 {
+        self.stripe
+    }
+    fn direct_io(&self) -> bool {
+        false
+    }
+}
+
+/// IoEngine over a `stripe`-wide stripe-mock backend with full-stripe writes on.
+/// Uses the chunklet constructor (Syscall backend, `pba_offset = RESERVED_BLOCKS`
+/// → `stripe_phase() = RESERVED_BLOCKS % stripe`), matching a real chunklet LD.
+fn stripe_io_engine(path: &std::path::Path, stripe: u32, metrics: Arc<EngineMetrics>) -> Arc<IoEngine> {
+    let dev = StripeMockDevice {
+        inner: RawDevice::open(path).unwrap(),
+        stripe,
+    };
+    Arc::new(IoEngine::new_chunklet(Arc::new(dev), false, metrics).with_full_stripe_writes(true))
+}
+
 /// Build a `PbaLifecycle` for tests that exercise the cleanup/retire path
 /// directly. Each call gets a fresh candidate cache (matching the old
 /// per-call `CandidateCache::new` behaviour these tests relied on).

@@ -971,3 +971,458 @@ fn seq_rejected_passthrough_unit_keeps_candidate_clean_and_retires_pba() {
     assert!(allocator.is_retired(unit_pba));
     assert!(!allocator.is_free(unit_pba));
 }
+
+/// Drain every `PassthroughCommitJob` dispatched to `cw_rx` and run its metadata
+/// commit inline (mirrors the commit-worker loop), so a `write_units_batch` test
+/// can read the published mappings back.
+fn drain_passthrough_commits(
+    cw_rx: crossbeam_channel::Receiver<super::writer::CommitJob>,
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    in_flight: &Arc<super::FlusherInFlightTracker>,
+    metrics: &Arc<EngineMetrics>,
+    done_tx: &crossbeam_channel::Sender<Vec<u64>>,
+    candidate: &crate::dedup::CandidateCache,
+) {
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+    let pool_pc = pool.clone();
+    let meta_pc = meta.clone();
+    let candidate_pc = candidate.clone();
+    let metrics_pc = metrics.clone();
+    let done_txs_pc = vec![done_tx.clone()];
+    let post_commit_handle = std::thread::spawn(move || {
+        BufferFlusher::post_commit_loop(
+            0,
+            &post_commit_rx,
+            &pool_pc,
+            &meta_pc,
+            &candidate_pc,
+            &metrics_pc,
+            &done_txs_pc,
+        );
+    });
+    for job in cw_rx.into_iter() {
+        match job {
+            super::writer::CommitJob::Passthrough(pj) => BufferFlusher::commit_passthrough_job(
+                pj,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                in_flight,
+                metrics,
+                &cleanup_tx,
+                candidate,
+                std::slice::from_ref(done_tx),
+                &post_commit_tx,
+                super::writer::TARGET_OPS_PER_COMMIT,
+                1,
+            ),
+            super::writer::CommitJob::Packed(_) => panic!("expected passthrough commit job"),
+        }
+    }
+    drop(post_commit_tx);
+    post_commit_handle.join().expect("post_commit_loop panicked");
+}
+
+/// Three sub-stripe (2-block) passthrough units at disjoint LBAs pack into ONE
+/// 6-block RAID stripe: they land on six consecutive, stripe-aligned PBAs, are
+/// written as a single full-stripe LV3 write, keep independent block-granular
+/// mappings (`slot_offset == 0`), and every LBA round-trips its distinct bytes.
+#[test]
+fn passthrough_groups_sub_stripe_units_into_one_full_stripe() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let data_tmp = NamedTempFile::new().unwrap();
+    data_tmp.as_file().set_len(4096 * 20000).unwrap();
+    let io_engine = stripe_io_engine(data_tmp.path(), 6, metrics.clone());
+    assert_eq!(io_engine.stripe_blocks(), 6);
+    assert_eq!(
+        io_engine.stripe_phase(),
+        (crate::types::RESERVED_BLOCKS % 6) as u32
+    );
+
+    // blocks_per_unit = [2, 2, 2] → exactly one stripe.
+    let specs = [(10u64, 0x10u8), (20, 0x30), (30, 0x50)];
+    let mut units = Vec::new();
+    let mut seqs_per_unit = Vec::new();
+    for (i, (lba, fill)) in specs.iter().enumerate() {
+        let seq = (i as u64) + 1;
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(*lba), seq, 1);
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(*lba + 1), seq, 1);
+        units.push(make_raw_unit_at(*lba, 2, *fill, seq));
+        seqs_per_unit.push(vec![seq]);
+    }
+    let completions_per_unit = vec![None, None, None];
+
+    let in_flight = Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (cw_tx, cw_rx) = unbounded::<super::writer::CommitJob>();
+
+    BufferFlusher::write_units_batch(
+        0,
+        units,
+        seqs_per_unit,
+        completions_per_unit,
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        &metrics,
+        &in_flight,
+        &done_tx,
+        std::slice::from_ref(&cw_tx),
+        1,
+    );
+    drop(cw_tx);
+
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    drain_passthrough_commits(
+        cw_rx, &pool, &meta, &lifecycle, &allocator, &in_flight, &metrics, &done_tx, &candidate,
+    );
+
+    let vol = VolumeId("flush-race".into());
+    let base = meta.get_mapping(&vol, Lba(10)).unwrap().unwrap().pba;
+    assert_eq!(
+        (base.0 + crate::types::RESERVED_BLOCKS) % 6,
+        0,
+        "grouped stripe must be aligned in device-offset space"
+    );
+    // (lba, expected sub-PBA offset from base, expected byte fill)
+    let expect = [
+        (10u64, 0u64, 0x10u8),
+        (11, 1, 0x11),
+        (20, 2, 0x30),
+        (21, 3, 0x31),
+        (30, 4, 0x50),
+        (31, 5, 0x51),
+    ];
+    let worker = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone());
+    for (lba, off, fill) in expect {
+        let m = meta.get_mapping(&vol, Lba(lba)).unwrap().unwrap();
+        assert_eq!(m.pba, Pba(base.0 + off), "lba {lba} must map to its stripe sub-PBA");
+        assert_eq!(m.slot_offset, 0, "grouped members stay block-granular");
+        let got = worker.handle_read("flush-race", Lba(lba)).unwrap().unwrap();
+        assert_eq!(got, vec![fill; BLOCK_SIZE as usize], "lba {lba} round-trip");
+    }
+}
+
+/// A grouped full-stripe write that fails IO rolls the whole stripe extent back
+/// exactly once (no 5-block leak, no double free) and publishes no mapping. Uses
+/// unique high LBAs so the shared-`vol_id` failpoint cannot collide with a
+/// parallel test's write.
+#[test]
+fn passthrough_group_io_failure_rolls_back_whole_stripe_without_leak() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let data_tmp = NamedTempFile::new().unwrap();
+    data_tmp.as_file().set_len(4096 * 20000).unwrap();
+    let io_engine = stripe_io_engine(data_tmp.path(), 6, metrics.clone());
+
+    let specs = [(700_010u64, 0x10u8), (700_020, 0x30), (700_030, 0x50)];
+    let mut units = Vec::new();
+    let mut seqs_per_unit = Vec::new();
+    for (i, (lba, fill)) in specs.iter().enumerate() {
+        let seq = (i as u64) + 1;
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(*lba), seq, 1);
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(*lba + 1), seq, 1);
+        units.push(make_raw_unit_at(*lba, 2, *fill, seq));
+        seqs_per_unit.push(vec![seq]);
+    }
+
+    // Fail the group's IO write via its first member's start_lba (auto-expiring
+    // after a single hit so it cannot leak into other work).
+    install_test_failpoint(
+        "flush-race",
+        Lba(700_010),
+        FlushFailStage::BeforeIoWrite,
+        Some(1),
+    );
+
+    let free_before = allocator.free_block_count();
+    let runs_before = allocator.free_extent_run_count();
+
+    let in_flight = Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (cw_tx, cw_rx) = unbounded::<super::writer::CommitJob>();
+
+    BufferFlusher::write_units_batch(
+        0,
+        units,
+        seqs_per_unit,
+        vec![None, None, None],
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        &metrics,
+        &in_flight,
+        &done_tx,
+        std::slice::from_ref(&cw_tx),
+        1,
+    );
+    drop(cw_tx);
+    clear_test_failpoint("flush-race", Lba(700_010), FlushFailStage::BeforeIoWrite);
+
+    // The whole group failed IO → nothing dispatched to the commit worker.
+    assert!(
+        cw_rx.into_iter().next().is_none(),
+        "a failed full-stripe group must not dispatch any commit job"
+    );
+
+    // The 6-block stripe extent was rolled back exactly once: free space and the
+    // free-list run count both return to baseline (no leak, no free-list bloat).
+    assert_eq!(
+        allocator.free_block_count(),
+        free_before,
+        "whole stripe must be freed once — no 5-block leak, no double free"
+    );
+    // The rolled-back stripe goes back to the global free list while the lane
+    // cache still holds its refill remainder, so a single rollback may split one
+    // run into two — but it must not fragment further (a 5-block leak scattered
+    // back would bloat the run count).
+    assert!(
+        allocator.free_extent_run_count() <= runs_before + 1,
+        "rolled-back stripe must not fragment the free list (runs {} → {})",
+        runs_before,
+        allocator.free_extent_run_count()
+    );
+    // No mapping was published for any LBA.
+    let vol = VolumeId("flush-race".into());
+    for (lba, _) in specs {
+        assert!(
+            meta.get_mapping(&vol, Lba(lba)).unwrap().is_none(),
+            "failed group must publish no mapping for lba {lba}"
+        );
+    }
+}
+
+/// Drain every `PackedCommitJob` dispatched to `cw_rx` and run its metadata
+/// commit inline (mirrors the commit-worker loop).
+fn drain_packed_commits(
+    cw_rx: crossbeam_channel::Receiver<super::writer::CommitJob>,
+    pool: &Arc<WriteBufferPool>,
+    meta: &Arc<MetaStore>,
+    lifecycle: &Arc<VolumeLifecycleManager>,
+    allocator: &Arc<SpaceAllocator>,
+    in_flight: &Arc<super::FlusherInFlightTracker>,
+    metrics: &Arc<EngineMetrics>,
+    done_tx: &crossbeam_channel::Sender<Vec<u64>>,
+    candidate: &crate::dedup::CandidateCache,
+) {
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
+    let pool_pc = pool.clone();
+    let meta_pc = meta.clone();
+    let candidate_pc = candidate.clone();
+    let metrics_pc = metrics.clone();
+    let done_txs_pc = vec![done_tx.clone()];
+    let handle = std::thread::spawn(move || {
+        BufferFlusher::post_commit_loop(
+            0,
+            &post_commit_rx,
+            &pool_pc,
+            &meta_pc,
+            &candidate_pc,
+            &metrics_pc,
+            &done_txs_pc,
+        );
+    });
+    for job in cw_rx.into_iter() {
+        match job {
+            super::writer::CommitJob::Packed(pj) => BufferFlusher::commit_packed_job(
+                pj,
+                pool,
+                meta,
+                lifecycle,
+                allocator,
+                in_flight,
+                metrics,
+                &cleanup_tx,
+                candidate,
+                done_tx,
+                &post_commit_tx,
+            ),
+            super::writer::CommitJob::Passthrough(_) => panic!("expected packed commit job"),
+        }
+    }
+    drop(post_commit_tx);
+    handle.join().expect("post_commit_loop panicked");
+}
+
+/// Six 4 KiB packed slots pack into ONE 6-block RAID stripe: they land on six
+/// consecutive stripe-aligned sub-PBAs, are written as a single full-stripe LV3
+/// write, keep their per-slot `slot_offset`, and each slot's physical block is
+/// assembled at its stripe position (verified by a direct device read, which
+/// bypasses the unchanged decode path).
+#[test]
+fn packed_groups_six_slots_into_one_full_stripe() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let data_tmp = NamedTempFile::new().unwrap();
+    data_tmp.as_file().set_len(4096 * 20000).unwrap();
+    let io_engine = stripe_io_engine(data_tmp.path(), 6, metrics.clone());
+
+    let mut sealed_slots = Vec::new();
+    let mut per_slot_buffers = Vec::new();
+    let mut datas = Vec::new();
+    for i in 0..6u64 {
+        let lba = 100 + i;
+        let seq = i + 1;
+        let fill = 0x40 + i as u8;
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(lba), seq, 1);
+        let unit = make_packed_unit_at(fill, seq, lba);
+        let pba = allocator.allocate_one_for_lane(0).unwrap();
+        let data = vec![fill; BLOCK_SIZE as usize];
+        sealed_slots.push(SealedSlot {
+            pba,
+            data: data.clone(),
+            fragments: vec![crate::packer::packer::SlotFragment {
+                unit,
+                slot_offset: 0,
+            }],
+        });
+        per_slot_buffers.push((vec![seq], Vec::new()));
+        datas.push(data);
+    }
+
+    let in_flight = Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (cw_tx, cw_rx) = unbounded::<super::writer::CommitJob>();
+    let mut retries = std::collections::VecDeque::new();
+
+    BufferFlusher::write_packed_slots_batch(
+        0,
+        sealed_slots,
+        per_slot_buffers,
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        &metrics,
+        &in_flight,
+        &done_tx,
+        &mut retries,
+        std::slice::from_ref(&cw_tx),
+        1,
+    );
+    drop(cw_tx);
+    assert!(retries.is_empty(), "clean IO → no packed retries");
+
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    drain_packed_commits(
+        cw_rx, &pool, &meta, &lifecycle, &allocator, &in_flight, &metrics, &done_tx, &candidate,
+    );
+
+    let vol = VolumeId("flush-race".into());
+    let base = meta.get_mapping(&vol, Lba(100)).unwrap().unwrap().pba;
+    assert_eq!(
+        (base.0 + crate::types::RESERVED_BLOCKS) % 6,
+        0,
+        "packed stripe must be aligned in device-offset space"
+    );
+    for i in 0..6u64 {
+        let m = meta.get_mapping(&vol, Lba(100 + i)).unwrap().unwrap();
+        assert_eq!(m.pba, Pba(base.0 + i), "slot {i} must map to its stripe sub-PBA");
+        assert_eq!(m.slot_offset, 0, "packed slot keeps its own slot_offset");
+        let block = io_engine
+            .read_blocks(Pba(base.0 + i), BLOCK_SIZE as usize)
+            .unwrap();
+        assert_eq!(
+            block, datas[i as usize],
+            "slot {i} 4 KiB block must be assembled at its stripe position"
+        );
+    }
+}
+
+/// A grouped packed full-stripe write that fails IO rolls the whole stripe back
+/// once (no leak of the stripe or the freed packer PBAs, no double free) and
+/// re-queues all six slots for retry, publishing no mapping.
+#[test]
+fn packed_group_io_failure_rolls_back_whole_stripe_without_leak() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let data_tmp = NamedTempFile::new().unwrap();
+    data_tmp.as_file().set_len(4096 * 20000).unwrap();
+    let io_engine = stripe_io_engine(data_tmp.path(), 6, metrics.clone());
+
+    let free_before = allocator.free_block_count();
+    let runs_before = allocator.free_extent_run_count();
+
+    let mut sealed_slots = Vec::new();
+    let mut per_slot_buffers = Vec::new();
+    for i in 0..6u64 {
+        let lba = 800_100 + i;
+        let seq = i + 1;
+        let fill = 0x40 + i as u8;
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(lba), seq, 1);
+        let unit = make_packed_unit_at(fill, seq, lba);
+        let pba = allocator.allocate_one_for_lane(0).unwrap();
+        sealed_slots.push(SealedSlot {
+            pba,
+            data: vec![fill; BLOCK_SIZE as usize],
+            fragments: vec![crate::packer::packer::SlotFragment {
+                unit,
+                slot_offset: 0,
+            }],
+        });
+        per_slot_buffers.push((vec![seq], Vec::new()));
+    }
+
+    install_test_failpoint(
+        "flush-race",
+        Lba(800_100),
+        FlushFailStage::BeforeIoWrite,
+        Some(1),
+    );
+
+    let in_flight = Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (cw_tx, cw_rx) = unbounded::<super::writer::CommitJob>();
+    let mut retries = std::collections::VecDeque::new();
+
+    BufferFlusher::write_packed_slots_batch(
+        0,
+        sealed_slots,
+        per_slot_buffers,
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        &metrics,
+        &in_flight,
+        &done_tx,
+        &mut retries,
+        std::slice::from_ref(&cw_tx),
+        1,
+    );
+    drop(cw_tx);
+    clear_test_failpoint("flush-race", Lba(800_100), FlushFailStage::BeforeIoWrite);
+
+    assert!(
+        cw_rx.into_iter().next().is_none(),
+        "a failed packed full-stripe group must dispatch no commit"
+    );
+    assert_eq!(retries.len(), 6, "all six slots must be re-queued for retry");
+    // `free_block_count` == baseline is the exact no-leak / no-double-free
+    // invariant: the stripe extent AND the six reassigned-away packer PBAs must
+    // all be back on the free list. (Run count is intentionally not asserted —
+    // the six individual packer allocations legitimately fragment the free list;
+    // block count is the load-bearing check.)
+    assert_eq!(
+        allocator.free_block_count(),
+        free_before,
+        "stripe + freed packer PBAs must net to baseline — no leak, no double free"
+    );
+    let _ = runs_before;
+    let vol = VolumeId("flush-race".into());
+    for i in 0..6u64 {
+        assert!(
+            meta.get_mapping(&vol, Lba(800_100 + i)).unwrap().is_none(),
+            "failed packed group must publish no mapping"
+        );
+    }
+}

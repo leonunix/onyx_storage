@@ -307,7 +307,7 @@ impl BufferFlusher {
     ///   defer_retry buffered seqs). The shard writer does not see it.
     pub(in crate::buffer::flush) fn write_packed_slots_batch(
         shard_idx: usize,
-        sealed_slots: Vec<SealedSlot>,
+        mut sealed_slots: Vec<SealedSlot>,
         per_slot_buffers: Vec<(Vec<u64>, Vec<Arc<crate::buffer::pipeline::DedupCompletion>>)>,
         pool: &WriteBufferPool,
         allocator: &SpaceAllocator,
@@ -326,6 +326,47 @@ impl BufferFlusher {
         let mut slot_io_ok = vec![true; n];
         let mut io_ops_count = 0u64;
 
+        // Stripe-batch full groups of `stripe` packed slots (each slot is
+        // exactly one block) into one stripe-aligned extent → a single zero-RMW
+        // full-stripe LV3 write. Reassign each member's PBA to its stripe
+        // sub-PBA and free the packer's original per-slot PBA (uncommitted, so a
+        // direct free is safe and it was never in the candidate cache). Leftover
+        // slots (a partial final group, or a non-stripe backend) keep their own
+        // PBA and the legacy per-slot path. On IO failure the whole stripe is
+        // rolled back once; the member slots retry (re-allocating a fresh PBA).
+        let stripe = io_engine.stripe_blocks();
+        let phase = io_engine.stripe_phase();
+        // group_of[i] = the stripe group slot i belongs to (else None = per-slot).
+        let mut group_of: Vec<Option<usize>> = vec![None; n];
+        let mut group_extents: Vec<Extent> = Vec::new();
+        let mut group_slots: Vec<Vec<usize>> = Vec::new();
+        if stripe > 1 {
+            let sw = stripe as usize;
+            let mut i = 0;
+            while i + sw <= n {
+                match allocator.allocate_stripe_extent_for_lane(shard_idx, stripe, stripe, phase) {
+                    Ok(ext) => {
+                        debug_assert_eq!(ext.count, stripe);
+                        let members: Vec<usize> = (i..i + sw).collect();
+                        for (j, &s) in members.iter().enumerate() {
+                            let old = sealed_slots[s].pba;
+                            sealed_slots[s].pba = Pba(ext.start.0 + j as u64);
+                            let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(
+                                allocator, old,
+                            );
+                            group_of[s] = Some(group_extents.len());
+                        }
+                        group_extents.push(ext);
+                        group_slots.push(members);
+                        i += sw;
+                    }
+                    // Near-full alignment fragmentation: stop grouping; the
+                    // remaining slots keep their packer PBAs (per-slot path).
+                    Err(_) => break,
+                }
+            }
+        }
+
         // The sealed PBA is private until metadata commit publishes
         // it, so the LV3 write runs without any lock here. The commit
         // worker re-takes lifecycle + L2P commit locks when it runs
@@ -333,14 +374,66 @@ impl BufferFlusher {
         let io_start = Instant::now();
         {
             use crate::io::engine::{LvOp, LvOpResult};
+            let bs = BLOCK_SIZE as usize;
+
+            // Assemble one contiguous stripe buffer per group (each member slot
+            // contributes its 4 KiB block at its stripe position). Held across
+            // the submit — the grouped `LvOp` borrows it.
+            let mut group_payloads: Vec<Vec<u8>> = Vec::with_capacity(group_slots.len());
+            for members in &group_slots {
+                let mut buf = vec![0u8; stripe as usize * bs];
+                for (j, &s) in members.iter().enumerate() {
+                    let data = sealed_slots[s].data.as_slice();
+                    buf[j * bs..j * bs + data.len()].copy_from_slice(data);
+                }
+                group_payloads.push(buf);
+            }
+
+            enum OpTarget {
+                Group(usize),
+                Slot(usize),
+            }
             let mut ops: Vec<LvOp> = Vec::with_capacity(n);
-            let mut op_to_slot: Vec<usize> = Vec::with_capacity(n);
-            for (i, sealed) in sealed_slots.iter().enumerate() {
+            let mut op_targets: Vec<OpTarget> = Vec::with_capacity(n);
+
+            // Full-stripe group ops.
+            for (gi, members) in group_slots.iter().enumerate() {
+                let inject = members.iter().find_map(|&s| {
+                    maybe_inject_test_failure_packed(
+                        &sealed_slots[s].fragments,
+                        FlushFailStage::BeforeIoWrite,
+                    )
+                    .err()
+                });
+                let ext = group_extents[gi];
+                if let Some(e) = inject {
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, ext);
+                    for &s in members {
+                        slot_io_ok[s] = false;
+                    }
+                    tracing::error!(error = %e, "writer: packed full-stripe group injected IO write failure");
+                    continue;
+                }
+                allocator.wait_for_readers(ext.start, stripe);
+                ops.push(LvOp::Write {
+                    pba: ext.start,
+                    payload: group_payloads[gi].as_slice(),
+                });
+                op_targets.push(OpTarget::Group(gi));
+            }
+
+            // Per-slot ops (leftover / ungrouped slots).
+            for i in 0..n {
+                if group_of[i].is_some() {
+                    continue;
+                }
+                let sealed = &sealed_slots[i];
                 if let Err(e) = maybe_inject_test_failure_packed(
                     &sealed.fragments,
                     FlushFailStage::BeforeIoWrite,
                 ) {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
+                    let _ =
+                        crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
                     slot_io_ok[i] = false;
                     tracing::error!(
                         pba = sealed.pba.0,
@@ -354,29 +447,62 @@ impl BufferFlusher {
                     pba: sealed.pba,
                     payload: sealed.data.as_slice(),
                 });
-                op_to_slot.push(i);
+                op_targets.push(OpTarget::Slot(i));
             }
+
             if !ops.is_empty() {
                 io_ops_count = ops.len() as u64;
                 match io_engine.submit_batch_on(write_session, ops, false) {
                     Ok(write_results) => {
                         for (idx, r) in write_results.into_iter().enumerate() {
-                            let slot_idx = op_to_slot[idx];
                             if let LvOpResult::Write(Err(e)) = r {
-                                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed_slots[slot_idx].pba);
-                                slot_io_ok[slot_idx] = false;
-                                tracing::error!(
-                                    pba = sealed_slots[slot_idx].pba.0,
-                                    error = %e,
-                                    "writer: packed-slot batch IO write failed"
-                                );
+                                match op_targets[idx] {
+                                    OpTarget::Group(gi) => {
+                                        let _ = crate::space::pba_lifecycle::rollback_uncommitted(
+                                            allocator,
+                                            group_extents[gi],
+                                        );
+                                        for &s in &group_slots[gi] {
+                                            slot_io_ok[s] = false;
+                                        }
+                                        tracing::error!(error = %e, "writer: packed full-stripe group IO write failed");
+                                    }
+                                    OpTarget::Slot(i) => {
+                                        let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(
+                                            allocator,
+                                            sealed_slots[i].pba,
+                                        );
+                                        slot_io_ok[i] = false;
+                                        tracing::error!(
+                                            pba = sealed_slots[i].pba.0,
+                                            error = %e,
+                                            "writer: packed-slot batch IO write failed"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
                     Err(e) => {
-                        for &slot_idx in &op_to_slot {
-                            let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed_slots[slot_idx].pba);
-                            slot_io_ok[slot_idx] = false;
+                        for t in &op_targets {
+                            match *t {
+                                OpTarget::Group(gi) => {
+                                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(
+                                        allocator,
+                                        group_extents[gi],
+                                    );
+                                    for &s in &group_slots[gi] {
+                                        slot_io_ok[s] = false;
+                                    }
+                                }
+                                OpTarget::Slot(i) => {
+                                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(
+                                        allocator,
+                                        sealed_slots[i].pba,
+                                    );
+                                    slot_io_ok[i] = false;
+                                }
+                            }
                         }
                         tracing::error!(
                             error = %e,

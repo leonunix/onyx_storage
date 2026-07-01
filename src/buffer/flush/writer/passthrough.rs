@@ -1,5 +1,70 @@
 use super::*;
 
+/// Greedily pack unit indices into full-RAID-stripe bins for the zero-RMW
+/// full-stripe write path. `blocks_per_unit[i]` is unit `i`'s block count;
+/// `stripe` is the RAID stripe width in blocks (`io_engine.stripe_blocks()`,
+/// 1 = no stripe). Returns `(groups, leftover)` where each group is a set of
+/// unit indices whose block counts sum to **exactly** `stripe`, and `leftover`
+/// is every other index (to take the per-unit path).
+///
+/// Only strictly-sub-stripe units (`1..stripe`) are packing candidates: a unit
+/// that is already a whole stripe multiple (`>= stripe`) either aligns on its
+/// own via [`BufferFlusher::alloc_passthrough`] or stays unaligned — we never
+/// split a unit across a stripe boundary. First-fit-decreasing (largest block
+/// count first, index tie-break) maximises exact fills while staying pure and
+/// deterministic, so it is unit-testable in isolation and never touches the
+/// allocator. Bins that do not fill exactly to `stripe` dissolve back into
+/// `leftover` (v1 does not pad or carry a partial bin across writer batches).
+fn plan_stripe_groups(blocks_per_unit: &[u32], stripe: u32) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let n = blocks_per_unit.len();
+    if stripe <= 1 {
+        return (Vec::new(), (0..n).collect());
+    }
+
+    // Candidates = strictly-sub-stripe units, largest-first for exact fills.
+    let mut candidates: Vec<usize> = (0..n)
+        .filter(|&i| blocks_per_unit[i] >= 1 && blocks_per_unit[i] < stripe)
+        .collect();
+    candidates.sort_by(|&a, &b| blocks_per_unit[b].cmp(&blocks_per_unit[a]).then(a.cmp(&b)));
+
+    // Open bins: (remaining_capacity, members). First-fit placement.
+    let mut bins: Vec<(u32, Vec<usize>)> = Vec::new();
+    for idx in candidates {
+        let b = blocks_per_unit[idx];
+        let mut placed = false;
+        for bin in bins.iter_mut() {
+            if bin.0 >= b {
+                bin.0 -= b;
+                bin.1.push(idx);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            bins.push((stripe - b, vec![idx]));
+        }
+    }
+
+    // Exactly-full bins become groups; partial bins dissolve to leftover.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut leftover: Vec<usize> = Vec::new();
+    for (rem, members) in bins {
+        if rem == 0 {
+            groups.push(members);
+        } else {
+            leftover.extend(members);
+        }
+    }
+    // Non-candidates (0 blocks, or whole stripe multiples / oversize) are leftover.
+    for i in 0..n {
+        if blocks_per_unit[i] == 0 || blocks_per_unit[i] >= stripe {
+            leftover.push(i);
+        }
+    }
+    leftover.sort_unstable();
+    (groups, leftover)
+}
+
 impl BufferFlusher {
     /// Legacy single-unit write path. NOT the steady-state hot path — that runs
     /// through the commit-worker pipeline (`write_units_batch` →
@@ -337,6 +402,17 @@ impl BufferFlusher {
         }
     }
 
+    /// Direct-free an uncommitted per-unit reservation (rollback / IO-failure
+    /// path). The PBA never entered metadb, so a direct free is safe. `blocks`
+    /// picks the single-block vs extent free form.
+    fn rollback_unit_alloc(allocator: &SpaceAllocator, pba: Pba, blocks: u32) {
+        if blocks == 1 {
+            let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
+        } else {
+            let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blocks));
+        }
+    }
+
     /// Batch a passthrough cycle and hand it off to the per-volume
     /// commit workers. Phase 1 of the per-volume commit architecture:
     /// the shard writer does alloc + LV3 IO synchronously (so PBA
@@ -384,26 +460,86 @@ impl BufferFlusher {
         let mut alloc_blocks: Vec<u32> = vec![0; n];
         let mut io_ops_count = 0u64;
 
-        // Phase A: alloc PBAs. Stripe-multiple units get a stripe-aligned extent
-        // (→ full-stripe write on a chunklet RAID5/6 backend); everything else
-        // keeps the legacy unaligned path. `stripe`/`phase` come from the LV3
-        // backend geometry (1/0 = no stripe, so this is a no-op off-chunklet or
-        // with the `raid_full_stripe_writes` flag off). alloc_blocks[i] stays ==
-        // blocks_needed (the aligned path never pads), so reclaim frees exactly
-        // what was reserved.
+        // Phase A: alloc PBAs. `stripe`/`phase` come from the LV3 backend
+        // geometry (1/0 = no stripe → off-chunklet or `raid_full_stripe_writes`
+        // off, so grouping is empty and every unit takes the legacy path).
+        //
+        // Sub-stripe units are bin-packed into full RAID stripes: each group
+        // reserves ONE stripe-aligned extent and is written as a single
+        // zero-RMW full-stripe LV3 write, but each member keeps its own
+        // block-granular mapping at a distinct sub-PBA (slot_offset stays 0),
+        // so read/free are unchanged. Stripe-multiple / oversize / partial-bin
+        // units fall through to the per-unit `alloc_passthrough` (which aligns
+        // whole-stripe-multiple units on its own). `alloc_blocks[i]` always ==
+        // the unit's block count, so reclaim frees exactly what was reserved.
         let stripe = io_engine.stripe_blocks();
         let phase = io_engine.stripe_phase();
         let alloc_start = Instant::now();
-        for (i, unit) in units.iter().enumerate() {
-            let bs = BLOCK_SIZE as usize;
-            let blocks_needed = ((unit.compressed_data.len() + bs - 1) / bs) as u32;
-            alloc_blocks[i] = blocks_needed;
-            match Self::alloc_passthrough(allocator, shard_idx, blocks_needed, stripe, phase) {
+        let bs = BLOCK_SIZE as usize;
+        let blocks_per_unit: Vec<u32> = units
+            .iter()
+            .map(|u| ((u.compressed_data.len() + bs - 1) / bs) as u32)
+            .collect();
+        for i in 0..n {
+            alloc_blocks[i] = blocks_per_unit[i];
+        }
+
+        let (groups, leftover) = plan_stripe_groups(&blocks_per_unit, stripe);
+        // group_extents[gi] = Some(ext) when the stripe extent was reserved;
+        // None means the group degraded to the per-unit path (alignment
+        // fragmentation near-full) and its members were allocated individually.
+        let mut group_extents: Vec<Option<Extent>> = Vec::with_capacity(groups.len());
+        // group_of[i] = the group unit i belongs to (meaningful only when that
+        // group's extent is Some — i.e. it wrote as a real full stripe).
+        let mut group_of: Vec<Option<usize>> = vec![None; n];
+
+        for (gi, members) in groups.iter().enumerate() {
+            match allocator.allocate_stripe_extent_for_lane(shard_idx, stripe, stripe, phase) {
+                Ok(ext) => {
+                    debug_assert_eq!(ext.count, stripe, "stripe extent must be one stripe wide");
+                    let mut off = 0u64;
+                    for &m in members {
+                        pbas[m] = Some(Pba(ext.start.0 + off));
+                        group_of[m] = Some(gi);
+                        off += blocks_per_unit[m] as u64;
+                    }
+                    debug_assert_eq!(off, stripe as u64, "members must fill the stripe exactly");
+                    group_extents.push(Some(ext));
+                }
+                Err(_) => {
+                    // Alignment fragmentation near-full: degrade to per-unit so
+                    // IO keeps flowing (these units just miss the full stripe).
+                    group_extents.push(None);
+                    for &m in members {
+                        match Self::alloc_passthrough(
+                            allocator,
+                            shard_idx,
+                            blocks_per_unit[m],
+                            stripe,
+                            phase,
+                        ) {
+                            Ok(pba) => pbas[m] = Some(pba),
+                            Err(e) => {
+                                tracing::error!(
+                                    vol = %units[m].vol_id,
+                                    start_lba = units[m].start_lba.0,
+                                    error = %e,
+                                    "writer: passthrough alloc failed (degraded group)"
+                                );
+                                failed[m] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for &i in &leftover {
+            match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[i], stripe, phase) {
                 Ok(pba) => pbas[i] = Some(pba),
                 Err(e) => {
                     tracing::error!(
-                        vol = %unit.vol_id,
-                        start_lba = unit.start_lba.0,
+                        vol = %units[i].vol_id,
+                        start_lba = units[i].start_lba.0,
                         error = %e,
                         "writer: passthrough alloc failed"
                     );
@@ -420,10 +556,75 @@ impl BufferFlusher {
         let io_start = Instant::now();
         {
             use crate::io::engine::{LvOp, LvOpResult};
+
+            // Assemble one contiguous stripe buffer per reserved group. Each
+            // member's compressed payload is copied to its block-aligned
+            // sub-offset; the tail padding inside each member's last block stays
+            // zero (the reader slices by `unit_compressed_size`). Held alive in
+            // `group_payloads` across the submit — the grouped `LvOp` borrows it.
+            let mut group_payloads: Vec<Vec<u8>> = Vec::with_capacity(groups.len());
+            for (gi, members) in groups.iter().enumerate() {
+                if group_extents[gi].is_none() {
+                    group_payloads.push(Vec::new());
+                    continue;
+                }
+                let mut buf = vec![0u8; stripe as usize * bs];
+                let mut off_blocks = 0usize;
+                for &m in members {
+                    let data = units[m].compressed_data.as_slice();
+                    let start = off_blocks * bs;
+                    buf[start..start + data.len()].copy_from_slice(data);
+                    off_blocks += alloc_blocks[m] as usize;
+                }
+                group_payloads.push(buf);
+            }
+
+            enum OpTarget {
+                Group(usize),
+                Unit(usize),
+            }
             let mut ops: Vec<LvOp> = Vec::with_capacity(n);
-            let mut op_to_unit: Vec<usize> = Vec::with_capacity(n);
+            let mut op_targets: Vec<OpTarget> = Vec::with_capacity(n);
+
+            // Full-stripe group ops: one `LvOp::Write` covers the whole 24 KiB
+            // stripe → chunklet takes its zero-RMW full-stripe path.
+            for (gi, members) in groups.iter().enumerate() {
+                if group_extents[gi].is_none() {
+                    continue;
+                }
+                // Fail the whole group if ANY member hits the injected failpoint.
+                let inject = members.iter().find_map(|&m| {
+                    maybe_inject_test_failure(
+                        &units[m].vol_id,
+                        units[m].start_lba,
+                        FlushFailStage::BeforeIoWrite,
+                    )
+                    .err()
+                });
+                let ext = group_extents[gi].unwrap();
+                if let Some(e) = inject {
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, ext);
+                    for &m in members {
+                        failed[m] = true;
+                    }
+                    tracing::error!(error = %e, group = gi, "writer: full-stripe group injected IO write failure");
+                    continue;
+                }
+                allocator.wait_for_readers(ext.start, stripe);
+                ops.push(LvOp::Write {
+                    pba: ext.start,
+                    payload: group_payloads[gi].as_slice(),
+                });
+                op_targets.push(OpTarget::Group(gi));
+            }
+
+            // Per-unit ops: leftover units + degraded-group members.
             for i in 0..n {
-                if failed[i] {
+                if failed[i] || pbas[i].is_none() {
+                    continue;
+                }
+                // Skip units already covered by a reserved full-stripe group.
+                if group_of[i].is_some_and(|gi| group_extents[gi].is_some()) {
                     continue;
                 }
                 if let Err(e) = maybe_inject_test_failure(
@@ -431,13 +632,7 @@ impl BufferFlusher {
                     units[i].start_lba,
                     FlushFailStage::BeforeIoWrite,
                 ) {
-                    let pba = pbas[i].unwrap();
-                    let blk = alloc_blocks[i];
-                    if blk == 1 {
-                        let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
-                    } else {
-                        let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blk));
-                    }
+                    Self::rollback_unit_alloc(allocator, pbas[i].unwrap(), alloc_blocks[i]);
                     failed[i] = true;
                     tracing::error!(
                         vol = units[i].vol_id,
@@ -452,45 +647,67 @@ impl BufferFlusher {
                     pba: pbas[i].unwrap(),
                     payload: units[i].compressed_data.as_slice(),
                 });
-                op_to_unit.push(i);
+                op_targets.push(OpTarget::Unit(i));
             }
+
             if !ops.is_empty() {
                 io_ops_count = ops.len() as u64;
                 match io_engine.submit_batch_on(write_session, ops, false) {
                     Ok(write_results) => {
                         for (idx, r) in write_results.into_iter().enumerate() {
-                            let unit_idx = op_to_unit[idx];
                             if let LvOpResult::Write(Err(e)) = r {
-                                let pba = pbas[unit_idx].unwrap();
-                                let blk = alloc_blocks[unit_idx];
-                                if blk == 1 {
-                                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
-                                } else {
-                                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blk));
+                                match op_targets[idx] {
+                                    OpTarget::Group(gi) => {
+                                        let ext = group_extents[gi].unwrap();
+                                        let _ = crate::space::pba_lifecycle::rollback_uncommitted(
+                                            allocator, ext,
+                                        );
+                                        for &m in &groups[gi] {
+                                            failed[m] = true;
+                                        }
+                                        tracing::error!(error = %e, group = gi, "writer: full-stripe group IO write failed");
+                                    }
+                                    OpTarget::Unit(i) => {
+                                        Self::rollback_unit_alloc(
+                                            allocator,
+                                            pbas[i].unwrap(),
+                                            alloc_blocks[i],
+                                        );
+                                        failed[i] = true;
+                                        tracing::error!(
+                                            vol = units[i].vol_id,
+                                            start_lba = units[i].start_lba.0,
+                                            error = %e,
+                                            "writer: passthrough IO write failed"
+                                        );
+                                    }
                                 }
-                                failed[unit_idx] = true;
-                                tracing::error!(
-                                    vol = units[unit_idx].vol_id,
-                                    start_lba = units[unit_idx].start_lba.0,
-                                    error = %e,
-                                    "writer: passthrough IO write failed"
-                                );
                             }
                         }
                     }
                     Err(e) => {
-                        for &unit_idx in &op_to_unit {
-                            if failed[unit_idx] {
-                                continue;
+                        for t in &op_targets {
+                            match *t {
+                                OpTarget::Group(gi) => {
+                                    let ext = group_extents[gi].unwrap();
+                                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(
+                                        allocator, ext,
+                                    );
+                                    for &m in &groups[gi] {
+                                        failed[m] = true;
+                                    }
+                                }
+                                OpTarget::Unit(i) => {
+                                    if !failed[i] {
+                                        Self::rollback_unit_alloc(
+                                            allocator,
+                                            pbas[i].unwrap(),
+                                            alloc_blocks[i],
+                                        );
+                                        failed[i] = true;
+                                    }
+                                }
                             }
-                            let pba = pbas[unit_idx].unwrap();
-                            let blk = alloc_blocks[unit_idx];
-                            if blk == 1 {
-                                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
-                            } else {
-                                let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blk));
-                            }
-                            failed[unit_idx] = true;
                         }
                         tracing::error!(error = %e, "writer: passthrough IO batch submit failed");
                     }
@@ -622,5 +839,105 @@ impl BufferFlusher {
                 "writer: slow passthrough batch (>=1s) — IO + dispatch only"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stripe_group_tests {
+    use super::plan_stripe_groups;
+
+    /// Total blocks covered by all groups must equal `groups * stripe`, and
+    /// group members + leftover must partition `0..n` exactly once.
+    fn assert_partition(blocks: &[u32], stripe: u32) {
+        let (groups, leftover) = plan_stripe_groups(blocks, stripe);
+        let mut seen = vec![false; blocks.len()];
+        for g in &groups {
+            let sum: u32 = g.iter().map(|&i| blocks[i]).sum();
+            assert_eq!(sum, stripe, "group {g:?} must sum to stripe {stripe}");
+            for &i in g {
+                assert!(!seen[i], "index {i} in two places");
+                seen[i] = true;
+            }
+        }
+        for &i in &leftover {
+            assert!(!seen[i], "index {i} in group and leftover");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every index placed once");
+    }
+
+    #[test]
+    fn exact_fills_form_one_group() {
+        // Each of these sums to exactly one 6-block stripe.
+        for blocks in [
+            vec![2, 2, 2],
+            vec![3, 3],
+            vec![1, 2, 3],
+            vec![4, 2],
+            vec![5, 1],
+            vec![1, 1, 1, 1, 1, 1],
+        ] {
+            let (groups, leftover) = plan_stripe_groups(&blocks, 6);
+            assert_eq!(groups.len(), 1, "{blocks:?} → exactly one full stripe");
+            assert!(leftover.is_empty(), "{blocks:?} → no leftover");
+            assert_partition(&blocks, 6);
+        }
+    }
+
+    #[test]
+    fn partial_bin_dissolves_to_leftover() {
+        // 3 + 2 = 5 < 6 → cannot fill a stripe → both leftover, no group.
+        let (groups, leftover) = plan_stripe_groups(&[3, 2], 6);
+        assert!(groups.is_empty());
+        assert_eq!(leftover, vec![0, 1]);
+    }
+
+    #[test]
+    fn whole_stripe_multiple_and_oversize_are_leftover() {
+        // 6 = one stripe on its own (alloc_passthrough aligns it); 7 > stripe,
+        // not a multiple → per-unit path. Neither is a packing candidate.
+        let (groups, leftover) = plan_stripe_groups(&[6, 7, 12], 6);
+        assert!(groups.is_empty());
+        assert_eq!(leftover, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn twelve_ones_form_two_stripes() {
+        let blocks = vec![1u32; 12];
+        let (groups, leftover) = plan_stripe_groups(&blocks, 6);
+        assert_eq!(groups.len(), 2);
+        assert!(leftover.is_empty());
+        assert_partition(&blocks, 6);
+    }
+
+    #[test]
+    fn mixed_batch_is_deterministic_and_partitions() {
+        // 3,3,2,2,5,1 (blocks) + a lone 4 that can't be completed.
+        let blocks = vec![3, 3, 2, 2, 5, 1, 4];
+        let (g1, l1) = plan_stripe_groups(&blocks, 6);
+        let (g2, l2) = plan_stripe_groups(&blocks, 6);
+        assert_eq!(g1, g2, "pure + deterministic");
+        assert_eq!(l1, l2);
+        assert_partition(&blocks, 6);
+        // FFD order 5,4,3,3,2,2,1 → stripes 5+1, 4+2, 3+3 (three full); the
+        // last 2-block (idx 3) has no partner left → leftover.
+        assert_eq!(g1.len(), 3);
+        assert_eq!(l1, vec![3]);
+    }
+
+    #[test]
+    fn stripe_one_is_all_leftover() {
+        let blocks = vec![1, 2, 3];
+        let (groups, leftover) = plan_stripe_groups(&blocks, 1);
+        assert!(groups.is_empty());
+        assert_eq!(leftover, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn empty_units_pass_through() {
+        // 0-block units are never candidates and always land in leftover.
+        let (groups, leftover) = plan_stripe_groups(&[0, 0], 6);
+        assert!(groups.is_empty());
+        assert_eq!(leftover, vec![0, 1]);
     }
 }
