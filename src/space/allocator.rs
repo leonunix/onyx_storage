@@ -69,6 +69,14 @@ impl SpaceAllocator {
         Self::new_with_hazards(device_size_bytes, num_lanes)
     }
 
+    /// `device_size_bytes` is the IO-ADDRESSABLE capacity, NOT the raw device
+    /// size: production callers pass `device.size() - RESERVED_BLOCKS *
+    /// BLOCK_SIZE` (see `OnyxEngine`), because the `IoEngine` translates
+    /// allocator PBA `p` to device block `p + RESERVED_BLOCKS` (its
+    /// `pba_offset`). Passing the raw device size here would let the top
+    /// RESERVED_BLOCKS PBAs write past the device end (chunklet "IO out of
+    /// range: offset == capacity"). The bottom RESERVED_BLOCKS reserved below is
+    /// the superblock / heartbeat / HA-lock region in the allocator's own space.
     pub fn new_with_hazards(device_size_bytes: u64, num_lanes: usize) -> Self {
         let total_blocks = device_size_bytes / BLOCK_SIZE as u64;
         let usable_blocks = total_blocks.saturating_sub(RESERVED_BLOCKS);
@@ -2003,6 +2011,55 @@ mod stripe_align_tests {
         assert_eq!(SpaceAllocator::round_up_blocks(7, 6), 12);
         assert_eq!(SpaceAllocator::round_up_blocks(12, 6), 12);
         assert_eq!(SpaceAllocator::round_up_blocks(4, 1), 4);
+    }
+
+    #[test]
+    fn io_addressable_capacity_reserves_top_for_offset() {
+        // The IoEngine writes allocator PBA `p` at device block `p +
+        // RESERVED_BLOCKS`. Production builds the allocator with the
+        // io-ADDRESSABLE capacity (`phys - RESERVED_BLOCKS` blocks) so the top
+        // RESERVED_BLOCKS physical blocks are never targeted. Draining the whole
+        // free list must never yield a PBA whose written device block reaches
+        // `phys_blocks`. Regression for the chunklet "Raid6 IO out of range:
+        // offset == capacity" flush failure.
+        let phys_blocks = 64u64;
+        let io_addressable = new_alloc_lanes(phys_blocks - RESERVED_BLOCKS, 1);
+        let mut max_pba = 0u64;
+        while let Ok(pba) = io_addressable.allocate_one_for_lane(0) {
+            assert!(
+                pba.0 + RESERVED_BLOCKS < phys_blocks,
+                "PBA {} + offset {} must stay below physical capacity {}",
+                pba.0,
+                RESERVED_BLOCKS,
+                phys_blocks
+            );
+            max_pba = max_pba.max(pba.0);
+        }
+        assert_eq!(max_pba, phys_blocks - RESERVED_BLOCKS - 1, "top usable PBA");
+    }
+
+    #[test]
+    fn stripe_extent_at_boundary_stays_in_capacity() {
+        // A near-full stripe allocation must never return an extent whose top
+        // block (+ offset) exceeds the physical device — the whole 24 KiB
+        // full-stripe write must land inside it. Build with the io-addressable
+        // capacity like production does.
+        let phys_blocks = 6 * 20 + 2 * RESERVED_BLOCKS; // room for ~20 stripes
+        let alloc = new_alloc_lanes(phys_blocks - RESERVED_BLOCKS, 1);
+        let mut got = 0;
+        while let Ok(ext) = alloc.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE) {
+            assert!(
+                ext.start.0 + ext.count as u64 + RESERVED_BLOCKS <= phys_blocks,
+                "stripe [{}, {}) + offset {} exceeds physical capacity {}",
+                ext.start.0,
+                ext.start.0 + ext.count as u64,
+                RESERVED_BLOCKS,
+                phys_blocks
+            );
+            assert_eq!((ext.start.0 + RESERVED_BLOCKS) % STRIPE as u64, 0, "device-aligned");
+            got += 1;
+        }
+        assert!(got > 0, "should allocate at least one boundary stripe");
     }
 
     #[test]

@@ -702,8 +702,15 @@ impl OnyxEngine {
         let io_engine = Self::build_io_engine(device.clone(), &config.storage, metrics.clone())?;
 
         // 3. Space allocator
+        // The allocator addresses PBAs through the IoEngine's `pba_offset`
+        // (= RESERVED_BLOCKS): device block = pba + pba_offset. So it must be
+        // built with the io-ADDRESSABLE capacity (raw device minus the reserved
+        // offset), not the raw device size — otherwise the top RESERVED_BLOCKS
+        // PBAs would translate past the device end and a boundary write (esp. a
+        // multi-block full-stripe write) fails with chunklet "IO out of range".
         let allocator = Arc::new(SpaceAllocator::new_with_hazards(
-            device_size,
+            device_size
+                .saturating_sub(crate::types::RESERVED_BLOCKS * crate::types::BLOCK_SIZE as u64),
             config.buffer.shards,
         ));
         allocator.rebuild_from_metadata(&meta)?;
@@ -1510,8 +1517,15 @@ impl OnyxEngine {
         let io_engine = Self::build_io_engine(device.clone(), &config.storage, metrics.clone())?;
 
         // Space allocator
+        // The allocator addresses PBAs through the IoEngine's `pba_offset`
+        // (= RESERVED_BLOCKS): device block = pba + pba_offset. So it must be
+        // built with the io-ADDRESSABLE capacity (raw device minus the reserved
+        // offset), not the raw device size — otherwise the top RESERVED_BLOCKS
+        // PBAs would translate past the device end and a boundary write (esp. a
+        // multi-block full-stripe write) fails with chunklet "IO out of range".
         let allocator = Arc::new(SpaceAllocator::new_with_hazards(
-            device_size,
+            device_size
+                .saturating_sub(crate::types::RESERVED_BLOCKS * crate::types::BLOCK_SIZE as u64),
             config.buffer.shards,
         ));
         allocator.rebuild_from_metadata(&meta)?;
