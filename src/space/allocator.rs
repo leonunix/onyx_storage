@@ -417,6 +417,202 @@ impl SpaceAllocator {
         Ok(result)
     }
 
+    /// Allocate a **stripe-aligned** contiguous extent for a flush lane.
+    ///
+    /// Returns an extent `e` with `(e.start.0 + phase) % stripe_blocks == 0` and
+    /// `e.count == round_up(data_blocks, stripe_blocks)` — a whole number of
+    /// full stripes whose *device* offset lands on a stripe boundary. The writer
+    /// pads the payload to `e.count` blocks, so a chunklet RAID5/6 backend sees a
+    /// full-stripe write and skips parity RMW. Only the `data_blocks` prefix is
+    /// L2P-referenced; the tail-pad blocks are freed with the unit (via the
+    /// caller's `alloc_blocks = e.count`) and never read.
+    ///
+    /// Alignment `phase` = `pba_offset % stripe_blocks` (device offset is
+    /// `(pba + pba_offset) * block_size`, so PBAs must align against the reserved
+    /// prefix, not 0 — see [`crate::io::IoEngine::stripe_phase`]).
+    ///
+    /// Stays lowest-address dense (first-fit). Alignment head/tail remainders go
+    /// back to the lane cache / free list — never leaked, never allocated-counted.
+    /// `stripe_blocks <= 1` degenerates to [`Self::allocate_extent_for_lane`] so
+    /// non-RAID backends (RawDevice, mirror, plain) are byte-for-byte unchanged.
+    pub fn allocate_stripe_extent_for_lane(
+        &self,
+        lane: usize,
+        data_blocks: u32,
+        stripe_blocks: u32,
+        phase: u32,
+    ) -> OnyxResult<Extent> {
+        if stripe_blocks <= 1 {
+            return self.allocate_extent_for_lane(lane, data_blocks);
+        }
+        if data_blocks == 0 {
+            return Err(OnyxError::Config("cannot allocate 0 blocks".into()));
+        }
+        let need = Self::round_up_blocks(data_blocks, stripe_blocks);
+        if lane >= self.lane_extent_caches.len() {
+            return self.allocate_stripe_extent_global(need, stripe_blocks, phase);
+        }
+
+        // Fast path: carve an aligned `need` out of an already-cached run. Once
+        // the cache is seeded with an aligned run, every tail it hands back is
+        // itself aligned (tail.start = aligned + need, need % stripe == 0), so
+        // steady-state carves have zero head pad.
+        {
+            let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+            if let Some(extent) =
+                Self::take_aligned_from_extent_cache(&mut cache, need, stripe_blocks, phase)
+            {
+                self.track_alloc(extent, "allocate_stripe_extent_for_lane_cache")?;
+                self.allocated_blocks.fetch_add(need as u64, Ordering::Relaxed);
+                self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
+                return Ok(extent);
+            }
+        }
+
+        // Refill: pull one run big enough to host `need` after worst-case head
+        // alignment (`need + stripe - 1`), sized to the normal lane refill. Push
+        // it into the cache and carve through the same remainder-handling path.
+        let floor = need + stripe_blocks - 1;
+        let want = LANE_EXTENT_CACHE_REFILL_BLOCKS.max(floor);
+        let refill = self
+            .take_extent_from_global_at_least(floor, want)
+            .or_else(|| {
+                self.drain_lane_caches();
+                self.take_extent_from_global_at_least(floor, want)
+            });
+        let Some(refill) = refill else {
+            // No run wide enough for a padded stripe; try any run that can host
+            // an aligned `need` exactly (a tight but aligned fragment).
+            return self.allocate_stripe_extent_global(need, stripe_blocks, phase);
+        };
+        let extent = {
+            let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+            cache.push(refill);
+            Self::take_aligned_from_extent_cache(&mut cache, need, stripe_blocks, phase)
+                .expect("refill run of need+stripe-1 always hosts an aligned need")
+        };
+        self.track_alloc(extent, "allocate_stripe_extent_for_lane_refill")?;
+        self.allocated_blocks.fetch_add(need as u64, Ordering::Relaxed);
+        self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
+        Ok(extent)
+    }
+
+    /// Smallest multiple of `stripe` that is `>= data` (`stripe <= 1` → `data`).
+    fn round_up_blocks(data: u32, stripe: u32) -> u32 {
+        if stripe <= 1 {
+            return data;
+        }
+        data.div_ceil(stripe) * stripe
+    }
+
+    /// Smallest PBA `>= from` with `(pba + phase) % stripe == 0`.
+    fn align_up_pba(from: u64, stripe: u64, phase: u64) -> u64 {
+        if stripe <= 1 {
+            return from;
+        }
+        let r = (from + phase) % stripe;
+        if r == 0 {
+            from
+        } else {
+            from + (stripe - r)
+        }
+    }
+
+    /// Carve a stripe-aligned `need`-block extent out of a contiguous `run`.
+    /// `need` MUST already be a multiple of `stripe`. Returns
+    /// `(aligned, head_pad, tail)` — head_pad = blocks below the aligned start,
+    /// tail = blocks above `aligned + need` — or `None` if `run` can't host an
+    /// aligned `need`.
+    fn carve_aligned_from_run(
+        run: Extent,
+        need: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<(Extent, Option<Extent>, Option<Extent>)> {
+        let aligned_start = Self::align_up_pba(run.start.0, stripe as u64, phase as u64);
+        let run_end = run.start.0 + run.count as u64;
+        if aligned_start + need as u64 > run_end {
+            return None;
+        }
+        let aligned = Extent::new(Pba(aligned_start), need);
+        let head = aligned_start - run.start.0;
+        let head_pad = (head > 0).then(|| Extent::new(run.start, head as u32));
+        let tail_start = aligned_start + need as u64;
+        let tail = (tail_start < run_end)
+            .then(|| Extent::new(Pba(tail_start), (run_end - tail_start) as u32));
+        Some((aligned, head_pad, tail))
+    }
+
+    /// Carve a stripe-aligned `need` from the first cached run that can host it,
+    /// pushing head/tail remainders back into the cache. Head is only non-empty
+    /// when a non-aligned run (e.g. a rest pushed by `allocate_extent_for_lane`)
+    /// is the only candidate; it stays lane-local for a later non-stripe alloc.
+    fn take_aligned_from_extent_cache(
+        cache: &mut Vec<Extent>,
+        need: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<Extent> {
+        for idx in 0..cache.len() {
+            if let Some((aligned, head, tail)) =
+                Self::carve_aligned_from_run(cache[idx], need, stripe, phase)
+            {
+                cache.swap_remove(idx);
+                if let Some(head) = head {
+                    cache.push(head);
+                }
+                if let Some(tail) = tail {
+                    cache.push(tail);
+                }
+                return Some(aligned);
+            }
+        }
+        None
+    }
+
+    /// Last-ditch stripe-aligned allocation straight from the global free list
+    /// (no lane cache). Picks the lowest-address run that can host an aligned
+    /// `need`, re-inserts head + tail as free. Returns `SpaceExhausted` rather
+    /// than a misaligned/short extent — the writer falls back to an unaligned
+    /// block-padded write so IO never stalls on alignment fragmentation.
+    fn allocate_stripe_extent_global(
+        &self,
+        need: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> OnyxResult<Extent> {
+        for attempt in 0..2 {
+            let mut free = self.free_extents.lock().unwrap();
+            let chosen = free
+                .iter()
+                .find(|e| Self::carve_aligned_from_run(**e, need, stripe, phase).is_some())
+                .copied();
+            if let Some(run) = chosen {
+                free.remove(&run);
+                let (aligned, head, tail) =
+                    Self::carve_aligned_from_run(run, need, stripe, phase).unwrap();
+                if let Some(head) = head {
+                    Self::coalesce_and_insert(&mut free, head);
+                }
+                if let Some(tail) = tail {
+                    Self::coalesce_and_insert(&mut free, tail);
+                }
+                drop(free);
+                self.track_alloc(aligned, "allocate_stripe_extent_global")?;
+                self.allocated_blocks.fetch_add(need as u64, Ordering::Relaxed);
+                self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
+                return Ok(aligned);
+            }
+            drop(free);
+            if attempt == 0 && self.has_lane_cached_blocks() {
+                self.drain_lane_caches();
+                continue;
+            }
+            break;
+        }
+        Err(OnyxError::SpaceExhausted)
+    }
+
     /// Allocate up to `count` contiguous blocks. Returns the extent actually allocated
     /// (may be smaller than requested if no large enough contiguous region exists).
     pub fn allocate_extent(&self, count: u32) -> OnyxResult<Extent> {
@@ -1158,6 +1354,14 @@ impl SpaceAllocator {
         self.total_blocks
     }
 
+    /// Number of distinct runs in the global free set. Test-only: the stripe
+    /// density guard asserts this stays O(1) under repeated aligned allocation
+    /// (alignment pads must not fragment the free list into per-alloc slivers).
+    #[cfg(test)]
+    pub(crate) fn free_extent_run_count(&self) -> usize {
+        self.free_extents.lock().unwrap().len()
+    }
+
     /// Insert an extent and merge with adjacent free extents.
     fn coalesce_and_insert(free: &mut BTreeSet<Extent>, new: Extent) {
         let mut merged_start = new.start.0;
@@ -1759,5 +1963,150 @@ mod age_tests {
         assert!(failed.is_empty());
         assert_eq!(a.retired_block_count(), count as u64);
         assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+}
+
+#[cfg(test)]
+mod stripe_align_tests {
+    //! RAID6 full-stripe-aligned allocation: `(pba + phase) % stripe == 0`,
+    //! length a whole number of stripes, lowest-address dense, no free-list
+    //! bloat, and `stripe <= 1` identical to the plain path.
+    use super::*;
+
+    // 6+2 RAID6 at a 4 KiB strip = 6-block stripe; RESERVED_BLOCKS=8 => phase 2.
+    const STRIPE: u32 = 6;
+    const PHASE: u32 = (RESERVED_BLOCKS % STRIPE as u64) as u32;
+
+    fn new_alloc_lanes(blocks: u64, lanes: usize) -> SpaceAllocator {
+        SpaceAllocator::new(blocks * BLOCK_SIZE as u64, lanes)
+    }
+
+    #[test]
+    fn align_up_pba_table() {
+        // phase 2: aligned pbas satisfy (pba+2)%6==0 => pba in {4,10,16,22,...}
+        assert_eq!(SpaceAllocator::align_up_pba(8, 6, 2), 10);
+        assert_eq!(SpaceAllocator::align_up_pba(11, 6, 2), 16);
+        assert_eq!(SpaceAllocator::align_up_pba(4, 6, 2), 4); // already aligned
+        assert_eq!(SpaceAllocator::align_up_pba(10, 6, 2), 10);
+        assert_eq!(SpaceAllocator::align_up_pba(5, 6, 2), 10);
+        // phase 0: multiples of stripe
+        assert_eq!(SpaceAllocator::align_up_pba(7, 6, 0), 12);
+        assert_eq!(SpaceAllocator::align_up_pba(12, 6, 0), 12);
+        // stripe<=1 is identity
+        assert_eq!(SpaceAllocator::align_up_pba(13, 1, 0), 13);
+    }
+
+    #[test]
+    fn round_up_blocks_table() {
+        assert_eq!(SpaceAllocator::round_up_blocks(1, 6), 6);
+        assert_eq!(SpaceAllocator::round_up_blocks(6, 6), 6);
+        assert_eq!(SpaceAllocator::round_up_blocks(7, 6), 12);
+        assert_eq!(SpaceAllocator::round_up_blocks(12, 6), 12);
+        assert_eq!(SpaceAllocator::round_up_blocks(4, 1), 4);
+    }
+
+    #[test]
+    fn carve_aligned_from_run_shapes() {
+        // run [8, 8+16) need 6 phase 2 => aligned@10, head [8,2), tail [16, ..)
+        let run = Extent::new(Pba(8), 16);
+        let (aligned, head, tail) =
+            SpaceAllocator::carve_aligned_from_run(run, 6, STRIPE, PHASE).unwrap();
+        assert_eq!(aligned, Extent::new(Pba(10), 6));
+        assert_eq!(head, Some(Extent::new(Pba(8), 2)));
+        assert_eq!(tail, Some(Extent::new(Pba(16), 8)));
+        // exact aligned run: no head, no tail
+        let run = Extent::new(Pba(10), 6);
+        let (aligned, head, tail) =
+            SpaceAllocator::carve_aligned_from_run(run, 6, STRIPE, PHASE).unwrap();
+        assert_eq!(aligned, Extent::new(Pba(10), 6));
+        assert_eq!(head, None);
+        assert_eq!(tail, None);
+        // run too small to host aligned need
+        assert!(SpaceAllocator::carve_aligned_from_run(Extent::new(Pba(11), 6), 6, STRIPE, PHASE)
+            .is_none());
+    }
+
+    #[test]
+    fn lane_alloc_is_aligned_and_sized() {
+        let a = new_alloc_lanes(65_536, 4);
+        for data in [1u32, 4, 6, 7, 12] {
+            let e = a
+                .allocate_stripe_extent_for_lane(0, data, STRIPE, PHASE)
+                .unwrap();
+            assert_eq!(
+                (e.start.0 + PHASE as u64) % STRIPE as u64,
+                0,
+                "start {} not stripe-aligned",
+                e.start.0
+            );
+            let want = SpaceAllocator::round_up_blocks(data, STRIPE);
+            assert_eq!(e.count, want, "data={data} count");
+        }
+    }
+
+    #[test]
+    fn lane_allocs_are_dense_and_disjoint() {
+        let a = new_alloc_lanes(65_536, 4);
+        let mut seen: Vec<Extent> = Vec::new();
+        for _ in 0..500 {
+            let e = a
+                .allocate_stripe_extent_for_lane(1, 4, STRIPE, PHASE)
+                .unwrap();
+            assert_eq!(e.count, 6);
+            assert_eq!((e.start.0 + PHASE as u64) % STRIPE as u64, 0);
+            seen.push(e);
+        }
+        seen.sort_by_key(|e| e.start.0);
+        for w in seen.windows(2) {
+            assert!(
+                w[0].end_pba().0 <= w[1].start.0,
+                "overlap {:?} {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn density_guard_no_freelist_bloat() {
+        // 10k aligned allocs must NOT explode the free set into per-alloc
+        // slivers (that would blow the metadb L2P leaf unit budget). One lane
+        // seeded from one contiguous run => free runs stay O(1).
+        let a = new_alloc_lanes(1_000_000, 2);
+        for _ in 0..10_000 {
+            a.allocate_stripe_extent_for_lane(0, 4, STRIPE, PHASE).unwrap();
+        }
+        assert!(
+            a.free_extent_run_count() < 16,
+            "free set fragmented to {} runs",
+            a.free_extent_run_count()
+        );
+    }
+
+    #[test]
+    fn stripe_one_matches_plain_path() {
+        let a = new_alloc_lanes(4096, 2);
+        let e = a.allocate_stripe_extent_for_lane(0, 5, 1, 0).unwrap();
+        assert_eq!(e.count, 5, "stripe<=1 must not pad");
+    }
+
+    #[test]
+    fn padded_extent_frees_whole_stripe() {
+        let a = new_alloc_lanes(4096, 2);
+        let before = a.free_block_count();
+        let e = a.allocate_stripe_extent_for_lane(0, 4, STRIPE, PHASE).unwrap();
+        assert_eq!(e.count, 6);
+        assert_eq!(a.free_block_count(), before - 6);
+        a.free_extent(e).unwrap();
+        assert_eq!(a.free_block_count(), before, "whole padded stripe returns");
+    }
+
+    #[test]
+    fn global_path_aligns_without_lane() {
+        // lane index out of range forces the global (no-lane) path.
+        let a = new_alloc_lanes(4096, 0);
+        let e = a.allocate_stripe_extent_for_lane(0, 7, STRIPE, PHASE).unwrap();
+        assert_eq!(e.count, 12);
+        assert_eq!((e.start.0 + PHASE as u64) % STRIPE as u64, 0);
     }
 }

@@ -2,11 +2,12 @@
 # on chunklet LogicalDisks carved from ONE pool over the raw NVMe. metadb still
 # lives on its own XFS mount (Phase 3 will move it).
 #
-# Disk plan (verify with `lsblk` first — NEVER touch sda = DELLBOSS system disk):
-#   nvme0n1..nvme7n1, nvme9n1  -> chunklet pool (9 PDs)
-#   nvme8n1                    -> XFS /mnt/onyx-meta (metadb)
-# md126 (old LV3 RAID0) + md127 (old LV2 RAID0) are torn down; their member PDs
-# (nvme2,3,4,5,6,7,9) are zeroed and handed to chunklet.
+# Disk plan (⚠ NVMe names reshuffle across reboots — verify by CONTENT every
+# session: `lsblk -f` / `blkid`. NEVER touch sda = DELLBOSS system disk):
+#   nvme0n1 = XFS LABEL "onyx-meta" -> /mnt/onyx-meta (metadb)   [find by label!]
+#   nvme1n1..nvme9n1               -> chunklet pool (9 PDs, no fs signature)
+# (Pre-reboot this was nvme8=metadb, nvme0-7,9=pool — the post-reboot rename is
+#  why the device list below is by current name; re-check before chunklet-init.)
 #
 # Run:
 #   target/release/onyx-storage -c config/nvme-chunklet.toml chunklet-init --force
@@ -22,17 +23,19 @@ cold_cache_policy = "auto"
 
 [chunklet]
 enabled = true
-# 9 raw NVMe PDs (nvme8 is metadb, excluded). RAID6 set width = 8, so the 9th PD
-# leaves one-PD rebuild headroom.
+# 9 raw NVMe PDs. ⚠ VERIFY BY CONTENT every reboot (blkid) — names reshuffle.
+# 2026-07-01 reboot: metadb = nvme2n1 (XFS LABEL onyx-meta) — EXCLUDED; pool =
+# the other 9 (nvme0,1,3-9). sda = DELLBOSS system disk — never touch.
+# RAID6 set width = 8, so the 9th PD leaves one-PD rebuild headroom.
 devices = [
     "/dev/nvme0n1",
     "/dev/nvme1n1",
-    "/dev/nvme2n1",
     "/dev/nvme3n1",
     "/dev/nvme4n1",
     "/dev/nvme5n1",
     "/dev/nvme6n1",
     "/dev/nvme7n1",
+    "/dev/nvme8n1",
     "/dev/nvme9n1",
 ]
 io_backend = "uring"
@@ -42,16 +45,20 @@ spare_pct = 5
 # all LDs). Production-size LDs need a chained/extent manifest (chunklet TODO).
 # Smoke geometry below stays under that wall (~92 chunklets total).
 #
-# LV3 = RAID6 (6 data + 2 parity), 8 rows, 256 KiB strip -> ~48 GiB usable (64 chunklets).
-lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 8, strip_kib = 256 }
+# LV3 = RAID6 (6 data + 2 parity), 8 rows, 4 KiB strip -> ~48 GiB usable (64 chunklets).
+# 4 KiB strip => full-stripe = 6 data x 4 KiB = 24 KiB. Paired with
+# storage.raid_full_stripe_writes=true + the 24 KiB coalesce below, onyx aligns
+# stripe-multiple units to a 24 KiB boundary so chunklet takes its zero-RMW
+# full-stripe path (roadmap ③). NVMe: 4K is the sweet spot, no HDD big-block need.
+lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 8, strip_kib = 4 }
 # LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable (24 chunklets).
 lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
 # metadb LD (created but unused until Phase 3) -> ~2 GiB (4 chunklets).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 1, strip_kib = 0 }
-# Filled in after `chunklet-init --force` printed them:
-lv3_ld_id = "69103442-1049-4c6b-9fb0-3d236b38141f"
-lv2_ld_id = "b27c033b-e5ff-4e22-9d37-7e0d122f04e8"
-meta_ld_id = "4b1c4da3-fb4e-4c93-91a4-bbe6b51673d0"
+# Filled in after `chunklet-init --force` (re-init'd post-reboot on nvme1-9):
+lv3_ld_id = "c82c7e0a-cd40-4f0c-8cf4-88520c677b31"
+lv2_ld_id = "69a01e87-853c-43c9-af77-0a36d598f870"
+meta_ld_id = "939fec79-9642-485a-a70d-51e2dd68580c"
 
 [meta]
 path = "/mnt/onyx-meta/metadb"
@@ -79,6 +86,12 @@ default_compression = "Lz4"
 io_backend = "uring"
 uring_sq_entries = 1024
 read_pool_workers = 16
+# Roadmap ③: allocate + write LV3 units that are a whole number of RAID6
+# stripes on a stripe-aligned PBA so chunklet takes its zero-RMW full-stripe
+# path. Pairs with the stripe-multiple coalesce below — a unit only qualifies
+# when its block count is a multiple of the 6-block (24 KiB) stripe. Default
+# off in code; turned on here for the A/B baseline.
+raid_full_stripe_writes = true
 
 [buffer]
 # device omitted: LV2 comes from the chunklet pool. capacity_mb is ignored in
@@ -101,8 +114,13 @@ queue_workers = 4
 
 [flush]
 compress_workers = 2
-coalesce_max_raw_bytes = 32768
-coalesce_max_lbas = 8
+# Coalesce to exactly ONE RAID6 stripe (6 × 4 KiB = 24 KiB). A full coalesce
+# unit is then a stripe multiple, so `raid_full_stripe_writes` can align it and
+# chunklet writes it as a zero-RMW full stripe. Incompressible fio data
+# (--refill_buffers) stays raw (min_compression_savings gate) at exactly 6
+# blocks → 0 pad. Box A/B sweep: try 6 (1 stripe) vs 12 LBAs / 49152 (2 stripes).
+coalesce_max_raw_bytes = 24576
+coalesce_max_lbas = 6
 min_compression_savings_pct = 12
 skip_fully_superseded = true
 packed_meta_batch_max_lbas = 1024

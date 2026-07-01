@@ -142,3 +142,61 @@ fn syscall_batch_writes_then_reads() {
         }
     }
 }
+
+/// Minimal in-memory backend to exercise the stripe accessors independent of a
+/// real chunklet LD: reports a chosen stripe width, no-ops IO.
+struct StripeMock {
+    stripe: u32,
+}
+impl crate::io::block_backend::BlockBackend for StripeMock {
+    fn read_at(&self, _buf: &mut [u8], _off: u64) -> OnyxResult<()> {
+        Ok(())
+    }
+    fn write_at(&self, _buf: &[u8], _off: u64) -> OnyxResult<()> {
+        Ok(())
+    }
+    fn flush(&self) -> OnyxResult<()> {
+        Ok(())
+    }
+    fn size(&self) -> u64 {
+        1 << 30
+    }
+    fn stripe_blocks(&self) -> u32 {
+        self.stripe
+    }
+}
+
+#[test]
+fn stripe_accessors_gate_on_flag() {
+    let dev: Arc<dyn crate::io::block_backend::BlockBackend> = Arc::new(StripeMock { stripe: 6 });
+    // Flag off: the whole feature no-ops — stripe reported as 1, phase 0.
+    let off = IoEngine::with_options(dev.clone(), false, RESERVED_BLOCKS, None, IoBackend::Syscall);
+    assert_eq!(off.stripe_blocks(), 1);
+    assert_eq!(off.stripe_phase(), 0);
+    // Flag on: reports the backend stripe; phase = pba_offset % stripe. With
+    // RESERVED_BLOCKS=8 and a 6-block stripe that is 2.
+    let on = IoEngine::with_options(dev, false, RESERVED_BLOCKS, None, IoBackend::Syscall)
+        .with_full_stripe_writes(true);
+    assert_eq!(on.stripe_blocks(), 6);
+    assert_eq!(on.stripe_phase(), (RESERVED_BLOCKS % 6) as u32);
+    assert_eq!(on.stripe_phase(), 2);
+}
+
+#[test]
+fn allocator_phase_composes_to_aligned_device_offset() {
+    // The allocator alignment and the engine phase compose: a PBA the allocator
+    // marks stripe-aligned maps to a stripe-aligned *device* offset through
+    // pba_to_offset (the RESERVED_BLOCKS=8 phase, which % 6 != 0, is the trap).
+    let dev: Arc<dyn crate::io::block_backend::BlockBackend> = Arc::new(StripeMock { stripe: 6 });
+    let engine = IoEngine::with_options(dev, false, RESERVED_BLOCKS, None, IoBackend::Syscall)
+        .with_full_stripe_writes(true);
+    let alloc = crate::space::allocator::SpaceAllocator::new(1 << 30, 4);
+    let stripe_bytes = engine.stripe_blocks() as u64 * BLOCK_SIZE as u64;
+    for _ in 0..64 {
+        let e = alloc
+            .allocate_stripe_extent_for_lane(0, 6, engine.stripe_blocks(), engine.stripe_phase())
+            .unwrap();
+        let dev_off = (e.start.0 + RESERVED_BLOCKS) * BLOCK_SIZE as u64;
+        assert_eq!(dev_off % stripe_bytes, 0, "pba {} unaligned", e.start.0);
+    }
+}

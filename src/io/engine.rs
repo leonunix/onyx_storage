@@ -85,6 +85,11 @@ pub struct IoEngine {
     /// Set from `storage.lv3_per_shard_write_rings`; false reproduces the legacy
     /// single-shared-ring behavior.
     per_shard_write_sessions: bool,
+    /// When true, the flush writer allocates + pads LV3 writes to whole RAID
+    /// stripes so a parity backend takes its zero-RMW full-stripe path. Set from
+    /// `storage.raid_full_stripe_writes`; false makes `stripe_blocks()` report 1
+    /// (no alignment, no padding) so the writer is byte-for-byte unchanged.
+    full_stripe_writes: bool,
 }
 
 /// One operation in a batched LV3 IO submission.
@@ -123,6 +128,7 @@ impl IoEngine {
             metrics,
             backend,
             per_shard_write_sessions: false,
+            full_stripe_writes: false,
         }
     }
 
@@ -191,6 +197,14 @@ impl IoEngine {
     /// Builder style so existing constructors stay unchanged.
     pub fn with_per_shard_write_sessions(mut self, enabled: bool) -> Self {
         self.per_shard_write_sessions = enabled;
+        self
+    }
+
+    /// Enable/disable RAID full-stripe-aligned LV3 writes (roadmap ③). When on,
+    /// `stripe_blocks()` reports the backend's stripe width so the flush writer
+    /// pads writes to whole stripes; when off it reports 1 (legacy behavior).
+    pub fn with_full_stripe_writes(mut self, enabled: bool) -> Self {
+        self.full_stripe_writes = enabled;
         self
     }
 
@@ -463,6 +477,33 @@ impl IoEngine {
 
     fn pba_to_offset(&self, pba: Pba) -> u64 {
         (pba.0 + self.pba_offset) * self.block_size as u64
+    }
+
+    /// RAID full-stripe width in blocks for the underlying backend (`1` = no
+    /// stripe constraint). The flush writer uses this to allocate + pad LV3
+    /// writes to whole stripes so a chunklet RAID5/6 LD takes its zero-RMW
+    /// full-stripe path. Reports `1` unless `full_stripe_writes` is enabled — the
+    /// single gate for the whole feature, so the writer/allocator paths no-op
+    /// when the flag is off.
+    pub fn stripe_blocks(&self) -> u32 {
+        if !self.full_stripe_writes {
+            return 1;
+        }
+        self.device.stripe_blocks().max(1)
+    }
+
+    /// Phase to add before the stripe-alignment modulo, in blocks. Device offset
+    /// is `(pba + pba_offset) * block_size`, so a stripe-aligned *device* offset
+    /// needs `(pba + pba_offset) % stripe_blocks == 0`, i.e. the allocator must
+    /// align PBAs against `pba_offset % stripe_blocks`, not 0. With
+    /// `pba_offset = RESERVED_BLOCKS = 8` and a 6-block stripe this phase is 2.
+    pub fn stripe_phase(&self) -> u32 {
+        let s = self.stripe_blocks();
+        if s <= 1 {
+            0
+        } else {
+            (self.pba_offset % s as u64) as u32
+        }
     }
 
     fn validate_uring_result(

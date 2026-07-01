@@ -191,11 +191,10 @@ impl OnyxEngine {
         // so we always drive it via the Syscall submission mode regardless of
         // storage.io_backend.
         if device.uring_target().is_none() {
-            return Ok(Arc::new(IoEngine::new_chunklet(
-                device,
-                storage.use_hugepages,
-                metrics,
-            )));
+            return Ok(Arc::new(
+                IoEngine::new_chunklet(device, storage.use_hugepages, metrics)
+                    .with_full_stripe_writes(storage.raid_full_stripe_writes),
+            ));
         }
         match storage.io_backend {
             IoBackendConfig::Syscall => Ok(Arc::new(IoEngine::new_block(

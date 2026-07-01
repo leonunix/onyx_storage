@@ -95,6 +95,17 @@ pub trait BlockBackend: Send + Sync {
         None
     }
 
+    /// RAID full-stripe width in **blocks** — the write-alignment granularity
+    /// the flush writer targets to hit a parity backend's zero-RMW full-stripe
+    /// path. `1` (the default) means "no stripe constraint": single files, block
+    /// devices, and non-parity chunklet LDs (mirror/plain/raid0) impose no
+    /// alignment beyond one block, so the writer's stripe padding is a no-op.
+    /// A chunklet RAID5/6 LD overrides this with `full_stripe_bytes / block_size`
+    /// (e.g. 6 for a 6+2 RAID6 at a 4 KiB strip).
+    fn stripe_blocks(&self) -> u32 {
+        1
+    }
+
     /// Human-readable identifier for error/log messages (a device path for a
     /// `RawDevice`, an LD label for chunklet).
     fn label(&self) -> String {
@@ -236,6 +247,10 @@ impl BlockBackend for BackendSlice {
             .map(|(fd, inner_base)| (fd, inner_base + self.base))
     }
 
+    fn stripe_blocks(&self) -> u32 {
+        self.inner.stripe_blocks()
+    }
+
     fn direct_io(&self) -> bool {
         self.inner.direct_io()
     }
@@ -335,6 +350,20 @@ impl BlockBackend for ChunkletBackend {
         self.capacity
     }
     // uring_target defaults to None: striped across PDs, no single fd.
+
+    fn stripe_blocks(&self) -> u32 {
+        // `LdRaid5/6::strip_size()` already returns full_stripe_bytes (data
+        // strips × strip), so full_stripe_blocks = strip_size / block_size.
+        // Mirror/plain/raid0 report their block/strip size => 1..N with no
+        // parity, and their `write_full_stripe` has no RMW to avoid, so the
+        // writer's stripe padding on them is harmless (usually just 1).
+        let bs = self.ld.block_size() as u64;
+        if bs == 0 {
+            return 1;
+        }
+        let strip = self.ld.strip_size() as u64;
+        u32::try_from((strip / bs).max(1)).unwrap_or(1)
+    }
 
     fn label(&self) -> String {
         format!("chunklet-ld:{:?}", self.ld.id())
@@ -455,5 +484,42 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         backend.read_at(&mut got, 0).unwrap();
         assert_eq!(got, payload);
+    }
+
+    /// stripe_blocks() derives the RAID6 full-stripe width (in blocks) from the
+    /// LD geometry: 3 data + 2 parity at a 4 KiB strip => 3-block (12 KiB)
+    /// stripe. This is the alignment granularity the flush writer targets.
+    #[test]
+    fn chunklet_backend_stripe_blocks_raid6() {
+        use onyx_chunklet::io::RawDevice as CkRaw;
+        use onyx_chunklet::pool::LdSpec;
+        use onyx_chunklet::{Pool, PoolConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut raws = Vec::new();
+        for i in 0..5 {
+            let p = dir.path().join(format!("pd{i}"));
+            raws.push(CkRaw::open_or_create(&p, 4 << 30).unwrap());
+        }
+        let pool = Pool::create(
+            raws,
+            PoolConfig {
+                spare_pct: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ld_id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+        let ld = pool.open_ld(ld_id).unwrap();
+        let backend = ChunkletBackend::new(ld);
+        assert_eq!(backend.stripe_blocks(), 3);
+    }
+
+    /// A single file/blockdev is not striped => stripe_blocks() is 1, so the
+    /// writer's stripe logic is a no-op off-chunklet.
+    #[test]
+    fn raw_device_stripe_blocks_is_one() {
+        let (b, _tmp) = backend(64 * 1024);
+        assert_eq!(b.stripe_blocks(), 1);
     }
 }

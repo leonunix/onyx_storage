@@ -58,6 +58,7 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             uring_sq_entries: 128,
             read_pool_workers: 4,
             lv3_per_shard_write_rings: true,
+            raid_full_stripe_writes: false,
         },
         buffer: BufferConfig {
             device: Some(buf_tmp.path().to_path_buf()),

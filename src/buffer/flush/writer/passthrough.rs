@@ -55,17 +55,23 @@ impl BufferFlusher {
             let alloc_start = Instant::now();
             let blocks_needed = (unit.compressed_data.len() + bs - 1) / bs;
 
-            let allocation = if blocks_needed == 1 {
-                Allocation::Single(allocator.allocate_one_for_lane(shard_idx)?)
-            } else {
-                let extent = allocator.allocate_extent_for_lane(shard_idx, blocks_needed as u32)?;
-                if (extent.count as usize) < blocks_needed {
-                    crate::space::pba_lifecycle::rollback_uncommitted(allocator, extent)?;
+            // Stripe-multiple units land on a stripe-aligned extent (full-stripe
+            // write); others take the unaligned path. Same helper as the batch
+            // hot path so both stay in lockstep.
+            let stripe = io_engine.stripe_blocks();
+            let phase = io_engine.stripe_phase();
+            let pba = match Self::alloc_passthrough(allocator, shard_idx, blocks_needed as u32, stripe, phase) {
+                Ok(pba) => pba,
+                Err(e) => {
                     Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
                     Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
-                    return Err(crate::error::OnyxError::SpaceExhausted);
+                    return Err(e);
                 }
-                Allocation::Extent(extent)
+            };
+            let allocation = if blocks_needed == 1 {
+                Allocation::Single(pba)
+            } else {
+                Allocation::Extent(Extent::new(pba, blocks_needed as u32))
             };
             Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
             let pba = allocation.start_pba();
@@ -286,6 +292,51 @@ impl BufferFlusher {
         })
     }
 
+    /// Reserve `blocks_needed` blocks for one passthrough unit. On a stripe
+    /// (RAID5/6) backend, a unit that is already a whole number of stripes gets
+    /// a stripe-**aligned** extent: the engine block-pads its write to
+    /// `blocks_needed` blocks and the aligned device offset makes chunklet take
+    /// its zero-RMW full-stripe path. Every other unit — and any
+    /// alignment-fragmentation `SpaceExhausted` — falls back to the normal
+    /// unaligned path so IO never stalls (that unit just stays partial-RMW).
+    ///
+    /// The allocated width always equals `blocks_needed`: the aligned path is
+    /// only taken when `blocks_needed % stripe == 0`, so `round_up` is a no-op
+    /// and there is **no tail pad to leak** on reclaim (cleanup frees
+    /// `physical_blocks` = the unpadded ceil size). Making units stripe-sized so
+    /// more of them qualify is the coalesce config's job (roadmap ③); sub-stripe
+    /// packing into full stripes is a documented follow-up.
+    fn alloc_passthrough(
+        allocator: &SpaceAllocator,
+        lane: usize,
+        blocks_needed: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> OnyxResult<Pba> {
+        if stripe > 1 && blocks_needed % stripe == 0 {
+            match allocator.allocate_stripe_extent_for_lane(lane, blocks_needed, stripe, phase) {
+                Ok(ext) => {
+                    debug_assert_eq!(ext.count, blocks_needed, "aligned multiple must not pad");
+                    return Ok(ext.start);
+                }
+                // Alignment fragmentation near full: fall back to unaligned so
+                // IO keeps flowing (this write misses the full-stripe path).
+                Err(crate::error::OnyxError::SpaceExhausted) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if blocks_needed == 1 {
+            allocator.allocate_one_for_lane(lane)
+        } else {
+            let ext = allocator.allocate_extent_for_lane(lane, blocks_needed)?;
+            if ext.count < blocks_needed {
+                crate::space::pba_lifecycle::rollback_uncommitted(allocator, ext)?;
+                return Err(crate::error::OnyxError::SpaceExhausted);
+            }
+            Ok(ext.start)
+        }
+    }
+
     /// Batch a passthrough cycle and hand it off to the per-volume
     /// commit workers. Phase 1 of the per-volume commit architecture:
     /// the shard writer does alloc + LV3 IO synchronously (so PBA
@@ -333,30 +384,22 @@ impl BufferFlusher {
         let mut alloc_blocks: Vec<u32> = vec![0; n];
         let mut io_ops_count = 0u64;
 
-        // Phase A: alloc PBAs.
+        // Phase A: alloc PBAs. Stripe-multiple units get a stripe-aligned extent
+        // (→ full-stripe write on a chunklet RAID5/6 backend); everything else
+        // keeps the legacy unaligned path. `stripe`/`phase` come from the LV3
+        // backend geometry (1/0 = no stripe, so this is a no-op off-chunklet or
+        // with the `raid_full_stripe_writes` flag off). alloc_blocks[i] stays ==
+        // blocks_needed (the aligned path never pads), so reclaim frees exactly
+        // what was reserved.
+        let stripe = io_engine.stripe_blocks();
+        let phase = io_engine.stripe_phase();
         let alloc_start = Instant::now();
         for (i, unit) in units.iter().enumerate() {
             let bs = BLOCK_SIZE as usize;
-            let blocks_needed = (unit.compressed_data.len() + bs - 1) / bs;
-            alloc_blocks[i] = blocks_needed as u32;
-            let allocation = if blocks_needed == 1 {
-                allocator
-                    .allocate_one_for_lane(shard_idx)
-                    .map(|pba| (pba, 1u32))
-            } else {
-                allocator
-                    .allocate_extent_for_lane(shard_idx, blocks_needed as u32)
-                    .and_then(|ext| {
-                        if (ext.count as usize) < blocks_needed {
-                            crate::space::pba_lifecycle::rollback_uncommitted(allocator, ext)?;
-                            Err(crate::error::OnyxError::SpaceExhausted)
-                        } else {
-                            Ok((ext.start, ext.count))
-                        }
-                    })
-            };
-            match allocation {
-                Ok((pba, _)) => pbas[i] = Some(pba),
+            let blocks_needed = ((unit.compressed_data.len() + bs - 1) / bs) as u32;
+            alloc_blocks[i] = blocks_needed;
+            match Self::alloc_passthrough(allocator, shard_idx, blocks_needed, stripe, phase) {
+                Ok(pba) => pbas[i] = Some(pba),
                 Err(e) => {
                     tracing::error!(
                         vol = %unit.vol_id,

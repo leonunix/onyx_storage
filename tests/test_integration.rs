@@ -117,6 +117,7 @@ fn setup_with_all_options(
             uring_sq_entries: 128,
             read_pool_workers: 4,
             lv3_per_shard_write_rings: true,
+            raid_full_stripe_writes: false,
         },
         buffer: BufferConfig {
             device: Some(buf_file.path().to_path_buf()),

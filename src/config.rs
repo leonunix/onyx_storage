@@ -841,6 +841,16 @@ pub struct StorageConfig {
     /// baseline). No effect on the syscall backend.
     #[serde(default = "default_lv3_per_shard_write_rings")]
     pub lv3_per_shard_write_rings: bool,
+    /// RAID-aware full-stripe writes (roadmap ③). When true, the flush writer
+    /// allocates + zero-pads each LV3 passthrough write to a whole RAID stripe
+    /// (`full_stripe_bytes` from the chunklet LD geometry) so a RAID5/6 backend
+    /// takes its zero-RMW full-stripe path instead of read-modify-write parity.
+    /// Default false (legacy unaligned writes). Only affects a parity chunklet
+    /// backend; non-parity backends report a 1-block stripe and no-op. Pair with
+    /// `flush.coalesce_max_raw_bytes` tuned to a stripe multiple to keep pad
+    /// waste low. Flag exists for A/B baselining + instant rollback.
+    #[serde(default = "default_raid_full_stripe_writes")]
+    pub raid_full_stripe_writes: bool,
 }
 
 impl Default for StorageConfig {
@@ -854,6 +864,7 @@ impl Default for StorageConfig {
             uring_sq_entries: default_uring_sq_entries(),
             read_pool_workers: default_read_pool_workers(),
             lv3_per_shard_write_rings: default_lv3_per_shard_write_rings(),
+            raid_full_stripe_writes: default_raid_full_stripe_writes(),
         }
     }
 }
@@ -864,6 +875,10 @@ fn default_uring_sq_entries() -> u32 {
 
 fn default_lv3_per_shard_write_rings() -> bool {
     true
+}
+
+fn default_raid_full_stripe_writes() -> bool {
+    false
 }
 
 fn default_read_pool_workers() -> usize {
