@@ -205,6 +205,7 @@ impl SpaceAllocator {
     }
 
     fn track_alloc(&self, extent: Extent, context: &'static str) -> OnyxResult<()> {
+        crate::space::free_trace::trace_alloc(extent, context);
         let Some(tracker) = &self.alloc_tracker else {
             return Ok(());
         };
@@ -713,47 +714,54 @@ impl SpaceAllocator {
         self.validate_extent_shape(extent, "retire_extent")?;
         self.ensure_not_in_lane_cache(extent, "retire_extent")?;
 
-        let free = self.free_extents.lock().unwrap();
-        if let Some(e) = Self::overlapping_extent(&free, extent) {
-            return Err(OnyxError::Config(format!(
-                "retire_extent: extent {:?} overlaps free extent {:?}",
-                extent, e
-            )));
-        }
-
-        let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
-        if (extent.count as u64) > current_alloc {
-            return Err(OnyxError::Config(format!(
-                "retire_extent: retiring {} blocks but only {} allocated",
-                extent.count, current_alloc
-            )));
-        }
-
-        // Lock order: retired_extents (set) BEFORE retired_age. Free held across
-        // (outermost) so the overlap check can't race a concurrent free.
-        let mut retired = self.retired_extents.lock().unwrap();
-        // Sub-ranges of `extent` not already covered by the coalesced set = the
-        // genuinely-new blocks. Computed BEFORE coalescing so already-retired
-        // sub-ranges keep their original age (never refreshed).
-        let gaps = Self::uncovered_subranges(&retired, extent);
-        let newly: u32 = gaps.iter().map(|g| g.count).sum();
-        Self::coalesce_and_insert_any_overlap(&mut retired, extent);
-        if newly > 0 {
-            let mut age = self.retired_age.lock().unwrap();
-            for g in gaps {
-                age.insert(
-                    g.start.0,
-                    RetiredRun {
-                        count: g.count,
-                        retired_at: now,
-                    },
-                );
+        let newly = {
+            let free = self.free_extents.lock().unwrap();
+            if let Some(e) = Self::overlapping_extent(&free, extent) {
+                return Err(OnyxError::Config(format!(
+                    "retire_extent: extent {:?} overlaps free extent {:?}",
+                    extent, e
+                )));
             }
-            // Keep the O(1) depth gauge in lockstep with the set (only the
-            // genuinely-new blocks; idempotent re-retire adds nothing).
-            self.retired_blocks
-                .fetch_add(u64::from(newly), Ordering::Relaxed);
-        }
+
+            let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
+            if (extent.count as u64) > current_alloc {
+                return Err(OnyxError::Config(format!(
+                    "retire_extent: retiring {} blocks but only {} allocated",
+                    extent.count, current_alloc
+                )));
+            }
+
+            // Lock order: retired_extents (set) BEFORE retired_age. Free held across
+            // (outermost) so the overlap check can't race a concurrent free.
+            let mut retired = self.retired_extents.lock().unwrap();
+            // Sub-ranges of `extent` not already covered by the coalesced set = the
+            // genuinely-new blocks. Computed BEFORE coalescing so already-retired
+            // sub-ranges keep their original age (never refreshed).
+            let gaps = Self::uncovered_subranges(&retired, extent);
+            let newly: u32 = gaps.iter().map(|g| g.count).sum();
+            Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+            if newly > 0 {
+                let mut age = self.retired_age.lock().unwrap();
+                for g in gaps {
+                    age.insert(
+                        g.start.0,
+                        RetiredRun {
+                            count: g.count,
+                            retired_at: now,
+                        },
+                    );
+                }
+                // Keep the O(1) depth gauge in lockstep with the set (only the
+                // genuinely-new blocks; idempotent re-retire adds nothing).
+                self.retired_blocks
+                    .fetch_add(u64::from(newly), Ordering::Relaxed);
+            }
+            newly
+        };
+        // Diagnostic trace OUTSIDE the free/retired locks — per-block map
+        // inserts inside the global lock section serialise every allocator
+        // client (measured collapse on the 2026-07-02 capture run).
+        crate::space::free_trace::trace_retire(extent, "retire_extent");
         Ok(newly)
     }
 
@@ -779,6 +787,7 @@ impl SpaceAllocator {
             let (lane_pbas, lane_exts) = self.snapshot_lane_caches();
             let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
             let mut chunk_newly: u64 = 0;
+            let mut chunk_retired: Vec<Extent> = Vec::new();
             // Lock order: free (outermost) → retired → retired_age, held across
             // the chunk (matches `retire_extent_at`).
             let free = self.free_extents.lock().unwrap();
@@ -791,9 +800,7 @@ impl SpaceAllocator {
                 }
                 let in_lane = (0..extent.count)
                     .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
-                    || lane_exts
-                        .iter()
-                        .any(|cached| Self::extents_overlap(extent, *cached));
+                    || Self::sorted_extents_overlap(&lane_exts, extent);
                 if in_lane
                     || Self::overlapping_extent(&free, extent).is_some()
                     || u64::from(extent.count) > current_alloc
@@ -806,6 +813,7 @@ impl SpaceAllocator {
                 let gaps = Self::uncovered_subranges(&retired, extent);
                 let newly: u32 = gaps.iter().map(|g| g.count).sum();
                 Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+                chunk_retired.push(extent);
                 if newly > 0 {
                     for g in gaps {
                         age.insert(
@@ -822,6 +830,10 @@ impl SpaceAllocator {
             drop(age);
             drop(retired);
             drop(free);
+            // Diagnostic trace outside the lock section (see retire_extent_at).
+            for &extent in &chunk_retired {
+                crate::space::free_trace::trace_retire(extent, "retire_batch");
+            }
             if chunk_newly > 0 {
                 self.retired_blocks
                     .fetch_add(chunk_newly, Ordering::Relaxed);
@@ -1088,6 +1100,8 @@ impl SpaceAllocator {
             // O(1) gauge. Failure re-inserted it above, so leave the gauge.
             self.retired_blocks
                 .fetch_sub(u64::from(extent.count), Ordering::Relaxed);
+            // Diagnostic trace outside the free lock (see retire_extent_at).
+            crate::space::free_trace::trace_reclaim(extent, "reclaim");
         }
         result.map(|_| true)
     }
@@ -1174,15 +1188,14 @@ impl SpaceAllocator {
             // conflicts. `chunk_freed` tracks the not-yet-applied allocated debit
             // so the underflow guard stays honest within the chunk.
             let mut conflicts: Vec<Extent> = Vec::new();
+            let mut chunk_reclaimed: Vec<Extent> = Vec::new();
             let mut chunk_freed: u64 = 0;
             {
                 let mut free = self.free_extents.lock().unwrap();
                 for &extent in &removed {
                     let in_lane = (0..extent.count)
                         .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
-                        || lane_exts
-                            .iter()
-                            .any(|cached| Self::extents_overlap(extent, *cached));
+                        || Self::sorted_extents_overlap(&lane_exts, extent);
                     if in_lane || Self::overlapping_extent(&free, extent).is_some() {
                         conflicts.push(extent);
                         continue;
@@ -1197,9 +1210,14 @@ impl SpaceAllocator {
                     }
                     Self::coalesce_and_insert(&mut free, extent);
                     self.track_release(extent, "reclaim_retired_extents_batch");
+                    chunk_reclaimed.push(extent);
                     chunk_freed += u64::from(extent.count);
                     freed_extents += 1;
                 }
+            }
+            // Diagnostic trace outside the free lock (see retire_extent_at).
+            for &extent in &chunk_reclaimed {
+                crate::space::free_trace::trace_reclaim(extent, "reclaim_batch");
             }
 
             // Counter debits ONCE per chunk (Relaxed gauges; same end state as
@@ -1229,6 +1247,15 @@ impl SpaceAllocator {
     /// batch reclaim can check membership without re-locking per extent. Each
     /// lane mutex is taken briefly and independently (no `free`/`retired` held),
     /// matching `ensure_not_in_lane_cache`'s lock discipline.
+    /// Returned extents are sorted by start (lane-cached extents never overlap
+    /// each other — they are disjoint carves off the global pool), so callers
+    /// can overlap-test in O(log M) via [`Self::sorted_extents_overlap`]. The
+    /// old linear `iter().any(extents_overlap)` per candidate extent was the
+    /// stall root cause: 4096-extent reclaim/retire chunks × tens of thousands
+    /// of cached fragment rests = 10^8 comparisons per chunk INSIDE the global
+    /// free lock (gc-runner pegged at 84% self time in
+    /// `reclaim_retired_extents_batch`, all 16 writers parked on the lock —
+    /// 2026-07-02 perf capture).
     fn snapshot_lane_caches(&self) -> (HashSet<Pba>, Vec<Extent>) {
         let mut pbas = HashSet::new();
         for cache in &self.lane_caches {
@@ -1238,7 +1265,20 @@ impl SpaceAllocator {
         for cache in &self.lane_extent_caches {
             exts.extend(cache.lock().unwrap().iter().copied());
         }
+        exts.sort_unstable_by_key(|e| e.start.0);
         (pbas, exts)
+    }
+
+    /// Binary-search overlap test against a start-sorted, mutually-disjoint
+    /// extent list (the [`Self::snapshot_lane_caches`] output). Only two
+    /// candidates can overlap `extent`: the last one starting at/before it and
+    /// the first one starting after it.
+    fn sorted_extents_overlap(sorted: &[Extent], extent: Extent) -> bool {
+        let idx = sorted.partition_point(|e| e.start.0 <= extent.start.0);
+        if idx > 0 && Self::extents_overlap(sorted[idx - 1], extent) {
+            return true;
+        }
+        idx < sorted.len() && Self::extents_overlap(sorted[idx], extent)
     }
 
     fn free_extent_unchecked_ownership(&self, extent: Extent) -> OnyxResult<()> {
@@ -1246,10 +1286,14 @@ impl SpaceAllocator {
 
         self.hazards.wait_extent_clear(extent.start, extent.count);
 
-        let mut free = self.free_extents.lock().unwrap();
-        self.ensure_not_free_or_retired_after_wait(extent, &free)?;
-        Self::coalesce_and_insert(&mut free, extent);
-        self.track_release(extent, "free_extent");
+        {
+            let mut free = self.free_extents.lock().unwrap();
+            self.ensure_not_free_or_retired_after_wait(extent, &free)?;
+            Self::coalesce_and_insert(&mut free, extent);
+            self.track_release(extent, "free_extent");
+        }
+        // Diagnostic trace outside the free lock (see retire_extent_at).
+        crate::space::free_trace::trace_free(extent, "free_extent");
         self.allocated_blocks
             .fetch_sub(extent.count as u64, Ordering::Relaxed);
         self.free_blocks

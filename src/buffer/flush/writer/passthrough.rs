@@ -493,7 +493,38 @@ impl BufferFlusher {
         // group's extent is Some — i.e. it wrote as a real full stripe).
         let mut group_of: Vec<Option<usize>> = vec![None; n];
 
+        // Batch-level short-circuit for alignment starvation. A failed aligned
+        // allocation on a fragmented free list is O(free-list length) — the
+        // finder walks the whole address-ordered BTreeSet through the low-address
+        // fragment belt while holding the global free lock. Retrying that scan
+        // for EVERY group/unit in a 1024-unit batch (and every batch, on all 16
+        // shard writers, serialised on one lock) collapses flusher throughput to
+        // ~zero → buffer fills → the whole frontend stalls (reproduced on the
+        // 2026-07-02 kill-replay capture, cycle 4). After the first
+        // SpaceExhausted, stop attempting stripe alignment for the REST of this
+        // batch (stripe=1 ⇒ alloc_passthrough skips the aligned path); the next
+        // batch probes again, so alignment resumes once reclaim re-coalesces.
+        let mut stripe_starved = false;
+
         for (gi, members) in groups.iter().enumerate() {
+            if stripe_starved {
+                group_extents.push(None);
+                for &m in members {
+                    match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[m], 1, 0) {
+                        Ok(pba) => pbas[m] = Some(pba),
+                        Err(e) => {
+                            tracing::error!(
+                                vol = %units[m].vol_id,
+                                start_lba = units[m].start_lba.0,
+                                error = %e,
+                                "writer: passthrough alloc failed (stripe-starved batch)"
+                            );
+                            failed[m] = true;
+                        }
+                    }
+                }
+                continue;
+            }
             match allocator.allocate_stripe_extent_for_lane(shard_idx, stripe, stripe, phase) {
                 Ok(ext) => {
                     debug_assert_eq!(ext.count, stripe, "stripe extent must be one stripe wide");
@@ -508,16 +539,13 @@ impl BufferFlusher {
                 }
                 Err(_) => {
                     // Alignment fragmentation near-full: degrade to per-unit so
-                    // IO keeps flowing (these units just miss the full stripe).
+                    // IO keeps flowing (these units just miss the full stripe),
+                    // and stop probing alignment for the rest of the batch.
+                    stripe_starved = true;
                     group_extents.push(None);
                     for &m in members {
-                        match Self::alloc_passthrough(
-                            allocator,
-                            shard_idx,
-                            blocks_per_unit[m],
-                            stripe,
-                            phase,
-                        ) {
+                        match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[m], 1, 0)
+                        {
                             Ok(pba) => pbas[m] = Some(pba),
                             Err(e) => {
                                 tracing::error!(
@@ -534,7 +562,9 @@ impl BufferFlusher {
             }
         }
         for &i in &leftover {
-            match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[i], stripe, phase) {
+            let (eff_stripe, eff_phase) = if stripe_starved { (1, 0) } else { (stripe, phase) };
+            match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[i], eff_stripe, eff_phase)
+            {
                 Ok(pba) => pbas[i] = Some(pba),
                 Err(e) => {
                     tracing::error!(
