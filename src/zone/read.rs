@@ -204,6 +204,14 @@ pub(crate) fn decode_unit_with_crc_accounting<'a>(
                         "inline read: no LV3 write record for covered PBA"
                     );
                 }
+                if let Some(trail) = crate::space::free_trace::describe_pba(covered_pba) {
+                    tracing::warn!(
+                        pba = covered_pba.0,
+                        mapping_start_pba = mapping.pba.0,
+                        trail = %trail,
+                        "inline read: PBA lifecycle trail"
+                    );
+                }
             }
         } else {
             tracing::debug!(

@@ -739,10 +739,52 @@ fn finish_request(ctx: &WorkerCtx, req: &ReadRequest, buf: &[u8], exp_bytes: u32
                 raw_extent_blocks = req.raw_extent.as_ref().map_or(0, Vec::len),
                 "read-pool: CRC mismatch"
             );
+            dump_crc_victim_forensics(&req.mapping, req.raw_extent.as_deref());
         }
     }
     ctx.metrics.record_read_pool_decode_ns(elapsed_ns(decode_start));
     let _ = req.reply.send(result);
+}
+
+/// DIAGNOSTIC (replay CRC hunt): per-victim forensics — last LV3 write record
+/// (`ONYX_TRACE_LV3_WRITES=1`) and per-PBA allocator lifecycle trail + rebuild
+/// reserved-set membership (`ONYX_PBA_TRACE=1`) for every physical block the
+/// failed mapping covers. Quiet unless the env gates are on.
+fn dump_crc_victim_forensics(mapping: &BlockmapValue, raw_extent: Option<&[BlockmapValue]>) {
+    let mut dump_one = |m: &BlockmapValue| {
+        for covered in m.physical_pbas(crate::types::BLOCK_SIZE) {
+            if let Some(rec) = crate::io::engine::lookup_lv3_write_record(covered) {
+                tracing::warn!(
+                    pba = covered.0,
+                    mapping_start_pba = m.pba.0,
+                    write_seq = rec.seq,
+                    write_start_pba = rec.start_pba,
+                    write_block_offset = rec.block_offset,
+                    write_payload_len = rec.payload_len,
+                    write_payload_crc = rec.payload_crc,
+                    write_padded_crc = rec.padded_crc,
+                    mapping_crc = m.crc32,
+                    "read-pool: last LV3 write record for covered PBA"
+                );
+            }
+            if let Some(trail) = crate::space::free_trace::describe_pba(covered) {
+                tracing::warn!(
+                    pba = covered.0,
+                    mapping_start_pba = m.pba.0,
+                    trail = %trail,
+                    "read-pool: PBA lifecycle trail"
+                );
+            }
+        }
+    };
+    match raw_extent {
+        Some(mappings) => {
+            for m in mappings {
+                dump_one(m);
+            }
+        }
+        None => dump_one(mapping),
+    }
 }
 
 fn elapsed_ns(start: Instant) -> u64 {

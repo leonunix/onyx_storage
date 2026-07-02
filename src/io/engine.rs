@@ -20,7 +20,11 @@ static SERIAL_SYSCALL_WRITES_INIT: AtomicBool = AtomicBool::new(false);
 static TRACE_LV3_WRITES: AtomicBool = AtomicBool::new(false);
 static TRACE_LV3_WRITES_INIT: AtomicBool = AtomicBool::new(false);
 static LV3_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
-static LV3_WRITE_RECORDS: OnceLock<Mutex<HashMap<u64, Lv3WriteRecord>>> = OnceLock::new();
+/// Sharded by pba so 16 concurrent flusher writers don't serialise on one
+/// global mutex (a single-map version measurably collapsed write throughput
+/// during the 2026-07-02 replay-CRC capture).
+const LV3_WRITE_RECORD_SHARDS: usize = 64;
+static LV3_WRITE_RECORDS: OnceLock<Vec<Mutex<HashMap<u64, Lv3WriteRecord>>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug)]
 pub struct Lv3WriteRecord {
@@ -36,7 +40,7 @@ pub struct Lv3WriteRecord {
 pub fn lookup_lv3_write_record(pba: Pba) -> Option<Lv3WriteRecord> {
     LV3_WRITE_RECORDS
         .get()
-        .and_then(|records| records.lock().ok()?.get(&pba.0).copied())
+        .and_then(|shards| shards[(pba.0 as usize) % LV3_WRITE_RECORD_SHARDS].lock().ok()?.get(&pba.0).copied())
 }
 
 /// Selects how `IoEngine` issues IO under the hood.
@@ -461,11 +465,16 @@ impl IoEngine {
             padded_crc: crc32fast::hash(&padded),
         };
         let blocks = (total_size / self.block_size as usize).max(1);
-        let records = LV3_WRITE_RECORDS.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Ok(mut records) = records.lock() {
-            for block_offset in 0..blocks {
-                records.insert(
-                    pba.0 + block_offset as u64,
+        let shards = LV3_WRITE_RECORDS.get_or_init(|| {
+            (0..LV3_WRITE_RECORD_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect()
+        });
+        for block_offset in 0..blocks {
+            let block_pba = pba.0 + block_offset as u64;
+            if let Ok(mut shard) = shards[(block_pba as usize) % LV3_WRITE_RECORD_SHARDS].lock() {
+                shard.insert(
+                    block_pba,
                     Lv3WriteRecord {
                         block_offset: block_offset as u32,
                         ..record

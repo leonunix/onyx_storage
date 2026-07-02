@@ -1460,6 +1460,9 @@ impl MetadbBackend {
     }
 
     pub(crate) fn iter_allocated_blocks(&self) -> OnyxResult<Vec<(Pba, u32)>> {
+        // Diagnostic classifier (ONYX_PBA_TRACE=1): snapshot which source
+        // reserved each PBA in this scan so CRC sites can report membership.
+        crate::space::free_trace::classifier_reset();
         let mut blocks: Vec<(Pba, u32)> = Vec::new();
         // COMPLETE L2P read-view = folded paged tree UNION the l2p_buffer
         // (committed-but-not-yet-folded staged mappings). `scan_all_blockmap_entries`
@@ -1482,6 +1485,7 @@ impl MetadbBackend {
                     Ok(decoded) => {
                         if !decoded.is_zero() {
                             for pba in decoded.physical_pbas(crate::types::BLOCK_SIZE) {
+                                crate::space::free_trace::mark_reserved_blockmap(pba);
                                 blocks.push((pba, 1));
                             }
                         }
@@ -1514,6 +1518,7 @@ impl MetadbBackend {
                 .to_blockmap_value()
                 .physical_pbas(crate::types::BLOCK_SIZE)
             {
+                crate::space::free_trace::mark_reserved_dedup(pba);
                 blocks.push((pba, 1));
             }
         }

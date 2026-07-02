@@ -40,25 +40,30 @@ devices = [
 ]
 io_backend = "uring"
 spare_pct = 5
-# NOTE: chunklet's on-disk superblock encodes every 1 GiB chunklet placement
-# explicitly in one 4028-byte slot (~21 B/chunklet → ~178 chunklets max across
-# all LDs). Production-size LDs need a chained/extent manifest (chunklet TODO).
-# Smoke geometry below stays under that wall (~92 chunklets total).
+# NOTE: chunklet descriptor v2 RLE codec exists but the pool allocator does NOT
+# yet place chunklets column-contiguously (S2 TODO), so a large LD's descriptor
+# stays uncompressed and overflows the 4028-byte superblock slot (~146 chunklets
+# max/LD: encoded body ≈ 1199 + 25.6·chunklets B must stay < 4028 → ≤110
+# chunklets ≈ num_rows 13). num_rows=12 (96 chunklets, 72 GiB usable, ~3657 B
+# descriptor) fits with margin and holds a 32 GiB fio volume at ~44% full —
+# enough headroom that the allocator never starves (removes the
+# GC-churn/overcommit confound for the write-path ceiling measurement) without
+# needing the S2 allocator work.
 #
-# LV3 = RAID6 (6 data + 2 parity), 8 rows, 4 KiB strip -> ~48 GiB usable (64 chunklets).
+# LV3 = RAID6 (6 data + 2 parity), 12 rows, 4 KiB strip -> ~72 GiB usable (96 chunklets).
 # 4 KiB strip => full-stripe = 6 data x 4 KiB = 24 KiB. Paired with
 # storage.raid_full_stripe_writes=true + the 24 KiB coalesce below, onyx aligns
 # stripe-multiple units to a 24 KiB boundary so chunklet takes its zero-RMW
 # full-stripe path (roadmap ③). NVMe: 4K is the sweet spot, no HDD big-block need.
-lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 8, strip_kib = 4 }
+lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 12, strip_kib = 4 }
 # LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable (24 chunklets).
 lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
 # metadb LD (created but unused until Phase 3) -> ~2 GiB (4 chunklets).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 1, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (re-init'd post-reboot on nvme1-9):
-lv3_ld_id = "c82c7e0a-cd40-4f0c-8cf4-88520c677b31"
-lv2_ld_id = "69a01e87-853c-43c9-af77-0a36d598f870"
-meta_ld_id = "939fec79-9642-485a-a70d-51e2dd68580c"
+lv3_ld_id = "95c825bd-c870-41d5-83ad-6e23d5d6dd16"
+lv2_ld_id = "93f79453-b215-4be3-9bec-f6e55fc10e6d"
+meta_ld_id = "31158fdb-5e38-4150-a4ad-a541b9691d5a"
 
 [meta]
 path = "/mnt/onyx-meta/metadb"
@@ -85,7 +90,7 @@ use_hugepages = false
 default_compression = "Lz4"
 io_backend = "uring"
 uring_sq_entries = 1024
-read_pool_workers = 16
+read_pool_workers = 32
 # Roadmap ③: allocate + write LV3 units that are a whole number of RAID6
 # stripes on a stripe-aligned PBA so chunklet takes its zero-RMW full-stripe
 # path. Pairs with the stripe-multiple coalesce below — a unit only qualifies
@@ -128,6 +133,10 @@ packed_meta_batch_max_lbas = 1024
 [engine]
 zone_count = 64
 zone_size_blocks = 256
+# Replay-CRC hunt: a killed-under-load pool replays a 100K+ entry tail; the
+# 60s default recovery timeout aborts engine open mid-replay. 10 min headroom
+# (the 470K-entry c3 replay took 266s, diagnostics add overhead).
+recovery_timeout_ms = 600000
 
 [gc]
 enabled = true
