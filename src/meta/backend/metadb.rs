@@ -1461,19 +1461,61 @@ impl MetadbBackend {
 
     pub(crate) fn iter_allocated_blocks(&self) -> OnyxResult<Vec<(Pba, u32)>> {
         let mut blocks: Vec<(Pba, u32)> = Vec::new();
-        for (_, _, value) in self.scan_all_blockmap_entries()? {
-            if value.is_zero() {
-                continue;
+        // COMPLETE L2P read-view = folded paged tree UNION the l2p_buffer
+        // (committed-but-not-yet-folded staged mappings). `scan_all_blockmap_entries`
+        // / `scan_range_unordered_chunked` only see the folded tree; on a heavily
+        // overwritten (REUSED) pool the l2p_buffer holds many committed single-block
+        // mappings that have not yet drained. Omitting them makes
+        // `rebuild_from_metadata` treat a still-live block as a free gap → the next
+        // allocation reuses it → foreground CRC + `retire_extent ... overlaps free
+        // extent` (soak-reproduced on a reused chunklet pool 2026-07-02;
+        // fresh-init-each-run masked it because the l2p_buffer was ~empty). The GC
+        // reclaim gate (`referenced_extents`) already scans tree ∪ l2p_buffer via the
+        // same `scan_l2p_live_consistent`; the free-list builder MUST use the same
+        // read-view or it frees exactly what the reclaim gate would protect.
+        let volumes = self.list_volumes()?;
+        for volume in volumes {
+            let ord = self.volume_ordinal(&volume.id)?;
+            let mut decode_error = None;
+            let scan_result = self.db.scan_l2p_live_consistent(ord, |_lba, value| {
+                match decode_l2p_value(value) {
+                    Ok(decoded) => {
+                        if !decoded.is_zero() {
+                            for pba in decoded.physical_pbas(crate::types::BLOCK_SIZE) {
+                                blocks.push((pba, 1));
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        decode_error = Some(err);
+                        Err(onyx_metadb::MetaDbError::Corruption(
+                            "onyx blockmap decode failed".into(),
+                        ))
+                    }
+                }
+            });
+            if let Some(err) = decode_error {
+                return Err(err);
             }
-            let physical_blocks = freed_blocks_for_l2p_value(&value);
-            for pba in value.physical_pbas(crate::types::BLOCK_SIZE) {
+            scan_result?;
+        }
+        // Also reserve PBAs referenced by the dedup_index. A promoted dedup
+        // entry (hash → pba) keeps its block alive at rc>0 even after every L2P
+        // sharer LBA has been overwritten (until orphan-reclaim demotes it).
+        // Such "dedup-only" blocks are NOT in the blockmap scan above; omitting
+        // them makes `rebuild_from_metadata` treat a still-referenced block as a
+        // free gap on restart → the next allocation reuses it → CRC corruption +
+        // a flood of dedup verify mismatches ("dedup entry overlaps free
+        // extent"). rebuild rebuilds only the allocator free list (not refcount),
+        // so the freed block still has rc>0 and the two views desynchronize.
+        for (_, entry) in self.iter_dedup_entries()? {
+            for pba in entry
+                .to_blockmap_value()
+                .physical_pbas(crate::types::BLOCK_SIZE)
+            {
                 blocks.push((pba, 1));
             }
-            debug_assert_eq!(
-                physical_blocks as usize,
-                value.physical_pbas(crate::types::BLOCK_SIZE).count(),
-                "freed block count must match expanded physical footprint"
-            );
         }
         blocks.sort_unstable_by_key(|(pba, _)| *pba);
         blocks.dedup_by_key(|(pba, _)| *pba);

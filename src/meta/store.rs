@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
-use crate::meta::backend::codec::freed_blocks_for_l2p_value;
 use crate::meta::backend::metadb::MetadbBackend;
 use crate::meta::schema::{
     encode_blockmap_key, encode_blockmap_value, BlockmapValue, ContentHash, DedupEntry,
@@ -708,17 +707,26 @@ impl MetaStore {
         self.backend.scan_dedup_from(cursor, limit)
     }
 
+    /// PBAs the allocator must reserve on rebuild — the COMPLETE liveness
+    /// read-view (folded L2P tree ∪ l2p_buffer ∪ dedup_index), delegated to the
+    /// backend so it is the single source of truth shared with the GC reclaim
+    /// gate (`referenced_extents`).
+    ///
+    /// The previous body scanned the blockmap only, which OMITS dedup-only
+    /// blocks: a promoted dedup entry keeps its 4K block live at rc>0 after every
+    /// L2P sharer LBA has been overwritten (until orphan-reclaim demotes it). On a
+    /// reused pool those blocks are absent from the blockmap, so
+    /// `rebuild_from_metadata` treated a still-referenced PBA as a free gap → the
+    /// next allocation reused a live block → foreground CRC. The dedup-union fix
+    /// had been applied to `MetadbBackend::iter_allocated_blocks`, but rebuild
+    /// reaches the free-list through THIS wrapper, so the fix never ran on the
+    /// live path (root-caused 2026-07-02).
     pub fn iter_allocated_blocks(&self) -> OnyxResult<Vec<Pba>> {
-        let mut allocated = std::collections::BTreeSet::new();
-        for (_, _, value) in self.backend.scan_all_blockmap_entries()? {
-            if value.is_zero() {
-                continue;
-            }
-            let blocks = freed_blocks_for_l2p_value(&value);
-            for block in 0..blocks {
-                allocated.insert(Pba(value.pba.0 + u64::from(block)));
-            }
-        }
-        Ok(allocated.into_iter().collect())
+        Ok(self
+            .backend
+            .iter_allocated_blocks()?
+            .into_iter()
+            .map(|(pba, _)| pba)
+            .collect())
     }
 }
