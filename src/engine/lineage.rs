@@ -85,22 +85,28 @@ impl LineageFreedPbaDrainHandle {
         // PBA is not in the allocator free list (so it cannot be reused under
         // us), and the reclaim path's delay + age grace lets any in-flight
         // sibling reference settle into the L2P before the reverify decides.
-        // `retire_committed` evicts the candidate cache.
-        for extent in extents {
-            // Idempotent duplicate-surface absorb (mirrors the old
-            // free_lineage_gc_proven precheck): metadb legitimately re-surfaces
-            // the same PBA across GC cycles (documented duplicate FreePbas). If a
-            // prior surface already retired+reclaimed it, the PBA is now free /
-            // still retired — `retire_committed` would otherwise hit
-            // "retire_extent overlaps free extent" and churn the retry queue.
-            // Skip it. (Harmless even without this — grace + GcRunner Gate-2
-            // prevent any bad free — but this keeps the log + retry queue clean.)
-            let allocator = pba_lifecycle.allocator();
-            if allocator.is_extent_free(extent) || allocator.is_retired(extent.start) {
-                continue;
-            }
-            pba_lifecycle.retire_committed("lineage_gc_surfaced", extent);
-        }
+        // `retire_committed_batch` evicts the candidate cache. Survivors of the
+        // precheck retire in ONE lock-amortized batch — the old per-extent
+        // `retire_committed` paid the full lane-scan + free/retired/age lock
+        // cost per surfaced extent, contending the allocator at the overwrite
+        // rate from this background thread.
+        let allocator = pba_lifecycle.allocator();
+        let survivors: Vec<_> = extents
+            .into_iter()
+            .filter(|extent| {
+                // Idempotent duplicate-surface absorb (mirrors the old
+                // free_lineage_gc_proven precheck): metadb legitimately
+                // re-surfaces the same PBA across GC cycles (documented
+                // duplicate FreePbas). If a prior surface already
+                // retired+reclaimed it, the PBA is now free / still retired —
+                // retiring again would hit "retire_extent overlaps free
+                // extent" and churn the retry queue. Skip it. (Harmless even
+                // without this — grace + GcRunner Gate-2 prevent any bad free
+                // — but this keeps the log + retry queue clean.)
+                !allocator.is_extent_free(*extent) && !allocator.is_retired(extent.start)
+            })
+            .collect();
+        pba_lifecycle.retire_committed_batch("lineage_gc_surfaced", &survivors);
     }
 
     pub(super) fn stop(&mut self) {

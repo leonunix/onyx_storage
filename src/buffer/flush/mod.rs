@@ -427,6 +427,33 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         context: &'static str,
     ) {
+        let mut dead = Vec::new();
+        Self::collect_unreferenced_raw_blocks(unit, base_pba, live_positions, &mut dead);
+        for extent in dead {
+            if let Err(e) = crate::space::pba_lifecycle::rollback_uncommitted(allocator, extent) {
+                tracing::warn!(
+                    pba = extent.start.0,
+                    blocks = extent.count,
+                    context,
+                    error = %e,
+                    "failed to free unreferenced raw block after metadata commit"
+                );
+            }
+        }
+    }
+
+    /// Collect variant of [`Self::free_unreferenced_raw_blocks`] for the
+    /// commit worker's batched cleanup: dead (superseded-before-commit)
+    /// positions of a full raw unit are pushed onto `out` as extents instead
+    /// of being freed one lock acquisition at a time. Adjacent dead positions
+    /// coalesce WITHIN this unit only — never across units, so one unit's
+    /// (never-expected) free failure can't leak another unit's blocks.
+    fn collect_unreferenced_raw_blocks(
+        unit: &CompressedUnit,
+        base_pba: Pba,
+        live_positions: &[usize],
+        out: &mut Vec<Extent>,
+    ) {
         if !Self::is_full_raw_unit(unit) {
             return;
         }
@@ -438,19 +465,26 @@ impl BufferFlusher {
             }
         }
 
+        let mut run: Option<Extent> = None;
         for (pos, is_live) in live.into_iter().enumerate() {
             if is_live {
+                if let Some(r) = run.take() {
+                    out.push(r);
+                }
                 continue;
             }
             let pba = Pba(base_pba.0 + pos as u64);
-            if let Err(e) = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba) {
-                tracing::warn!(
-                    pba = pba.0,
-                    context,
-                    error = %e,
-                    "failed to free unreferenced raw block after metadata commit"
-                );
-            }
+            run = Some(match run {
+                Some(r) if r.end_pba() == pba => Extent::new(r.start, r.count + 1),
+                Some(r) => {
+                    out.push(r);
+                    Extent::single(pba)
+                }
+                None => Extent::single(pba),
+            });
+        }
+        if let Some(r) = run {
+            out.push(r);
         }
     }
 

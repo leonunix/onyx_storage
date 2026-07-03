@@ -376,14 +376,16 @@ impl BufferFlusher {
         let seq_rejected_set: std::collections::HashSet<usize> =
             seq_rejected_indices.iter().copied().collect();
         let mut post_mark_ranges_by_shard: HashMap<usize, Vec<(u64, Lba, u32)>> = HashMap::new();
+        // Never-committed PBAs to roll back — collected across the loop and
+        // freed in ONE lock-amortized batch below. The old per-unit (and, for
+        // raw units under backlog, per-superseded-block) `rollback_uncommitted*`
+        // calls each paid the full lane-scan + free/retired lock cost on the
+        // commit worker, contending with every shard writer's allocation.
+        let mut rollbacks: Vec<Extent> = Vec::new();
 
         for (i, ucd) in units.iter().enumerate() {
             if discarded[i] {
-                if ucd.alloc_blocks == 1 {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
-                } else {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
-                }
+                rollbacks.push(Extent::new(ucd.pba, ucd.alloc_blocks));
                 post_mark_ranges_by_shard
                     .entry(ucd.shard_idx)
                     .or_default()
@@ -391,11 +393,7 @@ impl BufferFlusher {
                 continue;
             }
             if commit_failed_set.contains(&i) {
-                if ucd.alloc_blocks == 1 {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
-                } else {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
-                }
+                rollbacks.push(Extent::new(ucd.pba, ucd.alloc_blocks));
                 continue;
             }
             if seq_rejected_set.contains(&i) {
@@ -415,11 +413,7 @@ impl BufferFlusher {
                 continue;
             };
             if um.live_positions.is_empty() {
-                if ucd.alloc_blocks == 1 {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
-                } else {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
-                }
+                rollbacks.push(Extent::new(ucd.pba, ucd.alloc_blocks));
                 post_mark_ranges_by_shard
                     .entry(ucd.shard_idx)
                     .or_default()
@@ -430,13 +424,14 @@ impl BufferFlusher {
             // commit (never in any tx) are direct-freed; positions whose
             // remap was seq_guard-rejected have payload on LV3 and are
             // retired instead (see `retire_rejected_extent`). Per-LBA
-            // PBAs only exist for raw-split units.
-            Self::free_unreferenced_raw_blocks(
+            // PBAs only exist for raw-split units. Dead positions coalesce
+            // within this unit only (adjacent extents merge again inside the
+            // allocator batch, but a failure never spans units).
+            Self::collect_unreferenced_raw_blocks(
                 &ucd.unit,
                 ucd.pba,
                 &um.live_positions,
-                allocator,
-                "commit_worker_passthrough",
+                &mut rollbacks,
             );
             if um.accepted_positions.len() != um.live_positions.len()
                 && Self::is_full_raw_unit(&ucd.unit)
@@ -456,6 +451,11 @@ impl BufferFlusher {
                 .or_default()
                 .extend(ucd.unit.seq_lba_ranges.iter().cloned());
         }
+
+        // One lock-amortized batch for every never-committed rollback in this
+        // job (discarded / commit-failed / live-empty units + superseded raw
+        // sub-blocks).
+        crate::space::pba_lifecycle::rollback_uncommitted_batch(allocator, &rollbacks);
 
         if !actual_old_pba_meta.old_pba_meta.is_empty() {
             let _ = cleanup_tx.send(actual_old_pba_meta.old_pba_meta.into_values().collect());
@@ -1082,12 +1082,12 @@ impl BufferFlusher {
         lane_done_txs: &[Sender<Vec<u64>>],
         metrics: &EngineMetrics,
     ) {
+        let rollbacks: Vec<Extent> = units
+            .iter()
+            .map(|ucd| Extent::new(ucd.pba, ucd.alloc_blocks))
+            .collect();
+        crate::space::pba_lifecycle::rollback_uncommitted_batch(allocator, &rollbacks);
         for ucd in units {
-            if ucd.alloc_blocks == 1 {
-                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, ucd.pba);
-            } else {
-                let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(ucd.pba, ucd.alloc_blocks));
-            }
             metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
             match &ucd.completion {
                 None => in_flight_tracker.defer_retry(&ucd.seqs, Self::RETRY_BACKOFF),

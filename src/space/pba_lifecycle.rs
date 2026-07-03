@@ -60,6 +60,29 @@ pub fn rollback_uncommitted_one(allocator: &SpaceAllocator, pba: Pba) -> OnyxRes
     rollback_uncommitted(allocator, Extent::single(pba))
 }
 
+/// Batch form of [`rollback_uncommitted`] for the commit-worker cleanup loop.
+///
+/// Same semantics as the single path — never-committed PBAs, so the candidate
+/// cache is deliberately NOT touched — but the whole set goes through the
+/// allocator's lock-amortized [`SpaceAllocator::free_extents_batch`] instead
+/// of paying the full lane-scan + free/retired lock cost per extent. Failed
+/// extents are warn-logged in aggregate (the single-path callers `let _ =`
+/// these errors today; a failure here means the extent was already
+/// free/retired/lane-cached — an invariant breach worth surfacing loudly).
+pub fn rollback_uncommitted_batch(allocator: &SpaceAllocator, extents: &[Extent]) {
+    if extents.is_empty() {
+        return;
+    }
+    let (_freed, failed) = allocator.free_extents_batch(extents);
+    for extent in failed {
+        tracing::warn!(
+            pba = extent.start.0,
+            blocks = extent.count,
+            "pba_lifecycle: batched uncommitted rollback rejected; blocks leaked until restart"
+        );
+    }
+}
+
 struct RetireRetryItem {
     extent: Extent,
     reason: &'static str,
@@ -514,6 +537,26 @@ mod tests {
             candidate.has_pba(pba),
             "rollback_uncommitted must not evict candidate slots"
         );
+    }
+
+    #[test]
+    fn rollback_uncommitted_batch_frees_without_touching_candidate() {
+        let (allocator, candidate, _metrics, _lc) = lifecycle();
+        let p0 = allocator.allocate_one().unwrap();
+        let p1 = allocator.allocate_one().unwrap();
+        let fp: ContentHash = [8; 8];
+        candidate.insert(fp, bv(p0));
+        rollback_uncommitted_batch(&allocator, &[Extent::single(p0), Extent::single(p1)]);
+        assert!(allocator.is_free(p0));
+        assert!(allocator.is_free(p1));
+        assert!(
+            candidate.has_pba(p0),
+            "batched rollback must not evict candidate slots"
+        );
+        // A failed member (already free) is absorbed with a warn, the rest freed.
+        let p2 = allocator.allocate_one().unwrap();
+        rollback_uncommitted_batch(&allocator, &[Extent::single(p0), Extent::single(p2)]);
+        assert!(allocator.is_free(p2));
     }
 
     #[test]

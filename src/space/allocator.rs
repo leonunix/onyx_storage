@@ -854,6 +854,92 @@ impl SpaceAllocator {
         (total_newly, failed)
     }
 
+    /// Batch analogue of [`Self::free_extent`] (never-committed rollback
+    /// frees). The single-extent path pays, PER extent,
+    /// `ensure_not_in_lane_cache` (~2×num_lanes mutexes) + the `free` lock
+    /// TWICE (validate + insert) + the `retired` lock — and the commit workers
+    /// run it per discarded/superseded unit (and per dead raw sub-block) at
+    /// the overwrite rate, hammering the exact lock the shard writers need for
+    /// allocation. This amortizes the lane snapshot and every lock over a
+    /// bounded chunk, mirroring [`Self::retire_extents_batch`].
+    ///
+    /// Semantics per extent match the single path's authoritative in-lock
+    /// re-check (the single path's pre-lock validate is only an early-out):
+    /// shape, lane-cache overlap (via the chunk snapshot), free-list overlap,
+    /// retired overlap, counter underflow. Failures are returned in `failed`
+    /// and leave that extent untouched (callers today `let _ =` single-free
+    /// errors; batched callers warn-log the aggregate).
+    ///
+    /// Lock order matches the single path exactly — `free` (outermost) →
+    /// `retired` (inner; the single path takes `retired` inside the held
+    /// `free` via `overlapping_retired_extent`) — no inversion with retire
+    /// (free→retired→age) or the reclaim batch (never holds free+retired
+    /// together).
+    pub fn free_extents_batch(&self, extents: &[Extent]) -> (u64, Vec<Extent>) {
+        let mut total_freed: u64 = 0;
+        let mut failed: Vec<Extent> = Vec::new();
+        for chunk in extents.chunks(BATCH_LOCK_CHUNK) {
+            let (lane_pbas, lane_exts) = self.snapshot_lane_caches();
+            // Hazard barrier outside all locks (matches the single path's
+            // wait; cheap when unpinned). Shape-invalid extents are skipped
+            // here and rejected below.
+            for extent in chunk {
+                if extent.count > 0 && extent.end_pba().0 <= self.total_blocks {
+                    self.hazards.wait_extent_clear(extent.start, extent.count);
+                }
+            }
+
+            let mut chunk_freed: u64 = 0;
+            let mut chunk_released: Vec<Extent> = Vec::with_capacity(chunk.len());
+            {
+                let mut free = self.free_extents.lock().unwrap();
+                let retired = self.retired_extents.lock().unwrap();
+                for &extent in chunk {
+                    if self.validate_extent_shape(extent, "free_extents_batch").is_err() {
+                        failed.push(extent);
+                        continue;
+                    }
+                    let in_lane = (0..extent.count)
+                        .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
+                        || Self::sorted_extents_overlap(&lane_exts, extent);
+                    if in_lane
+                        || Self::overlapping_extent(free.by_addr(), extent).is_some()
+                        || Self::overlapping_extent(&retired, extent).is_some()
+                    {
+                        failed.push(extent);
+                        continue;
+                    }
+                    // Underflow guard with the running debit (counters are
+                    // only applied once per chunk, so the raw load is stale
+                    // within the chunk).
+                    let avail = self
+                        .allocated_blocks
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(chunk_freed);
+                    if u64::from(extent.count) > avail {
+                        failed.push(extent);
+                        continue;
+                    }
+                    free.coalesce_insert(extent);
+                    self.track_release(extent, "free_extents_batch");
+                    chunk_released.push(extent);
+                    chunk_freed += u64::from(extent.count);
+                }
+            }
+            // Diagnostic trace outside the lock section (see retire_extent_at).
+            for &extent in &chunk_released {
+                crate::space::free_trace::trace_free(extent, "free_batch");
+            }
+            if chunk_freed > 0 {
+                self.allocated_blocks
+                    .fetch_sub(chunk_freed, Ordering::Relaxed);
+                self.free_blocks.fetch_add(chunk_freed, Ordering::Relaxed);
+                total_freed += chunk_freed;
+            }
+        }
+        (total_freed, failed)
+    }
+
     /// Sub-ranges of `extent` NOT covered by any extent in the coalesced `set`
     /// (the genuinely-new portions of a retire). `set` is non-overlapping and
     /// sorted by start, so this is a single ordered walk.
@@ -2008,6 +2094,111 @@ mod age_tests {
         assert!(failed.is_empty());
         assert_eq!(a.retired_block_count(), count as u64);
         assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
+    }
+
+    /// The batched free must leave identical allocator state to freeing the
+    /// same extents one-by-one through `free_one`/`free_extent`.
+    #[test]
+    fn batch_free_equals_sequence() {
+        let mk = || {
+            let a = new_alloc(4096);
+            let n = alloc_first(&a, 200);
+            (a, n)
+        };
+        // Stride-2 singles + a couple of multi-block extents.
+        let extents: Vec<Extent> = {
+            let (_, n) = mk();
+            let mut v: Vec<Extent> = (0..50u64).map(|i| Extent::single(Pba(n + 2 * i))).collect();
+            v.push(Extent::new(Pba(n + 120), 4));
+            v.push(Extent::new(Pba(n + 130), 8));
+            v
+        };
+        let (a_seq, _) = mk();
+        for e in &extents {
+            a_seq.free_extent(*e).unwrap();
+        }
+        let (a_batch, _) = mk();
+        let (freed, failed) = a_batch.free_extents_batch(&extents);
+        assert_eq!(freed, 50 + 4 + 8);
+        assert!(failed.is_empty());
+        assert_eq!(a_seq.free_block_count(), a_batch.free_block_count());
+        assert_eq!(a_seq.allocated_block_count(), a_batch.allocated_block_count());
+        assert_eq!(
+            *a_seq.free_extents.lock().unwrap().by_addr(),
+            *a_batch.free_extents.lock().unwrap().by_addr(),
+            "end-state free lists must be identical"
+        );
+    }
+
+    /// Adjacent extents within one batch coalesce into the same end state the
+    /// sequential path produces.
+    #[test]
+    fn batch_free_coalesces_adjacent_members() {
+        let a = new_alloc(4096);
+        let n = alloc_first(&a, 12);
+        let batch = [
+            Extent::new(Pba(n), 3),
+            Extent::new(Pba(n + 3), 3),
+            Extent::new(Pba(n + 6), 6),
+        ];
+        let (freed, failed) = a.free_extents_batch(&batch);
+        assert_eq!((freed, failed.len()), (12, 0));
+        // All 12 blocks free and merged with the trailing free space into one run.
+        assert!(a.is_extent_free(Extent::new(Pba(n), 12)));
+        assert_eq!(a.allocated_block_count(), 0);
+    }
+
+    /// Failure mix: an already-free member and a retired member are rejected
+    /// (returned in `failed`), the rest of the batch still frees.
+    #[test]
+    fn batch_free_failure_mix() {
+        let a = new_alloc(4096);
+        let n = alloc_first(&a, 12);
+        let t0 = Instant::now();
+        a.free_one(Pba(n + 4)).unwrap(); // already free
+        a.retire_extent_at(Extent::single(Pba(n + 6)), t0).unwrap(); // retired
+        let batch = [
+            Extent::single(Pba(n)),      // frees
+            Extent::single(Pba(n + 4)),  // free-overlap → failed
+            Extent::single(Pba(n + 6)),  // retired-overlap → failed
+            Extent::single(Pba(n + 8)),  // frees
+        ];
+        let (freed, failed) = a.free_extents_batch(&batch);
+        assert_eq!(freed, 2);
+        assert_eq!(failed, vec![Extent::single(Pba(n + 4)), Extent::single(Pba(n + 6))]);
+        assert!(a.is_free(Pba(n)));
+        assert!(a.is_free(Pba(n + 8)));
+        assert!(a.is_retired(Pba(n + 6)), "retired member untouched");
+    }
+
+    /// A duplicate entry within one batch is caught by the intra-chunk
+    /// free-overlap check (first frees, second fails) — no double free.
+    #[test]
+    fn batch_free_rejects_intra_batch_duplicate() {
+        let a = new_alloc(64);
+        let n = alloc_first(&a, 2);
+        let batch = [Extent::single(Pba(n)), Extent::single(Pba(n))];
+        let (freed, failed) = a.free_extents_batch(&batch);
+        assert_eq!(freed, 1);
+        assert_eq!(failed, vec![Extent::single(Pba(n))]);
+        assert_eq!(a.allocated_block_count(), 1);
+    }
+
+    /// A batch larger than `BATCH_LOCK_CHUNK` frees every extent across chunks.
+    #[test]
+    fn batch_free_spans_chunks() {
+        let count = BATCH_LOCK_CHUNK + 50;
+        let a = new_alloc((4 * count as u64) + 256);
+        let base = alloc_first(&a, 2 * count);
+        let extents: Vec<Extent> = (0..count as u64)
+            .map(|i| Extent::single(Pba(base + 2 * i)))
+            .collect();
+        let (freed, failed) = a.free_extents_batch(&extents);
+        assert_eq!(freed, count as u64);
+        assert!(failed.is_empty());
+        for i in 0..count as u64 {
+            assert!(a.is_free(Pba(base + 2 * i)));
+        }
     }
 }
 
