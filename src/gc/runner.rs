@@ -52,6 +52,19 @@ const URGENCY_FREE_PCT: u64 = 50;
 /// 32) so a non-zero `effort` always makes real progress; 64 > 32 with margin.
 const COMPACTOR_MIN_WINDOW_LBAS: u64 = 64;
 
+/// Wall-clock cap on one cycle's rewrite loop. Each rewrite does a synchronous
+/// LV3 read + a buffer append that can PARK on ring space under load, and
+/// reclaim runs on the same gc thread between cycles — without this box, one
+/// oversized candidate batch starves reclaim, the free pool drains, the
+/// flusher hits SpaceExhausted and can no longer free the ring the parked
+/// append waits on (engine wedge, box 2026-07-03). 2 s of a 5 s cycle leaves
+/// reclaim its cadence; dropped candidates are re-selected next lap.
+const COMPACTOR_REWRITE_TIMEBOX_MS: u64 = 2_000;
+/// Stop DEFRAG rewrites (optional work) once the buffer is this full — they
+/// would only deepen the very backlog the effort model is trying to relieve.
+/// Legacy/slot-evac candidates (space-pressure work) are not fill-gated.
+const COMPACTOR_REWRITE_FILL_STOP_PCT: u8 = 70;
+
 /// Background GC runner thread.
 pub struct GcRunner {
     running: Arc<AtomicBool>,
@@ -533,12 +546,28 @@ impl GcRunner {
         // Legacy/slot-evac candidates come first in the vec (unit-budgeted at
         // scan time); defrag candidates follow, double-guarded here by their
         // BLOCK budget using actual rewritten counts.
+        //
+        // The loop is TIME-BOXED and FILL-GUARDED. Each rewrite is a
+        // synchronous LV3 read + a buffer append; under foreground load the
+        // append can park on ring space, and reclaim runs on THIS thread
+        // between cycles — an unbounded loop starves reclaim, the free pool
+        // drains, the flusher hits SpaceExhausted and can no longer free the
+        // ring the parked append is waiting for (box 2026-07-03: one 12.7K-
+        // candidate cycle wedged the whole engine). Unmoved candidates are
+        // simply dropped; the next window/lap re-selects them.
+        let deadline = Instant::now() + Duration::from_millis(COMPACTOR_REWRITE_TIMEBOX_MS);
         let mut defrag_blocks_moved = 0u64;
         for candidate in &candidates {
-            if !running.load(Ordering::Relaxed) {
+            if !running.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 break;
             }
-            if candidate.defrag && defrag_blocks_moved >= defrag.max_blocks {
+            if candidate.defrag
+                && (defrag_blocks_moved >= defrag.max_blocks
+                    || buffer_pool
+                        .fill_percentage()
+                        .max(buffer_pool.payload_fill_percentage())
+                        >= COMPACTOR_REWRITE_FILL_STOP_PCT)
+            {
                 break; // defrag candidates are the vec's tail — nothing after
             }
             metrics.gc_rewrite_attempts.fetch_add(1, Ordering::Relaxed);
@@ -554,8 +583,13 @@ impl GcRunner {
                     metrics
                         .gc_blocks_rewritten
                         .fetch_add(rewritten as u64, Ordering::Relaxed);
-                    if candidate.defrag {
+                    if candidate.defrag && rewritten > 0 {
                         defrag_blocks_moved += rewritten as u64;
+                        // Incremental (not end-of-loop) so status shows live
+                        // progress inside a long cycle.
+                        metrics
+                            .gc_defrag_blocks_moved
+                            .fetch_add(rewritten as u64, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
@@ -568,11 +602,6 @@ impl GcRunner {
                     );
                 }
             }
-        }
-        if defrag_blocks_moved > 0 {
-            metrics
-                .gc_defrag_blocks_moved
-                .fetch_add(defrag_blocks_moved, Ordering::Relaxed);
         }
     }
 
