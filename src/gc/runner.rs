@@ -28,7 +28,17 @@ use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 /// throughput under fragmented retires once the grace re-aging bug was fixed; a
 /// block budget keeps reclaim able to keep up with the retire rate. Bounded so a
 /// single cycle's Gate-2 fold-consistent rc rechecks (per-PBA) stay cheap.
-const MAX_RETIRED_RECLAIM_BLOCKS_PER_CYCLE: usize = 262_144;
+///
+/// 4 GiB/cycle: the old 262_144 (1 GiB) capped reclaim at ~52K blocks/s (5s
+/// cycles) while sustained randwrite overwrite retires 60-150K blocks/s —
+/// retired_depth grew monotonically (6.6M blocks on the 2026-07-03 capture)
+/// until multi-block allocations hit SpaceExhausted with 16 GiB nominally
+/// free but shattered into single-block fragments. The Gates scale linearly
+/// and the allocator-side batch insert is chunked with inter-chunk breathers,
+/// so a deeper cycle costs wall time on the GC thread only. Deeper cycles
+/// also return MORE adjacent dead blocks together, so the freed extents
+/// coalesce better (less single-block confetti).
+const MAX_RETIRED_RECLAIM_BLOCKS_PER_CYCLE: usize = 1_048_576;
 
 /// Free-space percentage at/below which the resident compactor's `urgency`
 /// reaches full and overrides the idle backoff (compact even under foreground
