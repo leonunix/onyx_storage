@@ -650,19 +650,33 @@ impl BufferShard {
 
         // ── Ring lock: reserve space, wait if shard is temporarily full ──
         // The flush lane will drain entries and notify ring_space_cv.
+        // The wait is TIMED (`buffer_backpressure_wait_ns` + `..._events`):
+        // when the flusher can't keep up, appenders park HERE — before the
+        // log-write/durability buckets — and without this bucket the stall is
+        // invisible in `front_write_ns` (the 2026-07-03 gap hunt found ~45% of
+        // append wall-time unaccounted, all of it this wait).
         let write_offset = {
             let mut ring = self.ring.lock();
-            loop {
+            let mut wait_start: Option<Instant> = None;
+            let offset = loop {
                 if let Some(offset) = Self::reserve_log_space(&mut ring, seq, slot_count) {
-                    break offset;
+                    break Ok(offset);
                 }
                 // Entry physically cannot fit even in empty ring → real error.
                 if Self::slot_bytes(slot_count) > ring.capacity_bytes {
-                    return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                    break Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
                 }
                 // No backpressure configured (tests) → fail immediately.
                 if self.backpressure_timeout.is_zero() {
-                    return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                    break Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                }
+                if wait_start.is_none() {
+                    wait_start = Some(Instant::now());
+                    if let Some(metrics) = self.metrics.get() {
+                        metrics
+                            .buffer_backpressure_events
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 if self.backpressure_waits_forever() {
                     let _ = self
@@ -675,9 +689,15 @@ impl BufferShard {
                     .ring_space_cv
                     .wait_for(&mut ring, self.backpressure_timeout);
                 if wait.timed_out() {
-                    return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                    break Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
                 }
+            };
+            if let (Some(start), Some(metrics)) = (wait_start, self.metrics.get()) {
+                metrics
+                    .buffer_backpressure_wait_ns
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
+            offset?
         };
 
         let payload_len = payload.len() as u64;

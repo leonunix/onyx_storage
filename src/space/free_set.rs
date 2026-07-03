@@ -26,6 +26,19 @@ pub(crate) struct FreeSet {
     /// Starts are unique (at most one extent per start in `by_addr`), so the
     /// pairs are unique too.
     by_size: BTreeSet<(u32, u64)>,
+    /// Engine RAID geometry `(stripe_blocks, phase)`, fixed at startup. When
+    /// set (stripe > 1), `by_eff` is maintained and `first_fit_aligned` for
+    /// THIS geometry is a size-class cursor jump instead of a scan.
+    geom: Option<(u32, u32)>,
+    /// Effective-aligned-capacity index for the configured geometry: one
+    /// `(count - head_pad(start), start)` per extent (saturating at 0). An
+    /// extent can host an aligned `need`-carve iff `eff >= need`, so
+    /// "lowest-address hosting extent" is the same cursor-jump argmin as
+    /// [`Self::first_fit`] — this kills the fragmented-belt pathology where
+    /// millions of misaligned tight fragments were linearly slack-checked
+    /// under the global free lock (65 ms/call at 3M fragments, box-measured
+    /// as multi-second front-end stalls).
+    by_eff: BTreeSet<(u32, u64)>,
 }
 
 impl FreeSet {
@@ -33,13 +46,52 @@ impl FreeSet {
         Self {
             by_addr: BTreeSet::new(),
             by_size: BTreeSet::new(),
+            geom: None,
+            by_eff: BTreeSet::new(),
         }
     }
 
     /// Build from an already-built address set (rebuild_from_metadata path).
+    /// Keeps the previously-configured geometry (rebuild happens after
+    /// startup wiring).
     pub(crate) fn from_addr_set(by_addr: BTreeSet<Extent>) -> Self {
         let by_size = by_addr.iter().map(|e| (e.count, e.start.0)).collect();
-        Self { by_addr, by_size }
+        Self {
+            by_addr,
+            by_size,
+            geom: None,
+            by_eff: BTreeSet::new(),
+        }
+    }
+
+    /// Configure the engine's fixed RAID geometry and (re)build the
+    /// effective-capacity index. Idempotent; `stripe <= 1` clears it.
+    pub(crate) fn set_geometry(&mut self, stripe: u32, phase: u32) {
+        if stripe <= 1 {
+            self.geom = None;
+            self.by_eff.clear();
+            return;
+        }
+        if self.geom == Some((stripe, phase)) && self.by_eff.len() == self.by_addr.len() {
+            return;
+        }
+        self.geom = Some((stripe, phase));
+        self.by_eff = self
+            .by_addr
+            .iter()
+            .map(|e| (Self::eff_count(*e, stripe, phase), e.start.0))
+            .collect();
+    }
+
+    pub(crate) fn geometry(&self) -> Option<(u32, u32)> {
+        self.geom
+    }
+
+    /// Blocks usable for an aligned carve starting at/after `align_up(start)`:
+    /// `count - head_pad(start)`, saturating at 0.
+    fn eff_count(e: Extent, stripe: u32, phase: u32) -> u32 {
+        let head = head_pad(e.start.0, stripe as u64, phase as u64);
+        e.count.saturating_sub(head as u32)
     }
 
     /// Read-only view for the overlap/covering/range logic that predates the
@@ -58,6 +110,10 @@ impl FreeSet {
         let inserted = self.by_addr.insert(extent);
         debug_assert!(inserted, "FreeSet::insert: duplicate start {}", extent.start.0);
         self.by_size.insert((extent.count, extent.start.0));
+        if let Some((stripe, phase)) = self.geom {
+            self.by_eff
+                .insert((Self::eff_count(extent, stripe, phase), extent.start.0));
+        }
         debug_assert_eq!(self.by_addr.len(), self.by_size.len());
     }
 
@@ -76,6 +132,12 @@ impl FreeSet {
                 );
                 let removed = self.by_size.remove(&(taken.count, taken.start.0));
                 debug_assert!(removed, "FreeSet: by_size missing ({}, {})", taken.count, taken.start.0);
+                if let Some((stripe, phase)) = self.geom {
+                    let removed_eff = self
+                        .by_eff
+                        .remove(&(Self::eff_count(taken, stripe, phase), taken.start.0));
+                    debug_assert!(removed_eff, "FreeSet: by_eff missing start {}", taken.start.0);
+                }
                 debug_assert_eq!(self.by_addr.len(), self.by_size.len());
                 true
             }
@@ -128,8 +190,37 @@ impl FreeSet {
     ///     ascend, so the first passing entry is that class's argmin.
     ///
     /// The answer is the address-argmin over both.
+    ///
+    /// When `(stripe, phase)` matches the configured geometry this is a pure
+    /// cursor jump over `by_eff` (hosting ⟺ `eff >= need`) — O(D·log N) even
+    /// when the belt is millions of misaligned tight fragments. The
+    /// slack-check scan below remains as the geometry-mismatch fallback
+    /// (tests / hypothetical multi-geometry callers): identical selection,
+    /// but O(class size) on a hostless fragmented belt — never let a hot path
+    /// take it (the 2026-07-03 oscillation was exactly this scan at 65 ms/call
+    /// under the global free lock).
     pub(crate) fn first_fit_aligned(&self, need: u32, stripe: u32, phase: u32) -> Option<Extent> {
         debug_assert!(stripe > 1 && need > 0 && need.is_multiple_of(stripe));
+        if self.geom == Some((stripe, phase)) {
+            // Cursor jump over distinct eff classes >= need; each class's
+            // first entry is that class's lowest address; argmin over classes.
+            let mut best: Option<(u64, u32)> = None;
+            let mut lower = Bound::Included((need, 0u64));
+            while let Some(&(eff, start)) = self.by_eff.range((lower, Bound::Unbounded)).next() {
+                if best.is_none_or(|(bs, _)| start < bs) {
+                    best = Some((start, eff));
+                }
+                lower = Bound::Excluded((eff, u64::MAX));
+            }
+            return best.map(|(start, _)| {
+                // Return the stored extent (count from by_addr, not eff).
+                *self
+                    .by_addr
+                    .get(&Extent::single(Pba(start)))
+                    .expect("by_eff start must exist in by_addr")
+            });
+        }
+
         let mut best: Option<Extent> = self.first_fit(need.saturating_add(stripe - 1));
         // Tight classes: count in [need, need+stripe-2]. Guard the upper bound
         // against u32 overflow (need close to u32::MAX).
@@ -208,6 +299,19 @@ impl FreeSet {
                 e.count,
                 e.start.0
             );
+        }
+        if let Some((stripe, phase)) = self.geom {
+            assert_eq!(self.by_addr.len(), self.by_eff.len());
+            for e in &self.by_addr {
+                assert!(
+                    self.by_eff
+                        .contains(&(Self::eff_count(*e, stripe, phase), e.start.0)),
+                    "by_eff missing start {}",
+                    e.start.0
+                );
+            }
+        } else {
+            assert!(self.by_eff.is_empty());
         }
     }
 }
@@ -352,26 +456,38 @@ mod tests {
 
     /// Shadow property test: random alloc/free traffic applied to FreeSet and
     /// a plain `BTreeSet<Extent>` in lockstep; every query must select the
-    /// SAME extent as the literal old linear-scan code, and the side index
-    /// must stay a perfect mirror.
+    /// SAME extent as the literal old linear-scan code, and the side indexes
+    /// must stay perfect mirrors. Even rounds configure the engine geometry
+    /// (exercising the `by_eff` fast path); odd rounds leave it unset and
+    /// query random geometries (exercising the slack-scan fallback).
     #[test]
     fn shadow_equivalence_random_traffic() {
         let mut rng = StdRng::seed_from_u64(0x000a_110c_a70e);
-        for round in 0..8 {
+        for round in 0..8usize {
             let mut fs = FreeSet::new();
             let mut shadow: BTreeSet<Extent> = BTreeSet::new();
             // Seed: one big run, mimicking a fresh allocator.
             let seed = Extent::new(Pba(8), 100_000);
             fs.insert(seed);
             shadow.insert(seed);
+            let fixed_geom = if round % 2 == 0 {
+                let stripe = [2u32, 6, 384][(round / 2) % 3];
+                let phase = (round as u32 * 7) % stripe;
+                fs.set_geometry(stripe, phase);
+                Some((stripe, phase))
+            } else {
+                None
+            };
             let mut allocated: Vec<Extent> = Vec::new();
 
             for _ in 0..4_000 {
                 // Queries first — every one must agree with the oracle.
                 let k = rng.gen_range(1..=64u32);
                 assert_eq!(fs.first_fit(k), shadow_first_fit(&shadow, k), "round {round} k {k}");
-                let stripe = [2u32, 6, 384][rng.gen_range(0..3)];
-                let phase = rng.gen_range(0..stripe);
+                let (stripe, phase) = fixed_geom.unwrap_or_else(|| {
+                    let s = [2u32, 6, 384][rng.gen_range(0..3)];
+                    (s, rng.gen_range(0..s))
+                });
                 let need = stripe * rng.gen_range(1..=2u32);
                 assert_eq!(
                     fs.first_fit_aligned(need, stripe, phase),
@@ -420,5 +536,64 @@ mod tests {
             assert_eq!(fs.by_addr(), &shadow, "round {round} end-state");
             fs.assert_consistent();
         }
+    }
+}
+
+#[cfg(test)]
+mod starve_bench {
+    use super::*;
+
+    /// Reproduce the fragmented-belt stall state: millions of MISALIGNED
+    /// tight-class fragments (sizes 6..=10 with phase-mismatched starts), NO
+    /// run >= need+stripe-1. Measures one first_fit_aligned call.
+    /// Run: cargo test --release --lib bench_first_fit_aligned_starved -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_first_fit_aligned_starved() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2; // aligned starts: (s+2)%6==0
+        let mut fs = FreeSet::new();
+        // 3M fragments, stride 16, sizes cycling 6..=10, starts arranged so
+        // (start+PHASE)%STRIPE != 0 AND align_up(start)+6 > end (never hosts).
+        let mut n = 0u64;
+        let mut start = 8u64;
+        while n < 3_000_000 {
+            let count = 6 + (n % 5) as u32; // 6..=10
+            // choose start with head_pad > count-6 => cannot host aligned 6
+            let mut s = start;
+            loop {
+                let head = { let r = (s + PHASE as u64) % STRIPE as u64; if r == 0 { 0 } else { STRIPE as u64 - r } };
+                if head > (count - 6) as u64 { break; }
+                s += 1;
+            }
+            fs.insert(Extent::new(Pba(s), count));
+            start = s + count as u64 + 8; // gap so no coalescing/hosting
+            n += 1;
+        }
+        let t = std::time::Instant::now();
+        let r = fs.first_fit_aligned(6, STRIPE, PHASE);
+        let el = t.elapsed();
+        println!("SCAN fallback over 3M misaligned tight fragments: {:?} result={:?}", el, r);
+        assert!(r.is_none());
+        // and the healthy comparison: one aligned fragment near the front
+        fs.insert(Extent::new(Pba(4), 6)); // (4+2)%6==0 aligned
+        let t = std::time::Instant::now();
+        let r2 = fs.first_fit_aligned(6, STRIPE, PHASE);
+        println!("SCAN with an aligned fragment at low address: {:?} result={:?}", t.elapsed(), r2);
+        fs.remove(&Extent::new(Pba(4), 6));
+
+        // Now with the engine geometry configured: the by_eff cursor jump.
+        let t = std::time::Instant::now();
+        fs.set_geometry(STRIPE, PHASE);
+        println!("set_geometry index build over 3M extents: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let r3 = fs.first_fit_aligned(6, STRIPE, PHASE);
+        println!("EFF-INDEX starved miss: {:?} result={:?}", t.elapsed(), r3);
+        assert!(r3.is_none());
+        fs.insert(Extent::new(Pba(4), 6));
+        let t = std::time::Instant::now();
+        let r4 = fs.first_fit_aligned(6, STRIPE, PHASE);
+        println!("EFF-INDEX with aligned fragment: {:?} result={:?}", t.elapsed(), r4);
+        assert_eq!(r4, Some(Extent::new(Pba(4), 6)));
     }
 }

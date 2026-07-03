@@ -713,6 +713,10 @@ impl OnyxEngine {
                 .saturating_sub(crate::types::RESERVED_BLOCKS * crate::types::BLOCK_SIZE as u64),
             config.buffer.shards,
         ));
+        // Fixed LV3 RAID geometry → effective-capacity index for stripe-aligned
+        // first-fit (set BEFORE rebuild so the rebuilt free list is indexed too;
+        // rebuild preserves it).
+        allocator.set_stripe_geometry(io_engine.stripe_blocks(), io_engine.stripe_phase());
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool (with shard migration if needed)
@@ -1528,6 +1532,7 @@ impl OnyxEngine {
                 .saturating_sub(crate::types::RESERVED_BLOCKS * crate::types::BLOCK_SIZE as u64),
             config.buffer.shards,
         ));
+        allocator.set_stripe_geometry(io_engine.stripe_blocks(), io_engine.stripe_phase());
         allocator.rebuild_from_metadata(&meta)?;
 
         // Write buffer pool (with shard migration if needed)

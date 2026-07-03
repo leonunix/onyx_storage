@@ -169,7 +169,16 @@ impl SpaceAllocator {
         let alloc_count = allocated.len() as u64;
         let free_count = usable_blocks - alloc_count;
 
-        *self.free_extents.lock().unwrap() = FreeSet::from_addr_set(free);
+        {
+            let mut fs = self.free_extents.lock().unwrap();
+            // Preserve the startup-configured RAID geometry across the
+            // wholesale rebuild (set_geometry rebuilds the eff index).
+            let geom = fs.geometry();
+            *fs = FreeSet::from_addr_set(free);
+            if let Some((stripe, phase)) = geom {
+                fs.set_geometry(stripe, phase);
+            }
+        }
         self.retired_extents.lock().unwrap().clear();
         self.retired_age.lock().unwrap().clear();
         self.retired_blocks.store(0, Ordering::Relaxed);
@@ -197,6 +206,19 @@ impl SpaceAllocator {
 
     pub fn hazards(&self) -> PbaHazards {
         self.hazards.clone()
+    }
+
+    /// Configure the engine's fixed LV3 RAID geometry so stripe-aligned
+    /// first-fit queries use the effective-capacity index instead of a
+    /// slack-check scan (65 ms/call on a 3M-fragment belt, inside the global
+    /// free lock — the 2026-07-03 throughput-oscillation root cause). Call
+    /// once at startup before flush traffic; idempotent; `stripe <= 1`
+    /// (non-RAID backends) clears it.
+    pub fn set_stripe_geometry(&self, stripe_blocks: u32, phase: u32) {
+        self.free_extents
+            .lock()
+            .unwrap()
+            .set_geometry(stripe_blocks, phase);
     }
 
     /// Wait until no in-flight reader currently pins this physical extent.
@@ -794,7 +816,14 @@ impl SpaceAllocator {
     pub fn retire_extents_batch(&self, extents: &[Extent], now: Instant) -> (u64, Vec<Extent>) {
         let mut total_newly: u64 = 0;
         let mut failed: Vec<Extent> = Vec::new();
-        for chunk in extents.chunks(BATCH_LOCK_CHUNK) {
+        for (chunk_idx, chunk) in extents.chunks(BATCH_LOCK_CHUNK).enumerate() {
+            // Same inter-chunk breather as `reclaim_retired_extents_batch`:
+            // callers are the background cleanup thread / lineage drain /
+            // volume delete, and each chunk holds the free+retired locks the
+            // flush writers allocate under.
+            if chunk_idx > 0 {
+                std::thread::sleep(Duration::from_micros(500));
+            }
             let (lane_pbas, lane_exts) = self.snapshot_lane_caches();
             let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
             let mut chunk_newly: u64 = 0;
@@ -1227,9 +1256,19 @@ impl SpaceAllocator {
     ) -> OnyxResult<(u64, usize)> {
         let mut freed_blocks: u64 = 0;
         let mut freed_extents: usize = 0;
-        for chunk in extents.chunks(BATCH_LOCK_CHUNK) {
+        for (chunk_idx, chunk) in extents.chunks(BATCH_LOCK_CHUNK).enumerate() {
             if !running.load(Ordering::Relaxed) {
                 break;
+            }
+            // Breathe between chunk lock-holds: this runs on the GC thread
+            // (latency-insensitive) but each Phase-B hold does up to 4096
+            // coalesce-inserts (~tens of ms on a multi-million-extent free
+            // list). Re-acquiring immediately wins the (unfair) mutex over the
+            // 16 parked flush writers — box-measured as 22-80 thread-s/s alloc
+            // convoy spikes phase-locked to every 262K-block reclaim batch.
+            // A short sleep guarantees the foreground a window per chunk.
+            if chunk_idx > 0 {
+                std::thread::sleep(Duration::from_micros(500));
             }
             // Snapshot the lane caches ONCE per chunk (vs once per extent). Same
             // mutexes/contents the single-extent `ensure_not_in_lane_cache`
