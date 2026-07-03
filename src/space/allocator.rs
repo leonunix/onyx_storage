@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::error::{OnyxError, OnyxResult};
 use crate::meta::store::MetaStore;
 use crate::space::extent::Extent;
+use crate::space::free_set::FreeSet;
 use crate::space::hazard::PbaHazards;
 use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
@@ -32,7 +33,11 @@ struct RetiredRun {
 
 pub struct SpaceAllocator {
     total_blocks: u64,
-    free_extents: Mutex<BTreeSet<Extent>>,
+    /// Address-ordered free list + (count, start) side index. First-fit
+    /// SELECTION is unchanged (lowest-address extent that fits — the metadb
+    /// L2P leaf codec's dense-PBA contract); the side index only makes finding
+    /// it O(D·log N) instead of an O(N) belt walk under this lock.
+    free_extents: Mutex<FreeSet>,
     /// Coalesced retired set — authority for containment/overlap (`is_retired`,
     /// `overlapping_retired_extent`, `retired_block_count`). NEVER carries age.
     retired_extents: Mutex<BTreeSet<Extent>>,
@@ -80,7 +85,7 @@ impl SpaceAllocator {
     pub fn new_with_hazards(device_size_bytes: u64, num_lanes: usize) -> Self {
         let total_blocks = device_size_bytes / BLOCK_SIZE as u64;
         let usable_blocks = total_blocks.saturating_sub(RESERVED_BLOCKS);
-        let mut free_extents = BTreeSet::new();
+        let mut free_extents = FreeSet::new();
         if usable_blocks > 0 {
             free_extents.insert(Extent::new(
                 Pba(RESERVED_BLOCKS),
@@ -164,7 +169,7 @@ impl SpaceAllocator {
         let alloc_count = allocated.len() as u64;
         let free_count = usable_blocks - alloc_count;
 
-        *self.free_extents.lock().unwrap() = free;
+        *self.free_extents.lock().unwrap() = FreeSet::from_addr_set(free);
         self.retired_extents.lock().unwrap().clear();
         self.retired_age.lock().unwrap().clear();
         self.retired_blocks.store(0, Ordering::Relaxed);
@@ -274,8 +279,9 @@ impl SpaceAllocator {
     }
 
     /// Helper: take one block from the free set (no counter update).
-    fn alloc_one_from_set(free: &mut BTreeSet<Extent>) -> Option<Pba> {
-        let extent = free.iter().next().copied()?;
+    /// Lowest-address extent first — `FreeSet::first` iterates by address.
+    fn alloc_one_from_set(free: &mut FreeSet) -> Option<Pba> {
+        let extent = free.first()?;
         free.remove(&extent);
         let pba = extent.start;
         if extent.count > 1 {
@@ -332,13 +338,13 @@ impl SpaceAllocator {
         for cache_mutex in &self.lane_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for pba in cache.drain(..) {
-                Self::coalesce_and_insert(&mut free, Extent::single(pba));
+                free.coalesce_insert(Extent::single(pba));
             }
         }
         for cache_mutex in &self.lane_extent_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for extent in cache.drain(..) {
-                Self::coalesce_and_insert(&mut free, extent);
+                free.coalesce_insert(extent);
             }
         }
         // No counter adjustment needed: cached blocks were never counted as allocated
@@ -358,6 +364,7 @@ impl SpaceAllocator {
     pub fn is_free(&self, pba: Pba) -> bool {
         let free = self.free_extents.lock().unwrap();
         if free
+            .by_addr()
             .range(..=Extent::single(pba))
             .next_back()
             .is_some_and(|extent| extent.contains(pba))
@@ -592,19 +599,23 @@ impl SpaceAllocator {
     ) -> OnyxResult<Extent> {
         for attempt in 0..2 {
             let mut free = self.free_extents.lock().unwrap();
-            let chosen = free
-                .iter()
-                .find(|e| Self::carve_aligned_from_run(**e, need, stripe, phase).is_some())
-                .copied();
+            // First-fit-by-address over the carve predicate, via the size
+            // index (O(stripe·log N) instead of walking the fragment belt).
+            // Selection is identical to the old
+            // `iter().find(|e| carve_aligned_from_run(e, ..).is_some())`.
+            let chosen = free.first_fit_aligned(need, stripe, phase);
             if let Some(run) = chosen {
+                debug_assert!(
+                    Self::carve_aligned_from_run(run, need, stripe, phase).is_some()
+                );
                 free.remove(&run);
                 let (aligned, head, tail) =
                     Self::carve_aligned_from_run(run, need, stripe, phase).unwrap();
                 if let Some(head) = head {
-                    Self::coalesce_and_insert(&mut free, head);
+                    free.coalesce_insert(head);
                 }
                 if let Some(tail) = tail {
-                    Self::coalesce_and_insert(&mut free, tail);
+                    free.coalesce_insert(tail);
                 }
                 drop(free);
                 self.track_alloc(aligned, "allocate_stripe_extent_global")?;
@@ -633,8 +644,8 @@ impl SpaceAllocator {
         for attempt in 0..2 {
             let mut free = self.free_extents.lock().unwrap();
 
-            // Find first extent that's large enough
-            let exact = free.iter().find(|e| e.count >= count).copied();
+            // First (lowest-address) extent that's large enough.
+            let exact = free.first_fit(count);
 
             if let Some(extent) = exact {
                 free.remove(&extent);
@@ -662,7 +673,7 @@ impl SpaceAllocator {
             }
 
             // No contiguous extent large enough — return the largest available
-            let largest = free.iter().max_by_key(|e| e.count).copied();
+            let largest = free.largest();
             if let Some(extent) = largest {
                 free.remove(&extent);
                 self.track_alloc(extent, "allocate_extent_largest")?;
@@ -716,7 +727,7 @@ impl SpaceAllocator {
 
         let newly = {
             let free = self.free_extents.lock().unwrap();
-            if let Some(e) = Self::overlapping_extent(&free, extent) {
+            if let Some(e) = Self::overlapping_extent(free.by_addr(), extent) {
                 return Err(OnyxError::Config(format!(
                     "retire_extent: extent {:?} overlaps free extent {:?}",
                     extent, e
@@ -802,7 +813,7 @@ impl SpaceAllocator {
                     .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
                     || Self::sorted_extents_overlap(&lane_exts, extent);
                 if in_lane
-                    || Self::overlapping_extent(&free, extent).is_some()
+                    || Self::overlapping_extent(free.by_addr(), extent).is_some()
                     || u64::from(extent.count) > current_alloc
                 {
                     failed.push(extent);
@@ -1064,7 +1075,7 @@ impl SpaceAllocator {
             self.ensure_not_in_lane_cache(extent, "reclaim_retired_extent")?;
 
             let mut free = self.free_extents.lock().unwrap();
-            if let Some(e) = Self::overlapping_extent(&free, extent) {
+            if let Some(e) = Self::overlapping_extent(free.by_addr(), extent) {
                 return Err(OnyxError::Config(format!(
                     "reclaim_retired_extent: extent {:?} overlaps free extent {:?}",
                     extent, e
@@ -1078,7 +1089,7 @@ impl SpaceAllocator {
                 )));
             }
 
-            Self::coalesce_and_insert(&mut free, extent);
+            free.coalesce_insert(extent);
             self.track_release(extent, "reclaim_retired_extent");
             self.allocated_blocks
                 .fetch_sub(extent.count as u64, Ordering::Relaxed);
@@ -1196,7 +1207,7 @@ impl SpaceAllocator {
                     let in_lane = (0..extent.count)
                         .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
                         || Self::sorted_extents_overlap(&lane_exts, extent);
-                    if in_lane || Self::overlapping_extent(&free, extent).is_some() {
+                    if in_lane || Self::overlapping_extent(free.by_addr(), extent).is_some() {
                         conflicts.push(extent);
                         continue;
                     }
@@ -1208,7 +1219,7 @@ impl SpaceAllocator {
                         conflicts.push(extent);
                         continue;
                     }
-                    Self::coalesce_and_insert(&mut free, extent);
+                    free.coalesce_insert(extent);
                     self.track_release(extent, "reclaim_retired_extents_batch");
                     chunk_reclaimed.push(extent);
                     chunk_freed += u64::from(extent.count);
@@ -1288,8 +1299,8 @@ impl SpaceAllocator {
 
         {
             let mut free = self.free_extents.lock().unwrap();
-            self.ensure_not_free_or_retired_after_wait(extent, &free)?;
-            Self::coalesce_and_insert(&mut free, extent);
+            self.ensure_not_free_or_retired_after_wait(extent, free.by_addr())?;
+            free.coalesce_insert(extent);
             self.track_release(extent, "free_extent");
         }
         // Diagnostic trace outside the free lock (see retire_extent_at).
@@ -1308,7 +1319,7 @@ impl SpaceAllocator {
         let free = self.free_extents.lock().unwrap();
 
         // Check no overlap with existing free extents
-        if let Some(e) = Self::overlapping_extent(&free, extent) {
+        if let Some(e) = Self::overlapping_extent(free.by_addr(), extent) {
             return Err(OnyxError::Config(format!(
                 "free_extent: extent {:?} overlaps free extent {:?}",
                 extent, e
@@ -1375,9 +1386,14 @@ impl SpaceAllocator {
     /// or all its blocks are sitting in lane caches.
     pub fn is_extent_free(&self, extent: Extent) -> bool {
         let free = self.free_extents.lock().unwrap();
-        if free.range(..=extent).next_back().is_some_and(|existing| {
-            extent.start.0 >= existing.start.0 && extent.end_pba().0 <= existing.end_pba().0
-        }) {
+        if free
+            .by_addr()
+            .range(..=extent)
+            .next_back()
+            .is_some_and(|existing| {
+                extent.start.0 >= existing.start.0 && extent.end_pba().0 <= existing.end_pba().0
+            })
+        {
             return true;
         }
         drop(free);
@@ -1412,32 +1428,6 @@ impl SpaceAllocator {
     #[cfg(test)]
     pub(crate) fn free_extent_run_count(&self) -> usize {
         self.free_extents.lock().unwrap().len()
-    }
-
-    /// Insert an extent and merge with adjacent free extents.
-    fn coalesce_and_insert(free: &mut BTreeSet<Extent>, new: Extent) {
-        let mut merged_start = new.start.0;
-        let mut merged_end = new.end_pba().0;
-
-        let before = free.range(..=new).next_back().copied();
-        if let Some(extent) = before {
-            if extent.end_pba().0 == merged_start {
-                merged_start = extent.start.0;
-                free.remove(&extent);
-            }
-        }
-
-        let probe = Extent::new(Pba(merged_end), 0);
-        let after = free.range(probe..).next().copied();
-        if let Some(extent) = after {
-            if extent.start.0 == merged_end {
-                merged_end = extent.end_pba().0;
-                free.remove(&extent);
-            }
-        }
-
-        let count = (merged_end - merged_start) as u32;
-        free.insert(Extent::new(Pba(merged_start), count));
     }
 
     fn coalesce_and_insert_any_overlap(set: &mut BTreeSet<Extent>, new: Extent) {
@@ -1516,7 +1506,7 @@ impl SpaceAllocator {
 
     fn take_extent_from_global(&self, max_count: u32) -> Option<Extent> {
         let mut free = self.free_extents.lock().unwrap();
-        let extent = free.iter().next().copied()?;
+        let extent = free.first()?;
         free.remove(&extent);
         let take = extent.count.min(max_count);
         if extent.count > take {
@@ -1530,7 +1520,10 @@ impl SpaceAllocator {
 
     fn take_extent_from_global_at_least(&self, count: u32, max_count: u32) -> Option<Extent> {
         let mut free = self.free_extents.lock().unwrap();
-        let extent = free.iter().find(|e| e.count >= count).copied()?;
+        // First-fit-by-address via the size index — O(D·log N), and the "no
+        // run >= count exists" refill miss is a fail-fast instead of an O(N)
+        // walk of the whole fragment belt under this lock.
+        let extent = free.first_fit(count)?;
         free.remove(&extent);
         let take = extent.count.min(max_count);
         if extent.count > take {
@@ -1884,7 +1877,7 @@ mod age_tests {
         let t0 = Instant::now();
         a.retire_extent_at(Extent::single(p), t0).unwrap();
         // Inject the inconsistency: the same PBA is also in the free list.
-        a.free_extents.lock().unwrap().insert(Extent::single(p));
+        a.free_extents.lock().unwrap().insert_for_test(Extent::single(p));
         let (blocks, cnt) = a
             .reclaim_retired_extents_batch(&[Extent::single(p)], &run_flag())
             .unwrap();
@@ -1932,7 +1925,7 @@ mod age_tests {
         a.free_extents
             .lock()
             .unwrap()
-            .insert(Extent::single(Pba(n + 8))); // conflict on n+8
+            .insert_for_test(Extent::single(Pba(n + 8))); // conflict on n+8
         let batch = [
             Extent::new(Pba(n), 2),         // freed (sub-extent of [n,4])
             Extent::single(Pba(n + 10)),    // skip (never retired)
