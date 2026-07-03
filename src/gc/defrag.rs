@@ -47,6 +47,18 @@ const WALK_BREATHER: std::time::Duration = std::time::Duration::from_micros(500)
 /// free+retired cover at least this share of its span. Not a config knob:
 /// it only controls when budget is handed back to the walk, never safety.
 const TARGET_DONE_PCT: u64 = 90;
+/// Hard bound on one cluster's span (blocks; 2048 = 8 MiB at 4 KiB). On a
+/// real confetti belt inter-extent gaps are almost always ≤ gap_max, so an
+/// unbounded accumulator swallows the WHOLE belt into one cluster — and any
+/// single stripe-capable member (or the belt-wide diluted density) then
+/// rejects everything (box 2026-07-03: 1M extents walked, 16 giant clusters,
+/// 0 qualified). Bounding the span makes qualification a LOCAL property and
+/// each emitted window still yields multi-MiB contiguous runs.
+const MAX_CLUSTER_SPAN: u64 = 2048;
+/// Reject a window whose stripe-capable capacity already covers more than
+/// this share of its span — it is mostly usable as-is; evacuating it buys
+/// little contiguity per block moved.
+const CLUSTER_CAPABLE_MAX_PCT: u64 = 25;
 
 /// One cluster being accumulated across chunk/cycle boundaries. The walk is
 /// descending, so the cluster grows downward: `lo` falls, `hi` is fixed at
@@ -55,9 +67,9 @@ struct ClusterAcc {
     lo: u64,
     hi: u64,
     free_blocks: u64,
-    /// Any member already hosts an aligned stripe carve → the region is
-    /// usable as-is; evacuating it wastes movement.
-    has_stripe_host: bool,
+    /// Σ whole-stripe capacity over members — how much of this window the
+    /// stripe allocator can already use without any defrag.
+    capable_blocks: u64,
 }
 
 /// What the runner consumes each cycle.
@@ -186,11 +198,15 @@ impl DefragState {
                         // Descending walk: `e` is strictly below the cluster.
                         let gap = acc.lo.saturating_sub(e.end_pba().0);
                         if gap <= cfg.defrag_gap_max_blocks as u64
-                            && acc.hi - e.start.0 <= u32::MAX as u64
+                            && acc.hi - e.start.0 <= MAX_CLUSTER_SPAN
                         {
                             acc.extend_down(*e, stripe, phase);
                             None
                         } else {
+                            // Gap break OR span bound: close the window here
+                            // and seed the next one from this extent, keeping
+                            // qualification a local (≤ MAX_CLUSTER_SPAN)
+                            // property even on a wall-to-wall confetti belt.
                             self.pending.replace(ClusterAcc::seed(*e, stripe, phase))
                         }
                     }
@@ -226,9 +242,12 @@ impl DefragState {
     ) {
         use std::sync::atomic::Ordering::Relaxed;
         let span = acc.hi - acc.lo;
-        // Reject: already usable (hosts an aligned stripe) — nothing to fix;
-        // or pure free space with no interior pinners — nothing to evacuate.
-        if acc.has_stripe_host || acc.free_blocks >= span {
+        // Reject: pure free space with no interior pinners (nothing to
+        // evacuate), or a window whose stripe-capable capacity is already
+        // high (mostly usable as-is — evacuation buys little per block moved).
+        if acc.free_blocks >= span
+            || acc.capable_blocks * 100 > span * CLUSTER_CAPABLE_MAX_PCT
+        {
             metrics.gc_defrag_clusters_rejected.fetch_add(1, Relaxed);
             return;
         }
@@ -309,7 +328,7 @@ impl ClusterAcc {
             lo: e.start.0,
             hi: e.end_pba().0,
             free_blocks: e.count as u64,
-            has_stripe_host: extent_hosts_stripe(e, stripe, phase),
+            capable_blocks: extent_stripe_capacity(e, stripe, phase),
         }
     }
 
@@ -317,15 +336,17 @@ impl ClusterAcc {
         debug_assert!(e.end_pba().0 <= self.lo);
         self.lo = e.start.0;
         self.free_blocks += e.count as u64;
-        self.has_stripe_host |= extent_hosts_stripe(e, stripe, phase);
+        self.capable_blocks += extent_stripe_capacity(e, stripe, phase);
     }
 }
 
-/// Can `e` host one aligned stripe carve? Mirrors `FreeSet::eff_count >= stripe`.
-fn extent_hosts_stripe(e: Extent, stripe: u32, phase: u32) -> bool {
+/// Whole-stripe aligned capacity of `e` — mirrors `FreeSet::stripe_floor ∘
+/// eff_count`.
+fn extent_stripe_capacity(e: Extent, stripe: u32, phase: u32) -> u64 {
     let r = (e.start.0 + phase as u64) % stripe as u64;
     let head = if r == 0 { 0 } else { stripe as u64 - r };
-    (e.count as u64) >= head + stripe as u64
+    let eff = (e.count as u64).saturating_sub(head);
+    eff / stripe as u64 * stripe as u64
 }
 
 /// Binary-search overlap test of a unit's physical footprint against the
@@ -463,6 +484,60 @@ mod tests {
             assert!(
                 t.end_pba().0 <= base + 6000 + 64,
                 "target {t:?} escaped the dense region"
+            );
+        }
+    }
+
+    /// A wall-to-wall confetti belt (every gap ≤ gap_max — the REAL fragmented
+    /// pool shape that made unbounded clusters swallow everything) must be
+    /// split into ≤ MAX_CLUSTER_SPAN windows, each qualifying locally.
+    #[test]
+    fn belt_is_split_into_bounded_windows() {
+        let a = new_alloc(65536);
+        let base = claim_all(&a, 65536);
+        confetti(&a, base, base + 65_528, 4, 2); // one belt, gaps 2 ≪ gap_max
+        let m = metrics();
+        let mut st = DefragState::new();
+        let mut wide = cfg();
+        wide.defrag_max_target_blocks = u64::MAX / 2;
+        let c = st.maintain(&a, &wide, 50, &m);
+        assert!(
+            c.targets.len() > 10,
+            "belt must yield many bounded windows, got {}",
+            c.targets.len()
+        );
+        for t in c.targets.iter() {
+            assert!(t.count as u64 <= MAX_CLUSTER_SPAN, "window {t:?} exceeds span bound");
+        }
+        for w in c.targets.windows(2) {
+            assert!(w[0].end_pba().0 <= w[1].start.0, "windows must stay disjoint");
+        }
+    }
+
+    /// A window whose stripe-capable capacity is already high is rejected —
+    /// but ONLY that window, not its confetti neighbors (the giant-cluster
+    /// failure mode).
+    #[test]
+    fn capable_window_rejected_without_poisoning_neighbors() {
+        let a = new_alloc(65536);
+        let base = claim_all(&a, 65536);
+        // Low confetti island, then (within gap_max!) a big aligned run, then
+        // more confetti — unbounded clustering would merge all three and the
+        // big run's capacity would reject everything.
+        confetti(&a, base, base + 6000, 4, 2);
+        a.free_extent(Extent::new(Pba(base + 6010), 1024)).unwrap(); // capable run
+        confetti(&a, base + 8100, base + 14_100, 4, 2);
+        let m = metrics();
+        let mut st = DefragState::new();
+        let c = st.maintain(&a, &cfg(), 50, &m);
+        assert!(c.active);
+        let covers_confetti = c.targets.iter().any(|t| t.start.0 < base + 6000)
+            && c.targets.iter().any(|t| t.start.0 >= base + 8100 && t.start.0 < base + 14_100);
+        assert!(covers_confetti, "both confetti islands must be targeted: {:?}", c.targets);
+        for t in c.targets.iter() {
+            assert!(
+                t.end_pba().0 <= base + 6010 || t.start.0 >= base + 6010 + 1024,
+                "target {t:?} must not sit on the capable run"
             );
         }
     }
