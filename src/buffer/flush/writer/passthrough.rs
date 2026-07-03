@@ -541,7 +541,13 @@ impl BufferFlusher {
                     // Alignment fragmentation near-full: degrade to per-unit so
                     // IO keeps flowing (these units just miss the full stripe),
                     // and stop probing alignment for the rest of the batch.
+                    // Counted per batch transition (the short-circuit makes
+                    // per-group counting meaningless): the rate ≈ share of
+                    // flush batches running degraded → RAID partial-RMW.
                     stripe_starved = true;
+                    metrics
+                        .flush_writer_stripe_starved_batches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     group_extents.push(None);
                     for &m in members {
                         match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[m], 1, 0)

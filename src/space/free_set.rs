@@ -39,6 +39,18 @@ pub(crate) struct FreeSet {
     /// under the global free lock (65 ms/call at 3M fragments, box-measured
     /// as multi-second front-end stalls).
     by_eff: BTreeSet<(u32, u64)>,
+    /// Σ count over `by_addr` — free blocks IN THIS SET (excludes lane-cached
+    /// extents, which are drained out; the global `free_blocks` atomic counts
+    /// those too, so ratios must use this field for a consistent denominator).
+    blocks_total: u64,
+    /// Σ floor(eff_count / stripe) * stripe over `by_addr` — WHOLE-stripe
+    /// aligned capacity for the configured geometry; 0 when `geom` is None.
+    /// The stripe-floor matters: a confetti belt of 3-block fragments has
+    /// nonzero raw eff (eff = count − head_pad) but can host zero stripe
+    /// writes, so summing raw eff would overstate capability ~33% and mask
+    /// the defrag trigger. `stripe_capacity / blocks_total` = fraction of the
+    /// free pool usable by stripe-aligned carves.
+    stripe_capacity: u64,
 }
 
 impl FreeSet {
@@ -48,7 +60,14 @@ impl FreeSet {
             by_size: BTreeSet::new(),
             geom: None,
             by_eff: BTreeSet::new(),
+            blocks_total: 0,
+            stripe_capacity: 0,
         }
+    }
+
+    /// eff floored to whole stripes — this extent's usable aligned capacity.
+    fn stripe_floor(eff: u32, stripe: u32) -> u64 {
+        (eff / stripe) as u64 * stripe as u64
     }
 
     /// Build from an already-built address set (rebuild_from_metadata path).
@@ -56,11 +75,14 @@ impl FreeSet {
     /// startup wiring).
     pub(crate) fn from_addr_set(by_addr: BTreeSet<Extent>) -> Self {
         let by_size = by_addr.iter().map(|e| (e.count, e.start.0)).collect();
+        let blocks_total = by_addr.iter().map(|e| e.count as u64).sum();
         Self {
             by_addr,
             by_size,
             geom: None,
             by_eff: BTreeSet::new(),
+            blocks_total,
+            stripe_capacity: 0,
         }
     }
 
@@ -70,17 +92,33 @@ impl FreeSet {
         if stripe <= 1 {
             self.geom = None;
             self.by_eff.clear();
+            self.stripe_capacity = 0;
             return;
         }
         if self.geom == Some((stripe, phase)) && self.by_eff.len() == self.by_addr.len() {
+            // by_eff (and therefore stripe_capacity) is maintained whenever
+            // geom is set, so both are already correct here.
+            debug_assert_eq!(
+                self.stripe_capacity,
+                self.by_eff
+                    .iter()
+                    .map(|&(eff, _)| Self::stripe_floor(eff, stripe))
+                    .sum::<u64>()
+            );
             return;
         }
         self.geom = Some((stripe, phase));
+        let mut capacity = 0u64;
         self.by_eff = self
             .by_addr
             .iter()
-            .map(|e| (Self::eff_count(*e, stripe, phase), e.start.0))
+            .map(|e| {
+                let eff = Self::eff_count(*e, stripe, phase);
+                capacity += Self::stripe_floor(eff, stripe);
+                (eff, e.start.0)
+            })
             .collect();
+        self.stripe_capacity = capacity;
     }
 
     pub(crate) fn geometry(&self) -> Option<(u32, u32)> {
@@ -104,15 +142,28 @@ impl FreeSet {
         self.by_addr.len()
     }
 
+    /// Σ count over the set — O(1) maintained aggregate (excludes lane caches).
+    pub(crate) fn blocks_total(&self) -> u64 {
+        self.blocks_total
+    }
+
+    /// Whole-stripe aligned capacity for the configured geometry — O(1)
+    /// maintained aggregate; 0 when no geometry is set.
+    pub(crate) fn stripe_capacity(&self) -> u64 {
+        self.stripe_capacity
+    }
+
     /// Plain insert (no coalescing) — for split remainders that are never
     /// adjacent to another free extent by construction.
     pub(crate) fn insert(&mut self, extent: Extent) {
         let inserted = self.by_addr.insert(extent);
         debug_assert!(inserted, "FreeSet::insert: duplicate start {}", extent.start.0);
         self.by_size.insert((extent.count, extent.start.0));
+        self.blocks_total += extent.count as u64;
         if let Some((stripe, phase)) = self.geom {
-            self.by_eff
-                .insert((Self::eff_count(extent, stripe, phase), extent.start.0));
+            let eff = Self::eff_count(extent, stripe, phase);
+            self.by_eff.insert((eff, extent.start.0));
+            self.stripe_capacity += Self::stripe_floor(eff, stripe);
         }
         debug_assert_eq!(self.by_addr.len(), self.by_size.len());
     }
@@ -132,11 +183,12 @@ impl FreeSet {
                 );
                 let removed = self.by_size.remove(&(taken.count, taken.start.0));
                 debug_assert!(removed, "FreeSet: by_size missing ({}, {})", taken.count, taken.start.0);
+                self.blocks_total -= taken.count as u64;
                 if let Some((stripe, phase)) = self.geom {
-                    let removed_eff = self
-                        .by_eff
-                        .remove(&(Self::eff_count(taken, stripe, phase), taken.start.0));
+                    let eff = Self::eff_count(taken, stripe, phase);
+                    let removed_eff = self.by_eff.remove(&(eff, taken.start.0));
                     debug_assert!(removed_eff, "FreeSet: by_eff missing start {}", taken.start.0);
+                    self.stripe_capacity -= Self::stripe_floor(eff, stripe);
                 }
                 debug_assert_eq!(self.by_addr.len(), self.by_size.len());
                 true
@@ -300,6 +352,11 @@ impl FreeSet {
                 e.start.0
             );
         }
+        assert_eq!(
+            self.blocks_total,
+            self.by_addr.iter().map(|e| e.count as u64).sum::<u64>(),
+            "blocks_total aggregate drifted"
+        );
         if let Some((stripe, phase)) = self.geom {
             assert_eq!(self.by_addr.len(), self.by_eff.len());
             for e in &self.by_addr {
@@ -310,8 +367,17 @@ impl FreeSet {
                     e.start.0
                 );
             }
+            assert_eq!(
+                self.stripe_capacity,
+                self.by_addr
+                    .iter()
+                    .map(|e| Self::stripe_floor(Self::eff_count(*e, stripe, phase), stripe))
+                    .sum::<u64>(),
+                "stripe_capacity aggregate drifted"
+            );
         } else {
             assert!(self.by_eff.is_empty());
+            assert_eq!(self.stripe_capacity, 0, "stripe_capacity must be 0 without geometry");
         }
     }
 }
@@ -387,6 +453,71 @@ mod tests {
         assert_eq!(fs.first_fit(7), None, "no run big enough");
         assert_eq!(fs.first_fit(5), Some(Extent::new(Pba(20), 6)));
         assert_eq!(fs.first_fit(1), Some(Extent::new(Pba(10), 4)));
+    }
+
+    /// Maintained aggregates (blocks_total / stripe_capacity) must track every
+    /// mutation path: insert, remove, coalesce_insert, set_geometry (build,
+    /// idempotent early-return, re-geometry, clear), from_addr_set, and the
+    /// u32::MAX extent edge. stripe_capacity floors eff to whole stripes —
+    /// sub-stripe fragments contribute ZERO (they can host no stripe write).
+    #[test]
+    fn aggregates_track_all_mutation_paths() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let mut fs = FreeSet::new();
+        assert_eq!((fs.blocks_total(), fs.stripe_capacity()), (0, 0));
+
+        // Insert/remove without geometry: stripe_capacity stays 0.
+        fs.insert(Extent::new(Pba(10), 8));
+        fs.insert(Extent::new(Pba(100), 5));
+        assert_eq!((fs.blocks_total(), fs.stripe_capacity()), (13, 0));
+        fs.assert_consistent();
+
+        // Geometry build: Pba(10): (10+2)%6=0 → head 0 → eff 8 → floor 6.
+        // Pba(100): (100+2)%6=0 → head 0 → eff 5 → floor 0 (sub-stripe!).
+        fs.set_geometry(STRIPE, PHASE);
+        assert_eq!(fs.stripe_capacity(), 6);
+        // Idempotent early-return keeps them intact.
+        fs.set_geometry(STRIPE, PHASE);
+        assert_eq!((fs.blocks_total(), fs.stripe_capacity()), (13, 6));
+
+        // Misaligned insert: Pba(30): (30+2)%6=2 → head 4 → eff 4 → floor 0.
+        fs.insert(Extent::new(Pba(30), 8));
+        assert_eq!((fs.blocks_total(), fs.stripe_capacity()), (21, 6));
+        fs.assert_consistent();
+
+        // coalesce_insert exercises remove + reinsert internally.
+        fs.remove(&Extent::new(Pba(30), 8));
+        fs.insert(Extent::new(Pba(18), 5));
+        fs.coalesce_insert(Extent::new(Pba(23), 4)); // merges with [18,23)
+        // Sets now: [10,18) eff 8→6, [18,27) head 4 → eff 5→0, [100,105) eff 5→0.
+        assert_eq!(fs.blocks_total(), 8 + 9 + 5);
+        assert_eq!(fs.stripe_capacity(), 6);
+        fs.assert_consistent();
+
+        // Re-geometry (different stripe) rebuilds the sum:
+        // [10,18): head_pad(10,4,0)=2 → eff 6 → floor 4;
+        // [18,27): head 2 → eff 7 → floor 4; [100,105): head 0 → eff 5 → floor 4.
+        fs.set_geometry(4, 0);
+        assert_eq!(fs.stripe_capacity(), 12);
+        fs.assert_consistent();
+        // Clearing geometry zeroes stripe_capacity.
+        fs.set_geometry(1, 0);
+        assert_eq!(fs.stripe_capacity(), 0);
+        fs.assert_consistent();
+
+        // u32::MAX extents must not overflow the u64 sums.
+        let mut fs = FreeSet::from_addr_set(
+            [
+                Extent::new(Pba(0), u32::MAX),
+                Extent::new(Pba(u32::MAX as u64), u32::MAX),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(fs.blocks_total(), 2 * u32::MAX as u64);
+        fs.set_geometry(STRIPE, PHASE);
+        fs.assert_consistent();
     }
 
     /// count == u32::MAX is legal (rebuild splits >16 TiB gaps); the size-class
@@ -480,7 +611,10 @@ mod tests {
             };
             let mut allocated: Vec<Extent> = Vec::new();
 
-            for _ in 0..4_000 {
+            for op in 0..4_000 {
+                if op % 512 == 0 {
+                    fs.assert_consistent(); // includes aggregate recompute
+                }
                 // Queries first — every one must agree with the oracle.
                 let k = rng.gen_range(1..=64u32);
                 assert_eq!(fs.first_fit(k), shadow_first_fit(&shadow, k), "round {round} k {k}");

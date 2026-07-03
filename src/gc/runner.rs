@@ -10,10 +10,11 @@ use crossbeam_channel::Sender;
 use crate::buffer::pool::WriteBufferPool;
 use crate::dedup::ColdTailTarget;
 use crate::gc::config::GcConfig;
+use crate::gc::defrag::{DefragCycle, DefragState};
 use crate::gc::heatmap::HeatMap;
 use crate::gc::ref_bitmap::RefBitmap;
 use crate::gc::rewriter::rewrite_candidate;
-use crate::gc::scanner::{scan_gc_candidates_window, SlotEvacParams};
+use crate::gc::scanner::{scan_gc_candidates_window, DefragScanParams, SlotEvacParams};
 use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::{BlockmapValue, FLAG_DEDUP_SKIPPED};
@@ -182,6 +183,7 @@ impl GcRunner {
     ) {
         let mut compactor_cursor = CompactorCursor::default();
         let mut heat_cursor = HeatCursor::default();
+        let mut defrag_state = DefragState::new();
         // Reclaim-age grace now lives in the allocator's per-original-retire age
         // log (`aged_candidates`), which is immune to the coalesce re-aging the
         // old runner-side `retired_first_seen: BTreeMap<Extent, Instant>` map
@@ -297,13 +299,30 @@ impl GcRunner {
             let fill_pct = buffer_pool
                 .fill_percentage()
                 .max(buffer_pool.payload_fill_percentage());
-            let effort = compute_effort(fill_pct, free_pct, cfg.buffer_usage_max_pct);
+            let mut effort = compute_effort(fill_pct, free_pct, cfg.buffer_usage_max_pct);
+
+            // Defrag maintenance: trigger latch + target selection walk. Runs
+            // BEFORE the idle check because the fragmented steady state is
+            // exactly "buffer full AND free% > 50" → effort < 0.01 → compactor
+            // idled — the effort floor below un-idles it while defrag is
+            // latched (the urgency/idle formula itself is untouched).
+            let t_defrag = Instant::now();
+            let defrag_cycle = if cfg.defrag_enabled {
+                defrag_state.maintain(allocator, &cfg, free_pct, metrics)
+            } else {
+                DefragCycle::inactive()
+            };
+            let defrag_ms = t_defrag.elapsed().as_millis();
+            if defrag_cycle.active {
+                effort = effort.max(cfg.defrag_min_effort.clamp(0.01, 1.0));
+            }
+
             if effort < 0.01 {
                 // Busy AND plenty of space → idle the compactor; cursor untouched
                 // so it resumes exactly where it left off when load drops.
                 metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
-                    cycle, reclaim_ms, heat_ms, compactor_ms = 0u128, effort,
+                    cycle, reclaim_ms, heat_ms, defrag_ms, compactor_ms = 0u128, effort,
                     depth = allocator.retired_block_count(),
                     "gc cycle timing (compactor idled)"
                 );
@@ -332,6 +351,18 @@ impl GcRunner {
                 block_size: BLOCK_SIZE,
             };
 
+            // Defrag rewrite budget in BLOCKS (independent of the legacy unit
+            // budget above); `.ceil()` so any effort > 0 makes progress.
+            let defrag_scan = if defrag_cycle.active {
+                DefragScanParams {
+                    targets: defrag_cycle.targets.clone(),
+                    max_blocks: (cfg.defrag_max_rewrite_blocks_per_cycle as f64 * effort).ceil()
+                        as u64,
+                }
+            } else {
+                DefragScanParams::disabled()
+            };
+
             let t_comp = Instant::now();
             Self::compactor_step(
                 metrics,
@@ -345,12 +376,14 @@ impl GcRunner {
                 scan_budget,
                 rewrite_budget,
                 slot_evac,
+                &defrag_scan,
                 running,
             );
             tracing::debug!(
-                cycle, reclaim_ms, heat_ms,
+                cycle, reclaim_ms, heat_ms, defrag_ms,
                 compactor_ms = t_comp.elapsed().as_millis(),
                 effort, scan_budget, rewrite_budget,
+                defrag_block_budget = defrag_scan.max_blocks,
                 depth = allocator.retired_block_count(),
                 "gc cycle timing"
             );
@@ -376,6 +409,7 @@ impl GcRunner {
         scan_budget: u64,
         rewrite_budget: usize,
         slot_evac: SlotEvacParams,
+        defrag: &DefragScanParams,
         running: &AtomicBool,
     ) {
         if scan_budget == 0 || rewrite_budget == 0 {
@@ -436,22 +470,24 @@ impl GcRunner {
             return;
         }
 
-        let (candidates, dead_estimate, slot_stats) = match scan_gc_candidates_window(
-            meta,
-            &vol.id,
-            Lba(phys_start),
-            chunk,
-            threshold,
-            rewrite_budget,
-            slot_evac,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(vol = %vol.id.0, error = %e, "compactor: window scan failed");
-                return;
-            }
-        };
+        let (candidates, dead_estimate, slot_stats, defrag_stats) =
+            match scan_gc_candidates_window(
+                meta,
+                &vol.id,
+                Lba(phys_start),
+                chunk,
+                threshold,
+                rewrite_budget,
+                slot_evac,
+                defrag,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(vol = %vol.id.0, error = %e, "compactor: window scan failed");
+                    return;
+                }
+            };
         cursor.dead_estimate_acc = cursor.dead_estimate_acc.saturating_add(dead_estimate);
 
         // Slot-aware compaction selection stats (no-op when slot-evac is off).
@@ -485,10 +521,25 @@ impl GcRunner {
         metrics
             .gc_candidates_found
             .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+        if defrag_stats.candidates > 0 {
+            metrics
+                .gc_defrag_candidates
+                .fetch_add(defrag_stats.candidates, Ordering::Relaxed);
+            metrics
+                .gc_defrag_blocks_selected
+                .fetch_add(defrag_stats.blocks_selected, Ordering::Relaxed);
+        }
 
+        // Legacy/slot-evac candidates come first in the vec (unit-budgeted at
+        // scan time); defrag candidates follow, double-guarded here by their
+        // BLOCK budget using actual rewritten counts.
+        let mut defrag_blocks_moved = 0u64;
         for candidate in &candidates {
             if !running.load(Ordering::Relaxed) {
                 break;
+            }
+            if candidate.defrag && defrag_blocks_moved >= defrag.max_blocks {
+                break; // defrag candidates are the vec's tail — nothing after
             }
             metrics.gc_rewrite_attempts.fetch_add(1, Ordering::Relaxed);
             match rewrite_candidate(
@@ -503,6 +554,9 @@ impl GcRunner {
                     metrics
                         .gc_blocks_rewritten
                         .fetch_add(rewritten as u64, Ordering::Relaxed);
+                    if candidate.defrag {
+                        defrag_blocks_moved += rewritten as u64;
+                    }
                 }
                 Err(e) => {
                     metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
@@ -514,6 +568,11 @@ impl GcRunner {
                     );
                 }
             }
+        }
+        if defrag_blocks_moved > 0 {
+            metrics
+                .gc_defrag_blocks_moved
+                .fetch_add(defrag_blocks_moved, Ordering::Relaxed);
         }
     }
 

@@ -20,6 +20,14 @@ pub struct EngineStatusSnapshot {
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
     pub allocator_total_blocks: Option<u64>,
+    /// Free-pool contiguity (fragmentation) snapshot: fragment count, largest
+    /// contiguous run, whole-stripe-capable blocks, and the free-set block
+    /// total they are measured against (excludes lane caches). None in
+    /// meta-only/standby or (for stripe_capable) without RAID geometry.
+    pub allocator_free_extents: Option<u64>,
+    pub allocator_largest_run_blocks: Option<u64>,
+    pub allocator_stripe_capable_blocks: Option<u64>,
+    pub allocator_free_blocks_in_set: Option<u64>,
     /// Adaptive reclaim heat-map summary (None when the map is disabled or in
     /// standby). Observe-only in Stage A.
     pub heat: Option<HeatSummary>,
@@ -469,6 +477,26 @@ impl EngineStatusSnapshot {
         {
             let _ = writeln!(out, "allocator_free_blocks: {}/{}", free, total);
         }
+        if let (Some(extents), Some(largest), Some(in_set)) = (
+            self.allocator_free_extents,
+            self.allocator_largest_run_blocks,
+            self.allocator_free_blocks_in_set,
+        ) {
+            let capable = self.allocator_stripe_capable_blocks;
+            let capable_pct = match capable {
+                Some(cap) if in_set > 0 => Some(cap * 100 / in_set),
+                _ => None,
+            };
+            let _ = writeln!(
+                out,
+                "allocator_contiguity: free_extents={} largest_run={} stripe_capable={}/{} ({}%)",
+                extents,
+                largest,
+                capable.unwrap_or(0),
+                in_set,
+                capable_pct.map_or_else(|| "-".to_string(), |p| p.to_string()),
+            );
+        }
         let _ = writeln!(
             out,
             "volume_ops: create={} delete={} open={} read={} write={} discard={}",
@@ -842,6 +870,20 @@ impl EngineStatusSnapshot {
             self.metrics.pba_reclaim_stuck,
             self.metrics.gc_reclaim_premature_free_averted,
             self.metrics.gc_errors
+        );
+        let _ = writeln!(
+            out,
+            "defrag: mode={} targets={} target_blocks={} walk_extents={} clusters_ok={} clusters_rej={} candidates={} selected={} moved={} stripe_starved_batches={}",
+            self.metrics.gc_defrag_mode_active,
+            self.metrics.gc_defrag_targets_active,
+            self.metrics.gc_defrag_target_blocks,
+            self.metrics.gc_defrag_walk_extents,
+            self.metrics.gc_defrag_clusters_qualified,
+            self.metrics.gc_defrag_clusters_rejected,
+            self.metrics.gc_defrag_candidates,
+            self.metrics.gc_defrag_blocks_selected,
+            self.metrics.gc_defrag_blocks_moved,
+            self.metrics.flush_writer_stripe_starved_batches
         );
         if let Some(h) = &self.heat {
             let _ = writeln!(

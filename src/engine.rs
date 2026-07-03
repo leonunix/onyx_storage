@@ -1734,6 +1734,7 @@ impl OnyxEngine {
     }
 
     pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {
+        let contiguity = self.allocator.as_ref().map(|alloc| alloc.contiguity_stats());
         Ok(EngineStatusSnapshot {
             mode: if self.zone_manager.is_some() {
                 "active".to_string()
@@ -1773,6 +1774,10 @@ impl OnyxEngine {
                 .allocator
                 .as_ref()
                 .map(|alloc| alloc.total_block_count()),
+            allocator_free_extents: contiguity.map(|c| c.free_extents),
+            allocator_largest_run_blocks: contiguity.map(|c| c.largest_run_blocks as u64),
+            allocator_stripe_capable_blocks: contiguity.and_then(|c| c.stripe_capable_blocks),
+            allocator_free_blocks_in_set: contiguity.map(|c| c.free_blocks_in_set),
             heat: self.heat.as_ref().map(|h| h.cached_summary()),
             metrics: self.metrics.snapshot(),
         })

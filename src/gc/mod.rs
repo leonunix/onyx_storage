@@ -1,4 +1,5 @@
 pub mod config;
+pub(crate) mod defrag;
 pub mod heatmap;
 pub mod ref_bitmap;
 pub mod rewriter;

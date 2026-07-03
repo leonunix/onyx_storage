@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::error::OnyxResult;
+use crate::gc::defrag::ranges_overlap_unit;
 use crate::meta::schema::{decode_blockmap_key, decode_blockmap_value, BlockmapValue}; // decode_blockmap_key now returns Option<Lba>
 use crate::meta::store::MetaStore;
+use crate::space::extent::Extent;
 use crate::types::{Lba, Pba, VolumeId, BLOCK_SIZE};
 
 /// A compression unit identified as having dead blocks worth reclaiming.
@@ -20,6 +23,44 @@ pub struct GcCandidate {
     pub live_lbas: Vec<(Lba, u16)>,
     /// Ratio of dead blocks: 1.0 - (live_count / unit_lba_count).
     pub dead_ratio: f64,
+    /// Selected because the unit's PBA lies inside a defrag target range
+    /// (physical-neighborhood compaction) — NOT via the dead-ratio /
+    /// slot-evac paths. Budgeted in BLOCKS by the compactor.
+    pub defrag: bool,
+}
+
+/// Defrag bypass parameters for the window scan: any fragment whose physical
+/// footprint overlaps one of `targets` (ascending, disjoint) is promoted to a
+/// rewrite candidate regardless of dead ratio — including single-LBA units the
+/// per-fragment path skips. `max_blocks` bounds Σ live blocks selected per
+/// scan (the movement cost); the first candidate always fits so any budget > 0
+/// makes progress.
+#[derive(Debug, Clone)]
+pub struct DefragScanParams {
+    pub targets: Arc<Vec<Extent>>,
+    pub max_blocks: u64,
+}
+
+impl DefragScanParams {
+    /// Defrag off (no targets — the bypass never fires).
+    pub fn disabled() -> Self {
+        Self {
+            targets: Arc::new(Vec::new()),
+            max_blocks: 0,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        !self.targets.is_empty() && self.max_blocks > 0
+    }
+}
+
+/// Per-scan defrag selection stats (folded into engine metrics by the
+/// compactor).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefragScanStats {
+    pub candidates: u64,
+    pub blocks_selected: u64,
 }
 
 /// Runtime parameters for slot-aware compaction (`compactor_slot_evac_enabled`).
@@ -98,6 +139,8 @@ struct FragmentInfo {
     pba: Pba,
     /// LBAs currently pointing to this fragment, with their offset_in_unit.
     live_lbas: Vec<(Lba, u16)>,
+    /// Physical footprint overlaps an active defrag target range.
+    defrag: bool,
 }
 
 impl FragmentInfo {
@@ -126,6 +169,7 @@ impl FragmentInfo {
             slot_offset: self.slot_offset,
             live_lbas: self.live_lbas,
             dead_ratio,
+            defrag: self.defrag,
         }
     }
 }
@@ -141,25 +185,38 @@ struct FragmentAccumulator {
     /// When false, the legacy per-fragment path skips them (they can never have
     /// a partial dead ratio, so they were dropped as an optimization).
     slot_evac: bool,
+    /// Active defrag target ranges (ascending, disjoint; empty = defrag off).
+    /// A fragment overlapping a target is observed even at `unit_lba_count <= 1`
+    /// and flagged for the defrag bypass in `finalize`.
+    defrag_targets: Arc<Vec<Extent>>,
 }
 
 impl FragmentAccumulator {
-    fn new(slot_evac: bool) -> Self {
+    fn new(slot_evac: bool, defrag_targets: Arc<Vec<Extent>>) -> Self {
         Self {
             frags: HashMap::new(),
             slot_evac,
+            defrag_targets,
         }
     }
 
     /// Record one live blockmap entry. Zero mappings are always skipped.
     /// Single-LBA units are skipped unless slot-evac is on (they can never have
-    /// dead blocks for the per-fragment path). Order-independent, so a
-    /// shard-internal-ordered range walk is fine.
+    /// dead blocks for the per-fragment path) or the unit's physical footprint
+    /// overlaps a defrag target (the whole point there is moving LIVE blocks,
+    /// so dead ratio — and hence LBA count — is irrelevant). Order-independent,
+    /// so a shard-internal-ordered range walk is fine.
     fn observe(&mut self, vol_id: &str, lba: Lba, bv: &BlockmapValue) {
         if bv.is_zero() {
             return;
         }
-        if !self.slot_evac && bv.unit_lba_count <= 1 {
+        let in_target = !self.defrag_targets.is_empty()
+            && ranges_overlap_unit(
+                &self.defrag_targets,
+                bv.pba,
+                bv.physical_blocks(BLOCK_SIZE),
+            );
+        if !self.slot_evac && !in_target && bv.unit_lba_count <= 1 {
             return;
         }
         let fkey = FragmentKey {
@@ -181,8 +238,45 @@ impl FragmentAccumulator {
             slot_offset: bv.slot_offset,
             pba: bv.pba,
             live_lbas: Vec::new(),
+            defrag: false,
         });
         info.live_lbas.push((lba, bv.offset_in_unit));
+        info.defrag |= in_target;
+    }
+
+    /// Extract the defrag-flagged fragments as candidates — highest PBA first
+    /// (evacuate the top of the belt first, matching the descending target
+    /// walk), Σ live blocks capped at `max_blocks` (the first candidate always
+    /// fits so any budget > 0 makes progress). Selected fragments leave the
+    /// map so the slot-evac/legacy paths can never double-emit them;
+    /// unselected flagged fragments stay and flow through those paths with
+    /// their normal (dead-ratio) semantics.
+    fn take_defrag_candidates(
+        &mut self,
+        defrag: &DefragScanParams,
+        stats: &mut DefragScanStats,
+    ) -> Vec<GcCandidate> {
+        if !defrag.enabled() {
+            return Vec::new();
+        }
+        let mut flagged: Vec<FragmentKey> = self
+            .frags
+            .iter()
+            .filter(|(_, info)| info.defrag)
+            .map(|(k, _)| *k)
+            .collect();
+        flagged.sort_by(|a, b| b.pba.0.cmp(&a.pba.0));
+        let mut out = Vec::new();
+        for key in flagged {
+            if stats.blocks_selected >= defrag.max_blocks {
+                break;
+            }
+            let info = self.frags.remove(&key).expect("flagged key present");
+            stats.blocks_selected += info.live_lbas.len() as u64;
+            stats.candidates += 1;
+            out.push(info.into_candidate());
+        }
+        out
     }
 
     /// Estimated compactable dead blocks across every observed multi-LBA
@@ -380,7 +474,7 @@ pub fn scan_gc_candidates(
     threshold: f64,
     max_results: usize,
 ) -> OnyxResult<Vec<GcCandidate>> {
-    let mut acc = FragmentAccumulator::new(false);
+    let mut acc = FragmentAccumulator::new(false, Arc::new(Vec::new()));
 
     // Iterate all blockmap entries across all volume CFs
     meta.scan_all_blockmap_entries(&mut |vol_id_str: &str, key: &[u8], val: &[u8]| {
@@ -417,6 +511,13 @@ pub fn scan_gc_candidates(
 /// dropped, and `rewrite_candidate` re-validates every LBA against the live
 /// blockmap before acting. For slot-evac, a boundary split makes `rc > visible`
 /// → the slot is deferred (counted in `incomplete_skips`), never mis-evacuated.
+/// For defrag, a boundary split only means partial evacuation this window —
+/// the remaining live members are re-observed on a later lap.
+///
+/// Defrag candidates (see [`DefragScanParams`]) are appended AFTER the
+/// slot-evac/legacy candidates and flagged `defrag: true`; the compactor
+/// budgets them in blocks, independent of `max_results`.
+#[allow(clippy::too_many_arguments)]
 pub fn scan_gc_candidates_window(
     meta: &MetaStore,
     vol_id: &VolumeId,
@@ -425,12 +526,16 @@ pub fn scan_gc_candidates_window(
     threshold: f64,
     max_results: usize,
     slot_evac: SlotEvacParams,
-) -> OnyxResult<(Vec<GcCandidate>, u64, SlotEvacStats)> {
-    let mut acc = FragmentAccumulator::new(slot_evac.enabled);
+    defrag: &DefragScanParams,
+) -> OnyxResult<(Vec<GcCandidate>, u64, SlotEvacStats, DefragScanStats)> {
+    let mut acc = FragmentAccumulator::new(slot_evac.enabled, defrag.targets.clone());
     meta.scan_blockmap_range(vol_id, start_lba, count, &mut |lba, bv| {
         acc.observe(&vol_id.0, lba, &bv);
     })?;
     let dead_estimate = acc.dead_estimate();
-    let (candidates, stats) = acc.finalize(threshold, max_results, slot_evac, meta)?;
-    Ok((candidates, dead_estimate, stats))
+    let mut defrag_stats = DefragScanStats::default();
+    let defrag_cands = acc.take_defrag_candidates(defrag, &mut defrag_stats);
+    let (mut candidates, stats) = acc.finalize(threshold, max_results, slot_evac, meta)?;
+    candidates.extend(defrag_cands);
+    Ok((candidates, dead_estimate, stats, defrag_stats))
 }

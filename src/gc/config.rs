@@ -83,6 +83,58 @@ pub struct GcConfig {
     #[serde(default = "default_compactor_slot_evac_max_live")]
     pub compactor_slot_evac_max_live: u16,
 
+    // --- Defrag: physical-neighborhood compaction (evacuate the few live
+    //     blocks pinning confetti clusters so reclaim can rebuild large,
+    //     stripe-capable free runs; per-unit dead-ratio can never see these) ---
+    /// Master switch for defrag target selection (default true). Trigger-gated:
+    /// inert until the free pool's stripe-capable fraction
+    /// (`eff_capacity / free_blocks`) drops below
+    /// `defrag_stripe_capable_min_pct`, so a healthy pool pays nothing.
+    /// Selection only — the rewriter and the retire/reclaim gates are unchanged.
+    #[serde(default = "default_defrag_enabled")]
+    pub defrag_enabled: bool,
+    /// Enter defrag mode when the stripe-capable fraction of the free pool is
+    /// below this percent (default 30). Exit at this + 10 (fixed hysteresis).
+    #[serde(default = "default_defrag_stripe_capable_min_pct")]
+    pub defrag_stripe_capable_min_pct: u8,
+    /// Don't enter defrag mode below this free% (default 5) — under real space
+    /// exhaustion the urgency ladder owns the problem and extra background
+    /// movement only competes for the last blocks.
+    #[serde(default = "default_defrag_min_free_pct")]
+    pub defrag_min_free_pct: u8,
+    /// A confetti cluster qualifies as a defrag target iff
+    /// `(free + retired) blocks / span >= this percent` (default 50) — i.e.
+    /// the live pinners to evacuate are at most half the span.
+    #[serde(default = "default_defrag_min_free_density_pct")]
+    pub defrag_min_free_density_pct: u8,
+    /// Max gap (allocated/retired blocks) between two free extents still
+    /// considered the same cluster (default 64).
+    #[serde(default = "default_defrag_gap_max_blocks")]
+    pub defrag_gap_max_blocks: u32,
+    /// Cap on the total span (blocks) of active defrag target ranges
+    /// (default 262_144 = 1 GiB at 4 KiB). Bounds the scanner's per-entry
+    /// range check and the treadmill exposure.
+    #[serde(default = "default_defrag_max_target_blocks")]
+    pub defrag_max_target_blocks: u64,
+    /// Free extents the target-selection walk visits per GC cycle
+    /// (default 32_768 = 8 × 4096-extent lock holds; a 2M-extent belt is
+    /// covered in ~60 cycles ≈ 5 min at the 5 s cadence).
+    #[serde(default = "default_defrag_scan_extents_per_cycle")]
+    pub defrag_scan_extents_per_cycle: usize,
+    /// Blocks of defrag candidates rewritten per GC cycle at full effort
+    /// (default 32_768 = 128 MiB ≈ 25 MB/s idle movement), scaled by the
+    /// per-cycle `effort`. Sized so the sequential rewrite loop (one
+    /// synchronous LV3 read per unit) stays well under the cycle interval;
+    /// independent of (additive with) `max_rewrite_per_cycle`.
+    #[serde(default = "default_defrag_max_rewrite_blocks_per_cycle")]
+    pub defrag_max_rewrite_blocks_per_cycle: u64,
+    /// Effort floor while defrag mode is latched (default 0.15). Without it
+    /// the fragmented steady state (buffer full AND free% > 50 → effort < 0.01)
+    /// idles the compactor exactly when defrag is needed. Only applies while
+    /// the trigger is latched; the urgency/idle formula is untouched.
+    #[serde(default = "default_defrag_min_effort")]
+    pub defrag_min_effort: f64,
+
     // --- Adaptive reclaim heat map (Stage A: observe-only) ---
     /// Master switch for the background PBA heat-map refresh (default true).
     /// Observe-only in Stage A: builds the map but changes no reclaim
@@ -203,6 +255,15 @@ impl Default for GcConfig {
             compactor_scan_max_lbas_per_cycle: default_compactor_scan_max_lbas_per_cycle(),
             compactor_slot_evac_enabled: default_compactor_slot_evac_enabled(),
             compactor_slot_evac_max_live: default_compactor_slot_evac_max_live(),
+            defrag_enabled: default_defrag_enabled(),
+            defrag_stripe_capable_min_pct: default_defrag_stripe_capable_min_pct(),
+            defrag_min_free_pct: default_defrag_min_free_pct(),
+            defrag_min_free_density_pct: default_defrag_min_free_density_pct(),
+            defrag_gap_max_blocks: default_defrag_gap_max_blocks(),
+            defrag_max_target_blocks: default_defrag_max_target_blocks(),
+            defrag_scan_extents_per_cycle: default_defrag_scan_extents_per_cycle(),
+            defrag_max_rewrite_blocks_per_cycle: default_defrag_max_rewrite_blocks_per_cycle(),
+            defrag_min_effort: default_defrag_min_effort(),
             heat_enabled: default_heat_enabled(),
             heat_bucket_size_blocks: default_heat_bucket_size_blocks(),
             heat_refresh_max_lbas_per_cycle: default_heat_refresh_max_lbas_per_cycle(),
@@ -261,6 +322,33 @@ fn default_compactor_slot_evac_enabled() -> bool {
 }
 fn default_compactor_slot_evac_max_live() -> u16 {
     16
+}
+fn default_defrag_enabled() -> bool {
+    true
+}
+fn default_defrag_stripe_capable_min_pct() -> u8 {
+    30
+}
+fn default_defrag_min_free_pct() -> u8 {
+    5
+}
+fn default_defrag_min_free_density_pct() -> u8 {
+    50
+}
+fn default_defrag_gap_max_blocks() -> u32 {
+    64
+}
+fn default_defrag_max_target_blocks() -> u64 {
+    262_144 // 1 GiB at 4 KiB blocks
+}
+fn default_defrag_scan_extents_per_cycle() -> usize {
+    32_768
+}
+fn default_defrag_max_rewrite_blocks_per_cycle() -> u64 {
+    32_768 // 128 MiB/cycle at full effort ≈ 25 MB/s movement
+}
+fn default_defrag_min_effort() -> f64 {
+    0.15
 }
 fn default_heat_enabled() -> bool {
     true

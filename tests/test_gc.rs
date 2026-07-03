@@ -10,7 +10,7 @@ use onyx_storage::config::{FlushConfig, MetaConfig};
 use onyx_storage::gc::config::GcConfig;
 use onyx_storage::gc::rewriter::rewrite_candidate;
 use onyx_storage::gc::scanner::{
-    scan_gc_candidates, scan_gc_candidates_window, GcCandidate, SlotEvacParams,
+    scan_gc_candidates, scan_gc_candidates_window, DefragScanParams, GcCandidate, SlotEvacParams,
 };
 use onyx_storage::io::device::RawDevice;
 use onyx_storage::io::engine::IoEngine;
@@ -452,7 +452,7 @@ fn gc_rewrite_overwritten_blocks() {
     // Windowed scan (resident compactor path): a window covering the whole
     // volume must surface the SAME candidate and report a nonzero compactable
     // dead-block estimate (the 6 dead members of the old unit).
-    let (win_candidates, dead_estimate, _slot_stats) = scan_gc_candidates_window(
+    let (win_candidates, dead_estimate, _slot_stats, _defrag_stats) = scan_gc_candidates_window(
         &env.meta,
         &vid,
         Lba(0),
@@ -460,6 +460,7 @@ fn gc_rewrite_overwritten_blocks() {
         0.25,
         100,
         onyx_storage::gc::scanner::SlotEvacParams::disabled(),
+        &onyx_storage::gc::scanner::DefragScanParams::disabled(),
     )
     .unwrap();
     let win = win_candidates
@@ -951,6 +952,7 @@ fn gc_rewriter_skips_lba_when_fragment_identity_changed_with_same_pba() {
         slot_offset: 0,
         live_lbas: vec![(Lba(0), 0)],
         dead_ratio: 0.5,
+        defrag: false,
     };
 
     // Simulate a race after scan: LBA 0 is remapped to a DIFFERENT fragment in
@@ -1550,8 +1552,8 @@ fn slot_evac_promotes_single_lba_packed_slot_when_rc_matches() {
     meta.set_refcount(pba, 1).unwrap();
 
     // Slot-evac OFF: single-LBA fragment is invisible to compaction.
-    let (cands_off, _de, stats_off) =
-        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, SlotEvacParams::disabled())
+    let (cands_off, _de, stats_off, _ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, SlotEvacParams::disabled(), &DefragScanParams::disabled())
             .unwrap();
     assert!(
         cands_off.is_empty(),
@@ -1560,8 +1562,8 @@ fn slot_evac_promotes_single_lba_packed_slot_when_rc_matches() {
     assert_eq!(stats_off.candidates, 0);
 
     // Slot-evac ON: the slot is promoted (rc==visible==1, byte-dead >= 0.25).
-    let (cands_on, _de2, stats_on) =
-        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    let (cands_on, _de2, stats_on, _ds2) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16), &DefragScanParams::disabled()).unwrap();
     assert_eq!(cands_on.len(), 1, "slot-evac promotes the pinning fragment");
     assert_eq!(cands_on[0].pba, pba);
     assert_eq!(stats_on.candidates, 1);
@@ -1581,8 +1583,8 @@ fn slot_evac_defers_when_window_misses_live_siblings() {
     // rc=3 simulates two live siblings outside this window/volume.
     meta.set_refcount(pba, 3).unwrap();
 
-    let (cands, _de, stats) =
-        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    let (cands, _de, stats, _ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16), &DefragScanParams::disabled()).unwrap();
     assert!(cands.is_empty(), "incomplete view must not evacuate");
     assert_eq!(stats.candidates, 0);
     assert_eq!(stats.incomplete_skips, 1);
@@ -1600,8 +1602,8 @@ fn slot_evac_skips_byte_full_slot() {
     put_frag(&meta, &vol, 0, pba, 0, 4000, 1, 0, 0x3333);
     meta.set_refcount(pba, 1).unwrap();
 
-    let (cands, _de, stats) =
-        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    let (cands, _de, stats, _ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16), &DefragScanParams::disabled()).unwrap();
     assert!(cands.is_empty(), "byte-full slot must not be evacuated");
     assert_eq!(stats.candidates, 0);
     // Failed the byte-deadness gate, not the completeness gate.
@@ -1623,8 +1625,8 @@ fn slot_evac_whole_slot_promote_dedups_against_per_fragment() {
     // visible_live = 2, visible_bytes = 500 → ~88% byte-dead.
     meta.set_refcount(pba, 2).unwrap();
 
-    let (cands, _de, stats) =
-        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16)).unwrap();
+    let (cands, _de, stats, _ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16), &DefragScanParams::disabled()).unwrap();
     assert_eq!(cands.len(), 2, "whole slot promoted, no duplicate fragment");
     assert_eq!(
         cands.iter().filter(|c| c.slot_offset == 0).count(),
@@ -1656,8 +1658,8 @@ fn slot_evac_does_not_partially_evacuate_a_slot_over_budget() {
     meta.set_refcount(pba, 3).unwrap();
 
     // Budget of 2 < the slot's 3 fragments → must NOT partially evacuate.
-    let (cands, _de, stats) =
-        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 2, se_params(16)).unwrap();
+    let (cands, _de, stats, _ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 2, se_params(16), &DefragScanParams::disabled()).unwrap();
     assert!(cands.is_empty(), "a slot is all-or-nothing within the budget");
     assert_eq!(stats.candidates, 0);
     // Passed completeness + byte-deadness; only the budget blocked it, so it is
@@ -1681,10 +1683,124 @@ fn slot_evac_skips_slot_over_max_live() {
 
     // max_live = 2 < 3 live → complete view (rc==visible==3) but too costly →
     // a COST-CAP skip, NOT a completeness/incomplete skip.
-    let (cands, _de, stats) =
-        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(2)).unwrap();
+    let (cands, _de, stats, _ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(2), &DefragScanParams::disabled()).unwrap();
     assert!(cands.is_empty(), "slot exceeding max_live must not be evacuated");
     assert_eq!(stats.candidates, 0);
     assert_eq!(stats.cost_cap_skips, 1, "complete-but-too-costly is a cost-cap skip");
     assert_eq!(stats.incomplete_skips, 0, "not an incomplete-view skip");
+}
+
+// ---------- Defrag bypass (physical-neighborhood compaction) selection tests ----------
+//
+// SELECTION only, like the slot-evac tests: the runner-side trigger/target walk
+// is covered by src/gc/defrag.rs unit tests; here we prove the scanner promotes
+// in-target fragments the dead-ratio path can never see, respects the block
+// budget, and never double-emits against slot-evac.
+
+fn defrag_params(targets: Vec<onyx_storage::space::extent::Extent>, max_blocks: u64) -> DefragScanParams {
+    DefragScanParams {
+        targets: std::sync::Arc::new(targets),
+        max_blocks,
+    }
+}
+
+fn ext(start: u64, count: u32) -> onyx_storage::space::extent::Extent {
+    onyx_storage::space::extent::Extent::new(Pba(start), count)
+}
+
+/// A fully-live single-LBA unit (dead_ratio 0, skipped outright by the legacy
+/// path even at threshold 0) inside a defrag target IS promoted, flagged
+/// `defrag: true`; an identical unit outside the target stays invisible.
+#[test]
+fn defrag_bypass_promotes_in_target_fully_live_fragment() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-df".into());
+    meta.create_blockmap_cf("vol-df").unwrap();
+    put_frag(&meta, &vol, 0, Pba(100), 0, 4096, 1, 0, 0xA001); // in target
+    put_frag(&meta, &vol, 1, Pba(500), 0, 4096, 1, 0, 0xA002); // out of target
+
+    let dp = defrag_params(vec![ext(90, 20)], 1024);
+    let (cands, _de, _ss, ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.85, 100, SlotEvacParams::disabled(), &dp)
+            .unwrap();
+    assert_eq!(cands.len(), 1, "only the in-target fragment is promoted");
+    assert_eq!(cands[0].pba, Pba(100));
+    assert!(cands[0].defrag);
+    assert_eq!(cands[0].live_lbas.len(), 1);
+    assert_eq!(ds.candidates, 1);
+    assert_eq!(ds.blocks_selected, 1);
+
+    // No targets → the bypass never fires (byte-identical legacy behavior).
+    let (cands_off, _de2, _ss2, ds_off) = scan_gc_candidates_window(
+        &meta, &vol, Lba(0), 64, 0.85, 100,
+        SlotEvacParams::disabled(), &DefragScanParams::disabled(),
+    )
+    .unwrap();
+    assert!(cands_off.is_empty());
+    assert_eq!(ds_off.candidates, 0);
+}
+
+/// Block budget: selection is highest-PBA-first (matching the descending
+/// target walk) and stops once Σ live blocks reaches the budget.
+#[test]
+fn defrag_block_budget_caps_selection_descending() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-df".into());
+    meta.create_blockmap_cf("vol-df").unwrap();
+    for i in 0..5u64 {
+        put_frag(&meta, &vol, i, Pba(100 + i), 0, 4096, 1, 0, 0xB000 + i as u32);
+    }
+    let dp = defrag_params(vec![ext(100, 5)], 2);
+    let (cands, _de, _ss, ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.85, 100, SlotEvacParams::disabled(), &dp)
+            .unwrap();
+    assert_eq!(ds.candidates, 2, "budget of 2 blocks admits 2 single-LBA units");
+    assert_eq!(ds.blocks_selected, 2);
+    let pbas: Vec<u64> = cands.iter().map(|c| c.pba.0).collect();
+    assert_eq!(pbas, vec![104, 103], "highest PBA first");
+    assert!(cands.iter().all(|c| c.defrag));
+}
+
+/// A multi-PBA passthrough unit whose FOOTPRINT overlaps a target (base PBA
+/// outside it) is still promoted — the check uses physical_blocks, not just
+/// the base address.
+#[test]
+fn defrag_footprint_overlap_catches_multi_pba_units() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-df".into());
+    meta.create_blockmap_cf("vol-df").unwrap();
+    // 2-block raw unit at [100, 102); target covers only block 101.
+    put_frag(&meta, &vol, 0, Pba(100), 0, 8192, 2, 0, 0xC001);
+    put_frag(&meta, &vol, 1, Pba(100), 0, 8192, 2, 1, 0xC001);
+    let dp = defrag_params(vec![ext(101, 1)], 1024);
+    let (cands, _de, _ss, ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.85, 100, SlotEvacParams::disabled(), &dp)
+            .unwrap();
+    assert_eq!(ds.candidates, 1);
+    assert_eq!(cands.len(), 1);
+    assert_eq!(cands[0].pba, Pba(100));
+    assert!(cands[0].defrag);
+    assert_eq!(cands[0].live_lbas.len(), 2, "both live members captured");
+}
+
+/// Coexistence with slot-evac: a defrag-selected fragment leaves the
+/// accumulator before the slot-evac/legacy pass runs — never emitted twice.
+#[test]
+fn defrag_and_slot_evac_never_double_emit() {
+    let (_dir, meta) = slot_evac_meta();
+    let vol = VolumeId("vol-df".into());
+    meta.create_blockmap_cf("vol-df").unwrap();
+    let pba = Pba(300);
+    // Byte-dead packed slot that slot-evac WOULD promote (rc==visible==1).
+    put_frag(&meta, &vol, 0, pba, 0, 300, 1, 0, 0xD001);
+    meta.set_refcount(pba, 1).unwrap();
+
+    let dp = defrag_params(vec![ext(295, 10)], 1024);
+    let (cands, _de, ss, ds) =
+        scan_gc_candidates_window(&meta, &vol, Lba(0), 64, 0.25, 100, se_params(16), &dp).unwrap();
+    assert_eq!(cands.len(), 1, "exactly one emission for the fragment");
+    assert!(cands[0].defrag, "defrag takes precedence (extracted first)");
+    assert_eq!(ds.candidates, 1);
+    assert_eq!(ss.candidates, 0, "slot-evac must not re-emit the taken fragment");
 }

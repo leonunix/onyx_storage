@@ -31,6 +31,20 @@ struct RetiredRun {
     retired_at: Instant,
 }
 
+/// Fragmentation snapshot of the global free set (one lock hold, O(log N)).
+/// `stripe_capable_blocks / free_blocks_in_set` = stripe-capable fraction of
+/// the free pool — the GC defrag trigger. Both numbers describe the SAME set
+/// (lane-cached extents excluded), unlike the `free_blocks` atomic.
+#[derive(Debug, Clone, Copy)]
+pub struct ContiguityStats {
+    pub free_blocks_in_set: u64,
+    pub free_extents: u64,
+    pub largest_run_blocks: u32,
+    /// Whole-stripe aligned capacity (eff floored to stripe multiples).
+    /// `None` when no stripe geometry is configured (stripe <= 1).
+    pub stripe_capable_blocks: Option<u64>,
+}
+
 pub struct SpaceAllocator {
     total_blocks: u64,
     /// Address-ordered free list + (count, start) side index. First-fit
@@ -1547,6 +1561,86 @@ impl SpaceAllocator {
         self.total_blocks
     }
 
+    /// O(1)/O(log N) fragmentation snapshot of the global free set — one lock
+    /// acquisition. `free_blocks_in_set` deliberately EXCLUDES lane-cached
+    /// extents (they are drained out of the set), so
+    /// `eff_capacity_blocks / free_blocks_in_set` is a consistent
+    /// "stripe-capable fraction" — the defrag trigger signal.
+    pub fn contiguity_stats(&self) -> ContiguityStats {
+        let free = self.free_extents.lock().unwrap();
+        ContiguityStats {
+            free_blocks_in_set: free.blocks_total(),
+            free_extents: free.len() as u64,
+            largest_run_blocks: free.largest().map_or(0, |e| e.count),
+            stripe_capable_blocks: free.geometry().map(|_| free.stripe_capacity()),
+        }
+    }
+
+    /// The configured RAID geometry `(stripe_blocks, phase)`, if any.
+    pub fn stripe_geometry(&self) -> Option<(u32, u32)> {
+        self.free_extents.lock().unwrap().geometry()
+    }
+
+    /// Blocks of `range` covered by free extents — the defrag target "done"
+    /// recheck. One brief free-lock hold, O(log N + overlaps in range).
+    pub(crate) fn free_overlap_blocks(&self, range: Extent) -> u64 {
+        let s = range.start.0;
+        let e = range.end_pba().0;
+        let free = self.free_extents.lock().unwrap();
+        let set = free.by_addr();
+        let mut covered = 0u64;
+        if let Some(prev) = set.range(..=Extent::single(range.start)).next_back() {
+            covered += prev.end_pba().0.min(e).saturating_sub(s);
+        }
+        for ext in set.range(Extent::single(Pba(s + 1))..) {
+            if ext.start.0 >= e {
+                break;
+            }
+            covered += ext.end_pba().0.min(e) - ext.start.0;
+        }
+        covered
+    }
+
+    /// Snapshot up to `max` free extents strictly below `below`, DESCENDING by
+    /// address — the defrag target-selection walk. ONE bounded lock hold
+    /// (`max` is chunk-sized by the caller); the snapshot is advisory, so
+    /// concurrent mutation between chunks is fine (the scanner/rewriter
+    /// re-validate everything downstream).
+    pub(crate) fn free_extents_below_desc(&self, below: Pba, max: usize) -> Vec<Extent> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let free = self.free_extents.lock().unwrap();
+        free.by_addr()
+            .range(..Extent::single(below))
+            .rev()
+            .take(max)
+            .copied()
+            .collect()
+    }
+
+    /// Blocks of `range` covered by retired extents. Takes ONLY the retired
+    /// lock (callers must NOT hold `free_extents` — keeps the free→retired
+    /// lock order one-directional). Retired extents never overlap each other
+    /// (coalesced set), so summing clamped intersections is exact.
+    pub(crate) fn retired_overlap_blocks(&self, range: Extent) -> u64 {
+        let s = range.start.0;
+        let e = range.end_pba().0;
+        let retired = self.retired_extents.lock().unwrap();
+        let mut covered = 0u64;
+        // The last extent starting at/before `s` may reach into the range.
+        if let Some(prev) = retired.range(..=Extent::single(range.start)).next_back() {
+            covered += prev.end_pba().0.min(e).saturating_sub(s);
+        }
+        for ext in retired.range(Extent::single(Pba(s + 1))..) {
+            if ext.start.0 >= e {
+                break;
+            }
+            covered += ext.end_pba().0.min(e) - ext.start.0;
+        }
+        covered
+    }
+
     /// Number of distinct runs in the global free set. Test-only: the stripe
     /// density guard asserts this stays O(1) under repeated aligned allocation
     /// (alignment pads must not fragment the free list into per-alloc slivers).
@@ -1724,6 +1818,92 @@ mod age_tests {
     const GRACE: Duration = Duration::from_secs(10);
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    /// contiguity_stats reflects the free set (blocks/extents/largest/eff) and
+    /// eff_capacity is None without geometry, Some with it.
+    #[test]
+    fn contiguity_stats_reflects_free_set() {
+        let a = new_alloc(8192);
+        let s0 = a.contiguity_stats();
+        assert_eq!(s0.free_blocks_in_set, 8192 - RESERVED_BLOCKS);
+        assert_eq!(s0.free_extents, 1);
+        assert_eq!(s0.largest_run_blocks as u64, 8192 - RESERVED_BLOCKS);
+        assert_eq!(s0.stripe_capable_blocks, None, "no geometry configured");
+
+        a.set_stripe_geometry(6, 2);
+        let s1 = a.contiguity_stats();
+        // Single run starting at RESERVED_BLOCKS=8: head_pad(8,6,2)=((8+2)%6=4→2),
+        // eff = total - head, floored to whole stripes.
+        let head = {
+            let r = (RESERVED_BLOCKS + 2) % 6;
+            if r == 0 { 0 } else { 6 - r }
+        };
+        let eff = 8192 - RESERVED_BLOCKS - head;
+        assert_eq!(s1.stripe_capable_blocks, Some(eff / 6 * 6));
+
+        // Punch holes: allocate 3 blocks (front carve keeps one run), then
+        // free-with-gap via retire is separate — just re-check counts move.
+        let _ = a.allocate_one().unwrap();
+        let s2 = a.contiguity_stats();
+        assert_eq!(s2.free_blocks_in_set, 8192 - RESERVED_BLOCKS - 1);
+    }
+
+    /// free_extents_below_desc returns strictly-below extents in descending
+    /// address order, capped at `max`.
+    #[test]
+    fn free_extents_below_desc_orders_and_caps() {
+        let a = new_alloc(64);
+        // Carve the single run into three fragments by allocating separators.
+        // Layout after: free runs are rebuilt via direct set manipulation —
+        // simpler: allocate everything, then free selected extents back.
+        let total = 64 - RESERVED_BLOCKS;
+        let first = a.allocate_extent(total as u32).unwrap();
+        assert_eq!(first.start.0, RESERVED_BLOCKS);
+        for e in [
+            Extent::new(Pba(10), 2),
+            Extent::new(Pba(20), 3),
+            Extent::new(Pba(40), 4),
+        ] {
+            a.free_extent(e).unwrap();
+        }
+        let all = a.free_extents_below_desc(Pba(u64::MAX), 16);
+        assert_eq!(
+            all,
+            vec![
+                Extent::new(Pba(40), 4),
+                Extent::new(Pba(20), 3),
+                Extent::new(Pba(10), 2)
+            ]
+        );
+        // Strictly below 40: excludes the extent starting at 40.
+        let below = a.free_extents_below_desc(Pba(40), 16);
+        assert_eq!(below.len(), 2);
+        assert_eq!(below[0].start.0, 20);
+        // Cap.
+        let capped = a.free_extents_below_desc(Pba(u64::MAX), 1);
+        assert_eq!(capped, vec![Extent::new(Pba(40), 4)]);
+        assert!(a.free_extents_below_desc(Pba(u64::MAX), 0).is_empty());
+    }
+
+    /// retired_overlap_blocks sums clamped intersections, including a retired
+    /// extent reaching into the range from below.
+    #[test]
+    fn retired_overlap_blocks_counts_intersections() {
+        let a = new_alloc(128);
+        let n = alloc_first(&a, 40); // n..n+40 allocated
+        let t0 = Instant::now();
+        // Retire [n+2, n+6) and [n+10, n+12).
+        a.retire_extent_at(Extent::new(Pba(n + 2), 4), t0).unwrap();
+        a.retire_extent_at(Extent::new(Pba(n + 10), 2), t0).unwrap();
+        // Range covering both fully.
+        assert_eq!(a.retired_overlap_blocks(Extent::new(Pba(n), 20)), 6);
+        // Range starting inside the first retired run (reach-from-below).
+        assert_eq!(a.retired_overlap_blocks(Extent::new(Pba(n + 4), 4)), 2);
+        // Range with no overlap.
+        assert_eq!(a.retired_overlap_blocks(Extent::new(Pba(n + 20), 5)), 0);
+        // Range clipping the tail of the second run only.
+        assert_eq!(a.retired_overlap_blocks(Extent::new(Pba(n + 11), 8)), 1);
     }
 
     /// HEADLINE: an aged block reclaims even while an adjacent younger block keeps

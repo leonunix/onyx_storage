@@ -470,6 +470,38 @@ pub struct EngineMetrics {
     pub gc_slot_evac_blocks: AtomicU64,
     pub gc_slot_evac_incomplete_skips: AtomicU64,
     pub gc_slot_evac_cost_cap_skips: AtomicU64,
+    /// Defrag (physical-neighborhood compaction; `gc.defrag_*` knobs).
+    /// Gauges: `mode_active` (trigger latched), `targets_active` /
+    /// `target_blocks` (published target ranges and their span). Counters:
+    /// `walk_extents` (free extents visited by the descending selection walk),
+    /// `clusters_qualified/rejected` (selection outcomes), `candidates` /
+    /// `blocks_selected` (scanner-side promotions inside target ranges),
+    /// `blocks_moved` (live blocks actually re-appended by the rewriter —
+    /// pair with `gc_retired_blocks_reclaimed`: moved ≫ subsequently-reclaimed
+    /// means pinned/wasted movement, the v2 rc-guard signal).
+    pub gc_defrag_mode_active: AtomicU64,
+    pub gc_defrag_targets_active: AtomicU64,
+    pub gc_defrag_target_blocks: AtomicU64,
+    pub gc_defrag_walk_extents: AtomicU64,
+    pub gc_defrag_clusters_qualified: AtomicU64,
+    pub gc_defrag_clusters_rejected: AtomicU64,
+    pub gc_defrag_candidates: AtomicU64,
+    pub gc_defrag_blocks_selected: AtomicU64,
+    pub gc_defrag_blocks_moved: AtomicU64,
+    /// Allocator free-pool contiguity gauges (published once per GC cycle from
+    /// `contiguity_stats`). `free_blocks_in_set` excludes lane caches, so
+    /// `stripe_capable_blocks / free_blocks_in_set` = the defrag trigger
+    /// fraction; `free_extents` counts fragments (confetti belt size);
+    /// `largest_free_run` is the biggest contiguous run in blocks.
+    pub allocator_free_extents: AtomicU64,
+    pub allocator_largest_free_run: AtomicU64,
+    pub allocator_stripe_capable_blocks: AtomicU64,
+    pub allocator_free_blocks_in_set: AtomicU64,
+    /// Flush-writer batches that hit stripe starvation (aligned allocation
+    /// failed → the whole remaining batch degraded to per-unit unaligned
+    /// writes → RAID partial-stripe RMW downstream). Rate ≈ share of flush
+    /// batches running degraded — the direct fragmentation-pathology signal.
+    pub flush_writer_stripe_starved_batches: AtomicU64,
     pub gc_errors: AtomicU64,
     /// Number of batched all-volume L2P scans the retired-extent reclaim path
     /// has run. With batching this is ~1 per GC cycle (was up to
