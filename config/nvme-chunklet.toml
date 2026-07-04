@@ -40,22 +40,24 @@ devices = [
 ]
 io_backend = "uring"
 spare_pct = 5
-# NOTE: chunklet descriptor v2 RLE codec exists but the pool allocator does NOT
-# yet place chunklets column-contiguously (S2 TODO), so a large LD's descriptor
-# stays uncompressed and overflows the 4028-byte superblock slot (~146 chunklets
-# max/LD: encoded body ≈ 1199 + 25.6·chunklets B must stay < 4028 → ≤110
-# chunklets ≈ num_rows 13). num_rows=12 (96 chunklets, 72 GiB usable, ~3657 B
-# descriptor) fits with margin and holds a 32 GiB fio volume at ~44% full —
-# enough headroom that the allocator never starves (removes the
-# GC-churn/overcommit confound for the write-path ceiling measurement) without
-# needing the S2 allocator work.
+# num_rows is no longer capped at ~13. The old wall was the 4 KiB superblock slot
+# (4028-byte manifest body) plus a row-major allocator whose fragmented placement
+# made the per-position RLE descriptor grow ~216 B/row. Two chunklet fixes removed
+# it: (S2) banded column-contiguous placement rotates the position->PD map per
+# row-band so the LD spreads balanced across ALL PDs (no idle disk, many-to-many
+# rebuild) while the descriptor stays O(N*positions), independent of num_rows;
+# (R3) the superblock slot is now 32 MiB (length-aware writes still touch only the
+# used ~4 KiB, no write amplification), giving fault-rebuild + large-pool headroom.
+# num_rows can now scale to fill the pool (all 9 PDs carry an even share; box:
+# rows=100 => ~89 chunklets/PD). Requires a fresh chunklet pool (superblock v3,
+# no migration) — re-run chunklet-init --force.
 #
-# LV3 = RAID6 (6 data + 2 parity), 12 rows, 4 KiB strip -> ~72 GiB usable (96 chunklets).
+# LV3 = RAID6 (6 data + 2 parity), 100 rows, 4 KiB strip -> ~600 GiB usable (800 chunklets).
 # 4 KiB strip => full-stripe = 6 data x 4 KiB = 24 KiB. Paired with
 # storage.raid_full_stripe_writes=true + the 24 KiB coalesce below, onyx aligns
 # stripe-multiple units to a 24 KiB boundary so chunklet takes its zero-RMW
 # full-stripe path (roadmap ③). NVMe: 4K is the sweet spot, no HDD big-block need.
-lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 12, strip_kib = 4 }
+lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 100, strip_kib = 4 }
 # LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable (24 chunklets).
 lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
 # metadb LD (created but unused until Phase 3) -> ~2 GiB (4 chunklets).
