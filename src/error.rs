@@ -47,6 +47,9 @@ pub enum OnyxError {
 
     #[error("Volume '{0}' has been deleted")]
     VolumeDeleted(String),
+
+    #[error("metadb persistence fenced: writes rejected until restart ({0})")]
+    MetaFenced(String),
 }
 
 pub type OnyxResult<T> = Result<T, OnyxError>;

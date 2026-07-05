@@ -609,6 +609,14 @@ pub struct WriteBufferPool {
     /// `mark_flushed` has been called. This guarantees that a buffer entry
     /// is never physically overwritten before its DB writes hit disk.
     pub(crate) durable_seq: Arc<AtomicU64>,
+    /// Metadb persistence fence. Empty = healthy. Set (once, latched) by the
+    /// durability-watermark thread when metadb checkpoints have failed fatally
+    /// (`CapacityExhausted` / "persistence subsystem failed") or repeatedly.
+    /// Once set, [`append`](WriteBufferPool::append) fail-fasts new writes with
+    /// the recorded reason instead of silently acking into a ring that can no
+    /// longer be drained — the ENOSPC "ack is a lie" hole. Reads are never
+    /// fenced. The fence only clears on process restart.
+    meta_fence: OnceLock<String>,
 }
 
 static TEST_PURGE_FAIL_VOLUMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();

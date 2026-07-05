@@ -31,6 +31,10 @@ pub struct EngineStatusSnapshot {
     /// Adaptive reclaim heat-map summary (None when the map is disabled or in
     /// standby). Observe-only in Stage A.
     pub heat: Option<HeatSummary>,
+    /// Metadb persistence fence reason, if tripped. `Some` means the durability
+    /// path has latched off new writes (metadb checkpoints failing fatally or
+    /// repeatedly); the engine must be restarted to clear it.
+    pub meta_fenced: Option<String>,
     pub metrics: EngineMetricsSnapshot,
 }
 
@@ -38,6 +42,9 @@ impl EngineStatusSnapshot {
     pub fn render_text(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "mode: {}", self.mode);
+        if let Some(reason) = &self.meta_fenced {
+            let _ = writeln!(out, "META_FENCED: {} (restart required)", reason);
+        }
         let _ = writeln!(out, "uptime_secs: {}", self.metrics.uptime_secs);
         let _ = writeln!(out, "volumes: {}", self.volume_count);
         let _ = writeln!(out, "live_handles: {}", self.live_handle_count);

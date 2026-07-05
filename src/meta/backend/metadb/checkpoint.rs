@@ -24,6 +24,18 @@ struct CheckpointFailure {
     start: u64,
     end: u64,
     message: String,
+    /// Fatal (durable-corruption / unrecoverable) failures stay sticky across a
+    /// later successful checkpoint; transient ones are pruned on success so the
+    /// vec stays bounded and stale errors don't linger.
+    fatal: bool,
+}
+
+impl CheckpointState {
+    /// Drop transient failures on a successful full checkpoint (it supersedes
+    /// them), keeping only latched fatal ones.
+    fn prune_transient_failures(&mut self) {
+        self.failures.retain(|failure| failure.fatal);
+    }
 }
 impl AsyncCheckpoint {
     pub(super) fn start(db: Arc<Db>) -> OnyxResult<Self> {
@@ -60,6 +72,11 @@ impl AsyncCheckpoint {
                     match result {
                         Ok(true) => {
                             state.checkpointed = state.checkpointed.max(target);
+                            // A full checkpoint folds all dirty state, so it
+                            // supersedes every prior transient failure. Keep only
+                            // fatal ones latched (they never get superseded — the
+                            // next attempt hits the same wall).
+                            state.prune_transient_failures();
                         }
                         Ok(false) => {
                             tracing::debug!(
@@ -69,10 +86,13 @@ impl AsyncCheckpoint {
                             );
                         }
                         Err(err) => {
+                            let message = err.to_string();
+                            let fatal = crate::meta::is_fatal_meta_failure(&message);
                             state.failures.push(CheckpointFailure {
                                 start,
                                 end: target,
-                                message: err.to_string(),
+                                message,
+                                fatal,
                             });
                         }
                     }
@@ -192,5 +212,39 @@ impl Drop for AsyncCheckpoint {
         if let Some(handle) = handle {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CheckpointFailure, CheckpointState};
+
+    fn failure(start: u64, end: u64, fatal: bool) -> CheckpointFailure {
+        CheckpointFailure {
+            start,
+            end,
+            message: if fatal { "capacity exhausted" } else { "transient" }.into(),
+            fatal,
+        }
+    }
+
+    #[test]
+    fn prune_keeps_fatal_drops_transient() {
+        let mut state = CheckpointState {
+            failures: vec![
+                failure(1, 2, false),
+                failure(3, 4, true),
+                failure(5, 6, false),
+            ],
+            ..Default::default()
+        };
+        state.prune_transient_failures();
+        assert_eq!(state.failures.len(), 1, "only the fatal failure should remain");
+        assert!(state.failures[0].fatal);
+        assert_eq!(state.failures[0].start, 3);
+
+        // Idempotent: a fatal failure survives repeated successful checkpoints.
+        state.prune_transient_failures();
+        assert_eq!(state.failures.len(), 1);
     }
 }

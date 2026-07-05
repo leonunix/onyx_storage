@@ -261,6 +261,49 @@ fn uring_sync_fast_path_single_linked_chain() {
 }
 
 #[test]
+fn meta_fence_rejects_new_appends_but_not_reads() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+
+    // A write before the fence trips succeeds and is visible.
+    let seq = pool
+        .append("test-vol", Lba(3), 1, &vec![0x11; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+    assert!(pool.lookup("test-vol", Lba(3)).unwrap().is_some());
+    assert!(!pool.is_meta_fenced());
+
+    // Trip the fence (as the durability thread would on fatal checkpoint loss).
+    pool.fence_meta("meta device capacity exhausted: need 10 pages, capacity 8");
+    assert!(pool.is_meta_fenced());
+    assert_eq!(
+        pool.meta_fence_reason(),
+        Some("meta device capacity exhausted: need 10 pages, capacity 8")
+    );
+
+    // New appends fail fast with MetaFenced instead of silently acking.
+    let err = pool
+        .append("test-vol", Lba(4), 1, &vec![0x22; BLOCK_SIZE as usize], 0)
+        .unwrap_err();
+    assert!(
+        matches!(err, OnyxError::MetaFenced(_)),
+        "expected MetaFenced, got {err:?}"
+    );
+
+    // Reads are never fenced — the earlier entry is still visible.
+    assert!(pool.lookup("test-vol", Lba(3)).unwrap().is_some());
+
+    // Fencing is idempotent: a second reason does not overwrite the first.
+    pool.fence_meta("some later reason");
+    assert_eq!(
+        pool.meta_fence_reason(),
+        Some("meta device capacity exhausted: need 10 pages, capacity 8")
+    );
+}
+
+#[test]
 fn flushed_entry_cannot_be_reinstalled_by_stale_eviction_state() {
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;

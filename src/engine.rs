@@ -1528,8 +1528,12 @@ impl OnyxEngine {
 
     /// Upgrade from a meta-only engine to full mode, reusing the existing MetaStore.
     ///
-    /// This avoids the metadb exclusive directory lock problem: the old engine's
-    /// MetaStore Arc is shared with the new engine rather than opening a second one.
+    /// The old engine's MetaStore Arc (and, on chunklet, the Pool it opened) is
+    /// shared with the new engine rather than opened a second time. For a
+    /// chunklet-backed metadb this is load-bearing: the pool now takes an
+    /// exclusive `flock` on every member PD (see `Pool::open`), so a second
+    /// `Pool::open` on the same devices would be rejected outright — and even if
+    /// it weren't, two in-memory pools would tear the shared superblock.
     pub fn upgrade_from_meta_only(meta: Arc<MetaStore>, config: &OnyxConfig) -> OnyxResult<Self> {
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
@@ -1839,6 +1843,10 @@ impl OnyxEngine {
             allocator_stripe_capable_blocks: contiguity.and_then(|c| c.stripe_capable_blocks),
             allocator_free_blocks_in_set: contiguity.map(|c| c.free_blocks_in_set),
             heat: self.heat.as_ref().map(|h| h.cached_summary()),
+            meta_fenced: self
+                .buffer_pool
+                .as_ref()
+                .and_then(|pool| pool.meta_fence_reason().map(str::to_string)),
             metrics: self.metrics.snapshot(),
         })
     }

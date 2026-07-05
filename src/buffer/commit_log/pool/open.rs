@@ -432,6 +432,7 @@ impl WriteBufferPool {
             throttle_last_wakeup_ns: AtomicU64::new(0),
             throttle_cached_fill_pct: AtomicU32::new(0),
             throttle_sample_counter: AtomicU32::new(0),
+            meta_fence: OnceLock::new(),
         };
 
         let expected_sb = GlobalSuperblock {

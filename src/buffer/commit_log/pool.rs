@@ -98,6 +98,31 @@ impl WriteBufferPool {
         }
     }
 
+    /// Latch the metadb persistence fence with `reason`. Idempotent: only the
+    /// first call records the reason and logs; subsequent calls are no-ops.
+    /// Called by the durability-watermark thread when metadb checkpoints fail
+    /// fatally or repeatedly, so `append` stops handing out durable acks the
+    /// system can no longer honor.
+    pub(crate) fn fence_meta(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if self.meta_fence.set(reason.clone()).is_ok() {
+            tracing::error!(
+                reason = %reason,
+                "metadb persistence fenced; rejecting new writes until restart"
+            );
+        }
+    }
+
+    /// True once the metadb persistence fence has tripped.
+    pub fn is_meta_fenced(&self) -> bool {
+        self.meta_fence.get().is_some()
+    }
+
+    /// The fence reason if tripped, else `None`. Surfaced by `onyx status`.
+    pub fn meta_fence_reason(&self) -> Option<&str> {
+        self.meta_fence.get().map(String::as_str)
+    }
+
     pub fn append(
         &self,
         vol_id: &str,
@@ -106,6 +131,13 @@ impl WriteBufferPool {
         payload: &[u8],
         vol_created_at: u64,
     ) -> OnyxResult<u64> {
+        // Fail-fast when metadb persistence is fenced: the buffer ring is the
+        // only durable record until a checkpoint folds it into manifest pages,
+        // so if checkpoints are dead an ack here would be a lie (the ring fills
+        // and never drains). Reads stay unfenced.
+        if let Some(reason) = self.meta_fence.get() {
+            return Err(OnyxError::MetaFenced(reason.clone()));
+        }
         let total_start = Instant::now();
         self.apply_write_throttle();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);

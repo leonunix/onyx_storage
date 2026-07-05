@@ -50,12 +50,17 @@ impl DurabilityWatermarkHandle {
                 let mut last_checkpoint = std::time::Instant::now();
                 let mut last_checkpoint_request_seq = 0u64;
                 let mut pending_checkpoint: Option<(u64, u64)> = None;
+                // Consecutive metadb-checkpoint failures. Reset on any success;
+                // fences the buffer pool once it reaches FENCE_FAILURE_THRESHOLD
+                // (or immediately on a fatal error) — see D6 in the Phase-3 plan.
+                let mut consecutive_failures = 0u32;
                 while !stop_clone.load(Ordering::Relaxed) {
                     std::thread::sleep(TICK_INTERVAL);
 
                     if let Some((token, seq)) = pending_checkpoint {
                         match meta.durable_checkpoint_outcome(token) {
                             Ok(Some(true)) => {
+                                consecutive_failures = 0;
                                 durable_seq.fetch_max(seq, Ordering::Release);
                                 if let Err(e) = buffer_pool_thread.release_below(seq) {
                                     tracing::warn!(
@@ -75,10 +80,22 @@ impl DurabilityWatermarkHandle {
                             }
                             Ok(None) => {}
                             Err(e) => {
+                                let msg = e.to_string();
+                                consecutive_failures += 1;
+                                let fatal = crate::meta::is_fatal_meta_failure(&msg);
                                 tracing::error!(
-                                    error = %e,
+                                    error = %msg,
+                                    consecutive_failures,
+                                    fatal,
                                     "durability watermark checkpoint failed; ring reclaim deferred to next cycle"
                                 );
+                                if Self::should_fence(consecutive_failures, fatal) {
+                                    // Stop acking new writes into a ring the dead
+                                    // checkpoint path can no longer drain.
+                                    buffer_pool_thread.fence_meta(format!(
+                                        "metadb checkpoint failed {consecutive_failures}x (last: {msg})"
+                                    ));
+                                }
                                 pending_checkpoint = None;
                             }
                         }
@@ -161,8 +178,19 @@ impl DurabilityWatermarkHandle {
         }
     }
 
+    /// Consecutive non-fatal checkpoint failures tolerated before the buffer
+    /// pool is fenced. Fatal failures (capacity exhausted / persistence
+    /// subsystem failed) fence on the first occurrence regardless.
+    const FENCE_FAILURE_THRESHOLD: u32 = 3;
+
     fn checkpoint_needed(captured: u64, last_checkpoint_request_seq: u64) -> bool {
         captured > last_checkpoint_request_seq
+    }
+
+    /// Fence decision: a fatal failure fences immediately; otherwise the pool is
+    /// fenced only once failures have piled up to the threshold.
+    fn should_fence(consecutive_failures: u32, fatal: bool) -> bool {
+        fatal || consecutive_failures >= Self::FENCE_FAILURE_THRESHOLD
     }
 
     pub(super) fn stop(&mut self) {
@@ -189,5 +217,16 @@ mod tests {
         assert!(DurabilityWatermarkHandle::checkpoint_needed(42, 41));
         assert!(!DurabilityWatermarkHandle::checkpoint_needed(42, 42));
         assert!(!DurabilityWatermarkHandle::checkpoint_needed(41, 42));
+    }
+
+    #[test]
+    fn fence_fires_on_fatal_or_repeated_failure() {
+        // Fatal fences immediately, even on the first failure.
+        assert!(DurabilityWatermarkHandle::should_fence(1, true));
+        // Non-fatal only after the threshold is reached.
+        assert!(!DurabilityWatermarkHandle::should_fence(1, false));
+        assert!(!DurabilityWatermarkHandle::should_fence(2, false));
+        assert!(DurabilityWatermarkHandle::should_fence(3, false));
+        assert!(DurabilityWatermarkHandle::should_fence(4, false));
     }
 }
