@@ -59,26 +59,30 @@ impl VolumeCatalog {
         if !path.exists() {
             return Ok(Self::default());
         }
+        Self::decode(&fs::read(path)?)
+    }
 
-        let bytes = fs::read(path)?;
+    /// Deserialize a catalog from its bincode bytes (version-branched). Shared by
+    /// the file path ([`load`](Self::load)) and the meta-LD A/B slots.
+    pub(super) fn decode(bytes: &[u8]) -> OnyxResult<Self> {
         // bincode 1.x encodes the leading `version: u32` as a 4-byte LE fixint, so
         // we can branch on the on-disk version without committing to a struct shape
         // that would mis-parse an older file (or reject its trailing-byte layout).
         if bytes.len() < 4 {
             return Err(OnyxError::Config(
-                "metadb volume catalog file is truncated".into(),
+                "metadb volume catalog is truncated".into(),
             ));
         }
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let (volumes, snapshots) = match version {
             1 => {
                 let file: VolumeCatalogFileV1 =
-                    bincode::deserialize(&bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
+                    bincode::deserialize(bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
                 (file.volumes, Vec::new())
             }
             2 => {
                 let file: VolumeCatalogFile =
-                    bincode::deserialize(&bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
+                    bincode::deserialize(bytes).map_err(|e| OnyxError::Config(e.to_string()))?;
                 (file.volumes, file.snapshots)
             }
             other => {
@@ -101,7 +105,9 @@ impl VolumeCatalog {
         Ok(Self { by_id, snapshots })
     }
 
-    pub(super) fn persist(&self, path: &Path) -> OnyxResult<()> {
+    /// Serialize to the current (v2) bincode wire form. Shared by the file path
+    /// and the meta-LD A/B slots.
+    pub(super) fn encode(&self) -> OnyxResult<Vec<u8>> {
         let mut volumes: Vec<VolumeCatalogEntry> = self.by_id.values().cloned().collect();
         volumes.sort_by_key(|entry| entry.ordinal);
         let mut snapshots = self.snapshots.clone();
@@ -111,8 +117,11 @@ impl VolumeCatalog {
             volumes,
             snapshots,
         };
-        let bytes = bincode::serialize(&file).map_err(|e| OnyxError::Config(e.to_string()))?;
-        atomic_write(path, &bytes)
+        bincode::serialize(&file).map_err(|e| OnyxError::Config(e.to_string()))
+    }
+
+    pub(super) fn persist(&self, path: &Path) -> OnyxResult<()> {
+        atomic_write(path, &self.encode()?)
     }
 
     /// Find a named snapshot by `(volume, name)`.

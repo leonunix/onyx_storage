@@ -567,6 +567,10 @@ fn main() -> anyhow::Result<()> {
             println!("  lv3_ld_id = \"{lv3}\"");
             println!("  lv2_ld_id = \"{lv2}\"");
             println!("  meta_ld_id = \"{meta}\"");
+            println!();
+            println!("to put metadb on the meta LD (removes the host-FS metadata SPOF), set:");
+            println!("  [meta]");
+            println!("  backend = \"chunklet\"");
         }
     }
 

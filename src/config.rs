@@ -203,12 +203,31 @@ pub enum MetadbJournalMode {
 // `Buffer` regardless of what the TOML file says. The enum is kept only
 // so old configuration files continue to parse.
 
+/// Which physical store backs metadb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MetaBackendKind {
+    /// Host-filesystem directory at `meta.path` (default; the `pages.onyx_meta`
+    /// flat file + a `lifecycle_log/` segment dir + `onyx-volume-catalog.bin`).
+    #[default]
+    File,
+    /// A chunklet meta LogicalDisk (RAID10). Requires `[chunklet].enabled` +
+    /// `meta_ld_id`; `meta.path` is ignored for persistence. Removes the
+    /// single-disk metadata SPOF.
+    Chunklet,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaConfig {
     /// Path to metadata directory (on LV1 / XFS). Holds blockmap, refcount,
     /// dedup index, volume metadata. None = bare mode (no metadata store).
+    /// Ignored for persistence when `backend = "chunklet"` (kept as a label).
     #[serde(default)]
     pub path: Option<PathBuf>,
+    /// Physical store backing metadb: `"file"` (default) or `"chunklet"` (meta
+    /// LD). See [`MetaBackendKind`].
+    #[serde(default)]
+    pub backend: MetaBackendKind,
     /// Shared block cache size in MB. One LRU cache is created at startup and
     /// shared across the metadata indexes (blockmap + refcount + dedup_index).
     /// Index + filter blocks are accounted against this cache
@@ -610,6 +629,7 @@ impl Default for MetaConfig {
     fn default() -> Self {
         Self {
             path: None,
+            backend: MetaBackendKind::File,
             block_cache_mb: default_block_cache_mb(),
             memtable_budget_mb: 0,
             index_pin_mb: default_index_pin_mb(),

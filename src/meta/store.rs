@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
@@ -114,6 +115,25 @@ impl MetaStore {
         Ok(Self {
             backend: MetadbBackend::open(config)?,
         })
+    }
+
+    /// Open the metadb store on a chunklet meta LogicalDisk. `meta_backend` is the
+    /// meta-role LD backend; `pool` is the shared chunklet Pool (kept alive by the
+    /// backend and reused for LV3/LV2 on a standby→active upgrade).
+    pub fn open_on_meta_ld(
+        config: &MetaConfig,
+        meta_backend: Arc<dyn crate::io::block_backend::BlockBackend>,
+        pool: Arc<onyx_chunklet::Pool>,
+    ) -> OnyxResult<Self> {
+        Ok(Self {
+            backend: MetadbBackend::open_on_meta_ld(config, meta_backend, pool)?,
+        })
+    }
+
+    /// The chunklet Pool metadb was opened over (device path), or `None` on the
+    /// file path.
+    pub fn chunklet_pool(&self) -> Option<Arc<onyx_chunklet::Pool>> {
+        self.backend.chunklet_pool()
     }
 
     pub fn sync_durable(&self) -> OnyxResult<()> {

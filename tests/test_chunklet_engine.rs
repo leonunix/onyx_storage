@@ -2,12 +2,12 @@
 //! AND LV2 on a chunklet RAID10 LD (both carved from one shared pool), then
 //! create a volume and round-trip data through the full write/read stack
 //! (buffer over the chunklet LV2 backend → flush → IoEngine over the chunklet
-//! LV3 backend → metadb → ReadPool over the chunklet backend). metadb still
-//! lives on its own file (Phase 3 scope).
+//! LV3 backend → metadb → ReadPool over the chunklet backend). The last test
+//! also puts metadb itself on the chunklet meta LD (Phase 3d).
 
 use onyx_storage::config::{
-    BufferConfig, ChunkletConfig, ChunkletIoBackend, EngineConfig, FlushConfig, MetaConfig,
-    OnyxConfig, StorageConfig, UblkConfig,
+    BufferConfig, ChunkletConfig, ChunkletIoBackend, EngineConfig, FlushConfig, MetaBackendKind,
+    MetaConfig, OnyxConfig, StorageConfig, UblkConfig,
 };
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::types::{CompressionAlgo, BLOCK_SIZE};
@@ -213,6 +213,111 @@ fn full_stripe_aligned_write_round_trips_after_reopen() {
         vol.read(0, payload.len()).unwrap(),
         payload,
         "24 KiB full-stripe write must round-trip from LV3 after reopen"
+    );
+    drop(vol);
+    engine.shutdown().unwrap();
+}
+
+/// Phase 3d: metadb ON a chunklet meta LD (RAID10). The entire metadata surface
+/// — page store, lifecycle journal ring, and the volume-catalog A/B slots —
+/// lives inside the chunklet pool, so no host FS holds metadata. Boot → create
+/// volume → write → clean shutdown → reopen exercises the device-path bounded
+/// scan open, the catalog A/B slot load, and the lifecycle ring; the volume and
+/// its data must survive with no `pages.onyx_meta` file anywhere.
+#[test]
+fn engine_metadb_on_chunklet_meta_ld_round_trips_after_reopen() {
+    let dir = tempdir().unwrap();
+    let devices: Vec<_> = (0..8).map(|i| dir.path().join(format!("pd{i}"))).collect();
+    for p in &devices {
+        std::fs::File::create(p).unwrap().set_len(4 << 30).unwrap();
+    }
+
+    // LV3/LV2/meta all use default geometries (RAID6 / RAID10 / RAID10).
+    let mut chunklet = ChunkletConfig {
+        enabled: true,
+        devices,
+        io_backend: ChunkletIoBackend::Sync,
+        spare_pct: 0,
+        ..Default::default()
+    };
+    let (pool, lv3, lv2, meta) = onyx_storage::chunklet_pool::init_pool(&chunklet).unwrap();
+    drop(pool);
+    chunklet.lv3_ld_id = Some(lv3.to_string());
+    chunklet.lv2_ld_id = Some(lv2.to_string());
+    chunklet.meta_ld_id = Some(meta.to_string());
+
+    // `meta.path` is only a diagnostic label on the device path; metadb persists
+    // nothing to it.
+    let meta_label = tempdir().unwrap();
+    let buffer_file = NamedTempFile::new().unwrap();
+    buffer_file.as_file().set_len(4096 + 1024 * 4096).unwrap();
+
+    let config = OnyxConfig {
+        meta: MetaConfig {
+            path: Some(meta_label.path().to_path_buf()),
+            backend: MetaBackendKind::Chunklet,
+            block_cache_mb: 32,
+            checkpoint_interval_ms: 5000,
+            group_commit_timeout_us: 1,
+            dedup_shards: 8,
+            dedup_cuckoo_buckets: 1_000_000,
+            dedup_l1_cache_entries: 256_000,
+            ..MetaConfig::default()
+        },
+        storage: StorageConfig {
+            data_device: None,
+            block_size: BLOCK_SIZE,
+            read_pool_workers: 2,
+            ..StorageConfig::default()
+        },
+        buffer: BufferConfig {
+            device: Some(buffer_file.path().to_path_buf()),
+            capacity_mb: 4,
+            shards: 1,
+            ..BufferConfig::default()
+        },
+        ublk: UblkConfig::default(),
+        flush: FlushConfig::default(),
+        engine: EngineConfig {
+            zone_count: 4,
+            zone_size_blocks: 128,
+            ..EngineConfig::default()
+        },
+        chunklet,
+        ..Default::default()
+    };
+
+    let payload: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+    {
+        let engine =
+            OnyxEngine::open(&config).expect("engine boots with metadb on the meta LD");
+        engine
+            .create_volume("meta-ld-vol", 64 * 1024 * 1024, CompressionAlgo::Lz4)
+            .unwrap();
+        let vol = engine.open_volume("meta-ld-vol").unwrap();
+        vol.write(0, &payload).unwrap();
+        assert_eq!(vol.read(0, payload.len()).unwrap(), payload);
+        drop(vol);
+        engine.shutdown().unwrap();
+    }
+
+    // No metadb page file was ever written to the host FS label dir.
+    assert!(
+        !meta_label.path().join("pages.onyx_meta").exists(),
+        "metadb must not write a page file on the host FS when backend = chunklet"
+    );
+
+    // Reopen: metadb recovers off the meta LD (bounded-scan device open + catalog
+    // A/B slot load + lifecycle ring). The volume is known by name (catalog
+    // survived) and its data round-trips.
+    let engine = OnyxEngine::open(&config).expect("engine reopens with metadb on the meta LD");
+    let vol = engine
+        .open_volume("meta-ld-vol")
+        .expect("volume survived reopen off the meta LD");
+    assert_eq!(
+        vol.read(0, payload.len()).unwrap(),
+        payload,
+        "data must round-trip after metadb reopens off the meta LD"
     );
     drop(vol);
     engine.shutdown().unwrap();

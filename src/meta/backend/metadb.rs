@@ -47,7 +47,13 @@ pub(crate) struct MetadbBackend {
     unlogged_flush_commits: bool,
     catalog: Mutex<VolumeCatalog>,
     volume_ordinals: DashMap<String, VolumeOrdinal>,
-    catalog_path: PathBuf,
+    /// Where the volume catalog is persisted: a host-FS file (default path) or
+    /// A/B slots on the meta LD (chunklet backend).
+    catalog_store: CatalogStore,
+    /// The chunklet Pool metadb was opened over (device path only). Kept alive
+    /// here for the meta LD's lifetime and handed to the engine's LV3/LV2 open on
+    /// the standby→active upgrade so the pool is never opened twice.
+    chunklet_pool: Option<Arc<onyx_chunklet::Pool>>,
     // Lineage GC freed-PBA signal channel.
     //
     // `metadb` invokes `freed_pbas_sink` synchronously on its GC driver
@@ -64,7 +70,25 @@ pub(crate) struct MetadbBackend {
 
 mod catalog;
 mod checkpoint;
+mod meta_ld;
 mod values;
+
+/// Where the volume catalog is persisted. The file path uses the host-FS
+/// tmp+rename `atomic_write`; the chunklet path uses generational A/B slots on
+/// the meta LD (no host FS involved).
+enum CatalogStore {
+    File(PathBuf),
+    Ld(meta_ld::MetaLdCatalog),
+}
+
+impl CatalogStore {
+    fn persist(&self, catalog: &VolumeCatalog) -> OnyxResult<()> {
+        match self {
+            CatalogStore::File(path) => catalog.persist(path),
+            CatalogStore::Ld(slots) => slots.persist(catalog),
+        }
+    }
+}
 
 use catalog::{SnapshotCatalogEntry, VolumeCatalog, VolumeCatalogEntry, CATALOG_FILE};
 use checkpoint::AsyncCheckpoint;
@@ -249,6 +273,8 @@ fn snapshot_info_from_entry(entry: &SnapshotCatalogEntry) -> SnapshotInfo {
 }
 
 impl MetadbBackend {
+    /// Open (or create) the metadb backend on the host filesystem at
+    /// `config.meta.path` (the default `backend = "file"` path).
     pub(crate) fn open(config: &MetaConfig) -> OnyxResult<Self> {
         let path = config.path().ok_or_else(|| {
             OnyxError::Config("meta.path is required to open metadb backend".into())
@@ -267,6 +293,51 @@ impl MetadbBackend {
 
         let catalog_path = path.join(CATALOG_FILE);
         let catalog = VolumeCatalog::load(&catalog_path)?;
+        Self::assemble(
+            config,
+            db,
+            catalog,
+            CatalogStore::File(catalog_path),
+            None,
+        )
+    }
+
+    /// Open (or first-time create) the metadb backend on a chunklet meta
+    /// LogicalDisk (`backend = "chunklet"`). `meta_backend` is the meta-role LD
+    /// backend; `pool` is the shared chunklet Pool (kept alive here + handed to a
+    /// later LV3/LV2 open so the pool is never opened twice).
+    pub(crate) fn open_on_meta_ld(
+        config: &MetaConfig,
+        meta_backend: Arc<dyn crate::io::block_backend::BlockBackend>,
+        pool: Arc<onyx_chunklet::Pool>,
+    ) -> OnyxResult<Self> {
+        // `config.meta.path` is only a diagnostic label on the device path; still
+        // build the metadb Config from it (it carries every non-path knob).
+        let label = config
+            .path()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("<meta-ld>"));
+        let db_config = metadb_config_from_onyx(&label, config);
+        let meta_ld = meta_ld::open_or_create(meta_backend, db_config)?;
+        Self::assemble(
+            config,
+            meta_ld.db,
+            meta_ld.catalog,
+            CatalogStore::Ld(meta_ld.catalog_store),
+            Some(pool),
+        )
+    }
+
+    /// Shared tail of both open paths: validate the catalog against the store,
+    /// seed the ordinal cache, start the async checkpoint, and wire the lineage
+    /// freed-PBA sink.
+    fn assemble(
+        config: &MetaConfig,
+        db: Arc<Db>,
+        catalog: VolumeCatalog,
+        catalog_store: CatalogStore,
+        chunklet_pool: Option<Arc<onyx_chunklet::Pool>>,
+    ) -> OnyxResult<Self> {
         catalog.validate_against_db(&db)?;
         let volume_ordinals = catalog
             .by_id
@@ -291,10 +362,18 @@ impl MetadbBackend {
             unlogged_flush_commits: config.unlogged_flush_commits,
             catalog: Mutex::new(catalog),
             volume_ordinals,
-            catalog_path,
+            catalog_store,
+            chunklet_pool,
             lineage_freed_pbas_tx,
             lineage_freed_pbas_rx,
         })
+    }
+
+    /// The chunklet Pool this backend was opened over (device path), for reuse by
+    /// the engine's LV3/LV2 open on the standby→active upgrade. `None` on the file
+    /// path.
+    pub(crate) fn chunklet_pool(&self) -> Option<Arc<onyx_chunklet::Pool>> {
+        self.chunklet_pool.clone()
     }
 
     /// Non-blocking drain of every PBA that lineage GC has signalled as
@@ -334,7 +413,7 @@ impl MetadbBackend {
             entry.config = config.clone();
             self.volume_ordinals
                 .insert(config.id.0.clone(), entry.ordinal);
-            catalog.persist(&self.catalog_path)?;
+            self.catalog_store.persist(&catalog)?;
             return Ok(());
         }
 
@@ -347,7 +426,7 @@ impl MetadbBackend {
             },
         );
         self.volume_ordinals.insert(config.id.0.clone(), ordinal);
-        catalog.persist(&self.catalog_path)?;
+        self.catalog_store.persist(&catalog)?;
         Ok(())
     }
 
@@ -453,7 +532,7 @@ impl MetadbBackend {
         catalog.by_id.remove(&id.0);
         catalog.snapshots.retain(|s| s.volume != id.0);
         self.volume_ordinals.remove(&id.0);
-        catalog.persist(&self.catalog_path)?;
+        self.catalog_store.persist(&catalog)?;
 
         cleanups.extend(snapshot_cleanups);
         Ok(cleanups)
@@ -507,7 +586,7 @@ impl MetadbBackend {
         let info = snapshot_info_from_entry(&entry);
         let mut catalog = self.catalog.lock().unwrap();
         catalog.snapshots.push(entry);
-        catalog.persist(&self.catalog_path)?;
+        self.catalog_store.persist(&catalog)?;
         Ok(info)
     }
 
@@ -552,7 +631,7 @@ impl MetadbBackend {
 
         let mut catalog = self.catalog.lock().unwrap();
         catalog.remove_snapshot(&vol_id.0, snap_name);
-        catalog.persist(&self.catalog_path)?;
+        self.catalog_store.persist(&catalog)?;
         Ok(freed)
     }
 
@@ -603,7 +682,7 @@ impl MetadbBackend {
         );
         self.volume_ordinals
             .insert(new_name.to_string(), new_ordinal);
-        catalog.persist(&self.catalog_path)?;
+        self.catalog_store.persist(&catalog)?;
         Ok(new_config)
     }
 

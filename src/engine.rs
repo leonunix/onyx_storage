@@ -237,6 +237,47 @@ impl OnyxEngine {
         }
     }
 
+    /// `meta.backend = "chunklet"` requires the chunklet pool to exist.
+    fn validate_meta_backend(config: &OnyxConfig) -> OnyxResult<()> {
+        if config.meta.backend == crate::config::MetaBackendKind::Chunklet
+            && !config.chunklet.enabled
+        {
+            return Err(OnyxError::Config(
+                "meta.backend = \"chunklet\" requires [chunklet].enabled = true".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Open the metadb store on whichever backend `meta.backend` selects. The
+    /// chunklet path resolves the meta-role LD from the shared `chunklet_pool`
+    /// (so the pool is opened exactly once for meta + LV3 + LV2) and keeps that
+    /// pool alive inside the backend.
+    fn acquire_meta_store(
+        config: &OnyxConfig,
+        chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
+    ) -> OnyxResult<MetaStore> {
+        match config.meta.backend {
+            crate::config::MetaBackendKind::Chunklet => {
+                let pool = chunklet_pool.as_ref().ok_or_else(|| {
+                    OnyxError::Config("meta.backend=chunklet but pool not opened (internal)".into())
+                })?;
+                let meta_backend: Arc<dyn crate::io::block_backend::BlockBackend> =
+                    crate::chunklet_pool::role_backend_from_pool(
+                        pool,
+                        &config.chunklet,
+                        crate::chunklet_pool::LdRoleSel::Meta,
+                    )?;
+                tracing::info!(
+                    capacity_bytes = meta_backend.size(),
+                    "metadb on chunklet meta RAID LD"
+                );
+                MetaStore::open_on_meta_ld(&config.meta, meta_backend, pool.clone())
+            }
+            crate::config::MetaBackendKind::File => MetaStore::open(&config.meta),
+        }
+    }
+
     /// Acquire the LV3 device backend for both full-mode startup paths. With
     /// `[chunklet].enabled`, this resolves the LV3 LD from the shared pool (the
     /// returned `ChunkletBackend` keeps the Pool alive); otherwise it opens the
@@ -623,20 +664,23 @@ impl OnyxEngine {
     pub fn open(config: &OnyxConfig) -> OnyxResult<Self> {
         Self::validate_data_buffer_devices_disjoint(config)?;
         Self::validate_dedup_read_pool(config)?;
+        Self::validate_meta_backend(config)?;
 
-        // 1. MetaStore
-        let meta = Arc::new(MetaStore::open(&config.meta)?);
+        // 1. Chunklet RAID Pool (opened once; meta + LV3 + LV2 all share it) —
+        //    None when [chunklet] is disabled. Opened BEFORE metadb because the
+        //    meta LD lives inside this pool when `meta.backend = "chunklet"`.
+        let chunklet_pool = Self::acquire_chunklet_pool(config)?;
+
+        // 2. MetaStore — on the meta LD (chunklet backend, from the shared pool)
+        //    or the host FS (file backend).
+        let meta = Arc::new(Self::acquire_meta_store(config, &chunklet_pool)?);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
 
         // (no shared deletion state needed — per-handle alive flags are used)
 
-        // 2. Chunklet RAID Pool (opened once; LV3 + LV2 share it) — None when
-        //    [chunklet] is disabled.
-        let chunklet_pool = Self::acquire_chunklet_pool(config)?;
-
-        // 2. LV3 device (RawDevice or chunklet RAID LD) + IO engine
+        // 3. LV3 device (RawDevice or chunklet RAID LD) + IO engine
         let device = Self::acquire_lv3_device(config, &chunklet_pool)?;
         let device_size = device.size();
 
@@ -919,7 +963,16 @@ impl OnyxEngine {
     /// Only volume management operations (create/delete/list) are available.
     /// Attempting to open_volume() will fail.
     pub fn open_meta_only(config: &OnyxConfig) -> OnyxResult<Self> {
-        let meta = Arc::new(MetaStore::open(&config.meta)?);
+        Self::validate_meta_backend(config)?;
+        // Meta-only mode has no LV3/LV2, so a file-backed metadb needs no pool.
+        // A meta-LD-backed metadb must still open the pool (it holds the meta LD);
+        // it stays alive inside `meta` and is reused by a later upgrade to active.
+        let chunklet_pool = if config.meta.backend == crate::config::MetaBackendKind::Chunklet {
+            Self::acquire_chunklet_pool(config)?
+        } else {
+            None
+        };
+        let meta = Arc::new(Self::acquire_meta_store(config, &chunklet_pool)?);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
@@ -1482,9 +1535,16 @@ impl OnyxEngine {
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
 
-        // Chunklet RAID Pool (opened once; LV3 + LV2 share it) + LV3 device.
+        // Chunklet RAID Pool (opened once; meta + LV3 + LV2 share it) + LV3
+        // device. If metadb already opened the pool (meta lives on the meta LD),
+        // REUSE it — a second `Pool::open` on the same PDs would tear the pool
+        // superblock. Only open a fresh pool when metadb is file-backed but the
+        // data plane is on chunklet.
         Self::validate_data_buffer_devices_disjoint(config)?;
-        let chunklet_pool = Self::acquire_chunklet_pool(config)?;
+        let chunklet_pool = match meta.chunklet_pool() {
+            Some(pool) => Some(pool),
+            None => Self::acquire_chunklet_pool(config)?,
+        };
         let device = Self::acquire_lv3_device(config, &chunklet_pool)?;
         let device_size = device.size();
 
