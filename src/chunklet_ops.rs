@@ -116,6 +116,44 @@ pub fn start_rebuild(pool: &Arc<Pool>, ld: &str) -> OnyxResult<u64> {
     Ok(id)
 }
 
+/// Spawn a background auto-failover after a PD was marked Failed: rebuild every
+/// affected redundant LD onto spares via `Pool::auto_recover`. Returns the job
+/// id to poll. `pd_label` is only for the job's `ld_id` display column (the op
+/// spans all affected LDs, not one). Reuses the same registry as manual
+/// rebuild/scrub so `chunklet job` surfaces it uniformly.
+///
+/// Like `rebuild_ld`, `auto_recover` holds each LD's write lock for that LD's
+/// rebuild; running it on this dedicated worker keeps the watchdog thread free
+/// to keep probing.
+pub fn start_auto_failover(pool: &Arc<Pool>, pd_label: &str) -> OnyxResult<u64> {
+    let id = insert_running("auto-failover", pd_label);
+    let pool = pool.clone();
+    let pd_label = pd_label.to_string();
+    std::thread::Builder::new()
+        .name(format!("ck-failover-{id}"))
+        .spawn(move || {
+            let report = pool.auto_recover(/* scrub_first */ false);
+            finish(
+                id,
+                if report.failed == 0 { "done" } else { "error" },
+                format!(
+                    "attempted={} recovered={} failed={}",
+                    report.attempted, report.recovered, report.failed
+                ),
+            );
+            tracing::info!(
+                job = id,
+                pd = %pd_label,
+                attempted = report.attempted,
+                recovered = report.recovered,
+                failed = report.failed,
+                "chunklet auto-failover job finished"
+            );
+        })
+        .map_err(OnyxError::Io)?;
+    Ok(id)
+}
+
 /// Spawn a background scrub (parity verify + quarantine) of `ld`. Returns the
 /// job id to poll.
 pub fn start_scrub(pool: &Arc<Pool>, ld: &str) -> OnyxResult<u64> {

@@ -13,6 +13,7 @@ pub mod affinity;
 pub mod buffer;
 pub mod chunklet_ops;
 pub mod chunklet_pool;
+pub mod chunklet_watchdog;
 pub mod numa;
 pub mod compress;
 pub mod dedup;

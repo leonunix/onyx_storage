@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::{BufferRuntimeLimits, ThrottleSettings, WriteBufferPool};
+use crate::chunklet_watchdog::{ChunkletWatchdog, WatchdogConfig};
 use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
@@ -53,6 +54,10 @@ pub struct OnyxEngine {
     flusher: Mutex<Option<BufferFlusher>>,
     gc_runner: Mutex<Option<GcRunner>>,
     dedup_scanner: Mutex<Option<DedupScanner>>,
+    /// Phase 4d: background PD-health watchdog. `Some` only in full mode with a
+    /// chunklet backend and `[chunklet].watchdog_enabled`. Probes each live PD
+    /// and auto-marks unresponsive ones Failed (and optionally auto-rebuilds).
+    chunklet_watchdog: Mutex<Option<ChunkletWatchdog>>,
     heartbeat_writer: Mutex<Option<HeartbeatWriter>>,
     /// Background thread that periodically syncs metadata, then advances
     /// the buffer pool's `durable_seq` watermark so ring reclaim can safely
@@ -242,6 +247,30 @@ impl OnyxEngine {
         } else {
             Ok(None)
         }
+    }
+
+    /// Start the Phase-4d PD-health watchdog when a chunklet pool is live and
+    /// `[chunklet].watchdog_enabled`. `None` otherwise (RawDevice path,
+    /// meta-only mode, or watchdog off). Shared by `open` and
+    /// `upgrade_from_meta_only`.
+    fn build_chunklet_watchdog(
+        chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
+        config: &OnyxConfig,
+    ) -> Option<ChunkletWatchdog> {
+        if !config.chunklet.watchdog_enabled {
+            return None;
+        }
+        let pool = chunklet_pool.as_ref()?.clone();
+        Some(ChunkletWatchdog::start(
+            pool,
+            WatchdogConfig {
+                interval: std::time::Duration::from_secs(
+                    config.chunklet.watchdog_interval_secs.max(1),
+                ),
+                fail_threshold: config.chunklet.watchdog_fail_threshold.max(1),
+                auto_failover: config.chunklet.auto_failover,
+            },
+        ))
     }
 
     /// `meta.backend = "chunklet"` requires the chunklet pool to exist.
@@ -950,6 +979,8 @@ impl OnyxEngine {
             std::time::Duration::from_millis(100),
         );
 
+        let chunklet_watchdog = Self::build_chunklet_watchdog(&chunklet_pool, config);
+
         Ok(Self {
             meta,
             io_engine: Some(io_engine),
@@ -958,6 +989,7 @@ impl OnyxEngine {
             flusher: Mutex::new(Some(flusher)),
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
+            chunklet_watchdog: Mutex::new(chunklet_watchdog),
             heartbeat_writer: Mutex::new(heartbeat_writer),
             durability_watermark: Mutex::new(Some(watermark)),
             lineage_drain: Mutex::new(Some(lineage_drain)),
@@ -1004,6 +1036,7 @@ impl OnyxEngine {
             flusher: Mutex::new(None),
             gc_runner: Mutex::new(None),
             dedup_scanner: Mutex::new(None),
+            chunklet_watchdog: Mutex::new(None),
             heartbeat_writer: Mutex::new(None),
             durability_watermark: Mutex::new(None),
             lineage_drain: Mutex::new(None),
@@ -1435,6 +1468,13 @@ impl OnyxEngine {
         }
         *done = true;
 
+        // Stop the PD-health watchdog first: it is independent of the data
+        // path (only reads PD liveness + spawns rebuild jobs), and stopping it
+        // early keeps it from kicking a fresh auto-failover mid-shutdown.
+        if let Some(mut wd) = self.chunklet_watchdog.lock().unwrap().take() {
+            wd.stop();
+        }
+
         // Stop heartbeat writer first
         if let Some(mut hb) = self.heartbeat_writer.lock().unwrap().take() {
             hb.stop();
@@ -1739,6 +1779,8 @@ impl OnyxEngine {
             std::time::Duration::from_millis(100),
         );
 
+        let chunklet_watchdog = Self::build_chunklet_watchdog(&chunklet_pool, config);
+
         Ok(Self {
             meta,
             io_engine: Some(io_engine),
@@ -1747,6 +1789,7 @@ impl OnyxEngine {
             flusher: Mutex::new(Some(flusher)),
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
+            chunklet_watchdog: Mutex::new(chunklet_watchdog),
             heartbeat_writer: Mutex::new(heartbeat_writer),
             durability_watermark: Mutex::new(Some(watermark)),
             lineage_drain: Mutex::new(Some(lineage_drain)),

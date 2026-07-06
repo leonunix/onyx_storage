@@ -940,6 +940,35 @@ pub struct ChunkletConfig {
     pub lv2_ld_id: Option<String>,
     #[serde(default)]
     pub meta_ld_id: Option<String>,
+    /// Runtime PD health watchdog (Phase 4d): a background thread periodically
+    /// probes each live PD (`Pool::probe_pd_liveness`) and auto-marks
+    /// unresponsive ones Failed after `watchdog_fail_threshold` consecutive
+    /// misses. Default `false` (opt-in) — a false positive marks a healthy PD
+    /// Failed and forces degraded reads until it is cleared/rebuilt.
+    #[serde(default)]
+    pub watchdog_enabled: bool,
+    /// Seconds between watchdog probe sweeps (default 10). Kept coarse: a probe
+    /// is a single O_DIRECT read per PD, and a pulled disk is not a sub-second
+    /// event.
+    #[serde(default = "default_watchdog_interval_secs")]
+    pub watchdog_interval_secs: u64,
+    /// Consecutive failed probes before a PD is marked Failed (default 3).
+    /// Debounces a single transient IO hiccup from flapping a PD.
+    #[serde(default = "default_watchdog_fail_threshold")]
+    pub watchdog_fail_threshold: u32,
+    /// After the watchdog auto-marks a PD Failed, automatically rebuild every
+    /// affected redundant LD onto spares (`Pool::auto_recover`). Default
+    /// `false`, and requires `watchdog_enabled`.
+    ///
+    /// ⚠ chunklet's `rebuild_ld` holds the target LD's write lock for the
+    /// whole rebuild, fully blocking that LD's foreground IO for its duration
+    /// (not merely slowing it — the buffer backpressure that throttles the
+    /// front-end does not cover a hard write-lock stall). Under a live ublk a
+    /// multi-minute rebuild can trip the kernel IO timeout and kill the device.
+    /// Only enable once box validation confirms rebuild duration stays within
+    /// the ublk timeout, or online per-chunklet rebuild lands.
+    #[serde(default)]
+    pub auto_failover: bool,
 }
 
 impl Default for ChunkletConfig {
@@ -955,12 +984,24 @@ impl Default for ChunkletConfig {
             lv3_ld_id: None,
             lv2_ld_id: None,
             meta_ld_id: None,
+            watchdog_enabled: false,
+            watchdog_interval_secs: default_watchdog_interval_secs(),
+            watchdog_fail_threshold: default_watchdog_fail_threshold(),
+            auto_failover: false,
         }
     }
 }
 
 fn default_chunklet_spare_pct() -> u8 {
     5
+}
+
+fn default_watchdog_interval_secs() -> u64 {
+    10
+}
+
+fn default_watchdog_fail_threshold() -> u32 {
+    3
 }
 
 /// Cross-PD IO submission backend selector inside chunklet.
