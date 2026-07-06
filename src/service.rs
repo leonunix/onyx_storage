@@ -976,6 +976,97 @@ impl ServiceController {
                     let _ = stream.flush();
                 }
 
+                // ── chunklet online operator ops ─────────────────
+                "chunklet-status-json" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    match opt.as_ref().and_then(|eng| eng.chunklet_pool()) {
+                        Some(pool) => match pool.metrics() {
+                            Ok(m) => {
+                                let snap = onyx_chunklet::ops::PoolSnapshot::from_metrics(&m);
+                                let json =
+                                    serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into());
+                                let _ = stream.write_all(json.as_bytes());
+                                let _ = stream.write_all(b"\nok\n");
+                            }
+                            Err(e) => {
+                                let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
+                            }
+                        },
+                        None => {
+                            let _ = stream.write_all(b"error: chunklet backend not enabled\n");
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                // rebuild/scrub hold the LD write lock for the whole op → spawn a
+                // background worker and return a job id immediately; poll via
+                // `chunklet-job`. Never block the handler thread on them.
+                "chunklet-rebuild" | "chunklet-scrub" => {
+                    require_engine!(engine, stream);
+                    if parts.len() < 2 {
+                        let _ = stream
+                            .write_all(format!("error: usage: {} <ld_id>\n", parts[0]).as_bytes());
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let ld = parts[1];
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.chunklet_pool() {
+                        Some(pool) => {
+                            let res = if parts[0] == "chunklet-rebuild" {
+                                crate::chunklet_ops::start_rebuild(&pool, ld)
+                            } else {
+                                crate::chunklet_ops::start_scrub(&pool, ld)
+                            };
+                            match res {
+                                Ok(job_id) => {
+                                    let _ =
+                                        stream.write_all(format!("ok {}\n", job_id).as_bytes());
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = stream.write_all(b"error: chunklet backend not enabled\n");
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                "chunklet-job" => {
+                    // Job state lives in a process-global registry, so this is
+                    // serviceable without loading the engine. No arg = list all.
+                    if parts.len() < 2 {
+                        let jobs = crate::chunklet_ops::all_jobs();
+                        let json = serde_json::to_string(&jobs).unwrap_or_else(|_| "[]".into());
+                        let _ = stream.write_all(json.as_bytes());
+                        let _ = stream.write_all(b"\nok\n");
+                    } else {
+                        match parts[1].parse::<u64>() {
+                            Ok(id) => match crate::chunklet_ops::job_view(id) {
+                                Some(v) => {
+                                    let json =
+                                        serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+                                    let _ = stream.write_all(json.as_bytes());
+                                    let _ = stream.write_all(b"\nok\n");
+                                }
+                                None => {
+                                    let _ = stream.write_all(b"error: no such job\n");
+                                }
+                            },
+                            Err(_) => {
+                                let _ = stream.write_all(b"error: invalid job id\n");
+                            }
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+
                 _ => {
                     let _ = stream.write_all(b"error: unknown command\n");
                     let _ = stream.flush();
@@ -1063,6 +1154,15 @@ pub fn send_list_volumes(socket_path: &Path) -> OnyxResult<Vec<String>> {
 
 pub fn send_status_command(socket_path: &Path) -> OnyxResult<Vec<String>> {
     let lines = send_ipc_command(socket_path, "status")?;
+    Ok(lines.into_iter().filter(|l| l != "ok").collect())
+}
+
+/// Send a chunklet online-ops command (`chunklet-status-json` / `chunklet-scrub
+/// <ld>` / `chunklet-rebuild <ld>` / `chunklet-job [id]`) and return the reply
+/// payload lines with the bare `ok` terminator stripped (an `ok <id>` line is
+/// kept so the caller can read a job id).
+pub fn send_chunklet_command(socket_path: &Path, command: &str) -> OnyxResult<Vec<String>> {
+    let lines = send_ipc_command(socket_path, command)?;
     Ok(lines.into_iter().filter(|l| l != "ok").collect())
 }
 

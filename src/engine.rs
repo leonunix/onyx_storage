@@ -1797,6 +1797,15 @@ impl OnyxEngine {
         self.metrics.volume_metrics_snapshot()
     }
 
+    /// The shared chunklet pool handle when running on the chunklet backend,
+    /// `None` on the file backend. Reaches it through `MetaStore`, which owns
+    /// the single `Pool::open` (all three role LDs derive from it), so online
+    /// operator ops (`chunklet_ops`) act on the same pool the engine serves IO
+    /// from rather than a second, superblock-tearing open.
+    pub fn chunklet_pool(&self) -> Option<Arc<onyx_chunklet::Pool>> {
+        self.meta.chunklet_pool()
+    }
+
     pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {
         let contiguity = self.allocator.as_ref().map(|alloc| alloc.contiguity_stats());
         Ok(EngineStatusSnapshot {
@@ -1847,6 +1856,14 @@ impl OnyxEngine {
                 .buffer_pool
                 .as_ref()
                 .and_then(|pool| pool.meta_fence_reason().map(str::to_string)),
+            // chunklet topology/health: read-only `pool.metrics()` (holds only
+            // `state.read()`, safe against live IO). None on the file backend or
+            // if the metrics read errors — status must never fail on it.
+            chunklet: self
+                .meta
+                .chunklet_pool()
+                .and_then(|pool| pool.metrics().ok())
+                .map(|m| onyx_chunklet::ops::PoolSnapshot::from_metrics(&m)),
             metrics: self.metrics.snapshot(),
         })
     }

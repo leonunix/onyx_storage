@@ -35,6 +35,11 @@ pub struct EngineStatusSnapshot {
     /// path has latched off new writes (metadb checkpoints failing fatally or
     /// repeatedly); the engine must be restarted to clear it.
     pub meta_fenced: Option<String>,
+    /// chunklet pool topology + health snapshot: `Some` under the chunklet
+    /// backend, `None` on the file backend or if the live `pool.metrics()` read
+    /// fails. Serialized verbatim into `status-json`; the text form renders a
+    /// pool summary plus a per-LD line for any degraded/rebuilding LD.
+    pub chunklet: Option<onyx_chunklet::ops::PoolSnapshot>,
     pub metrics: EngineMetricsSnapshot,
 }
 
@@ -503,6 +508,48 @@ impl EngineStatusSnapshot {
                 in_set,
                 capable_pct.map_or_else(|| "-".to_string(), |p| p.to_string()),
             );
+        }
+        if let Some(ck) = &self.chunklet {
+            let _ = writeln!(
+                out,
+                "chunklet_pool: id={} pds={}/{} healthy (failed={} draining={} drained={}) lds={} cpgs={}",
+                ck.pool_id,
+                ck.healthy_pds,
+                ck.pd_count,
+                ck.failed_pds,
+                ck.draining_pds,
+                ck.drained_pds,
+                ck.ld_count,
+                ck.cpg_count,
+            );
+            let _ = writeln!(
+                out,
+                "chunklet_capacity: used={}/{} user_bytes spare={} bad={} migrating={} (raw={})",
+                ck.used_bytes, ck.user_bytes, ck.spare_bytes, ck.bad_bytes, ck.migrating_bytes, ck.raw_bytes,
+            );
+            // One line per LD that is not fully healthy (any member down/degraded
+            // or a rebuild target). Healthy LDs stay quiet to keep status terse.
+            for ld in &ck.lds {
+                let degraded = ld.unavailable_members
+                    + ld.bad_members
+                    + ld.failed_members
+                    + ld.draining_members
+                    + ld.drained_members;
+                if degraded > 0 {
+                    let _ = writeln!(
+                        out,
+                        "  chunklet_ld[{}] {} degraded: unavailable={} bad={} failed={} draining={} drained={} (members={})",
+                        ld.ld_id,
+                        ld.raid_level,
+                        ld.unavailable_members,
+                        ld.bad_members,
+                        ld.failed_members,
+                        ld.draining_members,
+                        ld.drained_members,
+                        ld.member_count,
+                    );
+                }
+            }
         }
         let _ = writeln!(
             out,

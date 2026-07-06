@@ -124,6 +124,36 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// chunklet RAID pool online operations (status / scrub / rebuild / job).
+    /// Requires a running engine — the pool is flock-held by `start`, so these
+    /// are routed to it over the IPC socket, never a second `Pool::open`.
+    Chunklet {
+        #[command(subcommand)]
+        op: ChunkletOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChunkletOp {
+    /// Show pool topology + health as JSON (PDs, LDs, capacity, degraded state)
+    Status,
+    /// Start a background scrub (parity verify + quarantine) of an LD; prints a
+    /// job id to poll with `chunklet job <id>`
+    Scrub {
+        /// Target LD id (as printed by `chunklet-init` / `chunklet status`)
+        ld_id: String,
+    },
+    /// Start a background rebuild of an LD's failed members onto spares; prints
+    /// a job id to poll with `chunklet job <id>`
+    Rebuild {
+        /// Target LD id
+        ld_id: String,
+    },
+    /// Poll a background job by id, or list all jobs if no id is given
+    Job {
+        /// Job id from a prior scrub/rebuild; omit to list all jobs
+        id: Option<u64>,
+    },
 }
 
 fn parse_compression(s: &str) -> CompressionAlgo {
@@ -571,6 +601,41 @@ fn main() -> anyhow::Result<()> {
             println!("to put metadb on the meta LD (removes the host-FS metadata SPOF), set:");
             println!("  [meta]");
             println!("  backend = \"chunklet\"");
+        }
+        Command::Chunklet { op } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "chunklet online ops require a running engine (socket {:?} not found) — \
+                     start the engine first; offline pool setup is `chunklet-init`",
+                    sock
+                );
+            }
+            let cmd = match &op {
+                ChunkletOp::Status => "chunklet-status-json".to_string(),
+                ChunkletOp::Scrub { ld_id } => format!("chunklet-scrub {ld_id}"),
+                ChunkletOp::Rebuild { ld_id } => format!("chunklet-rebuild {ld_id}"),
+                ChunkletOp::Job { id } => match id {
+                    Some(i) => format!("chunklet-job {i}"),
+                    None => "chunklet-job".to_string(),
+                },
+            };
+            let lines = service::send_chunklet_command(sock, &cmd)?;
+            match &op {
+                ChunkletOp::Scrub { .. } | ChunkletOp::Rebuild { .. } => {
+                    // Reply is `ok <job_id>`.
+                    let job_id = lines
+                        .iter()
+                        .find_map(|l| l.strip_prefix("ok "))
+                        .unwrap_or("?");
+                    println!("started job {job_id}; poll with: chunklet job {job_id}");
+                }
+                _ => {
+                    for line in &lines {
+                        println!("{line}");
+                    }
+                }
+            }
         }
     }
 

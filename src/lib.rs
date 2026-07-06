@@ -11,6 +11,7 @@ pub mod types;
 
 pub mod affinity;
 pub mod buffer;
+pub mod chunklet_ops;
 pub mod chunklet_pool;
 pub mod numa;
 pub mod compress;
