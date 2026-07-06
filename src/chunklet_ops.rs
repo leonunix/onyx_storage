@@ -2,17 +2,16 @@
 //!
 //! # Why a background job model
 //!
-//! `Pool::rebuild_ld` / `Pool::scrub_ld` hold the target LD's `io_lock.write()`
-//! for the whole operation inside chunklet, so they can run for minutes and
-//! MUST NOT execute on the 5 s IPC handler thread. Each is spawned on a named
-//! worker thread and tracked in a process-global registry; the operator kicks
-//! one off (getting a job id back immediately) and polls completion via
-//! `chunklet-job <id>`.
+//! `Pool::rebuild_ld` / `Pool::scrub_ld` run for minutes (a full-chunklet
+//! backfill / scan), so they MUST NOT execute on the 5 s IPC handler thread.
+//! Each is spawned on a named worker thread and tracked in a process-global
+//! registry; the operator kicks one off (getting a job id back immediately) and
+//! polls completion via `chunklet-job <id>`.
 //!
-//! Making those ops *interleave* with foreground IO (per-chunklet write scope +
-//! rate limiting so the write lock isn't held for the whole LD) is Phase 4d and
-//! lives inside chunklet — this layer only moves the blocking call off the
-//! handler thread and exposes progress.
+//! `rebuild_ld` is now ONLINE inside chunklet (holds only `io_lock.read()`
+//! during the backfill, swapping the descriptor under a brief write lock), so
+//! foreground IO keeps flowing throughout — a running rebuild no longer stalls
+//! the volume. `scrub_ld` still holds `io_lock.write()` for its scan.
 //!
 //! The registry is a process singleton (there is exactly one chunklet `Pool`
 //! per engine process), so it lives in a `OnceLock` rather than threading a

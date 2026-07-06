@@ -957,18 +957,20 @@ pub struct ChunkletConfig {
     #[serde(default = "default_watchdog_fail_threshold")]
     pub watchdog_fail_threshold: u32,
     /// After the watchdog auto-marks a PD Failed, automatically rebuild every
-    /// affected redundant LD onto spares (`Pool::auto_recover`). Default
-    /// `false`, and requires `watchdog_enabled`.
+    /// affected redundant LD onto spares (`Pool::auto_recover`). Default `true`
+    /// — inert unless `watchdog_enabled` is also on, in which case auto-heal is
+    /// the sensible posture.
     ///
-    /// ⚠ chunklet's `rebuild_ld` holds the target LD's write lock for the
-    /// whole rebuild, fully blocking that LD's foreground IO for its duration
-    /// (not merely slowing it — the buffer backpressure that throttles the
-    /// front-end does not cover a hard write-lock stall). Under a live ublk a
-    /// multi-minute rebuild can trip the kernel IO timeout and kill the device.
-    /// Only enable once box validation confirms rebuild duration stays within
-    /// the ublk timeout, or online per-chunklet rebuild lands.
-    #[serde(default)]
+    /// chunklet's `rebuild_ld` is now ONLINE (non-blocking): it holds only
+    /// `io_lock.read()` during the backfill and swaps the descriptor under a
+    /// brief write lock, so foreground IO keeps flowing and a live ublk is not
+    /// starved. (The old whole-op write lock that made this unsafe is gone.)
+    #[serde(default = "default_true")]
     pub auto_failover: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ChunkletConfig {
@@ -987,7 +989,7 @@ impl Default for ChunkletConfig {
             watchdog_enabled: false,
             watchdog_interval_secs: default_watchdog_interval_secs(),
             watchdog_fail_threshold: default_watchdog_fail_threshold(),
-            auto_failover: false,
+            auto_failover: true,
         }
     }
 }
