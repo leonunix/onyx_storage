@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -8,6 +9,13 @@ use crate::error::{OnyxError, OnyxResult};
 pub(super) struct AsyncCheckpoint {
     state: Arc<(Mutex<CheckpointState>, Condvar)>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Test-only fault injection: when armed, the worker skips the real flush
+    /// and reports a fatal `CapacityExhausted`, so tests can exercise the
+    /// durability-thread fence path without physically filling a meta device.
+    /// Never armed in production (the only setters are `#[cfg(test)]`), and
+    /// per-instance so it can't leak into other tests' checkpoints.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fail_capacity: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -41,6 +49,8 @@ impl AsyncCheckpoint {
     pub(super) fn start(db: Arc<Db>) -> OnyxResult<Self> {
         let state = Arc::new((Mutex::new(CheckpointState::default()), Condvar::new()));
         let worker_state = state.clone();
+        let fail_capacity = Arc::new(AtomicBool::new(false));
+        let worker_fail = fail_capacity.clone();
         let thread = std::thread::Builder::new()
             .name("metadb-checkpoint".into())
             .spawn(move || {
@@ -62,7 +72,13 @@ impl AsyncCheckpoint {
                         )
                     };
 
-                    let result = if force {
+                    let result = if worker_fail.load(Ordering::Relaxed) {
+                        // Test-only injected fatal failure (see `fail_capacity`).
+                        Err(onyx_metadb::MetaDbError::CapacityExhausted {
+                            requested_pages: 1,
+                            capacity_pages: 0,
+                        })
+                    } else if force {
                         db.flush().map(|_| true)
                     } else {
                         db.try_flush()
@@ -104,7 +120,15 @@ impl AsyncCheckpoint {
         Ok(Self {
             state,
             thread: Mutex::new(Some(thread)),
+            fail_capacity,
         })
+    }
+
+    /// Test-only: arm the injected fatal-`CapacityExhausted` failpoint on this
+    /// checkpoint instance. Per-instance so it never affects another test's Db.
+    #[cfg(test)]
+    pub(super) fn arm_capacity_fail(&self) {
+        self.fail_capacity.store(true, Ordering::Relaxed);
     }
 
     pub(super) fn request_async(&self) -> OnyxResult<()> {

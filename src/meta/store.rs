@@ -173,6 +173,13 @@ impl MetaStore {
         self.backend.durable_checkpoint_outcome(token)
     }
 
+    /// Test-only: arm the checkpoint failpoint so the next durable checkpoint
+    /// reports a fatal `CapacityExhausted`, driving the durability-thread fence.
+    #[cfg(test)]
+    pub(crate) fn arm_checkpoint_capacity_fail(&self) {
+        self.backend.arm_checkpoint_capacity_fail();
+    }
+
     /// L2P-shard routing for the commit_worker pre-shard path. Flusher
     /// uses this to bucket a passthrough chunk's `(Lba, BlockmapValue)`
     /// pairs by L2P shard before issuing one metadb commit per shard,

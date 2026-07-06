@@ -229,4 +229,87 @@ mod tests {
         assert!(DurabilityWatermarkHandle::should_fence(3, false));
         assert!(DurabilityWatermarkHandle::should_fence(4, false));
     }
+
+    /// End-to-end: a real MetaStore + WriteBufferPool + durability thread. Arm
+    /// the checkpoint failpoint so the next checkpoint reports a fatal
+    /// `CapacityExhausted`; the durability thread must observe it, fence the
+    /// pool, and make `append` fail fast — while reads and reopen stay fine.
+    #[test]
+    fn durability_thread_fences_pool_on_fatal_checkpoint() {
+        use crate::buffer::pool::WriteBufferPool;
+        use crate::config::MetaConfig;
+        use crate::error::OnyxError;
+        use crate::io::device::RawDevice;
+        use crate::meta::store::MetaStore;
+        use crate::types::Lba;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta = Arc::new(
+            MetaStore::open(&MetaConfig {
+                path: Some(meta_dir.path().to_path_buf()),
+                block_cache_mb: 16,
+                checkpoint_interval_ms: 20,
+                dedup_cuckoo_buckets: 100_000,
+                dedup_l1_cache_entries: 4096,
+                ..MetaConfig::default()
+            })
+            .unwrap(),
+        );
+
+        let size = 4096 + 1024 * 4096;
+        let buf = tempfile::NamedTempFile::new().unwrap();
+        buf.as_file().set_len(size).unwrap();
+        let dev = RawDevice::open_or_create(buf.path(), size).unwrap();
+        let pool = Arc::new(
+            WriteBufferPool::open_with_options_full(
+                dev,
+                Duration::from_millis(1),
+                1,
+                256,
+                Duration::ZERO,
+                0,
+                None,
+            )
+            .unwrap(),
+        );
+
+        // Arm the per-instance failpoint and make the watermark thread want a
+        // checkpoint (pretend a flush advanced the seq).
+        meta.arm_checkpoint_capacity_fail();
+        let max_flushed = pool.max_flushed_seq_handle();
+        max_flushed.store(1, Ordering::Release);
+
+        let _watermark = DurabilityWatermarkHandle::start(
+            meta.clone(),
+            pool.clone(),
+            max_flushed,
+            pool.durable_seq_handle(),
+            Duration::from_millis(20),
+            0,
+        );
+
+        // Wait for the fence to trip (should be well under a second).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pool.is_meta_fenced() {
+            assert!(Instant::now() < deadline, "pool was never fenced");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The fence reason carries the fatal error; new appends fail fast.
+        assert!(pool
+            .meta_fence_reason()
+            .unwrap()
+            .contains("capacity exhausted"));
+        let err = pool
+            .append("vol", Lba(0), 1, &[0u8; 4096], 0)
+            .unwrap_err();
+        assert!(matches!(err, OnyxError::MetaFenced(_)), "got {err:?}");
+
+        // Reads are never fenced (looking up an unmapped LBA returns Ok(None),
+        // not an error).
+        assert!(pool.lookup("vol", Lba(0)).unwrap().is_none());
+    }
 }

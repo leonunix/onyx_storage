@@ -1630,6 +1630,13 @@ impl MetadbBackend {
         self.checkpoint.checkpoint_outcome(token)
     }
 
+    /// Test-only: arm this backend's checkpoint failpoint (injects a fatal
+    /// `CapacityExhausted` on the next checkpoint) to exercise the fence path.
+    #[cfg(test)]
+    pub(crate) fn arm_checkpoint_capacity_fail(&self) {
+        self.checkpoint.arm_capacity_fail();
+    }
+
     pub(crate) fn memory_stats(&self) -> OnyxResult<MetaMemorySnapshot> {
         Ok(MetaMemorySnapshot::from_metadb(
             self.db.last_applied_lsn_best_effort(),
