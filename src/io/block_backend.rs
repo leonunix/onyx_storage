@@ -28,8 +28,10 @@
 //! level, so concurrent callers do not need external coordination here.
 
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use onyx_chunklet::ld::LogicalDisk;
 
 use crate::error::OnyxResult;
@@ -164,7 +166,10 @@ impl BlockBackend for RawDevice {
 pub struct BackendSlice {
     inner: Arc<dyn BlockBackend>,
     base: u64,
-    len: u64,
+    /// Window length. Atomic so a meta-LD page window can be widened online
+    /// (after the inner `ChunkletBackend` swaps in the extended LD) via
+    /// [`Self::grow_len`], while concurrent IO bounds-checks read it lock-free.
+    len: AtomicU64,
 }
 
 impl BackendSlice {
@@ -182,7 +187,39 @@ impl BackendSlice {
                 inner.size()
             )));
         }
-        Ok(Self { inner, base, len })
+        Ok(Self {
+            inner,
+            base,
+            len: AtomicU64::new(len),
+        })
+    }
+
+    /// Widen the window to `new_len` after the inner backend has grown (meta-LD
+    /// `extend_ld` → `ChunkletBackend::swap_ld`). Grow-only, and bounded by the
+    /// (now larger) inner size so the window can never address past the device.
+    pub fn grow_len(&self, new_len: u64) -> OnyxResult<()> {
+        let end = self
+            .base
+            .checked_add(new_len)
+            .ok_or_else(|| crate::error::OnyxError::Config(format!(
+                "backend slice grow overflow: base={} new_len={new_len}",
+                self.base
+            )))?;
+        if end > self.inner.size() {
+            return Err(crate::error::OnyxError::Config(format!(
+                "backend slice grow out of bounds: base={} new_len={new_len} inner_size={}",
+                self.base,
+                self.inner.size()
+            )));
+        }
+        let cur = self.len.load(Ordering::Relaxed);
+        if new_len < cur {
+            return Err(crate::error::OnyxError::Config(format!(
+                "backend slice grow would shrink window {cur} -> {new_len}"
+            )));
+        }
+        self.len.store(new_len, Ordering::Release);
+        Ok(())
     }
 
     fn translate(&self, offset: u64, len: usize) -> OnyxResult<u64> {
@@ -191,10 +228,10 @@ impl BackendSlice {
             .ok_or_else(|| crate::error::OnyxError::Config(format!(
                 "backend slice IO overflow: offset={offset} len={len}"
             )))?;
-        if end > self.len {
+        let window = self.len.load(Ordering::Relaxed);
+        if end > window {
             return Err(crate::error::OnyxError::Config(format!(
-                "out-of-bounds slice IO: offset={offset} len={len} window={}",
-                self.len
+                "out-of-bounds slice IO: offset={offset} len={len} window={window}"
             )));
         }
         Ok(self.base + offset)
@@ -238,7 +275,7 @@ impl BlockBackend for BackendSlice {
     }
 
     fn size(&self) -> u64 {
-        self.len
+        self.len.load(Ordering::Relaxed)
     }
 
     fn uring_target(&self) -> Option<(RawFd, u64)> {
@@ -256,7 +293,12 @@ impl BlockBackend for BackendSlice {
     }
 
     fn label(&self) -> String {
-        format!("{}[+{}:{}]", self.inner.label(), self.base, self.len)
+        format!(
+            "{}[+{}:{}]",
+            self.inner.label(),
+            self.base,
+            self.len.load(Ordering::Relaxed)
+        )
     }
 }
 
@@ -279,8 +321,20 @@ pub fn slice_backend(
 /// chunklet can parallelise it in one submit. `size` is the LD's
 /// `capacity_bytes` (already net of per-chunklet headers + parity).
 pub struct ChunkletBackend {
-    ld: Arc<dyn LogicalDisk>,
-    capacity: u64,
+    /// Swappable LD handle. `extend_ld` does NOT bump the runtime epoch, so the
+    /// handle opened at startup keeps the OLD capacity forever; growing online
+    /// means re-`open_ld` and atomically swapping the handle in here. In-flight
+    /// IO holds a `load()` guard and completes against the old `Arc`; new IO
+    /// picks up the new handle. See [`Self::swap_ld`].
+    ///
+    /// `arc_swap::ArcSwap<T>` requires `T: Sized`, so the trait object is stored
+    /// behind an extra `Arc` (the standard trait-object workaround); reads stay
+    /// lock-free at the cost of one extra pointer hop.
+    ld: ArcSwap<Arc<dyn LogicalDisk>>,
+    /// LD capacity in bytes, published AFTER a `swap_ld` installs a larger
+    /// handle (grow-only) so a reader never sees a bigger capacity paired with
+    /// a handle that would reject IO past the old top.
+    capacity: AtomicU64,
     /// Keeps the owning `Pool` alive for the backend's lifetime (the LD holds
     /// its member PD `Arc`s, but the Pool owns background/management state and
     /// is the handle the Phase-4 ops surface needs). `None` when the caller
@@ -292,8 +346,8 @@ impl ChunkletBackend {
     pub fn new(ld: Arc<dyn LogicalDisk>) -> Self {
         let capacity = ld.capacity_bytes();
         Self {
-            ld,
-            capacity,
+            ld: ArcSwap::from_pointee(ld),
+            capacity: AtomicU64::new(capacity),
             pool: None,
         }
     }
@@ -305,49 +359,64 @@ impl ChunkletBackend {
         b
     }
 
-    /// Borrow the underlying logical disk (e.g. to read `strip_size()` for
-    /// packer alignment).
-    pub fn logical_disk(&self) -> &Arc<dyn LogicalDisk> {
-        &self.ld
+    /// The current underlying logical disk (e.g. to read `strip_size()` for
+    /// packer alignment). Clones the inner `Arc<dyn LogicalDisk>` out of the
+    /// double-`Arc` cell.
+    pub fn logical_disk(&self) -> Arc<dyn LogicalDisk> {
+        (**self.ld.load()).clone()
     }
 
     /// The owning pool, when this backend keeps it alive. The Phase-4 ops
-    /// surface (status / rebuild / scrub / replace-disk) routes through here.
+    /// surface (status / rebuild / scrub / extend / replace-disk) routes
+    /// through here.
     pub fn pool(&self) -> Option<&Arc<onyx_chunklet::Pool>> {
         self.pool.as_ref()
+    }
+
+    /// Install a freshly-opened LD handle after an online `extend_ld`. Grow-only
+    /// (extend is additive): store the new (larger) handle FIRST, then publish
+    /// the new capacity, so a concurrent reader that observes the new capacity
+    /// is guaranteed to also see the new handle that can service the extra
+    /// range. In-flight IO already holding a `load()` guard finishes on the old
+    /// `Arc`. `new_ld` must refer to the SAME LD (a re-`open_ld` of the extended
+    /// disk); capacity must not shrink.
+    pub fn swap_ld(&self, new_ld: Arc<dyn LogicalDisk>) {
+        let new_cap = new_ld.capacity_bytes();
+        self.ld.store(Arc::new(new_ld));
+        self.capacity.store(new_cap, Ordering::Release);
     }
 }
 
 impl BlockBackend for ChunkletBackend {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
         // chunklet's argument order is (offset, buf); ours is (buf, offset).
-        self.ld.read_at(offset, buf)?;
+        self.ld.load().read_at(offset, buf)?;
         Ok(())
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
-        self.ld.write_at(offset, buf)?;
+        self.ld.load().write_at(offset, buf)?;
         Ok(())
     }
 
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> OnyxResult<()> {
         // Signature matches chunklet's `LogicalDisk::read_many_at` exactly.
-        self.ld.read_many_at(ops)?;
+        self.ld.load().read_many_at(ops)?;
         Ok(())
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> OnyxResult<()> {
-        self.ld.write_many_at(ops)?;
+        self.ld.load().write_many_at(ops)?;
         Ok(())
     }
 
     fn flush(&self) -> OnyxResult<()> {
-        self.ld.flush()?;
+        self.ld.load().flush()?;
         Ok(())
     }
 
     fn size(&self) -> u64 {
-        self.capacity
+        self.capacity.load(Ordering::Acquire)
     }
     // uring_target defaults to None: striped across PDs, no single fd.
 
@@ -357,16 +426,17 @@ impl BlockBackend for ChunkletBackend {
         // Mirror/plain/raid0 report their block/strip size => 1..N with no
         // parity, and their `write_full_stripe` has no RMW to avoid, so the
         // writer's stripe padding on them is harmless (usually just 1).
-        let bs = self.ld.block_size() as u64;
+        let ld = self.ld.load();
+        let bs = ld.block_size() as u64;
         if bs == 0 {
             return 1;
         }
-        let strip = self.ld.strip_size() as u64;
+        let strip = ld.strip_size() as u64;
         u32::try_from((strip / bs).max(1)).unwrap_or(1)
     }
 
     fn label(&self) -> String {
-        format!("chunklet-ld:{:?}", self.ld.id())
+        format!("chunklet-ld:{:?}", self.ld.load().id())
     }
 }
 

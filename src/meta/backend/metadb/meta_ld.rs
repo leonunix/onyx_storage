@@ -24,8 +24,10 @@ use onyx_metadb::{
     PageDevice, RING_BLOCK_SIZE,
 };
 
+use onyx_chunklet::ld::LogicalDisk;
+
 use crate::error::{OnyxError, OnyxResult};
-use crate::io::block_backend::{BackendSlice, BlockBackend};
+use crate::io::block_backend::{BackendSlice, BlockBackend, ChunkletBackend};
 
 use super::catalog::VolumeCatalog;
 
@@ -231,6 +233,12 @@ impl PageBlockIo for MetaWindow {
     fn capacity_bytes(&self) -> u64 {
         self.slice.size()
     }
+
+    fn grow_capacity_bytes(&self, new_bytes: u64) -> Result<(), MetaDbError> {
+        // The inner `ChunkletBackend` has already been swapped to the extended
+        // LD, so the page-window slice can now widen up to the new device size.
+        self.slice.grow_len(new_bytes).map_err(meta_err)
+    }
 }
 
 /// `JournalDevice` over the meta LD's lifecycle-journal ring window.
@@ -374,18 +382,64 @@ impl MetaLdCatalog {
 
 // ─────────────────────────── open / create ───────────────────────────
 
+/// Online-grow handle for the meta LD: retains the concrete `ChunkletBackend`
+/// (for the `swap_ld` after `extend_ld`) and a mutable copy of the OMET
+/// superblock so the page-window size can be re-derived + rewritten in place.
+pub(super) struct MetaLdGrower {
+    backend: Arc<ChunkletBackend>,
+    sb: Mutex<MetaSuperblock>,
+}
+
+impl MetaLdGrower {
+    /// Propagate an online meta-LD extend: swap the extended LD into the shared
+    /// `ChunkletBackend` (so all windows see the larger device), then rewrite the
+    /// OMET superblock's page-window size and widen the metadb page device to
+    /// match — lifting metadb's `CapacityExhausted` ceiling. Grow-only: a swap to
+    /// an LD that does not enlarge the page window is a no-op past the swap.
+    pub(super) fn grow(&self, db: &Db, new_ld: Arc<dyn LogicalDisk>) -> OnyxResult<()> {
+        let new_cap = new_ld.capacity_bytes();
+        // 1) Install the extended LD. In-flight meta IO finishes on the old
+        //    handle; the page-window `BackendSlice` (same inner `ChunkletBackend`)
+        //    can now address up to `new_cap`.
+        self.backend.swap_ld(new_ld);
+        // 2) Recompute + persist the page-window span. The catalog + journal live
+        //    at fixed lower offsets and are untouched; only the tail page window
+        //    grows.
+        let mut sb = self.sb.lock();
+        let new_pages_bytes = new_cap.saturating_sub(sb.pages_off) & !(SB_BYTES - 1);
+        if new_pages_bytes <= sb.pages_bytes {
+            return Ok(());
+        }
+        sb.pages_bytes = new_pages_bytes;
+        self.backend.write_at(&sb.to_block(), 0)?;
+        self.backend.flush()?;
+        drop(sb);
+        // 3) Widen the metadb page device (grows the page-window slice + the
+        //    BlockPageDevice ceiling), so stalled commits resume.
+        db.grow_device_capacity(new_pages_bytes).map_err(onyx_err)?;
+        tracing::info!(
+            new_ld_capacity = new_cap,
+            new_pages_bytes,
+            "meta LD online grow: page window widened"
+        );
+        Ok(())
+    }
+}
+
 /// Everything the metadb backend needs once its store is on the meta LD.
 pub(super) struct MetaLd {
     pub(super) db: Arc<Db>,
     pub(super) catalog_store: MetaLdCatalog,
     pub(super) catalog: VolumeCatalog,
+    pub(super) grower: MetaLdGrower,
 }
 
-/// Open (or first-time create) metadb on the meta LD `backend`. Reads/initialises
-/// the OMET superblock, frames the page + journal windows, and routes to
-/// `Db::open_on_device` / `Db::create_on_device`.
+/// Open (or first-time create) metadb on the meta LD `backend` (the concrete
+/// chunklet backend, so an online extend can `swap_ld` it later). Reads /
+/// initialises the OMET superblock, frames the page + journal windows, and
+/// routes to `Db::open_on_device` / `Db::create_on_device`.
 pub(super) fn open_or_create(
-    backend: Arc<dyn BlockBackend>,
+    backend: Arc<ChunkletBackend>,
     db_config: MetaDbConfig,
 ) -> OnyxResult<MetaLd> {
     let capacity = backend.size();
@@ -414,8 +468,11 @@ pub(super) fn open_or_create(
         }
     };
 
-    let pages_slice = BackendSlice::new(backend.clone(), sb.pages_off, sb.pages_bytes)?;
-    let journal_slice = BackendSlice::new(backend.clone(), sb.journal_off, sb.journal_bytes)?;
+    // Upcast clones for the byte-window slices + catalog; the grower keeps the
+    // concrete `Arc<ChunkletBackend>` so an online extend can `swap_ld` it.
+    let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
+    let pages_slice = BackendSlice::new(backend_dyn.clone(), sb.pages_off, sb.pages_bytes)?;
+    let journal_slice = BackendSlice::new(backend_dyn.clone(), sb.journal_off, sb.journal_bytes)?;
     let page_io: Arc<dyn PageBlockIo> = Arc::new(MetaWindow { slice: pages_slice });
     let page_device: Arc<dyn PageDevice> =
         Arc::new(BlockPageDevice::new(page_io).map_err(onyx_err)?);
@@ -427,10 +484,15 @@ pub(super) fn open_or_create(
         Db::open_on_device(db_config, page_device, journal_device).map_err(onyx_err)?
     };
 
-    let (catalog_store, catalog) = MetaLdCatalog::load(backend, &sb)?;
+    let (catalog_store, catalog) = MetaLdCatalog::load(backend_dyn, &sb)?;
+    let grower = MetaLdGrower {
+        backend,
+        sb: Mutex::new(sb),
+    };
     Ok(MetaLd {
         db,
         catalog_store,
         catalog,
+        grower,
     })
 }

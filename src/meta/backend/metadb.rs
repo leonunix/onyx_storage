@@ -54,6 +54,10 @@ pub(crate) struct MetadbBackend {
     /// here for the meta LD's lifetime and handed to the engine's LV3/LV2 open on
     /// the standby→active upgrade so the pool is never opened twice.
     chunklet_pool: Option<Arc<onyx_chunklet::Pool>>,
+    /// Online-grow handle for the meta LD page window (device path only). `None`
+    /// on the file backend. Drives `swap_ld` + OMET superblock rewrite + metadb
+    /// device ceiling widen when the meta LD is extended online.
+    meta_grower: Option<meta_ld::MetaLdGrower>,
     // Lineage GC freed-PBA signal channel.
     //
     // `metadb` invokes `freed_pbas_sink` synchronously on its GC driver
@@ -299,6 +303,7 @@ impl MetadbBackend {
             catalog,
             CatalogStore::File(catalog_path),
             None,
+            None,
         )
     }
 
@@ -308,7 +313,7 @@ impl MetadbBackend {
     /// later LV3/LV2 open so the pool is never opened twice).
     pub(crate) fn open_on_meta_ld(
         config: &MetaConfig,
-        meta_backend: Arc<dyn crate::io::block_backend::BlockBackend>,
+        meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
         pool: Arc<onyx_chunklet::Pool>,
     ) -> OnyxResult<Self> {
         // `config.meta.path` is only a diagnostic label on the device path; still
@@ -325,7 +330,25 @@ impl MetadbBackend {
             meta_ld.catalog,
             CatalogStore::Ld(meta_ld.catalog_store),
             Some(pool),
+            Some(meta_ld.grower),
         )
+    }
+
+    /// Propagate an online meta-LD extend: swap the freshly-opened extended LD
+    /// into the meta `ChunkletBackend`, rewrite the OMET superblock's page-window
+    /// size, and widen the metadb page device so a full-meta `CapacityExhausted`
+    /// clears. Errors on the file backend (no growable device). `new_ld` is a
+    /// re-`open_ld` of the SAME meta LD after `pool.extend_ld`.
+    pub(crate) fn grow_meta_capacity(
+        &self,
+        new_ld: Arc<dyn onyx_chunklet::ld::LogicalDisk>,
+    ) -> OnyxResult<()> {
+        match &self.meta_grower {
+            Some(g) => g.grow(&self.db, new_ld),
+            None => Err(OnyxError::Config(
+                "meta backend is not on a growable chunklet LD".into(),
+            )),
+        }
     }
 
     /// Shared tail of both open paths: validate the catalog against the store,
@@ -337,6 +360,7 @@ impl MetadbBackend {
         catalog: VolumeCatalog,
         catalog_store: CatalogStore,
         chunklet_pool: Option<Arc<onyx_chunklet::Pool>>,
+        meta_grower: Option<meta_ld::MetaLdGrower>,
     ) -> OnyxResult<Self> {
         catalog.validate_against_db(&db)?;
         let volume_ordinals = catalog
@@ -364,6 +388,7 @@ impl MetadbBackend {
             volume_ordinals,
             catalog_store,
             chunklet_pool,
+            meta_grower,
             lineage_freed_pbas_tx,
             lineage_freed_pbas_rx,
         })

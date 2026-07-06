@@ -46,7 +46,10 @@ pub struct ContiguityStats {
 }
 
 pub struct SpaceAllocator {
-    total_blocks: u64,
+    /// IO-addressable capacity in blocks. Atomic so an online `grow_capacity`
+    /// (chunklet `extend_ld` on LV3) can publish the larger frontier while
+    /// concurrent bounds checks / status reads run lock-free. Only ever grows.
+    total_blocks: AtomicU64,
     /// Address-ordered free list + (count, start) side index. First-fit
     /// SELECTION is unchanged (lowest-address extent that fits — the metadb
     /// L2P leaf codec's dense-PBA contract); the side index only makes finding
@@ -118,7 +121,7 @@ impl SpaceAllocator {
             .unwrap_or(false)
             .then(|| Mutex::new(BTreeSet::new()));
         Self {
-            total_blocks,
+            total_blocks: AtomicU64::new(total_blocks),
             free_extents: Mutex::new(free_extents),
             retired_extents: Mutex::new(BTreeSet::new()),
             retired_age: Mutex::new(BTreeMap::new()),
@@ -167,8 +170,8 @@ impl SpaceAllocator {
         }
 
         // Trailing free space
-        if pos < self.total_blocks {
-            let gap = self.total_blocks - pos;
+        if pos < self.total_blocks.load(Ordering::Relaxed) {
+            let gap = self.total_blocks.load(Ordering::Relaxed) - pos;
             let mut start = pos;
             let mut remaining = gap;
             while remaining > 0 {
@@ -179,7 +182,7 @@ impl SpaceAllocator {
             }
         }
 
-        let usable_blocks = self.total_blocks.saturating_sub(RESERVED_BLOCKS);
+        let usable_blocks = self.total_blocks.load(Ordering::Relaxed).saturating_sub(RESERVED_BLOCKS);
         let alloc_count = allocated.len() as u64;
         let free_count = usable_blocks - alloc_count;
 
@@ -208,7 +211,7 @@ impl SpaceAllocator {
         self.free_blocks.store(free_count, Ordering::Relaxed);
 
         tracing::info!(
-            total = self.total_blocks,
+            total = self.total_blocks.load(Ordering::Relaxed),
             allocated = alloc_count,
             free = free_count,
             extents = self.free_extents.lock().unwrap().len(),
@@ -927,7 +930,7 @@ impl SpaceAllocator {
             // wait; cheap when unpinned). Shape-invalid extents are skipped
             // here and rejected below.
             for extent in chunk {
-                if extent.count > 0 && extent.end_pba().0 <= self.total_blocks {
+                if extent.count > 0 && extent.end_pba().0 <= self.total_blocks.load(Ordering::Relaxed) {
                     self.hazards.wait_extent_clear(extent.start, extent.count);
                 }
             }
@@ -1487,10 +1490,10 @@ impl SpaceAllocator {
                 "{context}: cannot cover 0 blocks"
             )));
         }
-        if extent.end_pba().0 > self.total_blocks {
+        if extent.end_pba().0 > self.total_blocks.load(Ordering::Relaxed) {
             return Err(OnyxError::Config(format!(
                 "{context}: extent {:?} exceeds total blocks {}",
-                extent, self.total_blocks
+                extent, self.total_blocks.load(Ordering::Relaxed)
             )));
         }
         Ok(())
@@ -1558,7 +1561,48 @@ impl SpaceAllocator {
     }
 
     pub fn total_block_count(&self) -> u64 {
-        self.total_blocks
+        self.total_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Grow the allocatable frontier online after a chunklet `extend_ld` on the
+    /// LV3 LD. `new_device_size_bytes` is the IO-ADDRESSABLE capacity — the SAME
+    /// transform the constructor takes (`new_ld.capacity_bytes() -
+    /// RESERVED_BLOCKS * BLOCK_SIZE`), NOT the raw LD size.
+    ///
+    /// The newly-addressable PBAs `[old_total, new_total)` are appended to the
+    /// free set as dense extents at the TOP of the space (split into `u32::MAX`
+    /// runs like the constructor / rebuild path), preserving the
+    /// dense/sequential PBA contract the metadb L2P leaf codec relies on:
+    /// first-fit still hands out the lowest free address, so the grown tail is
+    /// consumed last. Grow-only — a smaller-or-equal size is a no-op. Returns
+    /// the new total block count.
+    ///
+    /// Ordering: the larger frontier is published (`Release`) BEFORE the new
+    /// PBAs enter circulation via the `free_extents` insert, so a concurrent
+    /// bounds check (`free_extent` / `retire_*`) can never observe an allocated
+    /// PBA from the grown region while `total_blocks` still reads the old value.
+    pub fn grow_capacity(&self, new_device_size_bytes: u64) -> OnyxResult<u64> {
+        let new_total = new_device_size_bytes / BLOCK_SIZE as u64;
+        let old_total = self.total_blocks.load(Ordering::Relaxed);
+        if new_total <= old_total {
+            return Ok(old_total);
+        }
+        self.total_blocks.store(new_total, Ordering::Release);
+        let added = new_total - old_total;
+        {
+            let mut free = self.free_extents.lock().unwrap();
+            let mut start = old_total;
+            let mut remaining = added;
+            while remaining > 0 {
+                let count = remaining.min(u32::MAX as u64) as u32;
+                free.insert(Extent::new(Pba(start), count));
+                start += count as u64;
+                remaining -= count as u64;
+            }
+        }
+        self.free_blocks.fetch_add(added, Ordering::Relaxed);
+        tracing::info!(old_total, new_total, added, "allocator online grow_capacity");
+        Ok(new_total)
     }
 
     /// O(1)/O(log N) fragmentation snapshot of the global free set — one lock
@@ -1847,6 +1891,31 @@ mod age_tests {
         let _ = a.allocate_one().unwrap();
         let s2 = a.contiguity_stats();
         assert_eq!(s2.free_blocks_in_set, 8192 - RESERVED_BLOCKS - 1);
+    }
+
+    /// grow_capacity appends the new top range to the free set (both the free
+    /// atomic and the free set grow by the delta) and is a no-op when the new
+    /// size is not larger.
+    #[test]
+    fn grow_capacity_appends_new_free_range() {
+        let a = new_alloc(8192);
+        let old_free = a.free_block_count();
+        assert_eq!(a.total_block_count(), 8192);
+        assert_eq!(old_free, 8192 - RESERVED_BLOCKS);
+
+        // Grow to 16384 blocks (io-addressable size = blocks * BLOCK_SIZE).
+        let new_total = a.grow_capacity(16384 * BLOCK_SIZE as u64).unwrap();
+        assert_eq!(new_total, 16384);
+        assert_eq!(a.total_block_count(), 16384);
+        assert_eq!(a.free_block_count(), old_free + 8192);
+        // The free set gained exactly the [8192, 16384) range worth of blocks
+        // (coalesced with the existing top run or not — the total is invariant).
+        assert_eq!(a.contiguity_stats().free_blocks_in_set, 16384 - RESERVED_BLOCKS);
+
+        // Equal / smaller is a no-op — the frontier never regresses.
+        assert_eq!(a.grow_capacity(8192 * BLOCK_SIZE as u64).unwrap(), 16384);
+        assert_eq!(a.total_block_count(), 16384);
+        assert_eq!(a.free_block_count(), old_free + 8192);
     }
 
     /// free_extents_below_desc returns strictly-below extents in descending

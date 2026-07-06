@@ -8,6 +8,7 @@ use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::runner::GcRunner;
 use crate::gc::{HeatMap, RefBitmap};
+use crate::io::block_backend::BlockBackend;
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
@@ -80,6 +81,12 @@ pub struct OnyxEngine {
     /// meta-only mode or when the heat refresh is disabled.
     heat: Option<HeatMap>,
     generation_clock: AtomicU64,
+    /// Concrete LV3 chunklet backend (full mode + chunklet backend only), the
+    /// same `Arc` the IoEngine / ReadPool use. Held so an online `extend_ld` on
+    /// LV3 can `swap_ld` a re-opened, larger handle into the shared cell. `None`
+    /// on the RawDevice path or in meta-only mode. The meta LD's equivalent
+    /// lives inside `MetaStore` (it self-contains its grow via `grow_meta_capacity`).
+    lv3_ck_backend: Option<Arc<crate::io::block_backend::ChunkletBackend>>,
     config: OnyxConfig,
     shutdown_done: Mutex<bool>,
 }
@@ -262,12 +269,14 @@ impl OnyxEngine {
                 let pool = chunklet_pool.as_ref().ok_or_else(|| {
                     OnyxError::Config("meta.backend=chunklet but pool not opened (internal)".into())
                 })?;
-                let meta_backend: Arc<dyn crate::io::block_backend::BlockBackend> =
-                    crate::chunklet_pool::role_backend_from_pool(
-                        pool,
-                        &config.chunklet,
-                        crate::chunklet_pool::LdRoleSel::Meta,
-                    )?;
+                // Concrete `Arc<ChunkletBackend>` (not upcast): `MetaStore` keeps
+                // it in its grow handle so an online meta-LD `extend_ld` can
+                // `swap_ld` it in place.
+                let meta_backend = crate::chunklet_pool::role_backend_from_pool(
+                    pool,
+                    &config.chunklet,
+                    crate::chunklet_pool::LdRoleSel::Meta,
+                )?;
                 tracing::info!(
                     capacity_bytes = meta_backend.size(),
                     "metadb on chunklet meta RAID LD"
@@ -283,10 +292,17 @@ impl OnyxEngine {
     /// returned `ChunkletBackend` keeps the Pool alive); otherwise it opens the
     /// single `storage.data_device` as a `RawDevice`. Either way the result is a
     /// `BlockBackend` the rest of startup treats uniformly.
+    /// Returns the LV3 device backend plus, on the chunklet path, the concrete
+    /// `Arc<ChunkletBackend>` (a clone of the same instance the IoEngine/ReadPool
+    /// use) so an online `extend_ld` can `swap_ld` it. `None` concrete on the
+    /// RawDevice path.
     fn acquire_lv3_device(
         config: &OnyxConfig,
         chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
-    ) -> OnyxResult<Arc<dyn crate::io::block_backend::BlockBackend>> {
+    ) -> OnyxResult<(
+        Arc<dyn crate::io::block_backend::BlockBackend>,
+        Option<Arc<crate::io::block_backend::ChunkletBackend>>,
+    )> {
         if config.chunklet.enabled {
             let pool = chunklet_pool.as_ref().ok_or_else(|| {
                 OnyxError::Config("chunklet.enabled but pool not opened (internal)".into())
@@ -296,14 +312,14 @@ impl OnyxEngine {
                 &config.chunklet,
                 crate::chunklet_pool::LdRoleSel::Lv3,
             )?;
-            let device: Arc<dyn crate::io::block_backend::BlockBackend> = backend;
+            let device: Arc<dyn crate::io::block_backend::BlockBackend> = backend.clone();
             tracing::info!(capacity_bytes = device.size(), "LV3 on chunklet RAID LD");
-            Ok(device)
+            Ok((device, Some(backend)))
         } else {
             let data_path = config.storage.data_device.as_ref().ok_or_else(|| {
                 OnyxError::Config("storage.data_device is required for full mode".into())
             })?;
-            Ok(Arc::new(RawDevice::open(data_path)?))
+            Ok((Arc::new(RawDevice::open(data_path)?), None))
         }
     }
 
@@ -681,7 +697,7 @@ impl OnyxEngine {
         // (no shared deletion state needed — per-handle alive flags are used)
 
         // 3. LV3 device (RawDevice or chunklet RAID LD) + IO engine
-        let device = Self::acquire_lv3_device(config, &chunklet_pool)?;
+        let (device, lv3_ck_backend) = Self::acquire_lv3_device(config, &chunklet_pool)?;
         let device_size = device.size();
 
         // 2a. Validate / format LV3 superblock
@@ -953,6 +969,7 @@ impl OnyxEngine {
             heat,
             usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
+            lv3_ck_backend,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -998,6 +1015,7 @@ impl OnyxEngine {
             heat: None,
             usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
+            lv3_ck_backend: None,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -1549,7 +1567,7 @@ impl OnyxEngine {
             Some(pool) => Some(pool),
             None => Self::acquire_chunklet_pool(config)?,
         };
-        let device = Self::acquire_lv3_device(config, &chunklet_pool)?;
+        let (device, lv3_ck_backend) = Self::acquire_lv3_device(config, &chunklet_pool)?;
         let device_size = device.size();
 
         // Validate / format LV3 superblock
@@ -1740,6 +1758,7 @@ impl OnyxEngine {
             heat,
             usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
+            lv3_ck_backend,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -1804,6 +1823,69 @@ impl OnyxEngine {
     /// from rather than a second, superblock-tearing open.
     pub fn chunklet_pool(&self) -> Option<Arc<onyx_chunklet::Pool>> {
         self.meta.chunklet_pool()
+    }
+
+    /// Online-extend a chunklet role LD by `additional_rows` and propagate the
+    /// new capacity into the live engine — no restart. `role` is `"lv3"` or
+    /// `"meta"`:
+    /// - **lv3**: `extend_ld` → `open_ld` → `swap_ld` the shared backend →
+    ///   `SpaceAllocator::grow_capacity` (new dense PBAs at the top) → rewrite
+    ///   the LV3 superblock's `device_size_bytes` so the next boot's size check
+    ///   matches the grown LD.
+    /// - **meta**: `extend_ld` → `open_ld` → `MetaStore::grow_meta_capacity`
+    ///   (swap + OMET superblock rewrite + metadb page-device widen, clearing any
+    ///   `CapacityExhausted`).
+    ///
+    /// Returns the new LD capacity in bytes. `extend_ld` holds only the LD read
+    /// lock, so live IO continues; the extra rows are additive (old rows/parity
+    /// untouched).
+    pub fn chunklet_extend(&self, role: &str, additional_rows: u16) -> OnyxResult<u64> {
+        let pool = self
+            .chunklet_pool()
+            .ok_or_else(|| OnyxError::Config("chunklet backend not enabled".into()))?;
+        match role {
+            "lv3" => {
+                let id_str = self.config.chunklet.lv3_ld_id.as_deref().ok_or_else(|| {
+                    OnyxError::Config("[chunklet] lv3_ld_id is not configured".into())
+                })?;
+                let ld_id = onyx_chunklet::ops::parse_ld_id(id_str)?;
+                let new_cap = pool.extend_ld(ld_id, additional_rows)?;
+                let new_ld = pool.open_ld(ld_id)?;
+                let backend = self.lv3_ck_backend.as_ref().ok_or_else(|| {
+                    OnyxError::Config("LV3 is not on a chunklet LD (cannot online-extend)".into())
+                })?;
+                backend.swap_ld(new_ld);
+                if let Some(alloc) = &self.allocator {
+                    // Same io-addressable transform the allocator was built with.
+                    let io_addressable = new_cap.saturating_sub(
+                        crate::types::RESERVED_BLOCKS * crate::types::BLOCK_SIZE as u64,
+                    );
+                    alloc.grow_capacity(io_addressable)?;
+                }
+                if let Some(mut sb) = superblock::read_superblock(backend.as_ref())? {
+                    sb.device_size_bytes = new_cap;
+                    sb.update_crc();
+                    superblock::write_superblock(backend.as_ref(), &sb)?;
+                }
+                tracing::info!(role = "lv3", additional_rows, new_cap, "chunklet online extend complete");
+                Ok(new_cap)
+            }
+            "meta" => {
+                let id_str = self.config.chunklet.meta_ld_id.as_deref().ok_or_else(|| {
+                    OnyxError::Config("[chunklet] meta_ld_id is not configured".into())
+                })?;
+                let ld_id = onyx_chunklet::ops::parse_ld_id(id_str)?;
+                let new_cap = pool.extend_ld(ld_id, additional_rows)?;
+                let new_ld = pool.open_ld(ld_id)?;
+                self.meta.grow_meta_capacity(new_ld)?;
+                tracing::info!(role = "meta", additional_rows, new_cap, "chunklet online extend complete");
+                Ok(new_cap)
+            }
+            other => Err(OnyxError::Config(format!(
+                "unknown chunklet extend role '{other}' (use 'lv3' or 'meta'; \
+                 lv2/buffer online-extend is not supported)"
+            ))),
+        }
     }
 
     pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {

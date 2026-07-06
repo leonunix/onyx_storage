@@ -1038,6 +1038,39 @@ impl ServiceController {
                     }
                     let _ = stream.flush();
                 }
+                // extend holds only the LD read lock (additive rows) → fast,
+                // runs inline; returns the new LD capacity in bytes.
+                "chunklet-extend" => {
+                    require_engine!(engine, stream);
+                    if parts.len() < 3 {
+                        let _ = stream.write_all(
+                            b"error: usage: chunklet-extend <lv3|meta> <additional_rows>\n",
+                        );
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let role = parts[1];
+                    let rows: u16 = match parts[2].parse() {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let _ = stream.write_all(b"error: invalid additional_rows\n");
+                            let _ = stream.flush();
+                            continue;
+                        }
+                    };
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.chunklet_extend(role, rows) {
+                        Ok(new_cap) => {
+                            let _ = stream.write_all(format!("ok {}\n", new_cap).as_bytes());
+                        }
+                        Err(e) => {
+                            let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
+                        }
+                    }
+                    let _ = stream.flush();
+                }
                 "chunklet-job" => {
                     // Job state lives in a process-global registry, so this is
                     // serviceable without loading the engine. No arg = list all.

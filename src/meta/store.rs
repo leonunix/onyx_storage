@@ -122,7 +122,7 @@ impl MetaStore {
     /// backend and reused for LV3/LV2 on a standby→active upgrade).
     pub fn open_on_meta_ld(
         config: &MetaConfig,
-        meta_backend: Arc<dyn crate::io::block_backend::BlockBackend>,
+        meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
         pool: Arc<onyx_chunklet::Pool>,
     ) -> OnyxResult<Self> {
         Ok(Self {
@@ -134,6 +134,17 @@ impl MetaStore {
     /// file path.
     pub fn chunklet_pool(&self) -> Option<Arc<onyx_chunklet::Pool>> {
         self.backend.chunklet_pool()
+    }
+
+    /// Propagate an online meta-LD extend into the metadb page device (swap the
+    /// extended LD, rewrite the OMET superblock, widen the ceiling). `new_ld` is
+    /// a fresh `pool.open_ld` of the meta LD after `pool.extend_ld`. Errors on
+    /// the file backend.
+    pub fn grow_meta_capacity(
+        &self,
+        new_ld: Arc<dyn onyx_chunklet::ld::LogicalDisk>,
+    ) -> OnyxResult<()> {
+        self.backend.grow_meta_capacity(new_ld)
     }
 
     pub fn sync_durable(&self) -> OnyxResult<()> {

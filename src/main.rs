@@ -154,6 +154,14 @@ enum ChunkletOp {
         /// Job id from a prior scrub/rebuild; omit to list all jobs
         id: Option<u64>,
     },
+    /// Grow a role LD by N chunklet rows online (`extend_ld` + live capacity
+    /// propagation — the allocator/metadb pick it up without a restart)
+    Extend {
+        /// Which LD to grow: "lv3" (data) or "meta" (metadb)
+        role: String,
+        /// Additional chunklet rows to add
+        rows: u16,
+    },
 }
 
 fn parse_compression(s: &str) -> CompressionAlgo {
@@ -619,6 +627,7 @@ fn main() -> anyhow::Result<()> {
                     Some(i) => format!("chunklet-job {i}"),
                     None => "chunklet-job".to_string(),
                 },
+                ChunkletOp::Extend { role, rows } => format!("chunklet-extend {role} {rows}"),
             };
             let lines = service::send_chunklet_command(sock, &cmd)?;
             match &op {
@@ -629,6 +638,14 @@ fn main() -> anyhow::Result<()> {
                         .find_map(|l| l.strip_prefix("ok "))
                         .unwrap_or("?");
                     println!("started job {job_id}; poll with: chunklet job {job_id}");
+                }
+                ChunkletOp::Extend { role, .. } => {
+                    // Reply is `ok <new_capacity_bytes>`.
+                    let cap = lines
+                        .iter()
+                        .find_map(|l| l.strip_prefix("ok "))
+                        .unwrap_or("?");
+                    println!("extended {role}: new LD capacity = {cap} bytes");
                 }
                 _ => {
                     for line in &lines {
