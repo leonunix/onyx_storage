@@ -6,7 +6,7 @@
 
 **Userspace all-flash block storage engine with inline compression, content-addressable dedup, and RAID-aware space management.**
 
-Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses the in-tree onyx-metadb engine for metadata management, O_DIRECT for data I/O, and exposes block devices via Linux ublk. Designed for NVMe SSD arrays behind dm-raid / LVM.
+Onyx is a high-performance block storage engine inspired by Red Hat VDO. It uses the in-tree onyx-metadb engine for metadata management, O_DIRECT for data I/O, and exposes block devices via Linux ublk. Data, write buffer, **and the metadata engine itself** run on an in-tree userspace RAID layer, [onyx-chunklet](chunklet/) &mdash; a single pool over the raw NVMe devices carves the LV3 (data, RAID6), LV2 (write buffer, RAID10), and metadb (RAID10) logical disks, so there is no dm-raid/LVM and no filesystem metadata single-point-of-failure.
 
 > **Early Technology Preview** &mdash; This project is in early development for learning and research purposes. Core functionality (compression, dedup, GC, packer) is implemented and tested, but it is NOT production-ready. Do not use in production environments.
 
@@ -18,7 +18,8 @@ For the current functional audit and PBA/dedup mechanism map, see [docs/onyx-fun
 - **Content-addressable dedup** &mdash; xxh3_64 fingerprinting, RAM candidate cache for first-occurrence misses, LV3 byte-verified promote on duplicate sighting, sharded apply lanes, cuckoo-filter L0, cold-tail background rescan to recover ratio after restart
 - **Fragment packing** &mdash; VDO-style bin-packing of sub-4KB compressed fragments into shared physical slots
 - **Garbage collection** &mdash; background dead-block scanner and rewriter with back-pressure control
-- **Purpose-built metadata engine** &mdash; in-tree [onyx-metadb](metadb/) (paged COW radix L2P + paged-array refcount + cuckoo dedup_index) sharing one WAL with group commit
+- **Purpose-built metadata engine** &mdash; in-tree [onyx-metadb](metadb/) (paged COW radix L2P + paged-array refcount + cuckoo dedup_index) with group-commit transactions and per-shard apply lanes; recovery replays the LV2 write buffer (no separate metadb WAL)
+- **Userspace RAID backend** &mdash; in-tree [onyx-chunklet](chunklet/) carves RAID6/RAID10 logical disks from one pool over the raw NVMe; full-stripe writes avoid parity RMW, and metadb persists on its own mirrored meta LD (any single member disk can fail without losing metadata). A cross-process `flock` on the pool devices rejects a second opener
 - **Crash consistency** &mdash; LV2 write-buffer sync-before-ack; metadb commits publish L2P remaps and verified dedup promotes atomically, with checkpoint/watermark based ring release
 - **High-performance write path** &mdash; staging channel + write thread batch (encode/CRC off hot path), jemalloc, DashMap 256-shard indices, per-shard backpressure
 - **Retired PBA reclaim** &mdash; committed dead PBAs are retired first, then reclaimed only after refcount, hazard, and a fold-consistent blockmap/l2p-buffer confirmation scan plus a reclaim-age grace; metadb lineage `FreePbas` are surfaced as `rc == 0` candidates and routed through the same retire&rarr;reclaim path (not direct-freed), since the `rc == 0` proof does not cover rc-untracked packed/multi-LBA L2P sharing
@@ -38,17 +39,19 @@ WriteBufferPool  (staging channel + write thread batch, ring log on LV2, jemallo
   v
 Dedup Workers --> Compress Workers --> Commit Workers
   |
-IoEngine (O_DIRECT --> LV3) + MetaStore (metadb tx: L2P remap + verified DedupPut/repair)
+IoEngine (--> LV3) + MetaStore (metadb tx: L2P remap + verified DedupPut/repair)
   |
 SpaceAllocator (free -> allocated -> retired -> reclaimed; lineage FreePbas join the retire path)
   |
-dm-raid + LVM --> NVMe SSD x N
+BlockBackend: RawDevice (O_DIRECT, single disk) | ChunkletBackend (LV3/LV2/meta from one pool)
+  |
+onyx-chunklet pool  (userspace RAID6/RAID10 over chunklets, io_uring internal) --> NVMe SSD x N
 
-onyx-metadb (in-tree)
+onyx-metadb (in-tree; persists on a chunklet meta LD when [meta] backend = "chunklet")
   paged COW radix L2P (per-volume, snapshot-able)
   paged-array refcount + per-shard delta (dedup membership / lineage aware)
   cuckoo dedup_index (4 slots/bucket) + cuckoo-filter L0 + L1 hot cache
-  shared WAL + group commit + per-shard apply lanes
+  group commit + per-shard apply lanes (LV2 buffer is the durable journal; no separate WAL)
 ```
 
 ## Repository Layout
@@ -245,7 +248,7 @@ User-perceived latency = ring lock + memcpy + channel send. Encoding, CRC, disk 
 
 ## metadb Metadata Tables
 
-Onyx's logical "tables" map onto four purpose-built structures inside [onyx-metadb](metadb/), all sharing one WAL and committing through a single `tx` per writer batch:
+Onyx's logical "tables" map onto four purpose-built structures inside [onyx-metadb](metadb/), all committing through a single `tx` per writer batch (recovery replays the LV2 write buffer; there is no separate metadb WAL). The whole metadb persistent surface &mdash; pages, lifecycle journal, and volume catalog &mdash; can live on a chunklet meta LD (`[meta] backend = "chunklet"`) instead of the host filesystem; a full meta device fails a checkpoint cleanly with `CapacityExhausted` and fences new writes rather than corrupting, and reopens intact.
 
 | Logical table   | metadb backing                                       | Key                          | Value               | Purpose                                  |
 |-----------------|------------------------------------------------------|------------------------------|---------------------|------------------------------------------|
@@ -265,9 +268,11 @@ Committed PBA reclamation is intentionally two-stage. Remap/delete/dedup demote 
 - [x] Dedup: worker pool, dedup_index, tiered skip strategy, DEDUP_SKIPPED rescan, RAM candidate cache + LV3 byte-verified promote on duplicate sighting, candidate-before-retire cleanup, scrub/orphan maintenance, cold-tail blockmap rescan, cuckoo-filter L0
 - [x] Performance (frontend): staging buffer, write thread batch, jemalloc, DashMap 256-shard indices, ring backpressure
 - [x] Performance (backend): batched writer (drain 32 units per metadb tx), multi_get for old mappings, batched dedup cleanup, sharded dedup apply lanes, balanced read pool dispatch
-- [x] Metadata engine swap: replaced RocksDB with in-tree onyx-metadb (paged COW radix L2P, paged-array refcount + delta, cuckoo dedup_index, shared WAL with group commit)
+- [x] Metadata engine swap: replaced RocksDB with in-tree onyx-metadb (paged COW radix L2P, paged-array refcount + delta, cuckoo dedup_index, group commit; LV2 buffer as the durable journal)
 - [x] Service mode: multi-volume start, Unix socket IPC (stop/create/delete/list), signal handling (SIGTERM/SIGINT)
-- [ ] RAID-aware: strip-aligned writes, strip-granularity allocation
+- [x] RAID-aware: full-stripe (strip-aligned) writes + strip-granularity allocation, via the in-tree onyx-chunklet userspace RAID backend
+- [x] Chunklet integration: LV3 (RAID6), LV2 (RAID10), and metadb (RAID10 meta LD) all on one chunklet pool over the raw NVMe &mdash; retires the filesystem metadata SPOF; capacity-exhaustion fencing + crash-recovery validated on NVMe hardware
+- [ ] Chunklet online ops: capacity auto-grow (`extend_ld`), online RAID fault handling / rebuild passthrough, meta-device read-path optimization
 - [ ] Production hardening: iSCSI frontend, HA (active-standby dual controller), Prometheus metrics
 - [ ] High performance: NVMe-oF over RDMA
 

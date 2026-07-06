@@ -6,7 +6,7 @@
 
 **用户态全闪块存储引擎，支持内联压缩、内容寻址去重和 RAID 感知空间管理。**
 
-Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用仓库内的 onyx-metadb 管理元数据，O_DIRECT 进行数据 I/O，通过 Linux ublk 对外暴露块设备。面向 dm-raid / LVM 之上的 NVMe SSD 阵列。
+Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用仓库内的 onyx-metadb 管理元数据，O_DIRECT 进行数据 I/O，通过 Linux ublk 对外暴露块设备。数据、写缓冲、**以及元数据引擎自身**都跑在仓库内的用户态 RAID 层 [onyx-chunklet](chunklet/) 上——一个池子在裸 NVMe 上切出 LV3（数据，RAID6）、LV2（写缓冲，RAID10）、metadb（RAID10）三个逻辑盘，因此不再有 dm-raid/LVM，也不再有文件系统元数据单点故障。
 
 > **早期技术预览** &mdash; 本项目处于早期开发阶段，用于学习和研究存储引擎内部原理。核心功能（压缩、去重、GC、Packer）已实现并通过测试，但尚未达到生产级别，请勿用于生产环境。
 
@@ -18,7 +18,8 @@ Onyx 是一个高性能块存储引擎，设计灵感来自 Red Hat VDO。使用
 - **内容寻址去重** &mdash; xxh3_64 指纹、首次出现的 miss 进 RAM 候选缓存（CandidateCache）、第二次命中走 LV3 字节比对验证后再 promote 到 dedup_index、cuckoo-filter L0、后台 DEDUP_SKIPPED 补扫 + cold-tail 扫描恢复重启后的去重率
 - **Fragment 打包** &mdash; VDO 风格 bin-packing，多个 < 4KB 压缩 fragment 共享物理 slot
 - **垃圾回收** &mdash; 后台 dead block 扫描与回写，带背压控制
-- **定制元数据引擎** &mdash; in-tree [onyx-metadb](metadb/)（paged COW radix L2P + paged-array refcount + cuckoo dedup_index），共享一条 WAL + group commit
+- **定制元数据引擎** &mdash; in-tree [onyx-metadb](metadb/)（paged COW radix L2P + paged-array refcount + cuckoo dedup_index），group-commit 事务 + per-shard apply lane；恢复靠重放 LV2 写缓冲（无独立 metadb WAL）
+- **用户态 RAID 后端** &mdash; in-tree [onyx-chunklet](chunklet/) 在一个池子上切出 RAID6/RAID10 逻辑盘；full-stripe 写消除 parity RMW，metadb 落在自己的镜像 meta LD 上（任意单成员盘故障不丢元数据）。池设备上的跨进程 `flock` 拒绝二次打开
 - **崩溃一致性** &mdash; 写缓冲 sync 后才 ack；metadb 提交原子发布 L2P remap 与 verified dedup promote，配合 checkpoint/watermark 释放环形日志
 - **高性能写路径** &mdash; staging channel + write thread batch（encode/CRC 移出热路径）、jemalloc、DashMap 256 分片索引、per-shard 背压
 - **Retired PBA 回收** &mdash; committed dead PBA 先 retire，再在 refcount、hazard、fold-consistent 引用扫描和 reclaim-age grace 全部通过后才回收；metadb lineage `FreePbas` 也走同一条 retire→reclaim 路径
@@ -38,17 +39,19 @@ WriteBufferPool（LV2 上 O_DIRECT 环形日志，staging channel + write thread
   v
 Dedup Workers --> Compress Workers --> Packer（bin-pack）--> Commit Workers
   |
-IoEngine（O_DIRECT --> LV3）+ MetaStore（metadb tx：L2P remap + verified DedupPut/repair）
+IoEngine（--> LV3）+ MetaStore（metadb tx：L2P remap + verified DedupPut/repair）
   |
 SpaceAllocator（free -> allocated -> retired -> reclaimed；lineage FreePbas 并入 retire 路径）
   |
-dm-raid + LVM --> NVMe SSD x N
+BlockBackend：RawDevice（O_DIRECT 单盘）| ChunkletBackend（一个池子出 LV3/LV2/meta）
+  |
+onyx-chunklet 池（用户态 RAID6/RAID10 over chunklet，io_uring 内部）--> NVMe SSD x N
 
-onyx-metadb (in-tree)
+onyx-metadb (in-tree；[meta] backend = "chunklet" 时落在 chunklet meta LD 上)
   paged COW radix L2P（per-volume，可 snapshot）
   paged-array refcount + per-shard delta（dedup membership / lineage aware）
   cuckoo dedup_index（4 slots/bucket）+ cuckoo-filter L0 + L1 hot cache
-  共享 WAL + group commit + per-shard apply lane
+  group commit + per-shard apply lane（LV2 缓冲即持久日志，无独立 WAL）
 ```
 
 ## 快速开始
@@ -165,9 +168,11 @@ Per-volume blockmap（每个 volume 一个命名空间）：
 - [x] 去重：工作线程池、dedup_index、分级跳过策略、DEDUP_SKIPPED 补扫、RAM 候选缓存 + LV3 字节验证 promote、candidate-before-retire cleanup、scrub/orphan 维护、cold-tail blockmap 扫描、cuckoo-filter L0
 - [x] 高性能前台：staging channel + write thread batch、jemalloc、DashMap 256 分片索引、ring 背压
 - [x] 高性能后台：batch writer（drain 32 units → 1 metadb tx）、multi_get 旧 mapping、批量 dedup cleanup、sharded dedup apply lane
-- [x] 换元数据引擎：用 in-tree onyx-metadb 替换 RocksDB（paged COW radix L2P、paged-array refcount + delta、cuckoo dedup_index、共享 WAL + group commit）
+- [x] 换元数据引擎：用 in-tree onyx-metadb 替换 RocksDB（paged COW radix L2P、paged-array refcount + delta、cuckoo dedup_index、group commit；LV2 缓冲即持久日志）
 - [x] 服务模式：多卷启动、Unix socket IPC（stop/create/delete/list）、信号处理（SIGTERM/SIGINT）
-- [ ] RAID 感知：strip 对齐写出、strip 粒度分配
+- [x] RAID 感知：full-stripe（strip 对齐）写出 + strip 粒度分配，经仓库内 onyx-chunklet 用户态 RAID 后端落地
+- [x] chunklet 集成：LV3(RAID6)、LV2(RAID10)、metadb(RAID10 meta LD) 全在一个 chunklet 池上（裸 NVMe）——消除文件系统元数据 SPOF；满盘 fencing + 崩溃恢复已在 NVMe 真机验收
+- [ ] chunklet 在线 ops：容量自动扩（`extend_ld`）、在线 RAID 容错/rebuild 透传、meta 设备读路径优化
 - [ ] 生产化：iSCSI 前端、HA（双控 active-standby）、Prometheus 监控
 - [ ] 高性能：NVMe-oF over RDMA
 

@@ -30,6 +30,7 @@ enabled = true
 devices = [
     "/dev/nvme0n1",
     "/dev/nvme1n1",
+    "/dev/nvme2n1",
     "/dev/nvme3n1",
     "/dev/nvme4n1",
     "/dev/nvme5n1",
@@ -60,16 +61,23 @@ spare_pct = 5
 lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 100, strip_kib = 4 }
 # LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable (24 chunklets).
 lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
-# metadb LD (created but unused until Phase 3) -> ~2 GiB (4 chunklets).
-meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 1, strip_kib = 0 }
-# Filled in after `chunklet-init --force` (re-init'd post-reboot on nvme1-9):
-lv3_ld_id = "95c825bd-c870-41d5-83ad-6e23d5d6dd16"
-lv2_ld_id = "93f79453-b215-4be3-9bec-f6e55fc10e6d"
-meta_ld_id = "31158fdb-5e38-4150-a4ad-a541b9691d5a"
+# metadb LD (Phase 3f: metadb now LIVES here). RAID10 2x mirror, 2-wide stripe,
+# 32 rows -> ~64 GiB usable (128 chunklets). Carve = 4 KiB superblock + 8 MiB
+# catalog A/B + 1 GiB journal ring + ~63 GiB page window (>> 64M-cuckoo ~9 GiB +
+# L2P/rc for a 256 GiB volume). Any single meta-LD member PD can fail without
+# taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
+meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
+# Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
+lv3_ld_id = "4d37ac47-d336-43e2-a51d-7475b2e3e89e"
+lv2_ld_id = "a0e6764b-1338-412c-89a5-062a7e253c37"
+meta_ld_id = "b4383ac7-1c82-4280-83a7-d923e75e4097"
 
 [meta]
+# Phase 3f: metadb persists on the chunklet meta LD (see [chunklet].meta_ld_id),
+# not the host FS. `path` is now only a diagnostic label; there is no
+# pages.onyx_meta / wal on disk. This retires the /mnt/onyx-meta XFS SPOF.
+backend = "chunklet"
 path = "/mnt/onyx-meta/metadb"
-wal_dir = "/mnt/onyx-meta/wal"
 block_cache_mb = 32768
 memtable_budget_mb = 8192
 index_pin_mb = 8192
