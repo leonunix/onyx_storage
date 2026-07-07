@@ -30,9 +30,12 @@
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use onyx_chunklet::ld::LogicalDisk;
+use onyx_chunklet::ChunkletError;
+use parking_lot::Mutex;
 
 use crate::error::OnyxResult;
 use crate::io::device::RawDevice;
@@ -320,6 +323,20 @@ pub fn slice_backend(
 /// `read_many_at` / `write_many_at` forward the whole batch to the LD so
 /// chunklet can parallelise it in one submit. `size` is the LD's
 /// `capacity_bytes` (already net of per-chunklet headers + parity).
+///
+/// # Stale-handle refresh on failover / rebuild
+///
+/// A `Pool::mark_pd_failed` (disk pull → PD-health watchdog) and a rebuild
+/// commit both bump the chunklet LD **runtime epoch**, which forces every
+/// handle opened at the old epoch to fail its next IO with a `handle is stale:
+/// runtime epoch advanced` invariant so reads switch to reconstruct and writes
+/// write-forward onto the surviving PDs. This backend is the single seam every
+/// LV2 commit-log write, LV3 data write, and meta IO funnels through (directly
+/// or via a [`BackendSlice`]), so it centralises the recovery: on that error it
+/// re-`open_ld`s the LD onto the new epoch, swaps the fresh handle into the
+/// [`ArcSwap`] cell, and retries — transparently to every caller. Before this,
+/// the LV2 sync writer spin-retried the same stale handle tens of thousands of
+/// times and wedged the flush path on a live disk pull (2026-07-06 box).
 pub struct ChunkletBackend {
     /// Swappable LD handle. `extend_ld` does NOT bump the runtime epoch, so the
     /// handle opened at startup keeps the OLD capacity forever; growing online
@@ -338,8 +355,16 @@ pub struct ChunkletBackend {
     /// Keeps the owning `Pool` alive for the backend's lifetime (the LD holds
     /// its member PD `Arc`s, but the Pool owns background/management state and
     /// is the handle the Phase-4 ops surface needs). `None` when the caller
-    /// manages the pool lifetime itself (tests).
+    /// manages the pool lifetime itself (tests). Also the handle
+    /// [`Self::reopen_after_stale`] re-`open_ld`s through on an epoch advance —
+    /// with no pool there is nothing to re-open against, so the stale error just
+    /// surfaces.
     pool: Option<Arc<onyx_chunklet::Pool>>,
+    /// Serialises stale-handle re-opens so a herd of concurrent IO threads all
+    /// hitting the same epoch advance re-`open_ld`s the LD once, not once per
+    /// thread. Threads that lose the race find the handle already swapped and
+    /// simply retry against it.
+    reopen_lock: Mutex<()>,
 }
 
 impl ChunkletBackend {
@@ -349,6 +374,7 @@ impl ChunkletBackend {
             ld: ArcSwap::from_pointee(ld),
             capacity: AtomicU64::new(capacity),
             pool: None,
+            reopen_lock: Mutex::new(()),
         }
     }
 
@@ -385,34 +411,112 @@ impl ChunkletBackend {
         self.ld.store(Arc::new(new_ld));
         self.capacity.store(new_cap, Ordering::Release);
     }
+
+    /// Max transparent handle refreshes for a single IO before the stale error
+    /// surfaces. A failover/rebuild epoch bump needs one refresh; the small
+    /// ceiling tolerates a couple of back-to-back bumps (a `mark_pd_failed`
+    /// immediately followed by a rebuild commit) without ever hot-spinning.
+    /// Past it the error propagates and the caller's own retry loop (e.g. the
+    /// LV2 sync loop's backoff) takes over.
+    const MAX_STALE_REFRESH: u32 = 32;
+
+    /// True for the "runtime epoch advanced" invariant chunklet raises when a
+    /// `mark_pd_failed` / rebuild-commit bumps the LD runtime epoch out from
+    /// under a handle opened at the old epoch. Deliberately NOT true for the
+    /// "LD was dropped" invariant (which shares the `handle is stale:` prefix) —
+    /// a dropped LD never comes back, so re-opening is pointless and the error
+    /// must surface.
+    fn is_epoch_advanced(err: &ChunkletError) -> bool {
+        matches!(err, ChunkletError::Invariant(msg) if msg.contains("runtime epoch advanced"))
+    }
+
+    /// Re-open the LD onto the current runtime epoch and swap the fresh handle
+    /// into the cell, so subsequent IO reconstructs off / write-forwards onto
+    /// the surviving PDs. Deduplicated via `reopen_lock`: only the first thread
+    /// to observe a given stale handle re-opens; a thread that finds the handle
+    /// already swapped (pointer changed) just returns so the caller retries
+    /// against the new handle. Capacity is unchanged by a failover/rebuild
+    /// (no rows added), so it is left as-is — the online-extend path owns
+    /// capacity growth via [`Self::swap_ld`].
+    fn reopen_after_stale(&self, failed: &Arc<dyn LogicalDisk>) -> OnyxResult<()> {
+        let Some(pool) = self.pool.as_ref() else {
+            // No owning Pool (a bare `new` test backend): nothing to re-open
+            // against, so let the original stale error surface to the caller.
+            return Ok(());
+        };
+        let _g = self.reopen_lock.lock();
+        // If another thread already installed a fresh handle, don't re-open
+        // again — the caller will retry against the newly-swapped handle.
+        let current = self.ld.load();
+        let current_ref: &Arc<dyn LogicalDisk> = &current;
+        if !Arc::ptr_eq(current_ref, failed) {
+            return Ok(());
+        }
+        let ld_id = failed.id();
+        let fresh = pool.open_ld(ld_id)?;
+        self.ld.store(Arc::new(fresh));
+        Ok(())
+    }
+
+    /// Run `op` against the current LD handle, transparently re-opening and
+    /// retrying on a stale-epoch error. This is the failover/rebuild handle
+    /// refresh that keeps the LV2 commit-log writer, LV3 writer, and meta IO
+    /// from spinning on a stale handle after a disk pull bumps the LD epoch.
+    fn with_stale_retry<T>(
+        &self,
+        mut op: impl FnMut(&Arc<dyn LogicalDisk>) -> Result<T, ChunkletError>,
+    ) -> OnyxResult<T> {
+        let mut refreshes = 0u32;
+        loop {
+            let guard = self.ld.load();
+            let ld: &Arc<dyn LogicalDisk> = &guard;
+            match op(ld) {
+                Ok(v) => return Ok(v),
+                Err(err) => {
+                    if Self::is_epoch_advanced(&err)
+                        && self.pool.is_some()
+                        && refreshes < Self::MAX_STALE_REFRESH
+                    {
+                        refreshes += 1;
+                        // Back off only AFTER the first refresh: a single
+                        // failover bump has already settled, so the common case
+                        // pays no sleep. Repeated staleness (an in-flight
+                        // rebuild still bumping) gets a small bounded backoff
+                        // instead of a hot spin.
+                        if refreshes > 1 {
+                            std::thread::sleep(Duration::from_millis(u64::from(refreshes).min(8)));
+                        }
+                        self.reopen_after_stale(ld)?;
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+    }
 }
 
 impl BlockBackend for ChunkletBackend {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
         // chunklet's argument order is (offset, buf); ours is (buf, offset).
-        self.ld.load().read_at(offset, buf)?;
-        Ok(())
+        self.with_stale_retry(|ld| ld.read_at(offset, buf))
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
-        self.ld.load().write_at(offset, buf)?;
-        Ok(())
+        self.with_stale_retry(|ld| ld.write_at(offset, buf))
     }
 
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> OnyxResult<()> {
         // Signature matches chunklet's `LogicalDisk::read_many_at` exactly.
-        self.ld.load().read_many_at(ops)?;
-        Ok(())
+        self.with_stale_retry(|ld| ld.read_many_at(ops))
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> OnyxResult<()> {
-        self.ld.load().write_many_at(ops)?;
-        Ok(())
+        self.with_stale_retry(|ld| ld.write_many_at(ops))
     }
 
     fn flush(&self) -> OnyxResult<()> {
-        self.ld.load().flush()?;
-        Ok(())
+        self.with_stale_retry(|ld| ld.flush())
     }
 
     fn size(&self) -> u64 {
@@ -591,5 +695,82 @@ mod tests {
     fn raw_device_stripe_blocks_is_one() {
         let (b, _tmp) = backend(64 * 1024);
         assert_eq!(b.stripe_blocks(), 1);
+    }
+
+    /// Regression for the 2026-07-06 box bug: a `mark_pd_failed` bumps the LD
+    /// runtime epoch, staling the handle the backend cached at open. Before the
+    /// refresh-on-stale fix, every subsequent write/flush on that handle failed
+    /// with `handle is stale: runtime epoch advanced` (the LV2 commit-log writer
+    /// spun 45k times and wedged the flush). With the fix the backend re-opens
+    /// the LD onto the new epoch transparently, so writes/reads keep succeeding
+    /// on the now-degraded (reconstruct) set.
+    #[test]
+    fn chunklet_backend_refreshes_handle_after_epoch_bump() {
+        use onyx_chunklet::io::RawDevice as CkRaw;
+        use onyx_chunklet::pool::LdSpec;
+        use onyx_chunklet::{Pool, PoolConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut raws = Vec::new();
+        for i in 0..5 {
+            let p = dir.path().join(format!("pd{i}"));
+            raws.push(CkRaw::open_or_create(&p, 4 << 30).unwrap());
+        }
+        let pool = Pool::create(
+            raws,
+            PoolConfig {
+                spare_pct: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // set_size = 3 + 2 = 5 => the single set spans all 5 PDs, so failing any
+        // member bumps this LD's epoch; RAID6 tolerates 2 failures, so 1 pulled
+        // PD leaves the set writable (write-forward) and readable (reconstruct).
+        let ld_id = pool.create_ld(LdSpec::raid6(3, 1, 1, 0)).unwrap();
+        let ld = pool.open_ld(ld_id).unwrap();
+        // `with_pool` is what wires the re-open path (a bare `new` backend has no
+        // pool to re-open against).
+        let backend = ChunkletBackend::with_pool(ld, pool.clone());
+
+        // Baseline: write + flush + read-back on the healthy set.
+        let payload: Vec<u8> = (0..(64 << 10)).map(|i| (i % 251) as u8).collect();
+        backend.write_at(&payload, 0).unwrap();
+        backend.flush().unwrap();
+        let mut got = vec![0u8; payload.len()];
+        backend.read_at(&mut got, 0).unwrap();
+        assert_eq!(got, payload);
+
+        // Fail a member PD -> bumps the LD runtime epoch, staling the handle the
+        // backend is holding.
+        let member_pd = pool.find_ld(ld_id).unwrap().members[0].pd;
+        pool.mark_pd_failed(member_pd).unwrap();
+
+        // These would each fail with a stale-handle invariant pre-fix; with the
+        // fix the backend re-opens onto the new (degraded) epoch and retries.
+        let payload2: Vec<u8> = (0..(64 << 10)).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        backend
+            .write_at(&payload2, 0)
+            .expect("write must refresh the stale handle, not error");
+        backend
+            .flush()
+            .expect("flush must refresh the stale handle, not error");
+        let mut got2 = vec![0u8; payload2.len()];
+        backend
+            .read_at(&mut got2, 0)
+            .expect("read must refresh the stale handle, not error");
+        assert_eq!(got2, payload2, "degraded reconstruct read must return the new data");
+
+        // A second failover bump is likewise absorbed (covers the mark_pd_failed
+        // -> rebuild-commit double bump).
+        let member_pd2 = pool.find_ld(ld_id).unwrap().members[1].pd;
+        if member_pd2 != member_pd {
+            pool.mark_pd_failed(member_pd2).unwrap();
+            let mut got3 = vec![0u8; payload2.len()];
+            backend
+                .read_at(&mut got3, 0)
+                .expect("read must survive a second epoch bump");
+            assert_eq!(got3, payload2);
+        }
     }
 }

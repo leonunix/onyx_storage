@@ -39,4 +39,20 @@ mod tests {
         assert!(!is_fatal_meta_failure("apply gate busy"));
         assert!(!is_fatal_meta_failure(""));
     }
+
+    /// Regression guard for the 2026-07-06 box bug: the EXACT chunklet member
+    /// EIO string that a meta-LD write produces must NOT classify as fatal, so a
+    /// single redundant-LD member fault (now absorbed by chunklet inline-degrade)
+    /// can never permanently fence metadb. If chunklet ever fails to absorb it,
+    /// this stays non-fatal so it only counts toward the N=3 consecutive budget
+    /// (giving fast isolation time to reopen degraded) rather than one-shot fence.
+    #[test]
+    fn chunklet_member_eio_is_not_fatal() {
+        assert!(!is_fatal_meta_failure(
+            "metadb checkpoint failed: io error: chunklet error: io: Input/output error (os error 5)"
+        ));
+        assert!(!is_fatal_meta_failure(
+            "io error: chunklet error: io: No space left on device (os error 28)"
+        ));
+    }
 }

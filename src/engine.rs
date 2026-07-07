@@ -58,6 +58,10 @@ pub struct OnyxEngine {
     /// chunklet backend and `[chunklet].watchdog_enabled`. Probes each live PD
     /// and auto-marks unresponsive ones Failed (and optionally auto-rebuilds).
     chunklet_watchdog: Mutex<Option<ChunkletWatchdog>>,
+    /// Inline-degrade fast-isolation reactor. `Some` whenever a chunklet backend
+    /// is live (independent of `watchdog_enabled`), because inline-degrade
+    /// correctness depends on absorbed-write suspects being isolated promptly.
+    chunklet_isolation: Mutex<Option<crate::chunklet_isolation::ChunkletIsolationReactor>>,
     heartbeat_writer: Mutex<Option<HeartbeatWriter>>,
     /// Background thread that periodically syncs metadata, then advances
     /// the buffer pool's `durable_seq` watermark so ring reclaim can safely
@@ -270,6 +274,24 @@ impl OnyxEngine {
                 fail_threshold: config.chunklet.watchdog_fail_threshold.max(1),
                 auto_failover: config.chunklet.auto_failover,
             },
+        ))
+    }
+
+    /// Start the inline-degrade fast-isolation reactor whenever a chunklet pool
+    /// is live. Unlike the watchdog this is NOT gated on `watchdog_enabled`:
+    /// chunklet's RAID writes now ride through a member EIO on surviving
+    /// redundancy, and that ride-through is only safe if the failed member is
+    /// isolated promptly (epoch bump → degraded reopen). The reactor is the
+    /// consumer of `Pool::suspect_events` that performs that isolation.
+    /// `None` on the RawDevice / meta-only path (no pool to react to).
+    fn build_chunklet_isolation(
+        chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
+        config: &OnyxConfig,
+    ) -> Option<crate::chunklet_isolation::ChunkletIsolationReactor> {
+        let pool = chunklet_pool.as_ref()?.clone();
+        Some(crate::chunklet_isolation::ChunkletIsolationReactor::start(
+            pool,
+            config.chunklet.auto_failover,
         ))
     }
 
@@ -980,6 +1002,7 @@ impl OnyxEngine {
         );
 
         let chunklet_watchdog = Self::build_chunklet_watchdog(&chunklet_pool, config);
+        let chunklet_isolation = Self::build_chunklet_isolation(&chunklet_pool, config);
 
         Ok(Self {
             meta,
@@ -990,6 +1013,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             chunklet_watchdog: Mutex::new(chunklet_watchdog),
+            chunklet_isolation: Mutex::new(chunklet_isolation),
             heartbeat_writer: Mutex::new(heartbeat_writer),
             durability_watermark: Mutex::new(Some(watermark)),
             lineage_drain: Mutex::new(Some(lineage_drain)),
@@ -1037,6 +1061,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(None),
             dedup_scanner: Mutex::new(None),
             chunklet_watchdog: Mutex::new(None),
+            chunklet_isolation: Mutex::new(None),
             heartbeat_writer: Mutex::new(None),
             durability_watermark: Mutex::new(None),
             lineage_drain: Mutex::new(None),
@@ -1474,6 +1499,12 @@ impl OnyxEngine {
         if let Some(mut wd) = self.chunklet_watchdog.lock().unwrap().take() {
             wd.stop();
         }
+        // Stop the inline-degrade isolation reactor alongside the watchdog — it
+        // likewise only marks PDs failed + spawns rebuild jobs, so quiescing it
+        // early avoids a fresh isolation/failover racing shutdown.
+        if let Some(mut r) = self.chunklet_isolation.lock().unwrap().take() {
+            r.stop();
+        }
 
         // Stop heartbeat writer first
         if let Some(mut hb) = self.heartbeat_writer.lock().unwrap().take() {
@@ -1780,6 +1811,7 @@ impl OnyxEngine {
         );
 
         let chunklet_watchdog = Self::build_chunklet_watchdog(&chunklet_pool, config);
+        let chunklet_isolation = Self::build_chunklet_isolation(&chunklet_pool, config);
 
         Ok(Self {
             meta,
@@ -1790,6 +1822,7 @@ impl OnyxEngine {
             gc_runner: Mutex::new(gc_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             chunklet_watchdog: Mutex::new(chunklet_watchdog),
+            chunklet_isolation: Mutex::new(chunklet_isolation),
             heartbeat_writer: Mutex::new(heartbeat_writer),
             durability_watermark: Mutex::new(Some(watermark)),
             lineage_drain: Mutex::new(Some(lineage_drain)),
