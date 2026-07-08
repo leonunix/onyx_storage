@@ -39,11 +39,33 @@ use onyx_chunklet::{PdId, Pool};
 /// interval is rounded up to a whole number of these ticks.
 const STOP_CHECK_TICK: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WatchdogConfig {
     pub interval: Duration,
     pub fail_threshold: u32,
     pub auto_failover: bool,
+    /// Scan `device_glob` each sweep for a returned disk (Failed tombstone's
+    /// superblock present again) and auto-start a `reintegrate_wipe` job.
+    pub auto_reintegrate: bool,
+    /// After a reintegrate/failover leaves per-PD used-skew above target, kick a
+    /// bounded online `rebalance` job (event-driven, thrash-free).
+    pub auto_rebalance: bool,
+    pub rebalance_target_skew_pct: f64,
+    pub rebalance_max_moves: usize,
+    /// Content-addressed candidate device glob (e.g. `/dev/nvme*n*`). Required
+    /// for `auto_reintegrate` to find a returned disk by pool_id.
+    pub device_glob: Option<String>,
+}
+
+/// Mutable per-loop state threaded through each `sweep`.
+#[derive(Default)]
+struct SweepState {
+    /// Per-PD consecutive failed-probe counter.
+    misses: HashMap<PdId, u32>,
+    /// Set true when this loop starts an auto-failover or auto-reintegrate job
+    /// (both raise per-PD skew); consumed by the auto-rebalance trigger once the
+    /// pool is quiescent again. Event-driven so a stuck pool never re-thrashes.
+    pending_rebalance: bool,
 }
 
 /// Background PD-health watchdog thread handle.
@@ -58,14 +80,25 @@ impl ChunkletWatchdog {
     pub fn start(pool: Arc<Pool>, cfg: WatchdogConfig) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        // Snapshot the log fields before `cfg` moves into the worker closure
+        // (WatchdogConfig is Clone, not Copy).
+        let (interval_ms, fail_threshold, auto_failover, auto_reintegrate, auto_rebalance) = (
+            cfg.interval.as_millis() as u64,
+            cfg.fail_threshold,
+            cfg.auto_failover,
+            cfg.auto_reintegrate,
+            cfg.auto_rebalance,
+        );
         let handle = thread::Builder::new()
             .name("ck-watchdog".into())
             .spawn(move || run_loop(&pool, cfg, &running_clone))
             .expect("failed to spawn chunklet watchdog thread");
         tracing::info!(
-            interval_ms = cfg.interval.as_millis() as u64,
-            fail_threshold = cfg.fail_threshold,
-            auto_failover = cfg.auto_failover,
+            interval_ms,
+            fail_threshold,
+            auto_failover,
+            auto_reintegrate,
+            auto_rebalance,
             "chunklet PD health watchdog started"
         );
         Self {
@@ -123,16 +156,25 @@ mod tests {
 }
 
 fn run_loop(pool: &Arc<Pool>, cfg: WatchdogConfig, running: &AtomicBool) {
-    // Per-PD consecutive failed-probe counter. Reset on a healthy probe and
-    // once a PD is successfully marked Failed (so it stops being probed).
-    let mut misses: HashMap<PdId, u32> = HashMap::new();
-
+    let mut state = SweepState::default();
     while sleep_interruptible(cfg.interval, running) {
-        sweep(pool, cfg, &mut misses);
+        sweep(pool, &cfg, &mut state);
     }
 }
 
-fn sweep(pool: &Arc<Pool>, cfg: WatchdogConfig, misses: &mut HashMap<PdId, u32>) {
+fn sweep(pool: &Arc<Pool>, cfg: &WatchdogConfig, state: &mut SweepState) {
+    detect_failures(pool, cfg, state);
+    if cfg.auto_reintegrate {
+        auto_reintegrate(pool, cfg, state);
+    }
+    if cfg.auto_rebalance {
+        auto_rebalance(pool, cfg, state);
+    }
+}
+
+/// Probe every non-Failed PD; mark one Failed after `fail_threshold` consecutive
+/// misses and (if `auto_failover`) kick an `auto_recover` rebuild job.
+fn detect_failures(pool: &Arc<Pool>, cfg: &WatchdogConfig, state: &mut SweepState) {
     // PDs the pool already considers Failed are skipped (and their counters
     // cleared) — no point probing a disk we already gave up on.
     let already_failed: std::collections::HashSet<PdId> = pool.failed_pds().into_iter().collect();
@@ -140,24 +182,24 @@ fn sweep(pool: &Arc<Pool>, cfg: WatchdogConfig, misses: &mut HashMap<PdId, u32>)
     for info in pool.list_pds() {
         let pd_id = info.pd_id;
         if already_failed.contains(&pd_id) {
-            misses.remove(&pd_id);
+            state.misses.remove(&pd_id);
             continue;
         }
         // Belt-and-suspenders: skip if health already reads Failed even if it
         // isn't in the snapshot above (race with a manual mark).
         if pool.pd_health(pd_id) == Some(PdHealth::Failed) {
-            misses.remove(&pd_id);
+            state.misses.remove(&pd_id);
             continue;
         }
 
         // `None` (no live handle) is treated as a miss, same as a failed read.
         let alive = pool.probe_pd_liveness(pd_id).unwrap_or(false);
         if alive {
-            misses.remove(&pd_id);
+            state.misses.remove(&pd_id);
             continue;
         }
 
-        let n = misses.entry(pd_id).or_insert(0);
+        let n = state.misses.entry(pd_id).or_insert(0);
         *n += 1;
         tracing::warn!(
             pd = %pd_id,
@@ -174,16 +216,21 @@ fn sweep(pool: &Arc<Pool>, cfg: WatchdogConfig, misses: &mut HashMap<PdId, u32>)
         // the survivors), so this succeeds even when the disk is truly gone.
         match pool.mark_pd_failed(pd_id) {
             Ok(()) => {
-                misses.remove(&pd_id);
+                state.misses.remove(&pd_id);
                 tracing::error!(pd = %pd_id, "chunklet watchdog: PD marked Failed after repeated probe failures");
                 if cfg.auto_failover {
                     let pool_arc = pool.clone();
                     match crate::chunklet_ops::start_auto_failover(&pool_arc, &pd_id.to_string()) {
-                        Ok(job) => tracing::warn!(
-                            pd = %pd_id,
-                            job,
-                            "chunklet watchdog: auto-failover rebuild job started"
-                        ),
+                        Ok(job) => {
+                            // Failover moves the failed member's data onto spares
+                            // on surviving PDs → skew rises; queue a rebalance.
+                            state.pending_rebalance = true;
+                            tracing::warn!(
+                                pd = %pd_id,
+                                job,
+                                "chunklet watchdog: auto-failover rebuild job started"
+                            )
+                        }
                         Err(e) => tracing::error!(
                             pd = %pd_id,
                             error = %e,
@@ -200,4 +247,90 @@ fn sweep(pool: &Arc<Pool>, cfg: WatchdogConfig, misses: &mut HashMap<PdId, u32>)
             ),
         }
     }
+}
+
+/// Scan `device_glob` for a returned disk (a Failed tombstone's superblock
+/// present again) and auto-start a `reintegrate_wipe` job for each — but never a
+/// second job for a device already being reintegrated (idempotent; a successful
+/// reintegrate clears the tombstone so it won't re-fire).
+fn auto_reintegrate(pool: &Arc<Pool>, cfg: &WatchdogConfig, state: &mut SweepState) {
+    let Some(glob) = &cfg.device_glob else {
+        return;
+    };
+    let failed: std::collections::HashSet<PdId> = pool.failed_pds().into_iter().collect();
+    if failed.is_empty() {
+        return;
+    }
+    let in_flight: std::collections::HashSet<String> = crate::chunklet_ops::all_jobs()
+        .into_iter()
+        .filter(|j| j.kind == "reintegrate" && j.state == "running")
+        .map(|j| j.ld_id)
+        .collect();
+
+    for (path, old_pd) in crate::chunklet_pool::find_returned_pool_disks(glob, pool.id(), &failed) {
+        let path_str = path.display().to_string();
+        if in_flight.contains(&path_str) {
+            continue;
+        }
+        match crate::chunklet_ops::start_reintegrate(pool, &path_str) {
+            Ok(job) => {
+                // The reintegrated disk rejoins empty → skew rises; queue a
+                // rebalance for once the job (and the pool) is quiescent.
+                state.pending_rebalance = true;
+                tracing::warn!(pd = %old_pd, device = %path_str, job, "chunklet watchdog: auto-reintegrate started");
+            }
+            Err(e) => tracing::error!(
+                device = %path_str,
+                error = %e,
+                "chunklet watchdog: failed to start auto-reintegrate"
+            ),
+        }
+    }
+}
+
+/// Event-driven auto-rebalance: only after a skew-raising event
+/// (`pending_rebalance`) and once no chunklet job is in flight. Fires at most
+/// one bounded cycle per event, so a stuck/partially-converged pool never
+/// thrashes — the flag is cleared whether we start a cycle or find skew already
+/// within target.
+fn auto_rebalance(pool: &Arc<Pool>, cfg: &WatchdogConfig, state: &mut SweepState) {
+    if !state.pending_rebalance || any_chunklet_job_running() {
+        return;
+    }
+    match pool.metrics() {
+        Ok(m) if m.used_skew_pct > cfg.rebalance_target_skew_pct => {
+            match crate::chunklet_ops::start_rebalance(
+                pool,
+                cfg.rebalance_target_skew_pct,
+                cfg.rebalance_max_moves,
+            ) {
+                Ok(job) => {
+                    state.pending_rebalance = false;
+                    tracing::warn!(
+                        job,
+                        skew_pct = m.used_skew_pct,
+                        "chunklet watchdog: auto-rebalance started"
+                    );
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "chunklet watchdog: failed to start auto-rebalance"
+                ),
+            }
+        }
+        Ok(_) => {
+            // Skew already within target (e.g. failover landed balanced) — done.
+            state.pending_rebalance = false;
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "chunklet watchdog: metrics unavailable, will retry auto-rebalance next sweep"
+        ),
+    }
+}
+
+fn any_chunklet_job_running() -> bool {
+    crate::chunklet_ops::all_jobs()
+        .iter()
+        .any(|j| j.state == "running")
 }

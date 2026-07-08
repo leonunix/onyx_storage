@@ -162,6 +162,42 @@ enum ChunkletOp {
         /// Additional chunklet rows to add
         rows: u16,
     },
+    /// Reintegrate a physically-returned disk: wipe it and re-admit it under a
+    /// fresh id reusing the failed slot (safety-gated). Prints a job id to poll
+    Reintegrate {
+        /// Raw device path of the returned disk (e.g. /dev/nvme3n1)
+        device: String,
+    },
+    /// Rebalance data across PDs until per-PD used-skew converges; online +
+    /// bounded. Prints a job id to poll
+    Rebalance {
+        /// Stop once worst-case per-PD used-skew is within this percent (default 20)
+        #[arg(long, default_value_t = 20.0)]
+        target_skew_pct: f64,
+        /// Hard cap on committed moves this run (default 256)
+        #[arg(long, default_value_t = 256)]
+        max_moves: usize,
+    },
+    /// Reclaim `Used`-but-unreferenced chunklets pool-wide (returned-disk /
+    /// drop-ld leftovers); skips if the pool is incomplete. Prints a job id
+    Fsck,
+    /// Drain a PD: migrate every member off it onto spares so it can be pulled.
+    /// Prints a job id to poll
+    Drain {
+        /// Target PD id
+        pd_id: String,
+    },
+    /// Retire a gone-for-good failed PD: drop its tombstone + shrink the pool
+    /// (re-denses seqs). The disk must be Failed, absent, and unreferenced
+    RetireFailed {
+        /// Target PD id
+        pd_id: String,
+    },
+    /// Clear a PD's Failed flag (e.g. after a transient fault cleared)
+    ClearFailed {
+        /// Target PD id
+        pd_id: String,
+    },
 }
 
 fn parse_compression(s: &str) -> CompressionAlgo {
@@ -628,10 +664,24 @@ fn main() -> anyhow::Result<()> {
                     None => "chunklet-job".to_string(),
                 },
                 ChunkletOp::Extend { role, rows } => format!("chunklet-extend {role} {rows}"),
+                ChunkletOp::Reintegrate { device } => format!("chunklet-reintegrate {device}"),
+                ChunkletOp::Rebalance {
+                    target_skew_pct,
+                    max_moves,
+                } => format!("chunklet-rebalance {target_skew_pct} {max_moves}"),
+                ChunkletOp::Fsck => "chunklet-fsck".to_string(),
+                ChunkletOp::Drain { pd_id } => format!("chunklet-drain {pd_id}"),
+                ChunkletOp::RetireFailed { pd_id } => format!("chunklet-retire-failed {pd_id}"),
+                ChunkletOp::ClearFailed { pd_id } => format!("chunklet-clear-failed {pd_id}"),
             };
             let lines = service::send_chunklet_command(sock, &cmd)?;
             match &op {
-                ChunkletOp::Scrub { .. } | ChunkletOp::Rebuild { .. } => {
+                ChunkletOp::Scrub { .. }
+                | ChunkletOp::Rebuild { .. }
+                | ChunkletOp::Reintegrate { .. }
+                | ChunkletOp::Rebalance { .. }
+                | ChunkletOp::Fsck
+                | ChunkletOp::Drain { .. } => {
                     // Reply is `ok <job_id>`.
                     let job_id = lines
                         .iter()

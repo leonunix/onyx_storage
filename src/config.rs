@@ -990,6 +990,30 @@ pub struct ChunkletConfig {
     /// path.
     #[serde(default = "default_true")]
     pub tolerant_open: bool,
+    /// Full-auto returned-disk reintegration: the watchdog scans `device_glob`
+    /// each sweep for a disk whose superblock carries this pool_id and a Failed
+    /// tombstone's pd_id (a returned disk), and starts a `reintegrate_wipe` job
+    /// automatically (safety-gated in chunklet). Default `true`; inert unless
+    /// `watchdog_enabled` + a `device_glob` are set. Idempotent — a disk already
+    /// being reintegrated is not re-kicked.
+    #[serde(default = "default_true")]
+    pub auto_reintegrate: bool,
+    /// Full-auto data rebalance: after a reintegrate/failover leaves per-PD
+    /// used-skew above `rebalance_target_skew_pct`, the watchdog kicks a bounded
+    /// online `rebalance` job (write-forward keeps foreground IO flowing).
+    /// Default `true`; inert unless `watchdog_enabled`. Event-driven (fires once
+    /// per skew-raising event, never thrashes on a stuck pool).
+    #[serde(default = "default_true")]
+    pub auto_rebalance: bool,
+    /// Target worst-case per-PD used-skew percent for auto/manual rebalance
+    /// (default 20).
+    #[serde(default = "default_rebalance_target_skew_pct")]
+    pub rebalance_target_skew_pct: f64,
+    /// Hard cap on committed moves per auto-rebalance cycle (bounded work;
+    /// default 256). A cycle that hits the cap simply leaves the rest for the
+    /// next skew-raising event.
+    #[serde(default = "default_rebalance_max_moves")]
+    pub rebalance_max_moves_per_cycle: usize,
 }
 
 fn default_true() -> bool {
@@ -1016,8 +1040,20 @@ impl Default for ChunkletConfig {
             device_discovery: true,
             device_glob: None,
             tolerant_open: true,
+            auto_reintegrate: true,
+            auto_rebalance: true,
+            rebalance_target_skew_pct: default_rebalance_target_skew_pct(),
+            rebalance_max_moves_per_cycle: default_rebalance_max_moves(),
         }
     }
+}
+
+fn default_rebalance_target_skew_pct() -> f64 {
+    20.0
+}
+
+fn default_rebalance_max_moves() -> usize {
+    256
 }
 
 fn default_chunklet_spare_pct() -> u8 {

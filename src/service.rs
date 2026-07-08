@@ -1100,6 +1100,107 @@ impl ServiceController {
                     let _ = stream.flush();
                 }
 
+                // Pool-wide / PD-lifecycle background ops. All hold chunklet
+                // locks for a while (rebalance/fsck take manifest_lock per
+                // step; reintegrate/drain run rebuild_ld) → spawn a job and
+                // return its id immediately, poll via `chunklet-job`.
+                "chunklet-fsck" | "chunklet-rebalance" | "chunklet-reintegrate"
+                | "chunklet-drain" => {
+                    require_engine!(engine, stream);
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.chunklet_pool() {
+                        Some(pool) => {
+                            let res: Result<u64, _> = match parts[0] {
+                                "chunklet-fsck" => crate::chunklet_ops::start_fsck(&pool),
+                                "chunklet-rebalance" => {
+                                    // optional: <target_skew_pct> <max_moves>
+                                    let target = parts
+                                        .get(1)
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(20.0);
+                                    let max_moves = parts
+                                        .get(2)
+                                        .and_then(|s| s.parse::<usize>().ok())
+                                        .unwrap_or(256);
+                                    crate::chunklet_ops::start_rebalance(&pool, target, max_moves)
+                                }
+                                "chunklet-reintegrate" => {
+                                    if parts.len() < 2 {
+                                        let _ = stream.write_all(
+                                            b"error: usage: chunklet-reintegrate <device_path>\n",
+                                        );
+                                        let _ = stream.flush();
+                                        continue;
+                                    }
+                                    crate::chunklet_ops::start_reintegrate(&pool, parts[1])
+                                }
+                                _ /* chunklet-drain */ => {
+                                    if parts.len() < 2 {
+                                        let _ = stream
+                                            .write_all(b"error: usage: chunklet-drain <pd_id>\n");
+                                        let _ = stream.flush();
+                                        continue;
+                                    }
+                                    crate::chunklet_ops::start_drain(&pool, parts[1])
+                                }
+                            };
+                            match res {
+                                Ok(job_id) => {
+                                    let _ =
+                                        stream.write_all(format!("ok {}\n", job_id).as_bytes());
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = stream.write_all(b"error: chunklet backend not enabled\n");
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                // Fast PD bookkeeping ops (single manifest commit each) → inline.
+                "chunklet-retire-failed" | "chunklet-clear-failed" => {
+                    require_engine!(engine, stream);
+                    if parts.len() < 2 {
+                        let _ = stream
+                            .write_all(format!("error: usage: {} <pd_id>\n", parts[0]).as_bytes());
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let eng = opt.as_ref().unwrap();
+                    match eng.chunklet_pool() {
+                        Some(pool) => {
+                            let res = onyx_chunklet::ops::parse_pd_id(parts[1]).and_then(|pd_id| {
+                                if parts[0] == "chunklet-retire-failed" {
+                                    pool.retire_failed_pd(pd_id)
+                                } else {
+                                    pool.clear_pd_failed(pd_id)
+                                }
+                            });
+                            match res {
+                                Ok(()) => {
+                                    let _ = stream.write_all(b"ok\n");
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = stream.write_all(b"error: chunklet backend not enabled\n");
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+
                 _ => {
                     let _ = stream.write_all(b"error: unknown command\n");
                     let _ = stream.flush();

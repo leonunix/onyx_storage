@@ -18,11 +18,14 @@
 //! field through every `OnyxEngine` constructor.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 
+use onyx_chunklet::io::RawDevice as CkRawDevice;
+use onyx_chunklet::pool::RebalanceOptions;
 use onyx_chunklet::Pool;
 
 use crate::error::{OnyxError, OnyxResult};
@@ -31,9 +34,11 @@ use crate::error::{OnyxError, OnyxResult};
 #[derive(Clone, Debug, Serialize)]
 pub struct ChunkletJobView {
     pub id: u64,
-    /// "rebuild" | "scrub".
+    /// "rebuild" | "scrub" | "auto-failover" | "rebalance" | "reintegrate" |
+    /// "fsck" | "drain".
     pub kind: String,
-    /// LD id string the op targets.
+    /// The op's target label: an LD id (rebuild/scrub), a PD id (drain), a
+    /// device path (reintegrate), or "*" for pool-wide ops (rebalance/fsck).
     pub ld_id: String,
     /// "running" | "done" | "error".
     pub state: String,
@@ -148,6 +153,126 @@ pub fn start_auto_failover(pool: &Arc<Pool>, pd_label: &str) -> OnyxResult<u64> 
                 failed = report.failed,
                 "chunklet auto-failover job finished"
             );
+        })
+        .map_err(OnyxError::Io)?;
+    Ok(id)
+}
+
+/// Spawn a background online data rebalance: migrate members from over-full to
+/// under-full PDs until per-PD used-skew is within `target_skew_pct` or
+/// `max_moves` moves land. Online (write-forward keeps foreground IO flowing),
+/// bounded, one move at a time. Returns the job id to poll.
+pub fn start_rebalance(pool: &Arc<Pool>, target_skew_pct: f64, max_moves: usize) -> OnyxResult<u64> {
+    let id = insert_running("rebalance", "*");
+    let pool = pool.clone();
+    std::thread::Builder::new()
+        .name(format!("ck-rebalance-{id}"))
+        .spawn(move || {
+            let opts = RebalanceOptions {
+                target_skew_pct,
+                max_moves,
+            };
+            match pool.rebalance(opts) {
+                Ok(r) => finish(
+                    id,
+                    if r.stuck { "error" } else { "done" },
+                    format!(
+                        "moves={} skew_before={} skew_after={} converged={} stuck={}",
+                        r.moves_committed, r.skew_before, r.skew_after, r.converged, r.stuck
+                    ),
+                ),
+                Err(e) => finish(id, "error", e.to_string()),
+            }
+            tracing::info!(job = id, "chunklet rebalance job finished");
+        })
+        .map_err(OnyxError::Io)?;
+    Ok(id)
+}
+
+/// Spawn a background returned-disk reintegration (Wipe strategy): wipe the disk
+/// at `device_path` and re-admit it under a fresh PdId that reuses the failed
+/// tombstone's pool slot. The safety gate (never wipe a still-referenced disk)
+/// lives in `Pool::reintegrate_wipe`. Returns the job id to poll. The device is
+/// opened on the worker so a bad path fails inside the job, not on the handler.
+pub fn start_reintegrate(pool: &Arc<Pool>, device_path: &str) -> OnyxResult<u64> {
+    let path = PathBuf::from(device_path);
+    let id = insert_running("reintegrate", device_path);
+    let pool = pool.clone();
+    std::thread::Builder::new()
+        .name(format!("ck-reintegrate-{id}"))
+        .spawn(move || {
+            let result = CkRawDevice::open(&path)
+                .map_err(OnyxError::from)
+                .and_then(|raw| pool.reintegrate_wipe(raw).map_err(OnyxError::from));
+            match result {
+                Ok(r) => finish(
+                    id,
+                    "done",
+                    format!(
+                        "new_pd={} replaced={} reused_seq={} rebuilt_lds={} was_referenced={}",
+                        r.new_pd_id,
+                        r.replaced_pd_id,
+                        r.reused_seq,
+                        r.rebuilt_lds.len(),
+                        r.referenced_members_blocking
+                    ),
+                ),
+                Err(e) => finish(id, "error", e.to_string()),
+            }
+            tracing::info!(job = id, "chunklet reintegrate job finished");
+        })
+        .map_err(OnyxError::Io)?;
+    Ok(id)
+}
+
+/// Spawn a background whole-pool fsck: reclaim `Used`-but-unreferenced chunklets
+/// (returned-disk / drop-ld half-commit leftovers). Skips if the pool is
+/// incomplete. Returns the job id to poll.
+pub fn start_fsck(pool: &Arc<Pool>) -> OnyxResult<u64> {
+    let id = insert_running("fsck", "*");
+    let pool = pool.clone();
+    std::thread::Builder::new()
+        .name(format!("ck-fsck-{id}"))
+        .spawn(move || {
+            match pool.fsck() {
+                Ok(r) => finish(
+                    id,
+                    "done",
+                    format!(
+                        "reclaimed={} scanned_pds={} skipped_incomplete={}",
+                        r.total_reclaimed, r.scanned_pds, r.skipped_incomplete
+                    ),
+                ),
+                Err(e) => finish(id, "error", e.to_string()),
+            }
+            tracing::info!(job = id, "chunklet fsck job finished");
+        })
+        .map_err(OnyxError::Io)?;
+    Ok(id)
+}
+
+/// Spawn a background drain of `pd_id`: migrate every member off it onto spares
+/// so the disk can be removed. Returns the job id to poll.
+pub fn start_drain(pool: &Arc<Pool>, pd: &str) -> OnyxResult<u64> {
+    let pd_id = onyx_chunklet::ops::parse_pd_id(pd)?;
+    let id = insert_running("drain", pd);
+    let pool = pool.clone();
+    std::thread::Builder::new()
+        .name(format!("ck-drain-{id}"))
+        .spawn(move || {
+            match pool.drain_pd(pd_id) {
+                Ok(r) => finish(
+                    id,
+                    "done",
+                    format!(
+                        "lds_affected={} members_migrated={}",
+                        r.lds_affected.len(),
+                        r.members_migrated
+                    ),
+                ),
+                Err(e) => finish(id, "error", e.to_string()),
+            }
+            tracing::info!(job = id, "chunklet drain job finished");
         })
         .map_err(OnyxError::Io)?;
     Ok(id)

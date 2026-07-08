@@ -273,6 +273,11 @@ impl OnyxEngine {
                 ),
                 fail_threshold: config.chunklet.watchdog_fail_threshold.max(1),
                 auto_failover: config.chunklet.auto_failover,
+                auto_reintegrate: config.chunklet.auto_reintegrate,
+                auto_rebalance: config.chunklet.auto_rebalance,
+                rebalance_target_skew_pct: config.chunklet.rebalance_target_skew_pct,
+                rebalance_max_moves: config.chunklet.rebalance_max_moves_per_cycle,
+                device_glob: config.chunklet.device_glob.clone(),
             },
         ))
     }

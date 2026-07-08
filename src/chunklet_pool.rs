@@ -122,6 +122,30 @@ pub fn discover_pool_devices(cfg: &ChunkletConfig) -> OnyxResult<Vec<PathBuf>> {
     }
 }
 
+/// Scan `device_glob` for physically-returned pool disks: devices whose on-disk
+/// superblock carries `pool_id` and a pd_id in `failed` (a Failed tombstone).
+/// The watchdog's auto-reintegrate uses this to spot a disk that came back under
+/// a new `/dev/nvmeXnY` name. Returns `(path, old_pd_id)` pairs; devices that
+/// can't be opened/probed are silently skipped.
+pub fn find_returned_pool_disks(
+    device_glob: &str,
+    pool_id: onyx_chunklet::types::PoolId,
+    failed: &std::collections::HashSet<onyx_chunklet::types::PdId>,
+) -> Vec<(PathBuf, onyx_chunklet::types::PdId)> {
+    let mut out = Vec::new();
+    for p in glob_dev(device_glob) {
+        let Ok(raw) = CkRawDevice::open(&p) else {
+            continue;
+        };
+        if let Ok(Some((pid, pd_id))) = ops::probe_pool_and_pd_id(&raw) {
+            if pid == pool_id && failed.contains(&pd_id) {
+                out.push((p, pd_id));
+            }
+        }
+    }
+    out
+}
+
 fn open_raws_all(paths: &[PathBuf]) -> OnyxResult<Vec<CkRawDevice>> {
     let mut raws = Vec::with_capacity(paths.len());
     for p in paths {
@@ -395,6 +419,29 @@ mod tests {
 
         let pool2 = open_pool(&discover_cfg).unwrap();
         assert_eq!(pool2.pd_count(), 8);
+    }
+
+    /// The auto-reintegrate detector finds exactly the Failed tombstone's device
+    /// (by pool_id + pd_id), and nothing else in the glob.
+    #[test]
+    fn find_returned_pool_disks_matches_failed_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = init_cfg(dir.path(), 8);
+        let (pool, ..) = init_pool(&cfg).unwrap();
+        let victim = pool.list_pds()[3].pd_id;
+        pool.mark_pd_failed(victim).unwrap();
+        let failed: std::collections::HashSet<_> = pool.failed_pds().into_iter().collect();
+        assert!(failed.contains(&victim));
+
+        let glob = format!("{}/pd*", dir.path().display());
+        let found = find_returned_pool_disks(&glob, pool.id(), &failed);
+        assert_eq!(found.len(), 1, "only the failed tombstone's device matches");
+        assert_eq!(found[0].1, victim, "detector recovers the old pd_id");
+
+        // A healthy pool (no tombstones) matches nothing.
+        pool.clear_pd_failed(victim).unwrap();
+        let none = find_returned_pool_disks(&glob, pool.id(), &std::collections::HashSet::new());
+        assert!(none.is_empty(), "no Failed tombstones → no returned disks");
     }
 
     /// Tolerant open starts the engine degraded when one PD is absent at boot.
