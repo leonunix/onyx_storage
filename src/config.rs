@@ -967,6 +967,29 @@ pub struct ChunkletConfig {
     /// starved. (The old whole-op write lock that made this unsafe is gone.)
     #[serde(default = "default_true")]
     pub auto_failover: bool,
+    /// Content-addressed device discovery: scan `device_glob` and select the
+    /// pool's PDs by the on-disk pool_id in their superblocks, not by their
+    /// `/dev/nvmeXnY` path. Robust to NVMe re-enumeration across reboots /
+    /// hot-plug (a returned disk reappears under a new name). Default `true`;
+    /// `devices` is always the seed/fallback set. When off, `devices` is used
+    /// verbatim (legacy behavior).
+    #[serde(default = "default_true")]
+    pub device_discovery: bool,
+    /// Glob of candidate raw devices to probe for this pool (e.g.
+    /// `/dev/nvme*n*`). Only used when `device_discovery` is on: a single
+    /// directory + a `*`-wildcard filename pattern. Matched paths are probed
+    /// and the majority-pool_id set is kept.
+    #[serde(default)]
+    pub device_glob: Option<String>,
+    /// Tolerant open: if a strict open fails because a PD is missing, retry with
+    /// `Pool::open_with_missing` so the engine starts degraded (reads reconstruct
+    /// from redundancy; the missing member is rebuilt/reintegrated online).
+    /// Default `true` — full-auto operation must survive a single absent disk at
+    /// boot. A complete pool always opens strict (which also reverse-reconciles
+    /// stale capacity); only a genuinely-incomplete set falls to the degraded
+    /// path.
+    #[serde(default = "default_true")]
+    pub tolerant_open: bool,
 }
 
 fn default_true() -> bool {
@@ -990,6 +1013,9 @@ impl Default for ChunkletConfig {
             watchdog_interval_secs: default_watchdog_interval_secs(),
             watchdog_fail_threshold: default_watchdog_fail_threshold(),
             auto_failover: true,
+            device_discovery: true,
+            device_glob: None,
+            tolerant_open: true,
         }
     }
 }

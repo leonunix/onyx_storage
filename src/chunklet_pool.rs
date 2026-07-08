@@ -6,10 +6,12 @@
 //! in one module means the engine startup (step-0) and the `chunklet-init` CLI
 //! share exactly one open/create/resolve path.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use onyx_chunklet::io::{IoBackendKind, RawDevice as CkRawDevice};
 use onyx_chunklet::ld::LogicalDisk;
+use onyx_chunklet::ops;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::LdId;
 use onyx_chunklet::{Pool, PoolConfig};
@@ -53,13 +55,152 @@ fn open_raw_devices(cfg: &ChunkletConfig) -> OnyxResult<Vec<CkRawDevice>> {
     Ok(raws)
 }
 
-/// Open an existing pool (engine startup). All PDs must already carry a pool
-/// superblock from a prior `chunklet-init`.
+/// Open an existing pool (engine startup). Resolves the pool's PDs by on-disk
+/// identity (`discover_pool_devices`, robust to `/dev/nvmeXnY` re-enumeration)
+/// and, when `tolerant_open` is set, starts degraded if a PD is missing rather
+/// than refusing to boot.
 pub fn open_pool(cfg: &ChunkletConfig) -> OnyxResult<Arc<Pool>> {
-    let raws = open_raw_devices(cfg)?;
-    let pool = Pool::open(raws)?;
+    let paths = discover_pool_devices(cfg)?;
+    let pool = if cfg.tolerant_open {
+        open_pool_tolerant(&paths)?
+    } else {
+        let raws = open_raws_all(&paths)?;
+        Pool::open(raws)?
+    };
     pool.set_io_backend(cfg.io_backend.to_kind());
     Ok(pool)
+}
+
+/// Resolve the set of raw-device paths that make up this pool.
+///
+/// With `device_discovery` on (default) and a `device_glob` set, every matching
+/// device is probed for a chunklet pool superblock and the majority-`pool_id`
+/// set is kept — membership follows the on-disk identity, not the path, so a
+/// disk that returns under a new `/dev/nvmeXnY` name is still found. The static
+/// `[chunklet].devices` list is always a seed candidate and the fallback when
+/// discovery is off or nothing probes (e.g. a blank pre-`chunklet-init` disk
+/// set).
+pub fn discover_pool_devices(cfg: &ChunkletConfig) -> OnyxResult<Vec<PathBuf>> {
+    let mut candidates: Vec<PathBuf> = cfg.devices.clone();
+    if cfg.device_discovery {
+        if let Some(glob) = &cfg.device_glob {
+            for p in glob_dev(glob) {
+                if !candidates.contains(&p) {
+                    candidates.push(p);
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err(OnyxError::Config(
+            "chunklet: no candidate devices (empty [chunklet].devices and no device_glob match)"
+                .into(),
+        ));
+    }
+    if !cfg.device_discovery {
+        return Ok(candidates);
+    }
+    // Content-addressed: probe each candidate, tally pool_ids, keep the majority.
+    use std::collections::BTreeMap;
+    let mut by_pool: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for p in &candidates {
+        let Ok(raw) = CkRawDevice::open(p) else {
+            continue;
+        };
+        if let Ok(Some(pool_id)) = ops::probe_pool_id(&raw) {
+            by_pool
+                .entry(pool_id.to_string())
+                .or_default()
+                .push(p.clone());
+        }
+    }
+    match by_pool.into_values().max_by_key(|v| v.len()) {
+        Some(v) if !v.is_empty() => Ok(v),
+        // Nothing carried a superblock (fresh disks): fall back to the static
+        // list so a first open before init / a hand-listed pool still works.
+        _ => Ok(candidates),
+    }
+}
+
+fn open_raws_all(paths: &[PathBuf]) -> OnyxResult<Vec<CkRawDevice>> {
+    let mut raws = Vec::with_capacity(paths.len());
+    for p in paths {
+        raws.push(CkRawDevice::open(p)?);
+    }
+    Ok(raws)
+}
+
+/// Strict open first (a complete pool is fully authoritative and also reverse-
+/// reconciles stale capacity at open); on failure — typically a missing PD —
+/// fall back to a degraded `open_with_missing`. `open_available_pool_devices`
+/// opens only the reachable majority-pool devices, so a pulled disk simply
+/// isn't in the set.
+fn open_pool_tolerant(paths: &[PathBuf]) -> OnyxResult<Arc<Pool>> {
+    let (raws, _probes, _pool_id) = ops::open_available_pool_devices(paths)?;
+    match Pool::open(raws) {
+        Ok(pool) => Ok(pool),
+        Err(_strict_err) => {
+            // The first raws were consumed by the failed strict open; re-probe
+            // for the degraded retry (flocks were released on drop).
+            let (raws2, _p, _id) = ops::open_available_pool_devices(paths)?;
+            Ok(Pool::open_with_missing(raws2)?)
+        }
+    }
+}
+
+/// Minimal device glob: a directory plus a single-level filename pattern with
+/// `*` wildcards (e.g. `/dev/nvme*n*`). Not a general glob — just enough for
+/// block-device discovery. A missing directory yields no matches (not fatal).
+fn glob_dev(glob: &str) -> Vec<PathBuf> {
+    let path = Path::new(glob);
+    let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+    let Some(pattern) = path.file_name().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|name| wildcard_match(pattern, name))
+                .unwrap_or(false)
+        })
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Classic `*`-only wildcard match (no `?`, no char classes), two-pointer with
+/// backtracking.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Create a fresh pool over blank devices, then create the LV3/LV2/meta LDs from
@@ -205,6 +346,88 @@ mod tests {
         assert!(geom_to_spec(&geom("raid10", 2, 2, 1, 0)).is_ok());
         assert!(geom_to_spec(&geom("plain", 0, 1, 3, 0)).is_ok());
         assert!(geom_to_spec(&geom("bogus", 1, 1, 1, 0)).is_err());
+    }
+
+    fn init_cfg(dir: &std::path::Path, n: usize) -> ChunkletConfig {
+        let devices: Vec<_> = (0..n).map(|i| dir.join(format!("pd{i}"))).collect();
+        for p in &devices {
+            CkRawDevice::open_or_create(p, 4 << 30).unwrap();
+        }
+        ChunkletConfig {
+            enabled: true,
+            devices,
+            io_backend: ChunkletIoBackend::Sync,
+            spare_pct: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wildcard_match_basics() {
+        assert!(wildcard_match("nvme*n*", "nvme0n1"));
+        assert!(wildcard_match("nvme*n*", "nvme12n1"));
+        assert!(wildcard_match("pd*", "pd7"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("pd0", "pd0"));
+        assert!(!wildcard_match("pd*", "sda"));
+        assert!(!wildcard_match("nvme*n*", "nvme0")); // needs the trailing n<x>
+    }
+
+    /// Content-addressed discovery finds the pool's PDs by superblock pool_id
+    /// even with `devices` empty — only the glob points at them (the /dev rename
+    /// scenario: config paths gone, disks found by identity).
+    #[test]
+    fn discover_finds_pool_by_id_via_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = init_cfg(dir.path(), 8);
+        let (pool, ..) = init_pool(&cfg).unwrap();
+        drop(pool);
+
+        // Simulate re-enumeration: forget the configured paths, discover by glob.
+        let discover_cfg = ChunkletConfig {
+            devices: Vec::new(),
+            device_discovery: true,
+            device_glob: Some(format!("{}/pd*", dir.path().display())),
+            ..cfg.clone()
+        };
+        let found = discover_pool_devices(&discover_cfg).unwrap();
+        assert_eq!(found.len(), 8, "all 8 PDs discovered by pool_id");
+
+        let pool2 = open_pool(&discover_cfg).unwrap();
+        assert_eq!(pool2.pd_count(), 8);
+    }
+
+    /// Tolerant open starts the engine degraded when one PD is absent at boot.
+    #[test]
+    fn tolerant_open_starts_degraded_with_missing_pd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = init_cfg(dir.path(), 8);
+        let (pool, ..) = init_pool(&cfg).unwrap();
+        drop(pool);
+
+        // Pull one disk before boot.
+        std::fs::remove_file(dir.path().join("pd3")).unwrap();
+
+        let open_cfg = ChunkletConfig {
+            devices: Vec::new(),
+            device_discovery: true,
+            device_glob: Some(format!("{}/pd*", dir.path().display())),
+            tolerant_open: true,
+            ..cfg.clone()
+        };
+        let pool2 = open_pool(&open_cfg).unwrap();
+        assert_eq!(pool2.pd_count(), 7, "degraded open with 7 of 8 PDs");
+
+        // With tolerant_open off, the same missing PD refuses to boot.
+        let strict_cfg = ChunkletConfig {
+            tolerant_open: false,
+            ..open_cfg.clone()
+        };
+        drop(pool2);
+        assert!(
+            open_pool(&strict_cfg).is_err(),
+            "strict open must fail with a missing PD"
+        );
     }
 
     /// init_pool over sparse files creates 3 LDs and reopen resolves LV3.
