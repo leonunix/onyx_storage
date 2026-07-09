@@ -131,6 +131,20 @@ enum Command {
         #[command(subcommand)]
         op: ChunkletOp,
     },
+    /// Audit metadb for orphan pages (allocated but unreachable and not on
+    /// the free list) on the chunklet-backed meta LD. Offline-only: the pool
+    /// lock is exclusive, so the engine must be stopped first (`[meta]
+    /// backend = "file"` deployments already have this via the standalone
+    /// `metadb-verify <path>` binary).
+    MetadbVerify {
+        /// Escalate orphaned pages from a warning to a hard failure (nonzero
+        /// exit even if nothing else is wrong).
+        #[arg(long)]
+        strict: bool,
+        /// Print the report as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -239,6 +253,82 @@ fn with_engine_or_ipc<T>(
         let engine = OnyxEngine::open_meta_only(config)?;
         Ok(via_engine(&engine)?)
     }
+}
+
+/// Mirrors `metadb-verify`'s own `print_human` (metadb/src/bin/metadb-verify.rs)
+/// so the two tools read the same way regardless of which backend a
+/// deployment uses.
+fn print_verify_report_human(report: &onyx_metadb::VerifyReport) {
+    if let Some(slot) = report.manifest_slot {
+        println!("manifest_slot: {slot}");
+    }
+    if let Some(sequence) = report.manifest_sequence {
+        println!("manifest_sequence: {sequence}");
+    }
+    if let Some(lsn) = report.checkpoint_lsn {
+        println!("checkpoint_lsn: {lsn}");
+    }
+    println!("high_water: {}", report.high_water);
+    println!("scanned_pages: {}", report.scanned_pages);
+    println!("live_pages: {}", report.live_pages);
+    println!("free_pages: {}", report.free_pages);
+    println!("orphans: {}", report.orphan_pages.len());
+    if !report.orphan_page_types.is_empty() {
+        println!("orphan_page_types:");
+        for (pid, page_type) in &report.orphan_page_types {
+            println!("  - {pid}: {page_type:?}");
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("warnings:");
+        for warning in &report.warnings {
+            println!("  - {warning}");
+        }
+    }
+    if !report.issues.is_empty() {
+        println!("issues:");
+        for issue in &report.issues {
+            println!("  - {issue}");
+        }
+    }
+    println!("status: {}", if report.is_clean() { "clean" } else { "failed" });
+}
+
+fn print_verify_report_json(report: &onyx_metadb::VerifyReport) {
+    let orphan_ids: Vec<String> = report.orphan_pages.iter().map(u64::to_string).collect();
+    let orphan_types: Vec<String> = report
+        .orphan_page_types
+        .iter()
+        .map(|(pid, page_type)| format!("\"{pid}:{page_type:?}\""))
+        .collect();
+    let warnings: Vec<String> = report
+        .warnings
+        .iter()
+        .map(|w| format!("{:?}", w))
+        .collect();
+    let issues: Vec<String> = report.issues.iter().map(|i| format!("{:?}", i)).collect();
+    println!("{{");
+    println!(
+        "  \"manifest_slot\": {},",
+        report.manifest_slot.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+    );
+    println!(
+        "  \"manifest_sequence\": {},",
+        report.manifest_sequence.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+    );
+    println!(
+        "  \"checkpoint_lsn\": {},",
+        report.checkpoint_lsn.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+    );
+    println!("  \"high_water\": {},", report.high_water);
+    println!("  \"scanned_pages\": {},", report.scanned_pages);
+    println!("  \"live_pages\": {},", report.live_pages);
+    println!("  \"free_pages\": {},", report.free_pages);
+    println!("  \"orphan_pages\": [{}],", orphan_ids.join(", "));
+    println!("  \"orphan_page_types\": [{}],", orphan_types.join(", "));
+    println!("  \"warnings\": [{}],", warnings.join(", "));
+    println!("  \"issues\": [{}]", issues.join(", "));
+    println!("}}");
 }
 
 #[cfg(target_os = "linux")]
@@ -645,6 +735,46 @@ fn main() -> anyhow::Result<()> {
             println!("to put metadb on the meta LD (removes the host-FS metadata SPOF), set:");
             println!("  [meta]");
             println!("  backend = \"chunklet\"");
+        }
+        Command::MetadbVerify { strict, json } => {
+            if config.meta.backend != onyx_storage::config::MetaBackendKind::Chunklet {
+                let path = config
+                    .meta
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unset>".to_string());
+                println!(
+                    "[meta] backend is not \"chunklet\" — use the standalone \
+                     `metadb-verify {path}` binary instead"
+                );
+                return Ok(());
+            }
+            let (_pool, meta_backend) = onyx_storage::chunklet_pool::open_role_backend(
+                &config.chunklet,
+                onyx_storage::chunklet_pool::LdRoleSel::Meta,
+            )
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "{err} — if the engine is running against this pool, stop it first \
+                     (metadb-verify needs an exclusive open, same as chunklet-init)"
+                )
+            })?;
+            let report = onyx_storage::meta::backend::metadb::verify_meta_ld(
+                &config.meta,
+                meta_backend,
+                onyx_metadb::VerifyOptions {
+                    strict,
+                    ..Default::default()
+                },
+            )?;
+            if json {
+                print_verify_report_json(&report);
+            } else {
+                print_verify_report_human(&report);
+            }
+            if !report.is_clean() {
+                anyhow::bail!("metadb-verify found issues");
+            }
         }
         Command::Chunklet { op } => {
             let sock = &config.service.socket_path;

@@ -1851,6 +1851,32 @@ impl MetadbBackend {
         dedup_hit_results_from_remaps(hits, outcomes)
     }
 }
+
+/// Offline audit entry point: open metadb on the meta LD `meta_backend`
+/// **read-only** (errors if the LD was never initialised, never creates one)
+/// and run the same reachability/orphan-page scan `metadb-verify` runs for
+/// the plain-file backend. Callers own opening the chunklet pool exclusively
+/// first (e.g. `chunklet_pool::open_role_backend`) — this requires the live
+/// engine to NOT be holding the pool's flock.
+pub fn verify_meta_ld(
+    config: &MetaConfig,
+    meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
+    options: onyx_metadb::VerifyOptions,
+) -> OnyxResult<onyx_metadb::VerifyReport> {
+    let label = config
+        .path()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("<meta-ld>"));
+    // Same config the live engine would use (dedup_cuckoo_buckets, shard
+    // counts, ... — a mismatch there would misinterpret persisted data),
+    // already with `reclaim_orphans_on_open = false` baked in
+    // (`metadb_config_from_onyx` below), so this open cannot silently sweep
+    // the exact pages we're here to observe.
+    let db_config = metadb_config_from_onyx(&label, config);
+    let db = meta_ld::open_readonly(meta_backend, db_config)?;
+    Ok(db.verify(options)?)
+}
+
 fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     let mut cfg = MetaDbConfig::new(path);
     cfg.page_cache_bytes = config.block_cache_bytes() as u64;

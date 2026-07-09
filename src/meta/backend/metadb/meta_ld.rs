@@ -434,14 +434,26 @@ pub(super) struct MetaLd {
     pub(super) grower: MetaLdGrower,
 }
 
-/// Open (or first-time create) metadb on the meta LD `backend` (the concrete
-/// chunklet backend, so an online extend can `swap_ld` it later). Reads /
-/// initialises the OMET superblock, frames the page + journal windows, and
-/// routes to `Db::open_on_device` / `Db::create_on_device`.
-pub(super) fn open_or_create(
-    backend: Arc<ChunkletBackend>,
-    db_config: MetaDbConfig,
-) -> OnyxResult<MetaLd> {
+/// The superblock plus the two device-generic windows metadb ever sees,
+/// shared by the live open path ([`open_or_create`]) and the read-only audit
+/// path ([`open_readonly`]).
+struct MetaDeviceParts {
+    sb: MetaSuperblock,
+    fresh: bool,
+    backend_dyn: Arc<dyn BlockBackend>,
+    page_device: Arc<dyn PageDevice>,
+    journal_device: Arc<dyn JournalDevice>,
+}
+
+/// Read (or, if `create_if_missing`, first-time initialise) the OMET
+/// superblock on `backend` and frame the page + journal windows over it.
+/// `create_if_missing = false` is the audit-tool contract: a meta LD that was
+/// never initialised is reported as "nothing to verify", never silently
+/// stamped with a fresh superblock.
+fn open_device_parts(
+    backend: &Arc<ChunkletBackend>,
+    create_if_missing: bool,
+) -> OnyxResult<MetaDeviceParts> {
     let capacity = backend.size();
     if capacity < JOURNAL_OFF + MIN_JOURNAL_BYTES + SB_BYTES {
         return Err(OnyxError::Config(format!(
@@ -453,7 +465,7 @@ pub(super) fn open_or_create(
     backend.read_at(&mut sb_buf, 0)?;
     let (sb, fresh) = match MetaSuperblock::from_block(&sb_buf) {
         Some(sb) if sb.flags & FLAG_METADB_INIT != 0 => (sb, false),
-        _ => {
+        _ if create_if_missing => {
             let sb = MetaSuperblock::new_fresh(capacity)?;
             backend.write_at(&sb.to_block(), 0)?;
             backend.flush()?;
@@ -465,6 +477,11 @@ pub(super) fn open_or_create(
                 "initialised fresh metadb layout on meta LD"
             );
             (sb, true)
+        }
+        _ => {
+            return Err(OnyxError::Config(
+                "no metadb found on this meta LD — nothing to verify".into(),
+            ));
         }
     };
 
@@ -478,16 +495,37 @@ pub(super) fn open_or_create(
         Arc::new(BlockPageDevice::new(page_io).map_err(onyx_err)?);
     let journal_device: Arc<dyn JournalDevice> = Arc::new(JournalWindow::new(journal_slice));
 
-    let db = if fresh {
-        Db::create_on_device(db_config, page_device, journal_device).map_err(onyx_err)?
+    Ok(MetaDeviceParts {
+        sb,
+        fresh,
+        backend_dyn,
+        page_device,
+        journal_device,
+    })
+}
+
+/// Open (or first-time create) metadb on the meta LD `backend` (the concrete
+/// chunklet backend, so an online extend can `swap_ld` it later). Reads /
+/// initialises the OMET superblock, frames the page + journal windows, and
+/// routes to `Db::open_on_device` / `Db::create_on_device`.
+pub(super) fn open_or_create(
+    backend: Arc<ChunkletBackend>,
+    db_config: MetaDbConfig,
+) -> OnyxResult<MetaLd> {
+    let parts = open_device_parts(&backend, true)?;
+
+    let db = if parts.fresh {
+        Db::create_on_device(db_config, parts.page_device, parts.journal_device)
+            .map_err(onyx_err)?
     } else {
-        Db::open_on_device(db_config, page_device, journal_device).map_err(onyx_err)?
+        Db::open_on_device(db_config, parts.page_device, parts.journal_device)
+            .map_err(onyx_err)?
     };
 
-    let (catalog_store, catalog) = MetaLdCatalog::load(backend_dyn, &sb)?;
+    let (catalog_store, catalog) = MetaLdCatalog::load(parts.backend_dyn, &parts.sb)?;
     let grower = MetaLdGrower {
         backend,
-        sb: Mutex::new(sb),
+        sb: Mutex::new(parts.sb),
     };
     Ok(MetaLd {
         db,
@@ -495,4 +533,19 @@ pub(super) fn open_or_create(
         catalog,
         grower,
     })
+}
+
+/// Open metadb on the meta LD `backend` **read-only, for audit purposes**:
+/// never stamps a fresh superblock (errors instead if the LD was never
+/// initialised) and skips the volume-catalog load entirely — a verify tool
+/// only needs the `Db` handle to call [`onyx_metadb::Db::verify`] on, not the
+/// full onyx-side catalog/grower machinery `open_or_create` assembles for the
+/// live engine.
+pub(super) fn open_readonly(
+    backend: Arc<ChunkletBackend>,
+    db_config: MetaDbConfig,
+) -> OnyxResult<Arc<Db>> {
+    let parts = open_device_parts(&backend, false)?;
+    debug_assert!(!parts.fresh, "open_device_parts(create_if_missing=false) never returns fresh");
+    Db::open_on_device(db_config, parts.page_device, parts.journal_device).map_err(onyx_err)
 }
