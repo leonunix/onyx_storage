@@ -823,6 +823,105 @@ fn throttle_curve_is_monotonic_and_below_cap() {
     }
 }
 
+#[test]
+fn physical_fill_tracks_checkpoint_retained_entries_after_pending_drains() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let shard = &pool.shards[0].shard;
+
+    let seq = pool
+        .append("test-vol", Lba(7), 1, &vec![0xA5; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+
+    let expected_physical_fill = {
+        let ring = shard.ring.lock();
+        ((ring.used_bytes * 100) / ring.capacity_bytes) as u8
+    };
+    assert!(expected_physical_fill > 0);
+    assert!(pool.fill_percentage() > 0);
+
+    pool.mark_applied(seq, Lba(7), 1).unwrap();
+
+    assert_eq!(
+        pool.fill_percentage(),
+        0,
+        "pending pressure must be drained"
+    );
+    assert_eq!(
+        pool.physical_fill_percentage(),
+        expected_physical_fill,
+        "checkpoint-retained bytes must remain visible to the write throttle"
+    );
+}
+
+#[test]
+fn write_throttle_paces_only_the_target_ring_shard() {
+    let tmp = NamedTempFile::new().unwrap();
+    let slot = BufferShard::slot_size();
+    let data_start = COMMIT_LOG_SUPERBLOCK_SIZE + 2 * SHARD_CHECKPOINT_SIZE;
+    let size = data_start + 20 * slot;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let runtime_limits = BufferRuntimeLimits::default().with_throttle(ThrottleSettings {
+        min_pct: 60,
+        max_pct: 100,
+        scale_us: 100,
+        cap_us: 1_000,
+    });
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(dev),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::ZERO,
+        0,
+        None,
+        runtime_limits,
+    )
+    .unwrap();
+
+    {
+        let mut ring = pool.shards[0].shard.ring.lock();
+        assert_eq!(BufferShard::reserve_log_space(&mut ring, 1, 8), Some(0));
+    }
+    assert_eq!(pool.physical_fill_percentage_for_shard(0), 80);
+    assert_eq!(pool.physical_fill_percentage_for_shard(1), 0);
+
+    pool.throttle_states[1]
+        .cached_fill_pct
+        .store(80, Ordering::Relaxed);
+    pool.throttle_states[1]
+        .sample_counter
+        .store(1, Ordering::Relaxed);
+    pool.throttle_states[1]
+        .last_wakeup_ns
+        .store(1_000_000, Ordering::Relaxed);
+    pool.apply_write_throttle(1);
+    assert_eq!(
+        pool.throttle_states[1]
+            .last_wakeup_ns
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    pool.apply_write_throttle(0);
+    assert!(
+        pool.throttle_states[0]
+            .last_wakeup_ns
+            .load(Ordering::Relaxed)
+            > 0
+    );
+    assert_eq!(
+        pool.throttle_states[1]
+            .last_wakeup_ns
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
 // ── Phase A.2: mark_applied + release_below split ────────────────────
 //
 // The buffer-as-sole-journal plan needs to "apply" a buffer entry into
@@ -902,6 +1001,33 @@ fn release_below_advances_ring_only_when_checkpoint_covers_seq() {
     let advanced = pool.release_below(seq).unwrap();
     assert_eq!(advanced, 1);
     assert_eq!(shard.ring.lock().used_bytes, 0);
+}
+
+#[test]
+fn explicit_checkpoint_persists_released_ring_state() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let seq = pool
+        .append("test-vol", Lba(11), 1, &vec![0x5C; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+    pool.mark_applied(seq, Lba(11), 1).unwrap();
+    pool.durable_seq_handle()
+        .store(seq, std::sync::atomic::Ordering::Release);
+    assert_eq!(pool.release_below(seq).unwrap(), 1);
+
+    pool.persist_checkpoints().unwrap();
+
+    let mut encoded = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+    pool.root_device
+        .read_at(&mut encoded, COMMIT_LOG_SUPERBLOCK_SIZE)
+        .unwrap();
+    let checkpoint = ShardCheckpoint::decode(&encoded).unwrap();
+    assert_eq!(checkpoint.used_bytes, 0);
+    assert_eq!(checkpoint.head_offset, checkpoint.tail_offset);
+    assert!(checkpoint.max_seq >= seq);
 }
 
 // ── Regression: pending_seqs index must drop on every removal path ────

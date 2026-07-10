@@ -95,6 +95,12 @@ volatile_memory_mb = 49152
 staging_queue_entries = 1048576
 sync_batch_max_entries = 131072
 sync_batch_max_bytes_mb = 1024
+# Pace against physical LV2 occupancy (including checkpoint-retained entries)
+# before reserve_log_space falls into hard condvar backpressure.
+throttle_min_pct = 70
+throttle_max_pct = 95
+throttle_scale_us = 10
+throttle_cap_us = 2000
 
 [ublk]
 nr_queues = 32

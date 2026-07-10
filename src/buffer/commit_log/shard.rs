@@ -468,14 +468,21 @@ impl BufferShard {
 
     /// Write the current checkpoint to disk (no sync — this is a hint).
     pub(super) fn write_checkpoint(&self, max_seq: u64) {
+        if let Err(e) = self.persist_checkpoint(max_seq) {
+            tracing::debug!(error = %e, "failed to persist shard checkpoint (non-fatal)");
+        }
+    }
+
+    /// Persist the current checkpoint and surface write failures to callers
+    /// that must not advertise a clean shutdown without it.
+    pub(super) fn persist_checkpoint(&self, max_seq: u64) -> OnyxResult<()> {
         let Some(ref ckpt_dev) = self.checkpoint_device else {
-            return;
+            return Ok(());
         };
         let mut ckpt = self.snapshot_checkpoint();
         ckpt.max_seq = max_seq;
-        if let Err(e) = ckpt_dev.write_at(&ckpt.encode(), 0) {
-            tracing::debug!(error = %e, "failed to persist shard checkpoint (non-fatal)");
-        }
+        ckpt_dev.write_at(&ckpt.encode(), 0)?;
+        Ok(())
     }
 
     /// Encode the current checkpoint with the supplied max_seq, ready to be

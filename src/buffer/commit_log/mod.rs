@@ -573,22 +573,14 @@ pub struct WriteBufferPool {
     /// On-disk layout version — persisted on Drop. Must match the actual disk layout.
     disk_version: u32,
     /// Resolved hyperbolic throttle curve (`None` = disabled). Set once at
-    /// pool open; ZFS-style absolute-wakeup queue serializes producers.
+    /// pool open; each shard has an independent absolute-wakeup queue.
     throttle: Option<ThrottleSettings>,
-    /// Monotonic anchor for `throttle_last_wakeup_ns`.
+    /// Monotonic anchor shared by the per-shard wakeup timestamps.
     throttle_anchor: Instant,
-    /// Absolute wakeup time (ns since `throttle_anchor`) of the latest slot
-    /// claimed by a throttled producer. Each new throttle event atomically
-    /// advances this past `max(now, last) + delay`, so N concurrent producers
-    /// stack to N × delay rather than collapsing onto a single sleep window.
-    throttle_last_wakeup_ns: AtomicU64,
-    /// Cached `fill_percentage()` value, refreshed once every
-    /// `THROTTLE_SAMPLE_INTERVAL` appends. Recomputing live takes one Mutex
-    /// acquire per shard (16 by default), so caching keeps the hot path on
-    /// pure atomics when the throttle is armed but inactive.
-    throttle_cached_fill_pct: AtomicU32,
-    /// Append counter that drives `throttle_cached_fill_pct` refresh cadence.
-    throttle_sample_counter: AtomicU32,
+    /// Independent pacing state for each physical ring shard. Keeping wakeup
+    /// queues separate prevents one hot shard from serializing producers that
+    /// are headed to rings with available space.
+    throttle_states: Vec<ShardThrottleState>,
     /// Highest seq that has ever been passed to `mark_flushed` across any shard.
     /// Updated by flusher writers when they ack a completed seq. Read by the
     /// durability-watermark background thread to decide how far `durable_seq`
@@ -617,6 +609,16 @@ pub struct WriteBufferPool {
     /// longer be drained — the ENOSPC "ack is a lie" hole. Reads are never
     /// fenced. The fence only clears on process restart.
     meta_fence: OnceLock<String>,
+}
+
+#[derive(Default)]
+struct ShardThrottleState {
+    /// Absolute wakeup time in ns since `WriteBufferPool::throttle_anchor`.
+    last_wakeup_ns: AtomicU64,
+    /// Cached physical fill for this shard.
+    cached_fill_pct: AtomicU32,
+    /// Append counter that drives the cached-fill refresh cadence.
+    sample_counter: AtomicU32,
 }
 
 static TEST_PURGE_FAIL_VOLUMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();

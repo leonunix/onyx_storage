@@ -13,7 +13,11 @@ pub struct EngineStatusSnapshot {
     pub live_handle_count: usize,
     pub zone_count: Option<u32>,
     pub buffer_pending_entries: Option<u64>,
+    /// Unapplied logical work as a percentage of LV2 capacity.
     pub buffer_fill_pct: Option<u8>,
+    /// Fullest shard's physical ring occupancy, including applied entries
+    /// retained until the next metadb checkpoint covers them.
+    pub buffer_physical_fill_pct: Option<u8>,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
     pub metadb_memory: Option<MetaMemorySnapshot>,
@@ -68,6 +72,9 @@ impl EngineStatusSnapshot {
         }
         if let Some(fill_pct) = self.buffer_fill_pct {
             let _ = writeln!(out, "buffer_fill_pct: {}", fill_pct);
+        }
+        if let Some(fill_pct) = self.buffer_physical_fill_pct {
+            let _ = writeln!(out, "buffer_physical_fill_pct: {}", fill_pct);
         }
         if let Some(payload_bytes) = self.buffer_payload_memory_bytes {
             let limit = self.buffer_payload_memory_limit_bytes.unwrap_or(0);

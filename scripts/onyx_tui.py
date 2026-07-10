@@ -438,6 +438,7 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
     comp_out = num(metrics, "compress_output_bytes")
     pending = nested(status, "buffer_pending_entries", default=0) or 0
     fill_pct = nested(status, "buffer_fill_pct", default=0) or 0
+    physical_fill_pct = nested(status, "buffer_physical_fill_pct", default=fill_pct) or 0
     payload_mem = nested(status, "buffer_payload_memory_bytes", default=0) or 0
     payload_limit = nested(status, "buffer_payload_memory_limit_bytes", default=0) or 0
     volatile_mem = nested(status, "buffer_volatile_payload_memory_bytes", default=0) or 0
@@ -463,7 +464,7 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" submit {fmt_ms(avg_time(metrics, prev_metrics, 'read_pool_submit_wait_ns', 'read_pool_requests')):>10}"
         f" decode {fmt_ms(avg_time(metrics, prev_metrics, 'read_pool_decode_ns', 'read_pool_requests')):>10}",
         "",
-        f"Buffer pending={fmt_count(float(pending)):>8} fill={fill_pct:>3}% {bar(float(fill_pct), 100.0, 24)}"
+        f"Buffer pending={fmt_count(float(pending)):>8} work={fill_pct:>3}% ring={physical_fill_pct:>3}% {bar(float(physical_fill_pct), 100.0, 24)}"
         f" payload={fmt_bytes(float(payload_mem))}/{fmt_bytes(float(payload_limit))}"
         f" volatile={fmt_bytes(float(volatile_mem))}/{fmt_bytes(float(volatile_limit))}",
         f"Buffer append {rate(metrics, prev_metrics, 'buffer_appends', interval):9.1f}/s {fmt_rate_bytes(rate(metrics, prev_metrics, 'buffer_append_bytes', interval)):>14}"
@@ -603,6 +604,9 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
     write_bps = rate(metrics, prev_metrics, "volume_write_bytes", interval)
     pending = float(nested(status, "buffer_pending_entries", default=0) or 0)
     fill_pct = float(nested(status, "buffer_fill_pct", default=0) or 0)
+    physical_fill_pct = float(
+        nested(status, "buffer_physical_fill_pct", default=fill_pct) or 0
+    )
     payload_mem = float(nested(status, "buffer_payload_memory_bytes", default=0) or 0)
     payload_limit = float(nested(status, "buffer_payload_memory_limit_bytes", default=0) or 0)
     volatile_mem = float(nested(status, "buffer_volatile_payload_memory_bytes", default=0) or 0)
@@ -724,19 +728,19 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
     put(stdscr, 16, right_x + 2, "mb/s " + spark(pool_hist, right_w - 10), accent)
 
     panel(stdscr, 19, 0, 8, left_w, "Buffer Pressure", title_attr)
-    put(stdscr, 21, 2, f"fill    {fill_pct:5.1f}% {gauge(fill_pct, 100.0, left_w - 20)}", warn if fill_pct > 70 else good)
+    put(stdscr, 21, 2, f"work    {fill_pct:5.1f}% {gauge(fill_pct, 100.0, left_w - 20)}", warn if fill_pct > 70 else good)
     put(
         stdscr,
         22,
         2,
-        f"payload {fmt_bytes(payload_mem):>10} {gauge(payload_mem, payload_limit, left_w - 24)} {fmt_bytes(payload_limit)}",
-        good,
+        f"ring    {physical_fill_pct:5.1f}% {gauge(physical_fill_pct, 100.0, left_w - 20)}",
+        warn if physical_fill_pct > 70 else good,
     )
     put(
         stdscr,
         23,
         2,
-        f"volatile{fmt_bytes(volatile_mem):>10} {gauge(volatile_mem, volatile_limit, left_w - 24)} {fmt_bytes(volatile_limit)}",
+        f"payload {fmt_bytes(payload_mem):>10} {gauge(payload_mem, payload_limit, left_w - 24)} {fmt_bytes(payload_limit)}",
         good,
     )
     metric(

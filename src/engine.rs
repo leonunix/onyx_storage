@@ -1587,6 +1587,13 @@ impl OnyxEngine {
                     "final advance_tail at shutdown failed — pending entries may persist"
                 );
             }
+            if let Err(e) = pool.persist_checkpoints() {
+                tracing::error!(
+                    error = %e,
+                    "failed to persist final LV2 shard checkpoints — forcing dirty recovery on next boot"
+                );
+                return Ok(());
+            }
         }
 
         // Stamp the LV3 superblock with FLAG_CLEAN_SHUTDOWN so the next boot
@@ -1989,6 +1996,10 @@ impl OnyxEngine {
             zone_count: self.zone_manager.as_ref().map(|zm| zm.zone_count()),
             buffer_pending_entries: self.buffer_pool.as_ref().map(|pool| pool.pending_count()),
             buffer_fill_pct: self.buffer_pool.as_ref().map(|pool| pool.fill_percentage()),
+            buffer_physical_fill_pct: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.physical_fill_percentage()),
             buffer_payload_memory_bytes: self
                 .buffer_pool
                 .as_ref()

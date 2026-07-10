@@ -30,40 +30,47 @@ impl WriteBufferPool {
 
     /// ZFS-style hyperbolic write throttle on LV2 fill. Returns immediately
     /// when the throttle is disabled or fill is below the configured floor.
-    /// Otherwise sleeps until an atomically-claimed slot, so N concurrent
-    /// producers stack into N × delay rather than collapsing into one window
-    /// (throughput is independent of producer thread count, matching ZFS
-    /// `dmu_tx_delay`).
-    fn apply_write_throttle(&self) {
+    /// Otherwise sleeps until an atomically-claimed per-shard slot, so
+    /// concurrent producers headed to the same ring stack into N × delay while
+    /// unrelated shards continue independently.
+    pub(super) fn apply_write_throttle(&self, shard_idx: usize) {
         let Some(throttle) = self.throttle else {
             return;
         };
-        // Recomputing fill_percentage() acquires one Mutex per shard. Cache
-        // it; refresh only every Nth append so the hot path stays on pure
+        let Some(state) = self.throttle_states.get(shard_idx) else {
+            return;
+        };
+        // Recomputing physical_fill_percentage_for_shard() acquires the target
+        // ring Mutex. Cache it; refresh only every Nth append so the hot path stays on pure
         // atomics when the throttle is armed but inactive. The curve is
         // continuous and the absolute-wakeup queue smooths over the sample
         // lag, so a few-append staleness in fill_pct is invisible end-to-end.
         const SAMPLE_INTERVAL: u32 = 32;
-        let n = self.throttle_sample_counter.fetch_add(1, Ordering::Relaxed);
-        let fill_pct = if n % SAMPLE_INTERVAL == 0 {
-            let live = self.fill_percentage();
-            self.throttle_cached_fill_pct
-                .store(live as u32, Ordering::Relaxed);
+        let n = state.sample_counter.fetch_add(1, Ordering::Relaxed);
+        let cached_fill_pct = state.cached_fill_pct.load(Ordering::Relaxed) as u8;
+        let fill_pct = if n % SAMPLE_INTERVAL == 0 || cached_fill_pct >= throttle.min_pct {
+            let live = self.physical_fill_percentage_for_shard(shard_idx);
+            state.cached_fill_pct.store(live as u32, Ordering::Relaxed);
             live
         } else {
-            self.throttle_cached_fill_pct.load(Ordering::Relaxed) as u8
+            cached_fill_pct
         };
         let delay_us = throttle.delay_us_for_fill(fill_pct);
         if delay_us == 0 {
+            // A checkpoint may have released this ring while producers still
+            // had future wakeups reserved. Drop that obsolete queue once the
+            // shard is below the throttle floor so it cannot leak into the
+            // next pressure cycle.
+            state.last_wakeup_ns.store(0, Ordering::Relaxed);
             return;
         }
         let delay_ns = delay_us.saturating_mul(1_000);
         let now_ns = self.throttle_anchor.elapsed().as_nanos() as u64;
-        let mut last = self.throttle_last_wakeup_ns.load(Ordering::Relaxed);
+        let mut last = state.last_wakeup_ns.load(Ordering::Relaxed);
         let wakeup_ns = loop {
             let baseline = last.max(now_ns);
             let candidate = baseline.saturating_add(delay_ns);
-            match self.throttle_last_wakeup_ns.compare_exchange_weak(
+            match state.last_wakeup_ns.compare_exchange_weak(
                 last,
                 candidate,
                 Ordering::Relaxed,
@@ -73,7 +80,10 @@ impl WriteBufferPool {
                 Err(actual) => last = actual,
             }
         };
-        let sleep_ns = wakeup_ns.saturating_sub(now_ns);
+        // The thread may be descheduled while contending on the CAS above.
+        // Re-reading the clock avoids sleeping that scheduler delay twice.
+        let sleep_start_ns = self.throttle_anchor.elapsed().as_nanos() as u64;
+        let sleep_ns = wakeup_ns.saturating_sub(sleep_start_ns);
         if sleep_ns > 0 {
             std::thread::sleep(Duration::from_nanos(sleep_ns));
             if let Some(metrics) = self.metrics.get() {
@@ -139,9 +149,9 @@ impl WriteBufferPool {
             return Err(OnyxError::MetaFenced(reason.clone()));
         }
         let total_start = Instant::now();
-        self.apply_write_throttle();
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let shard_idx = self.shard_for_lba(start_lba);
+        self.apply_write_throttle(shard_idx);
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let shard = &self.shards[shard_idx];
 
         shard
@@ -476,6 +486,17 @@ impl WriteBufferPool {
         Ok(advanced)
     }
 
+    /// Persist the current reclaim position for every shard and flush LV2.
+    /// Clean shutdown must call this explicitly after its final tail advance;
+    /// relying on `Drop` is insufficient while other `Arc` owners still exist.
+    pub fn persist_checkpoints(&self) -> OnyxResult<()> {
+        let global_max_seq = self.next_seq.load(Ordering::Acquire).saturating_sub(1);
+        for shard in &self.shards {
+            shard.shard.persist_checkpoint(global_max_seq)?;
+        }
+        Self::sync_device_impl(self.root_device.as_ref())
+    }
+
     /// Buffer-as-sole-journal Phase A: routes to the seq's owning shard
     /// and runs the in-memory half of `mark_flushed` without the ring
     /// reclaim. The ring head advances later through [`release_below`].
@@ -636,6 +657,30 @@ impl WriteBufferPool {
         ((shard.shard.pending_bytes() * 100) / cap).min(100) as u8
     }
 
+    /// Hard-capacity pressure across the LV2 ring shards.
+    ///
+    /// Unlike [`fill_percentage`], this includes entries already applied to
+    /// metadb but retained in LV2 until a checkpoint covers them. Append hard
+    /// backpressure is per shard, so return the fullest shard rather than an
+    /// aggregate that could hide a hot shard behind free space elsewhere.
+    pub fn physical_fill_percentage(&self) -> u8 {
+        (0..self.shards.len())
+            .map(|idx| self.physical_fill_percentage_for_shard(idx))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn physical_fill_percentage_for_shard(&self, shard_idx: usize) -> u8 {
+        let Some(shard) = self.shards.get(shard_idx) else {
+            return 100;
+        };
+        let ring = shard.shard.ring.lock();
+        if ring.capacity_bytes == 0 {
+            return 100;
+        }
+        (((ring.used_bytes.saturating_mul(100)) / ring.capacity_bytes).min(100)) as u8
+    }
+
     /// Evict hydrated payloads from pending_entries for the given shard.
     /// Called by the coalescer after payload data has been copied into
     /// CoalesceUnits, so the memory budget is freed without waiting for
@@ -757,11 +802,9 @@ impl Drop for WriteBufferPool {
                 let _ = handle.join();
             }
         }
-        // Persist final checkpoint for each shard so recovery is fast.
-        let global_max_seq = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
-        for shard in &self.shards {
-            shard.shard.write_checkpoint(global_max_seq);
-        }
+        // Best-effort fallback. Normal engine shutdown persists these
+        // explicitly before advertising a clean LV3 superblock.
+        let _ = self.persist_checkpoints();
         let _ = self.persist_superblock(true);
     }
 }

@@ -7,8 +7,8 @@ metadb 的 on-disk cuckoo dedup 索引，其桶数（模数）原先在 `chunkle
 自动化测试（metadb 单元/集成 + 12× 并发迁移压力测试），进入**上机（nvme-box，10×NVMe，纯 chunklet
 后端）验收**阶段。
 
-上机验证挖出了 **3 个自动化测试没覆盖的真实 bug** + 1 个迁移写放大问题，并澄清了一个**与本功能无关
-的预存性能问题**。以下逐一说明。
+上机验证挖出了 **3 个自动化测试没覆盖的 resize bug** + 1 个迁移写放大问题，并进一步定位出两个
+**与本功能无关的 onyx LV2 ring 生命周期 bug**。以下逐一说明。
 
 ---
 
@@ -75,22 +75,43 @@ pass-through，读仍正确），把 L0 重建挪到**释放 apply_gate 之后**
 
 ---
 
-## fio 冻结 —— 定性为 onyx 预存的 checkpoint stall，**与本次 cuckoo resize 无关**
+## fio 冻结 —— LV2 ring 物理占用被隐藏，**与本次 cuckoo resize 无关**
 
 **现象**：上机 fio 出现秒级（实测 2–5s）写吞吐归零的冻结。
 
-**关键定位**：这些冻结在 **cuckoo 模数已到上限、无任何迁移在跑的 steady 状态下照样发生**；同时
-`metadb_flush`（checkpoint）实测最长 **22.9 秒**、持 `apply_gate.write` 最长 **4.3 秒** —— 即
-checkpoint 阶段把整条提交管道挡住，导致前台 append 冻结。该 stall 由**近满卷（253GiB/256GiB）的
-超大 L2P**驱动，与 cuckoo dedup 索引扩容正交。
+**第一层定位（仍成立）**：冻结在 **cuckoo 模数已到上限、无迁移运行的 steady 状态下照样发生**；
+`metadb_flush`（checkpoint）实测最长 **22.9 秒**、持 `apply_gate.write` 最长 **4.3 秒**。因此它与
+cuckoo resize 正交，checkpoint 延迟也确实会放大写路径尾延迟。
 
-**结论**：fio 冻结是 onyx 写管道**已知的预存问题**（大 L2P 上的 checkpoint / 4-shard 并发提交
-stall），迁移只是恰好同时在跑。本次 cuckoo resize 的三个 bug 修复与批量化均正确且不引入该冻结。
-建议作为**独立课题**单独立项排查（大 L2P flush 为何长持 apply_gate.write 数秒）。
+**进一步定位（修正原结论）**：`buffer_pending_entries` / `buffer_fill_pct` 表示的是尚未 apply 的
+**逻辑工作量**，不是 LV2 ring 的**物理占用**。entry apply 完成后会从 pending/index 消失，但在对应
+metadb checkpoint durable 之前仍不能推进 ring head、仍占着 slot。因此观察到 `pending=51` 甚至
+`work=0%` 时，某个 shard 的 ring 实际可能已经接近满；随后少量 append 就会进入硬 backpressure。
+原 throttle 同样读取逻辑 fill，因而无法提前保护真正承压的 shard。
+
+**另一个确定性 bug**：正常 shutdown 只推进了内存 ring head，checkpoint 原先依赖
+`WriteBufferPool::Drop` 持久化。服务停止时仍有 `Arc` owner，可能先把 LV3 标记 clean 并退出，导致下次
+启动从旧 checkpoint 重放已经 apply 的 entry。实测一次 clean restart 错误恢复了 **224611** 条 entry。
+
+**修复**：
+
+- 新增 `buffer_physical_fill_pct`（各 shard 物理 fill 的最大值），TUI 同时显示 `work` 与 `ring`。
+- soft throttle 改为按目标 shard 的物理 fill 独立节流，避免一个热点 shard 串行化所有 producer。
+- 修复 throttle 的陈旧时间戳和陈旧高水位缓存，避免重复 sleep 及 ring 已清空后的幽灵限流。
+- shutdown 在写 clean LV3 superblock 前显式持久化所有 LV2 shard checkpoint 并 flush；失败则不写 clean 标记。
+
+**上机验证**：修复后重启时 16/16 shard 均 `pending=0` 且 `head==tail`，没有后台 replay。最终 90 秒
+fio（8 jobs、iodepth=16、4K randrw）期间物理 ring 采样峰值 20%，结束回到 0%；
+`backpressure_events=0`、`throttle_count=0`，没有再出现 2–5 秒冻结。读/写 p99 为 **6.72/6.85ms**，
+最大延迟为 **54/33ms**。剩余毫秒级尾延迟仍需沿线程调度和大 L2P checkpoint 分开优化。
+
+**结论**：本次冻结与 cuckoo resize 无关这一点不变，但原先“仅由大 L2P checkpoint 长持
+`apply_gate.write` 直接造成”的定性不完整。`pending` 与物理 ring 占用混淆、throttle 取错压力信号，
+才解释了“pending 很低却几秒内突然背压”；shutdown checkpoint 漏持久化还会在重启后额外制造陈旧工作量。
 
 > 备注（诚实记录）：排查初期曾因监控脚本的单位 bug（把计数字段当字节、整除后恒为 0）+ 3 秒平均，
 > 一度误判为"迁移导致的持续冻结"。用正确解析 + 1 秒粒度 + steady 状态对照后，才定性为预存 checkpoint
-> stall。冻结本身真实，但根因不在本次扩容工作。
+> stall。冻结本身真实，根因不在本次扩容工作；后续 ring 指标和重启对照补齐后，才得到上述完整定性。
 
 ---
 
@@ -101,10 +122,10 @@ stall），迁移只是恰好同时在跑。本次 cuckoo resize 的三个 bug �
 | Bug A / B / C | 已修复 + 上机验证 + 回归测试 |
 | Issue D（迁移批量化） | 已修复 + 回归测试，迁移提速 ~2.7× |
 | 在线扩容功能本身 | **正确**：阶梯扩容、4100 万次提交零错误、0 CRC、0 dedup 校验失配、无数据丢失 |
-| 门禁 | metadb 库测 733/0、onyx 库测 311/0 全绿 |
-| fio 冻结 | 预存 onyx checkpoint stall，与本功能无关，单独立项 |
+| 门禁 | 完整 `cargo test`：675 passed、0 failed、5 ignored；release build 通过 |
+| fio 冻结 | LV2 ring 指标/节流/clean-shutdown checkpoint 已修复；剩余毫秒级尾延迟单独优化 |
 | 待办 | 多小时 metadb-soak（参照模型 oracle + 重启 + fault 注入）通过后提交 v25 |
 
-**一句话**：上机验收挖出并修掉了 3 个单元/压力测试没覆盖的真实 bug（其中 Bug A 是会失败前台提交、
-可能卡恢复的 P0），在线扩容功能已验证正确；观察到的 fio 冻结经定位是 onyx 预存的大-L2P checkpoint
-stall，与本次扩容无关。
+**一句话**：上机验收挖出并修掉了 3 个 resize bug（其中 Bug A 是会失败前台提交、可能卡恢复的 P0）、
+1 个迁移写放大问题和 2 个 onyx LV2 ring 生命周期 bug；在线扩容功能已验证正确，fio 秒级冻结与扩容
+无关，ring 修复后的最终对照中未复现。

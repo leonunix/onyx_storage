@@ -414,6 +414,9 @@ impl WriteBufferPool {
             COMMIT_LOG_VERSION_V2
         };
         let throttle = runtime_limits.throttle.resolved();
+        let throttle_states = (0..shards.len())
+            .map(|_| ShardThrottleState::default())
+            .collect();
         let pool = Self {
             root_device: device,
             shards,
@@ -429,9 +432,7 @@ impl WriteBufferPool {
             durable_seq,
             throttle,
             throttle_anchor: Instant::now(),
-            throttle_last_wakeup_ns: AtomicU64::new(0),
-            throttle_cached_fill_pct: AtomicU32::new(0),
-            throttle_sample_counter: AtomicU32::new(0),
+            throttle_states,
             meta_fence: OnceLock::new(),
         };
 
