@@ -40,6 +40,13 @@ pub struct EngineStatusSnapshot {
     /// fails. Serialized verbatim into `status-json`; the text form renders a
     /// pool summary plus a per-LD line for any degraded/rebuilding LD.
     pub chunklet: Option<onyx_chunklet::ops::PoolSnapshot>,
+    /// Live cuckoo dedup-index bucket count (modulus). Grows online as the
+    /// unique-hash working set reveals itself (see the online-resize scanner).
+    pub dedup_cuckoo_buckets: u64,
+    /// True while an online cuckoo modulus resize (Growing phase) is in flight.
+    pub dedup_resize_growing: bool,
+    /// The OLD (smaller, draining) modulus during a resize; 0 when not resizing.
+    pub dedup_resize_old_buckets: u64,
     pub metrics: EngineMetricsSnapshot,
 }
 
@@ -103,6 +110,19 @@ impl EngineStatusSnapshot {
                 "metadb_dedup_cuckoo: l0_distinct_fps={} l0_approx_bytes={} l1_entries={}",
                 metadb.dedup_l0_distinct_fps, metadb.dedup_l0_approx_bytes, metadb.dedup_l1_entries
             );
+            if self.dedup_resize_growing {
+                let _ = writeln!(
+                    out,
+                    "metadb_dedup_resize: GROWING {} -> {} buckets (migrating)",
+                    self.dedup_resize_old_buckets, self.dedup_cuckoo_buckets
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "metadb_dedup_resize: steady {} buckets",
+                    self.dedup_cuckoo_buckets
+                );
+            }
             let _ = writeln!(
                 out,
                 "metadb_cache: hits={} misses={} evictions={} pages={}/{} pinned_pages={} pin_budget_bytes={}",

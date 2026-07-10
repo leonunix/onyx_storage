@@ -180,6 +180,34 @@ impl MetaStore {
         self.backend.dirty_pages_estimate()
     }
 
+    // ---- online cuckoo dedup-index modulus resize (driven by DedupScanner) ----
+
+    /// Current resize phase + modulus + per-table live counts.
+    pub fn dedup_migration_status(&self) -> onyx_metadb::dedup::DedupMigrationStatus {
+        self.backend.dedup_migration_status()
+    }
+
+    /// Enter the Growing phase, targeting `target_bucket_count` buckets.
+    /// Idempotent if a resize is already in progress.
+    pub fn dedup_resize_begin(&self, target_bucket_count: u64) -> OnyxResult<()> {
+        self.backend.dedup_resize_begin(target_bucket_count)
+    }
+
+    /// Copy up to `max_pages` OLD pages into NEW (from `start_page`, wrapping).
+    /// Returns progress + resume cursor + `wrapped` (a full pass completed).
+    pub fn dedup_migrate_step(
+        &self,
+        start_page: usize,
+        max_pages: usize,
+    ) -> OnyxResult<onyx_metadb::dedup::MigrateStepStats> {
+        self.backend.dedup_migrate_step(start_page, max_pages)
+    }
+
+    /// Complete the resize (drop OLD, persist Single, free OLD pages).
+    pub fn dedup_resize_finish(&self) -> OnyxResult<()> {
+        self.backend.dedup_resize_finish()
+    }
+
     pub(crate) fn durable_checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
         self.backend.durable_checkpoint_outcome(token)
     }

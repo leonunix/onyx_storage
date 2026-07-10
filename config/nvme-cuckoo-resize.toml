@@ -1,0 +1,154 @@
+# Cuckoo dedup-index ONLINE MODULUS RESIZE box test profile.
+# Derived from nvme-chunklet.toml (Phase 3: LV3 RAID6 + LV2 RAID10 + metadb
+# RAID10 meta LD all in ONE chunklet pool). The ONLY differences vs the
+# production baseline are the intentionally SMALL initial cuckoo modulus +
+# the [dedup] auto-resize knobs + a faster scanner interval so the online
+# resize staircase (begin_grow -> migrate -> swap) fires and completes at an
+# observable pace under a dedup-heavy fio load.
+#
+# ⚠ NVMe names reshuffle across reboots — the device list below is the
+# 2026-07-10 enumeration (verified by lsblk: 10x 7.68TB Dell Ent NVMe, none is
+# sda=DELLBOSS). Re-verify by CONTENT (`lsblk -f`/`blkid`) before chunklet-init.
+#
+# Run:
+#   target/release/onyx-storage -c config/nvme-cuckoo-resize.toml chunklet-init --force
+#   # copy the printed lv3/lv2/meta ld ids into [chunklet] below, then:
+#   target/release/onyx-storage -c config/nvme-cuckoo-resize.toml create-volume -n fio-volume -s 274877906944 --compression lz4
+#   RUST_LOG=info target/release/onyx-storage -c config/nvme-cuckoo-resize.toml start -v fio-volume
+
+[numa]
+mode = "confine"
+home_node = 0
+reserve_cores_per_node = 2
+cold_cache_policy = "auto"
+
+[chunklet]
+enabled = true
+# 10 raw NVMe PDs (2026-07-10 enumeration). ⚠ VERIFY BY CONTENT before init.
+devices = [
+    "/dev/nvme0n2",
+    "/dev/nvme1n1",
+    "/dev/nvme2n1",
+    "/dev/nvme3n1",
+    "/dev/nvme4n2",
+    "/dev/nvme5n2",
+    "/dev/nvme6n2",
+    "/dev/nvme7n1",
+    "/dev/nvme8n1",
+    "/dev/nvme9n2",
+]
+io_backend = "uring"
+spare_pct = 5
+watchdog_enabled = true
+watchdog_interval_secs = 10
+watchdog_fail_threshold = 3
+auto_failover = true
+# LV3 = RAID6 (6 data + 2 parity), 100 rows, 4 KiB strip -> ~600 GiB usable.
+lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 100, strip_kib = 4 }
+# LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable.
+lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
+# metadb LD (Phase 3f). RAID10 2x mirror, 32 rows -> ~64 GiB usable (>> the
+# ~2 GiB the largest cuckoo table + L2P/rc need even after several grows).
+meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
+# LD ids from `chunklet-init --force` (2026-07-10 pool re-init, Issue D validation):
+lv3_ld_id = "7b2e01e4-de72-4bbd-b17b-067526b75b12"
+lv2_ld_id = "ce6f59e7-0b1a-404f-87b7-342bc439f2c2"
+meta_ld_id = "958f4821-5b4b-416f-bab8-eb6fbba8e17a"
+
+[meta]
+backend = "chunklet"
+path = "/mnt/onyx-meta/metadb"
+block_cache_mb = 32768
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 5000
+group_commit_timeout_us = 1
+dedup_shards = 8
+# ── RESIZE TEST: intentionally SMALL initial modulus so the auto-grow fires
+#    quickly. 65536 buckets x 4 slots = 262144 capacity; watermark 0.5 => first
+#    grow at ~131072 live dedup entries. Staircase 64K->128K->256K->512K->1M...
+dedup_cuckoo_buckets = 65536
+dedup_l1_cache_entries = 256000
+l2p_buffer_enabled = true
+rc_authoritative_reclaim = true
+commit_direct_apply_enabled = true
+bfg_threads_enabled = true
+parallel_l2p_drain_enabled = false
+
+[storage]
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 32
+raid_full_stripe_writes = true
+
+[buffer]
+capacity_mb = 32768
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+shards = 16
+max_memory_mb = 16384
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 24576
+coalesce_max_lbas = 6
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+recovery_timeout_ms = 600000
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+
+[dedup]
+enabled = true
+workers = 2
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 0
+# ── RESIZE TEST: faster scanner cycle so the migration walker + grow trigger
+#    run at an observable pace (each cycle migrates cuckoo_migrate_max_per_cycle
+#    OLD pages). 2s vs the 30s production default.
+rescan_interval_ms = 2000
+max_rescan_per_cycle = 4096
+cold_tail_max_per_cycle = 4096
+# ── RESIZE TEST: online cuckoo modulus auto-resize.
+cuckoo_auto_resize = true
+cuckoo_grow_watermark = 0.5
+cuckoo_grow_factor = 2
+cuckoo_max_buckets = 4194304
+cuckoo_migrate_max_per_cycle = 1024
+
+[threading]
+enabled = false
+
+[service]
+socket_path = "/tmp/onyx-storage-nvme.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30

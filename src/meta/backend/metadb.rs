@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use onyx_metadb::{
     Config as MetaDbConfig, Db, DedupValue, DeferredOutcomeHandle, L2pValue, Lsn, VolumeOrdinal,
 };
+use onyx_metadb::dedup::{DedupMigrationStatus, MigrateStepStats};
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
@@ -1645,6 +1646,28 @@ impl MetadbBackend {
 
     pub(crate) fn dirty_pages_estimate(&self) -> usize {
         self.db.dirty_pages_estimate()
+    }
+
+    // ---- online cuckoo dedup-index modulus resize (driven by DedupScanner) ----
+
+    pub(crate) fn dedup_migration_status(&self) -> DedupMigrationStatus {
+        self.db.dedup_migration_status()
+    }
+
+    pub(crate) fn dedup_resize_begin(&self, target_bucket_count: u64) -> OnyxResult<()> {
+        Ok(self.db.dedup_resize_begin(target_bucket_count)?)
+    }
+
+    pub(crate) fn dedup_migrate_step(
+        &self,
+        start_page: usize,
+        max_pages: usize,
+    ) -> OnyxResult<MigrateStepStats> {
+        Ok(self.db.dedup_migrate_step(start_page, max_pages)?)
+    }
+
+    pub(crate) fn dedup_resize_finish(&self) -> OnyxResult<()> {
+        Ok(self.db.dedup_resize_finish()?)
     }
 
     pub(crate) fn try_request_durable_checkpoint_token(&self) -> OnyxResult<Option<u64>> {

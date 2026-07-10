@@ -93,6 +93,36 @@ pub struct DedupConfig {
     /// Default 2.
     #[serde(default = "default_orphan_reclaim_clean_sweeps")]
     pub orphan_reclaim_clean_sweeps: u32,
+    /// Online cuckoo dedup-index modulus resize: master switch for the
+    /// scanner's grow TRIGGER (default false). When on, the scanner asks metadb
+    /// to grow the modulus once the live cuckoo load factor crosses
+    /// `cuckoo_grow_watermark`. An already-in-progress migration (e.g. resumed
+    /// after a crash) is ALWAYS driven to completion regardless of this flag, so
+    /// a Growing database never stalls. Kept off by default until box/soak
+    /// validation; the customer dedup ratio is unpredictable, so this is what
+    /// makes the modulus adapt on-demand instead of being frozen at init.
+    #[serde(default)]
+    pub cuckoo_auto_resize: bool,
+    /// Load factor (`live_entries / (bucket_count × 4)`) at which the scanner
+    /// triggers a grow when `cuckoo_auto_resize` is on. 0.5–0.6 is the cuckoo
+    /// sweet spot. Default 0.55.
+    #[serde(default = "default_cuckoo_grow_watermark")]
+    pub cuckoo_grow_watermark: f64,
+    /// Multiplier applied to the current bucket count on each grow (default 2).
+    #[serde(default = "default_cuckoo_grow_factor")]
+    pub cuckoo_grow_factor: u64,
+    /// Hard cap on the cuckoo bucket count the auto-grow will target. `0` = no
+    /// cap (bounded only by RAM: dense L0 filter + page-table). The unique-4K
+    /// hash working set is itself bounded by LV3 capacity / 4K. Default 0.
+    #[serde(default)]
+    pub cuckoo_max_buckets: u64,
+    /// OLD data pages the migration walker copies into NEW per scan cycle while
+    /// a resize is in progress. Bounds the `apply_gate.read()` the step holds
+    /// (it briefly blocks flush/snapshot writers). `0` disables migration
+    /// progress — do NOT set 0 if a resize can be in flight, or it stalls.
+    /// Default 256.
+    #[serde(default = "default_cuckoo_migrate_max_per_cycle")]
+    pub cuckoo_migrate_max_per_cycle: usize,
 }
 
 impl Default for DedupConfig {
@@ -113,8 +143,23 @@ impl Default for DedupConfig {
             orphan_reclaim_fresh_max_age: default_orphan_reclaim_fresh_max_age(),
             orphan_reclaim_per_pba: default_orphan_reclaim_per_pba(),
             orphan_reclaim_clean_sweeps: default_orphan_reclaim_clean_sweeps(),
+            cuckoo_auto_resize: false,
+            cuckoo_grow_watermark: default_cuckoo_grow_watermark(),
+            cuckoo_grow_factor: default_cuckoo_grow_factor(),
+            cuckoo_max_buckets: 0,
+            cuckoo_migrate_max_per_cycle: default_cuckoo_migrate_max_per_cycle(),
         }
     }
+}
+
+fn default_cuckoo_grow_watermark() -> f64 {
+    0.55
+}
+fn default_cuckoo_grow_factor() -> u64 {
+    2
+}
+fn default_cuckoo_migrate_max_per_cycle() -> usize {
+    256
 }
 
 fn default_enabled() -> bool {

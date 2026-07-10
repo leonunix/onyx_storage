@@ -1971,6 +1971,7 @@ impl OnyxEngine {
 
     pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {
         let contiguity = self.allocator.as_ref().map(|alloc| alloc.contiguity_stats());
+        let dedup_migration = self.meta.dedup_migration_status();
         Ok(EngineStatusSnapshot {
             mode: if self.zone_manager.is_some() {
                 "active".to_string()
@@ -2027,6 +2028,9 @@ impl OnyxEngine {
                 .chunklet_pool()
                 .and_then(|pool| pool.metrics().ok())
                 .map(|m| onyx_chunklet::ops::PoolSnapshot::from_metrics(&m)),
+            dedup_cuckoo_buckets: dedup_migration.new_bucket_count,
+            dedup_resize_growing: dedup_migration.growing,
+            dedup_resize_old_buckets: dedup_migration.old_bucket_count,
             metrics: self.metrics.snapshot(),
         })
     }

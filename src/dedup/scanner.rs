@@ -183,6 +183,9 @@ impl DedupScanner {
         // approach, which does not scale to a multi-billion-entry index.
         let mut index_scrub_cursor = DedupScanCursor::default();
         let mut orphan_cursor = DedupScanCursor::default();
+        // Resumable OLD-page cursor for the online cuckoo-resize migration
+        // walker (5th sub-pass). Reset to 0 at each begin/finish transition.
+        let mut cuckoo_migrate_cursor: usize = 0;
         while running.load(Ordering::Relaxed) {
             let cfg = config.load();
             thread::sleep(Duration::from_millis(cfg.rescan_interval_ms));
@@ -423,6 +426,81 @@ impl DedupScanner {
                         Err(e) => {
                             metrics.dedup_rescan_errors.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(error = %e, "dedup scanner: orphan reclaim failed");
+                        }
+                    }
+                }
+            }
+
+            // 5. Online cuckoo dedup-index modulus resize. An in-progress
+            //    migration is ALWAYS driven to completion (a Growing db — e.g.
+            //    resumed after a crash — must never stall), independent of the
+            //    `cuckoo_auto_resize` trigger switch. A fresh grow is triggered
+            //    only when `cuckoo_auto_resize` is on and the live cuckoo load
+            //    factor has crossed `cuckoo_grow_watermark`. All the heavy
+            //    lifting (atomic two-table migration, crash-safe phase commits,
+            //    OLD-page reclaim) is inside metadb; onyx just paces it.
+            if !rescan_debt && cfg.cuckoo_migrate_max_per_cycle > 0 {
+                let status = meta.dedup_migration_status();
+                if status.growing {
+                    match meta
+                        .dedup_migrate_step(cuckoo_migrate_cursor, cfg.cuckoo_migrate_max_per_cycle)
+                    {
+                        Ok(step) => {
+                            cuckoo_migrate_cursor = step.next_page;
+                            if step.wrapped {
+                                // A full pass over OLD completed → swap to Single.
+                                match meta.dedup_resize_finish() {
+                                    Ok(()) => {
+                                        cuckoo_migrate_cursor = 0;
+                                        tracing::info!(
+                                            modulus = status.new_bucket_count,
+                                            "dedup resize: migration complete, swapped to Single"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "dedup resize: finish/swap failed")
+                                    }
+                                }
+                            } else {
+                                tracing::debug!(
+                                    inserted = step.inserted,
+                                    already_present = step.already_present,
+                                    next_page = step.next_page,
+                                    "dedup resize: migrate step"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "dedup resize: migrate step failed"),
+                    }
+                } else if cfg.cuckoo_auto_resize {
+                    // Single phase: grow when the live load factor crosses the
+                    // watermark and the target is under the RAM cap.
+                    let capacity = status.new_bucket_count.saturating_mul(4);
+                    let load = if capacity == 0 {
+                        0.0
+                    } else {
+                        status.new_len as f64 / capacity as f64
+                    };
+                    if load >= cfg.cuckoo_grow_watermark {
+                        let factor = cfg.cuckoo_grow_factor.max(2);
+                        let target = status.new_bucket_count.saturating_mul(factor);
+                        let under_cap =
+                            cfg.cuckoo_max_buckets == 0 || target <= cfg.cuckoo_max_buckets;
+                        if target > status.new_bucket_count && under_cap {
+                            match meta.dedup_resize_begin(target) {
+                                Ok(()) => {
+                                    cuckoo_migrate_cursor = 0;
+                                    tracing::info!(
+                                        from = status.new_bucket_count,
+                                        to = target,
+                                        load,
+                                        "dedup resize: growing cuckoo modulus"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "dedup resize: begin failed")
+                                }
+                            }
                         }
                     }
                 }
