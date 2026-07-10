@@ -34,13 +34,21 @@ devices = [
     "/dev/nvme3n1",
     "/dev/nvme4n1",
     "/dev/nvme5n1",
-    "/dev/nvme6n1",
+    "/dev/nvme6n2",
     "/dev/nvme7n1",
     "/dev/nvme8n1",
-    "/dev/nvme9n1",
+    "/dev/nvme9n2",
 ]
 io_backend = "uring"
 spare_pct = 5
+# Phase 4d online-failover acceptance: watchdog probes every live PD's head
+# superblock (O_DIRECT), N consecutive misses -> mark_pd_failed -> (auto_failover)
+# background online rebuild-to-spare. rebuild is now ONLINE (io_lock.read during
+# backfill), so foreground IO keeps flowing — safe to leave auto_failover on.
+watchdog_enabled = true
+watchdog_interval_secs = 10
+watchdog_fail_threshold = 3
+auto_failover = true
 # num_rows is no longer capped at ~13. The old wall was the 4 KiB superblock slot
 # (4028-byte manifest body) plus a row-major allocator whose fragmented placement
 # made the per-position RLE descriptor grow ~216 B/row. Two chunklet fixes removed
@@ -68,9 +76,9 @@ lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0
 # taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
-lv3_ld_id = "4d37ac47-d336-43e2-a51d-7475b2e3e89e"
-lv2_ld_id = "a0e6764b-1338-412c-89a5-062a7e253c37"
-meta_ld_id = "b4383ac7-1c82-4280-83a7-d923e75e4097"
+lv3_ld_id = "f8215d7c-77c2-46f7-90e6-9a1594cd2156"
+lv2_ld_id = "71b74e06-a297-4c09-a73d-7a5d7c946281"
+meta_ld_id = "045efb32-f949-4ab0-924a-6209ed240b94"
 
 [meta]
 # Phase 3f: metadb persists on the chunklet meta LD (see [chunklet].meta_ld_id),

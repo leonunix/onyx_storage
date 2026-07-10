@@ -182,9 +182,9 @@ class OnyxService:
     def cli(self, *args: str) -> list[str]:
         return [*self.engine_cmd, "-c", str(self.config_path), *args]
 
-    def send_socket_cmd(self, cmd: str) -> list[str]:
+    def send_socket_cmd(self, cmd: str, timeout: float = 5.0) -> list[str]:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5.0)
+            sock.settimeout(timeout)
             sock.connect(str(self.socket_path))
             sock.sendall((cmd + "\n").encode("utf-8"))
             fileobj = sock.makefile("r", encoding="utf-8", newline="\n")
@@ -327,6 +327,91 @@ class Sampler:
             self.stop_event.wait(self.interval_secs)
 
 
+class SnapshotChurner:
+    """Create then delete snapshots on the live volume in a rolling window while
+    fio drives verified IO. This stresses the snapshot-drop freed-PBA retire path
+    against concurrent overwrites/dedup — the premature-free CRC hazard. A drop
+    that frees a PBA still referenced by the live volume surfaces as a fatal
+    read-pool CRC mismatch in engine.log (the run then fails in `main`'s finally)
+    and/or an fio verify error. Every op is logged to events.jsonl; counts land
+    in the summary under `snapshot_churn`."""
+
+    def __init__(
+        self,
+        service: "OnyxService",
+        run_dir: pathlib.Path,
+        volume: str,
+        interval_secs: int,
+        max_live: int,
+        name_prefix: str,
+    ) -> None:
+        self.service = service
+        self.run_dir = run_dir
+        self.volume = volume
+        self.interval_secs = interval_secs
+        self.max_live = max(1, max_live)
+        self.name_prefix = name_prefix
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="snapshot-churner")
+        self.live: list[str] = []
+        self.counter = 0
+        self.stats: dict[str, int] = {"created": 0, "deleted": 0, "errors": 0, "freed_blocks": 0}
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=max(30, self.interval_secs + 30))
+        # Drain remaining snapshots so the volume ends clean for verify/reopen.
+        while self.live:
+            self._delete(self.live.pop(0))
+
+    def _append_event(self, payload: dict[str, object]) -> None:
+        with (self.run_dir / "events.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    def _create(self, name: str) -> None:
+        ts = time.time()
+        try:
+            reply = self.service.send_socket_cmd(f"snapshot-create {self.volume} {name}", timeout=120.0)
+            self.stats["created"] += 1
+            self._append_event({"ts": ts, "event": "snapshot-create", "name": name, "reply": reply})
+        except Exception as exc:
+            self.stats["errors"] += 1
+            self._append_event(
+                {"ts": ts, "event": "snapshot-churn-error", "op": "create", "name": name, "error": str(exc)}
+            )
+
+    def _delete(self, name: str) -> None:
+        ts = time.time()
+        try:
+            reply = self.service.send_socket_cmd(f"snapshot-delete {self.volume} {name}", timeout=120.0)
+            self.stats["deleted"] += 1
+            for line in reply:  # reply like ["ok <freed_blocks>"]
+                if line.startswith("ok "):
+                    try:
+                        self.stats["freed_blocks"] += int(line.split()[1])
+                    except (IndexError, ValueError):
+                        pass
+            self._append_event({"ts": ts, "event": "snapshot-delete", "name": name, "reply": reply})
+        except Exception as exc:
+            self.stats["errors"] += 1
+            self._append_event(
+                {"ts": ts, "event": "snapshot-churn-error", "op": "delete", "name": name, "error": str(exc)}
+            )
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            self.counter += 1
+            name = f"{self.name_prefix}{self.counter}"
+            self._create(name)
+            self.live.append(name)
+            while len(self.live) > self.max_live:
+                self._delete(self.live.pop(0))
+            self.stop_event.wait(self.interval_secs)
+
+
 def render_jobfile(template: pathlib.Path, output: pathlib.Path, values: dict[str, object]) -> None:
     text = template.read_text(encoding="utf-8")
     for key, value in values.items():
@@ -462,6 +547,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--verify-async", type=int, default=2)
     parser.add_argument("--verify-backlog", type=int, default=4096)
     parser.add_argument("--verify-backlog-batch", type=int, default=512)
+    parser.add_argument(
+        "--snapshot-churn-interval",
+        type=parse_duration,
+        default=0,
+        help=(
+            "Seconds between snapshot create/delete churn ops on the live volume "
+            "while fio runs (e.g. '15s'). 0 (default) disables churn. Stresses the "
+            "snapshot-drop freed-PBA retire path against concurrent overwrites."
+        ),
+    )
+    parser.add_argument(
+        "--snapshot-max-live",
+        type=int,
+        default=4,
+        help="Rolling window: keep this many snapshots before deleting the oldest.",
+    )
+    parser.add_argument("--snapshot-name-prefix", default="churn-")
     parser.add_argument("--sample-interval", type=parse_duration, default=parse_duration("60s"))
     parser.add_argument("--startup-timeout", type=parse_duration, default=parse_duration("20m"))
     parser.add_argument("--stop-timeout", type=parse_duration, default=parse_duration("5m"))
@@ -554,6 +656,7 @@ def main(argv: list[str]) -> int:
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
     sampler: Optional[Sampler] = None
+    churner: Optional[SnapshotChurner] = None
     started = time.time()
     try:
         service.cleanup_ublk()
@@ -591,6 +694,16 @@ def main(argv: list[str]) -> int:
 
         sampler = Sampler(service, run_dir, args.sample_interval)
         sampler.start()
+        if args.snapshot_churn_interval > 0:
+            churner = SnapshotChurner(
+                service,
+                run_dir,
+                args.volume,
+                args.snapshot_churn_interval,
+                args.snapshot_max_live,
+                args.snapshot_name_prefix,
+            )
+            churner.start()
         fio_json = run_dir / "fio-result.json"
         fio_log = run_dir / "fio.log"
         fio_cmd = ["fio", str(rendered_job), "--output", str(fio_json), "--output-format=json"]
@@ -624,6 +737,9 @@ def main(argv: list[str]) -> int:
     finally:
         if sampler is not None:
             sampler.stop()
+        if churner is not None:
+            churner.stop()  # drains remaining snapshots via the socket
+            summary["snapshot_churn"] = churner.stats
         if not args.leave_running:
             try:
                 service.stop()
