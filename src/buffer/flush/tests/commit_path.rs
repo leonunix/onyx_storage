@@ -481,8 +481,16 @@ fn coalesced_passthrough_done_routes_to_origin_shards() {
     let (done0_tx, done0_rx) = unbounded::<Vec<u64>>();
     let (done1_tx, done1_rx) = unbounded::<Vec<u64>>();
 
+    let first_lba = 10u64;
+    let first_sid = meta.l2p_shard_of(Lba(first_lba));
+    let second_lba = (first_lba + 1..)
+        .find(|lba| meta.l2p_shard_of(Lba(*lba)) != first_sid)
+        .expect("test must find an LBA routed to a different metadb shard");
     let mut units = Vec::new();
-    for (shard_idx, seq, lba, fill) in [(0usize, 101u64, 10u64, 0x51), (1, 202, 20, 0x62)] {
+    for (shard_idx, seq, lba, fill) in [
+        (0usize, 101u64, first_lba, 0x51),
+        (1, 202, second_lba, 0x62),
+    ] {
         pool.note_latest_lba_seq_for_test("flush-race", Lba(lba), seq, 1);
         let pba = allocator.allocate_one_for_lane(shard_idx).unwrap();
         units.push(super::writer::UnitCommitData {
@@ -500,6 +508,7 @@ fn coalesced_passthrough_done_routes_to_origin_shards() {
         units,
         enqueued_at: Instant::now(),
     };
+    let before = meta.memory_stats().unwrap();
     let (post_commit_tx, post_commit_rx) = unbounded::<super::writer::PostCommitJob>();
     let pool_pc = pool.clone();
     let meta_pc = meta.clone();
@@ -536,6 +545,12 @@ fn coalesced_passthrough_done_routes_to_origin_shards() {
     post_commit_handle
         .join()
         .expect("post_commit_loop panicked");
+    let after = meta.memory_stats().unwrap();
+    assert_eq!(
+        after.commit_success - before.commit_success,
+        1,
+        "one passthrough chunk must stay one transaction even across L2P shards"
+    );
 
     assert_eq!(
         done0_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -608,6 +623,160 @@ fn commit_worker_publishes_candidates_before_post_commit() {
     );
     assert!(post.stale_repairs.is_empty());
     assert!(done_rx.try_recv().is_err());
+}
+
+#[test]
+fn commit_worker_batches_dedup_hit_jobs_and_splits_responses() {
+    let (meta, _pool, lifecycle, _allocator, _io, metrics, _meta_dir, _buf, _data) =
+        setup_flush_test_env();
+    let vol = VolumeId("flush-race".into());
+    let vol_created_at = meta.get_volume(&vol).unwrap().unwrap().created_at;
+    let target = BlockmapValue {
+        pba: Pba(42),
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0x1234_5678,
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.set_refcount(target.pba, 1).unwrap();
+
+    let (response_tx_1, response_rx_1) = bounded(1);
+    let (response_tx_2, response_rx_2) = bounded(1);
+    let jobs = vec![
+        super::writer::DedupHitCommitJob {
+            vol_id: vol.clone(),
+            vol_created_at,
+            hits: vec![(Lba(700), target, [1; 8])],
+            promote_entries: Vec::new(),
+            seqs: vec![1],
+            response_tx: response_tx_1,
+            enqueued_at: Instant::now(),
+        },
+        super::writer::DedupHitCommitJob {
+            vol_id: vol.clone(),
+            vol_created_at,
+            hits: vec![(Lba(701), target, [2; 8])],
+            promote_entries: Vec::new(),
+            seqs: vec![2],
+            response_tx: response_tx_2,
+            enqueued_at: Instant::now(),
+        },
+    ];
+    let attempts_before = meta.memory_stats().unwrap().commit_attempts;
+
+    BufferFlusher::dispatch_dedup_hit_jobs(jobs, &meta, &lifecycle, &metrics);
+
+    for response in [response_rx_1.recv().unwrap(), response_rx_2.recv().unwrap()] {
+        match response {
+            super::writer::DedupHitCommitResponse::Committed { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert!(matches!(results[0], DedupHitResult::Accepted(_)));
+            }
+            super::writer::DedupHitCommitResponse::Failed(error) => {
+                panic!("dedup hit batch failed: {error}")
+            }
+        }
+    }
+    assert_eq!(
+        meta.memory_stats().unwrap().commit_attempts - attempts_before,
+        1,
+        "two queued hit jobs must share one metadb transaction"
+    );
+    assert_eq!(
+        meta.get_mapping(&vol, Lba(700)).unwrap().unwrap().pba,
+        target.pba
+    );
+    assert_eq!(
+        meta.get_mapping(&vol, Lba(701)).unwrap().unwrap().pba,
+        target.pba
+    );
+}
+
+#[test]
+fn commit_worker_rejects_stale_dedup_hit_generation() {
+    let (meta, _pool, lifecycle, _allocator, _io, metrics, _meta_dir, _buf, _data) =
+        setup_flush_test_env();
+    let vol = VolumeId("flush-race".into());
+    let current_created_at = meta.get_volume(&vol).unwrap().unwrap().created_at;
+    let target = BlockmapValue {
+        pba: Pba(42),
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: 0x1234_5678,
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.set_refcount(target.pba, 1).unwrap();
+
+    let (response_tx, response_rx) = bounded(1);
+    BufferFlusher::dispatch_dedup_hit_jobs(
+        vec![super::writer::DedupHitCommitJob {
+            vol_id: vol.clone(),
+            vol_created_at: current_created_at.saturating_add(1),
+            hits: vec![(Lba(702), target, [3; 8])],
+            promote_entries: Vec::new(),
+            seqs: vec![3],
+            response_tx,
+            enqueued_at: Instant::now(),
+        }],
+        &meta,
+        &lifecycle,
+        &metrics,
+    );
+
+    match response_rx.recv().unwrap() {
+        super::writer::DedupHitCommitResponse::Failed(error) => {
+            assert!(
+                error.contains("has been deleted"),
+                "unexpected error: {error}"
+            );
+        }
+        super::writer::DedupHitCommitResponse::Committed { .. } => {
+            panic!("stale volume generation must not commit")
+        }
+    }
+    assert!(meta.get_mapping(&vol, Lba(702)).unwrap().is_none());
+}
+
+#[test]
+fn commit_aggregator_forms_full_batch_and_flushes_disconnect_tail() {
+    let (raw_tx, raw_rx) = bounded(8);
+    let (batch_tx, batch_rx) = bounded(8);
+    let target = BlockmapValue::zero();
+
+    for i in 0..5u64 {
+        let (response_tx, _response_rx) = bounded(1);
+        raw_tx
+            .send(super::writer::CommitJob::DedupHit(
+                super::writer::DedupHitCommitJob {
+                    vol_id: VolumeId("aggregate".into()),
+                    vol_created_at: 1,
+                    hits: vec![(Lba(i), target, [i as u8; 8])],
+                    promote_entries: Vec::new(),
+                    seqs: vec![i + 1],
+                    response_tx,
+                    enqueued_at: Instant::now(),
+                },
+            ))
+            .unwrap();
+    }
+    drop(raw_tx);
+
+    let aggregator = std::thread::spawn(move || {
+        BufferFlusher::commit_aggregator_loop(raw_rx, batch_tx, 3, Duration::ZERO, 0)
+    });
+
+    assert_eq!(batch_rx.recv().unwrap().len(), 3);
+    assert_eq!(batch_rx.recv().unwrap().len(), 2);
+    aggregator.join().unwrap();
+    assert!(batch_rx.recv().is_err());
 }
 
 #[test]
@@ -1021,11 +1190,15 @@ fn drain_passthrough_commits(
                 super::writer::TARGET_OPS_PER_COMMIT,
                 1,
             ),
-            super::writer::CommitJob::Packed(_) => panic!("expected passthrough commit job"),
+            super::writer::CommitJob::Packed(_) | super::writer::CommitJob::DedupHit(_) => {
+                panic!("expected passthrough commit job")
+            }
         }
     }
     drop(post_commit_tx);
-    post_commit_handle.join().expect("post_commit_loop panicked");
+    post_commit_handle
+        .join()
+        .expect("post_commit_loop panicked");
 }
 
 /// Three sub-stripe (2-block) passthrough units at disjoint LBAs pack into ONE
@@ -1103,11 +1276,71 @@ fn passthrough_groups_sub_stripe_units_into_one_full_stripe() {
     let worker = ZoneWorker::new(ZoneId(0), meta.clone(), pool.clone(), io_engine.clone());
     for (lba, off, fill) in expect {
         let m = meta.get_mapping(&vol, Lba(lba)).unwrap().unwrap();
-        assert_eq!(m.pba, Pba(base.0 + off), "lba {lba} must map to its stripe sub-PBA");
+        assert_eq!(
+            m.pba,
+            Pba(base.0 + off),
+            "lba {lba} must map to its stripe sub-PBA"
+        );
         assert_eq!(m.slot_offset, 0, "grouped members stay block-granular");
         let got = worker.handle_read("flush-race", Lba(lba)).unwrap().unwrap();
         assert_eq!(got, vec![fill; BLOCK_SIZE as usize], "lba {lba} round-trip");
     }
+}
+
+#[test]
+fn passthrough_partial_group_pads_io_and_returns_unused_extent() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let data_tmp = NamedTempFile::new().unwrap();
+    data_tmp.as_file().set_len(4096 * 20000).unwrap();
+    let io_engine = stripe_io_engine(data_tmp.path(), 6, metrics.clone());
+
+    let mut units = Vec::new();
+    let mut seqs_per_unit = Vec::new();
+    for (idx, (lba, fill)) in [(80u64, 0x60u8), (90, 0x70)].into_iter().enumerate() {
+        let seq = idx as u64 + 1;
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(lba), seq, 1);
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(lba + 1), seq, 1);
+        units.push(make_raw_unit_at(lba, 2, fill, seq));
+        seqs_per_unit.push(vec![seq]);
+    }
+
+    let free_before = allocator.free_block_count();
+    let in_flight = Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (cw_tx, cw_rx) = unbounded::<super::writer::CommitJob>();
+    BufferFlusher::write_units_batch(
+        0,
+        units,
+        seqs_per_unit,
+        vec![None, None],
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        &metrics,
+        &in_flight,
+        &done_tx,
+        std::slice::from_ref(&cw_tx),
+        1,
+    );
+    drop(cw_tx);
+    let candidate = crate::dedup::CandidateCache::new(8, 64);
+    drain_passthrough_commits(
+        cw_rx, &pool, &meta, &lifecycle, &allocator, &in_flight, &metrics, &done_tx, &candidate,
+    );
+
+    assert_eq!(
+        free_before - allocator.free_block_count(),
+        4,
+        "only mapped data blocks should remain allocated"
+    );
+    assert_eq!(metrics.lv3_write_ops.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        metrics.lv3_write_compressed_bytes.load(Ordering::Relaxed),
+        6 * BLOCK_SIZE as u64,
+        "partial bin should issue one padded full-stripe write"
+    );
 }
 
 /// A grouped full-stripe write that fails IO rolls the whole stripe extent back
@@ -1246,7 +1479,9 @@ fn drain_packed_commits(
                 done_tx,
                 &post_commit_tx,
             ),
-            super::writer::CommitJob::Passthrough(_) => panic!("expected packed commit job"),
+            super::writer::CommitJob::Passthrough(_) | super::writer::CommitJob::DedupHit(_) => {
+                panic!("expected packed commit job")
+            }
         }
     }
     drop(post_commit_tx);
@@ -1326,7 +1561,11 @@ fn packed_groups_six_slots_into_one_full_stripe() {
     );
     for i in 0..6u64 {
         let m = meta.get_mapping(&vol, Lba(100 + i)).unwrap().unwrap();
-        assert_eq!(m.pba, Pba(base.0 + i), "slot {i} must map to its stripe sub-PBA");
+        assert_eq!(
+            m.pba,
+            Pba(base.0 + i),
+            "slot {i} must map to its stripe sub-PBA"
+        );
         assert_eq!(m.slot_offset, 0, "packed slot keeps its own slot_offset");
         let block = io_engine
             .read_blocks(Pba(base.0 + i), BLOCK_SIZE as usize)
@@ -1406,7 +1645,11 @@ fn packed_group_io_failure_rolls_back_whole_stripe_without_leak() {
         cw_rx.into_iter().next().is_none(),
         "a failed packed full-stripe group must dispatch no commit"
     );
-    assert_eq!(retries.len(), 6, "all six slots must be re-queued for retry");
+    assert_eq!(
+        retries.len(),
+        6,
+        "all six slots must be re-queued for retry"
+    );
     // `free_block_count` == baseline is the exact no-leak / no-double-free
     // invariant: the stripe extent AND the six reassigned-away packer PBAs must
     // all be back on the free list. (Run count is intentionally not asserted —

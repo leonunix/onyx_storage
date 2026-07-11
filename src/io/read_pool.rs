@@ -648,7 +648,12 @@ fn process_backend_submit(
         let mut ops: Vec<(u64, &mut [u8])> = scratch.bufs[..n]
             .iter_mut()
             .enumerate()
-            .map(|(i, rb)| (offsets[i], &mut rb.buf.as_mut_slice()[..expected[i] as usize]))
+            .map(|(i, rb)| {
+                (
+                    offsets[i],
+                    &mut rb.buf.as_mut_slice()[..expected[i] as usize],
+                )
+            })
             .collect();
         backend.read_many_at(&mut ops)
     };
@@ -742,7 +747,8 @@ fn finish_request(ctx: &WorkerCtx, req: &ReadRequest, buf: &[u8], exp_bytes: u32
             dump_crc_victim_forensics(&req.mapping, req.raw_extent.as_deref());
         }
     }
-    ctx.metrics.record_read_pool_decode_ns(elapsed_ns(decode_start));
+    ctx.metrics
+        .record_read_pool_decode_ns(elapsed_ns(decode_start));
     let _ = req.reply.send(result);
 }
 

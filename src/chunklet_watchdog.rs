@@ -124,7 +124,10 @@ impl Drop for ChunkletWatchdog {
 /// Sleep `interval`, but wake every `STOP_CHECK_TICK` to honor a stop request.
 /// Returns `false` if a stop was requested during the wait.
 fn sleep_interruptible(interval: Duration, running: &AtomicBool) -> bool {
-    let ticks = interval.as_millis().div_ceil(STOP_CHECK_TICK.as_millis()).max(1);
+    let ticks = interval
+        .as_millis()
+        .div_ceil(STOP_CHECK_TICK.as_millis())
+        .max(1);
     for _ in 0..ticks {
         if !running.load(Ordering::Relaxed) {
             return false;

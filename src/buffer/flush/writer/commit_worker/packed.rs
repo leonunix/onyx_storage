@@ -205,7 +205,8 @@ impl BufferFlusher {
 
                 if batch_values.is_empty() {
                     for pba in &discarded_pbas {
-                        let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, *pba);
+                        let _ =
+                            crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, *pba);
                     }
                     return Ok(PackedCommitOutcome::Discarded { all_seq_lba_ranges });
                 }
@@ -272,7 +273,9 @@ impl BufferFlusher {
                     }
                     Err(e) => {
                         for pba in &live_pbas {
-                            let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, *pba);
+                            let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(
+                                allocator, *pba,
+                            );
                         }
                         Self::record_elapsed(&metrics.flush_writer_meta_ns, meta_start);
                         return Err(e);
@@ -403,7 +406,10 @@ impl BufferFlusher {
                     "commit_worker: packed slot batch commit failed; defer_retry buffered seqs"
                 );
                 for job in &jobs {
-                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, job.sealed.pba);
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(
+                        allocator,
+                        job.sealed.pba,
+                    );
                     if !job.buffered_seqs.is_empty() {
                         in_flight_tracker.defer_retry(&job.buffered_seqs, Self::RETRY_BACKOFF);
                     }

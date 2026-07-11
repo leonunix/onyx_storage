@@ -289,8 +289,7 @@ fn engine_metadb_on_chunklet_meta_ld_round_trips_after_reopen() {
 
     let payload: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
     {
-        let engine =
-            OnyxEngine::open(&config).expect("engine boots with metadb on the meta LD");
+        let engine = OnyxEngine::open(&config).expect("engine boots with metadb on the meta LD");
         engine
             .create_volume("meta-ld-vol", 64 * 1024 * 1024, CompressionAlgo::Lz4)
             .unwrap();

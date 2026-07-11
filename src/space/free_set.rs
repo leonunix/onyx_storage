@@ -157,7 +157,11 @@ impl FreeSet {
     /// adjacent to another free extent by construction.
     pub(crate) fn insert(&mut self, extent: Extent) {
         let inserted = self.by_addr.insert(extent);
-        debug_assert!(inserted, "FreeSet::insert: duplicate start {}", extent.start.0);
+        debug_assert!(
+            inserted,
+            "FreeSet::insert: duplicate start {}",
+            extent.start.0
+        );
         self.by_size.insert((extent.count, extent.start.0));
         self.blocks_total += extent.count as u64;
         if let Some((stripe, phase)) = self.geom {
@@ -182,12 +186,20 @@ impl FreeSet {
                     extent.start.0
                 );
                 let removed = self.by_size.remove(&(taken.count, taken.start.0));
-                debug_assert!(removed, "FreeSet: by_size missing ({}, {})", taken.count, taken.start.0);
+                debug_assert!(
+                    removed,
+                    "FreeSet: by_size missing ({}, {})",
+                    taken.count, taken.start.0
+                );
                 self.blocks_total -= taken.count as u64;
                 if let Some((stripe, phase)) = self.geom {
                     let eff = Self::eff_count(taken, stripe, phase);
                     let removed_eff = self.by_eff.remove(&(eff, taken.start.0));
-                    debug_assert!(removed_eff, "FreeSet: by_eff missing start {}", taken.start.0);
+                    debug_assert!(
+                        removed_eff,
+                        "FreeSet: by_eff missing start {}",
+                        taken.start.0
+                    );
                     self.stripe_capacity -= Self::stripe_floor(eff, stripe);
                 }
                 debug_assert_eq!(self.by_addr.len(), self.by_size.len());
@@ -280,10 +292,7 @@ impl FreeSet {
         for count in need..tight_end {
             // Within one class the max hostable head is fixed: head <= count - need.
             let max_head = (count - need) as u64;
-            for &(_, start) in self
-                .by_size
-                .range((count, 0u64)..(count, u64::MAX))
-            {
+            for &(_, start) in self.by_size.range((count, 0u64)..(count, u64::MAX)) {
                 if best.is_some_and(|b| b.start.0 <= start) {
                     // Every later entry in this class has a larger start; no
                     // improvement possible here.
@@ -330,7 +339,10 @@ impl FreeSet {
             }
         }
 
-        self.insert(Extent::new(Pba(merged_start), (merged_end - merged_start) as u32));
+        self.insert(Extent::new(
+            Pba(merged_start),
+            (merged_end - merged_start) as u32,
+        ));
     }
 
     /// Test-only raw insert that keeps both indexes in sync — for tests that
@@ -377,7 +389,10 @@ impl FreeSet {
             );
         } else {
             assert!(self.by_eff.is_empty());
-            assert_eq!(self.stripe_capacity, 0, "stripe_capacity must be 0 without geometry");
+            assert_eq!(
+                self.stripe_capacity, 0,
+                "stripe_capacity must be 0 without geometry"
+            );
         }
     }
 }
@@ -412,7 +427,11 @@ mod tests {
         // carve_aligned_from_run's success predicate.
         let aligned = {
             let r = (e.start.0 + phase as u64) % stripe as u64;
-            if r == 0 { e.start.0 } else { e.start.0 + (stripe as u64 - r) }
+            if r == 0 {
+                e.start.0
+            } else {
+                e.start.0 + (stripe as u64 - r)
+            }
         };
         aligned + need as u64 <= e.end_pba().0
     }
@@ -490,7 +509,7 @@ mod tests {
         fs.remove(&Extent::new(Pba(30), 8));
         fs.insert(Extent::new(Pba(18), 5));
         fs.coalesce_insert(Extent::new(Pba(23), 4)); // merges with [18,23)
-        // Sets now: [10,18) eff 8→6, [18,27) head 4 → eff 5→0, [100,105) eff 5→0.
+                                                     // Sets now: [10,18) eff 8→6, [18,27) head 4 → eff 5→0, [100,105) eff 5→0.
         assert_eq!(fs.blocks_total(), 8 + 9 + 5);
         assert_eq!(fs.stripe_capacity(), 6);
         fs.assert_consistent();
@@ -558,7 +577,7 @@ mod tests {
     fn first_fit_aligned_address_order_over_both_branches() {
         const STRIPE: u32 = 6;
         const PHASE: u32 = 2; // aligned starts: (pba+2)%6==0 -> 4,10,16,...
-        // Tight aligned fragment low, big run high.
+                              // Tight aligned fragment low, big run high.
         let mut fs = FreeSet::new();
         fs.insert(Extent::new(Pba(10), 6)); // aligned, exactly need
         fs.insert(Extent::new(Pba(100), 40)); // big
@@ -617,7 +636,11 @@ mod tests {
                 }
                 // Queries first — every one must agree with the oracle.
                 let k = rng.gen_range(1..=64u32);
-                assert_eq!(fs.first_fit(k), shadow_first_fit(&shadow, k), "round {round} k {k}");
+                assert_eq!(
+                    fs.first_fit(k),
+                    shadow_first_fit(&shadow, k),
+                    "round {round} k {k}"
+                );
                 let (stripe, phase) = fixed_geom.unwrap_or_else(|| {
                     let s = [2u32, 6, 384][rng.gen_range(0..3)];
                     (s, rng.gen_range(0..s))
@@ -693,11 +716,20 @@ mod starve_bench {
         let mut start = 8u64;
         while n < 3_000_000 {
             let count = 6 + (n % 5) as u32; // 6..=10
-            // choose start with head_pad > count-6 => cannot host aligned 6
+                                            // choose start with head_pad > count-6 => cannot host aligned 6
             let mut s = start;
             loop {
-                let head = { let r = (s + PHASE as u64) % STRIPE as u64; if r == 0 { 0 } else { STRIPE as u64 - r } };
-                if head > (count - 6) as u64 { break; }
+                let head = {
+                    let r = (s + PHASE as u64) % STRIPE as u64;
+                    if r == 0 {
+                        0
+                    } else {
+                        STRIPE as u64 - r
+                    }
+                };
+                if head > (count - 6) as u64 {
+                    break;
+                }
                 s += 1;
             }
             fs.insert(Extent::new(Pba(s), count));
@@ -707,19 +739,29 @@ mod starve_bench {
         let t = std::time::Instant::now();
         let r = fs.first_fit_aligned(6, STRIPE, PHASE);
         let el = t.elapsed();
-        println!("SCAN fallback over 3M misaligned tight fragments: {:?} result={:?}", el, r);
+        println!(
+            "SCAN fallback over 3M misaligned tight fragments: {:?} result={:?}",
+            el, r
+        );
         assert!(r.is_none());
         // and the healthy comparison: one aligned fragment near the front
         fs.insert(Extent::new(Pba(4), 6)); // (4+2)%6==0 aligned
         let t = std::time::Instant::now();
         let r2 = fs.first_fit_aligned(6, STRIPE, PHASE);
-        println!("SCAN with an aligned fragment at low address: {:?} result={:?}", t.elapsed(), r2);
+        println!(
+            "SCAN with an aligned fragment at low address: {:?} result={:?}",
+            t.elapsed(),
+            r2
+        );
         fs.remove(&Extent::new(Pba(4), 6));
 
         // Now with the engine geometry configured: the by_eff cursor jump.
         let t = std::time::Instant::now();
         fs.set_geometry(STRIPE, PHASE);
-        println!("set_geometry index build over 3M extents: {:?}", t.elapsed());
+        println!(
+            "set_geometry index build over 3M extents: {:?}",
+            t.elapsed()
+        );
         let t = std::time::Instant::now();
         let r3 = fs.first_fit_aligned(6, STRIPE, PHASE);
         println!("EFF-INDEX starved miss: {:?} result={:?}", t.elapsed(), r3);
@@ -727,7 +769,11 @@ mod starve_bench {
         fs.insert(Extent::new(Pba(4), 6));
         let t = std::time::Instant::now();
         let r4 = fs.first_fit_aligned(6, STRIPE, PHASE);
-        println!("EFF-INDEX with aligned fragment: {:?} result={:?}", t.elapsed(), r4);
+        println!(
+            "EFF-INDEX with aligned fragment: {:?} result={:?}",
+            t.elapsed(),
+            r4
+        );
         assert_eq!(r4, Some(Extent::new(Pba(4), 6)));
     }
 }

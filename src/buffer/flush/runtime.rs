@@ -76,6 +76,12 @@ impl BufferFlusher {
         let max_lbas = config.coalesce_max_lbas;
         let min_compression_savings_pct = config.min_compression_savings_pct.min(100);
         let skip_fully_superseded = config.skip_fully_superseded;
+        let buffer_write_window = Duration::from_millis(config.buffer_write_window_ms);
+        let buffer_write_window_pressure_pct = if config.buffer_write_window_pressure_pct == 0 {
+            80
+        } else {
+            config.buffer_write_window_pressure_pct.min(100)
+        };
         let packed_meta_batch_max_lbas = if config.packed_meta_batch_max_lbas == 0 {
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT
         } else {
@@ -115,30 +121,34 @@ impl BufferFlusher {
         let mut lane_done_txs: Vec<Sender<Vec<u64>>> = Vec::with_capacity(lane_count);
         let mut lane_cleanup_txs: Vec<Sender<CleanupBatch>> = Vec::with_capacity(lane_count);
 
-        // Spawn N per-volume commit workers up front (channels only
-        // — actual threads are spawned after the lane loop, once we
-        // have lane_done_txs / lane_cleanup_txs filled). Shard
-        // writers get a `Vec<Sender<CommitJob>>` clone and route by
-        // `hash(vol_id) % N`. Per-worker queue is bounded so a slow
-        // worker provides backpressure to the shard writers.
+        // Raw MPMC producer queue followed by a single aggregator and an
+        // executor queue of already-formed transactions. Directly sharing the
+        // raw receiver between executors made them race for individual jobs
+        // and fragmented a deep backlog into tiny transactions.
+        let commit_executor_count = commit_workers_per_volume;
+        let (commit_tx, commit_rx) = bounded::<writer::CommitJob>(writer::COMMIT_WORKER_QUEUE_CAP);
+        let (commit_batch_tx, commit_batch_rx) = bounded::<Vec<writer::CommitJob>>(
+            writer::COMMIT_EXECUTOR_QUEUE_CAP.max(commit_executor_count * 2),
+        );
         let mut commit_worker_txs: Vec<Sender<writer::CommitJob>> =
-            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
-        let mut commit_worker_rxs: Vec<Receiver<writer::CommitJob>> =
-            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
-        for _ in 0..writer::NUM_COMMIT_WORKERS {
-            let (tx, rx) = bounded::<writer::CommitJob>(writer::COMMIT_WORKER_QUEUE_CAP);
-            commit_worker_txs.push(tx);
-            commit_worker_rxs.push(rx);
+            Vec::with_capacity(commit_executor_count);
+        let mut commit_worker_rxs: Vec<Receiver<Vec<writer::CommitJob>>> =
+            Vec::with_capacity(commit_executor_count);
+        for _ in 0..commit_executor_count {
+            commit_worker_txs.push(commit_tx.clone());
+            commit_worker_rxs.push(commit_batch_rx.clone());
         }
+        drop(commit_tx);
+        drop(commit_batch_rx);
 
         // Post-commit pairing. One channel per commit_worker so
         // mark_flushed traffic for any one volume stays serialised
         // (matches the commit_worker's per-volume FIFO).
         let mut post_commit_txs: Vec<Sender<writer::PostCommitJob>> =
-            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+            Vec::with_capacity(commit_executor_count);
         let mut post_commit_rxs: Vec<Receiver<writer::PostCommitJob>> =
-            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
-        for _ in 0..writer::NUM_COMMIT_WORKERS {
+            Vec::with_capacity(commit_executor_count);
+        for _ in 0..commit_executor_count {
             let (tx, rx) = bounded::<writer::PostCommitJob>(writer::POST_COMMIT_QUEUE_CAP);
             post_commit_txs.push(tx);
             post_commit_rxs.push(rx);
@@ -154,10 +164,19 @@ impl BufferFlusher {
             // capped writer drain at 8 units regardless of
             // WRITER_BATCH_SIZE — bumping the const alone was a no-op.
             //
-            // Stage 1 → Stage 1.5 (dedup) or Stage 2 (compress)
-            let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(dedup_workers * 32);
+            // Stage 1 → Stage 1.5 (dedup) or Stage 2 (compress). These queues
+            // must hold several complete writer batches. The former
+            // `workers * 32` sizing was only 64 units with two workers, so the
+            // coalescer blocked after one eighth of a 512-unit writer batch and
+            // fed LV3 in increasingly fragmented waves.
+            let upstream_queue_cap = Self::WRITER_BATCH_SIZE.saturating_mul(4);
+            let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(
+                upstream_queue_cap.max(dedup_workers.saturating_mul(32)),
+            );
             // Stage 1.5 → Stage 2
-            let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(compress_workers * 32);
+            let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(
+                upstream_queue_cap.max(compress_workers.saturating_mul(32)),
+            );
             // Stage 2 → Stage 3 — sized to one full writer batch so a
             // single writer cycle can drain to capacity.
             let (write_tx, write_rx) =
@@ -198,6 +217,8 @@ impl BufferFlusher {
                         max_raw,
                         max_lbas,
                         skip_fully_superseded,
+                        buffer_write_window,
+                        buffer_write_window_pressure_pct,
                     );
                 })
                 .expect("failed to spawn coalescer thread");
@@ -217,6 +238,7 @@ impl BufferFlusher {
                     let cleanup_tx_d = cleanup_tx.clone();
                     let candidate_d = candidate.clone();
                     let read_pool_d = read_pool.clone();
+                    let commit_worker_txs_d = commit_worker_txs.clone();
                     let h = thread::Builder::new()
                         .name(format!("flusher-dedup-{}-{}", shard_idx, worker_idx))
                         .spawn(move || {
@@ -240,6 +262,9 @@ impl BufferFlusher {
                                 &cleanup_tx_d,
                                 &candidate_d,
                                 read_pool_d.as_deref(),
+                                &commit_worker_txs_d,
+                                commit_workers_per_volume,
+                                commit_worker_pipeline_depth.max(8),
                             );
                         })
                         .expect("failed to spawn dedup worker");
@@ -358,12 +383,29 @@ impl BufferFlusher {
             });
         }
 
-        // Spawn the per-volume commit workers now that lane channels
+        // The aggregator owns the only batch sender. It exits only after every
+        // raw sender is dropped, forwarding the final partial transaction
+        // before it disconnects the executor queue.
+        let commit_aggregator_handle = thread::Builder::new()
+            .name("flusher-commit-aggregator".to_string())
+            .spawn(move || {
+                affinity::bind_current(ThreadRole::CommitWorker, commit_executor_count);
+                Self::commit_aggregator_loop(
+                    commit_rx,
+                    commit_batch_tx,
+                    commit_coalesce_lba_budget,
+                    commit_coalesce_timeout,
+                    packed_commit_try_drain_lba_budget,
+                );
+            })
+            .expect("failed to spawn commit aggregator");
+
+        // Spawn the commit executors now that lane channels
         // exist. Each worker indexes `lane_done_txs` / `lane_cleanup_txs`
         // by `CommitJob.shard_idx` to fire `done_tx` and queue
         // cleanup payloads back into the originating shard's lane.
         let mut commit_worker_handles: Vec<JoinHandle<()>> =
-            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+            Vec::with_capacity(commit_executor_count);
         for (worker_idx, rx) in commit_worker_rxs.into_iter().enumerate() {
             let pool_c = pool.clone();
             let meta_c = meta.clone();
@@ -372,7 +414,6 @@ impl BufferFlusher {
             let in_flight_c = in_flight.clone();
             let metrics_c = metrics.clone();
             let candidate_c = candidate.clone();
-            let running_c = running.clone();
             let lane_done_txs_c = lane_done_txs.clone();
             let lane_cleanup_txs_c = lane_cleanup_txs.clone();
             let post_commit_tx_c = post_commit_txs[worker_idx].clone();
@@ -394,11 +435,7 @@ impl BufferFlusher {
                         &lane_done_txs_c,
                         &post_commit_tx_c,
                         commit_target_lbas_per_tx,
-                        commit_coalesce_lba_budget,
-                        commit_coalesce_timeout,
-                        packed_commit_try_drain_lba_budget,
                         commit_worker_pipeline_depth,
-                        &running_c,
                     );
                 })
                 .expect("failed to spawn commit worker");
@@ -412,7 +449,7 @@ impl BufferFlusher {
         drop(post_commit_txs);
 
         let mut post_commit_handles: Vec<JoinHandle<()>> =
-            Vec::with_capacity(writer::NUM_COMMIT_WORKERS);
+            Vec::with_capacity(commit_executor_count);
         for (worker_idx, rx) in post_commit_rxs.into_iter().enumerate() {
             let pool_c = pool.clone();
             let meta_c = meta.clone();
@@ -443,6 +480,7 @@ impl BufferFlusher {
             in_flight,
             candidate,
             pba_lifecycle,
+            commit_aggregator_handle: Some(commit_aggregator_handle),
             commit_worker_handles,
             commit_worker_txs,
             post_commit_handles,
@@ -572,11 +610,13 @@ impl BufferFlusher {
                 let _ = h.join();
             }
         }
-        // Shard writers have stopped — drop the commit_worker_txs we
-        // hold so the worker rx sides disconnect once their per-lane
-        // sender clones (held by writer threads) drop. This signals
-        // workers to drain and exit.
+        // Shard writers have stopped. Close and join the commit pipeline in
+        // producer order so no executor can exit before the aggregator has
+        // forwarded its final partial batch.
         self.commit_worker_txs.clear();
+        if let Some(h) = self.commit_aggregator_handle.take() {
+            let _ = h.join();
+        }
         for h in self.commit_worker_handles.drain(..) {
             let _ = h.join();
         }

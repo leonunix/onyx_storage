@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 use onyx_metadb::Db;
 
 use crate::error::{OnyxError, OnyxResult};
+use crate::meta::store::DurableCheckpointOutcome;
 
 pub(super) struct AsyncCheckpoint {
     state: Arc<(Mutex<CheckpointState>, Condvar)>,
@@ -23,6 +24,7 @@ struct CheckpointState {
     requested: u64,
     completed: u64,
     checkpointed: u64,
+    durable_buffer_seq: u64,
     force_requested: u64,
     failures: Vec<CheckpointFailure>,
     shutdown: bool,
@@ -79,22 +81,26 @@ impl AsyncCheckpoint {
                             capacity_pages: 0,
                         })
                     } else if force {
-                        db.flush().map(|_| true)
+                        db.flush()
+                            .map(|_| Some(db.durable_buffer_applied_watermark()))
                     } else {
                         db.try_flush()
+                            .map(|flushed| flushed.then(|| db.durable_buffer_applied_watermark()))
                     };
                     let (lock, cvar) = &*worker_state;
                     let mut state = lock.lock().unwrap();
                     match result {
-                        Ok(true) => {
+                        Ok(Some(durable_buffer_seq)) => {
                             state.checkpointed = state.checkpointed.max(target);
+                            state.durable_buffer_seq =
+                                state.durable_buffer_seq.max(durable_buffer_seq);
                             // A full checkpoint folds all dirty state, so it
                             // supersedes every prior transient failure. Keep only
                             // fatal ones latched (they never get superseded — the
                             // next attempt hits the same wall).
                             state.prune_transient_failures();
                         }
-                        Ok(false) => {
+                        Ok(None) => {
                             tracing::debug!(
                                 start,
                                 target,
@@ -159,7 +165,10 @@ impl AsyncCheckpoint {
         Ok(Some(token))
     }
 
-    pub(super) fn checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
+    pub(super) fn checkpoint_outcome(
+        &self,
+        token: u64,
+    ) -> OnyxResult<Option<DurableCheckpointOutcome>> {
         let (lock, _) = &*self.state;
         let state = lock.lock().unwrap();
         if let Some(failure) = state
@@ -173,15 +182,17 @@ impl AsyncCheckpoint {
             )));
         }
         if state.checkpointed >= token {
-            return Ok(Some(true));
+            return Ok(Some(DurableCheckpointOutcome::Durable {
+                buffer_seq: state.durable_buffer_seq,
+            }));
         }
         if state.completed >= token {
-            return Ok(Some(false));
+            return Ok(Some(DurableCheckpointOutcome::Skipped));
         }
         Ok(None)
     }
 
-    pub(super) fn sync(&self) -> OnyxResult<()> {
+    pub(super) fn sync(&self) -> OnyxResult<u64> {
         let token = self.request()?;
         self.wait(token)
     }
@@ -204,7 +215,7 @@ impl AsyncCheckpoint {
         Ok(token)
     }
 
-    fn wait(&self, token: u64) -> OnyxResult<()> {
+    fn wait(&self, token: u64) -> OnyxResult<u64> {
         let (lock, cvar) = &*self.state;
         let mut state = lock.lock().unwrap();
         while state.completed < token {
@@ -220,7 +231,13 @@ impl AsyncCheckpoint {
                 failure.message
             )));
         }
-        Ok(())
+        if state.checkpointed >= token {
+            Ok(state.durable_buffer_seq)
+        } else {
+            Err(OnyxError::Config(
+                "forced metadb checkpoint completed without a durable frontier".into(),
+            ))
+        }
     }
 }
 
@@ -247,7 +264,12 @@ mod tests {
         CheckpointFailure {
             start,
             end,
-            message: if fatal { "capacity exhausted" } else { "transient" }.into(),
+            message: if fatal {
+                "capacity exhausted"
+            } else {
+                "transient"
+            }
+            .into(),
             fatal,
         }
     }
@@ -263,7 +285,11 @@ mod tests {
             ..Default::default()
         };
         state.prune_transient_failures();
-        assert_eq!(state.failures.len(), 1, "only the fatal failure should remain");
+        assert_eq!(
+            state.failures.len(),
+            1,
+            "only the fatal failure should remain"
+        );
         assert!(state.failures[0].fatal);
         assert_eq!(state.failures[0].start, 3);
 

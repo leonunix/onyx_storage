@@ -370,18 +370,16 @@ impl DedupScanner {
                     // `recent_view` is the convergence gate (None until K) AND
                     // hoists the snapshot load out of the per-entry loop.
                     let k = cfg.orphan_reclaim_clean_sweeps.clamp(1, 4) as usize;
-                    ref_bitmap
-                        .and_then(|rb| rb.recent_view(k))
-                        .map(|view| {
-                            Self::orphan_reclaim_scan(
-                                meta,
-                                candidate,
-                                allocator,
-                                &mut orphan_cursor,
-                                budget,
-                                |entry| view.is_unreferenced(entry.pba),
-                            )
-                        })
+                    ref_bitmap.and_then(|rb| rb.recent_view(k)).map(|view| {
+                        Self::orphan_reclaim_scan(
+                            meta,
+                            candidate,
+                            allocator,
+                            &mut orphan_cursor,
+                            budget,
+                            |entry| view.is_unreferenced(entry.pba),
+                        )
+                    })
                 } else {
                     // §6 region: a STALE region (was live, now cold for
                     // > fresh_max_age sweeps). Convergence gate: heat epoch >= 2.
@@ -826,10 +824,7 @@ impl DedupScanner {
                 }
                 Err(_) => {
                     stats.errors += 1;
-                    tracing::debug!(
-                        pba = bv.pba.0,
-                        "cold-tail: ReadPool reply channel dropped"
-                    );
+                    tracing::debug!(pba = bv.pba.0, "cold-tail: ReadPool reply channel dropped");
                     continue;
                 }
             };

@@ -15,6 +15,7 @@
 //! windows (page window, journal ring), addressed from 0. All device IO on this
 //! path is synchronous batched writes + `flush` — io_uring lives inside chunklet.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -44,10 +45,19 @@ const JOURNAL_OFF: u64 = CATALOG_B_OFF + CATALOG_SLOT_BYTES; // 4 KiB + 8 MiB
 const FLAG_METADB_INIT: u64 = 1 << 0;
 const MIN_JOURNAL_BYTES: u64 = 1024 * 1024; // 256 ring blocks
 const MAX_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024; // plan D5 production size
-/// Max bytes per device batch (`write_many_at`/`read_many_at`), so a large
-/// checkpoint batch does not hold the chunklet LD's stripe/bucket locks across
-/// the whole thing and starve concurrent reads (plan D1 "批分片").
-const MAX_DEVICE_IO_BYTES: usize = 4 * 1024 * 1024;
+/// Read batches stay large to amortise recovery/prewarm submissions.
+const MAX_DEVICE_READ_BYTES: usize = 4 * 1024 * 1024;
+/// The production meta mirror uses a 128 KiB strip. A 4 MiB logical batch
+/// therefore expands to 32 strips and 64 mirror writes, exactly filling
+/// chunklet's per-thread io_uring depth.
+const MAX_DEVICE_WRITE_BYTES: usize = 4 * 1024 * 1024;
+/// Number of independent 4 MiB chunks allowed in flight for one checkpoint
+/// page write. Chunklet's io_uring backend owns one depth-64 ring per calling
+/// thread; a single caller therefore serialises thousands of mirrored 4 KiB
+/// writes through one shallow ring. Thirty-two scoped workers provide up to
+/// 2048 aggregate SQEs while keeping a fixed thread bound and each worker's
+/// range-lock footprint at 32 stripes.
+const MAX_PARALLEL_DEVICE_WRITES: usize = 32;
 /// Volume-catalog A/B slot header: `generation(8) | payload_len(4) | crc32(4)`.
 const CATALOG_SLOT_HEADER: usize = 16;
 
@@ -181,8 +191,8 @@ fn generate_uuid() -> [u8; 16] {
 
 /// `PageBlockIo` over the meta LD's page window. Byte offsets are window-relative
 /// (`page_id * PAGE_SIZE`); the `BackendSlice` adds the window base. Large batches
-/// are split to `MAX_DEVICE_IO_BYTES` so one `write_many_at` cannot pin the LD's
-/// stripe locks across a whole checkpoint.
+/// are split into bounded read/write chunks so one `write_many_at` cannot pin the
+/// LD's stripe locks across a whole checkpoint.
 struct MetaWindow {
     slice: BackendSlice,
 }
@@ -201,7 +211,7 @@ impl PageBlockIo for MetaWindow {
         while i < ops.len() {
             let mut j = i;
             let mut bytes = 0usize;
-            while j < ops.len() && (j == i || bytes + ops[j].1.len() <= MAX_DEVICE_IO_BYTES) {
+            while j < ops.len() && (j == i || bytes + ops[j].1.len() <= MAX_DEVICE_READ_BYTES) {
                 bytes += ops[j].1.len();
                 j += 1;
             }
@@ -212,18 +222,43 @@ impl PageBlockIo for MetaWindow {
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> Result<(), MetaDbError> {
-        let mut i = 0;
-        while i < ops.len() {
-            let mut j = i;
-            let mut bytes = 0usize;
-            while j < ops.len() && (j == i || bytes + ops[j].1.len() <= MAX_DEVICE_IO_BYTES) {
-                bytes += ops[j].1.len();
-                j += 1;
-            }
-            self.slice.write_many_at(&ops[i..j]).map_err(meta_err)?;
-            i = j;
+        let batches = write_batch_ranges(ops);
+        if batches.len() <= 1 {
+            return self.slice.write_many_at(ops).map_err(meta_err);
         }
-        Ok(())
+
+        let worker_count = batches.len().min(MAX_PARALLEL_DEVICE_WRITES);
+        let failed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for worker_idx in 0..worker_count {
+                let failed = &failed;
+                let batches = &batches;
+                handles.push(scope.spawn(move || {
+                    for batch_idx in (worker_idx..batches.len()).step_by(worker_count) {
+                        if failed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let range = batches[batch_idx].clone();
+                        if let Err(error) = self.slice.write_many_at(&ops[range]) {
+                            failed.store(true, Ordering::Release);
+                            return Err(meta_err(error));
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+
+            let mut first_error = None;
+            for handle in handles {
+                match handle.join().expect("metadb device write worker panicked") {
+                    Ok(()) => {}
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })
     }
 
     fn flush(&self) -> Result<(), MetaDbError> {
@@ -239,6 +274,22 @@ impl PageBlockIo for MetaWindow {
         // LD, so the page-window slice can now widen up to the new device size.
         self.slice.grow_len(new_bytes).map_err(meta_err)
     }
+}
+
+fn write_batch_ranges(ops: &[(u64, &[u8])]) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        let mut j = i;
+        let mut bytes = 0usize;
+        while j < ops.len() && (j == i || bytes + ops[j].1.len() <= MAX_DEVICE_WRITE_BYTES) {
+            bytes += ops[j].1.len();
+            j += 1;
+        }
+        batches.push(i..j);
+        i = j;
+    }
+    batches
 }
 
 /// `JournalDevice` over the meta LD's lifecycle-journal ring window.
@@ -322,7 +373,10 @@ impl MetaLdCatalog {
     }
 
     /// Load whichever slot won and return the catalog alongside the handle.
-    fn load(backend: Arc<dyn BlockBackend>, sb: &MetaSuperblock) -> OnyxResult<(Self, VolumeCatalog)> {
+    fn load(
+        backend: Arc<dyn BlockBackend>,
+        sb: &MetaSuperblock,
+    ) -> OnyxResult<(Self, VolumeCatalog)> {
         let this = Self {
             backend,
             a_off: sb.catalog_a_off,
@@ -518,8 +572,7 @@ pub(super) fn open_or_create(
         Db::create_on_device(db_config, parts.page_device, parts.journal_device)
             .map_err(onyx_err)?
     } else {
-        Db::open_on_device(db_config, parts.page_device, parts.journal_device)
-            .map_err(onyx_err)?
+        Db::open_on_device(db_config, parts.page_device, parts.journal_device).map_err(onyx_err)?
     };
 
     let (catalog_store, catalog) = MetaLdCatalog::load(parts.backend_dyn, &parts.sb)?;
@@ -546,6 +599,96 @@ pub(super) fn open_readonly(
     db_config: MetaDbConfig,
 ) -> OnyxResult<Arc<Db>> {
     let parts = open_device_parts(&backend, false)?;
-    debug_assert!(!parts.fresh, "open_device_parts(create_if_missing=false) never returns fresh");
+    debug_assert!(
+        !parts.fresh,
+        "open_device_parts(create_if_missing=false) never returns fresh"
+    );
     Db::open_on_device(db_config, parts.page_device, parts.journal_device).map_err(onyx_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    struct RecordingBackend {
+        size: u64,
+        calls: AtomicUsize,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl RecordingBackend {
+        fn new(size: u64) -> Self {
+            Self {
+                size,
+                calls: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            }
+        }
+
+        fn record_write(&self, bytes: usize) {
+            assert!(bytes <= MAX_DEVICE_WRITE_BYTES);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let current = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(10));
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    impl BlockBackend for RecordingBackend {
+        fn read_at(&self, buf: &mut [u8], _offset: u64) -> OnyxResult<()> {
+            buf.fill(0);
+            Ok(())
+        }
+
+        fn write_at(&self, buf: &[u8], _offset: u64) -> OnyxResult<()> {
+            self.record_write(buf.len());
+            Ok(())
+        }
+
+        fn write_many_at(&self, ops: &[(u64, &[u8])]) -> OnyxResult<()> {
+            self.record_write(ops.iter().map(|(_, buf)| buf.len()).sum());
+            Ok(())
+        }
+
+        fn flush(&self) -> OnyxResult<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> u64 {
+            self.size
+        }
+    }
+
+    #[test]
+    fn checkpoint_page_batches_are_written_with_bounded_parallelism() {
+        const PAGE_BYTES: usize = 4096;
+        const BATCH_COUNT: usize = MAX_PARALLEL_DEVICE_WRITES + 2;
+
+        let page_count = BATCH_COUNT * (MAX_DEVICE_WRITE_BYTES / PAGE_BYTES);
+        let backend_size = (page_count * PAGE_BYTES) as u64;
+        let backend = Arc::new(RecordingBackend::new(backend_size));
+        let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
+        let window = MetaWindow {
+            slice: BackendSlice::new(backend_dyn, 0, backend.size).unwrap(),
+        };
+        let page = [0xA5; PAGE_BYTES];
+        let ops: Vec<(u64, &[u8])> = (0..page_count)
+            .map(|idx| ((idx * PAGE_BYTES) as u64, page.as_slice()))
+            .collect();
+
+        window.write_many_at(&ops).unwrap();
+
+        assert_eq!(backend.calls.load(Ordering::Relaxed), BATCH_COUNT);
+        let max_in_flight = backend.max_in_flight.load(Ordering::Relaxed);
+        assert!(max_in_flight > 1, "large checkpoint writes must overlap");
+        assert!(
+            max_in_flight <= MAX_PARALLEL_DEVICE_WRITES,
+            "checkpoint write concurrency exceeded its bound: {max_in_flight}"
+        );
+    }
 }

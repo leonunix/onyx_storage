@@ -1818,7 +1818,11 @@ fn orphan_reclaim_demotes_cold_entry_retires_and_frees() {
             && allocator.is_retired(p)),
         "orphan pass should delete the dedup entry and retire the now-rc==0 PBA"
     );
-    assert_eq!(meta.get_refcount(p).unwrap(), 0, "delete drops membership rc to 0");
+    assert_eq!(
+        meta.get_refcount(p).unwrap(),
+        0,
+        "delete drops membership rc to 0"
+    );
     scanner.stop();
 
     // The existing GC confirm scan frees the unreferenced retired PBA.
@@ -2061,7 +2065,10 @@ fn orphan_reclaim_skips_hot_region() {
         !wait_until(800, || meta.get_dedup_entry(&hash).unwrap().is_none()),
         "orphan pass must not demote a dedup entry in a hot region"
     );
-    assert!(!allocator.is_retired(p), "hot-region PBA must not be retired");
+    assert!(
+        !allocator.is_retired(p),
+        "hot-region PBA must not be retired"
+    );
     scanner.stop();
 }
 
@@ -2213,7 +2220,11 @@ fn orphan_reclaim_per_pba_demotes_interleaved_orphan_in_hot_region() {
     pool.append("test-vol", Lba(2), 1, &d1, 1000).unwrap();
     assert!(wait_flushed(&pool, 10000));
     flusher.stop();
-    assert_eq!(meta.get_refcount(p).unwrap(), 1, "orphaned dedup PBA keeps rc==1");
+    assert_eq!(
+        meta.get_refcount(p).unwrap(),
+        1,
+        "orphaned dedup PBA keeps rc==1"
+    );
 
     // HOT heat region for P (neighbour live) → §6 region mode would skip P.
     let heat = converged_heat(&allocator);
@@ -2245,7 +2256,11 @@ fn orphan_reclaim_per_pba_demotes_interleaved_orphan_in_hot_region() {
             && allocator.is_retired(p)),
         "per-PBA pass must demote+retire the interleaved orphan despite the hot region"
     );
-    assert_eq!(meta.get_refcount(p).unwrap(), 0, "delete drops membership rc to 0");
+    assert_eq!(
+        meta.get_refcount(p).unwrap(),
+        0,
+        "delete drops membership rc to 0"
+    );
     scanner.stop();
 
     // GC confirm scan frees the unreferenced retired PBA end-to-end.
@@ -2355,7 +2370,10 @@ fn orphan_reclaim_per_pba_skips_referenced_pba() {
         !wait_until(800, || meta.get_dedup_entry(&hash).unwrap().is_none()),
         "per-PBA pass must not demote a PBA referenced in a recent barrier"
     );
-    assert!(!allocator.is_retired(p), "referenced PBA must not be retired");
+    assert!(
+        !allocator.is_retired(p),
+        "referenced PBA must not be retired"
+    );
     scanner.stop();
 }
 

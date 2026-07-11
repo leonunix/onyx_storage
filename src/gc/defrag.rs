@@ -82,7 +82,10 @@ pub(crate) struct DefragCycle {
 
 impl DefragCycle {
     pub(crate) fn inactive() -> Self {
-        Self { targets: Arc::new(Vec::new()), active: false }
+        Self {
+            targets: Arc::new(Vec::new()),
+            active: false,
+        }
     }
 }
 
@@ -146,7 +149,9 @@ impl DefragState {
                 "defrag mode ENTER: free pool no longer stripe-capable"
             );
         }
-        metrics.gc_defrag_mode_active.store(self.active as u64, Relaxed);
+        metrics
+            .gc_defrag_mode_active
+            .store(self.active as u64, Relaxed);
         if !self.active {
             return DefragCycle::inactive();
         }
@@ -229,7 +234,9 @@ impl DefragState {
                 break;
             }
         }
-        metrics.gc_defrag_walk_extents.fetch_add(walked as u64, Relaxed);
+        metrics
+            .gc_defrag_walk_extents
+            .fetch_add(walked as u64, Relaxed);
         self.cycle_output(metrics)
     }
 
@@ -245,9 +252,7 @@ impl DefragState {
         // Reject: pure free space with no interior pinners (nothing to
         // evacuate), or a window whose stripe-capable capacity is already
         // high (mostly usable as-is — evacuation buys little per block moved).
-        if acc.free_blocks >= span
-            || acc.capable_blocks * 100 > span * CLUSTER_CAPABLE_MAX_PCT
-        {
+        if acc.free_blocks >= span || acc.capable_blocks * 100 > span * CLUSTER_CAPABLE_MAX_PCT {
             metrics.gc_defrag_clusters_rejected.fetch_add(1, Relaxed);
             return;
         }
@@ -309,7 +314,9 @@ impl DefragState {
         metrics
             .gc_defrag_targets_active
             .store(self.targets.len() as u64, Relaxed);
-        metrics.gc_defrag_target_blocks.store(self.target_blocks, Relaxed);
+        metrics
+            .gc_defrag_target_blocks
+            .store(self.target_blocks, Relaxed);
         DefragCycle {
             targets: Arc::new(
                 self.targets
@@ -367,7 +374,9 @@ pub(crate) fn ranges_overlap_unit(sorted: &[Extent], start: Pba, phys_blocks: u3
 /// Publish the allocator contiguity gauges (once per GC cycle).
 fn publish_contiguity(metrics: &EngineMetrics, stats: &crate::space::allocator::ContiguityStats) {
     use std::sync::atomic::Ordering::Relaxed;
-    metrics.allocator_free_extents.store(stats.free_extents, Relaxed);
+    metrics
+        .allocator_free_extents
+        .store(stats.free_extents, Relaxed);
     metrics
         .allocator_largest_free_run
         .store(stats.largest_run_blocks as u64, Relaxed);
@@ -458,7 +467,8 @@ mod tests {
         let mut st = DefragState::new();
         assert!(st.maintain(&a, &cfg(), 50, &m).active);
         // Free a huge aligned run: capability jumps far above enter+10 → exit.
-        a.free_extent(Extent::new(Pba(base + 30_100), 30_000)).unwrap();
+        a.free_extent(Extent::new(Pba(base + 30_100), 30_000))
+            .unwrap();
         let c = st.maintain(&a, &cfg(), 50, &m);
         assert!(!c.active, "must exit once stripe-capable again");
         assert!(c.targets.is_empty(), "deactivation clears targets");
@@ -507,10 +517,16 @@ mod tests {
             c.targets.len()
         );
         for t in c.targets.iter() {
-            assert!(t.count as u64 <= MAX_CLUSTER_SPAN, "window {t:?} exceeds span bound");
+            assert!(
+                t.count as u64 <= MAX_CLUSTER_SPAN,
+                "window {t:?} exceeds span bound"
+            );
         }
         for w in c.targets.windows(2) {
-            assert!(w[0].end_pba().0 <= w[1].start.0, "windows must stay disjoint");
+            assert!(
+                w[0].end_pba().0 <= w[1].start.0,
+                "windows must stay disjoint"
+            );
         }
     }
 
@@ -532,8 +548,14 @@ mod tests {
         let c = st.maintain(&a, &cfg(), 50, &m);
         assert!(c.active);
         let covers_confetti = c.targets.iter().any(|t| t.start.0 < base + 6000)
-            && c.targets.iter().any(|t| t.start.0 >= base + 8100 && t.start.0 < base + 14_100);
-        assert!(covers_confetti, "both confetti islands must be targeted: {:?}", c.targets);
+            && c.targets
+                .iter()
+                .any(|t| t.start.0 >= base + 8100 && t.start.0 < base + 14_100);
+        assert!(
+            covers_confetti,
+            "both confetti islands must be targeted: {:?}",
+            c.targets
+        );
         for t in c.targets.iter() {
             assert!(
                 t.end_pba().0 <= base + 6010 || t.start.0 >= base + 6010 + 1024,
@@ -553,7 +575,10 @@ mod tests {
         let mut st = DefragState::new();
         let c = st.maintain(&a, &cfg(), 50, &m);
         // (trigger may latch — capability is 0 — but no targets emitted)
-        assert!(c.targets.is_empty(), "a bare free extent has no pinners to move");
+        assert!(
+            c.targets.is_empty(),
+            "a bare free extent has no pinners to move"
+        );
     }
 
     #[test]
@@ -575,10 +600,16 @@ mod tests {
         let low1 = c1.targets.first().map(|t| t.start.0).unwrap_or(u64::MAX);
         let c2 = st.maintain(&a, &small, 50, &m);
         let low2 = c2.targets.first().map(|t| t.start.0).unwrap_or(u64::MAX);
-        assert!(c2.targets.len() > c1.targets.len(), "walk must make progress");
+        assert!(
+            c2.targets.len() > c1.targets.len(),
+            "walk must make progress"
+        );
         assert!(low2 < low1, "later cycles reach lower addresses");
         for w in c2.targets.windows(2) {
-            assert!(w[0].end_pba().0 <= w[1].start.0, "targets must stay disjoint");
+            assert!(
+                w[0].end_pba().0 <= w[1].start.0,
+                "targets must stay disjoint"
+            );
         }
     }
 

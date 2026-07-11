@@ -291,7 +291,10 @@ fn print_verify_report_human(report: &onyx_metadb::VerifyReport) {
             println!("  - {issue}");
         }
     }
-    println!("status: {}", if report.is_clean() { "clean" } else { "failed" });
+    println!(
+        "status: {}",
+        if report.is_clean() { "clean" } else { "failed" }
+    );
 }
 
 fn print_verify_report_json(report: &onyx_metadb::VerifyReport) {
@@ -301,24 +304,29 @@ fn print_verify_report_json(report: &onyx_metadb::VerifyReport) {
         .iter()
         .map(|(pid, page_type)| format!("\"{pid}:{page_type:?}\""))
         .collect();
-    let warnings: Vec<String> = report
-        .warnings
-        .iter()
-        .map(|w| format!("{:?}", w))
-        .collect();
+    let warnings: Vec<String> = report.warnings.iter().map(|w| format!("{:?}", w)).collect();
     let issues: Vec<String> = report.issues.iter().map(|i| format!("{:?}", i)).collect();
     println!("{{");
     println!(
         "  \"manifest_slot\": {},",
-        report.manifest_slot.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+        report
+            .manifest_slot
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "  \"manifest_sequence\": {},",
-        report.manifest_sequence.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+        report
+            .manifest_sequence
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "  \"checkpoint_lsn\": {},",
-        report.checkpoint_lsn.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+        report
+            .checkpoint_lsn
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".into())
     );
     println!("  \"high_water\": {},", report.high_water);
     println!("  \"scanned_pages\": {},", report.scanned_pages);
@@ -373,7 +381,12 @@ fn ensure_fd_limit(config: &OnyxConfig) {
             if soft < hard {
                 match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
                     Ok(()) => {
-                        tracing::info!(old_soft = soft, new_soft = hard, hard, "raised RLIMIT_NOFILE to hard limit");
+                        tracing::info!(
+                            old_soft = soft,
+                            new_soft = hard,
+                            hard,
+                            "raised RLIMIT_NOFILE to hard limit"
+                        );
                         hard
                     }
                     Err(e) => {
@@ -394,8 +407,8 @@ fn ensure_fd_limit(config: &OnyxConfig) {
     if config.chunklet.enabled {
         // Rough working-set: one ring per read-pool worker + per buffer shard,
         // a few ublk fds per queue, plus headroom for PDs/metadb/sockets.
-        let recommended = 8 * (config.storage.read_pool_workers as u64
-            + config.buffer.shards as u64)
+        let recommended = 8
+            * (config.storage.read_pool_workers as u64 + config.buffer.shards as u64)
             + 4 * config.ublk.nr_queues as u64
             + 4096;
         if effective < recommended.max(65536) {
@@ -565,7 +578,11 @@ fn main() -> anyhow::Result<()> {
             with_engine_or_ipc(
                 &config,
                 |sock| service::send_snapshot_create(sock, &volume, &name),
-                |engine| engine.create_snapshot(&volume, &name).map(|info| info.snapshot_id),
+                |engine| {
+                    engine
+                        .create_snapshot(&volume, &name)
+                        .map(|info| info.snapshot_id)
+                },
             )
             .map(|id| println!("Snapshot '{}@{}' created (id {})", volume, name, id))?;
         }
@@ -611,10 +628,17 @@ fn main() -> anyhow::Result<()> {
             with_engine_or_ipc(
                 &config,
                 |sock| service::send_snapshot_clone(sock, &volume, &name, &to),
-                |engine| engine.clone_snapshot(&volume, &name, &to).map(|cfg| cfg.id.0),
+                |engine| {
+                    engine
+                        .clone_snapshot(&volume, &name, &to)
+                        .map(|cfg| cfg.id.0)
+                },
             )
             .map(|new_vol| {
-                println!("Snapshot '{}@{}' cloned into new volume '{}'", volume, name, new_vol)
+                println!(
+                    "Snapshot '{}@{}' cloned into new volume '{}'",
+                    volume, name, new_vol
+                )
             })?;
         }
         Command::SnapshotRestore { volume, name } => {
@@ -723,7 +747,9 @@ fn main() -> anyhow::Result<()> {
                 for d in &ck.devices {
                     eprintln!("  {}", d.display());
                 }
-                anyhow::bail!("refusing without --force (verify the disks, then re-run with --force)");
+                anyhow::bail!(
+                    "refusing without --force (verify the disks, then re-run with --force)"
+                );
             }
             let (_pool, lv3, lv2, meta) = onyx_storage::chunklet_pool::init_pool(ck)?;
             println!("chunklet pool initialized over {} PDs", ck.devices.len());

@@ -110,6 +110,12 @@ pub struct MetaStore {
     backend: MetadbBackend,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCheckpointOutcome {
+    Durable { buffer_seq: u64 },
+    Skipped,
+}
+
 impl MetaStore {
     pub fn open(config: &MetaConfig) -> OnyxResult<Self> {
         Ok(Self {
@@ -147,8 +153,12 @@ impl MetaStore {
         self.backend.grow_meta_capacity(new_ld)
     }
 
-    pub fn sync_durable(&self) -> OnyxResult<()> {
+    pub fn sync_durable(&self) -> OnyxResult<u64> {
         self.backend.sync_durable()
+    }
+
+    pub(crate) fn set_buffer_applied_watermark(&self, seq: u64) {
+        self.backend.set_buffer_applied_watermark(seq);
     }
 
     /// [[no-refcount-hot-path-design]] Rc-neutral path: pull every PBA that the
@@ -208,7 +218,10 @@ impl MetaStore {
         self.backend.dedup_resize_finish()
     }
 
-    pub(crate) fn durable_checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
+    pub(crate) fn durable_checkpoint_outcome(
+        &self,
+        token: u64,
+    ) -> OnyxResult<Option<DurableCheckpointOutcome>> {
         self.backend.durable_checkpoint_outcome(token)
     }
 
@@ -769,7 +782,11 @@ impl MetaStore {
         &self,
         cursor: onyx_metadb::DedupScanCursor,
         limit: usize,
-    ) -> OnyxResult<(Vec<(ContentHash, DedupEntry)>, onyx_metadb::DedupScanCursor, bool)> {
+    ) -> OnyxResult<(
+        Vec<(ContentHash, DedupEntry)>,
+        onyx_metadb::DedupScanCursor,
+        bool,
+    )> {
         self.backend.scan_dedup_from(cursor, limit)
     }
 

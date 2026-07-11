@@ -4,8 +4,8 @@ use super::*;
 /// full-stripe write path. `blocks_per_unit[i]` is unit `i`'s block count;
 /// `stripe` is the RAID stripe width in blocks (`io_engine.stripe_blocks()`,
 /// 1 = no stripe). Returns `(groups, leftover)` where each group is a set of
-/// unit indices whose block counts sum to **exactly** `stripe`, and `leftover`
-/// is every other index (to take the per-unit path).
+/// unit indices whose block counts sum to at most `stripe`, and `leftover` is
+/// every non-candidate (to take the per-unit path).
 ///
 /// Only strictly-sub-stripe units (`1..stripe`) are packing candidates: a unit
 /// that is already a whole stripe multiple (`>= stripe`) either aligns on its
@@ -13,8 +13,11 @@ use super::*;
 /// split a unit across a stripe boundary. First-fit-decreasing (largest block
 /// count first, index tie-break) maximises exact fills while staying pure and
 /// deterministic, so it is unit-testable in isolation and never touches the
-/// allocator. Bins that do not fill exactly to `stripe` dissolve back into
-/// `leftover` (v1 does not pad or carry a partial bin across writer batches).
+/// allocator. A partial final bin is deliberately retained: the writer pads it
+/// to a full stripe for parity IO, then returns the unused tail extent to the
+/// allocator after successful IO. This is the behavior promised by
+/// `raid_full_stripe_writes=true` and avoids exploding one partial bin back into
+/// dozens of 4 KiB RAID writes.
 fn plan_stripe_groups(blocks_per_unit: &[u32], stripe: u32) -> (Vec<Vec<usize>>, Vec<usize>) {
     let n = blocks_per_unit.len();
     if stripe <= 1 {
@@ -45,16 +48,10 @@ fn plan_stripe_groups(blocks_per_unit: &[u32], stripe: u32) -> (Vec<Vec<usize>>,
         }
     }
 
-    // Exactly-full bins become groups; partial bins dissolve to leftover.
-    let mut groups: Vec<Vec<usize>> = Vec::new();
+    // Every non-empty bin becomes one padded full-stripe IO. The writer tracks
+    // the used prefix and returns any unused tail after IO succeeds.
+    let groups: Vec<Vec<usize>> = bins.into_iter().map(|(_, members)| members).collect();
     let mut leftover: Vec<usize> = Vec::new();
-    for (rem, members) in bins {
-        if rem == 0 {
-            groups.push(members);
-        } else {
-            leftover.extend(members);
-        }
-    }
     // Non-candidates (0 blocks, or whole stripe multiples / oversize) are leftover.
     for i in 0..n {
         if blocks_per_unit[i] == 0 || blocks_per_unit[i] >= stripe {
@@ -125,7 +122,13 @@ impl BufferFlusher {
             // hot path so both stay in lockstep.
             let stripe = io_engine.stripe_blocks();
             let phase = io_engine.stripe_phase();
-            let pba = match Self::alloc_passthrough(allocator, shard_idx, blocks_needed as u32, stripe, phase) {
+            let pba = match Self::alloc_passthrough(
+                allocator,
+                shard_idx,
+                blocks_needed as u32,
+                stripe,
+                phase,
+            ) {
                 Ok(pba) => pba,
                 Err(e) => {
                     Self::record_elapsed(&metrics.flush_writer_alloc_ns, alloc_start);
@@ -290,7 +293,10 @@ impl BufferFlusher {
                     .collect();
                 candidate.insert_many(&fresh_dedup_pairs);
                 Self::repair_stale_dedup_index(meta, metrics, &stale_repairs, "write_unit");
-                Ok(UnitDisposition::Committed(live_positions, actual_old_pba_meta))
+                Ok(UnitDisposition::Committed(
+                    live_positions,
+                    actual_old_pba_meta,
+                ))
             })();
             let (live_positions, actual_old_pba_meta) = match commit {
                 Ok(UnitDisposition::Committed(lp, m)) => (lp, m),
@@ -303,11 +309,9 @@ impl BufferFlusher {
                 Ok(disposition) => {
                     match disposition {
                         UnitDisposition::Stale => allocation.free(allocator)?,
-                        UnitDisposition::Rejected => Self::retire_rejected_extent(
-                            cleanup_tx,
-                            pba,
-                            blocks_needed as u32,
-                        ),
+                        UnitDisposition::Rejected => {
+                            Self::retire_rejected_extent(cleanup_tx, pba, blocks_needed as u32)
+                        }
                         UnitDisposition::Committed(..) => unreachable!(),
                     }
                     let mark_start = Instant::now();
@@ -409,7 +413,10 @@ impl BufferFlusher {
         if blocks == 1 {
             let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, pba);
         } else {
-            let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, Extent::new(pba, blocks));
+            let _ = crate::space::pba_lifecycle::rollback_uncommitted(
+                allocator,
+                Extent::new(pba, blocks),
+            );
         }
     }
 
@@ -485,6 +492,10 @@ impl BufferFlusher {
         }
 
         let (groups, leftover) = plan_stripe_groups(&blocks_per_unit, stripe);
+        let group_used_blocks: Vec<u32> = groups
+            .iter()
+            .map(|members| members.iter().map(|&m| blocks_per_unit[m]).sum())
+            .collect();
         // group_extents[gi] = Some(ext) when the stripe extent was reserved;
         // None means the group degraded to the per-unit path (alignment
         // fragmentation near-full) and its members were allocated individually.
@@ -534,7 +545,11 @@ impl BufferFlusher {
                         group_of[m] = Some(gi);
                         off += blocks_per_unit[m] as u64;
                     }
-                    debug_assert_eq!(off, stripe as u64, "members must fill the stripe exactly");
+                    debug_assert_eq!(
+                        off, group_used_blocks[gi] as u64,
+                        "member PBAs must cover the planned used prefix"
+                    );
+                    debug_assert!(off <= stripe as u64, "group must fit within one stripe");
                     group_extents.push(Some(ext));
                 }
                 Err(_) => {
@@ -550,8 +565,13 @@ impl BufferFlusher {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     group_extents.push(None);
                     for &m in members {
-                        match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[m], 1, 0)
-                        {
+                        match Self::alloc_passthrough(
+                            allocator,
+                            shard_idx,
+                            blocks_per_unit[m],
+                            1,
+                            0,
+                        ) {
                             Ok(pba) => pbas[m] = Some(pba),
                             Err(e) => {
                                 tracing::error!(
@@ -568,9 +588,18 @@ impl BufferFlusher {
             }
         }
         for &i in &leftover {
-            let (eff_stripe, eff_phase) = if stripe_starved { (1, 0) } else { (stripe, phase) };
-            match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[i], eff_stripe, eff_phase)
-            {
+            let (eff_stripe, eff_phase) = if stripe_starved {
+                (1, 0)
+            } else {
+                (stripe, phase)
+            };
+            match Self::alloc_passthrough(
+                allocator,
+                shard_idx,
+                blocks_per_unit[i],
+                eff_stripe,
+                eff_phase,
+            ) {
                 Ok(pba) => pbas[i] = Some(pba),
                 Err(e) => {
                     tracing::error!(
@@ -749,6 +778,34 @@ impl BufferFlusher {
                     }
                 }
             }
+
+            // Successful padded groups only publish mappings for their used
+            // prefix. Return the never-mapped tail immediately; failed groups
+            // already rolled their whole stripe back above.
+            for (gi, extent) in group_extents.iter().enumerate() {
+                let Some(extent) = *extent else {
+                    continue;
+                };
+                if groups[gi].iter().any(|&m| failed[m]) {
+                    continue;
+                }
+                let used = group_used_blocks[gi];
+                if used < stripe {
+                    let padding = Extent::new(Pba(extent.start.0 + used as u64), stripe - used);
+                    if let Err(e) =
+                        crate::space::pba_lifecycle::rollback_uncommitted(allocator, padding)
+                    {
+                        metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            error = %e,
+                            group = gi,
+                            used_blocks = used,
+                            stripe_blocks = stripe,
+                            "writer: failed to return full-stripe padding extent"
+                        );
+                    }
+                }
+            }
         }
         let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
@@ -882,14 +939,17 @@ impl BufferFlusher {
 mod stripe_group_tests {
     use super::plan_stripe_groups;
 
-    /// Total blocks covered by all groups must equal `groups * stripe`, and
-    /// group members + leftover must partition `0..n` exactly once.
+    /// Every group must fit within one stripe, and group members + leftover
+    /// must partition `0..n` exactly once.
     fn assert_partition(blocks: &[u32], stripe: u32) {
         let (groups, leftover) = plan_stripe_groups(blocks, stripe);
         let mut seen = vec![false; blocks.len()];
         for g in &groups {
             let sum: u32 = g.iter().map(|&i| blocks[i]).sum();
-            assert_eq!(sum, stripe, "group {g:?} must sum to stripe {stripe}");
+            assert!(
+                sum > 0 && sum <= stripe,
+                "group {g:?} must fit stripe {stripe}, got {sum}"
+            );
             for &i in g {
                 assert!(!seen[i], "index {i} in two places");
                 seen[i] = true;
@@ -921,11 +981,11 @@ mod stripe_group_tests {
     }
 
     #[test]
-    fn partial_bin_dissolves_to_leftover() {
-        // 3 + 2 = 5 < 6 → cannot fill a stripe → both leftover, no group.
+    fn partial_bin_is_retained_for_full_stripe_padding() {
+        // 3 + 2 = 5 < 6 → one padded stripe, no per-unit fallback.
         let (groups, leftover) = plan_stripe_groups(&[3, 2], 6);
-        assert!(groups.is_empty());
-        assert_eq!(leftover, vec![0, 1]);
+        assert_eq!(groups, vec![vec![0, 1]]);
+        assert!(leftover.is_empty());
     }
 
     #[test]
@@ -956,9 +1016,9 @@ mod stripe_group_tests {
         assert_eq!(l1, l2);
         assert_partition(&blocks, 6);
         // FFD order 5,4,3,3,2,2,1 → stripes 5+1, 4+2, 3+3 (three full); the
-        // last 2-block (idx 3) has no partner left → leftover.
-        assert_eq!(g1.len(), 3);
-        assert_eq!(l1, vec![3]);
+        // last 2-block (idx 3) becomes one padded partial stripe.
+        assert_eq!(g1.len(), 4);
+        assert!(l1.is_empty());
     }
 
     #[test]

@@ -111,7 +111,11 @@ impl crate::io::block_backend::BlockBackend for StripeMockDevice {
 /// IoEngine over a `stripe`-wide stripe-mock backend with full-stripe writes on.
 /// Uses the chunklet constructor (Syscall backend, `pba_offset = RESERVED_BLOCKS`
 /// → `stripe_phase() = RESERVED_BLOCKS % stripe`), matching a real chunklet LD.
-fn stripe_io_engine(path: &std::path::Path, stripe: u32, metrics: Arc<EngineMetrics>) -> Arc<IoEngine> {
+fn stripe_io_engine(
+    path: &std::path::Path,
+    stripe: u32,
+    metrics: Arc<EngineMetrics>,
+) -> Arc<IoEngine> {
     let dev = StripeMockDevice {
         inner: RawDevice::open(path).unwrap(),
         stripe,

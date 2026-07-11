@@ -101,6 +101,32 @@ def avg_time(
     return delta(now, prev, ns_key) / count / ns_per_unit
 
 
+def avg_time_by_counts(
+    now: dict[str, Any],
+    prev: Optional[dict[str, Any]],
+    ns_key: str,
+    count_keys: tuple[str, ...],
+) -> float:
+    count = sum(delta(now, prev, key) for key in count_keys)
+    if count <= 0:
+        return 0.0
+    return delta(now, prev, ns_key) / count
+
+
+def avg_writer_time(
+    now: dict[str, Any], prev: Optional[dict[str, Any]], ns_key: str
+) -> float:
+    # flush_units_written excludes packed slots. Writer timers cover both
+    # paths, so using that counter alone inflates latency whenever packing is
+    # active (often by more than an order of magnitude).
+    return avg_time_by_counts(
+        now,
+        prev,
+        ns_key,
+        ("flush_units_written", "flush_packed_slots_written"),
+    )
+
+
 def fmt_count(value: float) -> str:
     value = float(value)
     for suffix in ("", "K", "M", "G", "T"):
@@ -360,11 +386,8 @@ class Monitor:
                     ns_per_unit=1.0,
                 )
                 / 1000.0,
-                "writer_meta_ms": avg_time(
-                    metrics,
-                    prev_metrics,
-                    "flush_writer_meta_ns",
-                    "flush_units_written",
+                "writer_meta_ms": avg_writer_time(
+                    metrics, prev_metrics, "flush_writer_meta_ns"
                 )
                 / 1_000_000.0,
             }
@@ -469,6 +492,7 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" volatile={fmt_bytes(float(volatile_mem))}/{fmt_bytes(float(volatile_limit))}",
         f"Buffer append {rate(metrics, prev_metrics, 'buffer_appends', interval):9.1f}/s {fmt_rate_bytes(rate(metrics, prev_metrics, 'buffer_append_bytes', interval)):>14}"
         f" sync_batches {rate(metrics, prev_metrics, 'buffer_sync_batches', interval):8.1f}/s"
+        f" flushes {rate(metrics, prev_metrics, 'buffer_sync_flushes', interval):8.1f}/s"
         f" backpressure +{fmt_count(delta(metrics, prev_metrics, 'buffer_backpressure_events'))}",
         "",
         f"Reduce logical={fmt_bytes(logical)} lv3={fmt_bytes(lv3_bytes)} total={ratio(logical, lv3_bytes)}"
@@ -485,12 +509,15 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f"Flush  units {rate(metrics, prev_metrics, 'flush_units_written', interval):9.1f}/s"
         f" packed_slots {rate(metrics, prev_metrics, 'flush_packed_slots_written', interval):8.1f}/s"
         f" stale +{fmt_count(delta(metrics, prev_metrics, 'flush_stale_discards'))}"
-        f" writer_avg {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_total_ns', 'flush_units_written'))}",
-        f"Writer alloc {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_alloc_ns', 'flush_units_written')):>10}"
-        f" io {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_io_ns', 'flush_units_written')):>10}"
-        f" meta {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_meta_ns', 'flush_units_written')):>10}"
-        f" cleanup_w {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_cleanup_ns', 'flush_units_written')):>10}"
+        f" writer_avg/unit {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_total_ns'))}",
+        f"Writer/unit alloc {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_alloc_ns')):>10}"
+        f" io {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_io_ns')):>10}"
+        f" meta {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_meta_ns')):>10}"
+        f" cleanup_w {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_cleanup_ns')):>10}"
         f" cleanup_th {fmt_ms(avg_time(metrics, prev_metrics, 'flush_cleanup_thread_ns', 'flush_cleanup_thread_batches')):>10}",
+        f"Writer/tx meta {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_meta_ns', 'flush_writer_meta_commits')):>10}"
+        f" | queue/job {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_queue_wait_ns', 'flush_commit_worker_jobs')):>10}"
+        f" service/job {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_service_ns', 'flush_commit_worker_jobs')):>10}",
         "",
         f"Meta   commit {rate(meta, prev.status.get('metadb_memory') if prev else None, 'commit_ops', interval):8.1f}/s"
         f" avg {fmt_us(avg_time(meta, prev.status.get('metadb_memory') if prev else None, 'commit_total_us', 'commit_ops', ns_per_unit=1.0))}"
@@ -620,8 +647,18 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
     comp_ratio = safe_div(comp_in, comp_out)
     dedup_hit_pct = safe_div(num(metrics, "dedup_hits"), total_dedup) * 100.0
     commit_avg_us = avg_time(meta, prev_meta, "commit_total_us", "commit_ops", ns_per_unit=1.0)
-    writer_total_ms = avg_time(metrics, prev_metrics, "flush_writer_total_ns", "flush_units_written") / 1_000_000.0
-    writer_meta_ms = avg_time(metrics, prev_metrics, "flush_writer_meta_ns", "flush_units_written") / 1_000_000.0
+    writer_total_ms = avg_writer_time(metrics, prev_metrics, "flush_writer_total_ns") / 1_000_000.0
+    writer_io_ms = avg_writer_time(metrics, prev_metrics, "flush_writer_io_ns") / 1_000_000.0
+    writer_meta_ms = avg_writer_time(metrics, prev_metrics, "flush_writer_meta_ns") / 1_000_000.0
+    writer_meta_tx_ms = avg_time(
+        metrics, prev_metrics, "flush_writer_meta_ns", "flush_writer_meta_commits"
+    ) / 1_000_000.0
+    writer_queue_job_ms = avg_time(
+        metrics,
+        prev_metrics,
+        "flush_commit_worker_queue_wait_ns",
+        "flush_commit_worker_jobs",
+    ) / 1_000_000.0
     cpu_delta = 0.0 if prev_system is None else max(0.0, system.get("cpu_total", 0.0) - prev_system.get("cpu_total", 0.0))
     idle_delta = 0.0 if prev_system is None else max(0.0, system.get("cpu_idle", 0.0) - prev_system.get("cpu_idle", 0.0))
     cpu_pct = safe_div(cpu_delta - idle_delta, cpu_delta) * 100.0
@@ -779,10 +816,19 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
         stdscr,
         31,
         2,
-        "avg",
-        f"total {writer_total_ms:,.2f} ms  io {avg_time(metrics, prev_metrics, 'flush_writer_io_ns', 'flush_units_written') / 1_000_000.0:,.2f} ms  meta {writer_meta_ms:,.2f} ms",
+        "per unit",
+        f"total {writer_total_ms:,.2f} ms  io {writer_io_ms:,.2f} ms  meta {writer_meta_ms:,.2f} ms",
         left_w - 4,
-        warn if writer_meta_ms > 20 else 0,
+        warn if writer_meta_ms > 5 else 0,
+    )
+    metric(
+        stdscr,
+        32,
+        2,
+        "tx / queue",
+        f"meta/tx {writer_meta_tx_ms:,.2f} ms  q/job {writer_queue_job_ms:,.2f} ms",
+        left_w - 4,
+        warn if writer_queue_job_ms > 10 else 0,
     )
     put(stdscr, 33, 2, "meta " + spark([item["writer_meta_ms"] for item in monitor.history], left_w - 9), accent)
 

@@ -432,8 +432,9 @@ impl BufferFlusher {
                     &sealed.fragments,
                     FlushFailStage::BeforeIoWrite,
                 ) {
-                    let _ =
-                        crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
+                    let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(
+                        allocator, sealed.pba,
+                    );
                     slot_io_ok[i] = false;
                     tracing::error!(
                         pba = sealed.pba.0,
@@ -468,10 +469,11 @@ impl BufferFlusher {
                                         tracing::error!(error = %e, "writer: packed full-stripe group IO write failed");
                                     }
                                     OpTarget::Slot(i) => {
-                                        let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(
-                                            allocator,
-                                            sealed_slots[i].pba,
-                                        );
+                                        let _ =
+                                            crate::space::pba_lifecycle::rollback_uncommitted_one(
+                                                allocator,
+                                                sealed_slots[i].pba,
+                                            );
                                         slot_io_ok[i] = false;
                                         tracing::error!(
                                             pba = sealed_slots[i].pba.0,
@@ -560,7 +562,8 @@ impl BufferFlusher {
                         let _ = done_tx.send(original_seqs);
                     }
                 }
-                let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
+                let _ =
+                    crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
                 continue;
             }
 

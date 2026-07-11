@@ -100,13 +100,12 @@ impl WriteBufferPool {
                         ),
                         "disk_len must equal the rounded encoded entry size"
                     );
-                    let payload_crc = crc32fast::hash(payload);
                     BufferEntry::encode_full_into_slice(
                         pending.seq,
                         &pending.vol_id,
                         pending.start_lba,
                         pending.lba_count,
-                        payload_crc,
+                        pending.payload_crc32,
                         false,
                         pending.vol_created_at,
                         payload,
@@ -938,6 +937,342 @@ impl WriteBufferPool {
         }
     }
 
+    /// Pool-level sync pipeline for a multi-shard backend whose durability
+    /// barrier applies to the whole logical disk (chunklet). One persistent
+    /// worker per shard drains and encodes entries in parallel. This thread
+    /// collects those prepared batches, writes them through the root LD, and
+    /// publishes all covered shard watermarks after one shared flush.
+    pub(super) fn global_sync_loop(
+        root_device: Arc<dyn BlockBackend>,
+        members: Vec<(u64, Arc<BufferShard>, Receiver<()>)>,
+        group_commit_wait: Duration,
+        shutdown: Arc<AtomicBool>,
+        metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
+    ) {
+        struct PreparedBatch {
+            member_idx: usize,
+            all: Vec<StagedEntry>,
+            spans: Vec<CoalescedSpan>,
+            checkpoint: Option<AlignedBuf>,
+            started: Instant,
+        }
+
+        struct WrittenBatch {
+            member_idx: usize,
+            all: Vec<StagedEntry>,
+            started: Instant,
+        }
+
+        let queue_depth = members.len().max(1);
+        let write_lane_count = members.len().min(4).max(1);
+        let write_lanes: Vec<_> = (0..write_lane_count)
+            .map(|_| bounded::<PreparedBatch>(queue_depth))
+            .collect();
+        let member_bases = Arc::new(members.iter().map(|member| member.0).collect::<Vec<_>>());
+        let (written_tx, written_rx) = bounded::<WrittenBatch>(queue_depth);
+        thread::scope(|scope| {
+            for (member_idx, (_, shard, wake_rx)) in members.iter().enumerate() {
+                let tx = write_lanes[member_idx % write_lane_count].0.clone();
+                let shard = shard.clone();
+                let wake_rx = wake_rx.clone();
+                let shutdown = shutdown.clone();
+                scope.spawn(move || {
+                    crate::affinity::bind_current(
+                        crate::affinity::ThreadRole::BufferSync,
+                        member_idx,
+                    );
+                    loop {
+                        if shard.staging_rx.is_empty() {
+                            match wake_rx.recv_timeout(Duration::from_millis(50)) {
+                                Ok(()) => {}
+                                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                                    if shutdown.load(Ordering::Relaxed)
+                                        && shard.staging_rx.is_empty()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        while wake_rx.try_recv().is_ok() {}
+                        // Let this shard accumulate a contiguous run before
+                        // encoding. The workers run in parallel, so this wait
+                        // overlaps sibling preparation and the prior epoch's
+                        // root write/flush instead of serializing all shards.
+                        if !group_commit_wait.is_zero() {
+                            thread::sleep(group_commit_wait);
+                            while wake_rx.try_recv().is_ok() {}
+                        }
+                        let started = Instant::now();
+                        let all = shard.drain_staged_limited();
+                        if all.is_empty() {
+                            continue;
+                        }
+                        let persist = {
+                            let lifecycle = shard.lifecycle.lock();
+                            all.iter()
+                                .filter(|entry| !lifecycle.cancelled.contains(&entry.pending.seq))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        };
+                        let spans = loop {
+                            match Self::encode_entries_into_spans(&persist) {
+                                Ok(spans) => break spans,
+                                Err(error) => {
+                                    tracing::error!(
+                                        member_idx,
+                                        error = %error,
+                                        "global sync prepare failed; retrying batch"
+                                    );
+                                    thread::sleep(Duration::from_millis(5));
+                                }
+                            }
+                        };
+                        let max_seq = all.iter().map(|entry| entry.pending.seq).max().unwrap_or(0);
+                        let checkpoint =
+                            shard
+                                .encode_checkpoint_for_uring(max_seq)
+                                .and_then(|payload| {
+                                    match AlignedBuf::new(SHARD_CHECKPOINT_SIZE as usize, false) {
+                                        Ok(mut buf) => {
+                                            buf.as_mut_slice()[..payload.len()]
+                                                .copy_from_slice(&payload);
+                                            Some(buf)
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                member_idx,
+                                                error = %error,
+                                                "global sync checkpoint hint allocation failed"
+                                            );
+                                            None
+                                        }
+                                    }
+                                });
+                        if tx
+                            .send(PreparedBatch {
+                                member_idx,
+                                all,
+                                spans,
+                                checkpoint,
+                                started,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                            return;
+                        }
+                    }
+                });
+            }
+            for (lane_idx, (lane_tx, lane_rx)) in write_lanes.into_iter().enumerate() {
+                drop(lane_tx);
+                let root_device = root_device.clone();
+                let member_bases = member_bases.clone();
+                let metrics = metrics.clone();
+                let written_tx = written_tx.clone();
+                scope.spawn(move || {
+                    crate::affinity::bind_current(
+                        crate::affinity::ThreadRole::BufferSync,
+                        lane_idx,
+                    );
+                    while let Ok(first) = lane_rx.recv() {
+                        let mut prepared = vec![first];
+                        if !group_commit_wait.is_zero() {
+                            let deadline = Instant::now() + group_commit_wait;
+                            loop {
+                                let now = Instant::now();
+                                if now >= deadline {
+                                    break;
+                                }
+                                match lane_rx.recv_timeout(deadline - now) {
+                                    Ok(batch) => prepared.push(batch),
+                                    Err(RecvTimeoutError::Timeout) => break,
+                                    Err(RecvTimeoutError::Disconnected) => break,
+                                }
+                            }
+                        }
+                        while let Ok(batch) = lane_rx.try_recv() {
+                            prepared.push(batch);
+                        }
+
+                        let mut consecutive_failures = 0u32;
+                        loop {
+                            let mut ops = Vec::new();
+                            for batch in &prepared {
+                                let shard_base = member_bases[batch.member_idx];
+                                ops.extend(batch.spans.iter().map(|span| {
+                                    (
+                                        shard_base + span.offset,
+                                        &span.buf.as_slice()[..span.len as usize],
+                                    )
+                                }));
+                            }
+                            // Multiple prepared batches from one shard can share
+                            // a lane. Only its newest recovery hint is useful and
+                            // avoids overlapping writes in the mirror batch.
+                            for (idx, batch) in prepared.iter().enumerate() {
+                                let newer_same_shard = prepared[idx + 1..]
+                                    .iter()
+                                    .any(|later| later.member_idx == batch.member_idx);
+                                if newer_same_shard {
+                                    continue;
+                                }
+                                if let Some(buf) = batch.checkpoint.as_ref() {
+                                    ops.push((
+                                        COMMIT_LOG_SUPERBLOCK_SIZE
+                                            + batch.member_idx as u64 * SHARD_CHECKPOINT_SIZE,
+                                        &buf.as_slice()[..SHARD_CHECKPOINT_SIZE as usize],
+                                    ));
+                                }
+                            }
+
+                            let write_started = Instant::now();
+                            match root_device.write_many_at(&ops) {
+                                Ok(()) => {
+                                    if let Some(metrics) = metrics.get() {
+                                        BufferShard::record_metric(
+                                            &metrics.buffer_append_log_write_ns,
+                                            write_started,
+                                        );
+                                    }
+                                    break;
+                                }
+                                Err(error) => {
+                                    consecutive_failures = consecutive_failures.saturating_add(1);
+                                    tracing::warn!(
+                                        lane_idx,
+                                        error = %error,
+                                        consecutive_failures,
+                                        "global sync write lane failed; retrying batch"
+                                    );
+                                    thread::sleep(Self::sync_retry_backoff(consecutive_failures));
+                                }
+                            }
+                        }
+
+                        for batch in prepared {
+                            if written_tx
+                                .send(WrittenBatch {
+                                    member_idx: batch.member_idx,
+                                    all: batch.all,
+                                    started: batch.started,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+            drop(written_tx);
+
+            let mut consecutive_failures = 0u32;
+            while let Ok(first) = written_rx.recv() {
+                let mut batches = vec![first];
+                if !group_commit_wait.is_zero() {
+                    let collect_started = Instant::now();
+                    let deadline = collect_started + group_commit_wait;
+                    loop {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        match written_rx.recv_timeout(deadline - now) {
+                            Ok(batch) => batches.push(batch),
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    if let Some(metrics) = metrics.get() {
+                        BufferShard::record_metric(&metrics.buffer_sync_sleep_ns, collect_started);
+                    }
+                }
+                while let Ok(batch) = written_rx.try_recv() {
+                    batches.push(batch);
+                }
+
+                loop {
+                    // All writes in `batches` completed before they entered the
+                    // channel. A device-wide flush now makes that whole prefix
+                    // durable. Workers may issue later writes concurrently;
+                    // those remain unacknowledged until a subsequent flush.
+                    let result = Self::sync_device_impl(root_device.as_ref());
+                    match result {
+                        Ok(()) => {
+                            consecutive_failures = 0;
+                            if let Some(metrics) = metrics.get() {
+                                metrics.buffer_sync_flushes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            tracing::warn!(
+                                error = %err,
+                                consecutive_failures,
+                                shard_batches = batches.len(),
+                                "global persistent slot sync failed; retrying epoch"
+                            );
+                            thread::sleep(Self::sync_retry_backoff(consecutive_failures));
+                        }
+                    }
+                }
+
+                for batch in batches {
+                    let shard = &members[batch.member_idx].1;
+                    let pendings: Vec<Arc<PendingEntry>> = batch
+                        .all
+                        .iter()
+                        .map(|entry| entry.pending.clone())
+                        .collect();
+                    shard.retire_superseded_by_durable_entries(&pendings);
+                    {
+                        let mut lifecycle = shard.lifecycle.lock();
+                        for entry in &batch.all {
+                            lifecycle.cancelled.remove(&entry.pending.seq);
+                        }
+                    }
+                    let max_seq = batch
+                        .all
+                        .iter()
+                        .map(|entry| entry.pending.seq)
+                        .max()
+                        .unwrap_or(0);
+                    shard.lv2_durability.advance(max_seq);
+                    if let Some(metrics) = metrics.get() {
+                        let entries = batch.all.len() as u64;
+                        let bytes = batch
+                            .all
+                            .iter()
+                            .map(|entry| entry.payload.len() as u64)
+                            .sum::<u64>();
+                        metrics.buffer_sync_batches.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .buffer_sync_entries
+                            .fetch_add(entries, Ordering::Relaxed);
+                        metrics
+                            .buffer_sync_bytes
+                            .fetch_add(bytes, Ordering::Relaxed);
+                        crate::metrics::record_counter_max(
+                            &metrics.buffer_sync_entries_max,
+                            entries,
+                        );
+                        crate::metrics::record_counter_max(&metrics.buffer_sync_bytes_max, bytes);
+                        metrics
+                            .buffer_sync_epochs_committed
+                            .fetch_add(entries, Ordering::Relaxed);
+                        BufferShard::record_metric(&metrics.buffer_sync_batch_ns, batch.started);
+                    }
+                }
+            }
+        });
+    }
+
     pub(super) fn sync_loop(
         device: Arc<dyn BlockBackend>,
         shard: Arc<BufferShard>,
@@ -1129,7 +1464,13 @@ impl WriteBufferPool {
                 Ok(())
             } else {
                 shard.write_checkpoint(batch_max_seq);
-                Self::sync_device_impl(device.as_ref())
+                let result = Self::sync_device_impl(device.as_ref());
+                if result.is_ok() {
+                    if let Some(metrics) = metrics.get() {
+                        metrics.buffer_sync_flushes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                result
             };
 
             match sync_result {

@@ -172,7 +172,9 @@ fn meta_only_snapshot_lifecycle() {
     assert!(engine.create_snapshot("vol-a", "snap1").is_err());
 
     // Clone the snapshot into a new writable volume.
-    let cloned = engine.clone_snapshot("vol-a", "snap1", "vol-clone").unwrap();
+    let cloned = engine
+        .clone_snapshot("vol-a", "snap1", "vol-clone")
+        .unwrap();
     assert_eq!(cloned.id.0, "vol-clone");
     assert_eq!(cloned.size_bytes, 1024 * 1024);
     let vols: Vec<String> = engine
@@ -185,7 +187,9 @@ fn meta_only_snapshot_lifecycle() {
     assert!(vols.contains(&"vol-clone".to_string()));
 
     // Cloning onto an existing volume name fails.
-    assert!(engine.clone_snapshot("vol-a", "snap1", "vol-clone").is_err());
+    assert!(engine
+        .clone_snapshot("vol-a", "snap1", "vol-clone")
+        .is_err());
 
     // Restore of an unchanged volume to its snapshot is a successful no-op.
     engine.restore_snapshot("vol-a", "snap1").unwrap();
@@ -382,7 +386,11 @@ fn full_engine_restore_snapshot_rolls_back() {
     let vol = engine.open_volume("vol-restore").unwrap();
     // Overwrites reverted + untouched snapshot LBAs intact.
     for i in 0u64..8 {
-        assert_eq!(vol.read(i * 4096, 4096).unwrap(), pat_a(i), "lba {i} restored");
+        assert_eq!(
+            vol.read(i * 4096, 4096).unwrap(),
+            pat_a(i),
+            "lba {i} restored"
+        );
     }
     // Post-snapshot adds are gone (unmapped => zero-filled).
     for i in 8u64..12 {
@@ -555,6 +563,46 @@ fn engine_metrics_snapshot_tracks_reads_writes_and_dedup() {
         snapshot.dedup_hits >= 1,
         "expected second identical block to dedup"
     );
+}
+
+#[test]
+fn buffer_write_window_collapses_overwrites_before_lv3() {
+    let (mut config, _md, _bf, _df) = make_config();
+    config.flush.buffer_write_window_ms = 300;
+    config.flush.buffer_write_window_pressure_pct = 95;
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-window", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-window").unwrap();
+
+    for generation in 1..=8u8 {
+        vol.write(0, &vec![generation; 4096]).unwrap();
+    }
+
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(vol.read(0, 4096).unwrap(), vec![8; 4096]);
+    assert_eq!(
+        engine.metrics_snapshot().lv3_write_ops,
+        0,
+        "the live write window must not materialise intermediate versions"
+    );
+    assert_eq!(
+        engine.buffer_pool().unwrap().pending_count(),
+        1,
+        "durable supersession should retain only the newest logical version"
+    );
+
+    assert!(
+        wait_for_buffer_drain(&engine, 5000),
+        "windowed flush timeout"
+    );
+    let snapshot = engine.metrics_snapshot();
+    assert_eq!(
+        snapshot.lv3_write_ops, 1,
+        "eight overwrites in one window should become one LV3 write"
+    );
+    assert_eq!(vol.read(0, 4096).unwrap(), vec![8; 4096]);
 }
 
 #[test]

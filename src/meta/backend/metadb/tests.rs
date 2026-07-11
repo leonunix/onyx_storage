@@ -1086,3 +1086,13 @@ fn atomic_batch_write_multi_with_dedup_deferred_round_trip() {
     assert!(sync_accepted.iter().all(|&ok| ok));
     assert!(sync_cleanup.is_empty());
 }
+
+#[test]
+fn l2p_buffer_interval_controls_metadb_bfg_roll_timer() {
+    let cfg = MetaConfig {
+        l2p_buffer_max_interval_ms: 31_337,
+        ..Default::default()
+    };
+    let mapped = super::metadb_config_from_onyx(std::path::Path::new("/tmp/metadb"), &cfg);
+    assert_eq!(mapped.bfg_timeout_ms, 31_337);
+}

@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use dashmap::DashMap;
+use onyx_metadb::dedup::{DedupMigrationStatus, MigrateStepStats};
 use onyx_metadb::{
     Config as MetaDbConfig, Db, DedupValue, DeferredOutcomeHandle, L2pValue, Lsn, VolumeOrdinal,
 };
-use onyx_metadb::dedup::{DedupMigrationStatus, MigrateStepStats};
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
@@ -647,11 +647,7 @@ impl MetadbBackend {
         };
 
         let freed = match self.db.drop_snapshot(snapshot_id)? {
-            Some(report) => report
-                .freed_pbas
-                .into_iter()
-                .map(from_metadb_pba)
-                .collect(),
+            Some(report) => report.freed_pbas.into_iter().map(from_metadb_pba).collect(),
             None => Vec::new(),
         };
 
@@ -681,12 +677,12 @@ impl MetadbBackend {
                     new_name
                 )));
             }
-            let snap = catalog
-                .find_snapshot(&vol_id.0, snap_name)
-                .ok_or_else(|| OnyxError::Config(format!(
+            let snap = catalog.find_snapshot(&vol_id.0, snap_name).ok_or_else(|| {
+                OnyxError::Config(format!(
                     "snapshot '{}' not found for volume '{}'",
                     snap_name, vol_id.0
-                )))?;
+                ))
+            })?;
             let src = catalog
                 .by_id
                 .get(&vol_id.0)
@@ -1632,8 +1628,12 @@ impl MetadbBackend {
         Ok(blocks)
     }
 
-    pub(crate) fn sync_durable(&self) -> OnyxResult<()> {
+    pub(crate) fn sync_durable(&self) -> OnyxResult<u64> {
         self.checkpoint.sync()
+    }
+
+    pub(crate) fn set_buffer_applied_watermark(&self, seq: u64) {
+        self.db.set_buffer_applied_watermark(seq);
     }
 
     pub(crate) fn request_durable_checkpoint(&self) -> OnyxResult<()> {
@@ -1674,7 +1674,10 @@ impl MetadbBackend {
         self.checkpoint.try_request_async_token()
     }
 
-    pub(crate) fn durable_checkpoint_outcome(&self, token: u64) -> OnyxResult<Option<bool>> {
+    pub(crate) fn durable_checkpoint_outcome(
+        &self,
+        token: u64,
+    ) -> OnyxResult<Option<crate::meta::store::DurableCheckpointOutcome>> {
         self.checkpoint.checkpoint_outcome(token)
     }
 
@@ -1954,8 +1957,13 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     // buffer-ring reclaim moving instead of tying it to one giant inline
     // checkpoint.
     cfg.bfg_threads_enabled = config.bfg_threads_enabled;
+    // Keep the BFG roll timer aligned with Onyx's configured L2P buffering
+    // window. Leaving this at metadb's 5 s default defeats a larger durable
+    // LV2 window by forcing page-tree materialisation five times per 30 s.
+    cfg.bfg_timeout_ms = config.l2p_buffer_max_interval_ms;
     cfg.parallel_l2p_drain_enabled = config.parallel_l2p_drain_enabled;
     cfg.l2p_drain_chunk_entries = config.l2p_drain_chunk_entries;
+    cfg.l2p_checkpoint_pipeline_enabled = config.l2p_checkpoint_pipeline_enabled;
     cfg.rc_authoritative_reclaim = config.rc_authoritative_reclaim;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;

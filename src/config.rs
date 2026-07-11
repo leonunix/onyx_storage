@@ -264,6 +264,13 @@ pub struct MetaConfig {
     /// should not run at buffer-ring watermark cadence.
     #[serde(default = "default_metadb_checkpoint_interval_ms")]
     pub checkpoint_interval_ms: u64,
+    /// Trigger a metadb checkpoint early when the physical LV2 ring occupancy
+    /// reaches this percentage. The ring is the durable write journal in
+    /// buffer mode, so this lets deployments use it as the cheap aggregation
+    /// window while retaining headroom for a checkpoint to finish before
+    /// write throttling starts. Set to 0 to disable the ring trigger.
+    #[serde(default)]
+    pub checkpoint_ring_fill_pct: u8,
     /// How long metadb's WAL writer waits for new sibling committers before
     /// fsyncing a partial group-commit batch. The writer still drains already
     /// queued commits first, so this should stay tiny on low-latency NVMe.
@@ -503,8 +510,12 @@ pub struct MetaConfig {
     #[serde(default = "default_l2p_buffer_enabled")]
     pub l2p_buffer_enabled: bool,
 
-    /// Per-shard soft trigger for the compactor (in entries). When
-    /// `active.len()` crosses this the compactor wakes.
+    /// Global L2P mutation budget per Open BFG. Crossing it wakes the
+    /// quiesce worker immediately; the checkpoint timer remains a low-rate
+    /// fallback. Attempted mutations are counted conservatively, so the
+    /// unique-key fold is never larger because of overwrite coalescing. The
+    /// trigger is suspended while snapshots are live; snapshot lifecycle uses
+    /// its own forced checkpoint boundaries.
     #[serde(default = "default_l2p_buffer_soft_entries")]
     pub l2p_buffer_soft_entries: usize,
 
@@ -555,7 +566,8 @@ pub struct MetaConfig {
     /// Fan the per-BFG L2P syncing-slot drain out across shards instead of
     /// folding them serially on the single `metadb-bfg-sync` thread (which
     /// was the drain bottleneck capping single-volume write throughput).
-    /// Default on; set false for the legacy serial fold (A/B, fallback).
+    /// Default off because the historical implementation regressed on
+    /// nvme-box; enable only for a current A/B.
     #[serde(default = "default_parallel_l2p_drain_enabled")]
     pub parallel_l2p_drain_enabled: bool,
 
@@ -566,6 +578,13 @@ pub struct MetaConfig {
     /// duration. `0` = legacy unbounded hold (A/B fallback). Default 4096.
     #[serde(default = "default_l2p_drain_chunk_entries")]
     pub l2p_drain_chunk_entries: usize,
+
+    /// Overlap the next frozen BFG's serial L2P fold with current checkpoint
+    /// page IO. This is a cross-stage pipeline, not the disproven per-shard
+    /// parallel drain. Snapshot/clone lifecycles automatically fall back to
+    /// strict serial checkpoint boundaries.
+    #[serde(default = "default_l2p_checkpoint_pipeline_enabled")]
+    pub l2p_checkpoint_pipeline_enabled: bool,
 
     /// Make PBA refcount authoritative for ALL live L2P references so GC
     /// reclaim is a pure `rc==0` check and the full-volume `referenced_extents`
@@ -635,6 +654,7 @@ impl Default for MetaConfig {
             index_pin_mb: default_index_pin_mb(),
             lsm_bloom_bits_per_entry: default_lsm_bloom_bits_per_entry(),
             checkpoint_interval_ms: default_metadb_checkpoint_interval_ms(),
+            checkpoint_ring_fill_pct: 0,
             group_commit_timeout_us: default_metadb_group_commit_timeout_us(),
             wal_async_group_commit_window_us: default_metadb_wal_async_group_commit_window_us(),
             journal_mode: default_metadb_journal_mode(),
@@ -680,6 +700,7 @@ impl Default for MetaConfig {
             bfg_threads_enabled: default_bfg_threads_enabled(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
             l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
+            l2p_checkpoint_pipeline_enabled: default_l2p_checkpoint_pipeline_enabled(),
             rc_authoritative_reclaim: default_rc_authoritative_reclaim(),
         }
     }
@@ -804,6 +825,9 @@ fn default_l2p_drain_chunk_entries() -> usize {
     // one-shot hold for A/B. Root-caused 2026-06-12: the unbounded hold
     // parked all commit workers + dedup lookups for multi-second folds.
     4096
+}
+fn default_l2p_checkpoint_pipeline_enabled() -> bool {
+    false
 }
 fn default_rc_authoritative_reclaim() -> bool {
     // Default OFF. Turning it on eliminates the reclaim
@@ -1289,20 +1313,25 @@ pub struct FlushConfig {
     /// data. Default `true`; set `false` to regression-test the full path.
     #[serde(default = "default_skip_fully_superseded")]
     pub skip_fully_superseded: bool,
+    /// Keep newly durable LV2 entries resident for at least this long before
+    /// admitting them to the LV3 flush pipeline. This gives later writes to
+    /// the same LBA a chance to supersede the old version in the cheap buffer.
+    /// `0` preserves immediate draining.
+    #[serde(default)]
+    pub buffer_write_window_ms: u64,
+    /// Bypass the write window when this shard's PHYSICAL ring fill reaches
+    /// the threshold. `0` means 80 percent.
+    #[serde(default)]
+    pub buffer_write_window_pressure_pct: u8,
     /// Maximum mapped LBAs folded into one packed-slot metadata commit.
     /// Lower values reduce metadb apply head-of-line tail under heavy mixed
     /// read/write load; higher values amortise WAL/apply overhead and improve
     /// drain throughput. Set 0 to use the built-in default.
     #[serde(default = "default_packed_meta_batch_max_lbas")]
     pub packed_meta_batch_max_lbas: usize,
-    /// Number of commit workers a single volume may fan out to.
-    /// Default 8 — with the L2P stripe Mutex removed in B-语义路
-    /// Batch D, same-LBA serialization is delegated to metadb's
-    /// seq_guard CAS, so one volume can use up to 8 consecutive
-    /// commit workers in parallel without pinning each other on
-    /// the onyx-side lock. Selection is `shard_idx % per_vol`.
-    /// Total commit workers stays at NUM_COMMIT_WORKERS=16; only
-    /// the per-vol fanout changes.
+    /// Number of commit executor threads. All executors consume one shared,
+    /// bounded MPMC queue, so queued jobs from every writer shard can be
+    /// coalesced before MetaDB apply. Capped at NUM_COMMIT_WORKERS.
     #[serde(default = "default_commit_workers_per_volume")]
     pub commit_workers_per_volume: usize,
     /// Maximum live LBAs placed in one passthrough metadb transaction.
@@ -1390,6 +1419,8 @@ impl Default for FlushConfig {
             coalesce_max_lbas: default_coalesce_max_lbas(),
             min_compression_savings_pct: default_min_compression_savings_pct(),
             skip_fully_superseded: default_skip_fully_superseded(),
+            buffer_write_window_ms: 0,
+            buffer_write_window_pressure_pct: 0,
             packed_meta_batch_max_lbas: default_packed_meta_batch_max_lbas(),
             commit_workers_per_volume: default_commit_workers_per_volume(),
             commit_target_lbas_per_tx: default_commit_target_lbas_per_tx(),
@@ -1507,15 +1538,13 @@ fn default_metadb_io_submitter_bg_inflight_cap() -> u64 {
     1024
 }
 fn default_metadb_async_reclaim_enabled() -> bool {
-    // OFF after 2026-05-15 nvme-box A/B. v1 tight-loop = correct
-    // but READ IOPS -26 % (NVMe contention); v2 one-cycle-per-notify =
-    // 72 967 refcount underflow errors. Infra retained but disabled
-    // until underflow root cause is identified. See memory
-    // `async_reclaim_default_off`.
-    false
+    // Reclaim is post-manifest maintenance and must not delay BFG durability.
+    // The worker is page-store-only, retryable, and background-priority;
+    // lineage GC runs on its separate Db-aware path.
+    true
 }
 fn default_metadb_async_reclaim_max_pages_per_cycle() -> u64 {
-    65_536
+    4_096
 }
 fn default_metadb_async_reclaim_idle_interval_ms() -> u64 {
     50

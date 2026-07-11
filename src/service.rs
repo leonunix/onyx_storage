@@ -708,8 +708,8 @@ impl ServiceController {
                 "snapshot-create" => {
                     require_engine!(engine, stream);
                     if parts.len() < 3 {
-                        let _ = stream
-                            .write_all(b"error: usage: snapshot-create <volume> <name>\n");
+                        let _ =
+                            stream.write_all(b"error: usage: snapshot-create <volume> <name>\n");
                         let _ = stream.flush();
                         continue;
                     }
@@ -718,8 +718,8 @@ impl ServiceController {
                     let eng = opt.as_ref().unwrap();
                     match eng.create_snapshot(parts[1], parts[2]) {
                         Ok(info) => {
-                            let _ = stream
-                                .write_all(format!("ok {}\n", info.snapshot_id).as_bytes());
+                            let _ =
+                                stream.write_all(format!("ok {}\n", info.snapshot_id).as_bytes());
                         }
                         Err(e) => {
                             let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
@@ -730,8 +730,8 @@ impl ServiceController {
                 "snapshot-delete" => {
                     require_engine!(engine, stream);
                     if parts.len() < 3 {
-                        let _ = stream
-                            .write_all(b"error: usage: snapshot-delete <volume> <name>\n");
+                        let _ =
+                            stream.write_all(b"error: usage: snapshot-delete <volume> <name>\n");
                         let _ = stream.flush();
                         continue;
                     }
@@ -803,8 +803,8 @@ impl ServiceController {
                 "snapshot-restore" => {
                     require_engine!(engine, stream);
                     if parts.len() < 3 {
-                        let _ = stream
-                            .write_all(b"error: usage: snapshot-restore <volume> <name>\n");
+                        let _ =
+                            stream.write_all(b"error: usage: snapshot-restore <volume> <name>\n");
                         let _ = stream.flush();
                         continue;
                     }
@@ -848,14 +848,13 @@ impl ServiceController {
                                             })
                                         })
                                         .collect();
-                                    let json = serde_json::to_string(&arr)
-                                        .unwrap_or_else(|_| "[]".into());
+                                    let json =
+                                        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into());
                                     let _ = stream.write_all(json.as_bytes());
                                     let _ = stream.write_all(b"\nok\n");
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                    let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
                                 }
                             }
                         }
@@ -872,21 +871,19 @@ impl ServiceController {
                         }
                         Some(eng) => {
                             if parts.len() < 2 {
-                                let _ =
-                                    stream.write_all(b"error: usage: volume-usage <volume>\n");
+                                let _ = stream.write_all(b"error: usage: volume-usage <volume>\n");
                                 let _ = stream.flush();
                                 continue;
                             }
                             match eng.volume_usage(parts[1]) {
                                 Ok(u) => {
-                                    let payload = serde_json::to_string(&u)
-                                        .unwrap_or_else(|_| "{}".into());
+                                    let payload =
+                                        serde_json::to_string(&u).unwrap_or_else(|_| "{}".into());
                                     let _ = stream.write_all(payload.as_bytes());
                                     let _ = stream.write_all(b"\nok\n");
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                    let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
                                 }
                             }
                         }
@@ -1023,12 +1020,10 @@ impl ServiceController {
                             };
                             match res {
                                 Ok(job_id) => {
-                                    let _ =
-                                        stream.write_all(format!("ok {}\n", job_id).as_bytes());
+                                    let _ = stream.write_all(format!("ok {}\n", job_id).as_bytes());
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                    let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
                                 }
                             }
                         }
@@ -1104,7 +1099,9 @@ impl ServiceController {
                 // locks for a while (rebalance/fsck take manifest_lock per
                 // step; reintegrate/drain run rebuild_ld) → spawn a job and
                 // return its id immediately, poll via `chunklet-job`.
-                "chunklet-fsck" | "chunklet-rebalance" | "chunklet-reintegrate"
+                "chunklet-fsck"
+                | "chunklet-rebalance"
+                | "chunklet-reintegrate"
                 | "chunklet-drain" => {
                     require_engine!(engine, stream);
                     let guard = engine.load();
@@ -1148,12 +1145,10 @@ impl ServiceController {
                             };
                             match res {
                                 Ok(job_id) => {
-                                    let _ =
-                                        stream.write_all(format!("ok {}\n", job_id).as_bytes());
+                                    let _ = stream.write_all(format!("ok {}\n", job_id).as_bytes());
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                    let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
                                 }
                             }
                         }
@@ -1189,8 +1184,7 @@ impl ServiceController {
                                     let _ = stream.write_all(b"ok\n");
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        stream.write_all(format!("error: {}\n", e).as_bytes());
+                                    let _ = stream.write_all(format!("error: {}\n", e).as_bytes());
                                 }
                             }
                         }
@@ -1306,17 +1300,17 @@ fn ok_suffix(lines: &[String]) -> Option<&str> {
 }
 
 pub fn send_snapshot_create(socket_path: &Path, volume: &str, name: &str) -> OnyxResult<u64> {
-    let lines =
-        send_ipc_command(socket_path, &format!("snapshot-create {} {}", volume, name))?;
+    let lines = send_ipc_command(socket_path, &format!("snapshot-create {} {}", volume, name))?;
     ok_suffix(&lines)
         .and_then(|s| s.trim().parse().ok())
         .ok_or_else(|| OnyxError::Config("snapshot-create: missing snapshot id in reply".into()))
 }
 
 pub fn send_snapshot_delete(socket_path: &Path, volume: &str, name: &str) -> OnyxResult<u64> {
-    let lines =
-        send_ipc_command(socket_path, &format!("snapshot-delete {} {}", volume, name))?;
-    Ok(ok_suffix(&lines).and_then(|s| s.trim().parse().ok()).unwrap_or(0))
+    let lines = send_ipc_command(socket_path, &format!("snapshot-delete {} {}", volume, name))?;
+    Ok(ok_suffix(&lines)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0))
 }
 
 pub fn send_snapshot_list(socket_path: &Path, volume: Option<&str>) -> OnyxResult<Vec<String>> {
@@ -1344,7 +1338,10 @@ pub fn send_snapshot_clone(
 }
 
 pub fn send_snapshot_restore(socket_path: &Path, volume: &str, name: &str) -> OnyxResult<()> {
-    send_ipc_command(socket_path, &format!("snapshot-restore {} {}", volume, name))?;
+    send_ipc_command(
+        socket_path,
+        &format!("snapshot-restore {} {}", volume, name),
+    )?;
     Ok(())
 }
 

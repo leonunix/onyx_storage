@@ -195,6 +195,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_buffer_hard_entries = config.l2p_buffer_hard_entries;
     cfg.l2p_buffer_max_interval_ms = config.l2p_buffer_max_interval_ms;
     cfg.commit_direct_apply_enabled = config.commit_direct_apply_enabled;
+    cfg.bfg_timeout_ms = config.l2p_buffer_max_interval_ms;
     cfg.flush_select_budget = config.flush_select_budget as usize;
     cfg.async_reclaim_enabled = config.async_reclaim_enabled;
     cfg.async_reclaim_max_pages_per_cycle = config.async_reclaim_max_pages_per_cycle as usize;

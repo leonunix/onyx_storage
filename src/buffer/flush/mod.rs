@@ -55,15 +55,15 @@ pub struct BufferFlusher {
     /// drain, GC reclaim, and dedup scanner share the same retire-retry queue
     /// and `pba_reclaim_stuck` gauge.
     pba_lifecycle: crate::space::pba_lifecycle::PbaLifecycle,
-    /// Per-volume commit workers. Each shard writer hands a
-    /// [`writer::CommitJob`] off to `commit_worker_handles[hash %
-    /// NUM_COMMIT_WORKERS]` after IO; the worker handles the metadb
-    /// commit, cleanup, and `mark_flushed`. See
-    /// `.claude/plans/per-volume-commit-worker.md`.
+    /// Sole consumer of the raw writer queue. It forms transaction-sized
+    /// batches before executors can compete for individual jobs.
+    commit_aggregator_handle: Option<JoinHandle<()>>,
+    /// Commit executors consume already-formed batches and run the metadb
+    /// commit, cleanup, and `mark_flushed` work.
     commit_worker_handles: Vec<JoinHandle<()>>,
-    /// Drop these on shutdown to signal commit workers their queues
-    /// are draining; sender clones held by shard writers are dropped
-    /// when the writer threads join.
+    /// Drop these after shard writers join to close the raw queue. The
+    /// aggregator then forwards its final partial batch and closes the
+    /// executor queue.
     commit_worker_txs: Vec<Sender<writer::CommitJob>>,
     /// Phase 2.2: per-worker post_commit threads run mark_applied +
     /// candidate insert + stale dedup repair off the commit_worker
@@ -170,6 +170,7 @@ enum SkipReason {
     RetryDeferred,
     AlreadySeen,
     NoPendingEntry,
+    WriteWindow,
     Superseded,
 }
 
@@ -292,8 +293,12 @@ impl Allocation {
 
     fn free(&self, allocator: &SpaceAllocator) -> OnyxResult<()> {
         match self {
-            Self::Single(pba) => crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, *pba),
-            Self::Extent(extent) => crate::space::pba_lifecycle::rollback_uncommitted(allocator, *extent),
+            Self::Single(pba) => {
+                crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, *pba)
+            }
+            Self::Extent(extent) => {
+                crate::space::pba_lifecycle::rollback_uncommitted(allocator, *extent)
+            }
         }
     }
 }
@@ -516,6 +521,9 @@ impl BufferFlusher {
         new_entries: &mut Vec<Arc<crate::buffer::commit_log::PendingEntry>>,
         metrics: &EngineMetrics,
         skip_fully_superseded: bool,
+        write_window: Duration,
+        write_window_cutoff: Option<Instant>,
+        bypass_write_window: bool,
     ) -> EnqueuePendingSeq {
         if in_flight.contains_key(&seq) {
             return EnqueuePendingSeq::Skipped(SkipReason::InFlight);
@@ -530,6 +538,20 @@ impl BufferFlusher {
         let Some(meta) = pool.get_pending_arc(seq) else {
             return EnqueuePendingSeq::Skipped(SkipReason::NoPendingEntry);
         };
+
+        // Recovered or memory-evicted entries have no resident payload and
+        // must progress immediately. Live entries stay in cheap LV2 until the
+        // coalescer freezes an epoch cutoff, then every entry at or before that
+        // cutoff is released as one drain burst. A per-entry `elapsed >= window`
+        // test would merely replay the foreground arrival rate after a delay;
+        // it would not create a write aggregation window.
+        if !bypass_write_window
+            && !write_window.is_zero()
+            && meta.payload.is_some()
+            && write_window_cutoff.is_none_or(|cutoff| meta.enqueued_at > cutoff)
+        {
+            return EnqueuePendingSeq::Skipped(SkipReason::WriteWindow);
+        }
 
         // Fast-path drop: if every LBA in this entry has already been
         // superseded by a later seq still in the ring, the writer would

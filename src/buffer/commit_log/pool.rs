@@ -151,12 +151,19 @@ impl WriteBufferPool {
         let total_start = Instant::now();
         let shard_idx = self.shard_for_lba(start_lba);
         self.apply_write_throttle(shard_idx);
+        let frontier_guard = self.frontier_gate.read();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let shard = &self.shards[shard_idx];
 
-        shard
-            .shard
-            .append_with_seq(seq, vol_id, start_lba, lba_count, payload, vol_created_at)?;
+        let append_result =
+            shard
+                .shard
+                .append_with_seq(seq, vol_id, start_lba, lba_count, payload, vol_created_at);
+        // The seq is now either visible in `pending_seqs`, or the append
+        // failed and no acknowledged write exists for this seq. Do not hold
+        // the gate across fdatasync / ready publication.
+        drop(frontier_guard);
+        append_result?;
         // Wake the per-shard sync thread so it drains the staging channel
         // promptly. The sync thread will fdatasync the batch and then
         // advance `lv2_durability.synced_seq` past our seq, which is what
@@ -724,6 +731,24 @@ impl WriteBufferPool {
     /// to capture before invoking `MetaStore::sync_durable`.
     pub fn max_flushed_seq_handle(&self) -> Arc<AtomicU64> {
         self.max_flushed_seq.clone()
+    }
+
+    /// Greatest global seq for which every acknowledged buffer entry at or
+    /// below it has completed its metadb apply.
+    ///
+    /// `max_flushed_seq` is only an upper bound and can jump over an older
+    /// commit that is still pending on another shard. The manifest replay
+    /// watermark and LV2 release boundary require a contiguous prefix, so we
+    /// derive it from the minimum pending seq across all physical shards.
+    pub fn applied_frontier(&self) -> u64 {
+        let _frontier_guard = self.frontier_gate.write();
+        let max_allocated = self.next_seq.load(Ordering::Acquire).saturating_sub(1);
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.shard.oldest_pending_seq())
+            .min()
+            .map(|oldest| oldest.saturating_sub(1).min(max_allocated))
+            .unwrap_or(max_allocated)
     }
 
     /// Atomic shared with every shard that gates ring-reclaim: an entry is

@@ -110,7 +110,10 @@ pub fn start_rebuild(pool: &Arc<Pool>, ld: &str) -> OnyxResult<u64> {
                 Ok(r) => finish(
                     id,
                     "done",
-                    format!("rebuilt_members={} skipped={}", r.rebuilt_members, r.skipped),
+                    format!(
+                        "rebuilt_members={} skipped={}",
+                        r.rebuilt_members, r.skipped
+                    ),
                 ),
                 Err(e) => finish(id, "error", e.to_string()),
             }
@@ -162,7 +165,11 @@ pub fn start_auto_failover(pool: &Arc<Pool>, pd_label: &str) -> OnyxResult<u64> 
 /// under-full PDs until per-PD used-skew is within `target_skew_pct` or
 /// `max_moves` moves land. Online (write-forward keeps foreground IO flowing),
 /// bounded, one move at a time. Returns the job id to poll.
-pub fn start_rebalance(pool: &Arc<Pool>, target_skew_pct: f64, max_moves: usize) -> OnyxResult<u64> {
+pub fn start_rebalance(
+    pool: &Arc<Pool>,
+    target_skew_pct: f64,
+    max_moves: usize,
+) -> OnyxResult<u64> {
     let id = insert_running("rebalance", "*");
     let pool = pool.clone();
     std::thread::Builder::new()

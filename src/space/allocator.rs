@@ -182,7 +182,10 @@ impl SpaceAllocator {
             }
         }
 
-        let usable_blocks = self.total_blocks.load(Ordering::Relaxed).saturating_sub(RESERVED_BLOCKS);
+        let usable_blocks = self
+            .total_blocks
+            .load(Ordering::Relaxed)
+            .saturating_sub(RESERVED_BLOCKS);
         let alloc_count = allocated.len() as u64;
         let free_count = usable_blocks - alloc_count;
 
@@ -518,7 +521,8 @@ impl SpaceAllocator {
                 Self::take_aligned_from_extent_cache(&mut cache, need, stripe_blocks, phase)
             {
                 self.track_alloc(extent, "allocate_stripe_extent_for_lane_cache")?;
-                self.allocated_blocks.fetch_add(need as u64, Ordering::Relaxed);
+                self.allocated_blocks
+                    .fetch_add(need as u64, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
                 return Ok(extent);
             }
@@ -547,7 +551,8 @@ impl SpaceAllocator {
                 .expect("refill run of need+stripe-1 always hosts an aligned need")
         };
         self.track_alloc(extent, "allocate_stripe_extent_for_lane_refill")?;
-        self.allocated_blocks.fetch_add(need as u64, Ordering::Relaxed);
+        self.allocated_blocks
+            .fetch_add(need as u64, Ordering::Relaxed);
         self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
         Ok(extent)
     }
@@ -644,9 +649,7 @@ impl SpaceAllocator {
             // `iter().find(|e| carve_aligned_from_run(e, ..).is_some())`.
             let chosen = free.first_fit_aligned(need, stripe, phase);
             if let Some(run) = chosen {
-                debug_assert!(
-                    Self::carve_aligned_from_run(run, need, stripe, phase).is_some()
-                );
+                debug_assert!(Self::carve_aligned_from_run(run, need, stripe, phase).is_some());
                 free.remove(&run);
                 let (aligned, head, tail) =
                     Self::carve_aligned_from_run(run, need, stripe, phase).unwrap();
@@ -658,7 +661,8 @@ impl SpaceAllocator {
                 }
                 drop(free);
                 self.track_alloc(aligned, "allocate_stripe_extent_global")?;
-                self.allocated_blocks.fetch_add(need as u64, Ordering::Relaxed);
+                self.allocated_blocks
+                    .fetch_add(need as u64, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
                 return Ok(aligned);
             }
@@ -851,7 +855,10 @@ impl SpaceAllocator {
             let mut retired = self.retired_extents.lock().unwrap();
             let mut age = self.retired_age.lock().unwrap();
             for &extent in chunk {
-                if self.validate_extent_shape(extent, "retire_extents_batch").is_err() {
+                if self
+                    .validate_extent_shape(extent, "retire_extents_batch")
+                    .is_err()
+                {
                     failed.push(extent);
                     continue;
                 }
@@ -930,7 +937,9 @@ impl SpaceAllocator {
             // wait; cheap when unpinned). Shape-invalid extents are skipped
             // here and rejected below.
             for extent in chunk {
-                if extent.count > 0 && extent.end_pba().0 <= self.total_blocks.load(Ordering::Relaxed) {
+                if extent.count > 0
+                    && extent.end_pba().0 <= self.total_blocks.load(Ordering::Relaxed)
+                {
                     self.hazards.wait_extent_clear(extent.start, extent.count);
                 }
             }
@@ -941,7 +950,10 @@ impl SpaceAllocator {
                 let mut free = self.free_extents.lock().unwrap();
                 let retired = self.retired_extents.lock().unwrap();
                 for &extent in chunk {
-                    if self.validate_extent_shape(extent, "free_extents_batch").is_err() {
+                    if self
+                        .validate_extent_shape(extent, "free_extents_batch")
+                        .is_err()
+                    {
                         failed.push(extent);
                         continue;
                     }
@@ -1493,7 +1505,8 @@ impl SpaceAllocator {
         if extent.end_pba().0 > self.total_blocks.load(Ordering::Relaxed) {
             return Err(OnyxError::Config(format!(
                 "{context}: extent {:?} exceeds total blocks {}",
-                extent, self.total_blocks.load(Ordering::Relaxed)
+                extent,
+                self.total_blocks.load(Ordering::Relaxed)
             )));
         }
         Ok(())
@@ -1601,7 +1614,12 @@ impl SpaceAllocator {
             }
         }
         self.free_blocks.fetch_add(added, Ordering::Relaxed);
-        tracing::info!(old_total, new_total, added, "allocator online grow_capacity");
+        tracing::info!(
+            old_total,
+            new_total,
+            added,
+            "allocator online grow_capacity"
+        );
         Ok(new_total)
     }
 
@@ -1881,7 +1899,11 @@ mod age_tests {
         // eff = total - head, floored to whole stripes.
         let head = {
             let r = (RESERVED_BLOCKS + 2) % 6;
-            if r == 0 { 0 } else { 6 - r }
+            if r == 0 {
+                0
+            } else {
+                6 - r
+            }
         };
         let eff = 8192 - RESERVED_BLOCKS - head;
         assert_eq!(s1.stripe_capable_blocks, Some(eff / 6 * 6));
@@ -1910,7 +1932,10 @@ mod age_tests {
         assert_eq!(a.free_block_count(), old_free + 8192);
         // The free set gained exactly the [8192, 16384) range worth of blocks
         // (coalesced with the existing top run or not — the total is invariant).
-        assert_eq!(a.contiguity_stats().free_blocks_in_set, 16384 - RESERVED_BLOCKS);
+        assert_eq!(
+            a.contiguity_stats().free_blocks_in_set,
+            16384 - RESERVED_BLOCKS
+        );
 
         // Equal / smaller is a no-op — the frontier never regresses.
         assert_eq!(a.grow_capacity(8192 * BLOCK_SIZE as u64).unwrap(), 16384);
@@ -1983,7 +2008,8 @@ mod age_tests {
         let n = alloc_first(&a, 2);
         let t0 = Instant::now();
         a.retire_extent_at(Extent::single(Pba(n)), t0).unwrap();
-        a.retire_extent_at(Extent::single(Pba(n + 1)), t0 + secs(5)).unwrap();
+        a.retire_extent_at(Extent::single(Pba(n + 1)), t0 + secs(5))
+            .unwrap();
         // t0+11s: N aged (11≥10), N+1 still young (age 6<10).
         let (cands, deferred) = a.aged_candidates(64, GRACE, t0 + secs(11));
         assert_eq!(cands, vec![Extent::new(Pba(n), 1)]);
@@ -2099,12 +2125,24 @@ mod age_tests {
                             "aged_only" => {}
                             "front_young" => {
                                 if i < young_front {
-                                    age.insert(pba, RetiredRun { count: 1, retired_at: now });
+                                    age.insert(
+                                        pba,
+                                        RetiredRun {
+                                            count: 1,
+                                            retired_at: now,
+                                        },
+                                    );
                                 }
                             }
                             "all_in_age" => {
                                 let retired_at = if i < young_front { now } else { base };
-                                age.insert(pba, RetiredRun { count: 1, retired_at });
+                                age.insert(
+                                    pba,
+                                    RetiredRun {
+                                        count: 1,
+                                        retired_at,
+                                    },
+                                );
                             }
                             _ => unreachable!(),
                         }
@@ -2127,7 +2165,14 @@ mod age_tests {
                 println!(
                     "N={:>10} mode={:<11} depth={:>10} | retired_block_count={:>8.1}ms | \
                      aged_candidates={:>8.1}ms emitted={:>7} deferred={:>9} cands={}",
-                    n, mode, depth, d_rbc, d_aged, emitted, deferred, cands.len()
+                    n,
+                    mode,
+                    depth,
+                    d_rbc,
+                    d_aged,
+                    emitted,
+                    deferred,
+                    cands.len()
                 );
             }
         }
@@ -2193,7 +2238,10 @@ mod age_tests {
         assert_eq!(a_seq.free_block_count(), a_batch.free_block_count());
         assert_eq!(a_seq.retired_block_count(), a_batch.retired_block_count());
         assert_eq!(a_batch.retired_block_count(), 0);
-        assert_eq!(a_batch.retired_block_count(), a_batch.retired_block_count_exact());
+        assert_eq!(
+            a_batch.retired_block_count(),
+            a_batch.retired_block_count_exact()
+        );
         for i in 0..100u64 {
             assert!(a_batch.is_free(Pba(n + i)));
         }
@@ -2231,7 +2279,9 @@ mod age_tests {
         a.retire_extent_at(Extent::single(Pba(n)), t0).unwrap();
         // n+10 is allocated but never retired → not reclaimable.
         let batch = [Extent::single(Pba(n)), Extent::single(Pba(n + 10))];
-        let (blocks, cnt) = a.reclaim_retired_extents_batch(&batch, &run_flag()).unwrap();
+        let (blocks, cnt) = a
+            .reclaim_retired_extents_batch(&batch, &run_flag())
+            .unwrap();
         assert_eq!((blocks, cnt), (1, 1));
         assert!(a.is_free(Pba(n)));
         assert!(!a.is_free(Pba(n + 10)), "non-retired entry untouched");
@@ -2251,7 +2301,10 @@ mod age_tests {
         let t0 = Instant::now();
         a.retire_extent_at(Extent::single(p), t0).unwrap();
         // Inject the inconsistency: the same PBA is also in the free list.
-        a.free_extents.lock().unwrap().insert_for_test(Extent::single(p));
+        a.free_extents
+            .lock()
+            .unwrap()
+            .insert_for_test(Extent::single(p));
         let (blocks, cnt) = a
             .reclaim_retired_extents_batch(&[Extent::single(p)], &run_flag())
             .unwrap();
@@ -2301,11 +2354,13 @@ mod age_tests {
             .unwrap()
             .insert_for_test(Extent::single(Pba(n + 8))); // conflict on n+8
         let batch = [
-            Extent::new(Pba(n), 2),         // freed (sub-extent of [n,4])
-            Extent::single(Pba(n + 10)),    // skip (never retired)
-            Extent::single(Pba(n + 8)),     // conflict → stays retired
+            Extent::new(Pba(n), 2),      // freed (sub-extent of [n,4])
+            Extent::single(Pba(n + 10)), // skip (never retired)
+            Extent::single(Pba(n + 8)),  // conflict → stays retired
         ];
-        let (blocks, _) = a.reclaim_retired_extents_batch(&batch, &run_flag()).unwrap();
+        let (blocks, _) = a
+            .reclaim_retired_extents_batch(&batch, &run_flag())
+            .unwrap();
         assert_eq!(blocks, 2);
         assert_eq!(a.retired_block_count(), a.retired_block_count_exact());
         assert_eq!(a.retired_block_count(), 3); // [n+2,2] remainder + n+8
@@ -2319,7 +2374,9 @@ mod age_tests {
         let n = alloc_first(&a_seq, 100);
         let t0 = Instant::now();
         for i in 0..100u64 {
-            a_seq.retire_extent_at(Extent::single(Pba(n + i)), t0).unwrap();
+            a_seq
+                .retire_extent_at(Extent::single(Pba(n + i)), t0)
+                .unwrap();
         }
         let a_batch = new_alloc(4096);
         let nb = alloc_first(&a_batch, 100);
@@ -2330,7 +2387,10 @@ mod age_tests {
         assert!(failed.is_empty());
         assert_eq!(a_seq.retired_block_count(), a_batch.retired_block_count());
         assert_eq!(a_batch.retired_block_count(), 100);
-        assert_eq!(a_batch.retired_block_count(), a_batch.retired_block_count_exact());
+        assert_eq!(
+            a_batch.retired_block_count(),
+            a_batch.retired_block_count_exact()
+        );
         for i in 0..100u64 {
             assert!(a_batch.is_retired(Pba(n + i)));
         }
@@ -2410,7 +2470,10 @@ mod age_tests {
         assert_eq!(freed, 50 + 4 + 8);
         assert!(failed.is_empty());
         assert_eq!(a_seq.free_block_count(), a_batch.free_block_count());
-        assert_eq!(a_seq.allocated_block_count(), a_batch.allocated_block_count());
+        assert_eq!(
+            a_seq.allocated_block_count(),
+            a_batch.allocated_block_count()
+        );
         assert_eq!(
             *a_seq.free_extents.lock().unwrap().by_addr(),
             *a_batch.free_extents.lock().unwrap().by_addr(),
@@ -2446,14 +2509,17 @@ mod age_tests {
         a.free_one(Pba(n + 4)).unwrap(); // already free
         a.retire_extent_at(Extent::single(Pba(n + 6)), t0).unwrap(); // retired
         let batch = [
-            Extent::single(Pba(n)),      // frees
-            Extent::single(Pba(n + 4)),  // free-overlap → failed
-            Extent::single(Pba(n + 6)),  // retired-overlap → failed
-            Extent::single(Pba(n + 8)),  // frees
+            Extent::single(Pba(n)),     // frees
+            Extent::single(Pba(n + 4)), // free-overlap → failed
+            Extent::single(Pba(n + 6)), // retired-overlap → failed
+            Extent::single(Pba(n + 8)), // frees
         ];
         let (freed, failed) = a.free_extents_batch(&batch);
         assert_eq!(freed, 2);
-        assert_eq!(failed, vec![Extent::single(Pba(n + 4)), Extent::single(Pba(n + 6))]);
+        assert_eq!(
+            failed,
+            vec![Extent::single(Pba(n + 4)), Extent::single(Pba(n + 6))]
+        );
         assert!(a.is_free(Pba(n)));
         assert!(a.is_free(Pba(n + 8)));
         assert!(a.is_retired(Pba(n + 6)), "retired member untouched");
@@ -2572,7 +2638,11 @@ mod stripe_align_tests {
                 RESERVED_BLOCKS,
                 phys_blocks
             );
-            assert_eq!((ext.start.0 + RESERVED_BLOCKS) % STRIPE as u64, 0, "device-aligned");
+            assert_eq!(
+                (ext.start.0 + RESERVED_BLOCKS) % STRIPE as u64,
+                0,
+                "device-aligned"
+            );
             got += 1;
         }
         assert!(got > 0, "should allocate at least one boundary stripe");
@@ -2595,8 +2665,10 @@ mod stripe_align_tests {
         assert_eq!(head, None);
         assert_eq!(tail, None);
         // run too small to host aligned need
-        assert!(SpaceAllocator::carve_aligned_from_run(Extent::new(Pba(11), 6), 6, STRIPE, PHASE)
-            .is_none());
+        assert!(
+            SpaceAllocator::carve_aligned_from_run(Extent::new(Pba(11), 6), 6, STRIPE, PHASE)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2647,7 +2719,8 @@ mod stripe_align_tests {
         // seeded from one contiguous run => free runs stay O(1).
         let a = new_alloc_lanes(1_000_000, 2);
         for _ in 0..10_000 {
-            a.allocate_stripe_extent_for_lane(0, 4, STRIPE, PHASE).unwrap();
+            a.allocate_stripe_extent_for_lane(0, 4, STRIPE, PHASE)
+                .unwrap();
         }
         assert!(
             a.free_extent_run_count() < 16,
@@ -2667,7 +2740,9 @@ mod stripe_align_tests {
     fn padded_extent_frees_whole_stripe() {
         let a = new_alloc_lanes(4096, 2);
         let before = a.free_block_count();
-        let e = a.allocate_stripe_extent_for_lane(0, 4, STRIPE, PHASE).unwrap();
+        let e = a
+            .allocate_stripe_extent_for_lane(0, 4, STRIPE, PHASE)
+            .unwrap();
         assert_eq!(e.count, 6);
         assert_eq!(a.free_block_count(), before - 6);
         a.free_extent(e).unwrap();
@@ -2678,7 +2753,9 @@ mod stripe_align_tests {
     fn global_path_aligns_without_lane() {
         // lane index out of range forces the global (no-lane) path.
         let a = new_alloc_lanes(4096, 0);
-        let e = a.allocate_stripe_extent_for_lane(0, 7, STRIPE, PHASE).unwrap();
+        let e = a
+            .allocate_stripe_extent_for_lane(0, 7, STRIPE, PHASE)
+            .unwrap();
         assert_eq!(e.count, 12);
         assert_eq!((e.start.0 + PHASE as u64) % STRIPE as u64, 0);
     }

@@ -39,6 +39,22 @@ struct PreparedDedupUnit {
     candidate_target_guards: Vec<PbaHazardGuard>,
 }
 
+type DedupHitChunkEntry = (usize, usize, Lba, BlockmapValue, ContentHash);
+
+struct PendingDedupHitChunk {
+    chunk: Vec<DedupHitChunkEntry>,
+    promote_hashes: Vec<ContentHash>,
+    claimed_promotes: Vec<ContentHash>,
+    response_rx: Receiver<writer::DedupHitCommitResponse>,
+    batch_len: usize,
+    vol_id_str: String,
+}
+
+struct PendingPreparedDedupBatch {
+    prepared: Vec<PreparedDedupUnit>,
+    chunks: Vec<PendingDedupHitChunk>,
+}
+
 impl BufferFlusher {
     pub(in crate::buffer::flush) fn dedup_loop(
         shard_idx: usize,
@@ -49,15 +65,31 @@ impl BufferFlusher {
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
         done_tx: &Sender<Vec<u64>>,
-        running: &AtomicBool,
+        _running: &AtomicBool,
         skip_threshold_pct: u8,
         pending_skip_threshold_entries: u64,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
         read_pool: Option<&crate::io::read_pool::ReadPool>,
+        commit_worker_txs: &[Sender<writer::CommitJob>],
+        commit_workers_per_volume: usize,
+        commit_pipeline_depth: usize,
     ) {
-        while running.load(Ordering::Relaxed) {
+        let pipeline_depth = commit_pipeline_depth.max(1);
+        let mut pending_batches: VecDeque<PendingPreparedDedupBatch> = VecDeque::new();
+        loop {
+            if pending_batches.len() >= pipeline_depth {
+                let pending = pending_batches
+                    .pop_front()
+                    .expect("dedup commit pipeline depth checked non-zero");
+                if !Self::finish_pending_prepared_batch(
+                    shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx, candidate,
+                ) {
+                    return;
+                }
+            }
+
             let recv_start = Instant::now();
             let first = match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(unit) => {
@@ -72,9 +104,27 @@ impl BufferFlusher {
                     metrics
                         .flush_dedup_worker_idle_ns
                         .fetch_add(idle_ns, Ordering::Relaxed);
+                    if let Some(pending) = pending_batches.pop_front() {
+                        if !Self::finish_pending_prepared_batch(
+                            shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx,
+                            candidate,
+                        ) {
+                            return;
+                        }
+                    }
                     continue;
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    while let Some(pending) = pending_batches.pop_front() {
+                        if !Self::finish_pending_prepared_batch(
+                            shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx,
+                            candidate,
+                        ) {
+                            return;
+                        }
+                    }
+                    return;
+                }
             };
             let active_start = Instant::now();
             metrics
@@ -150,7 +200,8 @@ impl BufferFlusher {
                     metrics,
                 );
             }
-            Self::commit_prepared_dedup_hits(
+            let chunks = Self::issue_prepared_dedup_hits(
+                shard_idx,
                 &mut prepared,
                 meta,
                 pool,
@@ -158,19 +209,19 @@ impl BufferFlusher {
                 metrics,
                 cleanup_tx,
                 candidate,
+                commit_worker_txs,
+                commit_workers_per_volume,
             );
 
-            for prepared_unit in prepared {
-                if !Self::finish_prepared_dedup_unit(
-                    shard_idx,
-                    prepared_unit,
-                    miss_tx,
-                    pool,
-                    done_tx,
-                    metrics,
+            let pending = PendingPreparedDedupBatch { prepared, chunks };
+            if pending.chunks.is_empty() {
+                if !Self::finish_pending_prepared_batch(
+                    shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx, candidate,
                 ) {
                     return;
                 }
+            } else {
+                pending_batches.push_back(pending);
             }
 
             let active_ns = active_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -490,7 +541,8 @@ impl BufferFlusher {
         }
     }
 
-    fn commit_prepared_dedup_hits(
+    fn issue_prepared_dedup_hits(
+        shard_idx: usize,
         prepared: &mut [PreparedDedupUnit],
         meta: &MetaStore,
         pool: &WriteBufferPool,
@@ -498,7 +550,10 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
-    ) {
+        commit_worker_txs: &[Sender<writer::CommitJob>],
+        commit_workers_per_volume: usize,
+    ) -> Vec<PendingDedupHitChunk> {
+        let mut issued = Vec::new();
         let mut by_volume: HashMap<String, Vec<usize>> = HashMap::new();
         for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
             if !prepared_unit.valid_hits.is_empty() {
@@ -578,7 +633,8 @@ impl BufferFlusher {
                         if maybe_inject_dedup_hit_failure(&vol_id_str, lba).is_ok() {
                             pending.push((unit_idx, i, lba, existing_value, hash));
                             if pending.len() >= Self::DEDUP_HIT_COMMIT_BATCH_SIZE {
-                                Self::commit_dedup_hit_chunk(
+                                issued.push(Self::issue_dedup_hit_chunk(
+                                    shard_idx,
                                     prepared,
                                     &vol_id,
                                     &vol_id_str,
@@ -587,7 +643,9 @@ impl BufferFlusher {
                                     metrics,
                                     cleanup_tx,
                                     candidate,
-                                );
+                                    commit_worker_txs,
+                                    commit_workers_per_volume,
+                                ));
                             }
                         } else {
                             prepared[unit_idx].is_hit[i] = false;
@@ -597,7 +655,8 @@ impl BufferFlusher {
                 }
 
                 if !pending.is_empty() {
-                    Self::commit_dedup_hit_chunk(
+                    issued.push(Self::issue_dedup_hit_chunk(
+                        shard_idx,
                         prepared,
                         &vol_id,
                         &vol_id_str,
@@ -606,12 +665,15 @@ impl BufferFlusher {
                         metrics,
                         cleanup_tx,
                         candidate,
-                    );
+                        commit_worker_txs,
+                        commit_workers_per_volume,
+                    ));
                 }
             });
         }
 
         Self::commit_prepared_zero_blocks(prepared, meta, pool, lifecycle, metrics, cleanup_tx);
+        issued
     }
 
     fn commit_prepared_zero_blocks(
@@ -735,16 +797,19 @@ impl BufferFlusher {
         }
     }
 
-    fn commit_dedup_hit_chunk(
+    fn issue_dedup_hit_chunk(
+        shard_idx: usize,
         prepared: &mut [PreparedDedupUnit],
         vol_id: &VolumeId,
         vol_id_str: &str,
         pending: &mut Vec<(usize, usize, Lba, BlockmapValue, ContentHash)>,
         meta: &MetaStore,
         metrics: &EngineMetrics,
-        cleanup_tx: &Sender<CleanupBatch>,
+        _cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
-    ) {
+        commit_worker_txs: &[Sender<writer::CommitJob>],
+        commit_workers_per_volume: usize,
+    ) -> PendingDedupHitChunk {
         let chunk = std::mem::take(pending);
         metrics
             .dedup_hit_commit_ops
@@ -759,6 +824,7 @@ impl BufferFlusher {
                 Self::latest_seq_for_lba(&prepared[*unit_idx].unit.seq_lba_ranges, *lba)
             })
             .collect();
+        let batch_len = batch_input.len();
 
         // Collect promote_candidates from the unit_idx values present
         // in this chunk. Each (lba_idx, hash, dedup_entry) tuple is a
@@ -813,27 +879,107 @@ impl BufferFlusher {
             }
         }
 
-        let hit_commit_start = Instant::now();
-        let batch_result = meta.atomic_batch_dedup_hits_with_promote(
-            vol_id,
-            &batch_input,
-            &promote_entries,
-            &batch_seqs,
-        );
-        Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
+        let promote_hashes: Vec<ContentHash> =
+            promote_entries.iter().map(|(hash, _)| *hash).collect();
+        let vol_created_at = chunk
+            .first()
+            .map(|(unit_idx, ..)| prepared[*unit_idx].unit.vol_created_at)
+            .unwrap_or_default();
+        let (response_tx, response_rx) = bounded(1);
+        if commit_worker_txs.is_empty() {
+            let hit_commit_start = Instant::now();
+            let result = meta
+                .atomic_batch_dedup_hits_with_promote(
+                    vol_id,
+                    &batch_input,
+                    &promote_entries,
+                    &batch_seqs,
+                )
+                .map(
+                    |(results, newly_zeroed)| writer::DedupHitCommitResponse::Committed {
+                        results,
+                        newly_zeroed,
+                    },
+                )
+                .unwrap_or_else(|error| writer::DedupHitCommitResponse::Failed(error.to_string()));
+            Self::record_elapsed(&metrics.dedup_hit_commit_ns, hit_commit_start);
+            let _ = response_tx.send(result);
+        } else {
+            let worker_idx =
+                writer::route_volume_to_worker(vol_id_str, shard_idx, commit_workers_per_volume);
+            if let Some(tx) = commit_worker_txs.get(worker_idx) {
+                let job = writer::CommitJob::DedupHit(writer::DedupHitCommitJob {
+                    vol_id: vol_id.clone(),
+                    vol_created_at,
+                    hits: batch_input,
+                    promote_entries,
+                    seqs: batch_seqs,
+                    response_tx,
+                    enqueued_at: Instant::now(),
+                });
+                if let Err(error) = tx.send(job) {
+                    let writer::CommitJob::DedupHit(failed_job) = error.0 else {
+                        unreachable!("dedup sender returned a different commit job kind")
+                    };
+                    let _ = failed_job
+                        .response_tx
+                        .send(writer::DedupHitCommitResponse::Failed(
+                            "dedup hit commit worker disconnected".to_string(),
+                        ));
+                }
+            } else {
+                let _ = response_tx.send(writer::DedupHitCommitResponse::Failed(
+                    "dedup hit commit worker route missing".to_string(),
+                ));
+            }
+        }
+
+        PendingDedupHitChunk {
+            chunk,
+            promote_hashes,
+            claimed_promotes,
+            response_rx,
+            batch_len,
+            vol_id_str: vol_id_str.to_string(),
+        }
+    }
+
+    fn finish_dedup_hit_chunk(
+        pending: PendingDedupHitChunk,
+        prepared: &mut [PreparedDedupUnit],
+        metrics: &EngineMetrics,
+        cleanup_tx: &Sender<CleanupBatch>,
+        candidate: &crate::dedup::CandidateCache,
+    ) {
+        let PendingDedupHitChunk {
+            chunk,
+            promote_hashes,
+            claimed_promotes,
+            response_rx,
+            batch_len,
+            vol_id_str,
+        } = pending;
+        let batch_result = response_rx.recv().unwrap_or_else(|_| {
+            writer::DedupHitCommitResponse::Failed(
+                "dedup hit commit response disconnected".to_string(),
+            )
+        });
 
         match batch_result {
-            Ok((results, newly_zeroed)) => {
+            writer::DedupHitCommitResponse::Committed {
+                results,
+                newly_zeroed,
+            } => {
                 // Promotion landed in the persistent dedup_index — drop
                 // the now-redundant candidate slot. If promote_entries
                 // was empty (no candidate hits in this chunk) this is
                 // a no-op.
-                for (hash, _) in &promote_entries {
+                for hash in &promote_hashes {
                     candidate.remove_by_hash(hash);
                 }
                 metrics
                     .dedup_promotions_committed
-                    .fetch_add(promote_entries.len() as u64, Ordering::Relaxed);
+                    .fetch_add(promote_hashes.len() as u64, Ordering::Relaxed);
 
                 for ((unit_idx, hit_idx, lba, _, _), result) in chunk.into_iter().zip(results) {
                     match result {
@@ -856,21 +1002,21 @@ impl BufferFlusher {
                     let _ = cleanup_tx.send(newly_zeroed.into_values().collect());
                 }
             }
-            Err(e) => {
+            writer::DedupHitCommitResponse::Failed(error) => {
                 metrics
                     .dedup_hit_failures
                     .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 metrics
                     .dedup_promotions_failed
-                    .fetch_add(promote_entries.len() as u64, Ordering::Relaxed);
+                    .fetch_add(promote_hashes.len() as u64, Ordering::Relaxed);
                 for (unit_idx, hit_idx, _, _, _) in chunk {
                     prepared[unit_idx].is_hit[hit_idx] = false;
                 }
                 tracing::error!(
                     vol = %vol_id_str,
-                    count = batch_input.len(),
-                    promotes = promote_entries.len(),
-                    error = %e,
+                    count = batch_len,
+                    promotes = promote_hashes.len(),
+                    error = %error,
                     "dedup worker: batch hit + promote commit failed, demoting all to miss"
                 );
             }
@@ -882,6 +1028,41 @@ impl BufferFlusher {
         for hash in &claimed_promotes {
             candidate.release_promote(hash);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_pending_prepared_batch(
+        shard_idx: usize,
+        mut pending: PendingPreparedDedupBatch,
+        miss_tx: &Sender<CoalesceUnit>,
+        pool: &WriteBufferPool,
+        done_tx: &Sender<Vec<u64>>,
+        metrics: &EngineMetrics,
+        cleanup_tx: &Sender<CleanupBatch>,
+        candidate: &crate::dedup::CandidateCache,
+    ) -> bool {
+        for chunk in pending.chunks {
+            Self::finish_dedup_hit_chunk(
+                chunk,
+                &mut pending.prepared,
+                metrics,
+                cleanup_tx,
+                candidate,
+            );
+        }
+        for prepared_unit in pending.prepared {
+            if !Self::finish_prepared_dedup_unit(
+                shard_idx,
+                prepared_unit,
+                miss_tx,
+                pool,
+                done_tx,
+                metrics,
+            ) {
+                return false;
+            }
+        }
+        true
     }
 
     fn finish_prepared_dedup_unit(

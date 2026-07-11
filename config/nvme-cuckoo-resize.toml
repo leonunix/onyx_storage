@@ -6,9 +6,9 @@
 # resize staircase (begin_grow -> migrate -> swap) fires and completes at an
 # observable pace under a dedup-heavy fio load.
 #
-# ⚠ NVMe names reshuffle across reboots — the device list below is the
-# 2026-07-10 enumeration (verified by lsblk: 10x 7.68TB Dell Ent NVMe, none is
-# sda=DELLBOSS). Re-verify by CONTENT (`lsblk -f`/`blkid`) before chunklet-init.
+# Stable EUI paths for the 10x 7.68TB Dell Ent NVMe devices. Keep using
+# by-id here: kernel nvmeXnY names reshuffle across reboots. None of these is
+# sda=DELLBOSS; re-verify serial/content before any destructive chunklet-init.
 #
 # Run:
 #   target/release/onyx-storage -c config/nvme-cuckoo-resize.toml chunklet-init --force
@@ -17,25 +17,26 @@
 #   RUST_LOG=info target/release/onyx-storage -c config/nvme-cuckoo-resize.toml start -v fio-volume
 
 [numa]
-mode = "confine"
+mode = "partition"
+data_nodes = [0, 1]
 home_node = 0
 reserve_cores_per_node = 2
 cold_cache_policy = "auto"
 
 [chunklet]
 enabled = true
-# 10 raw NVMe PDs (2026-07-10 enumeration). ⚠ VERIFY BY CONTENT before init.
+# 10 raw NVMe PDs. Verify by serial/content before any destructive init.
 devices = [
-    "/dev/nvme0n2",
-    "/dev/nvme1n1",
-    "/dev/nvme2n1",
-    "/dev/nvme3n1",
-    "/dev/nvme4n2",
-    "/dev/nvme5n2",
-    "/dev/nvme6n2",
-    "/dev/nvme7n1",
-    "/dev/nvme8n1",
-    "/dev/nvme9n2",
+    "/dev/disk/by-id/nvme-eui.36434d30574023960025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574020500025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574023950025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574020350025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574023870025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574023250025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574020330025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574023940025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574023730025384300000002",
+    "/dev/disk/by-id/nvme-eui.36434d30574020360025384300000002",
 ]
 io_backend = "uring"
 spare_pct = 5
@@ -43,17 +44,20 @@ watchdog_enabled = true
 watchdog_interval_secs = 10
 watchdog_fail_threshold = 3
 auto_failover = true
-# LV3 = RAID6 (6 data + 2 parity), 100 rows, 4 KiB strip -> ~600 GiB usable.
-lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 100, strip_kib = 4 }
+# LV3 = RAID6 (6 data + 2 parity), 100 rows, 256 KiB strip. The 1.5 MiB
+# full-stripe write keeps the ten NVMe devices fed even when the cross-lane
+# combiner has only ~64 operations available per device submission.
+lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 100, strip_kib = 256 }
 # LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable.
-lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
+lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 256, strip_kib = 128 }
 # metadb LD (Phase 3f). RAID10 2x mirror, 32 rows -> ~64 GiB usable (>> the
 # ~2 GiB the largest cuckoo table + L2P/rc need even after several grows).
-meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
-# LD ids from `chunklet-init --force` (2026-07-10 pool re-init, Issue D validation):
-lv3_ld_id = "7b2e01e4-de72-4bbd-b17b-067526b75b12"
-lv2_ld_id = "ce6f59e7-0b1a-404f-87b7-342bc439f2c2"
-meta_ld_id = "958f4821-5b4b-416f-bab8-eb6fbba8e17a"
+meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 128 }
+# Fresh no-migration stack for the 256 KiB LV3-strip A/B (2026-07-11). The
+# previous 64 KiB stack remains allocated and untouched for rollback.
+lv3_ld_id = "c89abc88-ddd5-4a70-b5f5-794489d9e6ed"
+lv2_ld_id = "c0235ebc-2511-4b52-b33b-5ed2944c84e1"
+meta_ld_id = "356ed7f3-37bd-425f-bfe2-9487769e6ca7"
 
 [meta]
 backend = "chunklet"
@@ -62,7 +66,12 @@ block_cache_mb = 32768
 memtable_budget_mb = 8192
 index_pin_mb = 8192
 lsm_bloom_bits_per_entry = 20
-checkpoint_interval_ms = 5000
+checkpoint_interval_ms = 120000
+# LV2 is the cheap durable aggregation window. Checkpoint before the physical
+# ring reaches throttle territory, while allowing repeated LBA/PBA updates to
+# collapse for up to two minutes under lighter pressure.
+checkpoint_ring_fill_pct = 50
+flush_dirty_pages_threshold = 0
 group_commit_timeout_us = 1
 dedup_shards = 8
 # ── RESIZE TEST: intentionally SMALL initial modulus so the auto-grow fires
@@ -71,10 +80,15 @@ dedup_shards = 8
 dedup_cuckoo_buckets = 65536
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
+l2p_buffer_soft_entries = 16000000
+l2p_buffer_hard_entries = 2000000
+l2p_buffer_max_interval_ms = 120000
 rc_authoritative_reclaim = true
 commit_direct_apply_enabled = true
 bfg_threads_enabled = true
 parallel_l2p_drain_enabled = false
+l2p_drain_chunk_entries = 4096
+l2p_checkpoint_pipeline_enabled = true
 
 [storage]
 block_size = 4096
@@ -86,9 +100,9 @@ read_pool_workers = 32
 raid_full_stripe_writes = true
 
 [buffer]
-capacity_mb = 32768
+capacity_mb = 524288
 flush_watermark_pct = 80
-group_commit_wait_us = 100
+group_commit_wait_us = 1000
 shards = 16
 max_memory_mb = 16384
 volatile_memory_mb = 49152
@@ -106,18 +120,38 @@ throttle_cap_us = 2000
 nr_queues = 32
 queue_depth = 256
 io_buf_bytes = 1048576
-queue_workers = 4
+queue_workers = 16
 
 [flush]
 compress_workers = 2
-coalesce_max_raw_bytes = 24576
-coalesce_max_lbas = 6
+# Keep one compression unit at 384 KiB (one quarter of the 1.5 MiB RAID6
+# stripe). The writer combines up to four units into full-stripe IO without
+# forcing a foreground 4 KiB read to decompress an entire 1.5 MiB unit.
+coalesce_max_raw_bytes = 393216
+coalesce_max_lbas = 96
 min_compression_savings_pct = 12
 skip_fully_superseded = true
+# Collapse overwrites in the 512 GiB LV2 before paying LV3 + metadata writes.
+# Bypass on PHYSICAL ring occupancy so checkpoint-retained slots cannot hide
+# pressure behind a low logical-pending value.
+buffer_write_window_ms = 30000
+buffer_write_window_pressure_pct = 50
 packed_meta_batch_max_lbas = 1024
+# Batch adjacent packed-slot metadata jobs into one metadb transaction. The
+# unbatched path degenerates to ~1 LBA/commit under dedup-heavy random writes,
+# leaving commit workers queued behind millisecond-scale apply service.
+commit_workers_per_volume = 8
+commit_target_lbas_per_tx = 8192
+# Keep enough work behind each of the eight volume workers for the batched
+# L2P/RC paths to amortise their lane footprint. The short wait applies only to
+# a sparse worker queue; under sustained load try_recv fills the 16K budget.
+commit_coalesce_lba_budget = 16384
+commit_coalesce_timeout_us = 2000
+packed_commit_try_drain_lba_budget = 150
+writer_read_active_batch_size = 1024
 
 [engine]
-zone_count = 64
+zone_count = 256
 zone_size_blocks = 256
 recovery_timeout_ms = 600000
 

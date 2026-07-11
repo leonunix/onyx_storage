@@ -403,7 +403,8 @@ impl PbaLifecycle {
         extents: &[Extent],
         running: &AtomicBool,
     ) -> OnyxResult<(u64, usize)> {
-        self.allocator.reclaim_retired_extents_batch(extents, running)
+        self.allocator
+            .reclaim_retired_extents_batch(extents, running)
     }
 }
 
@@ -428,7 +429,12 @@ mod tests {
         }
     }
 
-    fn lifecycle() -> (Arc<SpaceAllocator>, CandidateCache, Arc<EngineMetrics>, PbaLifecycle) {
+    fn lifecycle() -> (
+        Arc<SpaceAllocator>,
+        CandidateCache,
+        Arc<EngineMetrics>,
+        PbaLifecycle,
+    ) {
         let allocator = Arc::new(SpaceAllocator::new(4096 * 1000, 0));
         let candidate = CandidateCache::new(8, 64);
         let metrics = Arc::new(EngineMetrics::default());
@@ -451,7 +457,10 @@ mod tests {
         );
         assert!(allocator.is_free(pba), "PBA must be freed");
         assert_eq!(metrics.gc_lineage_freed_blocks.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.gc_lineage_idempotent_frees.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.gc_lineage_idempotent_frees.load(Ordering::Relaxed),
+            0
+        );
 
         // Duplicate surface of an already-free extent → absorbed idempotently,
         // no double free.
@@ -461,7 +470,10 @@ mod tests {
             1,
             "duplicate surface must not double-free"
         );
-        assert_eq!(metrics.gc_lineage_idempotent_frees.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.gc_lineage_idempotent_frees.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -514,7 +526,10 @@ mod tests {
         let pba2 = allocator.allocate_one().unwrap();
         assert_eq!(pba2, pba, "allocator hands back the lowest free PBA");
         lc.drive_retire_retries_force();
-        assert!(allocator.is_retired(pba), "deferred retire retried to success");
+        assert!(
+            allocator.is_retired(pba),
+            "deferred retire retried to success"
+        );
         assert_eq!(metrics.pba_reclaim_stuck.load(Ordering::Relaxed), 0);
         assert_eq!(
             metrics.pba_blocks_retired.load(Ordering::Relaxed),

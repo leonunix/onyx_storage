@@ -2,6 +2,135 @@ use super::*;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
+struct NoUringCountingBackend {
+    inner: RawDevice,
+    flushes: AtomicU64,
+    fail_remaining: AtomicU64,
+}
+
+impl NoUringCountingBackend {
+    fn open(path: &std::path::Path, size: u64, fail_remaining: u64) -> Self {
+        Self {
+            inner: RawDevice::open_or_create(path, size).unwrap(),
+            flushes: AtomicU64::new(0),
+            fail_remaining: AtomicU64::new(fail_remaining),
+        }
+    }
+}
+
+impl BlockBackend for NoUringCountingBackend {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
+        self.inner.read_at(buf, offset)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
+        self.inner.write_at(buf, offset)
+    }
+
+    fn flush(&self) -> OnyxResult<()> {
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        if self
+            .fail_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n > 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            return Err(OnyxError::Io(std::io::Error::other(
+                "injected root flush failure",
+            )));
+        }
+        self.inner.sync()
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn direct_io(&self) -> bool {
+        self.inner.is_direct_io()
+    }
+}
+
+#[test]
+fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 128 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let backend = Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0));
+    let pool = Arc::new(
+        WriteBufferPool::open_with_options_full_and_limits(
+            backend.clone(),
+            Duration::from_millis(10),
+            4,
+            1,
+            Duration::from_secs(1),
+            64 * 1024 * 1024,
+            None,
+            BufferRuntimeLimits::default(),
+        )
+        .unwrap(),
+    );
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+    backend.fail_remaining.store(1, Ordering::Release);
+    let start = Arc::new(std::sync::Barrier::new(65));
+    let mut writers = Vec::new();
+    for i in 0..64u64 {
+        let pool = pool.clone();
+        let start = start.clone();
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            pool.append("vol", Lba(i), 1, &[i as u8; BLOCK_SIZE as usize], 1)
+                .unwrap();
+        }));
+    }
+    start.wait();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    let batches = metrics.buffer_sync_batches.load(Ordering::Relaxed);
+    let flushes = metrics.buffer_sync_flushes.load(Ordering::Relaxed);
+    assert!(
+        batches >= 4,
+        "expected work from all four shards, got {batches}"
+    );
+    assert!(
+        flushes < batches,
+        "global epochs must cover multiple shard batches: flushes={flushes} batches={batches}"
+    );
+    drop(pool);
+
+    let reopened = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::from_millis(10),
+        4,
+        1,
+        Duration::from_secs(1),
+        64 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(reopened.pending_count(), 64);
+    for i in 0..64u64 {
+        assert_eq!(
+            reopened
+                .lookup("vol", Lba(i))
+                .unwrap()
+                .unwrap()
+                .payload
+                .unwrap()[0],
+            i as u8
+        );
+    }
+}
+
 fn create_pool(size: u64, group_commit_wait: Duration) -> (WriteBufferPool, NamedTempFile) {
     let tmp = NamedTempFile::new().unwrap();
     tmp.as_file().set_len(size).unwrap();
@@ -967,6 +1096,27 @@ fn mark_applied_clears_read_path_but_does_not_release_ring() {
         "mark_applied must not advance the ring head"
     );
     assert!(ring.flushed_seqs.contains(&seq));
+}
+
+#[test]
+fn applied_frontier_does_not_jump_over_older_pending_seq() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 16 * 8192, Duration::from_millis(1));
+    let seq1 = pool
+        .append("test-vol", Lba(1), 1, &vec![0x11; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    let seq2 = pool
+        .append("test-vol", Lba(2), 1, &vec![0x22; BLOCK_SIZE as usize], 0)
+        .unwrap();
+
+    pool.mark_applied(seq2, Lba(2), 1).unwrap();
+    assert_eq!(
+        pool.applied_frontier(),
+        seq1.saturating_sub(1),
+        "a completed high seq must not hide an older pending entry"
+    );
+
+    pool.mark_applied(seq1, Lba(1), 1).unwrap();
+    assert_eq!(pool.applied_frontier(), seq2);
 }
 
 #[test]

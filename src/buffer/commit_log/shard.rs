@@ -1131,6 +1131,10 @@ impl BufferShard {
         self.pending_entries.contains_key(&seq)
     }
 
+    pub(super) fn oldest_pending_seq(&self) -> Option<u64> {
+        self.ring.lock().pending_seqs.first().copied()
+    }
+
     /// Memory-only: reclaim ring space, cancel write thread if needed.
     /// No disk write — metadata commit to metadb is the durable record.
     /// On crash recovery, stale "unflushed" entries are detected by

@@ -134,6 +134,10 @@ pub struct EngineMetrics {
     pub buffer_append_log_write_ns: AtomicU64,
     pub buffer_append_wait_durable_ns: AtomicU64,
     pub buffer_sync_batches: AtomicU64,
+    /// Actual backend durability barriers. On a multi-shard chunklet LV2 this
+    /// is lower than `buffer_sync_batches` because one root flush covers a
+    /// cross-shard group-commit epoch.
+    pub buffer_sync_flushes: AtomicU64,
     pub buffer_sync_batch_ns: AtomicU64,
     pub buffer_sync_sleep_ns: AtomicU64,
     pub buffer_sync_epochs_committed: AtomicU64,
@@ -208,6 +212,10 @@ pub struct EngineMetrics {
     pub lv3_write_batch_calls: AtomicU64,
     pub lv3_write_batch_ops: AtomicU64,
     pub lv3_write_batch_bytes: AtomicU64,
+    pub lv3_write_batch_ns: AtomicU64,
+    pub lv3_write_batch_ns_max: AtomicU64,
+    pub lv3_write_batch_inflight: AtomicU64,
+    pub lv3_write_batch_inflight_max: AtomicU64,
     pub lv3_write_slab_allocs: AtomicU64,
     pub lv3_write_slab_bytes: AtomicU64,
     pub read_unmapped: AtomicU64,

@@ -7,8 +7,9 @@ mod post_commit;
 
 pub(crate) use commit_worker::TARGET_OPS_PER_COMMIT;
 pub(in crate::buffer::flush) use commit_worker::{
-    route_volume_to_worker, CommitJob, PackedCommitJob, PassthroughCommitJob, UnitCommitData,
-    COMMIT_WORKER_QUEUE_CAP, NUM_COMMIT_WORKERS,
+    route_volume_to_worker, CommitJob, DedupHitCommitJob, DedupHitCommitResponse, PackedCommitJob,
+    PassthroughCommitJob, UnitCommitData, COMMIT_EXECUTOR_QUEUE_CAP, COMMIT_WORKER_QUEUE_CAP,
+    NUM_COMMIT_WORKERS,
 };
 pub(in crate::buffer::flush) use post_commit::{PostCommitJob, POST_COMMIT_QUEUE_CAP};
 
@@ -25,14 +26,15 @@ impl BufferFlusher {
     /// The NVMe mixed workload exposes metadb's per-commit tail more
     /// sharply than the old 4-lane soak: more buffer shards means more
     /// writer threads, so reducing commit count matters more than keeping
-    /// each writer cycle tiny. 1024 keeps per-writer transient memory
-    /// bounded while giving metadb enough work to amortise apply/WAL cost.
+    /// each writer cycle tiny. 512 keeps per-writer transient memory bounded,
+    /// gives metadb enough work to amortise apply/WAL cost, and produces more
+    /// continuous LV3 waves than the former 1024-unit cap.
     ///
     /// Must stay paired with the bounded channel capacities in
     /// [`BufferFlusher::start_with_metrics`] — write_rx in particular
     /// caps at `WRITER_BATCH_SIZE`, so a smaller channel would silently
     /// starve the writer below this batch.
-    pub(super) const WRITER_BATCH_SIZE: usize = 1024;
+    pub(super) const WRITER_BATCH_SIZE: usize = 512;
     /// Foreground reads are latency-sensitive, while flush writes are already
     /// decoupled by LV2. When reads are flowing, cap each writer drain so one
     /// background batch cannot monopolize LV3 IO and metadb apply for hundreds
@@ -43,11 +45,21 @@ impl BufferFlusher {
     /// starved background drain to ~2K LBA/s while 1024 lifted active drain
     /// into the 46-59K LBA/s range. Keep the read-active default at 1024.
     pub(crate) const WRITER_BATCH_SIZE_READ_ACTIVE: usize = 1024;
-    /// After the first completed unit arrives, wait very briefly for the
-    /// compress/dedup pipeline to hand over adjacent work. This keeps fast LV3
-    /// writes from turning into many small metadb commits when the IO side gets
-    /// cheaper than the upstream handoff cadence.
-    pub(super) const WRITER_BATCH_COALESCE: Duration = Duration::from_micros(250);
+    /// The LV2 ring is the durable write window, so the LV3 writer should build
+    /// enough queue depth to amortise one chunklet `write_many_at` call instead
+    /// of chasing the compression workers one unit at a time. A direct chunklet
+    /// benchmark reaches its efficient regime around 128 random operations.
+    // A mature LV2 epoch already paid the write-window delay. 512 units keep
+    // each shard feeding multiple waves into the global chunklet combiner,
+    // while two typical writer requests still exceed its 12 MiB device-call
+    // target. Smaller 128-unit batches fragmented padding; 1024-unit batches
+    // left the device executors idle between four large per-shard waves.
+    pub(super) const WRITER_BATCH_TARGET_UNITS: usize = Self::WRITER_BATCH_SIZE;
+    pub(super) const WRITER_BATCH_COALESCE: Duration = Duration::from_millis(50);
+    /// Foreground reads share LV3 with the flusher. Keep their background
+    /// admission window shorter while still avoiding single-digit batches.
+    pub(super) const WRITER_READ_ACTIVE_BATCH_TARGET_UNITS: usize = 32;
+    pub(super) const WRITER_READ_ACTIVE_BATCH_COALESCE: Duration = Duration::from_micros(250);
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
     pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(200);
 
@@ -176,13 +188,30 @@ impl BufferFlusher {
                 rx_pending_at_start,
             );
 
-            // Drain up to the current writer batch limit.
+            // Drain up to the current writer batch limit. Under a sparse stream
+            // the target avoids paying the full coalesce timeout once a useful
+            // chunklet batch has formed; under a mature LV2-window burst the
+            // no-wait drain keeps going all the way to writer_batch_limit.
             let mut incoming = vec![first];
-            let drain_deadline = Instant::now() + Self::WRITER_BATCH_COALESCE;
+            let batch_target = if read_active {
+                Self::WRITER_READ_ACTIVE_BATCH_TARGET_UNITS
+            } else {
+                Self::WRITER_BATCH_TARGET_UNITS
+            }
+            .min(writer_batch_limit);
+            let batch_coalesce = if read_active {
+                Self::WRITER_READ_ACTIVE_BATCH_COALESCE
+            } else {
+                Self::WRITER_BATCH_COALESCE
+            };
+            let drain_deadline = Instant::now() + batch_coalesce;
             while incoming.len() < writer_batch_limit {
                 match rx.try_recv() {
                     Ok(unit) => incoming.push(unit),
                     Err(_) => {
+                        if incoming.len() >= batch_target {
+                            break;
+                        }
                         let now = Instant::now();
                         if now >= drain_deadline {
                             break;

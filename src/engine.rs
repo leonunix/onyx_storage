@@ -243,9 +243,7 @@ impl OnyxEngine {
     /// pool (a second in-process `Pool::open` over the same PDs would be a
     /// distinct in-memory pool — two writers to one superblock). Returns `None`
     /// in the non-chunklet deployment so callers keep the `RawDevice` paths.
-    fn acquire_chunklet_pool(
-        config: &OnyxConfig,
-    ) -> OnyxResult<Option<Arc<onyx_chunklet::Pool>>> {
+    fn acquire_chunklet_pool(config: &OnyxConfig) -> OnyxResult<Option<Arc<onyx_chunklet::Pool>>> {
         if config.chunklet.enabled {
             Ok(Some(crate::chunklet_pool::open_pool(&config.chunklet)?))
         } else {
@@ -995,10 +993,10 @@ impl OnyxEngine {
         let watermark = DurabilityWatermarkHandle::start(
             meta.clone(),
             buffer_pool.clone(),
-            buffer_pool.max_flushed_seq_handle(),
             buffer_pool.durable_seq_handle(),
             config.meta.checkpoint_interval(),
             config.meta.flush_dirty_pages_threshold,
+            config.meta.checkpoint_ring_fill_pct,
         );
         let lineage_drain = LineageFreedPbaDrainHandle::start(
             meta.clone(),
@@ -1213,9 +1211,9 @@ impl OnyxEngine {
     pub fn create_snapshot(&self, volume: &str, snap_name: &str) -> OnyxResult<SnapshotInfo> {
         self.lifecycle.with_write_lock(volume, || {
             let created_at = self.next_volume_generation();
-            let info = self
-                .meta
-                .create_snapshot(&VolumeId(volume.to_string()), snap_name, created_at)?;
+            let info =
+                self.meta
+                    .create_snapshot(&VolumeId(volume.to_string()), snap_name, created_at)?;
             self.metrics
                 .snapshot_create_ops
                 .fetch_add(1, Ordering::Relaxed);
@@ -1246,8 +1244,7 @@ impl OnyxEngine {
             }
         }
         let usage = self.compute_volume_usage(volume, now)?;
-        self.usage_cache
-            .insert(volume.to_string(), usage.clone());
+        self.usage_cache.insert(volume.to_string(), usage.clone());
         Ok(usage)
     }
 
@@ -1278,8 +1275,11 @@ impl OnyxEngine {
         let mut seen_units: HashSet<(u64, u16)> = HashSet::new();
         let mut orig_bytes: u64 = 0;
         let mut phys_bytes: u64 = 0;
-        self.meta
-            .scan_blockmap_range(&vol_id, crate::types::Lba(0), lba_count, &mut |_lba, v| {
+        self.meta.scan_blockmap_range(
+            &vol_id,
+            crate::types::Lba(0),
+            lba_count,
+            &mut |_lba, v| {
                 if v.is_zero() {
                     return;
                 }
@@ -1288,7 +1288,8 @@ impl OnyxEngine {
                     orig_bytes += u64::from(v.unit_original_size);
                     phys_bytes += u64::from(v.unit_compressed_size);
                 }
-            })?;
+            },
+        )?;
 
         let mapped_bytes = mapped_lbas.saturating_mul(block_size);
         let ratio = |num: u64, den: u64| -> f64 {
@@ -1326,7 +1327,12 @@ impl OnyxEngine {
         self.metrics
             .snapshot_delete_ops
             .fetch_add(1, Ordering::Relaxed);
-        tracing::info!(volume, snapshot = snap_name, freed_blocks, "snapshot deleted");
+        tracing::info!(
+            volume,
+            snapshot = snap_name,
+            freed_blocks,
+            "snapshot deleted"
+        );
         Ok(freed_blocks)
     }
 
@@ -1560,27 +1566,41 @@ impl OnyxEngine {
         }
 
         // Belt-and-suspenders: one more explicit sync in case new writes
-        // arrived between the watermark thread's final tick and now.
-        if let Err(e) = self.meta.sync_durable() {
-            tracing::error!(
-                error = %e,
-                "failed to sync_durable at shutdown — forcing dirty recovery on next boot"
-            );
-            return Ok(());
-        }
+        // arrived between the watermark thread's final tick and now. Stamp
+        // only the contiguous applied prefix, then use the frontier returned
+        // from the committed manifest for ring release below.
+        let requested_frontier = self
+            .buffer_pool
+            .as_ref()
+            .map(|pool| pool.applied_frontier())
+            .unwrap_or(0);
+        self.meta.set_buffer_applied_watermark(requested_frontier);
+        let durable_buffer_seq = match self.meta.sync_durable() {
+            Ok(seq) => seq,
+            Err(e) => {
+                tracing::error!(
+                    requested_frontier,
+                    error = %e,
+                    "failed to sync_durable at shutdown — forcing dirty recovery on next boot"
+                );
+                return Ok(());
+            }
+        };
 
         // Drive one final reclaim pass. The durability watermark thread has
-        // already advanced `durable_seq` to cover every mark_flushed'd seq,
-        // but `free_seq_allocation`'s inline reclaim used a stale watermark
-        // for the last few seqs in the drain. Re-running `advance_tail` with
-        // the now-up-to-date durable_seq lets those seqs release their ring
-        // slots so the next boot starts with a clean buffer log.
+        // Re-run release with the exact manifest frontier returned above so
+        // applied entries can leave the ring without crossing a lower seq
+        // that was still pending when the checkpoint was built.
         if let Some(pool) = self.buffer_pool.as_ref() {
-            pool.durable_seq_handle().store(
-                pool.max_flushed_seq_handle()
-                    .load(std::sync::atomic::Ordering::Acquire),
-                std::sync::atomic::Ordering::Release,
-            );
+            pool.durable_seq_handle()
+                .fetch_max(durable_buffer_seq, std::sync::atomic::Ordering::Release);
+            if let Err(e) = pool.release_below(durable_buffer_seq) {
+                tracing::warn!(
+                    durable_buffer_seq,
+                    error = %e,
+                    "final release_below at shutdown failed"
+                );
+            }
             if let Err(e) = pool.advance_tail() {
                 tracing::warn!(
                     error = %e,
@@ -1811,10 +1831,10 @@ impl OnyxEngine {
         let watermark = DurabilityWatermarkHandle::start(
             meta.clone(),
             buffer_pool.clone(),
-            buffer_pool.max_flushed_seq_handle(),
             buffer_pool.durable_seq_handle(),
             std::time::Duration::from_millis(50),
             config.meta.flush_dirty_pages_threshold,
+            config.meta.checkpoint_ring_fill_pct,
         );
         let lineage_drain = LineageFreedPbaDrainHandle::start(
             meta.clone(),
@@ -1955,7 +1975,12 @@ impl OnyxEngine {
                     sb.update_crc();
                     superblock::write_superblock(backend.as_ref(), &sb)?;
                 }
-                tracing::info!(role = "lv3", additional_rows, new_cap, "chunklet online extend complete");
+                tracing::info!(
+                    role = "lv3",
+                    additional_rows,
+                    new_cap,
+                    "chunklet online extend complete"
+                );
                 Ok(new_cap)
             }
             "meta" => {
@@ -1966,7 +1991,12 @@ impl OnyxEngine {
                 let new_cap = pool.extend_ld(ld_id, additional_rows)?;
                 let new_ld = pool.open_ld(ld_id)?;
                 self.meta.grow_meta_capacity(new_ld)?;
-                tracing::info!(role = "meta", additional_rows, new_cap, "chunklet online extend complete");
+                tracing::info!(
+                    role = "meta",
+                    additional_rows,
+                    new_cap,
+                    "chunklet online extend complete"
+                );
                 Ok(new_cap)
             }
             other => Err(OnyxError::Config(format!(
@@ -1977,7 +2007,10 @@ impl OnyxEngine {
     }
 
     pub fn status_snapshot(&self) -> OnyxResult<EngineStatusSnapshot> {
-        let contiguity = self.allocator.as_ref().map(|alloc| alloc.contiguity_stats());
+        let contiguity = self
+            .allocator
+            .as_ref()
+            .map(|alloc| alloc.contiguity_stats());
         let dedup_migration = self.meta.dedup_migration_status();
         Ok(EngineStatusSnapshot {
             mode: if self.zone_manager.is_some() {

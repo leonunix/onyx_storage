@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::affinity::{self, ThreadRole};
 use crate::buffer::pool::WriteBufferPool;
-use crate::meta::store::MetaStore;
+use crate::meta::store::{DurableCheckpointOutcome, MetaStore};
 
 /// Handle for the durability-watermark background thread.
 ///
@@ -21,12 +21,12 @@ impl DurabilityWatermarkHandle {
     /// Post-WAL invariant: metadb has no journal of its own; the buffer
     /// ring entries are the **only** durable record of commits until a
     /// metadb checkpoint folds their effects into manifest pages. So
-    /// `durable_seq` only advances on a confirmed `Ok(Some(true))`
-    /// checkpoint outcome, and ring slots are reclaimed via
-    /// `pool.release_below(checkpoint_seq)` at exactly the same moment.
-    /// There is no "fast bump" derived from `max_flushed_seq` — that
-    /// equated "metadb tx returned" with "durable", which was only true
-    /// while metadb had a WAL.
+    /// `durable_seq` only advances to the exact buffer frontier returned by a
+    /// committed metadb manifest, and ring slots are reclaimed via
+    /// `pool.release_below(buffer_seq)` at exactly the same moment. The
+    /// requested frontier comes from [`WriteBufferPool::applied_frontier`],
+    /// never from `max_flushed_seq`: the latter can jump over an older apply
+    /// still pending on another shard.
     ///
     /// `checkpoint_interval` is the periodic cadence; if `dirty_pages_threshold`
     /// is non-zero, in-memory L2P/RC pressure can trigger an early checkpoint
@@ -34,10 +34,10 @@ impl DurabilityWatermarkHandle {
     pub(super) fn start(
         meta: Arc<MetaStore>,
         buffer_pool: Arc<WriteBufferPool>,
-        max_flushed_seq: Arc<AtomicU64>,
         durable_seq: Arc<AtomicU64>,
         checkpoint_interval: std::time::Duration,
         dirty_pages_threshold: u64,
+        ring_fill_trigger_pct: u8,
     ) -> Self {
         const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         let stop = Arc::new(AtomicBool::new(false));
@@ -57,25 +57,26 @@ impl DurabilityWatermarkHandle {
                 while !stop_clone.load(Ordering::Relaxed) {
                     std::thread::sleep(TICK_INTERVAL);
 
-                    if let Some((token, seq)) = pending_checkpoint {
+                    if let Some((token, requested_seq)) = pending_checkpoint {
                         match meta.durable_checkpoint_outcome(token) {
-                            Ok(Some(true)) => {
+                            Ok(Some(DurableCheckpointOutcome::Durable { buffer_seq })) => {
                                 consecutive_failures = 0;
-                                durable_seq.fetch_max(seq, Ordering::Release);
-                                if let Err(e) = buffer_pool_thread.release_below(seq) {
+                                last_checkpoint_request_seq = buffer_seq;
+                                durable_seq.fetch_max(buffer_seq, Ordering::Release);
+                                if let Err(e) = buffer_pool_thread.release_below(buffer_seq) {
                                     tracing::warn!(
-                                        seq,
+                                        buffer_seq,
                                         error = %e,
                                         "release_below failed; ring reclaim deferred to next checkpoint"
                                     );
                                 }
                                 pending_checkpoint = None;
                             }
-                            Ok(Some(false)) => {
+                            Ok(Some(DurableCheckpointOutcome::Skipped)) => {
                                 // Non-blocking checkpoint found apply gate busy.
                                 // Retry on the next checkpoint interval.
                                 last_checkpoint_request_seq =
-                                    last_checkpoint_request_seq.min(seq.saturating_sub(1));
+                                    last_checkpoint_request_seq.min(requested_seq.saturating_sub(1));
                                 pending_checkpoint = None;
                             }
                             Ok(None) => {}
@@ -101,7 +102,7 @@ impl DurabilityWatermarkHandle {
                         }
                     }
 
-                    let captured = max_flushed_seq.load(Ordering::Relaxed);
+                    let captured = buffer_pool_thread.applied_frontier();
 
                     // Threshold-triggered path: when in-memory dirty work
                     // (L2P dirty pages + RC pending deltas) exceeds the
@@ -116,7 +117,24 @@ impl DurabilityWatermarkHandle {
                         && Self::checkpoint_needed(captured, last_checkpoint_request_seq)
                         && meta.dirty_pages_estimate() as u64 >= dirty_pages_threshold;
 
-                    if !early_trigger && last_checkpoint.elapsed() < checkpoint_interval {
+                    // LV2 is the sole durable journal between metadb
+                    // checkpoints. Use its physical occupancy, rather than
+                    // logical pending work, as the capacity-pressure signal.
+                    // A large ring can therefore absorb and coalesce writes
+                    // until either this watermark or the maximum interval is
+                    // reached, without confusing already-applied entries with
+                    // free physical slots.
+                    let ring_trigger = pending_checkpoint.is_none()
+                        && Self::checkpoint_needed(captured, last_checkpoint_request_seq)
+                        && Self::ring_checkpoint_needed(
+                            buffer_pool_thread.physical_fill_percentage(),
+                            ring_fill_trigger_pct,
+                        );
+
+                    if !early_trigger
+                        && !ring_trigger
+                        && last_checkpoint.elapsed() < checkpoint_interval
+                    {
                         continue;
                     }
                     last_checkpoint = std::time::Instant::now();
@@ -126,18 +144,19 @@ impl DurabilityWatermarkHandle {
                     if pending_checkpoint.is_some() {
                         continue;
                     }
+                    meta.set_buffer_applied_watermark(captured);
                     match meta.try_request_durable_checkpoint_token() {
                         Ok(Some(token)) => {
                             last_checkpoint_request_seq = captured;
                             pending_checkpoint = Some((token, captured));
                             tracing::debug!(
-                                max_flushed_seq = captured,
+                                applied_frontier = captured,
                                 "durability watermark requested metadb checkpoint"
                             );
                         }
                         Ok(None) => {
                             tracing::debug!(
-                                max_flushed_seq = captured,
+                                applied_frontier = captured,
                                 "durability watermark skipped checkpoint; previous one still running"
                             );
                         }
@@ -151,24 +170,26 @@ impl DurabilityWatermarkHandle {
                 }
                 // Final checkpoint at shutdown so any committed-but-not-yet-
                 // durable seqs get folded into manifest pages before exit.
-                let captured = max_flushed_seq.load(Ordering::Relaxed);
-                if let Err(e) = meta.sync_durable() {
-                    tracing::error!(
-                        error = %e,
-                        "durability watermark final checkpoint failed at shutdown"
-                    );
-                }
-                let _ = durable_seq.fetch_update(
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                    |cur| if captured > cur { Some(captured) } else { None },
-                );
-                if let Err(e) = buffer_pool_thread.release_below(captured) {
-                    tracing::warn!(
-                        captured,
-                        error = %e,
-                        "release_below failed during shutdown drain"
-                    );
+                let requested_frontier = buffer_pool_thread.applied_frontier();
+                meta.set_buffer_applied_watermark(requested_frontier);
+                match meta.sync_durable() {
+                    Ok(buffer_seq) => {
+                        durable_seq.fetch_max(buffer_seq, Ordering::Release);
+                        if let Err(e) = buffer_pool_thread.release_below(buffer_seq) {
+                            tracing::warn!(
+                                buffer_seq,
+                                error = %e,
+                                "release_below failed during shutdown drain"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            requested_frontier,
+                            error = %e,
+                            "durability watermark final checkpoint failed at shutdown; ring retained"
+                        );
+                    }
                 }
             })
             .expect("spawn durability-watermark thread");
@@ -185,6 +206,10 @@ impl DurabilityWatermarkHandle {
 
     fn checkpoint_needed(captured: u64, last_checkpoint_request_seq: u64) -> bool {
         captured > last_checkpoint_request_seq
+    }
+
+    fn ring_checkpoint_needed(physical_fill_pct: u8, trigger_pct: u8) -> bool {
+        trigger_pct > 0 && physical_fill_pct >= trigger_pct.min(100)
     }
 
     /// Fence decision: a fatal failure fences immediately; otherwise the pool is
@@ -220,6 +245,14 @@ mod tests {
     }
 
     #[test]
+    fn ring_checkpoint_uses_physical_occupancy_and_can_be_disabled() {
+        assert!(!DurabilityWatermarkHandle::ring_checkpoint_needed(100, 0));
+        assert!(!DurabilityWatermarkHandle::ring_checkpoint_needed(49, 50));
+        assert!(DurabilityWatermarkHandle::ring_checkpoint_needed(50, 50));
+        assert!(DurabilityWatermarkHandle::ring_checkpoint_needed(100, 150));
+    }
+
+    #[test]
     fn fence_fires_on_fatal_or_repeated_failure() {
         // Fatal fences immediately, even on the first failure.
         assert!(DurabilityWatermarkHandle::should_fence(1, true));
@@ -242,7 +275,6 @@ mod tests {
         use crate::io::device::RawDevice;
         use crate::meta::store::MetaStore;
         use crate::types::Lba;
-        use std::sync::atomic::Ordering;
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
@@ -276,18 +308,19 @@ mod tests {
             .unwrap(),
         );
 
-        // Arm the per-instance failpoint and make the watermark thread want a
-        // checkpoint (pretend a flush advanced the seq).
+        // Arm the per-instance failpoint and complete one buffer entry so the
+        // contiguous applied frontier makes the watermark thread request a
+        // checkpoint.
         meta.arm_checkpoint_capacity_fail();
-        let max_flushed = pool.max_flushed_seq_handle();
-        max_flushed.store(1, Ordering::Release);
+        let seq = pool.append("vol", Lba(0), 1, &[0u8; 4096], 0).unwrap();
+        pool.mark_applied(seq, Lba(0), 1).unwrap();
 
         let _watermark = DurabilityWatermarkHandle::start(
             meta.clone(),
             pool.clone(),
-            max_flushed,
             pool.durable_seq_handle(),
             Duration::from_millis(20),
+            0,
             0,
         );
 
@@ -303,9 +336,7 @@ mod tests {
             .meta_fence_reason()
             .unwrap()
             .contains("capacity exhausted"));
-        let err = pool
-            .append("vol", Lba(0), 1, &[0u8; 4096], 0)
-            .unwrap_err();
+        let err = pool.append("vol", Lba(0), 1, &[0u8; 4096], 0).unwrap_err();
         assert!(matches!(err, OnyxError::MetaFenced(_)), "got {err:?}");
 
         // Reads are never fenced (looking up an unmapped LBA returns Ok(None),

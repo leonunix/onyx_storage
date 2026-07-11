@@ -10,6 +10,9 @@ pub enum ThreadRole {
     FlusherCoalesce,
     FlusherDedup,
     FlusherCompress,
+    /// Chunklet LV3 batch executors. RAID5/6 parity planning and encoding are
+    /// streaming CPU/memory work, so partition mode spreads these across pods.
+    Lv3Batch,
     FlusherWriter,
     FlusherCleanup,
     /// Per-volume commit worker (`hash(vol_id) % NUM_COMMIT_WORKERS`).
@@ -106,6 +109,7 @@ impl PartitionTopo {
     /// non-home pod(s) and everything else stays home.
     pub fn pod_index(&self, role: ThreadRole, ordinal: usize) -> usize {
         match role {
+            ThreadRole::Lv3Batch => self.home_pod,
             // Compress is pure streaming CPU over 128KB units — the ideal
             // offload. Dedup looked similar but is NOT: its hot loop is
             // pointer-chasing home-socket metadata (cuckoo, candidate
@@ -135,7 +139,11 @@ impl PartitionTopo {
     /// Union of all pods' CPUs (the partition-mode "anywhere in the engine"
     /// set, used by the stray-thread enforcer).
     pub fn all_cpus(&self) -> Vec<usize> {
-        let mut all: Vec<usize> = self.pods.iter().flat_map(|p| p.cpus.iter().copied()).collect();
+        let mut all: Vec<usize> = self
+            .pods
+            .iter()
+            .flat_map(|p| p.cpus.iter().copied())
+            .collect();
         all.sort_unstable();
         all.dedup();
         all
@@ -241,6 +249,7 @@ impl AffinityLayout {
             ThreadRole::FlusherCoalesce => &self.flusher_coalesce,
             ThreadRole::FlusherDedup => &self.flusher_dedup,
             ThreadRole::FlusherCompress => &self.flusher_compress,
+            ThreadRole::Lv3Batch => &self.flusher_writer,
             ThreadRole::FlusherWriter => &self.flusher_writer,
             ThreadRole::FlusherCleanup => &self.flusher_cleanup,
             ThreadRole::CommitWorker => {
@@ -312,8 +321,14 @@ mod tests {
     fn topo2() -> PartitionTopo {
         PartitionTopo {
             pods: vec![
-                PodCpus { node: 0, cpus: vec![0, 2, 4, 6] },
-                PodCpus { node: 1, cpus: vec![1, 3, 5, 7] },
+                PodCpus {
+                    node: 0,
+                    cpus: vec![0, 2, 4, 6],
+                },
+                PodCpus {
+                    node: 1,
+                    cpus: vec![1, 3, 5, 7],
+                },
             ],
             home_pod: 0,
             shards: 16,
@@ -351,6 +366,17 @@ mod tests {
         let mut single = topo2();
         single.pods.truncate(1);
         assert_eq!(single.pod_index(ThreadRole::FlusherDedup, 3), 0);
+    }
+
+    #[test]
+    fn lv3_batch_executors_stay_with_lv3_locality() {
+        let t = topo2();
+        for ord in 0..8 {
+            assert_eq!(t.pod_index(ThreadRole::Lv3Batch, ord), 0);
+        }
+        let mut single = topo2();
+        single.pods.truncate(1);
+        assert_eq!(single.pod_index(ThreadRole::Lv3Batch, 7), 0);
     }
 
     #[test]

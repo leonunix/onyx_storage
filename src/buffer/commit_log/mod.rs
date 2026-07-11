@@ -561,6 +561,13 @@ pub struct WriteBufferPool {
     root_device: Arc<dyn BlockBackend>,
     shards: Vec<BufferShardHandle>,
     next_seq: AtomicU64,
+    /// Serialises a durability-frontier snapshot against the short interval
+    /// between allocating a global seq and publishing it into a shard's
+    /// `pending_seqs` index. Appends take the read side only through
+    /// `append_with_seq`; frontier sampling takes the write side. This keeps
+    /// concurrent appenders parallel while preventing a checkpoint from
+    /// mistaking an allocated-but-not-yet-visible seq for an applied gap.
+    frontier_gate: parking_lot::RwLock<()>,
     routing_zone_size_blocks: u64,
     ready_rx: Receiver<u64>,
     shard_ready_rxs: Vec<Receiver<u64>>,

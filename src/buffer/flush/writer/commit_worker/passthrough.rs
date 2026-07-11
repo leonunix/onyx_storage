@@ -14,9 +14,10 @@ struct PendingPassthroughChunk {
     /// and `accepted_positions` shrinkage operate on exactly the units
     /// that produced the staged outcomes.
     non_empty_units: Vec<usize>,
-    /// One entry per metadb `atomic_batch_write_multi_with_dedup_deferred`
-    /// call issued for this chunk (one per touched L2P shard).
-    shards: Vec<PendingShardCommit>,
+    /// Normally one atomic metadb commit for the whole chunk. Kept as a vec so
+    /// the existing deferred drain can preserve issue order if a future backend
+    /// imposes a hard transaction-size split.
+    commits: Vec<PendingMetaCommit>,
     /// Wall-clock when the first per-shard issue happened. The drain
     /// adds (issue + wait) into `flush_writer_meta_commit_ns` so the
     /// metric stays comparable with the sync path.
@@ -31,21 +32,15 @@ impl PendingPassthroughChunk {
     /// of the deque before the next issue, keeping `pending_q.len()`
     /// closer to the steady-state pipeline depth instead of the cap.
     fn is_ready(&self) -> bool {
-        self.shards.iter().all(|ps| ps.handle.is_ready())
+        self.commits.iter().all(|commit| commit.handle.is_ready())
     }
 }
 
-struct PendingShardCommit {
-    sid: usize,
+struct PendingMetaCommit {
     handle: DeferredCleanupHandle,
-    /// Per-unit slice that fed this shard's sub-batch — needed to
-    /// remap the flat `accepted: Vec<bool>` back into per-unit
-    /// `per_unit_accept[unit_idx][orig_pos]` during drain.
+    /// Per-unit slice in the transaction's flat accepted-bit result.
     sub_batches: Vec<PendingUnitSubBatch>,
-    /// Sum of `sub_pairs.len()` across this shard's sub-batches,
-    /// re-used for the post-drain LBA counters that previously fired
-    /// inline at sync-commit time.
-    sub_lbas: u64,
+    lbas: u64,
 }
 
 struct PendingUnitSubBatch {
@@ -206,7 +201,7 @@ impl BufferFlusher {
                 };
                 // Always split a full-raw (uncompressed) unit into per-LBA
                 // PBAs. A shared base PBA across N member LBAs is unsafe under
-            // Rc-neutral writes: overwriting one member records the
+                // Rc-neutral writes: overwriting one member records the
                 // shared base dead at rc==0 while the others still reference it,
                 // so lineage GC prematurely frees a still-live extent → CRC
                 // corruption (observed under compression=none). The sync
@@ -696,17 +691,11 @@ impl BufferFlusher {
 
     /// Issue half of the legacy `commit_passthrough_chunk`.
     ///
-    /// Bucket the chunk's `(Lba, BlockmapValue)` pairs by metadb L2P
-    /// shard, then issue one
-    /// `meta.atomic_batch_write_multi_with_dedup_deferred` call per
-    /// non-empty shard. Combined with the precise rc footprint in
-    /// `metadb/src/db/commit/lanes.rs::build_lane_dispatch_plan`,
-    /// each sub-commit's dispatch footprint is `{L2p(vol, sid)}` —
-    /// concurrent commit_workers writing to disjoint L2P shards
-    /// dispatch in parallel instead of serialising on the global
-    /// commit lane.
-    /// Component B of the commit-model overhaul (plan file:
-    /// /root/.claude/plans/golden-popping-newell.md).
+    /// Issue one metadb transaction for the whole chunk. MetaDB's lane planner
+    /// already buckets the transaction across L2P shards and runs those lanes
+    /// concurrently. Splitting here created up to 16 tiny transactions; with
+    /// rc-authoritative reclaim each one claims every RC lane, so those shard
+    /// transactions serialized globally and destroyed batch amortization.
     ///
     /// Returns `None` when the chunk is empty after shard bucketing
     /// (every unit either discarded or live-filtered out) or when
@@ -725,29 +714,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
         commit_failed_indices: &mut Vec<usize>,
     ) -> Option<PendingPassthroughChunk> {
-        // Sub-batch slice for ONE unit's pairs that fall into ONE L2P
-        // shard. Multiple sub-batches across shards may exist for a
-        // single unit when its contiguous LBA range crosses leaf
-        // boundaries (rare: a unit covers <= 32 LBAs, leaves are
-        // 128-aligned, so most units land in one shard).
-        struct UnitSubBatch {
-            unit_idx: usize,
-            sub_pairs: Vec<(Lba, BlockmapValue)>,
-            sub_seqs: Vec<u64>,
-            // Original `j` indices into the unit's `batch_values`.
-            // Used to reconstruct per-LBA accepted bits in original
-            // order after all sub-commits return.
-            sub_positions: Vec<usize>,
-            // `live_positions.len()` for the parent unit, forwarded as
-            // the `new_refcount` arg. metadb currently ignores this
-            // field (atomic_batch_write_multi_with_dedup: `let _ =
-            // new_refcount`) but we keep the contract intact.
-            live_count: u32,
-        }
-
-        // Bucket per-unit pairs by L2P shard.
         let mut non_empty_units: Vec<usize> = Vec::with_capacity(chunk.len());
-        let mut per_shard: HashMap<usize, Vec<UnitSubBatch>> = HashMap::new();
         for &i in chunk {
             let Some(um) = unit_metas[i].as_ref() else {
                 continue;
@@ -756,34 +723,11 @@ impl BufferFlusher {
                 continue;
             }
             non_empty_units.push(i);
-            let live_count = um.live_positions.len() as u32;
             debug_assert_eq!(
                 um.batch_values.len(),
                 um.seqs.len(),
                 "commit_worker: batch_values / seqs length mismatch"
             );
-            for (j, (lba, bv)) in um.batch_values.iter().enumerate() {
-                let sid = meta.l2p_shard_of(*lba);
-                let bucket = per_shard.entry(sid).or_default();
-                let pos = bucket.iter().rposition(|sb| sb.unit_idx == i);
-                match pos {
-                    Some(p) => {
-                        let entry = &mut bucket[p];
-                        entry.sub_pairs.push((*lba, *bv));
-                        entry.sub_seqs.push(um.seqs[j]);
-                        entry.sub_positions.push(j);
-                    }
-                    None => {
-                        bucket.push(UnitSubBatch {
-                            unit_idx: i,
-                            sub_pairs: vec![(*lba, *bv)],
-                            sub_seqs: vec![um.seqs[j]],
-                            sub_positions: vec![j],
-                            live_count,
-                        });
-                    }
-                }
-            }
         }
         if non_empty_units.is_empty() {
             return None;
@@ -813,84 +757,65 @@ impl BufferFlusher {
             }
         }
 
-        // Issue half: for each non-empty L2P shard, build flat
-        // sub-batch args and issue one
-        // `atomic_batch_write_multi_with_dedup_deferred` call. Park
-        // the handle plus the per-unit slice metadata needed to
-        // re-decode the per-LBA `accepted` bits at drain time. Iterate
-        // shards in id order so metric attribution stays deterministic.
-        let mut shard_ids: Vec<usize> = per_shard.keys().copied().collect();
-        shard_ids.sort_unstable();
         let issue_started_at = Instant::now();
-        let mut pending_shards: Vec<PendingShardCommit> = Vec::with_capacity(shard_ids.len());
-        for sid in shard_ids {
-            let shard_buckets = per_shard.remove(&sid).expect("shard id from keys");
-            let mut sub_batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
-                Vec::with_capacity(shard_buckets.len());
-            let mut sub_seqs_flat: Vec<u64> = Vec::new();
-            let mut sub_lbas: u64 = 0;
-            for ub in &shard_buckets {
-                sub_batch_args.push((vol_id, ub.sub_pairs.as_slice(), ub.live_count));
-                sub_seqs_flat.extend_from_slice(&ub.sub_seqs);
-                sub_lbas += ub.sub_pairs.len() as u64;
-            }
+        let mut batch_args: Vec<(&VolumeId, &[(Lba, BlockmapValue)], u32)> =
+            Vec::with_capacity(non_empty_units.len());
+        let mut seqs_flat = Vec::new();
+        let mut sub_batches = Vec::with_capacity(non_empty_units.len());
+        let mut total_lbas = 0u64;
+        for &unit_idx in &non_empty_units {
+            let um = unit_metas[unit_idx]
+                .as_ref()
+                .expect("non-empty unit was collected from unit_metas");
+            batch_args.push((
+                vol_id,
+                um.batch_values.as_slice(),
+                um.live_positions.len() as u32,
+            ));
+            seqs_flat.extend_from_slice(&um.seqs);
+            sub_batches.push(PendingUnitSubBatch {
+                unit_idx,
+                span: um.batch_values.len(),
+                sub_positions: (0..um.batch_values.len()).collect(),
+            });
+            total_lbas += um.batch_values.len() as u64;
+        }
 
-            let handle = match meta.atomic_batch_write_multi_with_dedup_deferred(
-                &sub_batch_args,
-                &[],
-                &sub_seqs_flat,
-            ) {
-                Ok(h) => h,
-                Err(e) => {
+        let handle =
+            match meta.atomic_batch_write_multi_with_dedup_deferred(&batch_args, &[], &seqs_flat) {
+                Ok(handle) => handle,
+                Err(error) => {
                     tracing::error!(
                         vol = %vol_id.0,
-                        shard_id = sid,
-                        sub_lbas,
+                        total_lbas,
                         chunk_units = chunk.len(),
-                        error = %e,
-                        "commit_worker: passthrough deferred shard issue failed"
+                        error = %error,
+                        "commit_worker: passthrough deferred transaction issue failed"
                     );
-                    for &j in &non_empty_units {
-                        commit_failed_indices.push(j);
-                    }
-                    // Previously-issued shard handles for this chunk
-                    // drop here; the metadb compactor will fire into
-                    // a disconnected sender (silent no-op).
+                    commit_failed_indices.extend(non_empty_units.iter().copied());
                     return None;
                 }
             };
-            metrics
-                .flush_writer_meta_commits
-                .fetch_add(1, Ordering::Relaxed);
-            metrics
-                .flush_writer_meta_lbas
-                .fetch_add(sub_lbas, Ordering::Relaxed);
-            metrics
-                .flush_writer_meta_pt_commits
-                .fetch_add(1, Ordering::Relaxed);
-            metrics
-                .flush_writer_meta_pt_lbas
-                .fetch_add(sub_lbas, Ordering::Relaxed);
-
-            let sub_batches: Vec<PendingUnitSubBatch> = shard_buckets
-                .into_iter()
-                .map(|ub| PendingUnitSubBatch {
-                    unit_idx: ub.unit_idx,
-                    span: ub.sub_pairs.len(),
-                    sub_positions: ub.sub_positions,
-                })
-                .collect();
-            pending_shards.push(PendingShardCommit {
-                sid,
-                handle,
-                sub_batches,
-                sub_lbas,
-            });
-        }
+        metrics
+            .flush_writer_meta_commits
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_writer_meta_lbas
+            .fetch_add(total_lbas, Ordering::Relaxed);
+        metrics
+            .flush_writer_meta_pt_commits
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .flush_writer_meta_pt_lbas
+            .fetch_add(total_lbas, Ordering::Relaxed);
 
         Some(PendingPassthroughChunk {
             non_empty_units,
-            shards: pending_shards,
+            commits: vec![PendingMetaCommit {
+                handle,
+                sub_batches,
+                lbas: total_lbas,
+            }],
             issue_started_at,
         })
     }
@@ -926,7 +851,7 @@ impl BufferFlusher {
     ) {
         let PendingPassthroughChunk {
             non_empty_units,
-            shards,
+            commits,
             issue_started_at,
         } = pending;
         let mut per_unit_accept: HashMap<usize, Vec<Option<bool>>> =
@@ -934,13 +859,12 @@ impl BufferFlusher {
         let mut all_returned: HashMap<Pba, RemapCleanup> = HashMap::new();
         let mut any_failure = false;
 
-        for ps in shards {
-            let PendingShardCommit {
-                sid,
+        for pending_commit in commits {
+            let PendingMetaCommit {
                 handle,
                 sub_batches,
-                sub_lbas,
-            } = ps;
+                lbas,
+            } = pending_commit;
             match handle.recv() {
                 Ok((returned, accepted)) => {
                     let mut offset: usize = 0;
@@ -968,10 +892,9 @@ impl BufferFlusher {
                 }
                 Err(e) => {
                     tracing::error!(
-                        shard_id = sid,
-                        sub_lbas,
+                        lbas,
                         error = %e,
-                        "commit_worker: passthrough deferred shard recv failed"
+                        "commit_worker: passthrough deferred transaction recv failed"
                     );
                     any_failure = true;
                     // Remaining handles drop with the for-loop; the
@@ -1034,8 +957,7 @@ impl BufferFlusher {
                             unit_accepted.get(k).copied().unwrap_or(true).then_some(pos)
                         })
                         .collect();
-                    let kept_set: std::collections::HashSet<usize> =
-                        kept.iter().copied().collect();
+                    let kept_set: std::collections::HashSet<usize> = kept.iter().copied().collect();
                     um.fresh_dedup_pairs
                         .retain(|(pos, _, _)| kept_set.contains(pos));
                     um.stale_repairs
@@ -1064,10 +986,12 @@ impl BufferFlusher {
         // chunk success.
         for &unit_idx in &non_empty_units {
             if let Some(um) = unit_metas[unit_idx].as_ref() {
-                accum_candidate_pairs
-                    .extend(um.fresh_dedup_pairs.iter().map(|&(_, h, v)| (h, v)));
-                accum_stale_repairs
-                    .extend(um.stale_repairs.iter().map(|&(_, h, old, new)| (h, old, new)));
+                accum_candidate_pairs.extend(um.fresh_dedup_pairs.iter().map(|&(_, h, v)| (h, v)));
+                accum_stale_repairs.extend(
+                    um.stale_repairs
+                        .iter()
+                        .map(|&(_, h, old, new)| (h, old, new)),
+                );
             }
         }
     }

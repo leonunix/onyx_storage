@@ -127,7 +127,12 @@ impl NumaNode {
 /// Parse a sysfs cpulist like `"0,2,4-6,8\n"`.
 pub fn parse_cpu_list(raw: &str) -> Vec<usize> {
     let mut cpus = Vec::new();
-    for part in raw.trim().split(',').map(str::trim).filter(|p| !p.is_empty()) {
+    for part in raw
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         if let Some((start, end)) = part.split_once('-') {
             if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
                 if s <= e {
@@ -411,14 +416,8 @@ mod policy {
         let mask = nodemask(nodes)?;
         // maxnode counts bits and must cover the highest set bit; pass the
         // full word width + 1 per the syscall's off-by-one convention.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_set_mempolicy,
-                mode,
-                &mask as *const u64,
-                65usize,
-            )
-        };
+        let rc =
+            unsafe { libc::syscall(libc::SYS_set_mempolicy, mode, &mask as *const u64, 65usize) };
         if rc == 0 {
             Ok(())
         } else {
@@ -477,11 +476,7 @@ mod policy {
     pub fn bind_region(_ptr: *mut u8, _len: usize, _node: usize) -> std::io::Result<()> {
         Ok(())
     }
-    pub fn interleave_region(
-        _ptr: *mut u8,
-        _len: usize,
-        _nodes: &[usize],
-    ) -> std::io::Result<()> {
+    pub fn interleave_region(_ptr: *mut u8, _len: usize, _nodes: &[usize]) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -578,8 +573,7 @@ fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResu
              usable) — shrink meta.block_cache_mb / buffer.max_memory_mb or \
              set numa.allow_overcommit = true",
             config.numa.home_node,
-            plan.home_capacity_bytes
-                .saturating_sub(PLAN_OS_FLOOR_BYTES) as f64
+            plan.home_capacity_bytes.saturating_sub(PLAN_OS_FLOOR_BYTES) as f64
                 / (1u64 << 30) as f64
         )));
     }
@@ -769,7 +763,8 @@ fn sweep_stray_threads(allowed: &std::collections::HashSet<usize>, cpus: &[usize
         if rc != 0 {
             continue; // thread exited
         }
-        let stray = (0..1024usize).any(|c| unsafe { libc::CPU_ISSET(c, &set) } && !allowed.contains(&c));
+        let stray =
+            (0..1024usize).any(|c| unsafe { libc::CPU_ISSET(c, &set) } && !allowed.contains(&c));
         if !stray {
             continue;
         }
@@ -922,8 +917,7 @@ mod tests {
 
     #[test]
     fn missing_sibling_topology_degrades_to_one_core_per_cpu() {
-        let (_g, node_root, cpu_root) =
-            fake_sysfs(&[(0, "0,1", 1024)], &[]);
+        let (_g, node_root, cpu_root) = fake_sysfs(&[(0, "0,1", 1024)], &[]);
         let topo = NumaTopology::detect_from_roots(&node_root, &cpu_root);
         assert_eq!(topo.node(0).unwrap().cores, vec![vec![0], vec![1]]);
     }

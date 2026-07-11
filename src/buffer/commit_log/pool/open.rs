@@ -310,6 +310,13 @@ impl WriteBufferPool {
         let mut shard_ready_rxs = Vec::with_capacity(shard_count);
         let mut shards = Vec::with_capacity(shard_count);
         let mut max_seq = 0u64;
+        // Chunklet exposes one logical durability domain but no single fd.
+        // Drain all shard staging queues through one pool-level sync loop so a
+        // single root-LD flush can cover the whole epoch. Raw/fd backends keep
+        // the existing per-shard io_uring pipeline.
+        let use_global_sync_loop = shard_count > 1 && device.uring_target().is_none();
+        let global_shutdown = Arc::new(AtomicBool::new(false));
+        let mut global_members = Vec::with_capacity(shard_count);
 
         // Recompute consumed for sync device slices.
         consumed = 0u64;
@@ -353,50 +360,61 @@ impl WriteBufferPool {
             let sync_device = slice_backend(device.clone(), shard_offset, shard_bytes)?;
             let shard = Arc::new(shard);
             let (sync_wake_tx, sync_wake_rx) = unbounded();
-            let sync_shutdown = Arc::new(AtomicBool::new(false));
+            let sync_shutdown = if use_global_sync_loop {
+                global_shutdown.clone()
+            } else {
+                Arc::new(AtomicBool::new(false))
+            };
             // Per-shard io_uring session (one ring per sync thread, no
             // contention). Skipped when uring_sq_entries is None.
             let shard_uring = match uring_sq_entries {
                 Some(entries) => Some(Arc::new(IoUringSession::new(entries)?)),
                 None => None,
             };
-            let sync_thread = thread::Builder::new()
-                .name(format!("persistent-slot-sync-{}", shard_idx))
-                .spawn({
-                    let metrics = metrics.clone();
-                    let shard = shard.clone();
-                    let shutdown = sync_shutdown.clone();
-                    let ready_tx = ready_tx.clone();
-                    let shard_ready_tx = shard_ready_tx_for_loop.clone();
-                    let uring = shard_uring.clone();
-                    let pipeline_depth = runtime_limits.lv2_sync_pipeline_depth;
-                    let commit_timeout_pct = runtime_limits.lv2_commit_timeout_pct;
-                    move || {
-                        crate::affinity::bind_current(
-                            crate::affinity::ThreadRole::BufferSync,
-                            shard_idx,
-                        );
-                        Self::sync_loop(
-                            sync_device,
-                            shard,
-                            group_commit_wait,
-                            sync_wake_rx,
-                            shutdown,
-                            metrics,
-                            ready_tx,
-                            shard_ready_tx,
-                            uring,
-                            pipeline_depth,
-                            commit_timeout_pct,
-                        );
-                    }
-                })
-                .map_err(|e| {
-                    OnyxError::Config(format!(
-                        "failed to spawn persistent slot sync thread for shard {}: {}",
-                        shard_idx, e
-                    ))
-                })?;
+            let sync_thread = if use_global_sync_loop {
+                global_members.push((shard_offset, shard.clone(), sync_wake_rx));
+                None
+            } else {
+                Some(
+                    thread::Builder::new()
+                        .name(format!("persistent-slot-sync-{}", shard_idx))
+                        .spawn({
+                            let metrics = metrics.clone();
+                            let shard = shard.clone();
+                            let shutdown = sync_shutdown.clone();
+                            let ready_tx = ready_tx.clone();
+                            let shard_ready_tx = shard_ready_tx_for_loop.clone();
+                            let uring = shard_uring.clone();
+                            let pipeline_depth = runtime_limits.lv2_sync_pipeline_depth;
+                            let commit_timeout_pct = runtime_limits.lv2_commit_timeout_pct;
+                            move || {
+                                crate::affinity::bind_current(
+                                    crate::affinity::ThreadRole::BufferSync,
+                                    shard_idx,
+                                );
+                                Self::sync_loop(
+                                    sync_device,
+                                    shard,
+                                    group_commit_wait,
+                                    sync_wake_rx,
+                                    shutdown,
+                                    metrics,
+                                    ready_tx,
+                                    shard_ready_tx,
+                                    uring,
+                                    pipeline_depth,
+                                    commit_timeout_pct,
+                                );
+                            }
+                        })
+                        .map_err(|e| {
+                            OnyxError::Config(format!(
+                                "failed to spawn persistent slot sync thread for shard {}: {}",
+                                shard_idx, e
+                            ))
+                        })?,
+                )
+            };
 
             shard_ready_txs.push(shard_ready_tx_for_loop);
             shard_ready_rxs.push(shard_ready_rxs_for_pool.remove(0));
@@ -404,8 +422,33 @@ impl WriteBufferPool {
                 shard,
                 sync_wake_tx,
                 sync_shutdown,
-                sync_thread: Some(sync_thread),
+                sync_thread,
             });
+        }
+
+        if use_global_sync_loop {
+            let root_device = device.clone();
+            let shutdown = global_shutdown.clone();
+            let metrics_for_loop = metrics.clone();
+            let sync_thread = thread::Builder::new()
+                .name("persistent-slot-sync-global".into())
+                .spawn(move || {
+                    crate::affinity::bind_current(crate::affinity::ThreadRole::BufferSync, 0);
+                    Self::global_sync_loop(
+                        root_device,
+                        global_members,
+                        group_commit_wait,
+                        shutdown,
+                        metrics_for_loop,
+                    );
+                })
+                .map_err(|e| {
+                    OnyxError::Config(format!(
+                        "failed to spawn global persistent slot sync thread: {}",
+                        e
+                    ))
+                })?;
+            shards[0].sync_thread = Some(sync_thread);
         }
 
         let disk_version = if use_v3 {
@@ -421,6 +464,7 @@ impl WriteBufferPool {
             root_device: device,
             shards,
             next_seq: AtomicU64::new(max_seq + 1),
+            frontier_gate: parking_lot::RwLock::new(()),
             routing_zone_size_blocks,
             ready_rx,
             shard_ready_rxs,

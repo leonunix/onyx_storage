@@ -13,6 +13,8 @@ impl BufferFlusher {
         max_raw: usize,
         max_lbas: u32,
         skip_fully_superseded: bool,
+        write_window: Duration,
+        write_window_pressure_pct: u8,
     ) {
         // in_flight tracks how many pipeline units still reference each seq.
         // A multi-LBA entry split into 2 units → refcount=2 for that seq.
@@ -31,8 +33,22 @@ impl BufferFlusher {
         };
         let ready_timeout = Duration::from_millis(10);
         let retry_snapshot_interval = Duration::from_millis(100);
-        let retry_snapshot_topup_limit = 64usize;
+        // With a residence window, ready notifications are intentionally
+        // consumed before entries mature. Once they do mature, recover the
+        // full 16 MiB coalesce admission window per retry pass rather than the
+        // legacy 64-entry starvation sample (which would cap 4 KiB draining).
+        let retry_snapshot_topup_limit = if write_window.is_zero() {
+            64usize
+        } else {
+            Self::COALESCE_READY_WINDOW_BYTES / BLOCK_SIZE as usize
+        };
         let mut last_retry_snapshot = Instant::now();
+        // A real write window is an epoch, not an age delay. The first pending
+        // entry starts the deadline; expiry freezes a cutoff and releases every
+        // entry at/before it. Newer writes belong to the next epoch even while
+        // the current one drains.
+        let mut write_window_deadline: Option<Instant> = None;
+        let mut write_window_cutoff: Option<Instant> = None;
 
         // Head-stuck diagnostic: emit at most one warn per shard every
         // DIAG_LOG_INTERVAL while the head is older than DIAG_AGE_THRESHOLD_MS.
@@ -64,6 +80,41 @@ impl BufferFlusher {
             let mut new_entries = Vec::new();
             let mut seen = std::collections::HashSet::new();
             let mut queued_bytes = 0usize;
+            let bypass_write_window =
+                pool.physical_fill_percentage_for_shard(shard_idx) >= write_window_pressure_pct;
+            if write_window.is_zero() || bypass_write_window {
+                write_window_deadline = None;
+                write_window_cutoff = None;
+            } else {
+                let now = Instant::now();
+
+                // Keep an active cutoff until its oldest pending entry has
+                // disappeared. pending seq order matches enqueue time, so once
+                // the oldest live entry is newer than the cutoff, the whole
+                // frozen epoch has committed (or been superseded).
+                if let Some(cutoff) = write_window_cutoff {
+                    let frozen_epoch_drained = pool
+                        .oldest_ready_pending_arcs_for_shard(shard_idx, 1)
+                        .first()
+                        .is_none_or(|entry| entry.payload.is_some() && entry.enqueued_at > cutoff);
+                    if frozen_epoch_drained {
+                        write_window_cutoff = None;
+                    }
+                }
+
+                if write_window_cutoff.is_none() {
+                    if pool.pending_count_for_shard(shard_idx) == 0 {
+                        write_window_deadline = None;
+                    } else {
+                        let deadline =
+                            write_window_deadline.get_or_insert_with(|| now + write_window);
+                        if now >= *deadline {
+                            write_window_cutoff = Some(now);
+                            write_window_deadline = None;
+                        }
+                    }
+                }
+            }
 
             // Always give the front of log_order a retry chance first. A single
             // partially flushed seq can otherwise starve behind newer ready work
@@ -82,6 +133,9 @@ impl BufferFlusher {
                     &mut new_entries,
                     metrics,
                     skip_fully_superseded,
+                    write_window,
+                    write_window_cutoff,
+                    bypass_write_window,
                 );
                 if let Some((lba_count, flushed_count, age_ms, vol_id)) = diag_snapshot {
                     if age_ms >= DIAG_AGE_THRESHOLD_MS {
@@ -133,6 +187,9 @@ impl BufferFlusher {
                             &mut new_entries,
                             metrics,
                             skip_fully_superseded,
+                            write_window,
+                            write_window_cutoff,
+                            bypass_write_window,
                         );
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -168,9 +225,18 @@ impl BufferFlusher {
                     &mut new_entries,
                     metrics,
                     skip_fully_superseded,
+                    write_window,
+                    write_window_cutoff,
+                    bypass_write_window,
                 ) {
                     EnqueuePendingSeq::Queued => queued_oldest_snapshot = true,
                     EnqueuePendingSeq::WindowFull => break,
+                    EnqueuePendingSeq::Skipped(SkipReason::WriteWindow) => {
+                        // oldest_pending_arcs is seq ordered. A live oldest
+                        // entry that has not matured proves newer live entries
+                        // are not ready either; avoid repeatedly walking them.
+                        break;
+                    }
                     EnqueuePendingSeq::Skipped(_) => {}
                 }
             }
@@ -195,6 +261,9 @@ impl BufferFlusher {
                             &mut new_entries,
                             metrics,
                             skip_fully_superseded,
+                            write_window,
+                            write_window_cutoff,
+                            bypass_write_window,
                         ),
                         EnqueuePendingSeq::WindowFull
                     ) {
@@ -228,21 +297,25 @@ impl BufferFlusher {
                     {
                         break;
                     }
-                    if matches!(
-                        Self::try_enqueue_pending_seq(
-                            entry.seq,
-                            pool,
-                            &in_flight,
-                            in_flight_tracker,
-                            &mut seen,
-                            &mut queued_bytes,
-                            &mut new_entries,
-                            metrics,
-                            skip_fully_superseded,
-                        ),
-                        EnqueuePendingSeq::Queued
-                    ) {
-                        topped_up += 1;
+                    let outcome = Self::try_enqueue_pending_seq(
+                        entry.seq,
+                        pool,
+                        &in_flight,
+                        in_flight_tracker,
+                        &mut seen,
+                        &mut queued_bytes,
+                        &mut new_entries,
+                        metrics,
+                        skip_fully_superseded,
+                        write_window,
+                        write_window_cutoff,
+                        bypass_write_window,
+                    );
+                    match outcome {
+                        EnqueuePendingSeq::Queued => topped_up += 1,
+                        EnqueuePendingSeq::Skipped(SkipReason::WriteWindow) => break,
+                        EnqueuePendingSeq::WindowFull => break,
+                        EnqueuePendingSeq::Skipped(_) => {}
                     }
                 }
             }

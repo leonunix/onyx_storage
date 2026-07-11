@@ -179,11 +179,11 @@ impl BackendSlice {
     /// Build a window over `inner`. Errors if `base + len` overflows or exceeds
     /// the inner backend's size (mirrors `RawDevice::slice` bounds checks).
     pub fn new(inner: Arc<dyn BlockBackend>, base: u64, len: u64) -> OnyxResult<Self> {
-        let end = base
-            .checked_add(len)
-            .ok_or_else(|| crate::error::OnyxError::Config(format!(
+        let end = base.checked_add(len).ok_or_else(|| {
+            crate::error::OnyxError::Config(format!(
                 "backend slice overflow: base={base} len={len}"
-            )))?;
+            ))
+        })?;
         if end > inner.size() {
             return Err(crate::error::OnyxError::Config(format!(
                 "backend slice out of bounds: base={base} len={len} inner_size={}",
@@ -201,13 +201,12 @@ impl BackendSlice {
     /// `extend_ld` → `ChunkletBackend::swap_ld`). Grow-only, and bounded by the
     /// (now larger) inner size so the window can never address past the device.
     pub fn grow_len(&self, new_len: u64) -> OnyxResult<()> {
-        let end = self
-            .base
-            .checked_add(new_len)
-            .ok_or_else(|| crate::error::OnyxError::Config(format!(
+        let end = self.base.checked_add(new_len).ok_or_else(|| {
+            crate::error::OnyxError::Config(format!(
                 "backend slice grow overflow: base={} new_len={new_len}",
                 self.base
-            )))?;
+            ))
+        })?;
         if end > self.inner.size() {
             return Err(crate::error::OnyxError::Config(format!(
                 "backend slice grow out of bounds: base={} new_len={new_len} inner_size={}",
@@ -226,11 +225,11 @@ impl BackendSlice {
     }
 
     fn translate(&self, offset: u64, len: usize) -> OnyxResult<u64> {
-        let end = offset
-            .checked_add(len as u64)
-            .ok_or_else(|| crate::error::OnyxError::Config(format!(
+        let end = offset.checked_add(len as u64).ok_or_else(|| {
+            crate::error::OnyxError::Config(format!(
                 "backend slice IO overflow: offset={offset} len={len}"
-            )))?;
+            ))
+        })?;
         let window = self.len.load(Ordering::Relaxed);
         if end > window {
             return Err(crate::error::OnyxError::Config(format!(
@@ -649,7 +648,10 @@ mod tests {
         let ld = pool.open_ld(ld_id).unwrap();
 
         let backend = ChunkletBackend::new(ld);
-        assert!(backend.uring_target().is_none(), "RAID LD must not expose a fd");
+        assert!(
+            backend.uring_target().is_none(),
+            "RAID LD must not expose a fd"
+        );
         assert!(backend.size() > 0);
 
         let payload: Vec<u8> = (0..(64 << 10)).map(|i| (i % 251) as u8).collect();
@@ -759,7 +761,10 @@ mod tests {
         backend
             .read_at(&mut got2, 0)
             .expect("read must refresh the stale handle, not error");
-        assert_eq!(got2, payload2, "degraded reconstruct read must return the new data");
+        assert_eq!(
+            got2, payload2,
+            "degraded reconstruct read must return the new data"
+        );
 
         // A second failover bump is likewise absorbed (covers the mark_pd_failed
         // -> rebuild-commit double bump).

@@ -56,7 +56,7 @@ fn open_buffer(device: Arc<dyn BlockBackend>) -> WriteBufferPool {
         1, // shards
         256,
         std::time::Duration::ZERO,
-        0, // max_payload_memory=0 → force lazy hydration from the LD
+        0,    // max_payload_memory=0 → force lazy hydration from the LD
         None, // uring_sq_entries=None → chunklet write_many_at + flush path
         BufferRuntimeLimits::default(),
     )
@@ -88,7 +88,11 @@ fn chunklet_lv2_append_is_durable_and_reads_back() {
         }
         last_seq = Some(seq);
     }
-    assert_eq!(buffer.pending_count(), n, "nothing flushed yet → all pending");
+    assert_eq!(
+        buffer.pending_count(),
+        n,
+        "nothing flushed yet → all pending"
+    );
 
     // Read each back (payload cache is disabled → hydrates from the LD).
     for i in 0..n {
@@ -138,7 +142,9 @@ fn chunklet_lv2_recovers_pending_ring_after_crash() {
             .lookup("recov", Lba(i))
             .unwrap()
             .expect("recovered entry present after crash");
-        let payload = hit.payload.expect("payload hydrated from chunklet LD post-crash");
+        let payload = hit
+            .payload
+            .expect("payload hydrated from chunklet LD post-crash");
         assert_eq!(payload.as_ref(), block(0xA0 + i as u8).as_slice());
     }
 

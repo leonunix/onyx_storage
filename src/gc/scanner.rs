@@ -211,11 +211,7 @@ impl FragmentAccumulator {
             return;
         }
         let in_target = !self.defrag_targets.is_empty()
-            && ranges_overlap_unit(
-                &self.defrag_targets,
-                bv.pba,
-                bv.physical_blocks(BLOCK_SIZE),
-            );
+            && ranges_overlap_unit(&self.defrag_targets, bv.pba, bv.physical_blocks(BLOCK_SIZE));
         if !self.slot_evac && !in_target && bv.unit_lba_count <= 1 {
             return;
         }

@@ -98,6 +98,9 @@ fn coalesce_enqueue_caps_ready_window_bytes() {
                 &mut new_entries,
                 &test_metrics,
                 true,
+                Duration::ZERO,
+                None,
+                false,
             ),
             EnqueuePendingSeq::WindowFull
         ) {
@@ -168,6 +171,9 @@ fn fully_superseded_entry_skipped_at_coalesce() {
         &mut new_entries,
         &test_metrics,
         true,
+        Duration::ZERO,
+        None,
+        false,
     );
     assert_eq!(out, EnqueuePendingSeq::Skipped(SkipReason::Superseded));
     assert!(new_entries.is_empty(), "superseded entry must not enqueue");
@@ -186,6 +192,9 @@ fn fully_superseded_entry_skipped_at_coalesce() {
         &mut new_entries,
         &test_metrics,
         true,
+        Duration::ZERO,
+        None,
+        false,
     );
     assert_eq!(out, EnqueuePendingSeq::Queued);
     assert_eq!(new_entries.len(), 1);
@@ -212,9 +221,87 @@ fn fully_superseded_entry_skipped_at_coalesce() {
         &mut new_entries,
         &test_metrics,
         false, // disabled
+        Duration::ZERO,
+        None,
+        false,
     );
     assert_eq!(out, EnqueuePendingSeq::Queued);
     // Counter didn't advance beyond the first drop.
     let snap = test_metrics.snapshot();
     assert_eq!(snap.coalesce_superseded_entries, 1);
+}
+
+#[test]
+fn coalesce_write_window_releases_frozen_epoch_or_pressure_bypass() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let pool = WriteBufferPool::open(dev).unwrap();
+    let payload = vec![0xA5; BLOCK_SIZE as usize];
+    let seq = pool.append("window-vol", Lba(7), 1, &payload, 0).unwrap();
+    let tracker = FlusherInFlightTracker::default();
+    let in_flight = HashMap::new();
+    let metrics = EngineMetrics::default();
+
+    let mut seen = HashSet::new();
+    let mut queued_bytes = 0;
+    let mut entries = Vec::new();
+    let deferred = BufferFlusher::try_enqueue_pending_seq(
+        seq,
+        &pool,
+        &in_flight,
+        &tracker,
+        &mut seen,
+        &mut queued_bytes,
+        &mut entries,
+        &metrics,
+        true,
+        Duration::from_secs(60),
+        None,
+        false,
+    );
+    assert_eq!(
+        deferred,
+        EnqueuePendingSeq::Skipped(SkipReason::WriteWindow)
+    );
+    assert!(entries.is_empty());
+
+    seen.clear();
+    let admitted_at_cutoff = BufferFlusher::try_enqueue_pending_seq(
+        seq,
+        &pool,
+        &in_flight,
+        &tracker,
+        &mut seen,
+        &mut queued_bytes,
+        &mut entries,
+        &metrics,
+        true,
+        Duration::from_secs(60),
+        Some(Instant::now()),
+        false,
+    );
+    assert_eq!(admitted_at_cutoff, EnqueuePendingSeq::Queued);
+    assert_eq!(entries.len(), 1);
+
+    entries.clear();
+    queued_bytes = 0;
+    seen.clear();
+    let admitted_under_pressure = BufferFlusher::try_enqueue_pending_seq(
+        seq,
+        &pool,
+        &in_flight,
+        &tracker,
+        &mut seen,
+        &mut queued_bytes,
+        &mut entries,
+        &metrics,
+        true,
+        Duration::from_secs(60),
+        None,
+        true,
+    );
+    assert_eq!(admitted_under_pressure, EnqueuePendingSeq::Queued);
+    assert_eq!(entries.len(), 1);
 }

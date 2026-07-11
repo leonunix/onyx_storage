@@ -28,9 +28,16 @@ pub(crate) const TARGET_OPS_PER_COMMIT: usize = 150;
 /// shards for LV2/dedup/compress parallelism; this is independent.
 pub(in crate::buffer::flush) const NUM_COMMIT_WORKERS: usize = 16;
 
-/// Channel capacity per commit worker. ~64 jobs of slack absorbs
-/// shard-writer cycle bursts without unbounded memory growth.
-pub(in crate::buffer::flush) const COMMIT_WORKER_QUEUE_CAP: usize = 64;
+/// Capacity of the shared commit-executor queue. All writer shards feed this
+/// one bounded MPMC queue; executor threads clone its receiver and coalesce
+/// across the global backlog. The old per-executor 64/1024-job queues split a
+/// single volume into tiny transactions even when thousands of jobs were
+/// waiting elsewhere.
+pub(in crate::buffer::flush) const COMMIT_WORKER_QUEUE_CAP: usize = 8192;
+
+/// Complete transaction batches allowed to wait behind the executors. The raw
+/// job queue remains the primary backpressure boundary.
+pub(in crate::buffer::flush) const COMMIT_EXECUTOR_QUEUE_CAP: usize = 64;
 
 /// Owned per-unit data the shard writer has staged (alloc + IO done).
 pub(in crate::buffer::flush) struct UnitCommitData {
@@ -62,45 +69,80 @@ pub(in crate::buffer::flush) struct PackedCommitJob {
     pub enqueued_at: Instant,
 }
 
+pub(in crate::buffer::flush) struct DedupHitCommitJob {
+    pub vol_id: VolumeId,
+    pub vol_created_at: u64,
+    pub hits: Vec<(Lba, BlockmapValue, ContentHash)>,
+    pub promote_entries: Vec<(ContentHash, DedupEntry)>,
+    pub seqs: Vec<u64>,
+    pub response_tx: Sender<DedupHitCommitResponse>,
+    pub enqueued_at: Instant,
+}
+
+pub(in crate::buffer::flush) enum DedupHitCommitResponse {
+    Committed {
+        results: Vec<DedupHitResult>,
+        newly_zeroed: HashMap<Pba, RemapCleanup>,
+    },
+    Failed(String),
+}
+
 pub(in crate::buffer::flush) enum CommitJob {
     Passthrough(PassthroughCommitJob),
     Packed(PackedCommitJob),
+    DedupHit(DedupHitCommitJob),
 }
 
-/// Stable hash + shard sub-route → worker index. With `per_vol = 1`
-/// (default), a single volume always routes to a single worker and
-/// LSN dispatch contention is zero. With `per_vol = N` (2 or 4 in
-/// current experiments), the volume fans out to N consecutive workers
-/// — `[base, base+1, ..., base+N-1] mod NUM_COMMIT_WORKERS` — and the
-/// shard writer's `shard_idx` selects within that slot via
-/// `shard_idx % per_vol`. This trades a small amount of apply-lane
-/// contention (multiple workers committing for the same volume) for
-/// up to N× per-volume commit throughput.
+/// Stable sender selection within the configured executor count. The senders
+/// are clones of one shared MPMC queue, so this index no longer partitions the
+/// backlog; retaining stable routing keeps the writer call sites and metrics
+/// deterministic.
 pub(in crate::buffer::flush) fn route_volume_to_worker(
     vol_id: &str,
     shard_idx: usize,
     per_vol: usize,
 ) -> usize {
-    if NUM_COMMIT_WORKERS <= 1 {
+    let worker_count = per_vol.max(1).min(NUM_COMMIT_WORKERS);
+    if worker_count <= 1 {
         return 0;
     }
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     vol_id.as_bytes().hash(&mut hasher);
-    let base = (hasher.finish() as usize) % NUM_COMMIT_WORKERS;
-    let per_vol = per_vol.max(1).min(NUM_COMMIT_WORKERS);
-    if per_vol == 1 {
-        return base;
-    }
-    let offset = shard_idx % per_vol;
-    (base + offset) % NUM_COMMIT_WORKERS
+    let base = (hasher.finish() as usize) % worker_count;
+    let offset = shard_idx % worker_count;
+    (base + offset) % worker_count
 }
 
 impl BufferFlusher {
+    /// Sole consumer of the raw commit-job queue. If every executor drains the
+    /// MPMC queue itself, they race for individual jobs and fragment a deep
+    /// backlog back into tiny metadb transactions.
+    pub(in crate::buffer::flush) fn commit_aggregator_loop(
+        rx: Receiver<CommitJob>,
+        batch_tx: Sender<Vec<CommitJob>>,
+        coalesce_lba_budget: usize,
+        coalesce_timeout: Duration,
+        packed_try_drain_lba_budget: usize,
+    ) {
+        while let Ok(first) = rx.recv() {
+            let batch = Self::drain_commit_batch(
+                first,
+                &rx,
+                coalesce_lba_budget,
+                coalesce_timeout,
+                packed_try_drain_lba_budget,
+            );
+            if batch_tx.send(batch).is_err() {
+                break;
+            }
+        }
+    }
+
     pub(in crate::buffer::flush) fn commit_worker_loop(
         worker_idx: usize,
-        rx: &Receiver<CommitJob>,
+        rx: &Receiver<Vec<CommitJob>>,
         pool: &WriteBufferPool,
         meta: &MetaStore,
         lifecycle: &VolumeLifecycleManager,
@@ -112,76 +154,26 @@ impl BufferFlusher {
         lane_done_txs: &[Sender<Vec<u64>>],
         post_commit_tx: &Sender<PostCommitJob>,
         target_lbas_per_tx: usize,
-        coalesce_lba_budget: usize,
-        coalesce_timeout: Duration,
-        packed_try_drain_lba_budget: usize,
         commit_worker_pipeline_depth: usize,
-        running: &AtomicBool,
     ) {
         let _ = worker_idx;
-        // Main loop. Poll with timeout so shutdown signal is observed
-        // even when the queue is idle. The shard writers are joined
-        // before us (BufferFlusher::join_lanes), then their commit_tx
-        // clones drop, the rx side disconnects, and we drain remaining
-        // jobs before exiting.
-        while running.load(Ordering::Relaxed) {
+        // The aggregator closes this queue only after the raw writer queue is
+        // disconnected and its final partial batch is forwarded. Receiving to
+        // disconnect is therefore also the shutdown drain protocol.
+        loop {
             let recv_start = Instant::now();
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(first) => {
-                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    metrics
-                        .flush_commit_worker_rx_idle_ns
-                        .fetch_add(idle_ns, Ordering::Relaxed);
-                    metrics
-                        .flush_commit_worker_rx_idle_iters
-                        .fetch_add(1, Ordering::Relaxed);
-                    Self::dispatch_commit_batch(
-                        Self::drain_commit_batch(
-                            first,
-                            rx,
-                            coalesce_lba_budget,
-                            coalesce_timeout,
-                            packed_try_drain_lba_budget,
-                        ),
-                        pool,
-                        meta,
-                        lifecycle,
-                        allocator,
-                        in_flight_tracker,
-                        metrics,
-                        lane_cleanup_txs,
-                        candidate,
-                        lane_done_txs,
-                        post_commit_tx,
-                        target_lbas_per_tx,
-                        commit_worker_pipeline_depth,
-                    );
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    metrics
-                        .flush_commit_worker_rx_idle_ns
-                        .fetch_add(idle_ns, Ordering::Relaxed);
-                    metrics
-                        .flush_commit_worker_rx_idle_iters
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        // Drain anything queued at shutdown. The shard writers may
-        // have pushed final jobs after we observed `running == false`
-        // but before they joined.
-        while let Ok(first) = rx.try_recv() {
+            let Ok(jobs) = rx.recv() else {
+                break;
+            };
+            let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            metrics
+                .flush_commit_worker_rx_idle_ns
+                .fetch_add(idle_ns, Ordering::Relaxed);
+            metrics
+                .flush_commit_worker_rx_idle_iters
+                .fetch_add(1, Ordering::Relaxed);
             Self::dispatch_commit_batch(
-                Self::drain_commit_batch(
-                    first,
-                    rx,
-                    coalesce_lba_budget,
-                    Duration::ZERO,
-                    packed_try_drain_lba_budget,
-                ),
+                jobs,
                 pool,
                 meta,
                 lifecycle,
@@ -207,15 +199,18 @@ impl BufferFlusher {
     ) -> Vec<CommitJob> {
         if coalesce_lba_budget == 0 {
             let mut batch = vec![first];
-            if packed_try_drain_lba_budget > 0 && matches!(batch[0], CommitJob::Packed(_)) {
+            let first_is_packed = matches!(batch[0], CommitJob::Packed(_));
+            let first_is_dedup = matches!(batch[0], CommitJob::DedupHit(_));
+            if packed_try_drain_lba_budget > 0 && (first_is_packed || first_is_dedup) {
                 let mut total_lbas = lbas_in_job(&batch[0]);
                 while total_lbas < packed_try_drain_lba_budget {
                     match rx.try_recv() {
                         Ok(job) => {
-                            let is_packed = matches!(job, CommitJob::Packed(_));
+                            let same_kind = matches!(job, CommitJob::Packed(_)) == first_is_packed
+                                && matches!(job, CommitJob::DedupHit(_)) == first_is_dedup;
                             total_lbas = total_lbas.saturating_add(lbas_in_job(&job));
                             batch.push(job);
-                            if !is_packed {
+                            if !same_kind {
                                 break;
                             }
                         }
@@ -273,6 +268,7 @@ impl BufferFlusher {
         Self::record_commit_worker_drain(metrics, &jobs);
         let mut pending_pt: Option<PassthroughCommitJob> = None;
         let mut pending_packed: Vec<PackedCommitJob> = Vec::new();
+        let mut pending_dedup: Vec<DedupHitCommitJob> = Vec::new();
         for job in jobs {
             match job {
                 CommitJob::Passthrough(mut pj) => match pending_pt.as_mut() {
@@ -303,6 +299,7 @@ impl BufferFlusher {
                 CommitJob::Packed(pj) => {
                     pending_packed.push(pj);
                 }
+                CommitJob::DedupHit(job) => pending_dedup.push(job),
             }
         }
 
@@ -329,6 +326,10 @@ impl BufferFlusher {
             );
         }
 
+        if !pending_dedup.is_empty() {
+            Self::dispatch_dedup_hit_jobs(pending_dedup, meta, lifecycle, metrics);
+        }
+
         if !pending_packed.is_empty() {
             Self::dispatch_packed_jobs(
                 pending_packed,
@@ -343,6 +344,74 @@ impl BufferFlusher {
                 lane_done_txs,
                 post_commit_tx,
             );
+        }
+    }
+
+    pub(in crate::buffer::flush) fn dispatch_dedup_hit_jobs(
+        jobs: Vec<DedupHitCommitJob>,
+        meta: &MetaStore,
+        lifecycle: &VolumeLifecycleManager,
+        metrics: &EngineMetrics,
+    ) {
+        let mut by_volume: HashMap<(String, u64), Vec<DedupHitCommitJob>> = HashMap::new();
+        for job in jobs {
+            by_volume
+                .entry((job.vol_id.0.clone(), job.vol_created_at))
+                .or_default()
+                .push(job);
+        }
+
+        for ((vol_id_str, vol_created_at), jobs) in by_volume {
+            let Some(first) = jobs.first() else {
+                continue;
+            };
+            let vol_id = first.vol_id.clone();
+            let mut hits = Vec::new();
+            let mut promote_entries = Vec::new();
+            let mut seqs = Vec::new();
+            let mut spans = Vec::with_capacity(jobs.len());
+            for job in &jobs {
+                spans.push(job.hits.len());
+                hits.extend_from_slice(&job.hits);
+                promote_entries.extend_from_slice(&job.promote_entries);
+                seqs.extend_from_slice(&job.seqs);
+            }
+
+            let service_start = Instant::now();
+            let result = lifecycle.with_read_lock(&vol_id_str, || {
+                let generation_matches = meta
+                    .get_volume(&vol_id)?
+                    .is_some_and(|volume| volume.created_at == vol_created_at);
+                if !generation_matches {
+                    return Err(crate::error::OnyxError::VolumeDeleted(vol_id_str.clone()));
+                }
+                meta.atomic_batch_dedup_hits_with_promote(&vol_id, &hits, &promote_entries, &seqs)
+            });
+            Self::record_elapsed(&metrics.dedup_hit_commit_ns, service_start);
+            Self::record_elapsed(&metrics.flush_commit_worker_service_ns, service_start);
+
+            match result {
+                Ok((results, newly_zeroed)) => {
+                    let mut offset = 0usize;
+                    let mut newly_zeroed = Some(newly_zeroed);
+                    for (job, span) in jobs.into_iter().zip(spans) {
+                        let response = DedupHitCommitResponse::Committed {
+                            results: results[offset..offset + span].to_vec(),
+                            newly_zeroed: newly_zeroed.take().unwrap_or_default(),
+                        };
+                        offset += span;
+                        let _ = job.response_tx.send(response);
+                    }
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    for job in jobs {
+                        let _ = job
+                            .response_tx
+                            .send(DedupHitCommitResponse::Failed(error.clone()));
+                    }
+                }
+            }
         }
     }
 
@@ -478,6 +547,7 @@ fn lbas_in_job(job: &CommitJob) -> usize {
             .iter()
             .map(|frag| frag.unit.lba_count as usize)
             .sum(),
+        CommitJob::DedupHit(job) => job.hits.len(),
     }
 }
 
@@ -485,5 +555,6 @@ fn enqueued_at_for_job(job: &CommitJob) -> Instant {
     match job {
         CommitJob::Passthrough(pj) => pj.enqueued_at,
         CommitJob::Packed(pj) => pj.enqueued_at,
+        CommitJob::DedupHit(job) => job.enqueued_at,
     }
 }

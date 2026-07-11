@@ -280,6 +280,87 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
+                "metadb_flush_prepare: dedup_drain_us={} dedup_drain_max_us={} l2p_fold_us={} l2p_fold_max_us={}",
+                metadb.flush_dedup_drain_us,
+                metadb.flush_dedup_drain_max_us,
+                metadb.flush_l2p_fold_us,
+                metadb.flush_l2p_fold_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_l2p_checkpoint_pipeline: attempts={} completed={} skipped={} errors={} work_us={} work_max_us={} wait_us={} wait_max_us={}",
+                metadb.l2p_prefold_attempts,
+                metadb.l2p_prefold_completed,
+                metadb.l2p_prefold_skipped,
+                metadb.l2p_prefold_errors,
+                metadb.l2p_prefold_us,
+                metadb.l2p_prefold_max_us,
+                metadb.l2p_prefold_wait_us,
+                metadb.l2p_prefold_wait_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_l2p_fold_pipeline: shard_cycles={} entries={} leaves={} chunks={} work_us={} shard_max_us={} plan_us={} plan_max_us={} tree_wait_us={} tree_wait_max_us={} apply_us={} apply_max_us={} publish_us={} publish_max_us={} finish_us={} finish_max_us={} sync_phase_us={} sync_phase_max_us={}",
+                metadb.l2p_buffer_compaction_cycles,
+                metadb.l2p_buffer_compaction_entries,
+                metadb.l2p_buffer_compaction_leaves,
+                metadb.l2p_buffer_compaction_chunks,
+                metadb.l2p_buffer_compaction_us,
+                metadb.l2p_buffer_compaction_max_us,
+                metadb.l2p_buffer_compaction_plan_us,
+                metadb.l2p_buffer_compaction_plan_max_us,
+                metadb.l2p_buffer_compaction_tree_wait_us,
+                metadb.l2p_buffer_compaction_tree_wait_max_us,
+                metadb.l2p_buffer_compaction_apply_us,
+                metadb.l2p_buffer_compaction_apply_max_us,
+                metadb.l2p_buffer_compaction_publish_us,
+                metadb.l2p_buffer_compaction_publish_max_us,
+                metadb.l2p_buffer_compaction_finish_us,
+                metadb.l2p_buffer_compaction_finish_max_us,
+                metadb.flush_l2p_fold_us,
+                metadb.flush_l2p_fold_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_flush_io_breakdown: seal_us={} seal_max_us={} page_write_us={} page_write_max_us={} rc_meta_us={} rc_meta_max_us={} fsync_us={} fsync_max_us={}",
+                metadb.flush_io_seal_us,
+                metadb.flush_io_seal_max_us,
+                metadb.flush_io_page_write_us,
+                metadb.flush_io_page_write_max_us,
+                metadb.flush_io_rc_meta_us,
+                metadb.flush_io_rc_meta_max_us,
+                metadb.flush_io_sync_us,
+                metadb.flush_io_sync_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_flush_publish: barrier_wait_us={} barrier_wait_max_us={} gate_wait_us={} gate_wait_max_us={} gate_hold_us={} gate_hold_max_us={} manifest_us={} manifest_max_us={} stage_us={} stage_max_us={} publish_us={} publish_max_us={} cleanup_us={} cleanup_max_us={}",
+                metadb.flush_publish_barrier_wait_us,
+                metadb.flush_publish_barrier_wait_max_us,
+                metadb.flush_gate_wait_us,
+                metadb.flush_gate_wait_max_us,
+                metadb.flush_gate_hold_us,
+                metadb.flush_gate_hold_max_us,
+                metadb.flush_manifest_us,
+                metadb.flush_manifest_max_us,
+                metadb.flush_manifest_stage_us,
+                metadb.flush_manifest_stage_max_us,
+                metadb.flush_manifest_publish_us,
+                metadb.flush_manifest_publish_max_us,
+                metadb.flush_manifest_cleanup_us,
+                metadb.flush_manifest_cleanup_max_us
+            );
+            let _ = writeln!(
+                out,
+                "metadb_async_reclaim: cycles={} selected_pages={} reclaimed_pages={} cycle_us={} cycle_max_us={}",
+                metadb.async_reclaim_cycles,
+                metadb.async_reclaim_selected_pages,
+                metadb.async_reclaim_reclaimed_pages,
+                metadb.async_reclaim_cycle_us,
+                metadb.async_reclaim_cycle_max_us
+            );
+            let _ = writeln!(
+                out,
                 "metadb_rc_drainer: cycles={} wakes={} preempts={} drained_entries={} pages_built={} cycle_us={} cycle_max_us={} overlay_size_max_pages={} checkpoint_wait_us={} checkpoint_wait_max_us={} backpressure_fallbacks={} pool_refills={}",
                 metadb.rc_drainer_cycles,
                 metadb.rc_drainer_wakes,
@@ -552,7 +633,12 @@ impl EngineStatusSnapshot {
             let _ = writeln!(
                 out,
                 "chunklet_capacity: used={}/{} user_bytes spare={} bad={} migrating={} (raw={})",
-                ck.used_bytes, ck.user_bytes, ck.spare_bytes, ck.bad_bytes, ck.migrating_bytes, ck.raw_bytes,
+                ck.used_bytes,
+                ck.user_bytes,
+                ck.spare_bytes,
+                ck.bad_bytes,
+                ck.migrating_bytes,
+                ck.raw_bytes,
             );
             // One line per LD that is not fully healthy (any member down/degraded
             // or a rebuild target). Healthy LDs stay quiet to keep status terse.
@@ -647,7 +733,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "lv3_io: read_ops={} read_compressed_bytes={} read_decompressed_bytes={} write_ops={} write_compressed_bytes={} write_batch_calls={} write_batch_ops={} write_batch_bytes={} write_slab_allocs={} write_slab_bytes={}",
+            "lv3_io: read_ops={} read_compressed_bytes={} read_decompressed_bytes={} write_ops={} write_compressed_bytes={} write_batch_calls={} write_batch_ops={} write_batch_bytes={} write_batch_ns={} write_batch_ns_max={} write_batch_inflight={} write_batch_inflight_max={} write_slab_allocs={} write_slab_bytes={}",
             self.metrics.lv3_read_ops,
             self.metrics.lv3_read_compressed_bytes,
             self.metrics.lv3_read_decompressed_bytes,
@@ -656,6 +742,10 @@ impl EngineStatusSnapshot {
             self.metrics.lv3_write_batch_calls,
             self.metrics.lv3_write_batch_ops,
             self.metrics.lv3_write_batch_bytes,
+            self.metrics.lv3_write_batch_ns,
+            self.metrics.lv3_write_batch_ns_max,
+            self.metrics.lv3_write_batch_inflight,
+            self.metrics.lv3_write_batch_inflight_max,
             self.metrics.lv3_write_slab_allocs,
             self.metrics.lv3_write_slab_bytes
         );
@@ -706,7 +796,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "front_write_ns: zone_submit={} zone_worker={} append_total={} append_prepare={} append_log_write={} append_wait_durable={} append_backpressure_wait={} sync_batches={} sync_batch_ns={} sync_sleep_ns={} sync_epochs={}",
+            "front_write_ns: zone_submit={} zone_worker={} append_total={} append_prepare={} append_log_write={} append_wait_durable={} append_backpressure_wait={} sync_batches={} sync_flushes={} sync_batch_ns={} sync_sleep_ns={} sync_epochs={}",
             self.metrics.zone_submit_write_ns,
             self.metrics.zone_worker_write_ns,
             self.metrics.buffer_append_total_ns,
@@ -715,6 +805,7 @@ impl EngineStatusSnapshot {
             self.metrics.buffer_append_wait_durable_ns,
             self.metrics.buffer_backpressure_wait_ns,
             self.metrics.buffer_sync_batches,
+            self.metrics.buffer_sync_flushes,
             self.metrics.buffer_sync_batch_ns,
             self.metrics.buffer_sync_sleep_ns,
             self.metrics.buffer_sync_epochs_committed

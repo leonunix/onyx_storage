@@ -21,8 +21,8 @@ use crate::meta::schema::{BlockmapValue, FLAG_DEDUP_SKIPPED};
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
-use crate::space::pba_lifecycle::PbaLifecycle;
 use crate::space::extent::Extent;
+use crate::space::pba_lifecycle::PbaLifecycle;
 use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 
 /// Per-cycle reclaim budget in BLOCKS (not extents). A per-extent cap collapsed
@@ -278,7 +278,10 @@ impl GcRunner {
 
             if !cfg.enabled || cfg.compactor_scan_max_lbas_per_cycle == 0 {
                 tracing::debug!(
-                    cycle, reclaim_ms, heat_ms, compactor_ms = 0u128,
+                    cycle,
+                    reclaim_ms,
+                    heat_ms,
+                    compactor_ms = 0u128,
                     depth = allocator.retired_block_count(),
                     "gc cycle timing (compactor skipped)"
                 );
@@ -335,7 +338,12 @@ impl GcRunner {
                 // so it resumes exactly where it left off when load drops.
                 metrics.gc_paused_cycles.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
-                    cycle, reclaim_ms, heat_ms, defrag_ms, compactor_ms = 0u128, effort,
+                    cycle,
+                    reclaim_ms,
+                    heat_ms,
+                    defrag_ms,
+                    compactor_ms = 0u128,
+                    effort,
                     depth = allocator.retired_block_count(),
                     "gc cycle timing (compactor idled)"
                 );
@@ -357,10 +365,8 @@ impl GcRunner {
             // so a single slot can never exceed the per-cycle budget.
             let slot_evac = SlotEvacParams {
                 enabled: cfg.compactor_slot_evac_enabled && meta.rc_authoritative_reclaim(),
-                max_live: std::cmp::min(
-                    cfg.compactor_slot_evac_max_live as usize,
-                    rewrite_budget,
-                ) as u16,
+                max_live: std::cmp::min(cfg.compactor_slot_evac_max_live as usize, rewrite_budget)
+                    as u16,
                 block_size: BLOCK_SIZE,
             };
 
@@ -393,9 +399,14 @@ impl GcRunner {
                 running,
             );
             tracing::debug!(
-                cycle, reclaim_ms, heat_ms, defrag_ms,
+                cycle,
+                reclaim_ms,
+                heat_ms,
+                defrag_ms,
                 compactor_ms = t_comp.elapsed().as_millis(),
-                effort, scan_budget, rewrite_budget,
+                effort,
+                scan_budget,
+                rewrite_budget,
                 defrag_block_budget = defrag_scan.max_blocks,
                 depth = allocator.retired_block_count(),
                 "gc cycle timing"
@@ -483,24 +494,23 @@ impl GcRunner {
             return;
         }
 
-        let (candidates, dead_estimate, slot_stats, defrag_stats) =
-            match scan_gc_candidates_window(
-                meta,
-                &vol.id,
-                Lba(phys_start),
-                chunk,
-                threshold,
-                rewrite_budget,
-                slot_evac,
-                defrag,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(vol = %vol.id.0, error = %e, "compactor: window scan failed");
-                    return;
-                }
-            };
+        let (candidates, dead_estimate, slot_stats, defrag_stats) = match scan_gc_candidates_window(
+            meta,
+            &vol.id,
+            Lba(phys_start),
+            chunk,
+            threshold,
+            rewrite_budget,
+            slot_evac,
+            defrag,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(vol = %vol.id.0, error = %e, "compactor: window scan failed");
+                return;
+            }
+        };
         cursor.dead_estimate_acc = cursor.dead_estimate_acc.saturating_add(dead_estimate);
 
         // Slot-aware compaction selection stats (no-op when slot-evac is off).
@@ -847,8 +857,9 @@ impl GcRunner {
                     let mut cur = 0usize;
                     for extent in &survivors {
                         let n = extent.count as usize;
-                        let still_referenced =
-                            refcounts[cur..cur + n].iter().any(|&refcount| refcount != 0);
+                        let still_referenced = refcounts[cur..cur + n]
+                            .iter()
+                            .any(|&refcount| refcount != 0);
                         cur += n;
                         if still_referenced {
                             // Gate-1 passed it (raced rc==0) but the consistent
@@ -949,8 +960,13 @@ impl GcRunner {
         // emitted when a cycle did non-trivial reclaim work.
         if select_ms + gate1_ms + gate2_ms + free_ms >= 50 {
             tracing::debug!(
-                select_ms, gate1_ms, gate2_ms, free_ms,
-                n_candidates, n_survivors, reclaimed,
+                select_ms,
+                gate1_ms,
+                gate2_ms,
+                free_ms,
+                n_candidates,
+                n_survivors,
+                reclaimed,
                 "gc reclaim phase timing"
             );
         }
@@ -1117,11 +1133,8 @@ impl GcRunner {
                     continue;
                 }
                 let mut bumps = 0u64;
-                let scan = meta.scan_blockmap_range(
-                    &vol.id,
-                    Lba(phys_start),
-                    chunk,
-                    &mut |lba, value| {
+                let scan =
+                    meta.scan_blockmap_range(&vol.id, Lba(phys_start), chunk, &mut |lba, value| {
                         if value.is_zero() {
                             return;
                         }
@@ -1141,8 +1154,7 @@ impl GcRunner {
                             lba,
                             &value,
                         );
-                    },
-                );
+                    });
                 if let Err(e) = scan {
                     tracing::debug!(vol = %vol.id.0, error = %e, "heat refresh (adaptive): scan_blockmap_range failed");
                 }
@@ -1267,9 +1279,12 @@ impl GcRunner {
         // absorbed by requiring K consecutive clean barriers + the Gate-2 scan.
         if let (Some(rb), Some(buf)) = (ref_bitmap, ref_fill.take()) {
             let all_lapped = lap_barrier_satisfied(
-                volumes
-                    .iter()
-                    .map(|v| (v.id.0.as_str(), v.size_bytes / u64::from(v.block_size.max(1)))),
+                volumes.iter().map(|v| {
+                    (
+                        v.id.0.as_str(),
+                        v.size_bytes / u64::from(v.block_size.max(1)),
+                    )
+                }),
                 &cursor.per_vol,
             );
             if all_lapped {
@@ -1865,7 +1880,10 @@ mod reclaim_consistency_tests {
         let p = pbas[5]; // referenced (rc=2)
         assert!(p.0 - q.0 >= 2, "q and p must be non-adjacent");
         meta.set_refcount(p, 2).unwrap();
-        assert_eq!(meta.multi_get_refcounts_consistent(&[q, p]).unwrap(), vec![0, 2]);
+        assert_eq!(
+            meta.multi_get_refcounts_consistent(&[q, p]).unwrap(),
+            vec![0, 2]
+        );
 
         // Retire both into the allocator's retired set (non-adjacent → two
         // distinct retired extents).
@@ -1875,19 +1893,16 @@ mod reclaim_consistency_tests {
 
         let running = AtomicBool::new(true);
         let reclaimed = GcRunner::reclaim_retired_extents(
-            &metrics,
-            &meta,
-            &allocator,
-            &lifecycle,
-            64,
-            &running,
-            None, // heat_ctx
+            &metrics, &meta, &allocator, &lifecycle, 64, &running, None, // heat_ctx
             None, // grace: immediate (test)
         );
 
         // Q (rc==0) freed via the consistent read; P (rc>0) left retired.
         assert_eq!(reclaimed, 1, "exactly the rc==0 extent reclaimed");
-        assert!(allocator.is_free(q), "rc==0 retired extent must be reclaimed");
+        assert!(
+            allocator.is_free(q),
+            "rc==0 retired extent must be reclaimed"
+        );
         assert!(
             allocator.is_retired(p),
             "rc>0 extent must NOT be freed under rc_authoritative reclaim"
@@ -1897,9 +1912,7 @@ mod reclaim_consistency_tests {
             "referenced PBA must never return to the free list (premature-free CRC)"
         );
         assert_eq!(
-            metrics
-                .gc_retired_blocks_reclaimed
-                .load(Ordering::Relaxed),
+            metrics.gc_retired_blocks_reclaimed.load(Ordering::Relaxed),
             1
         );
     }

@@ -526,6 +526,9 @@ fn dedup_worker_batches_hits_across_units() {
         // No verify in this unit-test path: hits trust hash. Tests
         // that need verify should construct their own ReadPool.
         None,
+        &[],
+        1,
+        8,
     );
     drop(miss_tx);
 
