@@ -564,6 +564,79 @@ fn dedup_worker_batches_hits_across_units() {
     );
 }
 
+#[test]
+fn dedup_worker_keeps_unsplit_all_miss_on_direct_completion_path() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let payload = Arc::<[u8]>::from(vec![0x5Au8; BLOCK_SIZE as usize * 2]);
+    let unit = CoalesceUnit {
+        vol_id: "flush-race".into(),
+        start_lba: Lba(42),
+        lba_count: 2,
+        raw_blocks: vec![
+            crate::buffer::pipeline::RawBlockRef {
+                payload: payload.clone(),
+                offset: 0,
+            },
+            crate::buffer::pipeline::RawBlockRef {
+                payload,
+                offset: BLOCK_SIZE as usize,
+            },
+        ],
+        compression: CompressionAlgo::None,
+        vol_created_at: 1,
+        seq_lba_ranges: vec![(7, Lba(42), 2)],
+        dedup_skipped: false,
+        block_hashes: None,
+        dedup_stale_repairs: None,
+        dedup_completion: None,
+    };
+
+    let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(4);
+    let (miss_tx, miss_rx) = bounded::<CoalesceUnit>(4);
+    let (done_tx, done_rx) = unbounded::<Vec<u64>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    dedup_tx.send(unit).unwrap();
+    drop(dedup_tx);
+
+    BufferFlusher::dedup_loop(
+        0,
+        &dedup_rx,
+        &miss_tx,
+        &meta,
+        &pool,
+        &lifecycle,
+        &allocator,
+        &done_tx,
+        &AtomicBool::new(true),
+        100,
+        0,
+        &metrics,
+        &cleanup_tx,
+        &crate::dedup::CandidateCache::new(1, 16),
+        None,
+        &[],
+        1,
+        1,
+    );
+    drop(miss_tx);
+
+    let miss = miss_rx
+        .recv()
+        .expect("all-miss unit must continue to compress");
+    assert_eq!(miss.start_lba, Lba(42));
+    assert_eq!(miss.lba_count, 2);
+    assert!(miss.block_hashes.is_some());
+    assert!(
+        miss.dedup_completion.is_none(),
+        "an unsplit all-miss unit must retain direct writer completion"
+    );
+    assert!(
+        done_rx.is_empty(),
+        "dedup must not complete a miss before write"
+    );
+}
+
 // ---------- Stage-B: reclaim consumes the heat map ----------
 
 /// A retired rc==0 extent whose region the heat map marks hot+fresh is

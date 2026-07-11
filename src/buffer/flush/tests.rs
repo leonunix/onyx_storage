@@ -154,7 +154,7 @@ fn make_unit(fill: u8, seq: u64) -> CompressedUnit {
         start_lba: Lba(0),
         lba_count: 1,
         original_size: BLOCK_SIZE,
-        compressed_data: data.clone(),
+        payload: CompressedPayload::Contiguous(data.clone()),
         compression: 0,
         crc32: crc32fast::hash(&data),
         vol_created_at: 1,
@@ -172,12 +172,19 @@ fn make_raw_unit_at(start_lba: u64, lba_count: u32, first_byte: u8, seq: u64) ->
     for (idx, block) in data.chunks_mut(BLOCK_SIZE as usize).enumerate() {
         block.fill(first_byte.wrapping_add(idx as u8));
     }
+    let raw: Arc<[u8]> = Arc::from(data.clone());
+    let blocks = (0..lba_count as usize)
+        .map(|idx| crate::buffer::pipeline::RawBlockRef {
+            payload: raw.clone(),
+            offset: idx * BLOCK_SIZE as usize,
+        })
+        .collect();
     CompressedUnit {
         vol_id: "flush-race".into(),
         start_lba: Lba(start_lba),
         lba_count,
         original_size: data.len() as u32,
-        compressed_data: data.clone(),
+        payload: CompressedPayload::RawBlocks(RawBlockPayload::new(blocks)),
         compression: 0,
         crc32: crc32fast::hash(&data),
         vol_created_at: 1,
@@ -197,7 +204,7 @@ fn make_packed_unit(fill: u8, seq: u64) -> CompressedUnit {
         start_lba: Lba(0),
         lba_count: 1,
         original_size: BLOCK_SIZE,
-        compressed_data: data.clone(),
+        payload: CompressedPayload::Contiguous(data.clone()),
         compression: 0,
         crc32: crc32fast::hash(&data),
         vol_created_at: 1,
@@ -217,7 +224,7 @@ fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
         start_lba: Lba(lba),
         lba_count: 1,
         original_size: BLOCK_SIZE,
-        compressed_data: data.clone(),
+        payload: CompressedPayload::Contiguous(data.clone()),
         compression: 0,
         crc32: crc32fast::hash(&data),
         vol_created_at: 1,

@@ -409,6 +409,22 @@ impl WriteBufferPool {
             .unwrap_or_default()
     }
 
+    pub fn oldest_ready_pending_arcs_for_shard_with_budget(
+        &self,
+        shard_idx: usize,
+        limit: usize,
+        byte_limit: usize,
+    ) -> Vec<Arc<PendingEntry>> {
+        self.shards
+            .get(shard_idx)
+            .map(|shard| {
+                shard
+                    .shard
+                    .oldest_pending_arcs_with_budget(limit, byte_limit)
+            })
+            .unwrap_or_default()
+    }
+
     pub fn head_stuck_seq_for_shard(&self, shard_idx: usize, min_age: Duration) -> Option<u64> {
         self.shards
             .get(shard_idx)

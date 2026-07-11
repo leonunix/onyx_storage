@@ -115,7 +115,7 @@ impl BufferFlusher {
 
             let bs = BLOCK_SIZE as usize;
             let alloc_start = Instant::now();
-            let blocks_needed = (unit.compressed_data.len() + bs - 1) / bs;
+            let blocks_needed = (unit.payload_len() + bs - 1) / bs;
 
             // Stripe-multiple units land on a stripe-aligned extent (full-stripe
             // write); others take the unaligned path. Same helper as the batch
@@ -158,7 +158,15 @@ impl BufferFlusher {
 
             allocator.wait_for_readers(pba, blocks_needed as u32);
 
-            if let Err(e) = io_engine.write_blocks(pba, &unit.compressed_data) {
+            let materialized_payload;
+            let payload = match unit.payload_contiguous() {
+                Some(payload) => payload,
+                None => {
+                    materialized_payload = unit.materialize_payload();
+                    &materialized_payload
+                }
+            };
+            if let Err(e) = io_engine.write_blocks(pba, payload) {
                 allocation.free(allocator)?;
                 Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);
                 Self::record_elapsed(&metrics.flush_writer_total_ns, total_start);
@@ -336,7 +344,7 @@ impl BufferFlusher {
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
                 .flush_unit_bytes
-                .fetch_add(unit.compressed_data.len() as u64, Ordering::Relaxed);
+                .fetch_add(unit.payload_len() as u64, Ordering::Relaxed);
 
             let mark_start = Instant::now();
             for (seq, lba_start, lba_count) in &unit.seq_lba_ranges {
@@ -351,7 +359,7 @@ impl BufferFlusher {
                 start_lba = unit.start_lba.0,
                 lba_count = unit.lba_count,
                 pba = pba.0,
-                compressed = unit.compressed_data.len(),
+                compressed = unit.payload_len(),
                 original = unit.original_size,
                 "flushed compression unit"
             );
@@ -485,7 +493,7 @@ impl BufferFlusher {
         let bs = BLOCK_SIZE as usize;
         let blocks_per_unit: Vec<u32> = units
             .iter()
-            .map(|u| ((u.compressed_data.len() + bs - 1) / bs) as u32)
+            .map(|u| ((u.payload_len() + bs - 1) / bs) as u32)
             .collect();
         for i in 0..n {
             alloc_blocks[i] = blocks_per_unit[i];
@@ -620,41 +628,89 @@ impl BufferFlusher {
         // Syscall backend: scoped threads inside submit_batch keep NVMe QD > 1.
         let io_start = Instant::now();
         {
-            use crate::io::engine::{LvOp, LvOpResult};
+            use crate::io::engine::{LvOpResult, OwnedLvWrite};
 
-            // Assemble one contiguous stripe buffer per reserved group. Each
-            // member's compressed payload is copied to its block-aligned
-            // sub-offset; the tail padding inside each member's last block stays
-            // zero (the reader slices by `unit_compressed_size`). Held alive in
-            // `group_payloads` across the submit — the grouped `LvOp` borrows it.
-            let mut group_payloads: Vec<Vec<u8>> = Vec::with_capacity(groups.len());
+            // Assemble directly into the O_DIRECT-aligned buffers that the
+            // global chunklet combiner will own. This removes the old
+            // full-stripe Vec -> IoEngine slab memcpy.
+            let mut group_buffers: Vec<Option<crate::io::aligned::AlignedBuf>> =
+                Vec::with_capacity(groups.len());
             for (gi, members) in groups.iter().enumerate() {
                 if group_extents[gi].is_none() {
-                    group_payloads.push(Vec::new());
+                    group_buffers.push(None);
                     continue;
                 }
-                let mut buf = vec![0u8; stripe as usize * bs];
+                let mut buf = match io_engine.allocate_owned_write_buffer(stripe as usize * bs) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        let ext = group_extents[gi].expect("reserved group has an extent");
+                        let _ = crate::space::pba_lifecycle::rollback_uncommitted(allocator, ext);
+                        for &m in members {
+                            failed[m] = true;
+                        }
+                        tracing::error!(error = %e, group = gi, "writer: aligned group buffer allocation failed");
+                        group_buffers.push(None);
+                        continue;
+                    }
+                };
+                buf.as_mut_slice().fill(0);
                 let mut off_blocks = 0usize;
                 for &m in members {
-                    let data = units[m].compressed_data.as_slice();
+                    let data_len = units[m].payload_len();
                     let start = off_blocks * bs;
-                    buf[start..start + data.len()].copy_from_slice(data);
+                    units[m].copy_payload_to(&mut buf.as_mut_slice()[start..start + data_len]);
                     off_blocks += alloc_blocks[m] as usize;
                 }
-                group_payloads.push(buf);
+                group_buffers.push(Some(buf));
             }
 
             enum OpTarget {
                 Group(usize),
                 Unit(usize),
             }
-            let mut ops: Vec<LvOp> = Vec::with_capacity(n);
+            // Alignment-starved and non-group units still get one aligned
+            // owner, filled directly from contiguous or scatter payloads.
+            let mut unit_buffers: Vec<Option<crate::io::aligned::AlignedBuf>> =
+                (0..n).map(|_| None).collect();
+            for i in 0..n {
+                let grouped = group_of[i].is_some_and(|gi| group_extents[gi].is_some());
+                if !grouped && !failed[i] && pbas[i].is_some() {
+                    let total = alloc_blocks[i] as usize * bs;
+                    match io_engine.allocate_owned_write_buffer(total) {
+                        Ok(mut buf) => {
+                            buf.as_mut_slice().fill(0);
+                            units[i]
+                                .copy_payload_to(&mut buf.as_mut_slice()[..units[i].payload_len()]);
+                            unit_buffers[i] = Some(buf);
+                        }
+                        Err(e) => {
+                            Self::rollback_unit_alloc(
+                                allocator,
+                                pbas[i].expect("allocated unit has PBA"),
+                                alloc_blocks[i],
+                            );
+                            failed[i] = true;
+                            tracing::error!(
+                                vol = units[i].vol_id,
+                                start_lba = units[i].start_lba.0,
+                                error = %e,
+                                "writer: aligned unit buffer allocation failed"
+                            );
+                        }
+                    }
+                }
+            }
+
+            let mut ops: Vec<OwnedLvWrite> = Vec::with_capacity(n);
             let mut op_targets: Vec<OpTarget> = Vec::with_capacity(n);
 
             // Full-stripe group ops: one `LvOp::Write` covers the whole 24 KiB
             // stripe → chunklet takes its zero-RMW full-stripe path.
             for (gi, members) in groups.iter().enumerate() {
-                if group_extents[gi].is_none() {
+                if group_extents[gi].is_none()
+                    || group_buffers[gi].is_none()
+                    || members.iter().any(|&m| failed[m])
+                {
                     continue;
                 }
                 // Fail the whole group if ANY member hits the injected failpoint.
@@ -676,9 +732,14 @@ impl BufferFlusher {
                     continue;
                 }
                 allocator.wait_for_readers(ext.start, stripe);
-                ops.push(LvOp::Write {
+                let buffer = group_buffers[gi]
+                    .take()
+                    .expect("reserved group has an aligned buffer");
+                let payload_len = buffer.len();
+                ops.push(OwnedLvWrite {
                     pba: ext.start,
-                    payload: group_payloads[gi].as_slice(),
+                    payload_len,
+                    buffer,
                 });
                 op_targets.push(OpTarget::Group(gi));
             }
@@ -708,16 +769,20 @@ impl BufferFlusher {
                     continue;
                 }
                 allocator.wait_for_readers(pbas[i].unwrap(), alloc_blocks[i]);
-                ops.push(LvOp::Write {
+                let buffer = unit_buffers[i]
+                    .take()
+                    .expect("per-unit payload must have an aligned buffer");
+                ops.push(OwnedLvWrite {
                     pba: pbas[i].unwrap(),
-                    payload: units[i].compressed_data.as_slice(),
+                    payload_len: units[i].payload_len(),
+                    buffer,
                 });
                 op_targets.push(OpTarget::Unit(i));
             }
 
             if !ops.is_empty() {
                 io_ops_count = ops.len() as u64;
-                match io_engine.submit_batch_on(write_session, ops, false) {
+                match io_engine.submit_owned_write_batch_on(write_session, ops, false) {
                     Ok(write_results) => {
                         for (idx, r) in write_results.into_iter().enumerate() {
                             if let LvOpResult::Write(Err(e)) = r {

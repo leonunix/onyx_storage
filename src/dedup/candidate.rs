@@ -255,23 +255,39 @@ impl CandidateCache {
     /// `pba`. Called from the writer's refcount→0 cleanup so a freed
     /// PBA can never be returned to a future verify check.
     pub fn remove_by_pba(&self, pba: Pba) {
-        let Some((_, hashes)) = self.inner.pba_to_hashes.remove(&pba) else {
+        self.remove_by_pbas(std::iter::once(pba));
+    }
+
+    /// Batch form of [`Self::remove_by_pba`]. Cleanup commonly retires tens of
+    /// thousands of raw 4 KiB PBAs at once. Probing the reverse DashMap and
+    /// allocating an LRU-shard bucket vector once per PBA made an empty cache
+    /// expensive and made a populated cache repeatedly lock the same shards.
+    pub fn remove_by_pbas<I>(&self, pbas: I)
+    where
+        I: IntoIterator<Item = Pba>,
+    {
+        if self.inner.pba_to_hashes.is_empty() {
             return;
-        };
-        // Group fps by LRU shard so we acquire each shard mutex once
-        // even when a packed slot's reverse list spans dozens of
-        // fragments.
-        let n = self.inner.shards.len();
-        let mut by_shard: Vec<Vec<ContentHash>> = (0..n).map(|_| Vec::new()).collect();
-        for fp in hashes {
-            by_shard[self.shard_for(&fp)].push(fp);
         }
-        for (shard_idx, shard_fps) in by_shard.into_iter().enumerate() {
-            if shard_fps.is_empty() {
+
+        // Group every matching fingerprint by LRU shard across the whole
+        // cleanup batch, so each shard mutex is acquired at most once.
+        let n = self.inner.shards.len();
+        let mut by_shard: Vec<Vec<(ContentHash, Pba)>> = (0..n).map(|_| Vec::new()).collect();
+        for pba in pbas {
+            let Some((_, hashes)) = self.inner.pba_to_hashes.remove(&pba) else {
+                continue;
+            };
+            for fp in hashes {
+                by_shard[self.shard_for(&fp)].push((fp, pba));
+            }
+        }
+        for (shard_idx, entries) in by_shard.into_iter().enumerate() {
+            if entries.is_empty() {
                 continue;
             }
             let mut g = self.inner.shards[shard_idx].lock();
-            for fp in shard_fps {
+            for (fp, pba) in entries {
                 // Pop only when the slot still points at the freed
                 // PBA. A racing `insert(fp, new_value)` for a *new*
                 // PBA may have stamped a fresh entry for the same fp;
@@ -447,6 +463,22 @@ mod tests {
         assert!(c.lookup(&fp(2)).is_none());
         assert!(c.lookup(&fp(3)).is_none());
         assert_eq!(c.lookup(&fp(4)), Some(bv(200)));
+    }
+
+    #[test]
+    fn remove_by_pbas_batches_across_reverse_and_lru_shards() {
+        let c = CandidateCache::new(8, 64);
+        for i in 0..32u8 {
+            c.insert(fp(i), bv(100 + u64::from(i % 4)));
+        }
+        c.insert(fp(200), bv(999));
+
+        c.remove_by_pbas((100..104).map(Pba));
+
+        for i in 0..32u8 {
+            assert!(c.lookup(&fp(i)).is_none());
+        }
+        assert_eq!(c.lookup(&fp(200)), Some(bv(999)));
     }
 
     #[test]

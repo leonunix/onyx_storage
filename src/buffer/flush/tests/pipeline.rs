@@ -1,6 +1,65 @@
 use super::*;
 
 #[test]
+fn stalled_lease_requires_both_old_seq_and_idle_writer() {
+    assert!(!BufferFlusher::stalled_lease_ready(
+        Duration::from_secs(29),
+        Duration::from_secs(60)
+    ));
+    assert!(!BufferFlusher::stalled_lease_ready(
+        Duration::from_secs(60),
+        Duration::from_secs(4)
+    ));
+    assert!(BufferFlusher::stalled_lease_ready(
+        Duration::from_secs(30),
+        Duration::from_secs(5)
+    ));
+}
+
+#[test]
+fn compress_loop_keeps_none_payload_scattered_until_writer() {
+    let metrics = EngineMetrics::default();
+    let running = AtomicBool::new(true);
+    let (tx, rx) = bounded::<CoalesceUnit>(1);
+    let (out_tx, out_rx) = bounded::<CompressedUnit>(1);
+
+    let raw: Vec<u8> = (0..4 * BLOCK_SIZE as usize)
+        .map(|idx| (idx as u8).wrapping_mul(31))
+        .collect();
+    let raw_arc: Arc<[u8]> = Arc::from(raw.clone());
+    let raw_blocks = (0..4)
+        .map(|i| crate::buffer::pipeline::RawBlockRef {
+            payload: raw_arc.clone(),
+            offset: i * BLOCK_SIZE as usize,
+        })
+        .collect();
+    tx.send(CoalesceUnit {
+        vol_id: "flush-race".into(),
+        start_lba: Lba(20_000),
+        lba_count: 4,
+        raw_blocks,
+        compression: CompressionAlgo::None,
+        vol_created_at: 1,
+        seq_lba_ranges: vec![(1, Lba(20_000), 4)],
+        dedup_skipped: false,
+        block_hashes: None,
+        dedup_stale_repairs: None,
+        dedup_completion: None,
+    })
+    .unwrap();
+    drop(tx);
+
+    BufferFlusher::compress_loop(&rx, &out_tx, &running, &metrics, 12);
+    drop(out_tx);
+
+    let unit = out_rx.try_recv().expect("raw unit should be emitted");
+    assert!(unit.payload_contiguous().is_none());
+    assert_eq!(unit.payload_len(), raw.len());
+    assert_eq!(unit.crc32, crc32fast::hash(&raw));
+    assert_eq!(unit.materialize_payload(), raw);
+}
+
+#[test]
 fn compress_loop_bypasses_low_savings_units() {
     let metrics = EngineMetrics::default();
     let running = AtomicBool::new(true);
@@ -46,10 +105,11 @@ fn compress_loop_bypasses_low_savings_units() {
         .try_recv()
         .expect("compressed unit should be emitted");
     assert_eq!(unit.compression, CompressionAlgo::None.to_u8());
-    assert_eq!(unit.compressed_data, raw);
+    let payload = unit.materialize_payload();
+    assert_eq!(payload, raw);
     assert_eq!(unit.original_size, (8 * BLOCK_SIZE) as u32);
     assert_eq!(unit.lba_count, 8);
-    assert_eq!(unit.crc32, crc32fast::hash(&unit.compressed_data));
+    assert_eq!(unit.crc32, crc32fast::hash(&payload));
     assert_eq!(
         metrics.compress_bypass_units.load(Ordering::Relaxed),
         1,
@@ -97,6 +157,7 @@ fn coalesce_enqueue_caps_ready_window_bytes() {
                 &mut queued_bytes,
                 &mut new_entries,
                 &test_metrics,
+                BufferFlusher::COALESCE_READY_WINDOW_BYTES,
                 true,
                 Duration::ZERO,
                 None,
@@ -170,6 +231,7 @@ fn fully_superseded_entry_skipped_at_coalesce() {
         &mut queued_bytes,
         &mut new_entries,
         &test_metrics,
+        BufferFlusher::COALESCE_READY_WINDOW_BYTES,
         true,
         Duration::ZERO,
         None,
@@ -191,6 +253,7 @@ fn fully_superseded_entry_skipped_at_coalesce() {
         &mut queued_bytes,
         &mut new_entries,
         &test_metrics,
+        BufferFlusher::COALESCE_READY_WINDOW_BYTES,
         true,
         Duration::ZERO,
         None,
@@ -220,6 +283,7 @@ fn fully_superseded_entry_skipped_at_coalesce() {
         &mut queued_bytes,
         &mut new_entries,
         &test_metrics,
+        BufferFlusher::COALESCE_READY_WINDOW_BYTES,
         false, // disabled
         Duration::ZERO,
         None,
@@ -232,7 +296,7 @@ fn fully_superseded_entry_skipped_at_coalesce() {
 }
 
 #[test]
-fn coalesce_write_window_releases_frozen_epoch_or_pressure_bypass() {
+fn coalesce_write_window_releases_mature_entries_or_pressure_bypass() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 32 * 1024 * 1024;
     tmp.as_file().set_len(size).unwrap();
@@ -256,9 +320,10 @@ fn coalesce_write_window_releases_frozen_epoch_or_pressure_bypass() {
         &mut queued_bytes,
         &mut entries,
         &metrics,
+        BufferFlusher::COALESCE_READY_WINDOW_BYTES,
         true,
         Duration::from_secs(60),
-        None,
+        Instant::now().checked_sub(Duration::from_secs(60)),
         false,
     );
     assert_eq!(
@@ -268,7 +333,9 @@ fn coalesce_write_window_releases_frozen_epoch_or_pressure_bypass() {
     assert!(entries.is_empty());
 
     seen.clear();
-    let admitted_at_cutoff = BufferFlusher::try_enqueue_pending_seq(
+    std::thread::sleep(Duration::from_millis(2));
+    let mature_cutoff = Instant::now().checked_sub(Duration::from_millis(1));
+    let admitted_when_mature = BufferFlusher::try_enqueue_pending_seq(
         seq,
         &pool,
         &in_flight,
@@ -277,12 +344,13 @@ fn coalesce_write_window_releases_frozen_epoch_or_pressure_bypass() {
         &mut queued_bytes,
         &mut entries,
         &metrics,
+        BufferFlusher::COALESCE_READY_WINDOW_BYTES,
         true,
-        Duration::from_secs(60),
-        Some(Instant::now()),
+        Duration::from_millis(1),
+        mature_cutoff,
         false,
     );
-    assert_eq!(admitted_at_cutoff, EnqueuePendingSeq::Queued);
+    assert_eq!(admitted_when_mature, EnqueuePendingSeq::Queued);
     assert_eq!(entries.len(), 1);
 
     entries.clear();
@@ -297,6 +365,7 @@ fn coalesce_write_window_releases_frozen_epoch_or_pressure_bypass() {
         &mut queued_bytes,
         &mut entries,
         &metrics,
+        BufferFlusher::COALESCE_READY_WINDOW_BYTES,
         true,
         Duration::from_secs(60),
         None,
@@ -304,4 +373,23 @@ fn coalesce_write_window_releases_frozen_epoch_or_pressure_bypass() {
     );
     assert_eq!(admitted_under_pressure, EnqueuePendingSeq::Queued);
     assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn coalesce_write_window_bypasses_after_foreground_idle_grace() {
+    assert!(!BufferFlusher::write_window_bypass_ready(
+        10,
+        50,
+        Duration::from_secs(4),
+    ));
+    assert!(BufferFlusher::write_window_bypass_ready(
+        50,
+        50,
+        Duration::ZERO,
+    ));
+    assert!(BufferFlusher::write_window_bypass_ready(
+        10,
+        50,
+        Duration::from_secs(5),
+    ));
 }

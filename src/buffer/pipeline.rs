@@ -123,12 +123,106 @@ pub struct DedupHit {
 
 /// A compressed coalesce unit, ready to be written to LV3.
 #[derive(Debug, Clone)]
+pub struct RawBlockPayload {
+    blocks: Vec<RawBlockRef>,
+}
+
+impl RawBlockPayload {
+    pub(crate) fn new(blocks: Vec<RawBlockRef>) -> Self {
+        Self { blocks }
+    }
+
+    fn len(&self) -> usize {
+        self.blocks.len() * BLOCK_SIZE as usize
+    }
+
+    fn copy_to(&self, dst: &mut [u8]) {
+        let bs = BLOCK_SIZE as usize;
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let start = idx * bs;
+            dst[start..start + bs].copy_from_slice(block.bytes());
+        }
+    }
+
+    fn block(&self, position: usize) -> &[u8] {
+        self.blocks[position].bytes()
+    }
+
+    pub(crate) fn crc32(&self) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        for block in &self.blocks {
+            hasher.update(block.bytes());
+        }
+        hasher.finalize()
+    }
+}
+
+/// Owned compressed bytes, or raw block references for the no-compression
+/// fast path. The latter avoids materialising a second full copy before the
+/// writer assembles its final RAID stripe buffer.
+#[derive(Debug, Clone)]
+pub enum CompressedPayload {
+    Contiguous(Vec<u8>),
+    RawBlocks(RawBlockPayload),
+}
+
+impl CompressedPayload {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(data) => data.len(),
+            Self::RawBlocks(data) => data.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_contiguous(&self) -> Option<&[u8]> {
+        match self {
+            Self::Contiguous(data) => Some(data),
+            Self::RawBlocks(_) => None,
+        }
+    }
+
+    pub fn materialize(&self) -> Vec<u8> {
+        match self {
+            Self::Contiguous(data) => data.clone(),
+            Self::RawBlocks(data) => {
+                let mut out = vec![0u8; data.len()];
+                data.copy_to(&mut out);
+                out
+            }
+        }
+    }
+
+    pub(crate) fn copy_to(&self, dst: &mut [u8]) {
+        assert!(dst.len() >= self.len(), "payload destination is too small");
+        match self {
+            Self::Contiguous(data) => dst[..data.len()].copy_from_slice(data),
+            Self::RawBlocks(data) => data.copy_to(&mut dst[..data.len()]),
+        }
+    }
+
+    pub(crate) fn block(&self, position: usize) -> &[u8] {
+        let bs = BLOCK_SIZE as usize;
+        match self {
+            Self::Contiguous(data) => {
+                let start = position * bs;
+                &data[start..start + bs]
+            }
+            Self::RawBlocks(data) => data.block(position),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CompressedUnit {
     pub vol_id: String,
     pub start_lba: Lba,
     pub lba_count: u32,
     pub original_size: u32,
-    pub compressed_data: Vec<u8>,
+    pub payload: CompressedPayload,
     pub compression: u8,
     pub crc32: u32,
     /// Volume generation epoch from the buffer entries.
@@ -147,6 +241,28 @@ pub struct CompressedUnit {
     pub compression_bypassed: bool,
     /// See CoalesceUnit::dedup_completion.
     pub dedup_completion: Option<Arc<DedupCompletion>>,
+}
+
+impl CompressedUnit {
+    pub fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub fn payload_contiguous(&self) -> Option<&[u8]> {
+        self.payload.as_contiguous()
+    }
+
+    pub fn materialize_payload(&self) -> Vec<u8> {
+        self.payload.materialize()
+    }
+
+    pub(crate) fn copy_payload_to(&self, dst: &mut [u8]) {
+        self.payload.copy_to(dst);
+    }
+
+    pub(crate) fn payload_block(&self, position: usize) -> &[u8] {
+        self.payload.block(position)
+    }
 }
 
 /// A single-LBA slice extracted from a (possibly multi-LBA) buffer entry.

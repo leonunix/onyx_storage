@@ -530,6 +530,15 @@ impl DedupScanner {
                 // stripe lock here. The re-check below guards the
                 // scanner-versus-buffer-commit race.
                 let result_inner = (|| -> OnyxResult<bool> {
+                    // Pin before re-reading the mapping. A foreground overwrite
+                    // may retire and recycle the scanned PBA between
+                    // scan_dedup_skipped() and the LV3 read; reclaim/allocation
+                    // waits on this guard before overwriting recycled blocks.
+                    // Revalidation after the pin rejects a scan result whose
+                    // mapping already changed before the guard was acquired.
+                    let hazards = pba_lifecycle.allocator().hazards();
+                    let _hazard_guard = hazards.pin_many(bv.physical_pbas(BLOCK_SIZE));
+
                     // Re-read the mapping to ensure it's still the same,
                     // capturing the committed seq so we can forward it as
                     // the seq_guard on the subsequent l2p_remap. The
@@ -768,10 +777,11 @@ impl DedupScanner {
     /// warm the candidate cache for a true miss. Shared by the legacy
     /// `cold_tail_rescan` (target discovery via its own
     /// `scan_blockmap_range`) and the Stage-4 `cold_tail_drain` (targets
-    /// arrive over the fold channel from the GC heat walk). All re-validation
-    /// (`get_mapping_with_seq` / `same_physical_mapping`) and lifecycle
-    /// read-locking is unchanged from the original cold-tail pass — callers
-    /// differ only in how `targets` is sourced.
+    /// arrive over the fold channel from the GC heat walk). Each target is
+    /// hazard-pinned and revalidated before its read is submitted, matching the
+    /// foreground read path. This closes the scan -> async-read window where an
+    /// overwrite could reclaim the copied PBA and turn a benign stale target
+    /// into a CRC error (or a stale candidate-cache insertion).
     #[allow(clippy::too_many_arguments)]
     fn process_cold_tail_targets(
         meta: &MetaStore,
@@ -789,10 +799,42 @@ impl DedupScanner {
 
         // Fan out the LV3 reads through ReadPool so io_uring can
         // keep multiple SQEs in flight for one drain.
+        let hazards = pba_lifecycle.allocator().hazards();
         let mut receivers = Vec::with_capacity(targets.len());
-        for (_lba, bv) in targets {
+        let mut hazard_guards = Vec::with_capacity(targets.len());
+        for (lba, bv) in targets {
+            // Pin first, then re-read L2P. If cleanup won the race before the
+            // pin, the mapping check observes the overwrite and we never read
+            // the recycled address. If cleanup runs after the pin, allocator
+            // reclaim waits until this guard drops.
+            let guard = hazards.pin_many(bv.physical_pbas(BLOCK_SIZE));
+            match meta.get_mapping(vol_id, *lba) {
+                Ok(Some(current)) if same_physical_mapping(&current, bv) => {}
+                Ok(_) => {
+                    stats.already_warm += 1;
+                    receivers.push(None);
+                    hazard_guards.push(None);
+                    continue;
+                }
+                Err(e) => {
+                    stats.errors += 1;
+                    tracing::debug!(
+                        vol = %vol_id.0,
+                        lba = lba.0,
+                        pba = bv.pba.0,
+                        error = %e,
+                        "cold-tail: failed to revalidate hazard-pinned mapping"
+                    );
+                    receivers.push(None);
+                    hazard_guards.push(None);
+                    continue;
+                }
+            }
             match pool.submit_read_async_for(*bv, ReadPurpose::DedupScanner) {
-                Ok(rx) => receivers.push(Some(rx)),
+                Ok(rx) => {
+                    receivers.push(Some(rx));
+                    hazard_guards.push(Some(guard));
+                }
                 Err(e) => {
                     stats.errors += 1;
                     tracing::debug!(
@@ -801,11 +843,19 @@ impl DedupScanner {
                         "cold-tail: failed to enqueue ReadPool request"
                     );
                     receivers.push(None);
+                    hazard_guards.push(None);
                 }
             }
         }
 
-        for ((lba, bv), rx_opt) in targets.iter().zip(receivers.into_iter()) {
+        for (((lba, bv), rx_opt), hazard_guard) in targets
+            .iter()
+            .zip(receivers.into_iter())
+            .zip(hazard_guards.into_iter())
+        {
+            let Some(_hazard_guard) = hazard_guard else {
+                continue;
+            };
             let Some(rx) = rx_opt else { continue };
             let block = match rx.recv() {
                 Ok(Ok(buf)) if buf.len() == BLOCK_SIZE as usize => buf,
@@ -928,30 +978,30 @@ impl DedupScanner {
                 continue;
             }
 
-            // True miss: warm the candidate cache so a *future*
-            // duplicate write can verify-and-promote against this
-            // fingerprint. Re-validate the mapping first so we do
-            // not cache a stale (vol, lba) -> pba pair.
+            // True miss: insert first, then revalidate. This ordering closes
+            // both sides of the mapping-change race: if overwrite cleanup runs
+            // after this insert it evicts the PBA; if it already ran, the
+            // post-insert mapping check observes the change and we evict it.
+            candidate.insert(hash, BlockmapValue { flags: 0, ..*bv });
             match meta.get_mapping(vol_id, *lba) {
-                Ok(Some(current)) if same_physical_mapping(&current, bv) => {}
+                Ok(Some(current)) if same_physical_mapping(&current, bv) => {
+                    stats.warmed += 1;
+                }
                 Ok(_) => {
+                    candidate.remove_by_pba(bv.pba);
                     stats.already_warm += 1;
-                    continue;
                 }
                 Err(e) => {
+                    candidate.remove_by_pba(bv.pba);
                     stats.errors += 1;
                     tracing::debug!(
                         vol = %vol_id.0,
                         lba = lba.0,
                         error = %e,
-                        "cold-tail: failed to revalidate mapping"
+                        "cold-tail: failed to revalidate candidate insertion"
                     );
-                    continue;
                 }
             }
-
-            candidate.insert(hash, BlockmapValue { flags: 0, ..*bv });
-            stats.warmed += 1;
         }
     }
 

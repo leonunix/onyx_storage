@@ -1,7 +1,7 @@
 /// Unit tests for the Packer module (bin-packing of small compressed fragments).
 use std::sync::Arc;
 
-use onyx_storage::buffer::pipeline::CompressedUnit;
+use onyx_storage::buffer::pipeline::{CompressedPayload, CompressedUnit};
 use onyx_storage::packer::packer::{PackResult, Packer};
 use onyx_storage::space::allocator::SpaceAllocator;
 use onyx_storage::types::*;
@@ -12,7 +12,7 @@ fn make_unit(vol_id: &str, start_lba: u64, lba_count: u32, data_size: usize) -> 
         start_lba: Lba(start_lba),
         lba_count,
         original_size: (lba_count as u32) * BLOCK_SIZE,
-        compressed_data: vec![0xAB; data_size],
+        payload: CompressedPayload::Contiguous(vec![0xAB; data_size]),
         compression: 1, // LZ4
         crc32: crc32fast::hash(&vec![0xAB; data_size]),
         vol_created_at: 1000,
@@ -43,7 +43,7 @@ fn passthrough_large_fragment() {
     match packer.pack_or_passthrough(unit).unwrap() {
         PackResult::Passthrough(u) => {
             assert_eq!(u.vol_id, "vol-a");
-            assert_eq!(u.compressed_data.len(), BLOCK_SIZE as usize);
+            assert_eq!(u.payload_len(), BLOCK_SIZE as usize);
         }
         _ => panic!("expected Passthrough for large fragment"),
     }
@@ -95,8 +95,8 @@ fn two_fragments_share_slot() {
     assert_eq!(sealed.fragments.len(), 2);
     assert_eq!(sealed.fragments[0].slot_offset, 0);
     assert_eq!(sealed.fragments[1].slot_offset, 1000);
-    assert_eq!(sealed.fragments[0].unit.compressed_data.len(), 1000);
-    assert_eq!(sealed.fragments[1].unit.compressed_data.len(), 1500);
+    assert_eq!(sealed.fragments[0].unit.payload_len(), 1000);
+    assert_eq!(sealed.fragments[1].unit.payload_len(), 1500);
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn fragment_doesnt_fit_seals_slot() {
         PackResult::SealedSlot(sealed) => {
             assert_eq!(sealed.fragments.len(), 1);
             assert_eq!(sealed.fragments[0].slot_offset, 0);
-            assert_eq!(sealed.fragments[0].unit.compressed_data.len(), 3000);
+            assert_eq!(sealed.fragments[0].unit.payload_len(), 3000);
         }
         _ => panic!("expected SealedSlot"),
     }
@@ -126,7 +126,7 @@ fn fragment_doesnt_fit_seals_slot() {
     let sealed2 = packer.flush_open_slot().unwrap();
     assert_eq!(sealed2.fragments.len(), 1);
     assert_eq!(sealed2.fragments[0].slot_offset, 0);
-    assert_eq!(sealed2.fragments[0].unit.compressed_data.len(), 2000);
+    assert_eq!(sealed2.fragments[0].unit.payload_len(), 2000);
 
     // Both slots should have different PBAs
     assert_ne!(sealed2.pba, Pba(0)); // PBA was allocated
@@ -218,7 +218,7 @@ fn alloc_failure_after_seal_returns_sealed_and_passthrough() {
     match packer.pack_or_passthrough(unit2).unwrap() {
         PackResult::SealedSlot(sealed) => {
             assert_eq!(sealed.fragments.len(), 1);
-            assert_eq!(sealed.fragments[0].unit.compressed_data.len(), 500);
+            assert_eq!(sealed.fragments[0].unit.payload_len(), 500);
         }
         _ => panic!("expected SealedSlot"),
     }
@@ -230,9 +230,9 @@ fn alloc_failure_after_seal_returns_sealed_and_passthrough() {
         PackResult::SealedSlotAndPassthrough(sealed, passthrough_unit) => {
             // Sealed slot contains unit2
             assert_eq!(sealed.fragments.len(), 1);
-            assert_eq!(sealed.fragments[0].unit.compressed_data.len(), 4000);
+            assert_eq!(sealed.fragments[0].unit.payload_len(), 4000);
             // Passthrough unit is unit3
-            assert_eq!(passthrough_unit.compressed_data.len(), 3500);
+            assert_eq!(passthrough_unit.payload_len(), 3500);
             assert_eq!(passthrough_unit.start_lba, Lba(2));
         }
         other => panic!(
@@ -257,12 +257,12 @@ fn sealed_slot_data_integrity() {
 
     // Use distinct data patterns to verify correct placement
     let mut unit1 = make_unit("vol-a", 0, 1, 100);
-    unit1.compressed_data = vec![0x11; 100];
-    unit1.crc32 = crc32fast::hash(&unit1.compressed_data);
+    unit1.payload = CompressedPayload::Contiguous(vec![0x11; 100]);
+    unit1.crc32 = crc32fast::hash(&unit1.materialize_payload());
 
     let mut unit2 = make_unit("vol-a", 1, 1, 200);
-    unit2.compressed_data = vec![0x22; 200];
-    unit2.crc32 = crc32fast::hash(&unit2.compressed_data);
+    unit2.payload = CompressedPayload::Contiguous(vec![0x22; 200]);
+    unit2.crc32 = crc32fast::hash(&unit2.materialize_payload());
 
     packer.pack_or_passthrough(unit1).unwrap();
     packer.pack_or_passthrough(unit2).unwrap();

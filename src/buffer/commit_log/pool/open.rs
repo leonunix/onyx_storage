@@ -230,15 +230,17 @@ impl WriteBufferPool {
             .map(|_| Arc::new(Lv2DurabilityWaiter::new(0)))
             .collect();
 
-        // Ready channels live up here so we can hand clones to each shard
-        // before recovery — appenders publish ready seqs through them, and
-        // we still need to feed any crash-recovered seqs into the channels
-        // post-open below.
-        let (ready_tx, ready_rx) = unbounded();
+        // Ready channels are lossy wake hints, not the authoritative work
+        // queue. Durable pending_entries + pending_seqs hold every seq until
+        // apply, so bounding these channels prevents a residence window from
+        // accumulating one duplicate notification per foreground append.
+        // Keep a modest global compatibility/debug stream; the per-shard
+        // flusher wake channel needs only one outstanding hint.
+        let (ready_tx, ready_rx) = bounded(1024);
         let mut shard_ready_txs_for_open = Vec::with_capacity(shard_count);
         let mut shard_ready_rxs_for_pool = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            let (tx, rx) = unbounded();
+            let (tx, rx) = bounded(1);
             shard_ready_txs_for_open.push(tx);
             shard_ready_rxs_for_pool.push(rx);
         }
@@ -344,8 +346,8 @@ impl WriteBufferPool {
                 .collect();
             recovered_seqs.sort_unstable();
             for seq in recovered_seqs {
-                let _ = ready_tx.send(seq);
-                let _ = shard_ready_tx_for_loop.send(seq);
+                let _ = ready_tx.try_send(seq);
+                let _ = shard_ready_tx_for_loop.try_send(seq);
             }
             max_seq = max_seq.max(shard_max_seq);
 

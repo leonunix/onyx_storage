@@ -960,16 +960,22 @@ impl WriteBufferPool {
         struct WrittenBatch {
             member_idx: usize,
             all: Vec<StagedEntry>,
+            max_seq: u64,
+            checkpoint: Option<AlignedBuf>,
             started: Instant,
         }
 
         let queue_depth = members.len().max(1);
+        // Four lanes overlap root writes while the device-wide durability
+        // coordinator publishes completed epochs. The group-commit wait lives
+        // only here (not in shard preparation or the coordinator), so each
+        // request pays one window rather than three.
         let write_lane_count = members.len().min(4).max(1);
         let write_lanes: Vec<_> = (0..write_lane_count)
             .map(|_| bounded::<PreparedBatch>(queue_depth))
             .collect();
         let member_bases = Arc::new(members.iter().map(|member| member.0).collect::<Vec<_>>());
-        let (written_tx, written_rx) = bounded::<WrittenBatch>(queue_depth);
+        let (written_tx, written_rx) = bounded::<Vec<WrittenBatch>>(queue_depth);
         thread::scope(|scope| {
             for (member_idx, (_, shard, wake_rx)) in members.iter().enumerate() {
                 let tx = write_lanes[member_idx % write_lane_count].0.clone();
@@ -996,14 +1002,11 @@ impl WriteBufferPool {
                             }
                         }
                         while wake_rx.try_recv().is_ok() {}
-                        // Let this shard accumulate a contiguous run before
-                        // encoding. The workers run in parallel, so this wait
-                        // overlaps sibling preparation and the prior epoch's
-                        // root write/flush instead of serializing all shards.
-                        if !group_commit_wait.is_zero() {
-                            thread::sleep(group_commit_wait);
-                            while wake_rx.try_recv().is_ok() {}
-                        }
+                        // Do not spend the group-commit window here. The four
+                        // write lanes below provide the one intentional
+                        // coalescing point across shards; waiting at prepare,
+                        // write, and flush used to charge the foreground ack
+                        // path the same window three times.
                         let started = Instant::now();
                         let all = shard.drain_staged_limited();
                         if all.is_empty() {
@@ -1081,8 +1084,9 @@ impl WriteBufferPool {
                     );
                     while let Ok(first) = lane_rx.recv() {
                         let mut prepared = vec![first];
+                        let collect_started = Instant::now();
                         if !group_commit_wait.is_zero() {
-                            let deadline = Instant::now() + group_commit_wait;
+                            let deadline = collect_started + group_commit_wait;
                             loop {
                                 let now = Instant::now();
                                 if now >= deadline {
@@ -1094,6 +1098,12 @@ impl WriteBufferPool {
                                     Err(RecvTimeoutError::Disconnected) => break,
                                 }
                             }
+                        }
+                        if let Some(metrics) = metrics.get() {
+                            BufferShard::record_metric(
+                                &metrics.buffer_sync_sleep_ns,
+                                collect_started,
+                            );
                         }
                         while let Ok(batch) = lane_rx.try_recv() {
                             prepared.push(batch);
@@ -1111,28 +1121,19 @@ impl WriteBufferPool {
                                     )
                                 }));
                             }
-                            // Multiple prepared batches from one shard can share
-                            // a lane. Only its newest recovery hint is useful and
-                            // avoids overlapping writes in the mirror batch.
-                            for (idx, batch) in prepared.iter().enumerate() {
-                                let newer_same_shard = prepared[idx + 1..]
-                                    .iter()
-                                    .any(|later| later.member_idx == batch.member_idx);
-                                if newer_same_shard {
-                                    continue;
-                                }
-                                if let Some(buf) = batch.checkpoint.as_ref() {
-                                    ops.push((
-                                        COMMIT_LOG_SUPERBLOCK_SIZE
-                                            + batch.member_idx as u64 * SHARD_CHECKPOINT_SIZE,
-                                        &buf.as_slice()[..SHARD_CHECKPOINT_SIZE as usize],
-                                    ));
-                                }
-                            }
-
                             let write_started = Instant::now();
                             match root_device.write_many_at(&ops) {
                                 Ok(()) => {
+                                    let write_elapsed = write_started.elapsed();
+                                    if write_elapsed >= Duration::from_millis(10) {
+                                        tracing::warn!(
+                                            lane_idx,
+                                            prepared_batches = prepared.len(),
+                                            ops = ops.len(),
+                                            elapsed_us = write_elapsed.as_micros() as u64,
+                                            "slow LV2 global root write"
+                                        );
+                                    }
                                     if let Some(metrics) = metrics.get() {
                                         BufferShard::record_metric(
                                             &metrics.buffer_append_log_write_ns,
@@ -1154,17 +1155,26 @@ impl WriteBufferPool {
                             }
                         }
 
-                        for batch in prepared {
-                            if written_tx
-                                .send(WrittenBatch {
+                        let written = prepared
+                            .into_iter()
+                            .map(|batch| {
+                                let max_seq = batch
+                                    .all
+                                    .iter()
+                                    .map(|entry| entry.pending.seq)
+                                    .max()
+                                    .unwrap_or(0);
+                                WrittenBatch {
                                     member_idx: batch.member_idx,
                                     all: batch.all,
+                                    max_seq,
+                                    checkpoint: batch.checkpoint,
                                     started: batch.started,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
+                                }
+                            })
+                            .collect();
+                        if written_tx.send(written).is_err() {
+                            return;
                         }
                     }
                 });
@@ -1172,41 +1182,103 @@ impl WriteBufferPool {
             drop(written_tx);
 
             let mut consecutive_failures = 0u32;
-            while let Ok(first) = written_rx.recv() {
-                let mut batches = vec![first];
-                if !group_commit_wait.is_zero() {
-                    let collect_started = Instant::now();
-                    let deadline = collect_started + group_commit_wait;
-                    loop {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            break;
-                        }
-                        match written_rx.recv_timeout(deadline - now) {
-                            Ok(batch) => batches.push(batch),
-                            Err(RecvTimeoutError::Timeout) => break,
-                            Err(RecvTimeoutError::Disconnected) => break,
-                        }
-                    }
-                    if let Some(metrics) = metrics.get() {
-                        BufferShard::record_metric(&metrics.buffer_sync_sleep_ns, collect_started);
-                    }
-                }
-                while let Ok(batch) = written_rx.try_recv() {
-                    batches.push(batch);
+            while let Ok(mut batches) = written_rx.recv() {
+                // A lane already formed the complete durability epoch for its
+                // root write. Drain any sibling epochs that finished in the
+                // meantime, then publish the shared barrier immediately.
+                while let Ok(epoch) = written_rx.try_recv() {
+                    batches.extend(epoch);
                 }
 
+                let epoch_started = batches
+                    .iter()
+                    .map(|batch| batch.started)
+                    .min()
+                    .expect("durability epoch has at least one batch");
+                let epoch_entries = batches.iter().map(|batch| batch.all.len()).sum::<usize>();
+
                 loop {
-                    // All writes in `batches` completed before they entered the
-                    // channel. A device-wide flush now makes that whole prefix
-                    // durable. Workers may issue later writes concurrently;
-                    // those remain unacknowledged until a subsequent flush.
+                    // Checkpoint pages all live in the first 128 KiB LV2
+                    // stripe. Writing one from every payload lane made the
+                    // lanes contend on the same chunklet range + stripe locks,
+                    // serialising otherwise-disjoint ring writes. Select the
+                    // newest hint per shard and write the compact checkpoint
+                    // set once, after all payload writes in this epoch landed.
+                    let mut latest_checkpoints: Vec<Option<(u64, &AlignedBuf)>> =
+                        (0..members.len()).map(|_| None).collect();
+                    for batch in &batches {
+                        let Some(checkpoint) = batch.checkpoint.as_ref() else {
+                            continue;
+                        };
+                        let slot = &mut latest_checkpoints[batch.member_idx];
+                        if slot
+                            .as_ref()
+                            .is_none_or(|(max_seq, _)| batch.max_seq >= *max_seq)
+                        {
+                            *slot = Some((batch.max_seq, checkpoint));
+                        }
+                    }
+                    let checkpoint_ops: Vec<(u64, &[u8])> = latest_checkpoints
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(member_idx, checkpoint)| {
+                            checkpoint.as_ref().map(|(_, buf)| {
+                                (
+                                    COMMIT_LOG_SUPERBLOCK_SIZE
+                                        + member_idx as u64 * SHARD_CHECKPOINT_SIZE,
+                                    &buf.as_slice()[..SHARD_CHECKPOINT_SIZE as usize],
+                                )
+                            })
+                        })
+                        .collect();
+                    let checkpoint_started = Instant::now();
+                    let checkpoint_result = if checkpoint_ops.is_empty() {
+                        Ok(())
+                    } else {
+                        root_device.write_many_at(&checkpoint_ops)
+                    };
+                    if let Err(err) = checkpoint_result {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        tracing::warn!(
+                            error = %err,
+                            consecutive_failures,
+                            checkpoint_pages = checkpoint_ops.len(),
+                            "global persistent slot checkpoint write failed; retrying epoch"
+                        );
+                        thread::sleep(Self::sync_retry_backoff(consecutive_failures));
+                        continue;
+                    }
+                    if let Some(metrics) = metrics.get() {
+                        BufferShard::record_metric(
+                            &metrics.buffer_append_log_write_ns,
+                            checkpoint_started,
+                        );
+                    }
+
+                    // All payload and checkpoint writes in `batches` completed.
+                    // A device-wide flush now makes that whole prefix durable.
+                    // Workers may issue later writes concurrently; those remain
+                    // unacknowledged until a subsequent flush.
+                    let flush_started = Instant::now();
                     let result = Self::sync_device_impl(root_device.as_ref());
+                    let flush_elapsed = flush_started.elapsed();
                     match result {
                         Ok(()) => {
                             consecutive_failures = 0;
                             if let Some(metrics) = metrics.get() {
                                 metrics.buffer_sync_flushes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let epoch_elapsed = epoch_started.elapsed();
+                            if flush_elapsed >= Duration::from_millis(10)
+                                || epoch_elapsed >= Duration::from_millis(10)
+                            {
+                                tracing::warn!(
+                                    shard_batches = batches.len(),
+                                    entries = epoch_entries,
+                                    flush_us = flush_elapsed.as_micros() as u64,
+                                    epoch_us = epoch_elapsed.as_micros() as u64,
+                                    "slow LV2 global durability epoch"
+                                );
                             }
                             break;
                         }

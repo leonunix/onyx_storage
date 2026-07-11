@@ -72,7 +72,7 @@ impl Packer {
 
     /// Try to pack a compressed unit into the current open slot.
     pub fn pack_or_passthrough(&mut self, unit: CompressedUnit) -> OnyxResult<PackResult> {
-        let frag_size = unit.compressed_data.len();
+        let frag_size = unit.payload_len();
 
         // Large units bypass packing entirely
         if frag_size >= BLOCK_SIZE as usize {
@@ -86,8 +86,7 @@ impl Packer {
             if slot.used + frag_size_u16 <= BLOCK_SIZE as u16 {
                 let slot = self.open_slot.as_mut().unwrap();
                 let offset = slot.used;
-                slot.data[offset as usize..offset as usize + frag_size]
-                    .copy_from_slice(&unit.compressed_data);
+                unit.copy_payload_to(&mut slot.data[offset as usize..offset as usize + frag_size]);
                 slot.used += frag_size_u16;
                 slot.fragments.push(SlotFragment {
                     unit,
@@ -162,9 +161,9 @@ impl Packer {
     }
 
     fn place_into_new_slot(&mut self, unit: CompressedUnit, pba: Pba) {
-        let frag_size = unit.compressed_data.len();
+        let frag_size = unit.payload_len();
         let mut data = vec![0u8; BLOCK_SIZE as usize];
-        data[..frag_size].copy_from_slice(&unit.compressed_data);
+        unit.copy_payload_to(&mut data[..frag_size]);
         let frag_size_u16 = frag_size as u16;
 
         self.open_slot = Some(OpenSlot {

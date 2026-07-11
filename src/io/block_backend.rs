@@ -30,7 +30,7 @@
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use onyx_chunklet::ld::LogicalDisk;
@@ -463,20 +463,46 @@ impl ChunkletBackend {
     /// from spinning on a stale handle after a disk pull bumps the LD epoch.
     fn with_stale_retry<T>(
         &self,
+        operation: &'static str,
         mut op: impl FnMut(&Arc<dyn LogicalDisk>) -> Result<T, ChunkletError>,
     ) -> OnyxResult<T> {
+        let total_started = Instant::now();
+        let mut load_elapsed = Duration::ZERO;
+        let mut operation_elapsed = Duration::ZERO;
+        let mut refresh_elapsed = Duration::ZERO;
         let mut refreshes = 0u32;
         loop {
+            let load_started = Instant::now();
             let guard = self.ld.load();
+            load_elapsed += load_started.elapsed();
             let ld: &Arc<dyn LogicalDisk> = &guard;
-            match op(ld) {
-                Ok(v) => return Ok(v),
+            let operation_started = Instant::now();
+            let result = op(ld);
+            operation_elapsed += operation_started.elapsed();
+            match result {
+                Ok(v) => {
+                    let total_elapsed = total_started.elapsed();
+                    if total_elapsed >= Duration::from_millis(10) {
+                        tracing::warn!(
+                            operation,
+                            ld = %ld.id(),
+                            refreshes,
+                            load_us = load_elapsed.as_micros() as u64,
+                            operation_us = operation_elapsed.as_micros() as u64,
+                            refresh_us = refresh_elapsed.as_micros() as u64,
+                            total_us = total_elapsed.as_micros() as u64,
+                            "slow chunklet backend operation"
+                        );
+                    }
+                    return Ok(v);
+                }
                 Err(err) => {
                     if Self::is_epoch_advanced(&err)
                         && self.pool.is_some()
                         && refreshes < Self::MAX_STALE_REFRESH
                     {
                         refreshes += 1;
+                        let refresh_started = Instant::now();
                         // Back off only AFTER the first refresh: a single
                         // failover bump has already settled, so the common case
                         // pays no sleep. Repeated staleness (an in-flight
@@ -486,7 +512,22 @@ impl ChunkletBackend {
                             std::thread::sleep(Duration::from_millis(u64::from(refreshes).min(8)));
                         }
                         self.reopen_after_stale(ld)?;
+                        refresh_elapsed += refresh_started.elapsed();
                         continue;
+                    }
+                    let total_elapsed = total_started.elapsed();
+                    if total_elapsed >= Duration::from_millis(10) {
+                        tracing::warn!(
+                            operation,
+                            ld = %ld.id(),
+                            refreshes,
+                            load_us = load_elapsed.as_micros() as u64,
+                            operation_us = operation_elapsed.as_micros() as u64,
+                            refresh_us = refresh_elapsed.as_micros() as u64,
+                            total_us = total_elapsed.as_micros() as u64,
+                            error = %err,
+                            "slow failed chunklet backend operation"
+                        );
                     }
                     return Err(err.into());
                 }
@@ -498,24 +539,24 @@ impl ChunkletBackend {
 impl BlockBackend for ChunkletBackend {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> OnyxResult<()> {
         // chunklet's argument order is (offset, buf); ours is (buf, offset).
-        self.with_stale_retry(|ld| ld.read_at(offset, buf))
+        self.with_stale_retry("read_at", |ld| ld.read_at(offset, buf))
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
-        self.with_stale_retry(|ld| ld.write_at(offset, buf))
+        self.with_stale_retry("write_at", |ld| ld.write_at(offset, buf))
     }
 
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> OnyxResult<()> {
         // Signature matches chunklet's `LogicalDisk::read_many_at` exactly.
-        self.with_stale_retry(|ld| ld.read_many_at(ops))
+        self.with_stale_retry("read_many_at", |ld| ld.read_many_at(ops))
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> OnyxResult<()> {
-        self.with_stale_retry(|ld| ld.write_many_at(ops))
+        self.with_stale_retry("write_many_at", |ld| ld.write_many_at(ops))
     }
 
     fn flush(&self) -> OnyxResult<()> {
-        self.with_stale_retry(|ld| ld.flush())
+        self.with_stale_retry("flush", |ld| ld.flush())
     }
 
     fn size(&self) -> u64 {

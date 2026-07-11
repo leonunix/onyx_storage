@@ -1074,7 +1074,7 @@ impl BufferFlusher {
         metrics: &EngineMetrics,
     ) -> bool {
         let PreparedDedupUnit {
-            unit,
+            mut unit,
             is_hit,
             all_hashes,
             stale_index_repairs,
@@ -1124,6 +1124,37 @@ impl BufferFlusher {
         }
         if let Some(start) = miss_start {
             miss_ranges.push((start, is_hit.len()));
+        }
+
+        // The overwhelmingly common random-write case is one unsplit all-miss
+        // unit. Wrapping it in a one-count DedupCompletion adds an unnecessary
+        // second completion protocol between writer and coalescer. More
+        // importantly, a lost/duplicated wrapper decrement can leave the
+        // original buffer seq permanently in-flight even though LV3 and
+        // metadb have both committed it. Preserve the normal direct done_tx
+        // semantics whenever dedup did not actually split the unit.
+        if completed_indices.is_empty()
+            && miss_ranges.len() == 1
+            && miss_ranges[0] == (0, is_hit.len())
+        {
+            unit.block_hashes = Some(all_hashes);
+            unit.dedup_stale_repairs = if stale_index_repairs.iter().any(Option::is_some) {
+                Some(stale_index_repairs)
+            } else {
+                None
+            };
+            let len_before = miss_tx.len();
+            let started = Instant::now();
+            let result = miss_tx.send(unit);
+            Self::record_stage_send(
+                &metrics.flush_stage_dedup_send_ns,
+                &metrics.flush_stage_dedup_send_ops,
+                &metrics.flush_stage_dedup_send_len_sum,
+                &metrics.flush_stage_dedup_send_len_max,
+                started,
+                len_before,
+            );
+            return result.is_ok();
         }
 
         let all_seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();

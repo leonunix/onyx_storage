@@ -1270,6 +1270,88 @@ fn head_pending_stuck_skips_stale_pending_seqs_entries() {
     assert_eq!(oldest[0].seq, seq_live);
 }
 
+#[test]
+fn oldest_pending_arcs_walks_and_prunes_stale_prefix_beyond_scan_window() {
+    let slot = BufferShard::slot_size();
+    let (pool, _tmp) = create_pool(
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE + 256 * slot,
+        Duration::from_millis(1),
+    );
+    let shard = &pool.shards[0].shard;
+    let mut seqs = Vec::new();
+
+    for lba in 0..97 {
+        seqs.push(
+            pool.append("test-vol", Lba(lba), 1, &[0xCD; BLOCK_SIZE as usize], 0)
+                .unwrap(),
+        );
+    }
+
+    // Model a stale index prefix longer than the cursor's minimum 64-entry
+    // scan window. The final seq remains live and must still be returned.
+    for seq in &seqs[..96] {
+        shard.pending_entries.remove(seq);
+    }
+    let live_seq = *seqs.last().unwrap();
+    shard
+        .lv2_durability
+        .synced_seq
+        .store(live_seq, std::sync::atomic::Ordering::Release);
+
+    let oldest = shard.oldest_pending_arcs(1);
+    assert_eq!(oldest.len(), 1);
+    assert_eq!(oldest[0].seq, live_seq);
+
+    let indexed: Vec<u64> = shard.ring.lock().pending_seqs.iter().copied().collect();
+    assert_eq!(indexed, vec![live_seq], "stale prefix must be pruned");
+}
+
+#[test]
+fn oldest_pending_arcs_byte_budget_stops_after_covering_window() {
+    let slot = BufferShard::slot_size();
+    let (pool, _tmp) = create_pool(
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE + 64 * slot,
+        Duration::from_millis(1),
+    );
+    let shard = &pool.shards[0].shard;
+    let payload = vec![0x5A; 4 * BLOCK_SIZE as usize];
+    let mut seqs = Vec::new();
+    for i in 0..3 {
+        seqs.push(pool.append("test-vol", Lba(i * 4), 4, &payload, 0).unwrap());
+    }
+
+    let snapshot = shard.oldest_pending_arcs_with_budget(100, 5 * BLOCK_SIZE as usize);
+    assert_eq!(snapshot.len(), 2);
+    assert_eq!(snapshot[0].seq, seqs[0]);
+    assert_eq!(snapshot[1].seq, seqs[1]);
+}
+
+#[test]
+fn shard_ready_channel_coalesces_wakes_without_hiding_pending_entries() {
+    let slot = BufferShard::slot_size();
+    let (pool, _tmp) = create_pool(
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE + 64 * slot,
+        Duration::from_millis(1),
+    );
+    for i in 0..8 {
+        pool.append("test-vol", Lba(i), 1, &[0xA5; BLOCK_SIZE as usize], 0)
+            .unwrap();
+    }
+
+    assert_eq!(pool.shard_ready_rxs[0].len(), 1);
+    assert_eq!(pool.oldest_ready_pending_arcs_for_shard(0, 16).len(), 8);
+}
+
+#[test]
+fn ring_reservation_does_not_publish_pending_seq_before_entry_exists() {
+    let mut ring = make_ring(128);
+    assert_eq!(BufferShard::reserve_log_space(&mut ring, 42, 1), Some(0));
+    assert!(
+        !ring.pending_seqs.contains(&42),
+        "reservation must not expose a seq before pending_entries insertion"
+    );
+}
+
 // ── Lv2DurabilityWaiter targeted-wakeup tests ────────────────────────────
 // The waiter wakes only the appenders whose seq is now durable; later-seq
 // waiters stay parked. These guard the durability/lost-wakeup invariants the

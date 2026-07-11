@@ -13,6 +13,7 @@ use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 /// Number of blocks to refill a lane cache from the global free list at once.
 const LANE_CACHE_REFILL_SIZE: u32 = 256;
 /// Number of blocks to reserve for each lane's contiguous extent cache.
+///
 /// Raw passthrough flushes commonly allocate 4-8 contiguous blocks per unit;
 /// serving those from a lane-local slice avoids hammering the global BTreeSet.
 const LANE_EXTENT_CACHE_REFILL_BLOCKS: u32 = 8192;

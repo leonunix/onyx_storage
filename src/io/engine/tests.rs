@@ -224,6 +224,78 @@ fn chunklet_batch_uses_one_write_many_slab_and_records_depth() {
 }
 
 #[test]
+fn chunklet_owned_batch_writes_aligned_buffers_without_repacking() {
+    let backend = Arc::new(BatchMock {
+        write_many_calls: std::sync::atomic::AtomicUsize::new(0),
+        write_many_ops: std::sync::atomic::AtomicUsize::new(0),
+        write_many_max_ops: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metrics = Arc::new(EngineMetrics::default());
+    let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
+    let mut writes = Vec::new();
+    for idx in 0..3 {
+        let mut buffer = engine.allocate_owned_write_buffer(4096).unwrap();
+        buffer.as_mut_slice().fill((idx + 1) as u8);
+        writes.push(OwnedLvWrite {
+            pba: Pba(idx),
+            payload_len: if idx == 1 { 3000 } else { 4096 },
+            buffer,
+        });
+    }
+
+    let results = engine
+        .submit_owned_write_batch_on(None, writes, false)
+        .unwrap();
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(backend.write_many_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.write_many_ops.load(Ordering::Relaxed), 3);
+    assert_eq!(metrics.lv3_write_slab_allocs.load(Ordering::Relaxed), 3);
+    assert_eq!(metrics.lv3_write_slab_bytes.load(Ordering::Relaxed), 12288);
+}
+
+#[test]
+fn chunklet_owned_batch_splits_oversized_request_across_executors() {
+    const WRITE_COUNT: u64 = CHUNKLET_BATCH_TARGET_BYTES as u64 / BLOCK_SIZE as u64 + 1;
+    let backend = Arc::new(BatchMock {
+        write_many_calls: std::sync::atomic::AtomicUsize::new(0),
+        write_many_ops: std::sync::atomic::AtomicUsize::new(0),
+        write_many_max_ops: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metrics = Arc::new(EngineMetrics::default());
+    let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
+    let mut writes = Vec::new();
+    for idx in 0..WRITE_COUNT {
+        let mut buffer = engine
+            .allocate_owned_write_buffer(BLOCK_SIZE as usize)
+            .unwrap();
+        buffer.as_mut_slice().fill(idx as u8);
+        writes.push(OwnedLvWrite {
+            pba: Pba(idx),
+            payload_len: BLOCK_SIZE as usize,
+            buffer,
+        });
+    }
+
+    let results = engine
+        .submit_owned_write_batch_on(None, writes, false)
+        .unwrap();
+
+    assert_eq!(results.len(), WRITE_COUNT as usize);
+    assert_eq!(
+        backend.write_many_ops.load(Ordering::Relaxed),
+        WRITE_COUNT as usize
+    );
+    assert_eq!(backend.write_many_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        backend.write_many_max_ops.load(Ordering::Relaxed),
+        (WRITE_COUNT - 1) as usize
+    );
+    assert_eq!(metrics.lv3_write_batch_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(metrics.lv3_write_batch_inflight.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn chunklet_batcher_combines_concurrent_callers() {
     let backend = Arc::new(BatchMock {
         write_many_calls: std::sync::atomic::AtomicUsize::new(0),

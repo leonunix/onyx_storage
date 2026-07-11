@@ -151,7 +151,7 @@ impl BufferFlusher {
                             let blockmap = BlockmapValue {
                                 pba: job.sealed.pba,
                                 compression: unit.compression,
-                                unit_compressed_size: unit.compressed_data.len() as u32,
+                                unit_compressed_size: unit.payload_len() as u32,
                                 unit_original_size: unit.original_size,
                                 unit_lba_count: unit.lba_count as u16,
                                 offset_in_unit: pos as u16,

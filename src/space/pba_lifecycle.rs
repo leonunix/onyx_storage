@@ -172,10 +172,13 @@ impl PbaLifecycle {
         if extents.is_empty() {
             return;
         }
-        // Candidate eviction MUST precede the allocator handoff.
-        for &extent in extents {
-            self.evict_candidates(extent);
-        }
+        // Candidate eviction MUST precede the allocator handoff. Batch the
+        // reverse-cache probes and LRU locks across the whole cleanup wave.
+        self.candidate.remove_by_pbas(
+            extents.iter().flat_map(|extent| {
+                (0..extent.count).map(|off| Pba(extent.start.0 + u64::from(off)))
+            }),
+        );
         let (total_newly, failed) = self.allocator.retire_extents_batch(extents, Instant::now());
         if total_newly > 0 {
             self.metrics

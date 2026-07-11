@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 use crate::affinity::{self, ThreadRole};
-use crate::buffer::pipeline::{coalesce_pending, CoalesceUnit, CompressedUnit};
+use crate::buffer::pipeline::{
+    coalesce_pending, CoalesceUnit, CompressedPayload, CompressedUnit, RawBlockPayload,
+};
 use crate::buffer::pool::WriteBufferPool;
 use crate::config::FlushConfig;
 use crate::dedup::config::DedupConfig;
@@ -306,6 +308,7 @@ impl Allocation {
 impl BufferFlusher {
     const HEAD_RETRY_AGE_THRESHOLD: Duration = Duration::from_millis(500);
     const COALESCE_READY_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+    const COALESCE_IDLE_READY_WINDOW_BYTES: usize = 256 * 1024 * 1024;
 
     /// compress_workers / dedup.workers are now **per-lane** counts.
     /// No division — each lane gets the configured number of workers.
@@ -324,9 +327,9 @@ impl BufferFlusher {
     fn is_full_raw_unit(unit: &CompressedUnit) -> bool {
         let bs = BLOCK_SIZE as usize;
         unit.compression == 0
-            && unit.compressed_data.len() == unit.original_size as usize
-            && unit.compressed_data.len() == unit.lba_count as usize * bs
-            && unit.compressed_data.len().is_multiple_of(bs)
+            && unit.payload_len() == unit.original_size as usize
+            && unit.payload_len() == unit.lba_count as usize * bs
+            && unit.payload_len().is_multiple_of(bs)
     }
 
     fn blockmap_for_unit_position(
@@ -355,10 +358,7 @@ impl BufferFlusher {
         split_full_raw_unit: bool,
     ) -> BlockmapValue {
         if split_full_raw_unit && slot_offset == 0 && Self::is_full_raw_unit(unit) {
-            let bs = BLOCK_SIZE as usize;
-            let start = position * bs;
-            let end = start + bs;
-            let block = &unit.compressed_data[start..end];
+            let block = unit.payload_block(position);
             return BlockmapValue {
                 pba: Pba(base_pba.0 + position as u64),
                 compression: 0,
@@ -375,7 +375,7 @@ impl BufferFlusher {
         BlockmapValue {
             pba: base_pba,
             compression: unit.compression,
-            unit_compressed_size: unit.compressed_data.len() as u32,
+            unit_compressed_size: unit.payload_len() as u32,
             unit_original_size: unit.original_size,
             unit_lba_count: unit.lba_count as u16,
             offset_in_unit: position as u16,
@@ -520,6 +520,7 @@ impl BufferFlusher {
         queued_bytes: &mut usize,
         new_entries: &mut Vec<Arc<crate::buffer::commit_log::PendingEntry>>,
         metrics: &EngineMetrics,
+        ready_window_bytes: usize,
         skip_fully_superseded: bool,
         write_window: Duration,
         write_window_cutoff: Option<Instant>,
@@ -540,11 +541,10 @@ impl BufferFlusher {
         };
 
         // Recovered or memory-evicted entries have no resident payload and
-        // must progress immediately. Live entries stay in cheap LV2 until the
-        // coalescer freezes an epoch cutoff, then every entry at or before that
-        // cutoff is released as one drain burst. A per-entry `elapsed >= window`
-        // test would merely replay the foreground arrival rate after a delay;
-        // it would not create a write aggregation window.
+        // must progress immediately. Live entries stay in cheap LV2 for the
+        // configured overwrite window, then mature independently. This keeps
+        // the overwrite-absorption benefit without releasing a whole epoch as
+        // a periodic CPU/IO burst that competes with foreground durability.
         if !bypass_write_window
             && !write_window.is_zero()
             && meta.payload.is_some()
@@ -553,12 +553,14 @@ impl BufferFlusher {
             return EnqueuePendingSeq::Skipped(SkipReason::WriteWindow);
         }
 
-        // Fast-path drop: if every LBA in this entry has already been
-        // superseded by a later seq still in the ring, the writer would
-        // discard it at the very end anyway — we just do all the hashing /
-        // compression / dedup_index churn in between for nothing. Retire
-        // this seq now so the ring tail can advance past it.
+        // Live appends record overwritten ranges on the newer PendingEntry;
+        // the LV2 sync coordinator retires those ranges as soon as that newer
+        // entry is durable. Rechecking every LBA here is therefore redundant
+        // for resident entries and turns random-write drain into millions of
+        // contended DashMap lookups. Keep the scan only as a recovery fallback
+        // for payload-less entries reconstructed without superseded_ranges.
         if skip_fully_superseded
+            && meta.payload.is_none()
             && pool.is_entry_fully_superseded(
                 &meta.vol_id,
                 meta.start_lba,
@@ -588,7 +590,7 @@ impl BufferFlusher {
 
         let estimated_bytes = Self::pending_entry_bytes(meta.as_ref());
         if !new_entries.is_empty()
-            && queued_bytes.saturating_add(estimated_bytes) > Self::COALESCE_READY_WINDOW_BYTES
+            && queued_bytes.saturating_add(estimated_bytes) > ready_window_bytes
         {
             return EnqueuePendingSeq::WindowFull;
         }

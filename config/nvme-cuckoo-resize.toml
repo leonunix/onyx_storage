@@ -17,8 +17,7 @@
 #   RUST_LOG=info target/release/onyx-storage -c config/nvme-cuckoo-resize.toml start -v fio-volume
 
 [numa]
-mode = "partition"
-data_nodes = [0, 1]
+mode = "confine"
 home_node = 0
 reserve_cores_per_node = 2
 cold_cache_policy = "auto"
@@ -44,20 +43,20 @@ watchdog_enabled = true
 watchdog_interval_secs = 10
 watchdog_fail_threshold = 3
 auto_failover = true
-# LV3 = RAID6 (6 data + 2 parity), 100 rows, 256 KiB strip. The 1.5 MiB
-# full-stripe write keeps the ten NVMe devices fed even when the cross-lane
-# combiner has only ~64 operations available per device submission.
-lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 100, strip_kib = 256 }
+# LV3 = RAID6 (8 data + 2 parity), 100 rows, 256 KiB strip. Every row uses all
+# ten NVMe devices, avoiding the row-to-row tail variance seen when an 8-wide
+# set rotated across a 10-PD pool. Full-stripe writes are 2 MiB.
+lv3 = { raid = "raid6", set_size = 8, row_size = 1, num_rows = 100, strip_kib = 256 }
 # LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable.
 lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 256, strip_kib = 128 }
 # metadb LD (Phase 3f). RAID10 2x mirror, 32 rows -> ~64 GiB usable (>> the
 # ~2 GiB the largest cuckoo table + L2P/rc need even after several grows).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 128 }
-# Fresh no-migration stack for the 256 KiB LV3-strip A/B (2026-07-11). The
-# previous 64 KiB stack remains allocated and untouched for rollback.
-lv3_ld_id = "c89abc88-ddd5-4a70-b5f5-794489d9e6ed"
-lv2_ld_id = "c0235ebc-2511-4b52-b33b-5ed2944c84e1"
-meta_ld_id = "356ed7f3-37bd-425f-bfe2-9487769e6ca7"
+# Fresh no-migration 10-wide stack for the 2026-07-11 A/B. The prior 8-wide
+# LV3 and its LV2/meta LDs remain allocated and untouched for rollback.
+lv3_ld_id = "5af723d5-b4a9-41d5-a382-1775c8a201b2"
+lv2_ld_id = "9b70b036-9eb3-4b3d-9206-d7b4f4818bcf"
+meta_ld_id = "49464ea3-85ea-4e2a-aca2-b2537c801925"
 
 [meta]
 backend = "chunklet"
@@ -85,6 +84,10 @@ l2p_buffer_hard_entries = 2000000
 l2p_buffer_max_interval_ms = 120000
 rc_authoritative_reclaim = true
 commit_direct_apply_enabled = true
+# Let the flusher issue several already-built metadata transactions before it
+# waits for the oldest apply outcome. The LV2 log remains the durability point;
+# this only overlaps metadb apply latency during background drain.
+commit_deferred_outcomes_enabled = true
 bfg_threads_enabled = true
 parallel_l2p_drain_enabled = false
 l2p_drain_chunk_entries = 4096
@@ -102,7 +105,7 @@ raid_full_stripe_writes = true
 [buffer]
 capacity_mb = 524288
 flush_watermark_pct = 80
-group_commit_wait_us = 1000
+group_commit_wait_us = 100
 shards = 16
 max_memory_mb = 16384
 volatile_memory_mb = 49152
@@ -124,11 +127,11 @@ queue_workers = 16
 
 [flush]
 compress_workers = 2
-# Keep one compression unit at 384 KiB (one quarter of the 1.5 MiB RAID6
+# Keep one compression unit at 512 KiB (one quarter of the 2 MiB RAID6
 # stripe). The writer combines up to four units into full-stripe IO without
-# forcing a foreground 4 KiB read to decompress an entire 1.5 MiB unit.
-coalesce_max_raw_bytes = 393216
-coalesce_max_lbas = 96
+# forcing a foreground 4 KiB read to decompress an entire 2 MiB unit.
+coalesce_max_raw_bytes = 524288
+coalesce_max_lbas = 128
 min_compression_savings_pct = 12
 skip_fully_superseded = true
 # Collapse overwrites in the 512 GiB LV2 before paying LV3 + metadata writes.
@@ -149,6 +152,8 @@ commit_coalesce_lba_budget = 16384
 commit_coalesce_timeout_us = 2000
 packed_commit_try_drain_lba_budget = 150
 writer_read_active_batch_size = 1024
+commit_worker_deferred_outcomes = true
+commit_worker_pipeline_depth = 4
 
 [engine]
 zone_count = 256

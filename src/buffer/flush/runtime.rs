@@ -170,9 +170,8 @@ impl BufferFlusher {
             // coalescer blocked after one eighth of a 512-unit writer batch and
             // fed LV3 in increasingly fragmented waves.
             let upstream_queue_cap = Self::WRITER_BATCH_SIZE.saturating_mul(4);
-            let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(
-                upstream_queue_cap.max(dedup_workers.saturating_mul(32)),
-            );
+            let (dedup_tx, dedup_rx) =
+                bounded::<CoalesceUnit>(upstream_queue_cap.max(dedup_workers.saturating_mul(32)));
             // Stage 1.5 → Stage 2
             let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(
                 upstream_queue_cap.max(compress_workers.saturating_mul(32)),

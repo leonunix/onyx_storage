@@ -50,19 +50,27 @@ impl BufferFlusher {
                         dedup_completion,
                     } = unit;
 
-                    // Phase A: materialise the unit's contiguous bytes.
-                    let raw_build_start = Instant::now();
                     let original_size = raw_blocks.len() * BLOCK_SIZE as usize;
-                    let mut raw_data = Vec::with_capacity(original_size);
-                    for block in &raw_blocks {
-                        raw_data.extend_from_slice(block.bytes());
-                    }
+                    // Phase A/B: materialisation + codec. None retains the
+                    // existing 4 KiB Arc slices and lets the writer copy them
+                    // directly into its final stripe. Codecs still need one
+                    // contiguous source buffer.
+                    let raw_build_start = Instant::now();
+                    let raw_data = if matches!(algo, CompressionAlgo::None) {
+                        None
+                    } else {
+                        let mut raw = Vec::with_capacity(original_size);
+                        for block in &raw_blocks {
+                            raw.extend_from_slice(block.bytes());
+                        }
+                        Some(raw)
+                    };
                     metrics.flush_compress_raw_build_ns.fetch_add(
                         raw_build_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                         Ordering::Relaxed,
                     );
 
-                    // Phase B: codec. We deliberately bypass the
+                    // We deliberately bypass the
                     // `Box<dyn Compressor>` trait + caller-supplied dst
                     // buffer pattern. The trait implementation allocated
                     // a zero-filled `vec![0u8; max_out]` then called
@@ -82,9 +90,13 @@ impl BufferFlusher {
                     // codec's Vec and keeps `raw_data`.
                     let codec_start = Instant::now();
                     let mut compression_bypassed = false;
-                    let (compression_byte, compressed_data) = match algo {
-                        CompressionAlgo::None => (0u8, raw_data),
+                    let (compression_byte, payload) = match algo {
+                        CompressionAlgo::None => (
+                            0u8,
+                            CompressedPayload::RawBlocks(RawBlockPayload::new(raw_blocks)),
+                        ),
                         CompressionAlgo::Lz4 => {
+                            let raw_data = raw_data.expect("LZ4 source must be materialised");
                             let max_out = lz4_flex::block::get_maximum_output_size(original_size);
                             if max_out <= compress_buf.len() {
                                 match lz4_flex::block::compress_into(
@@ -102,11 +114,16 @@ impl BufferFlusher {
                                         // the one alloc we accept on the success
                                         // path. Bypass (incompressible random)
                                         // input doesn't hit this branch.
-                                        (algo.to_u8(), compress_buf[..size].to_vec())
+                                        (
+                                            algo.to_u8(),
+                                            CompressedPayload::Contiguous(
+                                                compress_buf[..size].to_vec(),
+                                            ),
+                                        )
                                     }
                                     _ => {
                                         compression_bypassed = true;
-                                        (0u8, raw_data)
+                                        (0u8, CompressedPayload::Contiguous(raw_data))
                                     }
                                 }
                             } else {
@@ -119,15 +136,16 @@ impl BufferFlusher {
                                     out.len(),
                                     min_compression_savings_pct,
                                 ) {
-                                    (algo.to_u8(), out)
+                                    (algo.to_u8(), CompressedPayload::Contiguous(out))
                                 } else {
                                     compression_bypassed = true;
                                     drop(out);
-                                    (0u8, raw_data)
+                                    (0u8, CompressedPayload::Contiguous(raw_data))
                                 }
                             }
                         }
                         CompressionAlgo::Zstd { level } => {
+                            let raw_data = raw_data.expect("Zstd source must be materialised");
                             match zstd::encode_all(raw_data.as_slice(), level) {
                                 Ok(out)
                                     if Self::compression_saves_enough(
@@ -136,11 +154,11 @@ impl BufferFlusher {
                                         min_compression_savings_pct,
                                     ) =>
                                 {
-                                    (algo.to_u8(), out)
+                                    (algo.to_u8(), CompressedPayload::Contiguous(out))
                                 }
                                 _ => {
                                     compression_bypassed = true;
-                                    (0u8, raw_data)
+                                    (0u8, CompressedPayload::Contiguous(raw_data))
                                 }
                             }
                         }
@@ -156,7 +174,7 @@ impl BufferFlusher {
                         .fetch_add(original_size as u64, Ordering::Relaxed);
                     metrics
                         .compress_output_bytes
-                        .fetch_add(compressed_data.len() as u64, Ordering::Relaxed);
+                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
                     if compression_bypassed {
                         metrics
                             .compress_bypass_units
@@ -169,7 +187,10 @@ impl BufferFlusher {
                     // Phase C: CRC32 over the final compressed (or
                     // bypass-raw) payload.
                     let crc_start = Instant::now();
-                    let crc32 = crc32fast::hash(&compressed_data);
+                    let crc32 = match &payload {
+                        CompressedPayload::Contiguous(data) => crc32fast::hash(data),
+                        CompressedPayload::RawBlocks(data) => data.crc32(),
+                    };
                     metrics.flush_compress_crc_ns.fetch_add(
                         crc_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                         Ordering::Relaxed,
@@ -180,7 +201,7 @@ impl BufferFlusher {
                         start_lba,
                         lba_count,
                         original_size: original_size as u32,
-                        compressed_data,
+                        payload,
                         compression: compression_byte,
                         crc32,
                         vol_created_at,

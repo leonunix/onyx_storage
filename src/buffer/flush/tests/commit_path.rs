@@ -400,7 +400,7 @@ fn passthrough_commit_job_subbatches_above_threshold() {
             start_lba,
             lba_count: lbas_per_unit,
             original_size: BLOCK_SIZE * lbas_per_unit,
-            compressed_data: data.clone(),
+            payload: CompressedPayload::Contiguous(data.clone()),
             compression: 0,
             crc32: crc32fast::hash(&data),
             vol_created_at: 1,

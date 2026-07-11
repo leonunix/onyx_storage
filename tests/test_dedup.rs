@@ -1384,6 +1384,86 @@ fn cold_tail_fold_drain_warms_candidate_from_channel() {
 }
 
 #[test]
+fn cold_tail_fold_drain_skips_stale_mapping_before_lv3_read() {
+    use crossbeam_channel::bounded;
+    use onyx_storage::dedup::ColdTailTarget;
+
+    let (pool, meta, lifecycle, allocator, io_engine, read_pool) = setup_dedup_env_with_read_pool();
+    register_small_volume(&meta, "test-vol", 64);
+
+    let first = vec![0x31; 4096];
+    let second = vec![0x72; 4096];
+    let disabled = DedupConfig {
+        enabled: false,
+        ..dedup_test_config()
+    };
+    let mut flusher = start_flusher_custom(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        disabled.clone(),
+    );
+    pool.append("test-vol", Lba(0), 1, &first, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "initial flush timeout");
+    let stale = meta
+        .get_mapping(&VolumeId("test-vol".into()), Lba(0))
+        .unwrap()
+        .unwrap();
+
+    pool.append("test-vol", Lba(0), 1, &second, 1000).unwrap();
+    assert!(wait_flushed(&pool, 10000), "overwrite flush timeout");
+    flusher.stop();
+    assert_ne!(
+        meta.get_mapping(&VolumeId("test-vol".into()), Lba(0))
+            .unwrap()
+            .unwrap()
+            .pba,
+        stale.pba
+    );
+
+    // Keep the old payload readable so the failure is not masked by CRC: without
+    // pin-then-revalidate the scanner hashes it and warms a candidate for an
+    // L2P target that no longer exists.
+    io_engine.write_blocks(stale.pba, &first).unwrap();
+
+    let (tx, rx) = bounded::<ColdTailTarget>(64);
+    let cold_cfg = DedupConfig {
+        enabled: true,
+        rescan_interval_ms: 20,
+        max_rescan_per_cycle: 0,
+        cold_tail_max_per_cycle: 64,
+        index_scrub_max_per_cycle: 0,
+        ..dedup_test_config()
+    };
+    let (mut scanner, candidate) = start_scanner_with_candidate_read_pool_cold_rx(
+        &pool,
+        &meta,
+        &lifecycle,
+        &allocator,
+        &io_engine,
+        Some(read_pool),
+        Some(rx),
+        None,
+        cold_cfg,
+    );
+    tx.send(ColdTailTarget {
+        vol_id: VolumeId("test-vol".into()),
+        lba: Lba(0),
+        bv: stale,
+    })
+    .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    scanner.stop();
+
+    assert!(
+        !candidate.has_pba(stale.pba),
+        "a stale cold-tail target must be rejected before its recycled PBA is read"
+    );
+}
+
+#[test]
 fn cold_tail_fold_drain_skips_already_warm_target() {
     // The drain rejects targets whose PBA is already in the candidate cache
     // BEFORE spending a read on them (the cheap `has_pba` filter the consumer

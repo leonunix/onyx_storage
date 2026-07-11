@@ -440,7 +440,7 @@ impl BufferFlusher {
             metrics.flush_units_written.fetch_add(1, Ordering::Relaxed);
             metrics
                 .flush_unit_bytes
-                .fetch_add(ucd.unit.compressed_data.len() as u64, Ordering::Relaxed);
+                .fetch_add(ucd.unit.payload_len() as u64, Ordering::Relaxed);
             post_mark_ranges_by_shard
                 .entry(ucd.shard_idx)
                 .or_default()

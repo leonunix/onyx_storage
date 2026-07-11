@@ -26,15 +26,15 @@ impl BufferFlusher {
     /// The NVMe mixed workload exposes metadb's per-commit tail more
     /// sharply than the old 4-lane soak: more buffer shards means more
     /// writer threads, so reducing commit count matters more than keeping
-    /// each writer cycle tiny. 512 keeps per-writer transient memory bounded,
-    /// gives metadb enough work to amortise apply/WAL cost, and produces more
-    /// continuous LV3 waves than the former 1024-unit cap.
+    /// each writer cycle tiny. With owned full-stripe buffers, 1024 keeps
+    /// per-writer transient memory bounded while halving cycle boundaries that
+    /// otherwise emit a padded final stripe and another LV3 batch request.
     ///
     /// Must stay paired with the bounded channel capacities in
     /// [`BufferFlusher::start_with_metrics`] — write_rx in particular
     /// caps at `WRITER_BATCH_SIZE`, so a smaller channel would silently
     /// starve the writer below this batch.
-    pub(super) const WRITER_BATCH_SIZE: usize = 512;
+    pub(super) const WRITER_BATCH_SIZE: usize = 1024;
     /// Foreground reads are latency-sensitive, while flush writes are already
     /// decoupled by LV2. When reads are flowing, cap each writer drain so one
     /// background batch cannot monopolize LV3 IO and metadb apply for hundreds
@@ -49,13 +49,24 @@ impl BufferFlusher {
     /// enough queue depth to amortise one chunklet `write_many_at` call instead
     /// of chasing the compression workers one unit at a time. A direct chunklet
     /// benchmark reaches its efficient regime around 128 random operations.
-    // A mature LV2 epoch already paid the write-window delay. 512 units keep
-    // each shard feeding multiple waves into the global chunklet combiner,
-    // while two typical writer requests still exceed its 12 MiB device-call
-    // target. Smaller 128-unit batches fragmented padding; 1024-unit batches
-    // left the device executors idle between four large per-shard waves.
-    pub(super) const WRITER_BATCH_TARGET_UNITS: usize = Self::WRITER_BATCH_SIZE;
-    pub(super) const WRITER_BATCH_COALESCE: Duration = Duration::from_millis(50);
+    // A mature LV2 epoch already paid the write-window delay. Keep draining up
+    // to 1024 units when they are queued, but stop waiting once 512 are ready.
+    // The 16 MiB coalescer admission window yields ~900 random-write units per
+    // shard on nvme-box; a 1024 target therefore hit the full one-second
+    // coalesce timeout on every cycle and capped idle drain near 240 MiB/s.
+    pub(super) const WRITER_BATCH_TARGET_UNITS: usize = 512;
+    // A mature random-write stream reaches each of 16 shard writers at only
+    // ~1/16 of the device-wide IOPS. At 20k aggregate IOPS the old 50 ms
+    // deadline could collect only ~60 units per shard, fragmenting every
+    // 1024-unit target into tiny LV3 + metadata transactions. These entries
+    // already spent the configured residence window in durable LV2, so wait
+    // up to one second for an efficient batch; reaching the target returns
+    // immediately. The read-active path below keeps its 250 us deadline.
+    pub(super) const WRITER_BATCH_COALESCE: Duration = Duration::from_secs(1);
+    /// Small packed fragments must reach the packer frequently enough for its
+    /// age bound to remain meaningful; the large passthrough path keeps the
+    /// longer batch-coalescing window above.
+    pub(super) const WRITER_PACKED_BATCH_COALESCE: Duration = Duration::from_millis(50);
     /// Foreground reads share LV3 with the flusher. Keep their background
     /// admission window shorter while still avoiding single-digit batches.
     pub(super) const WRITER_READ_ACTIVE_BATCH_TARGET_UNITS: usize = 32;
@@ -169,6 +180,7 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
 
+            let first_is_packable = first.payload_len() < BLOCK_SIZE as usize;
             let read_submit_calls = metrics.read_submit_calls.load(Ordering::Relaxed);
             let read_active = read_submit_calls != last_read_submit_calls;
             last_read_submit_calls = read_submit_calls;
@@ -201,6 +213,8 @@ impl BufferFlusher {
             .min(writer_batch_limit);
             let batch_coalesce = if read_active {
                 Self::WRITER_READ_ACTIVE_BATCH_COALESCE
+            } else if first_is_packable {
+                Self::WRITER_PACKED_BATCH_COALESCE
             } else {
                 Self::WRITER_BATCH_COALESCE
             };

@@ -188,11 +188,6 @@ impl BufferShard {
             disk_offset: offset,
             slot_count,
         });
-        // Track in the pending-only index so coalesce lookups don't
-        // have to scan through already-applied seqs in log_order.
-        // Paired with `note_applied`'s removal; release_below doesn't
-        // need to touch this set (the seq is already absent by then).
-        ring.pending_seqs.insert(seq);
         if was_empty {
             ring.head_became_at = Some(Instant::now());
         }
@@ -763,6 +758,13 @@ impl BufferShard {
             self.pending_bytes
                 .fetch_add(disk_len as u64, Ordering::Relaxed);
         }
+        // Publish to the bounded coalescer index only AFTER pending_entries is
+        // visible. If reserve_log_space inserts first, oldest_pending_arcs can
+        // observe the seq in this window, fail its DashMap lookup, and prune it
+        // as stale. The append then leaves a real durable pending entry that no
+        // bounded retry can ever find. Removal remains paired with
+        // note_applied; release_below does not need to touch this set.
+        self.ring.lock().pending_seqs.insert(seq);
 
         // Account payload bytes toward the in-memory cache budget. LRU
         // eviction (`evict_payload_cache_to_budget`) will strip oldest
@@ -817,13 +819,12 @@ impl BufferShard {
         }
     }
 
-    /// Push the seq onto the flusher's ready channels. Called by the
-    /// appender after `wait_for_durable` returns, so the flusher's
-    /// push-notified path sees only seqs that are already (1) past LV2
-    /// fdatasync and (2) present in `pending_entries`.
+    /// Wake the flusher after this seq becomes durable. These bounded channels
+    /// are hints only: pending_entries + pending_seqs remain authoritative, so
+    /// a full channel may safely coalesce this wakeup with an earlier one.
     pub(super) fn publish_ready(&self, seq: u64) {
-        let _ = self.ready_tx.send(seq);
-        let _ = self.shard_ready_tx.send(seq);
+        let _ = self.ready_tx.try_send(seq);
+        let _ = self.shard_ready_tx.try_send(seq);
     }
 
     /// Drop the indices + cache state for an entry that was inserted but
@@ -988,88 +989,118 @@ impl BufferShard {
     /// path as the largest single contributor (~19 G of 152 G) to the
     /// coalesce thread's CPU; this routine drops it to O(limit).
     ///
-    /// Implementation:
-    ///   1. take the ring lock briefly to copy the `limit * 2` oldest
-    ///      seqs from `log_order` (already in insertion / seq order)
-    ///   2. take the lifecycle lock once to filter inflight in batch
-    ///   3. resolve survivors to `Arc<PendingEntry>` via per-seq
-    ///      DashMap lookup, stopping at `limit` resolved entries
-    ///
-    /// `limit * 2` slack handles entries that fail the readiness
-    /// filter or are missing from `pending_entries` (rare: entry
-    /// retired between log_order capture and DashMap lookup).
+    /// The ordered `pending_seqs` index is scanned with a bounded cursor.
+    /// Each ring-lock hold copies at most twice the remaining result count
+    /// (and at least 64 seqs), then resolves entries outside the lock. Missing
+    /// entries are pruned after the walk, so an arbitrarily long stale prefix
+    /// cannot hide live work or force future calls to rescan it.
     pub(super) fn oldest_pending_arcs(&self, limit: usize) -> Vec<Arc<PendingEntry>> {
-        if limit == 0 || self.pending_count.load(Ordering::Relaxed) == 0 {
+        self.oldest_pending_arcs_with_budget(limit, usize::MAX)
+    }
+
+    /// Byte-bounded oldest-pending snapshot for flusher admission. The entry
+    /// count remains a hard safety cap; `byte_limit` avoids cloning thousands
+    /// of random-write Arcs when a few hundred entries already fill the 16 MiB
+    /// coalesce window.
+    pub(super) fn oldest_pending_arcs_with_budget(
+        &self,
+        limit: usize,
+        byte_limit: usize,
+    ) -> Vec<Arc<PendingEntry>> {
+        if limit == 0 || byte_limit == 0 || self.pending_count.load(Ordering::Relaxed) == 0 {
             return Vec::new();
         }
-        // Snapshot the entire pending index under the ring lock and then
-        // walk it outside. pending_seqs.len() is bounded by the buffer's
-        // pending_count, which backpressure caps well below log_order's
-        // length, so the snapshot stays cheap. A bounded `take(limit*N)`
-        // would have to guess how many stale-front seqs to allow for —
-        // even one regression in a non-mark_applied removal path could
-        // wedge the head behind a tail of stale entries (the cfec549
-        // regression). Walking the full index turns any such regression
-        // into a few wasted DashMap probes, never a permanent stall.
-        let candidates: Vec<u64> = {
-            let ring = self.ring.lock();
-            ring.pending_seqs.iter().copied().collect()
-        };
         let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
         let mut result = Vec::with_capacity(limit);
-        for seq in candidates {
-            if seq > synced {
-                // pending_seqs is ascending — nothing past this point
-                // can be flush-ready either.
+        let mut result_bytes = 0usize;
+        let mut stale = Vec::new();
+        let mut after = None;
+
+        // Copy only a bounded slice of the ordered index at a time. The old
+        // whole-set snapshot made every 16 MiB coalesce admission O(all
+        // pending), which becomes O(n^2) while draining a large residence
+        // window. A cursor also walks past an arbitrarily long stale prefix;
+        // stale seqs are pruned after the DashMap probes, outside its locks.
+        while result.len() < limit {
+            let remaining = limit - result.len();
+            // A byte-budgeted caller usually fills its window long before the
+            // entry cap (random writes average several LBAs per entry). Resolve
+            // the ordered index in small chunks so we do not copy thousands of
+            // seqs under the ring lock only to discard the unused suffix.
+            let scan_limit = if byte_limit == usize::MAX {
+                remaining.saturating_mul(2).max(64)
+            } else {
+                remaining.saturating_mul(2).clamp(64, 256)
+            };
+            let candidates: Vec<u64> = {
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+
+                let ring = self.ring.lock();
+                match after {
+                    Some(seq) => ring
+                        .pending_seqs
+                        .range((Excluded(seq), Included(synced)))
+                        .take(scan_limit)
+                        .copied()
+                        .collect(),
+                    None => ring
+                        .pending_seqs
+                        .range((Unbounded, Included(synced)))
+                        .take(scan_limit)
+                        .copied()
+                        .collect(),
+                }
+            };
+            let Some(last) = candidates.last().copied() else {
+                break;
+            };
+            after = Some(last);
+
+            for seq in candidates {
+                if let Some(entry) = self.pending_entries.get(&seq) {
+                    let entry = entry.value().clone();
+                    result_bytes =
+                        result_bytes.saturating_add(entry.lba_count as usize * BLOCK_SIZE as usize);
+                    result.push(entry);
+                    if result.len() >= limit || result_bytes >= byte_limit {
+                        break;
+                    }
+                } else {
+                    stale.push(seq);
+                }
+            }
+            if result_bytes >= byte_limit {
                 break;
             }
-            if let Some(entry) = self.pending_entries.get(&seq) {
-                result.push(entry.value().clone());
-                if result.len() >= limit {
-                    break;
-                }
+        }
+
+        if !stale.is_empty() {
+            let mut ring = self.ring.lock();
+            for seq in stale {
+                ring.pending_seqs.remove(&seq);
             }
         }
         result
     }
 
     pub(super) fn head_pending_seq_if_stuck(&self, min_age: Duration) -> Option<u64> {
-        if self.pending_count.load(Ordering::Relaxed) == 0 {
-            return None;
-        }
-        // Walk pending_seqs from smallest seq upward. Skip seqs whose
-        // pending_entry has already been retired by a concurrent
-        // mark_applied / free_seq_allocation (the index drop happens
-        // under the ring lock, but pending_entries.remove runs outside
-        // it, so a brief stale-front window is normal). If a non-stale
-        // path EVER leaves stale entries in pending_seqs, this loop
-        // still finds the genuine head — turning a permanent stall
-        // into at most a cheap O(stale) probe per call.
-        let (snapshot, head_became_at) = {
-            let ring = self.ring.lock();
-            (
-                ring.pending_seqs.iter().copied().collect::<Vec<u64>>(),
-                ring.head_became_at,
-            )
-        };
-        let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
-        for seq in snapshot {
-            if seq > synced {
-                // pending_seqs is sorted ascending — everything beyond
-                // is also above the durable watermark.
-                return None;
-            }
-            if self.pending_entries.get(&seq).is_none() {
-                continue;
-            }
-            let old_enough = head_became_at.is_some_and(|ts| ts.elapsed() >= min_age);
-            let has_partial_progress = self.flush_progress.contains_key(&seq);
-            if !has_partial_progress && !old_enough {
-                return None;
-            }
-            return Some(seq);
-        }
-        None
+        // Reuse the bounded ordered-index cursor instead of snapshotting the
+        // entire pending_seqs BTreeSet. This diagnostic runs from every
+        // coalescer iteration; copying a 30-second random-write window here
+        // made an otherwise idle residence window consume multiple CPU cores.
+        // oldest_pending_arcs(1) also walks and prunes a stale prefix while
+        // respecting the LV2 durable watermark.
+        let entry = self.oldest_pending_arcs(1).into_iter().next()?;
+        let seq = entry.seq;
+
+        // This is the logical pending head. Its retry age must not be derived
+        // from RingState::head_became_at: the physical ring head may be an
+        // already-applied entry retained only until the next checkpoint, and
+        // can sit far in front of this seq.
+        let old_enough = entry.enqueued_at.elapsed() >= min_age;
+        drop(entry);
+        let has_partial_progress = self.flush_progress.contains_key(&seq);
+        (has_partial_progress || old_enough).then_some(seq)
     }
 
     /// Cheap, non-hydrating diagnostic snapshot for a given seq. Returns

@@ -28,30 +28,31 @@ static LV3_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 const LV3_WRITE_RECORD_SHARDS: usize = 64;
 static LV3_WRITE_RECORDS: OnceLock<Vec<Mutex<HashMap<u64, Lv3WriteRecord>>>> = OnceLock::new();
 
-// Device efficiency follows submitted bytes, not the number of logical
-// operations. On the 256 KiB-strip RAID6 LD, eight concurrent 12-24 MiB calls
-// sustain ~3.8 GiB/s; making each call larger consumes multiple synchronous
-// writer lanes and reduces device-call concurrency. Target the lower end so 16
-// lanes can keep all eight executors busy.
-const CHUNKLET_BATCH_TARGET_BYTES: usize = 12 * 1024 * 1024;
+// One 8+2 RAID6 full stripe is 2 MiB. Keep each synchronous chunklet call to
+// two stripes so foreground LV2 writes can interleave every ~4 ms instead of
+// sitting behind a 9-10 ms, ~9 MiB background call. A single-stripe quantum
+// capped measured idle drain below 2 GB/s; two stripes amortise the submit
+// overhead while six executor rings retain device concurrency.
+const CHUNKLET_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const CHUNKLET_BATCH_EXECUTORS: usize = 6;
 // Writer lanes arrive a few milliseconds apart after compression/allocation.
 // This is a background-only drain path: waiting here never delays the LV2
 // durable acknowledgement. Keep the cap short because one or two producer
-// slabs are enough to reach the byte target with 1.5 MiB full stripes.
+// slabs are enough to reach the byte target with 2 MiB full stripes.
 const CHUNKLET_BATCH_COALESCE: Duration = Duration::from_millis(2);
 const CHUNKLET_BATCH_QUEUE_CAP: usize = 256;
 
 struct OwnedBatchOp {
     device_offset: u64,
+    slab_index: usize,
     slab_offset: usize,
     len: usize,
 }
 
 struct ChunkletBatchRequest {
-    slab: AlignedBuf,
+    slabs: Vec<AlignedBuf>,
     ops: Vec<OwnedBatchOp>,
-    done: Sender<Result<(), String>>,
+    done: Sender<(Result<(), String>, Vec<AlignedBuf>)>,
 }
 
 struct ChunkletBatchWork {
@@ -60,7 +61,7 @@ struct ChunkletBatchWork {
 
 /// Cross-lane combiner for chunklet writes. Buffer lanes keep preparing data
 /// concurrently, while this layer restores the batch shape that the LD's
-/// thread-local rings need: roughly 12 MiB per call across eight fixed executor
+/// thread-local rings need: one full stripe per call across six fixed executor
 /// threads. Callers remain synchronous and do not publish metadata until their
 /// request's combined device call completes.
 struct ChunkletWriteBatcher {
@@ -88,10 +89,7 @@ impl ChunkletWriteBatcher {
                 std::thread::Builder::new()
                     .name(format!("lv3-batch-exec-{idx}"))
                     .spawn(move || {
-                        crate::affinity::bind_current(
-                            crate::affinity::ThreadRole::Lv3Batch,
-                            idx,
-                        );
+                        crate::affinity::bind_current(crate::affinity::ThreadRole::Lv3Batch, idx);
                         Self::executor_loop(work_rx, device, metrics)
                     })
                     .expect("failed to spawn LV3 batch executor"),
@@ -106,21 +104,69 @@ impl ChunkletWriteBatcher {
         }
     }
 
-    fn submit(&self, slab: AlignedBuf, ops: Vec<OwnedBatchOp>) -> OnyxResult<()> {
+    fn submit(
+        &self,
+        slabs: Vec<AlignedBuf>,
+        ops: Vec<OwnedBatchOp>,
+    ) -> OnyxResult<Vec<AlignedBuf>> {
         let (done_tx, done_rx) = bounded(1);
         self.request_tx
             .as_ref()
             .ok_or_else(|| OnyxError::Io(std::io::Error::other("LV3 batcher stopped")))?
             .send(ChunkletBatchRequest {
-                slab,
+                slabs,
                 ops,
                 done: done_tx,
             })
             .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batcher disconnected")))?;
-        done_rx
+        let (result, slabs) = done_rx
             .recv()
-            .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batch result lost")))?
+            .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batch result lost")))?;
+        result
             .map_err(|message| OnyxError::Io(std::io::Error::other(message)))
+            .map(|()| slabs)
+    }
+
+    /// Queue every request before waiting so an oversized writer cycle can be
+    /// split across all fixed executors instead of monopolising one executor.
+    fn submit_many(
+        &self,
+        requests: Vec<(Vec<AlignedBuf>, Vec<OwnedBatchOp>)>,
+    ) -> OnyxResult<Vec<Vec<AlignedBuf>>> {
+        let request_tx = self
+            .request_tx
+            .as_ref()
+            .ok_or_else(|| OnyxError::Io(std::io::Error::other("LV3 batcher stopped")))?;
+        let mut receivers = Vec::with_capacity(requests.len());
+        for (slabs, ops) in requests {
+            let (done_tx, done_rx) = bounded(1);
+            request_tx
+                .send(ChunkletBatchRequest {
+                    slabs,
+                    ops,
+                    done: done_tx,
+                })
+                .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batcher disconnected")))?;
+            receivers.push(done_rx);
+        }
+
+        let mut returned = Vec::with_capacity(receivers.len());
+        let mut first_error = None;
+        for done_rx in receivers {
+            let (result, slabs) = done_rx
+                .recv()
+                .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batch result lost")))?;
+            if let Err(message) = result {
+                if first_error.is_none() {
+                    first_error = Some(message);
+                }
+            }
+            returned.push(slabs);
+        }
+        if let Some(message) = first_error {
+            return Err(OnyxError::Io(std::io::Error::other(message)));
+        }
+        Ok(returned)
     }
 
     fn aggregate_loop(
@@ -179,7 +225,8 @@ impl ChunkletWriteBatcher {
                     request.ops.iter().map(|op| {
                         (
                             op.device_offset,
-                            &request.slab.as_slice()[op.slab_offset..op.slab_offset + op.len],
+                            &request.slabs[op.slab_index].as_slice()
+                                [op.slab_offset..op.slab_offset + op.len],
                         )
                     })
                 })
@@ -216,12 +263,13 @@ impl ChunkletWriteBatcher {
                     .fetch_sub(1, Ordering::Relaxed);
             }
             drop(write_ops);
-            for request in work.requests {
+            for mut request in work.requests {
                 let reply = match &result {
                     Ok(()) => Ok(()),
                     Err(message) => Err(message.clone()),
                 };
-                let _ = request.done.send(reply);
+                let slabs = std::mem::take(&mut request.slabs);
+                let _ = request.done.send((reply, slabs));
             }
         }
     }
@@ -332,6 +380,14 @@ pub enum LvOp<'a> {
 pub enum LvOpResult {
     Read(OnyxResult<Vec<u8>>),
     Write(OnyxResult<()>),
+}
+
+/// An aligned write buffer whose ownership can cross the global chunklet batch
+/// executor and return to the submitting writer thread for pool reuse.
+pub(crate) struct OwnedLvWrite {
+    pub pba: Pba,
+    pub payload_len: usize,
+    pub buffer: AlignedBuf,
 }
 
 impl IoEngine {
@@ -895,6 +951,111 @@ impl IoEngine {
         }
     }
 
+    pub(crate) fn allocate_owned_write_buffer(&self, size: usize) -> OnyxResult<AlignedBuf> {
+        AlignedBuf::new(size, self.use_hugepages)
+    }
+
+    /// Submit buffers the caller already assembled in O_DIRECT-aligned memory.
+    /// Chunklet transfers ownership through the global combiner and returns the
+    /// buffers to this thread after completion, avoiding a second payload copy
+    /// and preserving the writer thread's local allocation pool. Single-device
+    /// backends retain the existing per-session submission path.
+    pub(crate) fn submit_owned_write_batch_on(
+        &self,
+        session: Option<&Arc<IoUringSession>>,
+        writes: Vec<OwnedLvWrite>,
+        fsync_after: bool,
+    ) -> OnyxResult<Vec<LvOpResult>> {
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.chunklet_write_batcher.is_none() {
+            let ops = writes
+                .iter()
+                .map(|write| LvOp::Write {
+                    pba: write.pba,
+                    payload: &write.buffer.as_slice()[..write.payload_len],
+                })
+                .collect();
+            return self.submit_batch_on(session, ops, fsync_after);
+        }
+
+        let write_count = writes.len();
+        let mut meta_chunks = Vec::new();
+        let mut request_chunks = Vec::new();
+        let mut metas = Vec::new();
+        let mut slabs = Vec::new();
+        let mut ops = Vec::new();
+        let mut chunk_bytes = 0usize;
+        let mut total_bytes = 0usize;
+        for write in writes {
+            if write.payload_len == 0 || write.payload_len > write.buffer.len() {
+                return Err(OnyxError::Config(format!(
+                    "invalid owned LV3 payload length {} for {}-byte buffer",
+                    write.payload_len,
+                    write.buffer.len()
+                )));
+            }
+            let total = write.buffer.len();
+            let device_offset = self.pba_to_offset(write.pba);
+            total_bytes = total_bytes.checked_add(total).ok_or_else(|| {
+                OnyxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "chunklet owned write batch is too large",
+                ))
+            })?;
+            if !slabs.is_empty() && chunk_bytes.saturating_add(total) > CHUNKLET_BATCH_TARGET_BYTES
+            {
+                meta_chunks.push(std::mem::take(&mut metas));
+                request_chunks.push((std::mem::take(&mut slabs), std::mem::take(&mut ops)));
+                chunk_bytes = 0;
+            }
+            let slab_index = slabs.len();
+            metas.push((write.pba, write.payload_len, total));
+            ops.push(OwnedBatchOp {
+                device_offset,
+                slab_index,
+                slab_offset: 0,
+                len: total,
+            });
+            slabs.push(write.buffer);
+            chunk_bytes += total;
+        }
+        if !slabs.is_empty() {
+            meta_chunks.push(metas);
+            request_chunks.push((slabs, ops));
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .lv3_write_slab_allocs
+                .fetch_add(write_count as u64, Ordering::Relaxed);
+            metrics
+                .lv3_write_slab_bytes
+                .fetch_add(total_bytes as u64, Ordering::Relaxed);
+        }
+        let returned_chunks = self
+            .chunklet_write_batcher
+            .as_ref()
+            .expect("checked above")
+            .submit_many(request_chunks)?;
+
+        for (metas, returned) in meta_chunks.iter().zip(returned_chunks.iter()) {
+            for ((pba, payload_len, total), slab) in metas.iter().zip(returned.iter()) {
+                let payload = &slab.as_slice()[..*payload_len];
+                self.verify_write_payload(*pba, payload, *total)?;
+                self.record_lv3_write_trace(*pba, payload, *total);
+                self.record_lv3_write(*total);
+            }
+        }
+        if fsync_after {
+            self.device.flush()?;
+        }
+        Ok((0..write_count)
+            .map(|_| LvOpResult::Write(Ok(())))
+            .collect())
+    }
+
     fn submit_batch_syscall(
         &self,
         ops: Vec<LvOp<'_>>,
@@ -1022,11 +1183,14 @@ impl IoEngine {
                     .iter()
                     .map(|(_, _, offset, slab_offset, total)| OwnedBatchOp {
                         device_offset: *offset,
+                        slab_index: 0,
                         slab_offset: *slab_offset,
                         len: *total,
                     })
                     .collect();
-                batcher.submit(slab, owned_ops)?;
+                let returned = batcher.submit(vec![slab], owned_ops)?;
+                debug_assert_eq!(returned.len(), 1);
+                drop(returned);
             } else {
                 let write_ops: Vec<(u64, &[u8])> = metas
                     .iter()
