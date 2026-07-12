@@ -1390,6 +1390,31 @@ fn durability_waiter_fast_path_when_already_synced() {
 }
 
 #[test]
+fn durability_waiter_channel_fast_path_when_already_synced() {
+    let w = Lv2DurabilityWaiter::new(0);
+    let (tx, rx) = bounded(1);
+    w.advance(10);
+
+    assert!(w.arm_channel(10, &tx));
+    assert!(
+        rx.try_recv().is_err(),
+        "fast path must not queue a stale wake"
+    );
+}
+
+#[test]
+fn durability_waiter_channel_wakes_dispatcher() {
+    let w = Lv2DurabilityWaiter::new(0);
+    let (tx, rx) = bounded(1);
+
+    assert!(!w.arm_channel(7, &tx));
+    w.advance(7);
+
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(w.synced_seq.load(Ordering::Acquire) >= 7);
+}
+
+#[test]
 fn durability_waiter_wakes_parked_appender() {
     let w = Arc::new(Lv2DurabilityWaiter::new(0));
     let w2 = w.clone();
@@ -1473,6 +1498,25 @@ fn durability_waiter_no_lost_wakeup_under_race() {
         waiter.join().unwrap();
         advancer.join().unwrap();
         assert!(w.synced_seq.load(Ordering::Acquire) >= seq);
+    }
+}
+
+#[test]
+fn durability_waiter_channel_has_no_lost_wakeup_under_race() {
+    for _ in 0..200 {
+        let w = Arc::new(Lv2DurabilityWaiter::new(0));
+        let (tx, rx) = bounded(1);
+        let wc = w.clone();
+        let register = std::thread::spawn(move || wc.arm_channel(1, &tx));
+        let wa = w.clone();
+        let advance = std::thread::spawn(move || wa.advance(1));
+
+        let already_durable = register.join().unwrap();
+        advance.join().unwrap();
+        if !already_durable {
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(w.synced_seq.load(Ordering::Acquire) >= 1);
     }
 }
 

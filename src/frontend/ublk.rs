@@ -531,6 +531,8 @@ fn spawn_durability_dispatcher(
     completion_tx: Sender<CompletedIo>,
     event_fd: RawFd,
 ) -> JoinHandle<()> {
+    // Wakes are edge-coalesced: every wake scans all pending durability watermarks.
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
     thread::Builder::new()
         .name(format!("ublk-q{qid}-durable"))
         .spawn(move || {
@@ -540,21 +542,37 @@ fn spawn_durability_dispatcher(
             while input_open || !pending.is_empty() {
                 if pending.is_empty() {
                     match rx.recv() {
-                        Ok(item) => pending.push(item),
+                        Ok(item) => {
+                            for ticket in &item.tickets {
+                                ticket.arm_wakeup(&wake_tx);
+                            }
+                            pending.push(item);
+                        }
                         Err(_) => input_open = false,
                     }
-                } else {
-                    match rx.recv_timeout(std::time::Duration::from_micros(25)) {
-                        Ok(item) => pending.push(item),
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                            input_open = false
-                        }
+                } else if input_open {
+                    crossbeam_channel::select! {
+                        recv(rx) -> result => match result {
+                            Ok(item) => {
+                                for ticket in &item.tickets {
+                                    ticket.arm_wakeup(&wake_tx);
+                                }
+                                pending.push(item);
+                            }
+                            Err(_) => input_open = false,
+                        },
+                        recv(wake_rx) -> _ => {},
                     }
+                } else {
+                    let _ = wake_rx.recv();
                 }
                 while let Ok(item) = rx.try_recv() {
+                    for ticket in &item.tickets {
+                        ticket.arm_wakeup(&wake_tx);
+                    }
                     pending.push(item);
                 }
+                while wake_rx.try_recv().is_ok() {}
 
                 let mut idx = 0;
                 while idx < pending.len() {

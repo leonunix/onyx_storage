@@ -214,7 +214,12 @@ pub(crate) struct Lv2DurabilityWaiter {
 /// One parked appender, tagged with the seq it is waiting for.
 struct SeqWaiter {
     seq: u64,
-    parker: Arc<DurabilityParker>,
+    wake: DurabilityWake,
+}
+
+enum DurabilityWake {
+    Thread(Arc<DurabilityParker>),
+    Channel(Sender<()>),
 }
 
 /// A parked appender's wake handle. `done` is set (Release) before `unpark` so a
@@ -255,7 +260,7 @@ impl Lv2DurabilityWaiter {
             }
             waiters.push(SeqWaiter {
                 seq,
-                parker: parker.clone(),
+                wake: DurabilityWake::Thread(parker.clone()),
             });
         }
         // Park until `advance` unparks us. The re-check defends against a
@@ -279,22 +284,44 @@ impl Lv2DurabilityWaiter {
         }
         // Collect the now-durable waiters under the lock; unpark AFTER releasing
         // it so woken appenders never touch this lock on their way out.
-        let mut wake: Vec<Arc<DurabilityParker>> = Vec::new();
+        let mut wake = Vec::new();
         {
             let mut waiters = self.waiters.lock();
             let mut i = 0;
             while i < waiters.len() {
                 if waiters[i].seq <= max_seq {
-                    wake.push(waiters.swap_remove(i).parker);
+                    wake.push(waiters.swap_remove(i).wake);
                 } else {
                     i += 1;
                 }
             }
         }
-        for parker in wake {
-            parker.done.store(true, Ordering::Release);
-            parker.thread.unpark();
+        for waiter in wake {
+            match waiter {
+                DurabilityWake::Thread(parker) => {
+                    parker.done.store(true, Ordering::Release);
+                    parker.thread.unpark();
+                }
+                DurabilityWake::Channel(tx) => {
+                    let _ = tx.try_send(());
+                }
+            }
         }
+    }
+
+    fn arm_channel(&self, seq: u64, tx: &Sender<()>) -> bool {
+        if self.synced_seq.load(Ordering::Acquire) >= seq {
+            return true;
+        }
+        let mut waiters = self.waiters.lock();
+        if self.synced_seq.load(Ordering::Acquire) >= seq {
+            return true;
+        }
+        waiters.push(SeqWaiter {
+            seq,
+            wake: DurabilityWake::Channel(tx.clone()),
+        });
+        false
     }
 }
 
@@ -638,6 +665,10 @@ impl BufferAppendTicket {
 
     pub fn is_durable(&self) -> bool {
         self.shard.lv2_durability.synced_seq.load(Ordering::Acquire) >= self.seq
+    }
+
+    pub(crate) fn arm_wakeup(&self, tx: &Sender<()>) -> bool {
+        self.shard.lv2_durability.arm_channel(self.seq, tx)
     }
 
     pub fn wait(self) -> u64 {
