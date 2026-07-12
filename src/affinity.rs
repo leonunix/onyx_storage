@@ -60,7 +60,10 @@ enum LayoutKind {
     /// `numactl --cpunodebind`, but it also covers libublk's per-queue
     /// threads because the per-thread `bind_current` runs after libublk's
     /// own affinity call and overrides it.
-    WholeSet(Vec<usize>),
+    ConfineSets {
+        foreground: Vec<usize>,
+        background: Vec<usize>,
+    },
     /// `[numa] mode = "partition"`: sharded roles bind to their shard's pod
     /// (one pod per data node), singletons bind to the home pod. Threads
     /// also set their own memory policy to prefer the pod's node so Tier A
@@ -172,8 +175,11 @@ pub fn init(config: &ThreadingConfig) {
 /// inherit the caller's node-wide mask, which matches the proven
 /// "numactl + threading.enabled=false" profile where metadb runs unpinned
 /// inside the node.
-pub fn init_confine(cpus: Vec<usize>) {
-    let _ = LAYOUT.set(Some(LayoutKind::WholeSet(cpus)));
+pub fn init_confine(foreground: Vec<usize>, background: Vec<usize>) {
+    let _ = LAYOUT.set(Some(LayoutKind::ConfineSets {
+        foreground,
+        background,
+    }));
 }
 
 /// Partition-mode layout (see `PartitionTopo`).
@@ -192,7 +198,13 @@ pub fn bind_current(role: ThreadRole, ordinal: usize) {
             };
             set_current_cpus(&[cpu])
         }
-        LayoutKind::WholeSet(cpus) => set_current_cpus(cpus),
+        LayoutKind::ConfineSets {
+            foreground,
+            background,
+        } => match role {
+            ThreadRole::Ublk | ThreadRole::BufferSync => set_current_cpus(foreground),
+            _ => set_current_cpus(background),
+        },
         LayoutKind::Partition(topo) => {
             let pod = &topo.pods[topo.pod_index(role, ordinal)];
             // Tier A first-touch locality: this thread's future allocations

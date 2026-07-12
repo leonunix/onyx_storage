@@ -122,6 +122,40 @@ impl NumaNode {
             .filter(|c| !reserved.contains(c))
             .collect()
     }
+
+    fn confine_cpu_sets(
+        &self,
+        reserve_cores: usize,
+        foreground_cores: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let engine: std::collections::HashSet<usize> =
+            self.engine_cpus(reserve_cores).into_iter().collect();
+        let available: Vec<&Vec<usize>> = self
+            .cores
+            .iter()
+            .filter(|core| core.iter().any(|cpu| engine.contains(cpu)))
+            .collect();
+        let foreground_count = foreground_cores.min(available.len().saturating_sub(1));
+        if foreground_count == 0 {
+            let cpus: Vec<usize> = engine.iter().copied().collect();
+            return (cpus.clone(), cpus);
+        }
+        let foreground_set: std::collections::HashSet<usize> = available
+            .iter()
+            .take(foreground_count)
+            .flat_map(|core| core.iter().copied())
+            .filter(|cpu| engine.contains(cpu))
+            .collect();
+        let mut foreground: Vec<usize> = foreground_set.iter().copied().collect();
+        let mut background: Vec<usize> = engine
+            .iter()
+            .copied()
+            .filter(|cpu| !foreground_set.contains(cpu))
+            .collect();
+        foreground.sort_unstable();
+        background.sort_unstable();
+        (foreground, background)
+    }
 }
 
 /// Parse a sysfs cpulist like `"0,2,4-6,8\n"`.
@@ -629,7 +663,7 @@ fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResu
         dedup_shard_pods: vec![home_pod; meta_dedup],
     });
 
-    spawn_confine_enforcer(all_cpus.clone());
+    spawn_confine_enforcer(all_cpus.clone(), all_cpus.clone());
     tracing::info!(
         data_nodes = ?data_nodes,
         home_pod,
@@ -656,6 +690,10 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
         )));
     };
     let cpus = node.engine_cpus(config.numa.reserve_cores_per_node);
+    let (foreground_cpus, background_cpus) = node.confine_cpu_sets(
+        config.numa.reserve_cores_per_node,
+        config.numa.foreground_cores_per_node,
+    );
 
     let plan = plan_confine(
         &topo,
@@ -704,16 +742,18 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
         tracing::warn!(error = %err, home, "set_mempolicy(MPOL_BIND) failed; \
              memory placement falls back to the OS default");
     }
-    if let Err(err) = crate::affinity::bind_current_thread_to(&cpus) {
+    if let Err(err) = crate::affinity::bind_current_thread_to(&background_cpus) {
         return Err(crate::error::OnyxError::Config(format!(
             "failed to confine main thread to node {home} cpus {cpus:?}: {err}"
         )));
     }
-    crate::affinity::init_confine(cpus.clone());
-    spawn_confine_enforcer(cpus.clone());
+    crate::affinity::init_confine(foreground_cpus.clone(), background_cpus.clone());
+    spawn_confine_enforcer(foreground_cpus.clone(), background_cpus.clone());
     tracing::info!(
         home_node = home,
         engine_cpus = ?cpus,
+        foreground_cpus = ?foreground_cpus,
+        background_cpus = ?background_cpus,
         reserved_cores = config.numa.reserve_cores_per_node,
         "numa confine active (in-engine numactl equivalent; ublk queue \
          threads included)"
@@ -728,23 +768,20 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
 /// mask strays outside the allowed set, catching libublk today and any
 /// future self-pinning library. ~300 task dirs every 5s is noise.
 #[cfg(target_os = "linux")]
-fn spawn_confine_enforcer(cpus: Vec<usize>) {
+fn spawn_confine_enforcer(foreground: Vec<usize>, background: Vec<usize>) {
     let _ = std::thread::Builder::new()
         .name("numa-confine".to_string())
-        .spawn(move || {
-            let allowed: std::collections::HashSet<usize> = cpus.iter().copied().collect();
-            loop {
-                sweep_stray_threads(&allowed, &cpus);
-                std::thread::sleep(std::time::Duration::from_secs(5));
-            }
+        .spawn(move || loop {
+            sweep_stray_threads(&foreground, &background);
+            std::thread::sleep(std::time::Duration::from_secs(5));
         });
 }
 
 #[cfg(not(target_os = "linux"))]
-fn spawn_confine_enforcer(_cpus: Vec<usize>) {}
+fn spawn_confine_enforcer(_foreground: Vec<usize>, _background: Vec<usize>) {}
 
 #[cfg(target_os = "linux")]
-fn sweep_stray_threads(allowed: &std::collections::HashSet<usize>, cpus: &[usize]) {
+fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
         return;
     };
@@ -763,9 +800,15 @@ fn sweep_stray_threads(allowed: &std::collections::HashSet<usize>, cpus: &[usize
         if rc != 0 {
             continue; // thread exited
         }
-        let stray =
-            (0..1024usize).any(|c| unsafe { libc::CPU_ISSET(c, &set) } && !allowed.contains(&c));
-        if !stray {
+        let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        let cpus = if name.starts_with("ublk-") || name.starts_with("persistent-slot") {
+            foreground
+        } else {
+            background
+        };
+        let matches =
+            (0..1024usize).all(|c| (unsafe { libc::CPU_ISSET(c, &set) }) == cpus.contains(&c));
+        if matches {
             continue;
         }
         let mut target: libc::cpu_set_t = unsafe { std::mem::zeroed() };
@@ -1011,6 +1054,7 @@ mod tests {
             mode = "confine"
             home_node = 1
             reserve_cores_per_node = 3
+            foreground_cores_per_node = 4
             cold_cache_policy = "interleave"
             allow_overcommit = true
             "#,
@@ -1019,6 +1063,7 @@ mod tests {
         assert_eq!(cfg.mode, crate::config::NumaMode::Confine);
         assert_eq!(cfg.home_node, 1);
         assert_eq!(cfg.reserve_cores_per_node, 3);
+        assert_eq!(cfg.foreground_cores_per_node, 4);
         assert_eq!(cfg.cold_cache_policy, ColdCachePolicy::Interleave);
         assert!(cfg.allow_overcommit);
 
@@ -1027,7 +1072,21 @@ mod tests {
         assert_eq!(cfg.mode, crate::config::NumaMode::Off);
         assert_eq!(cfg.cold_cache_policy, ColdCachePolicy::Auto);
         assert_eq!(cfg.reserve_cores_per_node, 2);
+        assert_eq!(cfg.foreground_cores_per_node, 0);
         assert!(!cfg.allow_overcommit);
+    }
+
+    #[test]
+    fn confine_cpu_sets_carve_physical_cores_for_foreground() {
+        let node = NumaNode {
+            id: 0,
+            cpus: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            cores: vec![vec![0, 4], vec![1, 5], vec![2, 6], vec![3, 7]],
+            mem_total_bytes: 0,
+        };
+        let (foreground, background) = node.confine_cpu_sets(1, 1);
+        assert_eq!(foreground, vec![0, 4]);
+        assert_eq!(background, vec![1, 2, 5, 6]);
     }
 
     #[test]

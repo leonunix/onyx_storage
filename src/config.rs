@@ -85,6 +85,10 @@ pub struct NumaConfig {
     /// cores are reserved; capped so at least one core remains.
     #[serde(default = "default_numa_reserve_cores")]
     pub reserve_cores_per_node: usize,
+    /// Physical cores carved out of the confine engine set for foreground
+    /// ublk and LV2 sync threads. Zero preserves the shared-set behaviour.
+    #[serde(default)]
+    pub foreground_cores_per_node: usize,
     #[serde(default)]
     pub cold_cache_policy: ColdCachePolicy,
     /// Permit startup even when the memory plan does not fit the home node
@@ -105,6 +109,7 @@ impl Default for NumaConfig {
             home_node: 0,
             data_nodes: Vec::new(),
             reserve_cores_per_node: default_numa_reserve_cores(),
+            foreground_cores_per_node: 0,
             cold_cache_policy: ColdCachePolicy::Auto,
             allow_overcommit: false,
         }
