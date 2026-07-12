@@ -202,7 +202,9 @@ pub fn bind_current(role: ThreadRole, ordinal: usize) {
             foreground,
             background,
         } => match role {
-            ThreadRole::Ublk | ThreadRole::BufferSync => set_current_cpus(foreground),
+            ThreadRole::Ublk | ThreadRole::ReadPool | ThreadRole::BufferSync => {
+                set_current_cpus(foreground)
+            }
             _ => set_current_cpus(background),
         },
         LayoutKind::Partition(topo) => {
