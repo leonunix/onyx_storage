@@ -18,7 +18,10 @@ use super::*;
 /// allocator after successful IO. This is the behavior promised by
 /// `raid_full_stripe_writes=true` and avoids exploding one partial bin back into
 /// dozens of 4 KiB RAID writes.
-fn plan_stripe_groups(blocks_per_unit: &[u32], stripe: u32) -> (Vec<Vec<usize>>, Vec<usize>) {
+pub(super) fn plan_stripe_groups(
+    blocks_per_unit: &[u32],
+    stripe: u32,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
     let n = blocks_per_unit.len();
     if stripe <= 1 {
         return (Vec::new(), (0..n).collect());

@@ -366,12 +366,12 @@ fn write_packed_slots_batch_routes_first_occurrence_into_candidate_cache() {
 // per-slot metadata batch cap (`packed_meta_batch_max_lbas`) is gone.
 // Each packed slot now becomes its own `PackedCommitJob` and commits
 // alone (one slot = one tx). Sub-batch capping moved to
-// `commit_passthrough_job` at TARGET_OPS_PER_COMMIT (=150 LBAs);
+// `commit_passthrough_job` at TARGET_OPS_PER_COMMIT (=8192 LBAs);
 // covered by `passthrough_commit_job_subbatches_above_threshold`
 // below.
 
 #[test]
-fn passthrough_commit_job_subbatches_above_threshold() {
+fn passthrough_commit_job_keeps_500_lbas_in_one_transaction() {
     let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
     let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
@@ -379,10 +379,8 @@ fn passthrough_commit_job_subbatches_above_threshold() {
     let in_flight = std::sync::Arc::new(super::FlusherInFlightTracker::default());
     let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
 
-    // Build 5 units of 100 LBAs each = 500 LBAs total. With
-    // TARGET_OPS_PER_COMMIT=150 the worker should split into 4 sub
-    // batches (after 1 unit=100, after 2 units=200>150 → flush; new
-    // chunk 1, etc.).
+    // Build 5 units of 100 LBAs each = 500 LBAs total. This used to be
+    // split at 150 LBAs, which made RC apply dominate transaction cost.
     let lbas_per_unit: u32 = 100;
     let n_units = 5usize;
     let mut units = Vec::with_capacity(n_units);
@@ -465,9 +463,9 @@ fn passthrough_commit_job_subbatches_above_threshold() {
         .expect("post_commit_loop panicked");
     let after = meta.memory_stats().unwrap();
     let commits = after.commit_success - before.commit_success;
-    assert!(
-        commits >= 2,
-        "500-LBA passthrough job should split into multiple sub-batches at TARGET_OPS_PER_COMMIT (got {commits} commits)"
+    assert_eq!(
+        commits, 1,
+        "500-LBA passthrough job should remain one effective transaction"
     );
 }
 

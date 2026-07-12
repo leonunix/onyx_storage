@@ -73,6 +73,8 @@ impl BufferFlusher {
     pub(super) const WRITER_READ_ACTIVE_BATCH_COALESCE: Duration = Duration::from_micros(250);
     pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
     pub(super) const PACKED_SLOT_MAX_AGE: Duration = Duration::from_millis(200);
+    pub(super) const PARTIAL_STRIPE_MAX_AGE: Duration = Duration::from_millis(200);
+    pub(super) const PARTIAL_STRIPE_PRESSURE_PCT: u8 = 80;
 
     pub(super) fn writer_loop(
         shard_idx: usize,
@@ -102,6 +104,11 @@ impl BufferFlusher {
         let mut buffered_completions: Vec<Arc<crate::buffer::pipeline::DedupCompletion>> =
             Vec::new();
         let mut packed_retries: VecDeque<PackedSlotRetry> = VecDeque::new();
+        let mut pt_carry: Vec<CompressedUnit> = Vec::new();
+        let mut pt_carry_seqs: Vec<Vec<u64>> = Vec::new();
+        let mut pt_carry_completions: Vec<Option<Arc<crate::buffer::pipeline::DedupCompletion>>> =
+            Vec::new();
+        let mut pt_carry_since: Option<Instant> = None;
         let mut last_read_submit_calls = metrics.read_submit_calls.load(Ordering::Relaxed);
 
         /// Helper: hand off accumulated Passthrough units to the
@@ -174,6 +181,15 @@ impl BufferFlusher {
                             commit_worker_txs,
                             commit_workers_per_volume,
                         );
+                    }
+                    if !pt_carry.is_empty()
+                        && (pt_carry_since
+                            .is_some_and(|since| since.elapsed() >= Self::PARTIAL_STRIPE_MAX_AGE)
+                            || pool.physical_fill_percentage_for_shard(shard_idx)
+                                >= Self::PARTIAL_STRIPE_PRESSURE_PCT)
+                    {
+                        flush_pt_batch!(pt_carry, pt_carry_seqs, pt_carry_completions);
+                        pt_carry_since = None;
                     }
                     continue;
                 }
@@ -380,9 +396,67 @@ impl BufferFlusher {
                 );
             }
 
-            flush_pt_batch!(pt_batch, pt_seqs, pt_completions);
+            if !pt_batch.is_empty() {
+                if pt_carry.is_empty() {
+                    pt_carry_since = Some(Instant::now());
+                }
+                pt_carry.append(&mut pt_batch);
+                pt_carry_seqs.append(&mut pt_seqs);
+                pt_carry_completions.append(&mut pt_completions);
+            }
+
+            let stripe = io_engine.stripe_blocks();
+            if stripe <= 1 {
+                flush_pt_batch!(pt_carry, pt_carry_seqs, pt_carry_completions);
+                pt_carry_since = None;
+            } else {
+                let bs = BLOCK_SIZE as usize;
+                let blocks: Vec<u32> = pt_carry
+                    .iter()
+                    .map(|unit| unit.payload_len().div_ceil(bs) as u32)
+                    .collect();
+                let (groups, _) = passthrough::plan_stripe_groups(&blocks, stripe);
+                let mut ready = vec![false; pt_carry.len()];
+                for members in groups {
+                    let used: u32 = members.iter().map(|member| blocks[*member]).sum();
+                    if used == stripe {
+                        for member in members {
+                            ready[member] = true;
+                        }
+                    }
+                }
+                // Stripe-sized and larger units use the aligned passthrough path
+                // and must not wait behind an unrelated partial stripe.
+                for (idx, &count) in blocks.iter().enumerate() {
+                    if count >= stripe {
+                        ready[idx] = true;
+                    }
+                }
+                if ready.iter().any(|is_ready| *is_ready) {
+                    let mut ready_units = Vec::new();
+                    let mut ready_seqs = Vec::new();
+                    let mut ready_completions = Vec::new();
+                    for idx in (0..pt_carry.len()).rev() {
+                        if ready[idx] {
+                            ready_units.push(pt_carry.swap_remove(idx));
+                            ready_seqs.push(pt_carry_seqs.swap_remove(idx));
+                            ready_completions.push(pt_carry_completions.swap_remove(idx));
+                        }
+                    }
+                    ready_units.reverse();
+                    ready_seqs.reverse();
+                    ready_completions.reverse();
+                    flush_pt_batch!(ready_units, ready_seqs, ready_completions);
+                }
+                if pt_carry.is_empty() {
+                    pt_carry_since = None;
+                }
+            }
         }
 
+        // Shutdown is an explicit durability boundary: bounded padding is
+        // preferable to leaving durable LV2 entries unapplied indefinitely.
+        flush_pt_batch!(pt_carry, pt_carry_seqs, pt_carry_completions);
         // Drain remaining on shutdown (use per-unit path for simplicity).
         while let Ok(unit) = rx.try_recv() {
             Self::handle_compressed_unit(

@@ -15,14 +15,11 @@ mod packed;
 mod passthrough;
 
 /// Default sub-batch cap inside a single `CommitJob`. New per-volume routing
-/// has 0 LSN contention, so each commit only pays its own WAL fsync
-/// + apply lane scheduling cost. metadb-onyx-soak (2026-05-08) shows
-/// the per-op amortisation sweet spot at 50–200 ops; 150 sits in the
-/// middle and still leaves apply lanes headroom for cross-volume
-/// concurrency. Picking too small (e.g. 10) leaves WAL fsync (~100µs)
-/// un-amortised; too large (e.g. 1000+) reproduces the 22ms apply
-/// lane stall observed with `buffer.shards=1`.
-pub(crate) const TARGET_OPS_PER_COMMIT: usize = 150;
+/// has 0 LSN contention, so transactions should reach the configured
+/// 8K-LBA target before paying WAL + RC apply fixed costs. The global
+/// aggregator bounds cross-writer accumulation and executor concurrency
+/// preserves headroom for independent volumes.
+pub(crate) const TARGET_OPS_PER_COMMIT: usize = 8192;
 /// Number of dedicated commit workers. Per-volume routing uses
 /// `hash(vol_id) % NUM_COMMIT_WORKERS`. The buffer keeps its own 16
 /// shards for LV2/dedup/compress parallelism; this is independent.
@@ -266,36 +263,17 @@ impl BufferFlusher {
         commit_worker_pipeline_depth: usize,
     ) {
         Self::record_commit_worker_drain(metrics, &jobs);
-        let mut pending_pt: Option<PassthroughCommitJob> = None;
+        let mut pending_pt: HashMap<String, PassthroughCommitJob> = HashMap::new();
         let mut pending_packed: Vec<PackedCommitJob> = Vec::new();
         let mut pending_dedup: Vec<DedupHitCommitJob> = Vec::new();
         for job in jobs {
             match job {
-                CommitJob::Passthrough(mut pj) => match pending_pt.as_mut() {
-                    Some(existing) if existing.vol_id == pj.vol_id => {
-                        existing.units.append(&mut pj.units);
-                    }
-                    Some(_) => {
-                        let ready = pending_pt.take().expect("pending passthrough exists");
-                        Self::dispatch_passthrough_job(
-                            ready,
-                            pool,
-                            meta,
-                            lifecycle,
-                            allocator,
-                            in_flight_tracker,
-                            metrics,
-                            lane_cleanup_txs,
-                            candidate,
-                            lane_done_txs,
-                            post_commit_tx,
-                            target_lbas_per_tx,
-                            commit_worker_pipeline_depth,
-                        );
-                        pending_pt = Some(pj);
-                    }
-                    None => pending_pt = Some(pj),
-                },
+                CommitJob::Passthrough(mut pj) => {
+                    pending_pt
+                        .entry(pj.vol_id.0.clone())
+                        .and_modify(|existing| existing.units.append(&mut pj.units))
+                        .or_insert(pj);
+                }
                 CommitJob::Packed(pj) => {
                     pending_packed.push(pj);
                 }
@@ -308,7 +286,7 @@ impl BufferFlusher {
         // reordering packed before passthrough improves packed lbas/commit but
         // explodes commit-worker queue wait. Folding packed only at the drain
         // tail keeps PT moving while still collapsing many one-slot packed txs.
-        if let Some(pj) = pending_pt {
+        for pj in pending_pt.into_values() {
             Self::dispatch_passthrough_job(
                 pj,
                 pool,

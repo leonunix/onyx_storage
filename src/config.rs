@@ -1464,7 +1464,7 @@ fn default_commit_target_lbas_per_tx() -> usize {
     TARGET_OPS_PER_COMMIT
 }
 fn default_commit_coalesce_lba_budget() -> usize {
-    0
+    16_384
 }
 fn default_commit_coalesce_timeout_us() -> u64 {
     0
