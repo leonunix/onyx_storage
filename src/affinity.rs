@@ -154,6 +154,7 @@ impl PartitionTopo {
 }
 
 static LAYOUT: OnceLock<Option<LayoutKind>> = OnceLock::new();
+const BUFFER_SYNC_TIMER_SLACK_NS: u64 = 1_000;
 
 pub fn init(config: &ThreadingConfig) {
     let _ = LAYOUT.set(AffinityLayout::from_config(config).map(LayoutKind::PerRole));
@@ -188,6 +189,15 @@ pub fn init_partition(topo: PartitionTopo) {
 }
 
 pub fn bind_current(role: ThreadRole, ordinal: usize) {
+    // Linux defaults timer slack to 50 us. That turns the LV2 100 us group
+    // window into roughly 150-170 us in practice, directly extending every
+    // foreground durability epoch. Restrict tighter wakeups to the small
+    // BufferSync pool; background threads retain the power-friendly default.
+    if matches!(role, ThreadRole::BufferSync) {
+        if let Err(error) = set_current_timer_slack_ns(BUFFER_SYNC_TIMER_SLACK_NS) {
+            tracing::warn!(?role, ordinal, %error, "failed to tighten buffer sync timer slack");
+        }
+    }
     let Some(Some(layout)) = LAYOUT.get() else {
         return;
     };
@@ -446,5 +456,22 @@ fn set_current_cpus(cpus: &[usize]) -> std::io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn set_current_cpus(_cpus: &[usize]) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_current_timer_slack_ns(slack_ns: u64) -> std::io::Result<()> {
+    // SAFETY: PR_SET_TIMERSLACK consumes the scalar second argument and does
+    // not dereference any pointer. It changes only the calling thread.
+    let rc = unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, slack_ns as libc::c_ulong) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_current_timer_slack_ns(_slack_ns: u64) -> std::io::Result<()> {
     Ok(())
 }
