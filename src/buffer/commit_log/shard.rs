@@ -419,6 +419,9 @@ impl BufferShard {
                 pending_lba_buckets,
                 pending_entries,
                 pending_count,
+                append_ops: AtomicU64::new(0),
+                append_bytes: AtomicU64::new(0),
+                reserve_wait_ns: AtomicU64::new(0),
                 pending_bytes: AtomicU64::new(pending_bytes_init),
                 flush_progress: DashMap::with_shard_amount(DASHMAP_SHARDS),
                 staging_tx,
@@ -695,9 +698,11 @@ impl BufferShard {
                 }
             };
             if let (Some(start), Some(metrics)) = (wait_start, self.metrics.get()) {
+                let waited_ns = start.elapsed().as_nanos() as u64;
+                self.reserve_wait_ns.fetch_add(waited_ns, Ordering::Relaxed);
                 metrics
                     .buffer_backpressure_wait_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    .fetch_add(waited_ns, Ordering::Relaxed);
             }
             offset?
         };
@@ -801,6 +806,8 @@ impl BufferShard {
                 .buffer_write_bytes
                 .fetch_add(payload_len, Ordering::Relaxed);
         }
+        self.append_ops.fetch_add(1, Ordering::Relaxed);
+        self.append_bytes.fetch_add(payload_len, Ordering::Relaxed);
         Ok(())
     }
 

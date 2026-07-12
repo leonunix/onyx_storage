@@ -8,6 +8,10 @@ pub struct BufferShardSnapshot {
     pub capacity_bytes: u64,
     pub fill_pct: u8,
     pub pending_entries: u64,
+    /// Monotonic foreground counters; consumers derive per-window shard IOPS.
+    pub append_ops: u64,
+    pub append_bytes: u64,
+    pub reserve_wait_ns: u64,
     pub head_offset: u64,
     pub tail_offset: u64,
     /// Total entries in log_order (both flushed and unflushed).

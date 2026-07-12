@@ -503,6 +503,9 @@ struct BufferShard {
     pending_lba_buckets: DashMap<PendingBucketKey, AtomicU32>,
     pending_entries: DashMap<u64, Arc<PendingEntry>>,
     pending_count: AtomicU64,
+    append_ops: AtomicU64,
+    append_bytes: AtomicU64,
+    reserve_wait_ns: AtomicU64,
     /// Bytes of ring entries that have NOT yet been mark_applied. Increments
     /// on `reserve_log_space` by `slot_bytes(slot_count)` (== `disk_len` for
     /// the new entry); decrements when an entry leaves `pending_entries`
