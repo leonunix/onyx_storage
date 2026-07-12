@@ -20,6 +20,7 @@
 mode = "confine"
 home_node = 0
 reserve_cores_per_node = 2
+foreground_cores_per_node = 4
 cold_cache_policy = "auto"
 
 [chunklet]
