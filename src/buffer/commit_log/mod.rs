@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 
 use crate::buffer::entry::{BufferEntry, BUFFER_ENTRY_MAGIC, MAX_ENTRY_SIZE, MIN_ENTRY_SIZE};
 use crate::error::{OnyxError, OnyxResult};
-use crate::io::aligned::{round_up, AlignedBuf, AlignedBufPool};
+use crate::io::aligned::{round_up, AlignedBuf};
 use crate::io::block_backend::{slice_backend, BlockBackend};
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, LinkedOp, UringOp, UringOpResult};
@@ -29,6 +29,12 @@ const DASHMAP_SHARDS: usize = 256;
 const SHARD_CHECKPOINT_MAGIC: u32 = 0x5348_434B; // "SHCK"
 const SHARD_CHECKPOINT_VERSION: u32 = 1;
 const SHARD_CHECKPOINT_SIZE: u64 = 4096;
+const PACKED_CHECKPOINT_MAGIC: u32 = 0x5043_4B54; // "PCKT"
+const PACKED_CHECKPOINT_VERSION: u32 = 1;
+const PACKED_CHECKPOINT_HEADER_SIZE: usize = 32;
+const PACKED_CHECKPOINT_RECORD_SIZE: usize = 32;
+const PACKED_CHECKPOINT_CRC_OFFSET: usize = 24;
+const PACKED_CHECKPOINT_SLOT_COUNT: usize = 2;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STAGING_CHANNEL_CAPACITY: usize = 32 * 1024;
 /// Bound one sync epoch per shard. The previous unbounded drain could pull
@@ -464,12 +470,194 @@ impl GlobalSuperblock {
 
 // ── Per-shard checkpoint (recovery hint) ───────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShardCheckpoint {
     head_offset: u64,
     tail_offset: u64,
     max_seq: u64,
     used_bytes: u64,
+}
+
+/// One complete checkpoint image for every shard in a global durability
+/// domain. The 32-byte records keep all 64 supported shards inside one 4 KiB
+/// block. Global/chunklet sync alternates two existing v3 checkpoint pages;
+/// the v3 data-area offset therefore remains byte-for-byte unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackedCheckpointTable {
+    generation: u64,
+    checkpoints: Vec<ShardCheckpoint>,
+}
+
+impl PackedCheckpointTable {
+    #[cfg(test)]
+    fn new(generation: u64, checkpoints: Vec<ShardCheckpoint>) -> OnyxResult<Self> {
+        if checkpoints.len() < PACKED_CHECKPOINT_SLOT_COUNT
+            || checkpoints.len() > MAX_SHARDS_ON_DISK
+        {
+            return Err(OnyxError::Config(format!(
+                "packed checkpoint requires {}..={} shards, got {}",
+                PACKED_CHECKPOINT_SLOT_COUNT,
+                MAX_SHARDS_ON_DISK,
+                checkpoints.len()
+            )));
+        }
+        Ok(Self {
+            generation,
+            checkpoints,
+        })
+    }
+
+    #[cfg(test)]
+    fn encode(&self) -> [u8; SHARD_CHECKPOINT_SIZE as usize] {
+        let mut buf = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+        Self::encode_into(self.generation, &self.checkpoints, &mut buf)
+            .expect("packed checkpoint table was validated at construction");
+        buf
+    }
+
+    fn encode_into(
+        generation: u64,
+        checkpoints: &[ShardCheckpoint],
+        buf: &mut [u8],
+    ) -> OnyxResult<()> {
+        if checkpoints.len() < PACKED_CHECKPOINT_SLOT_COUNT
+            || checkpoints.len() > MAX_SHARDS_ON_DISK
+            || buf.len() != SHARD_CHECKPOINT_SIZE as usize
+        {
+            return Err(OnyxError::Config(format!(
+                "invalid packed checkpoint encode: shards={} bytes={}",
+                checkpoints.len(),
+                buf.len()
+            )));
+        }
+        buf.fill(0);
+        buf[0..4].copy_from_slice(&PACKED_CHECKPOINT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&PACKED_CHECKPOINT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&(checkpoints.len() as u32).to_le_bytes());
+        buf[12..16].copy_from_slice(&(PACKED_CHECKPOINT_RECORD_SIZE as u32).to_le_bytes());
+        buf[16..24].copy_from_slice(&generation.to_le_bytes());
+        for (idx, checkpoint) in checkpoints.iter().enumerate() {
+            let offset = PACKED_CHECKPOINT_HEADER_SIZE + idx * PACKED_CHECKPOINT_RECORD_SIZE;
+            buf[offset..offset + 8].copy_from_slice(&checkpoint.head_offset.to_le_bytes());
+            buf[offset + 8..offset + 16].copy_from_slice(&checkpoint.tail_offset.to_le_bytes());
+            buf[offset + 16..offset + 24].copy_from_slice(&checkpoint.max_seq.to_le_bytes());
+            buf[offset + 24..offset + 32].copy_from_slice(&checkpoint.used_bytes.to_le_bytes());
+        }
+        let crc = Self::crc(buf);
+        buf[PACKED_CHECKPOINT_CRC_OFFSET..PACKED_CHECKPOINT_CRC_OFFSET + 4]
+            .copy_from_slice(&crc.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(buf: &[u8; SHARD_CHECKPOINT_SIZE as usize]) -> Option<Self> {
+        if !Self::has_magic(buf) {
+            return None;
+        }
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        if version != PACKED_CHECKPOINT_VERSION {
+            return None;
+        }
+        let shard_count = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+        let record_size = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        if !(PACKED_CHECKPOINT_SLOT_COUNT..=MAX_SHARDS_ON_DISK).contains(&shard_count)
+            || record_size != PACKED_CHECKPOINT_RECORD_SIZE
+        {
+            return None;
+        }
+        let expected_crc = u32::from_le_bytes(
+            buf[PACKED_CHECKPOINT_CRC_OFFSET..PACKED_CHECKPOINT_CRC_OFFSET + 4]
+                .try_into()
+                .ok()?,
+        );
+        if expected_crc != Self::crc(buf) {
+            return None;
+        }
+        let generation = u64::from_le_bytes(buf[16..24].try_into().ok()?);
+        let mut checkpoints = Vec::with_capacity(shard_count);
+        for idx in 0..shard_count {
+            let offset = PACKED_CHECKPOINT_HEADER_SIZE + idx * PACKED_CHECKPOINT_RECORD_SIZE;
+            checkpoints.push(ShardCheckpoint {
+                head_offset: u64::from_le_bytes(buf[offset..offset + 8].try_into().ok()?),
+                tail_offset: u64::from_le_bytes(buf[offset + 8..offset + 16].try_into().ok()?),
+                max_seq: u64::from_le_bytes(buf[offset + 16..offset + 24].try_into().ok()?),
+                used_bytes: u64::from_le_bytes(buf[offset + 24..offset + 32].try_into().ok()?),
+            });
+        }
+        Some(Self {
+            generation,
+            checkpoints,
+        })
+    }
+
+    fn has_magic(buf: &[u8; SHARD_CHECKPOINT_SIZE as usize]) -> bool {
+        u32::from_le_bytes(buf[0..4].try_into().expect("packed checkpoint magic slice"))
+            == PACKED_CHECKPOINT_MAGIC
+    }
+
+    fn crc(buf: &[u8]) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&buf[..PACKED_CHECKPOINT_CRC_OFFSET]);
+        hasher.update(&[0u8; 4]);
+        hasher.update(&buf[PACKED_CHECKPOINT_CRC_OFFSET + 4..]);
+        hasher.finalize()
+    }
+
+    fn slot_for_generation(generation: u64) -> usize {
+        generation.saturating_sub(1) as usize % PACKED_CHECKPOINT_SLOT_COUNT
+    }
+}
+
+struct PackedCheckpointState {
+    generation: u64,
+    checkpoints: Vec<ShardCheckpoint>,
+    pending_checkpoints: Vec<ShardCheckpoint>,
+    scratch: AlignedBuf,
+}
+
+impl PackedCheckpointState {
+    fn new(generation: u64, checkpoints: Vec<ShardCheckpoint>) -> OnyxResult<Self> {
+        let pending_checkpoints = checkpoints.clone();
+        let scratch = AlignedBuf::new(SHARD_CHECKPOINT_SIZE as usize, false)?;
+        Ok(Self {
+            generation,
+            checkpoints,
+            pending_checkpoints,
+            scratch,
+        })
+    }
+
+    fn begin_next(&mut self) -> OnyxResult<u64> {
+        self.pending_checkpoints.clone_from(&self.checkpoints);
+        self.generation
+            .checked_add(1)
+            .ok_or_else(|| OnyxError::Config("packed checkpoint generation exhausted".into()))
+    }
+
+    fn encode_pending(&mut self, generation: u64) -> OnyxResult<()> {
+        PackedCheckpointTable::encode_into(
+            generation,
+            &self.pending_checkpoints,
+            self.scratch.as_mut_slice(),
+        )
+    }
+
+    fn commit_pending(&mut self, generation: u64) {
+        self.generation = generation;
+        std::mem::swap(&mut self.checkpoints, &mut self.pending_checkpoints);
+    }
+}
+
+enum PackedCheckpointLoad {
+    /// Both reserved A/B pages are valid legacy shard checkpoints: read the
+    /// original per-shard v3 pages and migrate on the first global durability
+    /// epoch.
+    Legacy,
+    /// Highest-generation, CRC-valid full-shard table.
+    Packed(PackedCheckpointTable),
+    /// Packed format was present but neither slot was usable. Mixing in stale
+    /// legacy pages after a packed migration can miss a wrapped epoch, so every
+    /// shard must take the self-describing full-scan recovery path.
+    Corrupt,
 }
 
 impl ShardCheckpoint {
@@ -641,6 +829,9 @@ pub struct WriteBufferPool {
     max_payload_memory: u64,
     /// On-disk layout version — persisted on Drop. Must match the actual disk layout.
     disk_version: u32,
+    /// Global/chunklet v3 checkpoints packed into alternating 4 KiB pages.
+    /// `None` for the per-shard raw/io_uring path and legacy v2 layout.
+    packed_checkpoint: Option<Arc<parking_lot::Mutex<PackedCheckpointState>>>,
     /// Resolved hyperbolic throttle curve (`None` = disabled). Set once at
     /// pool open; each shard has an independent absolute-wakeup queue.
     throttle: Option<ThrottleSettings>,

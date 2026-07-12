@@ -522,8 +522,29 @@ impl WriteBufferPool {
     /// Persist the current reclaim position for every shard and flush LV2.
     /// Clean shutdown must call this explicitly after its final tail advance;
     /// relying on `Drop` is insufficient while other `Arc` owners still exist.
+    /// Callers must quiesce foreground appends first: the global seq floor is
+    /// intentionally stamped into every shard and is not an online checkpoint
+    /// protocol racing with partially prepared sync batches.
     pub fn persist_checkpoints(&self) -> OnyxResult<()> {
         let global_max_seq = self.next_seq.load(Ordering::Acquire).saturating_sub(1);
+        if let Some(packed) = self.packed_checkpoint.as_ref() {
+            let mut state = packed.lock();
+            let generation = state.begin_next()?;
+            for (idx, shard) in self.shards.iter().enumerate() {
+                let mut checkpoint = shard.shard.snapshot_checkpoint();
+                checkpoint.max_seq = global_max_seq;
+                state.pending_checkpoints[idx] = checkpoint;
+            }
+            state.encode_pending(generation)?;
+            Self::write_packed_checkpoint_page(
+                self.root_device.as_ref(),
+                generation,
+                state.scratch.as_slice(),
+            )?;
+            Self::sync_device_impl(self.root_device.as_ref())?;
+            state.commit_pending(generation);
+            return Ok(());
+        }
         for shard in &self.shards {
             shard.shard.persist_checkpoint(global_max_seq)?;
         }

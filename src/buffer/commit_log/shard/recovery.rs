@@ -291,6 +291,9 @@ impl BufferShard {
             );
         }
 
+        // A freshly initialized v3 checkpoint is authoritative for an empty
+        // shard. Do not scan stale bytes left behind by a prior Onyx format or
+        // reinitialization and accidentally resurrect them as new writes.
         if checkpoint.used_bytes == 0
             && checkpoint.max_seq == 0
             && checkpoint.head_offset == 0
@@ -400,6 +403,7 @@ impl BufferShard {
         let mut forward_offset = checkpoint.head_offset;
         let mut forward_scanned_bytes = 0u64;
         let mut last_forward_seq = checkpoint.max_seq;
+        let mut forward_wrapped = false;
         while forward_scanned_bytes < capacity_bytes {
             let window = reader.slice_at(forward_offset)?;
             match Self::scan_entry_buf(window, forward_offset, capacity_bytes) {
@@ -410,8 +414,28 @@ impl BufferShard {
                     last_forward_seq = entry.seq;
                     record_scanned(forward_offset, entry, slot_count, &mut scanned);
                     let step = Self::slot_bytes(slot_count);
-                    forward_offset = (forward_offset + step) % capacity_bytes;
+                    let next = (forward_offset + step) % capacity_bytes;
+                    if next < forward_offset {
+                        if forward_wrapped {
+                            break;
+                        }
+                        forward_wrapped = true;
+                    }
+                    forward_offset = next;
                     forward_scanned_bytes = forward_scanned_bytes.saturating_add(step);
+                }
+                None if !forward_wrapped && forward_offset != 0 => {
+                    // A ring allocation that does not fit at the physical end
+                    // leaves an intentional gap and resumes at offset zero. A
+                    // previous A/B generation can be one durability epoch stale,
+                    // so cross that one end-gap and continue only if seq remains
+                    // strictly above checkpoint.max_seq. More than one wrap is
+                    // impossible for one unacknowledged epoch: its entries cannot
+                    // be reclaimed before this durability barrier completes.
+                    forward_scanned_bytes = forward_scanned_bytes
+                        .saturating_add(capacity_bytes.saturating_sub(forward_offset));
+                    forward_offset = 0;
+                    forward_wrapped = true;
                 }
                 None => break,
             }

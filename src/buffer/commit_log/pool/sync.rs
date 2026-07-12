@@ -951,12 +951,13 @@ impl WriteBufferPool {
         group_commit_wait: Duration,
         shutdown: Arc<AtomicBool>,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
+        packed_checkpoint: Option<Arc<parking_lot::Mutex<PackedCheckpointState>>>,
     ) {
         struct PreparedBatch {
             member_idx: usize,
             all: Vec<StagedEntry>,
             spans: Vec<CoalescedSpan>,
-            checkpoint: Option<AlignedBuf>,
+            checkpoint: ShardCheckpoint,
             started: Instant,
             prepared_at: Instant,
         }
@@ -965,7 +966,7 @@ impl WriteBufferPool {
             member_idx: usize,
             all: Vec<StagedEntry>,
             max_seq: u64,
-            checkpoint: Option<AlignedBuf>,
+            checkpoint: ShardCheckpoint,
             started: Instant,
         }
 
@@ -1048,26 +1049,8 @@ impl WriteBufferPool {
                             }
                         };
                         let max_seq = all.iter().map(|entry| entry.pending.seq).max().unwrap_or(0);
-                        let checkpoint =
-                            shard
-                                .encode_checkpoint_for_uring(max_seq)
-                                .and_then(|payload| {
-                                    match AlignedBuf::new(SHARD_CHECKPOINT_SIZE as usize, false) {
-                                        Ok(mut buf) => {
-                                            buf.as_mut_slice()[..payload.len()]
-                                                .copy_from_slice(&payload);
-                                            Some(buf)
-                                        }
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                member_idx,
-                                                error = %error,
-                                                "global sync checkpoint hint allocation failed"
-                                            );
-                                            None
-                                        }
-                                    }
-                                });
+                        let mut checkpoint = shard.snapshot_checkpoint();
+                        checkpoint.max_seq = max_seq;
                         if tx
                             .send(PreparedBatch {
                                 member_idx,
@@ -1238,45 +1221,54 @@ impl WriteBufferPool {
                     .expect("durability epoch has at least one batch");
                 let epoch_entries = batches.iter().map(|batch| batch.all.len()).sum::<usize>();
 
-                loop {
-                    // Checkpoint pages all live in the first 128 KiB LV2
-                    // stripe. Writing one from every payload lane made the
-                    // lanes contend on the same chunklet range + stripe locks,
-                    // serialising otherwise-disjoint ring writes. Select the
-                    // newest hint per shard and write the compact checkpoint
-                    // set once, after all payload writes in this epoch landed.
-                    let mut latest_checkpoints: Vec<Option<(u64, &AlignedBuf)>> =
-                        (0..members.len()).map(|_| None).collect();
-                    for batch in &batches {
-                        let Some(checkpoint) = batch.checkpoint.as_ref() else {
-                            continue;
-                        };
-                        let slot = &mut latest_checkpoints[batch.member_idx];
-                        if slot
-                            .as_ref()
-                            .is_none_or(|(max_seq, _)| batch.max_seq >= *max_seq)
-                        {
-                            *slot = Some((batch.max_seq, checkpoint));
+                // Serialize table generations against explicit clean-shutdown
+                // persistence. The mutex is otherwise uncontended: only this
+                // coordinator advances hot-path generations.
+                let mut packed_guard = packed_checkpoint.as_ref().map(|state| state.lock());
+                let pending_generation = if let Some(state) = packed_guard.as_mut() {
+                    let mut prepare_failures = 0u32;
+                    Some(loop {
+                        let prepared = (|| -> OnyxResult<u64> {
+                            let generation = state.begin_next()?;
+                            for batch in &batches {
+                                let slot = &mut state.pending_checkpoints[batch.member_idx];
+                                if batch.max_seq >= slot.max_seq {
+                                    *slot = batch.checkpoint;
+                                }
+                            }
+                            state.encode_pending(generation)?;
+                            Ok(generation)
+                        })();
+                        match prepared {
+                            Ok(generation) => break generation,
+                            Err(error) => {
+                                prepare_failures = prepare_failures.saturating_add(1);
+                                tracing::error!(
+                                    error = %error,
+                                    prepare_failures,
+                                    "global packed checkpoint encode failed; retrying epoch"
+                                );
+                                thread::sleep(Self::sync_retry_backoff(prepare_failures));
+                            }
                         }
-                    }
-                    let checkpoint_ops: Vec<(u64, &[u8])> = latest_checkpoints
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(member_idx, checkpoint)| {
-                            checkpoint.as_ref().map(|(_, buf)| {
-                                (
-                                    COMMIT_LOG_SUPERBLOCK_SIZE
-                                        + member_idx as u64 * SHARD_CHECKPOINT_SIZE,
-                                    &buf.as_slice()[..SHARD_CHECKPOINT_SIZE as usize],
-                                )
-                            })
-                        })
-                        .collect();
+                    })
+                } else {
+                    None
+                };
+
+                loop {
                     let checkpoint_started = Instant::now();
-                    let checkpoint_result = if checkpoint_ops.is_empty() {
-                        Ok(())
-                    } else {
-                        root_device.write_many_at(&checkpoint_ops)
+                    let checkpoint_result = match pending_generation {
+                        Some(generation) => Self::write_packed_checkpoint_page(
+                            root_device.as_ref(),
+                            generation,
+                            packed_guard
+                                .as_ref()
+                                .expect("packed generation has state")
+                                .scratch
+                                .as_slice(),
+                        ),
+                        None => Ok(()),
                     };
                     let checkpoint_elapsed = checkpoint_started.elapsed();
                     if let Err(err) = checkpoint_result {
@@ -1284,7 +1276,7 @@ impl WriteBufferPool {
                         tracing::warn!(
                             error = %err,
                             consecutive_failures,
-                            checkpoint_pages = checkpoint_ops.len(),
+                            checkpoint_pages = usize::from(pending_generation.is_some()),
                             "global persistent slot checkpoint write failed; retrying epoch"
                         );
                         thread::sleep(Self::sync_retry_backoff(consecutive_failures));
@@ -1295,7 +1287,7 @@ impl WriteBufferPool {
                             &metrics.buffer_append_log_write_ns,
                             checkpoint_started,
                         );
-                        if !checkpoint_ops.is_empty() {
+                        if pending_generation.is_some() {
                             metrics.record_buffer_lv2_checkpoint_write_ns(
                                 checkpoint_elapsed.as_nanos() as u64,
                             );
@@ -1312,6 +1304,11 @@ impl WriteBufferPool {
                     match result {
                         Ok(()) => {
                             consecutive_failures = 0;
+                            if let (Some(state), Some(generation)) =
+                                (packed_guard.as_mut(), pending_generation)
+                            {
+                                state.commit_pending(generation);
+                            }
                             if let Some(metrics) = metrics.get() {
                                 metrics.buffer_sync_flushes.fetch_add(1, Ordering::Relaxed);
                                 metrics.record_buffer_lv2_root_flush_ns(

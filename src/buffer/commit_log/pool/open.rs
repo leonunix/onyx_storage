@@ -170,6 +170,20 @@ impl WriteBufferPool {
         } else {
             COMMIT_LOG_SUPERBLOCK_SIZE
         };
+        // A chunklet LD is one durability domain but exposes no single fd. Its
+        // multi-shard global sync path packs all shard checkpoints into the first
+        // two already-reserved v3 pages. Raw/fd-backed paths retain their legacy
+        // per-shard checkpoint pages and io_uring pipeline.
+        let use_global_sync_loop = shard_count > 1 && device.uring_target().is_none();
+        let packed_load = if use_v3 && use_global_sync_loop {
+            Some(Self::read_packed_checkpoint(device.as_ref(), shard_count)?)
+        } else {
+            None
+        };
+        let packed_generation = match packed_load.as_ref() {
+            Some(PackedCheckpointLoad::Packed(table)) => table.generation,
+            _ => 0,
+        };
         // Round down to block_size so every shard's base_offset stays
         // block-aligned.  Without this, shards 1..N get non-aligned global
         // offsets and silently fall back to buffered IO, which on the same
@@ -197,7 +211,13 @@ impl WriteBufferPool {
 
             let data_device = slice_backend(device.clone(), shard_offset, shard_bytes)?;
             let (checkpoint, checkpoint_device) = if use_v3 {
-                let ckpt = Self::read_shard_checkpoint(device.as_ref(), shard_idx)?;
+                let ckpt = match packed_load.as_ref() {
+                    Some(PackedCheckpointLoad::Packed(table)) => Some(table.checkpoints[shard_idx]),
+                    Some(PackedCheckpointLoad::Corrupt) => None,
+                    Some(PackedCheckpointLoad::Legacy) | None => {
+                        Self::read_shard_checkpoint(device.as_ref(), shard_idx)?
+                    }
+                };
                 let ckpt_offset =
                     COMMIT_LOG_SUPERBLOCK_SIZE + shard_idx as u64 * SHARD_CHECKPOINT_SIZE;
                 let ckpt_dev = slice_backend(device.clone(), ckpt_offset, SHARD_CHECKPOINT_SIZE)?;
@@ -312,11 +332,6 @@ impl WriteBufferPool {
         let mut shard_ready_rxs = Vec::with_capacity(shard_count);
         let mut shards = Vec::with_capacity(shard_count);
         let mut max_seq = 0u64;
-        // Chunklet exposes one logical durability domain but no single fd.
-        // Drain all shard staging queues through one pool-level sync loop so a
-        // single root-LD flush can cover the whole epoch. Raw/fd backends keep
-        // the existing per-shard io_uring pipeline.
-        let use_global_sync_loop = shard_count > 1 && device.uring_target().is_none();
         let global_shutdown = Arc::new(AtomicBool::new(false));
         let mut global_members = Vec::with_capacity(shard_count);
 
@@ -428,10 +443,27 @@ impl WriteBufferPool {
             });
         }
 
+        let packed_checkpoint = if use_v3 && use_global_sync_loop {
+            let checkpoints = global_members
+                .iter()
+                .map(|(_, shard, _)| {
+                    let mut checkpoint = shard.snapshot_checkpoint();
+                    checkpoint.max_seq = shard.lv2_durability.synced_seq.load(Ordering::Acquire);
+                    checkpoint
+                })
+                .collect();
+            Some(Arc::new(parking_lot::Mutex::new(
+                PackedCheckpointState::new(packed_generation, checkpoints)?,
+            )))
+        } else {
+            None
+        };
+
         if use_global_sync_loop {
             let root_device = device.clone();
             let shutdown = global_shutdown.clone();
             let metrics_for_loop = metrics.clone();
+            let packed_for_loop = packed_checkpoint.clone();
             let sync_thread = thread::Builder::new()
                 .name("persistent-slot-sync-global".into())
                 .spawn(move || {
@@ -442,6 +474,7 @@ impl WriteBufferPool {
                         group_commit_wait,
                         shutdown,
                         metrics_for_loop,
+                        packed_for_loop,
                     );
                 })
                 .map_err(|e| {
@@ -474,6 +507,7 @@ impl WriteBufferPool {
             payload_bytes_in_memory,
             max_payload_memory,
             disk_version,
+            packed_checkpoint,
             max_flushed_seq,
             durable_seq,
             throttle,

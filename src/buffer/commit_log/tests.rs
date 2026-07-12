@@ -6,6 +6,9 @@ struct NoUringCountingBackend {
     inner: RawDevice,
     flushes: AtomicU64,
     fail_remaining: AtomicU64,
+    packed_write_attempts: AtomicU64,
+    fail_packed_writes: AtomicBool,
+    checkpoint_writes: Mutex<Vec<(u64, usize)>>,
 }
 
 impl NoUringCountingBackend {
@@ -14,7 +17,16 @@ impl NoUringCountingBackend {
             inner: RawDevice::open_or_create(path, size).unwrap(),
             flushes: AtomicU64::new(0),
             fail_remaining: AtomicU64::new(fail_remaining),
+            packed_write_attempts: AtomicU64::new(0),
+            fail_packed_writes: AtomicBool::new(false),
+            checkpoint_writes: Mutex::new(Vec::new()),
         }
+    }
+
+    fn reset_io_counts(&self) {
+        self.flushes.store(0, Ordering::Relaxed);
+        self.packed_write_attempts.store(0, Ordering::Relaxed);
+        self.checkpoint_writes.lock().unwrap().clear();
     }
 }
 
@@ -24,6 +36,26 @@ impl BlockBackend for NoUringCountingBackend {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
+        // Tests below open four-shard pools, whose complete v3 checkpoint area
+        // is [4 KiB, 20 KiB). Payload starts after it.
+        if (COMMIT_LOG_SUPERBLOCK_SIZE..COMMIT_LOG_SUPERBLOCK_SIZE + 4 * SHARD_CHECKPOINT_SIZE)
+            .contains(&offset)
+        {
+            self.checkpoint_writes
+                .lock()
+                .unwrap()
+                .push((offset, buf.len()));
+        }
+        if let Ok(page) = <&[u8; SHARD_CHECKPOINT_SIZE as usize]>::try_from(buf) {
+            if PackedCheckpointTable::has_magic(page) {
+                self.packed_write_attempts.fetch_add(1, Ordering::Relaxed);
+                if self.fail_packed_writes.load(Ordering::Acquire) {
+                    return Err(OnyxError::Io(std::io::Error::other(
+                        "injected packed checkpoint write failure",
+                    )));
+                }
+            }
+        }
         self.inner.write_at(buf, offset)
     }
 
@@ -56,6 +88,85 @@ impl BlockBackend for NoUringCountingBackend {
     }
 }
 
+fn packed_test_checkpoints(shards: usize, seq_base: u64) -> Vec<ShardCheckpoint> {
+    (0..shards)
+        .map(|idx| ShardCheckpoint {
+            head_offset: idx as u64 * 4096,
+            tail_offset: idx as u64 * 2048,
+            max_seq: seq_base + idx as u64,
+            used_bytes: idx as u64 * 8192,
+        })
+        .collect()
+}
+
+#[test]
+fn packed_checkpoint_roundtrip_crc_and_generation_slots() {
+    let table = PackedCheckpointTable::new(41, packed_test_checkpoints(64, 1_000)).unwrap();
+    let encoded = table.encode();
+    assert_eq!(PackedCheckpointTable::decode(&encoded), Some(table.clone()));
+    assert_eq!(PackedCheckpointTable::slot_for_generation(41), 0);
+    assert_eq!(PackedCheckpointTable::slot_for_generation(42), 1);
+
+    let mut corrupt = encoded;
+    corrupt[PACKED_CHECKPOINT_HEADER_SIZE + 17] ^= 0x80;
+    assert!(PackedCheckpointTable::has_magic(&corrupt));
+    assert!(PackedCheckpointTable::decode(&corrupt).is_none());
+}
+
+#[test]
+fn packed_checkpoint_selects_latest_valid_and_detects_double_corruption() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 64 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let older = PackedCheckpointTable::new(7, packed_test_checkpoints(4, 100)).unwrap();
+    let newer = PackedCheckpointTable::new(8, packed_test_checkpoints(4, 200)).unwrap();
+    WriteBufferPool::write_packed_checkpoint(&dev, &older).unwrap();
+    WriteBufferPool::write_packed_checkpoint(&dev, &newer).unwrap();
+
+    match WriteBufferPool::read_packed_checkpoint(&dev, 4).unwrap() {
+        PackedCheckpointLoad::Packed(table) => assert_eq!(table, newer),
+        _ => panic!("newest packed checkpoint was not selected"),
+    }
+
+    let mut newer_corrupt = newer.encode();
+    newer_corrupt[128] ^= 0x55;
+    dev.write_at(
+        &newer_corrupt,
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE,
+    )
+    .unwrap();
+    match WriteBufferPool::read_packed_checkpoint(&dev, 4).unwrap() {
+        PackedCheckpointLoad::Packed(table) => assert_eq!(table, older),
+        _ => panic!("older valid packed checkpoint was not used"),
+    }
+
+    let mut older_corrupt = older.encode();
+    older_corrupt[256] ^= 0xAA;
+    dev.write_at(&older_corrupt, COMMIT_LOG_SUPERBLOCK_SIZE)
+        .unwrap();
+    assert!(matches!(
+        WriteBufferPool::read_packed_checkpoint(&dev, 4).unwrap(),
+        PackedCheckpointLoad::Corrupt
+    ));
+
+    // Format detection must not depend solely on mutable packed magic bytes.
+    // If both A/B pages lose their magic after migration, treating the device
+    // as legacy would expose stale per-shard pages that were never updated
+    // again. Neither page decodes as a valid SHCK, so recovery must full-scan.
+    for slot in 0..PACKED_CHECKPOINT_SLOT_COUNT {
+        let offset = COMMIT_LOG_SUPERBLOCK_SIZE + slot as u64 * SHARD_CHECKPOINT_SIZE;
+        let mut page = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+        dev.read_at(&mut page, offset).unwrap();
+        page[..4].fill(0);
+        dev.write_at(&page, offset).unwrap();
+    }
+    assert!(matches!(
+        WriteBufferPool::read_packed_checkpoint(&dev, 4).unwrap(),
+        PackedCheckpointLoad::Corrupt
+    ));
+}
+
 #[test]
 fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
     let tmp = NamedTempFile::new().unwrap();
@@ -77,6 +188,7 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
     );
     let metrics = Arc::new(EngineMetrics::default());
     pool.attach_metrics(metrics.clone());
+    backend.reset_io_counts();
     backend.fail_remaining.store(1, Ordering::Release);
     let start = Arc::new(std::sync::Barrier::new(65));
     let mut writers = Vec::new();
@@ -103,6 +215,18 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
     assert!(
         flushes < batches,
         "global epochs must cover multiple shard batches: flushes={flushes} batches={batches}"
+    );
+    let checkpoint_writes = backend.checkpoint_writes.lock().unwrap().clone();
+    assert!(!checkpoint_writes.is_empty());
+    assert!(checkpoint_writes.iter().all(|(offset, len)| {
+        (*offset == COMMIT_LOG_SUPERBLOCK_SIZE
+            || *offset == COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE)
+            && *len == SHARD_CHECKPOINT_SIZE as usize
+    }));
+    assert_eq!(
+        checkpoint_writes.len() as u64,
+        backend.flushes.load(Ordering::Relaxed),
+        "every global barrier attempt must have exactly one packed 4 KiB write"
     );
     let stage_metrics = metrics.snapshot();
     assert_eq!(
@@ -183,6 +307,206 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
             i as u8
         );
     }
+}
+
+#[test]
+fn global_packed_checkpoint_failure_does_not_advance_durability() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 64 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let backend = Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0));
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        backend.clone(),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    backend.reset_io_counts();
+    backend.fail_packed_writes.store(true, Ordering::Release);
+
+    let ticket = pool
+        .append_deferred("vol", Lba(0), 1, &[0x5A; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while backend.packed_write_attempts.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "packed write was never attempted"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    thread::sleep(Duration::from_millis(5));
+    assert!(
+        !ticket.is_durable(),
+        "checkpoint write failure must not advance the LV2 watermark"
+    );
+    assert_eq!(
+        backend.flushes.load(Ordering::Relaxed),
+        0,
+        "root barrier must not run until the packed table write succeeds"
+    );
+
+    backend.fail_packed_writes.store(false, Ordering::Release);
+    assert_eq!(ticket.wait(), 1);
+    assert!(backend.flushes.load(Ordering::Relaxed) >= 1);
+}
+
+fn corrupt_packed_slot(path: &std::path::Path, size: u64, slot: usize) {
+    let dev = RawDevice::open_or_create(path, size).unwrap();
+    let offset = COMMIT_LOG_SUPERBLOCK_SIZE + slot as u64 * SHARD_CHECKPOINT_SIZE;
+    let mut page = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+    dev.read_at(&mut page, offset).unwrap();
+    assert!(PackedCheckpointTable::has_magic(&page));
+    page[PACKED_CHECKPOINT_HEADER_SIZE + 3] ^= 0x5A;
+    dev.write_at(&page, offset).unwrap();
+    dev.sync().unwrap();
+}
+
+#[test]
+fn packed_reopen_falls_back_to_older_generation_then_full_scans_if_both_corrupt() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 64 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let backend = Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0));
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        backend.clone(),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    for i in 0..8u64 {
+        pool.append("vol", Lba(i), 1, &[i as u8 + 1; BLOCK_SIZE as usize], 1)
+            .unwrap();
+    }
+    pool.persist_checkpoints().unwrap();
+    drop(pool);
+    drop(backend);
+
+    let (newest_generation, newest_slot, older_generation) = {
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let mut tables = Vec::new();
+        for slot in 0..PACKED_CHECKPOINT_SLOT_COUNT {
+            let mut page = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+            dev.read_at(
+                &mut page,
+                COMMIT_LOG_SUPERBLOCK_SIZE + slot as u64 * SHARD_CHECKPOINT_SIZE,
+            )
+            .unwrap();
+            tables.push((
+                slot,
+                PackedCheckpointTable::decode(&page).expect("both A/B slots must be valid"),
+            ));
+        }
+        tables.sort_unstable_by_key(|(_, table)| table.generation);
+        (tables[1].1.generation, tables[1].0, tables[0].1.generation)
+    };
+    assert!(newest_generation > older_generation);
+    corrupt_packed_slot(tmp.path(), size, newest_slot);
+
+    let reopened = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(reopened.pending_count(), 8);
+    assert_eq!(
+        reopened
+            .packed_checkpoint
+            .as_ref()
+            .unwrap()
+            .lock()
+            .generation,
+        older_generation
+    );
+    drop(reopened); // Repairs the damaged slot with the next clean generation.
+
+    for slot in 0..PACKED_CHECKPOINT_SLOT_COUNT {
+        corrupt_packed_slot(tmp.path(), size, slot);
+    }
+    let full_scan = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(full_scan.pending_count(), 8);
+    assert_eq!(
+        full_scan
+            .packed_checkpoint
+            .as_ref()
+            .unwrap()
+            .lock()
+            .generation,
+        0,
+        "double corruption must rebuild from full scans, not stale legacy pages"
+    );
+}
+
+#[test]
+fn packed_clean_checkpoint_reopens_empty_and_preserves_seq_floor() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    let seq = pool
+        .append("vol", Lba(11), 1, &[0xC3; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    pool.mark_applied(seq, Lba(11), 1).unwrap();
+    pool.durable_seq_handle().store(seq, Ordering::Release);
+    assert_eq!(pool.release_below(seq).unwrap(), 1);
+    pool.persist_checkpoints().unwrap();
+    drop(pool);
+
+    let reopened = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(reopened.pending_count(), 0);
+    let next = reopened
+        .append("vol", Lba(12), 1, &[0xD4; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    assert!(
+        next > seq,
+        "packed max_seq must preserve the restart seq floor"
+    );
 }
 
 #[test]
@@ -747,6 +1071,59 @@ fn guided_recovery_treats_zero_used_checkpoint_as_empty_even_if_offsets_differ()
     assert!(scan.log_order.is_empty());
     assert!(pending_entries.is_empty());
     assert!(lba_index.is_empty());
+}
+
+#[test]
+fn guided_recovery_crosses_one_wrap_gap_from_previous_packed_generation() {
+    let tmp = NamedTempFile::new().unwrap();
+    let slot = BufferShard::slot_size();
+    let capacity = 7 * slot;
+    tmp.as_file().set_len(capacity).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), capacity).unwrap();
+    let payload = vec![0x7B; BLOCK_SIZE as usize];
+    let encoded = BufferEntry::encode(
+        4,
+        "wrap-vol",
+        Lba(9),
+        1,
+        crc32fast::hash(&payload),
+        false,
+        1,
+        &payload,
+    )
+    .unwrap();
+    dev.write_at(&encoded, 0).unwrap();
+    dev.sync().unwrap();
+
+    let lba_index = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let latest_lba_seq = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let pending_lba_buckets = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let pending_entries = DashMap::with_shard_amount(DASHMAP_SHARDS);
+    let pending_count = AtomicU64::new(0);
+    let checkpoint = ShardCheckpoint {
+        // The next 8 KiB entry did not fit in the final 4 KiB, so allocation
+        // left [6*slot, capacity) as a gap and resumed at offset zero.
+        head_offset: 6 * slot,
+        tail_offset: 6 * slot,
+        max_seq: 3,
+        used_bytes: 0,
+    };
+
+    let scan = BufferShard::rebuild_indices_guided(
+        &dev,
+        capacity,
+        &checkpoint,
+        &lba_index,
+        &latest_lba_seq,
+        &pending_lba_buckets,
+        &pending_entries,
+        &pending_count,
+    )
+    .unwrap();
+    assert!(pending_entries.contains_key(&4));
+    assert_eq!(pending_count.load(Ordering::Relaxed), 1);
+    assert_eq!(scan.tail_offset, 0);
+    assert_eq!(scan.head_offset, encoded.len() as u64);
 }
 
 #[test]

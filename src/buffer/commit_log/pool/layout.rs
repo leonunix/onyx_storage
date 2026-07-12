@@ -54,6 +54,65 @@ impl WriteBufferPool {
         Ok(ShardCheckpoint::decode(&buf))
     }
 
+    pub(in crate::buffer::commit_log) fn read_packed_checkpoint(
+        device: &dyn BlockBackend,
+        shard_count: usize,
+    ) -> OnyxResult<PackedCheckpointLoad> {
+        debug_assert!(shard_count >= PACKED_CHECKPOINT_SLOT_COUNT);
+        let mut all_legacy = true;
+        let mut newest: Option<PackedCheckpointTable> = None;
+        for slot in 0..PACKED_CHECKPOINT_SLOT_COUNT {
+            let offset = COMMIT_LOG_SUPERBLOCK_SIZE + slot as u64 * SHARD_CHECKPOINT_SIZE;
+            let mut buf = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+            device.read_at(&mut buf, offset)?;
+            all_legacy &= ShardCheckpoint::decode(&buf).is_some();
+            let Some(table) = PackedCheckpointTable::decode(&buf) else {
+                continue;
+            };
+            if table.checkpoints.len() != shard_count {
+                continue;
+            }
+            // A valid older slot is the last completed acknowledgement epoch
+            // when the alternate slot tears: global sync writes the new page,
+            // barriers it, and only then advances waiters. This recovery model
+            // covers crash-during-newer-epoch, not latent media corruption after
+            // a successfully acknowledged durability barrier.
+            if newest
+                .as_ref()
+                .is_none_or(|current| table.generation > current.generation)
+            {
+                newest = Some(table);
+            }
+        }
+        Ok(match newest {
+            Some(table) => PackedCheckpointLoad::Packed(table),
+            None if all_legacy => PackedCheckpointLoad::Legacy,
+            None => PackedCheckpointLoad::Corrupt,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::buffer::commit_log) fn write_packed_checkpoint(
+        device: &dyn BlockBackend,
+        table: &PackedCheckpointTable,
+    ) -> OnyxResult<()> {
+        let encoded = table.encode();
+        let mut aligned = AlignedBuf::new(SHARD_CHECKPOINT_SIZE as usize, false)?;
+        aligned.as_mut_slice().copy_from_slice(&encoded);
+        Self::write_packed_checkpoint_page(device, table.generation, aligned.as_slice())
+    }
+
+    pub(super) fn write_packed_checkpoint_page(
+        device: &dyn BlockBackend,
+        generation: u64,
+        page: &[u8],
+    ) -> OnyxResult<()> {
+        debug_assert_eq!(page.len(), SHARD_CHECKPOINT_SIZE as usize);
+        let slot = PackedCheckpointTable::slot_for_generation(generation);
+        let offset = COMMIT_LOG_SUPERBLOCK_SIZE + slot as u64 * SHARD_CHECKPOINT_SIZE;
+        device.write_at(page, offset)
+    }
+
     /// Initialize checkpoint blocks to zero (used during v2→v3 migration).
 
     pub(super) fn init_checkpoint_blocks(
