@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 use crossbeam_channel::{Receiver, Sender};
 use io_uring::{opcode, types};
 
+use crate::buffer::pool::BufferAppendTicket;
 use crate::config::UblkConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::types::{Lba, VolumeConfig, BLOCK_SIZE, SECTOR_SIZE};
@@ -77,9 +78,69 @@ struct CompletedIo {
     completed_at: Instant,
 }
 
+enum IoWorkerResult {
+    Complete(i32),
+    AwaitDurability {
+        res: i32,
+        tickets: Vec<BufferAppendTicket>,
+    },
+}
+
+struct PendingDurableIo {
+    tag: u16,
+    op: u32,
+    res: i32,
+    queued_at: Instant,
+    queue_wait_ns: u64,
+    worker_ns: u64,
+    tickets: Vec<BufferAppendTicket>,
+}
+
 const OPPORTUNISTIC_COMPLETION_DRAIN_MAX: usize = 8;
 
 impl IoWorkerContext {
+    fn handle_io_deferred(
+        &self,
+        op: u32,
+        start_sector: u64,
+        nr_sectors: u32,
+        io_slice: &mut [u8],
+    ) -> IoWorkerResult {
+        let offset_bytes = start_sector * self.sector_size;
+        let io_bytes = nr_sectors as u64 * self.sector_size;
+        let io_len = io_bytes as usize;
+        if op == sys::UBLK_IO_OP_WRITE
+            && offset_bytes % self.block_size == 0
+            && io_bytes % self.block_size == 0
+            && io_len <= io_slice.len()
+        {
+            let start_lba = Lba(offset_bytes / self.block_size);
+            let lba_count = (io_bytes / self.block_size) as u32;
+            return match self.zone_manager.submit_write_deferred(
+                &self.vol_id,
+                start_lba,
+                lba_count,
+                &io_slice[..io_len],
+                self.vol_created_at,
+            ) {
+                Ok(tickets) => IoWorkerResult::AwaitDurability {
+                    res: io_bytes as i32,
+                    tickets,
+                },
+                Err(err) => {
+                    tracing::error!(
+                        lba = start_lba.0,
+                        count = lba_count,
+                        error = %err,
+                        "deferred write failed"
+                    );
+                    IoWorkerResult::Complete(-(libc::EIO as i32))
+                }
+            };
+        }
+        IoWorkerResult::Complete(self.handle_io(op, start_sector, nr_sectors, io_slice))
+    }
+
     fn handle_io(&self, op: u32, start_sector: u64, nr_sectors: u32, io_slice: &mut [u8]) -> i32 {
         let offset_bytes = start_sector * self.sector_size;
         let io_bytes = nr_sectors as u64 * self.sector_size;
@@ -383,12 +444,14 @@ fn spawn_queue_workers(
     ctx: IoWorkerContext,
     request_rx: Receiver<QueuedIo>,
     completion_tx: Sender<CompletedIo>,
+    durability_tx: Sender<PendingDurableIo>,
     event_fd: RawFd,
 ) -> Vec<JoinHandle<()>> {
     (0..workers)
         .map(|worker_idx| {
             let rx = request_rx.clone();
             let tx = completion_tx.clone();
+            let durable_tx = durability_tx.clone();
             let ctx = ctx.clone();
             thread::Builder::new()
                 .name(format!("ublk-q{qid}-worker-{worker_idx}"))
@@ -402,8 +465,8 @@ fn spawn_queue_workers(
                     while let Ok(mut req) = rx.recv() {
                         let worker_start = Instant::now();
                         let queue_wait_ns = req.queued_at.elapsed().as_nanos() as u64;
-                        let res = match &mut req.data {
-                            QueuedIoData::Owned(data) => ctx.handle_io(
+                        let result = match &mut req.data {
+                            QueuedIoData::Owned(data) => ctx.handle_io_deferred(
                                 req.op,
                                 req.start_sector,
                                 req.nr_sectors,
@@ -413,10 +476,35 @@ fn spawn_queue_workers(
                                 let io_slice = unsafe {
                                     std::slice::from_raw_parts_mut(*ptr as *mut u8, *len)
                                 };
-                                ctx.handle_io(req.op, req.start_sector, req.nr_sectors, io_slice)
+                                ctx.handle_io_deferred(
+                                    req.op,
+                                    req.start_sector,
+                                    req.nr_sectors,
+                                    io_slice,
+                                )
                             }
                         };
                         let worker_ns = worker_start.elapsed().as_nanos() as u64;
+                        let res = match result {
+                            IoWorkerResult::Complete(res) => res,
+                            IoWorkerResult::AwaitDurability { res, tickets } => {
+                                if durable_tx
+                                    .send(PendingDurableIo {
+                                        tag: req.tag,
+                                        op: req.op,
+                                        res,
+                                        queued_at: req.queued_at,
+                                        queue_wait_ns,
+                                        worker_ns,
+                                        tickets,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
                         let completed = CompletedIo {
                             tag: req.tag,
                             op: req.op,
@@ -435,6 +523,70 @@ fn spawn_queue_workers(
                 .unwrap_or_else(|err| panic!("failed to spawn ublk worker: {err}"))
         })
         .collect()
+}
+
+fn spawn_durability_dispatcher(
+    qid: u16,
+    rx: Receiver<PendingDurableIo>,
+    completion_tx: Sender<CompletedIo>,
+    event_fd: RawFd,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("ublk-q{qid}-durable"))
+        .spawn(move || {
+            crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
+            let mut pending = Vec::<PendingDurableIo>::new();
+            let mut input_open = true;
+            while input_open || !pending.is_empty() {
+                if pending.is_empty() {
+                    match rx.recv() {
+                        Ok(item) => pending.push(item),
+                        Err(_) => input_open = false,
+                    }
+                } else {
+                    match rx.recv_timeout(std::time::Duration::from_micros(25)) {
+                        Ok(item) => pending.push(item),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            input_open = false
+                        }
+                    }
+                }
+                while let Ok(item) = rx.try_recv() {
+                    pending.push(item);
+                }
+
+                let mut idx = 0;
+                while idx < pending.len() {
+                    if pending[idx]
+                        .tickets
+                        .iter()
+                        .all(BufferAppendTicket::is_durable)
+                    {
+                        let item = pending.swap_remove(idx);
+                        for ticket in item.tickets {
+                            ticket.finish();
+                        }
+                        let completed = CompletedIo {
+                            tag: item.tag,
+                            op: item.op,
+                            res: item.res,
+                            elapsed_ns: item.queued_at.elapsed().as_nanos() as u64,
+                            queue_wait_ns: item.queue_wait_ns,
+                            worker_ns: item.worker_ns,
+                            completed_at: Instant::now(),
+                        };
+                        if completion_tx.send(completed).is_err() {
+                            return;
+                        }
+                        eventfd_write(event_fd);
+                    } else {
+                        idx += 1;
+                    }
+                }
+            }
+        })
+        .unwrap_or_else(|err| panic!("failed to spawn ublk durability dispatcher: {err}"))
 }
 
 impl OnyxUblkTarget {
@@ -531,6 +683,7 @@ impl OnyxUblkTarget {
             let queue_thread_bound = Rc::new(Cell::new(false));
             let (request_tx, request_rx) = crossbeam_channel::unbounded::<QueuedIo>();
             let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<CompletedIo>();
+            let (durability_tx, durability_rx) = crossbeam_channel::unbounded::<PendingDurableIo>();
             let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
             if event_fd < 0 {
                 tracing::error!(
@@ -540,12 +693,15 @@ impl OnyxUblkTarget {
                 return;
             }
             let workers = queue_workers;
+            let durability_handle =
+                spawn_durability_dispatcher(qid, durability_rx, completion_tx.clone(), event_fd);
             let worker_handles = spawn_queue_workers(
                 qid,
                 workers,
                 worker_ctx.clone(),
                 request_rx,
                 completion_tx,
+                durability_tx.clone(),
                 event_fd,
             );
             let submit_tx = request_tx.clone();
@@ -697,6 +853,8 @@ impl OnyxUblkTarget {
             for handle in worker_handles {
                 let _ = handle.join();
             }
+            drop(durability_tx);
+            let _ = durability_handle.join();
             unsafe {
                 libc::close(event_fd);
             }

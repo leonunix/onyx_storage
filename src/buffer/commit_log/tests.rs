@@ -142,6 +142,29 @@ fn create_pool(size: u64, group_commit_wait: Duration) -> (WriteBufferPool, Name
 }
 
 #[test]
+fn dropped_deferred_ticket_is_published_by_sync() {
+    let (pool, _tmp) = create_pool(16 * 1024 * 1024, Duration::from_millis(5));
+    let ticket = pool
+        .append_deferred("test-vol", Lba(9), 1, &[0x5a; BLOCK_SIZE as usize], 0)
+        .unwrap();
+    let seq = ticket.seq();
+    drop(ticket);
+
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+    assert_eq!(
+        pool.lookup("test-vol", Lba(9))
+            .unwrap()
+            .unwrap()
+            .payload
+            .unwrap()[0],
+        0x5a
+    );
+}
+
+#[test]
 fn uring_sync_batch_chunks_over_sq_depth() {
     let tmp = NamedTempFile::new().unwrap();
     let slot = BufferShard::slot_size();

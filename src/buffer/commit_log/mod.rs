@@ -621,6 +621,42 @@ pub struct WriteBufferPool {
     meta_fence: OnceLock<String>,
 }
 
+/// A prepared LV2 append that becomes acknowledgeable once its shard's
+/// durability watermark reaches `seq`. This lets frontends wait outside the
+/// request worker while preserving ack-after-fdatasync semantics.
+pub struct BufferAppendTicket {
+    shard: Arc<BufferShard>,
+    seq: u64,
+    append_started: Instant,
+    durability_wait_started: Instant,
+}
+
+impl BufferAppendTicket {
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.shard.lv2_durability.synced_seq.load(Ordering::Acquire) >= self.seq
+    }
+
+    pub fn wait(self) -> u64 {
+        self.shard.wait_for_durable(self.seq);
+        self.finish()
+    }
+
+    pub fn finish(self) -> u64 {
+        debug_assert!(self.is_durable());
+        if let Some(metrics) = self.shard.metrics.get() {
+            metrics.record_buffer_append_wait_durable_ns(
+                self.durability_wait_started.elapsed().as_nanos() as u64,
+            );
+            BufferShard::record_metric(&metrics.buffer_append_total_ns, self.append_started);
+        }
+        self.seq
+    }
+}
+
 #[derive(Default)]
 struct ShardThrottleState {
     /// Absolute wakeup time in ns since `WriteBufferPool::throttle_anchor`.

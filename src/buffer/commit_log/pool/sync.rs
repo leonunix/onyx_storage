@@ -634,6 +634,9 @@ impl WriteBufferPool {
             }
         }
         shard.lv2_durability.advance(batch.max_seq);
+        for entry in &batch.inflight_all {
+            shard.publish_ready(entry.pending.seq);
+        }
         if let Some(m) = metrics.get() {
             let batch_entries = batch.inflight_all.len() as u64;
             let batch_bytes = batch
@@ -1316,6 +1319,9 @@ impl WriteBufferPool {
                         .max()
                         .unwrap_or(0);
                     shard.lv2_durability.advance(max_seq);
+                    for entry in &batch.all {
+                        shard.publish_ready(entry.pending.seq);
+                    }
                     if let Some(metrics) = metrics.get() {
                         let entries = batch.all.len() as u64;
                         let bytes = batch
@@ -1562,17 +1568,18 @@ impl WriteBufferPool {
                             lc.cancelled.remove(&entry.pending.seq);
                         }
                     }
-                    // Advance the LV2 fdatasync watermark and wake every
-                    // parked appender whose seq is now durable. Payload
-                    // caching + ready-channel publishing both moved into
-                    // the appender (see `pool.append`); the sync thread no
-                    // longer touches index state post-fdatasync.
+                    // Advance the LV2 fdatasync watermark, then publish every
+                    // durable entry. Sync owns this publication so a dropped
+                    // deferred ticket cannot strand an entry outside flusher.
                     let batch_max_durable = inflight
                         .iter()
                         .map(|entry| entry.pending.seq)
                         .max()
                         .unwrap_or(0);
                     shard.lv2_durability.advance(batch_max_durable);
+                    for entry in &inflight {
+                        shard.publish_ready(entry.pending.seq);
+                    }
                     if let Some(metrics) = metrics.get() {
                         let batch_entries = inflight.len() as u64;
                         let batch_bytes = inflight

@@ -141,6 +141,19 @@ impl WriteBufferPool {
         payload: &[u8],
         vol_created_at: u64,
     ) -> OnyxResult<u64> {
+        Ok(self
+            .append_deferred(vol_id, start_lba, lba_count, payload, vol_created_at)?
+            .wait())
+    }
+
+    pub fn append_deferred(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        payload: &[u8],
+        vol_created_at: u64,
+    ) -> OnyxResult<BufferAppendTicket> {
         // Fail-fast when metadb persistence is fenced: the buffer ring is the
         // only durable record until a checkpoint folds it into manifest pages,
         // so if checkpoints are dead an ack here would be a lie (the ring fills
@@ -172,19 +185,12 @@ impl WriteBufferPool {
         // advance `lv2_durability.synced_seq` past our seq, which is what
         // `wait_for_durable` parks on below.
         let _ = shard.sync_wake_tx.send(());
-
-        // Block until LV2 fdatasync covers this seq. This is the entire
-        // point of the post-volatile design: ack ⇒ durable on LV2.
-        shard.shard.wait_for_durable(seq);
-
-        // Push the seq onto the flusher's ready channels now that it is
-        // (1) durable on LV2 and (2) visible in pending_entries / lba_index.
-        shard.shard.publish_ready(seq);
-
-        if let Some(metrics) = self.metrics.get() {
-            BufferShard::record_metric(&metrics.buffer_append_total_ns, total_start);
-        }
-        Ok(seq)
+        Ok(BufferAppendTicket {
+            shard: shard.shard.clone(),
+            seq,
+            append_started: total_start,
+            durability_wait_started: Instant::now(),
+        })
     }
 
     pub fn lookup(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<PendingEntry>> {

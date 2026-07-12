@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::buffer::flush::BufferFlusher;
-use crate::buffer::pool::WriteBufferPool;
+use crate::buffer::pool::{BufferAppendTicket, WriteBufferPool};
 use crate::error::OnyxResult;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
@@ -286,9 +286,29 @@ impl ZoneManager {
         vol_created_at: u64,
     ) -> OnyxResult<()> {
         let total_start = Instant::now();
+        let tickets =
+            self.submit_write_deferred(vol_id, start_lba, lba_count, data, vol_created_at)?;
+        for ticket in tickets {
+            ticket.wait();
+        }
+        self.metrics.zone_submit_write_ns.fetch_add(
+            total_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    pub fn submit_write_deferred(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        data: &[u8],
+        vol_created_at: u64,
+    ) -> OnyxResult<Vec<BufferAppendTicket>> {
         let result = (|| {
             if lba_count == 0 {
-                return Ok(());
+                return Ok(Vec::new());
             }
 
             let chunks = if lba_count == 0 {
@@ -304,6 +324,7 @@ impl ZoneManager {
             let mut remaining_lbas = lba_count as u64;
             let mut current_lba = start_lba.0;
             let mut data_offset = 0usize;
+            let mut tickets = Vec::with_capacity(chunks as usize);
 
             while remaining_lbas > 0 {
                 let zone_end_lba =
@@ -312,13 +333,13 @@ impl ZoneManager {
                     remaining_lbas.min(zone_end_lba.saturating_sub(current_lba));
                 let byte_len = lbas_in_this_zone as usize * block_size;
                 let end = data_offset + byte_len;
-                self.buffer_pool.append(
+                tickets.push(self.buffer_pool.append_deferred(
                     vol_id,
                     Lba(current_lba),
                     lbas_in_this_zone as u32,
                     &data[data_offset..end],
                     vol_created_at,
-                )?;
+                )?);
                 current_lba += lbas_in_this_zone;
                 remaining_lbas -= lbas_in_this_zone;
                 data_offset = end;
@@ -336,14 +357,8 @@ impl ZoneManager {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            Ok(())
+            Ok(tickets)
         })();
-
-        self.metrics.zone_submit_write_ns.fetch_add(
-            total_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
         result
     }
 

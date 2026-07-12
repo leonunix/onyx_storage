@@ -817,11 +817,7 @@ impl BufferShard {
     /// appender whose seq is now durable. Called by `WriteBufferPool::append`
     /// before returning the ack to the caller.
     pub(super) fn wait_for_durable(&self, seq: u64) {
-        let wait_elapsed = self.lv2_durability.wait_for(seq);
-        if let Some(metrics) = self.metrics.get() {
-            let ns = wait_elapsed.as_nanos().min(u64::MAX as u128) as u64;
-            metrics.record_buffer_append_wait_durable_ns(ns);
-        }
+        self.lv2_durability.wait_for(seq);
     }
 
     /// Wake the flusher after this seq becomes durable. These bounded channels
