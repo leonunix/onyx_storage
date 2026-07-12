@@ -747,34 +747,183 @@ fn commit_worker_rejects_stale_dedup_hit_generation() {
 fn commit_aggregator_forms_full_batch_and_flushes_disconnect_tail() {
     let (raw_tx, raw_rx) = bounded(8);
     let (batch_tx, batch_rx) = bounded(8);
-    let target = BlockmapValue::zero();
 
     for i in 0..5u64 {
-        let (response_tx, _response_rx) = bounded(1);
-        raw_tx
-            .send(super::writer::CommitJob::DedupHit(
-                super::writer::DedupHitCommitJob {
-                    vol_id: VolumeId("aggregate".into()),
-                    vol_created_at: 1,
-                    hits: vec![(Lba(i), target, [i as u8; 8])],
-                    promote_entries: Vec::new(),
-                    seqs: vec![i + 1],
-                    response_tx,
-                    enqueued_at: Instant::now(),
-                },
-            ))
-            .unwrap();
+        raw_tx.send(aggregator_job(i, 1)).unwrap();
     }
     drop(raw_tx);
 
     let aggregator = std::thread::spawn(move || {
-        BufferFlusher::commit_aggregator_loop(raw_rx, batch_tx, 3, Duration::ZERO, 0)
+        BufferFlusher::commit_aggregator_loop(raw_rx, batch_tx, None, true, 3, 3, Duration::ZERO, 0)
     });
 
     assert_eq!(batch_rx.recv().unwrap().len(), 3);
     assert_eq!(batch_rx.recv().unwrap().len(), 2);
     aggregator.join().unwrap();
     assert!(batch_rx.recv().is_err());
+}
+
+#[test]
+fn commit_aggregator_idle_gap_resets_after_each_arrival() {
+    let (raw_tx, raw_rx) = bounded(8);
+    let (batch_tx, batch_rx) = bounded(8);
+    let aggregator = std::thread::spawn(move || {
+        BufferFlusher::commit_aggregator_loop(
+            raw_rx,
+            batch_tx,
+            None,
+            true,
+            3,
+            16,
+            Duration::from_millis(200),
+            0,
+        )
+    });
+
+    raw_tx.send(aggregator_job(0, 1)).unwrap();
+    std::thread::sleep(Duration::from_millis(120));
+    raw_tx.send(aggregator_job(1, 1)).unwrap();
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(batch_rx.try_recv().is_err());
+    raw_tx.send(aggregator_job(2, 1)).unwrap();
+
+    assert_eq!(
+        batch_rx.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        3
+    );
+    drop(raw_tx);
+    aggregator.join().unwrap();
+}
+
+#[test]
+fn commit_aggregator_idle_flushes_partial_without_splitting_jobs() {
+    let (raw_tx, raw_rx) = bounded(8);
+    let (batch_tx, batch_rx) = bounded(8);
+    let aggregator = std::thread::spawn(move || {
+        BufferFlusher::commit_aggregator_loop(
+            raw_rx,
+            batch_tx,
+            None,
+            true,
+            8,
+            16,
+            Duration::from_millis(20),
+            0,
+        )
+    });
+
+    raw_tx.send(aggregator_job(0, 6)).unwrap();
+    let partial = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(partial.len(), 1);
+    assert!(matches!(
+        &partial[0],
+        super::writer::CommitJob::DedupHit(job) if job.hits.len() == 6
+    ));
+
+    raw_tx.send(aggregator_job(6, 10)).unwrap();
+    let overshoot = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(overshoot.len(), 1);
+    assert!(matches!(
+        &overshoot[0],
+        super::writer::CommitJob::DedupHit(job) if job.hits.len() == 10
+    ));
+    drop(raw_tx);
+    aggregator.join().unwrap();
+}
+
+#[test]
+fn commit_aggregator_carries_whole_job_that_crosses_target() {
+    let (raw_tx, raw_rx) = bounded(8);
+    let (batch_tx, batch_rx) = bounded(8);
+    let aggregator = std::thread::spawn(move || {
+        BufferFlusher::commit_aggregator_loop(
+            raw_rx,
+            batch_tx,
+            None,
+            true,
+            8,
+            16,
+            Duration::from_secs(1),
+            0,
+        )
+    });
+
+    raw_tx.send(aggregator_job(0, 6)).unwrap();
+    raw_tx.send(aggregator_job(6, 4)).unwrap();
+    let prefix = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        prefix.as_slice(),
+        [super::writer::CommitJob::DedupHit(job)] if job.hits.len() == 6
+    ));
+
+    raw_tx.send(aggregator_job(10, 4)).unwrap();
+    let full = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(full.len(), 2);
+    assert_eq!(
+        full.iter()
+            .map(|job| match job {
+                super::writer::CommitJob::DedupHit(job) => job.hits.len(),
+                _ => 0,
+            })
+            .sum::<usize>(),
+        8
+    );
+    drop(raw_tx);
+    aggregator.join().unwrap();
+}
+
+#[test]
+fn commit_aggregator_retain_tail_gate_off_uses_legacy_budget() {
+    assert!(!crate::config::FlushConfig::default().commit_retain_tail);
+
+    let (raw_tx, raw_rx) = bounded(8);
+    let (batch_tx, batch_rx) = bounded(8);
+    for i in 0..5u64 {
+        raw_tx.send(aggregator_job(i, 1)).unwrap();
+    }
+    drop(raw_tx);
+
+    let aggregator = std::thread::spawn(move || {
+        BufferFlusher::commit_aggregator_loop(
+            raw_rx,
+            batch_tx,
+            None,
+            false,
+            3,
+            5,
+            Duration::ZERO,
+            0,
+        )
+    });
+
+    assert_eq!(
+        batch_rx.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        5,
+        "gate-off path must preserve the legacy coalesce budget"
+    );
+    aggregator.join().unwrap();
+    assert!(batch_rx.recv().is_err());
+}
+
+fn aggregator_job(start_lba: u64, lba_count: usize) -> super::writer::CommitJob {
+    let (response_tx, _response_rx) = bounded(1);
+    let target = BlockmapValue::zero();
+    super::writer::CommitJob::DedupHit(super::writer::DedupHitCommitJob {
+        vol_id: VolumeId("aggregate".into()),
+        vol_created_at: 1,
+        hits: (0..lba_count)
+            .map(|offset| {
+                let lba = start_lba + offset as u64;
+                (Lba(lba), target, [lba as u8; 8])
+            })
+            .collect(),
+        promote_entries: Vec::new(),
+        seqs: (0..lba_count)
+            .map(|offset| start_lba + offset as u64 + 1)
+            .collect(),
+        response_tx,
+        enqueued_at: Instant::now(),
+    })
 }
 
 #[test]

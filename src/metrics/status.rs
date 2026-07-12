@@ -497,6 +497,22 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
+                "metadb_apply_refcount_batch: batches={} actions={} pbas={} sampled_pbas={} grouping_us={} (max={}) base_lookup_us={} (max={}) pending_scan_us={} (max={}) delta_merge_us={} (max={})",
+                metadb.apply_refcount_batch_count,
+                metadb.apply_refcount_batch_actions,
+                metadb.apply_refcount_batch_pbas,
+                metadb.apply_refcount_breakdown_sampled_pbas,
+                metadb.apply_refcount_pba_grouping_us,
+                metadb.apply_refcount_pba_grouping_max_us,
+                metadb.apply_refcount_base_page_lookup_us,
+                metadb.apply_refcount_base_page_lookup_max_us,
+                metadb.apply_refcount_pending_slot_scan_us,
+                metadb.apply_refcount_pending_slot_scan_max_us,
+                metadb.apply_refcount_delta_merge_us,
+                metadb.apply_refcount_delta_merge_max_us,
+            );
+            let _ = writeln!(
+                out,
                 "metadb_apply_lane_l2p: tasks={} queue_depth_max={} queue_wait_us={} queue_wait_max_us={} exec_us={} exec_max_us={} idle_us={} idle_max_us={} wakeups={} empty_wakeups={} burst_total={} burst_max={}",
                 metadb.l2p_apply_lane_tasks,
                 metadb.l2p_apply_lane_queue_depth_max,

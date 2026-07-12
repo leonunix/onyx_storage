@@ -97,6 +97,7 @@ impl BufferFlusher {
             .min(Self::WRITER_BATCH_SIZE);
         let commit_target_lbas_per_tx = config.commit_target_lbas_per_tx.max(1);
         let commit_coalesce_lba_budget = config.commit_coalesce_lba_budget;
+        let commit_retain_tail = config.commit_retain_tail;
         let commit_coalesce_timeout = Duration::from_micros(config.commit_coalesce_timeout_us);
         let packed_commit_try_drain_lba_budget = config.packed_commit_try_drain_lba_budget;
         // Collapse the onyx flag + depth knob to a single effective cap.
@@ -385,6 +386,7 @@ impl BufferFlusher {
         // The aggregator owns the only batch sender. It exits only after every
         // raw sender is dropped, forwarding the final partial transaction
         // before it disconnects the executor queue.
+        let commit_aggregator_pool = pool.clone();
         let commit_aggregator_handle = thread::Builder::new()
             .name("flusher-commit-aggregator".to_string())
             .spawn(move || {
@@ -392,6 +394,9 @@ impl BufferFlusher {
                 Self::commit_aggregator_loop(
                     commit_rx,
                     commit_batch_tx,
+                    Some(commit_aggregator_pool),
+                    commit_retain_tail,
+                    commit_target_lbas_per_tx,
                     commit_coalesce_lba_budget,
                     commit_coalesce_timeout,
                     packed_commit_try_drain_lba_budget,

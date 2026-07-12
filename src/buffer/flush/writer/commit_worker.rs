@@ -36,6 +36,12 @@ pub(in crate::buffer::flush) const COMMIT_WORKER_QUEUE_CAP: usize = 8192;
 /// job queue remains the primary backpressure boundary.
 pub(in crate::buffer::flush) const COMMIT_EXECUTOR_QUEUE_CAP: usize = 64;
 
+/// Emergency tail-flush threshold. Normal batching stays bounded by the 8K
+/// transaction target; this only trades batching efficiency for faster LV2
+/// consumption when a physical ring is already close to hard backpressure.
+const COMMIT_AGGREGATOR_PRESSURE_PCT: u8 = 80;
+const COMMIT_AGGREGATOR_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Owned per-unit data the shard writer has staged (alloc + IO done).
 pub(in crate::buffer::flush) struct UnitCommitData {
     pub shard_idx: usize,
@@ -119,10 +125,85 @@ impl BufferFlusher {
     pub(in crate::buffer::flush) fn commit_aggregator_loop(
         rx: Receiver<CommitJob>,
         batch_tx: Sender<Vec<CommitJob>>,
+        pressure_pool: Option<Arc<WriteBufferPool>>,
+        retain_tail: bool,
+        target_lbas_per_tx: usize,
         coalesce_lba_budget: usize,
         coalesce_timeout: Duration,
         packed_try_drain_lba_budget: usize,
     ) {
+        if retain_tail && coalesce_lba_budget > 0 {
+            let target_lbas = target_lbas_per_tx.max(1);
+            let batch_lba_limit = coalesce_lba_budget.min(target_lbas).max(1);
+            let mut batch = Vec::new();
+            let mut total_lbas = 0usize;
+            let mut last_pressure_sample = Instant::now();
+            loop {
+                let received = if batch.is_empty() {
+                    rx.recv()
+                        .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)
+                } else {
+                    rx.recv_timeout(coalesce_timeout)
+                };
+                match received {
+                    Ok(job) => {
+                        let job_lbas = lbas_in_job(&job);
+                        if !batch.is_empty()
+                            && total_lbas.saturating_add(job_lbas) > batch_lba_limit
+                        {
+                            // Whole jobs are not splittable here. Send the
+                            // largest sub-target prefix and carry the crossing
+                            // job into the next transaction instead of creating
+                            // an 8K + tiny-tail pair in the executor.
+                            if batch_tx.send(std::mem::take(&mut batch)).is_err() {
+                                break;
+                            }
+                            total_lbas = 0;
+                        }
+                        total_lbas = total_lbas.saturating_add(job_lbas);
+                        batch.push(job);
+                        let reached_limit = total_lbas >= batch_lba_limit;
+                        let under_pressure = if !reached_limit
+                            && last_pressure_sample.elapsed()
+                                >= COMMIT_AGGREGATOR_PRESSURE_SAMPLE_INTERVAL
+                        {
+                            last_pressure_sample = Instant::now();
+                            pressure_pool.as_ref().is_some_and(|pool| {
+                                pool.physical_fill_percentage() >= COMMIT_AGGREGATOR_PRESSURE_PCT
+                            })
+                        } else {
+                            false
+                        };
+                        if reached_limit || under_pressure {
+                            if batch_tx.send(std::mem::take(&mut batch)).is_err() {
+                                break;
+                            }
+                            total_lbas = 0;
+                            last_pressure_sample = Instant::now();
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // Every successful receive starts a fresh idle gap, so
+                        // a steady stream carries its sub-target tail forward.
+                        if !batch.is_empty() {
+                            if batch_tx.send(std::mem::take(&mut batch)).is_err() {
+                                break;
+                            }
+                            total_lbas = 0;
+                            last_pressure_sample = Instant::now();
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        if !batch.is_empty() {
+                            let _ = batch_tx.send(batch);
+                        }
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
         while let Ok(first) = rx.recv() {
             let batch = Self::drain_commit_batch(
                 first,

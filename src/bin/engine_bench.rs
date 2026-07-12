@@ -834,6 +834,38 @@ fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
         meta.apply_refcount_max_us
     );
     println!(
+        "  \"metadb_apply_refcount_batch_count\": {},",
+        meta.apply_refcount_batch_count
+    );
+    println!(
+        "  \"metadb_apply_refcount_batch_actions\": {},",
+        meta.apply_refcount_batch_actions
+    );
+    println!(
+        "  \"metadb_apply_refcount_batch_pbas\": {},",
+        meta.apply_refcount_batch_pbas
+    );
+    println!(
+        "  \"metadb_apply_refcount_breakdown_sampled_pbas\": {},",
+        meta.apply_refcount_breakdown_sampled_pbas
+    );
+    println!(
+        "  \"metadb_apply_refcount_pba_grouping_us\": {},",
+        meta.apply_refcount_pba_grouping_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_page_lookup_us\": {},",
+        meta.apply_refcount_base_page_lookup_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_pending_slot_scan_us\": {},",
+        meta.apply_refcount_pending_slot_scan_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_delta_merge_us\": {},",
+        meta.apply_refcount_delta_merge_us
+    );
+    println!(
         "  \"metadb_apply_dedup_count\": {},",
         meta.apply_dedup_count
     );

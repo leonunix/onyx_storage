@@ -1350,6 +1350,11 @@ pub struct FlushConfig {
     /// Set 0 to disable cross-job coalescing.
     #[serde(default = "default_commit_coalesce_lba_budget")]
     pub commit_coalesce_lba_budget: usize,
+    /// Retain a sub-target commit tail across receive cycles so sustained
+    /// traffic can form transactions closer to `commit_target_lbas_per_tx`.
+    /// Disabled by default to preserve the legacy fixed-window drain behavior.
+    #[serde(default)]
+    pub commit_retain_tail: bool,
     /// Optional wait window after the first queued commit job arrives.
     /// This lets nearby shard-writer jobs join the same coalesced batch
     /// without making the queue unbounded. Set 0 for try_recv-only drain.
@@ -1430,6 +1435,7 @@ impl Default for FlushConfig {
             commit_workers_per_volume: default_commit_workers_per_volume(),
             commit_target_lbas_per_tx: default_commit_target_lbas_per_tx(),
             commit_coalesce_lba_budget: default_commit_coalesce_lba_budget(),
+            commit_retain_tail: false,
             commit_coalesce_timeout_us: default_commit_coalesce_timeout_us(),
             packed_commit_try_drain_lba_budget: default_packed_commit_try_drain_lba_budget(),
             writer_read_active_batch_size: default_writer_read_active_batch_size(),
