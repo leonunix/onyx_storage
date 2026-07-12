@@ -106,7 +106,10 @@ raid_full_stripe_writes = true
 [buffer]
 capacity_mb = 524288
 flush_watermark_pct = 80
-group_commit_wait_us = 100
+# X20 latency profile: the global LV2 coordinator still coalesces completed
+# write lanes before its shared flush, so 25us keeps batching without charging
+# every foreground write the previous 100us lane-collection window.
+group_commit_wait_us = 25
 shards = 16
 max_memory_mb = 16384
 volatile_memory_mb = 49152
