@@ -118,6 +118,9 @@ pub struct EngineMetrics {
     pub ublk_write_queue_wait_ns: AtomicU64,
     pub ublk_write_worker_ns: AtomicU64,
     pub ublk_write_completion_wait_ns: AtomicU64,
+    pub ublk_write_queue_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub ublk_write_worker_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub ublk_write_completion_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub volume_partial_write_ops: AtomicU64,
     pub zone_write_dispatches: AtomicU64,
     pub zone_submit_write_ns: AtomicU64,
@@ -133,6 +136,8 @@ pub struct EngineMetrics {
     pub buffer_append_prepare_ns: AtomicU64,
     pub buffer_append_log_write_ns: AtomicU64,
     pub buffer_append_wait_durable_ns: AtomicU64,
+    pub buffer_append_prepare_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub buffer_append_wait_durable_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub buffer_sync_batches: AtomicU64,
     /// Actual backend durability barriers. On a multi-shard chunklet LV2 this
     /// is lower than `buffer_sync_batches` because one root flush covers a
@@ -650,6 +655,32 @@ pub struct EngineMetrics {
 }
 
 impl EngineMetrics {
+    pub fn record_ublk_write_stages(
+        &self,
+        queue_wait_ns: u64,
+        worker_ns: u64,
+        completion_wait_ns: u64,
+    ) {
+        record_latency_bucket(&self.ublk_write_queue_wait_latency_buckets, queue_wait_ns);
+        record_latency_bucket(&self.ublk_write_worker_latency_buckets, worker_ns);
+        record_latency_bucket(
+            &self.ublk_write_completion_wait_latency_buckets,
+            completion_wait_ns,
+        );
+    }
+
+    pub fn record_buffer_append_prepare_ns(&self, ns: u64) {
+        self.buffer_append_prepare_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.buffer_append_prepare_latency_buckets, ns);
+    }
+
+    pub fn record_buffer_append_wait_durable_ns(&self, ns: u64) {
+        self.buffer_append_wait_durable_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&self.buffer_append_wait_durable_latency_buckets, ns);
+    }
+
     /// Get or create per-volume metrics counters.
     pub fn get_volume_metrics(&self, vol_id: &str) -> Arc<VolumeMetrics> {
         self.volume_metrics

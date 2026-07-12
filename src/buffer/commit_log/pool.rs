@@ -159,6 +159,9 @@ impl WriteBufferPool {
             shard
                 .shard
                 .append_with_seq(seq, vol_id, start_lba, lba_count, payload, vol_created_at);
+        if let Some(metrics) = self.metrics.get() {
+            metrics.record_buffer_append_prepare_ns(total_start.elapsed().as_nanos() as u64);
+        }
         // The seq is now either visible in `pending_seqs`, or the append
         // failed and no acknowledged write exists for this seq. Do not hold
         // the gate across fdatasync / ready publication.

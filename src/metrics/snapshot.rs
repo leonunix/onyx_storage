@@ -25,6 +25,15 @@ impl EngineMetrics {
             ublk_write_queue_wait_ns: load(&self.ublk_write_queue_wait_ns),
             ublk_write_worker_ns: load(&self.ublk_write_worker_ns),
             ublk_write_completion_wait_ns: load(&self.ublk_write_completion_wait_ns),
+            ublk_write_queue_wait_latency_buckets: load_latency_buckets(
+                &self.ublk_write_queue_wait_latency_buckets,
+            ),
+            ublk_write_worker_latency_buckets: load_latency_buckets(
+                &self.ublk_write_worker_latency_buckets,
+            ),
+            ublk_write_completion_wait_latency_buckets: load_latency_buckets(
+                &self.ublk_write_completion_wait_latency_buckets,
+            ),
             volume_partial_write_ops: load(&self.volume_partial_write_ops),
             zone_write_dispatches: load(&self.zone_write_dispatches),
             zone_submit_write_ns: load(&self.zone_submit_write_ns),
@@ -40,6 +49,12 @@ impl EngineMetrics {
             buffer_append_prepare_ns: load(&self.buffer_append_prepare_ns),
             buffer_append_log_write_ns: load(&self.buffer_append_log_write_ns),
             buffer_append_wait_durable_ns: load(&self.buffer_append_wait_durable_ns),
+            buffer_append_prepare_latency_buckets: load_latency_buckets(
+                &self.buffer_append_prepare_latency_buckets,
+            ),
+            buffer_append_wait_durable_latency_buckets: load_latency_buckets(
+                &self.buffer_append_wait_durable_latency_buckets,
+            ),
             buffer_sync_batches: load(&self.buffer_sync_batches),
             buffer_sync_flushes: load(&self.buffer_sync_flushes),
             buffer_sync_batch_ns: load(&self.buffer_sync_batch_ns),
@@ -358,6 +373,9 @@ pub struct EngineMetricsSnapshot {
     pub ublk_write_queue_wait_ns: u64,
     pub ublk_write_worker_ns: u64,
     pub ublk_write_completion_wait_ns: u64,
+    pub ublk_write_queue_wait_latency_buckets: Vec<u64>,
+    pub ublk_write_worker_latency_buckets: Vec<u64>,
+    pub ublk_write_completion_wait_latency_buckets: Vec<u64>,
     pub volume_partial_write_ops: u64,
     pub zone_write_dispatches: u64,
     pub zone_submit_write_ns: u64,
@@ -373,6 +391,8 @@ pub struct EngineMetricsSnapshot {
     pub buffer_append_prepare_ns: u64,
     pub buffer_append_log_write_ns: u64,
     pub buffer_append_wait_durable_ns: u64,
+    pub buffer_append_prepare_latency_buckets: Vec<u64>,
+    pub buffer_append_wait_durable_latency_buckets: Vec<u64>,
     pub buffer_sync_batches: u64,
     pub buffer_sync_flushes: u64,
     pub buffer_sync_batch_ns: u64,
@@ -686,6 +706,11 @@ impl EngineMetricsSnapshot {
                         &self.read_submit_unit_io_latency_buckets,
                         &earlier.read_submit_unit_io_latency_buckets,
                     ),
+                    ublk_write_queue_wait_latency_buckets: sub_latency_buckets(&self.ublk_write_queue_wait_latency_buckets, &earlier.ublk_write_queue_wait_latency_buckets),
+                    ublk_write_worker_latency_buckets: sub_latency_buckets(&self.ublk_write_worker_latency_buckets, &earlier.ublk_write_worker_latency_buckets),
+                    ublk_write_completion_wait_latency_buckets: sub_latency_buckets(&self.ublk_write_completion_wait_latency_buckets, &earlier.ublk_write_completion_wait_latency_buckets),
+                    buffer_append_prepare_latency_buckets: sub_latency_buckets(&self.buffer_append_prepare_latency_buckets, &earlier.buffer_append_prepare_latency_buckets),
+                    buffer_append_wait_durable_latency_buckets: sub_latency_buckets(&self.buffer_append_wait_durable_latency_buckets, &earlier.buffer_append_wait_durable_latency_buckets),
                 }
             };
         }

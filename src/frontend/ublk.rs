@@ -355,6 +355,7 @@ fn record_completed_io_metrics(
                 .fetch_add(completion_wait_ns, Ordering::Relaxed);
         }
         sys::UBLK_IO_OP_WRITE => {
+            metrics.record_ublk_write_stages(queue_wait_ns, worker_ns, completion_wait_ns);
             metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
             metrics
                 .volume_write_bytes

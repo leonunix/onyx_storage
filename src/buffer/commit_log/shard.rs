@@ -813,9 +813,7 @@ impl BufferShard {
         let wait_elapsed = self.lv2_durability.wait_for(seq);
         if let Some(metrics) = self.metrics.get() {
             let ns = wait_elapsed.as_nanos().min(u64::MAX as u128) as u64;
-            metrics
-                .buffer_append_wait_durable_ns
-                .fetch_add(ns, Ordering::Relaxed);
+            metrics.record_buffer_append_wait_durable_ns(ns);
         }
     }
 
