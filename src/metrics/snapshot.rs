@@ -55,6 +55,9 @@ impl EngineMetrics {
             buffer_append_wait_durable_latency_buckets: load_latency_buckets(
                 &self.buffer_append_wait_durable_latency_buckets,
             ),
+            buffer_append_wait_durable_fine_latency_buckets: self
+                .buffer_append_wait_durable_fine_latency
+                .snapshot(),
             buffer_sync_batches: load(&self.buffer_sync_batches),
             buffer_sync_flushes: load(&self.buffer_sync_flushes),
             buffer_sync_batch_ns: load(&self.buffer_sync_batch_ns),
@@ -64,6 +67,26 @@ impl EngineMetrics {
             buffer_sync_bytes: load(&self.buffer_sync_bytes),
             buffer_sync_entries_max: load(&self.buffer_sync_entries_max),
             buffer_sync_bytes_max: load(&self.buffer_sync_bytes_max),
+            buffer_lv2_latency_bucket_upper_bounds_ns: fine_latency_bucket_upper_bounds_ns(),
+            buffer_lv2_staging_queue_latency_buckets: self
+                .buffer_lv2_staging_queue_latency
+                .snapshot(),
+            buffer_lv2_prepared_queue_latency_buckets: self
+                .buffer_lv2_prepared_queue_latency
+                .snapshot(),
+            buffer_lv2_group_collect_latency_buckets: self
+                .buffer_lv2_group_collect_latency
+                .snapshot(),
+            buffer_lv2_payload_write_latency_buckets: self
+                .buffer_lv2_payload_write_latency
+                .snapshot(),
+            buffer_lv2_checkpoint_write_latency_buckets: self
+                .buffer_lv2_checkpoint_write_latency
+                .snapshot(),
+            buffer_lv2_root_flush_latency_buckets: self.buffer_lv2_root_flush_latency.snapshot(),
+            buffer_lv2_watermark_dispatch_latency_buckets: self
+                .buffer_lv2_watermark_dispatch_latency
+                .snapshot(),
             buffer_backpressure_events: load(&self.buffer_backpressure_events),
             buffer_backpressure_wait_ns: load(&self.buffer_backpressure_wait_ns),
             buffer_throttle_count: load(&self.buffer_throttle_count),
@@ -393,6 +416,7 @@ pub struct EngineMetricsSnapshot {
     pub buffer_append_wait_durable_ns: u64,
     pub buffer_append_prepare_latency_buckets: Vec<u64>,
     pub buffer_append_wait_durable_latency_buckets: Vec<u64>,
+    pub buffer_append_wait_durable_fine_latency_buckets: Vec<u64>,
     pub buffer_sync_batches: u64,
     pub buffer_sync_flushes: u64,
     pub buffer_sync_batch_ns: u64,
@@ -402,6 +426,17 @@ pub struct EngineMetricsSnapshot {
     pub buffer_sync_bytes: u64,
     pub buffer_sync_entries_max: u64,
     pub buffer_sync_bytes_max: u64,
+    /// Inclusive upper bound for every fine-grained LV2 latency bucket below.
+    /// The same bounds apply to each stage, which makes metrics-json snapshots
+    /// directly subtractable without changing any legacy histogram semantics.
+    pub buffer_lv2_latency_bucket_upper_bounds_ns: Vec<u64>,
+    pub buffer_lv2_staging_queue_latency_buckets: Vec<u64>,
+    pub buffer_lv2_prepared_queue_latency_buckets: Vec<u64>,
+    pub buffer_lv2_group_collect_latency_buckets: Vec<u64>,
+    pub buffer_lv2_payload_write_latency_buckets: Vec<u64>,
+    pub buffer_lv2_checkpoint_write_latency_buckets: Vec<u64>,
+    pub buffer_lv2_root_flush_latency_buckets: Vec<u64>,
+    pub buffer_lv2_watermark_dispatch_latency_buckets: Vec<u64>,
     pub buffer_backpressure_events: u64,
     pub buffer_backpressure_wait_ns: u64,
     pub buffer_throttle_count: u64,
@@ -711,6 +746,15 @@ impl EngineMetricsSnapshot {
                     ublk_write_completion_wait_latency_buckets: sub_latency_buckets(&self.ublk_write_completion_wait_latency_buckets, &earlier.ublk_write_completion_wait_latency_buckets),
                     buffer_append_prepare_latency_buckets: sub_latency_buckets(&self.buffer_append_prepare_latency_buckets, &earlier.buffer_append_prepare_latency_buckets),
                     buffer_append_wait_durable_latency_buckets: sub_latency_buckets(&self.buffer_append_wait_durable_latency_buckets, &earlier.buffer_append_wait_durable_latency_buckets),
+                    buffer_append_wait_durable_fine_latency_buckets: sub_latency_buckets(&self.buffer_append_wait_durable_fine_latency_buckets, &earlier.buffer_append_wait_durable_fine_latency_buckets),
+                    buffer_lv2_latency_bucket_upper_bounds_ns: self.buffer_lv2_latency_bucket_upper_bounds_ns.clone(),
+                    buffer_lv2_staging_queue_latency_buckets: sub_latency_buckets(&self.buffer_lv2_staging_queue_latency_buckets, &earlier.buffer_lv2_staging_queue_latency_buckets),
+                    buffer_lv2_prepared_queue_latency_buckets: sub_latency_buckets(&self.buffer_lv2_prepared_queue_latency_buckets, &earlier.buffer_lv2_prepared_queue_latency_buckets),
+                    buffer_lv2_group_collect_latency_buckets: sub_latency_buckets(&self.buffer_lv2_group_collect_latency_buckets, &earlier.buffer_lv2_group_collect_latency_buckets),
+                    buffer_lv2_payload_write_latency_buckets: sub_latency_buckets(&self.buffer_lv2_payload_write_latency_buckets, &earlier.buffer_lv2_payload_write_latency_buckets),
+                    buffer_lv2_checkpoint_write_latency_buckets: sub_latency_buckets(&self.buffer_lv2_checkpoint_write_latency_buckets, &earlier.buffer_lv2_checkpoint_write_latency_buckets),
+                    buffer_lv2_root_flush_latency_buckets: sub_latency_buckets(&self.buffer_lv2_root_flush_latency_buckets, &earlier.buffer_lv2_root_flush_latency_buckets),
+                    buffer_lv2_watermark_dispatch_latency_buckets: sub_latency_buckets(&self.buffer_lv2_watermark_dispatch_latency_buckets, &earlier.buffer_lv2_watermark_dispatch_latency_buckets),
                 }
             };
         }

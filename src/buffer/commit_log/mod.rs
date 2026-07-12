@@ -39,6 +39,13 @@ const SYNC_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Online payload hydration read-ahead. 128 KiB matches the common coalesce
 /// unit while keeping foreground read tail latency bounded.
 const HYDRATE_BATCH_MAX_BYTES: usize = 128 * 1024;
+static LV2_METRIC_CLOCK_START: OnceLock<Instant> = OnceLock::new();
+
+fn lv2_metric_timestamp_ns(now: Instant) -> u64 {
+    let start = *LV2_METRIC_CLOCK_START.get_or_init(|| now);
+    (now.saturating_duration_since(start).as_nanos() as u64).saturating_add(1)
+}
+
 /// Coarse read-path filter for pending buffer entries. A read range whose
 /// buckets are absent can skip the DashMap LBA index entirely. Collisions and
 /// stale buckets are harmless false positives; false negatives are avoided by
@@ -325,7 +332,7 @@ impl Lv2DurabilityWaiter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PendingEntry {
     pub seq: u64,
     pub vol_id: String,
@@ -340,11 +347,36 @@ pub struct PendingEntry {
     pub disk_len: u32,
     /// In-memory residency start used for starvation diagnostics.
     pub enqueued_at: Instant,
+    /// Monotonic timestamp recorded immediately before this entry's LV2
+    /// durability watermark is advanced. Zero for recovered entries and for
+    /// backends that do not use the global multi-shard sync path.
+    durability_advanced_at_ns: AtomicU64,
     /// Older buffered ranges overwritten by this entry at append time.
     /// Once this entry is durable in the commit log, these ranges can be
     /// retired immediately instead of waiting for the flusher to rediscover
     /// that they are stale.
     pub superseded_ranges: Vec<(u64, Lba, u32)>,
+}
+
+impl Clone for PendingEntry {
+    fn clone(&self) -> Self {
+        Self {
+            seq: self.seq,
+            vol_id: self.vol_id.clone(),
+            start_lba: self.start_lba,
+            lba_count: self.lba_count,
+            payload_crc32: self.payload_crc32,
+            vol_created_at: self.vol_created_at,
+            payload: self.payload.clone(),
+            disk_offset: self.disk_offset,
+            disk_len: self.disk_len,
+            enqueued_at: self.enqueued_at,
+            durability_advanced_at_ns: AtomicU64::new(
+                self.durability_advanced_at_ns.load(Ordering::Relaxed),
+            ),
+            superseded_ranges: self.superseded_ranges.clone(),
+        }
+    }
 }
 
 /// Lightweight recovery metadata — no payload clone.
@@ -653,6 +685,7 @@ pub struct WriteBufferPool {
 /// request worker while preserving ack-after-fdatasync semantics.
 pub struct BufferAppendTicket {
     shard: Arc<BufferShard>,
+    pending: Arc<PendingEntry>,
     seq: u64,
     append_started: Instant,
     durability_wait_started: Instant,
@@ -673,16 +706,42 @@ impl BufferAppendTicket {
 
     pub fn wait(self) -> u64 {
         self.shard.wait_for_durable(self.seq);
-        self.finish()
+        self.finish_at(Instant::now(), false)
     }
 
     pub fn finish(self) -> u64 {
+        self.finish_at(Instant::now(), false)
+    }
+
+    pub(crate) fn finish_dispatched(self) -> u64 {
+        self.finish_at(Instant::now(), true)
+    }
+
+    fn finish_at(self, finished_at: Instant, dispatched: bool) -> u64 {
         debug_assert!(self.is_durable());
         if let Some(metrics) = self.shard.metrics.get() {
             metrics.record_buffer_append_wait_durable_ns(
-                self.durability_wait_started.elapsed().as_nanos() as u64,
+                finished_at
+                    .saturating_duration_since(self.durability_wait_started)
+                    .as_nanos() as u64,
             );
-            BufferShard::record_metric(&metrics.buffer_append_total_ns, self.append_started);
+            metrics.buffer_append_total_ns.fetch_add(
+                finished_at
+                    .saturating_duration_since(self.append_started)
+                    .as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            if dispatched {
+                let advanced_at = self
+                    .pending
+                    .durability_advanced_at_ns
+                    .load(Ordering::Acquire);
+                if advanced_at != 0 {
+                    metrics.record_buffer_lv2_watermark_dispatch_ns(
+                        lv2_metric_timestamp_ns(finished_at).saturating_sub(advanced_at),
+                    );
+                }
+            }
         }
         self.seq
     }
@@ -752,6 +811,7 @@ struct BufferShardHandle {
 struct StagedEntry {
     pending: Arc<PendingEntry>,
     payload: Arc<[u8]>,
+    staged_at: Instant,
 }
 
 mod pool;

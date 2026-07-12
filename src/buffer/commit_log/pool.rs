@@ -179,7 +179,7 @@ impl WriteBufferPool {
         // failed and no acknowledged write exists for this seq. Do not hold
         // the gate across fdatasync / ready publication.
         drop(frontier_guard);
-        append_result?;
+        let pending = append_result?;
         // Wake the per-shard sync thread so it drains the staging channel
         // promptly. The sync thread will fdatasync the batch and then
         // advance `lv2_durability.synced_seq` past our seq, which is what
@@ -187,6 +187,7 @@ impl WriteBufferPool {
         let _ = shard.sync_wake_tx.send(());
         Ok(BufferAppendTicket {
             shard: shard.shard.clone(),
+            pending,
             seq,
             append_started: total_start,
             durability_wait_started: Instant::now(),

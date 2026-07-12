@@ -583,7 +583,7 @@ fn spawn_durability_dispatcher(
                     {
                         let item = pending.swap_remove(idx);
                         for ticket in item.tickets {
-                            ticket.finish();
+                            ticket.finish_dispatched();
                         }
                         let completed = CompletedIo {
                             tag: item.tag,

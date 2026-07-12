@@ -525,6 +525,9 @@ impl BufferShard {
             disk_offset: pending.disk_offset,
             disk_len: pending.disk_len,
             enqueued_at: pending.enqueued_at,
+            durability_advanced_at_ns: AtomicU64::new(
+                pending.durability_advanced_at_ns.load(Ordering::Relaxed),
+            ),
             superseded_ranges: pending.superseded_ranges.clone(),
         })
     }

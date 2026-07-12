@@ -958,6 +958,7 @@ impl WriteBufferPool {
             spans: Vec<CoalescedSpan>,
             checkpoint: Option<AlignedBuf>,
             started: Instant,
+            prepared_at: Instant,
         }
 
         struct WrittenBatch {
@@ -985,6 +986,7 @@ impl WriteBufferPool {
                 let shard = shard.clone();
                 let wake_rx = wake_rx.clone();
                 let shutdown = shutdown.clone();
+                let metrics = metrics.clone();
                 scope.spawn(move || {
                     crate::affinity::bind_current(
                         crate::affinity::ThreadRole::BufferSync,
@@ -1012,8 +1014,18 @@ impl WriteBufferPool {
                         // path the same window three times.
                         let started = Instant::now();
                         let all = shard.drain_staged_limited();
+                        let drained_at = Instant::now();
                         if all.is_empty() {
                             continue;
+                        }
+                        if let Some(metrics) = metrics.get() {
+                            for entry in &all {
+                                metrics.record_buffer_lv2_staging_queue_ns(
+                                    drained_at
+                                        .saturating_duration_since(entry.staged_at)
+                                        .as_nanos() as u64,
+                                );
+                            }
                         }
                         let persist = {
                             let lifecycle = shard.lifecycle.lock();
@@ -1063,6 +1075,7 @@ impl WriteBufferPool {
                                 spans,
                                 checkpoint,
                                 started,
+                                prepared_at: Instant::now(),
                             })
                             .is_err()
                         {
@@ -1086,6 +1099,11 @@ impl WriteBufferPool {
                         lane_idx,
                     );
                     while let Ok(first) = lane_rx.recv() {
+                        if let Some(metrics) = metrics.get() {
+                            metrics.record_buffer_lv2_prepared_queue_ns(
+                                first.prepared_at.elapsed().as_nanos() as u64,
+                            );
+                        }
                         let mut prepared = vec![first];
                         let collect_started = Instant::now();
                         if !group_commit_wait.is_zero() {
@@ -1096,7 +1114,14 @@ impl WriteBufferPool {
                                     break;
                                 }
                                 match lane_rx.recv_timeout(deadline - now) {
-                                    Ok(batch) => prepared.push(batch),
+                                    Ok(batch) => {
+                                        if let Some(metrics) = metrics.get() {
+                                            metrics.record_buffer_lv2_prepared_queue_ns(
+                                                batch.prepared_at.elapsed().as_nanos() as u64,
+                                            );
+                                        }
+                                        prepared.push(batch);
+                                    }
                                     Err(RecvTimeoutError::Timeout) => break,
                                     Err(RecvTimeoutError::Disconnected) => break,
                                 }
@@ -1109,7 +1134,17 @@ impl WriteBufferPool {
                             );
                         }
                         while let Ok(batch) = lane_rx.try_recv() {
+                            if let Some(metrics) = metrics.get() {
+                                metrics.record_buffer_lv2_prepared_queue_ns(
+                                    batch.prepared_at.elapsed().as_nanos() as u64,
+                                );
+                            }
                             prepared.push(batch);
+                        }
+                        if let Some(metrics) = metrics.get() {
+                            metrics.record_buffer_lv2_group_collect_ns(
+                                collect_started.elapsed().as_nanos() as u64,
+                            );
                         }
 
                         let mut consecutive_failures = 0u32;
@@ -1141,6 +1176,9 @@ impl WriteBufferPool {
                                         BufferShard::record_metric(
                                             &metrics.buffer_append_log_write_ns,
                                             write_started,
+                                        );
+                                        metrics.record_buffer_lv2_payload_write_ns(
+                                            write_elapsed.as_nanos() as u64,
                                         );
                                     }
                                     break;
@@ -1240,6 +1278,7 @@ impl WriteBufferPool {
                     } else {
                         root_device.write_many_at(&checkpoint_ops)
                     };
+                    let checkpoint_elapsed = checkpoint_started.elapsed();
                     if let Err(err) = checkpoint_result {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         tracing::warn!(
@@ -1256,6 +1295,11 @@ impl WriteBufferPool {
                             &metrics.buffer_append_log_write_ns,
                             checkpoint_started,
                         );
+                        if !checkpoint_ops.is_empty() {
+                            metrics.record_buffer_lv2_checkpoint_write_ns(
+                                checkpoint_elapsed.as_nanos() as u64,
+                            );
+                        }
                     }
 
                     // All payload and checkpoint writes in `batches` completed.
@@ -1270,6 +1314,9 @@ impl WriteBufferPool {
                             consecutive_failures = 0;
                             if let Some(metrics) = metrics.get() {
                                 metrics.buffer_sync_flushes.fetch_add(1, Ordering::Relaxed);
+                                metrics.record_buffer_lv2_root_flush_ns(
+                                    flush_elapsed.as_nanos() as u64
+                                );
                             }
                             let epoch_elapsed = epoch_started.elapsed();
                             if flush_elapsed >= Duration::from_millis(10)
@@ -1318,6 +1365,13 @@ impl WriteBufferPool {
                         .map(|entry| entry.pending.seq)
                         .max()
                         .unwrap_or(0);
+                    let advanced_at_ns = lv2_metric_timestamp_ns(Instant::now());
+                    for entry in &batch.all {
+                        entry
+                            .pending
+                            .durability_advanced_at_ns
+                            .store(advanced_at_ns, Ordering::Release);
+                    }
                     shard.lv2_durability.advance(max_seq);
                     for entry in &batch.all {
                         shard.publish_ready(entry.pending.seq);

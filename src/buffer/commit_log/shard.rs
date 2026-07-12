@@ -621,7 +621,7 @@ impl BufferShard {
         lba_count: u32,
         payload: &[u8],
         vol_created_at: u64,
-    ) -> OnyxResult<()> {
+    ) -> OnyxResult<Arc<PendingEntry>> {
         if vol_id.is_empty() || vol_id.len() > MAX_VOLUME_ID_BYTES {
             return Err(OnyxError::Config(format!(
                 "vol_id must be 1..{} bytes, got {}",
@@ -745,6 +745,7 @@ impl BufferShard {
             disk_offset: write_offset,
             disk_len,
             enqueued_at: Instant::now(),
+            durability_advanced_at_ns: AtomicU64::new(0),
             superseded_ranges,
         });
 
@@ -786,6 +787,7 @@ impl BufferShard {
             .send(StagedEntry {
                 pending: pending.clone(),
                 payload,
+                staged_at: Instant::now(),
             })
             .is_err()
         {
@@ -808,7 +810,7 @@ impl BufferShard {
         }
         self.append_ops.fetch_add(1, Ordering::Relaxed);
         self.append_bytes.fetch_add(payload_len, Ordering::Relaxed);
-        Ok(())
+        Ok(pending)
     }
 
     /// Block until the LV2 fdatasync watermark covers `seq`. The sync

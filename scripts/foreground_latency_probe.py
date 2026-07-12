@@ -77,10 +77,35 @@ def percentile_ns(buckets: list[int], percentile: float) -> int:
     return 1 << (len(buckets) - 1)
 
 
+def bounded_percentile_ns(buckets: list[int], bounds: list[int], percentile: float) -> int:
+    total = sum(buckets)
+    if total == 0 or not bounds:
+        return 0
+    target = max(1, int((total * percentile + 99) // 100))
+    seen = 0
+    for idx, count in enumerate(buckets):
+        seen += count
+        if seen >= target:
+            return int(bounds[min(idx, len(bounds) - 1)])
+    return int(bounds[-1])
+
+
 def bucket_delta(now: dict[str, Any], old: dict[str, Any], key: str) -> list[int]:
     current = now.get(key, [])
     previous = old.get(key, [])
     return [nonnegative(int(value), int(previous[idx]) if idx < len(previous) else 0) for idx, value in enumerate(current)]
+
+
+def fine_latency_summary(
+    metrics: dict[str, Any], old_metrics: dict[str, Any], key: str, bounds: list[int]
+) -> dict[str, int]:
+    buckets = bucket_delta(metrics, old_metrics, key)
+    return {
+        "samples": sum(buckets),
+        "p50_ns": bounded_percentile_ns(buckets, bounds, 50),
+        "p95_ns": bounded_percentile_ns(buckets, bounds, 95),
+        "p99_ns": bounded_percentile_ns(buckets, bounds, 99),
+    }
 
 
 def main() -> None:
@@ -114,6 +139,24 @@ def main() -> None:
                 "buffer_append_wait_durable_latency_buckets",
             ):
                 stages[key.removesuffix("_latency_buckets")] = percentile_ns(bucket_delta(metrics, old_metrics, key), 99)
+            fine_bounds = [
+                int(value)
+                for value in metrics.get("buffer_lv2_latency_bucket_upper_bounds_ns", [])
+            ]
+            lv2_stage_keys = {
+                "durable_wait": "buffer_append_wait_durable_fine_latency_buckets",
+                "staging_queue": "buffer_lv2_staging_queue_latency_buckets",
+                "prepared_queue": "buffer_lv2_prepared_queue_latency_buckets",
+                "group_collect": "buffer_lv2_group_collect_latency_buckets",
+                "payload_write": "buffer_lv2_payload_write_latency_buckets",
+                "checkpoint_write": "buffer_lv2_checkpoint_write_latency_buckets",
+                "root_flush": "buffer_lv2_root_flush_latency_buckets",
+                "watermark_dispatch": "buffer_lv2_watermark_dispatch_latency_buckets",
+            }
+            lv2_stages = {
+                name: fine_latency_summary(metrics, old_metrics, key, fine_bounds)
+                for name, key in lv2_stage_keys.items()
+            }
             old_shards = {int(s["shard_idx"]): s for s in old_status.get("buffer_shards", [])}
             shards = []
             for shard in status.get("buffer_shards", []):
@@ -141,7 +184,21 @@ def main() -> None:
                     "runqueue_ms": nonnegative(row["runqueue_ns"], old.get("runqueue_ns", 0)) / 1e6,
                     "switches": nonnegative(row["switches"], old.get("switches", 0)),
                 }
-            print(json.dumps({"ts": now, "elapsed": elapsed, "write_p99_ns": stages, "shards": shards, "scheduler": scheduler}, separators=(",", ":")), flush=True)
+            print(
+                json.dumps(
+                    {
+                        "ts": now,
+                        "elapsed": elapsed,
+                        "write_p99_ns": stages,
+                        "lv2_durable_stages": lv2_stages,
+                        "lv2_percentiles_are_bucket_upper_bounds": True,
+                        "shards": shards,
+                        "scheduler": scheduler,
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
         previous = (now, metrics, status, sched)
         sample += 1
         time.sleep(max(0.0, args.interval - (time.monotonic() - started)))

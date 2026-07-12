@@ -159,6 +159,7 @@ impl BufferShard {
                             disk_offset: offset,
                             disk_len,
                             enqueued_at: Instant::now(),
+                            durability_advanced_at_ns: AtomicU64::new(0),
                             superseded_ranges: Vec::new(),
                         })
                     });
@@ -328,6 +329,7 @@ impl BufferShard {
                         disk_offset: offset,
                         disk_len,
                         enqueued_at: Instant::now(),
+                        durability_advanced_at_ns: AtomicU64::new(0),
                         superseded_ranges: Vec::new(),
                     })
                 });

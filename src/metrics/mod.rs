@@ -6,6 +6,12 @@ use dashmap::DashMap;
 use serde::Serialize;
 
 const LATENCY_BUCKETS: usize = 64;
+const FINE_LATENCY_DIRECT_BUCKETS: usize = 16;
+const FINE_LATENCY_SUB_BUCKETS: usize = 16;
+const FINE_LATENCY_FIRST_EXPONENT: usize = 4;
+const FINE_LATENCY_LAST_EXPONENT: usize = 63;
+const FINE_LATENCY_BUCKETS: usize = FINE_LATENCY_DIRECT_BUCKETS
+    + (FINE_LATENCY_LAST_EXPONENT - FINE_LATENCY_FIRST_EXPONENT + 1) * FINE_LATENCY_SUB_BUCKETS;
 const MAX_READ_POOL_WORKERS: usize = 128;
 
 fn latency_bucket(ns: u64) -> usize {
@@ -35,6 +41,62 @@ fn sub_latency_buckets(now: &[u64], earlier: &[u64]) -> Vec<u64> {
     now.iter()
         .enumerate()
         .map(|(idx, value)| value.saturating_sub(earlier.get(idx).copied().unwrap_or(0)))
+        .collect()
+}
+
+/// A compact log-linear latency histogram. Values below 16 ns have exact
+/// integer buckets; every subsequent power-of-two range is split into 16
+/// equal-width buckets. A sample therefore costs one relaxed atomic increment
+/// while retaining roughly 3.1-6.25% resolution across the full u64 range.
+#[derive(Debug)]
+pub(crate) struct FineLatencyHistogram {
+    buckets: [AtomicU64; FINE_LATENCY_BUCKETS],
+}
+
+impl Default for FineLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl FineLatencyHistogram {
+    fn record(&self, ns: u64) {
+        self.buckets[fine_latency_bucket(ns)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Vec<u64> {
+        load_atomic_slice(&self.buckets)
+    }
+}
+
+fn fine_latency_bucket(ns: u64) -> usize {
+    if ns < FINE_LATENCY_DIRECT_BUCKETS as u64 {
+        return ns as usize;
+    }
+    let exponent = (u64::BITS - 1 - ns.leading_zeros()) as usize;
+    let width_shift = exponent - FINE_LATENCY_FIRST_EXPONENT;
+    let base = 1u64 << exponent;
+    let sub_bucket = ((ns - base) >> width_shift) as usize;
+    FINE_LATENCY_DIRECT_BUCKETS
+        + (exponent - FINE_LATENCY_FIRST_EXPONENT) * FINE_LATENCY_SUB_BUCKETS
+        + sub_bucket.min(FINE_LATENCY_SUB_BUCKETS - 1)
+}
+
+fn fine_latency_bucket_upper_bounds_ns() -> Vec<u64> {
+    (0..FINE_LATENCY_BUCKETS)
+        .map(|idx| {
+            if idx < FINE_LATENCY_DIRECT_BUCKETS {
+                return idx as u64;
+            }
+            let offset = idx - FINE_LATENCY_DIRECT_BUCKETS;
+            let exponent = FINE_LATENCY_FIRST_EXPONENT + offset / FINE_LATENCY_SUB_BUCKETS;
+            let sub_bucket = offset % FINE_LATENCY_SUB_BUCKETS;
+            let base = 1u128 << exponent;
+            let width = 1u128 << (exponent - FINE_LATENCY_FIRST_EXPONENT);
+            (base + (sub_bucket as u128 + 1) * width - 1) as u64
+        })
         .collect()
 }
 
@@ -138,6 +200,7 @@ pub struct EngineMetrics {
     pub buffer_append_wait_durable_ns: AtomicU64,
     pub buffer_append_prepare_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub buffer_append_wait_durable_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub(crate) buffer_append_wait_durable_fine_latency: FineLatencyHistogram,
     pub buffer_sync_batches: AtomicU64,
     /// Actual backend durability barriers. On a multi-shard chunklet LV2 this
     /// is lower than `buffer_sync_batches` because one root flush covers a
@@ -150,6 +213,17 @@ pub struct EngineMetrics {
     pub buffer_sync_bytes: AtomicU64,
     pub buffer_sync_entries_max: AtomicU64,
     pub buffer_sync_bytes_max: AtomicU64,
+    /// Fine-grained stage histograms for the multi-shard global LV2 durability
+    /// path. Raw buckets are exported so metrics-json snapshots can be
+    /// subtracted over an arbitrary probe interval. All stages share the
+    /// `buffer_lv2_latency_bucket_upper_bounds_ns` bounds in the snapshot.
+    pub(crate) buffer_lv2_staging_queue_latency: FineLatencyHistogram,
+    pub(crate) buffer_lv2_prepared_queue_latency: FineLatencyHistogram,
+    pub(crate) buffer_lv2_group_collect_latency: FineLatencyHistogram,
+    pub(crate) buffer_lv2_payload_write_latency: FineLatencyHistogram,
+    pub(crate) buffer_lv2_checkpoint_write_latency: FineLatencyHistogram,
+    pub(crate) buffer_lv2_root_flush_latency: FineLatencyHistogram,
+    pub(crate) buffer_lv2_watermark_dispatch_latency: FineLatencyHistogram,
     pub buffer_backpressure_events: AtomicU64,
     pub buffer_backpressure_wait_ns: AtomicU64,
     /// Tier 1.B (ZFS-inspired) hyperbolic LV2 write throttle. `count` =
@@ -679,6 +753,35 @@ impl EngineMetrics {
         self.buffer_append_wait_durable_ns
             .fetch_add(ns, Ordering::Relaxed);
         record_latency_bucket(&self.buffer_append_wait_durable_latency_buckets, ns);
+        self.buffer_append_wait_durable_fine_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_staging_queue_ns(&self, ns: u64) {
+        self.buffer_lv2_staging_queue_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_prepared_queue_ns(&self, ns: u64) {
+        self.buffer_lv2_prepared_queue_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_group_collect_ns(&self, ns: u64) {
+        self.buffer_lv2_group_collect_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_payload_write_ns(&self, ns: u64) {
+        self.buffer_lv2_payload_write_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_checkpoint_write_ns(&self, ns: u64) {
+        self.buffer_lv2_checkpoint_write_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_root_flush_ns(&self, ns: u64) {
+        self.buffer_lv2_root_flush_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_watermark_dispatch_ns(&self, ns: u64) {
+        self.buffer_lv2_watermark_dispatch_latency.record(ns);
     }
 
     /// Get or create per-volume metrics counters.
@@ -752,3 +855,60 @@ mod status;
 pub use meta_memory::{BufferShardSnapshot, MetaMemorySnapshot};
 pub use snapshot::EngineMetricsSnapshot;
 pub use status::EngineStatusSnapshot;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fine_latency_bucket_bounds_are_monotonic_and_contain_samples() {
+        let bounds = fine_latency_bucket_upper_bounds_ns();
+        assert_eq!(bounds.len(), FINE_LATENCY_BUCKETS);
+        assert_eq!(&bounds[..17], &(0u64..=16).collect::<Vec<_>>());
+        assert_eq!(bounds.last().copied(), Some(u64::MAX));
+        assert!(bounds.windows(2).all(|pair| pair[0] < pair[1]));
+
+        for ns in [
+            0,
+            1,
+            15,
+            16,
+            17,
+            31,
+            32,
+            1_000,
+            440_000,
+            1_048_576,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
+            let idx = fine_latency_bucket(ns);
+            assert!(bounds[idx] >= ns, "bucket {idx} does not cover {ns}");
+            if idx > 0 {
+                assert!(bounds[idx - 1] < ns, "bucket {idx} starts after {ns}");
+            }
+        }
+    }
+
+    #[test]
+    fn fine_latency_histograms_survive_snapshot_delta() {
+        let metrics = EngineMetrics::default();
+        metrics.record_buffer_lv2_root_flush_ns(100);
+        let earlier = metrics.snapshot();
+        metrics.record_buffer_lv2_root_flush_ns(440_000);
+        metrics.record_buffer_lv2_root_flush_ns(1_000_000);
+
+        let delta = metrics.snapshot().saturating_sub(&earlier);
+        assert_eq!(
+            delta
+                .buffer_lv2_root_flush_latency_buckets
+                .iter()
+                .sum::<u64>(),
+            2
+        );
+        assert_eq!(
+            delta.buffer_lv2_latency_bucket_upper_bounds_ns,
+            fine_latency_bucket_upper_bounds_ns()
+        );
+    }
+}

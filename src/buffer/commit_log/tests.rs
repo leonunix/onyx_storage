@@ -104,6 +104,60 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
         flushes < batches,
         "global epochs must cover multiple shard batches: flushes={flushes} batches={batches}"
     );
+    let stage_metrics = metrics.snapshot();
+    assert_eq!(
+        stage_metrics
+            .buffer_append_wait_durable_fine_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        64
+    );
+    assert_eq!(
+        stage_metrics
+            .buffer_lv2_staging_queue_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        64
+    );
+    for (name, samples) in [
+        (
+            "prepared_queue",
+            stage_metrics
+                .buffer_lv2_prepared_queue_latency_buckets
+                .iter()
+                .sum::<u64>(),
+        ),
+        (
+            "group_collect",
+            stage_metrics
+                .buffer_lv2_group_collect_latency_buckets
+                .iter()
+                .sum::<u64>(),
+        ),
+        (
+            "payload_write",
+            stage_metrics
+                .buffer_lv2_payload_write_latency_buckets
+                .iter()
+                .sum::<u64>(),
+        ),
+        (
+            "checkpoint_write",
+            stage_metrics
+                .buffer_lv2_checkpoint_write_latency_buckets
+                .iter()
+                .sum::<u64>(),
+        ),
+        (
+            "root_flush",
+            stage_metrics
+                .buffer_lv2_root_flush_latency_buckets
+                .iter()
+                .sum::<u64>(),
+        ),
+    ] {
+        assert!(samples > 0, "missing global LV2 {name} samples");
+    }
     drop(pool);
 
     let reopened = WriteBufferPool::open_with_options_full_and_limits(
@@ -129,6 +183,45 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
             i as u8
         );
     }
+}
+
+#[test]
+fn global_sync_records_watermark_to_dispatcher_latency() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let backend = Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0));
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        backend,
+        Duration::from_millis(10),
+        2,
+        1,
+        Duration::from_millis(1),
+        16 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+
+    let ticket = pool
+        .append_deferred("vol", Lba(0), 1, &[0x5a; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    let (wake_tx, wake_rx) = bounded(1);
+    if !ticket.arm_wakeup(&wake_tx) {
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    ticket.finish_dispatched();
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot
+            .buffer_lv2_watermark_dispatch_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        1
+    );
 }
 
 fn create_pool(size: u64, group_commit_wait: Duration) -> (WriteBufferPool, NamedTempFile) {
@@ -215,9 +308,14 @@ fn uring_sync_batch_chunks_over_sq_depth() {
             disk_offset: i * (disk_len as u64 + slot),
             disk_len,
             enqueued_at: Instant::now(),
+            durability_advanced_at_ns: AtomicU64::new(0),
             superseded_ranges: Vec::new(),
         });
-        entries.push(StagedEntry { pending, payload });
+        entries.push(StagedEntry {
+            pending,
+            payload,
+            staged_at: Instant::now(),
+        });
     }
 
     WriteBufferPool::write_batch_and_sync_uring(
@@ -384,10 +482,15 @@ fn uring_sync_fast_path_single_linked_chain() {
             disk_offset: next_off,
             disk_len,
             enqueued_at: Instant::now(),
+            durability_advanced_at_ns: AtomicU64::new(0),
             superseded_ranges: Vec::new(),
         });
         next_off += disk_len as u64;
-        entries.push(StagedEntry { pending, payload });
+        entries.push(StagedEntry {
+            pending,
+            payload,
+            staged_at: Instant::now(),
+        });
     }
 
     WriteBufferPool::write_batch_and_sync_uring(
