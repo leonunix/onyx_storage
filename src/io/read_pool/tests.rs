@@ -3,6 +3,7 @@ use crate::io::engine::IoEngine;
 use crate::types::{Pba, BLOCK_SIZE};
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 fn fresh_device() -> (RawDevice, NamedTempFile) {
@@ -27,6 +28,121 @@ fn make_mapping(pba: Pba, payload_len: u32, crc: u32) -> BlockmapValue {
         crc32: crc,
         slot_offset: 0,
         flags: 0,
+    }
+}
+
+fn queued_request(purpose: ReadPurpose, pba: Pba) -> ReadRequest {
+    let (reply, _rx) = bounded(1);
+    ReadRequest {
+        mapping: make_mapping(pba, BLOCK_SIZE, 0),
+        reply,
+        enqueued_at: Instant::now(),
+        purpose,
+        return_unit: false,
+        raw_extent: None,
+    }
+}
+
+#[test]
+fn reserves_half_of_multi_worker_pool_for_foreground() {
+    assert_eq!(reserved_foreground_workers(1), 0);
+    assert_eq!(reserved_foreground_workers(2), 1);
+    assert_eq!(reserved_foreground_workers(3), 2);
+    assert_eq!(reserved_foreground_workers(4), 2);
+    assert_eq!(reserved_foreground_workers(32), 16);
+}
+
+#[test]
+fn shared_worker_selects_foreground_at_batch_boundary() {
+    let (foreground_tx, foreground_rx) = bounded(2);
+    let (background_tx, background_rx) = bounded(2);
+    background_tx
+        .send(queued_request(ReadPurpose::DedupScanner, Pba(1)))
+        .unwrap();
+    foreground_tx
+        .send(queued_request(ReadPurpose::Foreground, Pba(2)))
+        .unwrap();
+
+    let first = receive_next(&foreground_rx, Some(&background_rx)).unwrap();
+    assert_eq!(first.purpose, ReadPurpose::Foreground);
+    let second = receive_next(&foreground_rx, Some(&background_rx)).unwrap();
+    assert_eq!(second.purpose, ReadPurpose::DedupScanner);
+}
+
+#[test]
+fn full_background_queue_cannot_block_reserved_foreground_worker() {
+    let (foreground_tx, foreground_rx) = bounded(1);
+    let (background_tx, background_rx) = bounded(1);
+    let worker = std::thread::spawn(move || {
+        let request = receive_next(&foreground_rx, None).unwrap();
+        assert_eq!(request.purpose, ReadPurpose::Foreground);
+        request.reply.send(Ok(vec![0xA5])).unwrap();
+    });
+    let mut pool = ReadPool {
+        senders: Some(RequestSenders {
+            foreground: foreground_tx,
+            background: background_tx,
+        }),
+        workers: vec![WorkerHandle { join: Some(worker) }],
+    };
+
+    let _background_reply = pool
+        .submit_read_async_for(
+            make_mapping(Pba(1), BLOCK_SIZE, 0),
+            ReadPurpose::DedupScanner,
+        )
+        .unwrap();
+    assert_eq!(background_rx.len(), 1);
+    let foreground_reply = pool
+        .submit_read_async(make_mapping(Pba(2), BLOCK_SIZE, 0))
+        .unwrap();
+
+    assert_eq!(
+        foreground_reply
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap(),
+        vec![0xA5]
+    );
+    assert_eq!(background_rx.len(), 1);
+    pool.shutdown();
+}
+
+#[test]
+fn shutdown_drains_both_priority_queues_without_hanging() {
+    let (dev, tmp) = fresh_device();
+    let engine = IoEngine::new_raw(dev, false);
+    let payload = vec![0x5Au8; BLOCK_SIZE as usize];
+    write_uncompressed(&engine, Pba(0), &payload);
+    let mapping = make_mapping(Pba(0), BLOCK_SIZE, crc32fast::hash(&payload));
+
+    let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
+    let metrics = Arc::new(EngineMetrics::default());
+    let mut pool = ReadPool::start(2, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics).unwrap();
+
+    let mut replies = Vec::new();
+    for _ in 0..8 {
+        replies.push(pool.submit_read_async(mapping).unwrap());
+        replies.push(
+            pool.submit_read_async_for(mapping, ReadPurpose::DedupScanner)
+                .unwrap(),
+        );
+    }
+    let (done_tx, done_rx) = bounded(1);
+    let shutdown = std::thread::spawn(move || {
+        pool.shutdown();
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ReadPool shutdown hung with both queues populated");
+    shutdown.join().unwrap();
+
+    for reply in replies {
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
+            payload
+        );
     }
 }
 

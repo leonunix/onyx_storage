@@ -16,9 +16,12 @@
 //!   (NVMe sees N concurrent IOs from one syscall), then CRC + decompress on
 //!   the worker thread (decompression scales with worker count).
 //!
-//! Routing: requests go through one shared bounded MPMC queue. Faster workers
-//! naturally pull more work, which avoids per-PBA shard hotspots while each
-//! worker still owns its own io_uring instance.
+//! Routing: foreground and background requests use separate bounded MPMC
+//! queues. Half of the workers are reserved for foreground reads; the other
+//! half service both queues but prefer foreground work at every batch boundary.
+//! This prevents a DedupScanner or verify burst from filling the foreground
+//! enqueue queue or occupying every reader. Faster workers within each class
+//! still pull more work, avoiding per-PBA shard hotspots.
 //!
 //! Buffer hits and unmapped reads are *not* sent through the pool — those
 //! paths are zero-IO and stay inline on the caller thread.
@@ -61,6 +64,18 @@ const BATCH_COALESCE_WINDOW: Duration = Duration::from_micros(8);
 /// some slack while preserving back-pressure under sustained overload.
 const REQUEST_CHANNEL_CAP: usize = 128;
 
+/// Keep enough readers completely outside background traffic to sustain a
+/// foreground queue-depth burst even when every shared worker is blocked in a
+/// slow RAID batch. A single-worker pool cannot reserve its only worker because
+/// dedup reads would never make progress; it still gets strict queue priority.
+fn reserved_foreground_workers(workers: usize) -> usize {
+    if workers < 2 {
+        0
+    } else {
+        workers / 2 + workers % 2
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadPurpose {
     Foreground,
@@ -68,6 +83,12 @@ pub enum ReadPurpose {
     DedupVerifyIndex,
     DedupVerifyCandidate,
     DedupScanner,
+}
+
+impl ReadPurpose {
+    fn is_foreground(self) -> bool {
+        matches!(self, Self::Foreground)
+    }
 }
 
 struct ReadRequest {
@@ -101,8 +122,13 @@ struct WorkerHandle {
     join: Option<JoinHandle<()>>,
 }
 
+struct RequestSenders {
+    foreground: Sender<ReadRequest>,
+    background: Sender<ReadRequest>,
+}
+
 pub struct ReadPool {
-    sender: Option<Sender<ReadRequest>>,
+    senders: Option<RequestSenders>,
     workers: Vec<WorkerHandle>,
 }
 
@@ -133,17 +159,25 @@ impl ReadPool {
         let channel_cap = workers
             .saturating_mul(REQUEST_CHANNEL_CAP)
             .max(REQUEST_CHANNEL_CAP);
-        let (tx, rx) = bounded::<ReadRequest>(channel_cap);
+        let (foreground_tx, foreground_rx) = bounded::<ReadRequest>(channel_cap);
+        let (background_tx, background_rx) = bounded::<ReadRequest>(channel_cap);
+        let foreground_workers = reserved_foreground_workers(workers);
 
         let mut handles = Vec::with_capacity(workers);
         for worker_idx in 0..workers {
-            let rx = rx.clone();
+            let foreground_rx = foreground_rx.clone();
+            let foreground_only = worker_idx < foreground_workers;
+            let background_rx = (!foreground_only).then(|| background_rx.clone());
             let session = IoUringSession::new(sq_entries)?;
             let worker_device = RawDevice::open(&device_path)?;
             let metrics = metrics.clone();
             let device_path_clone = device_path.clone();
             let join = thread::Builder::new()
-                .name(format!("read-pool-{}", worker_idx))
+                .name(if foreground_only {
+                    format!("read-pool-fg-{worker_idx}")
+                } else {
+                    format!("read-pool-{worker_idx}")
+                })
                 .spawn(move || {
                     affinity::bind_current(ThreadRole::ReadPool, worker_idx);
                     let fd = worker_device.as_raw_fd();
@@ -161,7 +195,7 @@ impl ReadPool {
                         metrics,
                         device_path: device_path_clone,
                     };
-                    worker_loop(ctx, rx);
+                    worker_loop(ctx, foreground_rx, background_rx);
                 })
                 .map_err(|e| {
                     OnyxError::Config(format!(
@@ -174,13 +208,19 @@ impl ReadPool {
 
         tracing::info!(
             workers,
+            foreground_workers,
+            shared_workers = workers - foreground_workers,
             sq_entries,
-            channel_cap,
-            "read pool started with shared queue"
+            foreground_channel_cap = channel_cap,
+            background_channel_cap = channel_cap,
+            "read pool started with foreground isolation"
         );
 
         Ok(Self {
-            sender: Some(tx),
+            senders: Some(RequestSenders {
+                foreground: foreground_tx,
+                background: background_tx,
+            }),
             workers: handles,
         })
     }
@@ -206,15 +246,23 @@ impl ReadPool {
         let channel_cap = workers
             .saturating_mul(REQUEST_CHANNEL_CAP)
             .max(REQUEST_CHANNEL_CAP);
-        let (tx, rx) = bounded::<ReadRequest>(channel_cap);
+        let (foreground_tx, foreground_rx) = bounded::<ReadRequest>(channel_cap);
+        let (background_tx, background_rx) = bounded::<ReadRequest>(channel_cap);
+        let foreground_workers = reserved_foreground_workers(workers);
 
         let mut handles = Vec::with_capacity(workers);
         for worker_idx in 0..workers {
-            let rx = rx.clone();
+            let foreground_rx = foreground_rx.clone();
+            let foreground_only = worker_idx < foreground_workers;
+            let background_rx = (!foreground_only).then(|| background_rx.clone());
             let metrics = metrics.clone();
             let backend = backend.clone();
             let join = thread::Builder::new()
-                .name(format!("read-pool-{}", worker_idx))
+                .name(if foreground_only {
+                    format!("read-pool-fg-{worker_idx}")
+                } else {
+                    format!("read-pool-{worker_idx}")
+                })
                 .spawn(move || {
                     affinity::bind_current(ThreadRole::ReadPool, worker_idx);
                     let ctx = WorkerCtx {
@@ -226,7 +274,7 @@ impl ReadPool {
                         metrics,
                         device_path: std::path::PathBuf::from("chunklet"),
                     };
-                    worker_loop(ctx, rx);
+                    worker_loop(ctx, foreground_rx, background_rx);
                 })
                 .map_err(|e| {
                     OnyxError::Config(format!(
@@ -237,10 +285,20 @@ impl ReadPool {
             handles.push(WorkerHandle { join: Some(join) });
         }
 
-        tracing::info!(workers, channel_cap, "read pool started (chunklet backend)");
+        tracing::info!(
+            workers,
+            foreground_workers,
+            shared_workers = workers - foreground_workers,
+            foreground_channel_cap = channel_cap,
+            background_channel_cap = channel_cap,
+            "read pool started with foreground isolation (chunklet backend)"
+        );
 
         Ok(Self {
-            sender: Some(tx),
+            senders: Some(RequestSenders {
+                foreground: foreground_tx,
+                background: background_tx,
+            }),
             workers: handles,
         })
     }
@@ -310,10 +368,15 @@ impl ReadPool {
         purpose: ReadPurpose,
     ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
         let (reply_tx, reply_rx) = bounded::<OnyxResult<Vec<u8>>>(1);
-        let sender = self
-            .sender
+        let senders = self
+            .senders
             .as_ref()
             .ok_or_else(|| OnyxError::Io(std::io::Error::other("read-pool already shut down")))?;
+        let sender = if purpose.is_foreground() {
+            &senders.foreground
+        } else {
+            &senders.background
+        };
         sender
             .send(ReadRequest {
                 mapping,
@@ -333,10 +396,11 @@ impl ReadPool {
         mappings: Vec<BlockmapValue>,
     ) -> OnyxResult<Receiver<OnyxResult<Vec<u8>>>> {
         let (reply_tx, reply_rx) = bounded::<OnyxResult<Vec<u8>>>(1);
-        let sender = self
-            .sender
+        let sender = &self
+            .senders
             .as_ref()
-            .ok_or_else(|| OnyxError::Io(std::io::Error::other("read-pool already shut down")))?;
+            .ok_or_else(|| OnyxError::Io(std::io::Error::other("read-pool already shut down")))?
+            .foreground;
         sender
             .send(ReadRequest {
                 mapping: first,
@@ -357,7 +421,7 @@ impl ReadPool {
     /// Drop every sender so worker threads observe a closed channel and exit,
     /// then join. Idempotent — safe to call from `Drop`.
     pub fn shutdown(&mut self) {
-        self.sender.take();
+        self.senders.take();
         for w in &mut self.workers {
             if let Some(join) = w.join.take() {
                 let _ = join.join();
@@ -463,16 +527,27 @@ struct ReadBuffer {
     buf: AlignedBuf,
 }
 
-fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
+fn worker_loop(
+    ctx: WorkerCtx,
+    foreground_rx: Receiver<ReadRequest>,
+    background_rx: Option<Receiver<ReadRequest>>,
+) {
     let mut scratch = BatchScratch::with_capacity(BATCH_MAX);
     let mut batch: Vec<ReadRequest> = Vec::with_capacity(BATCH_MAX);
     loop {
-        let first = match rx.recv() {
+        let first = match receive_next(&foreground_rx, background_rx.as_ref()) {
             Ok(req) => {
                 record_queue_wait(&ctx.metrics, ctx.worker_idx, &req);
                 req
             }
             Err(_) => return,
+        };
+        let batch_rx = if first.purpose.is_foreground() {
+            &foreground_rx
+        } else {
+            background_rx
+                .as_ref()
+                .expect("foreground-only workers cannot receive background requests")
         };
         batch.clear();
         batch.push(first);
@@ -480,7 +555,7 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
         let deadline = Instant::now() + BATCH_COALESCE_WINDOW;
         loop {
             while batch.len() < BATCH_MAX {
-                match rx.try_recv() {
+                match batch_rx.try_recv() {
                     Ok(req) => {
                         record_queue_wait(&ctx.metrics, ctx.worker_idx, &req);
                         batch.push(req);
@@ -495,7 +570,7 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
             if now >= deadline {
                 break;
             }
-            match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            match batch_rx.recv_timeout(deadline.saturating_duration_since(now)) {
                 Ok(req) => {
                     record_queue_wait(&ctx.metrics, ctx.worker_idx, &req);
                     batch.push(req);
@@ -507,6 +582,55 @@ fn worker_loop(ctx: WorkerCtx, rx: Receiver<ReadRequest>) {
             .read_pool_coalesce_wait_ns
             .fetch_add(elapsed_ns(coalesce_start), Ordering::Relaxed);
         process_batch(&ctx, &mut scratch, &mut batch);
+    }
+}
+
+/// Select the first request for a new batch. Shared workers always inspect the
+/// foreground queue first; `select_biased!` preserves that ordering when both
+/// queues wake together. Once a batch starts it stays within one class so a
+/// foreground completion never waits for unrelated background CQEs.
+fn receive_next(
+    foreground_rx: &Receiver<ReadRequest>,
+    background_rx: Option<&Receiver<ReadRequest>>,
+) -> Result<ReadRequest, ()> {
+    let Some(background_rx) = background_rx else {
+        return foreground_rx.recv().map_err(|_| ());
+    };
+    let mut foreground_open = true;
+    let mut background_open = true;
+    loop {
+        if foreground_open {
+            match foreground_rx.try_recv() {
+                Ok(req) => return Ok(req),
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => foreground_open = false,
+            }
+        }
+        if background_open {
+            match background_rx.try_recv() {
+                Ok(req) => return Ok(req),
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => background_open = false,
+            }
+        }
+
+        match (foreground_open, background_open) {
+            (false, false) => return Err(()),
+            (true, false) => return foreground_rx.recv().map_err(|_| ()),
+            (false, true) => return background_rx.recv().map_err(|_| ()),
+            (true, true) => {
+                crossbeam_channel::select_biased! {
+                    recv(foreground_rx) -> req => match req {
+                        Ok(req) => return Ok(req),
+                        Err(_) => foreground_open = false,
+                    },
+                    recv(background_rx) -> req => match req {
+                        Ok(req) => return Ok(req),
+                        Err(_) => background_open = false,
+                    },
+                }
+            }
+        }
     }
 }
 
