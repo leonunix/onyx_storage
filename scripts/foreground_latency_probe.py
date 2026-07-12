@@ -99,6 +99,7 @@ def main() -> None:
         started = time.monotonic()
         metrics = command(path, "metrics-json", args.timeout)
         status = command(path, "status-json", args.timeout)
+        status = status.get("status", status)
         sched = schedstat(pid)
         now = time.time()
         if previous:
