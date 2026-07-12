@@ -121,7 +121,7 @@ throttle_scale_us = 10
 throttle_cap_us = 2000
 
 [ublk]
-nr_queues = 32
+nr_queues = 8
 queue_depth = 256
 io_buf_bytes = 1048576
 queue_workers = 16
