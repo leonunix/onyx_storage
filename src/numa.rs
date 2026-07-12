@@ -801,10 +801,7 @@ fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
             continue; // thread exited
         }
         let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-        let cpus = if name.starts_with("ublk-")
-            || name.starts_with("persistent-slot")
-            || name.starts_with("read-pool")
-        {
+        let cpus = if name.starts_with("ublk-") || name.starts_with("persistent-slot") {
             foreground
         } else {
             background
