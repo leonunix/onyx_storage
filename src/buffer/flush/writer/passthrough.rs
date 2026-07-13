@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::OnyxError;
 
 /// Greedily pack unit indices into full-RAID-stripe bins for the zero-RMW
 /// full-stripe write path. `blocks_per_unit[i]` is unit `i`'s block count;
@@ -63,6 +64,29 @@ pub(super) fn plan_stripe_groups(
     }
     leftover.sort_unstable();
     (groups, leftover)
+}
+
+/// Reserve one contiguous extent for a grouped write. Prefer a padded,
+/// stripe-aligned allocation; under alignment starvation reserve only the
+/// group's used prefix so the fallback has no synthetic padding to reclaim.
+fn allocate_group_extent(
+    allocator: &SpaceAllocator,
+    lane: usize,
+    used_blocks: u32,
+    stripe: u32,
+    phase: u32,
+    try_aligned: bool,
+) -> OnyxResult<(Extent, bool)> {
+    if try_aligned {
+        match allocator.allocate_stripe_extent_for_lane(lane, stripe, stripe, phase) {
+            Ok(extent) => return Ok((extent, true)),
+            Err(OnyxError::SpaceExhausted) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    allocator
+        .allocate_extent_for_lane(lane, used_blocks)
+        .map(|extent| (extent, false))
 }
 
 impl BufferFlusher {
@@ -507,9 +531,9 @@ impl BufferFlusher {
             .iter()
             .map(|members| members.iter().map(|&m| blocks_per_unit[m]).sum())
             .collect();
-        // group_extents[gi] = Some(ext) when the stripe extent was reserved;
-        // None means the group degraded to the per-unit path (alignment
-        // fragmentation near-full) and its members were allocated individually.
+        // Some(ext) owns one grouped IO. Aligned extents are stripe-sized and
+        // may contain padding; unaligned fallbacks are exactly the used size.
+        // None means no contiguous run could hold even the used prefix.
         let mut group_extents: Vec<Option<Extent>> = Vec::with_capacity(groups.len());
         // group_of[i] = the group unit i belongs to (meaningful only when that
         // group's extent is Some — i.e. it wrote as a real full stripe).
@@ -529,27 +553,29 @@ impl BufferFlusher {
         let mut stripe_starved = false;
 
         for (gi, members) in groups.iter().enumerate() {
-            if stripe_starved {
-                group_extents.push(None);
-                for &m in members {
-                    match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[m], 1, 0) {
-                        Ok(pba) => pbas[m] = Some(pba),
-                        Err(e) => {
-                            tracing::error!(
-                                vol = %units[m].vol_id,
-                                start_lba = units[m].start_lba.0,
-                                error = %e,
-                                "writer: passthrough alloc failed (stripe-starved batch)"
-                            );
-                            failed[m] = true;
+            match allocate_group_extent(
+                allocator,
+                shard_idx,
+                group_used_blocks[gi],
+                stripe,
+                phase,
+                !stripe_starved,
+            ) {
+                Ok((ext, aligned)) => {
+                    debug_assert_eq!(
+                        ext.count,
+                        if aligned {
+                            stripe
+                        } else {
+                            group_used_blocks[gi]
                         }
+                    );
+                    if !aligned && !stripe_starved {
+                        stripe_starved = true;
+                        metrics
+                            .flush_writer_stripe_starved_batches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                }
-                continue;
-            }
-            match allocator.allocate_stripe_extent_for_lane(shard_idx, stripe, stripe, phase) {
-                Ok(ext) => {
-                    debug_assert_eq!(ext.count, stripe, "stripe extent must be one stripe wide");
                     let mut off = 0u64;
                     for &m in members {
                         pbas[m] = Some(Pba(ext.start.0 + off));
@@ -560,13 +586,12 @@ impl BufferFlusher {
                         off, group_used_blocks[gi] as u64,
                         "member PBAs must cover the planned used prefix"
                     );
-                    debug_assert!(off <= stripe as u64, "group must fit within one stripe");
+                    debug_assert!(off <= ext.count as u64, "group must fit within its extent");
                     group_extents.push(Some(ext));
                 }
                 Err(_) => {
-                    // Alignment fragmentation near-full: degrade to per-unit so
-                    // IO keeps flowing (these units just miss the full stripe),
-                    // and stop probing alignment for the rest of the batch.
+                    // No contiguous run can hold the group. Degrade to per-unit
+                    // IO and stop probing alignment for the rest of the batch.
                     // Counted per batch transition (the short-circuit makes
                     // per-group counting meaningless): the rate ≈ share of
                     // flush batches running degraded → RAID partial-RMW.
@@ -643,7 +668,10 @@ impl BufferFlusher {
                     group_buffers.push(None);
                     continue;
                 }
-                let mut buf = match io_engine.allocate_owned_write_buffer(stripe as usize * bs) {
+                let extent = group_extents[gi].expect("reserved group has an extent");
+                let mut buf = match io_engine
+                    .allocate_owned_write_buffer(extent.count as usize * bs)
+                {
                     Ok(buf) => buf,
                     Err(e) => {
                         let ext = group_extents[gi].expect("reserved group has an extent");
@@ -734,7 +762,7 @@ impl BufferFlusher {
                     tracing::error!(error = %e, group = gi, "writer: full-stripe group injected IO write failure");
                     continue;
                 }
-                allocator.wait_for_readers(ext.start, stripe);
+                allocator.wait_for_readers(ext.start, ext.count);
                 let buffer = group_buffers[gi]
                     .take()
                     .expect("reserved group has an aligned buffer");
@@ -858,8 +886,9 @@ impl BufferFlusher {
                     continue;
                 }
                 let used = group_used_blocks[gi];
-                if used < stripe {
-                    let padding = Extent::new(Pba(extent.start.0 + used as u64), stripe - used);
+                if used < extent.count {
+                    let padding =
+                        Extent::new(Pba(extent.start.0 + used as u64), extent.count - used);
                     if let Err(e) =
                         crate::space::pba_lifecycle::rollback_uncommitted(allocator, padding)
                     {
@@ -1005,7 +1034,10 @@ impl BufferFlusher {
 
 #[cfg(test)]
 mod stripe_group_tests {
-    use super::plan_stripe_groups;
+    use super::{allocate_group_extent, plan_stripe_groups};
+    use crate::space::allocator::SpaceAllocator;
+    use crate::space::extent::Extent;
+    use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
     /// Every group must fit within one stripe, and group members + leftover
     /// must partition `0..n` exactly once.
@@ -1095,6 +1127,27 @@ mod stripe_group_tests {
         let (groups, leftover) = plan_stripe_groups(&blocks, 1);
         assert!(groups.is_empty());
         assert_eq!(leftover, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn alignment_starved_group_reserves_only_used_prefix() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let allocator = SpaceAllocator::new(64 * BLOCK_SIZE as u64, 1);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+
+        let whole = allocator
+            .allocate_extent(64 - RESERVED_BLOCKS as u32)
+            .unwrap();
+        assert_eq!(whole.start, Pba(RESERVED_BLOCKS));
+        // [9, 14) can hold the 5-block group, but no aligned 6-block stripe.
+        allocator.free_extent(Extent::new(Pba(9), 5)).unwrap();
+
+        let (extent, aligned) =
+            allocate_group_extent(&allocator, 0, 5, STRIPE, PHASE, true).unwrap();
+        assert!(!aligned);
+        assert_eq!(extent, Extent::new(Pba(9), 5));
+        assert!(extent.end_pba().0 <= allocator.total_block_count());
     }
 
     #[test]
