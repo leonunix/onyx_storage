@@ -113,6 +113,21 @@ def avg_time_by_counts(
     return delta(now, prev, ns_key) / count
 
 
+def avg_residual_time(
+    now: dict[str, Any],
+    prev: Optional[dict[str, Any]],
+    total_key: str,
+    component_keys: tuple[str, ...],
+    count_key: str,
+) -> float:
+    count = delta(now, prev, count_key)
+    if count <= 0:
+        return 0.0
+    total = delta(now, prev, total_key)
+    components = sum(delta(now, prev, key) for key in component_keys)
+    return max(0.0, total - components) / count
+
+
 def avg_writer_time(
     now: dict[str, Any], prev: Optional[dict[str, Any]], ns_key: str
 ) -> float:
@@ -483,6 +498,7 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" done {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_read_completion_wait_ns', 'volume_read_ops')):>10}"
         f" | write q {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_write_queue_wait_ns', 'volume_write_ops')):>10}"
         f" worker {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_write_worker_ns', 'volume_write_ops')):>10}"
+        f" durable {fmt_ms(avg_residual_time(metrics, prev_metrics, 'volume_write_total_ns', ('ublk_write_queue_wait_ns', 'ublk_write_worker_ns', 'ublk_write_completion_wait_ns'), 'volume_write_ops')):>10}"
         f" done {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_write_completion_wait_ns', 'volume_write_ops')):>10}",
         f"Read   submit {fmt_ms(avg_time(metrics, prev_metrics, 'read_submit_total_ns', 'read_submit_calls')):>10}"
         f" lookup {fmt_ms(avg_time(metrics, prev_metrics, 'read_submit_buffer_lookup_ns', 'read_submit_calls')):>10}"
