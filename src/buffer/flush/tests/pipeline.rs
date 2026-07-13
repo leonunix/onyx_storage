@@ -393,3 +393,20 @@ fn coalesce_write_window_bypasses_after_foreground_idle_grace() {
         Duration::from_secs(5),
     ));
 }
+
+#[test]
+fn coalesce_write_window_bypasses_at_payload_pressure_threshold() {
+    // The coalesce loop passes max(shard physical ring fill, global payload
+    // fill), so a 20% resident-payload cache must release the write window even
+    // while the physical ring is still nearly empty.
+    assert!(BufferFlusher::write_window_bypass_ready(
+        20,
+        20,
+        Duration::ZERO,
+    ));
+    assert!(!BufferFlusher::write_window_bypass_ready(
+        19,
+        20,
+        Duration::ZERO,
+    ));
+}

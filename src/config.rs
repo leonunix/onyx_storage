@@ -1324,8 +1324,9 @@ pub struct FlushConfig {
     /// `0` preserves immediate draining.
     #[serde(default)]
     pub buffer_write_window_ms: u64,
-    /// Bypass the write window when this shard's PHYSICAL ring fill reaches
-    /// the threshold. `0` means 80 percent.
+    /// Bypass the write window when either this shard's physical ring fill or
+    /// the global resident-payload fill reaches the threshold. `0` means 80
+    /// percent.
     #[serde(default)]
     pub buffer_write_window_pressure_pct: u8,
     /// Maximum mapped LBAs folded into one packed-slot metadata commit.

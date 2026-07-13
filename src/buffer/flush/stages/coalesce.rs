@@ -20,11 +20,11 @@ const IN_FLIGHT_RESCUE_IDLE: Duration = Duration::from_secs(5);
 
 impl BufferFlusher {
     pub(in crate::buffer::flush) fn write_window_bypass_ready(
-        physical_fill_pct: u8,
+        buffer_pressure_pct: u8,
         pressure_pct: u8,
         foreground_idle: Duration,
     ) -> bool {
-        physical_fill_pct >= pressure_pct || foreground_idle >= WRITE_WINDOW_IDLE_BYPASS
+        buffer_pressure_pct >= pressure_pct || foreground_idle >= WRITE_WINDOW_IDLE_BYPASS
     }
 
     pub(in crate::buffer::flush) fn stalled_lease_ready(
@@ -126,8 +126,11 @@ impl BufferFlusher {
                 last_foreground_append = Instant::now();
             }
             let foreground_idle = last_foreground_append.elapsed();
+            let buffer_pressure_pct = pool
+                .physical_fill_percentage_for_shard(shard_idx)
+                .max(pool.payload_fill_percentage());
             let bypass_write_window = Self::write_window_bypass_ready(
-                pool.physical_fill_percentage_for_shard(shard_idx),
+                buffer_pressure_pct,
                 write_window_pressure_pct,
                 foreground_idle,
             );

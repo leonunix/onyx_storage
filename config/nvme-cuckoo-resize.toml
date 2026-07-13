@@ -139,7 +139,7 @@ skip_fully_superseded = true
 # Bypass on PHYSICAL ring occupancy so checkpoint-retained slots cannot hide
 # pressure behind a low logical-pending value.
 buffer_write_window_ms = 30000
-buffer_write_window_pressure_pct = 50
+buffer_write_window_pressure_pct = 20
 packed_meta_batch_max_lbas = 1024
 # Batch adjacent packed-slot metadata jobs into one metadb transaction. The
 # unbatched path degenerates to ~1 LBA/commit under dedup-heavy random writes,
