@@ -39,12 +39,17 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     jobs: usize,
 
+    /// Independent submit/durability lanes. Zero derives
+    /// min(jobs, ublk.nr_queues) from the loaded config.
+    #[arg(long, default_value_t = 0)]
+    submit_lanes: usize,
+
     /// Maximum durable writes in flight per job. Reads remain synchronous.
     #[arg(long, default_value_t = 64)]
     iodepth: usize,
 
     /// Threads performing synchronous LV2 append preparation. Zero derives
-    /// the production topology from ublk.nr_queues * ublk.queue_workers.
+    /// submit_lanes * ublk.queue_workers.
     #[arg(long, default_value_t = 0)]
     submitters: usize,
 
@@ -172,6 +177,7 @@ struct LatencySamples {
 }
 
 struct PendingWrite {
+    job: usize,
     ticket: Option<VolumeWriteTicket>,
     buffer: Option<Vec<u8>>,
     started: Instant,
@@ -233,6 +239,7 @@ impl Drop for PendingWrite {
 }
 
 struct SubmitTask {
+    job: usize,
     offset: u64,
     len: usize,
     buffer: Vec<u8>,
@@ -242,7 +249,11 @@ struct SubmitTask {
 
 enum SubmitResult {
     Pending(PendingWrite),
-    Failed { buffer: Vec<u8>, error: String },
+    Failed {
+        job: usize,
+        buffer: Vec<u8>,
+        error: String,
+    },
 }
 
 struct CompletedWrite {
@@ -375,17 +386,11 @@ fn main() -> Result<()> {
     }
 
     let config = OnyxConfig::load(&cli.config)?;
-    if cli.submitters == 0 {
-        cli.submitters = config.ublk.nr_queues as usize * config.ublk.queue_workers.max(1);
-    }
-    if cli.submitters == 0 {
-        return Err(anyhow!("--submitters must be > 0"));
-    }
-    if cli.submitters < cli.jobs {
-        return Err(anyhow!(
-            "--submitters must be >= --jobs so every submit lane has a worker"
-        ));
-    }
+    resolve_submit_topology(
+        &mut cli,
+        config.ublk.nr_queues as usize,
+        config.ublk.queue_workers,
+    )?;
     if cli.iodepth > 1 && cli.job_cpus.trim().is_empty() {
         eprintln!(
             "warn: --iodepth > 1 without --job-cpus may let load-generator completion threads compete with engine threads"
@@ -494,6 +499,9 @@ fn validate_args(cli: &Cli) -> Result<()> {
     if cli.iodepth == 0 {
         return Err(anyhow!("--iodepth must be > 0"));
     }
+    if cli.submit_lanes > cli.jobs {
+        return Err(anyhow!("--submit-lanes must be <= --jobs"));
+    }
     if cli.runtime_secs == 0 {
         return Err(anyhow!("--runtime-secs must be > 0"));
     }
@@ -518,6 +526,39 @@ fn validate_args(cli: &Cli) -> Result<()> {
         return Err(anyhow!("--working-set must be >= --max-bs"));
     }
     Ok(())
+}
+
+fn resolve_submit_topology(cli: &mut Cli, nr_queues: usize, queue_workers: usize) -> Result<()> {
+    if cli.submit_lanes == 0 {
+        cli.submit_lanes = cli.jobs.min(nr_queues);
+    }
+    if cli.submit_lanes == 0 {
+        return Err(anyhow!(
+            "--submit-lanes must be > 0 (ublk.nr_queues is zero)"
+        ));
+    }
+    if cli.submit_lanes > cli.jobs {
+        return Err(anyhow!("--submit-lanes must be <= --jobs"));
+    }
+    if cli.submitters == 0 {
+        cli.submitters = cli
+            .submit_lanes
+            .checked_mul(queue_workers.max(1))
+            .ok_or_else(|| anyhow!("derived --submitters value overflows usize"))?;
+    }
+    if cli.submitters == 0 {
+        return Err(anyhow!("--submitters must be > 0"));
+    }
+    if cli.submitters < cli.submit_lanes {
+        return Err(anyhow!(
+            "--submitters must be >= --submit-lanes so every submit lane has a worker"
+        ));
+    }
+    Ok(())
+}
+
+fn job_submit_lane(job: usize, submit_lanes: usize) -> usize {
+    job % submit_lanes
 }
 
 fn remove_configured_paths(
@@ -672,7 +713,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     if !submitter_cpus.is_empty() {
         eprintln!(
             "pinning {} append submitters and {} durability dispatchers to CPUs {:?}",
-            cli.submitters, cli.jobs, submitter_cpus
+            cli.submitters, cli.submit_lanes, submitter_cpus
         );
     }
 
@@ -690,50 +731,66 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     // Mirror ublk's topology: each kernel queue has its own request channel,
     // queue-worker group, and durability dispatcher. A global work-stealing
     // queue changes burst shape and hides per-queue head-of-line behavior.
-    let mut submit_txs = Vec::with_capacity(cli.jobs);
-    let mut submit_rxs = Vec::with_capacity(cli.jobs);
-    for _ in 0..cli.jobs {
-        let (tx, rx) = crossbeam_channel::bounded::<SubmitTask>(cli.iodepth);
+    let mut submit_txs = Vec::with_capacity(cli.submit_lanes);
+    let mut submit_rxs = Vec::with_capacity(cli.submit_lanes);
+    for lane in 0..cli.submit_lanes {
+        let jobs_in_lane =
+            cli.jobs / cli.submit_lanes + usize::from(lane < cli.jobs % cli.submit_lanes);
+        let lane_depth = cli
+            .iodepth
+            .checked_mul(jobs_in_lane)
+            .ok_or_else(|| anyhow!("submit lane {lane} queue depth overflows usize"))?;
+        let (tx, rx) = crossbeam_channel::bounded::<SubmitTask>(lane_depth);
         submit_txs.push(tx);
         submit_rxs.push(rx);
     }
 
-    let mut submitted_txs = Vec::with_capacity(cli.jobs);
-    let mut submitted_rxs = Vec::with_capacity(cli.jobs);
+    let mut submitted_txs = Vec::with_capacity(cli.submit_lanes);
+    let mut submitted_rxs = Vec::with_capacity(cli.submit_lanes);
+    for _ in 0..cli.submit_lanes {
+        let (submitted_tx, submitted_rx) = crossbeam_channel::unbounded::<SubmitResult>();
+        submitted_txs.push(submitted_tx);
+        submitted_rxs.push(submitted_rx);
+    }
     let mut job_event_txs = Vec::with_capacity(cli.jobs);
     let mut job_event_rxs = Vec::with_capacity(cli.jobs);
     for _ in 0..cli.jobs {
-        let (submitted_tx, submitted_rx) = crossbeam_channel::unbounded::<SubmitResult>();
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<JobEvent>();
-        submitted_txs.push(submitted_tx);
-        submitted_rxs.push(submitted_rx);
         job_event_txs.push(event_tx);
         job_event_rxs.push(event_rx);
     }
+    let job_event_txs = Arc::new(job_event_txs);
 
-    let mut durability_handles = Vec::with_capacity(cli.jobs);
-    for lane in 0..cli.jobs {
+    let mut durability_handles = Vec::with_capacity(cli.submit_lanes);
+    for lane in 0..cli.submit_lanes {
         let submitted_rx = submitted_rxs[lane].clone();
-        let event_tx = job_event_txs[lane].clone();
-        let failure_tx = event_tx.clone();
+        let event_txs = job_event_txs.clone();
+        let failure_txs = event_txs.clone();
+        let submit_lanes = cli.submit_lanes;
         let durability_cpus = submitter_cpus.clone();
         let spawn_result = thread::Builder::new()
             .name(format!("engine-durable-{lane}"))
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_durability_dispatcher(lane, submitted_rx, event_tx, &durability_cpus)
+                    run_durability_dispatcher(lane, submitted_rx, &event_txs, &durability_cpus)
                 }));
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        let _ = failure_tx.send(JobEvent::LaneFailed(format!(
-                            "durability dispatcher {lane} failed: {error:#}"
-                        )));
+                        broadcast_lane_failure(
+                            lane,
+                            submit_lanes,
+                            &failure_txs,
+                            format!("durability dispatcher {lane} failed: {error:#}"),
+                        );
                     }
                     Err(_) => {
-                        let _ = failure_tx.send(JobEvent::LaneFailed(format!(
-                            "durability dispatcher {lane} panicked"
-                        )));
+                        broadcast_lane_failure(
+                            lane,
+                            submit_lanes,
+                            &failure_txs,
+                            format!("durability dispatcher {lane} panicked"),
+                        );
                     }
                 }
             });
@@ -754,10 +811,11 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
 
     let mut submitter_handles = Vec::with_capacity(cli.submitters);
     for (idx, volume) in submitter_volumes.into_iter().enumerate() {
-        let lane = idx % cli.jobs;
+        let lane = idx % cli.submit_lanes;
         let worker_submit_rx = submit_rxs[lane].clone();
         let worker_result_tx = submitted_txs[lane].clone();
-        let failure_tx = job_event_txs[lane].clone();
+        let failure_txs = job_event_txs.clone();
+        let submit_lanes = cli.submit_lanes;
         let submitter_cpus = submitter_cpus.clone();
         let spawn_result = thread::Builder::new()
             .name(format!("engine-submit-{idx}"))
@@ -770,6 +828,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                     }
                     while let Ok(task) = worker_submit_rx.recv() {
                         let SubmitTask {
+                            job,
                             offset,
                             len,
                             buffer,
@@ -787,6 +846,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                             Ok(Ok(ticket)) => {
                                 let submitted = Instant::now();
                                 SubmitResult::Pending(PendingWrite {
+                                    job,
                                     ticket: Some(ticket),
                                     buffer: Some(buffer),
                                     started,
@@ -801,10 +861,12 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                                 })
                             }
                             Ok(Err(error)) => SubmitResult::Failed {
+                                job,
                                 buffer,
                                 error: error.to_string(),
                             },
                             Err(_) => SubmitResult::Failed {
+                                job,
                                 buffer,
                                 error: format!(
                                     "append submitter {idx} panicked while processing IO"
@@ -820,9 +882,12 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                     }
                 }));
                 if result.is_err() {
-                    let _ = failure_tx.send(JobEvent::LaneFailed(format!(
-                        "append submitter {idx} panicked"
-                    )));
+                    broadcast_lane_failure(
+                        lane,
+                        submit_lanes,
+                        &failure_txs,
+                        format!("append submitter {idx} panicked"),
+                    );
                 }
             });
         match spawn_result {
@@ -847,12 +912,12 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     drop(job_event_txs);
     let mut handles = Vec::with_capacity(cli.jobs);
 
-    for (job, ((volume, job_submit_tx), event_rx)) in job_volumes
+    for (job, (volume, event_rx)) in job_volumes
         .into_iter()
-        .zip(submit_txs.iter().cloned())
         .zip(job_event_rxs.into_iter())
         .enumerate()
     {
+        let job_submit_tx = submit_txs[job_submit_lane(job, cli.submit_lanes)].clone();
         let worker_stop = stop.clone();
         let worker_control = control.clone();
         let samples = samples.clone();
@@ -1174,7 +1239,7 @@ fn shutdown_submit_pipeline(
 fn run_durability_dispatcher(
     lane: usize,
     result_rx: Receiver<SubmitResult>,
-    event_tx: Sender<JobEvent>,
+    event_txs: &[Sender<JobEvent>],
     cpus: &[usize],
 ) -> Result<()> {
     if let Err(error) = pin_current_thread_to(cpus) {
@@ -1191,9 +1256,7 @@ fn run_durability_dispatcher(
         if pending.is_empty() {
             match result_rx.recv() {
                 Ok(result) => {
-                    if !accept_dispatch_result(result, &wake_tx, &event_tx, &mut pending) {
-                        return Ok(());
-                    }
+                    accept_dispatch_result(result, &wake_tx, event_txs, &mut pending)?;
                 }
                 Err(_) => input_open = false,
             }
@@ -1201,9 +1264,7 @@ fn run_durability_dispatcher(
             crossbeam_channel::select! {
                 recv(result_rx) -> result => match result {
                     Ok(result) => {
-                        if !accept_dispatch_result(result, &wake_tx, &event_tx, &mut pending) {
-                            return Ok(());
-                        }
+                        accept_dispatch_result(result, &wake_tx, event_txs, &mut pending)?;
                     }
                     Err(_) => input_open = false,
                 },
@@ -1214,14 +1275,10 @@ fn run_durability_dispatcher(
         }
 
         while let Ok(result) = result_rx.try_recv() {
-            if !accept_dispatch_result(result, &wake_tx, &event_tx, &mut pending) {
-                return Ok(());
-            }
+            accept_dispatch_result(result, &wake_tx, event_txs, &mut pending)?;
         }
         while wake_rx.try_recv().is_ok() {}
-        if !dispatch_durable_writes(&mut pending, &event_tx) {
-            return Ok(());
-        }
+        dispatch_durable_writes(&mut pending, event_txs)?;
     }
     Ok(())
 }
@@ -1229,36 +1286,60 @@ fn run_durability_dispatcher(
 fn accept_dispatch_result(
     result: SubmitResult,
     wake_tx: &Sender<()>,
-    event_tx: &Sender<JobEvent>,
+    event_txs: &[Sender<JobEvent>],
     pending: &mut Vec<PendingWrite>,
-) -> bool {
+) -> Result<()> {
     match result {
         SubmitResult::Pending(write) => {
             write.arm_wakeup(wake_tx);
             pending.push(write);
         }
-        SubmitResult::Failed { buffer, error } => {
-            if event_tx.send(JobEvent::Failed { buffer, error }).is_err() {
-                return false;
-            }
+        SubmitResult::Failed { job, buffer, error } => {
+            route_job_event(event_txs, job, JobEvent::Failed { buffer, error })?;
         }
     }
-    true
+    Ok(())
 }
 
-fn dispatch_durable_writes(pending: &mut Vec<PendingWrite>, event_tx: &Sender<JobEvent>) -> bool {
+fn dispatch_durable_writes(
+    pending: &mut Vec<PendingWrite>,
+    event_txs: &[Sender<JobEvent>],
+) -> Result<()> {
     let mut idx = 0;
     while idx < pending.len() {
         if !pending[idx].is_durable() {
             idx += 1;
             continue;
         }
-        let completed = pending.swap_remove(idx).finish_durable();
-        if event_tx.send(JobEvent::Complete(completed)).is_err() {
-            return false;
+        let write = pending.swap_remove(idx);
+        let job = write.job;
+        let completed = write.finish_durable();
+        route_job_event(event_txs, job, JobEvent::Complete(completed))?;
+    }
+    Ok(())
+}
+
+fn route_job_event(event_txs: &[Sender<JobEvent>], job: usize, event: JobEvent) -> Result<()> {
+    let event_tx = event_txs
+        .get(job)
+        .ok_or_else(|| anyhow!("submit result references unknown job {job}"))?;
+    // A disconnected receiver means the owning job has already exited. The
+    // other jobs sharing this lane must continue draining normally.
+    let _ = event_tx.send(event);
+    Ok(())
+}
+
+fn broadcast_lane_failure(
+    lane: usize,
+    submit_lanes: usize,
+    event_txs: &[Sender<JobEvent>],
+    error: String,
+) {
+    for (job, event_tx) in event_txs.iter().enumerate() {
+        if job_submit_lane(job, submit_lanes) == lane {
+            let _ = event_tx.send(JobEvent::LaneFailed(error.clone()));
         }
     }
-    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1316,6 +1397,7 @@ fn issue_one(
     *issued_writes = (*issued_writes).saturating_add(1);
     let started = Instant::now();
     let task = SubmitTask {
+        job,
         offset,
         len,
         buffer,
@@ -1578,15 +1660,15 @@ fn print_report(
     println!("  \"jobs\": {},", cli.jobs);
     println!("  \"iodepth\": {},", cli.iodepth);
     println!("  \"submitters\": {},", cli.submitters);
-    println!("  \"submit_lanes\": {},", cli.jobs);
-    println!("  \"durability_dispatchers\": {},", cli.jobs);
+    println!("  \"submit_lanes\": {},", cli.submit_lanes);
+    println!("  \"durability_dispatchers\": {},", cli.submit_lanes);
     println!(
         "  \"submitters_per_lane_min\": {},",
-        cli.submitters / cli.jobs
+        cli.submitters / cli.submit_lanes
     );
     println!(
         "  \"submitters_per_lane_max\": {},",
-        cli.submitters.div_ceil(cli.jobs)
+        cli.submitters.div_ceil(cli.submit_lanes)
     );
     println!(
         "  \"inflight_target\": {},",
@@ -2572,9 +2654,45 @@ mod tests {
         assert!(!cli.reset_buffer);
         assert!(!cli.prefill);
         assert_eq!(cli.jobs, 8);
+        assert_eq!(cli.submit_lanes, 0);
         assert_eq!(cli.iodepth, 64);
         assert_eq!(cli.ramp_secs, 5);
         assert_eq!(cli.pattern.as_str(), "fio-default");
+    }
+
+    #[test]
+    fn submit_topology_derives_lanes_and_validates_worker_coverage() {
+        let mut cli = Cli::try_parse_from(["onyx-engine-bench", "--jobs", "8"]).unwrap();
+        resolve_submit_topology(&mut cli, 4, 16).unwrap();
+        assert_eq!(cli.submit_lanes, 4);
+        assert_eq!(cli.submitters, 64);
+        assert_eq!(
+            (0..cli.jobs)
+                .map(|job| job_submit_lane(job, cli.submit_lanes))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 0, 1, 2, 3]
+        );
+
+        let mut explicit_lanes =
+            Cli::try_parse_from(["onyx-engine-bench", "--jobs", "8", "--submit-lanes", "2"])
+                .unwrap();
+        resolve_submit_topology(&mut explicit_lanes, 8, 8).unwrap();
+        assert_eq!(explicit_lanes.submitters, 16);
+
+        let mut invalid = Cli::try_parse_from([
+            "onyx-engine-bench",
+            "--jobs",
+            "8",
+            "--submit-lanes",
+            "4",
+            "--submitters",
+            "3",
+        ])
+        .unwrap();
+        let error = resolve_submit_topology(&mut invalid, 4, 16).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--submitters must be >= --submit-lanes"));
     }
 
     #[test]
