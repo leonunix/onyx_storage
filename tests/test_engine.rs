@@ -655,6 +655,83 @@ fn volume_aligned_write_read() {
 }
 
 #[test]
+fn volume_deferred_aligned_write_waits_for_durability() {
+    let (config, _md, _bf, _df) = make_config();
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-deferred", 256 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-deferred").unwrap();
+    let before = engine.metrics_snapshot();
+    let data = vec![0x5A; 8192];
+
+    let ticket = vol.write_aligned_deferred(0, &data).unwrap();
+    ticket.wait();
+
+    let finish_data = vec![0xA5; 4096];
+    let finish_ticket = vol.write_aligned_deferred(8192, &finish_data).unwrap();
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+    if !finish_ticket.arm_wakeup(&wake_tx) {
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    }
+    assert!(finish_ticket.is_durable());
+    finish_ticket.finish();
+
+    // One logical write crossing the configured LBA-128 zone boundary must
+    // wait both underlying shard tickets but count once at the volume layer.
+    let split_data = vec![0xC3; 8192];
+    vol.write_aligned_deferred(127 * 4096, &split_data)
+        .unwrap()
+        .wait();
+
+    let delta = engine.metrics_snapshot().saturating_sub(&before);
+    assert_eq!(delta.volume_write_ops, 3);
+    assert_eq!(
+        delta.volume_write_bytes,
+        (data.len() + finish_data.len() + split_data.len()) as u64
+    );
+    assert!(delta.volume_write_total_ns > 0);
+    assert!(delta.zone_submit_write_ns > 0);
+    assert_eq!(delta.zone_write_dispatches, 4);
+    assert_eq!(delta.zone_write_split_ops, 1);
+    assert_eq!(
+        delta
+            .buffer_append_wait_durable_fine_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        4
+    );
+    let (_, per_volume) = engine
+        .volume_metrics_snapshot()
+        .into_iter()
+        .find(|(name, _)| name == "vol-deferred")
+        .unwrap();
+    assert_eq!(per_volume.write_ops, 3);
+    assert_eq!(
+        per_volume.write_bytes,
+        (data.len() + finish_data.len() + split_data.len()) as u64
+    );
+    assert_eq!(vol.read(0, data.len()).unwrap(), data);
+    assert_eq!(vol.read(8192, finish_data.len()).unwrap(), finish_data);
+    assert_eq!(vol.read(127 * 4096, split_data.len()).unwrap(), split_data);
+    assert!(vol.write_aligned_deferred(1, &[0u8; 4096]).is_err());
+    assert!(vol.write_aligned_deferred(0, &[0u8; 4095]).is_err());
+
+    let appends_before_delete = engine.metrics_snapshot().buffer_appends;
+    engine.delete_volume("vol-deferred").unwrap();
+    assert!(matches!(
+        vol.write_aligned_deferred(0, &[0u8; 4096]),
+        Err(OnyxError::VolumeDeleted(_))
+    ));
+    assert_eq!(
+        engine.metrics_snapshot().buffer_appends,
+        appends_before_delete
+    );
+}
+
+#[test]
 fn volume_sparse_read_zeros() {
     let (config, _md, _bf, _df) = make_config();
     let engine = OnyxEngine::open(&config).unwrap();

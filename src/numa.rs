@@ -801,7 +801,10 @@ fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
             continue; // thread exited
         }
         let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-        let cpus = if name.starts_with("ublk-") || name.starts_with("persistent-slot") {
+        let Some(use_foreground) = confine_thread_placement(&name) else {
+            continue;
+        };
+        let cpus = if use_foreground {
             foreground
         } else {
             background
@@ -821,6 +824,16 @@ fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
         if rc == 0 {
             tracing::info!(tid, "numa confine: re-bound stray thread (self-pinned outside the node, e.g. libublk queue daemon)");
         }
+    }
+}
+
+/// `None` preserves affinity explicitly selected by a load generator. Normal
+/// engine threads remain confined to the engine-owned CPU sets.
+fn confine_thread_placement(name: &str) -> Option<bool> {
+    if name.trim_end().starts_with("engine-bench-") {
+        None
+    } else {
+        Some(name.starts_with("ublk-") || name.starts_with("persistent-slot"))
     }
 }
 
@@ -1087,6 +1100,13 @@ mod tests {
         let (foreground, background) = node.confine_cpu_sets(1, 1);
         assert_eq!(foreground, vec![0, 4]);
         assert_eq!(background, vec![1, 2, 5, 6]);
+    }
+
+    #[test]
+    fn confine_enforcer_preserves_engine_bench_affinity() {
+        assert_eq!(confine_thread_placement("engine-bench-7\n"), None);
+        assert_eq!(confine_thread_placement("ublk-queue\n"), Some(true));
+        assert_eq!(confine_thread_placement("BufferSync-0\n"), Some(false));
     }
 
     #[test]

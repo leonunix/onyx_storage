@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::buffer::commit_log::BufferAppendTicket;
 use crate::engine::VolumeAliveFlag;
 use crate::error::{OnyxError, OnyxResult};
 use crate::metrics::{EngineMetrics, VolumeMetrics};
@@ -32,6 +33,98 @@ pub struct OnyxVolume {
     vol_lock: Arc<RwLock<()>>,
     metrics: Arc<EngineMetrics>,
     vol_metrics: Arc<VolumeMetrics>,
+}
+
+/// An aligned volume write that has entered LV2 but is not necessarily durable.
+/// Waiting preserves the normal acknowledgement boundary: all covered buffer
+/// shards must advance their fdatasync watermark before the write completes.
+/// Dropping the ticket abandons acknowledgement and completion metrics; it does
+/// not cancel an append that has already entered LV2.
+#[must_use = "a deferred write must be waited or explicitly dropped"]
+pub struct VolumeWriteTicket {
+    tickets: Vec<BufferAppendTicket>,
+    metrics: Arc<EngineMetrics>,
+    vol_metrics: Arc<VolumeMetrics>,
+    bytes: u64,
+    volume_started: Instant,
+    zone_started: Instant,
+}
+
+impl VolumeWriteTicket {
+    pub fn is_durable(&self) -> bool {
+        self.tickets.iter().all(BufferAppendTicket::is_durable)
+    }
+
+    /// Register an edge-coalesced completion wakeup. The return value is true
+    /// when all shard tickets are already durable; otherwise at least one
+    /// future watermark advance will notify `tx`.
+    pub fn arm_wakeup(&self, tx: &crossbeam_channel::Sender<()>) -> bool {
+        for ticket in &self.tickets {
+            ticket.arm_wakeup(tx);
+        }
+        self.is_durable()
+    }
+
+    pub fn wait(self) {
+        let Self {
+            tickets,
+            metrics,
+            vol_metrics,
+            bytes,
+            volume_started,
+            zone_started,
+        } = self;
+        for ticket in tickets {
+            ticket.wait();
+        }
+        Self::record_completion(&metrics, &vol_metrics, bytes, volume_started, zone_started);
+    }
+
+    /// Complete a ticket that has already reached its durability watermark.
+    /// This is the non-blocking reap path used by asynchronous frontends. A
+    /// premature caller falls back to the normal durable wait rather than
+    /// acknowledging an unsynced write.
+    pub fn finish(self) {
+        if !self.is_durable() {
+            self.wait();
+            return;
+        }
+        let Self {
+            tickets,
+            metrics,
+            vol_metrics,
+            bytes,
+            volume_started,
+            zone_started,
+        } = self;
+        for ticket in tickets {
+            ticket.finish_dispatched();
+        }
+        Self::record_completion(&metrics, &vol_metrics, bytes, volume_started, zone_started);
+    }
+
+    fn record_completion(
+        metrics: &EngineMetrics,
+        vol_metrics: &VolumeMetrics,
+        bytes: u64,
+        volume_started: Instant,
+        zone_started: Instant,
+    ) {
+        let volume_elapsed_ns = volume_started.elapsed().as_nanos() as u64;
+        let zone_elapsed_ns = zone_started.elapsed().as_nanos() as u64;
+        metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .volume_write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        metrics
+            .volume_write_total_ns
+            .fetch_add(volume_elapsed_ns, Ordering::Relaxed);
+        metrics
+            .zone_submit_write_ns
+            .fetch_add(zone_elapsed_ns, Ordering::Relaxed);
+        vol_metrics.write_ops.fetch_add(1, Ordering::Relaxed);
+        vol_metrics.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 impl OnyxVolume {
@@ -140,29 +233,8 @@ impl OnyxVolume {
         let start = Instant::now();
         let bs = BLOCK_SIZE as u64;
         if offset_bytes % bs == 0 && len % bs == 0 {
-            self.check_alive()?;
-            let start_lba = Lba(offset_bytes / bs);
-            let lba_count = (len / bs) as u32;
-            self.zone_manager.submit_write(
-                &self.vol_id,
-                start_lba,
-                lba_count,
-                data,
-                self.created_at,
-            )?;
-            self.metrics
-                .volume_write_ops
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .volume_write_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            self.metrics
-                .volume_write_total_ns
-                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            self.vol_metrics.write_ops.fetch_add(1, Ordering::Relaxed);
-            self.vol_metrics
-                .write_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.write_aligned_deferred_started(offset_bytes, data, start)?
+                .wait();
             return Ok(());
         }
 
@@ -174,6 +246,63 @@ impl OnyxVolume {
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Submit one block-aligned write without waiting for LV2 durability.
+    /// Call [`VolumeWriteTicket::wait`] to reach the same completion boundary
+    /// as [`Self::write`]. This is intended for asynchronous frontends and
+    /// load generators that maintain multiple durable writes in flight.
+    pub fn write_aligned_deferred(
+        &self,
+        offset_bytes: u64,
+        data: &[u8],
+    ) -> OnyxResult<VolumeWriteTicket> {
+        self.write_aligned_deferred_started(offset_bytes, data, Instant::now())
+    }
+
+    fn write_aligned_deferred_started(
+        &self,
+        offset_bytes: u64,
+        data: &[u8],
+        volume_started: Instant,
+    ) -> OnyxResult<VolumeWriteTicket> {
+        if data.is_empty() {
+            return Err(OnyxError::Config(
+                "deferred aligned write data must not be empty".into(),
+            ));
+        }
+        let len = data.len() as u64;
+        if offset_bytes + len > self.size_bytes {
+            return Err(OnyxError::OutOfBounds {
+                offset: offset_bytes,
+                len,
+                size: self.size_bytes,
+            });
+        }
+        let bs = BLOCK_SIZE as u64;
+        if offset_bytes % bs != 0 || len % bs != 0 {
+            return Err(OnyxError::Config(format!(
+                "deferred write requires {BLOCK_SIZE}-byte aligned offset and length"
+            )));
+        }
+
+        self.check_alive()?;
+        let zone_started = Instant::now();
+        let tickets = self.zone_manager.submit_write_deferred(
+            &self.vol_id,
+            Lba(offset_bytes / bs),
+            (len / bs) as u32,
+            data,
+            self.created_at,
+        )?;
+        Ok(VolumeWriteTicket {
+            tickets,
+            metrics: self.metrics.clone(),
+            vol_metrics: self.vol_metrics.clone(),
+            bytes: len,
+            volume_started,
+            zone_started,
+        })
     }
 
     /// Read `len` bytes from a byte offset. Unmapped blocks return zeros.

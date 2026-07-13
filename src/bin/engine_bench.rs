@@ -1,17 +1,19 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
+use crossbeam_channel::{Receiver, Sender};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::engine::OnyxEngine;
-use onyx_storage::metrics::{EngineMetricsSnapshot, MetaMemorySnapshot};
+use onyx_storage::metrics::{EngineMetricsSnapshot, EngineStatusSnapshot, MetaMemorySnapshot};
 use onyx_storage::types::{CompressionAlgo, BLOCK_SIZE};
+use onyx_storage::volume::VolumeWriteTicket;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,6 +39,13 @@ struct Cli {
     #[arg(long, default_value_t = 16)]
     jobs: usize,
 
+    /// Maximum durable writes in flight per job. Reads remain synchronous.
+    #[arg(long, default_value_t = 1)]
+    iodepth: usize,
+
+    #[arg(long, default_value_t = 5)]
+    ramp_secs: u64,
+
     #[arg(long, default_value_t = 70)]
     rwmixread: u8,
 
@@ -52,16 +61,16 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CompressionChoice::Lz4)]
     compression: CompressionChoice,
 
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     reset: bool,
 
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     reset_buffer: bool,
 
     #[arg(long, default_value = "64m", value_parser = parse_size)]
     reset_buffer_bytes: u64,
 
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     prefill: bool,
 
     #[arg(long, default_value_t = 120)]
@@ -133,6 +142,82 @@ struct LatencySamples {
     write_ns: Vec<u64>,
 }
 
+struct PendingWrite {
+    ticket: VolumeWriteTicket,
+    started: Instant,
+    bytes: u64,
+    measured: bool,
+}
+
+struct TimedRun {
+    stats: BenchStats,
+    samples: LatencySamples,
+    elapsed: Duration,
+    completion_closure: Duration,
+    baseline_status: EngineStatusSnapshot,
+}
+
+struct DrainReport {
+    pending_before: Option<u64>,
+    physical_used_before_bytes: u64,
+    physical_fill_before_pct: Option<u8>,
+    pending_after_timed: Option<u64>,
+    physical_used_after_timed_bytes: u64,
+    physical_fill_after_timed_pct: Option<u8>,
+    pending_after_pending_drain: Option<u64>,
+    physical_used_after_pending_drain_bytes: u64,
+    physical_fill_after_pending_drain_pct: Option<u8>,
+    pending_after_physical_drain: Option<u64>,
+    physical_used_after_physical_drain_bytes: u64,
+    physical_fill_after_physical_drain_pct: Option<u8>,
+    pending_drained: bool,
+    physical_drained: bool,
+    pending_drain_elapsed: Duration,
+    physical_drain_elapsed: Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BenchPhase {
+    Setup,
+    Ramp,
+    Measure,
+    Stop,
+}
+
+struct BenchControlState {
+    phase: BenchPhase,
+    ready: usize,
+    ramp_done: usize,
+    error: Option<String>,
+}
+
+struct BenchControl {
+    state: Mutex<BenchControlState>,
+    changed: Condvar,
+}
+
+impl BenchControl {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(BenchControlState {
+                phase: BenchPhase::Setup,
+                ready: 0,
+                ramp_done: 0,
+                error: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn record_error(&self, error: &anyhow::Error) {
+        let mut state = self.state.lock().unwrap();
+        if state.error.is_none() {
+            state.error = Some(format!("{error:#}"));
+        }
+        self.changed.notify_all();
+    }
+}
+
 impl LatencySamples {
     fn merge(&mut self, mut other: Self) {
         self.read_ns.append(&mut other.read_ns);
@@ -149,6 +234,11 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     validate_args(&cli)?;
+    if cli.iodepth > 1 && cli.job_cpus.trim().is_empty() {
+        eprintln!(
+            "warn: --iodepth > 1 without --job-cpus may let load-generator completion threads compete with engine threads"
+        );
+    }
 
     if cli.reset {
         remove_configured_paths(&cli.config, cli.reset_buffer, cli.reset_buffer_bytes)?;
@@ -175,34 +265,70 @@ fn main() -> Result<()> {
             human_bytes(cli.max_bs)
         );
         prefill(&volume, &cli)?;
-        if !wait_for_drain(&engine, Duration::from_secs(cli.drain_timeout_secs)) {
+        if !wait_for_pending_drain(&engine, Duration::from_secs(cli.drain_timeout_secs)) {
             return Err(anyhow!("prefill drain timeout"));
         }
     }
 
-    let status_before = engine.status_snapshot()?;
-    let before = engine.metrics_snapshot();
-    let pending_before = status_before.buffer_pending_entries;
-    let meta_before = status_before.metadb_memory;
-    let started = Instant::now();
-    let (stats, samples) = run_mixed(&engine, &cli)?;
-    let elapsed = started.elapsed();
-    let status_after = engine.status_snapshot()?;
-    let pending_after = status_after.buffer_pending_entries;
-    let meta_delta = meta_before.and_then(|before| {
-        status_after
-            .metadb_memory
-            .map(|after| after.saturating_sub(&before))
-    });
-    let metrics = engine.metrics_snapshot().saturating_sub(&before);
+    let run = run_mixed(&engine, &cli)?;
+    // Freeze the performance window before waiting for either logical or
+    // physical drain. Otherwise RC/apply work after load stops contaminates
+    // the rates paired with timed IOPS and latency.
+    let status_after_timed = engine.status_snapshot()?;
+    let metrics = status_after_timed
+        .metrics
+        .saturating_sub(&run.baseline_status.metrics);
+    let meta_delta = run
+        .baseline_status
+        .metadb_memory
+        .as_ref()
+        .and_then(|before| {
+            status_after_timed
+                .metadb_memory
+                .as_ref()
+                .map(|after| after.saturating_sub(before))
+        });
+
+    let drain_started = Instant::now();
+    let drain_timeout = Duration::from_secs(cli.drain_timeout_secs);
+    let pending_drained = wait_for_pending_drain(&engine, drain_timeout);
+    let pending_drain_elapsed = drain_started.elapsed();
+    let status_after_pending_drain = engine.status_snapshot()?;
+    let physical_drained =
+        wait_for_physical_drain(&engine, drain_timeout.saturating_sub(pending_drain_elapsed));
+    let physical_drain_elapsed = drain_started.elapsed();
+    let status_after_physical_drain = engine.status_snapshot()?;
+    let drain = DrainReport {
+        pending_before: run.baseline_status.buffer_pending_entries,
+        physical_used_before_bytes: status_physical_used_bytes(&run.baseline_status),
+        physical_fill_before_pct: run.baseline_status.buffer_physical_fill_pct,
+        pending_after_timed: status_after_timed.buffer_pending_entries,
+        physical_used_after_timed_bytes: status_physical_used_bytes(&status_after_timed),
+        physical_fill_after_timed_pct: status_after_timed.buffer_physical_fill_pct,
+        pending_after_pending_drain: status_after_pending_drain.buffer_pending_entries,
+        physical_used_after_pending_drain_bytes: status_physical_used_bytes(
+            &status_after_pending_drain,
+        ),
+        physical_fill_after_pending_drain_pct: status_after_pending_drain.buffer_physical_fill_pct,
+        pending_after_physical_drain: status_after_physical_drain.buffer_pending_entries,
+        physical_used_after_physical_drain_bytes: status_physical_used_bytes(
+            &status_after_physical_drain,
+        ),
+        physical_fill_after_physical_drain_pct: status_after_physical_drain
+            .buffer_physical_fill_pct,
+        pending_drained,
+        physical_drained,
+        pending_drain_elapsed,
+        physical_drain_elapsed,
+    };
 
     print_report(
         &cli,
-        stats,
-        samples,
-        elapsed,
-        pending_before,
-        pending_after,
+        run.stats,
+        run.samples,
+        run.elapsed,
+        run.completion_closure,
+        &drain,
         &metrics,
         meta_delta.as_ref(),
     );
@@ -213,6 +339,9 @@ fn main() -> Result<()> {
 fn validate_args(cli: &Cli) -> Result<()> {
     if cli.jobs == 0 {
         return Err(anyhow!("--jobs must be > 0"));
+    }
+    if cli.iodepth == 0 {
+        return Err(anyhow!("--iodepth must be > 0"));
     }
     if cli.runtime_secs == 0 {
         return Err(anyhow!("--runtime-secs must be > 0"));
@@ -371,11 +500,15 @@ fn pin_current_thread_to(_cpus: &[usize]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<(BenchStats, LatencySamples)> {
+fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     let stop = Arc::new(AtomicBool::new(false));
-    let barrier = Arc::new(Barrier::new(cli.jobs + 1));
+    let control = Arc::new(BenchControl::new());
     let samples = Arc::new(Mutex::new(LatencySamples::default()));
     let mut handles = Vec::with_capacity(cli.jobs);
+    let mut volumes = Vec::with_capacity(cli.jobs);
+    for _ in 0..cli.jobs {
+        volumes.push(engine.open_volume(&cli.volume)?);
+    }
 
     let job_cpus = Arc::new(parse_cpu_list(&cli.job_cpus));
     if !job_cpus.is_empty() {
@@ -385,18 +518,19 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<(BenchStats, LatencySampl
         );
     }
 
-    for job in 0..cli.jobs {
-        let volume = engine.open_volume(&cli.volume)?;
-        let stop = stop.clone();
-        let barrier = barrier.clone();
+    for (job, volume) in volumes.into_iter().enumerate() {
+        let worker_stop = stop.clone();
+        let worker_control = control.clone();
         let samples = samples.clone();
         let job_cpus = job_cpus.clone();
         let pattern = cli.pattern;
         let rwmixread = cli.rwmixread;
+        let iodepth = cli.iodepth;
+        let ramp_secs = cli.ramp_secs;
         let min_blocks = cli.min_bs / BLOCK_SIZE as u64;
         let max_blocks = cli.max_bs / BLOCK_SIZE as u64;
         let max_start_lba = (cli.working_set / BLOCK_SIZE as u64).saturating_sub(max_blocks);
-        let handle = thread::Builder::new()
+        let spawn_result = thread::Builder::new()
             .name(format!("engine-bench-{job}"))
             .spawn(move || -> Result<BenchStats> {
                 if let Err(err) = pin_current_thread_to(&job_cpus) {
@@ -407,66 +541,298 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<(BenchStats, LatencySampl
                 let mut read_buf = vec![0u8; (max_blocks * BLOCK_SIZE as u64) as usize];
                 let mut local_samples = LatencySamples::default();
                 let mut stats = BenchStats::default();
-                barrier.wait();
+                let mut issued_writes = 0u64;
+                let mut inflight = Vec::<PendingWrite>::with_capacity(iodepth);
+                let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
 
-                while !stop.load(Ordering::Relaxed) {
-                    let blocks = min_blocks + (rng.next_u64() % (max_blocks - min_blocks + 1));
-                    let len = (blocks * BLOCK_SIZE as u64) as usize;
-                    let start_lba = if max_start_lba == 0 {
-                        0
-                    } else {
-                        rng.next_u64() % (max_start_lba + 1)
-                    };
-                    let offset = start_lba * BLOCK_SIZE as u64;
-                    let is_read = (rng.next_u64() % 100) < rwmixread as u64;
-                    let start = Instant::now();
-                    if is_read {
-                        volume.read_into(offset, &mut read_buf[..len])?;
-                        local_samples
-                            .read_ns
-                            .push(start.elapsed().as_nanos() as u64);
-                        stats.read_ops += 1;
-                        stats.read_bytes += len as u64;
-                    } else {
-                        fill_buffer(
-                            pattern,
-                            &mut write_buf[..len],
-                            &mut rng,
-                            job,
-                            stats.write_ops,
-                        );
-                        volume.write(offset, &write_buf[..len])?;
-                        local_samples
-                            .write_ns
-                            .push(start.elapsed().as_nanos() as u64);
-                        stats.write_ops += 1;
-                        stats.write_bytes += len as u64;
+                {
+                    let mut state = worker_control.state.lock().unwrap();
+                    state.ready += 1;
+                    worker_control.changed.notify_all();
+                    while state.phase == BenchPhase::Setup {
+                        state = worker_control.changed.wait(state).unwrap();
+                    }
+                    if state.phase == BenchPhase::Stop {
+                        return Ok(stats);
                     }
                 }
+
+                let ramp_deadline = Instant::now() + Duration::from_secs(ramp_secs);
+                let mut ramp_error = None;
+                while Instant::now() < ramp_deadline {
+                    if let Err(error) = issue_one(
+                        &volume,
+                        pattern,
+                        rwmixread,
+                        min_blocks,
+                        max_blocks,
+                        max_start_lba,
+                        iodepth,
+                        job,
+                        false,
+                        &mut rng,
+                        &mut write_buf,
+                        &mut read_buf,
+                        &mut inflight,
+                        &mut local_samples,
+                        &mut stats,
+                        &mut issued_writes,
+                        &wake_tx,
+                        &wake_rx,
+                    ) {
+                        ramp_error = Some(error);
+                        break;
+                    }
+                }
+                drain_writes(&mut inflight, &mut local_samples, &mut stats, &wake_rx);
+
+                {
+                    let mut state = worker_control.state.lock().unwrap();
+                    if let Some(error) = ramp_error.as_ref() {
+                        if state.error.is_none() {
+                            state.error = Some(format!("{error:#}"));
+                        }
+                    }
+                    state.ramp_done += 1;
+                    worker_control.changed.notify_all();
+                    while state.phase == BenchPhase::Ramp {
+                        state = worker_control.changed.wait(state).unwrap();
+                    }
+                    if state.phase == BenchPhase::Stop {
+                        return ramp_error.map_or(Ok(stats), Err);
+                    }
+                }
+
+                while !worker_stop.load(Ordering::Relaxed) {
+                    if let Err(error) = issue_one(
+                        &volume,
+                        pattern,
+                        rwmixread,
+                        min_blocks,
+                        max_blocks,
+                        max_start_lba,
+                        iodepth,
+                        job,
+                        true,
+                        &mut rng,
+                        &mut write_buf,
+                        &mut read_buf,
+                        &mut inflight,
+                        &mut local_samples,
+                        &mut stats,
+                        &mut issued_writes,
+                        &wake_tx,
+                        &wake_rx,
+                    ) {
+                        worker_control.record_error(&error);
+                        worker_stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                drain_writes(&mut inflight, &mut local_samples, &mut stats, &wake_rx);
 
                 let mut merged = samples.lock().unwrap();
                 merged.merge(local_samples);
                 Ok(stats)
-            })?;
-        handles.push(handle);
+            });
+        match spawn_result {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                let mut state = control.state.lock().unwrap();
+                state.phase = BenchPhase::Stop;
+                control.changed.notify_all();
+                drop(state);
+                for handle in handles {
+                    let _ = handle.join();
+                }
+                return Err(error.into());
+            }
+        }
     }
 
-    barrier.wait();
-    thread::sleep(Duration::from_secs(cli.runtime_secs));
+    {
+        let mut state = control.state.lock().unwrap();
+        while state.ready < cli.jobs {
+            state = control.changed.wait(state).unwrap();
+        }
+        state.phase = BenchPhase::Ramp;
+        control.changed.notify_all();
+        while state.ramp_done < cli.jobs {
+            state = control.changed.wait(state).unwrap();
+        }
+        if let Some(error) = state.error.clone() {
+            state.phase = BenchPhase::Stop;
+            control.changed.notify_all();
+            drop(state);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(anyhow!(error));
+        }
+    }
+
+    let baseline_status = match engine.status_snapshot() {
+        Ok(status) => status,
+        Err(error) => {
+            let mut state = control.state.lock().unwrap();
+            state.phase = BenchPhase::Stop;
+            control.changed.notify_all();
+            drop(state);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(error.into());
+        }
+    };
+    let measured_started = Instant::now();
+    {
+        let mut state = control.state.lock().unwrap();
+        state.phase = BenchPhase::Measure;
+        control.changed.notify_all();
+    }
+    let deadline = measured_started + Duration::from_secs(cli.runtime_secs);
+    let mut state = control.state.lock().unwrap();
+    while state.error.is_none() && Instant::now() < deadline {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let (next, _) = control.changed.wait_timeout(state, timeout).unwrap();
+        state = next;
+    }
+    let worker_error = state.error.clone();
+    drop(state);
+    let measured_elapsed = measured_started.elapsed();
     stop.store(true, Ordering::Relaxed);
 
     let mut stats = BenchStats::default();
     for handle in handles {
         stats.add(handle.join().map_err(|_| anyhow!("worker panicked"))??);
     }
+    let completion_closure = measured_started.elapsed().saturating_sub(measured_elapsed);
+    let worker_error = control.state.lock().unwrap().error.clone().or(worker_error);
+    if let Some(error) = worker_error {
+        return Err(anyhow!(error));
+    }
     let samples = Arc::try_unwrap(samples)
         .map_err(|_| anyhow!("latency samples still shared"))?
         .into_inner()
         .unwrap();
-    Ok((stats, samples))
+    Ok(TimedRun {
+        stats,
+        samples,
+        elapsed: measured_elapsed,
+        completion_closure,
+        baseline_status,
+    })
 }
 
-fn wait_for_drain(engine: &OnyxEngine, timeout: Duration) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn issue_one(
+    volume: &onyx_storage::volume::OnyxVolume,
+    pattern: Pattern,
+    rwmixread: u8,
+    min_blocks: u64,
+    max_blocks: u64,
+    max_start_lba: u64,
+    iodepth: usize,
+    job: usize,
+    measured: bool,
+    rng: &mut XorShift64,
+    write_buf: &mut [u8],
+    read_buf: &mut [u8],
+    inflight: &mut Vec<PendingWrite>,
+    samples: &mut LatencySamples,
+    stats: &mut BenchStats,
+    issued_writes: &mut u64,
+    wake_tx: &Sender<()>,
+    wake_rx: &Receiver<()>,
+) -> Result<()> {
+    reap_ready_writes(inflight, samples, stats);
+    let blocks = min_blocks + (rng.next_u64() % (max_blocks - min_blocks + 1));
+    let len = (blocks * BLOCK_SIZE as u64) as usize;
+    let start_lba = if max_start_lba == 0 {
+        0
+    } else {
+        rng.next_u64() % (max_start_lba + 1)
+    };
+    let offset = start_lba * BLOCK_SIZE as u64;
+    let is_read = (rng.next_u64() % 100) < rwmixread as u64;
+    if is_read {
+        let started = Instant::now();
+        volume.read_into(offset, &mut read_buf[..len])?;
+        if measured {
+            samples.read_ns.push(started.elapsed().as_nanos() as u64);
+            stats.read_ops += 1;
+            stats.read_bytes += len as u64;
+        }
+        reap_ready_writes(inflight, samples, stats);
+        return Ok(());
+    }
+
+    // Payload generation is load-generator work, not engine write latency.
+    fill_buffer(pattern, &mut write_buf[..len], rng, job, *issued_writes);
+    *issued_writes = (*issued_writes).saturating_add(1);
+    let started = Instant::now();
+    let ticket = volume.write_aligned_deferred(offset, &write_buf[..len])?;
+    ticket.arm_wakeup(wake_tx);
+    inflight.push(PendingWrite {
+        ticket,
+        started,
+        bytes: len as u64,
+        measured,
+    });
+    while inflight.len() >= iodepth {
+        if reap_ready_writes(inflight, samples, stats) == 0 {
+            let _ = wake_rx.recv();
+        }
+        while wake_rx.try_recv().is_ok() {}
+    }
+    Ok(())
+}
+
+fn reap_ready_writes(
+    inflight: &mut Vec<PendingWrite>,
+    samples: &mut LatencySamples,
+    stats: &mut BenchStats,
+) -> usize {
+    let mut completed = 0usize;
+    let mut idx = 0usize;
+    while idx < inflight.len() {
+        if !inflight[idx].ticket.is_durable() {
+            idx += 1;
+            continue;
+        }
+        let completed_at = Instant::now();
+        let pending = inflight.swap_remove(idx);
+        pending.ticket.finish();
+        if pending.measured {
+            samples.write_ns.push(
+                completed_at
+                    .saturating_duration_since(pending.started)
+                    .as_nanos() as u64,
+            );
+            stats.write_ops += 1;
+            stats.write_bytes += pending.bytes;
+        }
+        completed += 1;
+    }
+    completed
+}
+
+fn drain_writes(
+    inflight: &mut Vec<PendingWrite>,
+    samples: &mut LatencySamples,
+    stats: &mut BenchStats,
+    wake_rx: &Receiver<()>,
+) {
+    while !inflight.is_empty() {
+        if reap_ready_writes(inflight, samples, stats) == 0 {
+            let _ = wake_rx.recv();
+        }
+        while wake_rx.try_recv().is_ok() {}
+    }
+}
+
+fn wait_for_pending_drain(engine: &OnyxEngine, timeout: Duration) -> bool {
     let Some(pool) = engine.buffer_pool() else {
         return true;
     };
@@ -480,13 +846,35 @@ fn wait_for_drain(engine: &OnyxEngine, timeout: Duration) -> bool {
     pool.pending_count() == 0
 }
 
+fn wait_for_physical_drain(engine: &OnyxEngine, timeout: Duration) -> bool {
+    let Some(pool) = engine.buffer_pool() else {
+        return true;
+    };
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if pool.physical_is_empty() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    pool.physical_is_empty()
+}
+
+fn status_physical_used_bytes(status: &EngineStatusSnapshot) -> u64 {
+    status
+        .buffer_shards
+        .iter()
+        .map(|shard| shard.used_bytes)
+        .sum()
+}
+
 fn print_report(
     cli: &Cli,
     stats: BenchStats,
     mut samples: LatencySamples,
     elapsed: Duration,
-    pending_before: Option<u64>,
-    pending_after: Option<u64>,
+    completion_closure: Duration,
+    drain: &DrainReport,
     metrics: &EngineMetricsSnapshot,
     meta: Option<&MetaMemorySnapshot>,
 ) {
@@ -534,12 +922,47 @@ fn print_report(
         latency_bucket_percentile(&metrics.read_submit_unit_io_latency_buckets, 99.0);
     let read_submit_unit_io_p999 =
         latency_bucket_percentile(&metrics.read_submit_unit_io_latency_buckets, 99.9);
+    let fine_p99 = |buckets: &[u64]| {
+        bounded_latency_bucket_percentile(
+            buckets,
+            &metrics.buffer_lv2_latency_bucket_upper_bounds_ns,
+            99.0,
+        )
+    };
+    let fine_count = |buckets: &[u64]| buckets.iter().copied().sum::<u64>();
+    let durable_p50 = bounded_latency_bucket_percentile(
+        &metrics.buffer_append_wait_durable_fine_latency_buckets,
+        &metrics.buffer_lv2_latency_bucket_upper_bounds_ns,
+        50.0,
+    );
+    let durable_p95 = bounded_latency_bucket_percentile(
+        &metrics.buffer_append_wait_durable_fine_latency_buckets,
+        &metrics.buffer_lv2_latency_bucket_upper_bounds_ns,
+        95.0,
+    );
+    let durable_p99 = fine_p99(&metrics.buffer_append_wait_durable_fine_latency_buckets);
+    let durable_p999 = bounded_latency_bucket_percentile(
+        &metrics.buffer_append_wait_durable_fine_latency_buckets,
+        &metrics.buffer_lv2_latency_bucket_upper_bounds_ns,
+        99.9,
+    );
 
     println!("{{");
     println!("  \"kind\": \"onyx-engine-bench\",");
     println!("  \"volume\": {:?},", cli.volume);
     println!("  \"runtime_secs\": {:.3},", secs);
+    println!(
+        "  \"completion_closure_secs\": {:.6},",
+        completion_closure.as_secs_f64()
+    );
+    println!("  \"requested_runtime_secs\": {},", cli.runtime_secs);
+    println!("  \"ramp_secs\": {},", cli.ramp_secs);
     println!("  \"jobs\": {},", cli.jobs);
+    println!("  \"iodepth\": {},", cli.iodepth);
+    println!(
+        "  \"inflight_target\": {},",
+        cli.jobs.saturating_mul(cli.iodepth)
+    );
     println!("  \"rwmixread\": {},", cli.rwmixread);
     println!("  \"working_set_bytes\": {},", cli.working_set);
     println!("  \"read_iops\": {:.3},", read_iops);
@@ -554,6 +977,14 @@ fn print_report(
         percentile(&samples.read_ns, 99.9)
     );
     println!(
+        "  \"write_p50_ns\": {},",
+        percentile(&samples.write_ns, 50.0)
+    );
+    println!(
+        "  \"write_p95_ns\": {},",
+        percentile(&samples.write_ns, 95.0)
+    );
+    println!(
         "  \"write_p99_ns\": {},",
         percentile(&samples.write_ns, 99.0)
     );
@@ -561,8 +992,151 @@ fn print_report(
         "  \"write_p999_ns\": {},",
         percentile(&samples.write_ns, 99.9)
     );
-    println!("  \"pending_before\": {},", json_option_u64(pending_before));
-    println!("  \"pending_after\": {},", json_option_u64(pending_after));
+    println!(
+        "  \"pending_before\": {},",
+        json_option_u64(drain.pending_before)
+    );
+    println!(
+        "  \"physical_used_before_bytes\": {},",
+        drain.physical_used_before_bytes
+    );
+    println!(
+        "  \"physical_fill_before_pct\": {},",
+        json_option_u8(drain.physical_fill_before_pct)
+    );
+    println!(
+        "  \"pending_after_timed\": {},",
+        json_option_u64(drain.pending_after_timed)
+    );
+    println!(
+        "  \"physical_used_after_timed_bytes\": {},",
+        drain.physical_used_after_timed_bytes
+    );
+    println!(
+        "  \"physical_fill_after_timed_pct\": {},",
+        json_option_u8(drain.physical_fill_after_timed_pct)
+    );
+    println!("  \"pending_drained\": {},", drain.pending_drained);
+    println!(
+        "  \"pending_drain_secs\": {:.3},",
+        drain.pending_drain_elapsed.as_secs_f64()
+    );
+    println!(
+        "  \"pending_after_pending_drain\": {},",
+        json_option_u64(drain.pending_after_pending_drain)
+    );
+    println!(
+        "  \"physical_used_after_pending_drain_bytes\": {},",
+        drain.physical_used_after_pending_drain_bytes
+    );
+    println!(
+        "  \"physical_fill_after_pending_drain_pct\": {},",
+        json_option_u8(drain.physical_fill_after_pending_drain_pct)
+    );
+    println!("  \"physical_drained\": {},", drain.physical_drained);
+    println!(
+        "  \"physical_drain_secs\": {:.3},",
+        drain.physical_drain_elapsed.as_secs_f64()
+    );
+    println!(
+        "  \"pending_after_physical_drain\": {},",
+        json_option_u64(drain.pending_after_physical_drain)
+    );
+    println!(
+        "  \"physical_used_after_physical_drain_bytes\": {},",
+        drain.physical_used_after_physical_drain_bytes
+    );
+    println!(
+        "  \"physical_fill_after_physical_drain_pct\": {},",
+        json_option_u8(drain.physical_fill_after_physical_drain_pct)
+    );
+    println!("  \"buffer_appends\": {},", metrics.buffer_appends);
+    println!(
+        "  \"buffer_append_prepare_avg_ns\": {:.3},",
+        avg(metrics.buffer_append_prepare_ns, metrics.buffer_appends)
+    );
+    println!(
+        "  \"buffer_append_prepare_samples\": {},",
+        fine_count(&metrics.buffer_append_prepare_latency_buckets)
+    );
+    println!(
+        "  \"buffer_append_prepare_p99_ns\": {},",
+        latency_bucket_percentile(&metrics.buffer_append_prepare_latency_buckets, 99.0)
+    );
+    println!(
+        "  \"buffer_append_wait_durable_avg_ns\": {:.3},",
+        avg(
+            metrics.buffer_append_wait_durable_ns,
+            metrics.buffer_appends
+        )
+    );
+    println!(
+        "  \"buffer_append_wait_durable_samples\": {},",
+        fine_count(&metrics.buffer_append_wait_durable_fine_latency_buckets)
+    );
+    println!("  \"buffer_append_wait_durable_p50_ns\": {durable_p50},");
+    println!("  \"buffer_append_wait_durable_p95_ns\": {durable_p95},");
+    println!("  \"buffer_append_wait_durable_p99_ns\": {durable_p99},");
+    println!("  \"buffer_append_wait_durable_p999_ns\": {durable_p999},");
+    print_fine_stage(
+        "buffer_lv2_staging_queue",
+        &metrics.buffer_lv2_staging_queue_latency_buckets,
+        fine_p99(&metrics.buffer_lv2_staging_queue_latency_buckets),
+    );
+    print_fine_stage(
+        "buffer_lv2_prepared_queue",
+        &metrics.buffer_lv2_prepared_queue_latency_buckets,
+        fine_p99(&metrics.buffer_lv2_prepared_queue_latency_buckets),
+    );
+    print_fine_stage(
+        "buffer_lv2_group_collect",
+        &metrics.buffer_lv2_group_collect_latency_buckets,
+        fine_p99(&metrics.buffer_lv2_group_collect_latency_buckets),
+    );
+    print_fine_stage(
+        "buffer_lv2_payload_write",
+        &metrics.buffer_lv2_payload_write_latency_buckets,
+        fine_p99(&metrics.buffer_lv2_payload_write_latency_buckets),
+    );
+    print_fine_stage(
+        "buffer_lv2_checkpoint_write",
+        &metrics.buffer_lv2_checkpoint_write_latency_buckets,
+        fine_p99(&metrics.buffer_lv2_checkpoint_write_latency_buckets),
+    );
+    print_fine_stage(
+        "buffer_lv2_root_flush",
+        &metrics.buffer_lv2_root_flush_latency_buckets,
+        fine_p99(&metrics.buffer_lv2_root_flush_latency_buckets),
+    );
+    print_fine_stage(
+        "buffer_lv2_watermark_dispatch",
+        &metrics.buffer_lv2_watermark_dispatch_latency_buckets,
+        fine_p99(&metrics.buffer_lv2_watermark_dispatch_latency_buckets),
+    );
+    println!(
+        "  \"buffer_sync_entries_per_batch\": {:.3},",
+        avg(metrics.buffer_sync_entries, metrics.buffer_sync_batches)
+    );
+    println!(
+        "  \"buffer_backpressure_events\": {},",
+        metrics.buffer_backpressure_events
+    );
+    println!(
+        "  \"buffer_backpressure_wait_ns\": {},",
+        metrics.buffer_backpressure_wait_ns
+    );
+    println!(
+        "  \"buffer_throttle_count\": {},",
+        metrics.buffer_throttle_count
+    );
+    println!(
+        "  \"buffer_throttle_us_total\": {},",
+        metrics.buffer_throttle_us_total
+    );
+    println!(
+        "  \"buffer_throttle_us_max\": {},",
+        metrics.buffer_throttle_us_max
+    );
     println!("  \"read_submit_calls\": {},", metrics.read_submit_calls);
     println!(
         "  \"read_submit_total_ns\": {},",
@@ -1054,6 +1628,12 @@ fn json_option_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+fn json_option_u8(value: Option<u8>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn percentile(values: &[u64], pct: f64) -> u64 {
     if values.is_empty() {
         return 0;
@@ -1079,6 +1659,27 @@ fn latency_bucket_percentile(buckets: &[u64], pct: f64) -> u64 {
         }
     }
     u64::MAX
+}
+
+fn bounded_latency_bucket_percentile(buckets: &[u64], bounds: &[u64], pct: f64) -> u64 {
+    let total: u64 = buckets.iter().sum();
+    if total == 0 || bounds.is_empty() {
+        return 0;
+    }
+    let rank = ((total as f64 * pct / 100.0).ceil() as u64).max(1);
+    let mut seen = 0u64;
+    for (idx, count) in buckets.iter().copied().enumerate() {
+        seen = seen.saturating_add(count);
+        if seen >= rank {
+            return bounds[idx.min(bounds.len() - 1)];
+        }
+    }
+    *bounds.last().unwrap()
+}
+
+fn print_fine_stage(name: &str, buckets: &[u64], p99_ns: u64) {
+    println!("  \"{name}_samples\": {},", buckets.iter().sum::<u64>());
+    println!("  \"{name}_p99_ns\": {p99_ns},");
 }
 
 struct ReadPoolWorkerStats {
@@ -1212,5 +1813,39 @@ impl XorShift64 {
         x ^= x << 17;
         self.state = x;
         x
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destructive_setup_is_opt_in() {
+        let cli = Cli::try_parse_from(["onyx-engine-bench"]).unwrap();
+        assert!(!cli.reset);
+        assert!(!cli.reset_buffer);
+        assert!(!cli.prefill);
+        assert_eq!(cli.iodepth, 1);
+        assert_eq!(cli.ramp_secs, 5);
+    }
+
+    #[test]
+    fn bounded_histogram_percentile_uses_bucket_upper_bound() {
+        let buckets = [1, 2, 7];
+        let bounds = [9, 19, 29];
+        assert_eq!(
+            bounded_latency_bucket_percentile(&buckets, &bounds, 10.0),
+            9
+        );
+        assert_eq!(
+            bounded_latency_bucket_percentile(&buckets, &bounds, 50.0),
+            29
+        );
+        assert_eq!(
+            bounded_latency_bucket_percentile(&buckets, &bounds, 99.0),
+            29
+        );
+        assert_eq!(bounded_latency_bucket_percentile(&[], &[], 99.0), 0);
     }
 }

@@ -724,6 +724,14 @@ impl WriteBufferPool {
             .unwrap_or(0)
     }
 
+    /// Exact physical-ring emptiness. Unlike [`Self::physical_fill_percentage`],
+    /// this does not round sub-percent occupancy down to zero.
+    pub fn physical_is_empty(&self) -> bool {
+        self.shards
+            .iter()
+            .all(|shard| shard.shard.used_bytes() == 0)
+    }
+
     pub fn physical_fill_percentage_for_shard(&self, shard_idx: usize) -> u8 {
         let Some(shard) = self.shards.get(shard_idx) else {
             return 100;

@@ -1459,6 +1459,7 @@ fn throttle_curve_is_monotonic_and_below_cap() {
 fn physical_fill_tracks_checkpoint_retained_entries_after_pending_drains() {
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;
+    assert!(pool.physical_is_empty());
 
     let seq = pool
         .append("test-vol", Lba(7), 1, &vec![0xA5; BLOCK_SIZE as usize], 0)
@@ -1487,6 +1488,7 @@ fn physical_fill_tracks_checkpoint_retained_entries_after_pending_drains() {
         expected_physical_fill,
         "checkpoint-retained bytes must remain visible to the write throttle"
     );
+    assert!(!pool.physical_is_empty());
 }
 
 #[test]
