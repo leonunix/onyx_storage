@@ -478,6 +478,12 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         "",
         f"IO     read {read_iops:9.1f} iops {fmt_rate_bytes(read_bps):>14} avg {fmt_ms(avg_time(metrics, prev_metrics, 'volume_read_total_ns', 'volume_read_ops')):>10}"
         f" | write {write_iops:9.1f} iops {fmt_rate_bytes(write_bps):>14} avg {fmt_ms(avg_time(metrics, prev_metrics, 'volume_write_total_ns', 'volume_write_ops')):>10}",
+        f"Ublk   read q {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_read_queue_wait_ns', 'volume_read_ops')):>10}"
+        f" worker {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_read_worker_ns', 'volume_read_ops')):>10}"
+        f" done {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_read_completion_wait_ns', 'volume_read_ops')):>10}"
+        f" | write q {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_write_queue_wait_ns', 'volume_write_ops')):>10}"
+        f" worker {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_write_worker_ns', 'volume_write_ops')):>10}"
+        f" done {fmt_ms(avg_time(metrics, prev_metrics, 'ublk_write_completion_wait_ns', 'volume_write_ops')):>10}",
         f"Read   submit {fmt_ms(avg_time(metrics, prev_metrics, 'read_submit_total_ns', 'read_submit_calls')):>10}"
         f" lookup {fmt_ms(avg_time(metrics, prev_metrics, 'read_submit_buffer_lookup_ns', 'read_submit_calls')):>10}"
         f" meta {fmt_ms(avg_time(metrics, prev_metrics, 'read_submit_meta_get_ns', 'read_submit_calls')):>10}"
