@@ -50,9 +50,9 @@ auto_failover = true
 lv3 = { raid = "raid6", set_size = 8, row_size = 1, num_rows = 100, strip_kib = 256 }
 # LV2 = RAID10 (2-way mirror, 2-wide stripe), 6 rows -> ~12 GiB usable.
 lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 256, strip_kib = 128 }
-# metadb LD (Phase 3f). RAID10 2x mirror, 32 rows -> ~64 GiB usable (>> the
-# ~2 GiB the largest cuckoo table + L2P/rc need even after several grows).
-meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 128 }
+# metadb LD (Phase 3f). RAID10 2x mirror, 64 rows -> ~128 GiB usable. The
+# original 32-row LD exhausted its page arena during sustained direct-API A/B.
+meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 64, strip_kib = 128 }
 # Fresh no-migration 10-wide stack for the 2026-07-11 A/B. The prior 8-wide
 # LV3 and its LV2/meta LDs remain allocated and untouched for rollback.
 lv3_ld_id = "5af723d5-b4a9-41d5-a382-1775c8a201b2"
@@ -199,7 +199,8 @@ enabled = false
 socket_path = "/tmp/onyx-storage-nvme.sock"
 # Startup-only direct API placement selected by the CPU boundary sweep. In
 # confine mode ublk/LV2 persistence retain the full foreground pool; MetaDB and
-# flush background roles remain off these CPUs.
+# flush background roles remain off these CPUs. Keep this on the home NUMA
+# node: the equivalent node1 mask cut QD16 IOPS by 78% and raised p99 10.5x.
 direct_io_cpus = "2,4,6,8,10,12,50,52,54,56,58,60"
 
 [ha]
