@@ -831,7 +831,10 @@ fn sweep_stray_threads(foreground: &[usize], background: &[usize]) {
 /// engine threads remain confined to the engine-owned CPU sets.
 fn confine_thread_placement(name: &str) -> Option<bool> {
     let name = name.trim_end();
-    if name.starts_with("engine-bench-") || name.starts_with("engine-submit-") {
+    if name.starts_with("engine-bench-")
+        || name.starts_with("engine-submit-")
+        || name.starts_with("engine-durable-")
+    {
         None
     } else {
         Some(name.starts_with("ublk-") || name.starts_with("persistent-slot"))
@@ -1107,6 +1110,7 @@ mod tests {
     fn confine_enforcer_preserves_engine_bench_affinity() {
         assert_eq!(confine_thread_placement("engine-bench-7\n"), None);
         assert_eq!(confine_thread_placement("engine-submit-7\n"), None);
+        assert_eq!(confine_thread_placement("engine-durable-7\n"), None);
         assert_eq!(confine_thread_placement("ublk-queue\n"), Some(true));
         assert_eq!(confine_thread_placement("BufferSync-0\n"), Some(false));
     }

@@ -167,10 +167,12 @@ struct LatencySamples {
     submit_queue_ns: Vec<u64>,
     append_worker_ns: Vec<u64>,
     post_submit_completion_ns: Vec<u64>,
+    completion_delivery_ns: Vec<u64>,
+    frontend_total_ns: Vec<u64>,
 }
 
 struct PendingWrite {
-    ticket: VolumeWriteTicket,
+    ticket: Option<VolumeWriteTicket>,
     started: Instant,
     submitted: Instant,
     submit_queue_ns: u64,
@@ -179,14 +181,58 @@ struct PendingWrite {
     measured: bool,
 }
 
+impl PendingWrite {
+    fn arm_wakeup(&self, tx: &Sender<()>) {
+        self.ticket
+            .as_ref()
+            .expect("pending write ticket already completed")
+            .arm_wakeup(tx);
+    }
+
+    fn is_durable(&self) -> bool {
+        self.ticket
+            .as_ref()
+            .expect("pending write ticket already completed")
+            .is_durable()
+    }
+
+    fn wait(mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            ticket.wait();
+        }
+    }
+
+    fn finish_durable(mut self) -> CompletedWrite {
+        self.ticket
+            .take()
+            .expect("pending write ticket already completed")
+            .finish();
+        CompletedWrite {
+            started: self.started,
+            submitted: self.submitted,
+            completed_at: Instant::now(),
+            submit_queue_ns: self.submit_queue_ns,
+            append_worker_ns: self.append_worker_ns,
+            bytes: self.bytes,
+            measured: self.measured,
+        }
+    }
+}
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            ticket.wait();
+        }
+    }
+}
+
 struct SubmitTask {
     offset: u64,
     len: usize,
     buffer: Vec<u8>,
     started: Instant,
     measured: bool,
-    result_tx: Sender<SubmitResult>,
-    wake_tx: Sender<()>,
 }
 
 struct SubmitResult {
@@ -194,8 +240,24 @@ struct SubmitResult {
     buffer: Vec<u8>,
 }
 
+struct CompletedWrite {
+    started: Instant,
+    submitted: Instant,
+    completed_at: Instant,
+    submit_queue_ns: u64,
+    append_worker_ns: u64,
+    bytes: u64,
+    measured: bool,
+}
+
+enum JobEvent {
+    Buffer(Vec<u8>),
+    Complete(CompletedWrite),
+    Failed { buffer: Vec<u8>, error: String },
+    LaneFailed(String),
+}
+
 struct JobIoState {
-    inflight: Vec<PendingWrite>,
     free_buffers: Vec<Vec<u8>>,
     outstanding: usize,
 }
@@ -203,7 +265,6 @@ struct JobIoState {
 impl JobIoState {
     fn new(iodepth: usize, max_len: usize) -> Self {
         Self {
-            inflight: Vec::with_capacity(iodepth),
             free_buffers: (0..iodepth).map(|_| vec![0u8; max_len]).collect(),
             outstanding: 0,
         }
@@ -287,6 +348,9 @@ impl LatencySamples {
         self.append_worker_ns.append(&mut other.append_worker_ns);
         self.post_submit_completion_ns
             .append(&mut other.post_submit_completion_ns);
+        self.completion_delivery_ns
+            .append(&mut other.completion_delivery_ns);
+        self.frontend_total_ns.append(&mut other.frontend_total_ns);
     }
 }
 
@@ -602,9 +666,20 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     }
     if !submitter_cpus.is_empty() {
         eprintln!(
-            "pinning {} append submitters to CPUs {:?}",
-            cli.submitters, submitter_cpus
+            "pinning {} append submitters and {} durability dispatchers to CPUs {:?}",
+            cli.submitters, cli.jobs, submitter_cpus
         );
+    }
+
+    // Open every handle before starting the pipeline so an open failure cannot
+    // leave detached submit or durability threads behind.
+    let mut submitter_volumes = Vec::with_capacity(cli.submitters);
+    for _ in 0..cli.submitters {
+        submitter_volumes.push(engine.open_volume(&cli.volume)?);
+    }
+    let mut job_volumes = Vec::with_capacity(cli.jobs);
+    for _ in 0..cli.jobs {
+        job_volumes.push(engine.open_volume(&cli.volume)?);
     }
 
     // Mirror ublk's topology: each kernel queue has its own request channel,
@@ -617,67 +692,125 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
         submit_txs.push(tx);
         submit_rxs.push(rx);
     }
-    let mut submitter_volumes = Vec::with_capacity(cli.submitters);
-    for _ in 0..cli.submitters {
-        submitter_volumes.push(engine.open_volume(&cli.volume)?);
+
+    let mut submitted_txs = Vec::with_capacity(cli.jobs);
+    let mut submitted_rxs = Vec::with_capacity(cli.jobs);
+    let mut job_event_txs = Vec::with_capacity(cli.jobs);
+    let mut job_event_rxs = Vec::with_capacity(cli.jobs);
+    for _ in 0..cli.jobs {
+        let (submitted_tx, submitted_rx) = crossbeam_channel::unbounded::<SubmitResult>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded::<JobEvent>();
+        submitted_txs.push(submitted_tx);
+        submitted_rxs.push(submitted_rx);
+        job_event_txs.push(event_tx);
+        job_event_rxs.push(event_rx);
     }
+
+    let mut durability_handles = Vec::with_capacity(cli.jobs);
+    for lane in 0..cli.jobs {
+        let submitted_rx = submitted_rxs[lane].clone();
+        let event_tx = job_event_txs[lane].clone();
+        let failure_tx = event_tx.clone();
+        let durability_cpus = submitter_cpus.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!("engine-durable-{lane}"))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_durability_dispatcher(lane, submitted_rx, event_tx, &durability_cpus)
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let _ = failure_tx.send(JobEvent::LaneFailed(format!(
+                            "durability dispatcher {lane} failed: {error:#}"
+                        )));
+                    }
+                    Err(_) => {
+                        let _ = failure_tx.send(JobEvent::LaneFailed(format!(
+                            "durability dispatcher {lane} panicked"
+                        )));
+                    }
+                }
+            });
+        match spawn_result {
+            Ok(handle) => durability_handles.push(handle),
+            Err(error) => {
+                drop(submitted_txs);
+                drop(submitted_rxs);
+                drop(job_event_txs);
+                for handle in durability_handles {
+                    let _ = handle.join();
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    drop(submitted_rxs);
+
     let mut submitter_handles = Vec::with_capacity(cli.submitters);
     for (idx, volume) in submitter_volumes.into_iter().enumerate() {
         let lane = idx % cli.jobs;
         let worker_submit_rx = submit_rxs[lane].clone();
+        let worker_result_tx = submitted_txs[lane].clone();
+        let failure_tx = job_event_txs[lane].clone();
         let submitter_cpus = submitter_cpus.clone();
         let spawn_result = thread::Builder::new()
             .name(format!("engine-submit-{idx}"))
             .spawn(move || {
-                if let Err(error) = pin_current_thread_to(&submitter_cpus) {
-                    eprintln!(
-                        "warn: failed to pin append submitter {idx} to {submitter_cpus:?}: {error}"
-                    );
-                }
-                while let Ok(task) = worker_submit_rx.recv() {
-                    let SubmitTask {
-                        offset,
-                        len,
-                        buffer,
-                        started,
-                        measured,
-                        result_tx,
-                        wake_tx,
-                    } = task;
-                    let append_started = Instant::now();
-                    let submit_queue_ns =
-                        append_started.saturating_duration_since(started).as_nanos() as u64;
-                    let append_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            volume.write_aligned_deferred(offset, &buffer[..len])
-                        }));
-                    let outcome = match append_result {
-                        Ok(Ok(ticket)) => {
-                            let submitted = Instant::now();
-                            ticket.arm_wakeup(&wake_tx);
-                            Ok(PendingWrite {
-                                ticket,
-                                started,
-                                submitted,
-                                submit_queue_ns,
-                                append_worker_ns: submitted
-                                    .saturating_duration_since(append_started)
-                                    .as_nanos()
-                                    as u64,
-                                bytes: len as u64,
-                                measured,
-                            })
-                        }
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(_) => Err(format!(
-                            "append submitter {idx} panicked while processing IO"
-                        )),
-                    };
-                    if let Err(error) = result_tx.send(SubmitResult { outcome, buffer }) {
-                        if let Ok(pending) = error.0.outcome {
-                            pending.ticket.wait();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Err(error) = pin_current_thread_to(&submitter_cpus) {
+                        eprintln!(
+                            "warn: failed to pin append submitter {idx} to {submitter_cpus:?}: {error}"
+                        );
+                    }
+                    while let Ok(task) = worker_submit_rx.recv() {
+                        let SubmitTask {
+                            offset,
+                            len,
+                            buffer,
+                            started,
+                            measured,
+                        } = task;
+                        let append_started = Instant::now();
+                        let submit_queue_ns =
+                            append_started.saturating_duration_since(started).as_nanos() as u64;
+                        let append_result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                volume.write_aligned_deferred(offset, &buffer[..len])
+                            }));
+                        let outcome = match append_result {
+                            Ok(Ok(ticket)) => {
+                                let submitted = Instant::now();
+                                Ok(PendingWrite {
+                                    ticket: Some(ticket),
+                                    started,
+                                    submitted,
+                                    submit_queue_ns,
+                                    append_worker_ns: submitted
+                                        .saturating_duration_since(append_started)
+                                        .as_nanos()
+                                        as u64,
+                                    bytes: len as u64,
+                                    measured,
+                                })
+                            }
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(_) => Err(format!(
+                                "append submitter {idx} panicked while processing IO"
+                            )),
+                        };
+                        if let Err(error) = worker_result_tx.send(SubmitResult { outcome, buffer }) {
+                            if let Ok(pending) = error.0.outcome {
+                                pending.wait();
+                            }
+                            return;
                         }
                     }
+                }));
+                if result.is_err() {
+                    let _ = failure_tx.send(JobEvent::LaneFailed(format!(
+                        "append submitter {idx} panicked"
+                    )));
                 }
             });
         match spawn_result {
@@ -688,21 +821,24 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                 for handle in submitter_handles {
                     let _ = handle.join();
                 }
+                drop(submitted_txs);
+                drop(job_event_txs);
+                for handle in durability_handles {
+                    let _ = handle.join();
+                }
                 return Err(error.into());
             }
         }
     }
     drop(submit_rxs);
-
-    let mut job_volumes = Vec::with_capacity(cli.jobs);
-    for _ in 0..cli.jobs {
-        job_volumes.push(engine.open_volume(&cli.volume)?);
-    }
+    drop(submitted_txs);
+    drop(job_event_txs);
     let mut handles = Vec::with_capacity(cli.jobs);
 
-    for (job, (volume, job_submit_tx)) in job_volumes
+    for (job, ((volume, job_submit_tx), event_rx)) in job_volumes
         .into_iter()
         .zip(submit_txs.iter().cloned())
+        .zip(job_event_rxs.into_iter())
         .enumerate()
     {
         let worker_stop = stop.clone();
@@ -733,9 +869,6 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                         fill_random_buffer(buffer, &mut rng);
                     }
                 }
-                let (result_tx, result_rx) = crossbeam_channel::bounded::<SubmitResult>(iodepth);
-                let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
-
                 {
                     let mut state = worker_control.state.lock().unwrap();
                     state.ready += 1;
@@ -754,7 +887,6 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                     if let Err(error) = issue_one(
                         &volume,
                         &job_submit_tx,
-                        &result_tx,
                         pattern,
                         rwmixread,
                         min_blocks,
@@ -770,24 +902,26 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                         &mut stats,
                         &mut issued_writes,
                         &worker_stop,
-                        &wake_tx,
-                        &wake_rx,
-                        &result_rx,
+                        &event_rx,
                     ) {
                         ramp_error = Some(error);
                         break;
                     }
                 }
-                if let Err(error) = drain_writes(
-                    &mut io,
-                    &mut local_samples,
-                    &mut stats,
-                    &wake_rx,
-                    &result_rx,
-                ) {
+                if let Err(error) = drain_writes(&mut io, &mut local_samples, &mut stats, &event_rx)
+                {
                     if ramp_error.is_none() {
                         ramp_error = Some(error);
                     }
+                }
+                if ramp_error.is_none() && (io.outstanding != 0 || io.free_buffers.len() != iodepth)
+                {
+                    ramp_error = Some(anyhow!(
+                        "job {job} ramp drain invariant failed: outstanding={}, buffers={}/{}",
+                        io.outstanding,
+                        io.free_buffers.len(),
+                        iodepth
+                    ));
                 }
 
                 {
@@ -811,7 +945,6 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                     if let Err(error) = issue_one(
                         &volume,
                         &job_submit_tx,
-                        &result_tx,
                         pattern,
                         rwmixread,
                         min_blocks,
@@ -827,22 +960,15 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                         &mut stats,
                         &mut issued_writes,
                         &worker_stop,
-                        &wake_tx,
-                        &wake_rx,
-                        &result_rx,
+                        &event_rx,
                     ) {
                         worker_control.record_error(&error);
                         worker_stop.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
-                if let Err(error) = drain_writes(
-                    &mut io,
-                    &mut local_samples,
-                    &mut stats,
-                    &wake_rx,
-                    &result_rx,
-                ) {
+                if let Err(error) = drain_writes(&mut io, &mut local_samples, &mut stats, &event_rx)
+                {
                     worker_control.record_error(&error);
                 }
 
@@ -861,10 +987,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                 for handle in handles {
                     let _ = handle.join();
                 }
-                drop(submit_txs);
-                for handle in submitter_handles {
-                    let _ = handle.join();
-                }
+                let _ = shutdown_submit_pipeline(submit_txs, submitter_handles, durability_handles);
                 return Err(error.into());
             }
         }
@@ -905,10 +1028,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             for handle in handles {
                 let _ = handle.join();
             }
-            drop(submit_txs);
-            for handle in submitter_handles {
-                let _ = handle.join();
-            }
+            let _ = shutdown_submit_pipeline(submit_txs, submitter_handles, durability_handles);
             return Err(anyhow!(error));
         }
     }
@@ -923,10 +1043,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             for handle in handles {
                 let _ = handle.join();
             }
-            drop(submit_txs);
-            for handle in submitter_handles {
-                let _ = handle.join();
-            }
+            let _ = shutdown_submit_pipeline(submit_txs, submitter_handles, durability_handles);
             return Err(error.into());
         }
     };
@@ -971,13 +1088,13 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             }
         }
     }
-    drop(submit_txs);
-    for handle in submitter_handles {
-        if handle.join().is_err() && join_error.is_none() {
-            join_error = Some(anyhow!("append submitter panicked outside an IO task"));
+    let completion_closure = measured_started.elapsed().saturating_sub(measured_elapsed);
+    if let Some(error) = shutdown_submit_pipeline(submit_txs, submitter_handles, durability_handles)
+    {
+        if join_error.is_none() {
+            join_error = Some(error);
         }
     }
-    let completion_closure = measured_started.elapsed().saturating_sub(measured_elapsed);
     let worker_error = control.state.lock().unwrap().error.clone().or(worker_error);
     if let Some(error) = worker_error {
         return Err(anyhow!(error));
@@ -989,6 +1106,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
         .map_err(|_| anyhow!("latency samples still shared"))?
         .into_inner()
         .unwrap();
+    validate_write_sample_cardinality(&samples, stats.write_ops)?;
     Ok(TimedRun {
         stats,
         samples,
@@ -998,11 +1116,153 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     })
 }
 
+fn validate_write_sample_cardinality(samples: &LatencySamples, write_ops: u64) -> Result<()> {
+    let expected = samples.write_ns.len();
+    let counts = [
+        ("stats", write_ops as usize),
+        ("submit_queue", samples.submit_queue_ns.len()),
+        ("append_worker", samples.append_worker_ns.len()),
+        (
+            "post_submit_completion",
+            samples.post_submit_completion_ns.len(),
+        ),
+        ("completion_delivery", samples.completion_delivery_ns.len()),
+        ("frontend_total", samples.frontend_total_ns.len()),
+    ];
+    if let Some((name, actual)) = counts.into_iter().find(|(_, count)| *count != expected) {
+        return Err(anyhow!(
+            "write latency sample mismatch: write={expected}, {name}={actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn shutdown_submit_pipeline(
+    submit_txs: Vec<Sender<SubmitTask>>,
+    submitter_handles: Vec<thread::JoinHandle<()>>,
+    durability_handles: Vec<thread::JoinHandle<()>>,
+) -> Option<anyhow::Error> {
+    drop(submit_txs);
+    let mut first_error = None;
+    for handle in submitter_handles {
+        if handle.join().is_err() && first_error.is_none() {
+            first_error = Some(anyhow!("append submitter panicked outside its supervisor"));
+        }
+    }
+    for handle in durability_handles {
+        if handle.join().is_err() && first_error.is_none() {
+            first_error = Some(anyhow!(
+                "durability dispatcher panicked outside its supervisor"
+            ));
+        }
+    }
+    first_error
+}
+
+fn run_durability_dispatcher(
+    lane: usize,
+    result_rx: Receiver<SubmitResult>,
+    event_tx: Sender<JobEvent>,
+    cpus: &[usize],
+) -> Result<()> {
+    if let Err(error) = pin_current_thread_to(cpus) {
+        eprintln!("warn: failed to pin durability dispatcher {lane} to {cpus:?}: {error}");
+    }
+
+    // This is deliberately the same edge-coalesced scan model as the ublk
+    // durability dispatcher. It timestamps completion independently of the
+    // load-generator thread that eventually consumes the event.
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+    let mut pending = Vec::<PendingWrite>::new();
+    let mut input_open = true;
+    while input_open || !pending.is_empty() {
+        if pending.is_empty() {
+            match result_rx.recv() {
+                Ok(result) => {
+                    if !accept_dispatch_result(result, &wake_tx, &event_tx, &mut pending) {
+                        return Ok(());
+                    }
+                }
+                Err(_) => input_open = false,
+            }
+        } else if input_open {
+            crossbeam_channel::select! {
+                recv(result_rx) -> result => match result {
+                    Ok(result) => {
+                        if !accept_dispatch_result(result, &wake_tx, &event_tx, &mut pending) {
+                            return Ok(());
+                        }
+                    }
+                    Err(_) => input_open = false,
+                },
+                recv(wake_rx) -> _ => {},
+            }
+        } else {
+            let _ = wake_rx.recv();
+        }
+
+        while let Ok(result) = result_rx.try_recv() {
+            if !accept_dispatch_result(result, &wake_tx, &event_tx, &mut pending) {
+                return Ok(());
+            }
+        }
+        while wake_rx.try_recv().is_ok() {}
+        if !dispatch_durable_writes(&mut pending, &event_tx) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn accept_dispatch_result(
+    result: SubmitResult,
+    wake_tx: &Sender<()>,
+    event_tx: &Sender<JobEvent>,
+    pending: &mut Vec<PendingWrite>,
+) -> bool {
+    match result.outcome {
+        Ok(write) => {
+            write.arm_wakeup(wake_tx);
+            if event_tx.send(JobEvent::Buffer(result.buffer)).is_err() {
+                write.wait();
+                return false;
+            }
+            pending.push(write);
+        }
+        Err(error) => {
+            if event_tx
+                .send(JobEvent::Failed {
+                    buffer: result.buffer,
+                    error,
+                })
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn dispatch_durable_writes(pending: &mut Vec<PendingWrite>, event_tx: &Sender<JobEvent>) -> bool {
+    let mut idx = 0;
+    while idx < pending.len() {
+        if !pending[idx].is_durable() {
+            idx += 1;
+            continue;
+        }
+        let completed = pending.swap_remove(idx).finish_durable();
+        if event_tx.send(JobEvent::Complete(completed)).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn issue_one(
     volume: &onyx_storage::volume::OnyxVolume,
     submit_tx: &Sender<SubmitTask>,
-    result_tx: &Sender<SubmitResult>,
     pattern: Pattern,
     rwmixread: u8,
     min_blocks: u64,
@@ -1018,13 +1278,11 @@ fn issue_one(
     stats: &mut BenchStats,
     issued_writes: &mut u64,
     stop: &AtomicBool,
-    wake_tx: &Sender<()>,
-    wake_rx: &Receiver<()>,
-    result_rx: &Receiver<SubmitResult>,
+    event_rx: &Receiver<JobEvent>,
 ) -> Result<()> {
-    service_job_events(io, samples, stats, wake_rx, result_rx, false)?;
+    service_job_events(io, samples, stats, event_rx, false)?;
     while io.outstanding >= iodepth || io.free_buffers.is_empty() {
-        service_job_events(io, samples, stats, wake_rx, result_rx, true)?;
+        service_job_events(io, samples, stats, event_rx, true)?;
     }
     if measured && stop.load(Ordering::Relaxed) {
         return Ok(());
@@ -1046,7 +1304,7 @@ fn issue_one(
             stats.read_ops += 1;
             stats.read_bytes += len as u64;
         }
-        service_job_events(io, samples, stats, wake_rx, result_rx, false)?;
+        service_job_events(io, samples, stats, event_rx, false)?;
         return Ok(());
     }
 
@@ -1061,8 +1319,6 @@ fn issue_one(
         buffer,
         started,
         measured,
-        result_tx: result_tx.clone(),
-        wake_tx: wake_tx.clone(),
     };
     if let Err(error) = submit_tx.send(task) {
         io.free_buffers.push(error.0.buffer);
@@ -1072,53 +1328,15 @@ fn issue_one(
     Ok(())
 }
 
-fn reap_ready_writes(
-    io: &mut JobIoState,
-    samples: &mut LatencySamples,
-    stats: &mut BenchStats,
-) -> usize {
-    let mut completed = 0usize;
-    let mut idx = 0usize;
-    while idx < io.inflight.len() {
-        if !io.inflight[idx].ticket.is_durable() {
-            idx += 1;
-            continue;
-        }
-        let completed_at = Instant::now();
-        let pending = io.inflight.swap_remove(idx);
-        pending.ticket.finish();
-        if pending.measured {
-            samples.write_ns.push(
-                completed_at
-                    .saturating_duration_since(pending.started)
-                    .as_nanos() as u64,
-            );
-            samples.submit_queue_ns.push(pending.submit_queue_ns);
-            samples.append_worker_ns.push(pending.append_worker_ns);
-            samples.post_submit_completion_ns.push(
-                completed_at
-                    .saturating_duration_since(pending.submitted)
-                    .as_nanos() as u64,
-            );
-            stats.write_ops += 1;
-            stats.write_bytes += pending.bytes;
-        }
-        io.outstanding = io.outstanding.saturating_sub(1);
-        completed += 1;
-    }
-    completed
-}
-
 fn drain_writes(
     io: &mut JobIoState,
     samples: &mut LatencySamples,
     stats: &mut BenchStats,
-    wake_rx: &Receiver<()>,
-    result_rx: &Receiver<SubmitResult>,
+    event_rx: &Receiver<JobEvent>,
 ) -> Result<()> {
     let mut first_error = None;
     while io.outstanding > 0 {
-        if let Err(error) = service_job_events(io, samples, stats, wake_rx, result_rx, true) {
+        if let Err(error) = service_job_events(io, samples, stats, event_rx, true) {
             if first_error.is_none() {
                 first_error = Some(error);
             }
@@ -1134,55 +1352,32 @@ fn service_job_events(
     io: &mut JobIoState,
     samples: &mut LatencySamples,
     stats: &mut BenchStats,
-    wake_rx: &Receiver<()>,
-    result_rx: &Receiver<SubmitResult>,
+    event_rx: &Receiver<JobEvent>,
     block: bool,
 ) -> Result<usize> {
     let mut progress = 0usize;
     let mut first_error = None;
-    while let Ok(result) = result_rx.try_recv() {
+    if block {
+        match event_rx.recv() {
+            Ok(event) => {
+                progress += 1;
+                if let Err(error) = accept_job_event(io, samples, stats, event) {
+                    first_error = Some(error);
+                }
+            }
+            Err(_) => {
+                io.outstanding = 0;
+                return Err(anyhow!("job event channel closed with IO outstanding"));
+            }
+        }
+    }
+    while let Ok(event) = event_rx.try_recv() {
         progress += 1;
-        if let Err(error) = accept_submit_result(io, result) {
+        if let Err(error) = accept_job_event(io, samples, stats, event) {
             if first_error.is_none() {
                 first_error = Some(error);
             }
         }
-    }
-    while wake_rx.try_recv().is_ok() {
-        progress += 1;
-    }
-    progress += reap_ready_writes(io, samples, stats);
-
-    if progress == 0 && block {
-        crossbeam_channel::select! {
-            recv(result_rx) -> result => {
-                progress += 1;
-                match result {
-                    Ok(result) => {
-                        if let Err(error) = accept_submit_result(io, result) {
-                            first_error = Some(error);
-                        }
-                    }
-                    Err(_) => return Err(anyhow!("append submitter result channel closed")),
-                }
-            }
-            recv(wake_rx) -> result => {
-                result.map_err(|_| anyhow!("durability wake channel closed"))?;
-                progress += 1;
-            }
-        }
-        while let Ok(result) = result_rx.try_recv() {
-            progress += 1;
-            if let Err(error) = accept_submit_result(io, result) {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        while wake_rx.try_recv().is_ok() {
-            progress += 1;
-        }
-        progress += reap_ready_writes(io, samples, stats);
     }
 
     match first_error {
@@ -1191,15 +1386,65 @@ fn service_job_events(
     }
 }
 
-fn accept_submit_result(io: &mut JobIoState, result: SubmitResult) -> Result<()> {
-    io.free_buffers.push(result.buffer);
-    match result.outcome {
-        Ok(pending) => {
-            io.inflight.push(pending);
+fn accept_job_event(
+    io: &mut JobIoState,
+    samples: &mut LatencySamples,
+    stats: &mut BenchStats,
+    event: JobEvent,
+) -> Result<()> {
+    match event {
+        JobEvent::Buffer(buffer) => {
+            io.free_buffers.push(buffer);
             Ok(())
         }
-        Err(error) => {
-            io.outstanding = io.outstanding.saturating_sub(1);
+        JobEvent::Complete(completed) => {
+            let received_at = Instant::now();
+            if completed.measured {
+                samples.write_ns.push(
+                    completed
+                        .completed_at
+                        .saturating_duration_since(completed.started)
+                        .as_nanos() as u64,
+                );
+                samples.submit_queue_ns.push(completed.submit_queue_ns);
+                samples.append_worker_ns.push(completed.append_worker_ns);
+                samples.post_submit_completion_ns.push(
+                    completed
+                        .completed_at
+                        .saturating_duration_since(completed.submitted)
+                        .as_nanos() as u64,
+                );
+                samples.completion_delivery_ns.push(
+                    received_at
+                        .saturating_duration_since(completed.completed_at)
+                        .as_nanos() as u64,
+                );
+                samples.frontend_total_ns.push(
+                    received_at
+                        .saturating_duration_since(completed.started)
+                        .as_nanos() as u64,
+                );
+                stats.write_ops += 1;
+                stats.write_bytes += completed.bytes;
+            }
+            if io.outstanding == 0 {
+                return Err(anyhow!("completion received with no outstanding IO"));
+            }
+            io.outstanding -= 1;
+            Ok(())
+        }
+        JobEvent::Failed { buffer, error } => {
+            io.free_buffers.push(buffer);
+            if io.outstanding == 0 {
+                return Err(anyhow!(
+                    "append failure received with no outstanding IO: {error}"
+                ));
+            }
+            io.outstanding -= 1;
+            Err(anyhow!(error))
+        }
+        JobEvent::LaneFailed(error) => {
+            io.outstanding = 0;
             Err(anyhow!(error))
         }
     }
@@ -1256,6 +1501,8 @@ fn print_report(
     samples.submit_queue_ns.sort_unstable();
     samples.append_worker_ns.sort_unstable();
     samples.post_submit_completion_ns.sort_unstable();
+    samples.completion_delivery_ns.sort_unstable();
+    samples.frontend_total_ns.sort_unstable();
     let secs = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     let read_iops = stats.read_ops as f64 / secs;
     let write_iops = stats.write_ops as f64 / secs;
@@ -1340,6 +1587,7 @@ fn print_report(
     println!("  \"iodepth\": {},", cli.iodepth);
     println!("  \"submitters\": {},", cli.submitters);
     println!("  \"submit_lanes\": {},", cli.jobs);
+    println!("  \"durability_dispatchers\": {},", cli.jobs);
     println!(
         "  \"submitters_per_lane_min\": {},",
         cli.submitters / cli.jobs
@@ -1359,6 +1607,7 @@ fn print_report(
     println!("  \"write_iops\": {:.3},", write_iops);
     println!("  \"total_iops\": {:.3},", total_iops);
     println!("  \"throughput_mib_s\": {:.3},", mibps);
+    println!("  \"write_latency_scope\": \"request_start_to_durable_dispatcher_confirmation\",");
     println!("  \"read_p50_ns\": {},", percentile(&samples.read_ns, 50.0));
     println!("  \"read_p95_ns\": {},", percentile(&samples.read_ns, 95.0));
     println!("  \"read_p99_ns\": {},", percentile(&samples.read_ns, 99.0));
@@ -1383,6 +1632,26 @@ fn print_report(
         percentile(&samples.write_ns, 99.9)
     );
     println!("  \"write_latency_samples\": {},", samples.write_ns.len());
+    println!(
+        "  \"frontend_total_p50_ns\": {},",
+        percentile(&samples.frontend_total_ns, 50.0)
+    );
+    println!(
+        "  \"frontend_total_p95_ns\": {},",
+        percentile(&samples.frontend_total_ns, 95.0)
+    );
+    println!(
+        "  \"frontend_total_p99_ns\": {},",
+        percentile(&samples.frontend_total_ns, 99.0)
+    );
+    println!(
+        "  \"frontend_total_p999_ns\": {},",
+        percentile(&samples.frontend_total_ns, 99.9)
+    );
+    println!(
+        "  \"frontend_total_samples\": {},",
+        samples.frontend_total_ns.len()
+    );
     println!(
         "  \"submit_queue_samples\": {},",
         samples.submit_queue_ns.len()
@@ -1442,6 +1711,26 @@ fn print_report(
     println!(
         "  \"post_submit_completion_samples\": {},",
         samples.post_submit_completion_ns.len()
+    );
+    println!(
+        "  \"completion_delivery_p50_ns\": {},",
+        percentile(&samples.completion_delivery_ns, 50.0)
+    );
+    println!(
+        "  \"completion_delivery_p95_ns\": {},",
+        percentile(&samples.completion_delivery_ns, 95.0)
+    );
+    println!(
+        "  \"completion_delivery_p99_ns\": {},",
+        percentile(&samples.completion_delivery_ns, 99.0)
+    );
+    println!(
+        "  \"completion_delivery_p999_ns\": {},",
+        percentile(&samples.completion_delivery_ns, 99.9)
+    );
+    println!(
+        "  \"completion_delivery_samples\": {},",
+        samples.completion_delivery_ns.len()
     );
     println!(
         "  \"pending_before\": {},",
@@ -2326,5 +2615,20 @@ mod tests {
             29
         );
         assert_eq!(bounded_latency_bucket_percentile(&[], &[], 99.0), 0);
+    }
+
+    #[test]
+    fn write_latency_sample_cardinality_must_match() {
+        let mut samples = LatencySamples::default();
+        samples.write_ns.push(1);
+        samples.submit_queue_ns.push(1);
+        samples.append_worker_ns.push(1);
+        samples.post_submit_completion_ns.push(1);
+        samples.completion_delivery_ns.push(1);
+        samples.frontend_total_ns.push(1);
+        validate_write_sample_cardinality(&samples, 1).unwrap();
+
+        samples.completion_delivery_ns.clear();
+        assert!(validate_write_sample_cardinality(&samples, 1).is_err());
     }
 }
