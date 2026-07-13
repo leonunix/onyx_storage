@@ -143,18 +143,21 @@ where
 /// In the common passthrough case (`batch_values` is one CompressedUnit
 /// with strictly contiguous LBAs) this emits exactly one range op. A
 /// defensive gap or sub-range cap split produces multiple range ops.
+/// Returns the number of emitted range ops so callers can separate their
+/// outcomes from any following non-remap operations.
 pub(super) fn emit_l2p_remap_runs(
     tx: &mut Transaction<'_>,
     ord: VolumeOrdinal,
     batch_values: &[(Lba, BlockmapValue)],
     seqs: &[u64],
     seq_base: usize,
-) {
+) -> usize {
     if batch_values.is_empty() {
-        return;
+        return 0;
     }
     let cap = onyx_metadb::op::MAX_REMAP_RANGE_LBAS;
     let mut i = 0;
+    let mut emitted_ops = 0;
     while i < batch_values.len() {
         let run_start = i;
         let start_lba = batch_values[i].0;
@@ -181,8 +184,10 @@ pub(super) fn emit_l2p_remap_runs(
             ));
         }
         tx.l2p_remap_range(ord, start_lba.0, values.into_boxed_slice());
+        emitted_ops += 1;
         i += 1;
     }
+    emitted_ops
 }
 
 pub(super) fn dedup_hit_results_from_remaps(

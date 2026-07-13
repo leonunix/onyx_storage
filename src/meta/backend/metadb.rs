@@ -1065,7 +1065,7 @@ impl MetadbBackend {
         let ord = self.volume_ordinal(vol_id)?;
         let _ = new_refcount;
         let mut tx = self.db.begin();
-        emit_l2p_remap_runs(&mut tx, ord, batch_values, seqs, 0);
+        let remap_ops = emit_l2p_remap_runs(&mut tx, ord, batch_values, seqs, 0);
         for (hash, entry) in dedup_entries {
             tx.put_dedup(*hash, to_dedup_value(entry));
         }
@@ -1075,7 +1075,7 @@ impl MetadbBackend {
         let (_, outcomes) = tx.commit_staged_with_outcomes()?;
         newly_zeroed_from_remaps(
             batch_values.iter().map(|(_, value)| *value),
-            outcomes.into_iter().take(batch_values.len()).collect(),
+            outcomes.into_iter().take(remap_ops).collect(),
         )
     }
 
@@ -1183,13 +1183,14 @@ impl MetadbBackend {
         let mut tx = self.db.begin();
         let mut new_values = Vec::new();
         let mut flat_idx: usize = 0;
+        let mut remap_ops = 0usize;
         for (vol_id, batch_values, new_refcount) in units {
             let _ = new_refcount;
             let ord = self.volume_ordinal(vol_id)?;
             // Each unit's batch_values is contiguous LBAs by construction
             // (one CompressedUnit / one passthrough sub-batch); emit one
             // range op per maximal contiguous LBA run within the unit.
-            emit_l2p_remap_runs(&mut tx, ord, batch_values, seqs, flat_idx);
+            remap_ops += emit_l2p_remap_runs(&mut tx, ord, batch_values, seqs, flat_idx);
             for (_, value) in *batch_values {
                 new_values.push(*value);
             }
@@ -1209,10 +1210,9 @@ impl MetadbBackend {
         // through `ready_with_lsn` so the per-volume sequencer's
         // `handle.lsn()` contract is preserved.
         let (lsn, outcomes) = tx.commit_staged_with_outcomes()?;
-        let remap_count = new_values.len();
         let result = newly_zeroed_from_remaps(
             new_values,
-            outcomes.into_iter().take(remap_count).collect::<Vec<_>>(),
+            outcomes.into_iter().take(remap_ops).collect::<Vec<_>>(),
         );
         Ok(DeferredCleanupHandle::ready_with_lsn(result, lsn))
     }

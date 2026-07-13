@@ -175,11 +175,26 @@ def build_summary(
     status_available = status_after_payload is not None
     status_before = unwrap_metadb_status(status_before_payload)
     status_after = unwrap_metadb_status(status_after_payload)
-    apply_lbas = (
-        counter_delta(status_after, status_before, "apply_l2p_remap_range_lbas")
-        if status_available
-        else None
-    )
+    l2p_remap_breakdown = None
+    apply_lbas = None
+    if status_available:
+        remap_count = counter_delta(
+            status_after, status_before, "apply_l2p_remap_count"
+        )
+        range_count = counter_delta(
+            status_after, status_before, "apply_l2p_remap_range_count"
+        )
+        range_lbas = counter_delta(
+            status_after, status_before, "apply_l2p_remap_range_lbas"
+        )
+        apply_lbas = remap_count + range_lbas
+        l2p_remap_breakdown = {
+            "plain_remap_ops": remap_count,
+            "range_ops": range_count,
+            "range_lbas": range_lbas,
+            "lbas_per_range_op": optional_ratio(range_lbas, range_count),
+            "total_lbas": apply_lbas,
+        }
     commit_apply_us = (
         counter_delta(status_after, status_before, "commit_apply_us")
         if status_available
@@ -191,11 +206,13 @@ def build_summary(
         else None
     )
     l2p_apply_us = (
-        counter_delta(status_after, status_before, "apply_l2p_remap_range_us")
+        counter_delta(status_after, status_before, "apply_l2p_remap_us")
+        + counter_delta(status_after, status_before, "apply_l2p_remap_range_us")
         if status_available
         else None
     )
     refcount_batch = None
+    base_lookup_io_context = None
     grouping_us = 0
     if status_available and "apply_refcount_batch_count" in status_after:
         batch_count = counter_delta(
@@ -229,6 +246,9 @@ def build_summary(
             measured_stage_total_us * batch_pbas / sampled_pbas
             if sampled_pbas
             else None
+        )
+        estimated_base_lookup_us = (
+            base_lookup_us * batch_pbas / sampled_pbas if sampled_pbas else None
         )
         unattributed_stage_us = (
             max(0, refcount_apply_us - estimated_measured_components_us)
@@ -267,6 +287,59 @@ def build_summary(
                 else None
             ),
         }
+        cache_io_keys = (
+            "cache_hits",
+            "cache_misses",
+            "cache_evictions",
+            "meta_io_read_calls",
+            "meta_io_read_ops",
+            "meta_io_read_bytes",
+            "meta_io_read_us",
+        )
+        if all(
+            key in status_after and (not status_before or key in status_before)
+            for key in cache_io_keys
+        ):
+            cache_hits = counter_delta(status_after, status_before, "cache_hits")
+            cache_misses = counter_delta(status_after, status_before, "cache_misses")
+            cache_evictions = counter_delta(
+                status_after, status_before, "cache_evictions"
+            )
+            meta_read_calls = counter_delta(
+                status_after, status_before, "meta_io_read_calls"
+            )
+            meta_read_ops = counter_delta(
+                status_after, status_before, "meta_io_read_ops"
+            )
+            meta_read_bytes = counter_delta(
+                status_after, status_before, "meta_io_read_bytes"
+            )
+            meta_read_us = counter_delta(
+                status_after, status_before, "meta_io_read_us"
+            )
+            base_lookup_io_context = {
+                "scope": "global_metadb",
+                # Grouped-cache hits count requested PBAs, while misses count
+                # unique page runs. Keep the two distinct in the field names.
+                "cache_hit_requests": cache_hits,
+                "cache_miss_page_runs": cache_misses,
+                "cache_evictions": cache_evictions,
+                "meta_read_calls": meta_read_calls,
+                "meta_read_ops": meta_read_ops,
+                "meta_read_bytes": meta_read_bytes,
+                "meta_read_us": meta_read_us,
+                "meta_read_ops_per_call": optional_ratio(
+                    meta_read_ops, meta_read_calls
+                ),
+                "meta_read_us_per_op": optional_ratio(meta_read_us, meta_read_ops),
+                "meta_read_us_per_rc_pba": optional_ratio(meta_read_us, batch_pbas),
+                "estimated_base_lookup_us": estimated_base_lookup_us,
+                "estimated_lookup_minus_global_read_us": (
+                    max(0, estimated_base_lookup_us - meta_read_us)
+                    if estimated_base_lookup_us is not None
+                    else None
+                ),
+            }
     full_refcount_apply_us = (
         refcount_apply_us + grouping_us if refcount_apply_us is not None else None
     )
@@ -306,6 +379,7 @@ def build_summary(
             queue_wait_ns, commit_jobs * 1_000_000
         ),
         "apply_lbas": apply_lbas,
+        "l2p_remap_breakdown": l2p_remap_breakdown,
         "rc_apply_us_per_lba": (
             optional_ratio(refcount_apply_us, apply_lbas)
             if refcount_apply_us is not None and apply_lbas is not None
@@ -319,6 +393,7 @@ def build_summary(
         "apply_totals_us": apply_totals_us,
         "apply_totals_seconds": apply_totals_seconds,
         "refcount_batch_breakdown": refcount_batch,
+        "base_lookup_io_context": base_lookup_io_context,
         "pending_zero_seconds": pending_zero_seconds,
         "physical_ring_zero_seconds": ring_zero_seconds,
         "drain_timed_out": drain_timed_out,

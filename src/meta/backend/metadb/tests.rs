@@ -372,6 +372,103 @@ fn atomic_batch_write_range_with_gap_splits_into_two_ops() {
 }
 
 #[test]
+fn atomic_batch_write_range_outcomes_exclude_following_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = MetaConfig {
+        path: Some(dir.path().to_path_buf()),
+        block_cache_mb: 8,
+        memtable_budget_mb: 64,
+        index_pin_mb: 64,
+        lsm_bloom_bits_per_entry: 10,
+        checkpoint_interval_ms: 5000,
+        group_commit_timeout_us: 1,
+        wal_dir: None,
+        dedup_shards: 1,
+        dedup_cuckoo_buckets: 1_000_000,
+        dedup_l1_cache_entries: 256_000,
+        l2p_buffer_enabled: true,
+        commit_direct_apply_enabled: true,
+        ..Default::default()
+    };
+    let vol = VolumeConfig {
+        id: VolumeId("vol-range-outcomes".to_string()),
+        size_bytes: 4096 * 32,
+        block_size: 4096,
+        compression: CompressionAlgo::Lz4,
+        created_at: 10,
+        zone_count: 4,
+    };
+    let backend = MetadbBackend::open(&meta).unwrap();
+    backend.put_volume(&vol).unwrap();
+
+    let value = |pba: u64| BlockmapValue {
+        pba: Pba(pba),
+        compression: 1,
+        unit_compressed_size: 4096,
+        unit_original_size: 4096,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: pba as u32,
+        slot_offset: 0,
+        flags: 0,
+    };
+    let singleton = vec![(Lba(0), value(300))];
+    let range = vec![(Lba(10), value(310)), (Lba(11), value(311))];
+    let units = vec![
+        (&vol.id, singleton.as_slice(), 1u32),
+        (&vol.id, range.as_slice(), 1u32),
+    ];
+    let dedup_entries = [(
+        [7u8; 8],
+        DedupEntry {
+            pba: Pba(300),
+            slot_offset: 0,
+            compression: 1,
+            unit_compressed_size: 4096,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 300,
+        },
+    )];
+    let (_cleanups, accepted) = backend
+        .atomic_batch_write_multi_with_dedup(&units, &dedup_entries, &[1, 2, 3])
+        .unwrap();
+
+    assert_eq!(accepted, vec![true, true, true]);
+    for (lba, pba) in [(0, 300), (10, 310), (11, 311)] {
+        assert_eq!(
+            backend.get_mapping(&vol.id, Lba(lba)).unwrap().unwrap().pba,
+            Pba(pba),
+        );
+    }
+
+    // Cover the single-unit entry point's independent remap-outcome prefix.
+    let second_range = vec![(Lba(20), value(320)), (Lba(21), value(321))];
+    let second_dedup = [(
+        [8u8; 8],
+        DedupEntry {
+            pba: Pba(320),
+            slot_offset: 0,
+            compression: 1,
+            unit_compressed_size: 4096,
+            unit_original_size: 4096,
+            unit_lba_count: 1,
+            offset_in_unit: 0,
+            crc32: 320,
+        },
+    )];
+    let (_cleanups, second_accepted) = backend
+        .atomic_batch_write_with_dedup(&vol.id, &second_range, 1, &second_dedup, &[4, 5])
+        .unwrap();
+    assert_eq!(second_accepted, vec![true, true]);
+    assert_eq!(
+        backend.get_dedup(&second_dedup[0].0).unwrap(),
+        Some(second_dedup[0].1)
+    );
+}
+
+#[test]
 fn dedup_entries_and_flag_scan_round_trip() {
     // Rc-neutral path: `dedup_entry_is_live` checks rc(entry.pba)>0 to
     // catch entries pointing at PBAs whose final decref already
