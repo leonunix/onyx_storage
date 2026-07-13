@@ -747,16 +747,14 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
         )));
     };
     let direct_io_cpus = direct_io_cpus_for_topology(config, &topo)?;
-    let cpus = exclude_direct_io_cpus(
-        node.engine_cpus(config.numa.reserve_cores_per_node),
-        &direct_io_cpus,
-        "engine",
-    )?;
+    let cpus = node.engine_cpus(config.numa.reserve_cores_per_node);
     let (foreground_cpus, background_cpus) = node.confine_cpu_sets(
         config.numa.reserve_cores_per_node,
         config.numa.foreground_cores_per_node,
     );
-    let foreground_cpus = exclude_direct_io_cpus(foreground_cpus, &direct_io_cpus, "foreground")?;
+    // Direct API threads pin themselves explicitly. Keep their CPUs in the
+    // foreground pool so LV2 persistence and ublk can use the full data-plane
+    // capacity, while excluding them from MetaDB/flush background work.
     let background_cpus = exclude_direct_io_cpus(background_cpus, &direct_io_cpus, "background")?;
 
     let plan = plan_confine(
@@ -808,7 +806,7 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
     }
     if let Err(err) = crate::affinity::bind_current_thread_to(&background_cpus) {
         return Err(crate::error::OnyxError::Config(format!(
-            "failed to confine main thread to node {home} cpus {cpus:?}: {err}"
+            "failed to confine main thread to node {home} background cpus {background_cpus:?}: {err}"
         )));
     }
     crate::affinity::init_confine(foreground_cpus.clone(), background_cpus.clone());
@@ -1174,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_io_cpus_are_removed_from_both_confine_sets() {
+    fn direct_io_cpus_remain_in_foreground_and_are_removed_from_background() {
         let node = NumaNode {
             id: 0,
             cpus: vec![0, 1, 2, 3, 4, 5, 6, 7],
@@ -1183,9 +1181,8 @@ mod tests {
         };
         let (foreground, background) = node.confine_cpu_sets(1, 1);
         let direct_io_cpus = vec![0, 2];
-        let foreground = exclude_direct_io_cpus(foreground, &direct_io_cpus, "foreground").unwrap();
         let background = exclude_direct_io_cpus(background, &direct_io_cpus, "background").unwrap();
-        assert_eq!(foreground, vec![4]);
+        assert_eq!(foreground, vec![0, 4]);
         assert_eq!(background, vec![1, 5, 6]);
         // CPU 6 is CPU 2's SMT sibling, but only the explicitly configured
         // logical CPU is dedicated.
@@ -1193,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_io_cpu_exclusion_rejects_empty_engine_set() {
+    fn direct_io_cpu_exclusion_rejects_empty_background_set() {
         assert!(matches!(
             exclude_direct_io_cpus(vec![2], &[2], "background"),
             Err(crate::error::OnyxError::Config(_))

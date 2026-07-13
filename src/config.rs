@@ -1630,10 +1630,12 @@ pub struct ServiceConfig {
     /// Unix socket path for IPC (stop command, status queries)
     #[serde(default = "default_socket_path")]
     pub socket_path: PathBuf,
-    /// Startup-only CPU set dedicated to the direct-IO data-plane API. Accepts
-    /// Linux CPU-list syntax such as `"2"` or `"2,4-5"`. Empty keeps the
-    /// normal foreground (`ThreadRole::Ublk`) placement policy. Changing this
-    /// value requires a service restart.
+    /// Startup-only CPU set for the direct-IO data-plane API. Accepts Linux
+    /// CPU-list syntax such as `"2"` or `"2,4-5"`. In NUMA confine mode,
+    /// background roles are kept off this set while normal foreground roles
+    /// retain their full CPU pool. Empty uses the normal foreground
+    /// (`ThreadRole::Ublk`) placement policy. Changing this value requires a
+    /// service restart.
     #[serde(default)]
     pub direct_io_cpus: String,
 }
