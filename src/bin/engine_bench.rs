@@ -173,6 +173,7 @@ struct LatencySamples {
 
 struct PendingWrite {
     ticket: Option<VolumeWriteTicket>,
+    buffer: Option<Vec<u8>>,
     started: Instant,
     submitted: Instant,
     submit_queue_ns: u64,
@@ -208,6 +209,10 @@ impl PendingWrite {
             .expect("pending write ticket already completed")
             .finish();
         CompletedWrite {
+            buffer: self
+                .buffer
+                .take()
+                .expect("pending write buffer already returned"),
             started: self.started,
             submitted: self.submitted,
             completed_at: Instant::now(),
@@ -235,12 +240,13 @@ struct SubmitTask {
     measured: bool,
 }
 
-struct SubmitResult {
-    outcome: std::result::Result<PendingWrite, String>,
-    buffer: Vec<u8>,
+enum SubmitResult {
+    Pending(PendingWrite),
+    Failed { buffer: Vec<u8>, error: String },
 }
 
 struct CompletedWrite {
+    buffer: Vec<u8>,
     started: Instant,
     submitted: Instant,
     completed_at: Instant,
@@ -251,7 +257,6 @@ struct CompletedWrite {
 }
 
 enum JobEvent {
-    Buffer(Vec<u8>),
     Complete(CompletedWrite),
     Failed { buffer: Vec<u8>, error: String },
     LaneFailed(String),
@@ -778,11 +783,12 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 volume.write_aligned_deferred(offset, &buffer[..len])
                             }));
-                        let outcome = match append_result {
+                        let submit_result = match append_result {
                             Ok(Ok(ticket)) => {
                                 let submitted = Instant::now();
-                                Ok(PendingWrite {
+                                SubmitResult::Pending(PendingWrite {
                                     ticket: Some(ticket),
+                                    buffer: Some(buffer),
                                     started,
                                     submitted,
                                     submit_queue_ns,
@@ -794,13 +800,19 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                                     measured,
                                 })
                             }
-                            Ok(Err(error)) => Err(error.to_string()),
-                            Err(_) => Err(format!(
-                                "append submitter {idx} panicked while processing IO"
-                            )),
+                            Ok(Err(error)) => SubmitResult::Failed {
+                                buffer,
+                                error: error.to_string(),
+                            },
+                            Err(_) => SubmitResult::Failed {
+                                buffer,
+                                error: format!(
+                                    "append submitter {idx} panicked while processing IO"
+                                ),
+                            },
                         };
-                        if let Err(error) = worker_result_tx.send(SubmitResult { outcome, buffer }) {
-                            if let Ok(pending) = error.0.outcome {
+                        if let Err(error) = worker_result_tx.send(submit_result) {
+                            if let SubmitResult::Pending(pending) = error.0 {
                                 pending.wait();
                             }
                             return;
@@ -1220,23 +1232,13 @@ fn accept_dispatch_result(
     event_tx: &Sender<JobEvent>,
     pending: &mut Vec<PendingWrite>,
 ) -> bool {
-    match result.outcome {
-        Ok(write) => {
+    match result {
+        SubmitResult::Pending(write) => {
             write.arm_wakeup(wake_tx);
-            if event_tx.send(JobEvent::Buffer(result.buffer)).is_err() {
-                write.wait();
-                return false;
-            }
             pending.push(write);
         }
-        Err(error) => {
-            if event_tx
-                .send(JobEvent::Failed {
-                    buffer: result.buffer,
-                    error,
-                })
-                .is_err()
-            {
+        SubmitResult::Failed { buffer, error } => {
+            if event_tx.send(JobEvent::Failed { buffer, error }).is_err() {
                 return false;
             }
         }
@@ -1355,35 +1357,26 @@ fn service_job_events(
     event_rx: &Receiver<JobEvent>,
     block: bool,
 ) -> Result<usize> {
-    let mut progress = 0usize;
-    let mut first_error = None;
-    if block {
+    let event = if block {
         match event_rx.recv() {
-            Ok(event) => {
-                progress += 1;
-                if let Err(error) = accept_job_event(io, samples, stats, event) {
-                    first_error = Some(error);
-                }
-            }
+            Ok(event) => event,
             Err(_) => {
                 io.outstanding = 0;
                 return Err(anyhow!("job event channel closed with IO outstanding"));
             }
         }
-    }
-    while let Ok(event) = event_rx.try_recv() {
-        progress += 1;
-        if let Err(error) = accept_job_event(io, samples, stats, event) {
-            if first_error.is_none() {
-                first_error = Some(error);
+    } else {
+        match event_rx.try_recv() {
+            Ok(event) => event,
+            Err(crossbeam_channel::TryRecvError::Empty) => return Ok(0),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                io.outstanding = 0;
+                return Err(anyhow!("job event channel closed"));
             }
         }
-    }
-
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(progress),
-    }
+    };
+    accept_job_event(io, samples, stats, event)?;
+    Ok(1)
 }
 
 fn accept_job_event(
@@ -1393,39 +1386,38 @@ fn accept_job_event(
     event: JobEvent,
 ) -> Result<()> {
     match event {
-        JobEvent::Buffer(buffer) => {
-            io.free_buffers.push(buffer);
-            Ok(())
-        }
         JobEvent::Complete(completed) => {
+            let CompletedWrite {
+                buffer,
+                started,
+                submitted,
+                completed_at,
+                submit_queue_ns,
+                append_worker_ns,
+                bytes,
+                measured,
+            } = completed;
+            io.free_buffers.push(buffer);
             let received_at = Instant::now();
-            if completed.measured {
-                samples.write_ns.push(
-                    completed
-                        .completed_at
-                        .saturating_duration_since(completed.started)
-                        .as_nanos() as u64,
-                );
-                samples.submit_queue_ns.push(completed.submit_queue_ns);
-                samples.append_worker_ns.push(completed.append_worker_ns);
-                samples.post_submit_completion_ns.push(
-                    completed
-                        .completed_at
-                        .saturating_duration_since(completed.submitted)
-                        .as_nanos() as u64,
-                );
+            if measured {
+                samples
+                    .write_ns
+                    .push(completed_at.saturating_duration_since(started).as_nanos() as u64);
+                samples.submit_queue_ns.push(submit_queue_ns);
+                samples.append_worker_ns.push(append_worker_ns);
+                samples
+                    .post_submit_completion_ns
+                    .push(completed_at.saturating_duration_since(submitted).as_nanos() as u64);
                 samples.completion_delivery_ns.push(
                     received_at
-                        .saturating_duration_since(completed.completed_at)
+                        .saturating_duration_since(completed_at)
                         .as_nanos() as u64,
                 );
-                samples.frontend_total_ns.push(
-                    received_at
-                        .saturating_duration_since(completed.started)
-                        .as_nanos() as u64,
-                );
+                samples
+                    .frontend_total_ns
+                    .push(received_at.saturating_duration_since(started).as_nanos() as u64);
                 stats.write_ops += 1;
-                stats.write_bytes += completed.bytes;
+                stats.write_bytes += bytes;
             }
             if io.outstanding == 0 {
                 return Err(anyhow!("completion received with no outstanding IO"));
