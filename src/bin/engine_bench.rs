@@ -227,6 +227,7 @@ impl LatencySamples {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "onyx_storage=warn".to_string()),
         )
