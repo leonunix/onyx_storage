@@ -124,7 +124,7 @@ throttle_cap_us = 2000
 nr_queues = 8
 queue_depth = 256
 io_buf_bytes = 1048576
-queue_workers = 32
+queue_workers = 16
 
 [flush]
 compress_workers = 2
