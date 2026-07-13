@@ -36,11 +36,11 @@ struct Cli {
     #[arg(long, default_value_t = 60)]
     runtime_secs: u64,
 
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 8)]
     jobs: usize,
 
     /// Maximum durable writes in flight per job. Reads remain synchronous.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 64)]
     iodepth: usize,
 
     /// Threads performing synchronous LV2 append preparation. Zero derives
@@ -311,6 +311,11 @@ fn main() -> Result<()> {
     }
     if cli.submitters == 0 {
         return Err(anyhow!("--submitters must be > 0"));
+    }
+    if cli.submitters < cli.jobs {
+        return Err(anyhow!(
+            "--submitters must be >= --jobs so every submit lane has a worker"
+        ));
     }
     if cli.iodepth > 1 && cli.job_cpus.trim().is_empty() {
         eprintln!(
@@ -602,15 +607,24 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
         );
     }
 
-    let queue_capacity = cli.jobs.saturating_mul(cli.iodepth).max(cli.submitters);
-    let (submit_tx, submit_rx) = crossbeam_channel::bounded::<SubmitTask>(queue_capacity);
+    // Mirror ublk's topology: each kernel queue has its own request channel,
+    // queue-worker group, and durability dispatcher. A global work-stealing
+    // queue changes burst shape and hides per-queue head-of-line behavior.
+    let mut submit_txs = Vec::with_capacity(cli.jobs);
+    let mut submit_rxs = Vec::with_capacity(cli.jobs);
+    for _ in 0..cli.jobs {
+        let (tx, rx) = crossbeam_channel::bounded::<SubmitTask>(cli.iodepth);
+        submit_txs.push(tx);
+        submit_rxs.push(rx);
+    }
     let mut submitter_volumes = Vec::with_capacity(cli.submitters);
     for _ in 0..cli.submitters {
         submitter_volumes.push(engine.open_volume(&cli.volume)?);
     }
     let mut submitter_handles = Vec::with_capacity(cli.submitters);
     for (idx, volume) in submitter_volumes.into_iter().enumerate() {
-        let worker_submit_rx = submit_rx.clone();
+        let lane = idx % cli.jobs;
+        let worker_submit_rx = submit_rxs[lane].clone();
         let submitter_cpus = submitter_cpus.clone();
         let spawn_result = thread::Builder::new()
             .name(format!("engine-submit-{idx}"))
@@ -669,8 +683,8 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
         match spawn_result {
             Ok(handle) => submitter_handles.push(handle),
             Err(error) => {
-                drop(submit_tx);
-                drop(submit_rx);
+                drop(submit_txs);
+                drop(submit_rxs);
                 for handle in submitter_handles {
                     let _ = handle.join();
                 }
@@ -678,7 +692,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             }
         }
     }
-    drop(submit_rx);
+    drop(submit_rxs);
 
     let mut job_volumes = Vec::with_capacity(cli.jobs);
     for _ in 0..cli.jobs {
@@ -686,12 +700,15 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     }
     let mut handles = Vec::with_capacity(cli.jobs);
 
-    for (job, volume) in job_volumes.into_iter().enumerate() {
+    for (job, (volume, job_submit_tx)) in job_volumes
+        .into_iter()
+        .zip(submit_txs.iter().cloned())
+        .enumerate()
+    {
         let worker_stop = stop.clone();
         let worker_control = control.clone();
         let samples = samples.clone();
         let job_cpus = job_cpus.clone();
-        let job_submit_tx = submit_tx.clone();
         let pattern = cli.pattern;
         let rwmixread = cli.rwmixread;
         let iodepth = cli.iodepth;
@@ -844,7 +861,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                 for handle in handles {
                     let _ = handle.join();
                 }
-                drop(submit_tx);
+                drop(submit_txs);
                 for handle in submitter_handles {
                     let _ = handle.join();
                 }
@@ -888,7 +905,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             for handle in handles {
                 let _ = handle.join();
             }
-            drop(submit_tx);
+            drop(submit_txs);
             for handle in submitter_handles {
                 let _ = handle.join();
             }
@@ -906,7 +923,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             for handle in handles {
                 let _ = handle.join();
             }
-            drop(submit_tx);
+            drop(submit_txs);
             for handle in submitter_handles {
                 let _ = handle.join();
             }
@@ -954,7 +971,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             }
         }
     }
-    drop(submit_tx);
+    drop(submit_txs);
     for handle in submitter_handles {
         if handle.join().is_err() && join_error.is_none() {
             join_error = Some(anyhow!("append submitter panicked outside an IO task"));
@@ -1322,6 +1339,15 @@ fn print_report(
     println!("  \"jobs\": {},", cli.jobs);
     println!("  \"iodepth\": {},", cli.iodepth);
     println!("  \"submitters\": {},", cli.submitters);
+    println!("  \"submit_lanes\": {},", cli.jobs);
+    println!(
+        "  \"submitters_per_lane_min\": {},",
+        cli.submitters / cli.jobs
+    );
+    println!(
+        "  \"submitters_per_lane_max\": {},",
+        cli.submitters.div_ceil(cli.jobs)
+    );
     println!(
         "  \"inflight_target\": {},",
         cli.jobs.saturating_mul(cli.iodepth)
@@ -2264,7 +2290,8 @@ mod tests {
         assert!(!cli.reset);
         assert!(!cli.reset_buffer);
         assert!(!cli.prefill);
-        assert_eq!(cli.iodepth, 1);
+        assert_eq!(cli.jobs, 8);
+        assert_eq!(cli.iodepth, 64);
         assert_eq!(cli.ramp_secs, 5);
         assert_eq!(cli.pattern.as_str(), "fio-default");
     }
