@@ -160,6 +160,12 @@ impl NumaNode {
 
 /// Parse a sysfs cpulist like `"0,2,4-6,8\n"`.
 pub fn parse_cpu_list(raw: &str) -> Vec<usize> {
+    parse_cpu_list_checked(raw).unwrap_or_default()
+}
+
+/// Parse Linux CPU-list syntax, rejecting malformed or descending entries.
+/// Empty input is valid and represents an unspecified CPU set.
+pub fn parse_cpu_list_checked(raw: &str) -> Result<Vec<usize>, String> {
     let mut cpus = Vec::new();
     for part in raw
         .trim()
@@ -168,18 +174,26 @@ pub fn parse_cpu_list(raw: &str) -> Vec<usize> {
         .filter(|p| !p.is_empty())
     {
         if let Some((start, end)) = part.split_once('-') {
-            if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
-                if s <= e {
-                    cpus.extend(s..=e);
-                }
+            let s = start
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU range start {start:?}"))?;
+            let e = end
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU range end {end:?}"))?;
+            if s > e {
+                return Err(format!("descending CPU range {part:?}"));
             }
-        } else if let Ok(c) = part.parse::<usize>() {
-            cpus.push(c);
+            cpus.extend(s..=e);
+        } else {
+            cpus.push(
+                part.parse::<usize>()
+                    .map_err(|_| format!("invalid CPU entry {part:?}"))?,
+            );
         }
     }
     cpus.sort_unstable();
     cpus.dedup();
-    cpus
+    Ok(cpus)
 }
 
 /// Group a node's CPUs into physical cores via
@@ -539,6 +553,46 @@ pub fn setup(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult<()>
     }
 }
 
+fn direct_io_cpus_for_topology(
+    config: &crate::config::OnyxConfig,
+    topo: &NumaTopology,
+) -> crate::error::OnyxResult<Vec<usize>> {
+    let direct_io_cpus = config.service.direct_io_cpu_set()?;
+    if direct_io_cpus.is_empty() {
+        return Ok(direct_io_cpus);
+    }
+    let online: std::collections::HashSet<usize> = topo
+        .nodes
+        .iter()
+        .flat_map(|node| node.cpus.iter().copied())
+        .collect();
+    let missing: Vec<usize> = direct_io_cpus
+        .iter()
+        .copied()
+        .filter(|cpu| !online.contains(cpu))
+        .collect();
+    if !missing.is_empty() {
+        return Err(crate::error::OnyxError::Config(format!(
+            "service.direct_io_cpus contains unavailable CPUs {missing:?}"
+        )));
+    }
+    Ok(direct_io_cpus)
+}
+
+fn exclude_direct_io_cpus(
+    mut cpus: Vec<usize>,
+    direct_io_cpus: &[usize],
+    set_name: &str,
+) -> crate::error::OnyxResult<Vec<usize>> {
+    cpus.retain(|cpu| !direct_io_cpus.contains(cpu));
+    if cpus.is_empty() {
+        return Err(crate::error::OnyxError::Config(format!(
+            "service.direct_io_cpus {direct_io_cpus:?} leaves the NUMA {set_name} CPU set empty"
+        )));
+    }
+    Ok(cpus)
+}
+
 fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult<()> {
     if config.threading.enabled {
         tracing::warn!(
@@ -571,16 +625,18 @@ fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResu
         return setup_confine(config);
     }
 
-    let pods: Vec<crate::affinity::PodCpus> = data_nodes
-        .iter()
-        .map(|&id| crate::affinity::PodCpus {
-            node: id,
-            cpus: topo
-                .node(id)
+    let direct_io_cpus = direct_io_cpus_for_topology(config, &topo)?;
+    let mut pods = Vec::with_capacity(data_nodes.len());
+    for &id in &data_nodes {
+        let cpus = exclude_direct_io_cpus(
+            topo.node(id)
                 .unwrap()
                 .engine_cpus(config.numa.reserve_cores_per_node),
-        })
-        .collect();
+            &direct_io_cpus,
+            &format!("partition node {id}"),
+        )?;
+        pods.push(crate::affinity::PodCpus { node: id, cpus });
+    }
 
     // Memory model = same as confine: EVERYTHING except the offloaded
     // compress workers lives on the home node, under BIND. The first
@@ -668,6 +724,7 @@ fn setup_partition(config: &crate::config::OnyxConfig) -> crate::error::OnyxResu
         data_nodes = ?data_nodes,
         home_pod,
         pod_sizes = ?pods.iter().map(|p| p.cpus.len()).collect::<Vec<_>>(),
+        direct_io_cpus = ?direct_io_cpus,
         shards,
         "numa partition active (pod-per-node data plane, home-pod control plane)"
     );
@@ -689,11 +746,18 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
             topo.nodes.iter().map(|n| n.id).collect::<Vec<_>>()
         )));
     };
-    let cpus = node.engine_cpus(config.numa.reserve_cores_per_node);
+    let direct_io_cpus = direct_io_cpus_for_topology(config, &topo)?;
+    let cpus = exclude_direct_io_cpus(
+        node.engine_cpus(config.numa.reserve_cores_per_node),
+        &direct_io_cpus,
+        "engine",
+    )?;
     let (foreground_cpus, background_cpus) = node.confine_cpu_sets(
         config.numa.reserve_cores_per_node,
         config.numa.foreground_cores_per_node,
     );
+    let foreground_cpus = exclude_direct_io_cpus(foreground_cpus, &direct_io_cpus, "foreground")?;
+    let background_cpus = exclude_direct_io_cpus(background_cpus, &direct_io_cpus, "background")?;
 
     let plan = plan_confine(
         &topo,
@@ -754,6 +818,7 @@ fn setup_confine(config: &crate::config::OnyxConfig) -> crate::error::OnyxResult
         engine_cpus = ?cpus,
         foreground_cpus = ?foreground_cpus,
         background_cpus = ?background_cpus,
+        direct_io_cpus = ?direct_io_cpus,
         reserved_cores = config.numa.reserve_cores_per_node,
         "numa confine active (in-engine numactl equivalent; ublk queue \
          threads included)"
@@ -834,6 +899,7 @@ fn confine_thread_placement(name: &str) -> Option<bool> {
     if name.starts_with("engine-bench-")
         || name.starts_with("engine-submit-")
         || name.starts_with("engine-durable-")
+        || name.starts_with("direct-io-")
     {
         None
     } else {
@@ -918,6 +984,7 @@ mod tests {
         assert_eq!(parse_cpu_list(""), Vec::<usize>::new());
         assert_eq!(parse_cpu_list("3-1"), Vec::<usize>::new());
         assert_eq!(parse_cpu_list("7"), vec![7]);
+        assert!(parse_cpu_list_checked("2,bad").is_err());
     }
 
     #[test]
@@ -1107,10 +1174,52 @@ mod tests {
     }
 
     #[test]
+    fn direct_io_cpus_are_removed_from_both_confine_sets() {
+        let node = NumaNode {
+            id: 0,
+            cpus: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            cores: vec![vec![0, 4], vec![1, 5], vec![2, 6], vec![3, 7]],
+            mem_total_bytes: 0,
+        };
+        let (foreground, background) = node.confine_cpu_sets(1, 1);
+        let direct_io_cpus = vec![0, 2];
+        let foreground = exclude_direct_io_cpus(foreground, &direct_io_cpus, "foreground").unwrap();
+        let background = exclude_direct_io_cpus(background, &direct_io_cpus, "background").unwrap();
+        assert_eq!(foreground, vec![4]);
+        assert_eq!(background, vec![1, 5, 6]);
+        // CPU 6 is CPU 2's SMT sibling, but only the explicitly configured
+        // logical CPU is dedicated.
+        assert!(background.contains(&6));
+    }
+
+    #[test]
+    fn direct_io_cpu_exclusion_rejects_empty_engine_set() {
+        assert!(matches!(
+            exclude_direct_io_cpus(vec![2], &[2], "background"),
+            Err(crate::error::OnyxError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn direct_io_cpu_set_rejects_unavailable_cpu() {
+        let topo = one_node_topo(1);
+        let mut config = crate::config::OnyxConfig::default();
+        config.service.direct_io_cpus = "2".into();
+        assert!(matches!(
+            direct_io_cpus_for_topology(&config, &topo),
+            Err(crate::error::OnyxError::Config(_))
+        ));
+    }
+
+    #[test]
     fn confine_enforcer_preserves_engine_bench_affinity() {
         assert_eq!(confine_thread_placement("engine-bench-7\n"), None);
         assert_eq!(confine_thread_placement("engine-submit-7\n"), None);
         assert_eq!(confine_thread_placement("engine-durable-7\n"), None);
+        assert_eq!(confine_thread_placement("direct-io-session-7\n"), None);
+        assert_eq!(confine_thread_placement("direct-io-submit-q0-w0\n"), None);
+        assert_eq!(confine_thread_placement("direct-io-durable-7\n"), None);
+        assert_eq!(confine_thread_placement("direct-io-writer-7\n"), None);
         assert_eq!(confine_thread_placement("ublk-queue\n"), Some(true));
         assert_eq!(confine_thread_placement("BufferSync-0\n"), Some(false));
     }

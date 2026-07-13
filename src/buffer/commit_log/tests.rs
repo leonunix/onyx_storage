@@ -536,6 +536,9 @@ fn global_sync_records_watermark_to_dispatcher_latency() {
     if !ticket.arm_wakeup(&wake_tx) {
         wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
+    assert!(ticket
+        .completion_dispatch_delay_ns(Instant::now())
+        .is_some());
     ticket.finish_dispatched();
 
     let snapshot = metrics.snapshot();

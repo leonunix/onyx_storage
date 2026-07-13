@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 
 use crate::affinity::{self, ThreadRole};
 use crate::config::{ConfiguredMode, OnyxConfig};
+use crate::direct_io::DirectIoServer;
 use crate::engine::OnyxEngine;
 use crate::error::{OnyxError, OnyxResult};
 #[cfg(target_os = "linux")]
@@ -90,6 +91,26 @@ impl ServiceController {
             let _ = std::fs::remove_file(&self.socket_path);
         }
 
+        // The binary data-plane listener must stop and join every session
+        // before engine shutdown. Start it first so a control-socket bind
+        // failure can still unwind it cleanly through Drop.
+        let (nr_queues, queue_workers, direct_io_cpus) = {
+            let config = self.config.read();
+            (
+                config.ublk.nr_queues as usize,
+                config.ublk.queue_workers,
+                config.service.direct_io_cpu_set()?,
+            )
+        };
+        let mut direct_io_server = DirectIoServer::start(
+            &self.socket_path,
+            self.engine.clone(),
+            nr_queues,
+            queue_workers,
+            direct_io_cpus,
+        )
+        .map_err(OnyxError::Io)?;
+
         // Start socket listener thread (always, even in bare/standby)
         let socket_handle = self.start_socket_listener()?;
 
@@ -139,6 +160,11 @@ impl ServiceController {
 
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+
+        // Stop accepting direct IO. Already-durable writes are acknowledged;
+        // undurable tickets are failed after a bounded grace period so a dead
+        // LV2 durability watermark cannot block engine shutdown forever.
+        direct_io_server.shutdown_and_join();
 
         // Graceful shutdown
         {
@@ -347,6 +373,20 @@ impl ServiceController {
             tracing::warn!(
                 "buffer.shards changed — requires restart. \
                  Will auto-reinit if buffer is fully drained, otherwise start with old shard count first to drain"
+            );
+        }
+        if old_config.service.direct_io_cpus != new_config.service.direct_io_cpus {
+            tracing::warn!(
+                old = %old_config.service.direct_io_cpus,
+                new = %new_config.service.direct_io_cpus,
+                "service.direct_io_cpus changed — requires restart to rebuild direct IO and backend CPU masks"
+            );
+        }
+        if old_config.ublk.nr_queues != new_config.ublk.nr_queues
+            || old_config.ublk.queue_workers != new_config.ublk.queue_workers
+        {
+            tracing::warn!(
+                "ublk submit topology changed — requires restart to rebuild direct IO submit lanes"
             );
         }
 

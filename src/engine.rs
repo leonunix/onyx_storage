@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::buffer::flush::BufferFlusher;
 use crate::buffer::pool::{BufferRuntimeLimits, ThrottleSettings, WriteBufferPool};
@@ -39,6 +39,25 @@ const USAGE_CACHE_TTL_SECS: u64 = 60;
 /// references so it can invalidate all outstanding handles on delete.
 pub type VolumeAliveFlag = Arc<AtomicBool>;
 
+type LiveHandleRegistry = Vec<(String, Weak<AtomicBool>)>;
+
+fn register_live_handle(handles: &mut LiveHandleRegistry, name: &str, alive: &VolumeAliveFlag) {
+    handles.retain(|(_, flag)| flag.strong_count() > 0);
+    handles.push((name.to_string(), Arc::downgrade(alive)));
+}
+
+fn invalidate_live_handles_in(handles: &mut LiveHandleRegistry, name: &str) {
+    handles.retain(|(vol_name, weak)| {
+        let Some(flag) = weak.upgrade() else {
+            return false;
+        };
+        if vol_name == name {
+            flag.store(false, Ordering::Release);
+        }
+        true
+    });
+}
+
 /// Top-level storage engine handle (librbd-style).
 ///
 /// Owns all shared components. Use `open_volume()` to get per-volume IO handles.
@@ -77,9 +96,9 @@ pub struct OnyxEngine {
     zone_manager: Option<Arc<ZoneManager>>,
     /// Live volume handles: (vol_name, alive_flag).
     /// delete_volume sets all matching flags to false.
-    /// Entries with dropped handles (strong_count==1, only engine's copy) are
-    /// cleaned up lazily on subsequent open_volume/delete_volume calls.
-    live_handles: Mutex<Vec<(String, VolumeAliveFlag)>>,
+    /// Entries with dropped handles are cleaned up lazily on subsequent
+    /// open_volume/delete_volume calls.
+    live_handles: Mutex<LiveHandleRegistry>,
     lifecycle: Arc<VolumeLifecycleManager>,
     metrics: Arc<EngineMetrics>,
     /// Cold-data cache of per-volume capacity usage, keyed by volume name.
@@ -582,12 +601,7 @@ impl OnyxEngine {
 
     fn invalidate_live_handles(&self, name: &str) {
         let mut handles = self.live_handles.lock().unwrap();
-        for (vol_name, flag) in handles.iter() {
-            if vol_name == name {
-                flag.store(false, Ordering::Release);
-            }
-        }
-        handles.retain(|(_, flag)| Arc::strong_count(flag) > 1);
+        invalidate_live_handles_in(&mut handles, name);
     }
 
     #[cfg(target_os = "linux")]
@@ -1429,8 +1443,11 @@ impl OnyxEngine {
     /// is open). Restore and other L2P-rewriting ops must refuse while true.
     fn has_active_handle(&self, name: &str) -> bool {
         let handles = self.live_handles.lock().unwrap();
-        handles.iter().any(|(vol_name, flag)| {
-            vol_name == name && Arc::strong_count(flag) > 1 && flag.load(Ordering::Acquire)
+        handles.iter().any(|(vol_name, weak)| {
+            vol_name == name
+                && weak
+                    .upgrade()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
         })
     }
 
@@ -1476,10 +1493,7 @@ impl OnyxEngine {
             let vol_ord = self.meta.volume_ordinal_str(name)?;
 
             let alive = Arc::new(AtomicBool::new(true));
-            self.live_handles
-                .lock()
-                .unwrap()
-                .push((name.to_string(), alive.clone()));
+            register_live_handle(&mut self.live_handles.lock().unwrap(), name, &alive);
             self.metrics.volume_open_ops.fetch_add(1, Ordering::Relaxed);
 
             let vol_lock = self.lifecycle.get_lock(name);
@@ -2024,7 +2038,7 @@ impl OnyxEngine {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, flag)| Arc::strong_count(flag) > 1)
+                .filter(|(_, flag)| flag.strong_count() > 0)
                 .count(),
             zone_count: self.zone_manager.as_ref().map(|zm| zm.zone_count()),
             buffer_pending_entries: self.buffer_pool.as_ref().map(|pool| pool.pending_count()),
@@ -2212,5 +2226,29 @@ mod tests {
         cfg.dedup.enabled = false;
         cfg.storage.read_pool_workers = 0;
         assert!(OnyxEngine::validate_dedup_read_pool(&cfg).is_ok());
+    }
+
+    #[test]
+    fn live_handle_registry_does_not_retain_disconnected_sessions() {
+        let mut handles = LiveHandleRegistry::new();
+
+        for _ in 0..128 {
+            let alive = Arc::new(AtomicBool::new(true));
+            let observer = Arc::downgrade(&alive);
+            register_live_handle(&mut handles, "bench", &alive);
+            assert_eq!(handles.len(), 1);
+            drop(alive);
+            assert!(observer.upgrade().is_none());
+        }
+
+        let active = Arc::new(AtomicBool::new(true));
+        register_live_handle(&mut handles, "bench", &active);
+        assert_eq!(handles.len(), 1, "expired session entries must be pruned");
+
+        let other = Arc::new(AtomicBool::new(true));
+        register_live_handle(&mut handles, "other", &other);
+        invalidate_live_handles_in(&mut handles, "bench");
+        assert!(!active.load(Ordering::Acquire));
+        assert!(other.load(Ordering::Acquire));
     }
 }

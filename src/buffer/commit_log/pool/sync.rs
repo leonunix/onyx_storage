@@ -633,6 +633,13 @@ impl WriteBufferPool {
                 lc.cancelled.remove(&e.pending.seq);
             }
         }
+        let advanced_at_ns = lv2_metric_timestamp_ns(Instant::now());
+        for entry in &batch.inflight_all {
+            entry
+                .pending
+                .durability_advanced_at_ns
+                .store(advanced_at_ns, Ordering::Release);
+        }
         shard.lv2_durability.advance(batch.max_seq);
         for entry in &batch.inflight_all {
             shard.publish_ready(entry.pending.seq);
@@ -1627,6 +1634,13 @@ impl WriteBufferPool {
                         .map(|entry| entry.pending.seq)
                         .max()
                         .unwrap_or(0);
+                    let advanced_at_ns = lv2_metric_timestamp_ns(Instant::now());
+                    for entry in &inflight {
+                        entry
+                            .pending
+                            .durability_advanced_at_ns
+                            .store(advanced_at_ns, Ordering::Release);
+                    }
                     shard.lv2_durability.advance(batch_max_durable);
                     for entry in &inflight {
                         shard.publish_ready(entry.pending.seq);

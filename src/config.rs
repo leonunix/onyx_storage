@@ -1630,12 +1630,30 @@ pub struct ServiceConfig {
     /// Unix socket path for IPC (stop command, status queries)
     #[serde(default = "default_socket_path")]
     pub socket_path: PathBuf,
+    /// Startup-only CPU set dedicated to the direct-IO data-plane API. Accepts
+    /// Linux CPU-list syntax such as `"2"` or `"2,4-5"`. Empty keeps the
+    /// normal foreground (`ThreadRole::Ublk`) placement policy. Changing this
+    /// value requires a service restart.
+    #[serde(default)]
+    pub direct_io_cpus: String,
+}
+
+impl ServiceConfig {
+    pub fn direct_io_cpu_set(&self) -> OnyxResult<Vec<usize>> {
+        crate::numa::parse_cpu_list_checked(&self.direct_io_cpus).map_err(|error| {
+            OnyxError::Config(format!(
+                "invalid service.direct_io_cpus {:?}: {error}",
+                self.direct_io_cpus
+            ))
+        })
+    }
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             socket_path: default_socket_path(),
+            direct_io_cpus: String::new(),
         }
     }
 }
@@ -1789,3 +1807,42 @@ fn default_queue_workers() -> usize {
 }
 
 // OnyxConfig::load and should_standby are defined in the impl block above.
+
+#[cfg(test)]
+mod service_config_tests {
+    use super::*;
+
+    #[test]
+    fn service_direct_io_cpus_defaults_to_unset() {
+        let config: OnyxConfig = toml::from_str("").unwrap();
+        assert!(config.service.direct_io_cpus.is_empty());
+    }
+
+    #[test]
+    fn service_direct_io_cpus_deserializes_linux_cpu_list() {
+        let config: OnyxConfig = toml::from_str(
+            r#"
+                [service]
+                direct_io_cpus = "2,4-5"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.service.direct_io_cpus, "2,4-5");
+        assert_eq!(config.service.direct_io_cpu_set().unwrap(), vec![2, 4, 5]);
+    }
+
+    #[test]
+    fn service_direct_io_cpus_rejects_invalid_cpu_list() {
+        let config: OnyxConfig = toml::from_str(
+            r#"
+                [service]
+                direct_io_cpus = "2,bad"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.service.direct_io_cpu_set(),
+            Err(OnyxError::Config(_))
+        ));
+    }
+}

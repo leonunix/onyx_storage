@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::*;
 
@@ -377,7 +377,7 @@ impl EngineMetrics {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineMetricsSnapshot {
     pub uptime_secs: u64,
     pub volume_create_ops: u64,

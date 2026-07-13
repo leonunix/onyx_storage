@@ -197,6 +197,9 @@ enabled = false
 
 [service]
 socket_path = "/tmp/onyx-storage-nvme.sock"
+# Startup-only. Keep the existing foreground placement until the CPU boundary
+# A/B selects a dedicated logical or physical core set.
+direct_io_cpus = ""
 
 [ha]
 enabled = false

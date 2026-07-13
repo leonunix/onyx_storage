@@ -1,5 +1,10 @@
+#![recursion_limit = "256"]
+
+use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -10,6 +15,10 @@ use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, Sender};
 
 use onyx_storage::config::OnyxConfig;
+use onyx_storage::direct_io::{
+    RequestHeader, ResponseHeader, MAX_DIRECT_IO_OUTSTANDING, MAX_VOLUME_NAME_BYTES, OP_CLOSE,
+    OP_HELLO, OP_WRITE, REQUEST_HEADER_LEN, RESPONSE_HEADER_LEN,
+};
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::metrics::{EngineMetricsSnapshot, EngineStatusSnapshot, MetaMemorySnapshot};
 use onyx_storage::types::{CompressionAlgo, BLOCK_SIZE};
@@ -18,15 +27,21 @@ use onyx_storage::volume::VolumeWriteTicket;
 #[derive(Debug, Parser)]
 #[command(
     name = "onyx-engine-bench",
-    about = "Run fio-like mixed workloads directly against OnyxEngine without ublk"
+    about = "Run fio-like workloads through the Onyx data API or embedded engine"
 )]
 struct Cli {
     #[arg(short, long, default_value = "config/nvme-detailed.toml")]
     config: std::path::PathBuf,
 
+    /// Open the storage engine in this process. The default uses the running
+    /// daemon's direct data API and can safely benchmark an online engine.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    embedded: bool,
+
     #[arg(long, default_value = "engine-bench")]
     volume: String,
 
+    /// Embedded mode only: size used when --reset creates the benchmark volume.
     #[arg(long, default_value = "320g", value_parser = parse_size)]
     volume_size: u64,
 
@@ -39,7 +54,7 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     jobs: usize,
 
-    /// Independent submit/durability lanes. Zero derives
+    /// Embedded mode only: independent submit/durability lanes. Zero derives
     /// min(jobs, ublk.nr_queues) from the loaded config.
     #[arg(long, default_value_t = 0)]
     submit_lanes: usize,
@@ -48,21 +63,21 @@ struct Cli {
     #[arg(long, default_value_t = 64)]
     iodepth: usize,
 
-    /// Threads performing synchronous LV2 append preparation. Zero derives
-    /// submit_lanes * ublk.queue_workers.
+    /// Embedded mode only: threads performing synchronous LV2 append
+    /// preparation. Zero derives submit_lanes * ublk.queue_workers.
     #[arg(long, default_value_t = 0)]
     submitters: usize,
 
     #[arg(long, default_value_t = 5)]
     ramp_secs: u64,
 
-    #[arg(long, default_value_t = 70)]
+    #[arg(long, default_value_t = 0)]
     rwmixread: u8,
 
     #[arg(long, default_value = "4k", value_parser = parse_size)]
     min_bs: u64,
 
-    #[arg(long, default_value = "32k", value_parser = parse_size)]
+    #[arg(long, default_value = "4k", value_parser = parse_size)]
     max_bs: u64,
 
     /// Payload behavior. `fio-default` matches fio without refill_buffers:
@@ -70,6 +85,13 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Pattern::FioDefault)]
     pattern: Pattern,
 
+    /// Deterministic seed mixed into every workload RNG stream. Omit this
+    /// option to preserve the legacy offset and payload sequence exactly. Use
+    /// distinct values for A/B runs to avoid reusing dedup content.
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Embedded mode only: compression used when --reset creates the volume.
     #[arg(long, value_enum, default_value_t = CompressionChoice::Lz4)]
     compression: CompressionChoice,
 
@@ -96,13 +118,13 @@ struct Cli {
     #[arg(long, default_value = "")]
     job_cpus: String,
 
-    /// CPU set for append submitters. Use the same foreground set as the ublk
-    /// workers when comparing direct-engine results with fio.
+    /// Embedded mode only: CPU set for append submitters. Use the same
+    /// foreground set as the ublk workers when comparing with fio.
     #[arg(long, default_value = "")]
     submitter_cpus: String,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 enum Pattern {
     FioDefault,
@@ -295,6 +317,247 @@ struct TimedRun {
     baseline_status: EngineStatusSnapshot,
 }
 
+#[derive(Debug, Default)]
+struct RemoteLatencySamples {
+    client_api_total_ns: Vec<u64>,
+    client_transport_ns: Vec<u64>,
+    server_total_ns: Vec<u64>,
+    server_submit_queue_ns: Vec<u64>,
+    server_engine_submit_ns: Vec<u64>,
+    server_durable_wait_ns: Vec<u64>,
+    server_completion_dispatch_ns: Vec<u64>,
+    server_other_ns: Vec<u64>,
+}
+
+impl RemoteLatencySamples {
+    fn merge(&mut self, mut other: Self) {
+        self.client_api_total_ns
+            .append(&mut other.client_api_total_ns);
+        self.client_transport_ns
+            .append(&mut other.client_transport_ns);
+        self.server_total_ns.append(&mut other.server_total_ns);
+        self.server_submit_queue_ns
+            .append(&mut other.server_submit_queue_ns);
+        self.server_engine_submit_ns
+            .append(&mut other.server_engine_submit_ns);
+        self.server_durable_wait_ns
+            .append(&mut other.server_durable_wait_ns);
+        self.server_completion_dispatch_ns
+            .append(&mut other.server_completion_dispatch_ns);
+        self.server_other_ns.append(&mut other.server_other_ns);
+    }
+}
+
+struct RemoteTimedRun {
+    stats: BenchStats,
+    samples: RemoteLatencySamples,
+    elapsed: Duration,
+    completion_closure: Duration,
+    baseline_metrics: EngineMetricsSnapshot,
+    baseline_status: RemoteStatusPoint,
+    server_workers_per_lane: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteStatusPoint {
+    pending_entries: u64,
+    physical_used_bytes: u64,
+    physical_fill_pct: Option<u8>,
+}
+
+struct RemoteVolumeInfo {
+    size_bytes: u64,
+    compression: serde_json::Value,
+}
+
+struct RemotePendingWrite {
+    buffer: Vec<u8>,
+    started: Instant,
+    measured: bool,
+}
+
+struct DirectWriteCompletion {
+    request_id: u64,
+    server_total_ns: u64,
+    submit_queue_ns: u64,
+    engine_submit_ns: u64,
+    durable_wait_ns: u64,
+    completion_dispatch_ns: u64,
+}
+
+struct DirectApiClient {
+    stream: UnixStream,
+    next_request_id: u64,
+    server_workers_per_lane: u32,
+}
+
+impl DirectApiClient {
+    fn connect(socket_path: &Path, volume: &str) -> Result<Self> {
+        if volume.is_empty() || volume.len() > MAX_VOLUME_NAME_BYTES {
+            return Err(anyhow!(
+                "volume name must contain 1..={MAX_VOLUME_NAME_BYTES} bytes"
+            ));
+        }
+        let stream = UnixStream::connect(socket_path)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let mut client = Self {
+            stream,
+            next_request_id: 1,
+            server_workers_per_lane: 0,
+        };
+        client.write_request(
+            RequestHeader {
+                opcode: OP_HELLO,
+                flags: 0,
+                payload_len: volume.len() as u32,
+                request_id: 0,
+                offset: 0,
+                io_len: 0,
+            },
+            volume.as_bytes(),
+        )?;
+        let response = client.read_response()?;
+        client.validate_response(&response, OP_HELLO, 0)?;
+        client.reject_response_payload(&response)?;
+        if response.bytes == 0 {
+            return Err(anyhow!("direct API HELLO reported zero submit workers"));
+        }
+        client.server_workers_per_lane = response.bytes;
+        Ok(client)
+    }
+
+    fn submit_write(&mut self, offset: u64, payload: &[u8]) -> Result<u64> {
+        let request_id = self.take_request_id()?;
+        self.write_request(
+            RequestHeader {
+                opcode: OP_WRITE,
+                flags: 0,
+                payload_len: payload.len() as u32,
+                request_id,
+                offset,
+                io_len: payload.len() as u32,
+            },
+            payload,
+        )?;
+        Ok(request_id)
+    }
+
+    fn recv_write_completion(&mut self) -> Result<DirectWriteCompletion> {
+        let response = self.read_response()?;
+        self.validate_response(&response, OP_WRITE, response.request_id)?;
+        self.reject_response_payload(&response)?;
+        if response.bytes != BLOCK_SIZE as u32 {
+            return Err(anyhow!(
+                "write completion {} reports {} bytes, expected {BLOCK_SIZE}",
+                response.request_id,
+                response.bytes
+            ));
+        }
+        Ok(DirectWriteCompletion {
+            request_id: response.request_id,
+            server_total_ns: response.server_total_ns,
+            submit_queue_ns: response.submit_queue_ns,
+            engine_submit_ns: response.engine_submit_ns,
+            durable_wait_ns: response.durable_wait_ns,
+            completion_dispatch_ns: response.completion_dispatch_ns,
+        })
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let request_id = self.take_request_id()?;
+        self.write_request(
+            RequestHeader {
+                opcode: OP_CLOSE,
+                flags: 0,
+                payload_len: 0,
+                request_id,
+                offset: 0,
+                io_len: 0,
+            },
+            &[],
+        )?;
+        let response = self.read_response()?;
+        self.validate_response(&response, OP_CLOSE, request_id)?;
+        self.reject_response_payload(&response)
+    }
+
+    fn take_request_id(&mut self) -> Result<u64> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("direct API request id exhausted"))?;
+        Ok(request_id)
+    }
+
+    fn write_request(&mut self, header: RequestHeader, payload: &[u8]) -> Result<()> {
+        if payload.len() != header.payload_len as usize {
+            return Err(anyhow!(
+                "request {} payload length mismatch: header={}, actual={}",
+                header.request_id,
+                header.payload_len,
+                payload.len()
+            ));
+        }
+        self.stream.write_all(&header.encode())?;
+        self.stream.write_all(payload)?;
+        Ok(())
+    }
+
+    fn read_response(&mut self) -> Result<ResponseHeader> {
+        let mut bytes = [0u8; RESPONSE_HEADER_LEN];
+        self.stream.read_exact(&mut bytes)?;
+        Ok(ResponseHeader::decode(&bytes)?)
+    }
+
+    fn validate_response(
+        &self,
+        response: &ResponseHeader,
+        expected_opcode: u16,
+        expected_request_id: u64,
+    ) -> Result<()> {
+        if response.opcode != expected_opcode {
+            return Err(anyhow!(
+                "response opcode mismatch for request {}: got {}, expected {}",
+                response.request_id,
+                response.opcode,
+                expected_opcode
+            ));
+        }
+        if response.request_id != expected_request_id {
+            return Err(anyhow!(
+                "response request id mismatch: got {}, expected {}",
+                response.request_id,
+                expected_request_id
+            ));
+        }
+        if response.status != 0 {
+            let errno = response.status.saturating_neg();
+            return Err(anyhow!(
+                "direct API request {} failed with status {} ({})",
+                response.request_id,
+                response.status,
+                std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_response_payload(&mut self, response: &ResponseHeader) -> Result<()> {
+        if response.payload_len == 0 {
+            return Ok(());
+        }
+        let mut payload = vec![0u8; response.payload_len as usize];
+        self.stream.read_exact(&mut payload)?;
+        Err(anyhow!(
+            "unexpected {}-byte payload in opcode {} response",
+            response.payload_len,
+            response.opcode
+        ))
+    }
+}
+
 struct DrainReport {
     pending_before: Option<u64>,
     physical_used_before_bytes: u64,
@@ -381,11 +644,16 @@ fn main() -> Result<()> {
     let mut cli = Cli::parse();
     validate_args(&cli)?;
 
-    if cli.reset {
+    if !cli.embedded {
+        validate_remote_args(&cli)?;
+    } else if cli.reset {
         remove_configured_paths(&cli.config, cli.reset_buffer, cli.reset_buffer_bytes)?;
     }
 
     let config = OnyxConfig::load(&cli.config)?;
+    if !cli.embedded {
+        return run_remote(&config, &cli);
+    }
     resolve_submit_topology(
         &mut cli,
         config.ublk.nr_queues as usize,
@@ -514,16 +782,52 @@ fn validate_args(cli: &Cli) -> Result<()> {
     if cli.min_bs % BLOCK_SIZE as u64 != 0 || cli.max_bs % BLOCK_SIZE as u64 != 0 {
         return Err(anyhow!("bs range must be aligned to {BLOCK_SIZE} bytes"));
     }
-    if cli.working_set == 0 || cli.working_set > cli.volume_size {
+    if cli.working_set == 0 || (cli.embedded && cli.working_set > cli.volume_size) {
         return Err(anyhow!("--working-set must be in 1..=volume-size"));
     }
-    if cli.working_set % BLOCK_SIZE as u64 != 0 || cli.volume_size % BLOCK_SIZE as u64 != 0 {
+    if cli.working_set % BLOCK_SIZE as u64 != 0
+        || (cli.embedded && cli.volume_size % BLOCK_SIZE as u64 != 0)
+    {
         return Err(anyhow!(
             "volume size and working set must be {BLOCK_SIZE}-byte aligned"
         ));
     }
     if cli.working_set < cli.max_bs {
         return Err(anyhow!("--working-set must be >= --max-bs"));
+    }
+    Ok(())
+}
+
+fn validate_remote_args(cli: &Cli) -> Result<()> {
+    if cli.reset || cli.reset_buffer || cli.prefill {
+        return Err(anyhow!(
+            "--reset, --reset-buffer, and --prefill require --embedded true"
+        ));
+    }
+    if cli.rwmixread != 0 {
+        return Err(anyhow!(
+            "remote mode currently supports randwrite only; use --rwmixread 0"
+        ));
+    }
+    if cli.min_bs != BLOCK_SIZE as u64 || cli.max_bs != BLOCK_SIZE as u64 {
+        return Err(anyhow!(
+            "remote mode currently supports 4K IO only; use --min-bs 4k --max-bs 4k"
+        ));
+    }
+    if cli.pattern != Pattern::FioDefault {
+        return Err(anyhow!(
+            "remote mode currently supports --pattern fio-default only"
+        ));
+    }
+    if cli.iodepth > MAX_DIRECT_IO_OUTSTANDING {
+        return Err(anyhow!(
+            "remote --iodepth must be <= {MAX_DIRECT_IO_OUTSTANDING}"
+        ));
+    }
+    if cli.submit_lanes != 0 || cli.submitters != 0 || !cli.submitter_cpus.trim().is_empty() {
+        return Err(anyhow!(
+            "--submit-lanes, --submitters, and --submitter-cpus require --embedded true"
+        ));
     }
     Ok(())
 }
@@ -614,7 +918,7 @@ fn reset_buffer_prefix(config: &OnyxConfig, bytes: u64) -> Result<()> {
 }
 
 fn prefill(volume: &onyx_storage::volume::OnyxVolume, cli: &Cli) -> Result<()> {
-    let mut rng = XorShift64::seed(0x1234_5678_9abc_def0);
+    let mut rng = XorShift64::seed(mix_optional_seed(PREFILL_RNG_SEED, cli.seed));
     let mut buf = vec![0u8; cli.max_bs as usize];
     let mut offset = 0u64;
     while offset < cli.working_set {
@@ -689,6 +993,627 @@ fn pin_current_thread_to(cpus: &[usize]) -> std::io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn pin_current_thread_to(_cpus: &[usize]) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn control_json(socket_path: &Path, command: &str) -> Result<serde_json::Value> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    writeln!(stream, "{command}")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut payload = String::new();
+    let mut line = String::new();
+    let mut saw_ok = false;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim_end();
+        if trimmed == "ok" || trimmed.starts_with("ok ") {
+            saw_ok = true;
+            break;
+        }
+        if let Some(error) = trimmed.strip_prefix("error:") {
+            return Err(anyhow!(error.trim().to_string()));
+        }
+        payload.push_str(trimmed);
+        if payload.len() > 8 * 1024 * 1024 {
+            return Err(anyhow!("control response exceeds 8 MiB"));
+        }
+    }
+    if !saw_ok {
+        return Err(anyhow!("control command '{command}' ended without ok"));
+    }
+    serde_json::from_str(&payload)
+        .with_context(|| format!("invalid JSON response to control command '{command}'"))
+}
+
+fn remote_engine_metrics(control_socket_path: &Path) -> Result<EngineMetricsSnapshot> {
+    serde_json::from_value(control_json(control_socket_path, "metrics-json")?)
+        .context("metrics-json response does not match EngineMetricsSnapshot")
+}
+
+fn remote_volume_info(control_socket_path: &Path, volume: &str) -> Result<RemoteVolumeInfo> {
+    let volumes = control_json(control_socket_path, "volumes-json")?;
+    let volume = volumes
+        .as_array()
+        .and_then(|volumes| {
+            volumes.iter().find(|candidate| {
+                candidate.get("id").and_then(serde_json::Value::as_str) == Some(volume)
+            })
+        })
+        .ok_or_else(|| anyhow!("volume '{volume}' is not present in the running daemon"))?;
+    let size_bytes = volume
+        .get("size_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("volumes-json omitted size_bytes for benchmark volume"))?;
+    Ok(RemoteVolumeInfo {
+        size_bytes,
+        compression: volume
+            .get("compression")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn remote_status_point(control_socket_path: &Path) -> Result<RemoteStatusPoint> {
+    let payload = control_json(control_socket_path, "status-json")?;
+    let status = payload
+        .get("status")
+        .filter(|status| !status.is_null())
+        .ok_or_else(|| anyhow!("status-json omitted active engine status"))?;
+    let pending_entries = status
+        .get("buffer_pending_entries")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("status-json omitted buffer_pending_entries"))?;
+    let shards = status
+        .get("buffer_shards")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("status-json omitted buffer_shards"))?;
+    let physical_used_bytes = shards.iter().try_fold(0u64, |total, shard| {
+        let used = shard
+            .get("used_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("status-json buffer shard omitted used_bytes"))?;
+        Ok::<_, anyhow::Error>(total.saturating_add(used))
+    })?;
+    let physical_fill_pct = status
+        .get("buffer_physical_fill_pct")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok());
+    Ok(RemoteStatusPoint {
+        pending_entries,
+        physical_used_bytes,
+        physical_fill_pct,
+    })
+}
+
+fn wait_for_remote_drain(
+    control_socket_path: &Path,
+    baseline: RemoteStatusPoint,
+    after_timed: RemoteStatusPoint,
+    timeout: Duration,
+) -> Result<DrainReport> {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut after_pending = after_timed;
+    while after_pending.pending_entries != 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+        after_pending = remote_status_point(control_socket_path)?;
+    }
+    let pending_drain_elapsed = started.elapsed();
+    let pending_drained = after_pending.pending_entries == 0;
+
+    let mut after_physical = after_pending;
+    while after_physical.physical_used_bytes != 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+        after_physical = remote_status_point(control_socket_path)?;
+    }
+    let physical_drain_elapsed = started.elapsed();
+    let physical_drained = after_physical.physical_used_bytes == 0;
+
+    Ok(DrainReport {
+        pending_before: Some(baseline.pending_entries),
+        physical_used_before_bytes: baseline.physical_used_bytes,
+        physical_fill_before_pct: baseline.physical_fill_pct,
+        pending_after_timed: Some(after_timed.pending_entries),
+        physical_used_after_timed_bytes: after_timed.physical_used_bytes,
+        physical_fill_after_timed_pct: after_timed.physical_fill_pct,
+        pending_after_pending_drain: Some(after_pending.pending_entries),
+        physical_used_after_pending_drain_bytes: after_pending.physical_used_bytes,
+        physical_fill_after_pending_drain_pct: after_pending.physical_fill_pct,
+        pending_after_physical_drain: Some(after_physical.pending_entries),
+        physical_used_after_physical_drain_bytes: after_physical.physical_used_bytes,
+        physical_fill_after_physical_drain_pct: after_physical.physical_fill_pct,
+        pending_drained,
+        physical_drained,
+        pending_drain_elapsed,
+        physical_drain_elapsed,
+    })
+}
+
+fn run_remote(config: &OnyxConfig, cli: &Cli) -> Result<()> {
+    let socket_path = onyx_storage::direct_io::direct_io_socket_path(&config.service.socket_path);
+    let volume_info = remote_volume_info(&config.service.socket_path, &cli.volume)?;
+    if cli.working_set > volume_info.size_bytes {
+        return Err(anyhow!(
+            "--working-set {} exceeds running volume '{}' size {}",
+            human_bytes(cli.working_set),
+            cli.volume,
+            human_bytes(volume_info.size_bytes)
+        ));
+    }
+    let run = run_remote_mixed(&socket_path, &config.service.socket_path, cli)?;
+    validate_remote_sample_cardinality(&run.samples, run.stats.write_ops)?;
+    let metrics_after_timed = remote_engine_metrics(&config.service.socket_path)?;
+    let metrics = metrics_after_timed.saturating_sub(&run.baseline_metrics);
+    let status_after_timed = remote_status_point(&config.service.socket_path)?;
+    let drain = wait_for_remote_drain(
+        &config.service.socket_path,
+        run.baseline_status,
+        status_after_timed,
+        Duration::from_secs(cli.drain_timeout_secs),
+    )?;
+    print_remote_report(
+        cli,
+        &socket_path,
+        &volume_info,
+        config.ublk.nr_queues as usize,
+        run,
+        &drain,
+        &metrics,
+    )?;
+    Ok(())
+}
+
+fn run_remote_mixed(
+    socket_path: &Path,
+    control_socket_path: &Path,
+    cli: &Cli,
+) -> Result<RemoteTimedRun> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let control = Arc::new(BenchControl::new());
+    let samples = Arc::new(Mutex::new(RemoteLatencySamples::default()));
+    let server_workers_per_lane = Arc::new(Mutex::new(None::<u32>));
+    let job_cpus = Arc::new(parse_cpu_list(&cli.job_cpus));
+    if !cli.job_cpus.trim().is_empty() && job_cpus.is_empty() {
+        return Err(anyhow!("--job-cpus did not contain any valid CPU"));
+    }
+    if !job_cpus.is_empty() {
+        eprintln!(
+            "pinning {} remote API job threads to CPUs {:?}",
+            cli.jobs, job_cpus
+        );
+    }
+
+    let mut handles = Vec::with_capacity(cli.jobs);
+    for job in 0..cli.jobs {
+        let socket_path = socket_path.to_path_buf();
+        let volume = cli.volume.clone();
+        let worker_stop = stop.clone();
+        let worker_control = control.clone();
+        let merged_samples = samples.clone();
+        let observed_server_workers = server_workers_per_lane.clone();
+        let job_cpus = job_cpus.clone();
+        let iodepth = cli.iodepth;
+        let working_set = cli.working_set;
+        let ramp_secs = cli.ramp_secs;
+        let seed = cli.seed;
+        let spawn_result = thread::Builder::new()
+            .name(format!("engine-api-bench-{job}"))
+            .spawn(move || -> Result<BenchStats> {
+                let result = run_remote_job(
+                    job,
+                    &socket_path,
+                    &volume,
+                    iodepth,
+                    working_set,
+                    ramp_secs,
+                    seed,
+                    &worker_stop,
+                    &worker_control,
+                    &job_cpus,
+                    &merged_samples,
+                    &observed_server_workers,
+                );
+                if let Err(error) = &result {
+                    worker_control.record_error(error);
+                    worker_stop.store(true, Ordering::Relaxed);
+                }
+                result
+            });
+        match spawn_result {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                let mut state = control.state.lock().unwrap();
+                state.phase = BenchPhase::Stop;
+                control.changed.notify_all();
+                drop(state);
+                for handle in handles {
+                    let _ = handle.join();
+                }
+                return Err(error.into());
+            }
+        }
+    }
+
+    {
+        let mut state = control.state.lock().unwrap();
+        while state.ready < cli.jobs && state.error.is_none() {
+            if handles.iter().any(|handle| handle.is_finished()) {
+                state.error = Some("remote API job exited during setup".to_string());
+                break;
+            }
+            let (next, _) = control
+                .changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap();
+            state = next;
+        }
+        if state.error.is_none() {
+            state.phase = BenchPhase::Ramp;
+            control.changed.notify_all();
+            while state.ramp_done < cli.jobs && state.error.is_none() {
+                if handles.iter().any(|handle| handle.is_finished()) {
+                    state.error = Some("remote API job exited during ramp".to_string());
+                    break;
+                }
+                let (next, _) = control
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(100))
+                    .unwrap();
+                state = next;
+            }
+        }
+        if let Some(error) = state.error.clone() {
+            stop.store(true, Ordering::Relaxed);
+            state.phase = BenchPhase::Stop;
+            control.changed.notify_all();
+            drop(state);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(anyhow!(error));
+        }
+    }
+
+    let baseline = remote_engine_metrics(control_socket_path).and_then(|metrics| {
+        remote_status_point(control_socket_path).map(|status| (metrics, status))
+    });
+    let (baseline_metrics, baseline_status) = match baseline {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            stop.store(true, Ordering::Relaxed);
+            let mut state = control.state.lock().unwrap();
+            state.phase = BenchPhase::Stop;
+            control.changed.notify_all();
+            drop(state);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(error.context("failed to capture remote timed-window baseline"));
+        }
+    };
+
+    let measured_started = Instant::now();
+    {
+        let mut state = control.state.lock().unwrap();
+        state.phase = BenchPhase::Measure;
+        control.changed.notify_all();
+    }
+    let deadline = measured_started + Duration::from_secs(cli.runtime_secs);
+    let mut state = control.state.lock().unwrap();
+    while state.error.is_none() && Instant::now() < deadline {
+        if handles.iter().any(|handle| handle.is_finished()) {
+            state.error = Some("remote API job exited during measurement".to_string());
+            break;
+        }
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        let (next, _) = control.changed.wait_timeout(state, timeout).unwrap();
+        state = next;
+    }
+    let worker_error = state.error.clone();
+    drop(state);
+    let measured_elapsed = measured_started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+
+    let mut stats = BenchStats::default();
+    let mut join_error = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(worker_stats)) => stats.add(worker_stats),
+            Ok(Err(error)) => {
+                if join_error.is_none() {
+                    join_error = Some(error);
+                }
+            }
+            Err(_) => {
+                if join_error.is_none() {
+                    join_error = Some(anyhow!("remote API job panicked"));
+                }
+            }
+        }
+    }
+    let completion_closure = measured_started.elapsed().saturating_sub(measured_elapsed);
+    let worker_error = control.state.lock().unwrap().error.clone().or(worker_error);
+    if let Some(error) = worker_error {
+        return Err(anyhow!(error));
+    }
+    if let Some(error) = join_error {
+        return Err(error);
+    }
+    let samples = Arc::try_unwrap(samples)
+        .map_err(|_| anyhow!("remote latency samples still shared"))?
+        .into_inner()
+        .unwrap();
+    let server_workers_per_lane = server_workers_per_lane
+        .lock()
+        .unwrap()
+        .ok_or_else(|| anyhow!("remote jobs did not report server submit topology"))?;
+    Ok(RemoteTimedRun {
+        stats,
+        samples,
+        elapsed: measured_elapsed,
+        completion_closure,
+        baseline_metrics,
+        baseline_status,
+        server_workers_per_lane,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_remote_job(
+    job: usize,
+    socket_path: &Path,
+    volume: &str,
+    iodepth: usize,
+    working_set: u64,
+    ramp_secs: u64,
+    seed: Option<u64>,
+    stop: &AtomicBool,
+    control: &BenchControl,
+    job_cpus: &[usize],
+    merged_samples: &Mutex<RemoteLatencySamples>,
+    observed_server_workers: &Mutex<Option<u32>>,
+) -> Result<BenchStats> {
+    if let Err(error) = pin_current_thread_to(job_cpus) {
+        eprintln!("warn: failed to pin remote API job {job} to {job_cpus:?}: {error}");
+    }
+    let mut client = DirectApiClient::connect(socket_path, volume)
+        .with_context(|| format!("job {job} failed to connect to {}", socket_path.display()))?;
+    {
+        let mut observed = observed_server_workers.lock().unwrap();
+        match *observed {
+            Some(workers) if workers != client.server_workers_per_lane => {
+                return Err(anyhow!(
+                    "job {job} observed {workers} and {} server workers per lane",
+                    client.server_workers_per_lane
+                ));
+            }
+            None => *observed = Some(client.server_workers_per_lane),
+            _ => {}
+        }
+    }
+    let mut rng = XorShift64::seed(job_rng_seed(job, seed));
+    let mut free_buffers = (0..iodepth)
+        .map(|_| {
+            let mut buffer = vec![0u8; BLOCK_SIZE as usize];
+            fill_random_buffer(&mut buffer, &mut rng);
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let mut outstanding = HashMap::<u64, RemotePendingWrite>::with_capacity(iodepth);
+    let mut local_samples = RemoteLatencySamples::default();
+    let mut stats = BenchStats::default();
+    let mut issued_writes = 0u64;
+
+    {
+        let mut state = control.state.lock().unwrap();
+        state.ready += 1;
+        control.changed.notify_all();
+        while state.phase == BenchPhase::Setup {
+            state = control.changed.wait(state).unwrap();
+        }
+        if state.phase == BenchPhase::Stop {
+            client.close()?;
+            return Ok(stats);
+        }
+    }
+
+    let ramp_deadline = Instant::now() + Duration::from_secs(ramp_secs);
+    while Instant::now() < ramp_deadline && !stop.load(Ordering::Relaxed) {
+        while outstanding.len() < iodepth
+            && Instant::now() < ramp_deadline
+            && !stop.load(Ordering::Relaxed)
+        {
+            issue_remote_write(
+                &mut client,
+                job,
+                working_set,
+                false,
+                &mut rng,
+                &mut issued_writes,
+                &mut free_buffers,
+                &mut outstanding,
+            )?;
+        }
+        if !outstanding.is_empty() {
+            complete_remote_write(
+                &mut client,
+                &mut free_buffers,
+                &mut outstanding,
+                &mut local_samples,
+                &mut stats,
+            )?;
+        }
+    }
+    drain_remote_writes(
+        &mut client,
+        &mut free_buffers,
+        &mut outstanding,
+        &mut local_samples,
+        &mut stats,
+    )?;
+
+    {
+        let mut state = control.state.lock().unwrap();
+        state.ramp_done += 1;
+        control.changed.notify_all();
+        while state.phase == BenchPhase::Ramp {
+            state = control.changed.wait(state).unwrap();
+        }
+        if state.phase == BenchPhase::Stop {
+            client.close()?;
+            return Ok(stats);
+        }
+    }
+
+    while !stop.load(Ordering::Relaxed) {
+        while outstanding.len() < iodepth && !stop.load(Ordering::Relaxed) {
+            issue_remote_write(
+                &mut client,
+                job,
+                working_set,
+                true,
+                &mut rng,
+                &mut issued_writes,
+                &mut free_buffers,
+                &mut outstanding,
+            )?;
+        }
+        if !outstanding.is_empty() {
+            complete_remote_write(
+                &mut client,
+                &mut free_buffers,
+                &mut outstanding,
+                &mut local_samples,
+                &mut stats,
+            )?;
+        }
+    }
+    drain_remote_writes(
+        &mut client,
+        &mut free_buffers,
+        &mut outstanding,
+        &mut local_samples,
+        &mut stats,
+    )?;
+    if free_buffers.len() != iodepth {
+        return Err(anyhow!(
+            "job {job} remote drain invariant failed: buffers={}/{}",
+            free_buffers.len(),
+            iodepth
+        ));
+    }
+    client.close()?;
+    merged_samples.lock().unwrap().merge(local_samples);
+    Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue_remote_write(
+    client: &mut DirectApiClient,
+    job: usize,
+    working_set: u64,
+    measured: bool,
+    rng: &mut XorShift64,
+    issued_writes: &mut u64,
+    free_buffers: &mut Vec<Vec<u8>>,
+    outstanding: &mut HashMap<u64, RemotePendingWrite>,
+) -> Result<()> {
+    let block_count = working_set / BLOCK_SIZE as u64;
+    let offset = (rng.next_u64() % block_count) * BLOCK_SIZE as u64;
+    let mut buffer = free_buffers
+        .pop()
+        .ok_or_else(|| anyhow!("remote QD buffer pool exhausted"))?;
+    fill_buffer(Pattern::FioDefault, &mut buffer, rng, job, *issued_writes);
+    *issued_writes = issued_writes.saturating_add(1);
+    let started = Instant::now();
+    let request_id = client.submit_write(offset, &buffer)?;
+    if outstanding
+        .insert(
+            request_id,
+            RemotePendingWrite {
+                buffer,
+                started,
+                measured,
+            },
+        )
+        .is_some()
+    {
+        return Err(anyhow!("duplicate remote request id {request_id}"));
+    }
+    Ok(())
+}
+
+fn complete_remote_write(
+    client: &mut DirectApiClient,
+    free_buffers: &mut Vec<Vec<u8>>,
+    outstanding: &mut HashMap<u64, RemotePendingWrite>,
+    samples: &mut RemoteLatencySamples,
+    stats: &mut BenchStats,
+) -> Result<()> {
+    let completion = client.recv_write_completion()?;
+    let pending = outstanding.remove(&completion.request_id).ok_or_else(|| {
+        anyhow!(
+            "completion references unknown request {}",
+            completion.request_id
+        )
+    })?;
+    let completed_at = Instant::now();
+    free_buffers.push(pending.buffer);
+    if pending.measured {
+        let api_total_ns = completed_at
+            .saturating_duration_since(pending.started)
+            .as_nanos() as u64;
+        samples.client_api_total_ns.push(api_total_ns);
+        samples
+            .client_transport_ns
+            .push(api_total_ns.saturating_sub(completion.server_total_ns));
+        samples.server_total_ns.push(completion.server_total_ns);
+        samples
+            .server_submit_queue_ns
+            .push(completion.submit_queue_ns);
+        samples
+            .server_engine_submit_ns
+            .push(completion.engine_submit_ns);
+        samples
+            .server_durable_wait_ns
+            .push(completion.durable_wait_ns);
+        samples
+            .server_completion_dispatch_ns
+            .push(completion.completion_dispatch_ns);
+        samples.server_other_ns.push(
+            completion
+                .server_total_ns
+                .saturating_sub(completion.submit_queue_ns)
+                .saturating_sub(completion.engine_submit_ns)
+                .saturating_sub(completion.durable_wait_ns)
+                .saturating_sub(completion.completion_dispatch_ns),
+        );
+        stats.write_ops += 1;
+        stats.write_bytes += BLOCK_SIZE as u64;
+    }
+    Ok(())
+}
+
+fn drain_remote_writes(
+    client: &mut DirectApiClient,
+    free_buffers: &mut Vec<Vec<u8>>,
+    outstanding: &mut HashMap<u64, RemotePendingWrite>,
+    samples: &mut RemoteLatencySamples,
+    stats: &mut BenchStats,
+) -> Result<()> {
+    while !outstanding.is_empty() {
+        complete_remote_write(client, free_buffers, outstanding, samples, stats)?;
+    }
     Ok(())
 }
 
@@ -929,13 +1854,14 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
         let min_blocks = cli.min_bs / BLOCK_SIZE as u64;
         let max_blocks = cli.max_bs / BLOCK_SIZE as u64;
         let max_start_lba = (cli.working_set / BLOCK_SIZE as u64).saturating_sub(max_blocks);
+        let seed = cli.seed;
         let spawn_result = thread::Builder::new()
             .name(format!("engine-bench-{job}"))
             .spawn(move || -> Result<BenchStats> {
                 if let Err(err) = pin_current_thread_to(&job_cpus) {
                     eprintln!("warn: failed to pin bench job {job} to {job_cpus:?}: {err}");
                 }
-                let mut rng = XorShift64::seed(0x9e37_79b9_7f4a_7c15 ^ job as u64);
+                let mut rng = XorShift64::seed(job_rng_seed(job, seed));
                 let mut read_buf = vec![0u8; (max_blocks * BLOCK_SIZE as u64) as usize];
                 let mut local_samples = LatencySamples::default();
                 let mut stats = BenchStats::default();
@@ -1560,6 +2486,152 @@ fn status_physical_used_bytes(status: &EngineStatusSnapshot) -> u64 {
         .sum()
 }
 
+fn validate_remote_sample_cardinality(
+    samples: &RemoteLatencySamples,
+    write_ops: u64,
+) -> Result<()> {
+    let expected = samples.client_api_total_ns.len();
+    let counts = [
+        ("stats", write_ops as usize),
+        ("client_transport", samples.client_transport_ns.len()),
+        ("server_total", samples.server_total_ns.len()),
+        ("server_submit_queue", samples.server_submit_queue_ns.len()),
+        (
+            "server_engine_submit",
+            samples.server_engine_submit_ns.len(),
+        ),
+        ("server_durable_wait", samples.server_durable_wait_ns.len()),
+        (
+            "server_completion_dispatch",
+            samples.server_completion_dispatch_ns.len(),
+        ),
+        ("server_other", samples.server_other_ns.len()),
+    ];
+    if let Some((name, actual)) = counts.into_iter().find(|(_, count)| *count != expected) {
+        return Err(anyhow!(
+            "remote latency sample mismatch: client_api_total={expected}, {name}={actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn print_remote_report(
+    cli: &Cli,
+    socket_path: &Path,
+    volume_info: &RemoteVolumeInfo,
+    configured_submit_lanes: usize,
+    mut run: RemoteTimedRun,
+    drain: &DrainReport,
+    metrics: &EngineMetricsSnapshot,
+) -> Result<()> {
+    run.samples.client_api_total_ns.sort_unstable();
+    run.samples.client_transport_ns.sort_unstable();
+    run.samples.server_total_ns.sort_unstable();
+    run.samples.server_submit_queue_ns.sort_unstable();
+    run.samples.server_engine_submit_ns.sort_unstable();
+    run.samples.server_durable_wait_ns.sort_unstable();
+    run.samples.server_completion_dispatch_ns.sort_unstable();
+    run.samples.server_other_ns.sort_unstable();
+
+    let secs = run.elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    let write_iops = run.stats.write_ops as f64 / secs;
+    let throughput_mib_s = run.stats.write_bytes as f64 / 1024.0 / 1024.0 / secs;
+    let api_total = remote_latency_json(&run.samples.client_api_total_ns);
+    let report = serde_json::json!({
+        "kind": "onyx-engine-bench",
+        "mode": "remote-api",
+        "embedded": false,
+        "socket_path": socket_path.display().to_string(),
+        "protocol_request_header_bytes": REQUEST_HEADER_LEN,
+        "protocol_response_header_bytes": RESPONSE_HEADER_LEN,
+        "volume": cli.volume,
+        "volume_size_bytes": volume_info.size_bytes,
+        "volume_compression": volume_info.compression,
+        "runtime_secs": run.elapsed.as_secs_f64(),
+        "completion_closure_secs": run.completion_closure.as_secs_f64(),
+        "requested_runtime_secs": cli.runtime_secs,
+        "ramp_secs": cli.ramp_secs,
+        "jobs": cli.jobs,
+        "configured_server_submit_lanes": configured_submit_lanes,
+        "server_workers_per_lane": run.server_workers_per_lane,
+        "configured_server_submit_workers": configured_submit_lanes.saturating_mul(run.server_workers_per_lane as usize),
+        "server_submit_workers_for_active_connections": cli.jobs.min(configured_submit_lanes).saturating_mul(run.server_workers_per_lane as usize),
+        "iodepth": cli.iodepth,
+        "inflight_target": cli.jobs.saturating_mul(cli.iodepth),
+        "rwmixread": cli.rwmixread,
+        "pattern": cli.pattern.as_str(),
+        "seed": cli.seed,
+        "block_size_bytes": BLOCK_SIZE,
+        "working_set_bytes": cli.working_set,
+        "read_iops": 0.0,
+        "write_iops": write_iops,
+        "total_iops": write_iops,
+        "throughput_mib_s": throughput_mib_s,
+        "write_ops": run.stats.write_ops,
+        "write_bytes": run.stats.write_bytes,
+        "write_latency_scope": "client_request_start_to_response_header",
+        "client_transport_scope": "client_send_plus_server_response_queue_and_socket_delivery",
+        "server_total_scope": "request_payload_received_to_durable_response_queued",
+        "server_submit_queue_scope": "server_lane_enqueue_to_submit_worker_start",
+        "server_engine_submit_scope": "write_aligned_deferred_call",
+        "server_durable_wait_scope": "ticket_return_to_actual_durable_watermark",
+        "server_completion_dispatch_scope": "durable_watermark_to_server_dispatcher_observation",
+        "write_p50_ns": percentile(&run.samples.client_api_total_ns, 50.0),
+        "write_p95_ns": percentile(&run.samples.client_api_total_ns, 95.0),
+        "write_p99_ns": percentile(&run.samples.client_api_total_ns, 99.0),
+        "write_p999_ns": percentile(&run.samples.client_api_total_ns, 99.9),
+        "client_api_total": api_total,
+        "client_transport": remote_latency_json(&run.samples.client_transport_ns),
+        "server_total": remote_latency_json(&run.samples.server_total_ns),
+        "server_submit_queue": remote_latency_json(&run.samples.server_submit_queue_ns),
+        "server_engine_submit": remote_latency_json(&run.samples.server_engine_submit_ns),
+        "server_durable_wait": remote_latency_json(&run.samples.server_durable_wait_ns),
+        "server_completion_dispatch": remote_latency_json(&run.samples.server_completion_dispatch_ns),
+        "server_other": remote_latency_json(&run.samples.server_other_ns),
+        "engine_metrics_delta": metrics,
+        "drain": {
+            "pending_before": drain.pending_before,
+            "physical_used_before_bytes": drain.physical_used_before_bytes,
+            "physical_fill_before_pct": drain.physical_fill_before_pct,
+            "pending_after_timed": drain.pending_after_timed,
+            "physical_used_after_timed_bytes": drain.physical_used_after_timed_bytes,
+            "physical_fill_after_timed_pct": drain.physical_fill_after_timed_pct,
+            "pending_drained": drain.pending_drained,
+            "pending_zero_secs": drain.pending_drained.then(|| drain.pending_drain_elapsed.as_secs_f64()),
+            "pending_after_pending_drain": drain.pending_after_pending_drain,
+            "physical_used_after_pending_drain_bytes": drain.physical_used_after_pending_drain_bytes,
+            "physical_fill_after_pending_drain_pct": drain.physical_fill_after_pending_drain_pct,
+            "physical_drained": drain.physical_drained,
+            "physical_zero_secs": drain.physical_drained.then(|| drain.physical_drain_elapsed.as_secs_f64()),
+            "pending_after_physical_drain": drain.pending_after_physical_drain,
+            "physical_used_after_physical_drain_bytes": drain.physical_used_after_physical_drain_bytes,
+            "physical_fill_after_physical_drain_pct": drain.physical_fill_after_physical_drain_pct,
+        },
+    });
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, &report)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn remote_latency_json(values: &[u64]) -> serde_json::Value {
+    let mean_ns = if values.is_empty() {
+        0.0
+    } else {
+        values.iter().map(|value| *value as u128).sum::<u128>() as f64 / values.len() as f64
+    };
+    serde_json::json!({
+        "samples": values.len(),
+        "mean_ns": mean_ns,
+        "p50_ns": percentile(values, 50.0),
+        "p95_ns": percentile(values, 95.0),
+        "p99_ns": percentile(values, 99.0),
+        "p999_ns": percentile(values, 99.9),
+        "max_ns": values.last().copied().unwrap_or(0),
+    })
+}
+
 fn print_report(
     cli: &Cli,
     stats: BenchStats,
@@ -1676,6 +2748,7 @@ fn print_report(
     );
     println!("  \"rwmixread\": {},", cli.rwmixread);
     println!("  \"pattern\": \"{}\",", cli.pattern.as_str());
+    println!("  \"seed\": {},", json_option_u64(cli.seed));
     println!("  \"working_set_bytes\": {},", cli.working_set);
     println!("  \"read_iops\": {:.3},", read_iops);
     println!("  \"write_iops\": {:.3},", write_iops);
@@ -2628,6 +3701,26 @@ struct XorShift64 {
     state: u64,
 }
 
+const JOB_RNG_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+const PREFILL_RNG_SEED: u64 = 0x1234_5678_9abc_def0;
+
+fn job_rng_seed(job: usize, seed: Option<u64>) -> u64 {
+    mix_optional_seed(JOB_RNG_SEED ^ job as u64, seed)
+}
+
+fn mix_optional_seed(legacy_seed: u64, seed: Option<u64>) -> u64 {
+    let Some(seed) = seed else {
+        return legacy_seed;
+    };
+
+    // SplitMix64's finalizer gives nearby CLI seeds independent streams while
+    // keeping the legacy stream bit-for-bit unchanged when --seed is omitted.
+    let mut value = legacy_seed ^ seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 impl XorShift64 {
     fn seed(seed: u64) -> Self {
         Self { state: seed.max(1) }
@@ -2650,6 +3743,7 @@ mod tests {
     #[test]
     fn destructive_setup_is_opt_in() {
         let cli = Cli::try_parse_from(["onyx-engine-bench"]).unwrap();
+        assert!(!cli.embedded);
         assert!(!cli.reset);
         assert!(!cli.reset_buffer);
         assert!(!cli.prefill);
@@ -2657,7 +3751,198 @@ mod tests {
         assert_eq!(cli.submit_lanes, 0);
         assert_eq!(cli.iodepth, 64);
         assert_eq!(cli.ramp_secs, 5);
+        assert_eq!(cli.rwmixread, 0);
+        assert_eq!(cli.min_bs, BLOCK_SIZE as u64);
+        assert_eq!(cli.max_bs, BLOCK_SIZE as u64);
         assert_eq!(cli.pattern.as_str(), "fio-default");
+        assert_eq!(cli.seed, None);
+        validate_remote_args(&cli).unwrap();
+    }
+
+    #[test]
+    fn explicit_seed_is_validated_and_mixed_deterministically() {
+        let cli = Cli::try_parse_from(["onyx-engine-bench", "--seed", "42"]).unwrap();
+        assert_eq!(cli.seed, Some(42));
+        validate_args(&cli).unwrap();
+        validate_remote_args(&cli).unwrap();
+
+        let max =
+            Cli::try_parse_from(["onyx-engine-bench", "--seed", "18446744073709551615"]).unwrap();
+        assert_eq!(max.seed, Some(u64::MAX));
+        assert!(
+            Cli::try_parse_from(["onyx-engine-bench", "--seed", "18446744073709551616",]).is_err()
+        );
+
+        assert_eq!(job_rng_seed(7, None), JOB_RNG_SEED ^ 7);
+        assert_eq!(mix_optional_seed(PREFILL_RNG_SEED, None), PREFILL_RNG_SEED);
+        assert_eq!(job_rng_seed(7, Some(42)), job_rng_seed(7, Some(42)));
+        assert_ne!(job_rng_seed(7, Some(42)), job_rng_seed(7, Some(43)));
+        assert_ne!(job_rng_seed(7, Some(42)), job_rng_seed(8, Some(42)));
+        assert_ne!(
+            mix_optional_seed(PREFILL_RNG_SEED, Some(42)),
+            mix_optional_seed(PREFILL_RNG_SEED, Some(43))
+        );
+    }
+
+    #[test]
+    fn remote_mode_accepts_only_the_supported_randwrite_shape() {
+        let cli = Cli::try_parse_from([
+            "onyx-engine-bench",
+            "--runtime-secs",
+            "90",
+            "--jobs",
+            "8",
+            "--iodepth",
+            "64",
+            "--rwmixread",
+            "0",
+            "--min-bs",
+            "4k",
+            "--max-bs",
+            "4k",
+            "--pattern",
+            "fio-default",
+        ])
+        .unwrap();
+        validate_args(&cli).unwrap();
+        validate_remote_args(&cli).unwrap();
+
+        let reset = Cli::try_parse_from([
+            "onyx-engine-bench",
+            "--rwmixread",
+            "0",
+            "--min-bs",
+            "4k",
+            "--max-bs",
+            "4k",
+            "--reset",
+            "true",
+        ])
+        .unwrap();
+        assert!(validate_remote_args(&reset)
+            .unwrap_err()
+            .to_string()
+            .contains("--embedded true"));
+    }
+
+    #[test]
+    fn control_json_consumes_line_protocol_terminator() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "metrics-json\n");
+            let mut stream = reader.into_inner();
+            stream.write_all(b"{\"counter\":7}\nok\n").unwrap();
+        });
+
+        let response = control_json(&socket_path, "metrics-json").unwrap();
+        assert_eq!(response["counter"], 7);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn direct_api_client_accepts_out_of_order_write_completions_then_closes() {
+        use std::os::unix::net::UnixListener;
+
+        fn read_request(stream: &mut UnixStream) -> (RequestHeader, Vec<u8>) {
+            let mut header_bytes = [0u8; REQUEST_HEADER_LEN];
+            stream.read_exact(&mut header_bytes).unwrap();
+            let header = RequestHeader::decode(&header_bytes).unwrap();
+            let mut payload = vec![0u8; header.payload_len as usize];
+            stream.read_exact(&mut payload).unwrap();
+            (header, payload)
+        }
+
+        fn send_response(stream: &mut UnixStream, header: ResponseHeader) {
+            stream.write_all(&header.encode()).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("direct-api.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (hello, volume) = read_request(&mut stream);
+            assert_eq!(hello.opcode, OP_HELLO);
+            assert_eq!(volume, b"fio-none");
+            send_response(
+                &mut stream,
+                ResponseHeader {
+                    opcode: OP_HELLO,
+                    status: 0,
+                    request_id: hello.request_id,
+                    bytes: 8,
+                    payload_len: 0,
+                    server_total_ns: 0,
+                    submit_queue_ns: 0,
+                    engine_submit_ns: 0,
+                    durable_wait_ns: 0,
+                    completion_dispatch_ns: 0,
+                },
+            );
+
+            let (first, first_payload) = read_request(&mut stream);
+            let (second, second_payload) = read_request(&mut stream);
+            assert_eq!(first.opcode, OP_WRITE);
+            assert_eq!(second.opcode, OP_WRITE);
+            assert_eq!(first_payload.len(), BLOCK_SIZE as usize);
+            assert_eq!(second_payload.len(), BLOCK_SIZE as usize);
+            for request in [second, first] {
+                send_response(
+                    &mut stream,
+                    ResponseHeader {
+                        opcode: OP_WRITE,
+                        status: 0,
+                        request_id: request.request_id,
+                        bytes: BLOCK_SIZE,
+                        payload_len: 0,
+                        server_total_ns: 32,
+                        submit_queue_ns: 2,
+                        engine_submit_ns: 10,
+                        durable_wait_ns: 15,
+                        completion_dispatch_ns: 5,
+                    },
+                );
+            }
+
+            let (close, payload) = read_request(&mut stream);
+            assert_eq!(close.opcode, OP_CLOSE);
+            assert!(payload.is_empty());
+            send_response(
+                &mut stream,
+                ResponseHeader {
+                    opcode: OP_CLOSE,
+                    status: 0,
+                    request_id: close.request_id,
+                    bytes: 0,
+                    payload_len: 0,
+                    server_total_ns: 0,
+                    submit_queue_ns: 0,
+                    engine_submit_ns: 0,
+                    durable_wait_ns: 0,
+                    completion_dispatch_ns: 0,
+                },
+            );
+        });
+
+        let mut client = DirectApiClient::connect(&socket_path, "fio-none").unwrap();
+        let first = client
+            .submit_write(0, &vec![0x11; BLOCK_SIZE as usize])
+            .unwrap();
+        let second = client
+            .submit_write(BLOCK_SIZE as u64, &vec![0x22; BLOCK_SIZE as usize])
+            .unwrap();
+        assert_eq!(client.recv_write_completion().unwrap().request_id, second);
+        assert_eq!(client.recv_write_completion().unwrap().request_id, first);
+        client.close().unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -2740,5 +4025,22 @@ mod tests {
 
         samples.completion_delivery_ns.clear();
         assert!(validate_write_sample_cardinality(&samples, 1).is_err());
+    }
+
+    #[test]
+    fn remote_latency_sample_cardinality_includes_dispatch_delay() {
+        let mut samples = RemoteLatencySamples::default();
+        samples.client_api_total_ns.push(1);
+        samples.client_transport_ns.push(1);
+        samples.server_total_ns.push(1);
+        samples.server_submit_queue_ns.push(1);
+        samples.server_engine_submit_ns.push(1);
+        samples.server_durable_wait_ns.push(1);
+        samples.server_completion_dispatch_ns.push(1);
+        samples.server_other_ns.push(1);
+        validate_remote_sample_cardinality(&samples, 1).unwrap();
+
+        samples.server_completion_dispatch_ns.clear();
+        assert!(validate_remote_sample_cardinality(&samples, 1).is_err());
     }
 }

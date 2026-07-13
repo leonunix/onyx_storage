@@ -891,6 +891,17 @@ impl BufferAppendTicket {
         self.shard.lv2_durability.synced_seq.load(Ordering::Acquire) >= self.seq
     }
 
+    /// Time from the LV2 watermark advance that made this append durable until
+    /// an asynchronous frontend observed it. `None` means the watermark has not
+    /// advanced yet (or the entry came from recovery without a live timestamp).
+    pub(crate) fn completion_dispatch_delay_ns(&self, observed_at: Instant) -> Option<u64> {
+        let advanced_at = self
+            .pending
+            .durability_advanced_at_ns
+            .load(Ordering::Acquire);
+        (advanced_at != 0).then(|| lv2_metric_timestamp_ns(observed_at).saturating_sub(advanced_at))
+    }
+
     pub(crate) fn arm_wakeup(&self, tx: &Sender<()>) -> bool {
         self.shard.lv2_durability.arm_channel(self.seq, tx)
     }

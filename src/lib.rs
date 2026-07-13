@@ -17,6 +17,7 @@ pub mod chunklet_pool;
 pub mod chunklet_watchdog;
 pub mod compress;
 pub mod dedup;
+pub mod direct_io;
 pub mod frontend;
 pub mod gc;
 pub mod io;

@@ -55,6 +55,27 @@ impl VolumeWriteTicket {
         self.tickets.iter().all(BufferAppendTicket::is_durable)
     }
 
+    /// Abandon frontend acknowledgement without waiting for durability.
+    ///
+    /// The LV2 append has already been accepted by the engine and is not
+    /// cancelled by this operation. The normal engine shutdown/recovery path
+    /// remains responsible for it; callers must report the write as failed or
+    /// indeterminate rather than successful.
+    pub(crate) fn abandon(self) {}
+
+    /// Delay between the last covered shard becoming durable and an async
+    /// frontend observing the completed volume write.
+    pub(crate) fn completion_dispatch_delay_ns(&self, observed_at: Instant) -> Option<u64> {
+        if self.tickets.is_empty() || !self.is_durable() {
+            return None;
+        }
+        let mut min_delay = u64::MAX;
+        for ticket in &self.tickets {
+            min_delay = min_delay.min(ticket.completion_dispatch_delay_ns(observed_at)?);
+        }
+        Some(min_delay)
+    }
+
     /// Register an edge-coalesced completion wakeup. The return value is true
     /// when all shard tickets are already durable; otherwise at least one
     /// future watermark advance will notify `tx`.
@@ -178,7 +199,10 @@ impl OnyxVolume {
         if len == 0 {
             return Ok(());
         }
-        if offset_bytes + len > self.size_bytes {
+        if offset_bytes
+            .checked_add(len)
+            .is_none_or(|end| end > self.size_bytes)
+        {
             return Err(OnyxError::OutOfBounds {
                 offset: offset_bytes,
                 len,
