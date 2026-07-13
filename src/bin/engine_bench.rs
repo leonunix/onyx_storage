@@ -60,7 +60,9 @@ struct Cli {
     #[arg(long, default_value = "32k", value_parser = parse_size)]
     max_bs: u64,
 
-    #[arg(long, value_enum, default_value_t = Pattern::Random)]
+    /// Payload behavior. `fio-default` matches fio without refill_buffers:
+    /// random initialization once, then a small per-submit scramble.
+    #[arg(long, value_enum, default_value_t = Pattern::FioDefault)]
     pattern: Pattern,
 
     #[arg(long, value_enum, default_value_t = CompressionChoice::Lz4)]
@@ -98,9 +100,21 @@ struct Cli {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 enum Pattern {
+    FioDefault,
     Zero,
     Repeat,
     Random,
+}
+
+impl Pattern {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FioDefault => "fio-default",
+            Self::Zero => "zero",
+            Self::Repeat => "repeat",
+            Self::Random => "random",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -697,6 +711,11 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                 let mut stats = BenchStats::default();
                 let mut issued_writes = 0u64;
                 let mut io = JobIoState::new(iodepth, (max_blocks * BLOCK_SIZE as u64) as usize);
+                if matches!(pattern, Pattern::FioDefault) {
+                    for buffer in &mut io.free_buffers {
+                        fill_random_buffer(buffer, &mut rng);
+                    }
+                }
                 let (result_tx, result_rx) = crossbeam_channel::bounded::<SubmitResult>(iodepth);
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
 
@@ -1308,6 +1327,7 @@ fn print_report(
         cli.jobs.saturating_mul(cli.iodepth)
     );
     println!("  \"rwmixread\": {},", cli.rwmixread);
+    println!("  \"pattern\": \"{}\",", cli.pattern.as_str());
     println!("  \"working_set_bytes\": {},", cli.working_set);
     println!("  \"read_iops\": {:.3},", read_iops);
     println!("  \"write_iops\": {:.3},", write_iops);
@@ -2142,6 +2162,17 @@ fn read_pool_worker_stats(metrics: &EngineMetricsSnapshot) -> ReadPoolWorkerStat
 
 fn fill_buffer(pattern: Pattern, buf: &mut [u8], rng: &mut XorShift64, tid: usize, op_idx: u64) {
     match pattern {
+        Pattern::FioDefault => {
+            // fio initializes each IO buffer once, then scramble_buffers=true
+            // changes a small portion before every submit. This unique tuple
+            // defeats block dedup without paying for a full 4 KiB refill.
+            let op = op_idx.to_le_bytes();
+            let thread = (tid as u64).to_le_bytes();
+            let split = op.len().min(buf.len());
+            buf[..split].copy_from_slice(&op[..split]);
+            let tail = thread.len().min(buf.len().saturating_sub(split));
+            buf[split..split + tail].copy_from_slice(&thread[..tail]);
+        }
         Pattern::Zero => buf.fill(0),
         Pattern::Repeat => {
             let seed = ((tid as u64 * 131) ^ op_idx).to_le_bytes();
@@ -2150,13 +2181,15 @@ fn fill_buffer(pattern: Pattern, buf: &mut [u8], rng: &mut XorShift64, tid: usiz
                 chunk.copy_from_slice(&seed[..len]);
             }
         }
-        Pattern::Random => {
-            for chunk in buf.chunks_mut(8) {
-                let bytes = rng.next_u64().to_le_bytes();
-                let len = chunk.len();
-                chunk.copy_from_slice(&bytes[..len]);
-            }
-        }
+        Pattern::Random => fill_random_buffer(buf, rng),
+    }
+}
+
+fn fill_random_buffer(buf: &mut [u8], rng: &mut XorShift64) {
+    for chunk in buf.chunks_mut(8) {
+        let bytes = rng.next_u64().to_le_bytes();
+        let len = chunk.len();
+        chunk.copy_from_slice(&bytes[..len]);
     }
 }
 
@@ -2233,6 +2266,20 @@ mod tests {
         assert!(!cli.prefill);
         assert_eq!(cli.iodepth, 1);
         assert_eq!(cli.ramp_secs, 5);
+        assert_eq!(cli.pattern.as_str(), "fio-default");
+    }
+
+    #[test]
+    fn fio_default_scrambles_only_a_small_unique_prefix() {
+        let mut rng = XorShift64::seed(1);
+        let mut buffer = vec![0xA5; BLOCK_SIZE as usize];
+        fill_buffer(Pattern::FioDefault, &mut buffer, &mut rng, 7, 11);
+        let first = buffer.clone();
+        assert!(buffer[16..].iter().all(|byte| *byte == 0xA5));
+
+        fill_buffer(Pattern::FioDefault, &mut buffer, &mut rng, 7, 12);
+        assert_ne!(buffer, first);
+        assert!(buffer[16..].iter().all(|byte| *byte == 0xA5));
     }
 
     #[test]
