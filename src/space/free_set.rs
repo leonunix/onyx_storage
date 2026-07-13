@@ -236,6 +236,36 @@ impl FreeSet {
         best.map(|(start, count)| Extent::new(Pba(start), count))
     }
 
+    /// Lowest-address extent that can satisfy `min_count` but contributes no
+    /// whole-stripe capacity under the configured geometry. Small allocations
+    /// use this before ordinary first-fit so confetti is consumed ahead of the
+    /// scarce runs that can serve full-stripe writers.
+    ///
+    /// `by_eff` makes this bounded by the number of effective-size classes
+    /// below one stripe (512 on the box profile), not by the extent count.
+    pub(crate) fn first_fit_non_stripe(&self, min_count: u32) -> Option<Extent> {
+        let (stripe, _) = self.geom?;
+        if min_count == 0 || min_count >= stripe {
+            return None;
+        }
+
+        let mut best: Option<u64> = None;
+        let mut lower = Bound::Included((min_count, 0u64));
+        let upper = Bound::Excluded((stripe, 0u64));
+        while let Some(&(eff, start)) = self.by_eff.range((lower, upper)).next() {
+            if best.is_none_or(|best_start| start < best_start) {
+                best = Some(start);
+            }
+            lower = Bound::Excluded((eff, u64::MAX));
+        }
+        best.map(|start| {
+            *self
+                .by_addr
+                .get(&Extent::single(Pba(start)))
+                .expect("by_eff start must exist in by_addr")
+        })
+    }
+
     /// FIRST-FIT-BY-ADDRESS over the stripe-carve predicate: the
     /// lowest-address extent that can host an aligned `need`-block carve
     /// (`need` a multiple of `stripe`, alignment `(pba + phase) % stripe == 0`).
@@ -472,6 +502,26 @@ mod tests {
         assert_eq!(fs.first_fit(7), None, "no run big enough");
         assert_eq!(fs.first_fit(5), Some(Extent::new(Pba(20), 6)));
         assert_eq!(fs.first_fit(1), Some(Extent::new(Pba(10), 4)));
+    }
+
+    #[test]
+    fn non_stripe_fit_skips_capable_runs() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let mut fs = FreeSet::new();
+        fs.insert(Extent::new(Pba(10), 12)); // two aligned stripes
+        fs.insert(Extent::new(Pba(30), 5)); // effective count 1, no stripe
+        fs.insert(Extent::new(Pba(40), 4)); // effective count 2, no stripe
+        fs.set_geometry(STRIPE, PHASE);
+
+        assert_eq!(fs.first_fit(1), Some(Extent::new(Pba(10), 12)));
+        assert_eq!(
+            fs.first_fit_non_stripe(1),
+            Some(Extent::new(Pba(30), 5)),
+            "lowest non-stripe extent wins even when a capable run is lower"
+        );
+        assert_eq!(fs.first_fit_non_stripe(3), Some(Extent::new(Pba(40), 4)));
+        assert_eq!(fs.first_fit_non_stripe(STRIPE), None);
     }
 
     /// Maintained aggregates (blocks_total / stripe_capacity) must track every

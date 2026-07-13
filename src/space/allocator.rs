@@ -440,6 +440,45 @@ impl SpaceAllocator {
             return self.allocate_extent(count);
         }
 
+        let stripe_geometry = self.stripe_geometry().filter(|(stripe, _)| count < *stripe);
+
+        // Preserve scarce stripe-capable runs when confetti can satisfy this
+        // small allocation. This is preference-only: the ordinary cache/global
+        // paths below remain the availability fallback.
+        if let Some((stripe, phase)) = stripe_geometry {
+            {
+                let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+                if let Some(extent) =
+                    Self::take_non_stripe_from_extent_cache(&mut cache, count, stripe, phase)
+                {
+                    self.track_alloc(extent, "allocate_extent_for_lane_fragment_cache")?;
+                    self.allocated_blocks
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
+                    return Ok(extent);
+                }
+            }
+            if let Some(refill) = self
+                .take_non_stripe_extent_from_global_at_least(count, LANE_EXTENT_CACHE_REFILL_BLOCKS)
+            {
+                let result = Extent::new(refill.start, count);
+                self.track_alloc(result, "allocate_extent_for_lane_fragment_refill")?;
+                self.allocated_blocks
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
+                if refill.count > count {
+                    self.lane_extent_caches[lane]
+                        .lock()
+                        .unwrap()
+                        .push(Extent::new(
+                            Pba(refill.start.0 + count as u64),
+                            refill.count - count,
+                        ));
+                }
+                return Ok(result);
+            }
+        }
+
         {
             let mut cache = self.lane_extent_caches[lane].lock().unwrap();
             if let Some(extent) = Self::take_from_extent_cache(&mut cache, count) {
@@ -1817,8 +1856,46 @@ impl SpaceAllocator {
         Some(Extent::new(extent.start, take))
     }
 
+    fn take_non_stripe_extent_from_global_at_least(
+        &self,
+        count: u32,
+        max_count: u32,
+    ) -> Option<Extent> {
+        let mut free = self.free_extents.lock().unwrap();
+        let extent = free.first_fit_non_stripe(count)?;
+        free.remove(&extent);
+        let take = extent.count.min(max_count);
+        if extent.count > take {
+            free.insert(Extent::new(
+                Pba(extent.start.0 + take as u64),
+                extent.count - take,
+            ));
+        }
+        Some(Extent::new(extent.start, take))
+    }
+
     fn take_from_extent_cache(cache: &mut Vec<Extent>, count: u32) -> Option<Extent> {
         let idx = cache.iter().position(|extent| extent.count >= count)?;
+        let extent = cache[idx];
+        let result = Extent::new(extent.start, count);
+        if extent.count == count {
+            cache.swap_remove(idx);
+        } else {
+            cache[idx] = Extent::new(Pba(extent.start.0 + count as u64), extent.count - count);
+        }
+        Some(result)
+    }
+
+    fn take_non_stripe_from_extent_cache(
+        cache: &mut Vec<Extent>,
+        count: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<Extent> {
+        let idx = cache.iter().position(|extent| {
+            extent.count >= count
+                && Self::carve_aligned_from_run(*extent, stripe, stripe, phase).is_none()
+        })?;
         let extent = cache[idx];
         let result = Extent::new(extent.start, count);
         if extent.count == count {
@@ -2594,6 +2671,30 @@ mod stripe_align_tests {
         assert_eq!(SpaceAllocator::round_up_blocks(7, 6), 12);
         assert_eq!(SpaceAllocator::round_up_blocks(12, 6), 12);
         assert_eq!(SpaceAllocator::round_up_blocks(4, 1), 4);
+    }
+
+    #[test]
+    fn small_lane_allocations_preserve_stripe_capable_run_when_possible() {
+        let allocator = new_alloc_lanes(64, 1);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let usable = 64 - RESERVED_BLOCKS;
+        allocator.allocate_extent(usable as u32).unwrap();
+        allocator.free_extent(Extent::new(Pba(10), 12)).unwrap();
+        allocator.free_extent(Extent::new(Pba(30), 5)).unwrap();
+
+        for expected in 30..35 {
+            let extent = allocator.allocate_extent_for_lane(0, 1).unwrap();
+            assert_eq!(extent, Extent::single(Pba(expected)));
+        }
+        let stats = allocator.contiguity_stats();
+        assert_eq!(stats.stripe_capable_blocks, Some(12));
+
+        // Preference must not become an availability failure: once confetti is
+        // exhausted, ordinary first-fit is still allowed to consume the run.
+        assert_eq!(
+            allocator.allocate_extent_for_lane(0, 1).unwrap(),
+            Extent::single(Pba(10))
+        );
     }
 
     #[test]
