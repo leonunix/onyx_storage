@@ -43,6 +43,11 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     iodepth: usize,
 
+    /// Threads performing synchronous LV2 append preparation. Zero derives
+    /// the production topology from ublk.nr_queues * ublk.queue_workers.
+    #[arg(long, default_value_t = 0)]
+    submitters: usize,
+
     #[arg(long, default_value_t = 5)]
     ramp_secs: u64,
 
@@ -83,6 +88,11 @@ struct Cli {
     /// test never competes with the sync/commit threads for scheduling.
     #[arg(long, default_value = "")]
     job_cpus: String,
+
+    /// CPU set for append submitters. Use the same foreground set as the ublk
+    /// workers when comparing direct-engine results with fio.
+    #[arg(long, default_value = "")]
+    submitter_cpus: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -140,13 +150,50 @@ impl BenchStats {
 struct LatencySamples {
     read_ns: Vec<u64>,
     write_ns: Vec<u64>,
+    submit_queue_ns: Vec<u64>,
+    append_worker_ns: Vec<u64>,
+    post_submit_completion_ns: Vec<u64>,
 }
 
 struct PendingWrite {
     ticket: VolumeWriteTicket,
     started: Instant,
+    submitted: Instant,
+    submit_queue_ns: u64,
+    append_worker_ns: u64,
     bytes: u64,
     measured: bool,
+}
+
+struct SubmitTask {
+    offset: u64,
+    len: usize,
+    buffer: Vec<u8>,
+    started: Instant,
+    measured: bool,
+    result_tx: Sender<SubmitResult>,
+    wake_tx: Sender<()>,
+}
+
+struct SubmitResult {
+    outcome: std::result::Result<PendingWrite, String>,
+    buffer: Vec<u8>,
+}
+
+struct JobIoState {
+    inflight: Vec<PendingWrite>,
+    free_buffers: Vec<Vec<u8>>,
+    outstanding: usize,
+}
+
+impl JobIoState {
+    fn new(iodepth: usize, max_len: usize) -> Self {
+        Self {
+            inflight: Vec::with_capacity(iodepth),
+            free_buffers: (0..iodepth).map(|_| vec![0u8; max_len]).collect(),
+            outstanding: 0,
+        }
+    }
 }
 
 struct TimedRun {
@@ -222,6 +269,10 @@ impl LatencySamples {
     fn merge(&mut self, mut other: Self) {
         self.read_ns.append(&mut other.read_ns);
         self.write_ns.append(&mut other.write_ns);
+        self.submit_queue_ns.append(&mut other.submit_queue_ns);
+        self.append_worker_ns.append(&mut other.append_worker_ns);
+        self.post_submit_completion_ns
+            .append(&mut other.post_submit_completion_ns);
     }
 }
 
@@ -233,19 +284,30 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     validate_args(&cli)?;
-    if cli.iodepth > 1 && cli.job_cpus.trim().is_empty() {
-        eprintln!(
-            "warn: --iodepth > 1 without --job-cpus may let load-generator completion threads compete with engine threads"
-        );
-    }
 
     if cli.reset {
         remove_configured_paths(&cli.config, cli.reset_buffer, cli.reset_buffer_bytes)?;
     }
 
     let config = OnyxConfig::load(&cli.config)?;
+    if cli.submitters == 0 {
+        cli.submitters = config.ublk.nr_queues as usize * config.ublk.queue_workers.max(1);
+    }
+    if cli.submitters == 0 {
+        return Err(anyhow!("--submitters must be > 0"));
+    }
+    if cli.iodepth > 1 && cli.job_cpus.trim().is_empty() {
+        eprintln!(
+            "warn: --iodepth > 1 without --job-cpus may let load-generator completion threads compete with engine threads"
+        );
+    }
+    if cli.submitter_cpus.trim().is_empty() {
+        eprintln!(
+            "warn: append submitters have no explicit --submitter-cpus; NUMA confinement may place them with background engine work"
+        );
+    }
     let engine = OnyxEngine::open(&config)?;
     if cli.reset {
         let _ = engine.delete_volume(&cli.volume);
@@ -259,7 +321,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to open volume '{}'", cli.volume))?;
 
     if cli.prefill {
-        println!(
+        eprintln!(
             "prefill: {} over working_set={} bs={}",
             cli.volume,
             human_bytes(cli.working_set),
@@ -505,25 +567,117 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     let stop = Arc::new(AtomicBool::new(false));
     let control = Arc::new(BenchControl::new());
     let samples = Arc::new(Mutex::new(LatencySamples::default()));
-    let mut handles = Vec::with_capacity(cli.jobs);
-    let mut volumes = Vec::with_capacity(cli.jobs);
-    for _ in 0..cli.jobs {
-        volumes.push(engine.open_volume(&cli.volume)?);
-    }
-
     let job_cpus = Arc::new(parse_cpu_list(&cli.job_cpus));
+    let submitter_cpus = Arc::new(parse_cpu_list(&cli.submitter_cpus));
+    if !cli.job_cpus.trim().is_empty() && job_cpus.is_empty() {
+        return Err(anyhow!("--job-cpus did not contain any valid CPU"));
+    }
+    if !cli.submitter_cpus.trim().is_empty() && submitter_cpus.is_empty() {
+        return Err(anyhow!("--submitter-cpus did not contain any valid CPU"));
+    }
     if !job_cpus.is_empty() {
         eprintln!(
             "pinning {} bench job threads to CPUs {:?}",
             cli.jobs, job_cpus
         );
     }
+    if !submitter_cpus.is_empty() {
+        eprintln!(
+            "pinning {} append submitters to CPUs {:?}",
+            cli.submitters, submitter_cpus
+        );
+    }
 
-    for (job, volume) in volumes.into_iter().enumerate() {
+    let queue_capacity = cli.jobs.saturating_mul(cli.iodepth).max(cli.submitters);
+    let (submit_tx, submit_rx) = crossbeam_channel::bounded::<SubmitTask>(queue_capacity);
+    let mut submitter_volumes = Vec::with_capacity(cli.submitters);
+    for _ in 0..cli.submitters {
+        submitter_volumes.push(engine.open_volume(&cli.volume)?);
+    }
+    let mut submitter_handles = Vec::with_capacity(cli.submitters);
+    for (idx, volume) in submitter_volumes.into_iter().enumerate() {
+        let worker_submit_rx = submit_rx.clone();
+        let submitter_cpus = submitter_cpus.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!("engine-submit-{idx}"))
+            .spawn(move || {
+                if let Err(error) = pin_current_thread_to(&submitter_cpus) {
+                    eprintln!(
+                        "warn: failed to pin append submitter {idx} to {submitter_cpus:?}: {error}"
+                    );
+                }
+                while let Ok(task) = worker_submit_rx.recv() {
+                    let SubmitTask {
+                        offset,
+                        len,
+                        buffer,
+                        started,
+                        measured,
+                        result_tx,
+                        wake_tx,
+                    } = task;
+                    let append_started = Instant::now();
+                    let submit_queue_ns =
+                        append_started.saturating_duration_since(started).as_nanos() as u64;
+                    let append_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            volume.write_aligned_deferred(offset, &buffer[..len])
+                        }));
+                    let outcome = match append_result {
+                        Ok(Ok(ticket)) => {
+                            let submitted = Instant::now();
+                            ticket.arm_wakeup(&wake_tx);
+                            Ok(PendingWrite {
+                                ticket,
+                                started,
+                                submitted,
+                                submit_queue_ns,
+                                append_worker_ns: submitted
+                                    .saturating_duration_since(append_started)
+                                    .as_nanos()
+                                    as u64,
+                                bytes: len as u64,
+                                measured,
+                            })
+                        }
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err(format!(
+                            "append submitter {idx} panicked while processing IO"
+                        )),
+                    };
+                    if let Err(error) = result_tx.send(SubmitResult { outcome, buffer }) {
+                        if let Ok(pending) = error.0.outcome {
+                            pending.ticket.wait();
+                        }
+                    }
+                }
+            });
+        match spawn_result {
+            Ok(handle) => submitter_handles.push(handle),
+            Err(error) => {
+                drop(submit_tx);
+                drop(submit_rx);
+                for handle in submitter_handles {
+                    let _ = handle.join();
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    drop(submit_rx);
+
+    let mut job_volumes = Vec::with_capacity(cli.jobs);
+    for _ in 0..cli.jobs {
+        job_volumes.push(engine.open_volume(&cli.volume)?);
+    }
+    let mut handles = Vec::with_capacity(cli.jobs);
+
+    for (job, volume) in job_volumes.into_iter().enumerate() {
         let worker_stop = stop.clone();
         let worker_control = control.clone();
         let samples = samples.clone();
         let job_cpus = job_cpus.clone();
+        let job_submit_tx = submit_tx.clone();
         let pattern = cli.pattern;
         let rwmixread = cli.rwmixread;
         let iodepth = cli.iodepth;
@@ -538,12 +692,12 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                     eprintln!("warn: failed to pin bench job {job} to {job_cpus:?}: {err}");
                 }
                 let mut rng = XorShift64::seed(0x9e37_79b9_7f4a_7c15 ^ job as u64);
-                let mut write_buf = vec![0u8; (max_blocks * BLOCK_SIZE as u64) as usize];
                 let mut read_buf = vec![0u8; (max_blocks * BLOCK_SIZE as u64) as usize];
                 let mut local_samples = LatencySamples::default();
                 let mut stats = BenchStats::default();
                 let mut issued_writes = 0u64;
-                let mut inflight = Vec::<PendingWrite>::with_capacity(iodepth);
+                let mut io = JobIoState::new(iodepth, (max_blocks * BLOCK_SIZE as u64) as usize);
+                let (result_tx, result_rx) = crossbeam_channel::bounded::<SubmitResult>(iodepth);
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
 
                 {
@@ -563,6 +717,8 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                 while Instant::now() < ramp_deadline {
                     if let Err(error) = issue_one(
                         &volume,
+                        &job_submit_tx,
+                        &result_tx,
                         pattern,
                         rwmixread,
                         min_blocks,
@@ -572,20 +728,31 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                         job,
                         false,
                         &mut rng,
-                        &mut write_buf,
                         &mut read_buf,
-                        &mut inflight,
+                        &mut io,
                         &mut local_samples,
                         &mut stats,
                         &mut issued_writes,
+                        &worker_stop,
                         &wake_tx,
                         &wake_rx,
+                        &result_rx,
                     ) {
                         ramp_error = Some(error);
                         break;
                     }
                 }
-                drain_writes(&mut inflight, &mut local_samples, &mut stats, &wake_rx);
+                if let Err(error) = drain_writes(
+                    &mut io,
+                    &mut local_samples,
+                    &mut stats,
+                    &wake_rx,
+                    &result_rx,
+                ) {
+                    if ramp_error.is_none() {
+                        ramp_error = Some(error);
+                    }
+                }
 
                 {
                     let mut state = worker_control.state.lock().unwrap();
@@ -607,6 +774,8 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                 while !worker_stop.load(Ordering::Relaxed) {
                     if let Err(error) = issue_one(
                         &volume,
+                        &job_submit_tx,
+                        &result_tx,
                         pattern,
                         rwmixread,
                         min_blocks,
@@ -616,21 +785,30 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                         job,
                         true,
                         &mut rng,
-                        &mut write_buf,
                         &mut read_buf,
-                        &mut inflight,
+                        &mut io,
                         &mut local_samples,
                         &mut stats,
                         &mut issued_writes,
+                        &worker_stop,
                         &wake_tx,
                         &wake_rx,
+                        &result_rx,
                     ) {
                         worker_control.record_error(&error);
                         worker_stop.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
-                drain_writes(&mut inflight, &mut local_samples, &mut stats, &wake_rx);
+                if let Err(error) = drain_writes(
+                    &mut io,
+                    &mut local_samples,
+                    &mut stats,
+                    &wake_rx,
+                    &result_rx,
+                ) {
+                    worker_control.record_error(&error);
+                }
 
                 let mut merged = samples.lock().unwrap();
                 merged.merge(local_samples);
@@ -647,6 +825,10 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                 for handle in handles {
                     let _ = handle.join();
                 }
+                drop(submit_tx);
+                for handle in submitter_handles {
+                    let _ = handle.join();
+                }
                 return Err(error.into());
             }
         }
@@ -654,19 +836,41 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
 
     {
         let mut state = control.state.lock().unwrap();
-        while state.ready < cli.jobs {
-            state = control.changed.wait(state).unwrap();
+        while state.ready < cli.jobs && state.error.is_none() {
+            if handles.iter().any(|handle| handle.is_finished()) {
+                state.error = Some("bench job exited during setup".to_string());
+                break;
+            }
+            let (next, _) = control
+                .changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap();
+            state = next;
         }
-        state.phase = BenchPhase::Ramp;
-        control.changed.notify_all();
-        while state.ramp_done < cli.jobs {
-            state = control.changed.wait(state).unwrap();
+        if state.error.is_none() {
+            state.phase = BenchPhase::Ramp;
+            control.changed.notify_all();
+            while state.ramp_done < cli.jobs && state.error.is_none() {
+                if handles.iter().any(|handle| handle.is_finished()) {
+                    state.error = Some("bench job exited during ramp".to_string());
+                    break;
+                }
+                let (next, _) = control
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(100))
+                    .unwrap();
+                state = next;
+            }
         }
         if let Some(error) = state.error.clone() {
             state.phase = BenchPhase::Stop;
             control.changed.notify_all();
             drop(state);
             for handle in handles {
+                let _ = handle.join();
+            }
+            drop(submit_tx);
+            for handle in submitter_handles {
                 let _ = handle.join();
             }
             return Err(anyhow!(error));
@@ -683,6 +887,10 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
             for handle in handles {
                 let _ = handle.join();
             }
+            drop(submit_tx);
+            for handle in submitter_handles {
+                let _ = handle.join();
+            }
             return Err(error.into());
         }
     };
@@ -695,7 +903,13 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     let deadline = measured_started + Duration::from_secs(cli.runtime_secs);
     let mut state = control.state.lock().unwrap();
     while state.error.is_none() && Instant::now() < deadline {
-        let timeout = deadline.saturating_duration_since(Instant::now());
+        if handles.iter().any(|handle| handle.is_finished()) {
+            state.error = Some("bench job exited during measurement".to_string());
+            break;
+        }
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
         let (next, _) = control.changed.wait_timeout(state, timeout).unwrap();
         state = next;
     }
@@ -705,13 +919,35 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
     stop.store(true, Ordering::Relaxed);
 
     let mut stats = BenchStats::default();
+    let mut join_error = None;
     for handle in handles {
-        stats.add(handle.join().map_err(|_| anyhow!("worker panicked"))??);
+        match handle.join() {
+            Ok(Ok(worker_stats)) => stats.add(worker_stats),
+            Ok(Err(error)) => {
+                if join_error.is_none() {
+                    join_error = Some(error);
+                }
+            }
+            Err(_) => {
+                if join_error.is_none() {
+                    join_error = Some(anyhow!("worker panicked"));
+                }
+            }
+        }
+    }
+    drop(submit_tx);
+    for handle in submitter_handles {
+        if handle.join().is_err() && join_error.is_none() {
+            join_error = Some(anyhow!("append submitter panicked outside an IO task"));
+        }
     }
     let completion_closure = measured_started.elapsed().saturating_sub(measured_elapsed);
     let worker_error = control.state.lock().unwrap().error.clone().or(worker_error);
     if let Some(error) = worker_error {
         return Err(anyhow!(error));
+    }
+    if let Some(error) = join_error {
+        return Err(error);
     }
     let samples = Arc::try_unwrap(samples)
         .map_err(|_| anyhow!("latency samples still shared"))?
@@ -729,6 +965,8 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
 #[allow(clippy::too_many_arguments)]
 fn issue_one(
     volume: &onyx_storage::volume::OnyxVolume,
+    submit_tx: &Sender<SubmitTask>,
+    result_tx: &Sender<SubmitResult>,
     pattern: Pattern,
     rwmixread: u8,
     min_blocks: u64,
@@ -738,16 +976,23 @@ fn issue_one(
     job: usize,
     measured: bool,
     rng: &mut XorShift64,
-    write_buf: &mut [u8],
     read_buf: &mut [u8],
-    inflight: &mut Vec<PendingWrite>,
+    io: &mut JobIoState,
     samples: &mut LatencySamples,
     stats: &mut BenchStats,
     issued_writes: &mut u64,
+    stop: &AtomicBool,
     wake_tx: &Sender<()>,
     wake_rx: &Receiver<()>,
+    result_rx: &Receiver<SubmitResult>,
 ) -> Result<()> {
-    reap_ready_writes(inflight, samples, stats);
+    service_job_events(io, samples, stats, wake_rx, result_rx, false)?;
+    while io.outstanding >= iodepth || io.free_buffers.is_empty() {
+        service_job_events(io, samples, stats, wake_rx, result_rx, true)?;
+    }
+    if measured && stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let blocks = min_blocks + (rng.next_u64() % (max_blocks - min_blocks + 1));
     let len = (blocks * BLOCK_SIZE as u64) as usize;
     let start_lba = if max_start_lba == 0 {
@@ -765,45 +1010,46 @@ fn issue_one(
             stats.read_ops += 1;
             stats.read_bytes += len as u64;
         }
-        reap_ready_writes(inflight, samples, stats);
+        service_job_events(io, samples, stats, wake_rx, result_rx, false)?;
         return Ok(());
     }
 
     // Payload generation is load-generator work, not engine write latency.
-    fill_buffer(pattern, &mut write_buf[..len], rng, job, *issued_writes);
+    let mut buffer = io.free_buffers.pop().expect("capacity checked above");
+    fill_buffer(pattern, &mut buffer[..len], rng, job, *issued_writes);
     *issued_writes = (*issued_writes).saturating_add(1);
     let started = Instant::now();
-    let ticket = volume.write_aligned_deferred(offset, &write_buf[..len])?;
-    ticket.arm_wakeup(wake_tx);
-    inflight.push(PendingWrite {
-        ticket,
+    let task = SubmitTask {
+        offset,
+        len,
+        buffer,
         started,
-        bytes: len as u64,
         measured,
-    });
-    while inflight.len() >= iodepth {
-        if reap_ready_writes(inflight, samples, stats) == 0 {
-            let _ = wake_rx.recv();
-        }
-        while wake_rx.try_recv().is_ok() {}
+        result_tx: result_tx.clone(),
+        wake_tx: wake_tx.clone(),
+    };
+    if let Err(error) = submit_tx.send(task) {
+        io.free_buffers.push(error.0.buffer);
+        return Err(anyhow!("append submitter queue closed"));
     }
+    io.outstanding += 1;
     Ok(())
 }
 
 fn reap_ready_writes(
-    inflight: &mut Vec<PendingWrite>,
+    io: &mut JobIoState,
     samples: &mut LatencySamples,
     stats: &mut BenchStats,
 ) -> usize {
     let mut completed = 0usize;
     let mut idx = 0usize;
-    while idx < inflight.len() {
-        if !inflight[idx].ticket.is_durable() {
+    while idx < io.inflight.len() {
+        if !io.inflight[idx].ticket.is_durable() {
             idx += 1;
             continue;
         }
         let completed_at = Instant::now();
-        let pending = inflight.swap_remove(idx);
+        let pending = io.inflight.swap_remove(idx);
         pending.ticket.finish();
         if pending.measured {
             samples.write_ns.push(
@@ -811,25 +1057,115 @@ fn reap_ready_writes(
                     .saturating_duration_since(pending.started)
                     .as_nanos() as u64,
             );
+            samples.submit_queue_ns.push(pending.submit_queue_ns);
+            samples.append_worker_ns.push(pending.append_worker_ns);
+            samples.post_submit_completion_ns.push(
+                completed_at
+                    .saturating_duration_since(pending.submitted)
+                    .as_nanos() as u64,
+            );
             stats.write_ops += 1;
             stats.write_bytes += pending.bytes;
         }
+        io.outstanding = io.outstanding.saturating_sub(1);
         completed += 1;
     }
     completed
 }
 
 fn drain_writes(
-    inflight: &mut Vec<PendingWrite>,
+    io: &mut JobIoState,
     samples: &mut LatencySamples,
     stats: &mut BenchStats,
     wake_rx: &Receiver<()>,
-) {
-    while !inflight.is_empty() {
-        if reap_ready_writes(inflight, samples, stats) == 0 {
-            let _ = wake_rx.recv();
+    result_rx: &Receiver<SubmitResult>,
+) -> Result<()> {
+    let mut first_error = None;
+    while io.outstanding > 0 {
+        if let Err(error) = service_job_events(io, samples, stats, wake_rx, result_rx, true) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
-        while wake_rx.try_recv().is_ok() {}
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn service_job_events(
+    io: &mut JobIoState,
+    samples: &mut LatencySamples,
+    stats: &mut BenchStats,
+    wake_rx: &Receiver<()>,
+    result_rx: &Receiver<SubmitResult>,
+    block: bool,
+) -> Result<usize> {
+    let mut progress = 0usize;
+    let mut first_error = None;
+    while let Ok(result) = result_rx.try_recv() {
+        progress += 1;
+        if let Err(error) = accept_submit_result(io, result) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    while wake_rx.try_recv().is_ok() {
+        progress += 1;
+    }
+    progress += reap_ready_writes(io, samples, stats);
+
+    if progress == 0 && block {
+        crossbeam_channel::select! {
+            recv(result_rx) -> result => {
+                progress += 1;
+                match result {
+                    Ok(result) => {
+                        if let Err(error) = accept_submit_result(io, result) {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(_) => return Err(anyhow!("append submitter result channel closed")),
+                }
+            }
+            recv(wake_rx) -> result => {
+                result.map_err(|_| anyhow!("durability wake channel closed"))?;
+                progress += 1;
+            }
+        }
+        while let Ok(result) = result_rx.try_recv() {
+            progress += 1;
+            if let Err(error) = accept_submit_result(io, result) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        while wake_rx.try_recv().is_ok() {
+            progress += 1;
+        }
+        progress += reap_ready_writes(io, samples, stats);
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(progress),
+    }
+}
+
+fn accept_submit_result(io: &mut JobIoState, result: SubmitResult) -> Result<()> {
+    io.free_buffers.push(result.buffer);
+    match result.outcome {
+        Ok(pending) => {
+            io.inflight.push(pending);
+            Ok(())
+        }
+        Err(error) => {
+            io.outstanding = io.outstanding.saturating_sub(1);
+            Err(anyhow!(error))
+        }
     }
 }
 
@@ -881,6 +1217,9 @@ fn print_report(
 ) {
     samples.read_ns.sort_unstable();
     samples.write_ns.sort_unstable();
+    samples.submit_queue_ns.sort_unstable();
+    samples.append_worker_ns.sort_unstable();
+    samples.post_submit_completion_ns.sort_unstable();
     let secs = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     let read_iops = stats.read_ops as f64 / secs;
     let write_iops = stats.write_ops as f64 / secs;
@@ -950,7 +1289,10 @@ fn print_report(
 
     println!("{{");
     println!("  \"kind\": \"onyx-engine-bench\",");
-    println!("  \"volume\": {:?},", cli.volume);
+    println!(
+        "  \"volume\": {},",
+        serde_json::to_string(&cli.volume).unwrap()
+    );
     println!("  \"runtime_secs\": {:.3},", secs);
     println!(
         "  \"completion_closure_secs\": {:.6},",
@@ -960,6 +1302,7 @@ fn print_report(
     println!("  \"ramp_secs\": {},", cli.ramp_secs);
     println!("  \"jobs\": {},", cli.jobs);
     println!("  \"iodepth\": {},", cli.iodepth);
+    println!("  \"submitters\": {},", cli.submitters);
     println!(
         "  \"inflight_target\": {},",
         cli.jobs.saturating_mul(cli.iodepth)
@@ -992,6 +1335,67 @@ fn print_report(
     println!(
         "  \"write_p999_ns\": {},",
         percentile(&samples.write_ns, 99.9)
+    );
+    println!("  \"write_latency_samples\": {},", samples.write_ns.len());
+    println!(
+        "  \"submit_queue_samples\": {},",
+        samples.submit_queue_ns.len()
+    );
+    println!(
+        "  \"submit_queue_p50_ns\": {},",
+        percentile(&samples.submit_queue_ns, 50.0)
+    );
+    println!(
+        "  \"submit_queue_p95_ns\": {},",
+        percentile(&samples.submit_queue_ns, 95.0)
+    );
+    println!(
+        "  \"submit_queue_p99_ns\": {},",
+        percentile(&samples.submit_queue_ns, 99.0)
+    );
+    println!(
+        "  \"submit_queue_p999_ns\": {},",
+        percentile(&samples.submit_queue_ns, 99.9)
+    );
+    println!(
+        "  \"append_worker_p50_ns\": {},",
+        percentile(&samples.append_worker_ns, 50.0)
+    );
+    println!(
+        "  \"append_worker_p95_ns\": {},",
+        percentile(&samples.append_worker_ns, 95.0)
+    );
+    println!(
+        "  \"append_worker_p99_ns\": {},",
+        percentile(&samples.append_worker_ns, 99.0)
+    );
+    println!(
+        "  \"append_worker_p999_ns\": {},",
+        percentile(&samples.append_worker_ns, 99.9)
+    );
+    println!(
+        "  \"append_worker_samples\": {},",
+        samples.append_worker_ns.len()
+    );
+    println!(
+        "  \"post_submit_completion_p50_ns\": {},",
+        percentile(&samples.post_submit_completion_ns, 50.0)
+    );
+    println!(
+        "  \"post_submit_completion_p95_ns\": {},",
+        percentile(&samples.post_submit_completion_ns, 95.0)
+    );
+    println!(
+        "  \"post_submit_completion_p99_ns\": {},",
+        percentile(&samples.post_submit_completion_ns, 99.0)
+    );
+    println!(
+        "  \"post_submit_completion_p999_ns\": {},",
+        percentile(&samples.post_submit_completion_ns, 99.9)
+    );
+    println!(
+        "  \"post_submit_completion_samples\": {},",
+        samples.post_submit_completion_ns.len()
     );
     println!(
         "  \"pending_before\": {},",
