@@ -66,10 +66,10 @@ block_cache_mb = 32768
 memtable_budget_mb = 8192
 index_pin_mb = 8192
 lsm_bloom_bits_per_entry = 20
-checkpoint_interval_ms = 120000
-# LV2 is the cheap durable aggregation window. Checkpoint before the physical
-# ring reaches throttle territory, while allowing repeated LBA/PBA updates to
-# collapse for up to two minutes under lighter pressure.
+checkpoint_interval_ms = 30000
+# LV2 is the cheap durable aggregation window. Bound each BFG to 4M submitted
+# L2P mutations or 30 seconds so refcount checkpoint pages cannot consume the
+# NUMA0 memory headroom before the physical-ring pressure trigger fires.
 checkpoint_ring_fill_pct = 50
 flush_dirty_pages_threshold = 0
 group_commit_timeout_us = 1
@@ -80,9 +80,9 @@ dedup_shards = 8
 dedup_cuckoo_buckets = 65536
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
-l2p_buffer_soft_entries = 16000000
+l2p_buffer_soft_entries = 4000000
 l2p_buffer_hard_entries = 2000000
-l2p_buffer_max_interval_ms = 120000
+l2p_buffer_max_interval_ms = 30000
 rc_authoritative_reclaim = true
 commit_direct_apply_enabled = true
 # Let the flusher issue several already-built metadata transactions before it
