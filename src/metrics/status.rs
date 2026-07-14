@@ -818,11 +818,15 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "front_write_ns: zone_submit={} zone_worker={} append_total={} append_prepare={} append_log_write={} append_wait_durable={} append_backpressure_wait={} sync_batches={} sync_flushes={} sync_batch_ns={} sync_sleep_ns={} sync_epochs={}",
+            "front_write_ns: zone_submit={} zone_worker={} append_total={} append_prepare={} append_order_wait={} append_order_hold={} append_order_wait_max={} append_order_hold_max={} append_log_write={} append_wait_durable={} append_backpressure_wait={} sync_batches={} sync_flushes={} sync_batch_ns={} sync_sleep_ns={} sync_epochs={}",
             self.metrics.zone_submit_write_ns,
             self.metrics.zone_worker_write_ns,
             self.metrics.buffer_append_total_ns,
             self.metrics.buffer_append_prepare_ns,
+            self.metrics.buffer_append_order_wait_ns,
+            self.metrics.buffer_append_order_hold_ns,
+            self.metrics.buffer_append_order_wait_max_ns,
+            self.metrics.buffer_append_order_hold_max_ns,
             self.metrics.buffer_append_log_write_ns,
             self.metrics.buffer_append_wait_durable_ns,
             self.metrics.buffer_backpressure_wait_ns,
@@ -899,6 +903,29 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "flush_qos: mode={} rate_bps={} foreground_bps={} foreground_outstanding={} durable_p99_ns={} logical_pct={} physical_pct={} payload_pct={} admitted_bytes={} wait_ns={} wait_events={} wait_max_ns={} waiters={} waiters_max={} idle_bypass={} emergency_bypass={} emergency_transitions={} rate_up={} rate_down={}",
+            self.metrics.flush_qos_mode,
+            self.metrics.flush_qos_rate_bytes_per_sec,
+            self.metrics.flush_qos_foreground_bytes_per_sec,
+            self.metrics.foreground_io_outstanding,
+            self.metrics.flush_qos_durable_p99_ns,
+            self.metrics.flush_qos_logical_fill_pct,
+            self.metrics.flush_qos_physical_fill_pct,
+            self.metrics.flush_qos_payload_fill_pct,
+            self.metrics.flush_qos_admitted_bytes,
+            self.metrics.flush_qos_wait_ns,
+            self.metrics.flush_qos_wait_events,
+            self.metrics.flush_qos_wait_max_ns,
+            self.metrics.flush_qos_waiters,
+            self.metrics.flush_qos_waiters_max,
+            self.metrics.flush_qos_idle_bypasses,
+            self.metrics.flush_qos_emergency_bypasses,
+            self.metrics.flush_qos_emergency_transitions,
+            self.metrics.flush_qos_rate_increases,
+            self.metrics.flush_qos_rate_decreases,
+        );
+        let _ = writeln!(
+            out,
             "flush_writer_batch: cycles={} cycles_full={} cycles_partial={} read_active_cycles={} drained_units={} drained_units_max={} rx_pending_max={} commit_send_ns={} commit_send_ops={} commit_send_len_max={} commit_worker_queue_wait_ns={} commit_worker_aggregator_residence_ns={} commit_worker_executor_queue_wait_ns={} commit_worker_service_ns={} commit_worker_jobs={} commit_worker_job_lbas={} commit_worker_drain_batches={} commit_worker_drain_jobs={} commit_worker_drain_lbas={} commit_worker_drain_jobs_max={} commit_worker_drain_lbas_max={} pt_batches={} pt_units={} pt_lbas={} pt_io_ops={} pt_units_max={} pt_lbas_max={} pt_io_ops_max={} packed_batches={} packed_slots={} packed_lbas={} packed_io_ops={} packed_slots_max={} packed_lbas_max={} packed_io_ops_max={}",
             self.metrics.flush_writer_cycles,
             self.metrics.flush_writer_cycles_full,
@@ -935,6 +962,17 @@ impl EngineStatusSnapshot {
             self.metrics.flush_writer_packed_batch_slots_max,
             self.metrics.flush_writer_packed_batch_lbas_max,
             self.metrics.flush_writer_packed_batch_io_ops_max
+        );
+        let _ = writeln!(
+            out,
+            "commit_executor_load: queue_depth={} queue_depth_max={} active={} active_max={} executor_queue_wait_max_ns={} service_batches={}",
+            self.metrics.flush_commit_executor_queue_depth,
+            self.metrics.flush_commit_executor_queue_depth_max,
+            self.metrics.flush_commit_executors_active,
+            self.metrics.flush_commit_executors_active_max,
+            self.metrics
+                .flush_commit_worker_executor_queue_wait_max_ns,
+            self.metrics.flush_commit_worker_service_batches,
         );
         let _ = writeln!(
             out,

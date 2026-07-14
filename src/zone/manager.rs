@@ -160,6 +160,11 @@ fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
+fn with_foreground_io<T>(metrics: &Arc<EngineMetrics>, f: impl FnOnce() -> T) -> T {
+    let _lease = metrics.begin_foreground_io();
+    f()
+}
+
 /// RAII guard that records elapsed wall time on drop. Used so `submit_reads`
 /// charges the total ns counter once on every exit (early-return paths and
 /// the success path) without having to thread the bookkeeping through each
@@ -310,6 +315,12 @@ impl ZoneManager {
             if lba_count == 0 {
                 return Ok(Vec::new());
             }
+            // Create the request lease before the first LV2 append. If reserve
+            // or durability stalls before dispatch counters advance, flush QoS
+            // must still see live foreground pressure. Every split ticket gets
+            // the same Arc, so the gauge falls only after the last ticket is
+            // completed, failed, or abandoned.
+            let foreground_io = self.metrics.begin_foreground_io();
 
             let chunks = if lba_count == 0 {
                 0
@@ -333,13 +344,15 @@ impl ZoneManager {
                     remaining_lbas.min(zone_end_lba.saturating_sub(current_lba));
                 let byte_len = lbas_in_this_zone as usize * block_size;
                 let end = data_offset + byte_len;
-                tickets.push(self.buffer_pool.append_deferred(
+                let mut ticket = self.buffer_pool.append_deferred(
                     vol_id,
                     Lba(current_lba),
                     lbas_in_this_zone as u32,
                     &data[data_offset..end],
                     vol_created_at,
-                )?);
+                )?;
+                ticket.attach_foreground_io_lease(Arc::clone(&foreground_io));
+                tickets.push(ticket);
                 current_lba += lbas_in_this_zone;
                 remaining_lbas -= lbas_in_this_zone;
                 data_offset = end;
@@ -375,20 +388,22 @@ impl ZoneManager {
         lba: Lba,
         vol_created_at: u64,
     ) -> OnyxResult<Option<Vec<u8>>> {
-        self.metrics
-            .zone_read_dispatches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        read::execute_read(
-            &self.meta,
-            &self.buffer_pool,
-            &self.io_engine,
-            &self.metrics,
-            self.read_pool.as_deref(),
-            self.allocator.as_ref().map(|allocator| allocator.hazards()),
-            vol_id,
-            lba,
-            vol_created_at,
-        )
+        with_foreground_io(&self.metrics, || {
+            self.metrics
+                .zone_read_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            read::execute_read(
+                &self.meta,
+                &self.buffer_pool,
+                &self.io_engine,
+                &self.metrics,
+                self.read_pool.as_deref(),
+                self.allocator.as_ref().map(|allocator| allocator.hazards()),
+                vol_id,
+                lba,
+                vol_created_at,
+            )
+        })
     }
 
     /// Vectorized block-aligned read for a contiguous LBA range. Writes
@@ -423,6 +438,10 @@ impl ZoneManager {
         vol_created_at: u64,
         out_buf: &mut [u8],
     ) -> OnyxResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let _foreground_io = self.metrics.begin_foreground_io();
         let mut vol_ord = vol_ord;
         loop {
             match self.submit_reads_with_ordinal_once(
@@ -947,5 +966,30 @@ impl ZoneManager {
 impl Drop for ZoneManager {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod foreground_activity_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn foreground_read_scope_releases_on_success_and_error() {
+        let metrics = Arc::new(EngineMetrics::default());
+
+        let success: Result<(), &'static str> = with_foreground_io(&metrics, || {
+            assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 1);
+            Ok(())
+        });
+        assert!(success.is_ok());
+        assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 0);
+
+        let failure: Result<(), &'static str> = with_foreground_io(&metrics, || {
+            assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 1);
+            Err("injected read failure")
+        });
+        assert_eq!(failure, Err("injected read failure"));
+        assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 0);
     }
 }

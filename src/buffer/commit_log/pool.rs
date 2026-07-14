@@ -4,6 +4,22 @@ mod layout;
 mod open;
 mod sync;
 
+struct AppendOrderGuardSet<'a> {
+    _guards: Vec<parking_lot::MutexGuard<'a, ()>>,
+    metrics: Option<&'a EngineMetrics>,
+    hold_started: Instant,
+}
+
+impl Drop for AppendOrderGuardSet<'_> {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics {
+            metrics.record_buffer_append_order_hold_ns(
+                self.hold_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
+    }
+}
+
 impl WriteBufferPool {
     pub fn attach_metrics(&self, metrics: Arc<EngineMetrics>) {
         let _ = self.metrics.set(metrics.clone());
@@ -17,6 +33,53 @@ impl WriteBufferPool {
             0
         } else {
             ((lba.0 / self.routing_zone_size_blocks) % self.shards.len() as u64) as usize
+        }
+    }
+
+    fn append_order_hash(mut value: u64) -> u64 {
+        // SplitMix64 finalizer: fast avalanche after hashing the volume once.
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn lock_append_order(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+    ) -> AppendOrderGuardSet<'_> {
+        use std::hash::{Hash, Hasher};
+
+        debug_assert!(APPEND_ORDER_STRIPES.is_power_of_two());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        vol_id.hash(&mut hasher);
+        let volume_hash = hasher.finish();
+        let mut indices = Vec::with_capacity(lba_count as usize);
+        for offset in 0..lba_count {
+            let lba = start_lba.0 + offset as u64;
+            let mixed =
+                Self::append_order_hash(volume_hash ^ lba.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            indices.push((mixed as usize) & (APPEND_ORDER_STRIPES - 1));
+        }
+        indices.sort_unstable();
+        indices.dedup();
+
+        let wait_started = Instant::now();
+        let guards = indices
+            .into_iter()
+            .map(|index| self.append_order_stripes[index].lock.lock())
+            .collect();
+        let metrics = self.metrics.get().map(Arc::as_ref);
+        if let Some(metrics) = metrics {
+            metrics.record_buffer_append_order_wait_ns(
+                wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
+        AppendOrderGuardSet {
+            _guards: guards,
+            metrics,
+            hold_started: Instant::now(),
         }
     }
 
@@ -121,7 +184,7 @@ impl WriteBufferPool {
         }
     }
 
-    /// Latch the metadb persistence fence with `reason`. Idempotent: only the
+    /// Latch the persistence fence with `reason`. Idempotent: only the
     /// first call records the reason and logs; subsequent calls are no-ops.
     /// Called by the durability-watermark thread when metadb checkpoints fail
     /// fatally or repeatedly, so `append` stops handing out durable acks the
@@ -131,7 +194,7 @@ impl WriteBufferPool {
         if self.meta_fence.set(reason.clone()).is_ok() {
             tracing::error!(
                 reason = %reason,
-                "metadb persistence fenced; rejecting new writes until restart"
+                "persistence pipeline fenced; rejecting new writes until restart"
             );
         }
     }
@@ -246,36 +309,52 @@ impl WriteBufferPool {
         }
         self.apply_write_throttle(shard_idx);
         let shard = &self.shards[shard_idx];
-        let append_order = shard.shard.append_order.lock();
+        let prepared =
+            shard
+                .shard
+                .prepare_append(vol_id, start_lba, lba_count, payload, vol_created_at)?;
+        let append_order = self.lock_append_order(vol_id, start_lba, lba_count);
         // The fence may trip while this producer was throttled or queued behind
         // another append. Do not enter LV2 after fail-stop has been published.
-        if let Some(reason) = self.meta_fence.get() {
-            return Err(OnyxError::MetaFenced(reason.clone()));
+        let append_result = (|| {
+            if let Some(reason) = self.meta_fence.get() {
+                return Err(OnyxError::MetaFenced(reason.clone()));
+            }
+            if !validate()? {
+                return Ok(None);
+            }
+            let (reservation, frontier_guard) = shard.shard.reserve_append(
+                &self.next_seq,
+                &self.frontier_gate,
+                prepared.slot_count,
+            )?;
+            let seq = reservation.seq;
+            let pending = shard
+                .shard
+                .publish_prepared(reservation, prepared, relocation_source)?;
+            // The seq is now either visible in `pending_seqs`, or the append
+            // failed and no acknowledged write exists for this seq. Do not hold
+            // the gate across fdatasync / ready publication.
+            drop(frontier_guard);
+            Ok(Some((seq, pending)))
+        })();
+        if let Err(OnyxError::MetaFenced(reason)) = &append_result {
+            // Publish failures after a physical reservation are not locally
+            // recoverable: later non-overlapping appends may already own the
+            // following ring records. Fence before releasing the LBA stripes
+            // so no overlapping writer can pass validation after the fault.
+            self.fence_meta(reason.clone());
         }
-        if !validate()? {
-            return Ok(None);
+        drop(append_order);
+        if append_result.as_ref().is_ok_and(|result| result.is_some()) {
+            shard.shard.maintain_payload_cache_after_append();
         }
-        let frontier_guard = self.frontier_gate.read();
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-
-        let append_result = shard.shard.append_with_seq(
-            seq,
-            vol_id,
-            start_lba,
-            lba_count,
-            payload,
-            vol_created_at,
-            relocation_source,
-        );
         if let Some(metrics) = self.metrics.get() {
             metrics.record_buffer_append_prepare_ns(total_start.elapsed().as_nanos() as u64);
         }
-        // The seq is now either visible in `pending_seqs`, or the append
-        // failed and no acknowledged write exists for this seq. Do not hold
-        // the gate across fdatasync / ready publication.
-        drop(frontier_guard);
-        drop(append_order);
-        let pending = append_result?;
+        let Some((seq, pending)) = append_result? else {
+            return Ok(None);
+        };
         // Wake the per-shard sync thread so it drains the staging channel
         // promptly. The sync thread will fdatasync the batch and then
         // advance `lv2_durability.synced_seq` past our seq, which is what
@@ -287,6 +366,7 @@ impl WriteBufferPool {
             seq,
             append_started: total_start,
             durability_wait_started: Instant::now(),
+            foreground_io_lease: None,
         }))
     }
 

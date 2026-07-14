@@ -7,9 +7,9 @@ mod post_commit;
 
 pub(crate) use commit_worker::TARGET_OPS_PER_COMMIT;
 pub(in crate::buffer::flush) use commit_worker::{
-    route_volume_to_worker, CommitBatch, CommitJob, DedupHitCommitJob, DedupHitCommitResponse,
-    PackedCommitJob, PassthroughCommitJob, UnitCommitData, COMMIT_EXECUTOR_QUEUE_CAP,
-    COMMIT_WORKER_QUEUE_CAP, NUM_COMMIT_WORKERS,
+    commit_executor_queue_capacity, route_volume_to_worker, CommitBatch, CommitExecutorLoad,
+    CommitJob, DedupHitCommitJob, DedupHitCommitResponse, PackedCommitJob, PassthroughCommitJob,
+    UnitCommitData, COMMIT_WORKER_QUEUE_CAP, NUM_COMMIT_WORKERS,
 };
 pub(in crate::buffer::flush) use post_commit::{PostCommitJob, POST_COMMIT_QUEUE_CAP};
 

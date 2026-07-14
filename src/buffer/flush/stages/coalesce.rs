@@ -20,11 +20,15 @@ const IN_FLIGHT_RESCUE_IDLE: Duration = Duration::from_secs(5);
 
 impl BufferFlusher {
     pub(in crate::buffer::flush) fn write_window_bypass_ready(
-        buffer_pressure_pct: u8,
-        pressure_pct: u8,
+        physical_pressure_pct: u8,
+        physical_threshold_pct: u8,
+        payload_pressure_pct: u8,
+        payload_threshold_pct: u8,
         foreground_idle: Duration,
     ) -> bool {
-        buffer_pressure_pct >= pressure_pct || foreground_idle >= WRITE_WINDOW_IDLE_BYPASS
+        physical_pressure_pct >= physical_threshold_pct
+            || payload_pressure_pct >= payload_threshold_pct
+            || foreground_idle >= WRITE_WINDOW_IDLE_BYPASS
     }
 
     pub(in crate::buffer::flush) fn stalled_lease_ready(
@@ -48,6 +52,8 @@ impl BufferFlusher {
         skip_fully_superseded: bool,
         write_window: Duration,
         write_window_pressure_pct: u8,
+        write_window_payload_pressure_pct: u8,
+        flush_admission_qos: &FlushAdmissionQos,
     ) {
         // in_flight tracks how many pipeline units still reference each seq.
         // A multi-LBA entry split into 2 units → refcount=2 for that seq.
@@ -82,7 +88,7 @@ impl BufferFlusher {
         let mut last_retry_snapshot = Instant::now();
         let mut write_window_cutoff = Instant::now().checked_sub(write_window);
         let mut next_cutoff_refresh = Instant::now() + WRITE_WINDOW_RELEASE_QUANTUM;
-        let mut last_buffer_appends = metrics.buffer_appends.load(Ordering::Relaxed);
+        let mut last_foreground_writes = metrics.zone_write_dispatches.load(Ordering::Relaxed);
         let mut last_foreground_append = Instant::now();
         // Head-stuck diagnostic: emit at most one warn per shard every
         // DIAG_LOG_INTERVAL while the head is older than DIAG_AGE_THRESHOLD_MS.
@@ -120,18 +126,19 @@ impl BufferFlusher {
                 last_writer_units = writer_units;
                 last_writer_progress = Instant::now();
             }
-            let buffer_appends = metrics.buffer_appends.load(Ordering::Relaxed);
-            if buffer_appends != last_buffer_appends {
-                last_buffer_appends = buffer_appends;
+            let foreground_writes = metrics.zone_write_dispatches.load(Ordering::Relaxed);
+            if foreground_writes != last_foreground_writes {
+                last_foreground_writes = foreground_writes;
                 last_foreground_append = Instant::now();
             }
             let foreground_idle = last_foreground_append.elapsed();
-            let buffer_pressure_pct = pool
-                .physical_fill_percentage_for_shard(shard_idx)
-                .max(pool.payload_fill_percentage());
+            let physical_pressure_pct = pool.physical_fill_percentage_for_shard(shard_idx);
+            let payload_pressure_pct = pool.payload_fill_percentage();
             let bypass_write_window = Self::write_window_bypass_ready(
-                buffer_pressure_pct,
+                physical_pressure_pct,
                 write_window_pressure_pct,
+                payload_pressure_pct,
+                write_window_payload_pressure_pct,
                 foreground_idle,
             );
             let admission_window_bytes = if foreground_idle >= WRITE_WINDOW_IDLE_BYPASS {
@@ -558,8 +565,14 @@ impl BufferFlusher {
                 );
             }
 
-            // Count how many units reference each seq
-            for unit in &units {
+            for unit in units {
+                // The only flush QoS gate lives here, before any downstream
+                // dedup/compress/writer work. Bounded channels propagate this
+                // one global permit stream through the whole pipeline.
+                flush_admission_qos.admit(unit.raw_len() as u64, running);
+
+                // Count references immediately before publication so paced
+                // units do not look like downstream in-flight work.
                 for (seq, _, _) in &unit.seq_lba_ranges {
                     let count = in_flight.entry(*seq).or_insert(0);
                     if *count == 0 {
@@ -568,9 +581,6 @@ impl BufferFlusher {
                     }
                     *count += 1;
                 }
-            }
-
-            for unit in units {
                 let len_before = tx.len();
                 let started = Instant::now();
                 let result = tx.send(unit);

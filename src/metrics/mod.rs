@@ -71,6 +71,33 @@ impl FineLatencyHistogram {
     }
 }
 
+fn histogram_p99_delta(
+    histogram: &FineLatencyHistogram,
+    previous: &mut Vec<u64>,
+) -> Option<(u64, u64)> {
+    let current = histogram.snapshot();
+    if previous.len() != current.len() {
+        *previous = current;
+        return None;
+    }
+    let deltas = sub_latency_buckets(&current, previous);
+    *previous = current;
+    let total = deltas.iter().copied().sum::<u64>();
+    if total == 0 {
+        return None;
+    }
+    let rank = total.saturating_mul(99).div_ceil(100).max(1);
+    let bounds = fine_latency_bucket_upper_bounds_ns();
+    let mut cumulative = 0u64;
+    for (idx, count) in deltas.into_iter().enumerate() {
+        cumulative = cumulative.saturating_add(count);
+        if cumulative >= rank {
+            return Some((bounds[idx], total));
+        }
+    }
+    bounds.last().copied().map(|bound| (bound, total))
+}
+
 fn fine_latency_bucket(ns: u64) -> usize {
     if ns < FINE_LATENCY_DIRECT_BUCKETS as u64 {
         return ns as usize;
@@ -184,6 +211,11 @@ pub struct EngineMetrics {
     pub ublk_write_worker_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub ublk_write_completion_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub volume_partial_write_ops: AtomicU64,
+    /// Foreground read/write requests that have entered the engine but have not
+    /// yet completed, failed, or been abandoned by their frontend. One logical
+    /// request owns one shared RAII lease even when it spans multiple LV2
+    /// tickets, so this remains a request count rather than a shard count.
+    pub foreground_io_outstanding: AtomicU64,
     pub zone_write_dispatches: AtomicU64,
     pub zone_submit_write_ns: AtomicU64,
     pub zone_worker_write_ns: AtomicU64,
@@ -196,11 +228,21 @@ pub struct EngineMetrics {
     pub buffer_write_bytes: AtomicU64,
     pub buffer_append_total_ns: AtomicU64,
     pub buffer_append_prepare_ns: AtomicU64,
+    pub buffer_append_order_wait_ns: AtomicU64,
+    pub buffer_append_order_hold_ns: AtomicU64,
+    pub buffer_append_order_wait_max_ns: AtomicU64,
+    pub buffer_append_order_hold_max_ns: AtomicU64,
     pub buffer_append_log_write_ns: AtomicU64,
     pub buffer_append_wait_durable_ns: AtomicU64,
     pub buffer_append_prepare_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub buffer_append_order_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub buffer_append_order_hold_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub buffer_append_wait_durable_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
     pub(crate) buffer_append_wait_durable_fine_latency: FineLatencyHistogram,
+    /// LV2 durability samples from foreground-tagged tickets only. GC and other
+    /// internal appenders deliberately remain in the aggregate histogram above
+    /// but cannot dilute the flush QoS feedback signal.
+    pub(crate) buffer_append_wait_durable_foreground_fine_latency: FineLatencyHistogram,
     pub buffer_sync_batches: AtomicU64,
     /// Actual backend durability barriers. On a multi-shard chunklet LV2 this
     /// is lower than `buffer_sync_batches` because one root flush covers a
@@ -390,6 +432,28 @@ pub struct EngineMetrics {
     /// lock is removed and concurrent same-LBA commits race.
     pub flush_seq_rejects: AtomicU64,
     pub flush_errors: AtomicU64,
+    /// Global coalescer admission QoS. Mode: 0 idle/disabled, 1 protected,
+    /// 2 occupancy recovery, 3 physical-ring emergency.
+    pub flush_qos_mode: AtomicU64,
+    pub flush_qos_rate_bytes_per_sec: AtomicU64,
+    pub flush_qos_foreground_bytes_per_sec: AtomicU64,
+    pub flush_qos_durable_p99_ns: AtomicU64,
+    pub flush_qos_logical_fill_pct: AtomicU64,
+    pub flush_qos_physical_fill_pct: AtomicU64,
+    pub flush_qos_payload_fill_pct: AtomicU64,
+    pub flush_qos_admitted_bytes: AtomicU64,
+    pub flush_qos_wait_ns: AtomicU64,
+    pub flush_qos_wait_events: AtomicU64,
+    /// Longest end-to-end wait of one admission request since process start.
+    pub flush_qos_wait_max_ns: AtomicU64,
+    /// Requests currently queued in the device-wide FIFO and its lifetime HWM.
+    pub flush_qos_waiters: AtomicU64,
+    pub flush_qos_waiters_max: AtomicU64,
+    pub flush_qos_idle_bypasses: AtomicU64,
+    pub flush_qos_emergency_bypasses: AtomicU64,
+    pub flush_qos_emergency_transitions: AtomicU64,
+    pub flush_qos_rate_increases: AtomicU64,
+    pub flush_qos_rate_decreases: AtomicU64,
     pub flush_writer_total_ns: AtomicU64,
     pub flush_writer_alloc_ns: AtomicU64,
     pub flush_writer_io_ns: AtomicU64,
@@ -425,6 +489,17 @@ pub struct EngineMetrics {
     pub flush_commit_worker_aggregator_residence_ns: AtomicU64,
     /// Portion after a batch is sealed and before an executor dequeues it.
     pub flush_commit_worker_executor_queue_wait_ns: AtomicU64,
+    /// Maximum executor-queue residence of one sealed batch.
+    pub flush_commit_worker_executor_queue_wait_max_ns: AtomicU64,
+    /// Shared downstream batch backlog and high-water mark. The current depth
+    /// conservatively includes the sole aggregator's blocked handoff when the
+    /// bounded channel is full.
+    pub flush_commit_executor_queue_depth: AtomicU64,
+    pub flush_commit_executor_queue_depth_max: AtomicU64,
+    /// Executors currently dispatching a commit batch and their high-water
+    /// mark. These gauges drive adaptive-seal admission as well as observability.
+    pub flush_commit_executors_active: AtomicU64,
+    pub flush_commit_executors_active_max: AtomicU64,
     /// Aggregator seal reasons. `capacity` means the next indivisible job would
     /// cross the target; it is neither a full-target recovery nor an underfill
     /// sample. `deadline` is the hard oldest-job residence ceiling;
@@ -437,6 +512,10 @@ pub struct EngineMetrics {
     pub flush_commit_aggregator_seals_adaptive_underfill: AtomicU64,
     pub flush_commit_aggregator_seals_pressure: AtomicU64,
     pub flush_commit_aggregator_seals_shutdown: AtomicU64,
+    /// Number of timed service invocations represented by
+    /// `flush_commit_worker_service_ns`. Unlike raw jobs, this has the same
+    /// accounting boundary as the service timer and is its correct divisor.
+    pub flush_commit_worker_service_batches: AtomicU64,
     pub flush_commit_worker_service_ns: AtomicU64,
     pub flush_commit_worker_jobs: AtomicU64,
     pub flush_commit_worker_job_lbas: AtomicU64,
@@ -773,7 +852,46 @@ pub struct EngineMetrics {
     pub discard_blocks_freed: AtomicU64,
 }
 
+#[derive(Debug)]
+pub(crate) struct ForegroundIoLease {
+    metrics: Arc<EngineMetrics>,
+}
+
+impl ForegroundIoLease {
+    pub(crate) fn record_buffer_append_wait_durable_ns(&self, ns: u64) {
+        self.metrics
+            .record_buffer_append_wait_durable_foreground_ns(ns);
+    }
+}
+
+impl Drop for ForegroundIoLease {
+    fn drop(&mut self) {
+        let result = self.metrics.foreground_io_outstanding.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        );
+        debug_assert!(result.is_ok(), "foreground IO gauge underflow");
+        if result.is_err() {
+            tracing::error!("foreground IO gauge underflow prevented");
+        }
+    }
+}
+
 impl EngineMetrics {
+    /// Mark one logical foreground IO active until the last holder drops.
+    ///
+    /// Callers may clone the returned `Arc` across split LV2 tickets. The gauge
+    /// is decremented by the lease object's `Drop`, so success, error, abandon,
+    /// channel disconnect, and unwind paths share one accounting boundary.
+    pub(crate) fn begin_foreground_io(self: &Arc<Self>) -> Arc<ForegroundIoLease> {
+        self.foreground_io_outstanding
+            .fetch_add(1, Ordering::Relaxed);
+        Arc::new(ForegroundIoLease {
+            metrics: Arc::clone(self),
+        })
+    }
+
     pub fn record_ublk_write_stages(
         &self,
         queue_wait_ns: u64,
@@ -794,11 +912,58 @@ impl EngineMetrics {
         record_latency_bucket(&self.buffer_append_prepare_latency_buckets, ns);
     }
 
+    pub fn record_buffer_append_order_wait_ns(&self, ns: u64) {
+        self.buffer_append_order_wait_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_counter_max(&self.buffer_append_order_wait_max_ns, ns);
+        record_latency_bucket(&self.buffer_append_order_wait_latency_buckets, ns);
+    }
+
+    pub fn record_buffer_append_order_hold_ns(&self, ns: u64) {
+        self.buffer_append_order_hold_ns
+            .fetch_add(ns, Ordering::Relaxed);
+        record_counter_max(&self.buffer_append_order_hold_max_ns, ns);
+        record_latency_bucket(&self.buffer_append_order_hold_latency_buckets, ns);
+    }
+
     pub fn record_buffer_append_wait_durable_ns(&self, ns: u64) {
         self.buffer_append_wait_durable_ns
             .fetch_add(ns, Ordering::Relaxed);
         record_latency_bucket(&self.buffer_append_wait_durable_latency_buckets, ns);
         self.buffer_append_wait_durable_fine_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_append_wait_durable_foreground_ns(&self, ns: u64) {
+        self.buffer_append_wait_durable_foreground_fine_latency
+            .record(ns);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_append_wait_durable_p99_delta(
+        &self,
+        previous: &mut Vec<u64>,
+    ) -> Option<(u64, u64)> {
+        histogram_p99_delta(&self.buffer_append_wait_durable_fine_latency, previous)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_append_wait_durable_fine_snapshot(&self) -> Vec<u64> {
+        self.buffer_append_wait_durable_fine_latency.snapshot()
+    }
+
+    pub(crate) fn buffer_append_wait_durable_foreground_p99_delta(
+        &self,
+        previous: &mut Vec<u64>,
+    ) -> Option<(u64, u64)> {
+        histogram_p99_delta(
+            &self.buffer_append_wait_durable_foreground_fine_latency,
+            previous,
+        )
+    }
+
+    pub(crate) fn buffer_append_wait_durable_foreground_fine_snapshot(&self) -> Vec<u64> {
+        self.buffer_append_wait_durable_foreground_fine_latency
+            .snapshot()
     }
 
     pub(crate) fn record_buffer_lv2_staging_queue_ns(&self, ns: u64) {
@@ -922,6 +1087,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn foreground_io_lease_is_shared_and_decrements_exactly_once() {
+        let metrics = Arc::new(EngineMetrics::default());
+        let first = metrics.begin_foreground_io();
+        let second = Arc::clone(&first);
+        assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 1);
+
+        drop(first);
+        assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 1);
+        drop(second);
+        assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn fine_latency_bucket_bounds_are_monotonic_and_contain_samples() {
         let bounds = fine_latency_bucket_upper_bounds_ns();
         assert_eq!(bounds.len(), FINE_LATENCY_BUCKETS);
@@ -971,6 +1149,46 @@ mod tests {
             delta.buffer_lv2_latency_bucket_upper_bounds_ns,
             fine_latency_bucket_upper_bounds_ns()
         );
+    }
+
+    #[test]
+    fn durable_p99_delta_advances_without_full_metrics_snapshot() {
+        let metrics = EngineMetrics::default();
+        let mut previous = metrics.buffer_append_wait_durable_fine_snapshot();
+        for _ in 0..99 {
+            metrics.record_buffer_append_wait_durable_ns(10_000_000);
+        }
+        metrics.record_buffer_append_wait_durable_ns(200_000_000);
+
+        let (p99_ns, samples) = metrics
+            .buffer_append_wait_durable_p99_delta(&mut previous)
+            .unwrap();
+        assert_eq!(samples, 100);
+        assert!(p99_ns >= 10_000_000);
+        assert!(p99_ns < 200_000_000);
+        assert!(metrics
+            .buffer_append_wait_durable_p99_delta(&mut previous)
+            .is_none());
+    }
+
+    #[test]
+    fn foreground_durable_histogram_excludes_aggregate_only_samples() {
+        let metrics = EngineMetrics::default();
+        let mut previous = metrics.buffer_append_wait_durable_foreground_fine_snapshot();
+        metrics.record_buffer_append_wait_durable_ns(900_000_000);
+        assert!(metrics
+            .buffer_append_wait_durable_foreground_p99_delta(&mut previous)
+            .is_none());
+
+        for _ in 0..64 {
+            metrics.record_buffer_append_wait_durable_foreground_ns(10_000_000);
+        }
+        let (p99_ns, samples) = metrics
+            .buffer_append_wait_durable_foreground_p99_delta(&mut previous)
+            .unwrap();
+        assert_eq!(samples, 64);
+        assert!(p99_ns >= 10_000_000);
+        assert!(p99_ns < 900_000_000);
     }
 
     #[test]

@@ -259,9 +259,12 @@ impl FlusherInFlightTracker {
 
 mod cleanup;
 mod failpoints;
+mod qos;
 mod runtime;
 mod stages;
 mod writer;
+
+use qos::{FlushAdmissionQos, FlushAdmissionQosConfig};
 
 #[cfg(test)]
 mod tests;

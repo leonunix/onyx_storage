@@ -1331,11 +1331,52 @@ pub struct FlushConfig {
     /// `0` preserves immediate draining.
     #[serde(default)]
     pub buffer_write_window_ms: u64,
-    /// Bypass the write window when either this shard's physical ring fill or
-    /// the global resident-payload fill reaches the threshold. `0` means 80
-    /// percent.
+    /// Deprecated combined-pressure knob retained for config compatibility.
+    /// When both split thresholds are unset, this value is used for physical
+    /// and payload pressure, preserving old configuration behavior.
     #[serde(default)]
     pub buffer_write_window_pressure_pct: u8,
+    /// Bypass the write window when this shard's physical LV2 ring fill reaches
+    /// the threshold. Admission remains paced until the separate QoS emergency
+    /// watermark is reached. `0` falls back to the legacy field, then 80%.
+    #[serde(default)]
+    pub buffer_write_window_physical_pressure_pct: u8,
+    /// Bypass the write window when the global resident-payload cache reaches
+    /// this threshold. Payload pressure is deliberately separate from physical
+    /// LV2 occupancy: it should admit old work, but must not unleash an
+    /// unpaced, device-wide catch-up burst while foreground IO is active. `0`
+    /// means 80 percent.
+    #[serde(default)]
+    pub buffer_write_window_payload_pressure_pct: u8,
+    /// Foreground durable-write p99 target used by the global flush-admission
+    /// controller. The controller AIMD-adjusts aggregate raw bytes admitted to
+    /// coalesce/dedup/compress while ublk writes are active. `0` disables QoS.
+    #[serde(default = "default_foreground_flush_target_p99_ms")]
+    pub foreground_flush_target_p99_ms: u64,
+    /// Normal aggregate admission rate while foreground writes are active and
+    /// LV2 occupancy is below the recovery watermark. `0` means 128 MiB/s.
+    #[serde(default)]
+    pub foreground_flush_active_mib_s: u64,
+    /// Lower bound after latency-driven multiplicative backoff. `0` means 32
+    /// MiB/s; space-recovery mode can override it.
+    #[serde(default)]
+    pub foreground_flush_min_mib_s: u64,
+    /// Admission rate reached as LV2 approaches its emergency watermark. `0`
+    /// means 384 MiB/s.
+    #[serde(default)]
+    pub foreground_flush_max_mib_s: u64,
+    /// Global token-bucket burst allowance. It is clamped to at least one
+    /// coalesced unit; `0` means 8 MiB.
+    #[serde(default)]
+    pub foreground_flush_burst_mib: u64,
+    /// Logical/physical LV2 fill where occupancy recovery starts ramping above
+    /// the normal foreground-active rate. `0` means 40 percent.
+    #[serde(default)]
+    pub foreground_flush_recovery_pct: u8,
+    /// Physical LV2 fill where admission becomes unlimited so cache QoS cannot
+    /// consume durability capacity. `0` means 65 percent.
+    #[serde(default)]
+    pub foreground_flush_emergency_pct: u8,
     /// Maximum mapped LBAs folded into one packed-slot metadata commit.
     /// Lower values reduce metadb apply head-of-line tail under heavy mixed
     /// read/write load; higher values amortise WAL/apply overhead and improve
@@ -1440,6 +1481,15 @@ impl Default for FlushConfig {
             skip_fully_superseded: default_skip_fully_superseded(),
             buffer_write_window_ms: 0,
             buffer_write_window_pressure_pct: 0,
+            buffer_write_window_physical_pressure_pct: 0,
+            buffer_write_window_payload_pressure_pct: 0,
+            foreground_flush_target_p99_ms: default_foreground_flush_target_p99_ms(),
+            foreground_flush_active_mib_s: 0,
+            foreground_flush_min_mib_s: 0,
+            foreground_flush_max_mib_s: 0,
+            foreground_flush_burst_mib: 0,
+            foreground_flush_recovery_pct: 0,
+            foreground_flush_emergency_pct: 0,
             packed_meta_batch_max_lbas: default_packed_meta_batch_max_lbas(),
             commit_workers_per_volume: default_commit_workers_per_volume(),
             commit_target_lbas_per_tx: default_commit_target_lbas_per_tx(),
@@ -1468,6 +1518,9 @@ fn default_min_compression_savings_pct() -> u8 {
 }
 fn default_skip_fully_superseded() -> bool {
     true
+}
+fn default_foreground_flush_target_p99_ms() -> u64 {
+    100
 }
 fn default_packed_meta_batch_max_lbas() -> usize {
     DEFAULT_PACKED_META_BATCH_LBA_LIMIT

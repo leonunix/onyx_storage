@@ -15,7 +15,7 @@ use crate::io::block_backend::{slice_backend, BlockBackend};
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, LinkedOp, UringOp, UringOpResult};
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
-use crate::metrics::{BufferShardSnapshot, EngineMetrics};
+use crate::metrics::{BufferShardSnapshot, EngineMetrics, ForegroundIoLease};
 use crate::types::{Lba, BLOCK_SIZE};
 
 const COMMIT_LOG_MAGIC: u32 = 0x4F43_4C47; // "OCLG"
@@ -25,6 +25,10 @@ const COMMIT_LOG_SUPERBLOCK_SIZE: u64 = 4096;
 const MAX_SHARDS_ON_DISK: usize = 64;
 /// DashMap internal shard count — high value reduces contention under many writers.
 const DASHMAP_SHARDS: usize = 256;
+/// Fixed conflict domains for append ordering. Requests that overlap at any
+/// `(volume, LBA)` acquire at least one common stripe; unrelated requests stay
+/// parallel even when they share one physical LV2 shard.
+const APPEND_ORDER_STRIPES: usize = 16 * 1024;
 
 const SHARD_CHECKPOINT_MAGIC: u32 = 0x5348_434B; // "SHCK"
 const SHARD_CHECKPOINT_VERSION: u32 = 1;
@@ -92,7 +96,7 @@ pub struct BufferRuntimeLimits {
 ///
 /// Curve: `delay_us = scale_us * (fill - min_pct) / (max_pct - fill)`, capped
 /// at `cap_us`. At `fill = max_pct` the gate falls through to the existing
-/// condvar-based hard backpressure path inside `BufferShard::append_with_seq`.
+/// condvar-based hard backpressure path inside `BufferShard::reserve_append`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ThrottleSettings {
     /// Fill % below which append pays no throttle.
@@ -455,6 +459,46 @@ struct LogRecord {
     slot_count: u32,
 }
 
+struct PreparedAppend {
+    vol_id: String,
+    vid: Arc<str>,
+    start_lba: Lba,
+    lba_count: u32,
+    payload: Arc<[u8]>,
+    payload_crc32: u32,
+    payload_len: u64,
+    vol_created_at: u64,
+    disk_len: u32,
+    slot_count: u32,
+    keys: Vec<LbaKey>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AppendReservation {
+    seq: u64,
+    write_offset: u64,
+    stage_order: u64,
+}
+
+#[derive(Default)]
+struct AppendStageTurn {
+    next: parking_lot::Mutex<u64>,
+    changed: parking_lot::Condvar,
+}
+
+#[repr(align(64))]
+struct AppendOrderStripe {
+    lock: parking_lot::Mutex<()>,
+}
+
+impl Default for AppendOrderStripe {
+    fn default() -> Self {
+        Self {
+            lock: parking_lot::Mutex::new(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GlobalSuperblock {
     shard_count: u32,
@@ -780,11 +824,6 @@ struct LifecycleState {
 
 struct BufferShard {
     device: Arc<dyn BlockBackend>,
-    /// Orders seq allocation and LBA-index publication for this routing shard.
-    /// Foreground writes and GC relocation share this domain, so relocation can
-    /// revalidate its physical source immediately before append without a stale
-    /// payload overtaking a concurrent user write.
-    append_order: parking_lot::Mutex<()>,
     ring: parking_lot::Mutex<RingState>,
     /// Signaled when ring space is freed (reclaim_log_prefix).
     ring_space_cv: parking_lot::Condvar,
@@ -812,6 +851,16 @@ struct BufferShard {
     flush_progress: DashMap<u64, HashSet<u16>>,
     staging_tx: Sender<StagedEntry>,
     staging_rx: Receiver<StagedEntry>,
+    /// Reservation order is allocated while holding `ring`, so it has the same
+    /// order as physical ring records and per-shard global seqs.
+    next_reservation_order: AtomicU64,
+    /// Multiple non-overlapping appenders may publish indices concurrently, but
+    /// the sync channel must retain physical reservation order because
+    /// `synced_seq` is a scalar watermark and guided recovery expects increasing
+    /// seqs after the checkpoint head.
+    stage_turn: AppendStageTurn,
+    #[cfg(test)]
+    fail_next_staging_send: AtomicBool,
     sync_batch_max_entries: usize,
     sync_batch_max_bytes: usize,
     /// FIFO tracking eviction order for the in-memory payload cache. Payloads
@@ -820,7 +869,7 @@ struct BufferShard {
     cached_payload_order: parking_lot::Mutex<VecDeque<u64>>,
     lifecycle: parking_lot::Mutex<LifecycleState>,
     /// LV2 fdatasync watermark. Advanced by the sync thread after each
-    /// successful fdatasync; `append_with_seq` parks on it before returning
+    /// successful fdatasync; append tickets park on it before returning
     /// to the caller, so every ack implies the payload is durable on LV2.
     pub(crate) lv2_durability: Arc<Lv2DurabilityWaiter>,
     /// Sender for the flusher's global ready channel. Appender publishes
@@ -859,10 +908,11 @@ pub struct WriteBufferPool {
     /// Serialises a durability-frontier snapshot against the short interval
     /// between allocating a global seq and publishing it into a shard's
     /// `pending_seqs` index. Appends take the read side only through
-    /// `append_with_seq`; frontier sampling takes the write side. This keeps
+    /// `publish_prepared`; frontier sampling takes the write side. This keeps
     /// concurrent appenders parallel while preventing a checkpoint from
     /// mistaking an allocated-but-not-yet-visible seq for an applied gap.
     frontier_gate: parking_lot::RwLock<()>,
+    append_order_stripes: Box<[AppendOrderStripe]>,
     routing_zone_size_blocks: u64,
     ready_rx: Receiver<u64>,
     shard_ready_rxs: Vec<Receiver<u64>>,
@@ -925,6 +975,9 @@ pub struct BufferAppendTicket {
     seq: u64,
     append_started: Instant,
     durability_wait_started: Instant,
+    /// Shared by every LV2 shard ticket belonging to one foreground request.
+    /// The final ticket drop releases the request's outstanding-IO lease.
+    foreground_io_lease: Option<Arc<ForegroundIoLease>>,
 }
 
 impl BufferAppendTicket {
@@ -951,6 +1004,11 @@ impl BufferAppendTicket {
         self.shard.lv2_durability.arm_channel(self.seq, tx)
     }
 
+    pub(crate) fn attach_foreground_io_lease(&mut self, lease: Arc<ForegroundIoLease>) {
+        debug_assert!(self.foreground_io_lease.is_none());
+        self.foreground_io_lease = Some(lease);
+    }
+
     pub fn wait(self) -> u64 {
         self.shard.wait_for_durable(self.seq);
         self.finish_at(Instant::now(), false)
@@ -966,12 +1024,14 @@ impl BufferAppendTicket {
 
     fn finish_at(self, finished_at: Instant, dispatched: bool) -> u64 {
         debug_assert!(self.is_durable());
+        let durable_wait_ns = finished_at
+            .saturating_duration_since(self.durability_wait_started)
+            .as_nanos() as u64;
+        if let Some(lease) = &self.foreground_io_lease {
+            lease.record_buffer_append_wait_durable_ns(durable_wait_ns);
+        }
         if let Some(metrics) = self.shard.metrics.get() {
-            metrics.record_buffer_append_wait_durable_ns(
-                finished_at
-                    .saturating_duration_since(self.durability_wait_started)
-                    .as_nanos() as u64,
-            );
+            metrics.record_buffer_append_wait_durable_ns(durable_wait_ns);
             metrics.buffer_append_total_ns.fetch_add(
                 finished_at
                     .saturating_duration_since(self.append_started)

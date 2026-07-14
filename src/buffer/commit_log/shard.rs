@@ -3,6 +3,25 @@ use super::*;
 mod payload;
 mod recovery;
 
+impl AppendStageTurn {
+    pub(super) fn run<T>(&self, order: u64, f: impl FnOnce() -> T) -> T {
+        let mut next = self.next.lock();
+        while *next < order {
+            self.changed.wait(&mut next);
+        }
+        assert_eq!(
+            *next, order,
+            "append stage order must be consumed exactly once"
+        );
+        let result = f();
+        *next = next
+            .checked_add(1)
+            .expect("append stage order exhausted u64");
+        self.changed.notify_all();
+        result
+    }
+}
+
 impl BufferShard {
     pub(super) fn elapsed_ns(start: Instant) -> u64 {
         start.elapsed().as_nanos().min(u64::MAX as u128) as u64
@@ -129,11 +148,7 @@ impl BufferShard {
         arc
     }
 
-    pub(super) fn reserve_log_space(
-        ring: &mut RingState,
-        seq: u64,
-        slot_count: u32,
-    ) -> Option<u64> {
+    fn log_space_offset(ring: &RingState, slot_count: u32) -> Option<(u64, u64)> {
         let len_bytes = Self::slot_bytes(slot_count);
         if len_bytes > ring.capacity_bytes {
             return None;
@@ -150,7 +165,7 @@ impl BufferShard {
         // ring becomes a dead gap.  Track it in `gap` so used_bytes stays
         // accurate (prevents head==tail with used<capacity from being
         // misinterpreted as "has space").
-        let (offset, gap) = if ring.used_bytes == 0 {
+        let offset_and_gap = if ring.used_bytes == 0 {
             // Ring is empty — the entire capacity is available, but we must
             // still check whether the entry fits between head and the end of
             // the device.  If it doesn't, wrap to offset 0.
@@ -179,9 +194,19 @@ impl BufferShard {
             // fill the entire capacity).
             return None;
         };
+        Some(offset_and_gap)
+    }
+
+    pub(super) fn reserve_log_space(
+        ring: &mut RingState,
+        seq: u64,
+        slot_count: u32,
+    ) -> Option<u64> {
+        let len_bytes = Self::slot_bytes(slot_count);
+        let (offset, gap) = Self::log_space_offset(ring, slot_count)?;
 
         let was_empty = ring.log_order.is_empty();
-        ring.head_offset = (offset + len_bytes) % capacity;
+        ring.head_offset = (offset + len_bytes) % ring.capacity_bytes;
         ring.used_bytes += len_bytes + gap;
         ring.log_order.push_back(LogRecord {
             seq,
@@ -192,6 +217,19 @@ impl BufferShard {
             ring.head_became_at = Some(Instant::now());
         }
         Some(offset)
+    }
+
+    fn record_reserve_wait(&self, wait_start: Option<Instant>) {
+        let Some(start) = wait_start else {
+            return;
+        };
+        let waited_ns = start.elapsed().as_nanos() as u64;
+        self.reserve_wait_ns.fetch_add(waited_ns, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_backpressure_wait_ns
+                .fetch_add(waited_ns, Ordering::Relaxed);
+        }
     }
 
     /// Advance the ring tail past contiguously-flushed-and-durable entries
@@ -401,7 +439,6 @@ impl BufferShard {
         Ok((
             Self {
                 device,
-                append_order: parking_lot::Mutex::new(()),
                 ring: parking_lot::Mutex::new(RingState {
                     used_bytes: scan.used_bytes,
                     capacity_bytes,
@@ -427,6 +464,10 @@ impl BufferShard {
                 flush_progress: DashMap::with_shard_amount(DASHMAP_SHARDS),
                 staging_tx,
                 staging_rx,
+                next_reservation_order: AtomicU64::new(0),
+                stage_turn: AppendStageTurn::default(),
+                #[cfg(test)]
+                fail_next_staging_send: AtomicBool::new(false),
                 sync_batch_max_entries: runtime_limits.sync_batch_max_entries.max(1),
                 sync_batch_max_bytes: runtime_limits.sync_batch_max_bytes.max(BLOCK_SIZE as usize),
                 cached_payload_order: parking_lot::Mutex::new(VecDeque::with_capacity(1024)),
@@ -611,19 +652,16 @@ impl BufferShard {
         }
     }
 
-    /// Hot-path append. No disk I/O, no CRC, no encoding.
-    /// Locks: ring Mutex (~50ns), then DashMap inserts (concurrent).
-    /// Channel send (lock-free ~30ns).
-    pub(super) fn append_with_seq(
+    /// Perform all fallible validation, payload copying, CRC work, and LBA-key
+    /// construction before entering an append ordering domain.
+    pub(super) fn prepare_append(
         &self,
-        seq: u64,
         vol_id: &str,
         start_lba: Lba,
         lba_count: u32,
         payload: &[u8],
         vol_created_at: u64,
-        relocation_source: Option<crate::space::extent::Extent>,
-    ) -> OnyxResult<Arc<PendingEntry>> {
+    ) -> OnyxResult<PreparedAppend> {
         if vol_id.is_empty() || vol_id.len() > MAX_VOLUME_ID_BYTES {
             return Err(OnyxError::Config(format!(
                 "vol_id must be 1..{} bytes, got {}",
@@ -634,7 +672,9 @@ impl BufferShard {
         if lba_count == 0 {
             return Err(OnyxError::Config("lba_count must be > 0".into()));
         }
-        let expected_len = lba_count as usize * BLOCK_SIZE as usize;
+        let expected_len = (lba_count as usize)
+            .checked_mul(BLOCK_SIZE as usize)
+            .ok_or_else(|| OnyxError::Config("buffer append payload length overflow".into()))?;
         if payload.len() != expected_len {
             return Err(OnyxError::Config(format!(
                 "payload must be {} bytes (lba_count={} * {}), got {}",
@@ -644,6 +684,10 @@ impl BufferShard {
                 payload.len()
             )));
         }
+        start_lba
+            .0
+            .checked_add(lba_count as u64 - 1)
+            .ok_or_else(|| OnyxError::Config("buffer append LBA range overflows u64".into()))?;
 
         let raw_size = BufferEntry::raw_size_for(vol_id, payload.len());
         let disk_len = round_up(raw_size, BLOCK_SIZE as usize) as u32;
@@ -655,6 +699,43 @@ impl BufferShard {
             )));
         }
 
+        let payload = Arc::<[u8]>::from(payload);
+        let payload_crc32 = crc32fast::hash(&payload);
+        let payload_len = payload.len() as u64;
+        let vid = self.intern_vol_id(vol_id);
+        let mut keys = Vec::with_capacity(lba_count as usize);
+        for i in 0..lba_count {
+            keys.push(LbaKey {
+                vol_id: vid.clone(),
+                lba: Lba(start_lba.0 + i as u64),
+            });
+        }
+
+        Ok(PreparedAppend {
+            vol_id: vol_id.to_string(),
+            vid,
+            start_lba,
+            lba_count,
+            payload,
+            payload_crc32,
+            payload_len,
+            vol_created_at,
+            disk_len,
+            slot_count,
+            keys,
+        })
+    }
+
+    /// Reserve a physical ring record and assign its global seq while holding
+    /// the ring mutex. The seq is allocated only after space is known to be
+    /// available, so condvar waits cannot let a later seq occupy an earlier
+    /// physical position.
+    pub(super) fn reserve_append<'a>(
+        &self,
+        next_seq: &AtomicU64,
+        frontier_gate: &'a parking_lot::RwLock<()>,
+        slot_count: u32,
+    ) -> OnyxResult<(AppendReservation, parking_lot::RwLockReadGuard<'a, ()>)> {
         // ── Ring lock: reserve space, wait if shard is temporarily full ──
         // The flush lane will drain entries and notify ring_space_cv.
         // The wait is TIMED (`buffer_backpressure_wait_ns` + `..._events`):
@@ -662,73 +743,103 @@ impl BufferShard {
         // log-write/durability buckets — and without this bucket the stall is
         // invisible in `front_write_ns` (the 2026-07-03 gap hunt found ~45% of
         // append wall-time unaccounted, all of it this wait).
-        let write_offset = {
-            let mut ring = self.ring.lock();
-            let mut wait_start: Option<Instant> = None;
-            let offset = loop {
-                if let Some(offset) = Self::reserve_log_space(&mut ring, seq, slot_count) {
-                    break Ok(offset);
+        let mut ring = self.ring.lock();
+        let mut wait_start: Option<Instant> = None;
+        loop {
+            if Self::log_space_offset(&ring, slot_count).is_some() {
+                // `applied_frontier` takes frontier(write) before ring. Drop the
+                // ring before taking frontier(read), then recheck under both in
+                // that same order. This keeps a full-ring waiter from blocking
+                // the durability path that must release its space.
+                drop(ring);
+                let frontier_guard = frontier_gate.read();
+                ring = self.ring.lock();
+                if Self::log_space_offset(&ring, slot_count).is_some() {
+                    let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                    let write_offset = Self::reserve_log_space(&mut ring, seq, slot_count)
+                        .expect("ring geometry unchanged while mutex is held");
+                    let stage_order = self.next_reservation_order.fetch_add(1, Ordering::Relaxed);
+                    let reservation = AppendReservation {
+                        seq,
+                        write_offset,
+                        stage_order,
+                    };
+                    self.record_reserve_wait(wait_start);
+                    drop(ring);
+                    return Ok((reservation, frontier_guard));
                 }
-                // Entry physically cannot fit even in empty ring → real error.
-                if Self::slot_bytes(slot_count) > ring.capacity_bytes {
-                    break Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+                drop(frontier_guard);
+                continue;
+            }
+            // Entry physically cannot fit even in empty ring → real error.
+            if Self::slot_bytes(slot_count) > ring.capacity_bytes {
+                return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+            }
+            // No backpressure configured (tests) → fail immediately.
+            if self.backpressure_timeout.is_zero() {
+                return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
+            }
+            if wait_start.is_none() {
+                wait_start = Some(Instant::now());
+                if let Some(metrics) = self.metrics.get() {
+                    metrics
+                        .buffer_backpressure_events
+                        .fetch_add(1, Ordering::Relaxed);
                 }
-                // No backpressure configured (tests) → fail immediately.
-                if self.backpressure_timeout.is_zero() {
-                    break Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
-                }
-                if wait_start.is_none() {
-                    wait_start = Some(Instant::now());
-                    if let Some(metrics) = self.metrics.get() {
-                        metrics
-                            .buffer_backpressure_events
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                if self.backpressure_waits_forever() {
-                    let _ = self
-                        .ring_space_cv
-                        .wait_for(&mut ring, BACKPRESSURE_POLL_INTERVAL);
-                    continue;
-                }
-                // Wait for flush lane to free space (condvar releases ring lock).
-                let wait = self
+            }
+            if self.backpressure_waits_forever() {
+                let _ = self
                     .ring_space_cv
-                    .wait_for(&mut ring, self.backpressure_timeout);
-                if wait.timed_out() {
-                    break Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
-                }
-            };
-            if let (Some(start), Some(metrics)) = (wait_start, self.metrics.get()) {
-                let waited_ns = start.elapsed().as_nanos() as u64;
-                self.reserve_wait_ns.fetch_add(waited_ns, Ordering::Relaxed);
-                metrics
-                    .buffer_backpressure_wait_ns
-                    .fetch_add(waited_ns, Ordering::Relaxed);
+                    .wait_for(&mut ring, BACKPRESSURE_POLL_INTERVAL);
+                continue;
             }
-            offset?
-        };
+            // Wait for flush lane to free space (condvar releases ring lock).
+            let wait = self
+                .ring_space_cv
+                .wait_for(&mut ring, self.backpressure_timeout);
+            if wait.timed_out() {
+                let used_bytes = ring.used_bytes as usize;
+                drop(ring);
+                self.record_reserve_wait(wait_start);
+                return Err(OnyxError::BufferPoolFull(used_bytes));
+            }
+        }
+    }
 
-        let payload_len = payload.len() as u64;
-
-        let payload = Arc::<[u8]>::from(payload);
-        let payload_crc32 = crc32fast::hash(&payload);
-
-        let vid = self.intern_vol_id(vol_id);
-        let mut keys = Vec::with_capacity(lba_count as usize);
+    /// Publish a prepared append into the in-memory indices, then hand it to the
+    /// sync thread in physical reservation order. Callers hold every LBA stripe
+    /// covered by `prepared`, so overlapping foreground and GC writes cannot
+    /// reorder their validation or index publication.
+    pub(super) fn publish_prepared(
+        &self,
+        reservation: AppendReservation,
+        prepared: PreparedAppend,
+        relocation_source: Option<crate::space::extent::Extent>,
+    ) -> OnyxResult<Arc<PendingEntry>> {
+        let PreparedAppend {
+            vol_id,
+            vid,
+            start_lba,
+            lba_count,
+            payload,
+            payload_crc32,
+            payload_len,
+            vol_created_at,
+            disk_len,
+            slot_count: _,
+            keys,
+        } = prepared;
         let mut superseded_ranges = Vec::new();
-        for i in 0..lba_count {
-            let lba = Lba(start_lba.0 + i as u64);
-            let key = LbaKey {
-                vol_id: vid.clone(),
-                lba,
-            };
-            if let Some(existing) = self.lba_index.get(&key) {
-                if existing.seq != seq {
-                    Self::add_seq_lba_range(&mut superseded_ranges, existing.seq, lba);
+        let mut replaced_indices = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let previous = self.lba_index.get(key).map(|entry| entry.value().clone());
+            if let Some(existing) = previous.as_ref() {
+                if existing.seq != reservation.seq {
+                    Self::add_seq_lba_range(&mut superseded_ranges, existing.seq, key.lba);
                 }
             }
-            keys.push(key);
+            let previous_latest = self.latest_lba_seq.get(key).map(|entry| *entry.value());
+            replaced_indices.push((key.clone(), previous, previous_latest));
         }
 
         // Build PendingEntry with payload populated eagerly. This is the
@@ -737,15 +848,15 @@ impl BufferShard {
         // `entry.payload` (Some) or fall back to LV2 disk for crash-recovered
         // entries that were rebuilt with `payload: None`.
         let pending = Arc::new(PendingEntry {
-            seq,
-            vol_id: vol_id.to_string(),
+            seq: reservation.seq,
+            vol_id,
             start_lba,
             lba_count,
             payload_crc32,
             vol_created_at,
             relocation_source,
             payload: Some(payload.clone()),
-            disk_offset: write_offset,
+            disk_offset: reservation.write_offset,
             disk_len,
             enqueued_at: Instant::now(),
             durability_advanced_at_ns: AtomicU64::new(0),
@@ -760,9 +871,14 @@ impl BufferShard {
         Self::add_pending_buckets(&self.pending_lba_buckets, &vid, start_lba, lba_count);
         for key in keys {
             self.lba_index.insert(key.clone(), pending.clone());
-            self.latest_lba_seq.insert(key, (seq, vol_created_at));
+            self.latest_lba_seq
+                .insert(key, (reservation.seq, vol_created_at));
         }
-        if self.pending_entries.insert(seq, pending.clone()).is_none() {
+        if self
+            .pending_entries
+            .insert(reservation.seq, pending.clone())
+            .is_none()
+        {
             self.pending_count.fetch_add(1, Ordering::Relaxed);
             self.pending_bytes
                 .fetch_add(disk_len as u64, Ordering::Relaxed);
@@ -773,32 +889,47 @@ impl BufferShard {
         // as stale. The append then leaves a real durable pending entry that no
         // bounded retry can ever find. Removal remains paired with
         // note_applied; release_below does not need to touch this set.
-        self.ring.lock().pending_seqs.insert(seq);
+        self.ring.lock().pending_seqs.insert(reservation.seq);
 
         // Account payload bytes toward the in-memory cache budget. LRU
         // eviction (`evict_payload_cache_to_budget`) will strip oldest
         // entries' payload field if we exceed `max_payload_memory`.
         self.payload_bytes_in_memory
             .fetch_add(payload_len, Ordering::Relaxed);
-        self.cached_payload_order.lock().push_back(seq);
-        self.evict_payload_cache_to_budget();
-        self.compact_payload_cache_order_if_needed();
+        self.cached_payload_order.lock().push_back(reservation.seq);
 
-        // ── Channel send (lock-free MPSC, ~30ns) ──
-        if self
-            .staging_tx
-            .send(StagedEntry {
+        // Different LBA stripes may reach this point out of order. Serialize
+        // only the final channel handoff so the scalar durability watermark and
+        // checkpoint-guided recovery retain their increasing-seq invariant.
+        let send_result = self.stage_turn.run(reservation.stage_order, || {
+            let staged = StagedEntry {
                 pending: pending.clone(),
                 payload,
                 staged_at: Instant::now(),
-            })
-            .is_err()
-        {
-            // Back out the index inserts and the payload accounting.
-            self.evict_pending_entry(seq, &pending);
-            return Err(OnyxError::Io(std::io::Error::other(
-                "buffer sync thread is not accepting staged entries",
-            )));
+            };
+            #[cfg(test)]
+            if self.fail_next_staging_send.swap(false, Ordering::Relaxed) {
+                return Err(());
+            }
+            self.staging_tx.send(staged).map_err(|_| ())
+        });
+        if send_result.is_err() {
+            // Back out the new entry and restore the successfully published
+            // value it replaced. The caller still fail-stops the whole pool:
+            // the physical reservation is a ghost record that cannot be
+            // safely removed once later non-overlapping reservations exist.
+            self.evict_pending_entry(reservation.seq, &pending);
+            for (key, previous, previous_latest) in replaced_indices {
+                if let Some(previous) = previous {
+                    self.lba_index.insert(key.clone(), previous);
+                }
+                if let Some(previous_latest) = previous_latest {
+                    self.latest_lba_seq.insert(key, previous_latest);
+                }
+            }
+            return Err(OnyxError::MetaFenced(
+                "buffer sync staging channel closed".into(),
+            ));
         }
 
         if let Some(metrics) = self.metrics.get() {
@@ -814,6 +945,19 @@ impl BufferShard {
         self.append_ops.fetch_add(1, Ordering::Relaxed);
         self.append_bytes.fetch_add(payload_len, Ordering::Relaxed);
         Ok(pending)
+    }
+
+    /// Cache eviction does not participate in append ordering. Running it after
+    /// the caller releases LBA stripes keeps scans and payload replacement out
+    /// of foreground ordering critical sections.
+    pub(super) fn maintain_payload_cache_after_append(&self) {
+        self.evict_payload_cache_to_budget();
+        self.compact_payload_cache_order_if_needed();
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_staging_send_for_test(&self) {
+        self.fail_next_staging_send.store(true, Ordering::Relaxed);
     }
 
     /// Block until the LV2 fdatasync watermark covers `seq`. The sync
@@ -845,6 +989,13 @@ impl BufferShard {
                     lba: Lba(pending.start_lba.0 + i as u64),
                 },
                 |_, value| value.seq == seq,
+            );
+            self.latest_lba_seq.remove_if(
+                &LbaKey {
+                    vol_id: vid.clone(),
+                    lba: Lba(pending.start_lba.0 + i as u64),
+                },
+                |_, &(latest_seq, _)| latest_seq == seq,
             );
         }
         self.remove_pending_buckets(&vid, pending.start_lba, pending.lba_count);

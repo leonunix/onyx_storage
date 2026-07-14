@@ -759,6 +759,7 @@ fn commit_aggregator_forms_full_batch_and_flushes_disconnect_tail() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            aggregator_executor_load(),
             None,
             Some(aggregator_metrics),
             true,
@@ -796,6 +797,7 @@ fn commit_aggregator_hard_deadline_is_not_extended_by_arrivals() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            aggregator_executor_load(),
             None,
             None,
             true,
@@ -845,6 +847,7 @@ fn commit_aggregator_adapts_after_sustained_underfill() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            aggregator_executor_load(),
             None,
             Some(aggregator_metrics),
             true,
@@ -872,6 +875,7 @@ fn commit_aggregator_idle_flushes_partial_without_splitting_jobs() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            aggregator_executor_load(),
             None,
             None,
             true,
@@ -909,6 +913,7 @@ fn commit_aggregator_carries_whole_job_that_crosses_target() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            aggregator_executor_load(),
             None,
             None,
             true,
@@ -959,6 +964,7 @@ fn commit_aggregator_3162_lba_crossing_is_capacity_not_target() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            aggregator_executor_load(),
             None,
             Some(aggregator_metrics),
             true,
@@ -1006,6 +1012,7 @@ fn commit_aggregator_retain_tail_gate_off_uses_legacy_budget() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            aggregator_executor_load(),
             None,
             None,
             false,
@@ -1047,6 +1054,7 @@ fn commit_aggregator_reports_executor_disconnect_to_dedup_waiter() {
     BufferFlusher::commit_aggregator_loop(
         raw_rx,
         batch_tx,
+        aggregator_executor_load(),
         None,
         Some(metrics.clone()),
         true,
@@ -1168,6 +1176,12 @@ fn aggregator_job(start_lba: u64, lba_count: usize) -> super::writer::CommitJob 
         response_tx,
         enqueued_at: Instant::now(),
     })
+}
+
+fn aggregator_executor_load() -> Arc<super::writer::CommitExecutorLoad> {
+    // Tests that are not specifically about downstream saturation should keep
+    // ample headroom so their existing seal-policy expectations stay focused.
+    Arc::new(super::writer::CommitExecutorLoad::new(16))
 }
 
 fn aggregator_job_enqueued_at(

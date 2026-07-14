@@ -229,6 +229,22 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
         "every global barrier attempt must have exactly one packed 4 KiB write"
     );
     let stage_metrics = metrics.snapshot();
+    assert!(stage_metrics.buffer_append_order_wait_ns > 0);
+    assert!(stage_metrics.buffer_append_order_hold_ns > 0);
+    assert_eq!(
+        stage_metrics
+            .buffer_append_order_wait_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        64
+    );
+    assert_eq!(
+        stage_metrics
+            .buffer_append_order_hold_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        64
+    );
     assert_eq!(
         stage_metrics
             .buffer_append_wait_durable_fine_latency_buckets
@@ -670,6 +686,197 @@ fn foreground_append_cannot_be_overtaken_after_relocation_validation() {
     let latest = pool.lookup("test-vol", Lba(77)).unwrap().unwrap();
     assert_eq!(latest.seq, foreground_seq);
     assert_eq!(latest.payload.unwrap()[0], 0xEE);
+}
+
+#[test]
+fn concurrent_foreground_writes_to_one_lba_leave_highest_seq_visible() {
+    let (pool, _tmp) = create_pool(32 * 1024 * 1024, Duration::from_millis(1));
+    let pool = Arc::new(pool);
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+    let start = Arc::new(std::sync::Barrier::new(17));
+    let mut writers = Vec::new();
+    for byte in 1u8..=16 {
+        let pool = pool.clone();
+        let start = start.clone();
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            let seq = pool
+                .append("test-vol", Lba(91), 1, &[byte; BLOCK_SIZE as usize], 5)
+                .unwrap();
+            (seq, byte)
+        }));
+    }
+    start.wait();
+    let outcomes: Vec<(u64, u8)> = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect();
+    let &(latest_seq, latest_byte) = outcomes.iter().max_by_key(|(seq, _)| seq).unwrap();
+
+    let latest = pool.lookup("test-vol", Lba(91)).unwrap().unwrap();
+    assert_eq!(latest.seq, latest_seq);
+    assert_eq!(latest.payload.unwrap()[0], latest_byte);
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot
+            .buffer_append_order_wait_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        16
+    );
+    assert_eq!(
+        snapshot
+            .buffer_append_order_hold_latency_buckets
+            .iter()
+            .sum::<u64>(),
+        16
+    );
+}
+
+#[test]
+fn failed_stage_turn_advances_waiting_successor() {
+    let turn = Arc::new(AppendStageTurn::default());
+    let (waiting_tx, waiting_rx) = bounded(1);
+    let (ran_tx, ran_rx) = bounded(1);
+    let later_turn = turn.clone();
+    let later = std::thread::spawn(move || {
+        waiting_tx.send(()).unwrap();
+        later_turn.run(1, || ran_tx.send("second"))
+    });
+
+    waiting_rx.recv().unwrap();
+    assert!(matches!(
+        ran_rx.recv_timeout(Duration::from_millis(20)),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+    ));
+    let first: Result<(), &str> = turn.run(0, || Err("staging channel closed"));
+    assert_eq!(first, Err("staging channel closed"));
+    assert_eq!(
+        ran_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "second"
+    );
+    later.join().unwrap().unwrap();
+}
+
+#[test]
+fn staging_failure_restores_previous_mapping_fences_and_reopens() {
+    let size = 16 * 1024 * 1024;
+    let (pool, tmp) = create_pool(size, Duration::from_millis(1));
+    let lba = Lba(93);
+    let old_seq = pool
+        .append("test-vol", lba, 1, &[0x3c; BLOCK_SIZE as usize], 7)
+        .unwrap();
+    pool.shards[0].shard.fail_next_staging_send_for_test();
+
+    let error = pool
+        .append("test-vol", lba, 1, &[0xa7; BLOCK_SIZE as usize], 7)
+        .unwrap_err();
+    assert!(matches!(error, OnyxError::MetaFenced(_)));
+    assert!(pool.is_meta_fenced());
+    let visible = pool.lookup("test-vol", lba).unwrap().unwrap();
+    assert_eq!(visible.seq, old_seq);
+    assert_eq!(visible.payload.unwrap()[0], 0x3c);
+    assert!(matches!(
+        pool.append("test-vol", Lba(94), 1, &[0x55; BLOCK_SIZE as usize], 7,),
+        Err(OnyxError::MetaFenced(_))
+    ));
+
+    drop(pool);
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let reopened =
+        WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(1)).unwrap();
+    let recovered = reopened.lookup("test-vol", lba).unwrap().unwrap();
+    assert_eq!(recovered.seq, old_seq);
+    assert_eq!(recovered.payload.unwrap()[0], 0x3c);
+}
+
+#[test]
+fn foreground_lease_spans_split_tickets_and_gc_stays_untracked() {
+    let (pool, _tmp) = create_pool(16 * 1024 * 1024, Duration::from_millis(1));
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(Arc::clone(&metrics));
+
+    let lease = metrics.begin_foreground_io();
+    let mut first = pool
+        .append_deferred("test-vol", Lba(100), 1, &[0x11; BLOCK_SIZE as usize], 7)
+        .unwrap();
+    first.attach_foreground_io_lease(Arc::clone(&lease));
+    let mut second = pool
+        .append_deferred("test-vol", Lba(101), 1, &[0x22; BLOCK_SIZE as usize], 7)
+        .unwrap();
+    second.attach_foreground_io_lease(Arc::clone(&lease));
+    drop(lease);
+
+    assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 1);
+    first.wait();
+    assert_eq!(
+        metrics.foreground_io_outstanding.load(Ordering::Relaxed),
+        1,
+        "one logical request remains outstanding until its final split ticket"
+    );
+    second.wait();
+    assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 0);
+
+    let foreground_samples = metrics
+        .buffer_append_wait_durable_foreground_fine_snapshot()
+        .into_iter()
+        .sum::<u64>();
+    assert_eq!(foreground_samples, 2);
+
+    // GC and other internal users append directly to the pool and never attach
+    // a foreground lease. They stay in aggregate durability telemetry only.
+    pool.append_deferred("test-vol", Lba(102), 1, &[0x33; BLOCK_SIZE as usize], 7)
+        .unwrap()
+        .wait();
+    assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        metrics
+            .buffer_append_wait_durable_foreground_fine_snapshot()
+            .into_iter()
+            .sum::<u64>(),
+        foreground_samples
+    );
+    assert_eq!(
+        metrics
+            .buffer_append_wait_durable_fine_snapshot()
+            .into_iter()
+            .sum::<u64>(),
+        3
+    );
+}
+
+#[test]
+fn foreground_lease_releases_when_a_later_split_append_fails() {
+    let (pool, _tmp) = create_pool(16 * 1024 * 1024, Duration::from_millis(1));
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(Arc::clone(&metrics));
+
+    let submit_like_zone_manager = || -> OnyxResult<Vec<BufferAppendTicket>> {
+        let lease = metrics.begin_foreground_io();
+        let mut tickets = Vec::new();
+        let mut first =
+            pool.append_deferred("test-vol", Lba(103), 1, &[0x44; BLOCK_SIZE as usize], 7)?;
+        first.attach_foreground_io_lease(Arc::clone(&lease));
+        tickets.push(first);
+
+        pool.shards[0].shard.fail_next_staging_send_for_test();
+        let mut second =
+            pool.append_deferred("test-vol", Lba(104), 1, &[0x55; BLOCK_SIZE as usize], 7)?;
+        second.attach_foreground_io_lease(lease);
+        tickets.push(second);
+        Ok(tickets)
+    };
+
+    assert!(matches!(
+        submit_like_zone_manager(),
+        Err(OnyxError::MetaFenced(_))
+    ));
+    assert_eq!(
+        metrics.foreground_io_outstanding.load(Ordering::Relaxed),
+        0,
+        "the local lease and earlier split tickets must unwind on a later append failure"
+    );
 }
 
 #[test]

@@ -35,6 +35,7 @@ impl EngineMetrics {
                 &self.ublk_write_completion_wait_latency_buckets,
             ),
             volume_partial_write_ops: load(&self.volume_partial_write_ops),
+            foreground_io_outstanding: load(&self.foreground_io_outstanding),
             zone_write_dispatches: load(&self.zone_write_dispatches),
             zone_submit_write_ns: load(&self.zone_submit_write_ns),
             zone_worker_write_ns: load(&self.zone_worker_write_ns),
@@ -47,16 +48,29 @@ impl EngineMetrics {
             buffer_write_bytes: load(&self.buffer_write_bytes),
             buffer_append_total_ns: load(&self.buffer_append_total_ns),
             buffer_append_prepare_ns: load(&self.buffer_append_prepare_ns),
+            buffer_append_order_wait_ns: load(&self.buffer_append_order_wait_ns),
+            buffer_append_order_hold_ns: load(&self.buffer_append_order_hold_ns),
+            buffer_append_order_wait_max_ns: load(&self.buffer_append_order_wait_max_ns),
+            buffer_append_order_hold_max_ns: load(&self.buffer_append_order_hold_max_ns),
             buffer_append_log_write_ns: load(&self.buffer_append_log_write_ns),
             buffer_append_wait_durable_ns: load(&self.buffer_append_wait_durable_ns),
             buffer_append_prepare_latency_buckets: load_latency_buckets(
                 &self.buffer_append_prepare_latency_buckets,
+            ),
+            buffer_append_order_wait_latency_buckets: load_latency_buckets(
+                &self.buffer_append_order_wait_latency_buckets,
+            ),
+            buffer_append_order_hold_latency_buckets: load_latency_buckets(
+                &self.buffer_append_order_hold_latency_buckets,
             ),
             buffer_append_wait_durable_latency_buckets: load_latency_buckets(
                 &self.buffer_append_wait_durable_latency_buckets,
             ),
             buffer_append_wait_durable_fine_latency_buckets: self
                 .buffer_append_wait_durable_fine_latency
+                .snapshot(),
+            buffer_append_wait_durable_foreground_fine_latency_buckets: self
+                .buffer_append_wait_durable_foreground_fine_latency
                 .snapshot(),
             buffer_sync_batches: load(&self.buffer_sync_batches),
             buffer_sync_flushes: load(&self.buffer_sync_flushes),
@@ -216,6 +230,24 @@ impl EngineMetrics {
             flush_stale_discards: load(&self.flush_stale_discards),
             flush_seq_rejects: load(&self.flush_seq_rejects),
             flush_errors: load(&self.flush_errors),
+            flush_qos_mode: load(&self.flush_qos_mode),
+            flush_qos_rate_bytes_per_sec: load(&self.flush_qos_rate_bytes_per_sec),
+            flush_qos_foreground_bytes_per_sec: load(&self.flush_qos_foreground_bytes_per_sec),
+            flush_qos_durable_p99_ns: load(&self.flush_qos_durable_p99_ns),
+            flush_qos_logical_fill_pct: load(&self.flush_qos_logical_fill_pct),
+            flush_qos_physical_fill_pct: load(&self.flush_qos_physical_fill_pct),
+            flush_qos_payload_fill_pct: load(&self.flush_qos_payload_fill_pct),
+            flush_qos_admitted_bytes: load(&self.flush_qos_admitted_bytes),
+            flush_qos_wait_ns: load(&self.flush_qos_wait_ns),
+            flush_qos_wait_events: load(&self.flush_qos_wait_events),
+            flush_qos_wait_max_ns: load(&self.flush_qos_wait_max_ns),
+            flush_qos_waiters: load(&self.flush_qos_waiters),
+            flush_qos_waiters_max: load(&self.flush_qos_waiters_max),
+            flush_qos_idle_bypasses: load(&self.flush_qos_idle_bypasses),
+            flush_qos_emergency_bypasses: load(&self.flush_qos_emergency_bypasses),
+            flush_qos_emergency_transitions: load(&self.flush_qos_emergency_transitions),
+            flush_qos_rate_increases: load(&self.flush_qos_rate_increases),
+            flush_qos_rate_decreases: load(&self.flush_qos_rate_decreases),
             flush_writer_total_ns: load(&self.flush_writer_total_ns),
             flush_writer_alloc_ns: load(&self.flush_writer_alloc_ns),
             flush_writer_io_ns: load(&self.flush_writer_io_ns),
@@ -247,6 +279,15 @@ impl EngineMetrics {
             flush_commit_worker_executor_queue_wait_ns: load(
                 &self.flush_commit_worker_executor_queue_wait_ns,
             ),
+            flush_commit_worker_executor_queue_wait_max_ns: load(
+                &self.flush_commit_worker_executor_queue_wait_max_ns,
+            ),
+            flush_commit_executor_queue_depth: load(&self.flush_commit_executor_queue_depth),
+            flush_commit_executor_queue_depth_max: load(
+                &self.flush_commit_executor_queue_depth_max,
+            ),
+            flush_commit_executors_active: load(&self.flush_commit_executors_active),
+            flush_commit_executors_active_max: load(&self.flush_commit_executors_active_max),
             flush_commit_aggregator_seals_target: load(&self.flush_commit_aggregator_seals_target),
             flush_commit_aggregator_seals_capacity: load(
                 &self.flush_commit_aggregator_seals_capacity,
@@ -263,6 +304,7 @@ impl EngineMetrics {
             flush_commit_aggregator_seals_shutdown: load(
                 &self.flush_commit_aggregator_seals_shutdown,
             ),
+            flush_commit_worker_service_batches: load(&self.flush_commit_worker_service_batches),
             flush_commit_worker_service_ns: load(&self.flush_commit_worker_service_ns),
             flush_commit_worker_jobs: load(&self.flush_commit_worker_jobs),
             flush_commit_worker_job_lbas: load(&self.flush_commit_worker_job_lbas),
@@ -448,6 +490,8 @@ pub struct EngineMetricsSnapshot {
     pub ublk_write_worker_latency_buckets: Vec<u64>,
     pub ublk_write_completion_wait_latency_buckets: Vec<u64>,
     pub volume_partial_write_ops: u64,
+    #[serde(default)]
+    pub foreground_io_outstanding: u64,
     pub zone_write_dispatches: u64,
     pub zone_submit_write_ns: u64,
     pub zone_worker_write_ns: u64,
@@ -460,11 +504,25 @@ pub struct EngineMetricsSnapshot {
     pub buffer_write_bytes: u64,
     pub buffer_append_total_ns: u64,
     pub buffer_append_prepare_ns: u64,
+    #[serde(default)]
+    pub buffer_append_order_wait_ns: u64,
+    #[serde(default)]
+    pub buffer_append_order_hold_ns: u64,
+    #[serde(default)]
+    pub buffer_append_order_wait_max_ns: u64,
+    #[serde(default)]
+    pub buffer_append_order_hold_max_ns: u64,
     pub buffer_append_log_write_ns: u64,
     pub buffer_append_wait_durable_ns: u64,
     pub buffer_append_prepare_latency_buckets: Vec<u64>,
+    #[serde(default)]
+    pub buffer_append_order_wait_latency_buckets: Vec<u64>,
+    #[serde(default)]
+    pub buffer_append_order_hold_latency_buckets: Vec<u64>,
     pub buffer_append_wait_durable_latency_buckets: Vec<u64>,
     pub buffer_append_wait_durable_fine_latency_buckets: Vec<u64>,
+    #[serde(default)]
+    pub buffer_append_wait_durable_foreground_fine_latency_buckets: Vec<u64>,
     pub buffer_sync_batches: u64,
     pub buffer_sync_flushes: u64,
     pub buffer_sync_batch_ns: u64,
@@ -601,6 +659,42 @@ pub struct EngineMetricsSnapshot {
     pub flush_stale_discards: u64,
     pub flush_seq_rejects: u64,
     pub flush_errors: u64,
+    #[serde(default)]
+    pub flush_qos_mode: u64,
+    #[serde(default)]
+    pub flush_qos_rate_bytes_per_sec: u64,
+    #[serde(default)]
+    pub flush_qos_foreground_bytes_per_sec: u64,
+    #[serde(default)]
+    pub flush_qos_durable_p99_ns: u64,
+    #[serde(default)]
+    pub flush_qos_logical_fill_pct: u64,
+    #[serde(default)]
+    pub flush_qos_physical_fill_pct: u64,
+    #[serde(default)]
+    pub flush_qos_payload_fill_pct: u64,
+    #[serde(default)]
+    pub flush_qos_admitted_bytes: u64,
+    #[serde(default)]
+    pub flush_qos_wait_ns: u64,
+    #[serde(default)]
+    pub flush_qos_wait_events: u64,
+    #[serde(default)]
+    pub flush_qos_wait_max_ns: u64,
+    #[serde(default)]
+    pub flush_qos_waiters: u64,
+    #[serde(default)]
+    pub flush_qos_waiters_max: u64,
+    #[serde(default)]
+    pub flush_qos_idle_bypasses: u64,
+    #[serde(default)]
+    pub flush_qos_emergency_bypasses: u64,
+    #[serde(default)]
+    pub flush_qos_emergency_transitions: u64,
+    #[serde(default)]
+    pub flush_qos_rate_increases: u64,
+    #[serde(default)]
+    pub flush_qos_rate_decreases: u64,
     pub flush_writer_total_ns: u64,
     pub flush_writer_alloc_ns: u64,
     pub flush_writer_io_ns: u64,
@@ -631,6 +725,16 @@ pub struct EngineMetricsSnapshot {
     #[serde(default)]
     pub flush_commit_worker_executor_queue_wait_ns: u64,
     #[serde(default)]
+    pub flush_commit_worker_executor_queue_wait_max_ns: u64,
+    #[serde(default)]
+    pub flush_commit_executor_queue_depth: u64,
+    #[serde(default)]
+    pub flush_commit_executor_queue_depth_max: u64,
+    #[serde(default)]
+    pub flush_commit_executors_active: u64,
+    #[serde(default)]
+    pub flush_commit_executors_active_max: u64,
+    #[serde(default)]
     pub flush_commit_aggregator_seals_target: u64,
     #[serde(default)]
     pub flush_commit_aggregator_seals_capacity: u64,
@@ -642,6 +746,8 @@ pub struct EngineMetricsSnapshot {
     pub flush_commit_aggregator_seals_pressure: u64,
     #[serde(default)]
     pub flush_commit_aggregator_seals_shutdown: u64,
+    #[serde(default)]
+    pub flush_commit_worker_service_batches: u64,
     pub flush_commit_worker_service_ns: u64,
     pub flush_commit_worker_jobs: u64,
     pub flush_commit_worker_job_lbas: u64,
@@ -807,8 +913,24 @@ impl EngineMetricsSnapshot {
             ($($field:ident),+ $(,)?) => {
                 Self {
                     $(
-                        $field: self.$field.saturating_sub(earlier.$field),
+                    $field: self.$field.saturating_sub(earlier.$field),
                     )+
+                    flush_qos_mode: self.flush_qos_mode,
+                    flush_qos_rate_bytes_per_sec: self.flush_qos_rate_bytes_per_sec,
+                    flush_qos_foreground_bytes_per_sec: self.flush_qos_foreground_bytes_per_sec,
+                    flush_qos_durable_p99_ns: self.flush_qos_durable_p99_ns,
+                    flush_qos_logical_fill_pct: self.flush_qos_logical_fill_pct,
+                    flush_qos_physical_fill_pct: self.flush_qos_physical_fill_pct,
+                    flush_qos_payload_fill_pct: self.flush_qos_payload_fill_pct,
+                    flush_qos_wait_max_ns: self.flush_qos_wait_max_ns,
+                    flush_qos_waiters: self.flush_qos_waiters,
+                    flush_qos_waiters_max: self.flush_qos_waiters_max,
+                    foreground_io_outstanding: self.foreground_io_outstanding,
+                    flush_commit_executor_queue_depth: self.flush_commit_executor_queue_depth,
+                    flush_commit_worker_executor_queue_wait_max_ns: self.flush_commit_worker_executor_queue_wait_max_ns,
+                    flush_commit_executor_queue_depth_max: self.flush_commit_executor_queue_depth_max,
+                    flush_commit_executors_active: self.flush_commit_executors_active,
+                    flush_commit_executors_active_max: self.flush_commit_executors_active_max,
                     read_pool_queue_wait_latency_buckets: sub_latency_buckets(
                         &self.read_pool_queue_wait_latency_buckets,
                         &earlier.read_pool_queue_wait_latency_buckets,
@@ -845,8 +967,11 @@ impl EngineMetricsSnapshot {
                     ublk_write_worker_latency_buckets: sub_latency_buckets(&self.ublk_write_worker_latency_buckets, &earlier.ublk_write_worker_latency_buckets),
                     ublk_write_completion_wait_latency_buckets: sub_latency_buckets(&self.ublk_write_completion_wait_latency_buckets, &earlier.ublk_write_completion_wait_latency_buckets),
                     buffer_append_prepare_latency_buckets: sub_latency_buckets(&self.buffer_append_prepare_latency_buckets, &earlier.buffer_append_prepare_latency_buckets),
+                    buffer_append_order_wait_latency_buckets: sub_latency_buckets(&self.buffer_append_order_wait_latency_buckets, &earlier.buffer_append_order_wait_latency_buckets),
+                    buffer_append_order_hold_latency_buckets: sub_latency_buckets(&self.buffer_append_order_hold_latency_buckets, &earlier.buffer_append_order_hold_latency_buckets),
                     buffer_append_wait_durable_latency_buckets: sub_latency_buckets(&self.buffer_append_wait_durable_latency_buckets, &earlier.buffer_append_wait_durable_latency_buckets),
                     buffer_append_wait_durable_fine_latency_buckets: sub_latency_buckets(&self.buffer_append_wait_durable_fine_latency_buckets, &earlier.buffer_append_wait_durable_fine_latency_buckets),
+                    buffer_append_wait_durable_foreground_fine_latency_buckets: sub_latency_buckets(&self.buffer_append_wait_durable_foreground_fine_latency_buckets, &earlier.buffer_append_wait_durable_foreground_fine_latency_buckets),
                     buffer_lv2_latency_bucket_upper_bounds_ns: self.buffer_lv2_latency_bucket_upper_bounds_ns.clone(),
                     buffer_lv2_staging_queue_latency_buckets: sub_latency_buckets(&self.buffer_lv2_staging_queue_latency_buckets, &earlier.buffer_lv2_staging_queue_latency_buckets),
                     buffer_lv2_prepared_queue_latency_buckets: sub_latency_buckets(&self.buffer_lv2_prepared_queue_latency_buckets, &earlier.buffer_lv2_prepared_queue_latency_buckets),
@@ -878,6 +1003,7 @@ impl EngineMetricsSnapshot {
             ublk_write_worker_ns,
             ublk_write_completion_wait_ns,
             volume_partial_write_ops,
+            // foreground_io_outstanding is a live gauge preserved above.
             zone_write_dispatches,
             zone_submit_write_ns,
             zone_worker_write_ns,
@@ -890,6 +1016,10 @@ impl EngineMetricsSnapshot {
             buffer_write_bytes,
             buffer_append_total_ns,
             buffer_append_prepare_ns,
+            buffer_append_order_wait_ns,
+            buffer_append_order_hold_ns,
+            buffer_append_order_wait_max_ns,
+            buffer_append_order_hold_max_ns,
             buffer_append_log_write_ns,
             buffer_append_wait_durable_ns,
             buffer_sync_batches,
@@ -1002,6 +1132,14 @@ impl EngineMetricsSnapshot {
             flush_stale_discards,
             flush_seq_rejects,
             flush_errors,
+            flush_qos_admitted_bytes,
+            flush_qos_wait_ns,
+            flush_qos_wait_events,
+            flush_qos_idle_bypasses,
+            flush_qos_emergency_bypasses,
+            flush_qos_emergency_transitions,
+            flush_qos_rate_increases,
+            flush_qos_rate_decreases,
             flush_writer_total_ns,
             flush_writer_alloc_ns,
             flush_writer_io_ns,
@@ -1035,6 +1173,7 @@ impl EngineMetricsSnapshot {
             flush_commit_aggregator_seals_adaptive_underfill,
             flush_commit_aggregator_seals_pressure,
             flush_commit_aggregator_seals_shutdown,
+            flush_commit_worker_service_batches,
             flush_commit_worker_service_ns,
             flush_commit_worker_jobs,
             flush_commit_worker_job_lbas,
@@ -1195,6 +1334,32 @@ mod compatibility_tests {
         let mut value = serde_json::to_value(EngineMetrics::default().snapshot()).unwrap();
         let object = value.as_object_mut().unwrap();
         for field in [
+            "foreground_io_outstanding",
+            "buffer_append_wait_durable_foreground_fine_latency_buckets",
+            "flush_commit_worker_executor_queue_wait_max_ns",
+            "flush_commit_executor_queue_depth",
+            "flush_commit_executor_queue_depth_max",
+            "flush_commit_executors_active",
+            "flush_commit_executors_active_max",
+            "flush_commit_worker_service_batches",
+            "flush_qos_mode",
+            "flush_qos_rate_bytes_per_sec",
+            "flush_qos_foreground_bytes_per_sec",
+            "flush_qos_durable_p99_ns",
+            "flush_qos_logical_fill_pct",
+            "flush_qos_physical_fill_pct",
+            "flush_qos_payload_fill_pct",
+            "flush_qos_admitted_bytes",
+            "flush_qos_wait_ns",
+            "flush_qos_wait_events",
+            "flush_qos_wait_max_ns",
+            "flush_qos_waiters",
+            "flush_qos_waiters_max",
+            "flush_qos_idle_bypasses",
+            "flush_qos_emergency_bypasses",
+            "flush_qos_emergency_transitions",
+            "flush_qos_rate_increases",
+            "flush_qos_rate_decreases",
             "gc_defrag_segments_completed",
             "gc_defrag_segments_cancelled",
             "gc_defrag_dedup_hits_rejected",
@@ -1206,6 +1371,12 @@ mod compatibility_tests {
             "flush_writer_group_short_extent_allocs",
             "flush_writer_group_fallback_units",
             "flush_writer_group_unused_blocks",
+            "buffer_append_order_wait_ns",
+            "buffer_append_order_hold_ns",
+            "buffer_append_order_wait_max_ns",
+            "buffer_append_order_hold_max_ns",
+            "buffer_append_order_wait_latency_buckets",
+            "buffer_append_order_hold_latency_buckets",
         ] {
             assert!(
                 object.remove(field).is_some(),
@@ -1214,8 +1385,82 @@ mod compatibility_tests {
         }
 
         let decoded: EngineMetricsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.flush_commit_executor_queue_depth, 0);
+        assert_eq!(decoded.flush_commit_executors_active, 0);
+        assert_eq!(decoded.flush_commit_worker_service_batches, 0);
+        assert_eq!(decoded.foreground_io_outstanding, 0);
+        assert!(decoded
+            .buffer_append_wait_durable_foreground_fine_latency_buckets
+            .is_empty());
+        assert_eq!(decoded.flush_qos_mode, 0);
+        assert_eq!(decoded.flush_qos_admitted_bytes, 0);
+        assert_eq!(decoded.flush_qos_wait_max_ns, 0);
+        assert_eq!(decoded.flush_qos_waiters, 0);
+        assert_eq!(decoded.flush_qos_waiters_max, 0);
         assert_eq!(decoded.gc_defrag_segments_completed, 0);
         assert_eq!(decoded.allocator_stripe_reserve_blocks, 0);
         assert_eq!(decoded.flush_writer_group_aligned_ops, 0);
+        assert_eq!(decoded.buffer_append_order_wait_ns, 0);
+        assert!(decoded.buffer_append_order_wait_latency_buckets.is_empty());
+    }
+
+    #[test]
+    fn interval_delta_preserves_live_gauges_and_subtracts_counters() {
+        let mut earlier = EngineMetricsSnapshot::default();
+        earlier.flush_qos_mode = 3;
+        earlier.flush_qos_rate_bytes_per_sec = 400;
+        earlier.flush_qos_logical_fill_pct = 80;
+        earlier.flush_qos_wait_max_ns = 900;
+        earlier.flush_qos_waiters = 12;
+        earlier.flush_qos_waiters_max = 16;
+        earlier.flush_commit_executor_queue_depth = 12;
+        earlier.flush_commit_executors_active = 8;
+        earlier.foreground_io_outstanding = 9;
+        earlier.flush_commit_worker_executor_queue_wait_max_ns = 12;
+        earlier.flush_commit_executor_queue_depth_max = 12;
+        earlier.flush_commit_executors_active_max = 12;
+        earlier.flush_qos_admitted_bytes = 10;
+
+        let mut current = EngineMetricsSnapshot::default();
+        current.flush_qos_mode = 1;
+        current.flush_qos_rate_bytes_per_sec = 128;
+        current.flush_qos_logical_fill_pct = 20;
+        current.flush_qos_wait_max_ns = 900;
+        current.flush_qos_waiters = 2;
+        current.flush_qos_waiters_max = 16;
+        current.flush_commit_executor_queue_depth = 2;
+        current.flush_commit_executors_active = 1;
+        current.foreground_io_outstanding = 3;
+        current.flush_commit_worker_executor_queue_wait_max_ns = 12;
+        current.flush_commit_executor_queue_depth_max = 12;
+        current.flush_commit_executors_active_max = 12;
+        current.flush_qos_admitted_bytes = 25;
+
+        let delta = current.saturating_sub(&earlier);
+        assert_eq!(delta.flush_qos_mode, 1);
+        assert_eq!(delta.flush_qos_rate_bytes_per_sec, 128);
+        assert_eq!(delta.flush_qos_logical_fill_pct, 20);
+        assert_eq!(delta.flush_qos_wait_max_ns, 900);
+        assert_eq!(delta.flush_qos_waiters, 2);
+        assert_eq!(delta.flush_qos_waiters_max, 16);
+        assert_eq!(delta.flush_commit_executor_queue_depth, 2);
+        assert_eq!(delta.flush_commit_executors_active, 1);
+        assert_eq!(delta.foreground_io_outstanding, 3);
+        assert_eq!(delta.flush_commit_worker_executor_queue_wait_max_ns, 12);
+        assert_eq!(delta.flush_commit_executor_queue_depth_max, 12);
+        assert_eq!(delta.flush_commit_executors_active_max, 12);
+        assert_eq!(delta.flush_qos_admitted_bytes, 15);
+
+        current.flush_commit_worker_executor_queue_wait_max_ns = 15;
+        current.flush_commit_executor_queue_depth_max = 15;
+        current.flush_commit_executors_active_max = 15;
+        current.flush_qos_wait_max_ns = 1_200;
+        current.flush_qos_waiters_max = 20;
+        let grown_hwm = current.saturating_sub(&earlier);
+        assert_eq!(grown_hwm.flush_commit_worker_executor_queue_wait_max_ns, 15);
+        assert_eq!(grown_hwm.flush_commit_executor_queue_depth_max, 15);
+        assert_eq!(grown_hwm.flush_commit_executors_active_max, 15);
+        assert_eq!(grown_hwm.flush_qos_wait_max_ns, 1_200);
+        assert_eq!(grown_hwm.flush_qos_waiters_max, 20);
     }
 }

@@ -25,7 +25,7 @@ impl BufferShard {
     // NOTE: `cache_committed_payload` was deleted as part of the
     // ack-after-LV2-fdatasync refactor. Payload now lives in
     // `PendingEntry::payload` from append time onward (set eagerly in
-    // `append_with_seq`); the sync thread no longer mutates index state
+    // `publish_prepared`); the sync thread no longer mutates index state
     // post-fdatasync, so the previous "swap Arc to inject payload" dance
     // disappears entirely.
 

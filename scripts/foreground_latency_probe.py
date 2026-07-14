@@ -185,9 +185,19 @@ def main() -> None:
                 int(metrics.get("flush_commit_worker_service_ns", 0)),
                 int(old_metrics.get("flush_commit_worker_service_ns", 0)),
             )
+            commit_service_batches = nonnegative(
+                int(metrics.get("flush_commit_worker_service_batches", 0)),
+                int(old_metrics.get("flush_commit_worker_service_batches", 0)),
+            )
+            # Older engines do not export the service-boundary counter. Their
+            # drain-batch count is the closest compatible divisor; keep the old
+            # raw-job-normalized value under explicit legacy names below.
+            service_batch_divisor = commit_service_batches or commit_batches
+            service_job_avg_ns = commit_service_ns // commit_jobs if commit_jobs else 0
             commit_worker = {
                 "jobs": commit_jobs,
                 "batches": commit_batches,
+                "service_batches": commit_service_batches,
                 "lbas": commit_lbas,
                 "jobs_per_batch": commit_jobs / commit_batches if commit_batches else 0,
                 "lbas_per_batch": commit_lbas / commit_batches if commit_batches else 0,
@@ -198,7 +208,25 @@ def main() -> None:
                 "executor_queue_wait_avg_ns": commit_executor_queue_wait_ns // commit_jobs
                 if commit_jobs
                 else 0,
-                "service_avg_ns": commit_service_ns // commit_jobs if commit_jobs else 0,
+                "service_batch_avg_ns": commit_service_ns // service_batch_divisor
+                if service_batch_divisor
+                else 0,
+                "service_job_avg_ns_legacy": service_job_avg_ns,
+                # Backward-compatible alias for existing probe consumers.
+                "service_avg_ns": service_job_avg_ns,
+                "executor_queue_wait_max_ns": int(
+                    metrics.get("flush_commit_worker_executor_queue_wait_max_ns", 0)
+                ),
+                "executor_queue_depth": int(
+                    metrics.get("flush_commit_executor_queue_depth", 0)
+                ),
+                "executor_queue_depth_max": int(
+                    metrics.get("flush_commit_executor_queue_depth_max", 0)
+                ),
+                "executors_active": int(metrics.get("flush_commit_executors_active", 0)),
+                "executors_active_max": int(
+                    metrics.get("flush_commit_executors_active_max", 0)
+                ),
                 "pipeline_depth_max": int(metrics.get("flush_commit_worker_pipeline_depth_max", 0)),
                 "pipeline_issues": nonnegative(
                     int(metrics.get("flush_commit_worker_pipeline_issues", 0)),
@@ -225,6 +253,43 @@ def main() -> None:
                 "flushes": sync_flushes,
                 "entries": sync_entries,
                 "entries_per_flush": sync_entries / sync_flushes if sync_flushes else 0,
+            }
+            flush_qos = {
+                "mode": int(metrics.get("flush_qos_mode", 0)),
+                "foreground_outstanding": int(
+                    metrics.get("foreground_io_outstanding", 0)
+                ),
+                "rate_mib_s": int(metrics.get("flush_qos_rate_bytes_per_sec", 0)) / 1048576,
+                "foreground_mib_s": int(
+                    metrics.get("flush_qos_foreground_bytes_per_sec", 0)
+                )
+                / 1048576,
+                "durable_p99_ms": int(metrics.get("flush_qos_durable_p99_ns", 0)) / 1e6,
+                "logical_fill_pct": int(metrics.get("flush_qos_logical_fill_pct", 0)),
+                "physical_fill_pct": int(metrics.get("flush_qos_physical_fill_pct", 0)),
+                "payload_fill_pct": int(metrics.get("flush_qos_payload_fill_pct", 0)),
+                "admitted_mib_s": nonnegative(
+                    int(metrics.get("flush_qos_admitted_bytes", 0)),
+                    int(old_metrics.get("flush_qos_admitted_bytes", 0)),
+                )
+                / elapsed
+                / 1048576,
+                "wait_ms": nonnegative(
+                    int(metrics.get("flush_qos_wait_ns", 0)),
+                    int(old_metrics.get("flush_qos_wait_ns", 0)),
+                )
+                / 1e6,
+                "wait_events": nonnegative(
+                    int(metrics.get("flush_qos_wait_events", 0)),
+                    int(old_metrics.get("flush_qos_wait_events", 0)),
+                ),
+                "wait_max_ms_lifetime": int(metrics.get("flush_qos_wait_max_ns", 0)) / 1e6,
+                "waiters": int(metrics.get("flush_qos_waiters", 0)),
+                "waiters_max_lifetime": int(metrics.get("flush_qos_waiters_max", 0)),
+                "emergency_transitions": nonnegative(
+                    int(metrics.get("flush_qos_emergency_transitions", 0)),
+                    int(old_metrics.get("flush_qos_emergency_transitions", 0)),
+                ),
             }
             old_shards = {int(s["shard_idx"]): s for s in old_status.get("buffer_shards", [])}
             shards = []
@@ -262,6 +327,7 @@ def main() -> None:
                         "lv2_durable_stages": lv2_stages,
                         "lv2_percentiles_are_bucket_upper_bounds": True,
                         "commit_worker": commit_worker,
+                        "flush_qos": flush_qos,
                         "buffer_sync": buffer_sync,
                         "shards": shards,
                         "scheduler": scheduler,

@@ -1,5 +1,25 @@
 use super::*;
 
+fn write_window_pressure_thresholds(config: &FlushConfig) -> (u8, u8) {
+    let physical = if config.buffer_write_window_physical_pressure_pct > 0 {
+        config.buffer_write_window_physical_pressure_pct.min(100)
+    } else if config.buffer_write_window_pressure_pct > 0 {
+        config.buffer_write_window_pressure_pct.min(100)
+    } else {
+        80
+    };
+    let payload = if config.buffer_write_window_payload_pressure_pct > 0 {
+        config.buffer_write_window_payload_pressure_pct.min(100)
+    } else if config.buffer_write_window_physical_pressure_pct == 0
+        && config.buffer_write_window_pressure_pct > 0
+    {
+        config.buffer_write_window_pressure_pct.min(100)
+    } else {
+        80
+    };
+    (physical, payload)
+}
+
 impl BufferFlusher {
     pub fn start(
         pool: Arc<WriteBufferPool>,
@@ -77,11 +97,13 @@ impl BufferFlusher {
         let min_compression_savings_pct = config.min_compression_savings_pct.min(100);
         let skip_fully_superseded = config.skip_fully_superseded;
         let buffer_write_window = Duration::from_millis(config.buffer_write_window_ms);
-        let buffer_write_window_pressure_pct = if config.buffer_write_window_pressure_pct == 0 {
-            80
-        } else {
-            config.buffer_write_window_pressure_pct.min(100)
-        };
+        let (buffer_write_window_pressure_pct, buffer_write_window_payload_pressure_pct) =
+            write_window_pressure_thresholds(config);
+        let flush_admission_qos = Arc::new(FlushAdmissionQos::new(
+            FlushAdmissionQosConfig::from_flush(config),
+            pool.clone(),
+            metrics.clone(),
+        ));
         let packed_meta_batch_max_lbas = if config.packed_meta_batch_max_lbas == 0 {
             DEFAULT_PACKED_META_BATCH_LBA_LIMIT
         } else {
@@ -127,9 +149,10 @@ impl BufferFlusher {
         // raw receiver between executors made them race for individual jobs
         // and fragmented a deep backlog into tiny transactions.
         let commit_executor_count = commit_workers_per_volume;
+        let commit_executor_load = Arc::new(writer::CommitExecutorLoad::new(commit_executor_count));
         let (commit_tx, commit_rx) = bounded::<writer::CommitJob>(writer::COMMIT_WORKER_QUEUE_CAP);
         let (commit_batch_tx, commit_batch_rx) = bounded::<writer::CommitBatch>(
-            writer::COMMIT_EXECUTOR_QUEUE_CAP.max(commit_executor_count * 2),
+            writer::commit_executor_queue_capacity(commit_executor_count),
         );
         let mut commit_worker_txs: Vec<Sender<writer::CommitJob>> =
             Vec::with_capacity(commit_executor_count);
@@ -196,6 +219,7 @@ impl BufferFlusher {
             let meta_c = meta.clone();
             let metrics_c = metrics.clone();
             let in_flight_c = in_flight.clone();
+            let flush_admission_qos_c = flush_admission_qos.clone();
             let coalesce_out_tx = if dedup_enabled {
                 dedup_tx.clone()
             } else {
@@ -219,6 +243,8 @@ impl BufferFlusher {
                         skip_fully_superseded,
                         buffer_write_window,
                         buffer_write_window_pressure_pct,
+                        buffer_write_window_payload_pressure_pct,
+                        &flush_admission_qos_c,
                     );
                 })
                 .expect("failed to spawn coalescer thread");
@@ -388,6 +414,7 @@ impl BufferFlusher {
         // before it disconnects the executor queue.
         let commit_aggregator_pool = pool.clone();
         let commit_aggregator_metrics = metrics.clone();
+        let commit_aggregator_load = commit_executor_load.clone();
         let commit_aggregator_handle = thread::Builder::new()
             .name("flusher-commit-aggregator".to_string())
             .spawn(move || {
@@ -395,6 +422,7 @@ impl BufferFlusher {
                 Self::commit_aggregator_loop(
                     commit_rx,
                     commit_batch_tx,
+                    commit_aggregator_load,
                     Some(commit_aggregator_pool),
                     Some(commit_aggregator_metrics),
                     commit_retain_tail,
@@ -423,6 +451,7 @@ impl BufferFlusher {
             let lane_done_txs_c = lane_done_txs.clone();
             let lane_cleanup_txs_c = lane_cleanup_txs.clone();
             let post_commit_tx_c = post_commit_txs[worker_idx].clone();
+            let commit_executor_load_c = commit_executor_load.clone();
             let h = thread::Builder::new()
                 .name(format!("flusher-commit-{}", worker_idx))
                 .spawn(move || {
@@ -430,6 +459,7 @@ impl BufferFlusher {
                     Self::commit_worker_loop(
                         worker_idx,
                         &rx,
+                        &commit_executor_load_c,
                         &pool_c,
                         &meta_c,
                         &lifecycle_c,
@@ -649,5 +679,30 @@ impl BufferFlusher {
 impl Drop for BufferFlusher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod pressure_config_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_pressure_value_still_controls_both_signals() {
+        let config = FlushConfig {
+            buffer_write_window_pressure_pct: 23,
+            ..FlushConfig::default()
+        };
+        assert_eq!(write_window_pressure_thresholds(&config), (23, 23));
+    }
+
+    #[test]
+    fn split_pressure_values_override_legacy_independently() {
+        let config = FlushConfig {
+            buffer_write_window_pressure_pct: 23,
+            buffer_write_window_physical_pressure_pct: 40,
+            buffer_write_window_payload_pressure_pct: 80,
+            ..FlushConfig::default()
+        };
+        assert_eq!(write_window_pressure_thresholds(&config), (40, 80));
     }
 }

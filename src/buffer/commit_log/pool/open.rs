@@ -501,6 +501,9 @@ impl WriteBufferPool {
             shards,
             next_seq: AtomicU64::new(max_seq + 1),
             frontier_gate: parking_lot::RwLock::new(()),
+            append_order_stripes: (0..APPEND_ORDER_STRIPES)
+                .map(|_| AppendOrderStripe::default())
+                .collect(),
             routing_zone_size_blocks,
             ready_rx,
             shard_ready_rxs,

@@ -142,7 +142,22 @@ skip_fully_superseded = true
 # Bypass on PHYSICAL ring occupancy so checkpoint-retained slots cannot hide
 # pressure behind a low logical-pending value.
 buffer_write_window_ms = 30000
-buffer_write_window_pressure_pct = 20
+buffer_write_window_physical_pressure_pct = 20
+# Resident payload is only a memory/cache signal. Admit work at 80%, then let
+# the global latency-feedback controller pace it; do not turn 3.2 GiB of cached
+# payload into an unbounded 16-lane catch-up burst at the physical 20% mark.
+buffer_write_window_payload_pressure_pct = 80
+# Aggregate flush admission uses LV2 durable-write p99 as its feedback signal.
+# It starts conservatively, increases while p99 has headroom, and backs off
+# multiplicatively above the 100 ms SLO. Physical LV2 pressure still overrides
+# pacing so durability capacity cannot be exhausted silently.
+foreground_flush_target_p99_ms = 100
+foreground_flush_active_mib_s = 128
+foreground_flush_min_mib_s = 32
+foreground_flush_max_mib_s = 384
+foreground_flush_burst_mib = 8
+foreground_flush_recovery_pct = 40
+foreground_flush_emergency_pct = 65
 packed_meta_batch_max_lbas = 1024
 # Batch adjacent packed-slot metadata jobs into one metadb transaction. The
 # unbatched path degenerates to ~1 LBA/commit under dedup-heavy random writes,

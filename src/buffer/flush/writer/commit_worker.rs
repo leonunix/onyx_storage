@@ -32,9 +32,125 @@ pub(in crate::buffer::flush) const NUM_COMMIT_WORKERS: usize = 16;
 /// waiting elsewhere.
 pub(in crate::buffer::flush) const COMMIT_WORKER_QUEUE_CAP: usize = 8192;
 
-/// Complete transaction batches allowed to wait behind the executors. The raw
-/// job queue remains the primary backpressure boundary.
-pub(in crate::buffer::flush) const COMMIT_EXECUTOR_QUEUE_CAP: usize = 64;
+/// Keep at most two ready batches per executor. A deeper queue seals work too
+/// early during a MetaDB checkpoint: transaction-shaped batches wait behind
+/// stalled executors while the raw queue can no longer combine their jobs.
+pub(in crate::buffer::flush) fn commit_executor_queue_capacity(executor_count: usize) -> usize {
+    executor_count.max(1).saturating_mul(2).max(2)
+}
+
+/// Shared admission state for the aggregator and all commit executors.
+///
+/// `queued` includes the single batch that the sole aggregator may currently
+/// be handing to a full channel. That conservative extra count prevents an
+/// adaptive early seal while the handoff itself is already backpressured.
+pub(in crate::buffer::flush) struct CommitExecutorLoad {
+    worker_count: usize,
+    queued: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl CommitExecutorLoad {
+    pub(in crate::buffer::flush) fn new(worker_count: usize) -> Self {
+        Self {
+            worker_count: worker_count.max(1),
+            queued: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn has_headroom(&self) -> bool {
+        self.active
+            .load(Ordering::Relaxed)
+            .saturating_add(self.queued.load(Ordering::Relaxed))
+            < self.worker_count
+    }
+
+    fn note_queued(&self, metrics: Option<&EngineMetrics>) {
+        let depth = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(metrics) = metrics {
+            metrics
+                .flush_commit_executor_queue_depth
+                .fetch_add(1, Ordering::Relaxed);
+            crate::metrics::record_counter_max(
+                &metrics.flush_commit_executor_queue_depth_max,
+                depth as u64,
+            );
+        }
+    }
+
+    fn note_dequeued(&self, metrics: Option<&EngineMetrics>) {
+        decrement_saturating(&self.queued);
+        if let Some(metrics) = metrics {
+            decrement_gauge_saturating(&metrics.flush_commit_executor_queue_depth);
+        }
+    }
+
+    fn enter<'a>(&'a self, metrics: &'a EngineMetrics) -> CommitExecutorActiveGuard<'a> {
+        let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics
+            .flush_commit_executors_active
+            .fetch_add(1, Ordering::Relaxed);
+        crate::metrics::record_counter_max(
+            &metrics.flush_commit_executors_active_max,
+            active as u64,
+        );
+        CommitExecutorActiveGuard {
+            load: self,
+            metrics,
+        }
+    }
+}
+
+struct CommitExecutorActiveGuard<'a> {
+    load: &'a CommitExecutorLoad,
+    metrics: &'a EngineMetrics,
+}
+
+impl Drop for CommitExecutorActiveGuard<'_> {
+    fn drop(&mut self) {
+        decrement_saturating(&self.load.active);
+        decrement_gauge_saturating(&self.metrics.flush_commit_executors_active);
+    }
+}
+
+fn decrement_saturating(counter: &std::sync::atomic::AtomicUsize) -> usize {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            debug_assert!(false, "commit executor load counter underflow");
+            return 0;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current - 1,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn decrement_gauge_saturating(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            debug_assert!(false, "commit executor metric gauge underflow");
+            return 0;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current - 1,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Emergency tail-flush threshold. Normal batching stays bounded by the 8K
 /// transaction target; this only trades batching efficiency for faster LV2
@@ -110,12 +226,14 @@ impl AdaptiveCommitSeal {
         lbas: usize,
         oldest_enqueued_at: Instant,
         now: Instant,
+        adaptive_headroom: bool,
     ) -> Option<CommitSealReason> {
         let age = now.saturating_duration_since(oldest_enqueued_at);
         if age >= self.max_window {
             return Some(CommitSealReason::Deadline);
         }
-        if self.underfill_active
+        if adaptive_headroom
+            && self.underfill_active
             && lbas >= self.adaptive_min_lbas()
             && age >= self.adaptive_window()
         {
@@ -124,10 +242,16 @@ impl AdaptiveCommitSeal {
         None
     }
 
-    fn next_timed_wake(&self, lbas: usize, oldest_enqueued_at: Instant, now: Instant) -> Duration {
+    fn next_timed_wake(
+        &self,
+        lbas: usize,
+        oldest_enqueued_at: Instant,
+        now: Instant,
+        adaptive_headroom: bool,
+    ) -> Duration {
         let hard_deadline = oldest_enqueued_at + self.max_window;
         let mut wake_at = hard_deadline;
-        if self.underfill_active && lbas >= self.adaptive_min_lbas() {
+        if adaptive_headroom && self.underfill_active && lbas >= self.adaptive_min_lbas() {
             wake_at = wake_at.min(oldest_enqueued_at + self.adaptive_window());
         }
         wake_at.saturating_duration_since(now)
@@ -287,6 +411,7 @@ impl BufferFlusher {
     pub(in crate::buffer::flush) fn commit_aggregator_loop(
         rx: Receiver<CommitJob>,
         batch_tx: Sender<CommitBatch>,
+        executor_load: Arc<CommitExecutorLoad>,
         pressure_pool: Option<Arc<WriteBufferPool>>,
         metrics: Option<Arc<EngineMetrics>>,
         retain_tail: bool,
@@ -326,6 +451,7 @@ impl BufferFlusher {
                         &mut total_lbas,
                         &mut oldest_enqueued_at,
                         &mut seal_policy,
+                        &executor_load,
                         pressure_pool.as_deref(),
                         metrics.as_deref(),
                         CommitSealReason::Capacity,
@@ -352,6 +478,7 @@ impl BufferFlusher {
                         &mut total_lbas,
                         &mut oldest_enqueued_at,
                         &mut seal_policy,
+                        &executor_load,
                         pressure_pool.as_deref(),
                         metrics.as_deref(),
                         reason,
@@ -366,13 +493,19 @@ impl BufferFlusher {
                 // jobs up to the target before sealing.
                 if coalesce_timeout > Duration::ZERO {
                     let oldest = oldest_enqueued_at.expect("non-empty batch has an enqueue time");
-                    if let Some(reason) = seal_policy.timed_reason(total_lbas, oldest, now) {
+                    if let Some(reason) = seal_policy.timed_reason(
+                        total_lbas,
+                        oldest,
+                        now,
+                        executor_load.has_headroom(),
+                    ) {
                         if !seal_commit_batch(
                             &batch_tx,
                             &mut batch,
                             &mut total_lbas,
                             &mut oldest_enqueued_at,
                             &mut seal_policy,
+                            &executor_load,
                             pressure_pool.as_deref(),
                             metrics.as_deref(),
                             reason,
@@ -395,6 +528,7 @@ impl BufferFlusher {
                             &mut total_lbas,
                             &mut oldest_enqueued_at,
                             &mut seal_policy,
+                            &executor_load,
                             pressure_pool.as_deref(),
                             metrics.as_deref(),
                             CommitSealReason::Shutdown,
@@ -416,6 +550,7 @@ impl BufferFlusher {
                         &mut total_lbas,
                         &mut oldest_enqueued_at,
                         &mut seal_policy,
+                        &executor_load,
                         pressure_pool.as_deref(),
                         metrics.as_deref(),
                         CommitSealReason::Pressure,
@@ -426,13 +561,19 @@ impl BufferFlusher {
                     }
 
                     let oldest = oldest_enqueued_at.expect("non-empty batch has an enqueue time");
-                    if let Some(reason) = seal_policy.timed_reason(total_lbas, oldest, now) {
+                    if let Some(reason) = seal_policy.timed_reason(
+                        total_lbas,
+                        oldest,
+                        now,
+                        executor_load.has_headroom(),
+                    ) {
                         if !seal_commit_batch(
                             &batch_tx,
                             &mut batch,
                             &mut total_lbas,
                             &mut oldest_enqueued_at,
                             &mut seal_policy,
+                            &executor_load,
                             pressure_pool.as_deref(),
                             metrics.as_deref(),
                             reason,
@@ -442,7 +583,12 @@ impl BufferFlusher {
                         break;
                     }
 
-                    let mut wait = seal_policy.next_timed_wake(total_lbas, oldest, now);
+                    let mut wait = seal_policy.next_timed_wake(
+                        total_lbas,
+                        oldest,
+                        now,
+                        executor_load.has_headroom(),
+                    );
                     if pressure_pool.is_some() {
                         let pressure_wait = last_pressure_sample.map_or(Duration::ZERO, |last| {
                             COMMIT_AGGREGATOR_PRESSURE_SAMPLE_INTERVAL
@@ -463,6 +609,7 @@ impl BufferFlusher {
                                 &mut total_lbas,
                                 &mut oldest_enqueued_at,
                                 &mut seal_policy,
+                                &executor_load,
                                 pressure_pool.as_deref(),
                                 metrics.as_deref(),
                                 CommitSealReason::Shutdown,
@@ -483,8 +630,13 @@ impl BufferFlusher {
                 coalesce_timeout,
                 packed_try_drain_lba_budget,
             );
-            if let Err(error) = batch_tx.send(CommitBatch::new(batch)) {
-                fail_commit_batch_handoff(error.0, pressure_pool.as_deref(), metrics.as_deref());
+            if !send_commit_batch(
+                &batch_tx,
+                CommitBatch::new(batch),
+                &executor_load,
+                pressure_pool.as_deref(),
+                metrics.as_deref(),
+            ) {
                 break;
             }
         }
@@ -493,6 +645,7 @@ impl BufferFlusher {
     pub(in crate::buffer::flush) fn commit_worker_loop(
         worker_idx: usize,
         rx: &Receiver<CommitBatch>,
+        executor_load: &CommitExecutorLoad,
         pool: &WriteBufferPool,
         meta: &MetaStore,
         lifecycle: &VolumeLifecycleManager,
@@ -522,6 +675,10 @@ impl BufferFlusher {
             metrics
                 .flush_commit_worker_rx_idle_iters
                 .fetch_add(1, Ordering::Relaxed);
+            // Enter active before removing the queued count so the aggregator's
+            // headroom view is conservative across the queue -> active handoff.
+            let _active_guard = executor_load.enter(metrics);
+            executor_load.note_dequeued(Some(metrics));
             Self::record_commit_worker_drain(metrics, &batch.jobs, batch.sealed_at);
             Self::dispatch_commit_batch(
                 batch.jobs,
@@ -719,7 +876,7 @@ impl BufferFlusher {
                 meta.atomic_batch_dedup_hits_with_promote(&vol_id, &hits, &promote_entries, &seqs)
             });
             Self::record_elapsed(&metrics.dedup_hit_commit_ns, service_start);
-            Self::record_elapsed(&metrics.flush_commit_worker_service_ns, service_start);
+            Self::record_commit_worker_service(metrics, service_start);
 
             match result {
                 Ok((results, newly_zeroed)) => {
@@ -752,6 +909,10 @@ impl BufferFlusher {
         let drain_lbas = jobs.iter().map(lbas_in_job).sum::<usize>() as u64;
         let (queue_wait_ns, aggregator_residence_ns, executor_queue_wait_ns) =
             commit_wait_components_ns(jobs.iter().map(enqueued_at_for_job), sealed_at, dequeued_at);
+        let executor_queue_wait_batch_ns = dequeued_at
+            .saturating_duration_since(sealed_at)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
         metrics
             .flush_commit_worker_drain_batches
             .fetch_add(1, Ordering::Relaxed);
@@ -770,6 +931,10 @@ impl BufferFlusher {
         metrics
             .flush_commit_worker_executor_queue_wait_ns
             .fetch_add(executor_queue_wait_ns, Ordering::Relaxed);
+        crate::metrics::record_counter_max(
+            &metrics.flush_commit_worker_executor_queue_wait_max_ns,
+            executor_queue_wait_batch_ns,
+        );
         metrics
             .flush_commit_worker_jobs
             .fetch_add(drain_jobs, Ordering::Relaxed);
@@ -778,6 +943,13 @@ impl BufferFlusher {
             .fetch_add(drain_lbas, Ordering::Relaxed);
         crate::metrics::record_counter_max(&metrics.flush_commit_worker_drain_jobs_max, drain_jobs);
         crate::metrics::record_counter_max(&metrics.flush_commit_worker_drain_lbas_max, drain_lbas);
+    }
+
+    fn record_commit_worker_service(metrics: &EngineMetrics, started_at: Instant) {
+        Self::record_elapsed(&metrics.flush_commit_worker_service_ns, started_at);
+        metrics
+            .flush_commit_worker_service_batches
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn dispatch_passthrough_job(
@@ -850,7 +1022,7 @@ impl BufferFlusher {
             target_lbas_per_tx,
             commit_worker_pipeline_depth,
         );
-        Self::record_elapsed(&metrics.flush_commit_worker_service_ns, service_start);
+        Self::record_commit_worker_service(metrics, service_start);
     }
 
     fn dispatch_packed_jobs(
@@ -925,7 +1097,7 @@ impl BufferFlusher {
             lane_done_txs,
             post_commit_tx,
         );
-        Self::record_elapsed(&metrics.flush_commit_worker_service_ns, service_start);
+        Self::record_commit_worker_service(metrics, service_start);
     }
 }
 
@@ -973,6 +1145,7 @@ fn seal_commit_batch(
     total_lbas: &mut usize,
     oldest_enqueued_at: &mut Option<Instant>,
     seal_policy: &mut AdaptiveCommitSeal,
+    executor_load: &CommitExecutorLoad,
     failure_pool: Option<&WriteBufferPool>,
     metrics: Option<&EngineMetrics>,
     reason: CommitSealReason,
@@ -997,9 +1170,30 @@ fn seal_commit_batch(
     }
     *total_lbas = 0;
     *oldest_enqueued_at = None;
-    match batch_tx.send(CommitBatch::new_at(std::mem::take(batch), sealed_at)) {
+    send_commit_batch(
+        batch_tx,
+        CommitBatch::new_at(std::mem::take(batch), sealed_at),
+        executor_load,
+        failure_pool,
+        metrics,
+    )
+}
+
+fn send_commit_batch(
+    batch_tx: &Sender<CommitBatch>,
+    batch: CommitBatch,
+    executor_load: &CommitExecutorLoad,
+    failure_pool: Option<&WriteBufferPool>,
+    metrics: Option<&EngineMetrics>,
+) -> bool {
+    // Count before send so a fast receiver cannot dequeue before the shared
+    // depth is visible. If the bounded channel is full this also represents the
+    // aggregator's one blocked handoff, which must suppress another early seal.
+    executor_load.note_queued(metrics);
+    match batch_tx.send(batch) {
         Ok(()) => true,
         Err(error) => {
+            executor_load.note_dequeued(metrics);
             fail_commit_batch_handoff(error.0, failure_pool, metrics);
             false
         }
@@ -1075,15 +1269,15 @@ mod wait_component_tests {
             Some(CommitSealReason::Target)
         );
         assert_eq!(
-            policy.timed_reason(3_000, start, start + Duration::from_millis(74)),
+            policy.timed_reason(3_000, start, start + Duration::from_millis(74), true),
             None
         );
         assert_eq!(
-            policy.timed_reason(3_000, start, start + Duration::from_millis(75)),
+            policy.timed_reason(3_000, start, start + Duration::from_millis(75), true),
             Some(CommitSealReason::Deadline)
         );
         assert_eq!(
-            policy.next_timed_wake(3_000, start, start + Duration::from_millis(20)),
+            policy.next_timed_wake(3_000, start, start + Duration::from_millis(20), true),
             Duration::from_millis(55)
         );
     }
@@ -1109,11 +1303,11 @@ mod wait_component_tests {
 
         let oldest = start + Duration::from_millis(162);
         assert_eq!(
-            policy.timed_reason(2_047, oldest, oldest + Duration::from_millis(60)),
+            policy.timed_reason(2_047, oldest, oldest + Duration::from_millis(60), true),
             None
         );
         assert_eq!(
-            policy.timed_reason(2_048, oldest, oldest + Duration::from_millis(40)),
+            policy.timed_reason(2_048, oldest, oldest + Duration::from_millis(40), true),
             Some(CommitSealReason::AdaptiveUnderfill)
         );
         assert_eq!(
@@ -1189,6 +1383,132 @@ mod wait_component_tests {
             !policy.underfill_active,
             "an idle max-window starts a fresh burst"
         );
+    }
+
+    #[test]
+    fn slow_executors_suppress_only_adaptive_early_seal() {
+        let metrics = EngineMetrics::default();
+        let load = CommitExecutorLoad::new(2);
+        let first = load.enter(&metrics);
+        let second = load.enter(&metrics);
+        let start = Instant::now();
+        let mut policy = AdaptiveCommitSeal::new(8_192, Duration::from_millis(80));
+
+        policy.observe_seal(
+            CommitSealReason::Deadline,
+            3_000,
+            start + Duration::from_millis(80),
+        );
+        policy.observe_seal(
+            CommitSealReason::Deadline,
+            3_100,
+            start + Duration::from_millis(160),
+        );
+        assert!(policy.underfill_active);
+        assert!(!load.has_headroom());
+
+        let oldest = start + Duration::from_millis(161);
+        assert_eq!(
+            policy.timed_reason(
+                2_048,
+                oldest,
+                oldest + Duration::from_millis(40),
+                load.has_headroom(),
+            ),
+            None,
+            "all executors busy must suppress the half-window seal"
+        );
+        assert_eq!(
+            policy.timed_reason(
+                2_048,
+                oldest,
+                oldest + Duration::from_millis(80),
+                load.has_headroom(),
+            ),
+            Some(CommitSealReason::Deadline),
+            "the hard oldest-job ceiling remains in force"
+        );
+
+        drop(second);
+        assert!(load.has_headroom());
+        assert_eq!(
+            policy.timed_reason(
+                2_048,
+                oldest,
+                oldest + Duration::from_millis(40),
+                load.has_headroom(),
+            ),
+            Some(CommitSealReason::AdaptiveUnderfill)
+        );
+        drop(first);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.flush_commit_executors_active, 0);
+        assert_eq!(snapshot.flush_commit_executors_active_max, 2);
+    }
+
+    #[test]
+    fn executor_queue_capacity_is_two_per_effective_worker() {
+        assert_eq!(commit_executor_queue_capacity(0), 2);
+        assert_eq!(commit_executor_queue_capacity(1), 2);
+        assert_eq!(commit_executor_queue_capacity(8), 16);
+        assert_eq!(commit_executor_queue_capacity(NUM_COMMIT_WORKERS), 32);
+    }
+
+    #[test]
+    fn executor_load_tracks_queue_and_active_high_water() {
+        let metrics = EngineMetrics::default();
+        let load = CommitExecutorLoad::new(2);
+
+        load.note_queued(Some(&metrics));
+        load.note_queued(Some(&metrics));
+        assert!(!load.has_headroom());
+
+        let active = load.enter(&metrics);
+        load.note_dequeued(Some(&metrics));
+        assert!(!load.has_headroom());
+        drop(active);
+        assert!(load.has_headroom());
+        load.note_dequeued(Some(&metrics));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.flush_commit_executor_queue_depth, 0);
+        assert_eq!(snapshot.flush_commit_executor_queue_depth_max, 2);
+        assert_eq!(snapshot.flush_commit_executors_active, 0);
+        assert_eq!(snapshot.flush_commit_executors_active_max, 1);
+    }
+
+    #[test]
+    fn executor_load_gauges_return_to_zero_after_concurrent_handoffs() {
+        const WORKERS: usize = 8;
+        const HANDOFFS_PER_WORKER: usize = 2_000;
+
+        let metrics = Arc::new(EngineMetrics::default());
+        let load = Arc::new(CommitExecutorLoad::new(WORKERS));
+        let threads = (0..WORKERS)
+            .map(|_| {
+                let metrics = Arc::clone(&metrics);
+                let load = Arc::clone(&load);
+                std::thread::spawn(move || {
+                    for _ in 0..HANDOFFS_PER_WORKER {
+                        load.note_queued(Some(&metrics));
+                        let _active = load.enter(&metrics);
+                        load.note_dequeued(Some(&metrics));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().expect("executor load test thread");
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.flush_commit_executor_queue_depth, 0);
+        assert_eq!(snapshot.flush_commit_executors_active, 0);
+        assert!(snapshot.flush_commit_executor_queue_depth_max > 0);
+        assert!(snapshot.flush_commit_executors_active_max > 0);
+        assert!(load.has_headroom());
     }
 
     #[test]

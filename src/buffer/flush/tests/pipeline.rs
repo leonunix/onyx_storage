@@ -382,33 +382,49 @@ fn coalesce_write_window_bypasses_after_foreground_idle_grace() {
     assert!(!BufferFlusher::write_window_bypass_ready(
         10,
         50,
+        20,
+        80,
         Duration::from_secs(4),
     ));
     assert!(BufferFlusher::write_window_bypass_ready(
         50,
         50,
+        20,
+        80,
         Duration::ZERO,
     ));
     assert!(BufferFlusher::write_window_bypass_ready(
         10,
         50,
+        20,
+        80,
         Duration::from_secs(5),
     ));
 }
 
 #[test]
 fn coalesce_write_window_bypasses_at_payload_pressure_threshold() {
-    // The coalesce loop passes max(shard physical ring fill, global payload
-    // fill), so a 20% resident-payload cache must release the write window even
-    // while the physical ring is still nearly empty.
+    // Payload pressure admits old work at its own high watermark; it no longer
+    // inherits a deliberately low physical-ring emergency threshold.
     assert!(BufferFlusher::write_window_bypass_ready(
+        1,
         20,
-        20,
+        80,
+        80,
         Duration::ZERO,
     ));
     assert!(!BufferFlusher::write_window_bypass_ready(
-        19,
+        1,
         20,
+        20,
+        80,
+        Duration::ZERO,
+    ));
+    assert!(BufferFlusher::write_window_bypass_ready(
+        20,
+        20,
+        20,
+        80,
         Duration::ZERO,
     ));
 }

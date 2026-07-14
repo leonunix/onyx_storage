@@ -113,6 +113,19 @@ def avg_time_by_counts(
     return delta(now, prev, ns_key) / count
 
 
+def avg_commit_service_batch(
+    now: dict[str, Any], prev: Optional[dict[str, Any]]
+) -> float:
+    count = delta(now, prev, "flush_commit_worker_service_batches")
+    if count <= 0:
+        # Compatibility with an older engine that has the service timer but
+        # predates the matching service-boundary counter.
+        count = delta(now, prev, "flush_commit_worker_drain_batches")
+    if count <= 0:
+        return 0.0
+    return delta(now, prev, "flush_commit_worker_service_ns") / count
+
+
 def avg_residual_time(
     now: dict[str, Any],
     prev: Optional[dict[str, Any]],
@@ -544,13 +557,25 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" packed_slots {rate(metrics, prev_metrics, 'flush_packed_slots_written', interval):8.1f}/s"
         f" stale +{fmt_count(delta(metrics, prev_metrics, 'flush_stale_discards'))}"
         f" writer_avg/unit {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_total_ns'))}",
+        f"QoS    mode={int(num(metrics, 'flush_qos_mode'))}"
+        f" outstanding={fmt_count(num(metrics, 'foreground_io_outstanding'))}"
+        f" admit={fmt_rate_bytes(num(metrics, 'flush_qos_rate_bytes_per_sec'))}"
+        f" foreground={fmt_rate_bytes(num(metrics, 'flush_qos_foreground_bytes_per_sec'))}"
+        f" durable_p99={fmt_ms(num(metrics, 'flush_qos_durable_p99_ns'))}"
+        f" q={fmt_count(num(metrics, 'flush_qos_waiters'))}/"
+        f"{fmt_count(num(metrics, 'flush_qos_waiters_max'))}"
+        f" wait_max={fmt_ms(num(metrics, 'flush_qos_wait_max_ns'))}"
+        f" fill={fmt_count(num(metrics, 'flush_qos_logical_fill_pct'))}/"
+        f"{fmt_count(num(metrics, 'flush_qos_physical_fill_pct'))}/"
+        f"{fmt_count(num(metrics, 'flush_qos_payload_fill_pct'))}%",
         f"Writer/unit alloc {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_alloc_ns')):>10}"
         f" io {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_io_ns')):>10}"
         f" meta {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_meta_ns')):>10}"
         f" cleanup_w {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_cleanup_ns')):>10}"
         f" cleanup_th {fmt_ms(avg_time(metrics, prev_metrics, 'flush_cleanup_thread_ns', 'flush_cleanup_thread_batches')):>10}",
         f"Writer/tx meta {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_meta_ns', 'flush_writer_meta_commits')):>10}"
-        f" service/job {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_service_ns', 'flush_commit_worker_jobs')):>10}",
+        f" service/batch {fmt_ms(avg_commit_service_batch(metrics, prev_metrics)):>10}"
+        f" legacy_service/job {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_service_ns', 'flush_commit_worker_jobs')):>10}",
         f"Commit/job total {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_queue_wait_ns', 'flush_commit_worker_jobs')):>10}"
         f" aggregator {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_aggregator_residence_ns', 'flush_commit_worker_jobs')):>10}"
         f" executor_q {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_executor_queue_wait_ns', 'flush_commit_worker_jobs')):>10}",
@@ -559,6 +584,11 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" deadline +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_deadline'))}"
         f" adaptive +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_adaptive_underfill'))}"
         f" pressure +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_pressure'))}",
+        f"Executor q={fmt_count(num(metrics, 'flush_commit_executor_queue_depth'))}"
+        f"/{fmt_count(num(metrics, 'flush_commit_executor_queue_depth_max'))}"
+        f" active={fmt_count(num(metrics, 'flush_commit_executors_active'))}"
+        f"/{fmt_count(num(metrics, 'flush_commit_executors_active_max'))}"
+        f" wait_max={fmt_ms(num(metrics, 'flush_commit_worker_executor_queue_wait_max_ns'))}",
         "",
         f"Meta   commit {rate(meta, prev.status.get('metadb_memory') if prev else None, 'commit_ops', interval):8.1f}/s"
         f" avg {fmt_us(avg_time(meta, prev.status.get('metadb_memory') if prev else None, 'commit_total_us', 'commit_ops', ns_per_unit=1.0))}"
@@ -691,13 +721,11 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
     writer_total_ms = avg_writer_time(metrics, prev_metrics, "flush_writer_total_ns") / 1_000_000.0
     writer_io_ms = avg_writer_time(metrics, prev_metrics, "flush_writer_io_ns") / 1_000_000.0
     writer_meta_ms = avg_writer_time(metrics, prev_metrics, "flush_writer_meta_ns") / 1_000_000.0
-    writer_meta_tx_ms = avg_time(
-        metrics, prev_metrics, "flush_writer_meta_ns", "flush_writer_meta_commits"
-    ) / 1_000_000.0
-    writer_queue_job_ms = avg_time(
+    writer_service_batch_ms = avg_commit_service_batch(metrics, prev_metrics) / 1_000_000.0
+    writer_service_job_legacy_ms = avg_time(
         metrics,
         prev_metrics,
-        "flush_commit_worker_queue_wait_ns",
+        "flush_commit_worker_service_ns",
         "flush_commit_worker_jobs",
     ) / 1_000_000.0
     writer_aggregator_job_ms = avg_time(
@@ -712,6 +740,10 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
         "flush_commit_worker_executor_queue_wait_ns",
         "flush_commit_worker_jobs",
     ) / 1_000_000.0
+    qos_mode = int(num(metrics, "flush_qos_mode"))
+    qos_mode_name = {0: "idle", 1: "protect", 2: "recover", 3: "emergency"}.get(
+        qos_mode, str(qos_mode)
+    )
     cpu_delta = 0.0 if prev_system is None else max(0.0, system.get("cpu_total", 0.0) - prev_system.get("cpu_total", 0.0))
     idle_delta = 0.0 if prev_system is None else max(0.0, system.get("cpu_idle", 0.0) - prev_system.get("cpu_idle", 0.0))
     cpu_pct = safe_div(cpu_delta - idle_delta, cpu_delta) * 100.0
@@ -835,6 +867,15 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
     )
     metric(
         stdscr,
+        24,
+        2,
+        "flush qos",
+        f"{qos_mode_name} io={fmt_count(num(metrics, 'foreground_io_outstanding'))} {fmt_rate_bytes(num(metrics, 'flush_qos_rate_bytes_per_sec'))} p99 {fmt_ms(num(metrics, 'flush_qos_durable_p99_ns'))} q={fmt_count(num(metrics, 'flush_qos_waiters'))}/{fmt_count(num(metrics, 'flush_qos_waiters_max'))} wait {fmt_ms(num(metrics, 'flush_qos_wait_max_ns'))}",
+        left_w - 4,
+        warn if qos_mode == 3 else good,
+    )
+    metric(
+        stdscr,
         25,
         2,
         "pending",
@@ -878,8 +919,8 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
         stdscr,
         32,
         2,
-        "tx / total",
-        f"meta/tx {writer_meta_tx_ms:,.2f} ms  total/job {writer_queue_job_ms:,.2f} ms",
+        "service",
+        f"batch {writer_service_batch_ms:,.2f} ms  legacy/job {writer_service_job_legacy_ms:,.2f} ms",
         left_w - 4,
     )
     metric(
