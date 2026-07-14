@@ -282,7 +282,9 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_flush_rc_checkpoint: fold_service_us={} fold_service_max_us={} stream_calls={} stream_pages={} stream_service_us={} stream_max_chunk_us={} stream_max_chunk_pages={}",
+                "metadb_flush_rc_checkpoint: fold_lock_wait_us={} fold_lock_wait_max_us={} fold_service_us={} fold_service_max_us={} stream_calls={} stream_pages={} stream_service_us={} stream_max_chunk_us={} stream_max_chunk_pages={}",
+                metadb.flush_rc_fold_lock_wait_us,
+                metadb.flush_rc_fold_lock_wait_max_us,
                 metadb.flush_rc_fold_service_us,
                 metadb.flush_rc_fold_service_max_us,
                 metadb.flush_rc_stream_calls,
@@ -520,7 +522,7 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_apply_refcount_batch: batches={} actions={} pbas={} sampled_pbas={} grouping_us={} (max={}) base_lookup_us={} (max={}) pending_scan_us={} (max={}) delta_merge_us={} (max={})",
+                "metadb_apply_refcount_batch: batches={} actions={} pbas={} sampled_pbas={} grouping_us={} (max={}) base_lookup_us={} (max={}) base_lookup_attempts={} epoch_retries={} fold_lock_wait_us={} (max={}) slot_lock_wait_us={} (max={}) pending_scan_us={} (max={}) delta_merge_us={} (max={})",
                 metadb.apply_refcount_batch_count,
                 metadb.apply_refcount_batch_actions,
                 metadb.apply_refcount_batch_pbas,
@@ -529,6 +531,12 @@ impl EngineStatusSnapshot {
                 metadb.apply_refcount_pba_grouping_max_us,
                 metadb.apply_refcount_base_page_lookup_us,
                 metadb.apply_refcount_base_page_lookup_max_us,
+                metadb.apply_refcount_base_lookup_attempts,
+                metadb.apply_refcount_epoch_retries,
+                metadb.apply_refcount_fold_lock_wait_us,
+                metadb.apply_refcount_fold_lock_wait_max_us,
+                metadb.apply_refcount_slot_lock_wait_us,
+                metadb.apply_refcount_slot_lock_wait_max_us,
                 metadb.apply_refcount_pending_slot_scan_us,
                 metadb.apply_refcount_pending_slot_scan_max_us,
                 metadb.apply_refcount_delta_merge_us,

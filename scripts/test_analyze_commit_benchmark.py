@@ -34,6 +34,18 @@ class AnalyzeCommitBenchmarkTests(unittest.TestCase):
             "apply_l2p_remap_range_count": 1,
             "apply_l2p_remap_range_lbas": 4,
             "apply_l2p_remap_range_us": 20,
+            "apply_refcount_batch_count": 10,
+            "apply_refcount_batch_actions": 100,
+            "apply_refcount_batch_pbas": 80,
+            "apply_refcount_breakdown_sampled_pbas": 40,
+            "apply_refcount_pba_grouping_us": 100,
+            "apply_refcount_base_page_lookup_us": 200,
+            "apply_refcount_base_lookup_attempts": 90,
+            "apply_refcount_epoch_retries": 10,
+            "apply_refcount_fold_lock_wait_us": 30,
+            "apply_refcount_slot_lock_wait_us": 40,
+            "apply_refcount_pending_slot_scan_us": 300,
+            "apply_refcount_delta_merge_us": 400,
         }
         after_status = {
             "commit_apply_us": 200,
@@ -43,6 +55,18 @@ class AnalyzeCommitBenchmarkTests(unittest.TestCase):
             "apply_l2p_remap_range_count": 3,
             "apply_l2p_remap_range_lbas": 8,
             "apply_l2p_remap_range_us": 50,
+            "apply_refcount_batch_count": 12,
+            "apply_refcount_batch_actions": 130,
+            "apply_refcount_batch_pbas": 100,
+            "apply_refcount_breakdown_sampled_pbas": 50,
+            "apply_refcount_pba_grouping_us": 160,
+            "apply_refcount_base_page_lookup_us": 250,
+            "apply_refcount_base_lookup_attempts": 113,
+            "apply_refcount_epoch_retries": 13,
+            "apply_refcount_fold_lock_wait_us": 37,
+            "apply_refcount_slot_lock_wait_us": 49,
+            "apply_refcount_pending_slot_scan_us": 370,
+            "apply_refcount_delta_merge_us": 480,
         }
         fio = {
             "jobs": [
@@ -71,6 +95,12 @@ class AnalyzeCommitBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["queue_wait_ms_per_job"], 1.0)
         self.assertEqual(summary["aggregator_residence_ms_per_job"], 0.75)
         self.assertEqual(summary["executor_queue_wait_ms_per_job"], 0.25)
+        refcount_batch = summary["refcount_batch_breakdown"]
+        self.assertEqual(refcount_batch["base_lookup_attempts"], 23)
+        self.assertEqual(refcount_batch["epoch_retries"], 3)
+        self.assertEqual(refcount_batch["fold_lock_wait_us"], 7)
+        self.assertEqual(refcount_batch["slot_lock_wait_us"], 9)
+        self.assertEqual(refcount_batch["measured_stage_total_us"], 216)
         self.assertEqual(
             summary["l2p_remap_breakdown"],
             {

@@ -249,13 +249,31 @@ def build_summary(
         base_lookup_us = counter_delta(
             status_after, status_before, "apply_refcount_base_page_lookup_us"
         )
+        base_lookup_attempts = optional_counter_delta(
+            status_after, status_before, "apply_refcount_base_lookup_attempts"
+        )
+        epoch_retries = optional_counter_delta(
+            status_after, status_before, "apply_refcount_epoch_retries"
+        )
+        fold_lock_wait_us = optional_counter_delta(
+            status_after, status_before, "apply_refcount_fold_lock_wait_us"
+        )
+        slot_lock_wait_us = optional_counter_delta(
+            status_after, status_before, "apply_refcount_slot_lock_wait_us"
+        )
         pending_scan_us = counter_delta(
             status_after, status_before, "apply_refcount_pending_slot_scan_us"
         )
         delta_merge_us = counter_delta(
             status_after, status_before, "apply_refcount_delta_merge_us"
         )
-        measured_stage_total_us = base_lookup_us + pending_scan_us + delta_merge_us
+        measured_stage_total_us = (
+            base_lookup_us
+            + (fold_lock_wait_us or 0)
+            + (slot_lock_wait_us or 0)
+            + pending_scan_us
+            + delta_merge_us
+        )
         estimated_measured_components_us = (
             measured_stage_total_us * batch_pbas / sampled_pbas
             if sampled_pbas
@@ -283,6 +301,35 @@ def build_summary(
             "base_lookup_us": base_lookup_us,
             "base_lookup_us_per_sampled_pba": optional_ratio(
                 base_lookup_us, sampled_pbas
+            ),
+            "base_lookup_attempts": base_lookup_attempts,
+            "base_lookup_attempts_per_batch": (
+                optional_ratio(base_lookup_attempts, batch_count)
+                if base_lookup_attempts is not None
+                else None
+            ),
+            "epoch_retries": epoch_retries,
+            "epoch_retries_per_batch": (
+                optional_ratio(epoch_retries, batch_count)
+                if epoch_retries is not None
+                else None
+            ),
+            "epoch_retry_pct_of_attempts": (
+                optional_ratio(epoch_retries * 100, base_lookup_attempts)
+                if epoch_retries is not None and base_lookup_attempts is not None
+                else None
+            ),
+            "fold_lock_wait_us": fold_lock_wait_us,
+            "fold_lock_wait_us_per_sampled_pba": (
+                optional_ratio(fold_lock_wait_us, sampled_pbas)
+                if fold_lock_wait_us is not None
+                else None
+            ),
+            "slot_lock_wait_us": slot_lock_wait_us,
+            "slot_lock_wait_us_per_sampled_pba": (
+                optional_ratio(slot_lock_wait_us, sampled_pbas)
+                if slot_lock_wait_us is not None
+                else None
             ),
             "pending_scan_us": pending_scan_us,
             "pending_scan_us_per_sampled_pba": optional_ratio(

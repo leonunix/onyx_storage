@@ -3319,6 +3319,22 @@ fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
         meta.apply_refcount_base_page_lookup_us
     );
     println!(
+        "  \"metadb_apply_refcount_base_lookup_attempts\": {},",
+        meta.apply_refcount_base_lookup_attempts
+    );
+    println!(
+        "  \"metadb_apply_refcount_epoch_retries\": {},",
+        meta.apply_refcount_epoch_retries
+    );
+    println!(
+        "  \"metadb_apply_refcount_fold_lock_wait_us\": {},",
+        meta.apply_refcount_fold_lock_wait_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_slot_lock_wait_us\": {},",
+        meta.apply_refcount_slot_lock_wait_us
+    );
+    println!(
         "  \"metadb_apply_refcount_pending_slot_scan_us\": {},",
         meta.apply_refcount_pending_slot_scan_us
     );
@@ -3478,6 +3494,14 @@ fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
     println!(
         "  \"metadb_flush_gate_wait_us\": {},",
         meta.flush_gate_wait_us
+    );
+    println!(
+        "  \"metadb_flush_rc_fold_lock_wait_us\": {},",
+        meta.flush_rc_fold_lock_wait_us
+    );
+    println!(
+        "  \"metadb_flush_rc_fold_lock_wait_max_us\": {},",
+        meta.flush_rc_fold_lock_wait_max_us
     );
     println!("  \"metadb_flush_io_us\": {},", meta.flush_io_us);
     println!(
