@@ -68,8 +68,8 @@ index_pin_mb = 8192
 lsm_bloom_bits_per_entry = 20
 checkpoint_interval_ms = 30000
 # LV2 is the cheap durable aggregation window. Bound each BFG to 4M submitted
-# L2P mutations or 30 seconds so refcount checkpoint pages cannot consume the
-# NUMA0 memory headroom before the physical-ring pressure trigger fires.
+# L2P mutations or 30 seconds so one checkpoint has bounded input work. RC
+# page-payload residency is bounded separately by streaming checkpoint chunks.
 checkpoint_ring_fill_pct = 50
 flush_dirty_pages_threshold = 0
 group_commit_timeout_us = 1
@@ -83,7 +83,9 @@ l2p_buffer_enabled = true
 l2p_buffer_soft_entries = 4000000
 l2p_buffer_hard_entries = 2000000
 l2p_buffer_max_interval_ms = 30000
-rc_authoritative_reclaim = true
+# Keep the exact blockmap reclaim gate enabled until the persisted RC semantic
+# audit is clean; the current pool has observed payload CRC/free-extent overlap.
+rc_authoritative_reclaim = false
 commit_direct_apply_enabled = true
 # Let the flusher issue several already-built metadata transactions before it
 # waits for the oldest apply outcome. The LV2 log remains the durability point;
