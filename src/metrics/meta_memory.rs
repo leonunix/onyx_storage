@@ -35,6 +35,9 @@ pub struct BufferShardSnapshot {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MetaMemorySnapshot {
+    /// 0 = threads-off/all-slots, 1 = threads-on legacy one-shot,
+    /// 2 = threads-on bounded streaming.
+    pub rc_checkpoint_mode: u64,
     pub block_cache_capacity_bytes: Option<u64>,
     pub block_cache_usage_bytes: Option<u64>,
     pub block_cache_pinned_usage_bytes: Option<u64>,

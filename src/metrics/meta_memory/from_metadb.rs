@@ -11,6 +11,7 @@ impl MetaMemorySnapshot {
         pending: onyx_metadb::PendingState,
     ) -> Self {
         Self {
+            rc_checkpoint_mode: meta.rc_checkpoint_mode,
             block_cache_capacity_bytes: Some(cache.capacity_bytes),
             block_cache_usage_bytes: Some(cache.current_bytes),
             block_cache_pinned_usage_bytes: Some(cache.pinned_bytes),

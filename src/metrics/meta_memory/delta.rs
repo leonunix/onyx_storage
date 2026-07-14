@@ -29,6 +29,7 @@ impl MetaMemorySnapshot {
         }
 
         Self {
+            rc_checkpoint_mode: self.rc_checkpoint_mode,
             block_cache_capacity_bytes: self.block_cache_capacity_bytes,
             block_cache_usage_bytes: opt_sub(
                 self.block_cache_usage_bytes,

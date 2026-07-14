@@ -366,6 +366,15 @@ impl ServiceController {
         if old_config.meta.path() != new_config.meta.path() {
             tracing::warn!("meta.path changed — requires restart to take effect");
         }
+        if old_config.meta.rc_checkpoint_streaming_enabled
+            != new_config.meta.rc_checkpoint_streaming_enabled
+        {
+            tracing::warn!(
+                old = old_config.meta.rc_checkpoint_streaming_enabled,
+                new = new_config.meta.rc_checkpoint_streaming_enabled,
+                "meta.rc_checkpoint_streaming_enabled changed — requires restart to take effect"
+            );
+        }
         if old_config.engine.zone_count != new_config.engine.zone_count {
             tracing::warn!("engine.zone_count changed — requires restart to take effect");
         }

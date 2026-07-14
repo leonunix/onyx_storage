@@ -1195,6 +1195,18 @@ fn l2p_buffer_interval_controls_metadb_bfg_roll_timer() {
 }
 
 #[test]
+fn rc_checkpoint_streaming_toggle_maps_to_metadb() {
+    for enabled in [false, true] {
+        let cfg = MetaConfig {
+            rc_checkpoint_streaming_enabled: enabled,
+            ..Default::default()
+        };
+        let mapped = super::metadb_config_from_onyx(std::path::Path::new("/tmp/metadb"), &cfg);
+        assert_eq!(mapped.rc_checkpoint_streaming_enabled, enabled);
+    }
+}
+
+#[test]
 fn offline_audit_config_disables_continuous_mutators() {
     let cfg = MetaConfig {
         dedup_shards: 8,

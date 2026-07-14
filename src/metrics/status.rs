@@ -88,6 +88,13 @@ impl EngineStatusSnapshot {
             );
         }
         if let Some(metadb) = &self.metadb_memory {
+            let rc_checkpoint_mode = match metadb.rc_checkpoint_mode {
+                0 => "threads-off/all-slots",
+                1 => "threads-on/legacy",
+                2 => "threads-on/streaming",
+                _ => "unknown",
+            };
+            let _ = writeln!(out, "metadb_rc_checkpoint_mode: {rc_checkpoint_mode}");
             let _ = writeln!(
                 out,
                 "metadb_block_cache_bytes: usage={} pinned={} capacity={}",

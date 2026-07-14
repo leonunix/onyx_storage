@@ -568,6 +568,12 @@ pub struct MetaConfig {
     #[serde(default = "default_bfg_threads_enabled")]
     pub bfg_threads_enabled: bool,
 
+    /// Stream threads-on refcount checkpoint page writeback in bounded chunks.
+    /// Disable only for a controlled A/B against the legacy one-shot path;
+    /// commit queues, BFG cadence, and shard selection remain unchanged.
+    #[serde(default = "default_rc_checkpoint_streaming_enabled")]
+    pub rc_checkpoint_streaming_enabled: bool,
+
     /// Fan the per-BFG L2P syncing-slot drain out across shards instead of
     /// folding them serially on the single `metadb-bfg-sync` thread (which
     /// was the drain bottleneck capping single-volume write throughput).
@@ -703,6 +709,7 @@ impl Default for MetaConfig {
             commit_direct_apply_enabled: default_commit_direct_apply_enabled(),
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
             bfg_threads_enabled: default_bfg_threads_enabled(),
+            rc_checkpoint_streaming_enabled: default_rc_checkpoint_streaming_enabled(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
             l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
             l2p_checkpoint_pipeline_enabled: default_l2p_checkpoint_pipeline_enabled(),
@@ -814,6 +821,9 @@ fn default_bfg_threads_enabled() -> bool {
     // Default ON: the BFG quiesce/sync workers keep metadata draining in
     // the background, which keeps buffer reclaim moving during sustained
     // write load. Only engages when `l2p_buffer_enabled = true`.
+    true
+}
+fn default_rc_checkpoint_streaming_enabled() -> bool {
     true
 }
 fn default_parallel_l2p_drain_enabled() -> bool {
