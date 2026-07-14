@@ -515,18 +515,18 @@ pub struct MetaConfig {
     #[serde(default = "default_l2p_buffer_enabled")]
     pub l2p_buffer_enabled: bool,
 
-    /// Global L2P mutation budget per Open BFG. Crossing it wakes the
-    /// quiesce worker immediately; the checkpoint timer remains a low-rate
-    /// fallback. Attempted mutations are counted conservatively, so the
-    /// unique-key fold is never larger because of overwrite coalescing. The
-    /// trigger is suspended while snapshots are live; snapshot lifecycle uses
-    /// its own forced checkpoint boundaries.
+    /// Global L2P mutation budget per Open BFG. The crossing batch is admitted
+    /// and closes that generation to later commits until it rolls, bounding
+    /// submitted work by `limit + max_single_batch - 1`. The checkpoint timer
+    /// remains a low-rate fallback. Attempted mutations are counted
+    /// conservatively; the trigger is suspended while snapshots are live,
+    /// whose lifecycle uses its own forced checkpoint boundaries.
     #[serde(default = "default_l2p_buffer_soft_entries")]
     pub l2p_buffer_soft_entries: usize,
 
-    /// Per-shard hard trigger. Commits to a shard block on a Condvar
-    /// when its `active.len()` reaches this until the compactor swaps
-    /// the active map out.
+    /// Reserved compatibility setting for a future per-shard hard trigger.
+    /// It is currently parsed and forwarded but not enforced; use
+    /// `l2p_buffer_soft_entries` for the active global BFG admission bound.
     #[serde(default = "default_l2p_buffer_hard_entries")]
     pub l2p_buffer_hard_entries: usize,
 

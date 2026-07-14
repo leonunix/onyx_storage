@@ -72,6 +72,8 @@ pub struct MetaMemorySnapshot {
     pub commit_wal_submit_max_us: u64,
     pub commit_drop_gate_wait_us: u64,
     pub commit_drop_gate_wait_max_us: u64,
+    pub commit_bfg_admission_wait_us: u64,
+    pub commit_bfg_admission_wait_max_us: u64,
     pub commit_apply_wait_us: u64,
     pub commit_apply_wait_max_us: u64,
     pub commit_apply_gate_wait_us: u64,
@@ -509,3 +511,30 @@ pub struct MetaMemorySnapshot {
 
 mod delta;
 mod from_metadb;
+
+#[cfg(test)]
+mod tests {
+    use super::MetaMemorySnapshot;
+
+    #[test]
+    fn bfg_admission_wait_metrics_serialize_and_delta() {
+        let earlier = MetaMemorySnapshot {
+            commit_bfg_admission_wait_us: 30,
+            commit_bfg_admission_wait_max_us: 20,
+            ..MetaMemorySnapshot::default()
+        };
+        let current = MetaMemorySnapshot {
+            commit_bfg_admission_wait_us: 75,
+            commit_bfg_admission_wait_max_us: 40,
+            ..MetaMemorySnapshot::default()
+        };
+
+        let delta = current.saturating_sub(&earlier);
+        assert_eq!(delta.commit_bfg_admission_wait_us, 45);
+        assert_eq!(delta.commit_bfg_admission_wait_max_us, 40);
+
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["commit_bfg_admission_wait_us"].as_u64(), Some(75));
+        assert_eq!(json["commit_bfg_admission_wait_max_us"].as_u64(), Some(40));
+    }
+}

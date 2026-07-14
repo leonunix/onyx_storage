@@ -402,7 +402,7 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_commit: attempts={} success={} errors={} empty={} ops={} wal_body_bytes={} wal_body_bytes_max={} total_us={} max_us={} drop_gate_wait_us={} drop_gate_wait_max_us={} wal_submit_us={} wal_submit_max_us={} apply_wait_us={} apply_wait_max_us={} apply_gate_wait_us={} apply_gate_wait_max_us={} finish_global_wait_us={} finish_global_wait_max_us={} apply_us={} apply_max_us={} plan_us={} plan_max_us={} encode_us={} encode_max_us={} unlogged_gate_wait_us={} unlogged_gate_wait_max_us={} checkpoint_unlogged_us={} checkpoint_unlogged_max_us={} read_held_us={} read_held_max_us={}",
+                "metadb_commit: attempts={} success={} errors={} empty={} ops={} wal_body_bytes={} wal_body_bytes_max={} total_us={} max_us={} drop_gate_wait_us={} drop_gate_wait_max_us={} bfg_admission_wait_us={} bfg_admission_wait_max_us={} wal_submit_us={} wal_submit_max_us={} apply_wait_us={} apply_wait_max_us={} apply_gate_wait_us={} apply_gate_wait_max_us={} finish_global_wait_us={} finish_global_wait_max_us={} apply_us={} apply_max_us={} plan_us={} plan_max_us={} encode_us={} encode_max_us={} unlogged_gate_wait_us={} unlogged_gate_wait_max_us={} checkpoint_unlogged_us={} checkpoint_unlogged_max_us={} read_held_us={} read_held_max_us={}",
                 metadb.commit_attempts,
                 metadb.commit_success,
                 metadb.commit_errors,
@@ -414,6 +414,8 @@ impl EngineStatusSnapshot {
                 metadb.commit_total_max_us,
                 metadb.commit_drop_gate_wait_us,
                 metadb.commit_drop_gate_wait_max_us,
+                metadb.commit_bfg_admission_wait_us,
+                metadb.commit_bfg_admission_wait_max_us,
                 metadb.commit_wal_submit_us,
                 metadb.commit_wal_submit_max_us,
                 metadb.commit_apply_wait_us,
