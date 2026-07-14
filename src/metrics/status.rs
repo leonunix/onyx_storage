@@ -263,17 +263,30 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_flush_sample_work: l2p_dirty_pages={} l2p_dirty_pages_max={} rc_drained_deltas={} rc_drained_deltas_max={} rc_fresh_pages={} rc_fresh_pages_max={}",
+                "metadb_flush_sample_work: l2p_dirty_pages={} l2p_dirty_pages_max={} rc_drained_deltas={} rc_drained_deltas_max={} rc_fresh_pages={} rc_fresh_pages_max={} rc_staged_pages={} rc_staged_pages_max={}",
                 metadb.flush_sample_l2p_dirty_pages,
                 metadb.flush_sample_l2p_dirty_pages_max,
                 metadb.flush_sample_rc_drained_deltas,
                 metadb.flush_sample_rc_drained_deltas_max,
                 metadb.flush_sample_rc_fresh_pages,
-                metadb.flush_sample_rc_fresh_pages_max
+                metadb.flush_sample_rc_fresh_pages_max,
+                metadb.flush_sample_rc_staged_pages,
+                metadb.flush_sample_rc_staged_pages_max
             );
             let _ = writeln!(
                 out,
-                "metadb_flush_sample_breakdown: lock_us={} lock_max_us={} l2p_walk_us={} l2p_walk_max_us={} rc_drain_us={} rc_drain_max_us={}",
+                "metadb_flush_rc_checkpoint: fold_service_us={} fold_service_max_us={} stream_calls={} stream_pages={} stream_service_us={} stream_max_chunk_us={} stream_max_chunk_pages={}",
+                metadb.flush_rc_fold_service_us,
+                metadb.flush_rc_fold_service_max_us,
+                metadb.flush_rc_stream_calls,
+                metadb.flush_rc_stream_pages,
+                metadb.flush_rc_stream_service_us,
+                metadb.flush_rc_stream_max_chunk_us,
+                metadb.flush_rc_stream_max_chunk_pages
+            );
+            let _ = writeln!(
+                out,
+                "metadb_flush_sample_breakdown: lock_us={} lock_max_us={} l2p_walk_us={} l2p_walk_max_us={} rc_checkpoint_wall_us={} rc_checkpoint_wall_max_us={}",
                 metadb.flush_sample_lock_us,
                 metadb.flush_sample_lock_max_us,
                 metadb.flush_sample_l2p_walk_us,
