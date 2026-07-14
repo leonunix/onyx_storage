@@ -84,9 +84,12 @@ fn allocate_group_extent(
             Err(error) => return Err(error),
         }
     }
-    allocator
-        .allocate_extent_for_lane(lane, used_blocks)
-        .map(|extent| (extent, false))
+    let extent = allocator.allocate_extent_for_lane(lane, used_blocks)?;
+    if extent.count != used_blocks {
+        crate::space::pba_lifecycle::rollback_uncommitted(allocator, extent)?;
+        return Err(OnyxError::SpaceExhausted);
+    }
+    Ok((extent, false))
 }
 
 impl BufferFlusher {
@@ -1148,6 +1151,31 @@ mod stripe_group_tests {
         assert!(!aligned);
         assert_eq!(extent, Extent::new(Pba(9), 5));
         assert!(extent.end_pba().0 <= allocator.total_block_count());
+    }
+
+    #[test]
+    fn alignment_starved_short_fallback_is_rolled_back() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let allocator = SpaceAllocator::new(64 * BLOCK_SIZE as u64, 1);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+
+        let whole = allocator
+            .allocate_extent(64 - RESERVED_BLOCKS as u32)
+            .unwrap();
+        assert_eq!(whole.start, Pba(RESERVED_BLOCKS));
+        allocator.free_extent(Extent::new(Pba(9), 4)).unwrap();
+        let free_before = allocator.free_block_count();
+
+        let result = allocate_group_extent(&allocator, 0, 5, STRIPE, PHASE, true);
+        assert!(matches!(
+            result,
+            Err(crate::error::OnyxError::SpaceExhausted)
+        ));
+        assert_eq!(allocator.free_block_count(), free_before);
+        for pba in 9..13 {
+            assert!(allocator.is_free(Pba(pba)));
+        }
     }
 
     #[test]
