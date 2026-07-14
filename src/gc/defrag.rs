@@ -18,16 +18,16 @@
 //! separate naturally instead of treadmilling. Allocation policy itself is
 //! NEVER touched (dense-PBA metadb leaf contract).
 //!
-//! Target lifecycle: emit (cluster qualifies, span budget permitting) →
-//! evacuate (scanner/rewriter drain the live pinners over L2P laps) → done
-//! (range re-checked ≥`TARGET_DONE_PCT` free+retired → retired from the map,
-//! budget handed back, walk continues) → walk lap wraps to the device top
-//! (already-targeted or now-stripe-capable regions skip/re-qualify
-//! idempotently). Stale targets are harmless: the scanner just finds nothing
-//! there and the rewriter re-validates every LBA against the live L2P.
+//! Target lifecycle: select one exact stripe → quarantine its free fragments →
+//! evacuate every live reference → wait for retire/reclaim to make the entire
+//! stripe free → atomically publish it back as stripe reserve. Quarantine is an
+//! allocation policy state, not persistent metadata: after a crash the folded
+//! L2P/dedup index rebuild remains authoritative and merely loses cleaner
+//! progress.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
@@ -43,10 +43,6 @@ const WALK_CHUNK: usize = 4096;
 /// alloc/free between our snapshot holds (same value as the allocator's
 /// retire/reclaim batches).
 const WALK_BREATHER: std::time::Duration = std::time::Duration::from_micros(500);
-/// A target is "done" (evacuated enough to retire from the active map) when
-/// free+retired cover at least this share of its span. Not a config knob:
-/// it only controls when budget is handed back to the walk, never safety.
-const TARGET_DONE_PCT: u64 = 90;
 /// Hard bound on one cluster's span (blocks; 2048 = 8 MiB at 4 KiB). On a
 /// real confetti belt inter-extent gaps are almost always ≤ gap_max, so an
 /// unbounded accumulator swallows the WHOLE belt into one cluster — and any
@@ -94,11 +90,18 @@ pub(crate) struct DefragState {
     /// Next walk visits free extents strictly below this address.
     cursor: Pba,
     pending: Option<ClusterAcc>,
-    /// Active targets: start → span blocks. Ascending & non-overlapping by
-    /// construction (insertions skip anything overlapping a neighbor).
-    targets: BTreeMap<u64, u32>,
+    /// Active allocator-owned quarantine targets. Every target is exactly one
+    /// stripe and remains here until all blocks are truly free (retired blocks
+    /// do not count) or the no-progress watchdog cancels it.
+    targets: BTreeMap<u64, ActiveTarget>,
     /// Σ span over `targets` (the budget).
     target_blocks: u64,
+}
+
+struct ActiveTarget {
+    count: u32,
+    last_free_blocks: u64,
+    last_progress: Instant,
 }
 
 impl DefragState {
@@ -123,6 +126,66 @@ impl DefragState {
         metrics: &EngineMetrics,
     ) -> DefragCycle {
         use std::sync::atomic::Ordering::Relaxed;
+
+        // Completion is based on actual allocator ownership, not "free +
+        // retired" coverage. Retired PBAs are still allocated until the hazard
+        // and metadata gates reclaim them, and even a few scattered pinners can
+        // make every stripe unusable. The allocator publishes a fully-free
+        // quarantine atomically into the stripe reserve.
+        let now = Instant::now();
+        let stall_after = Duration::from_secs(cfg.defrag_target_stall_secs.max(1));
+        let mut completed = Vec::new();
+        let mut cancelled = Vec::new();
+        for (&start, target) in self.targets.iter_mut() {
+            let pba = Pba(start);
+            let Some((free_blocks, total_blocks)) = allocator.defrag_quarantine_progress(pba)
+            else {
+                // Allocator state disappeared only after an explicit completion
+                // or cancellation. Drop the stale scanner range defensively.
+                completed.push(start);
+                continue;
+            };
+            if free_blocks > target.last_free_blocks {
+                target.last_free_blocks = free_blocks;
+                target.last_progress = now;
+            }
+            if free_blocks == total_blocks {
+                match allocator.complete_defrag_quarantine(pba) {
+                    Ok(true) => completed.push(start),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(start, error = %error, "defrag target publish failed");
+                    }
+                }
+            } else if now.duration_since(target.last_progress) >= stall_after {
+                if allocator.cancel_defrag_quarantine(pba) {
+                    cancelled.push(start);
+                }
+            }
+        }
+        for start in completed {
+            if let Some(target) = self.targets.remove(&start) {
+                self.target_blocks -= u64::from(target.count);
+                metrics.gc_defrag_segments_completed.fetch_add(1, Relaxed);
+                tracing::info!(
+                    start,
+                    blocks = target.count,
+                    "defrag stripe published to reserve"
+                );
+            }
+        }
+        for start in cancelled {
+            if let Some(target) = self.targets.remove(&start) {
+                self.target_blocks -= u64::from(target.count);
+                metrics.gc_defrag_segments_cancelled.fetch_add(1, Relaxed);
+                tracing::warn!(
+                    start,
+                    blocks = target.count,
+                    "defrag target cancelled after no progress"
+                );
+            }
+        }
+
         let stats = allocator.contiguity_stats();
         publish_contiguity(metrics, &stats);
 
@@ -135,10 +198,10 @@ impl DefragState {
         // Trigger latch with +10 pct exit hysteresis.
         let enter = cfg.defrag_stripe_capable_min_pct as u64;
         if !cfg.defrag_enabled || geom.is_none() || free_pct < cfg.defrag_min_free_pct as u64 {
-            self.deactivate(metrics);
+            self.deactivate(allocator, metrics);
         } else if self.active {
             if capable_pct >= enter + 10 {
-                self.deactivate(metrics);
+                self.deactivate(allocator, metrics);
             }
         } else if capable_pct < enter {
             self.active = true;
@@ -157,29 +220,11 @@ impl DefragState {
         }
         let (stripe, phase) = geom.expect("active implies geometry");
 
-        // Retire evacuated targets: once free+retired cover ≥ TARGET_DONE_PCT
-        // of the span, reclaim/coalescing owns the rest — hand the budget back.
-        let done: Vec<u64> = self
-            .targets
-            .iter()
-            .filter(|&(&start, &count)| {
-                let t = Extent::new(Pba(start), count);
-                let covered =
-                    allocator.free_overlap_blocks(t) + allocator.retired_overlap_blocks(t);
-                covered * 100 >= count as u64 * TARGET_DONE_PCT
-            })
-            .map(|(&start, _)| start)
-            .collect();
-        for start in done {
-            let count = self.targets.remove(&start).expect("collected above");
-            self.target_blocks -= count as u64;
-            tracing::debug!(start, blocks = count, "defrag target done (evacuated)");
-        }
-
         // Continue the descending walk while span budget remains.
         let mut walked = 0usize;
         while walked < cfg.defrag_scan_extents_per_cycle
             && self.target_blocks < cfg.defrag_max_target_blocks
+            && self.targets.len() < cfg.defrag_max_active_targets.max(1)
         {
             if walked > 0 {
                 std::thread::sleep(WALK_BREATHER);
@@ -191,7 +236,9 @@ impl DefragState {
 
             for e in &chunk {
                 self.cursor = e.start;
-                if self.target_blocks >= cfg.defrag_max_target_blocks {
+                if self.target_blocks >= cfg.defrag_max_target_blocks
+                    || self.targets.len() >= cfg.defrag_max_active_targets.max(1)
+                {
                     break;
                 }
                 let closed = match &mut self.pending {
@@ -256,36 +303,78 @@ impl DefragState {
             metrics.gc_defrag_clusters_rejected.fetch_add(1, Relaxed);
             return;
         }
-        // Density gate: (free + retired) / span. The retired query takes only
-        // the retired lock; no free lock is held here (snapshots released).
-        let span_ext = Extent::new(Pba(acc.lo), span as u32);
-        let reclaimable = acc.free_blocks + allocator.retired_overlap_blocks(span_ext);
-        if reclaimable * 100 < span * cfg.defrag_min_free_density_pct as u64 {
+
+        let Some((stripe, phase)) = allocator.stripe_geometry() else {
+            return;
+        };
+        let stripe_u64 = u64::from(stripe);
+        if stripe <= 1 || span < stripe_u64 {
             metrics.gc_defrag_clusters_rejected.fetch_add(1, Relaxed);
             return;
         }
-        // Clamp to the remaining span budget, keeping the TOP of the cluster
-        // (highest addresses evacuate first).
-        let budget_left = cfg.defrag_max_target_blocks - self.target_blocks;
-        let take = span.min(budget_left);
-        if take == 0 {
-            return;
+
+        // Materialize exact full-stripe candidates inside the cluster and rank
+        // them by relocation cost (most already-free/reclaimable first), then by
+        // descending PBA to preserve the source/destination separation policy.
+        let mut candidates = Vec::new();
+        let mut start = align_up_with_phase(acc.lo, stripe_u64, u64::from(phase));
+        while start.saturating_add(stripe_u64) <= acc.hi {
+            let target = Extent::new(Pba(start), stripe);
+            if !self.overlaps_existing(target) {
+                let free = allocator.free_overlap_blocks(target);
+                let retired = allocator.retired_overlap_blocks(target);
+                let reclaimable = free.saturating_add(retired);
+                if free < stripe_u64
+                    && reclaimable * 100 >= stripe_u64 * u64::from(cfg.defrag_min_free_density_pct)
+                {
+                    candidates.push((reclaimable, start));
+                }
+            }
+            start = start.saturating_add(stripe_u64);
         }
-        let target = Extent::new(Pba(acc.hi - take), take as u32);
-        // Skip anything overlapping an existing target (re-walks of a
-        // still-active target re-qualify here) — keeps the map disjoint and
-        // the budget accounting exact.
-        if self.overlaps_existing(target) {
-            return;
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut emitted = 0u64;
+        for (_, start) in candidates {
+            if self.target_blocks + stripe_u64 > cfg.defrag_max_target_blocks
+                || self.targets.len() >= cfg.defrag_max_active_targets.max(1)
+            {
+                break;
+            }
+            let target = Extent::new(Pba(start), stripe);
+            match allocator.begin_defrag_quarantine(target) {
+                Ok(()) => {
+                    let initial_free = allocator
+                        .defrag_quarantine_progress(target.start)
+                        .map_or(0, |(free, _)| free);
+                    self.targets.insert(
+                        start,
+                        ActiveTarget {
+                            count: stripe,
+                            last_free_blocks: initial_free,
+                            last_progress: Instant::now(),
+                        },
+                    );
+                    self.target_blocks += stripe_u64;
+                    emitted += 1;
+                }
+                Err(error) => {
+                    tracing::debug!(start, error = %error, "defrag target quarantine rejected");
+                }
+            }
         }
-        self.targets.insert(target.start.0, target.count);
-        self.target_blocks += take;
-        metrics.gc_defrag_clusters_qualified.fetch_add(1, Relaxed);
+        if emitted > 0 {
+            metrics
+                .gc_defrag_clusters_qualified
+                .fetch_add(emitted, Relaxed);
+        } else {
+            metrics.gc_defrag_clusters_rejected.fetch_add(1, Relaxed);
+        }
     }
 
     fn overlaps_existing(&self, t: Extent) -> bool {
-        if let Some((&s, &c)) = self.targets.range(..=t.start.0).next_back() {
-            if s + c as u64 > t.start.0 {
+        if let Some((&s, target)) = self.targets.range(..=t.start.0).next_back() {
+            if s + u64::from(target.count) > t.start.0 {
                 return true;
             }
         }
@@ -295,10 +384,16 @@ impl DefragState {
             .is_some_and(|(&s, _)| s < t.end_pba().0)
     }
 
-    fn deactivate(&mut self, metrics: &EngineMetrics) {
+    pub(crate) fn deactivate(&mut self, allocator: &SpaceAllocator, metrics: &EngineMetrics) {
         use std::sync::atomic::Ordering::Relaxed;
         if self.active {
             tracing::info!("defrag mode EXIT: free pool stripe-capable again");
+        }
+        let starts: Vec<Pba> = self.targets.keys().copied().map(Pba).collect();
+        for start in starts {
+            if allocator.cancel_defrag_quarantine(start) {
+                metrics.gc_defrag_segments_cancelled.fetch_add(1, Relaxed);
+            }
         }
         self.active = false;
         self.pending = None;
@@ -307,6 +402,20 @@ impl DefragState {
         self.cursor = Pba(u64::MAX);
         metrics.gc_defrag_targets_active.store(0, Relaxed);
         metrics.gc_defrag_target_blocks.store(0, Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track_target_for_exit_test(&mut self, target: Extent) {
+        self.active = true;
+        self.target_blocks += u64::from(target.count);
+        self.targets.insert(
+            target.start.0,
+            ActiveTarget {
+                count: target.count,
+                last_free_blocks: 0,
+                last_progress: Instant::now(),
+            },
+        );
     }
 
     fn cycle_output(&self, metrics: &EngineMetrics) -> DefragCycle {
@@ -321,11 +430,20 @@ impl DefragState {
             targets: Arc::new(
                 self.targets
                     .iter()
-                    .map(|(&start, &count)| Extent::new(Pba(start), count))
+                    .map(|(&start, target)| Extent::new(Pba(start), target.count))
                     .collect(),
             ),
             active: true,
         }
+    }
+}
+
+fn align_up_with_phase(from: u64, stripe: u64, phase: u64) -> u64 {
+    let rem = (from + phase) % stripe;
+    if rem == 0 {
+        from
+    } else {
+        from + (stripe - rem)
     }
 }
 
@@ -386,12 +504,22 @@ fn publish_contiguity(metrics: &EngineMetrics, stats: &crate::space::allocator::
     metrics
         .allocator_free_blocks_in_set
         .store(stats.free_blocks_in_set, Relaxed);
+    metrics
+        .allocator_stripe_reserve_blocks
+        .store(stats.stripe_reserve_blocks, Relaxed);
+    metrics
+        .allocator_quarantine_target_blocks
+        .store(stats.quarantine_target_blocks, Relaxed);
+    metrics
+        .allocator_quarantine_free_blocks
+        .store(stats.quarantine_free_blocks, Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{BLOCK_SIZE, RESERVED_BLOCKS};
+    use std::sync::atomic::Ordering::Relaxed;
 
     const STRIPE: u32 = 6;
     const PHASE: u32 = 2; // aligned starts: (pba+2)%6 == 0
@@ -423,7 +551,14 @@ mod tests {
     /// Allocate the whole pool so tests can carve free patterns explicitly.
     fn claim_all(a: &SpaceAllocator, blocks: u64) -> u64 {
         let total = blocks - RESERVED_BLOCKS;
-        a.allocate_extent(total as u32).unwrap().start.0
+        // Policy classes deliberately split one physical run at stripe
+        // boundaries. Claim before enabling geometry so the setup itself does
+        // not depend on the allocator's documented short-extent fallback.
+        a.set_stripe_geometry(1, 0);
+        let claimed = a.allocate_extent(total as u32).unwrap();
+        assert_eq!(claimed, Extent::new(Pba(RESERVED_BLOCKS), total as u32));
+        a.set_stripe_geometry(STRIPE, PHASE);
+        claimed.start.0
     }
 
     #[test]
@@ -493,7 +628,7 @@ mod tests {
         for t in c.targets.iter() {
             assert!(
                 t.end_pba().0 <= base + 6000 + 64,
-                "target {t:?} escaped the dense region"
+                "target {t:?} escaped the dense region",
             );
         }
     }
@@ -510,6 +645,7 @@ mod tests {
         let mut st = DefragState::new();
         let mut wide = cfg();
         wide.defrag_max_target_blocks = u64::MAX / 2;
+        wide.defrag_max_active_targets = usize::MAX;
         let c = st.maintain(&a, &wide, 50, &m);
         assert!(
             c.targets.len() > 10,
@@ -517,10 +653,8 @@ mod tests {
             c.targets.len()
         );
         for t in c.targets.iter() {
-            assert!(
-                t.count as u64 <= MAX_CLUSTER_SPAN,
-                "window {t:?} exceeds span bound"
-            );
+            assert_eq!(t.count, STRIPE, "every quarantine is one exact stripe");
+            assert_eq!((t.start.0 + PHASE as u64) % STRIPE as u64, 0);
         }
         for w in c.targets.windows(2) {
             assert!(
@@ -541,11 +675,14 @@ mod tests {
         // more confetti — unbounded clustering would merge all three and the
         // big run's capacity would reject everything.
         confetti(&a, base, base + 6000, 4, 2);
-        a.free_extent(Extent::new(Pba(base + 6010), 1024)).unwrap(); // capable run
+        let capable_run = Extent::new(Pba(base + 6010), 1024);
+        a.free_extent(capable_run).unwrap();
         confetti(&a, base + 8100, base + 14_100, 4, 2);
         let m = metrics();
         let mut st = DefragState::new();
-        let c = st.maintain(&a, &cfg(), 50, &m);
+        let mut wide = cfg();
+        wide.defrag_max_active_targets = usize::MAX;
+        let c = st.maintain(&a, &wide, 50, &m);
         assert!(c.active);
         let covers_confetti = c.targets.iter().any(|t| t.start.0 < base + 6000)
             && c.targets
@@ -556,10 +693,13 @@ mod tests {
             "both confetti islands must be targeted: {:?}",
             c.targets
         );
+        let reserve_start = align_up_with_phase(capable_run.start.0, STRIPE as u64, PHASE as u64);
+        let reserve_end = reserve_start
+            + capable_run.end_pba().0.saturating_sub(reserve_start) / STRIPE as u64 * STRIPE as u64;
         for t in c.targets.iter() {
             assert!(
-                t.end_pba().0 <= base + 6010 || t.start.0 >= base + 6010 + 1024,
-                "target {t:?} must not sit on the capable run"
+                t.end_pba().0 <= reserve_start || t.start.0 >= reserve_end,
+                "target {t:?} must not overlap the already-capable reserve"
             );
         }
     }
@@ -596,6 +736,7 @@ mod tests {
         let mut st = DefragState::new();
         let mut small = cfg();
         small.defrag_scan_extents_per_cycle = 512; // force multi-cycle walk
+        small.defrag_max_active_targets = usize::MAX;
         let c1 = st.maintain(&a, &small, 50, &m);
         let low1 = c1.targets.first().map(|t| t.start.0).unwrap_or(u64::MAX);
         let c2 = st.maintain(&a, &small, 50, &m);
@@ -633,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn done_targets_are_retired_and_budget_returns() {
+    fn target_completes_only_at_one_hundred_percent_free() {
         let a = new_alloc(8192);
         let base = claim_all(&a, 8192);
         confetti(&a, base, base + 8184, 3, 3);
@@ -641,20 +782,73 @@ mod tests {
         let mut st = DefragState::new();
         let c = st.maintain(&a, &cfg(), 50, &m);
         assert!(c.active && !c.targets.is_empty());
-        // "Evacuate" one target by freeing its live gaps → ≥90% free.
+        // Free all but one live PBA. Partial physical ownership must never be
+        // published, even though the stripe is mostly free.
         let t0 = *c.targets.last().unwrap();
-        let mut p = t0.start.0;
-        while p < t0.end_pba().0 {
-            let _ = a.free_extent(Extent::single(Pba(p)));
-            p += 1;
+        let live: Vec<Pba> = (0..t0.count)
+            .map(|offset| Pba(t0.start.0 + u64::from(offset)))
+            .filter(|pba| !a.is_free(*pba))
+            .collect();
+        assert!(!live.is_empty());
+        for pba in live.iter().take(live.len() - 1) {
+            a.free_one(*pba).unwrap();
         }
         let c2 = st.maintain(&a, &cfg(), 50, &m);
-        for t in c2.targets.iter() {
+        assert!(c2.targets.iter().any(|target| *target == t0));
+        assert_eq!(
+            m.gc_defrag_segments_completed.load(Relaxed),
+            0,
+            "partial stripe must remain quarantined"
+        );
+
+        a.free_one(*live.last().unwrap()).unwrap();
+        let c3 = st.maintain(&a, &cfg(), 50, &m);
+        for t in c3.targets.iter() {
             assert!(
                 t.end_pba().0 <= t0.start.0 || t.start.0 >= t0.end_pba().0,
-                "evacuated target must be retired from the active map"
+                "completed target must leave the active map"
             );
         }
+        assert_eq!(m.gc_defrag_segments_completed.load(Relaxed), 1);
+        assert!(a.contiguity_stats().stripe_reserve_blocks >= STRIPE as u64);
+    }
+
+    #[test]
+    fn active_target_count_is_hard_bounded() {
+        let a = new_alloc(65_536);
+        let base = claim_all(&a, 65_536);
+        confetti(&a, base, base + 65_528, 4, 2);
+        let m = metrics();
+        let mut st = DefragState::new();
+        let mut capped = cfg();
+        capped.defrag_max_active_targets = 3;
+        capped.defrag_max_target_blocks = u64::MAX / 2;
+
+        let cycle = st.maintain(&a, &capped, 50, &m);
+        assert_eq!(cycle.targets.len(), 3);
+        assert_eq!(m.gc_defrag_targets_active.load(Relaxed), 3);
+    }
+
+    #[test]
+    fn stalled_target_is_cancelled_without_losing_free_blocks() {
+        let a = new_alloc(8192);
+        let base = claim_all(&a, 8192);
+        confetti(&a, base, base + 8184, 3, 3);
+        let m = metrics();
+        let mut st = DefragState::new();
+        let mut short_watchdog = cfg();
+        short_watchdog.defrag_target_stall_secs = 1;
+        let first = st.maintain(&a, &short_watchdog, 50, &m);
+        let target = *first.targets.last().expect("target selected");
+        let free_before = a.free_block_count();
+        st.targets.get_mut(&target.start.0).unwrap().last_progress =
+            Instant::now() - Duration::from_secs(2);
+        short_watchdog.defrag_max_target_blocks = 0;
+
+        let _ = st.maintain(&a, &short_watchdog, 50, &m);
+        assert_eq!(m.gc_defrag_segments_cancelled.load(Relaxed), 1);
+        assert!(!a.is_defrag_quarantined(target));
+        assert_eq!(a.free_block_count(), free_before);
     }
 
     #[test]
@@ -678,13 +872,25 @@ mod tests {
         confetti(&a, base, base + 4088, 3, 5);
         let m = metrics();
         let mut st = DefragState::new();
+        let active = st.maintain(&a, &cfg(), 50, &m);
+        let target = *active.targets.first().expect("defrag target selected");
+        let free_before = a.free_block_count();
+        assert!(a.is_defrag_quarantined(target));
+
         let mut off = cfg();
         off.defrag_enabled = false;
         assert!(!st.maintain(&a, &off, 50, &m).active);
+        assert!(!a.is_defrag_quarantined(target));
+        assert_eq!(a.free_block_count(), free_before);
+        assert!(m.gc_defrag_segments_cancelled.load(Relaxed) > 0);
 
         // No geometry (stripe=1 backend): never activates.
         let b = SpaceAllocator::new(4096 * BLOCK_SIZE as u64, 0);
-        let base_b = claim_all(&b, 4096);
+        let base_b = b
+            .allocate_extent((4096 - RESERVED_BLOCKS) as u32)
+            .unwrap()
+            .start
+            .0;
         confetti(&b, base_b, base_b + 4088, 3, 5);
         let mut st_b = DefragState::new();
         assert!(!st_b.maintain(&b, &cfg(), 50, &m).active);

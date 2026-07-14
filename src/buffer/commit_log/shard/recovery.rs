@@ -155,6 +155,7 @@ impl BufferShard {
                             lba_count: entry.lba_count,
                             payload_crc32: entry.payload_crc32,
                             vol_created_at: entry.vol_created_at,
+                            relocation_source: None,
                             payload: None, // lazy: hydrated from disk on demand
                             disk_offset: offset,
                             disk_len,
@@ -328,6 +329,7 @@ impl BufferShard {
                         lba_count: entry.lba_count,
                         payload_crc32: entry.payload_crc32,
                         vol_created_at: entry.vol_created_at,
+                        relocation_source: None,
                         payload: None, // lazy: hydrated from disk on demand
                         disk_offset: offset,
                         disk_len,

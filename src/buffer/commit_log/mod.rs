@@ -352,6 +352,10 @@ pub struct PendingEntry {
     pub lba_count: u32,
     pub payload_crc32: u32,
     pub vol_created_at: u64,
+    /// Physical source for an in-memory GC relocation. This intent is not
+    /// encoded in LV2; recovered entries deliberately fall back to ordinary
+    /// writes and a later defrag sweep can retry any lost relocation intent.
+    pub relocation_source: Option<crate::space::extent::Extent>,
     /// Payload data. `None` for recovered entries whose payload hasn't been
     /// loaded from the buffer device yet (lazy hydration to avoid OOM).
     pub payload: Option<Arc<[u8]>>,
@@ -379,6 +383,7 @@ impl Clone for PendingEntry {
             lba_count: self.lba_count,
             payload_crc32: self.payload_crc32,
             vol_created_at: self.vol_created_at,
+            relocation_source: self.relocation_source,
             payload: self.payload.clone(),
             disk_offset: self.disk_offset,
             disk_len: self.disk_len,
@@ -387,6 +392,35 @@ impl Clone for PendingEntry {
                 self.durability_advanced_at_ns.load(Ordering::Relaxed),
             ),
             superseded_ranges: self.superseded_ranges.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl PendingEntry {
+    pub(crate) fn test_entry(
+        seq: u64,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        payload: Arc<[u8]>,
+        vol_created_at: u64,
+        relocation_source: Option<crate::space::extent::Extent>,
+    ) -> Self {
+        Self {
+            seq,
+            vol_id: vol_id.to_string(),
+            start_lba,
+            lba_count,
+            payload_crc32: crc32fast::hash(&payload),
+            vol_created_at,
+            relocation_source,
+            payload: Some(payload),
+            disk_offset: 0,
+            disk_len: 0,
+            enqueued_at: Instant::now(),
+            durability_advanced_at_ns: AtomicU64::new(0),
+            superseded_ranges: Vec::new(),
         }
     }
 }
@@ -746,6 +780,11 @@ struct LifecycleState {
 
 struct BufferShard {
     device: Arc<dyn BlockBackend>,
+    /// Orders seq allocation and LBA-index publication for this routing shard.
+    /// Foreground writes and GC relocation share this domain, so relocation can
+    /// revalidate its physical source immediately before append without a stale
+    /// payload overtaking a concurrent user write.
+    append_order: parking_lot::Mutex<()>,
     ring: parking_lot::Mutex<RingState>,
     /// Signaled when ring space is freed (reclaim_log_prefix).
     ring_space_cv: parking_lot::Condvar,

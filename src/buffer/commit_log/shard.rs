@@ -401,6 +401,7 @@ impl BufferShard {
         Ok((
             Self {
                 device,
+                append_order: parking_lot::Mutex::new(()),
                 ring: parking_lot::Mutex::new(RingState {
                     used_bytes: scan.used_bytes,
                     capacity_bytes,
@@ -621,6 +622,7 @@ impl BufferShard {
         lba_count: u32,
         payload: &[u8],
         vol_created_at: u64,
+        relocation_source: Option<crate::space::extent::Extent>,
     ) -> OnyxResult<Arc<PendingEntry>> {
         if vol_id.is_empty() || vol_id.len() > MAX_VOLUME_ID_BYTES {
             return Err(OnyxError::Config(format!(
@@ -741,6 +743,7 @@ impl BufferShard {
             lba_count,
             payload_crc32,
             vol_created_at,
+            relocation_source,
             payload: Some(payload.clone()),
             disk_offset: write_offset,
             disk_len,

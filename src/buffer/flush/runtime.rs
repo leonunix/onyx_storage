@@ -387,6 +387,7 @@ impl BufferFlusher {
         // raw sender is dropped, forwarding the final partial transaction
         // before it disconnects the executor queue.
         let commit_aggregator_pool = pool.clone();
+        let commit_aggregator_metrics = metrics.clone();
         let commit_aggregator_handle = thread::Builder::new()
             .name("flusher-commit-aggregator".to_string())
             .spawn(move || {
@@ -395,6 +396,7 @@ impl BufferFlusher {
                     commit_rx,
                     commit_batch_tx,
                     Some(commit_aggregator_pool),
+                    Some(commit_aggregator_metrics),
                     commit_retain_tail,
                     commit_target_lbas_per_tx,
                     commit_coalesce_lba_budget,

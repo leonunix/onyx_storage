@@ -7,6 +7,7 @@ use crate::buffer::commit_log::PendingEntry;
 use crate::buffer::entry::BufferEntry;
 use crate::meta::schema::{BlockmapValue, ContentHash, DedupEntry};
 use crate::metrics::EngineMetrics;
+use crate::space::extent::Extent;
 use crate::types::{CompressionAlgo, Lba, BLOCK_SIZE};
 
 /// Tracks completion of sub-units produced by dedup splitting.
@@ -86,6 +87,9 @@ pub struct CoalesceUnit {
 pub(crate) struct RawBlockRef {
     pub payload: Arc<[u8]>,
     pub offset: usize,
+    /// Old physical extent when this block was injected by GC relocation.
+    /// Dedup targets overlapping it must be treated as misses.
+    pub relocation_source: Option<Extent>,
 }
 
 impl RawBlockRef {
@@ -273,6 +277,7 @@ struct LbaSlice<'a> {
     offset: usize,
     entry_seq: u64,
     vol_created_at: u64,
+    relocation_source: Option<Extent>,
 }
 
 /// Record that `lba` from entry `seq` is in this unit.
@@ -326,6 +331,7 @@ pub fn coalesce(
                     offset,
                     entry_seq: entry.seq,
                     vol_created_at: entry.vol_created_at,
+                    relocation_source: None,
                 });
             }
         }
@@ -365,6 +371,7 @@ pub fn coalesce_pending(
                     offset,
                     entry_seq: entry.seq,
                     vol_created_at: entry.vol_created_at,
+                    relocation_source: entry.relocation_source,
                 });
             }
         }
@@ -459,6 +466,7 @@ fn coalesce_slices(
             cur.raw_blocks.push(RawBlockRef {
                 payload: block_payload(&ds.latest.payload, ds.latest.offset, bs),
                 offset: 0,
+                relocation_source: ds.latest.relocation_source,
             });
             for &seq in &ds.all_seqs {
                 add_seq_lba(&mut cur.seq_lba_ranges, seq, ds.latest.lba);
@@ -478,6 +486,7 @@ fn coalesce_slices(
                 raw_blocks: vec![RawBlockRef {
                     payload: block_payload(&ds.latest.payload, ds.latest.offset, bs),
                     offset: 0,
+                    relocation_source: ds.latest.relocation_source,
                 }],
                 compression: vol_compression(ds.latest.vol_id),
                 vol_created_at: ds.latest.vol_created_at,
@@ -518,6 +527,37 @@ mod tests {
             vol_created_at: 0,
             payload: Arc::from(payload),
         }
+    }
+
+    #[test]
+    fn coalesce_pending_preserves_relocation_source_per_block() {
+        let source = Extent::new(crate::types::Pba(100), 2);
+        let payload: Arc<[u8]> = vec![0xA5; 2 * BLOCK_SIZE as usize].into();
+        let entry = Arc::new(PendingEntry::test_entry(
+            7,
+            "vol-a",
+            Lba(20),
+            2,
+            payload,
+            9,
+            Some(source),
+        ));
+
+        let units = coalesce_pending(
+            &[entry],
+            2 * BLOCK_SIZE as usize,
+            2,
+            &|_| CompressionAlgo::None,
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].raw_blocks.len(), 2);
+        assert!(units[0]
+            .raw_blocks
+            .iter()
+            .all(|block| block.relocation_source == Some(source)));
     }
 
     #[test]

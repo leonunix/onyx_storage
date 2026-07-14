@@ -320,7 +320,6 @@ impl BufferFlusher {
         commit_worker_txs: &[Sender<CommitJob>],
         commit_workers_per_volume: usize,
     ) {
-        let _ = pool;
         let total_start = Instant::now();
         let n = sealed_slots.len();
         let mut slot_io_ok = vec![true; n];
@@ -548,22 +547,21 @@ impl BufferFlusher {
                 .sum::<u64>();
 
             if no_workers {
-                // Defensive: if no worker channels are available, fall
-                // back to defer_retry so seqs are not orphaned.
-                in_flight_tracker.defer_retry(&buffered_seqs, Self::RETRY_BACKOFF);
-                for dc in &buffered_completions {
-                    in_flight_tracker.defer_retry(dc.seqs(), Self::RETRY_BACKOFF);
-                }
-                if !buffered_seqs.is_empty() {
-                    let _ = done_tx.send(buffered_seqs);
-                }
-                for dc in buffered_completions {
-                    if let Some(original_seqs) = dc.decrement() {
-                        let _ = done_tx.send(original_seqs);
-                    }
-                }
-                let _ =
-                    crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, sealed.pba);
+                Self::fail_undispatched_packed_job(
+                    PackedCommitJob {
+                        sealed,
+                        shard_idx,
+                        buffered_seqs,
+                        buffered_completions,
+                        enqueued_at: Instant::now(),
+                    },
+                    pool,
+                    allocator,
+                    in_flight_tracker,
+                    metrics,
+                    Some(done_tx),
+                    "commit aggregator channel unavailable",
+                );
                 continue;
             }
 
@@ -584,7 +582,7 @@ impl BufferFlusher {
                 enqueued_at: Instant::now(),
             });
             let send_start = Instant::now();
-            let _ = commit_worker_txs[tx_idx].send(job);
+            let send_result = commit_worker_txs[tx_idx].send(job);
             Self::record_elapsed(&metrics.flush_writer_commit_send_ns, send_start);
             metrics
                 .flush_writer_commit_send_ops
@@ -593,6 +591,20 @@ impl BufferFlusher {
                 &metrics.flush_writer_commit_send_len_max,
                 commit_worker_txs[tx_idx].len() as u64,
             );
+            if let Err(error) = send_result {
+                let CommitJob::Packed(failed_job) = error.0 else {
+                    unreachable!("packed sender returned a different commit job kind")
+                };
+                Self::fail_undispatched_packed_job(
+                    failed_job,
+                    pool,
+                    allocator,
+                    in_flight_tracker,
+                    metrics,
+                    Some(done_tx),
+                    "commit aggregator disconnected during packed handoff",
+                );
+            }
         }
 
         // Counters tracking the IO + dispatch phase. Metadata-phase

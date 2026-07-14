@@ -22,6 +22,7 @@ use crate::meta::schema::*;
 use crate::meta::store::MetaStore;
 use crate::metrics::EngineMetrics;
 use crate::space::allocator::SpaceAllocator;
+use crate::space::extent::Extent;
 use crate::space::pba_lifecycle::PbaLifecycle;
 use crate::types::{Lba, VolumeId, BLOCK_SIZE};
 use onyx_metadb::DedupScanCursor;
@@ -507,7 +508,7 @@ impl DedupScanner {
     }
 
     fn rescan_skipped_blocks(
-        _metrics: &EngineMetrics,
+        metrics: &EngineMetrics,
         meta: &MetaStore,
         io_engine: &IoEngine,
         lifecycle: &VolumeLifecycleManager,
@@ -581,6 +582,22 @@ impl DedupScanner {
                                 flags: 0, // Clear DEDUP_SKIPPED
                                 ..existing.to_blockmap_value()
                             };
+                            let target_blocks = new_bv.physical_blocks(BLOCK_SIZE);
+                            let Some(_target_guard) = pba_lifecycle
+                                .allocator()
+                                .pin_dedup_target_if_allowed(new_bv.pba, target_blocks)
+                            else {
+                                // An active cleaner owns this physical range.
+                                // Treat it as a miss and clear the skipped bit;
+                                // the normal GC relocation path will move the
+                                // current source if it is inside the target.
+                                metrics
+                                    .gc_defrag_dedup_hits_rejected
+                                    .fetch_add(1, Ordering::Relaxed);
+                                meta.update_blockmap_flags(&vol_id, *lba, 0)?;
+                                stats.misses += 1;
+                                return Ok(true);
+                            };
                             // Forward the observed seq so apply's
                             // seq_guard rejects a losing race against a
                             // concurrent buffer-flusher commit. The old
@@ -608,13 +625,20 @@ impl DedupScanner {
                             // write byte-verifies against this PBA. Drop the
                             // FLAG_DEDUP_SKIPPED bit so the scanner does not
                             // re-process this LBA forever.
-                            candidate.insert(
-                                hash,
-                                BlockmapValue {
-                                    flags: 0,
-                                    ..current
-                                },
-                            );
+                            let source_extent =
+                                Extent::new(current.pba, current.physical_blocks(BLOCK_SIZE));
+                            if !pba_lifecycle
+                                .allocator()
+                                .is_defrag_quarantined(source_extent)
+                            {
+                                candidate.insert(
+                                    hash,
+                                    BlockmapValue {
+                                        flags: 0,
+                                        ..current
+                                    },
+                                );
+                            }
                             meta.update_blockmap_flags(&vol_id, *lba, 0)?;
                             stats.misses += 1;
                         }
@@ -928,6 +952,18 @@ impl DedupScanner {
                     continue;
                 }
 
+                let existing_bv = existing.to_blockmap_value();
+                let Some(_target_guard) = pba_lifecycle.allocator().pin_dedup_target_if_allowed(
+                    existing_bv.pba,
+                    existing_bv.physical_blocks(BLOCK_SIZE),
+                ) else {
+                    // Do not create a new reference into an allocator-owned
+                    // evacuation target. A later cold-tail pass can retry after
+                    // the segment is published or cancelled.
+                    stats.already_warm += 1;
+                    continue;
+                };
+
                 // Remap under the volume read lock so the volume
                 // cannot be dropped mid-tx, mirroring
                 // `rescan_skipped_blocks`. Re-read the mapping with
@@ -948,7 +984,7 @@ impl DedupScanner {
                     }
                     let new_bv = BlockmapValue {
                         flags: 0,
-                        ..existing.to_blockmap_value()
+                        ..existing_bv
                     };
                     let decremented =
                         meta.atomic_dedup_hit(vol_id, *lba, &new_bv, &hash, observed_seq)?;
@@ -982,6 +1018,14 @@ impl DedupScanner {
             // both sides of the mapping-change race: if overwrite cleanup runs
             // after this insert it evicts the PBA; if it already ran, the
             // post-insert mapping check observes the change and we evict it.
+            let source_extent = Extent::new(bv.pba, bv.physical_blocks(BLOCK_SIZE));
+            if pba_lifecycle
+                .allocator()
+                .is_defrag_quarantined(source_extent)
+            {
+                stats.already_warm += 1;
+                continue;
+            }
             candidate.insert(hash, BlockmapValue { flags: 0, ..*bv });
             match meta.get_mapping(vol_id, *lba) {
                 Ok(Some(current)) if same_physical_mapping(&current, bv) => {

@@ -6,8 +6,40 @@ use crate::io::engine::IoEngine;
 use crate::lifecycle::VolumeLifecycleManager;
 use crate::meta::schema::BlockmapValue;
 use crate::meta::store::MetaStore;
+use crate::space::extent::Extent;
 use crate::space::hazard::PbaHazards;
 use crate::types::{CompressionAlgo, BLOCK_SIZE};
+
+fn relocation_run_end(ready_lbas: &[(crate::types::Lba, usize)], run_start: usize) -> usize {
+    let mut run_end = run_start + 1;
+    while run_end < ready_lbas.len() {
+        let (previous_lba, previous_offset) = ready_lbas[run_end - 1];
+        let (next_lba, next_offset) = ready_lbas[run_end];
+        if previous_lba.0.checked_add(1) != Some(next_lba.0)
+            || previous_offset.checked_add(BLOCK_SIZE as usize) != Some(next_offset)
+        {
+            break;
+        }
+        run_end += 1;
+    }
+    run_end
+}
+
+fn finish_relocation_submissions<T, E>(
+    submissions: Vec<(T, u32)>,
+    append_error: Option<E>,
+    mut wait: impl FnMut(T),
+) -> Result<u32, E> {
+    let mut rewritten = 0u32;
+    for (ticket, lba_count) in submissions {
+        wait(ticket);
+        rewritten = rewritten.saturating_add(lba_count);
+    }
+    match append_error {
+        Some(error) => Err(error),
+        None => Ok(rewritten),
+    }
+}
 
 fn candidate_matches_mapping(
     candidate: &GcCandidate,
@@ -86,21 +118,20 @@ pub fn rewrite_candidate(
         return Ok(0);
     }
 
+    let candidate_mapping = BlockmapValue {
+        pba: candidate.pba,
+        compression: candidate.compression,
+        unit_compressed_size: candidate.unit_compressed_size,
+        unit_original_size: candidate.unit_original_size,
+        unit_lba_count: candidate.unit_lba_count,
+        offset_in_unit: 0,
+        crc32: candidate.crc32,
+        slot_offset: candidate.slot_offset,
+        flags: 0,
+    };
+    let source_extent = Extent::new(candidate.pba, candidate_mapping.physical_blocks(BLOCK_SIZE));
     let _hazard_guard = if let Some(hazards) = hazards {
-        let guard = hazards.pin_many(
-            BlockmapValue {
-                pba: candidate.pba,
-                compression: candidate.compression,
-                unit_compressed_size: candidate.unit_compressed_size,
-                unit_original_size: candidate.unit_original_size,
-                unit_lba_count: candidate.unit_lba_count,
-                offset_in_unit: 0,
-                crc32: candidate.crc32,
-                slot_offset: candidate.slot_offset,
-                flags: 0,
-            }
-            .physical_pbas(BLOCK_SIZE),
-        );
+        let guard = hazards.pin_many(candidate_mapping.physical_pbas(BLOCK_SIZE));
         let still_valid = valid_lbas.iter().any(|(lba, off)| {
             meta.get_mapping(&candidate.vol_id, *lba)
                 .ok()
@@ -179,21 +210,22 @@ pub fn rewrite_candidate(
         buf
     };
 
-    let mut rewritten = 0u32;
+    let mut ready_lbas = Vec::with_capacity(valid_lbas.len());
+    let valid_lba_count = valid_lbas.len();
 
-    // Use the pre-validated set, but re-verify each LBA one more time right
-    // before writing — mappings could have shifted during the disk read.
-    for (lba, offset_in_unit) in &valid_lbas {
-        let current = meta.get_mapping(&candidate.vol_id, *lba)?;
+    // Use the pre-validated set, but re-verify each LBA one more time before
+    // staging it — mappings could have shifted during the disk read.
+    for (lba, offset_in_unit) in valid_lbas {
+        let current = meta.get_mapping(&candidate.vol_id, lba)?;
         match current {
-            Some(bv) if candidate_matches_mapping(candidate, *offset_in_unit, &bv) => {}
+            Some(bv) if candidate_matches_mapping(candidate, offset_in_unit, &bv) => {}
             _ => continue,
         }
 
         // If this LBA already has a pending newer value in the write buffer,
         // let the normal flusher path drain it instead of re-injecting the
         // same block every GC cycle and starving the commit from reaching LV3.
-        if let Some(pending) = buffer_pool.lookup(&candidate.vol_id.0, *lba)? {
+        if let Some(pending) = buffer_pool.lookup(&candidate.vol_id.0, lba)? {
             if pending.vol_created_at == 0
                 || vol_created_at == 0
                 || pending.vol_created_at == vol_created_at
@@ -203,7 +235,7 @@ pub fn rewrite_candidate(
         }
 
         // Extract the 4KB block from the decompressed unit
-        let start = *offset_in_unit as usize * BLOCK_SIZE as usize;
+        let start = offset_in_unit as usize * BLOCK_SIZE as usize;
         let end = start + BLOCK_SIZE as usize;
         if end > decompressed.len() {
             tracing::warn!(
@@ -215,22 +247,129 @@ pub fn rewrite_candidate(
             continue;
         }
 
-        let block_data = &decompressed[start..end];
-
-        // Write back to buffer pool — reuses the normal write path
-        buffer_pool.append(&candidate.vol_id.0, *lba, 1, block_data, vol_created_at)?;
-
-        rewritten += 1;
+        ready_lbas.push((lba, start));
     }
+
+    // Submit every contiguous logical run before waiting for LV2 durability.
+    // The sync thread can then fold the writes into one durability epoch instead
+    // of the old append/wait loop serialising one fdatasync boundary per block.
+    ready_lbas.sort_unstable_by_key(|(lba, _)| lba.0);
+    let mut tickets = Vec::new();
+    let mut append_error = None;
+    let mut run_start = 0usize;
+    while run_start < ready_lbas.len() {
+        let contiguous_end = relocation_run_end(&ready_lbas, run_start);
+        let routing_count = buffer_pool.lbas_until_routing_boundary(
+            ready_lbas[run_start].0,
+            (contiguous_end - run_start) as u32,
+        ) as usize;
+        let run_end = run_start + routing_count;
+        let mut payload = Vec::with_capacity((run_end - run_start) * BLOCK_SIZE as usize);
+        for (_, source_offset) in &ready_lbas[run_start..run_end] {
+            payload.extend_from_slice(
+                &decompressed[*source_offset..*source_offset + BLOCK_SIZE as usize],
+            );
+        }
+        let lba_count = (run_end - run_start) as u32;
+        let run_lbas = &ready_lbas[run_start..run_end];
+        let append_result = lifecycle.with_read_lock(&candidate.vol_id.0, || {
+            buffer_pool.append_relocation_deferred_checked(
+                &candidate.vol_id.0,
+                ready_lbas[run_start].0,
+                lba_count,
+                &payload,
+                vol_created_at,
+                source_extent,
+                || {
+                    // This closure runs while foreground appends for the same
+                    // routing shard are serialized. Recheck both pending LV2
+                    // state and the source mapping immediately before the GC
+                    // seq is allocated; otherwise stale relocation data could
+                    // receive a newer seq and supersede a racing user write.
+                    for &(lba, source_offset) in run_lbas {
+                        if buffer_pool.lookup(&candidate.vol_id.0, lba)?.is_some() {
+                            return Ok(false);
+                        }
+                        let offset_in_unit = u16::try_from(source_offset / BLOCK_SIZE as usize)
+                            .map_err(|_| {
+                                crate::error::OnyxError::Config(
+                                    "GC relocation offset exceeds u16".into(),
+                                )
+                            })?;
+                        let Some(current) = meta.get_mapping(&candidate.vol_id, lba)? else {
+                            return Ok(false);
+                        };
+                        if !candidate_matches_mapping(candidate, offset_in_unit, &current) {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                },
+            )
+        });
+        match append_result {
+            Ok(Some(ticket)) => tickets.push((ticket, lba_count)),
+            Ok(None) => {}
+            Err(error) => {
+                append_error = Some(error);
+                break;
+            }
+        }
+        run_start = run_end;
+    }
+
+    // A later run can fail after earlier deferred appends were accepted. Drain
+    // those durability tickets before surfacing the error so the caller never
+    // drops accepted relocation work with ambiguous LV2 durability.
+    let rewritten = finish_relocation_submissions(tickets, append_error, |ticket| {
+        ticket.wait();
+    })?;
 
     tracing::debug!(
         pba = candidate.pba.0,
         vol = %candidate.vol_id,
-        live = valid_lbas.len(),
+        live = valid_lba_count,
         rewritten,
         dead_ratio = candidate.dead_ratio,
         "gc: rewrote candidate"
     );
 
     Ok(rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Lba;
+
+    #[test]
+    fn relocation_runs_require_lba_and_source_offset_continuity() {
+        let block = BLOCK_SIZE as usize;
+        let ready = vec![
+            (Lba(10), 0),
+            (Lba(11), block),
+            // LBA is contiguous, but this source offset skips a block.
+            (Lba(12), block * 3),
+            (Lba(13), block * 4),
+            // Source is contiguous, but the logical LBA skips a block.
+            (Lba(15), block * 5),
+        ];
+
+        assert_eq!(relocation_run_end(&ready, 0), 2);
+        assert_eq!(relocation_run_end(&ready, 2), 4);
+        assert_eq!(relocation_run_end(&ready, 4), 5);
+    }
+
+    #[test]
+    fn partial_submission_drains_accepted_tickets_before_error() {
+        let mut waited = Vec::new();
+        let result = finish_relocation_submissions(
+            vec![(11u64, 2), (22u64, 3)],
+            Some("later append failed"),
+            |ticket| waited.push(ticket),
+        );
+
+        assert_eq!(waited, vec![11, 22]);
+        assert_eq!(result, Err("later append failed"));
+    }
 }

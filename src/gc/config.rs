@@ -116,6 +116,16 @@ pub struct GcConfig {
     /// range check and the treadmill exposure.
     #[serde(default = "default_defrag_max_target_blocks")]
     pub defrag_max_target_blocks: u64,
+    /// Maximum number of stripe-aligned evacuation targets active at once.
+    /// Keeping this bounded concentrates the logical L2P walk on segments that
+    /// can actually finish instead of spreading work over hundreds of ranges.
+    #[serde(default = "default_defrag_max_active_targets")]
+    pub defrag_max_active_targets: usize,
+    /// Cancel a target that has made no physical-free progress for this many
+    /// seconds. Cancellation only releases its quarantined free fragments; live
+    /// mappings remain authoritative, so it is always safe.
+    #[serde(default = "default_defrag_target_stall_secs")]
+    pub defrag_target_stall_secs: u64,
     /// Free extents the target-selection walk visits per GC cycle
     /// (default 32_768 = 8 × 4096-extent lock holds; a 2M-extent belt is
     /// covered in ~60 cycles ≈ 5 min at the 5 s cadence).
@@ -261,6 +271,8 @@ impl Default for GcConfig {
             defrag_min_free_density_pct: default_defrag_min_free_density_pct(),
             defrag_gap_max_blocks: default_defrag_gap_max_blocks(),
             defrag_max_target_blocks: default_defrag_max_target_blocks(),
+            defrag_max_active_targets: default_defrag_max_active_targets(),
+            defrag_target_stall_secs: default_defrag_target_stall_secs(),
             defrag_scan_extents_per_cycle: default_defrag_scan_extents_per_cycle(),
             defrag_max_rewrite_blocks_per_cycle: default_defrag_max_rewrite_blocks_per_cycle(),
             defrag_min_effort: default_defrag_min_effort(),
@@ -340,6 +352,12 @@ fn default_defrag_gap_max_blocks() -> u32 {
 }
 fn default_defrag_max_target_blocks() -> u64 {
     262_144 // 1 GiB at 4 KiB blocks
+}
+fn default_defrag_max_active_targets() -> usize {
+    32
+}
+fn default_defrag_target_stall_secs() -> u64 {
+    3600
 }
 fn default_defrag_scan_extents_per_cycle() -> usize {
     32_768

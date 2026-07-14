@@ -747,30 +747,56 @@ fn commit_worker_rejects_stale_dedup_hit_generation() {
 fn commit_aggregator_forms_full_batch_and_flushes_disconnect_tail() {
     let (raw_tx, raw_rx) = bounded(8);
     let (batch_tx, batch_rx) = bounded(8);
+    let metrics = Arc::new(EngineMetrics::default());
 
     for i in 0..5u64 {
         raw_tx.send(aggregator_job(i, 1)).unwrap();
     }
     drop(raw_tx);
 
+    let aggregator_metrics = metrics.clone();
     let aggregator = std::thread::spawn(move || {
-        BufferFlusher::commit_aggregator_loop(raw_rx, batch_tx, None, true, 3, 3, Duration::ZERO, 0)
+        BufferFlusher::commit_aggregator_loop(
+            raw_rx,
+            batch_tx,
+            None,
+            Some(aggregator_metrics),
+            true,
+            3,
+            3,
+            Duration::ZERO,
+            0,
+        )
     });
 
     assert_eq!(batch_rx.recv().unwrap().jobs.len(), 3);
     assert_eq!(batch_rx.recv().unwrap().jobs.len(), 2);
     aggregator.join().unwrap();
     assert!(batch_rx.recv().is_err());
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.flush_commit_aggregator_seals_target, 1);
+    assert_eq!(snapshot.flush_commit_aggregator_seals_shutdown, 1);
 }
 
 #[test]
-fn commit_aggregator_idle_gap_resets_after_each_arrival() {
+fn commit_aggregator_hard_deadline_is_not_extended_by_arrivals() {
     let (raw_tx, raw_rx) = bounded(8);
     let (batch_tx, batch_rx) = bounded(8);
+    raw_tx
+        .send(aggregator_job_enqueued_at(
+            0,
+            1,
+            Instant::now() - Duration::from_millis(250),
+        ))
+        .unwrap();
+    raw_tx.send(aggregator_job(1, 1)).unwrap();
+    drop(raw_tx);
+
     let aggregator = std::thread::spawn(move || {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            None,
             None,
             true,
             3,
@@ -780,22 +806,62 @@ fn commit_aggregator_idle_gap_resets_after_each_arrival() {
         )
     });
 
-    raw_tx.send(aggregator_job(0, 1)).unwrap();
-    std::thread::sleep(Duration::from_millis(120));
-    raw_tx.send(aggregator_job(1, 1)).unwrap();
-    std::thread::sleep(Duration::from_millis(120));
-    assert!(batch_rx.try_recv().is_err());
-    raw_tx.send(aggregator_job(2, 1)).unwrap();
-    assert_eq!(
-        batch_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .jobs
-            .len(),
-        3
-    );
-    drop(raw_tx);
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 1);
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 1);
     aggregator.join().unwrap();
+}
+
+#[test]
+fn commit_aggregator_adapts_after_sustained_underfill() {
+    let (raw_tx, raw_rx) = bounded(8);
+    let (batch_tx, batch_rx) = bounded(8);
+    let metrics = Arc::new(EngineMetrics::default());
+    let now = Instant::now();
+    raw_tx
+        .send(aggregator_job_enqueued_at(
+            0,
+            3_000,
+            now - Duration::from_millis(100),
+        ))
+        .unwrap();
+    raw_tx
+        .send(aggregator_job_enqueued_at(
+            3_000,
+            3_000,
+            now - Duration::from_millis(90),
+        ))
+        .unwrap();
+    raw_tx
+        .send(aggregator_job_enqueued_at(
+            6_000,
+            2_048,
+            now - Duration::from_millis(40),
+        ))
+        .unwrap();
+    drop(raw_tx);
+
+    let aggregator_metrics = metrics.clone();
+    let aggregator = std::thread::spawn(move || {
+        BufferFlusher::commit_aggregator_loop(
+            raw_rx,
+            batch_tx,
+            None,
+            Some(aggregator_metrics),
+            true,
+            8_192,
+            16_384,
+            Duration::from_millis(75),
+            0,
+        )
+    });
+
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 1);
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 1);
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 1);
+    aggregator.join().unwrap();
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.flush_commit_aggregator_seals_deadline, 2);
+    assert_eq!(snapshot.flush_commit_aggregator_seals_adaptive_underfill, 1);
 }
 
 #[test]
@@ -806,6 +872,7 @@ fn commit_aggregator_idle_flushes_partial_without_splitting_jobs() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            None,
             None,
             true,
             8,
@@ -843,6 +910,7 @@ fn commit_aggregator_carries_whole_job_that_crosses_target() {
             raw_rx,
             batch_tx,
             None,
+            None,
             true,
             8,
             16,
@@ -877,6 +945,53 @@ fn commit_aggregator_carries_whole_job_that_crosses_target() {
 }
 
 #[test]
+fn commit_aggregator_3162_lba_crossing_is_capacity_not_target() {
+    let (raw_tx, raw_rx) = bounded(8);
+    let (batch_tx, batch_rx) = bounded(8);
+    let metrics = Arc::new(EngineMetrics::default());
+    for start_lba in [0, 3_162, 6_324] {
+        raw_tx.send(aggregator_job(start_lba, 3_162)).unwrap();
+    }
+    drop(raw_tx);
+
+    let aggregator_metrics = metrics.clone();
+    let aggregator = std::thread::spawn(move || {
+        BufferFlusher::commit_aggregator_loop(
+            raw_rx,
+            batch_tx,
+            None,
+            Some(aggregator_metrics),
+            true,
+            8_192,
+            16_384,
+            Duration::from_millis(75),
+            0,
+        )
+    });
+
+    let prefix = batch_rx.recv().unwrap();
+    assert_eq!(prefix.jobs.len(), 2);
+    assert_eq!(
+        prefix
+            .jobs
+            .iter()
+            .map(|job| match job {
+                super::writer::CommitJob::DedupHit(job) => job.hits.len(),
+                _ => 0,
+            })
+            .sum::<usize>(),
+        6_324
+    );
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 1);
+    aggregator.join().unwrap();
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.flush_commit_aggregator_seals_capacity, 1);
+    assert_eq!(snapshot.flush_commit_aggregator_seals_target, 0);
+    assert_eq!(snapshot.flush_commit_aggregator_seals_shutdown, 1);
+}
+
+#[test]
 fn commit_aggregator_retain_tail_gate_off_uses_legacy_budget() {
     assert!(!crate::config::FlushConfig::default().commit_retain_tail);
 
@@ -891,6 +1006,7 @@ fn commit_aggregator_retain_tail_gate_off_uses_legacy_budget() {
         BufferFlusher::commit_aggregator_loop(
             raw_rx,
             batch_tx,
+            None,
             None,
             false,
             3,
@@ -913,6 +1029,126 @@ fn commit_aggregator_retain_tail_gate_off_uses_legacy_budget() {
     assert!(batch_rx.recv().is_err());
 }
 
+#[test]
+fn commit_aggregator_reports_executor_disconnect_to_dedup_waiter() {
+    let (raw_tx, raw_rx) = bounded(1);
+    let (batch_tx, batch_rx) = bounded(1);
+    drop(batch_rx);
+    let metrics = Arc::new(EngineMetrics::default());
+    let (response_tx, response_rx) = bounded(1);
+    let mut job = aggregator_job(0, 1);
+    let super::writer::CommitJob::DedupHit(dedup) = &mut job else {
+        unreachable!()
+    };
+    dedup.response_tx = response_tx;
+    raw_tx.send(job).unwrap();
+    drop(raw_tx);
+
+    BufferFlusher::commit_aggregator_loop(
+        raw_rx,
+        batch_tx,
+        None,
+        Some(metrics.clone()),
+        true,
+        1,
+        1,
+        Duration::ZERO,
+        0,
+    );
+
+    assert!(matches!(
+        response_rx.recv().unwrap(),
+        super::writer::DedupHitCommitResponse::Failed(error)
+            if error.contains("executors disconnected")
+    ));
+    assert_eq!(metrics.snapshot().flush_errors, 1);
+}
+
+#[test]
+fn passthrough_send_disconnect_rolls_back_and_fences() {
+    let (_meta, pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let seq = 7_001;
+    pool.note_latest_lba_seq_for_test("flush-race", Lba(901), seq, 1);
+    let free_before = allocator.free_block_count();
+    let (commit_tx, commit_rx) = bounded(1);
+    drop(commit_rx);
+    let (done_tx, done_rx) = bounded(1);
+    let in_flight = FlusherInFlightTracker::default();
+
+    BufferFlusher::write_units_batch(
+        0,
+        vec![make_raw_unit_at(901, 1, 0xA1, seq)],
+        vec![vec![seq]],
+        vec![None],
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        &metrics,
+        &in_flight,
+        &done_tx,
+        &[commit_tx],
+        1,
+    );
+
+    assert!(pool.is_meta_fenced());
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        vec![seq]
+    );
+    assert_eq!(allocator.free_block_count(), free_before);
+    assert_eq!(metrics.snapshot().flush_errors, 1);
+}
+
+#[test]
+fn packed_send_disconnect_rolls_back_and_fences() {
+    let (_meta, pool, _lifecycle, allocator, io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let seq = 7_002;
+    let free_before = allocator.free_block_count();
+    let pba = allocator.allocate_one_for_lane(0).unwrap();
+    let sealed = SealedSlot {
+        pba,
+        data: vec![0xB2; BLOCK_SIZE as usize],
+        fragments: vec![crate::packer::packer::SlotFragment {
+            unit: make_packed_unit_at(0xB2, seq, 902),
+            slot_offset: 0,
+        }],
+    };
+    let (commit_tx, commit_rx) = bounded(1);
+    drop(commit_rx);
+    let (done_tx, done_rx) = bounded(1);
+    let in_flight = FlusherInFlightTracker::default();
+    let mut retries = VecDeque::new();
+
+    BufferFlusher::write_packed_slots_batch(
+        0,
+        vec![sealed],
+        vec![(vec![seq], Vec::new())],
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        &metrics,
+        &in_flight,
+        &done_tx,
+        &mut retries,
+        &[commit_tx],
+        1,
+    );
+
+    assert!(pool.is_meta_fenced());
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        vec![seq]
+    );
+    assert!(retries.is_empty());
+    assert!(allocator.is_free(pba));
+    assert_eq!(allocator.free_block_count(), free_before);
+    assert_eq!(metrics.snapshot().flush_errors, 1);
+}
+
 fn aggregator_job(start_lba: u64, lba_count: usize) -> super::writer::CommitJob {
     let (response_tx, _response_rx) = bounded(1);
     let target = BlockmapValue::zero();
@@ -932,6 +1168,19 @@ fn aggregator_job(start_lba: u64, lba_count: usize) -> super::writer::CommitJob 
         response_tx,
         enqueued_at: Instant::now(),
     })
+}
+
+fn aggregator_job_enqueued_at(
+    start_lba: u64,
+    lba_count: usize,
+    enqueued_at: Instant,
+) -> super::writer::CommitJob {
+    let mut job = aggregator_job(start_lba, lba_count);
+    match &mut job {
+        super::writer::CommitJob::DedupHit(job) => job.enqueued_at = enqueued_at,
+        _ => unreachable!(),
+    }
+    job
 }
 
 #[test]

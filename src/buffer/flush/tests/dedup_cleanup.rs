@@ -494,6 +494,7 @@ fn dedup_worker_batches_hits_across_units() {
                 raw_blocks: vec![crate::buffer::pipeline::RawBlockRef {
                     payload: Arc::from(source.clone()),
                     offset: 0,
+                    relocation_source: None,
                 }],
                 compression: CompressionAlgo::None,
                 vol_created_at: 1,
@@ -565,6 +566,99 @@ fn dedup_worker_batches_hits_across_units() {
 }
 
 #[test]
+fn dedup_worker_routes_relocation_self_hit_to_miss() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    pool.durable_seq_handle().store(u64::MAX, Ordering::Release);
+
+    let source = vec![0x6Du8; BLOCK_SIZE as usize];
+    let hash: ContentHash = crate::meta::schema::compute_content_hash(&source);
+    let target = BlockmapValue {
+        pba: Pba(88),
+        compression: 0,
+        unit_compressed_size: BLOCK_SIZE,
+        unit_original_size: BLOCK_SIZE,
+        unit_lba_count: 1,
+        offset_in_unit: 0,
+        crc32: crc32fast::hash(&source),
+        slot_offset: 0,
+        flags: 0,
+    };
+    meta.set_refcount(target.pba, 1).unwrap();
+    meta.put_dedup_entries(&[(hash, target.to_dedup_entry())])
+        .unwrap();
+
+    let lba = Lba(20_000);
+    pool.note_latest_lba_seq_for_test("flush-race", lba, 7, 1);
+    let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(4);
+    let (miss_tx, miss_rx) = bounded::<CoalesceUnit>(4);
+    let (done_tx, done_rx) = unbounded::<Vec<u64>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    dedup_tx
+        .send(CoalesceUnit {
+            vol_id: "flush-race".into(),
+            start_lba: lba,
+            lba_count: 1,
+            raw_blocks: vec![crate::buffer::pipeline::RawBlockRef {
+                payload: Arc::from(source),
+                offset: 0,
+                relocation_source: Some(crate::space::extent::Extent::new(target.pba, 1)),
+            }],
+            compression: CompressionAlgo::None,
+            vol_created_at: 1,
+            seq_lba_ranges: vec![(7, lba, 1)],
+            dedup_skipped: false,
+            block_hashes: None,
+            dedup_stale_repairs: None,
+            dedup_completion: None,
+        })
+        .unwrap();
+    drop(dedup_tx);
+
+    let running = AtomicBool::new(true);
+    let candidate = crate::dedup::CandidateCache::new(1, 4);
+    BufferFlusher::dedup_loop(
+        0,
+        &dedup_rx,
+        &miss_tx,
+        &meta,
+        &pool,
+        &lifecycle,
+        &allocator,
+        &done_tx,
+        &running,
+        100,
+        0,
+        &metrics,
+        &cleanup_tx,
+        &candidate,
+        None,
+        &[],
+        1,
+        8,
+    );
+    drop(miss_tx);
+
+    let miss = miss_rx
+        .try_recv()
+        .expect("self-hit must be routed to writer");
+    assert_eq!(miss.start_lba, lba);
+    assert_eq!(
+        miss.raw_blocks[0].relocation_source.unwrap().start,
+        target.pba
+    );
+    assert!(done_rx.is_empty());
+    assert!(meta
+        .get_mapping(&VolumeId("flush-race".into()), lba)
+        .unwrap()
+        .is_none());
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.dedup_hits, 0);
+    assert_eq!(snapshot.dedup_misses, 1);
+    assert_eq!(snapshot.gc_defrag_dedup_hits_rejected, 1);
+}
+
+#[test]
 fn dedup_worker_keeps_unsplit_all_miss_on_direct_completion_path() {
     let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
         setup_flush_test_env();
@@ -577,10 +671,12 @@ fn dedup_worker_keeps_unsplit_all_miss_on_direct_completion_path() {
             crate::buffer::pipeline::RawBlockRef {
                 payload: payload.clone(),
                 offset: 0,
+                relocation_source: None,
             },
             crate::buffer::pipeline::RawBlockRef {
                 payload,
                 offset: BLOCK_SIZE as usize,
+                relocation_source: None,
             },
         ],
         compression: CompressionAlgo::None,

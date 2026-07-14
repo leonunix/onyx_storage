@@ -76,6 +76,89 @@ impl BufferFlusher {
     pub(super) const PARTIAL_STRIPE_MAX_AGE: Duration = Duration::from_millis(200);
     pub(super) const PARTIAL_STRIPE_PRESSURE_PCT: u8 = 80;
 
+    /// Fail-stop handoff for LV3 writes whose metadata job could not reach the
+    /// commit aggregator. The payload was written but never published, so its
+    /// reservation is still an uncommitted rollback. LV2 remains authoritative
+    /// and the retry marker makes the entry eligible after restart; the fence
+    /// prevents the broken commit pipeline from accepting more durable writes.
+    fn fail_undispatched_passthrough_job(
+        job: PassthroughCommitJob,
+        pool: &WriteBufferPool,
+        allocator: &SpaceAllocator,
+        in_flight_tracker: &FlusherInFlightTracker,
+        metrics: &EngineMetrics,
+        done_tx: Option<&Sender<Vec<u64>>>,
+        reason: &'static str,
+    ) {
+        pool.fence_meta(reason);
+        metrics
+            .flush_errors
+            .fetch_add(job.units.len() as u64, Ordering::Relaxed);
+        let rollbacks: Vec<Extent> = job
+            .units
+            .iter()
+            .map(|unit| Extent::new(unit.pba, unit.alloc_blocks))
+            .collect();
+        crate::space::pba_lifecycle::rollback_uncommitted_batch(allocator, &rollbacks);
+
+        for unit in job.units {
+            match &unit.completion {
+                None => in_flight_tracker.defer_retry(&unit.seqs, Self::RETRY_BACKOFF),
+                Some(completion) => {
+                    in_flight_tracker.defer_retry(completion.seqs(), Self::RETRY_BACKOFF)
+                }
+            }
+            let Some(done_tx) = done_tx else {
+                continue;
+            };
+            match unit.completion {
+                None => {
+                    let _ = done_tx.send(unit.seqs);
+                }
+                Some(completion) => {
+                    if let Some(original_seqs) = completion.decrement() {
+                        let _ = done_tx.send(original_seqs);
+                    }
+                }
+            }
+        }
+        tracing::error!(
+            reason,
+            "writer: passthrough metadata handoff failed; persistence fenced"
+        );
+    }
+
+    fn fail_undispatched_packed_job(
+        mut job: PackedCommitJob,
+        pool: &WriteBufferPool,
+        allocator: &SpaceAllocator,
+        in_flight_tracker: &FlusherInFlightTracker,
+        metrics: &EngineMetrics,
+        done_tx: Option<&Sender<Vec<u64>>>,
+        reason: &'static str,
+    ) {
+        pool.fence_meta(reason);
+        metrics.flush_errors.fetch_add(1, Ordering::Relaxed);
+        let _ = crate::space::pba_lifecycle::rollback_uncommitted_one(allocator, job.sealed.pba);
+        if !job.buffered_seqs.is_empty() {
+            in_flight_tracker.defer_retry(&job.buffered_seqs, Self::RETRY_BACKOFF);
+        }
+        for completion in &job.buffered_completions {
+            in_flight_tracker.defer_retry(completion.seqs(), Self::RETRY_BACKOFF);
+        }
+        if let Some(done_tx) = done_tx {
+            Self::flush_buffered_done(
+                &mut job.buffered_seqs,
+                &mut job.buffered_completions,
+                done_tx,
+            );
+        }
+        tracing::error!(
+            reason,
+            "writer: packed metadata handoff failed; persistence fenced"
+        );
+    }
+
     pub(super) fn writer_loop(
         shard_idx: usize,
         rx: &Receiver<CompressedUnit>,

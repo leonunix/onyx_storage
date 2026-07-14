@@ -527,6 +527,18 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" l0={fmt_count(num(meta, 'dedup_l0_distinct_fps'))}"
         f" l1={fmt_count(num(meta, 'dedup_l1_entries'))}"
         f" ssts={fmt_count(num(meta, 'dedup_index_ssts'))}",
+        f"Defrag mode={fmt_count(num(metrics, 'gc_defrag_mode_active'))}"
+        f" targets={fmt_count(num(metrics, 'gc_defrag_targets_active'))}"
+        f" qfree={fmt_count(num(metrics, 'allocator_quarantine_free_blocks'))}/{fmt_count(num(metrics, 'allocator_quarantine_target_blocks'))}"
+        f" reserve={fmt_count(num(metrics, 'allocator_stripe_reserve_blocks'))}"
+        f" completed +{fmt_count(delta(metrics, prev_metrics, 'gc_defrag_segments_completed'))}"
+        f" cancelled +{fmt_count(delta(metrics, prev_metrics, 'gc_defrag_segments_cancelled'))}"
+        f" dedup_reject +{fmt_count(delta(metrics, prev_metrics, 'gc_defrag_dedup_hits_rejected'))}",
+        f"Runs   aligned {rate(metrics, prev_metrics, 'flush_writer_group_aligned_ops', interval):8.1f}/s"
+        f" unaligned {rate(metrics, prev_metrics, 'flush_writer_group_unaligned_ops', interval):8.1f}/s"
+        f" short +{fmt_count(delta(metrics, prev_metrics, 'flush_writer_group_short_extent_allocs'))}"
+        f" fallback +{fmt_count(delta(metrics, prev_metrics, 'flush_writer_group_fallback_units'))}"
+        f" unused +{fmt_count(delta(metrics, prev_metrics, 'flush_writer_group_unused_blocks'))} blocks",
         "",
         f"Flush  units {rate(metrics, prev_metrics, 'flush_units_written', interval):9.1f}/s"
         f" packed_slots {rate(metrics, prev_metrics, 'flush_packed_slots_written', interval):8.1f}/s"
@@ -542,6 +554,11 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f"Commit/job total {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_queue_wait_ns', 'flush_commit_worker_jobs')):>10}"
         f" aggregator {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_aggregator_residence_ns', 'flush_commit_worker_jobs')):>10}"
         f" executor_q {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_executor_queue_wait_ns', 'flush_commit_worker_jobs')):>10}",
+        f"Commit seals target +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_target'))}"
+        f" capacity +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_capacity'))}"
+        f" deadline +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_deadline'))}"
+        f" adaptive +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_adaptive_underfill'))}"
+        f" pressure +{fmt_count(delta(metrics, prev_metrics, 'flush_commit_aggregator_seals_pressure'))}",
         "",
         f"Meta   commit {rate(meta, prev.status.get('metadb_memory') if prev else None, 'commit_ops', interval):8.1f}/s"
         f" avg {fmt_us(avg_time(meta, prev.status.get('metadb_memory') if prev else None, 'commit_total_us', 'commit_ops', ns_per_unit=1.0))}"

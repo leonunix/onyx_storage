@@ -22,7 +22,7 @@ use crate::metrics::EngineMetrics;
 use crate::packer::packer::{PackResult, Packer, SealedSlot};
 use crate::space::allocator::SpaceAllocator;
 use crate::space::extent::Extent;
-use crate::space::hazard::{PbaHazardGuard, PbaHazards};
+use crate::space::hazard::PbaHazardGuard;
 use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 
 type CleanupBatch = Vec<RemapCleanup>;

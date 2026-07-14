@@ -23,20 +23,13 @@ struct PreparedDedupUnit {
     /// and the writer compare-puts the index to the fresh mapping
     /// only if it still points at this stale old entry.
     stale_index_repairs: Vec<Option<DedupEntry>>,
-    /// Physical pins for dedup targets that passed byte-verify and are
-    /// waiting for the metadata remap. Without this, a verified target PBA
-    /// can be freed and reused between verify completion and hit commit.
-    verified_target_guards: Vec<PbaHazardGuard>,
-    /// Physical pins for candidate-cache promote targets, taken the moment
-    /// the mapping is copied out of the cache in `candidate_lookup_pass`
-    /// (i.e. earlier than `verified_target_guards`, which pin at verify).
-    /// The promote's `L2pRemap` is unguarded, so this pin is what tells the
-    /// GC reclaim path a remap onto the target may be in flight; pinning at
-    /// lookup (not verify) closes the lookup→pin gap so a promote cannot be
-    /// freed out from under by `reclaim_retired_extents`' hazard barrier.
-    /// Held until the unit is dropped in `finish_prepared_dedup_unit`,
-    /// after the commit.
-    candidate_target_guards: Vec<PbaHazardGuard>,
+    /// Atomic quarantine-check + physical pins taken when a dedup target is
+    /// copied out of either lookup layer. Held until the remap commit response
+    /// is consumed, closing both lookup-to-pin and quarantine-publish races.
+    target_guards: Vec<PbaHazardGuard>,
+    /// One bit per logical block so a persistent-index reject followed by the
+    /// same candidate-cache reject is counted once, not twice.
+    dedup_target_rejected: Vec<bool>,
 }
 
 type DedupHitChunkEntry = (usize, usize, Lba, BlockmapValue, ContentHash);
@@ -183,8 +176,8 @@ impl BufferFlusher {
                 continue;
             }
 
-            Self::lookup_dedup_hits(&mut prepared, meta, pool, metrics);
-            Self::candidate_lookup_pass(&mut prepared, candidate, pool, &allocator.hazards());
+            Self::lookup_dedup_hits(&mut prepared, meta, pool, allocator, metrics);
+            Self::candidate_lookup_pass(&mut prepared, candidate, pool, allocator, metrics);
             // LV3 verify ALL hits (dedup_index- and candidate-sourced).
             // The xxh3_64 schema does not have crypto-strength
             // collision resistance, so verify is correctness, not
@@ -192,13 +185,7 @@ impl BufferFlusher {
             // to trust-hash mode; see BufferFlusher::start_with_metrics
             // doc comment for the trade-off).
             if let Some(rp) = read_pool {
-                Self::verify_prepared_dedup_hits(
-                    &mut prepared,
-                    rp,
-                    allocator.hazards(),
-                    candidate,
-                    metrics,
-                );
+                Self::verify_prepared_dedup_hits(&mut prepared, rp, candidate, metrics);
             }
             let chunks = Self::issue_prepared_dedup_hits(
                 shard_idx,
@@ -263,8 +250,8 @@ impl BufferFlusher {
             valid_hits: Vec::new(),
             promote_candidates: Vec::new(),
             stale_index_repairs: vec![None; lba_count],
-            verified_target_guards: Vec::new(),
-            candidate_target_guards: Vec::new(),
+            target_guards: Vec::new(),
+            dedup_target_rejected: vec![false; lba_count],
         }
     }
 
@@ -272,6 +259,7 @@ impl BufferFlusher {
         prepared: &mut [PreparedDedupUnit],
         meta: &MetaStore,
         pool: &WriteBufferPool,
+        allocator: &SpaceAllocator,
         metrics: &EngineMetrics,
     ) {
         let total_lookups = prepared
@@ -313,6 +301,28 @@ impl BufferFlusher {
             for (entry_pos, &i) in prepared_unit.lookup_indices.iter().enumerate() {
                 if let Some(entry) = unit_lookup_entries[entry_pos] {
                     let hash = prepared_unit.all_hashes[i];
+                    let value = entry.to_blockmap_value();
+                    if Self::dedup_target_overlaps_relocation_source(
+                        prepared_unit.unit.raw_blocks.get(i),
+                        &value,
+                    ) {
+                        Self::record_dedup_target_rejected(
+                            &mut prepared_unit.dedup_target_rejected,
+                            i,
+                            metrics,
+                        );
+                        continue;
+                    }
+                    let Some(guard) = allocator
+                        .pin_dedup_target_if_allowed(value.pba, value.physical_blocks(BLOCK_SIZE))
+                    else {
+                        Self::record_dedup_target_rejected(
+                            &mut prepared_unit.dedup_target_rejected,
+                            i,
+                            metrics,
+                        );
+                        continue;
+                    };
                     prepared_unit.is_hit[i] = true;
                     let lba = Lba(prepared_unit.unit.start_lba.0 + i as u64);
                     let latest_seq =
@@ -330,11 +340,38 @@ impl BufferFlusher {
                     // below has a refcount guard and rejects dead targets
                     // atomically. Avoiding a second forward-index/refcount
                     // read is the hot-path win for high-hit workloads.
-                    prepared_unit
-                        .valid_hits
-                        .push((i, entry.to_blockmap_value(), hash));
+                    prepared_unit.valid_hits.push((i, value, hash));
+                    prepared_unit.target_guards.push(guard);
                 }
             }
+        }
+    }
+
+    fn dedup_target_overlaps_relocation_source(
+        block: Option<&crate::buffer::pipeline::RawBlockRef>,
+        target: &BlockmapValue,
+    ) -> bool {
+        let Some(source) = block.and_then(|block| block.relocation_source) else {
+            return false;
+        };
+        let blocks = target.physical_blocks(BLOCK_SIZE);
+        if blocks == 0 {
+            return false;
+        }
+        let target_end = target.pba.0.saturating_add(u64::from(blocks));
+        source.start.0 < target_end && target.pba.0 < source.end_pba().0
+    }
+
+    fn record_dedup_target_rejected(
+        rejected: &mut [bool],
+        lba_idx: usize,
+        metrics: &EngineMetrics,
+    ) {
+        if !rejected[lba_idx] {
+            rejected[lba_idx] = true;
+            metrics
+                .gc_defrag_dedup_hits_rejected
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -358,7 +395,8 @@ impl BufferFlusher {
         prepared: &mut [PreparedDedupUnit],
         candidate: &crate::dedup::CandidateCache,
         pool: &WriteBufferPool,
-        hazards: &PbaHazards,
+        allocator: &SpaceAllocator,
+        metrics: &EngineMetrics,
     ) {
         for prepared_unit in prepared.iter_mut() {
             for &i in &prepared_unit.lookup_indices {
@@ -374,16 +412,29 @@ impl BufferFlusher {
                 let Some(value) = candidate.lookup(&hash) else {
                     continue;
                 };
-                // Pin the candidate target the instant its mapping leaves the
-                // cache, before any further checks (P0 premature-free fix). The
-                // promote's `L2pRemap` is unguarded, so this pin is the only
-                // signal to the GC reclaim path that a remap onto this PBA may
-                // be in flight. Pinning here (not at verify) shrinks the
-                // lookup→pin gap to nothing so `reclaim_retired_extents`' hazard
-                // barrier always observes an about-to-promote target. On the
-                // stale-write early-out below the guard simply drops (no
-                // promote, pin released immediately).
-                let guard = hazards.pin_many(value.physical_pbas(BLOCK_SIZE));
+                if Self::dedup_target_overlaps_relocation_source(
+                    prepared_unit.unit.raw_blocks.get(i),
+                    &value,
+                ) {
+                    Self::record_dedup_target_rejected(
+                        &mut prepared_unit.dedup_target_rejected,
+                        i,
+                        metrics,
+                    );
+                    continue;
+                }
+                // The allocator checks quarantine and registers the hazard under
+                // one lock, so target publication cannot slip between them.
+                let Some(guard) = allocator
+                    .pin_dedup_target_if_allowed(value.pba, value.physical_blocks(BLOCK_SIZE))
+                else {
+                    Self::record_dedup_target_rejected(
+                        &mut prepared_unit.dedup_target_rejected,
+                        i,
+                        metrics,
+                    );
+                    continue;
+                };
                 let lba = Lba(prepared_unit.unit.start_lba.0 + i as u64);
                 let latest_seq = Self::latest_seq_for_lba(&prepared_unit.unit.seq_lba_ranges, lba);
                 if !pool.is_latest_lba_seq(
@@ -405,7 +456,7 @@ impl BufferFlusher {
                 prepared_unit
                     .promote_candidates
                     .push((i, hash, value.to_dedup_entry()));
-                prepared_unit.candidate_target_guards.push(guard);
+                prepared_unit.target_guards.push(guard);
             }
         }
     }
@@ -428,7 +479,6 @@ impl BufferFlusher {
     fn verify_prepared_dedup_hits(
         prepared: &mut [PreparedDedupUnit],
         read_pool: &crate::io::read_pool::ReadPool,
-        hazards: PbaHazards,
         candidate: &crate::dedup::CandidateCache,
         metrics: &EngineMetrics,
     ) {
@@ -442,7 +492,6 @@ impl BufferFlusher {
             ContentHash,
             BlockmapValue,
             crate::io::read_pool::ReadPurpose,
-            PbaHazardGuard,
         )> = Vec::new();
         for (unit_idx, prepared_unit) in prepared.iter().enumerate() {
             for (lba_idx, mapping, hash) in prepared_unit.valid_hits.iter() {
@@ -455,7 +504,6 @@ impl BufferFlusher {
                 } else {
                     crate::io::read_pool::ReadPurpose::DedupVerifyIndex
                 };
-                let guard = hazards.pin_many(mapping.physical_pbas(BLOCK_SIZE));
                 let Some(block) = prepared_unit.unit.raw_blocks.get(*lba_idx) else {
                     // No raw bytes available — should not happen if
                     // valid_hits was populated correctly; defensively
@@ -466,7 +514,7 @@ impl BufferFlusher {
                         &[],
                         purpose,
                     ));
-                    placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose, guard));
+                    placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose));
                     continue;
                 };
                 targets.push(crate::dedup::VerifyTarget::new_with_purpose(
@@ -474,7 +522,7 @@ impl BufferFlusher {
                     block.bytes(),
                     purpose,
                 ));
-                placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose, guard));
+                placement.push((unit_idx, *lba_idx, *hash, *mapping, purpose));
             }
         }
         if targets.is_empty() {
@@ -498,12 +546,10 @@ impl BufferFlusher {
         // the retain filters O(n) instead of O(n × |mismatches|).
         let mut mismatches_per_unit: HashMap<usize, std::collections::HashSet<usize>> =
             HashMap::new();
-        for ((unit_idx, lba_idx, hash, mapping, purpose, guard), matched) in
+        for ((unit_idx, lba_idx, hash, mapping, purpose), matched) in
             placement.into_iter().zip(results)
         {
-            if matched {
-                prepared[unit_idx].verified_target_guards.push(guard);
-            } else {
+            if !matched {
                 match purpose {
                     crate::io::read_pool::ReadPurpose::DedupVerifyIndex
                     | crate::io::read_pool::ReadPurpose::DedupVerify => {
@@ -1243,5 +1289,146 @@ impl BufferFlusher {
             },
             dedup_completion,
         }
+    }
+}
+
+#[cfg(test)]
+mod relocation_tests {
+    use super::*;
+    use crate::buffer::pipeline::RawBlockRef;
+    use crate::space::extent::Extent;
+    use crate::types::Pba;
+    use std::sync::Arc;
+
+    fn target(pba: u64, compressed_size: u32) -> BlockmapValue {
+        BlockmapValue {
+            pba: Pba(pba),
+            compression: 0,
+            unit_compressed_size: compressed_size,
+            unit_original_size: compressed_size,
+            unit_lba_count: (compressed_size / BLOCK_SIZE) as u16,
+            offset_in_unit: 0,
+            crc32: 0,
+            slot_offset: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn relocation_rejects_any_dedup_target_overlapping_source_extent() {
+        let block = RawBlockRef {
+            payload: Arc::from(vec![0x55; BLOCK_SIZE as usize]),
+            offset: 0,
+            relocation_source: Some(Extent::new(Pba(100), 2)),
+        };
+
+        assert!(BufferFlusher::dedup_target_overlaps_relocation_source(
+            Some(&block),
+            &target(100, BLOCK_SIZE)
+        ));
+        assert!(BufferFlusher::dedup_target_overlaps_relocation_source(
+            Some(&block),
+            &target(99, 2 * BLOCK_SIZE)
+        ));
+        assert!(!BufferFlusher::dedup_target_overlaps_relocation_source(
+            Some(&block),
+            &target(102, BLOCK_SIZE)
+        ));
+    }
+
+    #[test]
+    fn relocation_dedup_reject_metric_counts_once_per_block() {
+        let metrics = EngineMetrics::default();
+        let mut rejected = vec![false];
+
+        BufferFlusher::record_dedup_target_rejected(&mut rejected, 0, &metrics);
+        BufferFlusher::record_dedup_target_rejected(&mut rejected, 0, &metrics);
+
+        assert_eq!(
+            metrics
+                .gc_defrag_dedup_hits_rejected
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn dedup_target_guard_survives_until_commit_response_is_consumed() {
+        let allocator = SpaceAllocator::new(16 * 1024 * 1024, 1);
+        let hazards = allocator.hazards();
+        let guarded_pba = Pba(100);
+        let guard = allocator
+            .pin_dedup_target_if_allowed(guarded_pba, 1)
+            .unwrap();
+        let unit = CoalesceUnit {
+            vol_id: "guard-vol".into(),
+            start_lba: Lba(1),
+            lba_count: 1,
+            raw_blocks: vec![RawBlockRef {
+                payload: Arc::from(vec![0x44; BLOCK_SIZE as usize]),
+                offset: 0,
+                relocation_source: None,
+            }],
+            compression: CompressionAlgo::None,
+            vol_created_at: 1,
+            seq_lba_ranges: vec![(1, Lba(1), 1)],
+            dedup_skipped: false,
+            block_hashes: None,
+            dedup_stale_repairs: None,
+            dedup_completion: None,
+        };
+        let mut prepared = BufferFlusher::prepare_dedup_unit(unit);
+        prepared.target_guards.push(guard);
+
+        let (response_tx, response_rx) = bounded(1);
+        let pending = PendingPreparedDedupBatch {
+            prepared: vec![prepared],
+            chunks: vec![PendingDedupHitChunk {
+                chunk: Vec::new(),
+                promote_hashes: Vec::new(),
+                claimed_promotes: Vec::new(),
+                response_rx,
+                batch_len: 0,
+                vol_id_str: "guard-vol".into(),
+            }],
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let size = 16 * 1024 * 1024;
+        tmp.as_file().set_len(size).unwrap();
+        let device = crate::io::device::RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let pool = WriteBufferPool::open_with_group_commit_wait(device, Duration::ZERO).unwrap();
+        let (miss_tx, miss_rx) = bounded(1);
+        let (done_tx, _done_rx) = bounded(1);
+        let metrics = Arc::new(EngineMetrics::default());
+        let (cleanup_tx, _cleanup_rx) = bounded(1);
+        let candidate = crate::dedup::CandidateCache::new(1, 4);
+
+        let worker_metrics = metrics.clone();
+        let worker = std::thread::spawn(move || {
+            BufferFlusher::finish_pending_prepared_batch(
+                0,
+                pending,
+                &miss_tx,
+                &pool,
+                &done_tx,
+                &worker_metrics,
+                &cleanup_tx,
+                &candidate,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            !worker.is_finished(),
+            "worker should be waiting for commit response"
+        );
+        assert!(hazards.is_pinned(guarded_pba));
+
+        response_tx
+            .send(writer::DedupHitCommitResponse::Failed("injected".into()))
+            .unwrap();
+        assert!(worker.join().unwrap());
+        assert!(!hazards.is_pinned(guarded_pba));
+        assert_eq!(miss_rx.try_recv().unwrap().start_lba, Lba(1));
     }
 }

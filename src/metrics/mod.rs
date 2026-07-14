@@ -224,6 +224,16 @@ pub struct EngineMetrics {
     pub(crate) buffer_lv2_checkpoint_write_latency: FineLatencyHistogram,
     pub(crate) buffer_lv2_root_flush_latency: FineLatencyHistogram,
     pub(crate) buffer_lv2_watermark_dispatch_latency: FineLatencyHistogram,
+    /// Sampled (1/64 root writes) wall/CPU split for the chunklet LV2 payload
+    /// write. `offcpu_ns = wall_ns - cpu_ns` covers scheduler, lock, and device
+    /// blocking; it intentionally excludes the group-commit and flush stages.
+    pub buffer_lv2_payload_profile_samples: AtomicU64,
+    pub buffer_lv2_payload_profile_wall_ns: AtomicU64,
+    pub buffer_lv2_payload_profile_cpu_ns: AtomicU64,
+    pub buffer_lv2_payload_profile_offcpu_ns: AtomicU64,
+    pub buffer_lv2_payload_profile_wall_max_ns: AtomicU64,
+    pub buffer_lv2_payload_profile_cpu_max_ns: AtomicU64,
+    pub buffer_lv2_payload_profile_offcpu_max_ns: AtomicU64,
     pub buffer_backpressure_events: AtomicU64,
     pub buffer_backpressure_wait_ns: AtomicU64,
     /// Tier 1.B (ZFS-inspired) hyperbolic LV2 write throttle. `count` =
@@ -415,6 +425,18 @@ pub struct EngineMetrics {
     pub flush_commit_worker_aggregator_residence_ns: AtomicU64,
     /// Portion after a batch is sealed and before an executor dequeues it.
     pub flush_commit_worker_executor_queue_wait_ns: AtomicU64,
+    /// Aggregator seal reasons. `capacity` means the next indivisible job would
+    /// cross the target; it is neither a full-target recovery nor an underfill
+    /// sample. `deadline` is the hard oldest-job residence ceiling;
+    /// `adaptive_underfill` is the half-window useful-fill path. `pressure` is
+    /// the LV2 physical-fill escape hatch, while `shutdown` proves the final
+    /// partial batch was forwarded during orderly drain.
+    pub flush_commit_aggregator_seals_target: AtomicU64,
+    pub flush_commit_aggregator_seals_capacity: AtomicU64,
+    pub flush_commit_aggregator_seals_deadline: AtomicU64,
+    pub flush_commit_aggregator_seals_adaptive_underfill: AtomicU64,
+    pub flush_commit_aggregator_seals_pressure: AtomicU64,
+    pub flush_commit_aggregator_seals_shutdown: AtomicU64,
     pub flush_commit_worker_service_ns: AtomicU64,
     pub flush_commit_worker_jobs: AtomicU64,
     pub flush_commit_worker_job_lbas: AtomicU64,
@@ -568,10 +590,10 @@ pub struct EngineMetrics {
     /// `target_blocks` (published target ranges and their span). Counters:
     /// `walk_extents` (free extents visited by the descending selection walk),
     /// `clusters_qualified/rejected` (selection outcomes), `candidates` /
-    /// `blocks_selected` (scanner-side promotions inside target ranges),
-    /// `blocks_moved` (live blocks actually re-appended by the rewriter —
-    /// pair with `gc_retired_blocks_reclaimed`: moved ≫ subsequently-reclaimed
-    /// means pinned/wasted movement, the v2 rc-guard signal).
+    /// `blocks_selected` (scanner-side promotions inside target ranges), and
+    /// `blocks_moved` (legacy name: blocks durably re-appended to LV2, not proof
+    /// of a physical remap). `segments_completed` is the authoritative physical
+    /// outcome: it advances only after every PBA in a quarantine is reclaimed.
     pub gc_defrag_mode_active: AtomicU64,
     pub gc_defrag_targets_active: AtomicU64,
     pub gc_defrag_target_blocks: AtomicU64,
@@ -581,6 +603,15 @@ pub struct EngineMetrics {
     pub gc_defrag_candidates: AtomicU64,
     pub gc_defrag_blocks_selected: AtomicU64,
     pub gc_defrag_blocks_moved: AtomicU64,
+    /// Full stripe quarantine targets that reached 100% physically free and
+    /// were atomically published into the allocator reserve.
+    pub gc_defrag_segments_completed: AtomicU64,
+    /// Quarantine targets released without completion (mode exit or no-progress
+    /// watchdog). Cancellation is safe and loses only cleaner progress.
+    pub gc_defrag_segments_cancelled: AtomicU64,
+    /// Dedup hits deliberately converted to fresh writes because the candidate
+    /// was the relocation source or overlapped an active quarantine target.
+    pub gc_defrag_dedup_hits_rejected: AtomicU64,
     /// Allocator free-pool contiguity gauges (published once per GC cycle from
     /// `contiguity_stats`). `free_blocks_in_set` excludes lane caches, so
     /// `stripe_capable_blocks / free_blocks_in_set` = the defrag trigger
@@ -590,11 +621,19 @@ pub struct EngineMetrics {
     pub allocator_largest_free_run: AtomicU64,
     pub allocator_stripe_capable_blocks: AtomicU64,
     pub allocator_free_blocks_in_set: AtomicU64,
+    pub allocator_stripe_reserve_blocks: AtomicU64,
+    pub allocator_quarantine_target_blocks: AtomicU64,
+    pub allocator_quarantine_free_blocks: AtomicU64,
     /// Flush-writer batches that hit stripe starvation (aligned allocation
     /// failed → the whole remaining batch degraded to per-unit unaligned
     /// writes → RAID partial-stripe RMW downstream). Rate ≈ share of flush
     /// batches running degraded — the direct fragmentation-pathology signal.
     pub flush_writer_stripe_starved_batches: AtomicU64,
+    pub flush_writer_group_aligned_ops: AtomicU64,
+    pub flush_writer_group_unaligned_ops: AtomicU64,
+    pub flush_writer_group_short_extent_allocs: AtomicU64,
+    pub flush_writer_group_fallback_units: AtomicU64,
+    pub flush_writer_group_unused_blocks: AtomicU64,
     pub gc_errors: AtomicU64,
     /// Number of batched all-volume L2P scans the retired-extent reclaim path
     /// has run. With batching this is ~1 per GC cycle (was up to
@@ -778,6 +817,22 @@ impl EngineMetrics {
         self.buffer_lv2_payload_write_latency.record(ns);
     }
 
+    pub(crate) fn record_buffer_lv2_payload_profile(&self, wall_ns: u64, cpu_ns: u64) {
+        let cpu_ns = cpu_ns.min(wall_ns);
+        let offcpu_ns = wall_ns.saturating_sub(cpu_ns);
+        self.buffer_lv2_payload_profile_samples
+            .fetch_add(1, Ordering::Relaxed);
+        self.buffer_lv2_payload_profile_wall_ns
+            .fetch_add(wall_ns, Ordering::Relaxed);
+        self.buffer_lv2_payload_profile_cpu_ns
+            .fetch_add(cpu_ns, Ordering::Relaxed);
+        self.buffer_lv2_payload_profile_offcpu_ns
+            .fetch_add(offcpu_ns, Ordering::Relaxed);
+        record_counter_max(&self.buffer_lv2_payload_profile_wall_max_ns, wall_ns);
+        record_counter_max(&self.buffer_lv2_payload_profile_cpu_max_ns, cpu_ns);
+        record_counter_max(&self.buffer_lv2_payload_profile_offcpu_max_ns, offcpu_ns);
+    }
+
     pub(crate) fn record_buffer_lv2_checkpoint_write_ns(&self, ns: u64) {
         self.buffer_lv2_checkpoint_write_latency.record(ns);
     }
@@ -916,5 +971,21 @@ mod tests {
             delta.buffer_lv2_latency_bucket_upper_bounds_ns,
             fine_latency_bucket_upper_bounds_ns()
         );
+    }
+
+    #[test]
+    fn lv2_payload_profile_splits_wall_and_cpu_time() {
+        let metrics = EngineMetrics::default();
+        metrics.record_buffer_lv2_payload_profile(1_000, 400);
+        metrics.record_buffer_lv2_payload_profile(800, 900);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.buffer_lv2_payload_profile_samples, 2);
+        assert_eq!(snapshot.buffer_lv2_payload_profile_wall_ns, 1_800);
+        assert_eq!(snapshot.buffer_lv2_payload_profile_cpu_ns, 1_200);
+        assert_eq!(snapshot.buffer_lv2_payload_profile_offcpu_ns, 600);
+        assert_eq!(snapshot.buffer_lv2_payload_profile_wall_max_ns, 1_000);
+        assert_eq!(snapshot.buffer_lv2_payload_profile_cpu_max_ns, 800);
+        assert_eq!(snapshot.buffer_lv2_payload_profile_offcpu_max_ns, 600);
     }
 }

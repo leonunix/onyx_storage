@@ -10,7 +10,7 @@ use crossbeam_channel::Sender;
 use crate::buffer::pool::WriteBufferPool;
 use crate::dedup::ColdTailTarget;
 use crate::gc::config::GcConfig;
-use crate::gc::defrag::{DefragCycle, DefragState};
+use crate::gc::defrag::DefragState;
 use crate::gc::heatmap::HeatMap;
 use crate::gc::ref_bitmap::RefBitmap;
 use crate::gc::rewriter::rewrite_candidate;
@@ -64,6 +64,31 @@ const COMPACTOR_REWRITE_TIMEBOX_MS: u64 = 2_000;
 /// would only deepen the very backlog the effort model is trying to relieve.
 /// Legacy/slot-evac candidates (space-pressure work) are not fill-gated.
 const COMPACTOR_REWRITE_FILL_STOP_PCT: u8 = 70;
+
+/// Owns the loop-local defrag state and releases allocator quarantines on every
+/// exit path, including normal stop and panic unwind. Quarantined free blocks
+/// must be available before the flusher performs its shutdown drain.
+struct DefragLoopState<'a> {
+    state: DefragState,
+    allocator: &'a SpaceAllocator,
+    metrics: &'a EngineMetrics,
+}
+
+impl<'a> DefragLoopState<'a> {
+    fn new(allocator: &'a SpaceAllocator, metrics: &'a EngineMetrics) -> Self {
+        Self {
+            state: DefragState::new(),
+            allocator,
+            metrics,
+        }
+    }
+}
+
+impl Drop for DefragLoopState<'_> {
+    fn drop(&mut self) {
+        self.state.deactivate(self.allocator, self.metrics);
+    }
+}
 
 /// Background GC runner thread.
 pub struct GcRunner {
@@ -196,7 +221,7 @@ impl GcRunner {
     ) {
         let mut compactor_cursor = CompactorCursor::default();
         let mut heat_cursor = HeatCursor::default();
-        let mut defrag_state = DefragState::new();
+        let mut defrag_state = DefragLoopState::new(allocator, metrics);
         // Reclaim-age grace now lives in the allocator's per-original-retire age
         // log (`aged_candidates`), which is immune to the coalesce re-aging the
         // old runner-side `retired_first_seen: BTreeMap<Extent, Instant>` map
@@ -277,6 +302,10 @@ impl GcRunner {
             let heat_ms = t_heat.elapsed().as_millis();
 
             if !cfg.enabled || cfg.compactor_scan_max_lbas_per_cycle == 0 {
+                // A runtime kill-switch must also return allocator-owned
+                // quarantine fragments to the ordinary free pools. Skipping
+                // DefragState entirely would strand them until restart.
+                defrag_state.state.deactivate(allocator, metrics);
                 tracing::debug!(
                     cycle,
                     reclaim_ms,
@@ -323,11 +352,11 @@ impl GcRunner {
             // idled — the effort floor below un-idles it while defrag is
             // latched (the urgency/idle formula itself is untouched).
             let t_defrag = Instant::now();
-            let defrag_cycle = if cfg.defrag_enabled {
-                defrag_state.maintain(allocator, &cfg, free_pct, metrics)
-            } else {
-                DefragCycle::inactive()
-            };
+            // `maintain` owns the enable/disable transition so a hot reload of
+            // `defrag_enabled=false` cancels every active quarantine.
+            let defrag_cycle = defrag_state
+                .state
+                .maintain(allocator, &cfg, free_pct, metrics);
             let defrag_ms = t_defrag.elapsed().as_millis();
             if defrag_cycle.active {
                 effort = effort.max(cfg.defrag_min_effort.clamp(0.01, 1.0));
@@ -1603,7 +1632,7 @@ fn try_push_cold_tail(
 mod tests {
     use super::{
         advance_sweep, compute_effort, lap_barrier_satisfied, next_compactor_window,
-        split_refresh_budget, CompactorCursor, CompactorLap, HeatLap,
+        split_refresh_budget, CompactorCursor, CompactorLap, DefragLoopState, HeatLap,
     };
     use std::collections::HashMap;
 
@@ -1657,6 +1686,36 @@ mod tests {
         assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 40), 0.50);
         assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 20), 0.30);
         assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 5), 0.25);
+    }
+
+    #[test]
+    fn dropping_gc_loop_state_releases_active_quarantine_before_flusher_drain() {
+        use std::sync::atomic::Ordering;
+
+        use crate::metrics::EngineMetrics;
+        use crate::space::allocator::SpaceAllocator;
+        use crate::types::{BLOCK_SIZE, RESERVED_BLOCKS};
+
+        const STRIPE: u32 = 6;
+        let phase = (RESERVED_BLOCKS % u64::from(STRIPE)) as u32;
+        let allocator = SpaceAllocator::new(128 * BLOCK_SIZE as u64, 0);
+        allocator.set_stripe_geometry(STRIPE, phase);
+        let target = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, phase)
+            .unwrap();
+        allocator.begin_defrag_quarantine(target).unwrap();
+        let metrics = EngineMetrics::default();
+
+        {
+            let mut loop_state = DefragLoopState::new(&allocator, &metrics);
+            loop_state.state.track_target_for_exit_test(target);
+        }
+
+        assert!(!allocator.is_defrag_quarantined(target));
+        assert_eq!(
+            metrics.gc_defrag_segments_cancelled.load(Ordering::Relaxed),
+            1
+        );
     }
 
     // ---- resident compactor: lap window ----

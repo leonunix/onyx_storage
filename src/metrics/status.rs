@@ -32,6 +32,9 @@ pub struct EngineStatusSnapshot {
     pub allocator_largest_run_blocks: Option<u64>,
     pub allocator_stripe_capable_blocks: Option<u64>,
     pub allocator_free_blocks_in_set: Option<u64>,
+    pub allocator_stripe_reserve_blocks: Option<u64>,
+    pub allocator_quarantine_target_blocks: Option<u64>,
+    pub allocator_quarantine_free_blocks: Option<u64>,
     /// Adaptive reclaim heat-map summary (None when the map is disabled or in
     /// standby). Observe-only in Stage A.
     pub heat: Option<HeatSummary>,
@@ -625,12 +628,15 @@ impl EngineStatusSnapshot {
             };
             let _ = writeln!(
                 out,
-                "allocator_contiguity: free_extents={} largest_run={} stripe_capable={}/{} ({}%)",
+                "allocator_contiguity: free_extents={} largest_run={} stripe_capable={}/{} ({}%) reserve={} quarantine={}/{}",
                 extents,
                 largest,
                 capable.unwrap_or(0),
                 in_set,
                 capable_pct.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                self.allocator_stripe_reserve_blocks.unwrap_or(0),
+                self.allocator_quarantine_free_blocks.unwrap_or(0),
+                self.allocator_quarantine_target_blocks.unwrap_or(0),
             );
         }
         if let Some(ck) = &self.chunklet {
@@ -932,6 +938,17 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "commit_aggregator_seals: target={} capacity={} deadline={} adaptive_underfill={} pressure={} shutdown={}",
+            self.metrics.flush_commit_aggregator_seals_target,
+            self.metrics.flush_commit_aggregator_seals_capacity,
+            self.metrics.flush_commit_aggregator_seals_deadline,
+            self.metrics
+                .flush_commit_aggregator_seals_adaptive_underfill,
+            self.metrics.flush_commit_aggregator_seals_pressure,
+            self.metrics.flush_commit_aggregator_seals_shutdown,
+        );
+        let _ = writeln!(
+            out,
             "flush_stage_send: coalesce_ns={} coalesce_ops={} coalesce_len_sum={} coalesce_len_max={} dedup_ns={} dedup_ops={} dedup_len_sum={} dedup_len_max={} compress_ns={} compress_ops={} compress_len_sum={} compress_len_max={}",
             self.metrics.flush_stage_coalesce_send_ns,
             self.metrics.flush_stage_coalesce_send_ops,
@@ -1063,17 +1080,27 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "defrag: mode={} targets={} target_blocks={} walk_extents={} clusters_ok={} clusters_rej={} candidates={} selected={} moved={} stripe_starved_batches={}",
+            "defrag: mode={} targets={} target_blocks={} quarantine_free={} reserve={} completed={} cancelled={} walk_extents={} clusters_ok={} clusters_rej={} candidates={} selected={} reappended={} dedup_rejected={} stripe_starved_batches={} group_aligned={} group_unaligned={} group_short={} group_fallback_units={} group_unused_blocks={}",
             self.metrics.gc_defrag_mode_active,
             self.metrics.gc_defrag_targets_active,
             self.metrics.gc_defrag_target_blocks,
+            self.metrics.allocator_quarantine_free_blocks,
+            self.metrics.allocator_stripe_reserve_blocks,
+            self.metrics.gc_defrag_segments_completed,
+            self.metrics.gc_defrag_segments_cancelled,
             self.metrics.gc_defrag_walk_extents,
             self.metrics.gc_defrag_clusters_qualified,
             self.metrics.gc_defrag_clusters_rejected,
             self.metrics.gc_defrag_candidates,
             self.metrics.gc_defrag_blocks_selected,
             self.metrics.gc_defrag_blocks_moved,
-            self.metrics.flush_writer_stripe_starved_batches
+            self.metrics.gc_defrag_dedup_hits_rejected,
+            self.metrics.flush_writer_stripe_starved_batches,
+            self.metrics.flush_writer_group_aligned_ops,
+            self.metrics.flush_writer_group_unaligned_ops,
+            self.metrics.flush_writer_group_short_extent_allocs,
+            self.metrics.flush_writer_group_fallback_units,
+            self.metrics.flush_writer_group_unused_blocks
         );
         if let Some(h) = &self.heat {
             let _ = writeln!(

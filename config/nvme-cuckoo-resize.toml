@@ -113,6 +113,9 @@ volatile_memory_mb = 49152
 staging_queue_entries = 1048576
 sync_batch_max_entries = 131072
 sync_batch_max_bytes_mb = 1024
+# Preserve the measured four-lane topology while the new sampled wall/CPU
+# profile identifies root-write service versus scheduler delay.
+lv2_prepared_queue_depth_per_lane = 16
 # Pace against physical LV2 occupancy (including checkpoint-retained entries)
 # before reserve_log_space falls into hard condvar backpressure.
 throttle_min_pct = 70
@@ -153,8 +156,9 @@ commit_retain_tail = true
 # Keep the legacy receive budget at 16K for the gate-off A/B. With tail
 # retention enabled, the aggregator caps each emitted batch at the 8K target.
 commit_coalesce_lba_budget = 16384
-# A shard writer contributes roughly 600-700 LBAs per job under random write.
-# Keep the sole aggregator open long enough to collect an effective 8K tx.
+# Hard maximum from the oldest queued job; arrivals cannot restart it. The
+# adaptive seal retains this 75ms throughput ceiling but closes useful
+# quarter-target batches at half-window after sustained underfill.
 commit_coalesce_timeout_us = 75000
 packed_commit_try_drain_lba_budget = 150
 writer_read_active_batch_size = 1024
@@ -173,6 +177,10 @@ dead_ratio_threshold = 0.25
 buffer_usage_max_pct = 80
 buffer_usage_resume_pct = 50
 max_rewrite_per_cycle = 1024
+# Exact-stripe cleaner: concentrate work on a bounded target set and abandon a
+# target only after one hour without any increase in physically-free blocks.
+defrag_max_active_targets = 32
+defrag_target_stall_secs = 3600
 
 [dedup]
 enabled = true

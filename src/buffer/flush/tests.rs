@@ -177,6 +177,7 @@ fn make_raw_unit_at(start_lba: u64, lba_count: u32, first_byte: u8, seq: u64) ->
         .map(|idx| crate::buffer::pipeline::RawBlockRef {
             payload: raw.clone(),
             offset: idx * BLOCK_SIZE as usize,
+            relocation_source: None,
         })
         .collect();
     CompressedUnit {

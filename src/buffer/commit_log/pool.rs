@@ -20,6 +20,19 @@ impl WriteBufferPool {
         }
     }
 
+    /// Maximum prefix of `[start_lba, start_lba + max_lbas)` that remains in
+    /// one physical routing zone. Conditional relocation must not span append
+    /// ordering domains; production foreground writes use the same boundary.
+    pub(crate) fn lbas_until_routing_boundary(&self, start_lba: Lba, max_lbas: u32) -> u32 {
+        if max_lbas == 0 {
+            return 0;
+        }
+        let zone_size = self.routing_zone_size_blocks.max(1);
+        let offset = start_lba.0 % zone_size;
+        let available = zone_size - offset;
+        max_lbas.min(available.min(u64::from(u32::MAX)) as u32)
+    }
+
     /// Find the shard that owns a seq by checking each shard's pending_entries.
     /// O(shard_count) DashMap lookups — fine for background mark_flushed path.
     fn shard_for_seq(&self, seq: u64) -> Option<usize> {
@@ -154,6 +167,67 @@ impl WriteBufferPool {
         payload: &[u8],
         vol_created_at: u64,
     ) -> OnyxResult<BufferAppendTicket> {
+        self.append_deferred_inner(vol_id, start_lba, lba_count, payload, vol_created_at, None)
+    }
+
+    /// Conditionally append a GC relocation while retaining its old physical
+    /// source in memory. `validate` runs inside the same per-shard append-order
+    /// lock used by foreground writes, immediately before seq allocation and
+    /// LBA-index publication. `Ok(None)` means the source became stale and no
+    /// seq or ring space was consumed.
+    pub(crate) fn append_relocation_deferred_checked(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        payload: &[u8],
+        vol_created_at: u64,
+        relocation_source: crate::space::extent::Extent,
+        validate: impl FnOnce() -> OnyxResult<bool>,
+    ) -> OnyxResult<Option<BufferAppendTicket>> {
+        self.append_deferred_inner_checked(
+            vol_id,
+            start_lba,
+            lba_count,
+            payload,
+            vol_created_at,
+            Some(relocation_source),
+            validate,
+        )
+    }
+
+    fn append_deferred_inner(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        payload: &[u8],
+        vol_created_at: u64,
+        relocation_source: Option<crate::space::extent::Extent>,
+    ) -> OnyxResult<BufferAppendTicket> {
+        Ok(self
+            .append_deferred_inner_checked(
+                vol_id,
+                start_lba,
+                lba_count,
+                payload,
+                vol_created_at,
+                relocation_source,
+                || Ok(true),
+            )?
+            .expect("unconditional append validation always succeeds"))
+    }
+
+    fn append_deferred_inner_checked(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        payload: &[u8],
+        vol_created_at: u64,
+        relocation_source: Option<crate::space::extent::Extent>,
+        validate: impl FnOnce() -> OnyxResult<bool>,
+    ) -> OnyxResult<Option<BufferAppendTicket>> {
         // Fail-fast when metadb persistence is fenced: the buffer ring is the
         // only durable record until a checkpoint folds it into manifest pages,
         // so if checkpoints are dead an ack here would be a lie (the ring fills
@@ -163,15 +237,36 @@ impl WriteBufferPool {
         }
         let total_start = Instant::now();
         let shard_idx = self.shard_for_lba(start_lba);
+        if relocation_source.is_some()
+            && self.lbas_until_routing_boundary(start_lba, lba_count) != lba_count
+        {
+            return Err(OnyxError::Config(
+                "GC relocation append crosses a buffer routing boundary".into(),
+            ));
+        }
         self.apply_write_throttle(shard_idx);
+        let shard = &self.shards[shard_idx];
+        let append_order = shard.shard.append_order.lock();
+        // The fence may trip while this producer was throttled or queued behind
+        // another append. Do not enter LV2 after fail-stop has been published.
+        if let Some(reason) = self.meta_fence.get() {
+            return Err(OnyxError::MetaFenced(reason.clone()));
+        }
+        if !validate()? {
+            return Ok(None);
+        }
         let frontier_guard = self.frontier_gate.read();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let shard = &self.shards[shard_idx];
 
-        let append_result =
-            shard
-                .shard
-                .append_with_seq(seq, vol_id, start_lba, lba_count, payload, vol_created_at);
+        let append_result = shard.shard.append_with_seq(
+            seq,
+            vol_id,
+            start_lba,
+            lba_count,
+            payload,
+            vol_created_at,
+            relocation_source,
+        );
         if let Some(metrics) = self.metrics.get() {
             metrics.record_buffer_append_prepare_ns(total_start.elapsed().as_nanos() as u64);
         }
@@ -179,19 +274,20 @@ impl WriteBufferPool {
         // failed and no acknowledged write exists for this seq. Do not hold
         // the gate across fdatasync / ready publication.
         drop(frontier_guard);
+        drop(append_order);
         let pending = append_result?;
         // Wake the per-shard sync thread so it drains the staging channel
         // promptly. The sync thread will fdatasync the batch and then
         // advance `lv2_durability.synced_seq` past our seq, which is what
         // `wait_for_durable` parks on below.
         let _ = shard.sync_wake_tx.send(());
-        Ok(BufferAppendTicket {
+        Ok(Some(BufferAppendTicket {
             shard: shard.shard.clone(),
             pending,
             seq,
             append_started: total_start,
             durability_wait_started: Instant::now(),
-        })
+        }))
     }
 
     pub fn lookup(&self, vol_id: &str, lba: Lba) -> OnyxResult<Option<PendingEntry>> {

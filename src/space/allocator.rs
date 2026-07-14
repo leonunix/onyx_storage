@@ -7,7 +7,7 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::meta::store::MetaStore;
 use crate::space::extent::Extent;
 use crate::space::free_set::FreeSet;
-use crate::space::hazard::PbaHazards;
+use crate::space::hazard::{PbaHazardGuard, PbaHazards};
 use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
 
 /// Number of blocks to refill a lane cache from the global free list at once.
@@ -33,9 +33,10 @@ struct RetiredRun {
 }
 
 /// Fragmentation snapshot of the global free set (one lock hold, O(log N)).
-/// `stripe_capable_blocks / free_blocks_in_set` = stripe-capable fraction of
-/// the free pool — the GC defrag trigger. Both numbers describe the SAME set
-/// (lane-cached extents excluded), unlike the `free_blocks` atomic.
+/// `stripe_capable_blocks / free_blocks_in_set` = currently allocatable stripe
+/// capacity over globally tracked free space. Lane-cached extents are excluded
+/// from both; quarantine-free blocks remain in the denominator but are excluded
+/// from capability until their target is complete and published to reserve.
 #[derive(Debug, Clone, Copy)]
 pub struct ContiguityStats {
     pub free_blocks_in_set: u64,
@@ -44,6 +45,336 @@ pub struct ContiguityStats {
     /// Whole-stripe aligned capacity (eff floored to stripe multiples).
     /// `None` when no stripe geometry is configured (stripe <= 1).
     pub stripe_capable_blocks: Option<u64>,
+    /// Free whole-stripe blocks held exclusively for aligned allocations.
+    pub stripe_reserve_blocks: u64,
+    /// Total physical span covered by active defrag quarantines.
+    pub quarantine_target_blocks: u64,
+    /// Already-free blocks held inside active defrag quarantines.
+    pub quarantine_free_blocks: u64,
+}
+
+/// Free-space policy classes protected by one lock. Every free PBA belongs to
+/// exactly one of `general`, `stripe_reserve`, an active quarantine's
+/// `free_parts`, or a detached lane cache.
+struct FreePools {
+    general: FreeSet,
+    stripe_reserve: FreeSet,
+    quarantines: BTreeMap<u64, QuarantineTarget>,
+}
+
+struct QuarantineTarget {
+    range: Extent,
+    free_parts: FreeSet,
+}
+
+impl FreePools {
+    fn new() -> Self {
+        Self {
+            general: FreeSet::new(),
+            stripe_reserve: FreeSet::new(),
+            quarantines: BTreeMap::new(),
+        }
+    }
+
+    fn geometry(&self) -> Option<(u32, u32)> {
+        self.general.geometry()
+    }
+
+    fn empty_set_with_geometry(&self) -> FreeSet {
+        let mut set = FreeSet::new();
+        if let Some((stripe, phase)) = self.geometry() {
+            set.set_geometry(stripe, phase);
+        }
+        set
+    }
+
+    fn set_geometry(&mut self, stripe: u32, phase: u32) {
+        let requested = (stripe > 1).then_some((stripe, phase));
+        if self.geometry() == requested {
+            return;
+        }
+        let mut runs: Vec<Extent> = self.general.by_addr().iter().copied().collect();
+        runs.extend(self.stripe_reserve.by_addr().iter().copied());
+        runs.extend(
+            self.quarantines
+                .values()
+                .flat_map(|target| target.free_parts.by_addr().iter().copied()),
+        );
+        self.general = FreeSet::new();
+        self.stripe_reserve = FreeSet::new();
+        self.general.set_geometry(stripe, phase);
+        self.stripe_reserve.set_geometry(stripe, phase);
+        self.quarantines.clear();
+        runs.sort_unstable_by_key(|extent| extent.start.0);
+        for run in runs {
+            self.insert_classified(run);
+        }
+    }
+
+    fn replace_general(&mut self, free: BTreeSet<Extent>) {
+        let geometry = self.geometry();
+        self.general = FreeSet::new();
+        self.stripe_reserve = FreeSet::new();
+        if let Some((stripe, phase)) = geometry {
+            self.general.set_geometry(stripe, phase);
+            self.stripe_reserve.set_geometry(stripe, phase);
+        }
+        self.quarantines.clear();
+        for run in free {
+            self.insert_classified(run);
+        }
+    }
+
+    /// Insert a free run into the canonical policy partition. Adjacent runs in
+    /// either pool are first folded into one maximal run; its aligned whole-
+    /// stripe middle goes to the reserve and only its head/tail stay general.
+    fn insert_classified(&mut self, extent: Extent) {
+        let mut start = extent.start.0;
+        let mut end = extent.end_pba().0;
+
+        loop {
+            let mut changed = false;
+            for reserve in [false, true] {
+                let set = if reserve {
+                    &mut self.stripe_reserve
+                } else {
+                    &mut self.general
+                };
+                let probe = Extent::single(Pba(start));
+                if let Some(before) = set.by_addr().range(..=probe).next_back().copied() {
+                    if before.end_pba().0 == start {
+                        set.remove(&before);
+                        start = before.start.0;
+                        changed = true;
+                    }
+                }
+                let probe = Extent::single(Pba(end));
+                if let Some(after) = set.by_addr().range(probe..).next().copied() {
+                    if after.start.0 == end {
+                        set.remove(&after);
+                        end = after.end_pba().0;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let Some((stripe, phase)) = self.geometry().filter(|(stripe, _)| *stripe > 1) else {
+            Self::insert_split(&mut self.general, start, end - start, 1);
+            return;
+        };
+        let aligned_start = SpaceAllocator::align_up_pba(start, stripe as u64, phase as u64);
+        if aligned_start >= end {
+            // A sub-stripe fragment can end before the next alignment point.
+            // Never use that future alignment as the head boundary: doing so
+            // would manufacture free PBAs beyond the released range.
+            Self::insert_split(&mut self.general, start, end - start, 1);
+            return;
+        }
+        let aligned_blocks = end
+            .saturating_sub(aligned_start)
+            .checked_div(stripe as u64)
+            .unwrap_or(0)
+            * stripe as u64;
+        let aligned_end = aligned_start + aligned_blocks;
+        if aligned_start > start {
+            Self::insert_split(&mut self.general, start, aligned_start - start, 1);
+        }
+        if aligned_blocks > 0 {
+            Self::insert_split(
+                &mut self.stripe_reserve,
+                aligned_start,
+                aligned_blocks,
+                stripe,
+            );
+        }
+        if aligned_end < end {
+            Self::insert_split(&mut self.general, aligned_end, end - aligned_end, 1);
+        }
+    }
+
+    fn insert_split(set: &mut FreeSet, mut start: u64, mut count: u64, multiple: u32) {
+        let multiple = u64::from(multiple.max(1));
+        let max_chunk = (u32::MAX as u64 / multiple) * multiple;
+        debug_assert!(max_chunk > 0);
+        while count > 0 {
+            let take = count.min(max_chunk);
+            set.insert(Extent::new(Pba(start), take as u32));
+            start += take;
+            count -= take;
+        }
+    }
+
+    fn free_blocks_in_pools(&self) -> u64 {
+        self.general.blocks_total()
+            + self.stripe_reserve.blocks_total()
+            + self
+                .quarantines
+                .values()
+                .map(|target| target.free_parts.blocks_total())
+                .sum::<u64>()
+    }
+
+    fn overlapping_in_set(set: &FreeSet, extent: Extent) -> Option<Extent> {
+        SpaceAllocator::overlapping_extent(set.by_addr(), extent)
+    }
+
+    fn overlapping_free(&self, extent: Extent) -> Option<Extent> {
+        Self::overlapping_in_set(&self.general, extent)
+            .or_else(|| Self::overlapping_in_set(&self.stripe_reserve, extent))
+            .or_else(|| {
+                self.quarantine_starts_overlapping(extent)
+                    .into_iter()
+                    .find_map(|start| {
+                        Self::overlapping_in_set(
+                            &self
+                                .quarantines
+                                .get(&start)
+                                .expect("quarantine key remains present")
+                                .free_parts,
+                            extent,
+                        )
+                    })
+            })
+    }
+
+    /// Whether the union of policy pools covers `extent`. Canonical
+    /// classification may split one physical run at general/reserve
+    /// boundaries, so a single-set covering query is insufficient. Advance by
+    /// whole stored runs rather than probing every block.
+    fn covers_free(&self, extent: Extent) -> bool {
+        let mut cursor = extent.start.0;
+        let end = extent.end_pba().0;
+        while cursor < end {
+            let Some(run) = self.overlapping_free(Extent::single(Pba(cursor))) else {
+                return false;
+            };
+            let next = run.end_pba().0.min(end);
+            if next <= cursor {
+                return false;
+            }
+            cursor = next;
+        }
+        true
+    }
+
+    fn overlaps_reserve(&self, extent: Extent) -> bool {
+        Self::overlapping_in_set(&self.stripe_reserve, extent).is_some()
+    }
+
+    fn overlapping_quarantine(&self, extent: Extent) -> Option<Extent> {
+        let mut candidate = self
+            .quarantines
+            .range(..=extent.start.0)
+            .next_back()
+            .map(|(_, target)| target.range);
+        if candidate.is_none_or(|range| range.end_pba().0 <= extent.start.0) {
+            candidate = self
+                .quarantines
+                .range(extent.start.0..)
+                .next()
+                .map(|(_, target)| target.range);
+        }
+        candidate.filter(|range| SpaceAllocator::extents_overlap(*range, extent))
+    }
+
+    fn quarantine_starts_overlapping(&self, extent: Extent) -> Vec<u64> {
+        let mut starts = Vec::new();
+        if let Some((&start, target)) = self.quarantines.range(..extent.start.0).next_back() {
+            if target.range.end_pba().0 > extent.start.0 {
+                starts.push(start);
+            }
+        }
+        for (&start, target) in self.quarantines.range(extent.start.0..extent.end_pba().0) {
+            if target.range.start.0 >= extent.end_pba().0 {
+                break;
+            }
+            starts.push(start);
+        }
+        starts
+    }
+
+    fn extract_from_general(&mut self, range: Extent) -> Vec<Extent> {
+        let mut overlaps = Vec::new();
+        if let Some(before) = self
+            .general
+            .by_addr()
+            .range(..Extent::single(range.start))
+            .next_back()
+            .copied()
+        {
+            if before.end_pba().0 > range.start.0 {
+                overlaps.push(before);
+            }
+        }
+        for extent in self.general.by_addr().range(Extent::single(range.start)..) {
+            if extent.start.0 >= range.end_pba().0 {
+                break;
+            }
+            overlaps.push(*extent);
+        }
+        let mut extracted = Vec::with_capacity(overlaps.len());
+        for extent in overlaps {
+            self.general.remove(&extent);
+            let intersection_start = extent.start.0.max(range.start.0);
+            let intersection_end = extent.end_pba().0.min(range.end_pba().0);
+            if extent.start.0 < intersection_start {
+                self.general.insert(Extent::new(
+                    extent.start,
+                    (intersection_start - extent.start.0) as u32,
+                ));
+            }
+            extracted.push(Extent::new(
+                Pba(intersection_start),
+                (intersection_end - intersection_start) as u32,
+            ));
+            if intersection_end < extent.end_pba().0 {
+                self.general.insert(Extent::new(
+                    Pba(intersection_end),
+                    (extent.end_pba().0 - intersection_end) as u32,
+                ));
+            }
+        }
+        extracted
+    }
+
+    /// Route newly-free blocks around active quarantine boundaries.
+    fn release_extent(&mut self, extent: Extent) {
+        let target_starts = self.quarantine_starts_overlapping(extent);
+        let mut cursor = extent.start.0;
+        let end = extent.end_pba().0;
+        for target_start in target_starts {
+            let target_range = self
+                .quarantines
+                .get(&target_start)
+                .expect("collected quarantine target remains present")
+                .range;
+            if cursor < target_range.start.0 {
+                self.insert_classified(Extent::new(
+                    Pba(cursor),
+                    (target_range.start.0 - cursor) as u32,
+                ));
+            }
+            let part_start = cursor.max(target_range.start.0);
+            let part_end = end.min(target_range.end_pba().0);
+            if part_start < part_end {
+                let target = self
+                    .quarantines
+                    .get_mut(&target_start)
+                    .expect("collected quarantine target remains present");
+                target
+                    .free_parts
+                    .coalesce_insert(Extent::new(Pba(part_start), (part_end - part_start) as u32));
+                cursor = part_end;
+            }
+        }
+        if cursor < end {
+            self.insert_classified(Extent::new(Pba(cursor), (end - cursor) as u32));
+        }
+    }
 }
 
 pub struct SpaceAllocator {
@@ -55,7 +386,7 @@ pub struct SpaceAllocator {
     /// SELECTION is unchanged (lowest-address extent that fits — the metadb
     /// L2P leaf codec's dense-PBA contract); the side index only makes finding
     /// it O(D·log N) instead of an O(N) belt walk under this lock.
-    free_extents: Mutex<FreeSet>,
+    free_pools: Mutex<FreePools>,
     /// Coalesced retired set — authority for containment/overlap (`is_retired`,
     /// `overlapping_retired_extent`, `retired_block_count`). NEVER carries age.
     retired_extents: Mutex<BTreeSet<Extent>>,
@@ -103,9 +434,9 @@ impl SpaceAllocator {
     pub fn new_with_hazards(device_size_bytes: u64, num_lanes: usize) -> Self {
         let total_blocks = device_size_bytes / BLOCK_SIZE as u64;
         let usable_blocks = total_blocks.saturating_sub(RESERVED_BLOCKS);
-        let mut free_extents = FreeSet::new();
+        let mut free_pools = FreePools::new();
         if usable_blocks > 0 {
-            free_extents.insert(Extent::new(
+            free_pools.general.insert(Extent::new(
                 Pba(RESERVED_BLOCKS),
                 usable_blocks.min(u32::MAX as u64) as u32,
             ));
@@ -123,7 +454,7 @@ impl SpaceAllocator {
             .then(|| Mutex::new(BTreeSet::new()));
         Self {
             total_blocks: AtomicU64::new(total_blocks),
-            free_extents: Mutex::new(free_extents),
+            free_pools: Mutex::new(free_pools),
             retired_extents: Mutex::new(BTreeSet::new()),
             retired_age: Mutex::new(BTreeMap::new()),
             retired_blocks: AtomicU64::new(0),
@@ -190,16 +521,7 @@ impl SpaceAllocator {
         let alloc_count = allocated.len() as u64;
         let free_count = usable_blocks - alloc_count;
 
-        {
-            let mut fs = self.free_extents.lock().unwrap();
-            // Preserve the startup-configured RAID geometry across the
-            // wholesale rebuild (set_geometry rebuilds the eff index).
-            let geom = fs.geometry();
-            *fs = FreeSet::from_addr_set(free);
-            if let Some((stripe, phase)) = geom {
-                fs.set_geometry(stripe, phase);
-            }
-        }
+        self.free_pools.lock().unwrap().replace_general(free);
         self.retired_extents.lock().unwrap().clear();
         self.retired_age.lock().unwrap().clear();
         self.retired_blocks.store(0, Ordering::Relaxed);
@@ -218,7 +540,10 @@ impl SpaceAllocator {
             total = self.total_blocks.load(Ordering::Relaxed),
             allocated = alloc_count,
             free = free_count,
-            extents = self.free_extents.lock().unwrap().len(),
+            extents = {
+                let pools = self.free_pools.lock().unwrap();
+                pools.general.len() + pools.stripe_reserve.len()
+            },
             "space allocator rebuilt from metadata"
         );
 
@@ -236,10 +561,131 @@ impl SpaceAllocator {
     /// once at startup before flush traffic; idempotent; `stripe <= 1`
     /// (non-RAID backends) clears it.
     pub fn set_stripe_geometry(&self, stripe_blocks: u32, phase: u32) {
-        self.free_extents
+        self.free_pools
             .lock()
             .unwrap()
             .set_geometry(stripe_blocks, phase);
+    }
+
+    /// Remove an aligned physical range from ordinary allocation while the
+    /// defragger evacuates its live pinners. Existing free pieces are moved into
+    /// the target atomically; after publication, wait for pre-existing PBA pins
+    /// without holding the allocator lock.
+    pub fn begin_defrag_quarantine(&self, target: Extent) -> OnyxResult<()> {
+        self.validate_extent_shape(target, "begin_defrag_quarantine")?;
+        {
+            let mut pools = self.free_pools.lock().unwrap();
+            let (stripe, phase) = pools.geometry().ok_or_else(|| {
+                OnyxError::Config("begin_defrag_quarantine requires stripe geometry".into())
+            })?;
+            if stripe <= 1
+                || target.count % stripe != 0
+                || (target.start.0 + phase as u64) % stripe as u64 != 0
+            {
+                return Err(OnyxError::Config(format!(
+                    "defrag quarantine {:?} is not aligned to stripe={} phase={}",
+                    target, stripe, phase
+                )));
+            }
+            if let Some(existing) = pools.overlapping_quarantine(target) {
+                return Err(OnyxError::Config(format!(
+                    "defrag quarantine {:?} overlaps target {:?}",
+                    target, existing
+                )));
+            }
+            if pools.overlaps_reserve(target) {
+                return Err(OnyxError::Config(format!(
+                    "defrag quarantine {:?} overlaps stripe reserve",
+                    target
+                )));
+            }
+            // Lock order is FreePools -> lane caches. Allocation fast paths
+            // never hold a lane lock while acquiring FreePools. Cached blocks
+            // are logically free, so detach only the target intersections and
+            // leave any head/tail pieces in their originating lane.
+            let mut free_parts = pools.extract_from_general(target);
+            free_parts.extend(self.extract_lane_cache_free_parts(target));
+            let mut target_free = pools.empty_set_with_geometry();
+            for extent in free_parts {
+                target_free.coalesce_insert(extent);
+            }
+            pools.quarantines.insert(
+                target.start.0,
+                QuarantineTarget {
+                    range: target,
+                    free_parts: target_free,
+                },
+            );
+        }
+
+        self.hazards.wait_extent_clear(target.start, target.count);
+        Ok(())
+    }
+
+    pub fn defrag_quarantine_progress(&self, start: Pba) -> Option<(u64, u64)> {
+        let pools = self.free_pools.lock().unwrap();
+        let target = pools.quarantines.get(&start.0)?;
+        Some((target.free_parts.blocks_total(), target.range.count as u64))
+    }
+
+    /// Publish a fully-free quarantine as stripe reserve. A partially-free
+    /// target remains active and returns `Ok(false)`.
+    pub fn complete_defrag_quarantine(&self, start: Pba) -> OnyxResult<bool> {
+        let mut pools = self.free_pools.lock().unwrap();
+        let Some(target) = pools.quarantines.get(&start.0) else {
+            return Ok(false);
+        };
+        if target.free_parts.blocks_total() != target.range.count as u64 {
+            return Ok(false);
+        }
+        let target = pools
+            .quarantines
+            .remove(&start.0)
+            .expect("target checked above");
+        pools.insert_classified(target.range);
+        Ok(true)
+    }
+
+    /// Abandon an active quarantine and return only its already-free pieces to
+    /// the canonical general/reserve partition. Live/retired pieces were never
+    /// removed from their ownership states.
+    pub fn cancel_defrag_quarantine(&self, start: Pba) -> bool {
+        let mut pools = self.free_pools.lock().unwrap();
+        let Some(target) = pools.quarantines.remove(&start.0) else {
+            return false;
+        };
+        let free_parts: Vec<Extent> = target.free_parts.by_addr().iter().copied().collect();
+        for extent in free_parts {
+            pools.insert_classified(extent);
+        }
+        true
+    }
+
+    pub fn is_defrag_quarantined(&self, extent: Extent) -> bool {
+        self.free_pools
+            .lock()
+            .unwrap()
+            .overlapping_quarantine(extent)
+            .is_some()
+    }
+
+    /// Atomically reject new dedup pins after a quarantine is published. A pin
+    /// that wins the race before publication is waited out by
+    /// `begin_defrag_quarantine` after it drops the allocator lock.
+    pub fn pin_dedup_target_if_allowed(&self, start: Pba, count: u32) -> Option<PbaHazardGuard> {
+        let end = start.0.checked_add(count as u64)?;
+        if count == 0 || end > self.total_blocks.load(Ordering::Acquire) {
+            return None;
+        }
+        let extent = Extent::new(start, count);
+        let pools = self.free_pools.lock().unwrap();
+        if pools.overlapping_quarantine(extent).is_some() {
+            return None;
+        }
+        Some(
+            self.hazards
+                .pin_many((0..count).map(|offset| Pba(start.0 + offset as u64))),
+        )
     }
 
     /// Wait until no in-flight reader currently pins this physical extent.
@@ -299,8 +745,8 @@ impl SpaceAllocator {
     /// Allocate a single block. Returns PBA.
     pub fn allocate_one(&self) -> OnyxResult<Pba> {
         {
-            let mut free = self.free_extents.lock().unwrap();
-            if let Some(pba) = Self::alloc_one_from_set(&mut free) {
+            let mut pools = self.free_pools.lock().unwrap();
+            if let Some(pba) = Self::alloc_one_from_pools(&mut pools) {
                 self.track_alloc(Extent::single(pba), "allocate_one")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(1, Ordering::Relaxed);
@@ -310,8 +756,8 @@ impl SpaceAllocator {
         // Global pool empty — drain lane caches and retry
         if !self.lane_caches.is_empty() {
             self.drain_lane_caches();
-            let mut free = self.free_extents.lock().unwrap();
-            if let Some(pba) = Self::alloc_one_from_set(&mut free) {
+            let mut pools = self.free_pools.lock().unwrap();
+            if let Some(pba) = Self::alloc_one_from_pools(&mut pools) {
                 self.track_alloc(Extent::single(pba), "allocate_one_retry")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
                 self.free_blocks.fetch_sub(1, Ordering::Relaxed);
@@ -321,16 +767,11 @@ impl SpaceAllocator {
         Err(OnyxError::SpaceExhausted)
     }
 
-    /// Helper: take one block from the free set (no counter update).
-    /// Lowest-address extent first — `FreeSet::first` iterates by address.
-    fn alloc_one_from_set(free: &mut FreeSet) -> Option<Pba> {
-        let extent = free.first()?;
-        free.remove(&extent);
-        let pba = extent.start;
-        if extent.count > 1 {
-            free.insert(Extent::new(Pba(pba.0 + 1), extent.count - 1));
-        }
-        Some(pba)
+    /// Small allocations preserve allocator-wide first-fit-by-address across
+    /// both policy pools. This ordering is a MetaDB L2P codec correctness
+    /// contract; the reserve controls aligned ownership, never address order.
+    fn alloc_one_from_pools(pools: &mut FreePools) -> Option<Pba> {
+        Self::take_first_from_pools(pools, 1).map(|extent| extent.start)
     }
 
     /// Allocate a single block using the per-lane cache to avoid global lock contention.
@@ -350,44 +791,39 @@ impl SpaceAllocator {
                 return Ok(pba);
             }
         }
-        // Slow path: refill from global (blocks stay logically "free" in the cache)
-        let (first_pba, refill) = match self.take_extent_from_global(LANE_CACHE_REFILL_SIZE) {
-            Some(extent) => (extent.start, extent.count),
+        // Slow path: refill from global (blocks stay logically "free" in the cache).
+        // The global-pool removal and lane-tail publication share the FreePools
+        // critical section so defrag quarantine cannot miss an in-flight refill.
+        let first_pba = match self.refill_one_lane_from_global(lane, LANE_CACHE_REFILL_SIZE) {
+            Some(pba) => pba,
             None => {
                 self.drain_lane_caches();
-                let extent = self
-                    .take_extent_from_global(LANE_CACHE_REFILL_SIZE)
-                    .ok_or(OnyxError::SpaceExhausted)?;
-                (extent.start, extent.count)
+                self.refill_one_lane_from_global(lane, LANE_CACHE_REFILL_SIZE)
+                    .ok_or(OnyxError::SpaceExhausted)?
             }
         };
-        // First block goes to caller (counted as allocated), rest into cache
+        // First block goes to caller (counted as allocated); the helper has
+        // already published the remainder into the lane cache.
         self.track_alloc(Extent::single(first_pba), "allocate_one_for_lane_refill")?;
         self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
         self.free_blocks.fetch_sub(1, Ordering::Relaxed);
-        if refill > 1 {
-            let mut cache = self.lane_caches[lane].lock().unwrap();
-            for i in 1..refill {
-                cache.push(Pba(first_pba.0 + i as u64));
-            }
-        }
         Ok(first_pba)
     }
 
     /// Return all cached blocks from lane caches to the global free list.
     /// Called during shutdown to prevent block leaks.
     pub fn drain_lane_caches(&self) {
-        let mut free = self.free_extents.lock().unwrap();
+        let mut pools = self.free_pools.lock().unwrap();
         for cache_mutex in &self.lane_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for pba in cache.drain(..) {
-                free.coalesce_insert(Extent::single(pba));
+                pools.release_extent(Extent::single(pba));
             }
         }
         for cache_mutex in &self.lane_extent_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for extent in cache.drain(..) {
-                free.coalesce_insert(extent);
+                pools.release_extent(extent);
             }
         }
         // No counter adjustment needed: cached blocks were never counted as allocated
@@ -405,16 +841,11 @@ impl SpaceAllocator {
     /// or sitting in a lane cache (allocated from the free list but not yet
     /// handed out to a caller).
     pub fn is_free(&self, pba: Pba) -> bool {
-        let free = self.free_extents.lock().unwrap();
-        if free
-            .by_addr()
-            .range(..=Extent::single(pba))
-            .next_back()
-            .is_some_and(|extent| extent.contains(pba))
-        {
+        let pools = self.free_pools.lock().unwrap();
+        if pools.overlapping_free(Extent::single(pba)).is_some() {
             return true;
         }
-        drop(free);
+        drop(pools);
         for cache_mutex in &self.lane_caches {
             let cache = cache_mutex.lock().unwrap();
             if cache.contains(&pba) {
@@ -433,50 +864,40 @@ impl SpaceAllocator {
     /// Allocate a contiguous extent using a lane-local cache before touching
     /// the global free list. This is the hot path for raw 8/16/32 KiB flushes.
     pub fn allocate_extent_for_lane(&self, lane: usize, count: u32) -> OnyxResult<Extent> {
+        match self.allocate_exact_extent_for_lane(lane, count) {
+            Ok(extent) => Ok(extent),
+            Err(OnyxError::SpaceExhausted) => self.allocate_extent(count),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Exact-width lane allocation. Unlike [`Self::allocate_extent`], this API
+    /// never removes and returns the largest short fragment on a miss. Writers
+    /// that cannot safely consume a short extent use this to fail without a
+    /// compensating rollback/free cycle.
+    pub fn allocate_exact_extent_for_lane(&self, lane: usize, count: u32) -> OnyxResult<Extent> {
         if count == 0 {
             return Err(OnyxError::Config("cannot allocate 0 blocks".into()));
         }
         if lane >= self.lane_extent_caches.len() {
-            return self.allocate_extent(count);
-        }
-
-        let stripe_geometry = self.stripe_geometry().filter(|(stripe, _)| count < *stripe);
-
-        // Preserve scarce stripe-capable runs when confetti can satisfy this
-        // small allocation. This is preference-only: the ordinary cache/global
-        // paths below remain the availability fallback.
-        if let Some((stripe, phase)) = stripe_geometry {
-            {
-                let mut cache = self.lane_extent_caches[lane].lock().unwrap();
-                if let Some(extent) =
-                    Self::take_non_stripe_from_extent_cache(&mut cache, count, stripe, phase)
-                {
-                    self.track_alloc(extent, "allocate_extent_for_lane_fragment_cache")?;
+            for attempt in 0..2 {
+                if let Some(extent) = {
+                    let mut pools = self.free_pools.lock().unwrap();
+                    Self::take_exact_from_pools(&mut pools, count, count)
+                } {
+                    self.track_alloc(extent, "allocate_exact_extent_global")?;
                     self.allocated_blocks
                         .fetch_add(count as u64, Ordering::Relaxed);
                     self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
                     return Ok(extent);
                 }
-            }
-            if let Some(refill) = self
-                .take_non_stripe_extent_from_global_at_least(count, LANE_EXTENT_CACHE_REFILL_BLOCKS)
-            {
-                let result = Extent::new(refill.start, count);
-                self.track_alloc(result, "allocate_extent_for_lane_fragment_refill")?;
-                self.allocated_blocks
-                    .fetch_add(count as u64, Ordering::Relaxed);
-                self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
-                if refill.count > count {
-                    self.lane_extent_caches[lane]
-                        .lock()
-                        .unwrap()
-                        .push(Extent::new(
-                            Pba(refill.start.0 + count as u64),
-                            refill.count - count,
-                        ));
+                if attempt == 0 {
+                    self.drain_lane_caches();
+                    continue;
                 }
-                return Ok(result);
+                break;
             }
+            return Err(OnyxError::SpaceExhausted);
         }
 
         {
@@ -491,27 +912,23 @@ impl SpaceAllocator {
         }
 
         let target = LANE_EXTENT_CACHE_REFILL_BLOCKS.max(count);
-        let refill = self
-            .take_extent_from_global_at_least(count, target)
-            .or_else(|| {
-                self.drain_lane_caches();
-                self.take_extent_from_global_at_least(count, target)
-            });
+        let mut result = self.refill_extent_lane(lane, count, target);
+        if result.is_none() {
+            // A global fragment can become usable only after it coalesces with
+            // short pieces held by one or more lanes. Exact allocation is the
+            // ENOSPC boundary, so pay for one bounded drain and retry here.
+            self.drain_lane_caches();
+            result = self.refill_extent_lane(lane, count, target);
+        }
 
-        let Some(refill) = refill else {
-            return self.allocate_extent(count);
+        let Some(result) = result else {
+            return Err(OnyxError::SpaceExhausted);
         };
 
-        let result = Extent::new(refill.start, count);
         self.track_alloc(result, "allocate_extent_for_lane_refill")?;
         self.allocated_blocks
             .fetch_add(count as u64, Ordering::Relaxed);
         self.free_blocks.fetch_sub(count as u64, Ordering::Relaxed);
-
-        if refill.count > count {
-            let rest = Extent::new(Pba(refill.start.0 + count as u64), refill.count - count);
-            self.lane_extent_caches[lane].lock().unwrap().push(rest);
-        }
         Ok(result)
     }
 
@@ -568,27 +985,20 @@ impl SpaceAllocator {
             }
         }
 
-        // Refill: pull one run big enough to host `need` after worst-case head
-        // alignment (`need + stripe - 1`), sized to the normal lane refill. Push
-        // it into the cache and carve through the same remainder-handling path.
-        let floor = need + stripe_blocks - 1;
-        let want = LANE_EXTENT_CACHE_REFILL_BLOCKS.max(floor);
-        let refill = self
-            .take_extent_from_global_at_least(floor, want)
-            .or_else(|| {
-                self.drain_lane_caches();
-                self.take_extent_from_global_at_least(floor, want)
-            });
-        let Some(refill) = refill else {
-            // No run wide enough for a padded stripe; try any run that can host
-            // an aligned `need` exactly (a tight but aligned fragment).
+        // Refill only from the stripe reserve. General/free-fragment runs are
+        // deliberately invisible to this path so small allocation and aligned
+        // allocation cannot consume each other's working set.
+        let want = LANE_EXTENT_CACHE_REFILL_BLOCKS.max(need);
+        let mut extent = self.refill_stripe_extent_lane(lane, need, want, stripe_blocks, phase);
+        if extent.is_none() {
+            // A cold lane may hold the only remaining aligned refill. Reclaim
+            // all lane caches once at the reserve-miss boundary, then let the
+            // requesting lane seed itself from the reconstituted reserve.
+            self.drain_lane_caches();
+            extent = self.refill_stripe_extent_lane(lane, need, want, stripe_blocks, phase);
+        }
+        let Some(extent) = extent else {
             return self.allocate_stripe_extent_global(need, stripe_blocks, phase);
-        };
-        let extent = {
-            let mut cache = self.lane_extent_caches[lane].lock().unwrap();
-            cache.push(refill);
-            Self::take_aligned_from_extent_cache(&mut cache, need, stripe_blocks, phase)
-                .expect("refill run of need+stripe-1 always hosts an aligned need")
         };
         self.track_alloc(extent, "allocate_stripe_extent_for_lane_refill")?;
         self.allocated_blocks
@@ -681,39 +1091,14 @@ impl SpaceAllocator {
         stripe: u32,
         phase: u32,
     ) -> OnyxResult<Extent> {
-        for attempt in 0..2 {
-            let mut free = self.free_extents.lock().unwrap();
-            // First-fit-by-address over the carve predicate, via the size
-            // index (O(stripe·log N) instead of walking the fragment belt).
-            // Selection is identical to the old
-            // `iter().find(|e| carve_aligned_from_run(e, ..).is_some())`.
-            let chosen = free.first_fit_aligned(need, stripe, phase);
-            if let Some(run) = chosen {
-                debug_assert!(Self::carve_aligned_from_run(run, need, stripe, phase).is_some());
-                free.remove(&run);
-                let (aligned, head, tail) =
-                    Self::carve_aligned_from_run(run, need, stripe, phase).unwrap();
-                if let Some(head) = head {
-                    free.coalesce_insert(head);
-                }
-                if let Some(tail) = tail {
-                    free.coalesce_insert(tail);
-                }
-                drop(free);
-                self.track_alloc(aligned, "allocate_stripe_extent_global")?;
-                self.allocated_blocks
-                    .fetch_add(need as u64, Ordering::Relaxed);
-                self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
-                return Ok(aligned);
-            }
-            drop(free);
-            if attempt == 0 && self.has_lane_cached_blocks() {
-                self.drain_lane_caches();
-                continue;
-            }
-            break;
-        }
-        Err(OnyxError::SpaceExhausted)
+        let extent = self
+            .take_aligned_extent_from_global(need, stripe, phase)
+            .ok_or(OnyxError::SpaceExhausted)?;
+        self.track_alloc(extent, "allocate_stripe_extent_global")?;
+        self.allocated_blocks
+            .fetch_add(need as u64, Ordering::Relaxed);
+        self.free_blocks.fetch_sub(need as u64, Ordering::Relaxed);
+        Ok(extent)
     }
 
     /// Allocate up to `count` contiguous blocks. Returns the extent actually allocated
@@ -725,20 +1110,9 @@ impl SpaceAllocator {
 
         // Try allocation from global free list. If insufficient, drain lane caches and retry.
         for attempt in 0..2 {
-            let mut free = self.free_extents.lock().unwrap();
+            let mut pools = self.free_pools.lock().unwrap();
 
-            // First (lowest-address) extent that's large enough.
-            let exact = free.first_fit(count);
-
-            if let Some(extent) = exact {
-                free.remove(&extent);
-                let result = Extent::new(extent.start, count);
-                if extent.count > count {
-                    free.insert(Extent::new(
-                        Pba(extent.start.0 + count as u64),
-                        extent.count - count,
-                    ));
-                }
+            if let Some(result) = Self::take_exact_from_pools(&mut pools, count, count) {
                 self.track_alloc(result, "allocate_extent")?;
                 self.allocated_blocks
                     .fetch_add(count as u64, Ordering::Relaxed);
@@ -750,15 +1124,13 @@ impl SpaceAllocator {
             // enough free contiguous space, so fold them back once before
             // falling back to the largest global fragment.
             if attempt == 0 && self.has_lane_cached_blocks() {
-                drop(free);
+                drop(pools);
                 self.drain_lane_caches();
                 continue;
             }
 
             // No contiguous extent large enough — return the largest available
-            let largest = free.largest();
-            if let Some(extent) = largest {
-                free.remove(&extent);
+            if let Some(extent) = Self::take_largest_from_pools(&mut pools) {
                 self.track_alloc(extent, "allocate_extent_largest")?;
                 self.allocated_blocks
                     .fetch_add(extent.count as u64, Ordering::Relaxed);
@@ -768,7 +1140,7 @@ impl SpaceAllocator {
             }
 
             // No free extents at all — drain lane caches and retry once
-            drop(free);
+            drop(pools);
             if attempt == 0 && self.has_lane_cached_blocks() {
                 self.drain_lane_caches();
                 continue;
@@ -809,8 +1181,8 @@ impl SpaceAllocator {
         self.ensure_not_in_lane_cache(extent, "retire_extent")?;
 
         let newly = {
-            let free = self.free_extents.lock().unwrap();
-            if let Some(e) = Self::overlapping_extent(free.by_addr(), extent) {
+            let pools = self.free_pools.lock().unwrap();
+            if let Some(e) = pools.overlapping_free(extent) {
                 return Err(OnyxError::Config(format!(
                     "retire_extent: extent {:?} overlaps free extent {:?}",
                     extent, e
@@ -891,7 +1263,7 @@ impl SpaceAllocator {
             let mut chunk_retired: Vec<Extent> = Vec::new();
             // Lock order: free (outermost) → retired → retired_age, held across
             // the chunk (matches `retire_extent_at`).
-            let free = self.free_extents.lock().unwrap();
+            let pools = self.free_pools.lock().unwrap();
             let mut retired = self.retired_extents.lock().unwrap();
             let mut age = self.retired_age.lock().unwrap();
             for &extent in chunk {
@@ -906,7 +1278,7 @@ impl SpaceAllocator {
                     .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
                     || Self::sorted_extents_overlap(&lane_exts, extent);
                 if in_lane
-                    || Self::overlapping_extent(free.by_addr(), extent).is_some()
+                    || pools.overlapping_free(extent).is_some()
                     || u64::from(extent.count) > current_alloc
                 {
                     failed.push(extent);
@@ -933,7 +1305,7 @@ impl SpaceAllocator {
             }
             drop(age);
             drop(retired);
-            drop(free);
+            drop(pools);
             // Diagnostic trace outside the lock section (see retire_extent_at).
             for &extent in &chunk_retired {
                 crate::space::free_trace::trace_retire(extent, "retire_batch");
@@ -987,7 +1359,7 @@ impl SpaceAllocator {
             let mut chunk_freed: u64 = 0;
             let mut chunk_released: Vec<Extent> = Vec::with_capacity(chunk.len());
             {
-                let mut free = self.free_extents.lock().unwrap();
+                let mut pools = self.free_pools.lock().unwrap();
                 let retired = self.retired_extents.lock().unwrap();
                 for &extent in chunk {
                     if self
@@ -1001,7 +1373,7 @@ impl SpaceAllocator {
                         .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
                         || Self::sorted_extents_overlap(&lane_exts, extent);
                     if in_lane
-                        || Self::overlapping_extent(free.by_addr(), extent).is_some()
+                        || pools.overlapping_free(extent).is_some()
                         || Self::overlapping_extent(&retired, extent).is_some()
                     {
                         failed.push(extent);
@@ -1018,7 +1390,7 @@ impl SpaceAllocator {
                         failed.push(extent);
                         continue;
                     }
-                    free.coalesce_insert(extent);
+                    pools.release_extent(extent);
                     self.track_release(extent, "free_extents_batch");
                     chunk_released.push(extent);
                     chunk_freed += u64::from(extent.count);
@@ -1258,8 +1630,8 @@ impl SpaceAllocator {
             self.hazards.wait_extent_clear(extent.start, extent.count);
             self.ensure_not_in_lane_cache(extent, "reclaim_retired_extent")?;
 
-            let mut free = self.free_extents.lock().unwrap();
-            if let Some(e) = Self::overlapping_extent(free.by_addr(), extent) {
+            let mut pools = self.free_pools.lock().unwrap();
+            if let Some(e) = pools.overlapping_free(extent) {
                 return Err(OnyxError::Config(format!(
                     "reclaim_retired_extent: extent {:?} overlaps free extent {:?}",
                     extent, e
@@ -1273,7 +1645,7 @@ impl SpaceAllocator {
                 )));
             }
 
-            free.coalesce_insert(extent);
+            pools.release_extent(extent);
             self.track_release(extent, "reclaim_retired_extent");
             self.allocated_blocks
                 .fetch_sub(extent.count as u64, Ordering::Relaxed);
@@ -1396,12 +1768,12 @@ impl SpaceAllocator {
             let mut chunk_reclaimed: Vec<Extent> = Vec::new();
             let mut chunk_freed: u64 = 0;
             {
-                let mut free = self.free_extents.lock().unwrap();
+                let mut pools = self.free_pools.lock().unwrap();
                 for &extent in &removed {
                     let in_lane = (0..extent.count)
                         .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
                         || Self::sorted_extents_overlap(&lane_exts, extent);
-                    if in_lane || Self::overlapping_extent(free.by_addr(), extent).is_some() {
+                    if in_lane || pools.overlapping_free(extent).is_some() {
                         conflicts.push(extent);
                         continue;
                     }
@@ -1413,7 +1785,7 @@ impl SpaceAllocator {
                         conflicts.push(extent);
                         continue;
                     }
-                    free.coalesce_insert(extent);
+                    pools.release_extent(extent);
                     self.track_release(extent, "reclaim_retired_extents_batch");
                     chunk_reclaimed.push(extent);
                     chunk_freed += u64::from(extent.count);
@@ -1492,9 +1864,9 @@ impl SpaceAllocator {
         self.hazards.wait_extent_clear(extent.start, extent.count);
 
         {
-            let mut free = self.free_extents.lock().unwrap();
-            self.ensure_not_free_or_retired_after_wait(extent, free.by_addr())?;
-            free.coalesce_insert(extent);
+            let mut pools = self.free_pools.lock().unwrap();
+            self.ensure_not_free_or_retired_after_wait(extent, &pools)?;
+            pools.release_extent(extent);
             self.track_release(extent, "free_extent");
         }
         // Diagnostic trace outside the free lock (see retire_extent_at).
@@ -1510,10 +1882,10 @@ impl SpaceAllocator {
         self.validate_extent_shape(extent, "free_extent")?;
         self.ensure_not_in_lane_cache(extent, "free_extent")?;
 
-        let free = self.free_extents.lock().unwrap();
+        let pools = self.free_pools.lock().unwrap();
 
         // Check no overlap with existing free extents
-        if let Some(e) = Self::overlapping_extent(free.by_addr(), extent) {
+        if let Some(e) = pools.overlapping_free(extent) {
             return Err(OnyxError::Config(format!(
                 "free_extent: extent {:?} overlaps free extent {:?}",
                 extent, e
@@ -1577,21 +1949,70 @@ impl SpaceAllocator {
         Ok(())
     }
 
+    /// Detach the portions of lane-cached free space covered by `target`.
+    ///
+    /// The caller must hold `free_pools`; this establishes the allocator-wide
+    /// lock order `FreePools -> lane cache`. Allocation paths release a lane
+    /// cache before acquiring `FreePools`, so quarantine publication cannot
+    /// deadlock with a refill/drain. Counters are unchanged because the blocks
+    /// remain logically free while moving from a lane cache to quarantine.
+    fn extract_lane_cache_free_parts(&self, target: Extent) -> Vec<Extent> {
+        let mut extracted = Vec::new();
+
+        for cache_mutex in &self.lane_caches {
+            let mut cache = cache_mutex.lock().unwrap();
+            cache.retain(|pba| {
+                if target.contains(*pba) {
+                    extracted.push(Extent::single(*pba));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        for cache_mutex in &self.lane_extent_caches {
+            let mut cache = cache_mutex.lock().unwrap();
+            let mut retained = Vec::with_capacity(cache.len());
+            for cached in cache.drain(..) {
+                if !Self::extents_overlap(cached, target) {
+                    retained.push(cached);
+                    continue;
+                }
+
+                let intersection_start = cached.start.0.max(target.start.0);
+                let intersection_end = cached.end_pba().0.min(target.end_pba().0);
+                if cached.start.0 < intersection_start {
+                    retained.push(Extent::new(
+                        cached.start,
+                        (intersection_start - cached.start.0) as u32,
+                    ));
+                }
+                extracted.push(Extent::new(
+                    Pba(intersection_start),
+                    (intersection_end - intersection_start) as u32,
+                ));
+                if intersection_end < cached.end_pba().0 {
+                    retained.push(Extent::new(
+                        Pba(intersection_end),
+                        (cached.end_pba().0 - intersection_end) as u32,
+                    ));
+                }
+            }
+            *cache = retained;
+        }
+
+        extracted
+    }
+
     /// Return true if the whole extent is already covered by a free extent
     /// or all its blocks are sitting in lane caches.
     pub fn is_extent_free(&self, extent: Extent) -> bool {
-        let free = self.free_extents.lock().unwrap();
-        if free
-            .by_addr()
-            .range(..=extent)
-            .next_back()
-            .is_some_and(|existing| {
-                extent.start.0 >= existing.start.0 && extent.end_pba().0 <= existing.end_pba().0
-            })
-        {
+        let pools = self.free_pools.lock().unwrap();
+        if pools.covers_free(extent) {
             return true;
         }
-        drop(free);
+        drop(pools);
         // Fallback: check if every block in the extent is in a lane cache.
         (0..extent.count).all(|i| {
             let pba = Pba(extent.start.0 + i as u64);
@@ -1643,12 +2064,12 @@ impl SpaceAllocator {
         self.total_blocks.store(new_total, Ordering::Release);
         let added = new_total - old_total;
         {
-            let mut free = self.free_extents.lock().unwrap();
+            let mut pools = self.free_pools.lock().unwrap();
             let mut start = old_total;
             let mut remaining = added;
             while remaining > 0 {
                 let count = remaining.min(u32::MAX as u64) as u32;
-                free.insert(Extent::new(Pba(start), count));
+                pools.insert_classified(Extent::new(Pba(start), count));
                 start += count as u64;
                 remaining -= count as u64;
             }
@@ -1666,21 +2087,50 @@ impl SpaceAllocator {
     /// O(1)/O(log N) fragmentation snapshot of the global free set — one lock
     /// acquisition. `free_blocks_in_set` deliberately EXCLUDES lane-cached
     /// extents (they are drained out of the set), so
-    /// `eff_capacity_blocks / free_blocks_in_set` is a consistent
-    /// "stripe-capable fraction" — the defrag trigger signal.
+    /// `stripe_capable_blocks / free_blocks_in_set` is the defrag trigger
+    /// signal. Active quarantine-free blocks remain in the denominator but are
+    /// intentionally unavailable in the numerator until publication.
     pub fn contiguity_stats(&self) -> ContiguityStats {
-        let free = self.free_extents.lock().unwrap();
+        let pools = self.free_pools.lock().unwrap();
+        let quarantine_free_blocks: u64 = pools
+            .quarantines
+            .values()
+            .map(|target| target.free_parts.blocks_total())
+            .sum();
+        let quarantine_target_blocks: u64 = pools
+            .quarantines
+            .values()
+            .map(|target| target.range.count as u64)
+            .sum();
+        let geometry = pools.geometry();
         ContiguityStats {
-            free_blocks_in_set: free.blocks_total(),
-            free_extents: free.len() as u64,
-            largest_run_blocks: free.largest().map_or(0, |e| e.count),
-            stripe_capable_blocks: free.geometry().map(|_| free.stripe_capacity()),
+            free_blocks_in_set: pools.free_blocks_in_pools(),
+            free_extents: (pools.general.len()
+                + pools.stripe_reserve.len()
+                + pools
+                    .quarantines
+                    .values()
+                    .map(|target| target.free_parts.len())
+                    .sum::<usize>()) as u64,
+            largest_run_blocks: pools
+                .general
+                .largest()
+                .into_iter()
+                .chain(pools.stripe_reserve.largest())
+                .map(|extent| extent.count)
+                .max()
+                .unwrap_or(0),
+            stripe_capable_blocks: geometry
+                .map(|_| pools.general.stripe_capacity() + pools.stripe_reserve.stripe_capacity()),
+            stripe_reserve_blocks: pools.stripe_reserve.blocks_total(),
+            quarantine_target_blocks,
+            quarantine_free_blocks,
         }
     }
 
     /// The configured RAID geometry `(stripe_blocks, phase)`, if any.
     pub fn stripe_geometry(&self) -> Option<(u32, u32)> {
-        self.free_extents.lock().unwrap().geometry()
+        self.free_pools.lock().unwrap().geometry()
     }
 
     /// Blocks of `range` covered by free extents — the defrag target "done"
@@ -1688,19 +2138,39 @@ impl SpaceAllocator {
     pub(crate) fn free_overlap_blocks(&self, range: Extent) -> u64 {
         let s = range.start.0;
         let e = range.end_pba().0;
-        let free = self.free_extents.lock().unwrap();
-        let set = free.by_addr();
-        let mut covered = 0u64;
-        if let Some(prev) = set.range(..=Extent::single(range.start)).next_back() {
-            covered += prev.end_pba().0.min(e).saturating_sub(s);
-        }
-        for ext in set.range(Extent::single(Pba(s + 1))..) {
-            if ext.start.0 >= e {
-                break;
+        let pools = self.free_pools.lock().unwrap();
+        let overlap = |set: &FreeSet| {
+            let mut covered = 0u64;
+            if let Some(prev) = set
+                .by_addr()
+                .range(..=Extent::single(range.start))
+                .next_back()
+            {
+                covered += prev.end_pba().0.min(e).saturating_sub(s);
             }
-            covered += ext.end_pba().0.min(e) - ext.start.0;
-        }
-        covered
+            for ext in set.by_addr().range(Extent::single(Pba(s + 1))..) {
+                if ext.start.0 >= e {
+                    break;
+                }
+                covered += ext.end_pba().0.min(e) - ext.start.0;
+            }
+            covered
+        };
+        overlap(&pools.general)
+            + overlap(&pools.stripe_reserve)
+            + pools
+                .quarantine_starts_overlapping(range)
+                .into_iter()
+                .map(|start| {
+                    overlap(
+                        &pools
+                            .quarantines
+                            .get(&start)
+                            .expect("quarantine key remains present")
+                            .free_parts,
+                    )
+                })
+                .sum::<u64>()
     }
 
     /// Snapshot up to `max` free extents strictly below `below`, DESCENDING by
@@ -1712,8 +2182,10 @@ impl SpaceAllocator {
         if max == 0 {
             return Vec::new();
         }
-        let free = self.free_extents.lock().unwrap();
-        free.by_addr()
+        let pools = self.free_pools.lock().unwrap();
+        pools
+            .general
+            .by_addr()
             .range(..Extent::single(below))
             .rev()
             .take(max)
@@ -1748,7 +2220,8 @@ impl SpaceAllocator {
     /// (alignment pads must not fragment the free list into per-alloc slivers).
     #[cfg(test)]
     pub(crate) fn free_extent_run_count(&self) -> usize {
-        self.free_extents.lock().unwrap().len()
+        let pools = self.free_pools.lock().unwrap();
+        pools.general.len() + pools.stripe_reserve.len()
     }
 
     fn coalesce_and_insert_any_overlap(set: &mut BTreeSet<Extent>, new: Extent) {
@@ -1798,9 +2271,9 @@ impl SpaceAllocator {
     fn ensure_not_free_or_retired_after_wait(
         &self,
         extent: Extent,
-        free: &BTreeSet<Extent>,
+        pools: &FreePools,
     ) -> OnyxResult<()> {
-        if let Some(e) = Self::overlapping_extent(free, extent) {
+        if let Some(e) = pools.overlapping_free(extent) {
             return Err(OnyxError::Config(format!(
                 "free_extent: extent {:?} overlaps free extent {:?} after hazard wait",
                 extent, e
@@ -1825,77 +2298,213 @@ impl SpaceAllocator {
                 .any(|cache| !cache.lock().unwrap().is_empty())
     }
 
-    fn take_extent_from_global(&self, max_count: u32) -> Option<Extent> {
-        let mut free = self.free_extents.lock().unwrap();
-        let extent = free.first()?;
-        free.remove(&extent);
-        let take = extent.count.min(max_count);
-        if extent.count > take {
-            free.insert(Extent::new(
-                Pba(extent.start.0 + take as u64),
-                extent.count - take,
-            ));
+    /// Transfer a global refill into a single-block lane cache atomically with
+    /// respect to defrag quarantine publication. The returned first block is no
+    /// longer free; every remaining block is visible in the lane cache before
+    /// `FreePools` is unlocked.
+    fn refill_one_lane_from_global(&self, lane: usize, max_count: u32) -> Option<Pba> {
+        let mut pools = self.free_pools.lock().unwrap();
+        let refill = Self::take_first_from_pools(&mut pools, max_count)?;
+        if refill.count > 1 {
+            let mut cache = self.lane_caches[lane].lock().unwrap();
+            for i in 1..refill.count {
+                cache.push(Pba(refill.start.0 + i as u64));
+            }
         }
-        Some(Extent::new(extent.start, take))
+        Some(refill.start)
     }
 
-    fn take_extent_from_global_at_least(&self, count: u32, max_count: u32) -> Option<Extent> {
-        let mut free = self.free_extents.lock().unwrap();
-        // First-fit-by-address via the size index — O(D·log N), and the "no
-        // run >= count exists" refill miss is a fail-fast instead of an O(N)
-        // walk of the whole fragment belt under this lock.
-        let extent = free.first_fit(count)?;
-        free.remove(&extent);
-        let take = extent.count.min(max_count);
-        if extent.count > take {
-            free.insert(Extent::new(
-                Pba(extent.start.0 + take as u64),
-                extent.count - take,
-            ));
-        }
-        Some(Extent::new(extent.start, take))
-    }
-
-    fn take_non_stripe_extent_from_global_at_least(
-        &self,
-        count: u32,
-        max_count: u32,
-    ) -> Option<Extent> {
-        let mut free = self.free_extents.lock().unwrap();
-        let extent = free.first_fit_non_stripe(count)?;
-        free.remove(&extent);
-        let take = extent.count.min(max_count);
-        if extent.count > take {
-            free.insert(Extent::new(
-                Pba(extent.start.0 + take as u64),
-                extent.count - take,
-            ));
-        }
-        Some(Extent::new(extent.start, take))
-    }
-
-    fn take_from_extent_cache(cache: &mut Vec<Extent>, count: u32) -> Option<Extent> {
-        let idx = cache.iter().position(|extent| extent.count >= count)?;
-        let extent = cache[idx];
-        let result = Extent::new(extent.start, count);
-        if extent.count == count {
-            cache.swap_remove(idx);
-        } else {
-            cache[idx] = Extent::new(Pba(extent.start.0 + count as u64), extent.count - count);
+    /// Take exactly `count` blocks for the caller and publish the rest of the
+    /// refill into its extent cache before releasing `FreePools`.
+    fn refill_extent_lane(&self, lane: usize, count: u32, max_count: u32) -> Option<Extent> {
+        let mut pools = self.free_pools.lock().unwrap();
+        let refill = Self::take_exact_from_pools(&mut pools, count, max_count)?;
+        let result = Extent::new(refill.start, count);
+        if refill.count > count {
+            self.lane_extent_caches[lane]
+                .lock()
+                .unwrap()
+                .push(Extent::new(
+                    Pba(refill.start.0 + count as u64),
+                    refill.count - count,
+                ));
         }
         Some(result)
     }
 
-    fn take_non_stripe_from_extent_cache(
-        cache: &mut Vec<Extent>,
-        count: u32,
+    fn refill_stripe_extent_lane(
+        &self,
+        lane: usize,
+        min_count: u32,
+        max_count: u32,
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
-        let idx = cache.iter().position(|extent| {
-            extent.count >= count
-                && Self::carve_aligned_from_run(*extent, stripe, stripe, phase).is_none()
-        })?;
+        let mut pools = self.free_pools.lock().unwrap();
+        if pools.geometry() != Some((stripe, phase)) {
+            return None;
+        }
+        let extent = pools.stripe_reserve.first_fit(min_count)?;
+        pools.stripe_reserve.remove(&extent);
+        let available = extent.count.min(max_count);
+        let take = (available / stripe) * stripe;
+        if take < min_count {
+            pools.stripe_reserve.insert(extent);
+            return None;
+        }
+        if extent.count > take {
+            pools.insert_classified(Extent::new(
+                Pba(extent.start.0 + take as u64),
+                extent.count - take,
+            ));
+        }
+        let refill = Extent::new(extent.start, take);
+        let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+        cache.push(refill);
+        Some(
+            Self::take_aligned_from_extent_cache(&mut cache, min_count, stripe, phase)
+                .expect("stripe-reserve refill is aligned and large enough"),
+        )
+    }
+
+    /// Take an aligned extent while preserving the legacy API contract that
+    /// the geometry supplied to `allocate_stripe_extent_for_lane` is enough on
+    /// its own. Production's configured geometry uses the O(log N) reserve
+    /// path; tests and hypothetical alternate-geometry callers fall back to
+    /// the indexed aligned search across both policy pools.
+    fn take_aligned_extent_from_global(
+        &self,
+        need: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<Extent> {
+        let mut pools = self.free_pools.lock().unwrap();
+        let reserve_only = pools.geometry() == Some((stripe, phase));
+        let (from_reserve, run) = if reserve_only {
+            (true, pools.stripe_reserve.first_fit(need)?)
+        } else {
+            let general = pools.general.first_fit_aligned(need, stripe, phase);
+            let reserve = pools.stripe_reserve.first_fit_aligned(need, stripe, phase);
+            match (general, reserve) {
+                (Some(general), Some(reserve)) => {
+                    if reserve.start.0 < general.start.0 {
+                        (true, reserve)
+                    } else {
+                        (false, general)
+                    }
+                }
+                (Some(general), None) => (false, general),
+                (None, Some(reserve)) => (true, reserve),
+                (None, None) => return None,
+            }
+        };
+
+        let (aligned, head, tail) = Self::carve_aligned_from_run(run, need, stripe, phase)?;
+        if from_reserve {
+            pools.stripe_reserve.remove(&run);
+        } else {
+            pools.general.remove(&run);
+        }
+        if let Some(head) = head {
+            pools.insert_classified(head);
+        }
+        if let Some(tail) = tail {
+            pools.insert_classified(tail);
+        }
+        Some(aligned)
+    }
+
+    fn take_first_from_pools(pools: &mut FreePools, max_count: u32) -> Option<Extent> {
+        let (from_reserve, extent) =
+            Self::lowest_pool_candidate(pools.general.first(), pools.stripe_reserve.first())?;
+        if from_reserve {
+            pools.stripe_reserve.remove(&extent);
+        } else {
+            pools.general.remove(&extent);
+        }
+        let take = extent.count.min(max_count);
+        if extent.count > take {
+            let tail = Extent::new(Pba(extent.start.0 + take as u64), extent.count - take);
+            if from_reserve {
+                pools.insert_classified(tail);
+            } else {
+                pools.general.insert(Extent::new(
+                    Pba(extent.start.0 + take as u64),
+                    extent.count - take,
+                ));
+            }
+        }
+        Some(Extent::new(extent.start, take))
+    }
+
+    fn take_exact_from_pools(
+        pools: &mut FreePools,
+        min_count: u32,
+        max_count: u32,
+    ) -> Option<Extent> {
+        let (from_reserve, extent) = Self::lowest_pool_candidate(
+            pools.general.first_fit(min_count),
+            pools.stripe_reserve.first_fit(min_count),
+        )?;
+        if from_reserve {
+            pools.stripe_reserve.remove(&extent);
+        } else {
+            pools.general.remove(&extent);
+        }
+        let take = extent.count.min(max_count);
+        if extent.count > take {
+            let tail = Extent::new(Pba(extent.start.0 + take as u64), extent.count - take);
+            if from_reserve {
+                pools.insert_classified(tail);
+            } else {
+                pools.general.insert(Extent::new(
+                    Pba(extent.start.0 + take as u64),
+                    extent.count - take,
+                ));
+            }
+        }
+        Some(Extent::new(extent.start, take))
+    }
+
+    fn lowest_pool_candidate(
+        general: Option<Extent>,
+        reserve: Option<Extent>,
+    ) -> Option<(bool, Extent)> {
+        match (general, reserve) {
+            (Some(general), Some(reserve)) => {
+                if reserve.start.0 < general.start.0 {
+                    Some((true, reserve))
+                } else {
+                    Some((false, general))
+                }
+            }
+            (Some(general), None) => Some((false, general)),
+            (None, Some(reserve)) => Some((true, reserve)),
+            (None, None) => None,
+        }
+    }
+
+    fn take_largest_from_pools(pools: &mut FreePools) -> Option<Extent> {
+        let general = pools.general.largest();
+        let reserve = pools.stripe_reserve.largest();
+        let take_reserve = match (general, reserve) {
+            (None, Some(_)) => true,
+            (Some(g), Some(r)) => (r.count, r.start.0) > (g.count, g.start.0),
+            _ => false,
+        };
+        if take_reserve {
+            let extent = reserve.expect("selected reserve candidate");
+            pools.stripe_reserve.remove(&extent);
+            Some(extent)
+        } else {
+            let extent = general?;
+            pools.general.remove(&extent);
+            Some(extent)
+        }
+    }
+
+    fn take_from_extent_cache(cache: &mut Vec<Extent>, count: u32) -> Option<Extent> {
+        let idx = cache.iter().position(|extent| extent.count >= count)?;
         let extent = cache[idx];
         let result = Extent::new(extent.start, count);
         if extent.count == count {
@@ -1932,6 +2541,370 @@ impl SpaceAllocator {
     fn overlapping_retired_extent(&self, extent: Extent) -> Option<Extent> {
         let retired = self.retired_extents.lock().unwrap();
         Self::overlapping_extent(&retired, extent)
+    }
+}
+
+#[cfg(test)]
+mod free_pool_policy_tests {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const STRIPE: u32 = 6;
+    const PHASE: u32 = 2;
+
+    fn allocator(blocks: u64, lanes: usize) -> SpaceAllocator {
+        SpaceAllocator::new(blocks * BLOCK_SIZE as u64, lanes)
+    }
+
+    #[test]
+    fn sub_stripe_release_before_next_alignment_never_expands() {
+        let mut pools = FreePools::new();
+        pools.set_geometry(STRIPE, PHASE);
+        let released = Extent::new(Pba(12_954), 2);
+
+        pools.insert_classified(released);
+
+        assert_eq!(pools.free_blocks_in_pools(), 2);
+        assert_eq!(pools.stripe_reserve.blocks_total(), 0);
+        assert_eq!(
+            pools.general.by_addr().iter().copied().collect::<Vec<_>>(),
+            vec![released]
+        );
+        assert!(pools
+            .overlapping_free(Extent::single(released.end_pba()))
+            .is_none());
+    }
+
+    #[test]
+    fn adjacent_u32_sized_releases_coalesce_without_count_truncation() {
+        let mut pools = FreePools::new();
+        pools.set_geometry(STRIPE, 0);
+        let start = 12u64;
+        let first = Extent::new(Pba(start), u32::MAX);
+        let second = Extent::new(Pba(start + u32::MAX as u64), 100);
+
+        pools.insert_classified(first);
+        pools.insert_classified(second);
+
+        let expected = u32::MAX as u64 + 100;
+        assert_eq!(pools.free_blocks_in_pools(), expected);
+        assert!(pools
+            .stripe_reserve
+            .by_addr()
+            .iter()
+            .all(|extent| extent.count.is_multiple_of(STRIPE)));
+
+        let mut runs: Vec<Extent> = pools.general.by_addr().iter().copied().collect();
+        runs.extend(pools.stripe_reserve.by_addr().iter().copied());
+        runs.sort_unstable_by_key(|extent| extent.start.0);
+        assert_eq!(runs.first().unwrap().start.0, start);
+        assert_eq!(runs.last().unwrap().end_pba().0, start + expected);
+        assert!(runs
+            .windows(2)
+            .all(|pair| pair[0].end_pba().0 == pair[1].start.0));
+        assert_eq!(
+            runs.iter().map(|extent| extent.count as u64).sum::<u64>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn geometry_change_preserves_quarantined_free_blocks() {
+        let mut pools = FreePools::new();
+        pools.set_geometry(STRIPE, PHASE);
+        pools.insert_classified(Extent::new(Pba(30), 5));
+        let mut free_parts = pools.empty_set_with_geometry();
+        free_parts.insert(Extent::new(Pba(100), 3));
+        pools.quarantines.insert(
+            100,
+            QuarantineTarget {
+                range: Extent::new(Pba(100), STRIPE),
+                free_parts,
+            },
+        );
+        let before = pools.free_blocks_in_pools();
+
+        pools.set_geometry(4, 0);
+
+        assert!(pools.quarantines.is_empty());
+        assert_eq!(pools.free_blocks_in_pools(), before);
+        assert!(pools.overlapping_free(Extent::new(Pba(100), 3)).is_some());
+    }
+
+    #[test]
+    fn exact_miss_drains_once_without_consuming_short_space() {
+        let allocator = allocator(RESERVED_BLOCKS + 4, 1);
+        assert_eq!(
+            allocator.allocate_exact_extent_for_lane(0, 1).unwrap(),
+            Extent::single(Pba(RESERVED_BLOCKS))
+        );
+        let cached_before = allocator.lane_extent_caches[0].lock().unwrap().clone();
+        let free_before = allocator.free_block_count();
+        assert_eq!(
+            cached_before,
+            vec![Extent::new(Pba(RESERVED_BLOCKS + 1), 3)]
+        );
+
+        for _ in 0..2 {
+            assert!(matches!(
+                allocator.allocate_exact_extent_for_lane(0, 4),
+                Err(OnyxError::SpaceExhausted)
+            ));
+            assert_eq!(allocator.free_block_count(), free_before);
+            assert!(allocator.is_extent_free(cached_before[0]));
+        }
+        assert!(allocator.lane_extent_caches[0].lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_miss_coalesces_global_and_lane_boundary_before_enospc() {
+        let allocator = allocator(32, 1);
+        {
+            let mut pools = allocator.free_pools.lock().unwrap();
+            *pools = FreePools::new();
+            pools.general.insert(Extent::single(Pba(13)));
+        }
+        allocator.lane_extent_caches[0]
+            .lock()
+            .unwrap()
+            .push(Extent::new(Pba(14), 2));
+
+        assert_eq!(
+            allocator.allocate_exact_extent_for_lane(0, 3).unwrap(),
+            Extent::new(Pba(13), 3)
+        );
+    }
+
+    #[test]
+    fn cross_pool_selection_is_first_fit_for_single_exact_and_lane_refill() {
+        let mut pools = FreePools::new();
+        pools.general.insert(Extent::new(Pba(100), 16));
+        pools.stripe_reserve.insert(Extent::new(Pba(10), 24));
+
+        assert_eq!(
+            SpaceAllocator::alloc_one_from_pools(&mut pools),
+            Some(Pba(10))
+        );
+        assert_eq!(
+            SpaceAllocator::take_exact_from_pools(&mut pools, 4, 4),
+            Some(Extent::new(Pba(11), 4))
+        );
+
+        let allocator = allocator(128, 1);
+        {
+            let mut allocator_pools = allocator.free_pools.lock().unwrap();
+            *allocator_pools = pools;
+        }
+        assert_eq!(
+            allocator.refill_extent_lane(0, 2, 8),
+            Some(Extent::new(Pba(15), 2))
+        );
+    }
+
+    #[test]
+    fn quarantine_cannot_miss_pool_to_lane_refill_in_flight() {
+        let allocator = Arc::new(allocator(128, 1));
+        let target = Extent::new(Pba(10), STRIPE);
+        {
+            let mut pools = allocator.free_pools.lock().unwrap();
+            *pools = FreePools::new();
+            pools.general.set_geometry(STRIPE, PHASE);
+            pools.stripe_reserve.set_geometry(STRIPE, PHASE);
+            pools.stripe_reserve.insert(target);
+        }
+
+        let held_lane = allocator.lane_caches[0].lock().unwrap();
+        let refill = {
+            let allocator = Arc::clone(&allocator);
+            thread::spawn(move || {
+                allocator
+                    .refill_one_lane_from_global(0, LANE_CACHE_REFILL_SIZE)
+                    .expect("test reserve contains a refill")
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if matches!(
+                allocator.free_pools.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "refill never acquired FreePools");
+            thread::yield_now();
+        }
+        let quarantine = {
+            let allocator = Arc::clone(&allocator);
+            thread::spawn(move || allocator.begin_defrag_quarantine(target))
+        };
+        drop(held_lane);
+
+        let first = refill.join().unwrap();
+        quarantine.join().unwrap().unwrap();
+        assert_eq!(first, target.start);
+        assert_eq!(
+            allocator.defrag_quarantine_progress(target.start),
+            Some((u64::from(STRIPE - 1), u64::from(STRIPE)))
+        );
+        assert!(allocator.lane_caches[0]
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|pba| !target.contains(*pba)));
+
+        allocator
+            .track_alloc(Extent::single(first), "quarantine_refill_test")
+            .unwrap();
+        allocator.allocated_blocks.fetch_add(1, Ordering::Relaxed);
+        allocator.free_blocks.fetch_sub(1, Ordering::Relaxed);
+        allocator.free_one(first).unwrap();
+        assert!(allocator.complete_defrag_quarantine(target.start).unwrap());
+    }
+
+    #[test]
+    fn free_coverage_crosses_general_reserve_boundaries_by_run() {
+        let allocator = allocator(32, 0);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let usable = Extent::new(Pba(RESERVED_BLOCKS), 32 - RESERVED_BLOCKS as u32);
+        assert!(allocator.is_extent_free(usable));
+
+        let allocated = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        assert!(!allocator.is_extent_free(usable));
+        allocator.free_extent(allocated).unwrap();
+        assert!(allocator.is_extent_free(usable));
+    }
+
+    #[test]
+    fn explicit_alternate_stripe_geometry_keeps_legacy_api_working() {
+        let allocator = allocator(64, 1);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+
+        let extent = allocator
+            .allocate_stripe_extent_for_lane(0, 3, 4, 0)
+            .unwrap();
+
+        assert_eq!(extent.count, 4);
+        assert_eq!(extent.start.0 % 4, 0);
+    }
+
+    #[test]
+    fn quarantine_extracts_and_splits_lane_extent_cache() {
+        let allocator = allocator(32, 1);
+        assert_eq!(
+            allocator.allocate_exact_extent_for_lane(0, 1).unwrap(),
+            Extent::single(Pba(RESERVED_BLOCKS))
+        );
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let target = Extent::new(Pba(10), STRIPE);
+
+        allocator.begin_defrag_quarantine(target).unwrap();
+
+        assert_eq!(
+            allocator.defrag_quarantine_progress(target.start),
+            Some((STRIPE as u64, STRIPE as u64))
+        );
+        let cached = allocator.lane_extent_caches[0].lock().unwrap().clone();
+        assert_eq!(
+            cached,
+            vec![Extent::single(Pba(9)), Extent::new(Pba(16), 16),]
+        );
+        assert!(allocator.complete_defrag_quarantine(target.start).unwrap());
+        assert_eq!(
+            allocator.contiguity_stats().stripe_reserve_blocks,
+            STRIPE as u64
+        );
+    }
+
+    #[test]
+    fn quarantine_extracts_single_block_lane_cache_members() {
+        let allocator = allocator(32, 1);
+        assert_eq!(
+            allocator.allocate_one_for_lane(0).unwrap(),
+            Pba(RESERVED_BLOCKS)
+        );
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let target = Extent::new(Pba(10), STRIPE);
+
+        allocator.begin_defrag_quarantine(target).unwrap();
+
+        assert_eq!(
+            allocator.defrag_quarantine_progress(target.start),
+            Some((STRIPE as u64, STRIPE as u64))
+        );
+        assert!(allocator.lane_caches[0]
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|pba| !target.contains(*pba)));
+        assert!(allocator.complete_defrag_quarantine(target.start).unwrap());
+    }
+
+    #[test]
+    fn quarantine_routes_releases_until_target_is_complete() {
+        let allocator = allocator(128, 0);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let target = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        assert_eq!(target, Extent::new(Pba(10), STRIPE));
+        allocator.begin_defrag_quarantine(target).unwrap();
+
+        allocator
+            .free_extent(Extent::new(target.start, STRIPE / 2))
+            .unwrap();
+        assert_eq!(
+            allocator.defrag_quarantine_progress(target.start),
+            Some(((STRIPE / 2) as u64, STRIPE as u64))
+        );
+        assert!(!allocator.complete_defrag_quarantine(target.start).unwrap());
+
+        allocator
+            .free_extent(Extent::new(
+                Pba(target.start.0 + (STRIPE / 2) as u64),
+                STRIPE / 2,
+            ))
+            .unwrap();
+        assert!(allocator.complete_defrag_quarantine(target.start).unwrap());
+        assert!(!allocator.is_defrag_quarantined(target));
+        assert!(allocator.contiguity_stats().stripe_reserve_blocks >= STRIPE as u64);
+    }
+
+    #[test]
+    fn dedup_pin_and_quarantine_publication_are_atomic() {
+        let allocator = Arc::new(allocator(128, 0));
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let target = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        let old_pin = allocator
+            .pin_dedup_target_if_allowed(target.start, target.count)
+            .expect("pin before publication must succeed");
+
+        let worker = {
+            let allocator = Arc::clone(&allocator);
+            thread::spawn(move || allocator.begin_defrag_quarantine(target))
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !allocator.is_defrag_quarantined(target) {
+            assert!(Instant::now() < deadline, "quarantine was not published");
+            thread::yield_now();
+        }
+        assert!(allocator
+            .pin_dedup_target_if_allowed(target.start, target.count)
+            .is_none());
+        assert!(
+            !worker.is_finished(),
+            "pre-publication pin must be waited out"
+        );
+
+        drop(old_pin);
+        worker.join().unwrap().unwrap();
+        assert!(allocator.cancel_defrag_quarantine(target.start));
     }
 }
 
@@ -2379,9 +3352,10 @@ mod age_tests {
         let t0 = Instant::now();
         a.retire_extent_at(Extent::single(p), t0).unwrap();
         // Inject the inconsistency: the same PBA is also in the free list.
-        a.free_extents
+        a.free_pools
             .lock()
             .unwrap()
+            .general
             .insert_for_test(Extent::single(p));
         let (blocks, cnt) = a
             .reclaim_retired_extents_batch(&[Extent::single(p)], &run_flag())
@@ -2427,9 +3401,10 @@ mod age_tests {
         let t0 = Instant::now();
         a.retire_extent_at(Extent::new(Pba(n), 4), t0).unwrap();
         a.retire_extent_at(Extent::single(Pba(n + 8)), t0).unwrap();
-        a.free_extents
+        a.free_pools
             .lock()
             .unwrap()
+            .general
             .insert_for_test(Extent::single(Pba(n + 8))); // conflict on n+8
         let batch = [
             Extent::new(Pba(n), 2),      // freed (sub-extent of [n,4])
@@ -2552,10 +3527,17 @@ mod age_tests {
             a_seq.allocated_block_count(),
             a_batch.allocated_block_count()
         );
+        let seq_pools = a_seq.free_pools.lock().unwrap();
+        let batch_pools = a_batch.free_pools.lock().unwrap();
         assert_eq!(
-            *a_seq.free_extents.lock().unwrap().by_addr(),
-            *a_batch.free_extents.lock().unwrap().by_addr(),
-            "end-state free lists must be identical"
+            *seq_pools.general.by_addr(),
+            *batch_pools.general.by_addr(),
+            "end-state general free lists must be identical"
+        );
+        assert_eq!(
+            *seq_pools.stripe_reserve.by_addr(),
+            *batch_pools.stripe_reserve.by_addr(),
+            "end-state stripe reserves must be identical"
         );
     }
 
@@ -2674,27 +3656,40 @@ mod stripe_align_tests {
     }
 
     #[test]
-    fn small_lane_allocations_preserve_stripe_capable_run_when_possible() {
+    fn small_lane_allocations_preserve_cross_pool_first_fit() {
         let allocator = new_alloc_lanes(64, 1);
-        allocator.set_stripe_geometry(STRIPE, PHASE);
         let usable = 64 - RESERVED_BLOCKS;
         allocator.allocate_extent(usable as u32).unwrap();
+        allocator.set_stripe_geometry(STRIPE, PHASE);
         allocator.free_extent(Extent::new(Pba(10), 12)).unwrap();
         allocator.free_extent(Extent::new(Pba(30), 5)).unwrap();
 
-        for expected in 30..35 {
+        for expected in 10..22 {
             let extent = allocator.allocate_extent_for_lane(0, 1).unwrap();
             assert_eq!(extent, Extent::single(Pba(expected)));
         }
-        let stats = allocator.contiguity_stats();
-        assert_eq!(stats.stripe_capable_blocks, Some(12));
-
-        // Preference must not become an availability failure: once confetti is
-        // exhausted, ordinary first-fit is still allowed to consume the run.
         assert_eq!(
             allocator.allocate_extent_for_lane(0, 1).unwrap(),
-            Extent::single(Pba(10))
+            Extent::single(Pba(30))
         );
+    }
+
+    #[test]
+    fn stripe_reserve_miss_reclaims_cold_lane_refill_for_hot_lane() {
+        let allocator = new_alloc_lanes(128, 2);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+
+        let cold = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        assert!(!allocator.lane_extent_caches[0].lock().unwrap().is_empty());
+
+        let hot = allocator
+            .allocate_stripe_extent_for_lane(1, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        assert_ne!(hot, cold);
+        assert_eq!((hot.start.0 + u64::from(PHASE)) % u64::from(STRIPE), 0);
+        assert_eq!(hot.count, STRIPE);
     }
 
     #[test]

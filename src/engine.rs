@@ -2074,6 +2074,9 @@ impl OnyxEngine {
             allocator_largest_run_blocks: contiguity.map(|c| c.largest_run_blocks as u64),
             allocator_stripe_capable_blocks: contiguity.and_then(|c| c.stripe_capable_blocks),
             allocator_free_blocks_in_set: contiguity.map(|c| c.free_blocks_in_set),
+            allocator_stripe_reserve_blocks: contiguity.map(|c| c.stripe_reserve_blocks),
+            allocator_quarantine_target_blocks: contiguity.map(|c| c.quarantine_target_blocks),
+            allocator_quarantine_free_blocks: contiguity.map(|c| c.quarantine_free_blocks),
             heat: self.heat.as_ref().map(|h| h.cached_summary()),
             meta_fenced: self
                 .buffer_pool

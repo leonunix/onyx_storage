@@ -585,6 +585,122 @@ fn dropped_deferred_ticket_is_published_by_sync() {
 }
 
 #[test]
+fn relocation_source_is_live_only_and_cleared_on_recovery() {
+    let size = 16 * 1024 * 1024;
+    let (pool, tmp) = create_pool(size, Duration::from_millis(1));
+    let source = crate::space::extent::Extent::new(crate::types::Pba(900), 2);
+    let ticket = pool
+        .append_relocation_deferred_checked(
+            "test-vol",
+            Lba(40),
+            2,
+            &[0xC3; 2 * BLOCK_SIZE as usize],
+            5,
+            source,
+            || Ok(true),
+        )
+        .unwrap()
+        .unwrap();
+    let seq = ticket.wait();
+
+    assert_eq!(
+        pool.pending_entry_arc(seq).unwrap().relocation_source,
+        Some(source)
+    );
+    drop(pool);
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let reopened =
+        WriteBufferPool::open_with_group_commit_wait(dev, Duration::from_millis(1)).unwrap();
+    let recovered = reopened.pending_entry_arc(seq).unwrap();
+    assert_eq!(recovered.relocation_source, None);
+    assert_eq!(recovered.start_lba, Lba(40));
+    assert_eq!(recovered.lba_count, 2);
+}
+
+#[test]
+fn foreground_append_cannot_be_overtaken_after_relocation_validation() {
+    let (pool, _tmp) = create_pool(32 * 1024 * 1024, Duration::from_millis(1));
+    let pool = Arc::new(pool);
+    let source = crate::space::extent::Extent::single(crate::types::Pba(900));
+    let (validated_tx, validated_rx) = bounded(1);
+    let (release_tx, release_rx) = bounded(1);
+
+    let gc_pool = pool.clone();
+    let gc = std::thread::spawn(move || {
+        let ticket = gc_pool
+            .append_relocation_deferred_checked(
+                "test-vol",
+                Lba(77),
+                1,
+                &[0x11; BLOCK_SIZE as usize],
+                5,
+                source,
+                || {
+                    validated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(true)
+                },
+            )
+            .unwrap()
+            .unwrap();
+        ticket.wait()
+    });
+
+    validated_rx.recv().unwrap();
+    let foreground_pool = pool.clone();
+    let (foreground_started_tx, foreground_started_rx) = bounded(1);
+    let foreground = std::thread::spawn(move || {
+        foreground_started_tx.send(()).unwrap();
+        foreground_pool
+            .append("test-vol", Lba(77), 1, &[0xEE; BLOCK_SIZE as usize], 5)
+            .unwrap()
+    });
+    foreground_started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(
+        !foreground.is_finished(),
+        "foreground must queue behind relocation's validate+append critical section"
+    );
+
+    release_tx.send(()).unwrap();
+    let gc_seq = gc.join().unwrap();
+    let foreground_seq = foreground.join().unwrap();
+    assert!(foreground_seq > gc_seq);
+    let latest = pool.lookup("test-vol", Lba(77)).unwrap().unwrap();
+    assert_eq!(latest.seq, foreground_seq);
+    assert_eq!(latest.payload.unwrap()[0], 0xEE);
+}
+
+#[test]
+fn stale_relocation_validation_consumes_no_seq_or_ring_entry() {
+    let (pool, _tmp) = create_pool(16 * 1024 * 1024, Duration::from_millis(1));
+    let source = crate::space::extent::Extent::single(crate::types::Pba(901));
+    let first_seq = pool
+        .append("test-vol", Lba(88), 1, &[0xAB; BLOCK_SIZE as usize], 5)
+        .unwrap();
+
+    let relocation = pool
+        .append_relocation_deferred_checked(
+            "test-vol",
+            Lba(88),
+            1,
+            &[0x11; BLOCK_SIZE as usize],
+            5,
+            source,
+            || Ok(pool.lookup("test-vol", Lba(88))?.is_none()),
+        )
+        .unwrap();
+    assert!(relocation.is_none());
+
+    let second_seq = pool
+        .append("test-vol", Lba(89), 1, &[0xCD; BLOCK_SIZE as usize], 5)
+        .unwrap();
+    assert_eq!(second_seq, first_seq + 1, "rejected relocation used a seq");
+    assert_eq!(pool.pending_count(), 2);
+}
+
+#[test]
 fn uring_sync_batch_chunks_over_sq_depth() {
     let tmp = NamedTempFile::new().unwrap();
     let slot = BufferShard::slot_size();
@@ -631,6 +747,7 @@ fn uring_sync_batch_chunks_over_sq_depth() {
             lba_count: 1,
             payload_crc32: payload_crc,
             vol_created_at: 7,
+            relocation_source: None,
             payload: Some(payload.clone()),
             disk_offset: i * (disk_len as u64 + slot),
             disk_len,
@@ -805,6 +922,7 @@ fn uring_sync_fast_path_single_linked_chain() {
             lba_count: 1,
             payload_crc32: payload_crc,
             vol_created_at: 9,
+            relocation_source: None,
             payload: Some(payload.clone()),
             disk_offset: next_off,
             disk_len,

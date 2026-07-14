@@ -87,6 +87,19 @@ impl EngineMetrics {
             buffer_lv2_watermark_dispatch_latency_buckets: self
                 .buffer_lv2_watermark_dispatch_latency
                 .snapshot(),
+            buffer_lv2_payload_profile_samples: load(&self.buffer_lv2_payload_profile_samples),
+            buffer_lv2_payload_profile_wall_ns: load(&self.buffer_lv2_payload_profile_wall_ns),
+            buffer_lv2_payload_profile_cpu_ns: load(&self.buffer_lv2_payload_profile_cpu_ns),
+            buffer_lv2_payload_profile_offcpu_ns: load(&self.buffer_lv2_payload_profile_offcpu_ns),
+            buffer_lv2_payload_profile_wall_max_ns: load(
+                &self.buffer_lv2_payload_profile_wall_max_ns,
+            ),
+            buffer_lv2_payload_profile_cpu_max_ns: load(
+                &self.buffer_lv2_payload_profile_cpu_max_ns,
+            ),
+            buffer_lv2_payload_profile_offcpu_max_ns: load(
+                &self.buffer_lv2_payload_profile_offcpu_max_ns,
+            ),
             buffer_backpressure_events: load(&self.buffer_backpressure_events),
             buffer_backpressure_wait_ns: load(&self.buffer_backpressure_wait_ns),
             buffer_throttle_count: load(&self.buffer_throttle_count),
@@ -234,6 +247,22 @@ impl EngineMetrics {
             flush_commit_worker_executor_queue_wait_ns: load(
                 &self.flush_commit_worker_executor_queue_wait_ns,
             ),
+            flush_commit_aggregator_seals_target: load(&self.flush_commit_aggregator_seals_target),
+            flush_commit_aggregator_seals_capacity: load(
+                &self.flush_commit_aggregator_seals_capacity,
+            ),
+            flush_commit_aggregator_seals_deadline: load(
+                &self.flush_commit_aggregator_seals_deadline,
+            ),
+            flush_commit_aggregator_seals_adaptive_underfill: load(
+                &self.flush_commit_aggregator_seals_adaptive_underfill,
+            ),
+            flush_commit_aggregator_seals_pressure: load(
+                &self.flush_commit_aggregator_seals_pressure,
+            ),
+            flush_commit_aggregator_seals_shutdown: load(
+                &self.flush_commit_aggregator_seals_shutdown,
+            ),
             flush_commit_worker_service_ns: load(&self.flush_commit_worker_service_ns),
             flush_commit_worker_jobs: load(&self.flush_commit_worker_jobs),
             flush_commit_worker_job_lbas: load(&self.flush_commit_worker_job_lbas),
@@ -334,11 +363,24 @@ impl EngineMetrics {
             gc_defrag_candidates: load(&self.gc_defrag_candidates),
             gc_defrag_blocks_selected: load(&self.gc_defrag_blocks_selected),
             gc_defrag_blocks_moved: load(&self.gc_defrag_blocks_moved),
+            gc_defrag_segments_completed: load(&self.gc_defrag_segments_completed),
+            gc_defrag_segments_cancelled: load(&self.gc_defrag_segments_cancelled),
+            gc_defrag_dedup_hits_rejected: load(&self.gc_defrag_dedup_hits_rejected),
             allocator_free_extents: load(&self.allocator_free_extents),
             allocator_largest_free_run: load(&self.allocator_largest_free_run),
             allocator_stripe_capable_blocks: load(&self.allocator_stripe_capable_blocks),
             allocator_free_blocks_in_set: load(&self.allocator_free_blocks_in_set),
+            allocator_stripe_reserve_blocks: load(&self.allocator_stripe_reserve_blocks),
+            allocator_quarantine_target_blocks: load(&self.allocator_quarantine_target_blocks),
+            allocator_quarantine_free_blocks: load(&self.allocator_quarantine_free_blocks),
             flush_writer_stripe_starved_batches: load(&self.flush_writer_stripe_starved_batches),
+            flush_writer_group_aligned_ops: load(&self.flush_writer_group_aligned_ops),
+            flush_writer_group_unaligned_ops: load(&self.flush_writer_group_unaligned_ops),
+            flush_writer_group_short_extent_allocs: load(
+                &self.flush_writer_group_short_extent_allocs,
+            ),
+            flush_writer_group_fallback_units: load(&self.flush_writer_group_fallback_units),
+            flush_writer_group_unused_blocks: load(&self.flush_writer_group_unused_blocks),
             gc_errors: load(&self.gc_errors),
             gc_reclaim_premature_free_averted: load(&self.gc_reclaim_premature_free_averted),
             gc_lineage_freed_blocks: load(&self.gc_lineage_freed_blocks),
@@ -443,6 +485,20 @@ pub struct EngineMetricsSnapshot {
     pub buffer_lv2_checkpoint_write_latency_buckets: Vec<u64>,
     pub buffer_lv2_root_flush_latency_buckets: Vec<u64>,
     pub buffer_lv2_watermark_dispatch_latency_buckets: Vec<u64>,
+    #[serde(default)]
+    pub buffer_lv2_payload_profile_samples: u64,
+    #[serde(default)]
+    pub buffer_lv2_payload_profile_wall_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_payload_profile_cpu_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_payload_profile_offcpu_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_payload_profile_wall_max_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_payload_profile_cpu_max_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_payload_profile_offcpu_max_ns: u64,
     pub buffer_backpressure_events: u64,
     pub buffer_backpressure_wait_ns: u64,
     pub buffer_throttle_count: u64,
@@ -574,6 +630,18 @@ pub struct EngineMetricsSnapshot {
     pub flush_commit_worker_aggregator_residence_ns: u64,
     #[serde(default)]
     pub flush_commit_worker_executor_queue_wait_ns: u64,
+    #[serde(default)]
+    pub flush_commit_aggregator_seals_target: u64,
+    #[serde(default)]
+    pub flush_commit_aggregator_seals_capacity: u64,
+    #[serde(default)]
+    pub flush_commit_aggregator_seals_deadline: u64,
+    #[serde(default)]
+    pub flush_commit_aggregator_seals_adaptive_underfill: u64,
+    #[serde(default)]
+    pub flush_commit_aggregator_seals_pressure: u64,
+    #[serde(default)]
+    pub flush_commit_aggregator_seals_shutdown: u64,
     pub flush_commit_worker_service_ns: u64,
     pub flush_commit_worker_jobs: u64,
     pub flush_commit_worker_job_lbas: u64,
@@ -664,11 +732,33 @@ pub struct EngineMetricsSnapshot {
     pub gc_defrag_candidates: u64,
     pub gc_defrag_blocks_selected: u64,
     pub gc_defrag_blocks_moved: u64,
+    #[serde(default)]
+    pub gc_defrag_segments_completed: u64,
+    #[serde(default)]
+    pub gc_defrag_segments_cancelled: u64,
+    #[serde(default)]
+    pub gc_defrag_dedup_hits_rejected: u64,
     pub allocator_free_extents: u64,
     pub allocator_largest_free_run: u64,
     pub allocator_stripe_capable_blocks: u64,
     pub allocator_free_blocks_in_set: u64,
+    #[serde(default)]
+    pub allocator_stripe_reserve_blocks: u64,
+    #[serde(default)]
+    pub allocator_quarantine_target_blocks: u64,
+    #[serde(default)]
+    pub allocator_quarantine_free_blocks: u64,
     pub flush_writer_stripe_starved_batches: u64,
+    #[serde(default)]
+    pub flush_writer_group_aligned_ops: u64,
+    #[serde(default)]
+    pub flush_writer_group_unaligned_ops: u64,
+    #[serde(default)]
+    pub flush_writer_group_short_extent_allocs: u64,
+    #[serde(default)]
+    pub flush_writer_group_fallback_units: u64,
+    #[serde(default)]
+    pub flush_writer_group_unused_blocks: u64,
     pub gc_errors: u64,
     pub gc_reclaim_premature_free_averted: u64,
     pub gc_lineage_freed_blocks: u64,
@@ -811,6 +901,13 @@ impl EngineMetricsSnapshot {
             buffer_sync_bytes,
             buffer_sync_entries_max,
             buffer_sync_bytes_max,
+            buffer_lv2_payload_profile_samples,
+            buffer_lv2_payload_profile_wall_ns,
+            buffer_lv2_payload_profile_cpu_ns,
+            buffer_lv2_payload_profile_offcpu_ns,
+            buffer_lv2_payload_profile_wall_max_ns,
+            buffer_lv2_payload_profile_cpu_max_ns,
+            buffer_lv2_payload_profile_offcpu_max_ns,
             buffer_backpressure_events,
             buffer_backpressure_wait_ns,
             buffer_throttle_count,
@@ -932,6 +1029,12 @@ impl EngineMetricsSnapshot {
             flush_commit_worker_queue_wait_ns,
             flush_commit_worker_aggregator_residence_ns,
             flush_commit_worker_executor_queue_wait_ns,
+            flush_commit_aggregator_seals_target,
+            flush_commit_aggregator_seals_capacity,
+            flush_commit_aggregator_seals_deadline,
+            flush_commit_aggregator_seals_adaptive_underfill,
+            flush_commit_aggregator_seals_pressure,
+            flush_commit_aggregator_seals_shutdown,
             flush_commit_worker_service_ns,
             flush_commit_worker_jobs,
             flush_commit_worker_job_lbas,
@@ -1022,11 +1125,22 @@ impl EngineMetricsSnapshot {
             gc_defrag_candidates,
             gc_defrag_blocks_selected,
             gc_defrag_blocks_moved,
+            gc_defrag_segments_completed,
+            gc_defrag_segments_cancelled,
+            gc_defrag_dedup_hits_rejected,
             allocator_free_extents,
             allocator_largest_free_run,
             allocator_stripe_capable_blocks,
             allocator_free_blocks_in_set,
+            allocator_stripe_reserve_blocks,
+            allocator_quarantine_target_blocks,
+            allocator_quarantine_free_blocks,
             flush_writer_stripe_starved_batches,
+            flush_writer_group_aligned_ops,
+            flush_writer_group_unaligned_ops,
+            flush_writer_group_short_extent_allocs,
+            flush_writer_group_fallback_units,
+            flush_writer_group_unused_blocks,
             gc_errors,
             gc_reclaim_premature_free_averted,
             gc_lineage_freed_blocks,
@@ -1068,5 +1182,40 @@ impl EngineMetricsSnapshot {
             volume_discard_lbas,
             discard_blocks_freed,
         }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::metrics::EngineMetrics;
+
+    #[test]
+    fn new_production_metrics_default_when_reading_an_older_engine() {
+        let mut value = serde_json::to_value(EngineMetrics::default().snapshot()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "gc_defrag_segments_completed",
+            "gc_defrag_segments_cancelled",
+            "gc_defrag_dedup_hits_rejected",
+            "allocator_stripe_reserve_blocks",
+            "allocator_quarantine_target_blocks",
+            "allocator_quarantine_free_blocks",
+            "flush_writer_group_aligned_ops",
+            "flush_writer_group_unaligned_ops",
+            "flush_writer_group_short_extent_allocs",
+            "flush_writer_group_fallback_units",
+            "flush_writer_group_unused_blocks",
+        ] {
+            assert!(
+                object.remove(field).is_some(),
+                "missing fixture field {field}"
+            );
+        }
+
+        let decoded: EngineMetricsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.gc_defrag_segments_completed, 0);
+        assert_eq!(decoded.allocator_stripe_reserve_blocks, 0);
+        assert_eq!(decoded.flush_writer_group_aligned_ops, 0);
     }
 }

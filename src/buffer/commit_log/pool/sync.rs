@@ -4,6 +4,32 @@ use std::os::fd::RawFd;
 
 const POST_WRITE_VERIFY: bool = false;
 
+/// Profiling every root write would add two clock syscalls to the LV2 hot path.
+/// One sample per 64 calls is frequent enough for one-second metrics deltas while
+/// keeping the measurement overhead negligible.
+const LV2_PAYLOAD_PROFILE_SAMPLE_MASK: u64 = 63;
+
+fn should_sample_lv2_payload_write(sequence: &mut u64) -> bool {
+    *sequence = sequence.wrapping_add(1);
+    *sequence & LV2_PAYLOAD_PROFILE_SAMPLE_MASK == 0
+}
+
+#[cfg(target_os = "linux")]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let ts = unsafe { ts.assume_init() };
+    Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
+
 /// ZFS `zil_commit_waiter` floor: even with a cold/zero EMA (or a pathologically
 /// fast device) the OPEN batch accumulates at least this long before sealing, so
 /// the loop never busy-seals empty/tiny batches. The adaptive close window is
@@ -1110,6 +1136,7 @@ impl WriteBufferPool {
                         crate::affinity::ThreadRole::BufferSync,
                         lane_idx,
                     );
+                    let mut payload_profile_sequence = 0u64;
                     while let Ok(first) = lane_rx.recv() {
                         if let Some(metrics) = metrics.get() {
                             metrics.record_buffer_lv2_prepared_queue_ns(
@@ -1172,6 +1199,9 @@ impl WriteBufferPool {
                                 }));
                             }
                             let write_started = Instant::now();
+                            let profile_this_write =
+                                should_sample_lv2_payload_write(&mut payload_profile_sequence);
+                            let cpu_started = profile_this_write.then(thread_cpu_time).flatten();
                             match root_device.write_many_at(&ops) {
                                 Ok(()) => {
                                     let write_elapsed = write_started.elapsed();
@@ -1192,6 +1222,14 @@ impl WriteBufferPool {
                                         metrics.record_buffer_lv2_payload_write_ns(
                                             write_elapsed.as_nanos() as u64,
                                         );
+                                        if let Some(cpu_elapsed) = cpu_started.and_then(|started| {
+                                            thread_cpu_time().map(|now| now.saturating_sub(started))
+                                        }) {
+                                            metrics.record_buffer_lv2_payload_profile(
+                                                write_elapsed.as_nanos() as u64,
+                                                cpu_elapsed.as_nanos() as u64,
+                                            );
+                                        }
                                     }
                                     break;
                                 }
@@ -1736,5 +1774,19 @@ impl WriteBufferPool {
                 BufferShard::record_metric(&metrics.buffer_sync_batch_ns, batch_start);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod payload_profile_tests {
+    use super::should_sample_lv2_payload_write;
+
+    #[test]
+    fn payload_profile_samples_exactly_one_in_sixty_four_writes() {
+        let mut sequence = 0;
+        let sampled = (1..=128)
+            .filter(|_| should_sample_lv2_payload_write(&mut sequence))
+            .collect::<Vec<_>>();
+        assert_eq!(sampled, vec![64, 128]);
     }
 }

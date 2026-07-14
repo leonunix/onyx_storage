@@ -31,6 +31,7 @@ fn compress_loop_keeps_none_payload_scattered_until_writer() {
         .map(|i| crate::buffer::pipeline::RawBlockRef {
             payload: raw_arc.clone(),
             offset: i * BLOCK_SIZE as usize,
+            relocation_source: None,
         })
         .collect();
     tx.send(CoalesceUnit {
@@ -79,6 +80,7 @@ fn compress_loop_bypasses_low_savings_units() {
         .map(|i| crate::buffer::pipeline::RawBlockRef {
             payload: raw_arc.clone(),
             offset: i * BLOCK_SIZE as usize,
+            relocation_source: None,
         })
         .collect();
 

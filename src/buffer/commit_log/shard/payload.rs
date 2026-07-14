@@ -521,6 +521,7 @@ impl BufferShard {
             lba_count: pending.lba_count,
             payload_crc32: pending.payload_crc32,
             vol_created_at: pending.vol_created_at,
+            relocation_source: pending.relocation_source,
             payload: None,
             disk_offset: pending.disk_offset,
             disk_len: pending.disk_len,
