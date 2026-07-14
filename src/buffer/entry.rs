@@ -288,7 +288,13 @@ impl BufferEntry {
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&buf[0..36]);
-        hasher.update(&buf[40..data_end]);
+        hasher.update(&buf[40..payload_start]);
+        // append already hashed the payload before staging this entry. Rebuild
+        // that hash state and combine it with the header CRC so preparation
+        // does not scan the payload a second time.
+        let payload_hasher =
+            crc32fast::Hasher::new_with_initial_len(payload_crc32, payload.len() as u64);
+        hasher.combine(&payload_hasher);
         let entry_crc = hasher.finalize();
         buf[36..40].copy_from_slice(&entry_crc.to_le_bytes());
 
@@ -719,5 +725,66 @@ impl BufferEntry {
             },
             slot_count,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_full_entry_crc_matches_direct_payload_scan() {
+        for payload_len in [
+            BLOCK_SIZE as usize,
+            8 * BLOCK_SIZE as usize,
+            32 * BLOCK_SIZE as usize,
+        ] {
+            let payload = (0..payload_len)
+                .map(|index| (index.wrapping_mul(131) as u8) ^ 0x5a)
+                .collect::<Vec<_>>();
+            for volume_id_len in [1, MAX_VOLUME_ID_BYTES] {
+                let volume_id = "v".repeat(volume_id_len);
+                let payload_crc = crc32fast::hash(&payload);
+                let encoded = BufferEntry::encode(
+                    0x0102_0304_0506_0708,
+                    &volume_id,
+                    Lba(0x1112_1314_1516_1718),
+                    (payload_len / BLOCK_SIZE as usize) as u32,
+                    payload_crc,
+                    false,
+                    0x2122_2324_2526_2728,
+                    &payload,
+                )
+                .unwrap();
+
+                let payload_start = FIXED_HEADER_SIZE + volume_id_len;
+                let data_end = payload_start + payload_len;
+                let mut reference = crc32fast::Hasher::new();
+                reference.update(&encoded[0..36]);
+                reference.update(&encoded[40..data_end]);
+                let stored = u32::from_le_bytes(encoded[36..40].try_into().unwrap());
+
+                assert_eq!(stored, reference.finalize());
+                assert!(BufferEntry::from_bytes(&encoded).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn combined_full_entry_crc_rejects_mismatched_payload_crc() {
+        let payload = vec![0xa5; BLOCK_SIZE as usize];
+        let encoded = BufferEntry::encode(
+            1,
+            "v",
+            Lba(2),
+            1,
+            crc32fast::hash(&payload) ^ 1,
+            false,
+            3,
+            &payload,
+        )
+        .unwrap();
+
+        assert!(BufferEntry::from_bytes(&encoded).is_none());
     }
 }
