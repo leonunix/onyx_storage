@@ -9,6 +9,7 @@ use onyx_metadb::dedup::{DedupMigrationStatus, MigrateStepStats};
 use onyx_metadb::{
     Config as MetaDbConfig, Db, DedupValue, DeferredOutcomeHandle, L2pValue, Lsn, VolumeOrdinal,
 };
+use serde::Serialize;
 
 use crate::config::MetaConfig;
 use crate::error::{OnyxError, OnyxResult};
@@ -17,7 +18,9 @@ use crate::meta::store::{DedupHitResult, RemapCleanup, SnapshotInfo, SnapshotRes
 use crate::metrics::MetaMemorySnapshot;
 use crate::types::{Lba, Pba, VolumeConfig, VolumeId};
 
-use super::codec::{blockmap_from_l2p_bytes, freed_blocks_for_l2p_value};
+use super::codec::{
+    blockmap_from_l2p_bytes, freed_blocks_for_l2p_value, L2P_BIRTH_OFFSET, L2P_SEQ_OFFSET,
+};
 
 const METADB_DEDUP_VALUE_BYTES: usize = 28;
 const METADB_PAGE_FILE: &str = "pages.onyx_meta";
@@ -1878,29 +1881,198 @@ impl MetadbBackend {
     }
 }
 
-/// Offline audit entry point: open metadb on the meta LD `meta_backend`
-/// **read-only** (errors if the LD was never initialised, never creates one)
-/// and run the same reachability/orphan-page scan `metadb-verify` runs for
-/// the plain-file backend. Callers own opening the chunklet pool exclusively
-/// first (e.g. `chunklet_pool::open_role_backend`) — this requires the live
-/// engine to NOT be holding the pool's flock.
+/// Offline audit entry point: open metadb on the meta LD `meta_backend` and
+/// run the same reachability/orphan-page scan `metadb-verify` runs for the
+/// plain-file backend. The audit open never initialises a fresh MetaDB and
+/// disables continuous background mutation, but it is not a strictly
+/// read-only open: chunklet may already have reconciled the pool, and MetaDB
+/// may replay lifecycle records and persist the recovery result. Callers own
+/// opening the chunklet pool exclusively first (e.g.
+/// `chunklet_pool::open_role_backend`) — the live engine must not hold its
+/// flock.
 pub fn verify_meta_ld(
     config: &MetaConfig,
     meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
     options: onyx_metadb::VerifyOptions,
 ) -> OnyxResult<onyx_metadb::VerifyReport> {
+    let db = open_meta_ld_for_offline_audit(config, meta_backend)?;
+    Ok(db.verify(options)?)
+}
+
+/// One volume's result in an offline chunklet-backed MetaDB point probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbProbeVolume {
+    pub volume_ordinal: VolumeOrdinal,
+    pub mapping: Option<MetaDbProbeMapping>,
+}
+
+/// Decoded Onyx payload plus the MetaDB-owned L2P trailer fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbProbeMapping {
+    pub pba: u64,
+    /// `None` for an explicit zero mapping, whose PBA field is ignored.
+    pub refcount: Option<u32>,
+    pub commit_seq: u64,
+    pub birth_lsn: u64,
+    pub compression: u8,
+    pub unit_compressed_size: u32,
+    pub unit_original_size: u32,
+    pub unit_lba_count: u16,
+    pub offset_in_unit: u16,
+    pub crc32: u32,
+    pub slot_offset: u16,
+    pub flags: u8,
+    pub is_zero: bool,
+}
+
+/// Optional independent refcount point query requested with `--pba`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbProbePba {
+    pub pba: u64,
+    pub refcount: u32,
+}
+
+/// Complete result of one bounded, offline MetaDB probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbProbeReport {
+    pub lba: u64,
+    pub volumes: Vec<MetaDbProbeVolume>,
+    pub explicit_pba: Option<MetaDbProbePba>,
+}
+
+/// Open chunklet-backed MetaDB for an offline audit and perform bounded point
+/// lookups.
+///
+/// The caller must own an exclusive chunklet pool open, which naturally
+/// enforces the offline-only contract. The open can perform required pool
+/// reconciliation and MetaDB lifecycle recovery before the query, but all
+/// continuous background mutators are disabled. The query walks only the
+/// manifest's volume ordinals, performs one L2P lookup per volume, and batches
+/// the mapped/explicit PBAs through MetaDB's fold-consistent refcount reader.
+/// It never scans L2P or reads LV3 payload data.
+pub fn probe_meta_ld(
+    config: &MetaConfig,
+    meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
+    lba: u64,
+    explicit_pba: Option<u64>,
+) -> OnyxResult<MetaDbProbeReport> {
+    let db = open_meta_ld_for_offline_audit(config, meta_backend)?;
+
+    let mut volumes = Vec::new();
+    let mut refcount_pbas = Vec::new();
+    for volume in db.manifest().volumes {
+        let mapping = match db.get(volume.ord, lba)? {
+            Some(raw) => {
+                let value = decode_l2p_value(raw).map_err(|err| {
+                    OnyxError::Config(format!(
+                        "metadb L2P value for volume {} LBA {} is invalid: {err}",
+                        volume.ord, lba
+                    ))
+                })?;
+                if !value.is_zero() {
+                    refcount_pbas.push(value.pba.0);
+                }
+                let commit_seq = u64::from_be_bytes(
+                    raw.0[L2P_SEQ_OFFSET..L2P_BIRTH_OFFSET]
+                        .try_into()
+                        .expect("MetaDB L2P seq field has fixed length"),
+                );
+                let birth_lsn = u64::from_be_bytes(
+                    raw.0[L2P_BIRTH_OFFSET..]
+                        .try_into()
+                        .expect("MetaDB L2P birth field has fixed length"),
+                );
+                Some(MetaDbProbeMapping {
+                    pba: value.pba.0,
+                    refcount: None,
+                    commit_seq,
+                    birth_lsn,
+                    compression: value.compression,
+                    unit_compressed_size: value.unit_compressed_size,
+                    unit_original_size: value.unit_original_size,
+                    unit_lba_count: value.unit_lba_count,
+                    offset_in_unit: value.offset_in_unit,
+                    crc32: value.crc32,
+                    slot_offset: value.slot_offset,
+                    flags: value.flags,
+                    is_zero: value.is_zero(),
+                })
+            }
+            None => None,
+        };
+        volumes.push(MetaDbProbeVolume {
+            volume_ordinal: volume.ord,
+            mapping,
+        });
+    }
+    if let Some(pba) = explicit_pba {
+        refcount_pbas.push(pba);
+    }
+    refcount_pbas.sort_unstable();
+    refcount_pbas.dedup();
+
+    let refcounts = db.multi_get_refcount_consistent(&refcount_pbas)?;
+    let refcounts: HashMap<u64, u32> = refcount_pbas.into_iter().zip(refcounts).collect();
+    for volume in &mut volumes {
+        if let Some(mapping) = &mut volume.mapping {
+            if !mapping.is_zero {
+                mapping.refcount = refcounts.get(&mapping.pba).copied();
+            }
+        }
+    }
+    let explicit_pba = explicit_pba.map(|pba| MetaDbProbePba {
+        pba,
+        refcount: refcounts.get(&pba).copied().unwrap_or(0),
+    });
+
+    Ok(MetaDbProbeReport {
+        lba,
+        volumes,
+        explicit_pba,
+    })
+}
+
+/// Build and open the shared offline-audit MetaDB view used by point probes
+/// and full verification.
+///
+/// This deliberately preserves layout/recovery settings from production while
+/// disabling every configured background writer. It does not suppress the
+/// one-time mutations required to make an existing store coherent: the caller's
+/// `Pool::open` may reconcile chunklet state, and `Db::open_on_device` may replay
+/// lifecycle records and commit their recovered roots.
+fn open_meta_ld_for_offline_audit(
+    config: &MetaConfig,
+    meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
+) -> OnyxResult<Arc<Db>> {
     let label = config
         .path()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("<meta-ld>"));
-    // Same config the live engine would use (dedup_cuckoo_buckets, shard
-    // counts, ... — a mismatch there would misinterpret persisted data),
-    // already with `reclaim_orphans_on_open = false` baked in
-    // (`metadb_config_from_onyx` below), so this open cannot silently sweep
-    // the exact pages we're here to observe.
-    let db_config = metadb_config_from_onyx(&label, config);
-    let db = meta_ld::open_readonly(meta_backend, db_config)?;
-    Ok(db.verify(options)?)
+    let db_config = metadb_config_for_offline_audit(&label, config);
+    meta_ld::open_for_offline_audit(meta_backend, db_config)
+}
+
+fn metadb_config_for_offline_audit(path: &Path, config: &MetaConfig) -> MetaDbConfig {
+    let mut cfg = metadb_config_from_onyx(path, config);
+    sanitize_offline_audit_config(&mut cfg);
+    cfg
+}
+
+/// Turn a production MetaDB config into an offline-audit config. Keep this in
+/// one place so every audit entry point stays inert after open-time recovery.
+pub(super) fn sanitize_offline_audit_config(cfg: &mut MetaDbConfig) {
+    cfg.bfg_threads_enabled = false;
+    cfg.parallel_l2p_drain_enabled = false;
+    cfg.l2p_checkpoint_pipeline_enabled = false;
+    cfg.l2p_writeback_enabled = false;
+    cfg.dedup_drainer_enabled = false;
+    // The current refcount fold is inline, but keep the legacy/configured
+    // drainer disabled so a future implementation cannot silently re-arm it.
+    cfg.refcount_drainer_enabled = false;
+    cfg.async_reclaim_enabled = false;
+    cfg.livelist_condense_min_segments = 0;
+    cfg.lineage_gc_enabled = false;
+    cfg.reclaim_orphans_on_open = false;
 }
 
 fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {

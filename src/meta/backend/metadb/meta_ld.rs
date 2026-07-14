@@ -489,8 +489,8 @@ pub(super) struct MetaLd {
 }
 
 /// The superblock plus the two device-generic windows metadb ever sees,
-/// shared by the live open path ([`open_or_create`]) and the read-only audit
-/// path ([`open_readonly`]).
+/// shared by the live open path ([`open_or_create`]) and the offline audit
+/// path ([`open_for_offline_audit`]).
 struct MetaDeviceParts {
     sb: MetaSuperblock,
     fresh: bool,
@@ -502,7 +502,7 @@ struct MetaDeviceParts {
 /// Read (or, if `create_if_missing`, first-time initialise) the OMET
 /// superblock on `backend` and frame the page + journal windows over it.
 /// `create_if_missing = false` is the audit-tool contract: a meta LD that was
-/// never initialised is reported as "nothing to verify", never silently
+/// never initialised is reported as "nothing to audit", never silently
 /// stamped with a fresh superblock.
 fn open_device_parts(
     backend: &Arc<ChunkletBackend>,
@@ -534,7 +534,7 @@ fn open_device_parts(
         }
         _ => {
             return Err(OnyxError::Config(
-                "no metadb found on this meta LD — nothing to verify".into(),
+                "no metadb found on this meta LD — nothing to audit".into(),
             ));
         }
     };
@@ -588,16 +588,24 @@ pub(super) fn open_or_create(
     })
 }
 
-/// Open metadb on the meta LD `backend` **read-only, for audit purposes**:
-/// never stamps a fresh superblock (errors instead if the LD was never
-/// initialised) and skips the volume-catalog load entirely — a verify tool
-/// only needs the `Db` handle to call [`onyx_metadb::Db::verify`] on, not the
-/// full onyx-side catalog/grower machinery `open_or_create` assembles for the
-/// live engine.
-pub(super) fn open_readonly(
+/// Open metadb on the meta LD `backend` for an offline audit. This never stamps
+/// a fresh superblock (an uninitialised LD is an error), skips the Onyx volume
+/// catalog/grower machinery, and forcibly disables MetaDB's continuous
+/// background mutators.
+///
+/// This is intentionally not called "read-only": `Db::open_on_device` can
+/// replay lifecycle records and persist a recovery commit. The chunklet pool
+/// was also opened before this function and may have reconciled its own state.
+/// Those one-time recovery writes are required for a coherent audit view and
+/// remain part of the offline-only contract.
+pub(super) fn open_for_offline_audit(
     backend: Arc<ChunkletBackend>,
-    db_config: MetaDbConfig,
+    mut db_config: MetaDbConfig,
 ) -> OnyxResult<Arc<Db>> {
+    // Defend this lowest audit-only entry point as well as its current callers:
+    // a future tool cannot accidentally pass production background-worker
+    // settings and mutate the store for the lifetime of a point query.
+    super::sanitize_offline_audit_config(&mut db_config);
     let parts = open_device_parts(&backend, false)?;
     debug_assert!(
         !parts.fresh,

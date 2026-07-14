@@ -135,12 +135,27 @@ enum Command {
     /// the free list) on the chunklet-backed meta LD. Offline-only: the pool
     /// lock is exclusive, so the engine must be stopped first (`[meta]
     /// backend = "file"` deployments already have this via the standalone
-    /// `metadb-verify <path>` binary).
+    /// `metadb-verify <path>` binary). Opening may perform required chunklet
+    /// reconciliation or MetaDB lifecycle recovery before the audit runs.
     MetadbVerify {
         /// Escalate orphaned pages from a warning to a hard failure (nonzero
         /// exit even if nothing else is wrong).
         #[arg(long)]
         strict: bool,
+        /// Print the report as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Point-probe chunklet-backed MetaDB without scanning L2P or reading LV3.
+    /// Offline-only: the engine must be stopped. Opening may perform required
+    /// chunklet reconciliation or MetaDB lifecycle recovery before the query.
+    MetadbProbe {
+        /// Logical block address to query in every manifest volume.
+        #[arg(long)]
+        lba: u64,
+        /// Also query this physical block's fold-consistent refcount.
+        #[arg(long)]
+        pba: Option<u64>,
         /// Print the report as JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -337,6 +352,50 @@ fn print_verify_report_json(report: &onyx_metadb::VerifyReport) {
     println!("  \"warnings\": [{}],", warnings.join(", "));
     println!("  \"issues\": [{}]", issues.join(", "));
     println!("}}");
+}
+
+fn format_metadb_probe_human(
+    report: &onyx_storage::meta::backend::metadb::MetaDbProbeReport,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    writeln!(out, "lba: {}", report.lba).unwrap();
+    writeln!(out, "volumes_checked: {}", report.volumes.len()).unwrap();
+    for volume in &report.volumes {
+        let Some(mapping) = &volume.mapping else {
+            writeln!(out, "volume {}: unmapped", volume.volume_ordinal).unwrap();
+            continue;
+        };
+        writeln!(out, "volume {}:", volume.volume_ordinal).unwrap();
+        writeln!(out, "  pba: {}", mapping.pba).unwrap();
+        match mapping.refcount {
+            Some(refcount) => writeln!(out, "  refcount: {refcount}").unwrap(),
+            None => writeln!(out, "  refcount: n/a").unwrap(),
+        }
+        writeln!(out, "  commit_seq: {}", mapping.commit_seq).unwrap();
+        writeln!(out, "  birth_lsn: {}", mapping.birth_lsn).unwrap();
+        writeln!(out, "  compression: {}", mapping.compression).unwrap();
+        writeln!(
+            out,
+            "  unit_compressed_size: {}",
+            mapping.unit_compressed_size
+        )
+        .unwrap();
+        writeln!(out, "  unit_original_size: {}", mapping.unit_original_size).unwrap();
+        writeln!(out, "  unit_lba_count: {}", mapping.unit_lba_count).unwrap();
+        writeln!(out, "  offset_in_unit: {}", mapping.offset_in_unit).unwrap();
+        writeln!(out, "  crc32: {:#010x}", mapping.crc32).unwrap();
+        writeln!(out, "  slot_offset: {}", mapping.slot_offset).unwrap();
+        writeln!(out, "  flags: {:#04x}", mapping.flags).unwrap();
+        writeln!(out, "  is_zero: {}", mapping.is_zero).unwrap();
+    }
+    if let Some(pba) = &report.explicit_pba {
+        writeln!(out, "explicit_pba:").unwrap();
+        writeln!(out, "  pba: {}", pba.pba).unwrap();
+        writeln!(out, "  refcount: {}", pba.refcount).unwrap();
+    }
+    out
 }
 
 #[cfg(target_os = "linux")]
@@ -802,6 +861,35 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("metadb-verify found issues");
             }
         }
+        Command::MetadbProbe { lba, pba, json } => {
+            if config.meta.backend != onyx_storage::config::MetaBackendKind::Chunklet {
+                anyhow::bail!(
+                    "metadb-probe requires [meta] backend = \"chunklet\"; \
+                     use `metadb-dump` for a file-backed MetaDB"
+                );
+            }
+            let (_pool, meta_backend) = onyx_storage::chunklet_pool::open_role_backend(
+                &config.chunklet,
+                onyx_storage::chunklet_pool::LdRoleSel::Meta,
+            )
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "{err} — metadb-probe is offline-only; stop the engine first \
+                     so it can acquire the chunklet pool lock"
+                )
+            })?;
+            let report = onyx_storage::meta::backend::metadb::probe_meta_ld(
+                &config.meta,
+                meta_backend,
+                lba,
+                pba,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_metadb_probe_human(&report));
+            }
+        }
         Command::Chunklet { op } => {
             let sock = &config.service.socket_path;
             if !sock.exists() {
@@ -863,4 +951,85 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onyx_storage::meta::backend::metadb::{
+        MetaDbProbeMapping, MetaDbProbePba, MetaDbProbeReport, MetaDbProbeVolume,
+    };
+
+    #[test]
+    fn parses_metadb_probe_arguments() {
+        let cli = Cli::try_parse_from([
+            "onyx-storage",
+            "--config",
+            "/tmp/onyx.toml",
+            "metadb-probe",
+            "--lba",
+            "123",
+            "--pba",
+            "456",
+            "--json",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.config, PathBuf::from("/tmp/onyx.toml"));
+        match cli.command {
+            Command::MetadbProbe { lba, pba, json } => {
+                assert_eq!(lba, 123);
+                assert_eq!(pba, Some(456));
+                assert!(json);
+            }
+            _ => panic!("parsed the wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn formats_metadb_probe_report() {
+        let report = MetaDbProbeReport {
+            lba: 9,
+            volumes: vec![
+                MetaDbProbeVolume {
+                    volume_ordinal: 0,
+                    mapping: None,
+                },
+                MetaDbProbeVolume {
+                    volume_ordinal: 2,
+                    mapping: Some(MetaDbProbeMapping {
+                        pba: 44,
+                        refcount: Some(3),
+                        commit_seq: 12,
+                        birth_lsn: 8,
+                        compression: 1,
+                        unit_compressed_size: 2048,
+                        unit_original_size: 4096,
+                        unit_lba_count: 1,
+                        offset_in_unit: 0,
+                        crc32: 0xaabb_ccdd,
+                        slot_offset: 16,
+                        flags: 1,
+                        is_zero: false,
+                    }),
+                },
+            ],
+            explicit_pba: Some(MetaDbProbePba {
+                pba: 77,
+                refcount: 0,
+            }),
+        };
+
+        let human = format_metadb_probe_human(&report);
+        assert!(human.contains("volume 0: unmapped"));
+        assert!(human.contains("volume 2:\n  pba: 44\n  refcount: 3"));
+        assert!(human.contains("commit_seq: 12"));
+        assert!(human.contains("birth_lsn: 8"));
+        assert!(human.contains("crc32: 0xaabbccdd"));
+        assert!(human.contains("explicit_pba:\n  pba: 77\n  refcount: 0"));
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["volumes"][1]["mapping"]["pba"], 44);
+        assert_eq!(json["explicit_pba"]["refcount"], 0);
+    }
 }

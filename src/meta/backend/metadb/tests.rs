@@ -1193,3 +1193,38 @@ fn l2p_buffer_interval_controls_metadb_bfg_roll_timer() {
     let mapped = super::metadb_config_from_onyx(std::path::Path::new("/tmp/metadb"), &cfg);
     assert_eq!(mapped.bfg_timeout_ms, 31_337);
 }
+
+#[test]
+fn offline_audit_config_disables_continuous_mutators() {
+    let cfg = MetaConfig {
+        dedup_shards: 8,
+        dedup_drainer_enabled: true,
+        refcount_drainer_enabled: true,
+        l2p_writeback_enabled: true,
+        l2p_buffer_enabled: true,
+        bfg_threads_enabled: true,
+        parallel_l2p_drain_enabled: true,
+        l2p_checkpoint_pipeline_enabled: true,
+        async_reclaim_enabled: true,
+        lineage_gc_enabled: true,
+        ..Default::default()
+    };
+
+    let audit = super::metadb_config_for_offline_audit(std::path::Path::new("/tmp/metadb"), &cfg);
+
+    assert!(!audit.bfg_threads_enabled);
+    assert!(!audit.parallel_l2p_drain_enabled);
+    assert!(!audit.l2p_checkpoint_pipeline_enabled);
+    assert!(!audit.l2p_writeback_enabled);
+    assert!(!audit.dedup_drainer_enabled);
+    assert!(!audit.refcount_drainer_enabled);
+    assert!(!audit.async_reclaim_enabled);
+    assert_eq!(audit.livelist_condense_min_segments, 0);
+    assert!(!audit.lineage_gc_enabled);
+    assert!(!audit.reclaim_orphans_on_open);
+
+    // Layout and recovery semantics still match production. In particular,
+    // lifecycle replay sees the same shard topology and L2P representation.
+    assert_eq!(audit.dedup_shards, 8);
+    assert!(audit.l2p_buffer_enabled);
+}
