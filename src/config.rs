@@ -1356,9 +1356,10 @@ pub struct FlushConfig {
     /// Disabled by default to preserve the legacy fixed-window drain behavior.
     #[serde(default)]
     pub commit_retain_tail: bool,
-    /// Optional wait window after the first queued commit job arrives.
-    /// This lets nearby shard-writer jobs join the same coalesced batch
-    /// without making the queue unbounded. Set 0 for try_recv-only drain.
+    /// Idle wait window restarted after each queued commit job arrives.
+    /// This lets nearby shard-writer jobs join the same coalesced batch and
+    /// carries a sub-target tail under steady traffic. Set 0 for try_recv-only
+    /// drain.
     #[serde(default = "default_commit_coalesce_timeout_us")]
     pub commit_coalesce_timeout_us: u64,
     /// No-wait LBA budget for batching consecutive packed-slot metadata jobs.

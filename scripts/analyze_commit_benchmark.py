@@ -50,6 +50,14 @@ def counter_delta(after: JsonObject, before: JsonObject, key: str) -> int:
     return after_value - before_value
 
 
+def optional_counter_delta(
+    after: JsonObject, before: JsonObject, key: str
+) -> int | None:
+    if key not in after and (not before or key not in before):
+        return None
+    return counter_delta(after, before, key)
+
+
 def optional_ratio(numerator: int | float, denominator: int | float) -> float | None:
     return float(numerator) / float(denominator) if denominator else None
 
@@ -171,6 +179,12 @@ def build_summary(
     )
     commit_jobs = counter_delta(after, before, commit_jobs_key)
     queue_wait_ns = counter_delta(after, before, "flush_commit_worker_queue_wait_ns")
+    aggregator_residence_ns = optional_counter_delta(
+        after, before, "flush_commit_worker_aggregator_residence_ns"
+    )
+    executor_queue_wait_ns = optional_counter_delta(
+        after, before, "flush_commit_worker_executor_queue_wait_ns"
+    )
 
     status_available = status_after_payload is not None
     status_before = unwrap_metadb_status(status_before_payload)
@@ -378,6 +392,16 @@ def build_summary(
         "queue_wait_ms_per_job": optional_ratio(
             queue_wait_ns, commit_jobs * 1_000_000
         ),
+        "aggregator_residence_ms_per_job": optional_ratio(
+            aggregator_residence_ns, commit_jobs * 1_000_000
+        )
+        if aggregator_residence_ns is not None
+        else None,
+        "executor_queue_wait_ms_per_job": optional_ratio(
+            executor_queue_wait_ns, commit_jobs * 1_000_000
+        )
+        if executor_queue_wait_ns is not None
+        else None,
         "apply_lbas": apply_lbas,
         "l2p_remap_breakdown": l2p_remap_breakdown,
         "rc_apply_us_per_lba": (

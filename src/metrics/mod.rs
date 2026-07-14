@@ -408,7 +408,13 @@ pub struct EngineMetrics {
     pub flush_writer_commit_send_ns: AtomicU64,
     pub flush_writer_commit_send_ops: AtomicU64,
     pub flush_writer_commit_send_len_max: AtomicU64,
+    /// Total residence from raw job enqueue through executor dequeue.
     pub flush_commit_worker_queue_wait_ns: AtomicU64,
+    /// Portion before a batch is sealed. This includes producer send
+    /// backpressure, raw-queue residence, and intentional coalescing.
+    pub flush_commit_worker_aggregator_residence_ns: AtomicU64,
+    /// Portion after a batch is sealed and before an executor dequeues it.
+    pub flush_commit_worker_executor_queue_wait_ns: AtomicU64,
     pub flush_commit_worker_service_ns: AtomicU64,
     pub flush_commit_worker_jobs: AtomicU64,
     pub flush_commit_worker_job_lbas: AtomicU64,

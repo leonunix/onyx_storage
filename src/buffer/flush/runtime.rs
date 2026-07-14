@@ -128,12 +128,12 @@ impl BufferFlusher {
         // and fragmented a deep backlog into tiny transactions.
         let commit_executor_count = commit_workers_per_volume;
         let (commit_tx, commit_rx) = bounded::<writer::CommitJob>(writer::COMMIT_WORKER_QUEUE_CAP);
-        let (commit_batch_tx, commit_batch_rx) = bounded::<Vec<writer::CommitJob>>(
+        let (commit_batch_tx, commit_batch_rx) = bounded::<writer::CommitBatch>(
             writer::COMMIT_EXECUTOR_QUEUE_CAP.max(commit_executor_count * 2),
         );
         let mut commit_worker_txs: Vec<Sender<writer::CommitJob>> =
             Vec::with_capacity(commit_executor_count);
-        let mut commit_worker_rxs: Vec<Receiver<Vec<writer::CommitJob>>> =
+        let mut commit_worker_rxs: Vec<Receiver<writer::CommitBatch>> =
             Vec::with_capacity(commit_executor_count);
         for _ in 0..commit_executor_count {
             commit_worker_txs.push(commit_tx.clone());

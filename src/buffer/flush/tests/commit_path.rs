@@ -757,8 +757,8 @@ fn commit_aggregator_forms_full_batch_and_flushes_disconnect_tail() {
         BufferFlusher::commit_aggregator_loop(raw_rx, batch_tx, None, true, 3, 3, Duration::ZERO, 0)
     });
 
-    assert_eq!(batch_rx.recv().unwrap().len(), 3);
-    assert_eq!(batch_rx.recv().unwrap().len(), 2);
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 3);
+    assert_eq!(batch_rx.recv().unwrap().jobs.len(), 2);
     aggregator.join().unwrap();
     assert!(batch_rx.recv().is_err());
 }
@@ -786,9 +786,12 @@ fn commit_aggregator_idle_gap_resets_after_each_arrival() {
     std::thread::sleep(Duration::from_millis(120));
     assert!(batch_rx.try_recv().is_err());
     raw_tx.send(aggregator_job(2, 1)).unwrap();
-
     assert_eq!(
-        batch_rx.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        batch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .jobs
+            .len(),
         3
     );
     drop(raw_tx);
@@ -814,17 +817,17 @@ fn commit_aggregator_idle_flushes_partial_without_splitting_jobs() {
 
     raw_tx.send(aggregator_job(0, 6)).unwrap();
     let partial = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(partial.len(), 1);
+    assert_eq!(partial.jobs.len(), 1);
     assert!(matches!(
-        &partial[0],
+        &partial.jobs[0],
         super::writer::CommitJob::DedupHit(job) if job.hits.len() == 6
     ));
 
     raw_tx.send(aggregator_job(6, 10)).unwrap();
     let overshoot = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(overshoot.len(), 1);
+    assert_eq!(overshoot.jobs.len(), 1);
     assert!(matches!(
-        &overshoot[0],
+        &overshoot.jobs[0],
         super::writer::CommitJob::DedupHit(job) if job.hits.len() == 10
     ));
     drop(raw_tx);
@@ -852,15 +855,16 @@ fn commit_aggregator_carries_whole_job_that_crosses_target() {
     raw_tx.send(aggregator_job(6, 4)).unwrap();
     let prefix = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(matches!(
-        prefix.as_slice(),
+        prefix.jobs.as_slice(),
         [super::writer::CommitJob::DedupHit(job)] if job.hits.len() == 6
     ));
 
     raw_tx.send(aggregator_job(10, 4)).unwrap();
     let full = batch_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(full.len(), 2);
+    assert_eq!(full.jobs.len(), 2);
     assert_eq!(
-        full.iter()
+        full.jobs
+            .iter()
             .map(|job| match job {
                 super::writer::CommitJob::DedupHit(job) => job.hits.len(),
                 _ => 0,
@@ -897,7 +901,11 @@ fn commit_aggregator_retain_tail_gate_off_uses_legacy_budget() {
     });
 
     assert_eq!(
-        batch_rx.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        batch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .jobs
+            .len(),
         5,
         "gate-off path must preserve the legacy coalesce budget"
     );

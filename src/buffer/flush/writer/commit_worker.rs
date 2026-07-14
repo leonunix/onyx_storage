@@ -96,6 +96,20 @@ pub(in crate::buffer::flush) enum CommitJob {
     DedupHit(DedupHitCommitJob),
 }
 
+pub(in crate::buffer::flush) struct CommitBatch {
+    pub jobs: Vec<CommitJob>,
+    sealed_at: Instant,
+}
+
+impl CommitBatch {
+    fn new(jobs: Vec<CommitJob>) -> Self {
+        Self {
+            jobs,
+            sealed_at: Instant::now(),
+        }
+    }
+}
+
 /// Stable sender selection within the configured executor count. The senders
 /// are clones of one shared MPMC queue, so this index no longer partitions the
 /// backlog; retaining stable routing keeps the writer call sites and metrics
@@ -124,7 +138,7 @@ impl BufferFlusher {
     /// backlog back into tiny metadb transactions.
     pub(in crate::buffer::flush) fn commit_aggregator_loop(
         rx: Receiver<CommitJob>,
-        batch_tx: Sender<Vec<CommitJob>>,
+        batch_tx: Sender<CommitBatch>,
         pressure_pool: Option<Arc<WriteBufferPool>>,
         retain_tail: bool,
         target_lbas_per_tx: usize,
@@ -155,7 +169,10 @@ impl BufferFlusher {
                             // largest sub-target prefix and carry the crossing
                             // job into the next transaction instead of creating
                             // an 8K + tiny-tail pair in the executor.
-                            if batch_tx.send(std::mem::take(&mut batch)).is_err() {
+                            if batch_tx
+                                .send(CommitBatch::new(std::mem::take(&mut batch)))
+                                .is_err()
+                            {
                                 break;
                             }
                             total_lbas = 0;
@@ -175,7 +192,10 @@ impl BufferFlusher {
                             false
                         };
                         if reached_limit || under_pressure {
-                            if batch_tx.send(std::mem::take(&mut batch)).is_err() {
+                            if batch_tx
+                                .send(CommitBatch::new(std::mem::take(&mut batch)))
+                                .is_err()
+                            {
                                 break;
                             }
                             total_lbas = 0;
@@ -186,7 +206,10 @@ impl BufferFlusher {
                         // Every successful receive starts a fresh idle gap, so
                         // a steady stream carries its sub-target tail forward.
                         if !batch.is_empty() {
-                            if batch_tx.send(std::mem::take(&mut batch)).is_err() {
+                            if batch_tx
+                                .send(CommitBatch::new(std::mem::take(&mut batch)))
+                                .is_err()
+                            {
                                 break;
                             }
                             total_lbas = 0;
@@ -195,7 +218,7 @@ impl BufferFlusher {
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                         if !batch.is_empty() {
-                            let _ = batch_tx.send(batch);
+                            let _ = batch_tx.send(CommitBatch::new(batch));
                         }
                         break;
                     }
@@ -212,7 +235,7 @@ impl BufferFlusher {
                 coalesce_timeout,
                 packed_try_drain_lba_budget,
             );
-            if batch_tx.send(batch).is_err() {
+            if batch_tx.send(CommitBatch::new(batch)).is_err() {
                 break;
             }
         }
@@ -220,7 +243,7 @@ impl BufferFlusher {
 
     pub(in crate::buffer::flush) fn commit_worker_loop(
         worker_idx: usize,
-        rx: &Receiver<Vec<CommitJob>>,
+        rx: &Receiver<CommitBatch>,
         pool: &WriteBufferPool,
         meta: &MetaStore,
         lifecycle: &VolumeLifecycleManager,
@@ -240,7 +263,7 @@ impl BufferFlusher {
         // disconnect is therefore also the shutdown drain protocol.
         loop {
             let recv_start = Instant::now();
-            let Ok(jobs) = rx.recv() else {
+            let Ok(batch) = rx.recv() else {
                 break;
             };
             let idle_ns = recv_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -250,8 +273,9 @@ impl BufferFlusher {
             metrics
                 .flush_commit_worker_rx_idle_iters
                 .fetch_add(1, Ordering::Relaxed);
+            Self::record_commit_worker_drain(metrics, &batch.jobs, batch.sealed_at);
             Self::dispatch_commit_batch(
-                jobs,
+                batch.jobs,
                 pool,
                 meta,
                 lifecycle,
@@ -343,7 +367,6 @@ impl BufferFlusher {
         target_lbas_per_tx: usize,
         commit_worker_pipeline_depth: usize,
     ) {
-        Self::record_commit_worker_drain(metrics, &jobs);
         let mut pending_pt: HashMap<String, PassthroughCommitJob> = HashMap::new();
         let mut pending_packed: Vec<PackedCommitJob> = Vec::new();
         let mut pending_dedup: Vec<DedupHitCommitJob> = Vec::new();
@@ -474,18 +497,12 @@ impl BufferFlusher {
         }
     }
 
-    fn record_commit_worker_drain(metrics: &EngineMetrics, jobs: &[CommitJob]) {
-        let now = Instant::now();
+    fn record_commit_worker_drain(metrics: &EngineMetrics, jobs: &[CommitJob], sealed_at: Instant) {
+        let dequeued_at = Instant::now();
         let drain_jobs = jobs.len() as u64;
         let drain_lbas = jobs.iter().map(lbas_in_job).sum::<usize>() as u64;
-        let queue_wait_ns = jobs
-            .iter()
-            .map(|job| {
-                now.saturating_duration_since(enqueued_at_for_job(job))
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64
-            })
-            .sum::<u64>();
+        let (queue_wait_ns, aggregator_residence_ns, executor_queue_wait_ns) =
+            commit_wait_components_ns(jobs.iter().map(enqueued_at_for_job), sealed_at, dequeued_at);
         metrics
             .flush_commit_worker_drain_batches
             .fetch_add(1, Ordering::Relaxed);
@@ -498,6 +515,12 @@ impl BufferFlusher {
         metrics
             .flush_commit_worker_queue_wait_ns
             .fetch_add(queue_wait_ns, Ordering::Relaxed);
+        metrics
+            .flush_commit_worker_aggregator_residence_ns
+            .fetch_add(aggregator_residence_ns, Ordering::Relaxed);
+        metrics
+            .flush_commit_worker_executor_queue_wait_ns
+            .fetch_add(executor_queue_wait_ns, Ordering::Relaxed);
         metrics
             .flush_commit_worker_jobs
             .fetch_add(drain_jobs, Ordering::Relaxed);
@@ -615,5 +638,53 @@ fn enqueued_at_for_job(job: &CommitJob) -> Instant {
         CommitJob::Passthrough(pj) => pj.enqueued_at,
         CommitJob::Packed(pj) => pj.enqueued_at,
         CommitJob::DedupHit(job) => job.enqueued_at,
+    }
+}
+
+fn commit_wait_components_ns(
+    enqueued_at: impl IntoIterator<Item = Instant>,
+    sealed_at: Instant,
+    dequeued_at: Instant,
+) -> (u64, u64, u64) {
+    let mut jobs = 0u128;
+    let mut total_ns = 0u128;
+    let mut aggregator_ns = 0u128;
+    for enqueued_at in enqueued_at {
+        jobs += 1;
+        total_ns = total_ns.saturating_add(
+            dequeued_at
+                .saturating_duration_since(enqueued_at)
+                .as_nanos(),
+        );
+        aggregator_ns = aggregator_ns
+            .saturating_add(sealed_at.saturating_duration_since(enqueued_at).as_nanos());
+    }
+    let executor_ns = dequeued_at
+        .saturating_duration_since(sealed_at)
+        .as_nanos()
+        .saturating_mul(jobs);
+    let cap = |value: u128| value.min(u64::MAX as u128) as u64;
+    (cap(total_ns), cap(aggregator_ns), cap(executor_ns))
+}
+
+#[cfg(test)]
+mod wait_component_tests {
+    use super::*;
+
+    #[test]
+    fn commit_wait_components_split_total_by_job() {
+        let start = Instant::now();
+        let sealed_at = start + Duration::from_millis(30);
+        let dequeued_at = start + Duration::from_millis(35);
+        let (total, aggregator, executor) = commit_wait_components_ns(
+            [start, start + Duration::from_millis(10)],
+            sealed_at,
+            dequeued_at,
+        );
+
+        assert_eq!(total, 60_000_000);
+        assert_eq!(aggregator, 50_000_000);
+        assert_eq!(executor, 10_000_000);
+        assert_eq!(total, aggregator + executor);
     }
 }

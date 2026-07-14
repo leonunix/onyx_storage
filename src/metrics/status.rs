@@ -893,7 +893,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "flush_writer_batch: cycles={} cycles_full={} cycles_partial={} read_active_cycles={} drained_units={} drained_units_max={} rx_pending_max={} commit_send_ns={} commit_send_ops={} commit_send_len_max={} commit_worker_queue_wait_ns={} commit_worker_service_ns={} commit_worker_jobs={} commit_worker_job_lbas={} commit_worker_drain_batches={} commit_worker_drain_jobs={} commit_worker_drain_lbas={} commit_worker_drain_jobs_max={} commit_worker_drain_lbas_max={} pt_batches={} pt_units={} pt_lbas={} pt_io_ops={} pt_units_max={} pt_lbas_max={} pt_io_ops_max={} packed_batches={} packed_slots={} packed_lbas={} packed_io_ops={} packed_slots_max={} packed_lbas_max={} packed_io_ops_max={}",
+            "flush_writer_batch: cycles={} cycles_full={} cycles_partial={} read_active_cycles={} drained_units={} drained_units_max={} rx_pending_max={} commit_send_ns={} commit_send_ops={} commit_send_len_max={} commit_worker_queue_wait_ns={} commit_worker_aggregator_residence_ns={} commit_worker_executor_queue_wait_ns={} commit_worker_service_ns={} commit_worker_jobs={} commit_worker_job_lbas={} commit_worker_drain_batches={} commit_worker_drain_jobs={} commit_worker_drain_lbas={} commit_worker_drain_jobs_max={} commit_worker_drain_lbas_max={} pt_batches={} pt_units={} pt_lbas={} pt_io_ops={} pt_units_max={} pt_lbas_max={} pt_io_ops_max={} packed_batches={} packed_slots={} packed_lbas={} packed_io_ops={} packed_slots_max={} packed_lbas_max={} packed_io_ops_max={}",
             self.metrics.flush_writer_cycles,
             self.metrics.flush_writer_cycles_full,
             self.metrics.flush_writer_cycles_partial,
@@ -905,6 +905,8 @@ impl EngineStatusSnapshot {
             self.metrics.flush_writer_commit_send_ops,
             self.metrics.flush_writer_commit_send_len_max,
             self.metrics.flush_commit_worker_queue_wait_ns,
+            self.metrics.flush_commit_worker_aggregator_residence_ns,
+            self.metrics.flush_commit_worker_executor_queue_wait_ns,
             self.metrics.flush_commit_worker_service_ns,
             self.metrics.flush_commit_worker_jobs,
             self.metrics.flush_commit_worker_job_lbas,

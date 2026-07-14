@@ -228,6 +228,12 @@ impl EngineMetrics {
             flush_writer_commit_send_ops: load(&self.flush_writer_commit_send_ops),
             flush_writer_commit_send_len_max: load(&self.flush_writer_commit_send_len_max),
             flush_commit_worker_queue_wait_ns: load(&self.flush_commit_worker_queue_wait_ns),
+            flush_commit_worker_aggregator_residence_ns: load(
+                &self.flush_commit_worker_aggregator_residence_ns,
+            ),
+            flush_commit_worker_executor_queue_wait_ns: load(
+                &self.flush_commit_worker_executor_queue_wait_ns,
+            ),
             flush_commit_worker_service_ns: load(&self.flush_commit_worker_service_ns),
             flush_commit_worker_jobs: load(&self.flush_commit_worker_jobs),
             flush_commit_worker_job_lbas: load(&self.flush_commit_worker_job_lbas),
@@ -564,6 +570,10 @@ pub struct EngineMetricsSnapshot {
     pub flush_writer_commit_send_ops: u64,
     pub flush_writer_commit_send_len_max: u64,
     pub flush_commit_worker_queue_wait_ns: u64,
+    #[serde(default)]
+    pub flush_commit_worker_aggregator_residence_ns: u64,
+    #[serde(default)]
+    pub flush_commit_worker_executor_queue_wait_ns: u64,
     pub flush_commit_worker_service_ns: u64,
     pub flush_commit_worker_jobs: u64,
     pub flush_commit_worker_job_lbas: u64,
@@ -920,6 +930,8 @@ impl EngineMetricsSnapshot {
             flush_writer_commit_send_ops,
             flush_writer_commit_send_len_max,
             flush_commit_worker_queue_wait_ns,
+            flush_commit_worker_aggregator_residence_ns,
+            flush_commit_worker_executor_queue_wait_ns,
             flush_commit_worker_service_ns,
             flush_commit_worker_jobs,
             flush_commit_worker_job_lbas,

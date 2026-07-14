@@ -157,6 +157,75 @@ def main() -> None:
                 name: fine_latency_summary(metrics, old_metrics, key, fine_bounds)
                 for name, key in lv2_stage_keys.items()
             }
+            commit_jobs = nonnegative(
+                int(metrics.get("flush_commit_worker_jobs", 0)),
+                int(old_metrics.get("flush_commit_worker_jobs", 0)),
+            )
+            commit_batches = nonnegative(
+                int(metrics.get("flush_commit_worker_drain_batches", 0)),
+                int(old_metrics.get("flush_commit_worker_drain_batches", 0)),
+            )
+            commit_lbas = nonnegative(
+                int(metrics.get("flush_commit_worker_drain_lbas", 0)),
+                int(old_metrics.get("flush_commit_worker_drain_lbas", 0)),
+            )
+            commit_queue_wait_ns = nonnegative(
+                int(metrics.get("flush_commit_worker_queue_wait_ns", 0)),
+                int(old_metrics.get("flush_commit_worker_queue_wait_ns", 0)),
+            )
+            commit_aggregator_residence_ns = nonnegative(
+                int(metrics.get("flush_commit_worker_aggregator_residence_ns", 0)),
+                int(old_metrics.get("flush_commit_worker_aggregator_residence_ns", 0)),
+            )
+            commit_executor_queue_wait_ns = nonnegative(
+                int(metrics.get("flush_commit_worker_executor_queue_wait_ns", 0)),
+                int(old_metrics.get("flush_commit_worker_executor_queue_wait_ns", 0)),
+            )
+            commit_service_ns = nonnegative(
+                int(metrics.get("flush_commit_worker_service_ns", 0)),
+                int(old_metrics.get("flush_commit_worker_service_ns", 0)),
+            )
+            commit_worker = {
+                "jobs": commit_jobs,
+                "batches": commit_batches,
+                "lbas": commit_lbas,
+                "jobs_per_batch": commit_jobs / commit_batches if commit_batches else 0,
+                "lbas_per_batch": commit_lbas / commit_batches if commit_batches else 0,
+                "queue_wait_avg_ns": commit_queue_wait_ns // commit_jobs if commit_jobs else 0,
+                "aggregator_residence_avg_ns": commit_aggregator_residence_ns // commit_jobs
+                if commit_jobs
+                else 0,
+                "executor_queue_wait_avg_ns": commit_executor_queue_wait_ns // commit_jobs
+                if commit_jobs
+                else 0,
+                "service_avg_ns": commit_service_ns // commit_jobs if commit_jobs else 0,
+                "pipeline_depth_max": int(metrics.get("flush_commit_worker_pipeline_depth_max", 0)),
+                "pipeline_issues": nonnegative(
+                    int(metrics.get("flush_commit_worker_pipeline_issues", 0)),
+                    int(old_metrics.get("flush_commit_worker_pipeline_issues", 0)),
+                ),
+            }
+            sync_flushes = nonnegative(
+                int(metrics.get("buffer_sync_flushes", 0)),
+                int(old_metrics.get("buffer_sync_flushes", 0)),
+            )
+            sync_entries = nonnegative(
+                int(metrics.get("buffer_sync_entries", 0)),
+                int(old_metrics.get("buffer_sync_entries", 0)),
+            )
+            buffer_sync = {
+                "appends": nonnegative(
+                    int(metrics.get("buffer_appends", 0)),
+                    int(old_metrics.get("buffer_appends", 0)),
+                ),
+                "batches": nonnegative(
+                    int(metrics.get("buffer_sync_batches", 0)),
+                    int(old_metrics.get("buffer_sync_batches", 0)),
+                ),
+                "flushes": sync_flushes,
+                "entries": sync_entries,
+                "entries_per_flush": sync_entries / sync_flushes if sync_flushes else 0,
+            }
             old_shards = {int(s["shard_idx"]): s for s in old_status.get("buffer_shards", [])}
             shards = []
             for shard in status.get("buffer_shards", []):
@@ -192,6 +261,8 @@ def main() -> None:
                         "write_p99_ns": stages,
                         "lv2_durable_stages": lv2_stages,
                         "lv2_percentiles_are_bucket_upper_bounds": True,
+                        "commit_worker": commit_worker,
+                        "buffer_sync": buffer_sync,
                         "shards": shards,
                         "scheduler": scheduler,
                     },

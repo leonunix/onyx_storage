@@ -194,6 +194,8 @@ impl Default for EngineMetrics {
             flush_writer_commit_send_ops: AtomicU64::new(0),
             flush_writer_commit_send_len_max: AtomicU64::new(0),
             flush_commit_worker_queue_wait_ns: AtomicU64::new(0),
+            flush_commit_worker_aggregator_residence_ns: AtomicU64::new(0),
+            flush_commit_worker_executor_queue_wait_ns: AtomicU64::new(0),
             flush_commit_worker_service_ns: AtomicU64::new(0),
             flush_commit_worker_jobs: AtomicU64::new(0),
             flush_commit_worker_job_lbas: AtomicU64::new(0),

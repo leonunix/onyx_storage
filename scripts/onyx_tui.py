@@ -538,8 +538,10 @@ def build_lines(cur: Sample, prev: Optional[Sample], socket_path: pathlib.Path) 
         f" cleanup_w {fmt_ms(avg_writer_time(metrics, prev_metrics, 'flush_writer_cleanup_ns')):>10}"
         f" cleanup_th {fmt_ms(avg_time(metrics, prev_metrics, 'flush_cleanup_thread_ns', 'flush_cleanup_thread_batches')):>10}",
         f"Writer/tx meta {fmt_ms(avg_time(metrics, prev_metrics, 'flush_writer_meta_ns', 'flush_writer_meta_commits')):>10}"
-        f" | queue/job {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_queue_wait_ns', 'flush_commit_worker_jobs')):>10}"
         f" service/job {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_service_ns', 'flush_commit_worker_jobs')):>10}",
+        f"Commit/job total {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_queue_wait_ns', 'flush_commit_worker_jobs')):>10}"
+        f" aggregator {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_aggregator_residence_ns', 'flush_commit_worker_jobs')):>10}"
+        f" executor_q {fmt_ms(avg_time(metrics, prev_metrics, 'flush_commit_worker_executor_queue_wait_ns', 'flush_commit_worker_jobs')):>10}",
         "",
         f"Meta   commit {rate(meta, prev.status.get('metadb_memory') if prev else None, 'commit_ops', interval):8.1f}/s"
         f" avg {fmt_us(avg_time(meta, prev.status.get('metadb_memory') if prev else None, 'commit_total_us', 'commit_ops', ns_per_unit=1.0))}"
@@ -679,6 +681,18 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
         metrics,
         prev_metrics,
         "flush_commit_worker_queue_wait_ns",
+        "flush_commit_worker_jobs",
+    ) / 1_000_000.0
+    writer_aggregator_job_ms = avg_time(
+        metrics,
+        prev_metrics,
+        "flush_commit_worker_aggregator_residence_ns",
+        "flush_commit_worker_jobs",
+    ) / 1_000_000.0
+    writer_executor_queue_job_ms = avg_time(
+        metrics,
+        prev_metrics,
+        "flush_commit_worker_executor_queue_wait_ns",
         "flush_commit_worker_jobs",
     ) / 1_000_000.0
     cpu_delta = 0.0 if prev_system is None else max(0.0, system.get("cpu_total", 0.0) - prev_system.get("cpu_total", 0.0))
@@ -847,12 +861,19 @@ def draw_dashboard(stdscr: Any, monitor: Monitor) -> bool:
         stdscr,
         32,
         2,
-        "tx / queue",
-        f"meta/tx {writer_meta_tx_ms:,.2f} ms  q/job {writer_queue_job_ms:,.2f} ms",
+        "tx / total",
+        f"meta/tx {writer_meta_tx_ms:,.2f} ms  total/job {writer_queue_job_ms:,.2f} ms",
         left_w - 4,
-        warn if writer_queue_job_ms > 10 else 0,
     )
-    put(stdscr, 33, 2, "meta " + spark([item["writer_meta_ms"] for item in monitor.history], left_w - 9), accent)
+    metric(
+        stdscr,
+        33,
+        2,
+        "queue split",
+        f"aggregator/job {writer_aggregator_job_ms:,.2f} ms  executor/job {writer_executor_queue_job_ms:,.2f} ms",
+        left_w - 4,
+        warn if writer_executor_queue_job_ms > 10 else 0,
+    )
 
     panel(stdscr, 28, right_x, 7, right_w, "MetaDB", title_attr)
     metric(

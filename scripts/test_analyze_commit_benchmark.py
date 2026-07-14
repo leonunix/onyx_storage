@@ -6,18 +6,25 @@ import analyze_commit_benchmark as analyzer
 
 
 class AnalyzeCommitBenchmarkTests(unittest.TestCase):
+    def test_optional_counter_delta_accepts_legacy_snapshots(self) -> None:
+        self.assertIsNone(analyzer.optional_counter_delta({}, {}, "new_counter"))
+
     def test_combines_single_and_range_remap_work(self) -> None:
         before_metrics = {
             "flush_writer_meta_lbas": 100,
             "flush_writer_meta_commits": 10,
             "flush_commit_worker_jobs": 5,
             "flush_commit_worker_queue_wait_ns": 1_000_000,
+            "flush_commit_worker_aggregator_residence_ns": 750_000,
+            "flush_commit_worker_executor_queue_wait_ns": 250_000,
         }
         after_metrics = {
             "flush_writer_meta_lbas": 110,
             "flush_writer_meta_commits": 12,
             "flush_commit_worker_jobs": 7,
             "flush_commit_worker_queue_wait_ns": 3_000_000,
+            "flush_commit_worker_aggregator_residence_ns": 2_250_000,
+            "flush_commit_worker_executor_queue_wait_ns": 750_000,
         }
         before_status = {
             "commit_apply_us": 100,
@@ -61,6 +68,9 @@ class AnalyzeCommitBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["apply_lbas"], 10)
         self.assertEqual(summary["apply_totals_us"]["l2p"], 60)
         self.assertEqual(summary["l2p_apply_us_per_lba"], 6.0)
+        self.assertEqual(summary["queue_wait_ms_per_job"], 1.0)
+        self.assertEqual(summary["aggregator_residence_ms_per_job"], 0.75)
+        self.assertEqual(summary["executor_queue_wait_ms_per_job"], 0.25)
         self.assertEqual(
             summary["l2p_remap_breakdown"],
             {
