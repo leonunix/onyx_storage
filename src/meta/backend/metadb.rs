@@ -1635,6 +1635,10 @@ impl MetadbBackend {
         self.checkpoint.sync()
     }
 
+    pub(crate) fn drain_deferred_reclaim_durable(&self) -> OnyxResult<usize> {
+        Ok(self.db.drain_deferred_reclaim_durable()?)
+    }
+
     pub(crate) fn set_buffer_applied_watermark(&self, seq: u64) {
         self.db.set_buffer_applied_watermark(seq);
     }

@@ -157,6 +157,13 @@ impl MetaStore {
         self.backend.sync_durable()
     }
 
+    /// Terminal metadata-page reclaim. This stops metadb background mutators,
+    /// persists the resulting device free-list bitmap, and durably fences the
+    /// reclaimed pages. No further metadata writes may follow a successful call.
+    pub fn drain_deferred_reclaim_durable(&self) -> OnyxResult<usize> {
+        self.backend.drain_deferred_reclaim_durable()
+    }
+
     pub(crate) fn set_buffer_applied_watermark(&self, seq: u64) {
         self.backend.set_buffer_applied_watermark(seq);
     }

@@ -1602,6 +1602,19 @@ impl OnyxEngine {
             }
         };
 
+        // The final checkpoint retires its old metadata pages only after the
+        // manifest is durable. Drain those pages and publish a following
+        // free-list bitmap before setting the clean marker; otherwise strict
+        // verification sees allocated L2P orphans and the device fast-open path
+        // permanently loses the reclaimed capacity.
+        if let Err(e) = self.meta.drain_deferred_reclaim_durable() {
+            tracing::error!(
+                error = %e,
+                "failed to durably drain deferred metadb reclaim at shutdown -- forcing dirty recovery on next boot"
+            );
+            return Ok(());
+        }
+
         // Drive one final reclaim pass. The durability watermark thread has
         // Re-run release with the exact manifest frontier returned above so
         // applied entries can leave the ring without crossing a lower seq

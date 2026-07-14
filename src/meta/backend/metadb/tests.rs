@@ -1207,6 +1207,22 @@ fn rc_checkpoint_streaming_toggle_maps_to_metadb() {
 }
 
 #[test]
+fn meta_store_exposes_terminal_durable_reclaim() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = MetaConfig {
+        path: Some(dir.path().to_path_buf()),
+        dedup_shards: 1,
+        dedup_cuckoo_buckets: 256,
+        dedup_l1_cache_entries: 256,
+        async_reclaim_max_pages_per_cycle: 1,
+        ..Default::default()
+    };
+    let store = crate::meta::store::MetaStore::open(&cfg).unwrap();
+    store.sync_durable().unwrap();
+    store.drain_deferred_reclaim_durable().unwrap();
+}
+
+#[test]
 fn offline_audit_config_disables_continuous_mutators() {
     let cfg = MetaConfig {
         dedup_shards: 8,
