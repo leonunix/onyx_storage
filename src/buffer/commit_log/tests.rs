@@ -2026,3 +2026,19 @@ fn durability_waiter_many_appenders_all_wake() {
     }
     assert_eq!(woke.load(Ordering::Relaxed), 64);
 }
+
+#[test]
+fn global_prepared_queue_depth_preserves_auto_default_and_explicit_override() {
+    assert_eq!(
+        WriteBufferPool::resolve_global_prepared_queue_depth(0, 16),
+        16
+    );
+    assert_eq!(
+        WriteBufferPool::resolve_global_prepared_queue_depth(4, 16),
+        4
+    );
+    assert_eq!(
+        WriteBufferPool::resolve_global_prepared_queue_depth(0, 0),
+        1
+    );
+}

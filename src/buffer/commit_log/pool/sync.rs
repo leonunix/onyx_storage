@@ -952,10 +952,22 @@ impl WriteBufferPool {
     /// worker per shard drains and encodes entries in parallel. This thread
     /// collects those prepared batches, writes them through the root LD, and
     /// publishes all covered shard watermarks after one shared flush.
+    pub(in crate::buffer::commit_log) fn resolve_global_prepared_queue_depth(
+        configured: usize,
+        member_count: usize,
+    ) -> usize {
+        if configured == 0 {
+            member_count.max(1)
+        } else {
+            configured
+        }
+    }
+
     pub(super) fn global_sync_loop(
         root_device: Arc<dyn BlockBackend>,
         members: Vec<(u64, Arc<BufferShard>, Receiver<()>)>,
         group_commit_wait: Duration,
+        lv2_prepared_queue_depth_per_lane: usize,
         shutdown: Arc<AtomicBool>,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
         packed_checkpoint: Option<Arc<parking_lot::Mutex<PackedCheckpointState>>>,
@@ -978,13 +990,23 @@ impl WriteBufferPool {
         }
 
         let queue_depth = members.len().max(1);
+        let prepared_queue_depth = Self::resolve_global_prepared_queue_depth(
+            lv2_prepared_queue_depth_per_lane,
+            members.len(),
+        );
         // Four lanes overlap root writes while the device-wide durability
         // coordinator publishes completed epochs. The group-commit wait lives
         // only here (not in shard preparation or the coordinator), so each
         // request pays one window rather than three.
         let write_lane_count = members.len().min(4).max(1);
+        tracing::info!(
+            write_lane_count,
+            prepared_queue_depth,
+            written_queue_depth = queue_depth,
+            "LV2 global sync queue topology"
+        );
         let write_lanes: Vec<_> = (0..write_lane_count)
-            .map(|_| bounded::<PreparedBatch>(queue_depth))
+            .map(|_| bounded::<PreparedBatch>(prepared_queue_depth))
             .collect();
         let member_bases = Arc::new(members.iter().map(|member| member.0).collect::<Vec<_>>());
         let (written_tx, written_rx) = bounded::<Vec<WrittenBatch>>(queue_depth);

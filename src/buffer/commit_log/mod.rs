@@ -73,6 +73,9 @@ pub struct BufferRuntimeLimits {
     pub staging_channel_capacity: usize,
     pub sync_batch_max_entries: usize,
     pub sync_batch_max_bytes: usize,
+    /// Prepared-batch channel depth for each global root-write lane. Zero keeps
+    /// the legacy dynamic depth of one slot per buffer shard.
+    pub lv2_prepared_queue_depth_per_lane: usize,
     pub throttle: ThrottleSettings,
     /// Resolved ZFS-style adaptive commit-window percent for the LV2 sync
     /// pipeline (>= 1). See `LV2_COMMIT_TIMEOUT_PCT`.
@@ -149,6 +152,7 @@ impl BufferRuntimeLimits {
         staging_channel_capacity: usize,
         sync_batch_max_entries: usize,
         sync_batch_max_bytes: usize,
+        lv2_prepared_queue_depth_per_lane: usize,
         lv2_sync_pipeline_depth: usize,
         lv2_commit_timeout_pct: u64,
     ) -> Self {
@@ -169,6 +173,7 @@ impl BufferRuntimeLimits {
             } else {
                 sync_batch_max_bytes
             },
+            lv2_prepared_queue_depth_per_lane,
             throttle: defaults.throttle,
             lv2_commit_timeout_pct: if lv2_commit_timeout_pct == 0 {
                 defaults.lv2_commit_timeout_pct
@@ -195,6 +200,7 @@ impl Default for BufferRuntimeLimits {
             staging_channel_capacity: STAGING_CHANNEL_CAPACITY,
             sync_batch_max_entries: SYNC_BATCH_MAX_ENTRIES,
             sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
+            lv2_prepared_queue_depth_per_lane: 0,
             throttle: ThrottleSettings::default(),
             lv2_commit_timeout_pct: LV2_COMMIT_TIMEOUT_PCT,
             lv2_sync_pipeline_depth: LV2_SYNC_PIPELINE_DEPTH,

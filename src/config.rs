@@ -1207,6 +1207,12 @@ pub struct BufferConfig {
     /// 0 = engine default.
     #[serde(default)]
     pub sync_batch_max_bytes_mb: usize,
+    /// Prepared-batch channel depth for each LV2 global root-write lane.
+    /// Smaller values propagate a slow root write back to shard staging sooner,
+    /// allowing later entries to coalesce before encoding. 0 preserves the
+    /// existing depth of one slot per buffer shard.
+    #[serde(default)]
+    pub lv2_prepared_queue_depth_per_lane: usize,
     /// Tier 1.B (ZFS-inspired) hyperbolic write throttle: LV2 fill percentage
     /// at which the throttle starts paying per-append delay. 0 disables the
     /// throttle entirely (the existing condvar-based hard backpressure at
@@ -1255,6 +1261,7 @@ impl Default for BufferConfig {
             staging_queue_entries: 0,
             sync_batch_max_entries: 0,
             sync_batch_max_bytes_mb: 0,
+            lv2_prepared_queue_depth_per_lane: 0,
             throttle_min_pct: 0,
             throttle_max_pct: 0,
             throttle_scale_us: 0,
@@ -1848,5 +1855,20 @@ mod service_config_tests {
             config.service.direct_io_cpu_set(),
             Err(OnyxError::Config(_))
         ));
+    }
+
+    #[test]
+    fn lv2_prepared_queue_depth_defaults_to_auto_and_accepts_explicit_value() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(default_config.buffer.lv2_prepared_queue_depth_per_lane, 0);
+
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [buffer]
+                lv2_prepared_queue_depth_per_lane = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.buffer.lv2_prepared_queue_depth_per_lane, 4);
     }
 }

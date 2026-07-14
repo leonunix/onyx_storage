@@ -449,6 +449,7 @@ impl OnyxEngine {
             config.buffer.staging_queue_entries,
             config.buffer.sync_batch_max_entries,
             config.buffer.sync_batch_max_bytes_mb as usize * 1024 * 1024,
+            config.buffer.lv2_prepared_queue_depth_per_lane,
             config.buffer.lv2_sync_pipeline_depth,
             config.buffer.lv2_commit_timeout_pct,
         )

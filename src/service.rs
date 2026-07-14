@@ -375,6 +375,13 @@ impl ServiceController {
                  Will auto-reinit if buffer is fully drained, otherwise start with old shard count first to drain"
             );
         }
+        if old_config.buffer.lv2_prepared_queue_depth_per_lane
+            != new_config.buffer.lv2_prepared_queue_depth_per_lane
+        {
+            tracing::warn!(
+                "buffer.lv2_prepared_queue_depth_per_lane changed — requires restart to take effect"
+            );
+        }
         if old_config.service.direct_io_cpus != new_config.service.direct_io_cpus {
             tracing::warn!(
                 old = %old_config.service.direct_io_cpus,
