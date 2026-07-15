@@ -1232,6 +1232,7 @@ fn offline_audit_config_disables_continuous_mutators() {
         l2p_buffer_enabled: true,
         bfg_threads_enabled: true,
         parallel_l2p_drain_enabled: true,
+        parallel_l2p_drain_workers: 4,
         l2p_checkpoint_pipeline_enabled: true,
         async_reclaim_enabled: true,
         lineage_gc_enabled: true,
@@ -1242,6 +1243,7 @@ fn offline_audit_config_disables_continuous_mutators() {
 
     assert!(!audit.bfg_threads_enabled);
     assert!(!audit.parallel_l2p_drain_enabled);
+    assert_eq!(audit.parallel_l2p_drain_workers, 4);
     assert!(!audit.l2p_checkpoint_pipeline_enabled);
     assert!(!audit.l2p_writeback_enabled);
     assert!(!audit.dedup_drainer_enabled);

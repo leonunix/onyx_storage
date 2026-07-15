@@ -588,6 +588,12 @@ pub struct MetaConfig {
     #[serde(default = "default_parallel_l2p_drain_enabled")]
     pub parallel_l2p_drain_enabled: bool,
 
+    /// Maximum concurrently executing L2P shard folds when parallel drain is
+    /// enabled. `0` preserves the legacy unbounded fan-out; positive values are
+    /// a hard cap. Set this explicitly for production A/B runs.
+    #[serde(default = "default_parallel_l2p_drain_workers")]
+    pub parallel_l2p_drain_workers: usize,
+
     /// Bound on buffered entries the BFG syncing-slot drain folds per
     /// `tree.write()` hold. The one-shot fold parked every commit worker
     /// (`apply_l2p_remap` takes the same write lock) and dedup/read
@@ -717,6 +723,7 @@ impl Default for MetaConfig {
             bfg_threads_enabled: default_bfg_threads_enabled(),
             rc_checkpoint_streaming_enabled: default_rc_checkpoint_streaming_enabled(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
+            parallel_l2p_drain_workers: default_parallel_l2p_drain_workers(),
             l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
             l2p_checkpoint_pipeline_enabled: default_l2p_checkpoint_pipeline_enabled(),
             rc_authoritative_reclaim: default_rc_authoritative_reclaim(),
@@ -839,6 +846,11 @@ fn default_parallel_l2p_drain_enabled() -> bool {
     // L2P buffer well under cap). Default OFF; kept behind the flag as a
     // documented dead-end. See memory parallel_l2p_drain_impl.
     false
+}
+fn default_parallel_l2p_drain_workers() -> usize {
+    // Parallel drain is still default-off, but once enabled it should leave
+    // room for RC apply. Zero remains available for an explicit legacy A/B.
+    4
 }
 fn default_l2p_drain_chunk_entries() -> usize {
     // Bounded fold lock-holds default-ON (semantics-preserving: same lock,
@@ -2050,6 +2062,21 @@ mod service_config_tests {
     fn service_direct_io_cpus_defaults_to_unset() {
         let config: OnyxConfig = toml::from_str("").unwrap();
         assert!(config.service.direct_io_cpus.is_empty());
+    }
+
+    #[test]
+    fn parallel_l2p_drain_workers_default_bounded_and_accept_legacy_zero() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(default_config.meta.parallel_l2p_drain_workers, 4);
+
+        let legacy: OnyxConfig = toml::from_str(
+            r#"
+                [meta]
+                parallel_l2p_drain_workers = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(legacy.meta.parallel_l2p_drain_workers, 0);
     }
 
     #[test]

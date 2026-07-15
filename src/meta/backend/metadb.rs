@@ -2147,6 +2147,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     // LV2 window by forcing page-tree materialisation five times per 30 s.
     cfg.bfg_timeout_ms = config.l2p_buffer_max_interval_ms;
     cfg.parallel_l2p_drain_enabled = config.parallel_l2p_drain_enabled;
+    cfg.parallel_l2p_drain_workers = config.parallel_l2p_drain_workers;
     cfg.l2p_drain_chunk_entries = config.l2p_drain_chunk_entries;
     cfg.l2p_checkpoint_pipeline_enabled = config.l2p_checkpoint_pipeline_enabled;
     cfg.rc_authoritative_reclaim = config.rc_authoritative_reclaim;
