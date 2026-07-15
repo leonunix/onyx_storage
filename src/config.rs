@@ -966,7 +966,8 @@ pub struct ChunkletConfig {
     pub io_backend: ChunkletIoBackend,
     /// Pool-wide cap on concurrent chunklet write batches across LV2, LV3,
     /// and MetaDB. `0` disables Onyx-side class admission. When enabled, the
-    /// three class shares below must be non-zero and sum to this value.
+    /// three class reservations below must be non-zero and their sum must not
+    /// exceed this value. Remaining slots are shared headroom.
     #[serde(default)]
     pub write_max_active: u32,
     /// LV2 durability share while LV3 or MetaDB writes are waiting.
@@ -1134,9 +1135,11 @@ impl ChunkletConfig {
         let sum = shares
             .into_iter()
             .try_fold(0u32, |total, share| total.checked_add(share));
-        if shares.into_iter().any(|share| share == 0) || sum != Some(self.write_max_active) {
+        if shares.into_iter().any(|share| share == 0)
+            || !sum.is_some_and(|total| total <= self.write_max_active)
+        {
             return Err(OnyxError::Config(
-                "chunklet write scheduler requires three non-zero shares whose checked sum equals write_max_active"
+                "chunklet write scheduler requires three non-zero reservations whose checked sum does not exceed write_max_active"
                     .into(),
             ));
         }
@@ -2008,11 +2011,17 @@ mod service_config_tests {
         config.chunklet.enabled = true;
         config.chunklet.write_max_active = 4;
         config.chunklet.write_lv3_active = 1;
-        config.chunklet.write_meta_active = 1;
+        config.chunklet.write_meta_active = 0;
         assert!(config.validate().is_err());
+
+        config.chunklet.write_meta_active = 1;
+        assert!(config.validate().is_ok());
 
         config.chunklet.write_foreground_active = 2;
         assert!(config.validate().is_ok());
+
+        config.chunklet.write_foreground_active = 3;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -2026,7 +2035,7 @@ mod service_config_tests {
                 write_max_active = 24
                 write_foreground_active = 9
                 write_lv3_active = 6
-                write_meta_active = 8
+                write_meta_active = 10
             "#
         )
         .unwrap();

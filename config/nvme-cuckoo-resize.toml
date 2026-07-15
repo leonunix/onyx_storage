@@ -40,9 +40,10 @@ devices = [
 ]
 io_backend = "uring"
 # Experimental work-conserving safety cap over the shared 10-PD pool. These are
-# high-level batch calls, not hardware queue-depth units, so 24/9/6/9 is only an
-# A/B seed and must not be retained unless a 24/32/40/48 sweep proves it. Idle
-# shares are always borrowable; the cap never rate-limits backend bandwidth.
+# high-level batch calls, not hardware queue-depth units, so 24 with 9/6/9
+# minimum reservations is only an A/B seed. A 24/32/40/48 sweep keeps those
+# minima fixed and exposes extra total slots as shared headroom. Idle
+# reservations are always borrowable.
 write_max_active = 24
 write_foreground_active = 9
 write_lv3_active = 6
@@ -133,7 +134,11 @@ throttle_min_pct = 20
 throttle_max_pct = 30
 throttle_scale_us = 10
 throttle_cap_us = 2000
-throttle_backend_debt = true
+# The queue-only backend-debt signal remains opt-in. The 2026-07-15 A/B cut
+# fio throughput 20.5% while backend service/checkpoint time worsened; physical
+# ring debt remains the authoritative foreground throttle until a service-time
+# aware controller replaces it.
+throttle_backend_debt = false
 
 [ublk]
 nr_queues = 8
@@ -156,8 +161,8 @@ skip_fully_superseded = true
 buffer_write_window_ms = 30000
 buffer_write_window_physical_pressure_pct = 30
 # Resident payload is only a memory/cache signal. Keep its bypass at the hard
-# cache ceiling so executor debt throttles foreground admission without
-# prematurely destroying the 30-second overwrite residence window.
+# cache ceiling so it does not prematurely destroy the 30-second overwrite
+# residence window.
 buffer_write_window_payload_pressure_pct = 100
 # Keep the backend healthy: it must consume durable LV2 work at its natural
 # completion-driven rate even while foreground IO is active. If that full

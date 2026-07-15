@@ -2354,7 +2354,7 @@ mod tests {
         cfg.chunklet.write_max_active = 24;
         cfg.chunklet.write_foreground_active = 9;
         cfg.chunklet.write_lv3_active = 6;
-        cfg.chunklet.write_meta_active = 8;
+        cfg.chunklet.write_meta_active = 10;
         assert!(OnyxEngine::configured_chunklet_io_scheduler(&cfg).is_err());
 
         cfg.chunklet.write_meta_active = 9;

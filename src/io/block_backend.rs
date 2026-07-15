@@ -181,10 +181,10 @@ impl ChunkletIoScheduler {
             .try_fold(0u32, |sum, share| sum.checked_add(share));
         if total_limit == 0
             || reserved.into_iter().any(|share| share == 0)
-            || reserved_sum != Some(total_limit)
+            || !reserved_sum.is_some_and(|sum| sum <= total_limit)
         {
             return Err(OnyxError::Config(
-                "chunklet IO scheduler requires three non-zero shares whose checked sum equals total"
+                "chunklet IO scheduler requires three non-zero reservations whose checked sum does not exceed total"
                     .into(),
             ));
         }
@@ -1091,6 +1091,8 @@ mod tests {
         assert!(ChunkletIoScheduler::new(4, [2, 2, 0]).is_err());
         assert!(ChunkletIoScheduler::new(4, [2, 1, 2]).is_err());
         assert!(ChunkletIoScheduler::new(u32::MAX, [u32::MAX, 1, 1]).is_err());
+        let headroom = ChunkletIoScheduler::new(40, [9, 7, 9]).unwrap();
+        assert_eq!(headroom.snapshot().total_limit, 40);
         let scheduler = ChunkletIoScheduler::new(40, [9, 7, 24]).unwrap();
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.total_limit, 40);
