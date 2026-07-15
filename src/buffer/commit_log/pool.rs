@@ -116,22 +116,25 @@ impl WriteBufferPool {
         let Some(state) = self.throttle_states.get(shard_idx) else {
             return;
         };
-        // Recomputing physical_fill_percentage_for_shard() acquires the target
-        // ring Mutex. Cache it; refresh only every Nth append so the hot path stays on pure
-        // atomics when the throttle is armed but inactive. The curve is
-        // continuous and the absolute-wakeup queue smooths over the sample
-        // lag, so a few-append staleness in fill_pct is invisible end-to-end.
+        // Recomputing physical fill acquires the target ring Mutex. Cache it;
+        // refresh only every Nth append so the hot path stays on pure atomics
+        // when the throttle is armed but inactive. Basis-point precision keeps
+        // a narrow dirty window smooth even when LV2 is hundreds of GiB.
         const SAMPLE_INTERVAL: u32 = 32;
         let n = state.sample_counter.fetch_add(1, Ordering::Relaxed);
-        let cached_fill_pct = state.cached_fill_pct.load(Ordering::Relaxed) as u8;
-        let fill_pct = if n % SAMPLE_INTERVAL == 0 || cached_fill_pct >= throttle.min_pct {
-            let live = self.physical_fill_percentage_for_shard(shard_idx);
-            state.cached_fill_pct.store(live as u32, Ordering::Relaxed);
-            live
-        } else {
-            cached_fill_pct
-        };
-        let delay_us = throttle.delay_us_for_fill(fill_pct);
+        let cached_fill_basis_points = state.cached_fill_basis_points.load(Ordering::Relaxed);
+        let min_basis_points = u32::from(throttle.min_pct).saturating_mul(100);
+        let fill_basis_points =
+            if n % SAMPLE_INTERVAL == 0 || cached_fill_basis_points >= min_basis_points {
+                let live = self.physical_fill_basis_points_for_shard(shard_idx);
+                state
+                    .cached_fill_basis_points
+                    .store(live, Ordering::Relaxed);
+                live
+            } else {
+                cached_fill_basis_points
+            };
+        let delay_us = throttle.delay_us_for_fill_basis_points(fill_basis_points);
         if delay_us == 0 {
             // A checkpoint may have released this ring while producers still
             // had future wakeups reserved. Drop that obsolete queue once the
@@ -916,7 +919,20 @@ impl WriteBufferPool {
         if ring.capacity_bytes == 0 {
             return 100;
         }
-        (((ring.used_bytes.saturating_mul(100)) / ring.capacity_bytes).min(100)) as u8
+        ((u128::from(ring.used_bytes).saturating_mul(100) / u128::from(ring.capacity_bytes))
+            .min(100)) as u8
+    }
+
+    pub(crate) fn physical_fill_basis_points_for_shard(&self, shard_idx: usize) -> u32 {
+        let Some(shard) = self.shards.get(shard_idx) else {
+            return 10_000;
+        };
+        let ring = shard.shard.ring.lock();
+        if ring.capacity_bytes == 0 {
+            return 10_000;
+        }
+        ((u128::from(ring.used_bytes).saturating_mul(10_000) / u128::from(ring.capacity_bytes))
+            .min(10_000)) as u32
     }
 
     /// Evict hydrated payloads from pending_entries for the given shard.

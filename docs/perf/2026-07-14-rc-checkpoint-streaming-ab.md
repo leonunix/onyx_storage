@@ -29,6 +29,25 @@ p99.99，后者反而上升 37.57%，不能把这轮结果描述成尾延迟已�
 下一阶段应在保留 **4M 严格 cohort 上界**的前提下继续降低 RC sample/prefold/page-IO service max；
 不再缩 admission bound，也不扩大 commit queue。
 
+### ZFS 调度对照与并发排空口径
+
+4M A' 的 `46,878.08 IOPS / 806 MB/s` 是 LV2 durable ingress，不是 LV3 后台 service rate。600 秒
+workload 内 `lv3_write_batch_bytes` 只增长 105.877 GB，即 176.45 MB/s；fio 停止后 pending drain 又写出
+178.256 GB，并在 190.052 秒内完成，即 **937.93 MB/s**。因此此前按 fio + physical drain 摊平得到的
+583 MB/s 是完整生命周期有效速率，不能解释为后端单独运行时的刷新上限。
+
+workload 内 `flush_qos_wait_ns` 累计 7,468.44 秒。原控制器直到 LV2 logical/physical fill 达 40% 才从
+foreground-protected rate 向 384 MiB/s ramp，且要到 65% 才解除限速；对 512 GiB durable ring 而言，
+这等于先允许约 200 GiB backlog，明显晚于设备饱和所需的 dirty window。A' 实际需要的完整 LV3 写量为
+284.133 GB，若要在 workload 内不增长 pending，平均只需约 473.53 MB/s，低于已测得的 idle drain 能力。
+
+本地 OpenZFS 对照表明正确顺序是先让 async backend 达到自然 service rate；若 dirty data 仍增长，再对
+新前台事务施加双曲线 delay，而不是为了保护前台反向限制后台。Onyx 首轮候选因此禁用 flusher p99 token
+bucket，将 write-window pressure 提前到 2%，并只在 5%-10% physical fill 对新 LV2 append 渐进节流。
+后台始终由实际 completion 自时钟运行，physical ring 的 condvar hard backpressure 继续作为最终安全线；
+5%-10% 窄窗口使用 basis-point fill 计算，避免 512 GiB ring 上整数百分比造成前台从不限速直接跳到
+2 ms/append。该变化不会扩大 commit queue，也不改变 4M BFG admission bound。
+
 下面的“受控 A/B”和“阶段拆解 fresh 基线”不是同一组可互换样本。后者包含额外正确性修复、指标和新
 Meta LD，用于 correctness + hotspot 定位，**不能拿它的 fio 数字与旧 A/B 直接计算优化幅度**。
 

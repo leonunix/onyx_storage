@@ -597,6 +597,25 @@ mod tests {
     }
 
     #[test]
+    fn zero_target_disables_backend_admission_limit() {
+        let flush = FlushConfig {
+            foreground_flush_target_p99_ms: 0,
+            ..FlushConfig::default()
+        };
+        let cfg = FlushAdmissionQosConfig::from_flush(&flush);
+        assert_eq!(cfg.target_p99_ns, 0);
+        assert!(!cfg.enabled());
+
+        let pool = test_pool();
+        let metrics = Arc::new(EngineMetrics::default());
+        let qos = FlushAdmissionQos::new(cfg, pool, metrics.clone());
+        let running = AtomicBool::new(true);
+        qos.admit(MIB, &running);
+        assert_eq!(metrics.flush_qos_wait_events.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.flush_qos_admitted_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn concurrent_lanes_share_one_aggregate_rate() {
         let pool = test_pool();
         let metrics = Arc::new(EngineMetrics::default());

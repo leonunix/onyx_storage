@@ -135,18 +135,28 @@ impl ThrottleSettings {
         })
     }
 
-    /// Hyperbolic curve evaluation. Pure function for unit tests.
+    /// Hyperbolic curve evaluation at whole-percent precision. Kept as a small
+    /// convenience wrapper for configuration tests; the runtime path uses
+    /// [`Self::delay_us_for_fill_basis_points`] so narrow dirty windows do not
+    /// collapse into a one-percent step function.
+    #[cfg(test)]
     pub(crate) fn delay_us_for_fill(&self, fill_pct: u8) -> u64 {
-        if fill_pct <= self.min_pct {
+        self.delay_us_for_fill_basis_points(u32::from(fill_pct).saturating_mul(100))
+    }
+
+    pub(crate) fn delay_us_for_fill_basis_points(&self, fill_basis_points: u32) -> u64 {
+        let min_basis_points = u32::from(self.min_pct).saturating_mul(100);
+        let max_basis_points = u32::from(self.max_pct).saturating_mul(100);
+        if fill_basis_points <= min_basis_points {
             return 0;
         }
-        if fill_pct >= self.max_pct {
+        if fill_basis_points >= max_basis_points {
             return self.cap_us;
         }
-        let num = (fill_pct - self.min_pct) as u64;
-        let den = (self.max_pct - fill_pct) as u64;
-        let delay = num.saturating_mul(self.scale_us) / den.max(1);
-        delay.min(self.cap_us)
+        let num = u128::from(fill_basis_points - min_basis_points);
+        let den = u128::from(max_basis_points - fill_basis_points);
+        let delay = num.saturating_mul(u128::from(self.scale_us)) / den.max(1);
+        delay.min(u128::from(self.cap_us)) as u64
     }
 }
 
@@ -1058,8 +1068,8 @@ impl BufferAppendTicket {
 struct ShardThrottleState {
     /// Absolute wakeup time in ns since `WriteBufferPool::throttle_anchor`.
     last_wakeup_ns: AtomicU64,
-    /// Cached physical fill for this shard.
-    cached_fill_pct: AtomicU32,
+    /// Cached physical fill for this shard in basis points (100 = 1%).
+    cached_fill_basis_points: AtomicU32,
     /// Append counter that drives the cached-fill refresh cadence.
     sample_counter: AtomicU32,
 }

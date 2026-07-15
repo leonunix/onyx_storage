@@ -118,10 +118,11 @@ sync_batch_max_bytes_mb = 1024
 # Preserve the measured four-lane topology while the new sampled wall/CPU
 # profile identifies root-write service versus scheduler delay.
 lv2_prepared_queue_depth_per_lane = 16
-# Pace against physical LV2 occupancy (including checkpoint-retained entries)
-# before reserve_log_space falls into hard condvar backpressure.
-throttle_min_pct = 70
-throttle_max_pct = 95
+# ZFS-style foreground transaction delay. Backend flush stays unthrottled; new
+# appends are paced only after the 512 GiB durable ring carries 5% physical debt.
+# Basis-point runtime sampling keeps the narrow 5%-10% curve continuous.
+throttle_min_pct = 5
+throttle_max_pct = 10
 throttle_scale_us = 10
 throttle_cap_us = 2000
 
@@ -144,16 +145,15 @@ skip_fully_superseded = true
 # Bypass on PHYSICAL ring occupancy so checkpoint-retained slots cannot hide
 # pressure behind a low logical-pending value.
 buffer_write_window_ms = 30000
-buffer_write_window_physical_pressure_pct = 20
-# Resident payload is only a memory/cache signal. Admit work at 80%, then let
-# the global latency-feedback controller pace it; do not turn 3.2 GiB of cached
-# payload into an unbounded 16-lane catch-up burst at the physical 20% mark.
+buffer_write_window_physical_pressure_pct = 2
+# Resident payload is only a memory/cache signal. At 80%, bypass the overwrite
+# residence window so the unthrottled backend can protect durable capacity.
 buffer_write_window_payload_pressure_pct = 80
-# Aggregate flush admission uses LV2 durable-write p99 as its feedback signal.
-# It starts conservatively, increases while p99 has headroom, and backs off
-# multiplicatively above the 100 ms SLO. Physical LV2 pressure still overrides
-# pacing so durability capacity cannot be exhausted silently.
-foreground_flush_target_p99_ms = 100
+# Keep the backend healthy: it must consume durable LV2 work at its natural
+# completion-driven rate even while foreground IO is active. If that full
+# service rate cannot keep up, apply the ZFS-style hyperbolic delay to new LV2
+# appends at 5%-10% fill instead of rate-limiting the flusher.
+foreground_flush_target_p99_ms = 0
 foreground_flush_active_mib_s = 128
 foreground_flush_min_mib_s = 32
 foreground_flush_max_mib_s = 384

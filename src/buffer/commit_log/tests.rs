@@ -1784,6 +1784,27 @@ fn throttle_curve_is_monotonic_and_below_cap() {
 }
 
 #[test]
+fn throttle_curve_keeps_basis_point_precision_in_narrow_window() {
+    let r = ThrottleSettings {
+        min_pct: 5,
+        max_pct: 10,
+        scale_us: 10,
+        cap_us: 2_000,
+    };
+    assert_eq!(r.delay_us_for_fill_basis_points(500), 0);
+    assert_eq!(r.delay_us_for_fill_basis_points(900), 40);
+    assert_eq!(r.delay_us_for_fill_basis_points(985), 323);
+    assert_eq!(r.delay_us_for_fill_basis_points(1_000), 2_000);
+
+    let mut previous = 0;
+    for fill in 501..1_000 {
+        let delay = r.delay_us_for_fill_basis_points(fill);
+        assert!(delay >= previous, "non-monotonic at {fill}bp");
+        previous = delay;
+    }
+}
+
+#[test]
 fn physical_fill_tracks_checkpoint_retained_entries_after_pending_drains() {
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;
@@ -1850,11 +1871,13 @@ fn write_throttle_paces_only_the_target_ring_shard() {
         assert_eq!(BufferShard::reserve_log_space(&mut ring, 1, 8), Some(0));
     }
     assert_eq!(pool.physical_fill_percentage_for_shard(0), 80);
+    assert_eq!(pool.physical_fill_basis_points_for_shard(0), 8_000);
     assert_eq!(pool.physical_fill_percentage_for_shard(1), 0);
+    assert_eq!(pool.physical_fill_basis_points_for_shard(1), 0);
 
     pool.throttle_states[1]
-        .cached_fill_pct
-        .store(80, Ordering::Relaxed);
+        .cached_fill_basis_points
+        .store(8_000, Ordering::Relaxed);
     pool.throttle_states[1]
         .sample_counter
         .store(1, Ordering::Relaxed);
