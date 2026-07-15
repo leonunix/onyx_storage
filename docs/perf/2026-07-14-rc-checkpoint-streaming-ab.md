@@ -48,6 +48,19 @@ bucket，将 write-window pressure 提前到 2%，并只在 5%-10% physical fill
 5%-10% 窄窗口使用 basis-point fill 计算，避免 512 GiB ring 上整数百分比造成前台从不限速直接跳到
 2 ms/append。该变化不会扩大 commit queue，也不改变 4M BFG admission bound。
 
+首轮 `rc-auth-on-zfs-dirty-throttle-4m-600s` 证明“后台不限速、债务压前台”的方向正确，但否定了
+`buffer_write_window_physical_pressure_pct=2`。后台在 workload 内完成 253.395 GB，前台写入
+254.835 GB，physical fill 全程约 3%-10%，fio 结束时 pending 已为 0，physical ring 15.117 秒归零；
+相比 A' workload 内仅 105.877 GB 的 LV3 写出，后台并发 service 已恢复。但 2% pressure 几乎立即
+绕过 30 秒 overwrite residence window，使完整 LV3/前台字节比从 A' 的 58.72% 恶化到 99.44%。fio
+因此从 46,878 IOPS / 806.38 MB/s 降到 23,741 IOPS / 424.49 MB/s，p99 从 113.77 ms 升至
+299.89 ms；按 physical ring 归零计算的完整生命周期有效吞吐也低于 A'，不能保留该阈值。
+
+下一候选保留 `foreground_flush_target_p99_ms=0` 和 5%-10% 前台双曲线 delay，只把 write-window
+physical pressure 提到 10%。这样 30 秒内仍可做 overwrite collapse；只有达到前台 throttle ceiling
+时才旁路 residence window，让后台立即消费全部债务。验收仍要求后台 QoS wait=0、physical fill 不越过
+10%、无 hard backpressure，同时 LV3/前台字节比和完整生命周期吞吐必须恢复。
+
 下面的“受控 A/B”和“阶段拆解 fresh 基线”不是同一组可互换样本。后者包含额外正确性修复、指标和新
 Meta LD，用于 correctness + hotspot 定位，**不能拿它的 fio 数字与旧 A/B 直接计算优化幅度**。
 

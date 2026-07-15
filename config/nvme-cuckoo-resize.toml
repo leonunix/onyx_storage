@@ -145,14 +145,15 @@ skip_fully_superseded = true
 # Bypass on PHYSICAL ring occupancy so checkpoint-retained slots cannot hide
 # pressure behind a low logical-pending value.
 buffer_write_window_ms = 30000
-buffer_write_window_physical_pressure_pct = 2
+buffer_write_window_physical_pressure_pct = 10
 # Resident payload is only a memory/cache signal. At 80%, bypass the overwrite
 # residence window so the unthrottled backend can protect durable capacity.
 buffer_write_window_payload_pressure_pct = 80
 # Keep the backend healthy: it must consume durable LV2 work at its natural
 # completion-driven rate even while foreground IO is active. If that full
 # service rate cannot keep up, apply the ZFS-style hyperbolic delay to new LV2
-# appends at 5%-10% fill instead of rate-limiting the flusher.
+# appends at 5%-10% fill instead of rate-limiting the flusher. Preserve the
+# 30-second overwrite window below 10%; bypass it only at the throttle ceiling.
 foreground_flush_target_p99_ms = 0
 foreground_flush_active_mib_s = 128
 foreground_flush_min_mib_s = 32
