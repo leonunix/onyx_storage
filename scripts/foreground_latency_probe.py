@@ -151,6 +151,7 @@ def pd_scheduler_summary(
     max_pd_active = 0
     flush_waiters = 0
     flush_fenced = 0
+    pd_rows: list[dict[str, Any]] = []
     for pd in current.get("pds", []):
         if not isinstance(pd, dict):
             continue
@@ -164,7 +165,25 @@ def pd_scheduler_summary(
         flush_fenced += int(bool(pd.get("flush_fenced", False)))
         old_pd = old_pds.get(str(pd.get("pd_id", "")), {})
         old_classes = class_rows(old_pd)
-        for class_name, row in class_rows(pd).items():
+        current_classes = class_rows(pd)
+        pd_rows.append(
+            {
+                "pd_id": str(pd.get("pd_id", "")),
+                "max_active_blocks": int(pd.get("max_active_blocks", 0)),
+                "total_queued_blocks": queued,
+                "total_active_blocks": active,
+                "flush_waiters": int(pd.get("flush_waiters", 0)),
+                "flush_fenced": bool(pd.get("flush_fenced", False)),
+                "classes": {
+                    class_name: {
+                        "queued_blocks": int(row.get("queued_blocks", 0)),
+                        "active_blocks": int(row.get("active_blocks", 0)),
+                    }
+                    for class_name, row in current_classes.items()
+                },
+            }
+        )
+        for class_name, row in current_classes.items():
             old_row = old_classes.get(class_name, {})
             aggregate = classes.setdefault(
                 class_name,
@@ -208,6 +227,7 @@ def pd_scheduler_summary(
         "max_pd_active_blocks": max_pd_active,
         "flush_waiters": flush_waiters,
         "flush_fenced_pds": flush_fenced,
+        "pd_rows": pd_rows,
         "classes": classes,
     }
 
