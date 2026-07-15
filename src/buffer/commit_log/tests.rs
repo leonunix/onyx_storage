@@ -2390,3 +2390,11 @@ fn global_prepared_queue_depth_preserves_auto_default_and_explicit_override() {
         1
     );
 }
+
+#[test]
+fn global_write_lanes_scale_with_members_up_to_eight() {
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(0), 1);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(4), 4);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(8), 8);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(16), 8);
+}

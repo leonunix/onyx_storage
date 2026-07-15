@@ -989,6 +989,15 @@ impl WriteBufferPool {
         }
     }
 
+    pub(in crate::buffer::commit_log) fn resolve_global_write_lane_count(
+        member_count: usize,
+    ) -> usize {
+        // Match the eight foreground ublk queues in the production profile.
+        // Each lane owns one chunklet io_uring, so this reserves enough sync
+        // submission concurrency without increasing per-lane queue depth.
+        member_count.min(8).max(1)
+    }
+
     pub(super) fn global_sync_loop(
         root_device: Arc<dyn BlockBackend>,
         members: Vec<(u64, Arc<BufferShard>, Receiver<()>)>,
@@ -1020,11 +1029,11 @@ impl WriteBufferPool {
             lv2_prepared_queue_depth_per_lane,
             members.len(),
         );
-        // Four lanes overlap root writes while the device-wide durability
+        // Independent lanes overlap root writes while the device-wide durability
         // coordinator publishes completed epochs. The group-commit wait lives
         // only here (not in shard preparation or the coordinator), so each
         // request pays one window rather than three.
-        let write_lane_count = members.len().min(4).max(1);
+        let write_lane_count = Self::resolve_global_write_lane_count(members.len());
         tracing::info!(
             write_lane_count,
             prepared_queue_depth,
