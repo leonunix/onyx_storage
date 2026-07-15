@@ -39,15 +39,14 @@ devices = [
     "/dev/disk/by-id/nvme-eui.36434d30574020360025384300000002",
 ]
 io_backend = "uring"
-# Experimental work-conserving safety cap over the shared 10-PD pool. These are
-# high-level batch calls, not hardware queue-depth units, so 24 with 9/6/9
-# minimum reservations is only an A/B seed. A 24/32/40/48 sweep keeps those
-# minima fixed and exposes extra total slots as shared headroom. Idle
-# reservations are always borrowable.
-write_max_active = 24
-write_foreground_active = 9
-write_lv3_active = 6
-write_meta_active = 9
+# Disabled: a high-level write_many call is not a hardware-QD unit and couples
+# otherwise independent LV2, LV3, and Meta execution domains. Foreground
+# overload is handled by the LV2 dirty-debt throttle; physical scheduling will
+# move to chunklet's per-PD block layer.
+write_max_active = 0
+write_foreground_active = 0
+write_lv3_active = 0
+write_meta_active = 0
 spare_pct = 5
 watchdog_enabled = true
 watchdog_interval_secs = 10
