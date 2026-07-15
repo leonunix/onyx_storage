@@ -232,6 +232,10 @@ pub struct MetaMemorySnapshot {
     pub rc_apply_lane_idle_max_us: u64,
     pub rc_apply_lane_pending_set_wait_us: u64,
     pub rc_apply_lane_pending_set_wait_max_us: u64,
+    pub rc_apply_lane_reserved_hold_us: u64,
+    pub rc_apply_lane_reserved_hold_max_us: u64,
+    pub rc_apply_lane_reserved_hold_active: u64,
+    pub rc_apply_lane_reserved_hold_active_max: u64,
     pub rc_apply_lane_wakeups: u64,
     pub rc_apply_lane_empty_wakeups: u64,
     pub rc_apply_lane_burst_total: u64,
@@ -536,5 +540,92 @@ mod tests {
         let json = serde_json::to_value(&current).unwrap();
         assert_eq!(json["commit_bfg_admission_wait_us"].as_u64(), Some(75));
         assert_eq!(json["commit_bfg_admission_wait_max_us"].as_u64(), Some(40));
+    }
+
+    #[test]
+    fn rc_reserved_hold_metrics_map_serialize_and_delta() {
+        let meta = onyx_metadb::MetaMetricsSnapshot {
+            rc_apply_lane_reserved_hold_us: 175,
+            rc_apply_lane_reserved_hold_max_us: 90,
+            rc_apply_lane_reserved_hold_active: 3,
+            rc_apply_lane_reserved_hold_active_max: 7,
+            ..onyx_metadb::MetaMetricsSnapshot::default()
+        };
+        let current = MetaMemorySnapshot::from_metadb(
+            0,
+            0,
+            0,
+            onyx_metadb::dedup::TierSizes {
+                l0_distinct_fps: 0,
+                l0_approx_bytes: 0,
+                l1_entries: 0,
+            },
+            onyx_metadb::PageCacheStats::default(),
+            meta,
+            onyx_metadb::PendingState::default(),
+        );
+
+        assert_eq!(current.rc_apply_lane_reserved_hold_us, 175);
+        assert_eq!(current.rc_apply_lane_reserved_hold_max_us, 90);
+        assert_eq!(current.rc_apply_lane_reserved_hold_active, 3);
+        assert_eq!(current.rc_apply_lane_reserved_hold_active_max, 7);
+
+        let earlier = MetaMemorySnapshot {
+            rc_apply_lane_reserved_hold_us: 50,
+            rc_apply_lane_reserved_hold_max_us: 80,
+            rc_apply_lane_reserved_hold_active: 1,
+            rc_apply_lane_reserved_hold_active_max: 6,
+            ..MetaMemorySnapshot::default()
+        };
+        let delta = current.saturating_sub(&earlier);
+        assert_eq!(delta.rc_apply_lane_reserved_hold_us, 125);
+        assert_eq!(delta.rc_apply_lane_reserved_hold_max_us, 90);
+        assert_eq!(delta.rc_apply_lane_reserved_hold_active, 3);
+        assert_eq!(delta.rc_apply_lane_reserved_hold_active_max, 7);
+
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["rc_apply_lane_reserved_hold_us"].as_u64(), Some(175));
+        assert_eq!(
+            json["rc_apply_lane_reserved_hold_max_us"].as_u64(),
+            Some(90)
+        );
+        assert_eq!(json["rc_apply_lane_reserved_hold_active"].as_u64(), Some(3));
+        assert_eq!(
+            json["rc_apply_lane_reserved_hold_active_max"].as_u64(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn rc_reserved_hold_metrics_reach_status_json_and_text() {
+        let status = crate::metrics::EngineStatusSnapshot {
+            metadb_memory: Some(MetaMemorySnapshot {
+                rc_apply_lane_reserved_hold_us: 175,
+                rc_apply_lane_reserved_hold_max_us: 90,
+                rc_apply_lane_reserved_hold_active: 3,
+                rc_apply_lane_reserved_hold_active_max: 7,
+                ..MetaMemorySnapshot::default()
+            }),
+            ..crate::metrics::EngineStatusSnapshot::default()
+        };
+
+        let json = serde_json::to_value(&status).unwrap();
+        let meta = &json["metadb_memory"];
+        assert_eq!(meta["rc_apply_lane_reserved_hold_us"].as_u64(), Some(175));
+        assert_eq!(
+            meta["rc_apply_lane_reserved_hold_max_us"].as_u64(),
+            Some(90)
+        );
+        assert_eq!(meta["rc_apply_lane_reserved_hold_active"].as_u64(), Some(3));
+        assert_eq!(
+            meta["rc_apply_lane_reserved_hold_active_max"].as_u64(),
+            Some(7)
+        );
+
+        let text = status.render_text();
+        assert!(text.contains(
+            "reserved_hold_us=175 reserved_hold_max_us=90 reserved_hold_active=3 \
+             reserved_hold_active_max=7"
+        ));
     }
 }

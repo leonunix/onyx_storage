@@ -581,7 +581,7 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_apply_lane_rc: tasks={} queue_depth_max={} queue_wait_us={} queue_wait_max_us={} exec_us={} exec_max_us={} idle_us={} idle_max_us={} pending_set_wait_us={} pending_set_wait_max_us={} wakeups={} empty_wakeups={} burst_total={} burst_max={}",
+                "metadb_apply_lane_rc: tasks={} queue_depth_max={} queue_wait_us={} queue_wait_max_us={} exec_us={} exec_max_us={} idle_us={} idle_max_us={} pending_set_wait_us={} pending_set_wait_max_us={} reserved_hold_us={} reserved_hold_max_us={} reserved_hold_active={} reserved_hold_active_max={} wakeups={} empty_wakeups={} burst_total={} burst_max={}",
                 metadb.rc_apply_lane_tasks,
                 metadb.rc_apply_lane_queue_depth_max,
                 metadb.rc_apply_lane_queue_wait_us,
@@ -592,6 +592,10 @@ impl EngineStatusSnapshot {
                 metadb.rc_apply_lane_idle_max_us,
                 metadb.rc_apply_lane_pending_set_wait_us,
                 metadb.rc_apply_lane_pending_set_wait_max_us,
+                metadb.rc_apply_lane_reserved_hold_us,
+                metadb.rc_apply_lane_reserved_hold_max_us,
+                metadb.rc_apply_lane_reserved_hold_active,
+                metadb.rc_apply_lane_reserved_hold_active_max,
                 metadb.rc_apply_lane_wakeups,
                 metadb.rc_apply_lane_empty_wakeups,
                 metadb.rc_apply_lane_burst_total,
