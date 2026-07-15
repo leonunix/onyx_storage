@@ -421,6 +421,15 @@ impl ServiceController {
                 "chunklet per-PD write scheduler changed — requires restart to take effect"
             );
         }
+        if old_config.chunklet.pd_write_foreground_workers
+            != new_config.chunklet.pd_write_foreground_workers
+            || old_config.chunklet.pd_write_background_workers
+                != new_config.chunklet.pd_write_background_workers
+        {
+            tracing::warn!(
+                "chunklet persistent write execution pools changed — requires restart to take effect"
+            );
+        }
         if old_config.service.direct_io_cpus != new_config.service.direct_io_cpus {
             tracing::warn!(
                 old = %old_config.service.direct_io_cpus,

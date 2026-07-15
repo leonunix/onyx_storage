@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use onyx_chunklet::io::{
     IoBackendKind, IoClass as ChunkletIoClass, RawDevice as CkRawDevice, SchedulerConfig,
+    UringPoolConfig,
 };
 use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::ops;
@@ -73,10 +74,55 @@ fn pd_write_scheduler_config(cfg: &ChunkletConfig) -> Option<SchedulerConfig> {
     })
 }
 
+fn uring_pool_config(cfg: &ChunkletConfig) -> UringPoolConfig {
+    UringPoolConfig {
+        foreground_workers: cfg.pd_write_foreground_workers,
+        background_workers: cfg.pd_write_background_workers,
+        foreground_cpus: crate::affinity::role_cpu_set(crate::affinity::ThreadRole::BufferSync),
+        background_cpus: crate::affinity::role_cpu_set(crate::affinity::ThreadRole::Lv3Batch),
+    }
+}
+
+fn cpu_sets_disjoint(foreground: &[usize], background: &[usize]) -> bool {
+    !foreground.is_empty()
+        && !background.is_empty()
+        && foreground.iter().all(|cpu| !background.contains(cpu))
+}
+
+fn validate_uring_execution_cpu_sets(
+    cfg: &ChunkletConfig,
+    uring: &UringPoolConfig,
+    confine: bool,
+) -> OnyxResult<bool> {
+    if cfg.pd_write_foreground_workers == 0 || cfg.pd_write_background_workers == 0 {
+        return Ok(false);
+    }
+    let disjoint = cpu_sets_disjoint(&uring.foreground_cpus, &uring.background_cpus);
+    if confine && !disjoint {
+        return Err(OnyxError::Config(format!(
+            "chunklet persistent write execution requires disjoint confine CPU sets: foreground={:?}, background={:?}",
+            uring.foreground_cpus, uring.background_cpus
+        )));
+    }
+    Ok(!uring.foreground_cpus.is_empty() && !uring.background_cpus.is_empty() && !disjoint)
+}
+
 fn configure_pool_io_backend(pool: &Pool, cfg: &ChunkletConfig) -> OnyxResult<()> {
+    let uring = uring_pool_config(cfg);
+    if validate_uring_execution_cpu_sets(cfg, &uring, crate::affinity::is_confine_layout())? {
+        tracing::warn!(
+            foreground_cpus = ?uring.foreground_cpus,
+            background_cpus = ?uring.background_cpus,
+            "chunklet foreground/background execution CPU sets overlap; worker queues remain independent but CPU capacity is shared"
+        );
+    }
     match pd_write_scheduler_config(cfg) {
-        Some(scheduler) => pool.set_scheduled_io_backend(cfg.io_backend.to_kind(), scheduler)?,
-        None => pool.set_io_backend(cfg.io_backend.to_kind()),
+        Some(scheduler) => pool.set_scheduled_io_backend_with_uring_pool_config(
+            cfg.io_backend.to_kind(),
+            scheduler,
+            uring,
+        )?,
+        None => pool.set_io_backend_with_uring_pool_config(cfg.io_backend.to_kind(), uring),
     }
     Ok(())
 }
@@ -430,6 +476,36 @@ mod tests {
         assert!(geom_to_spec(&geom("bogus", 1, 1, 1, 0)).is_err());
     }
 
+    #[test]
+    fn confine_requires_disjoint_execution_cpu_sets() {
+        let cfg = ChunkletConfig {
+            enabled: true,
+            pd_write_foreground_workers: 2,
+            pd_write_background_workers: 2,
+            ..Default::default()
+        };
+        let overlapping = UringPoolConfig {
+            foreground_workers: 2,
+            background_workers: 2,
+            foreground_cpus: vec![0, 2, 4],
+            background_cpus: vec![4, 6, 8],
+        };
+        assert_eq!(
+            validate_uring_execution_cpu_sets(&cfg, &overlapping, false).unwrap(),
+            true
+        );
+        assert!(validate_uring_execution_cpu_sets(&cfg, &overlapping, true).is_err());
+
+        let disjoint = UringPoolConfig {
+            background_cpus: vec![1, 3, 5],
+            ..overlapping
+        };
+        assert_eq!(
+            validate_uring_execution_cpu_sets(&cfg, &disjoint, true).unwrap(),
+            false
+        );
+    }
+
     fn init_cfg(dir: &std::path::Path, n: usize) -> ChunkletConfig {
         let devices: Vec<_> = (0..n).map(|i| dir.join(format!("pd{i}"))).collect();
         for p in &devices {
@@ -586,9 +662,32 @@ mod tests {
 
         pool.set_io_backend(IoBackendKind::Sync);
         assert!(pool.io_scheduler_snapshot().is_none());
+        let execution_only = ChunkletConfig {
+            io_backend: ChunkletIoBackend::Uring,
+            pd_write_foreground_workers: 1,
+            pd_write_background_workers: 1,
+            pd_write_max_active_blocks: 0,
+            pd_write_foreground_min_blocks: 0,
+            pd_write_lv3_min_blocks: 0,
+            pd_write_meta_min_blocks: 0,
+            pd_write_maintenance_min_blocks: 0,
+            ..cfg.clone()
+        };
+        configure_pool_io_backend(&pool, &execution_only).unwrap();
+        assert!(pool.io_scheduler_snapshot().is_none());
+        if let Some(execution) = pool.io_execution_snapshot() {
+            assert!(execution.enabled);
+            assert_eq!(execution.foreground_workers, 1);
+            assert_eq!(execution.background_workers, 1);
+            assert_eq!(execution.classes.len(), ChunkletIoClass::ALL.len());
+        }
         configure_pool_io_backend(&pool, &cfg).unwrap();
+        assert!(pool.io_execution_snapshot().is_none());
         drop(pool);
 
+        cfg.io_backend = ChunkletIoBackend::Uring;
+        cfg.pd_write_foreground_workers = 2;
+        cfg.pd_write_background_workers = 2;
         cfg.lv3_ld_id = Some(lv3.to_string());
         let (pool2, backend) = open_role_backend(&cfg, LdRoleSel::Lv3).unwrap();
         assert!(backend.size() > 0);
@@ -624,6 +723,34 @@ mod tests {
         );
         assert!(lv3_admitted_blocks > 0);
         assert_eq!(lv3_completed_blocks, lv3_admitted_blocks);
+        if let Some(execution) = pool2.io_execution_snapshot() {
+            assert!(execution.enabled);
+            assert_eq!(execution.foreground_workers, 2);
+            assert_eq!(execution.background_workers, 2);
+            let drain_data = execution
+                .classes
+                .iter()
+                .find(|class| class.class == ChunkletIoClass::DrainData)
+                .unwrap();
+            assert!(drain_data.batches > 0);
+            assert!(drain_data.groups > 0);
+            assert!(drain_data.ops > 0);
+
+            let status = crate::metrics::EngineStatusSnapshot {
+                chunklet_io_execution: Some(execution.into()),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(status).unwrap();
+            assert_eq!(json["chunklet_io_execution"]["foreground_workers"], 2);
+            assert_eq!(json["chunklet_io_execution"]["background_workers"], 2);
+            assert_eq!(
+                json["chunklet_io_execution"]["classes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                ChunkletIoClass::ALL.len()
+            );
+        }
         let mut got = vec![0u8; payload.len()];
         backend.read_at(&mut got, 0).unwrap();
         assert_eq!(got, payload);

@@ -900,6 +900,10 @@ fn confine_thread_placement(name: &str) -> Option<bool> {
         || name.starts_with("direct-io-")
     {
         None
+    } else if name.starts_with("ckuring-fg-") {
+        Some(true)
+    } else if name.starts_with("ckuring-bg-") {
+        Some(false)
     } else {
         Some(name.starts_with("ublk-") || name.starts_with("persistent-slot"))
     }
@@ -1218,6 +1222,8 @@ mod tests {
         assert_eq!(confine_thread_placement("direct-io-durable-7\n"), None);
         assert_eq!(confine_thread_placement("direct-io-writer-7\n"), None);
         assert_eq!(confine_thread_placement("ublk-queue\n"), Some(true));
+        assert_eq!(confine_thread_placement("ckuring-fg-7\n"), Some(true));
+        assert_eq!(confine_thread_placement("ckuring-bg-11\n"), Some(false));
         assert_eq!(confine_thread_placement("BufferSync-0\n"), Some(false));
     }
 

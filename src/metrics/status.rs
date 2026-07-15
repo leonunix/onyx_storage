@@ -96,6 +96,56 @@ impl From<onyx_chunklet::io::SchedulerSnapshot> for ChunkletPdIoSchedulerSnapsho
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChunkletIoExecutionClassSnapshot {
+    pub class: String,
+    pub batches: u64,
+    pub groups: u64,
+    pub ops: u64,
+    pub queue_wait_ns: u64,
+    pub queue_wait_max_ns: u64,
+    pub execute_ns: u64,
+    pub execute_max_ns: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChunkletIoExecutionSnapshot {
+    pub enabled: bool,
+    pub foreground_workers: usize,
+    pub background_workers: usize,
+    pub foreground_cpus: Vec<usize>,
+    pub background_cpus: Vec<usize>,
+    pub cpu_sets_disjoint: bool,
+    pub classes: Vec<ChunkletIoExecutionClassSnapshot>,
+}
+
+impl From<onyx_chunklet::io::IoExecutionSnapshot> for ChunkletIoExecutionSnapshot {
+    fn from(snapshot: onyx_chunklet::io::IoExecutionSnapshot) -> Self {
+        Self {
+            enabled: snapshot.enabled,
+            foreground_workers: snapshot.foreground_workers,
+            background_workers: snapshot.background_workers,
+            foreground_cpus: snapshot.foreground_cpus,
+            background_cpus: snapshot.background_cpus,
+            cpu_sets_disjoint: snapshot.cpu_sets_disjoint,
+            classes: snapshot
+                .classes
+                .into_iter()
+                .map(|class| ChunkletIoExecutionClassSnapshot {
+                    class: chunklet_io_class_label(class.class).to_string(),
+                    batches: class.batches,
+                    groups: class.groups,
+                    ops: class.ops,
+                    queue_wait_ns: class.queue_wait_ns,
+                    queue_wait_max_ns: class.queue_wait_max_ns,
+                    execute_ns: class.execute_ns,
+                    execute_max_ns: class.execute_max_ns,
+                })
+                .collect(),
+        }
+    }
+}
+
 fn chunklet_io_class_label(class: onyx_chunklet::io::IoClass) -> &'static str {
     match class {
         onyx_chunklet::io::IoClass::Foreground => "foreground",
@@ -124,6 +174,8 @@ pub struct EngineStatusSnapshot {
     /// Per-PD block scheduler inside chunklet, after RAID fanout. Independent
     /// of the legacy Onyx-side batch admission snapshot above.
     pub chunklet_pd_io_scheduler: Option<ChunkletPdIoSchedulerSnapshot>,
+    /// Persistent chunklet io_uring execution pools and per-class work totals.
+    pub chunklet_io_execution: Option<ChunkletIoExecutionSnapshot>,
     pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
@@ -226,6 +278,32 @@ impl EngineStatusSnapshot {
                 queued,
                 max_per_pd,
                 flush_waiters,
+            );
+        }
+        if let Some(execution) = &self.chunklet_io_execution {
+            let batches: u64 = execution.classes.iter().map(|class| class.batches).sum();
+            let groups: u64 = execution.classes.iter().map(|class| class.groups).sum();
+            let ops: u64 = execution.classes.iter().map(|class| class.ops).sum();
+            let queue_wait_ns: u64 = execution
+                .classes
+                .iter()
+                .map(|class| class.queue_wait_ns)
+                .sum();
+            let execute_ns: u64 = execution.classes.iter().map(|class| class.execute_ns).sum();
+            let _ = writeln!(
+                out,
+                "chunklet_io_execution: enabled={} foreground_workers={} background_workers={} foreground_cpus={:?} background_cpus={:?} cpu_sets_disjoint={} batches={} groups={} ops={} queue_wait_ns={} execute_ns={}",
+                execution.enabled,
+                execution.foreground_workers,
+                execution.background_workers,
+                execution.foreground_cpus,
+                execution.background_cpus,
+                execution.cpu_sets_disjoint,
+                batches,
+                groups,
+                ops,
+                queue_wait_ns,
+                execute_ns,
             );
         }
         if let Some(metadb) = &self.metadb_memory {
@@ -1352,5 +1430,77 @@ impl EngineStatusSnapshot {
             self.metrics.discard_blocks_freed
         );
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunklet_execution_snapshot_reaches_json_and_text() {
+        let classes = onyx_chunklet::io::IoClass::ALL
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, class)| onyx_chunklet::io::IoExecutionClassSnapshot {
+                    class,
+                    batches: index as u64 + 1,
+                    groups: index as u64 + 11,
+                    ops: index as u64 + 21,
+                    queue_wait_ns: index as u64 + 31,
+                    queue_wait_max_ns: index as u64 + 41,
+                    execute_ns: index as u64 + 51,
+                    execute_max_ns: index as u64 + 61,
+                },
+            )
+            .collect();
+        let status = EngineStatusSnapshot {
+            chunklet_io_execution: Some(
+                onyx_chunklet::io::IoExecutionSnapshot {
+                    enabled: true,
+                    foreground_workers: 8,
+                    background_workers: 12,
+                    foreground_cpus: vec![0, 2, 4, 6],
+                    background_cpus: vec![1, 3, 5, 7],
+                    cpu_sets_disjoint: true,
+                    classes,
+                }
+                .into(),
+            ),
+            ..EngineStatusSnapshot::default()
+        };
+
+        let json = serde_json::to_value(&status).unwrap();
+        let execution = &json["chunklet_io_execution"];
+        assert_eq!(execution["enabled"], true);
+        assert_eq!(execution["foreground_workers"], 8);
+        assert_eq!(execution["background_workers"], 12);
+        assert_eq!(
+            execution["foreground_cpus"],
+            serde_json::json!([0, 2, 4, 6])
+        );
+        assert_eq!(
+            execution["background_cpus"],
+            serde_json::json!([1, 3, 5, 7])
+        );
+        assert_eq!(execution["cpu_sets_disjoint"], true);
+        let classes = execution["classes"].as_array().unwrap();
+        assert_eq!(classes.len(), 4);
+        assert_eq!(classes[0]["class"], "foreground");
+        assert_eq!(classes[1]["class"], "drain_data");
+        assert_eq!(classes[2]["class"], "drain_meta");
+        assert_eq!(classes[3]["class"], "maintenance");
+        assert_eq!(classes[3]["batches"], 4);
+        assert_eq!(classes[3]["groups"], 14);
+        assert_eq!(classes[3]["ops"], 24);
+        assert_eq!(classes[3]["queue_wait_ns"], 34);
+        assert_eq!(classes[3]["queue_wait_max_ns"], 44);
+        assert_eq!(classes[3]["execute_ns"], 54);
+        assert_eq!(classes[3]["execute_max_ns"], 64);
+
+        assert!(status.render_text().contains(
+            "chunklet_io_execution: enabled=true foreground_workers=8 background_workers=12 foreground_cpus=[0, 2, 4, 6] background_cpus=[1, 3, 5, 7] cpu_sets_disjoint=true"
+        ));
     }
 }

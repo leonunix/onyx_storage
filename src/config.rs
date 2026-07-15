@@ -964,6 +964,15 @@ pub struct ChunkletConfig {
     /// Cross-PD IO backend inside chunklet: `uring` (default) or `sync`.
     #[serde(default)]
     pub io_backend: ChunkletIoBackend,
+    /// Persistent chunklet io_uring workers reserved for foreground writes.
+    /// `0` together with `pd_write_background_workers = 0` preserves the
+    /// caller-thread execution path.
+    #[serde(default)]
+    pub pd_write_foreground_workers: usize,
+    /// Persistent chunklet io_uring workers shared by LV3, MetaDB, rebuild,
+    /// and rebalance writes. Must be enabled together with the foreground pool.
+    #[serde(default)]
+    pub pd_write_background_workers: usize,
     /// Pool-wide cap on concurrent chunklet write batches across LV2, LV3,
     /// and MetaDB. `0` disables Onyx-side class admission. When enabled, the
     /// three class reservations below must be non-zero and their sum must not
@@ -1102,6 +1111,8 @@ impl Default for ChunkletConfig {
             enabled: false,
             devices: Vec::new(),
             io_backend: ChunkletIoBackend::default(),
+            pd_write_foreground_workers: 0,
+            pd_write_background_workers: 0,
             write_max_active: 0,
             write_foreground_active: 0,
             write_lv3_active: 0,
@@ -1165,7 +1176,33 @@ impl ChunkletConfig {
             }
         }
 
+        self.validate_pd_write_workers()?;
         self.validate_pd_write_scheduler()
+    }
+
+    fn validate_pd_write_workers(&self) -> OnyxResult<()> {
+        let foreground = self.pd_write_foreground_workers;
+        let background = self.pd_write_background_workers;
+        if (foreground == 0) != (background == 0) {
+            return Err(OnyxError::Config(
+                "chunklet persistent write execution requires both pd_write_foreground_workers and pd_write_background_workers to be zero or both to be non-zero"
+                    .into(),
+            ));
+        }
+        if foreground == 0 {
+            return Ok(());
+        }
+        if !self.enabled {
+            return Err(OnyxError::Config(
+                "chunklet persistent write execution requires [chunklet].enabled = true".into(),
+            ));
+        }
+        if self.io_backend != ChunkletIoBackend::Uring {
+            return Err(OnyxError::Config(
+                "chunklet persistent write execution requires io_backend = \"uring\"".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_pd_write_scheduler(&self) -> OnyxResult<()> {
@@ -2101,6 +2138,8 @@ mod service_config_tests {
     #[test]
     fn chunklet_pd_write_scheduler_defaults_parse_and_validate_independently() {
         let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(default_config.chunklet.pd_write_foreground_workers, 0);
+        assert_eq!(default_config.chunklet.pd_write_background_workers, 0);
         assert_eq!(default_config.chunklet.pd_write_max_active_blocks, 0);
         assert_eq!(default_config.chunklet.pd_write_foreground_min_blocks, 0);
         assert_eq!(default_config.chunklet.pd_write_lv3_min_blocks, 0);
@@ -2167,5 +2206,42 @@ mod service_config_tests {
 
         config.chunklet.pd_write_maintenance_min_blocks = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn chunklet_persistent_write_workers_parse_without_pd_admission() {
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [chunklet]
+                enabled = true
+                io_backend = "uring"
+                pd_write_foreground_workers = 8
+                pd_write_background_workers = 12
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(configured.chunklet.pd_write_foreground_workers, 8);
+        assert_eq!(configured.chunklet.pd_write_background_workers, 12);
+        assert_eq!(configured.chunklet.pd_write_max_active_blocks, 0);
+        assert!(configured.validate().is_ok());
+    }
+
+    #[test]
+    fn chunklet_persistent_write_workers_require_a_pair_and_uring() {
+        let mut config = OnyxConfig::default();
+        config.chunklet.enabled = true;
+        config.chunklet.pd_write_foreground_workers = 1;
+        assert!(config.validate().is_err());
+
+        config.chunklet.pd_write_background_workers = 1;
+        assert!(config.validate().is_ok());
+
+        config.chunklet.io_backend = ChunkletIoBackend::Sync;
+        assert!(config.validate().is_err());
+
+        config.chunklet.pd_write_foreground_workers = 0;
+        config.chunklet.pd_write_background_workers = 0;
+        assert!(config.validate().is_ok());
     }
 }

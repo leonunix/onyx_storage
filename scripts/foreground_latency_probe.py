@@ -51,7 +51,12 @@ def schedstat(pid: int) -> dict[str, dict[str, int]]:
             runtime, delay, switches = map(int, (task / "schedstat").read_text().split()[:3])
         except (OSError, ValueError):
             continue
-        role = name.split("-")[0]
+        if name.startswith("ckuring-fg-"):
+            role = "ckuring-fg"
+        elif name.startswith("ckuring-bg-"):
+            role = "ckuring-bg"
+        else:
+            role = name.split("-")[0]
         row = totals.setdefault(role, {"threads": 0, "runtime_ns": 0, "runqueue_ns": 0, "switches": 0})
         row["threads"] += 1
         row["runtime_ns"] += runtime
@@ -105,6 +110,147 @@ def fine_latency_summary(
         "p50_ns": bounded_percentile_ns(buckets, bounds, 50),
         "p95_ns": bounded_percentile_ns(buckets, bounds, 95),
         "p99_ns": bounded_percentile_ns(buckets, bounds, 99),
+    }
+
+
+def class_rows(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(row.get("class", "")): row
+        for row in snapshot.get("classes", [])
+        if isinstance(row, dict) and row.get("class")
+    }
+
+
+def pd_scheduler_summary(
+    current: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> dict[str, Any]:
+    if not current:
+        return {}
+    old_pds = {
+        str(pd.get("pd_id", "")): pd
+        for pd in previous.get("pds", [])
+        if isinstance(pd, dict)
+    }
+    counters = (
+        "admission_events",
+        "admitted_blocks",
+        "wait_events",
+        "wait_ns",
+        "borrow_events",
+        "borrowed_blocks_total",
+        "reclaim_events",
+        "reclaimed_blocks",
+        "completed_blocks",
+        "error_blocks",
+        "service_ns",
+    )
+    classes: dict[str, dict[str, Any]] = {}
+    total_queued = 0
+    total_active = 0
+    max_pd_queued = 0
+    max_pd_active = 0
+    flush_waiters = 0
+    flush_fenced = 0
+    for pd in current.get("pds", []):
+        if not isinstance(pd, dict):
+            continue
+        queued = int(pd.get("total_queued_blocks", 0))
+        active = int(pd.get("total_active_blocks", 0))
+        total_queued += queued
+        total_active += active
+        max_pd_queued = max(max_pd_queued, queued)
+        max_pd_active = max(max_pd_active, active)
+        flush_waiters += int(pd.get("flush_waiters", 0))
+        flush_fenced += int(bool(pd.get("flush_fenced", False)))
+        old_pd = old_pds.get(str(pd.get("pd_id", "")), {})
+        old_classes = class_rows(old_pd)
+        for class_name, row in class_rows(pd).items():
+            old_row = old_classes.get(class_name, {})
+            aggregate = classes.setdefault(
+                class_name,
+                {
+                    "configured_min_blocks": 0,
+                    "queued_blocks": 0,
+                    "active_blocks": 0,
+                    "wait_max_ns_lifetime": 0,
+                    "service_max_ns_lifetime": 0,
+                    **{key: 0 for key in counters},
+                },
+            )
+            aggregate["configured_min_blocks"] += int(
+                row.get("configured_min_blocks", 0)
+            )
+            aggregate["queued_blocks"] += int(row.get("queued_blocks", 0))
+            aggregate["active_blocks"] += int(row.get("active_blocks", 0))
+            aggregate["wait_max_ns_lifetime"] = max(
+                aggregate["wait_max_ns_lifetime"], int(row.get("wait_max_ns", 0))
+            )
+            aggregate["service_max_ns_lifetime"] = max(
+                aggregate["service_max_ns_lifetime"],
+                int(row.get("service_max_ns", 0)),
+            )
+            for key in counters:
+                aggregate[key] += nonnegative(
+                    int(row.get(key, 0)), int(old_row.get(key, 0))
+                )
+    for row in classes.values():
+        row["admitted_blocks_s"] = row["admitted_blocks"] / elapsed
+        row["completed_blocks_s"] = row["completed_blocks"] / elapsed
+        row["completed_mib_s"] = row["completed_blocks"] * 4096 / elapsed / 1048576
+        row["error_blocks_s"] = row["error_blocks"] / elapsed
+        row["wait_ms"] = row.pop("wait_ns") / 1e6
+        row["service_ms"] = row.pop("service_ns") / 1e6
+    return {
+        "pds": len(current.get("pds", [])),
+        "total_queued_blocks": total_queued,
+        "total_active_blocks": total_active,
+        "max_pd_queued_blocks": max_pd_queued,
+        "max_pd_active_blocks": max_pd_active,
+        "flush_waiters": flush_waiters,
+        "flush_fenced_pds": flush_fenced,
+        "classes": classes,
+    }
+
+
+def execution_summary(
+    current: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> dict[str, Any]:
+    if not current:
+        return {}
+    old_classes = class_rows(previous)
+    classes: dict[str, dict[str, Any]] = {}
+    for class_name, row in class_rows(current).items():
+        old_row = old_classes.get(class_name, {})
+        batches = nonnegative(int(row.get("batches", 0)), int(old_row.get("batches", 0)))
+        groups = nonnegative(int(row.get("groups", 0)), int(old_row.get("groups", 0)))
+        ops = nonnegative(int(row.get("ops", 0)), int(old_row.get("ops", 0)))
+        queue_wait_ns = nonnegative(
+            int(row.get("queue_wait_ns", 0)), int(old_row.get("queue_wait_ns", 0))
+        )
+        execute_ns = nonnegative(
+            int(row.get("execute_ns", 0)), int(old_row.get("execute_ns", 0))
+        )
+        classes[class_name] = {
+            "batches": batches,
+            "groups": groups,
+            "ops": ops,
+            "groups_s": groups / elapsed,
+            "ops_s": ops / elapsed,
+            "groups_per_batch": groups / batches if batches else 0,
+            "ops_per_group": ops / groups if groups else 0,
+            "queue_wait_avg_ns": queue_wait_ns // groups if groups else 0,
+            "queue_wait_max_ns_lifetime": int(row.get("queue_wait_max_ns", 0)),
+            "execute_avg_ns": execute_ns // groups if groups else 0,
+            "execute_max_ns_lifetime": int(row.get("execute_max_ns", 0)),
+        }
+    return {
+        "enabled": bool(current.get("enabled", False)),
+        "foreground_workers": int(current.get("foreground_workers", 0)),
+        "background_workers": int(current.get("background_workers", 0)),
+        "foreground_cpus": current.get("foreground_cpus", []),
+        "background_cpus": current.get("background_cpus", []),
+        "cpu_sets_disjoint": bool(current.get("cpu_sets_disjoint", False)),
+        "classes": classes,
     }
 
 
@@ -371,6 +517,16 @@ def main() -> None:
                 chunklet_io_scheduler["total_max_active"] = int(
                     io_scheduler_now.get("total_max_active", 0)
                 )
+            chunklet_pd_io_scheduler = pd_scheduler_summary(
+                status.get("chunklet_pd_io_scheduler") or {},
+                old_status.get("chunklet_pd_io_scheduler") or {},
+                elapsed,
+            )
+            chunklet_io_execution = execution_summary(
+                status.get("chunklet_io_execution") or {},
+                old_status.get("chunklet_io_execution") or {},
+                elapsed,
+            )
             old_shards = {int(s["shard_idx"]): s for s in old_status.get("buffer_shards", [])}
             shards = []
             for shard in status.get("buffer_shards", []):
@@ -410,6 +566,8 @@ def main() -> None:
                         "flush_qos": flush_qos,
                         "write_throttle": write_throttle,
                         "chunklet_io_scheduler": chunklet_io_scheduler,
+                        "chunklet_pd_io_scheduler": chunklet_pd_io_scheduler,
+                        "chunklet_io_execution": chunklet_io_execution,
                         "buffer_sync": buffer_sync,
                         "shards": shards,
                         "scheduler": scheduler,

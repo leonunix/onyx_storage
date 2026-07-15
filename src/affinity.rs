@@ -151,6 +151,22 @@ impl PartitionTopo {
         all.dedup();
         all
     }
+
+    fn cpu_set_for_role(&self, role: ThreadRole) -> Vec<usize> {
+        let pod_indices: Vec<usize> = match role {
+            ThreadRole::FlusherCompress if self.pods.len() > 1 => (0..self.pods.len())
+                .filter(|&pod| pod != self.home_pod)
+                .collect(),
+            _ => vec![self.home_pod],
+        };
+        let mut cpus: Vec<_> = pod_indices
+            .into_iter()
+            .flat_map(|pod| self.pods[pod].cpus.iter().copied())
+            .collect();
+        cpus.sort_unstable();
+        cpus.dedup();
+        cpus
+    }
 }
 
 static LAYOUT: OnceLock<Option<LayoutKind>> = OnceLock::new();
@@ -187,6 +203,22 @@ pub fn init_partition(topo: PartitionTopo) {
     let _ = LAYOUT.set(Some(LayoutKind::Partition(topo)));
 }
 
+/// Return the complete CPU set assigned to a role by the active layout.
+/// An empty vector means affinity is not configured and the caller should
+/// inherit its creating thread's mask.
+pub fn role_cpu_set(role: ThreadRole) -> Vec<usize> {
+    let Some(Some(layout)) = LAYOUT.get() else {
+        return Vec::new();
+    };
+    layout.cpu_set_for_role(role)
+}
+
+/// Whether the active runtime layout uses the strict foreground/background
+/// confine split.
+pub fn is_confine_layout() -> bool {
+    matches!(LAYOUT.get(), Some(Some(LayoutKind::ConfineSets { .. })))
+}
+
 pub fn bind_current(role: ThreadRole, ordinal: usize) {
     let Some(Some(layout)) = LAYOUT.get() else {
         return;
@@ -201,10 +233,11 @@ pub fn bind_current(role: ThreadRole, ordinal: usize) {
         LayoutKind::ConfineSets {
             foreground,
             background,
-        } => match role {
-            ThreadRole::Ublk | ThreadRole::BufferSync => set_current_cpus(foreground),
-            _ => set_current_cpus(background),
-        },
+        } => set_current_cpus(if role_uses_foreground_set(role) {
+            foreground
+        } else {
+            background
+        }),
         LayoutKind::Partition(topo) => {
             let pod = &topo.pods[topo.pod_index(role, ordinal)];
             // Tier A first-touch locality: this thread's future allocations
@@ -224,6 +257,29 @@ pub fn bind_current(role: ThreadRole, ordinal: usize) {
             "failed to set thread CPU affinity"
         );
     }
+}
+
+impl LayoutKind {
+    fn cpu_set_for_role(&self, role: ThreadRole) -> Vec<usize> {
+        match self {
+            Self::PerRole(layout) => layout.cpus_for(role).cpus.clone(),
+            Self::ConfineSets {
+                foreground,
+                background,
+            } => {
+                if role_uses_foreground_set(role) {
+                    foreground.clone()
+                } else {
+                    background.clone()
+                }
+            }
+            Self::Partition(topo) => topo.cpu_set_for_role(role),
+        }
+    }
+}
+
+fn role_uses_foreground_set(role: ThreadRole) -> bool {
+    matches!(role, ThreadRole::Ublk | ThreadRole::BufferSync)
 }
 
 /// Bind the *calling* thread to `cpus`. Used by `numa::setup` on the main
@@ -405,6 +461,48 @@ mod tests {
     #[test]
     fn partition_all_cpus_union() {
         assert_eq!(topo2().all_cpus(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn role_cpu_sets_cover_per_role_confine_and_partition_layouts() {
+        let config = ThreadingConfig {
+            enabled: true,
+            ublk_cpus: "7,3-4,3".into(),
+            buffer_sync_cpus: "5-6".into(),
+            flusher_writer_cpus: "8-9".into(),
+            background_cpus: "10-11".into(),
+            ..ThreadingConfig::default()
+        };
+        let per_role = LayoutKind::PerRole(AffinityLayout::from_config(&config).unwrap());
+        assert_eq!(per_role.cpu_set_for_role(ThreadRole::Ublk), vec![3, 4, 7]);
+        assert_eq!(
+            per_role.cpu_set_for_role(ThreadRole::Background),
+            vec![10, 11]
+        );
+        assert_eq!(
+            per_role.cpu_set_for_role(ThreadRole::BufferSync),
+            vec![5, 6]
+        );
+        assert_eq!(per_role.cpu_set_for_role(ThreadRole::Lv3Batch), vec![8, 9]);
+
+        let confine = LayoutKind::ConfineSets {
+            foreground: vec![0, 2],
+            background: vec![4, 6],
+        };
+        assert_eq!(confine.cpu_set_for_role(ThreadRole::Ublk), vec![0, 2]);
+        assert_eq!(confine.cpu_set_for_role(ThreadRole::BufferSync), vec![0, 2]);
+        assert_eq!(confine.cpu_set_for_role(ThreadRole::Background), vec![4, 6]);
+        assert_eq!(confine.cpu_set_for_role(ThreadRole::Lv3Batch), vec![4, 6]);
+
+        let partition = LayoutKind::Partition(topo2());
+        assert_eq!(
+            partition.cpu_set_for_role(ThreadRole::Ublk),
+            vec![0, 2, 4, 6]
+        );
+        assert_eq!(
+            partition.cpu_set_for_role(ThreadRole::FlusherCompress),
+            vec![1, 3, 5, 7]
+        );
     }
 }
 

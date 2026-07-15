@@ -2143,6 +2143,10 @@ impl OnyxEngine {
             .as_ref()
             .and_then(|pool| pool.io_scheduler_snapshot())
             .map(Into::into);
+        let chunklet_io_execution = chunklet_pool
+            .as_ref()
+            .and_then(|pool| pool.io_execution_snapshot())
+            .map(Into::into);
         Ok(EngineStatusSnapshot {
             mode: if self.zone_manager.is_some() {
                 "active".to_string()
@@ -2177,6 +2181,7 @@ impl OnyxEngine {
                 .as_ref()
                 .map(|scheduler| scheduler.snapshot()),
             chunklet_pd_io_scheduler,
+            chunklet_io_execution,
             metadb_memory: self.meta.memory_stats().ok(),
             buffer_shards: self
                 .buffer_pool
