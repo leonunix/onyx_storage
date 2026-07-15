@@ -306,7 +306,7 @@ impl ServiceController {
     }
 
     /// Open all volumes and start ublk devices for them.
-    fn activate_volumes(&self, _new_config: &OnyxConfig) -> OnyxResult<()> {
+    fn activate_volumes(&self, new_config: &OnyxConfig) -> OnyxResult<()> {
         let guard = self.engine.load();
         let opt: &Option<OnyxEngine> = &guard;
         let engine = opt.as_ref().unwrap();
@@ -319,14 +319,13 @@ impl ServiceController {
 
         #[cfg(target_os = "linux")]
         if !volumes.is_empty() {
-            let config = self.config.read();
             let zm = engine
                 .zone_manager()
                 .ok_or_else(|| OnyxError::Config("no zone manager after activation".into()))?
                 .clone();
 
             for vol in &volumes {
-                let target = OnyxUblkTarget::new(&config.ublk, zm.clone(), vol)?;
+                let target = OnyxUblkTarget::new(&new_config.ublk, zm.clone(), vol)?;
                 let dev_ids = self.dev_ids.clone();
                 let vol_name = vol.id.0.clone();
 
@@ -390,6 +389,22 @@ impl ServiceController {
             tracing::warn!(
                 "buffer.lv2_prepared_queue_depth_per_lane changed — requires restart to take effect"
             );
+        }
+        if old_config.buffer.throttle_min_pct != new_config.buffer.throttle_min_pct
+            || old_config.buffer.throttle_max_pct != new_config.buffer.throttle_max_pct
+            || old_config.buffer.throttle_scale_us != new_config.buffer.throttle_scale_us
+            || old_config.buffer.throttle_cap_us != new_config.buffer.throttle_cap_us
+            || old_config.buffer.throttle_backend_debt != new_config.buffer.throttle_backend_debt
+        {
+            tracing::warn!("buffer write throttle changed — requires restart to take effect");
+        }
+        if old_config.chunklet.write_max_active != new_config.chunklet.write_max_active
+            || old_config.chunklet.write_foreground_active
+                != new_config.chunklet.write_foreground_active
+            || old_config.chunklet.write_lv3_active != new_config.chunklet.write_lv3_active
+            || old_config.chunklet.write_meta_active != new_config.chunklet.write_meta_active
+        {
+            tracing::warn!("chunklet write scheduler changed — requires restart to take effect");
         }
         if old_config.service.direct_io_cpus != new_config.service.direct_io_cpus {
             tracing::warn!(

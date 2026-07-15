@@ -1805,6 +1805,60 @@ fn throttle_curve_keeps_basis_point_precision_in_narrow_window() {
 }
 
 #[test]
+fn throttle_maps_commit_executor_debt_across_the_curve() {
+    let r = ThrottleSettings {
+        min_pct: 20,
+        max_pct: 30,
+        scale_us: 10,
+        cap_us: 2_000,
+    };
+    assert_eq!(r.executor_debt_basis_points(8, 7, 17), 0);
+    assert_eq!(r.executor_debt_basis_points(8, 8, 8), 0);
+    assert_eq!(r.executor_debt_basis_points(8, 8, 9), 2_111);
+    assert_eq!(r.executor_debt_basis_points(8, 8, 13), 2_555);
+    assert_eq!(r.executor_debt_basis_points(8, 8, 17), 3_000);
+    assert_eq!(r.executor_debt_basis_points(8, 8, 100), 3_000);
+}
+
+#[test]
+fn backend_throttle_hysteresis_rejects_spikes_and_requires_quiet_release() {
+    let throttle = ThrottleSettings {
+        min_pct: 20,
+        max_pct: 30,
+        scale_us: 10,
+        cap_us: 2_000,
+    };
+    let state = BackendThrottleControl::default();
+
+    assert_eq!(state.pressure_basis_points(throttle, 8, 8, 13, 1), 0);
+    assert_eq!(
+        state.pressure_basis_points(throttle, 8, 8, 13, BACKEND_THROTTLE_ARM_NS),
+        0
+    );
+    assert_eq!(
+        state.pressure_basis_points(throttle, 8, 8, 13, BACKEND_THROTTLE_ARM_NS + 1),
+        2_555
+    );
+
+    assert_eq!(
+        state.pressure_basis_points(throttle, 8, 8, 4, BACKEND_THROTTLE_ARM_NS + 2),
+        0
+    );
+    assert!(state.armed.load(Ordering::Relaxed));
+    assert_eq!(
+        state.pressure_basis_points(
+            throttle,
+            8,
+            8,
+            4,
+            BACKEND_THROTTLE_ARM_NS + BACKEND_THROTTLE_RELEASE_NS + 2,
+        ),
+        0
+    );
+    assert!(!state.armed.load(Ordering::Relaxed));
+}
+
+#[test]
 fn physical_fill_tracks_checkpoint_retained_entries_after_pending_drains() {
     let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
     let shard = &pool.shards[0].shard;
@@ -1884,7 +1938,7 @@ fn write_throttle_paces_only_the_target_ring_shard() {
     pool.throttle_states[1]
         .last_wakeup_ns
         .store(1_000_000, Ordering::Relaxed);
-    pool.apply_write_throttle(1);
+    pool.apply_write_throttle(1, true);
     assert_eq!(
         pool.throttle_states[1]
             .last_wakeup_ns
@@ -1892,7 +1946,7 @@ fn write_throttle_paces_only_the_target_ring_shard() {
         0
     );
 
-    pool.apply_write_throttle(0);
+    pool.apply_write_throttle(0, true);
     assert!(
         pool.throttle_states[0]
             .last_wakeup_ns
@@ -1900,10 +1954,122 @@ fn write_throttle_paces_only_the_target_ring_shard() {
             > 0
     );
     assert_eq!(
+        pool.backend_throttle_control
+            .last_wakeup_ns
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
         pool.throttle_states[1]
             .last_wakeup_ns
             .load(Ordering::Relaxed),
         0
+    );
+}
+
+#[test]
+fn backend_debt_throttles_foreground_without_pacing_relocation() {
+    let tmp = NamedTempFile::new().unwrap();
+    let slot = BufferShard::slot_size();
+    let data_start = COMMIT_LOG_SUPERBLOCK_SIZE + 2 * SHARD_CHECKPOINT_SIZE;
+    let size = data_start + 20 * slot;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let runtime_limits = BufferRuntimeLimits::default()
+        .with_throttle(ThrottleSettings {
+            min_pct: 20,
+            max_pct: 30,
+            scale_us: 10,
+            cap_us: 100,
+        })
+        .with_backend_debt_throttle(true);
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(dev),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::ZERO,
+        0,
+        None,
+        runtime_limits,
+    )
+    .unwrap();
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+    metrics
+        .flush_commit_executors_limit
+        .store(8, Ordering::Relaxed);
+    metrics
+        .flush_commit_executors_active
+        .store(8, Ordering::Relaxed);
+    metrics
+        .flush_commit_executors_active_max
+        .store(8, Ordering::Relaxed);
+    metrics
+        .flush_commit_executor_queue_depth
+        .store(17, Ordering::Relaxed);
+    pool.backend_throttle_control
+        .armed
+        .store(true, Ordering::Relaxed);
+
+    pool.apply_write_throttle(0, true);
+    assert_eq!(
+        metrics
+            .buffer_backend_debt_throttle_count
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(
+        pool.backend_throttle_control
+            .last_wakeup_ns
+            .load(Ordering::Relaxed)
+            > 0
+    );
+    assert_eq!(
+        pool.throttle_states[0]
+            .last_wakeup_ns
+            .load(Ordering::Relaxed),
+        0
+    );
+    let global_wakeup = pool
+        .backend_throttle_control
+        .last_wakeup_ns
+        .load(Ordering::Relaxed);
+
+    pool.apply_write_throttle(1, false);
+    assert_eq!(
+        metrics
+            .buffer_backend_debt_throttle_count
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pool.throttle_states[1]
+            .last_wakeup_ns
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pool.backend_throttle_control
+            .last_wakeup_ns
+            .load(Ordering::Relaxed),
+        global_wakeup,
+        "GC relocation must not reset the foreground backend-debt clock"
+    );
+
+    pool.apply_write_throttle(1, true);
+    assert_eq!(
+        metrics
+            .buffer_backend_debt_throttle_count
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert!(
+        pool.backend_throttle_control
+            .last_wakeup_ns
+            .load(Ordering::Relaxed)
+            > global_wakeup,
+        "all foreground shards must claim the same pool-wide pacing clock"
     );
 }
 

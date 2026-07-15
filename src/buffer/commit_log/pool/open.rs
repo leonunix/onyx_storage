@@ -517,6 +517,8 @@ impl WriteBufferPool {
             throttle,
             throttle_anchor: Instant::now(),
             throttle_states,
+            backend_debt_throttle_enabled: runtime_limits.throttle_backend_debt,
+            backend_throttle_control: BackendThrottleControl::default(),
             meta_fence: OnceLock::new(),
         };
 

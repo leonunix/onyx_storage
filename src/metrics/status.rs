@@ -20,6 +20,7 @@ pub struct EngineStatusSnapshot {
     pub buffer_physical_fill_pct: Option<u8>,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
+    pub chunklet_io_scheduler: Option<crate::io::block_backend::ChunkletIoSchedulerSnapshot>,
     pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
@@ -85,6 +86,24 @@ impl EngineStatusSnapshot {
                 out,
                 "buffer_payload_memory_bytes: {}/{}",
                 payload_bytes, limit
+            );
+        }
+        if let Some(scheduler) = &self.chunklet_io_scheduler {
+            let _ = writeln!(
+                out,
+                "chunklet_write_scheduler: active={}/{} max={} fg={}/{}({} waiters) lv3={}/{}({} waiters) meta={}/{}({} waiters)",
+                scheduler.total_active,
+                scheduler.total_limit,
+                scheduler.total_max_active,
+                scheduler.foreground.active,
+                scheduler.foreground.reserved,
+                scheduler.foreground.waiters,
+                scheduler.lv3.active,
+                scheduler.lv3.reserved,
+                scheduler.lv3.waiters,
+                scheduler.meta.active,
+                scheduler.meta.reserved,
+                scheduler.meta.waiters,
             );
         }
         if let Some(metadb) = &self.metadb_memory {
@@ -745,7 +764,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "buffer: appends={} append_bytes={} write_ops={} write_bytes={} read_ops={} read_bytes={} lookup_hits={} lookup_misses={} backpressure_events={} throttle_count={} throttle_us_total={} throttle_us_max={} hydration_skips={} hydration_head_bypass={}",
+            "buffer: appends={} append_bytes={} write_ops={} write_bytes={} read_ops={} read_bytes={} lookup_hits={} lookup_misses={} backpressure_events={} throttle_count={} throttle_us_total={} throttle_us_max={} backend_debt_throttle_count={} backend_debt_throttle_us_total={} backend_debt_throttle_us_max={} hydration_skips={} hydration_head_bypass={}",
             self.metrics.buffer_appends,
             self.metrics.buffer_append_bytes,
             self.metrics.buffer_write_ops,
@@ -758,6 +777,9 @@ impl EngineStatusSnapshot {
             self.metrics.buffer_throttle_count,
             self.metrics.buffer_throttle_us_total,
             self.metrics.buffer_throttle_us_max,
+            self.metrics.buffer_backend_debt_throttle_count,
+            self.metrics.buffer_backend_debt_throttle_us_total,
+            self.metrics.buffer_backend_debt_throttle_us_max,
             self.metrics.buffer_hydration_skipped_due_to_mem_limit,
             self.metrics.buffer_hydration_head_bypass_count
         );
@@ -995,9 +1017,10 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "commit_executor_load: queue_depth={} queue_depth_max={} active={} active_max={} executor_queue_wait_max_ns={} service_batches={}",
+            "commit_executor_load: queue_depth={} queue_depth_max={} limit={} active={} active_max={} executor_queue_wait_max_ns={} service_batches={}",
             self.metrics.flush_commit_executor_queue_depth,
             self.metrics.flush_commit_executor_queue_depth_max,
+            self.metrics.flush_commit_executors_limit,
             self.metrics.flush_commit_executors_active,
             self.metrics.flush_commit_executors_active_max,
             self.metrics

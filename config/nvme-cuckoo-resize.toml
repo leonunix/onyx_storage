@@ -39,6 +39,14 @@ devices = [
     "/dev/disk/by-id/nvme-eui.36434d30574020360025384300000002",
 ]
 io_backend = "uring"
+# Experimental work-conserving safety cap over the shared 10-PD pool. These are
+# high-level batch calls, not hardware queue-depth units, so 24/9/6/9 is only an
+# A/B seed and must not be retained unless a 24/32/40/48 sweep proves it. Idle
+# shares are always borrowable; the cap never rate-limits backend bandwidth.
+write_max_active = 24
+write_foreground_active = 9
+write_lv3_active = 6
+write_meta_active = 9
 spare_pct = 5
 watchdog_enabled = true
 watchdog_interval_secs = 10
@@ -125,6 +133,7 @@ throttle_min_pct = 20
 throttle_max_pct = 30
 throttle_scale_us = 10
 throttle_cap_us = 2000
+throttle_backend_debt = true
 
 [ublk]
 nr_queues = 8
@@ -146,9 +155,10 @@ skip_fully_superseded = true
 # pressure behind a low logical-pending value.
 buffer_write_window_ms = 30000
 buffer_write_window_physical_pressure_pct = 30
-# Resident payload is only a memory/cache signal. At 80%, bypass the overwrite
-# residence window so the unthrottled backend can protect durable capacity.
-buffer_write_window_payload_pressure_pct = 80
+# Resident payload is only a memory/cache signal. Keep its bypass at the hard
+# cache ceiling so executor debt throttles foreground admission without
+# prematurely destroying the 30-second overwrite residence window.
+buffer_write_window_payload_pressure_pct = 100
 # Keep the backend healthy: it must consume durable LV2 work at its natural
 # completion-driven rate even while foreground IO is active. If that full
 # service rate cannot keep up, apply the ZFS-style hyperbolic delay to new LV2

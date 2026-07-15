@@ -119,6 +119,11 @@ impl EngineMetrics {
             buffer_throttle_count: load(&self.buffer_throttle_count),
             buffer_throttle_us_total: load(&self.buffer_throttle_us_total),
             buffer_throttle_us_max: load(&self.buffer_throttle_us_max),
+            buffer_backend_debt_throttle_count: load(&self.buffer_backend_debt_throttle_count),
+            buffer_backend_debt_throttle_us_total: load(
+                &self.buffer_backend_debt_throttle_us_total,
+            ),
+            buffer_backend_debt_throttle_us_max: load(&self.buffer_backend_debt_throttle_us_max),
             buffer_hydration_skipped_due_to_mem_limit: load(
                 &self.buffer_hydration_skipped_due_to_mem_limit,
             ),
@@ -286,6 +291,7 @@ impl EngineMetrics {
             flush_commit_executor_queue_depth_max: load(
                 &self.flush_commit_executor_queue_depth_max,
             ),
+            flush_commit_executors_limit: load(&self.flush_commit_executors_limit),
             flush_commit_executors_active: load(&self.flush_commit_executors_active),
             flush_commit_executors_active_max: load(&self.flush_commit_executors_active_max),
             flush_commit_aggregator_seals_target: load(&self.flush_commit_aggregator_seals_target),
@@ -562,6 +568,12 @@ pub struct EngineMetricsSnapshot {
     pub buffer_throttle_count: u64,
     pub buffer_throttle_us_total: u64,
     pub buffer_throttle_us_max: u64,
+    #[serde(default)]
+    pub buffer_backend_debt_throttle_count: u64,
+    #[serde(default)]
+    pub buffer_backend_debt_throttle_us_total: u64,
+    #[serde(default)]
+    pub buffer_backend_debt_throttle_us_max: u64,
     pub buffer_hydration_skipped_due_to_mem_limit: u64,
     pub buffer_hydration_head_bypass_count: u64,
     pub buffer_payload_cache_evict_entries: u64,
@@ -730,6 +742,8 @@ pub struct EngineMetricsSnapshot {
     pub flush_commit_executor_queue_depth: u64,
     #[serde(default)]
     pub flush_commit_executor_queue_depth_max: u64,
+    #[serde(default)]
+    pub flush_commit_executors_limit: u64,
     #[serde(default)]
     pub flush_commit_executors_active: u64,
     #[serde(default)]
@@ -929,6 +943,7 @@ impl EngineMetricsSnapshot {
                     flush_commit_executor_queue_depth: self.flush_commit_executor_queue_depth,
                     flush_commit_worker_executor_queue_wait_max_ns: self.flush_commit_worker_executor_queue_wait_max_ns,
                     flush_commit_executor_queue_depth_max: self.flush_commit_executor_queue_depth_max,
+                    flush_commit_executors_limit: self.flush_commit_executors_limit,
                     flush_commit_executors_active: self.flush_commit_executors_active,
                     flush_commit_executors_active_max: self.flush_commit_executors_active_max,
                     read_pool_queue_wait_latency_buckets: sub_latency_buckets(
@@ -1043,6 +1058,9 @@ impl EngineMetricsSnapshot {
             buffer_throttle_count,
             buffer_throttle_us_total,
             buffer_throttle_us_max,
+            buffer_backend_debt_throttle_count,
+            buffer_backend_debt_throttle_us_total,
+            buffer_backend_debt_throttle_us_max,
             buffer_hydration_skipped_due_to_mem_limit,
             buffer_hydration_head_bypass_count,
             buffer_payload_cache_evict_entries,
@@ -1339,6 +1357,7 @@ mod compatibility_tests {
             "flush_commit_worker_executor_queue_wait_max_ns",
             "flush_commit_executor_queue_depth",
             "flush_commit_executor_queue_depth_max",
+            "flush_commit_executors_limit",
             "flush_commit_executors_active",
             "flush_commit_executors_active_max",
             "flush_commit_worker_service_batches",
@@ -1386,6 +1405,7 @@ mod compatibility_tests {
 
         let decoded: EngineMetricsSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.flush_commit_executor_queue_depth, 0);
+        assert_eq!(decoded.flush_commit_executors_limit, 0);
         assert_eq!(decoded.flush_commit_executors_active, 0);
         assert_eq!(decoded.flush_commit_worker_service_batches, 0);
         assert_eq!(decoded.foreground_io_outstanding, 0);
@@ -1414,6 +1434,7 @@ mod compatibility_tests {
         earlier.flush_qos_waiters = 12;
         earlier.flush_qos_waiters_max = 16;
         earlier.flush_commit_executor_queue_depth = 12;
+        earlier.flush_commit_executors_limit = 8;
         earlier.flush_commit_executors_active = 8;
         earlier.foreground_io_outstanding = 9;
         earlier.flush_commit_worker_executor_queue_wait_max_ns = 12;
@@ -1429,6 +1450,7 @@ mod compatibility_tests {
         current.flush_qos_waiters = 2;
         current.flush_qos_waiters_max = 16;
         current.flush_commit_executor_queue_depth = 2;
+        current.flush_commit_executors_limit = 8;
         current.flush_commit_executors_active = 1;
         current.foreground_io_outstanding = 3;
         current.flush_commit_worker_executor_queue_wait_max_ns = 12;
@@ -1444,6 +1466,7 @@ mod compatibility_tests {
         assert_eq!(delta.flush_qos_waiters, 2);
         assert_eq!(delta.flush_qos_waiters_max, 16);
         assert_eq!(delta.flush_commit_executor_queue_depth, 2);
+        assert_eq!(delta.flush_commit_executors_limit, 8);
         assert_eq!(delta.flush_commit_executors_active, 1);
         assert_eq!(delta.foreground_io_outstanding, 3);
         assert_eq!(delta.flush_commit_worker_executor_queue_wait_max_ns, 12);

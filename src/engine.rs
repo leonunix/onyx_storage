@@ -9,7 +9,7 @@ use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
 use crate::gc::runner::GcRunner;
 use crate::gc::{HeatMap, RefBitmap};
-use crate::io::block_backend::BlockBackend;
+use crate::io::block_backend::{BlockBackend, ChunkletIoScheduler};
 use crate::io::device::RawDevice;
 use crate::io::engine::IoEngine;
 use crate::io::read_pool::ReadPool;
@@ -115,6 +115,9 @@ pub struct OnyxEngine {
     /// on the RawDevice path or in meta-only mode. The meta LD's equivalent
     /// lives inside `MetaStore` (it self-contains its grow via `grow_meta_capacity`).
     lv3_ck_backend: Option<Arc<crate::io::block_backend::ChunkletBackend>>,
+    /// Shared work-conserving write admission for the three chunklet LD roles.
+    /// `None` preserves the legacy unconstrained caller fan-out.
+    chunklet_io_scheduler: Option<Arc<ChunkletIoScheduler>>,
     config: OnyxConfig,
     shutdown_done: Mutex<bool>,
 }
@@ -329,6 +332,42 @@ impl OnyxEngine {
         Ok(())
     }
 
+    fn configured_chunklet_io_scheduler(
+        config: &OnyxConfig,
+    ) -> OnyxResult<Option<Arc<ChunkletIoScheduler>>> {
+        let chunklet = &config.chunklet;
+        chunklet.validate_write_scheduler()?;
+        let shares = [
+            chunklet.write_foreground_active,
+            chunklet.write_lv3_active,
+            chunklet.write_meta_active,
+        ];
+        if chunklet.write_max_active == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(ChunkletIoScheduler::new(
+            chunklet.write_max_active,
+            shares,
+        )?)))
+    }
+
+    fn chunklet_role_backend(
+        pool: &Arc<onyx_chunklet::Pool>,
+        config: &OnyxConfig,
+        role: crate::chunklet_pool::LdRoleSel,
+        scheduler: &Option<Arc<ChunkletIoScheduler>>,
+    ) -> OnyxResult<Arc<crate::io::block_backend::ChunkletBackend>> {
+        match scheduler {
+            Some(scheduler) => crate::chunklet_pool::scheduled_role_backend_from_pool(
+                pool,
+                &config.chunklet,
+                role,
+                scheduler,
+            ),
+            None => crate::chunklet_pool::role_backend_from_pool(pool, &config.chunklet, role),
+        }
+    }
+
     /// Open the metadb store on whichever backend `meta.backend` selects. The
     /// chunklet path resolves the meta-role LD from the shared `chunklet_pool`
     /// (so the pool is opened exactly once for meta + LV3 + LV2) and keeps that
@@ -336,6 +375,7 @@ impl OnyxEngine {
     fn acquire_meta_store(
         config: &OnyxConfig,
         chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
+        scheduler: &Option<Arc<ChunkletIoScheduler>>,
     ) -> OnyxResult<MetaStore> {
         match config.meta.backend {
             crate::config::MetaBackendKind::Chunklet => {
@@ -345,10 +385,11 @@ impl OnyxEngine {
                 // Concrete `Arc<ChunkletBackend>` (not upcast): `MetaStore` keeps
                 // it in its grow handle so an online meta-LD `extend_ld` can
                 // `swap_ld` it in place.
-                let meta_backend = crate::chunklet_pool::role_backend_from_pool(
+                let meta_backend = Self::chunklet_role_backend(
                     pool,
-                    &config.chunklet,
+                    config,
                     crate::chunklet_pool::LdRoleSel::Meta,
+                    scheduler,
                 )?;
                 tracing::info!(
                     capacity_bytes = meta_backend.size(),
@@ -372,6 +413,7 @@ impl OnyxEngine {
     fn acquire_lv3_device(
         config: &OnyxConfig,
         chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
+        scheduler: &Option<Arc<ChunkletIoScheduler>>,
     ) -> OnyxResult<(
         Arc<dyn crate::io::block_backend::BlockBackend>,
         Option<Arc<crate::io::block_backend::ChunkletBackend>>,
@@ -380,10 +422,11 @@ impl OnyxEngine {
             let pool = chunklet_pool.as_ref().ok_or_else(|| {
                 OnyxError::Config("chunklet.enabled but pool not opened (internal)".into())
             })?;
-            let backend = crate::chunklet_pool::role_backend_from_pool(
+            let backend = Self::chunklet_role_backend(
                 pool,
-                &config.chunklet,
+                config,
                 crate::chunklet_pool::LdRoleSel::Lv3,
+                scheduler,
             )?;
             let device: Arc<dyn crate::io::block_backend::BlockBackend> = backend.clone();
             tracing::info!(capacity_bytes = device.size(), "LV3 on chunklet RAID LD");
@@ -433,6 +476,7 @@ impl OnyxEngine {
     fn open_buffer_pool(
         config: &OnyxConfig,
         chunklet_pool: &Option<Arc<onyx_chunklet::Pool>>,
+        scheduler: &Option<Arc<ChunkletIoScheduler>>,
         meta: &Arc<MetaStore>,
         lifecycle: &Arc<VolumeLifecycleManager>,
         allocator: &Arc<SpaceAllocator>,
@@ -458,7 +502,8 @@ impl OnyxEngine {
             max_pct: config.buffer.throttle_max_pct,
             scale_us: config.buffer.throttle_scale_us,
             cap_us: config.buffer.throttle_cap_us,
-        });
+        })
+        .with_backend_debt_throttle(config.buffer.throttle_backend_debt);
 
         // Resolve the LV2 backend + whether onyx drives its own device-level
         // io_uring. A chunklet LD owns its cross-PD io_uring internally, so the
@@ -476,10 +521,11 @@ impl OnyxEngine {
                 OnyxError::Config("chunklet.enabled but pool not opened (internal)".into())
             })?;
             let backend: Arc<dyn crate::io::block_backend::BlockBackend> =
-                crate::chunklet_pool::role_backend_from_pool(
+                Self::chunklet_role_backend(
                     pool,
-                    &config.chunklet,
+                    config,
                     crate::chunklet_pool::LdRoleSel::Lv2,
+                    scheduler,
                 )?;
             tracing::info!(capacity_bytes = backend.size(), "LV2 on chunklet RAID LD");
             (backend, None)
@@ -755,10 +801,15 @@ impl OnyxEngine {
         //    None when [chunklet] is disabled. Opened BEFORE metadb because the
         //    meta LD lives inside this pool when `meta.backend = "chunklet"`.
         let chunklet_pool = Self::acquire_chunklet_pool(config)?;
+        let chunklet_io_scheduler = Self::configured_chunklet_io_scheduler(config)?;
 
         // 2. MetaStore — on the meta LD (chunklet backend, from the shared pool)
         //    or the host FS (file backend).
-        let meta = Arc::new(Self::acquire_meta_store(config, &chunklet_pool)?);
+        let meta = Arc::new(Self::acquire_meta_store(
+            config,
+            &chunklet_pool,
+            &chunklet_io_scheduler,
+        )?);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
@@ -766,7 +817,8 @@ impl OnyxEngine {
         // (no shared deletion state needed — per-handle alive flags are used)
 
         // 3. LV3 device (RawDevice or chunklet RAID LD) + IO engine
-        let (device, lv3_ck_backend) = Self::acquire_lv3_device(config, &chunklet_pool)?;
+        let (device, lv3_ck_backend) =
+            Self::acquire_lv3_device(config, &chunklet_pool, &chunklet_io_scheduler)?;
         let device_size = device.size();
 
         // 2a. Validate / format LV3 superblock
@@ -852,6 +904,7 @@ impl OnyxEngine {
         let buffer_pool = Self::open_buffer_pool(
             config,
             &chunklet_pool,
+            &chunklet_io_scheduler,
             &meta,
             &lifecycle,
             &allocator,
@@ -1044,6 +1097,7 @@ impl OnyxEngine {
             usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
             lv3_ck_backend,
+            chunklet_io_scheduler,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -1063,7 +1117,12 @@ impl OnyxEngine {
         } else {
             None
         };
-        let meta = Arc::new(Self::acquire_meta_store(config, &chunklet_pool)?);
+        let chunklet_io_scheduler = Self::configured_chunklet_io_scheduler(config)?;
+        let meta = Arc::new(Self::acquire_meta_store(
+            config,
+            &chunklet_pool,
+            &chunklet_io_scheduler,
+        )?);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
@@ -1092,6 +1151,7 @@ impl OnyxEngine {
             usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
             lv3_ck_backend: None,
+            chunklet_io_scheduler,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -1684,6 +1744,8 @@ impl OnyxEngine {
     /// `Pool::open` on the same devices would be rejected outright — and even if
     /// it weren't, two in-memory pools would tear the shared superblock.
     pub fn upgrade_from_meta_only(meta: Arc<MetaStore>, config: &OnyxConfig) -> OnyxResult<Self> {
+        Self::validate_dedup_read_pool(config)?;
+        Self::validate_meta_backend(config)?;
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;
@@ -1698,7 +1760,41 @@ impl OnyxEngine {
             Some(pool) => Some(pool),
             None => Self::acquire_chunklet_pool(config)?,
         };
-        let (device, lv3_ck_backend) = Self::acquire_lv3_device(config, &chunklet_pool)?;
+        let configured_scheduler = Self::configured_chunklet_io_scheduler(config)?;
+        let existing_scheduler = meta.chunklet_io_scheduler();
+        let chunklet_io_scheduler = match (existing_scheduler, configured_scheduler) {
+            (Some(existing), Some(configured)) => {
+                let existing_snapshot = existing.snapshot();
+                let configured_snapshot = configured.snapshot();
+                if existing_snapshot.total_limit != configured_snapshot.total_limit
+                    || existing_snapshot.foreground_reserved
+                        != configured_snapshot.foreground_reserved
+                    || existing_snapshot.lv3_reserved != configured_snapshot.lv3_reserved
+                    || existing_snapshot.meta_reserved != configured_snapshot.meta_reserved
+                {
+                    return Err(OnyxError::Config(
+                        "chunklet write scheduler cannot change during meta-only to full upgrade"
+                            .into(),
+                    ));
+                }
+                Some(existing)
+            }
+            (Some(_), None) => {
+                return Err(OnyxError::Config(
+                    "chunklet write scheduler cannot be disabled during meta-only to full upgrade"
+                        .into(),
+                ));
+            }
+            (None, Some(_)) if meta.chunklet_pool().is_some() => {
+                return Err(OnyxError::Config(
+                    "cannot enable chunklet write scheduler after an unscheduled meta-LD open; restart directly in full mode"
+                        .into(),
+                ));
+            }
+            (None, configured) => configured,
+        };
+        let (device, lv3_ck_backend) =
+            Self::acquire_lv3_device(config, &chunklet_pool, &chunklet_io_scheduler)?;
         let device_size = device.size();
 
         // Validate / format LV3 superblock
@@ -1752,6 +1848,7 @@ impl OnyxEngine {
         let buffer_pool = Self::open_buffer_pool(
             config,
             &chunklet_pool,
+            &chunklet_io_scheduler,
             &meta,
             &lifecycle,
             &allocator,
@@ -1860,7 +1957,7 @@ impl OnyxEngine {
             meta.clone(),
             buffer_pool.clone(),
             buffer_pool.durable_seq_handle(),
-            std::time::Duration::from_millis(50),
+            config.meta.checkpoint_interval(),
             config.meta.flush_dirty_pages_threshold,
             config.meta.checkpoint_ring_fill_pct,
         );
@@ -1895,6 +1992,7 @@ impl OnyxEngine {
             usage_cache: dashmap::DashMap::new(),
             generation_clock: AtomicU64::new(generation_clock),
             lv3_ck_backend,
+            chunklet_io_scheduler,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
         })
@@ -2069,6 +2167,10 @@ impl OnyxEngine {
                 .buffer_pool
                 .as_ref()
                 .map(|pool| pool.payload_memory_limit_bytes()),
+            chunklet_io_scheduler: self
+                .chunklet_io_scheduler
+                .as_ref()
+                .map(|scheduler| scheduler.snapshot()),
             metadb_memory: self.meta.memory_stats().ok(),
             buffer_shards: self
                 .buffer_pool
@@ -2243,6 +2345,37 @@ mod tests {
         cfg.dedup.enabled = false;
         cfg.storage.read_pool_workers = 0;
         assert!(OnyxEngine::validate_dedup_read_pool(&cfg).is_ok());
+    }
+
+    #[test]
+    fn chunklet_write_scheduler_requires_complete_shares() {
+        let mut cfg = default_config();
+        cfg.chunklet.enabled = true;
+        cfg.chunklet.write_max_active = 24;
+        cfg.chunklet.write_foreground_active = 9;
+        cfg.chunklet.write_lv3_active = 6;
+        cfg.chunklet.write_meta_active = 8;
+        assert!(OnyxEngine::configured_chunklet_io_scheduler(&cfg).is_err());
+
+        cfg.chunklet.write_meta_active = 9;
+        let scheduler = OnyxEngine::configured_chunklet_io_scheduler(&cfg)
+            .unwrap()
+            .unwrap();
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.total_limit, 24);
+        assert_eq!(snapshot.foreground_reserved, 9);
+        assert_eq!(snapshot.lv3_reserved, 6);
+        assert_eq!(snapshot.meta_reserved, 9);
+    }
+
+    #[test]
+    fn chunklet_write_scheduler_is_disabled_only_when_all_knobs_are_zero() {
+        let mut cfg = default_config();
+        assert!(OnyxEngine::configured_chunklet_io_scheduler(&cfg)
+            .unwrap()
+            .is_none());
+        cfg.chunklet.write_lv3_active = 1;
+        assert!(OnyxEngine::configured_chunklet_io_scheduler(&cfg).is_err());
     }
 
     #[test]

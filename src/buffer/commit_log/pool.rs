@@ -104,12 +104,11 @@ impl WriteBufferPool {
             .position(|shard| shard.shard.has_seq(seq))
     }
 
-    /// ZFS-style hyperbolic write throttle on LV2 fill. Returns immediately
-    /// when the throttle is disabled or fill is below the configured floor.
-    /// Otherwise sleeps until an atomically-claimed per-shard slot, so
-    /// concurrent producers headed to the same ring stack into N × delay while
-    /// unrelated shards continue independently.
-    pub(super) fn apply_write_throttle(&self, shard_idx: usize) {
+    /// ZFS-style hyperbolic foreground throttle. Saturated metadata commit
+    /// executors are mapped onto a virtual fill value and use one pool-wide
+    /// wake queue; physical ring pressure remains per shard. The backend itself
+    /// remains completion-driven.
+    pub(super) fn apply_write_throttle(&self, shard_idx: usize, include_backend_debt: bool) {
         let Some(throttle) = self.throttle else {
             return;
         };
@@ -134,22 +133,60 @@ impl WriteBufferPool {
             } else {
                 cached_fill_basis_points
             };
-        let delay_us = throttle.delay_us_for_fill_basis_points(fill_basis_points);
-        if delay_us == 0 {
-            // A checkpoint may have released this ring while producers still
-            // had future wakeups reserved. Drop that obsolete queue once the
-            // shard is below the throttle floor so it cannot leak into the
-            // next pressure cycle.
+        let physical_delay_us = throttle.delay_us_for_fill_basis_points(fill_basis_points);
+        let backend_delay_us = if include_backend_debt && self.backend_debt_throttle_enabled {
+            self.metrics
+                .get()
+                .map(|metrics| {
+                    let workers = metrics
+                        .flush_commit_executors_limit
+                        .load(Ordering::Relaxed)
+                        .max(1);
+                    let active = metrics
+                        .flush_commit_executors_active
+                        .load(Ordering::Relaxed);
+                    let queued = metrics
+                        .flush_commit_executor_queue_depth
+                        .load(Ordering::Relaxed);
+                    throttle.delay_us_for_fill_basis_points(
+                        self.backend_throttle_control.pressure_basis_points(
+                            throttle,
+                            workers,
+                            active,
+                            queued,
+                            self.throttle_anchor.elapsed().as_nanos() as u64,
+                        ),
+                    )
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let backend_debt_dominant = backend_delay_us >= physical_delay_us && backend_delay_us > 0;
+        let delay_us = physical_delay_us.max(backend_delay_us);
+        if physical_delay_us == 0 {
             state.last_wakeup_ns.store(0, Ordering::Relaxed);
+        }
+        if include_backend_debt && self.backend_debt_throttle_enabled && backend_delay_us == 0 {
+            self.backend_throttle_control
+                .last_wakeup_ns
+                .store(0, Ordering::Relaxed);
+        }
+        if delay_us == 0 {
             return;
         }
         let delay_ns = delay_us.saturating_mul(1_000);
         let now_ns = self.throttle_anchor.elapsed().as_nanos() as u64;
-        let mut last = state.last_wakeup_ns.load(Ordering::Relaxed);
+        let wakeup_clock = if backend_debt_dominant {
+            &self.backend_throttle_control.last_wakeup_ns
+        } else {
+            &state.last_wakeup_ns
+        };
+        let mut last = wakeup_clock.load(Ordering::Relaxed);
         let wakeup_ns = loop {
             let baseline = last.max(now_ns);
             let candidate = baseline.saturating_add(delay_ns);
-            match state.last_wakeup_ns.compare_exchange_weak(
+            match wakeup_clock.compare_exchange_weak(
                 last,
                 candidate,
                 Ordering::Relaxed,
@@ -182,6 +219,22 @@ impl WriteBufferPool {
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                     );
+                }
+                if backend_debt_dominant {
+                    metrics
+                        .buffer_backend_debt_throttle_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .buffer_backend_debt_throttle_us_total
+                        .fetch_add(mine, Ordering::Relaxed);
+                    let debt_max = metrics
+                        .buffer_backend_debt_throttle_us_max
+                        .load(Ordering::Relaxed);
+                    if mine > debt_max {
+                        let _ = metrics
+                            .buffer_backend_debt_throttle_us_max
+                            .compare_exchange(debt_max, mine, Ordering::Relaxed, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -310,7 +363,7 @@ impl WriteBufferPool {
                 "GC relocation append crosses a buffer routing boundary".into(),
             ));
         }
-        self.apply_write_throttle(shard_idx);
+        self.apply_write_throttle(shard_idx, relocation_source.is_none());
         let shard = &self.shards[shard_idx];
         let prepared =
             shard

@@ -18,7 +18,7 @@ use onyx_chunklet::{Pool, PoolConfig};
 
 use crate::config::{ChunkletConfig, ChunkletIoBackend, ChunkletLdGeom};
 use crate::error::{OnyxError, OnyxResult};
-use crate::io::block_backend::ChunkletBackend;
+use crate::io::block_backend::{ChunkletBackend, ChunkletIoScheduler, IoClass};
 
 /// Which LV a resolved LD serves — selects the role's configured id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +305,28 @@ pub fn role_backend_from_pool(
 ) -> OnyxResult<Arc<ChunkletBackend>> {
     let ld = resolve_ld(pool, cfg, role)?;
     Ok(Arc::new(ChunkletBackend::with_pool(ld, pool.clone())))
+}
+
+/// Scheduled engine path. Every role derived from one Pool must receive the
+/// same scheduler Arc; the role selects its protected write class.
+pub(crate) fn scheduled_role_backend_from_pool(
+    pool: &Arc<Pool>,
+    cfg: &ChunkletConfig,
+    role: LdRoleSel,
+    scheduler: &Arc<ChunkletIoScheduler>,
+) -> OnyxResult<Arc<ChunkletBackend>> {
+    let ld = resolve_ld(pool, cfg, role)?;
+    let class = match role {
+        LdRoleSel::Lv2 => IoClass::Foreground,
+        LdRoleSel::Lv3 => IoClass::Lv3,
+        LdRoleSel::Meta => IoClass::Meta,
+    };
+    Ok(Arc::new(ChunkletBackend::with_pool_and_scheduler(
+        ld,
+        pool.clone(),
+        class,
+        scheduler.clone(),
+    )))
 }
 
 /// Translate `strip_kib` into chunklet's `strip_size_log2`. 0 → 0 (one 4 KiB

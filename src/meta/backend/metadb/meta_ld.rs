@@ -445,6 +445,12 @@ pub(super) struct MetaLdGrower {
 }
 
 impl MetaLdGrower {
+    pub(super) fn io_scheduler(
+        &self,
+    ) -> Option<Arc<crate::io::block_backend::ChunkletIoScheduler>> {
+        self.backend.io_scheduler()
+    }
+
     /// Propagate an online meta-LD extend: swap the extended LD into the shared
     /// `ChunkletBackend` (so all windows see the larger device), then rewrite the
     /// OMET superblock's page-window size and widen the metadb page device to

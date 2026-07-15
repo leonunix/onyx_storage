@@ -27,6 +27,7 @@
 //! `pwrite` are positional), and a chunklet LD serialises only at the stripe
 //! level, so concurrent callers do not need external coordination here.
 
+use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -35,10 +36,389 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::ChunkletError;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
+use serde::Serialize;
 
-use crate::error::OnyxResult;
+use crate::error::{OnyxError, OnyxResult};
 use crate::io::device::RawDevice;
+
+/// IO service class used by the Onyx-side chunklet admission scheduler.
+///
+/// The scheduler counts synchronous chunklet batch calls, not their internal
+/// PD operations. Keeping LV3 and Meta separate matters: a MetaDB checkpoint
+/// can fan out many calls and must not strand the LV3 drain path behind one
+/// shared background FIFO.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IoClass {
+    /// LV2 commit-log writes that gate foreground acknowledgement.
+    Foreground,
+    /// LV3 payload writes that drain the durable LV2 ring.
+    Lv3,
+    /// MetaDB WAL, apply, and checkpoint writes.
+    Meta,
+}
+
+impl IoClass {
+    const ALL: [Self; 3] = [Self::Foreground, Self::Lv3, Self::Meta];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Foreground => 0,
+            Self::Lv3 => 1,
+            Self::Meta => 2,
+        }
+    }
+}
+
+/// Per-class scheduler counters captured under the scheduler mutex.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ChunkletIoClassSnapshot {
+    pub reserved: u32,
+    pub active: u32,
+    pub waiters: u32,
+    pub max_active: u32,
+    pub max_waiters: u32,
+    pub admissions: u64,
+    pub wait_ns: u64,
+    pub wait_max_ns: u64,
+    pub borrowed_admissions: u64,
+    /// Time for this class to regain service after it queued behind another
+    /// class holding more than its reservation.
+    pub reclaim_max_ns: u64,
+    pub reclaim_current_ns: u64,
+    pub reclaim_events: u64,
+    pub reclaim_in_progress: bool,
+}
+
+/// Point-in-time scheduler state and lifetime high-water counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ChunkletIoSchedulerSnapshot {
+    pub total_limit: u32,
+    pub foreground_reserved: u32,
+    pub lv3_reserved: u32,
+    pub meta_reserved: u32,
+    pub total_active: u32,
+    pub total_max_active: u32,
+    pub foreground: ChunkletIoClassSnapshot,
+    pub lv3: ChunkletIoClassSnapshot,
+    pub meta: ChunkletIoClassSnapshot,
+    /// Aggregate maximum/current reclaim delay across all three classes.
+    pub reclaim_max_ns: u64,
+    pub reclaim_current_ns: u64,
+    pub reclaim_events: u64,
+    pub reclaim_in_progress: bool,
+}
+
+#[derive(Debug)]
+struct SchedulerWaiter {
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct SchedulerClassState {
+    active: u32,
+    max_active: u32,
+    max_waiters: u32,
+    admissions: u64,
+    wait_ns: u64,
+    wait_max_ns: u64,
+    borrowed_admissions: u64,
+    /// Explicit nodes avoid a numeric ticket that could wrap after a long run.
+    queue: VecDeque<Arc<SchedulerWaiter>>,
+    reclaim_started: Option<Instant>,
+    reclaim_max_ns: u64,
+    reclaim_events: u64,
+}
+
+struct SchedulerState {
+    total_active: u32,
+    total_max_active: u32,
+    next_class: usize,
+    classes: [SchedulerClassState; 3],
+}
+
+impl Default for SchedulerState {
+    fn default() -> Self {
+        Self {
+            total_active: 0,
+            total_max_active: 0,
+            next_class: 0,
+            classes: std::array::from_fn(|_| SchedulerClassState::default()),
+        }
+    }
+}
+
+impl SchedulerState {
+    fn class(&self, class: IoClass) -> &SchedulerClassState {
+        &self.classes[class.index()]
+    }
+
+    fn class_mut(&mut self, class: IoClass) -> &mut SchedulerClassState {
+        &mut self.classes[class.index()]
+    }
+}
+
+/// Bounded three-class admission for synchronous chunklet write batches.
+///
+/// Each class owns a non-zero guaranteed reservation. Deficit classes are
+/// served first; once every waiting class has its reservation, any queued class
+/// may borrow idle shares up to `total_limit`. Existing borrowers are not
+/// preempted and retire at the next batch completion. A FIFO queue per class
+/// prevents same-class starvation.
+pub(crate) struct ChunkletIoScheduler {
+    total_limit: u32,
+    reserved: [u32; 3],
+    state: Mutex<SchedulerState>,
+}
+
+impl ChunkletIoScheduler {
+    /// Build a scheduler with protected `[Foreground, LV3, Meta]` shares.
+    /// No production default is embedded here so box experiments can sweep the
+    /// total and contention split independently.
+    pub(crate) fn new(total_limit: u32, reserved: [u32; 3]) -> OnyxResult<Self> {
+        let reserved_sum = reserved
+            .into_iter()
+            .try_fold(0u32, |sum, share| sum.checked_add(share));
+        if total_limit == 0
+            || reserved.into_iter().any(|share| share == 0)
+            || reserved_sum != Some(total_limit)
+        {
+            return Err(OnyxError::Config(
+                "chunklet IO scheduler requires three non-zero shares whose checked sum equals total"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            total_limit,
+            reserved,
+            state: Mutex::new(SchedulerState::default()),
+        })
+    }
+
+    fn reserved(&self, class: IoClass) -> u32 {
+        self.reserved[class.index()]
+    }
+
+    fn next_candidate(&self, state: &SchedulerState) -> Option<IoClass> {
+        let has_deficit = IoClass::ALL.into_iter().any(|class| {
+            !state.class(class).queue.is_empty() && state.class(class).active < self.reserved(class)
+        });
+        (0..IoClass::ALL.len()).find_map(|offset| {
+            let class = IoClass::ALL[(state.next_class + offset) % IoClass::ALL.len()];
+            let own = state.class(class);
+            (!own.queue.is_empty() && (!has_deficit || own.active < self.reserved(class)))
+                .then_some(class)
+        })
+    }
+
+    fn candidate_waiter(&self, state: &SchedulerState) -> Option<Arc<SchedulerWaiter>> {
+        self.next_candidate(state)
+            .and_then(|class| state.class(class).queue.front().cloned())
+    }
+
+    fn elapsed_ns(started: Instant) -> u64 {
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    fn other_class_is_borrowing(&self, state: &SchedulerState, class: IoClass) -> bool {
+        IoClass::ALL
+            .into_iter()
+            .any(|other| other != class && state.class(other).active > self.reserved(other))
+    }
+
+    fn maybe_start_reclaim(&self, state: &mut SchedulerState, class: IoClass) {
+        if state.class(class).active < self.reserved(class)
+            && state.class(class).reclaim_started.is_none()
+            && self.other_class_is_borrowing(state, class)
+        {
+            let own = state.class_mut(class);
+            own.reclaim_started = Some(Instant::now());
+            own.reclaim_events = own.reclaim_events.saturating_add(1);
+        }
+    }
+
+    fn finish_reclaim(state: &mut SchedulerState, class: IoClass) {
+        let own = state.class_mut(class);
+        if let Some(started) = own.reclaim_started.take() {
+            let elapsed = Self::elapsed_ns(started);
+            own.reclaim_max_ns = own.reclaim_max_ns.max(elapsed);
+        }
+    }
+
+    fn record_admission(&self, state: &mut SchedulerState, class: IoClass, wait_ns: u64) {
+        let reserved = self.reserved(class);
+        {
+            let own = state.class_mut(class);
+            let borrowed = own.active >= reserved;
+            own.active = own
+                .active
+                .checked_add(1)
+                .expect("scheduler class active count overflow");
+            own.max_active = own.max_active.max(own.active);
+            own.admissions = own.admissions.saturating_add(1);
+            own.wait_ns = own.wait_ns.saturating_add(wait_ns);
+            own.wait_max_ns = own.wait_max_ns.max(wait_ns);
+            if borrowed {
+                own.borrowed_admissions = own.borrowed_admissions.saturating_add(1);
+            }
+        }
+        state.total_active = state
+            .total_active
+            .checked_add(1)
+            .expect("scheduler total active count overflow");
+        debug_assert!(state.total_active <= self.total_limit);
+        state.total_max_active = state.total_max_active.max(state.total_active);
+        state.next_class = (class.index() + 1) % IoClass::ALL.len();
+        Self::finish_reclaim(state, class);
+    }
+
+    pub(crate) fn acquire(self: &Arc<Self>, class: IoClass) -> ChunkletIoPermit {
+        let mut state = self.state.lock();
+        if state.total_active < self.total_limit
+            && IoClass::ALL
+                .into_iter()
+                .all(|queued| state.class(queued).queue.is_empty())
+        {
+            self.record_admission(&mut state, class, 0);
+            drop(state);
+            return ChunkletIoPermit {
+                scheduler: Arc::clone(self),
+                class,
+            };
+        }
+        drop(state);
+
+        let waiter = Arc::new(SchedulerWaiter { cv: Condvar::new() });
+        let wait_started = Instant::now();
+        let mut state = self.state.lock();
+        {
+            let own = state.class_mut(class);
+            own.queue.push_back(Arc::clone(&waiter));
+            own.max_waiters = own
+                .max_waiters
+                .max(u32::try_from(own.queue.len()).unwrap_or(u32::MAX));
+        }
+        loop {
+            let is_head = state
+                .class(class)
+                .queue
+                .front()
+                .is_some_and(|head| Arc::ptr_eq(head, &waiter));
+            if is_head
+                && self.next_candidate(&state) == Some(class)
+                && state.total_active < self.total_limit
+            {
+                break;
+            }
+            if is_head {
+                self.maybe_start_reclaim(&mut state, class);
+            }
+            waiter.cv.wait(&mut state);
+        }
+
+        let wait_ns = Self::elapsed_ns(wait_started);
+        {
+            let own = state.class_mut(class);
+            let head = own.queue.pop_front().expect("scheduler waiter disappeared");
+            debug_assert!(Arc::ptr_eq(&head, &waiter));
+        }
+        self.record_admission(&mut state, class, wait_ns);
+        let next = (state.total_active < self.total_limit)
+            .then(|| self.candidate_waiter(&state))
+            .flatten();
+        drop(state);
+        if let Some(waiter) = next {
+            waiter.cv.notify_one();
+        }
+
+        ChunkletIoPermit {
+            scheduler: Arc::clone(self),
+            class,
+        }
+    }
+
+    fn release(&self, class: IoClass) {
+        let mut state = self.state.lock();
+        let own = state.class_mut(class);
+        debug_assert!(own.active > 0, "scheduler permit released twice");
+        own.active = own.active.saturating_sub(1);
+        debug_assert!(state.total_active > 0, "scheduler total underflow");
+        state.total_active = state.total_active.saturating_sub(1);
+        let next = self.candidate_waiter(&state);
+        drop(state);
+        if let Some(waiter) = next {
+            waiter.cv.notify_one();
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ChunkletIoSchedulerSnapshot {
+        let state = self.state.lock();
+        let class_snapshot = |class: IoClass| {
+            let state = state.class(class);
+            let reclaim_current_ns = state.reclaim_started.map(Self::elapsed_ns).unwrap_or(0);
+            ChunkletIoClassSnapshot {
+                reserved: self.reserved(class),
+                active: state.active,
+                waiters: u32::try_from(state.queue.len()).unwrap_or(u32::MAX),
+                max_active: state.max_active,
+                max_waiters: state.max_waiters,
+                admissions: state.admissions,
+                wait_ns: state.wait_ns,
+                wait_max_ns: state.wait_max_ns,
+                borrowed_admissions: state.borrowed_admissions,
+                reclaim_max_ns: state.reclaim_max_ns.max(reclaim_current_ns),
+                reclaim_current_ns,
+                reclaim_events: state.reclaim_events,
+                reclaim_in_progress: state.reclaim_started.is_some(),
+            }
+        };
+        let foreground = class_snapshot(IoClass::Foreground);
+        let lv3 = class_snapshot(IoClass::Lv3);
+        let meta = class_snapshot(IoClass::Meta);
+        let reclaim_max_ns = foreground
+            .reclaim_max_ns
+            .max(lv3.reclaim_max_ns)
+            .max(meta.reclaim_max_ns);
+        let reclaim_current_ns = foreground
+            .reclaim_current_ns
+            .max(lv3.reclaim_current_ns)
+            .max(meta.reclaim_current_ns);
+        ChunkletIoSchedulerSnapshot {
+            total_limit: self.total_limit,
+            foreground_reserved: self.reserved(IoClass::Foreground),
+            lv3_reserved: self.reserved(IoClass::Lv3),
+            meta_reserved: self.reserved(IoClass::Meta),
+            total_active: state.total_active,
+            total_max_active: state.total_max_active,
+            foreground,
+            lv3,
+            meta,
+            reclaim_max_ns,
+            reclaim_current_ns,
+            reclaim_events: foreground
+                .reclaim_events
+                .saturating_add(lv3.reclaim_events)
+                .saturating_add(meta.reclaim_events),
+            reclaim_in_progress: foreground.reclaim_in_progress
+                || lv3.reclaim_in_progress
+                || meta.reclaim_in_progress,
+        }
+    }
+}
+
+/// Releases one scheduler admission on every return path, including errors and
+/// stale-handle retry failures.
+#[must_use = "dropping the permit releases the scheduler admission"]
+pub(crate) struct ChunkletIoPermit {
+    scheduler: Arc<ChunkletIoScheduler>,
+    class: IoClass,
+}
+
+impl Drop for ChunkletIoPermit {
+    fn drop(&mut self) {
+        self.scheduler.release(self.class);
+    }
+}
 
 /// Linear block device exposed to LV2/LV3. Offsets and lengths are byte
 /// quantities; alignment to the underlying block size is the implementation's
@@ -364,6 +744,10 @@ pub struct ChunkletBackend {
     /// thread. Threads that lose the race find the handle already swapped and
     /// simply retry against it.
     reopen_lock: Mutex<()>,
+    /// Optional Onyx-side write admission. Disabled for legacy constructors
+    /// and callers that have not explicitly wired all LD roles to one shared
+    /// scheduler.
+    io_scheduler: Option<(Arc<ChunkletIoScheduler>, IoClass)>,
 }
 
 impl ChunkletBackend {
@@ -374,6 +758,7 @@ impl ChunkletBackend {
             capacity: AtomicU64::new(capacity),
             pool: None,
             reopen_lock: Mutex::new(()),
+            io_scheduler: None,
         }
     }
 
@@ -382,6 +767,38 @@ impl ChunkletBackend {
         let mut b = Self::new(ld);
         b.pool = Some(pool);
         b
+    }
+
+    /// Build a scheduled backend without an owning Pool (primarily tests and
+    /// callers that manage the Pool lifetime separately).
+    pub(crate) fn new_scheduled(
+        ld: Arc<dyn LogicalDisk>,
+        class: IoClass,
+        scheduler: Arc<ChunkletIoScheduler>,
+    ) -> Self {
+        let mut backend = Self::new(ld);
+        backend.io_scheduler = Some((scheduler, class));
+        backend
+    }
+
+    /// Production constructor for one role-specific backend. LV2, LV3, and
+    /// MetaDB must receive the same scheduler Arc for reservations to apply
+    /// across the shared physical pool.
+    pub(crate) fn with_pool_and_scheduler(
+        ld: Arc<dyn LogicalDisk>,
+        pool: Arc<onyx_chunklet::Pool>,
+        class: IoClass,
+        scheduler: Arc<ChunkletIoScheduler>,
+    ) -> Self {
+        let mut backend = Self::with_pool(ld, pool);
+        backend.io_scheduler = Some((scheduler, class));
+        backend
+    }
+
+    fn acquire_write_permit(&self) -> Option<ChunkletIoPermit> {
+        self.io_scheduler
+            .as_ref()
+            .map(|(scheduler, class)| scheduler.acquire(*class))
     }
 
     /// The current underlying logical disk (e.g. to read `strip_size()` for
@@ -396,6 +813,12 @@ impl ChunkletBackend {
     /// through here.
     pub fn pool(&self) -> Option<&Arc<onyx_chunklet::Pool>> {
         self.pool.as_ref()
+    }
+
+    pub(crate) fn io_scheduler(&self) -> Option<Arc<ChunkletIoScheduler>> {
+        self.io_scheduler
+            .as_ref()
+            .map(|(scheduler, _)| scheduler.clone())
     }
 
     /// Install a freshly-opened LD handle after an online `extend_ld`. Grow-only
@@ -543,6 +966,7 @@ impl BlockBackend for ChunkletBackend {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
+        let _permit = self.acquire_write_permit();
         self.with_stale_retry("write_at", |ld| ld.write_at(offset, buf))
     }
 
@@ -552,10 +976,14 @@ impl BlockBackend for ChunkletBackend {
     }
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> OnyxResult<()> {
+        let _permit = self.acquire_write_permit();
         self.with_stale_retry("write_many_at", |ld| ld.write_many_at(ops))
     }
 
     fn flush(&self) -> OnyxResult<()> {
+        // A barrier must never wait behind writes whose durability it may need
+        // to establish. Current write-through PDs skip it, but preserving this
+        // bypass also keeps future write-back devices deadlock-free.
         self.with_stale_retry("flush", |ld| ld.flush())
     }
 
@@ -587,7 +1015,362 @@ impl BlockBackend for ChunkletBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    use onyx_chunklet::types::LdId;
     use tempfile::NamedTempFile;
+
+    struct FailingLogicalDisk;
+
+    impl LogicalDisk for FailingLogicalDisk {
+        fn id(&self) -> LdId {
+            LdId::nil()
+        }
+
+        fn capacity_bytes(&self) -> u64 {
+            4096
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn strip_size(&self) -> usize {
+            4096
+        }
+
+        fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<(), ChunkletError> {
+            Err(ChunkletError::Invariant("injected read failure".into()))
+        }
+
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<(), ChunkletError> {
+            Err(ChunkletError::Invariant("injected write failure".into()))
+        }
+
+        fn flush(&self) -> Result<(), ChunkletError> {
+            Ok(())
+        }
+    }
+
+    fn wait_for_scheduler(
+        scheduler: &ChunkletIoScheduler,
+        predicate: impl Fn(&ChunkletIoSchedulerSnapshot) -> bool,
+    ) -> ChunkletIoSchedulerSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = scheduler.snapshot();
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "scheduler state did not converge: {snapshot:?}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn spawn_permit_holder(
+        scheduler: Arc<ChunkletIoScheduler>,
+        class: IoClass,
+        id: u32,
+        acquired: mpsc::Sender<u32>,
+        release: mpsc::Receiver<()>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let _permit = scheduler.acquire(class);
+            acquired.send(id).unwrap();
+            release.recv().unwrap();
+        })
+    }
+
+    #[test]
+    fn chunklet_io_scheduler_validates_share() {
+        assert!(ChunkletIoScheduler::new(0, [0, 0, 0]).is_err());
+        assert!(ChunkletIoScheduler::new(4, [2, 2, 0]).is_err());
+        assert!(ChunkletIoScheduler::new(4, [2, 1, 2]).is_err());
+        assert!(ChunkletIoScheduler::new(u32::MAX, [u32::MAX, 1, 1]).is_err());
+        let scheduler = ChunkletIoScheduler::new(40, [9, 7, 24]).unwrap();
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.total_limit, 40);
+        assert_eq!(snapshot.foreground_reserved, 9);
+        assert_eq!(snapshot.lv3_reserved, 7);
+        assert_eq!(snapshot.meta_reserved, 24);
+        assert_eq!(snapshot.foreground.reserved, 9);
+        assert_eq!(snapshot.lv3.reserved, 7);
+        assert_eq!(snapshot.meta.reserved, 24);
+    }
+
+    #[test]
+    fn chunklet_io_scheduler_borrows_but_never_exceeds_total() {
+        let scheduler = Arc::new(ChunkletIoScheduler::new(4, [1, 1, 2]).unwrap());
+        let mut permits = Vec::new();
+        for _ in 0..4 {
+            permits.push(scheduler.acquire(IoClass::Meta));
+        }
+        let full = scheduler.snapshot();
+        assert_eq!(full.total_active, 4);
+        assert_eq!(full.total_max_active, 4);
+        assert_eq!(full.meta.active, 4);
+        assert_eq!(full.meta.borrowed_admissions, 2);
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let waiter = spawn_permit_holder(
+            Arc::clone(&scheduler),
+            IoClass::Meta,
+            1,
+            acquired_tx,
+            release_rx,
+        );
+        wait_for_scheduler(&scheduler, |snapshot| snapshot.meta.waiters == 1);
+        assert_eq!(scheduler.snapshot().total_active, 4);
+
+        drop(permits.pop());
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        assert_eq!(scheduler.snapshot().total_active, 4);
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+        drop(permits);
+
+        let drained = scheduler.snapshot();
+        assert_eq!(drained.total_active, 0);
+        assert_eq!(drained.total_max_active, 4);
+        assert_eq!(drained.meta.borrowed_admissions, 3);
+    }
+
+    #[test]
+    fn chunklet_io_scheduler_is_fifo_within_each_class() {
+        let scheduler = Arc::new(ChunkletIoScheduler::new(3, [1, 1, 1]).unwrap());
+        let mut borrowed = vec![
+            scheduler.acquire(IoClass::Meta),
+            scheduler.acquire(IoClass::Meta),
+            scheduler.acquire(IoClass::Meta),
+        ];
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let first = spawn_permit_holder(
+            Arc::clone(&scheduler),
+            IoClass::Lv3,
+            1,
+            acquired_tx.clone(),
+            first_release_rx,
+        );
+        wait_for_scheduler(&scheduler, |snapshot| snapshot.lv3.waiters == 1);
+
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+        let second = spawn_permit_holder(
+            Arc::clone(&scheduler),
+            IoClass::Lv3,
+            2,
+            acquired_tx,
+            second_release_rx,
+        );
+        wait_for_scheduler(&scheduler, |snapshot| snapshot.lv3.waiters == 2);
+
+        drop(borrowed.pop());
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        drop(borrowed.pop());
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+
+        first_release_tx.send(()).unwrap();
+        second_release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        drop(borrowed);
+
+        let drained = scheduler.snapshot();
+        assert_eq!(drained.total_active, 0);
+        assert_eq!(drained.total_max_active, 3);
+        assert_eq!(drained.lv3.max_waiters, 2);
+        assert_eq!(drained.lv3.admissions, 2);
+        assert_eq!(drained.meta.admissions, 3);
+        assert!(drained.lv3.wait_max_ns > 0);
+        assert!(drained.reclaim_events >= 1);
+        assert!(drained.reclaim_max_ns > 0);
+        assert!(!drained.reclaim_in_progress);
+    }
+
+    #[test]
+    fn chunklet_io_scheduler_meta_saturation_preserves_lv3_share() {
+        // A checkpoint can occupy every admission while nobody else waits.
+        // Once LV3 queues, new Meta calls stop at Meta's share and completions
+        // are reclaimed until LV3 owns its protected two slots.
+        let scheduler = Arc::new(ChunkletIoScheduler::new(6, [2, 2, 2]).unwrap());
+        let mut meta_borrowers = (0..6)
+            .map(|_| scheduler.acquire(IoClass::Meta))
+            .collect::<Vec<_>>();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let (lv3_first_release_tx, lv3_first_release_rx) = mpsc::channel();
+        let lv3_first = spawn_permit_holder(
+            Arc::clone(&scheduler),
+            IoClass::Lv3,
+            1,
+            acquired_tx.clone(),
+            lv3_first_release_rx,
+        );
+        wait_for_scheduler(&scheduler, |snapshot| snapshot.lv3.waiters == 1);
+
+        let (lv3_second_release_tx, lv3_second_release_rx) = mpsc::channel();
+        let lv3_second = spawn_permit_holder(
+            Arc::clone(&scheduler),
+            IoClass::Lv3,
+            2,
+            acquired_tx.clone(),
+            lv3_second_release_rx,
+        );
+        wait_for_scheduler(&scheduler, |snapshot| snapshot.lv3.waiters == 2);
+
+        let (meta_waiter_release_tx, meta_waiter_release_rx) = mpsc::channel();
+        let meta_waiter = spawn_permit_holder(
+            Arc::clone(&scheduler),
+            IoClass::Meta,
+            3,
+            acquired_tx,
+            meta_waiter_release_rx,
+        );
+        wait_for_scheduler(&scheduler, |snapshot| snapshot.meta.waiters == 1);
+
+        drop(meta_borrowers.pop());
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        drop(meta_borrowers.pop());
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+
+        let protected = scheduler.snapshot();
+        assert_eq!(protected.total_active, 6);
+        assert_eq!(protected.meta.active, 4);
+        assert_eq!(protected.lv3.active, 2);
+        assert_eq!(protected.meta.waiters, 1);
+        assert_eq!(protected.lv3.waiters, 0);
+
+        // After protected LV3 demand has entered, an exiting LV3 call leaves
+        // genuinely idle capacity that the queued Meta caller may borrow.
+        lv3_first_release_tx.send(()).unwrap();
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
+
+        lv3_second_release_tx.send(()).unwrap();
+        meta_waiter_release_tx.send(()).unwrap();
+        lv3_first.join().unwrap();
+        lv3_second.join().unwrap();
+        meta_waiter.join().unwrap();
+        drop(meta_borrowers);
+
+        let drained = scheduler.snapshot();
+        assert_eq!(drained.total_active, 0);
+        assert_eq!(drained.total_max_active, 6);
+        assert_eq!(drained.lv3.admissions, 2);
+        assert_eq!(drained.meta.admissions, 7);
+        assert!(drained.lv3.reclaim_events >= 1);
+        assert!(drained.lv3.reclaim_max_ns > 0);
+    }
+
+    #[test]
+    fn chunklet_io_scheduler_is_work_conserving_when_meta_is_idle() {
+        let scheduler = Arc::new(ChunkletIoScheduler::new(5, [2, 1, 2]).unwrap());
+        let mut foreground = (0..5)
+            .map(|_| scheduler.acquire(IoClass::Foreground))
+            .collect::<Vec<_>>();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut waiters = Vec::new();
+
+        for (id, class) in [
+            (1, IoClass::Lv3),
+            (2, IoClass::Lv3),
+            (3, IoClass::Lv3),
+            (4, IoClass::Foreground),
+            (5, IoClass::Foreground),
+        ] {
+            let (release_tx, release_rx) = mpsc::channel();
+            waiters.push(spawn_permit_holder(
+                Arc::clone(&scheduler),
+                class,
+                id,
+                acquired_tx.clone(),
+                release_rx,
+            ));
+            releases.push(release_tx);
+        }
+        wait_for_scheduler(&scheduler, |snapshot| {
+            snapshot.foreground.waiters == 2 && snapshot.lv3.waiters == 3
+        });
+
+        for _ in 0..5 {
+            drop(foreground.pop());
+            acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+
+        let full = scheduler.snapshot();
+        assert_eq!(full.total_active, 5);
+        assert_eq!(full.foreground.active, 2);
+        assert_eq!(full.lv3.active, 3);
+        assert_eq!(full.meta.active, 0);
+        assert!(full.lv3.borrowed_admissions > 0);
+
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+        assert_eq!(scheduler.snapshot().total_active, 0);
+    }
+
+    #[test]
+    fn chunklet_io_scheduler_reclaim_tracks_actual_block_to_service() {
+        let scheduler = Arc::new(ChunkletIoScheduler::new(3, [1, 1, 1]).unwrap());
+        let mut meta = vec![
+            scheduler.acquire(IoClass::Meta),
+            scheduler.acquire(IoClass::Meta),
+            scheduler.acquire(IoClass::Meta),
+        ];
+        let healthy_borrow = scheduler.snapshot();
+        assert_eq!(healthy_borrow.meta.borrowed_admissions, 2);
+        assert_eq!(healthy_borrow.reclaim_events, 0);
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let lv3 = spawn_permit_holder(
+            Arc::clone(&scheduler),
+            IoClass::Lv3,
+            1,
+            acquired_tx,
+            release_rx,
+        );
+        let blocked = wait_for_scheduler(&scheduler, |snapshot| {
+            snapshot.lv3.waiters == 1 && snapshot.lv3.reclaim_in_progress
+        });
+        assert_eq!(blocked.lv3.reclaim_events, 1);
+
+        drop(meta.pop());
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        let served = scheduler.snapshot();
+        assert!(!served.lv3.reclaim_in_progress);
+        assert!(served.lv3.reclaim_max_ns > 0);
+
+        release_tx.send(()).unwrap();
+        lv3.join().unwrap();
+        drop(meta);
+        assert_eq!(scheduler.snapshot().total_active, 0);
+    }
+
+    #[test]
+    fn chunklet_io_scheduler_error_path_releases_permit() {
+        let scheduler = Arc::new(ChunkletIoScheduler::new(3, [1, 1, 1]).unwrap());
+        let backend = ChunkletBackend::new_scheduled(
+            Arc::new(FailingLogicalDisk),
+            IoClass::Foreground,
+            Arc::clone(&scheduler),
+        );
+        assert!(backend.write_at(&vec![0; 4096], 0).is_err());
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.total_active, 0);
+        assert_eq!(snapshot.foreground.active, 0);
+        assert_eq!(snapshot.foreground.admissions, 1);
+    }
 
     fn backend(size: u64) -> (RawDevice, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();

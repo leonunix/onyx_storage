@@ -40,6 +40,8 @@ const PACKED_CHECKPOINT_RECORD_SIZE: usize = 32;
 const PACKED_CHECKPOINT_CRC_OFFSET: usize = 24;
 const PACKED_CHECKPOINT_SLOT_COUNT: usize = 2;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BACKEND_THROTTLE_ARM_NS: u64 = 30_000_000;
+const BACKEND_THROTTLE_RELEASE_NS: u64 = 500_000_000;
 const STAGING_CHANNEL_CAPACITY: usize = 32 * 1024;
 /// Bound one sync epoch per shard. The previous unbounded drain could pull
 /// millions of staged 4K writes into one Vec under fio, multiplying memory
@@ -81,6 +83,7 @@ pub struct BufferRuntimeLimits {
     /// the legacy dynamic depth of one slot per buffer shard.
     pub lv2_prepared_queue_depth_per_lane: usize,
     pub throttle: ThrottleSettings,
+    pub throttle_backend_debt: bool,
     /// Resolved ZFS-style adaptive commit-window percent for the LV2 sync
     /// pipeline (>= 1). See `LV2_COMMIT_TIMEOUT_PCT`.
     pub lv2_commit_timeout_pct: u64,
@@ -158,6 +161,29 @@ impl ThrottleSettings {
         let delay = num.saturating_mul(u128::from(self.scale_us)) / den.max(1);
         delay.min(u128::from(self.cap_us)) as u64
     }
+
+    /// Map a saturated commit-executor queue onto the same pressure interval
+    /// used by the physical-ring curve. One queued batch per worker is normal
+    /// pipeline occupancy; a second full wave means the metadata backend is no
+    /// longer keeping up and reaches the throttle ceiling.
+    pub(crate) fn executor_debt_basis_points(
+        &self,
+        worker_count: u64,
+        active_workers: u64,
+        queue_depth: u64,
+    ) -> u32 {
+        let workers = worker_count.max(1);
+        if active_workers < workers || queue_depth <= workers {
+            return 0;
+        }
+        let min_basis_points = u64::from(self.min_pct).saturating_mul(100);
+        let max_basis_points = u64::from(self.max_pct).saturating_mul(100);
+        let debt = queue_depth.saturating_sub(workers).min(workers + 1);
+        let span = max_basis_points.saturating_sub(min_basis_points);
+        min_basis_points
+            .saturating_add(span.saturating_mul(debt) / (workers + 1))
+            .min(max_basis_points) as u32
+    }
 }
 
 impl BufferRuntimeLimits {
@@ -189,6 +215,7 @@ impl BufferRuntimeLimits {
             },
             lv2_prepared_queue_depth_per_lane,
             throttle: defaults.throttle,
+            throttle_backend_debt: defaults.throttle_backend_debt,
             lv2_commit_timeout_pct: if lv2_commit_timeout_pct == 0 {
                 defaults.lv2_commit_timeout_pct
             } else {
@@ -206,6 +233,11 @@ impl BufferRuntimeLimits {
         self.throttle = throttle;
         self
     }
+
+    pub fn with_backend_debt_throttle(mut self, enabled: bool) -> Self {
+        self.throttle_backend_debt = enabled;
+        self
+    }
 }
 
 impl Default for BufferRuntimeLimits {
@@ -216,6 +248,7 @@ impl Default for BufferRuntimeLimits {
             sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
             lv2_prepared_queue_depth_per_lane: 0,
             throttle: ThrottleSettings::default(),
+            throttle_backend_debt: false,
             lv2_commit_timeout_pct: LV2_COMMIT_TIMEOUT_PCT,
             lv2_sync_pipeline_depth: LV2_SYNC_PIPELINE_DEPTH,
         }
@@ -946,6 +979,10 @@ pub struct WriteBufferPool {
     /// queues separate prevents one hot shard from serializing producers that
     /// are headed to rings with available space.
     throttle_states: Vec<ShardThrottleState>,
+    backend_debt_throttle_enabled: bool,
+    /// Hysteresis for the device-wide commit-executor debt signal. Wakeup
+    /// pacing remains per shard; only the advisory pressure state is global.
+    backend_throttle_control: BackendThrottleControl,
     /// Highest seq that has ever been passed to `mark_flushed` across any shard.
     /// Updated by flusher writers when they ack a completed seq. Read by the
     /// durability-watermark background thread to decide how far `durable_seq`
@@ -1072,6 +1109,75 @@ struct ShardThrottleState {
     cached_fill_basis_points: AtomicU32,
     /// Append counter that drives the cached-fill refresh cadence.
     sample_counter: AtomicU32,
+}
+
+#[derive(Default)]
+struct BackendThrottleControl {
+    armed: AtomicBool,
+    saturation_started_ns: AtomicU64,
+    recovery_started_ns: AtomicU64,
+    /// Device-wide pacing clock for backend debt. Unlike physical ring
+    /// pressure, this signal is shared by every shard and must produce one
+    /// aggregate foreground admission stream.
+    last_wakeup_ns: AtomicU64,
+}
+
+impl BackendThrottleControl {
+    fn pressure_basis_points(
+        &self,
+        throttle: ThrottleSettings,
+        worker_count: u64,
+        active_workers: u64,
+        queue_depth: u64,
+        now_ns: u64,
+    ) -> u32 {
+        let workers = worker_count.max(1);
+        let saturated = active_workers >= workers && queue_depth > workers;
+        let now_ns = now_ns.max(1);
+
+        if !self.armed.load(Ordering::Relaxed) {
+            if !saturated {
+                self.saturation_started_ns.store(0, Ordering::Relaxed);
+                return 0;
+            }
+            let started = self.saturation_started_ns.load(Ordering::Relaxed);
+            if started == 0 {
+                let _ = self.saturation_started_ns.compare_exchange(
+                    0,
+                    now_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return 0;
+            }
+            if now_ns.saturating_sub(started) < BACKEND_THROTTLE_ARM_NS {
+                return 0;
+            }
+            self.armed.store(true, Ordering::Relaxed);
+            self.recovery_started_ns.store(0, Ordering::Relaxed);
+        }
+
+        if queue_depth <= workers / 2 {
+            let recovery_started = self.recovery_started_ns.load(Ordering::Relaxed);
+            if recovery_started == 0 {
+                let _ = self.recovery_started_ns.compare_exchange(
+                    0,
+                    now_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            } else if now_ns.saturating_sub(recovery_started) >= BACKEND_THROTTLE_RELEASE_NS {
+                self.armed.store(false, Ordering::Relaxed);
+                self.saturation_started_ns.store(0, Ordering::Relaxed);
+                self.recovery_started_ns.store(0, Ordering::Relaxed);
+                return 0;
+            }
+        } else {
+            self.recovery_started_ns.store(0, Ordering::Relaxed);
+        }
+
+        throttle.executor_debt_basis_points(workers, active_workers, queue_depth)
+    }
 }
 
 static TEST_PURGE_FAIL_VOLUMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();

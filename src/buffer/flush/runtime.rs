@@ -149,6 +149,10 @@ impl BufferFlusher {
         // raw receiver between executors made them race for individual jobs
         // and fragmented a deep backlog into tiny transactions.
         let commit_executor_count = commit_workers_per_volume;
+        metrics.flush_commit_executors_limit.store(
+            u64::try_from(commit_executor_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let commit_executor_load = Arc::new(writer::CommitExecutorLoad::new(commit_executor_count));
         let (commit_tx, commit_rx) = bounded::<writer::CommitJob>(writer::COMMIT_WORKER_QUEUE_CAP);
         let (commit_batch_tx, commit_batch_rx) = bounded::<writer::CommitBatch>(

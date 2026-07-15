@@ -182,8 +182,14 @@ impl OnyxConfig {
         let content = std::fs::read_to_string(path).map_err(|e| {
             OnyxError::Config(format!("failed to read config file {:?}: {}", path, e))
         })?;
-        toml::from_str(&content)
-            .map_err(|e| OnyxError::Config(format!("failed to parse config: {}", e)))
+        let config: Self = toml::from_str(&content)
+            .map_err(|e| OnyxError::Config(format!("failed to parse config: {}", e)))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> OnyxResult<()> {
+        self.chunklet.validate_write_scheduler()
     }
 }
 
@@ -958,6 +964,20 @@ pub struct ChunkletConfig {
     /// Cross-PD IO backend inside chunklet: `uring` (default) or `sync`.
     #[serde(default)]
     pub io_backend: ChunkletIoBackend,
+    /// Pool-wide cap on concurrent chunklet write batches across LV2, LV3,
+    /// and MetaDB. `0` disables Onyx-side class admission. When enabled, the
+    /// three class shares below must be non-zero and sum to this value.
+    #[serde(default)]
+    pub write_max_active: u32,
+    /// LV2 durability share while LV3 or MetaDB writes are waiting.
+    #[serde(default)]
+    pub write_foreground_active: u32,
+    /// LV3 drain share while LV2 or MetaDB writes are waiting.
+    #[serde(default)]
+    pub write_lv3_active: u32,
+    /// MetaDB apply/checkpoint share while LV2 or LV3 writes are waiting.
+    #[serde(default)]
+    pub write_meta_active: u32,
     /// Per-PD free chunklets reserved for rebuild (percent, default 5).
     #[serde(default = "default_chunklet_spare_pct")]
     pub spare_pct: u8,
@@ -1065,6 +1085,10 @@ impl Default for ChunkletConfig {
             enabled: false,
             devices: Vec::new(),
             io_backend: ChunkletIoBackend::default(),
+            write_max_active: 0,
+            write_foreground_active: 0,
+            write_lv3_active: 0,
+            write_meta_active: 0,
             spare_pct: default_chunklet_spare_pct(),
             lv3: ChunkletLdGeom::lv3_default(),
             lv2: ChunkletLdGeom::lv2_default(),
@@ -1084,6 +1108,39 @@ impl Default for ChunkletConfig {
             rebalance_target_skew_pct: default_rebalance_target_skew_pct(),
             rebalance_max_moves_per_cycle: default_rebalance_max_moves(),
         }
+    }
+}
+
+impl ChunkletConfig {
+    pub fn validate_write_scheduler(&self) -> OnyxResult<()> {
+        let shares = [
+            self.write_foreground_active,
+            self.write_lv3_active,
+            self.write_meta_active,
+        ];
+        if self.write_max_active == 0 {
+            if shares.into_iter().any(|share| share != 0) {
+                return Err(OnyxError::Config(
+                    "chunklet write class shares require write_max_active > 0".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if !self.enabled {
+            return Err(OnyxError::Config(
+                "chunklet write scheduler requires [chunklet].enabled = true".into(),
+            ));
+        }
+        let sum = shares
+            .into_iter()
+            .try_fold(0u32, |total, share| total.checked_add(share));
+        if shares.into_iter().any(|share| share == 0) || sum != Some(self.write_max_active) {
+            return Err(OnyxError::Config(
+                "chunklet write scheduler requires three non-zero shares whose checked sum equals write_max_active"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1240,6 +1297,11 @@ pub struct BufferConfig {
     /// Per-append throttle delay cap (microseconds). 0 = 100_000 = 100 ms.
     #[serde(default)]
     pub throttle_cap_us: u64,
+    /// Also drive the foreground throttle from sustained MetaDB commit
+    /// executor debt. Disabled by default so existing physical-fill profiles
+    /// keep identical pacing until this controller is explicitly enabled.
+    #[serde(default)]
+    pub throttle_backend_debt: bool,
     /// Number of LV2 fdatasync chains a sync thread keeps in flight at once.
     /// 1 = legacy serial behaviour (submit → wait-all → submit-next). >1
     /// pipelines: batch N+1's writes overlap batch N's fdatasync flush, so the
@@ -1276,6 +1338,7 @@ impl Default for BufferConfig {
             throttle_max_pct: 0,
             throttle_scale_us: 0,
             throttle_cap_us: 0,
+            throttle_backend_debt: false,
             lv2_sync_pipeline_depth: 0,
             lv2_commit_timeout_pct: 0,
         }
@@ -1885,6 +1948,7 @@ fn default_queue_workers() -> usize {
 #[cfg(test)]
 mod service_config_tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn service_direct_io_cpus_defaults_to_unset() {
@@ -1933,5 +1997,39 @@ mod service_config_tests {
         )
         .unwrap();
         assert_eq!(configured.buffer.lv2_prepared_queue_depth_per_lane, 4);
+    }
+
+    #[test]
+    fn chunklet_write_scheduler_validation_rejects_partial_or_invalid_shares() {
+        let mut config = OnyxConfig::default();
+        config.chunklet.write_foreground_active = 1;
+        assert!(config.validate().is_err());
+
+        config.chunklet.enabled = true;
+        config.chunklet.write_max_active = 4;
+        config.chunklet.write_lv3_active = 1;
+        config.chunklet.write_meta_active = 1;
+        assert!(config.validate().is_err());
+
+        config.chunklet.write_foreground_active = 2;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_load_rejects_invalid_chunklet_write_scheduler() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+                [chunklet]
+                enabled = true
+                write_max_active = 24
+                write_foreground_active = 9
+                write_lv3_active = 6
+                write_meta_active = 8
+            "#
+        )
+        .unwrap();
+        assert!(OnyxConfig::load(file.path()).is_err());
     }
 }

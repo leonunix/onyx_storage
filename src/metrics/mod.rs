@@ -285,6 +285,9 @@ pub struct EngineMetrics {
     pub buffer_throttle_count: AtomicU64,
     pub buffer_throttle_us_total: AtomicU64,
     pub buffer_throttle_us_max: AtomicU64,
+    pub buffer_backend_debt_throttle_count: AtomicU64,
+    pub buffer_backend_debt_throttle_us_total: AtomicU64,
+    pub buffer_backend_debt_throttle_us_max: AtomicU64,
     pub buffer_hydration_skipped_due_to_mem_limit: AtomicU64,
     pub buffer_hydration_head_bypass_count: AtomicU64,
     pub buffer_payload_cache_evict_entries: AtomicU64,
@@ -496,6 +499,9 @@ pub struct EngineMetrics {
     /// bounded channel is full.
     pub flush_commit_executor_queue_depth: AtomicU64,
     pub flush_commit_executor_queue_depth_max: AtomicU64,
+    /// Configured executor count. This is a live capacity gauge, not a
+    /// lifetime high-water proxy.
+    pub flush_commit_executors_limit: AtomicU64,
     /// Executors currently dispatching a commit batch and their high-water
     /// mark. These gauges drive adaptive-seal admission as well as observability.
     pub flush_commit_executors_active: AtomicU64,

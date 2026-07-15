@@ -142,6 +142,12 @@ impl MetaStore {
         self.backend.chunklet_pool()
     }
 
+    pub(crate) fn chunklet_io_scheduler(
+        &self,
+    ) -> Option<Arc<crate::io::block_backend::ChunkletIoScheduler>> {
+        self.backend.chunklet_io_scheduler()
+    }
+
     /// Propagate an online meta-LD extend into the metadb page device (swap the
     /// extended LD, rewrite the OMET superblock, widen the ceiling). `new_ld` is
     /// a fresh `pool.open_ld` of the meta LD after `pool.extend_ld`. Errors on

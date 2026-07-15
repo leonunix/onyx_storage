@@ -224,6 +224,7 @@ def main() -> None:
                     metrics.get("flush_commit_executor_queue_depth_max", 0)
                 ),
                 "executors_active": int(metrics.get("flush_commit_executors_active", 0)),
+                "executors_limit": int(metrics.get("flush_commit_executors_limit", 0)),
                 "executors_active_max": int(
                     metrics.get("flush_commit_executors_active_max", 0)
                 ),
@@ -291,6 +292,85 @@ def main() -> None:
                     int(old_metrics.get("flush_qos_emergency_transitions", 0)),
                 ),
             }
+            write_throttle = {
+                "count": nonnegative(
+                    int(metrics.get("buffer_throttle_count", 0)),
+                    int(old_metrics.get("buffer_throttle_count", 0)),
+                ),
+                "wait_ms": nonnegative(
+                    int(metrics.get("buffer_throttle_us_total", 0)),
+                    int(old_metrics.get("buffer_throttle_us_total", 0)),
+                )
+                / 1000,
+                "wait_max_ms_lifetime": int(metrics.get("buffer_throttle_us_max", 0))
+                / 1000,
+                "backend_debt_count": nonnegative(
+                    int(metrics.get("buffer_backend_debt_throttle_count", 0)),
+                    int(old_metrics.get("buffer_backend_debt_throttle_count", 0)),
+                ),
+                "backend_debt_wait_ms": nonnegative(
+                    int(metrics.get("buffer_backend_debt_throttle_us_total", 0)),
+                    int(old_metrics.get("buffer_backend_debt_throttle_us_total", 0)),
+                )
+                / 1000,
+                "backend_debt_wait_max_ms_lifetime": int(
+                    metrics.get("buffer_backend_debt_throttle_us_max", 0)
+                )
+                / 1000,
+            }
+            io_scheduler_now = status.get("chunklet_io_scheduler") or {}
+            io_scheduler_old = old_status.get("chunklet_io_scheduler") or {}
+            chunklet_io_scheduler: dict[str, Any] = {}
+            if io_scheduler_now:
+                for class_name in ("foreground", "lv3", "meta"):
+                    current_class = io_scheduler_now.get(class_name, {})
+                    old_class = io_scheduler_old.get(class_name, {})
+                    chunklet_io_scheduler[class_name] = {
+                        "reserved": int(current_class.get("reserved", 0)),
+                        "active": int(current_class.get("active", 0)),
+                        "waiters": int(current_class.get("waiters", 0)),
+                        "max_active": int(current_class.get("max_active", 0)),
+                        "max_waiters": int(current_class.get("max_waiters", 0)),
+                        "admissions": nonnegative(
+                            int(current_class.get("admissions", 0)),
+                            int(old_class.get("admissions", 0)),
+                        ),
+                        "wait_ms": nonnegative(
+                            int(current_class.get("wait_ns", 0)),
+                            int(old_class.get("wait_ns", 0)),
+                        )
+                        / 1e6,
+                        "wait_max_ms_lifetime": int(current_class.get("wait_max_ns", 0))
+                        / 1e6,
+                        "borrowed_admissions": nonnegative(
+                            int(current_class.get("borrowed_admissions", 0)),
+                            int(old_class.get("borrowed_admissions", 0)),
+                        ),
+                        "reclaim_max_ms_lifetime": int(
+                            current_class.get("reclaim_max_ns", 0)
+                        )
+                        / 1e6,
+                        "reclaim_current_ms": int(
+                            current_class.get("reclaim_current_ns", 0)
+                        )
+                        / 1e6,
+                        "reclaim_events": nonnegative(
+                            int(current_class.get("reclaim_events", 0)),
+                            int(old_class.get("reclaim_events", 0)),
+                        ),
+                        "reclaim_in_progress": bool(
+                            current_class.get("reclaim_in_progress", False)
+                        ),
+                    }
+                chunklet_io_scheduler["total_limit"] = int(
+                    io_scheduler_now.get("total_limit", 0)
+                )
+                chunklet_io_scheduler["total_active"] = int(
+                    io_scheduler_now.get("total_active", 0)
+                )
+                chunklet_io_scheduler["total_max_active"] = int(
+                    io_scheduler_now.get("total_max_active", 0)
+                )
             old_shards = {int(s["shard_idx"]): s for s in old_status.get("buffer_shards", [])}
             shards = []
             for shard in status.get("buffer_shards", []):
@@ -328,6 +408,8 @@ def main() -> None:
                         "lv2_percentiles_are_bucket_upper_bounds": True,
                         "commit_worker": commit_worker,
                         "flush_qos": flush_qos,
+                        "write_throttle": write_throttle,
+                        "chunklet_io_scheduler": chunklet_io_scheduler,
                         "buffer_sync": buffer_sync,
                         "shards": shards,
                         "scheduler": scheduler,

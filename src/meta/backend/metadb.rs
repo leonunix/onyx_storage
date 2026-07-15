@@ -405,6 +405,14 @@ impl MetadbBackend {
         self.chunklet_pool.clone()
     }
 
+    pub(crate) fn chunklet_io_scheduler(
+        &self,
+    ) -> Option<Arc<crate::io::block_backend::ChunkletIoScheduler>> {
+        self.meta_grower
+            .as_ref()
+            .and_then(meta_ld::MetaLdGrower::io_scheduler)
+    }
+
     /// Non-blocking drain of every PBA that lineage GC has signalled as
     /// freed since the last call. Returns owned `Vec<Pba>`; the engine
     /// passes this through `coalesce_free_pbas_to_extents` and retires the
