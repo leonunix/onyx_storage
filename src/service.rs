@@ -406,6 +406,21 @@ impl ServiceController {
         {
             tracing::warn!("chunklet write scheduler changed — requires restart to take effect");
         }
+        if old_config.chunklet.pd_write_max_active_blocks
+            != new_config.chunklet.pd_write_max_active_blocks
+            || old_config.chunklet.pd_write_foreground_min_blocks
+                != new_config.chunklet.pd_write_foreground_min_blocks
+            || old_config.chunklet.pd_write_lv3_min_blocks
+                != new_config.chunklet.pd_write_lv3_min_blocks
+            || old_config.chunklet.pd_write_meta_min_blocks
+                != new_config.chunklet.pd_write_meta_min_blocks
+            || old_config.chunklet.pd_write_maintenance_min_blocks
+                != new_config.chunklet.pd_write_maintenance_min_blocks
+        {
+            tracing::warn!(
+                "chunklet per-PD write scheduler changed — requires restart to take effect"
+            );
+        }
         if old_config.service.direct_io_cpus != new_config.service.direct_io_cpus {
             tracing::warn!(
                 old = %old_config.service.direct_io_cpus,

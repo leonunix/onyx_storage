@@ -6,6 +6,106 @@ use super::{BufferShardSnapshot, EngineMetricsSnapshot, MetaMemorySnapshot};
 use crate::gc::heatmap::HeatSummary;
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct ChunkletPdIoClassSnapshot {
+    pub class: String,
+    pub configured_min_blocks: u64,
+    pub queued_blocks: u64,
+    pub queued_blocks_max: u64,
+    pub active_blocks: u64,
+    pub active_blocks_max: u64,
+    pub wait_events: u64,
+    pub wait_ns: u64,
+    pub wait_max_ns: u64,
+    pub admission_events: u64,
+    pub admitted_blocks: u64,
+    pub borrow_events: u64,
+    pub borrowed_blocks: u64,
+    pub borrowed_blocks_max: u64,
+    pub borrowed_blocks_total: u64,
+    pub reclaim_events: u64,
+    pub reclaimed_blocks: u64,
+    pub completed_blocks: u64,
+    pub error_blocks: u64,
+    pub service_ns: u64,
+    pub service_max_ns: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChunkletPdIoPdSnapshot {
+    pub pd_id: String,
+    pub max_active_blocks: u64,
+    pub total_queued_blocks: u64,
+    pub total_queued_blocks_max: u64,
+    pub total_active_blocks: u64,
+    pub total_active_blocks_max: u64,
+    pub flush_waiters: u64,
+    pub flush_fenced: bool,
+    pub classes: Vec<ChunkletPdIoClassSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChunkletPdIoSchedulerSnapshot {
+    pub pds: Vec<ChunkletPdIoPdSnapshot>,
+}
+
+impl From<onyx_chunklet::io::SchedulerSnapshot> for ChunkletPdIoSchedulerSnapshot {
+    fn from(snapshot: onyx_chunklet::io::SchedulerSnapshot) -> Self {
+        Self {
+            pds: snapshot
+                .pds
+                .into_iter()
+                .map(|pd| ChunkletPdIoPdSnapshot {
+                    pd_id: pd.pd_id.to_string(),
+                    max_active_blocks: pd.max_active_blocks,
+                    total_queued_blocks: pd.total_queued_blocks,
+                    total_queued_blocks_max: pd.total_queued_blocks_max,
+                    total_active_blocks: pd.total_active_blocks,
+                    total_active_blocks_max: pd.total_active_blocks_max,
+                    flush_waiters: pd.flush_waiters,
+                    flush_fenced: pd.flush_fenced,
+                    classes: pd
+                        .classes
+                        .into_iter()
+                        .map(|class| ChunkletPdIoClassSnapshot {
+                            class: chunklet_io_class_label(class.class).to_string(),
+                            configured_min_blocks: class.configured_min_blocks,
+                            queued_blocks: class.queued_blocks,
+                            queued_blocks_max: class.queued_blocks_max,
+                            active_blocks: class.active_blocks,
+                            active_blocks_max: class.active_blocks_max,
+                            wait_events: class.wait_events,
+                            wait_ns: class.wait_ns,
+                            wait_max_ns: class.wait_max_ns,
+                            admission_events: class.admission_events,
+                            admitted_blocks: class.admitted_blocks,
+                            borrow_events: class.borrow_events,
+                            borrowed_blocks: class.borrowed_blocks,
+                            borrowed_blocks_max: class.borrowed_blocks_max,
+                            borrowed_blocks_total: class.borrowed_blocks_total,
+                            reclaim_events: class.reclaim_events,
+                            reclaimed_blocks: class.reclaimed_blocks,
+                            completed_blocks: class.completed_blocks,
+                            error_blocks: class.error_blocks,
+                            service_ns: class.service_ns,
+                            service_max_ns: class.service_max_ns,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn chunklet_io_class_label(class: onyx_chunklet::io::IoClass) -> &'static str {
+    match class {
+        onyx_chunklet::io::IoClass::Foreground => "foreground",
+        onyx_chunklet::io::IoClass::DrainData => "drain_data",
+        onyx_chunklet::io::IoClass::DrainMeta => "drain_meta",
+        onyx_chunklet::io::IoClass::Maintenance => "maintenance",
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EngineStatusSnapshot {
     /// "active", "standby", or "meta-only"
     pub mode: String,
@@ -21,6 +121,9 @@ pub struct EngineStatusSnapshot {
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
     pub chunklet_io_scheduler: Option<crate::io::block_backend::ChunkletIoSchedulerSnapshot>,
+    /// Per-PD block scheduler inside chunklet, after RAID fanout. Independent
+    /// of the legacy Onyx-side batch admission snapshot above.
+    pub chunklet_pd_io_scheduler: Option<ChunkletPdIoSchedulerSnapshot>,
     pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
@@ -104,6 +207,25 @@ impl EngineStatusSnapshot {
                 scheduler.meta.active,
                 scheduler.meta.reserved,
                 scheduler.meta.waiters,
+            );
+        }
+        if let Some(scheduler) = &self.chunklet_pd_io_scheduler {
+            let active: u64 = scheduler.pds.iter().map(|pd| pd.total_active_blocks).sum();
+            let queued: u64 = scheduler.pds.iter().map(|pd| pd.total_queued_blocks).sum();
+            let flush_waiters: u64 = scheduler.pds.iter().map(|pd| pd.flush_waiters).sum();
+            let max_per_pd = scheduler
+                .pds
+                .first()
+                .map(|pd| pd.max_active_blocks)
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "chunklet_pd_write_scheduler: pds={} active_blocks={} queued_blocks={} max_blocks_per_pd={} flush_waiters={}",
+                scheduler.pds.len(),
+                active,
+                queued,
+                max_per_pd,
+                flush_waiters,
             );
         }
         if let Some(metadb) = &self.metadb_memory {

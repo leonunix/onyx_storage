@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use onyx_chunklet::io::{with_io_class, IoClass as ChunkletIoClass};
 use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::ChunkletError;
 use parking_lot::{Condvar, Mutex};
@@ -66,6 +67,14 @@ impl IoClass {
             Self::Foreground => 0,
             Self::Lv3 => 1,
             Self::Meta => 2,
+        }
+    }
+
+    const fn chunklet(self) -> ChunkletIoClass {
+        match self {
+            Self::Foreground => ChunkletIoClass::Foreground,
+            Self::Lv3 => ChunkletIoClass::DrainData,
+            Self::Meta => ChunkletIoClass::DrainMeta,
         }
     }
 }
@@ -744,6 +753,9 @@ pub struct ChunkletBackend {
     /// thread. Threads that lose the race find the handle already swapped and
     /// simply retry against it.
     reopen_lock: Mutex<()>,
+    /// Physical-IO class passed into chunklet for every write, independent of
+    /// whether the legacy Onyx-side batch admission scheduler is enabled.
+    nested_io_class: ChunkletIoClass,
     /// Optional Onyx-side write admission. Disabled for legacy constructors
     /// and callers that have not explicitly wired all LD roles to one shared
     /// scheduler.
@@ -758,6 +770,7 @@ impl ChunkletBackend {
             capacity: AtomicU64::new(capacity),
             pool: None,
             reopen_lock: Mutex::new(()),
+            nested_io_class: ChunkletIoClass::Foreground,
             io_scheduler: None,
         }
     }
@@ -769,6 +782,18 @@ impl ChunkletBackend {
         b
     }
 
+    /// Build an unscheduled role backend while preserving its nested physical
+    /// IO class. This is the production path when legacy batch admission is off.
+    pub(crate) fn with_pool_and_class(
+        ld: Arc<dyn LogicalDisk>,
+        pool: Arc<onyx_chunklet::Pool>,
+        class: IoClass,
+    ) -> Self {
+        let mut backend = Self::with_pool(ld, pool);
+        backend.nested_io_class = class.chunklet();
+        backend
+    }
+
     /// Build a scheduled backend without an owning Pool (primarily tests and
     /// callers that manage the Pool lifetime separately).
     pub(crate) fn new_scheduled(
@@ -777,6 +802,7 @@ impl ChunkletBackend {
         scheduler: Arc<ChunkletIoScheduler>,
     ) -> Self {
         let mut backend = Self::new(ld);
+        backend.nested_io_class = class.chunklet();
         backend.io_scheduler = Some((scheduler, class));
         backend
     }
@@ -790,7 +816,7 @@ impl ChunkletBackend {
         class: IoClass,
         scheduler: Arc<ChunkletIoScheduler>,
     ) -> Self {
-        let mut backend = Self::with_pool(ld, pool);
+        let mut backend = Self::with_pool_and_class(ld, pool, class);
         backend.io_scheduler = Some((scheduler, class));
         backend
     }
@@ -967,7 +993,9 @@ impl BlockBackend for ChunkletBackend {
 
     fn write_at(&self, buf: &[u8], offset: u64) -> OnyxResult<()> {
         let _permit = self.acquire_write_permit();
-        self.with_stale_retry("write_at", |ld| ld.write_at(offset, buf))
+        with_io_class(self.nested_io_class, || {
+            self.with_stale_retry("write_at", |ld| ld.write_at(offset, buf))
+        })
     }
 
     fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> OnyxResult<()> {
@@ -977,14 +1005,18 @@ impl BlockBackend for ChunkletBackend {
 
     fn write_many_at(&self, ops: &[(u64, &[u8])]) -> OnyxResult<()> {
         let _permit = self.acquire_write_permit();
-        self.with_stale_retry("write_many_at", |ld| ld.write_many_at(ops))
+        with_io_class(self.nested_io_class, || {
+            self.with_stale_retry("write_many_at", |ld| ld.write_many_at(ops))
+        })
     }
 
     fn flush(&self) -> OnyxResult<()> {
         // A barrier must never wait behind writes whose durability it may need
         // to establish. Current write-through PDs skip it, but preserving this
         // bypass also keeps future write-back devices deadlock-free.
-        self.with_stale_retry("flush", |ld| ld.flush())
+        with_io_class(self.nested_io_class, || {
+            self.with_stale_retry("flush", |ld| ld.flush())
+        })
     }
 
     fn size(&self) -> u64 {
@@ -1372,6 +1404,13 @@ mod tests {
         assert_eq!(snapshot.total_active, 0);
         assert_eq!(snapshot.foreground.active, 0);
         assert_eq!(snapshot.foreground.admissions, 1);
+    }
+
+    #[test]
+    fn chunklet_io_classes_map_to_nested_block_classes() {
+        assert_eq!(IoClass::Foreground.chunklet(), ChunkletIoClass::Foreground);
+        assert_eq!(IoClass::Lv3.chunklet(), ChunkletIoClass::DrainData);
+        assert_eq!(IoClass::Meta.chunklet(), ChunkletIoClass::DrainMeta);
     }
 
     fn backend(size: u64) -> (RawDevice, NamedTempFile) {

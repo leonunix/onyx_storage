@@ -2138,6 +2138,11 @@ impl OnyxEngine {
             .as_ref()
             .map(|alloc| alloc.contiguity_stats());
         let dedup_migration = self.meta.dedup_migration_status();
+        let chunklet_pool = self.meta.chunklet_pool();
+        let chunklet_pd_io_scheduler = chunklet_pool
+            .as_ref()
+            .and_then(|pool| pool.io_scheduler_snapshot())
+            .map(Into::into);
         Ok(EngineStatusSnapshot {
             mode: if self.zone_manager.is_some() {
                 "active".to_string()
@@ -2171,6 +2176,7 @@ impl OnyxEngine {
                 .chunklet_io_scheduler
                 .as_ref()
                 .map(|scheduler| scheduler.snapshot()),
+            chunklet_pd_io_scheduler,
             metadb_memory: self.meta.memory_stats().ok(),
             buffer_shards: self
                 .buffer_pool
@@ -2200,9 +2206,7 @@ impl OnyxEngine {
             // chunklet topology/health: read-only `pool.metrics()` (holds only
             // `state.read()`, safe against live IO). None on the file backend or
             // if the metrics read errors — status must never fail on it.
-            chunklet: self
-                .meta
-                .chunklet_pool()
+            chunklet: chunklet_pool
                 .and_then(|pool| pool.metrics().ok())
                 .map(|m| onyx_chunklet::ops::PoolSnapshot::from_metrics(&m)),
             dedup_cuckoo_buckets: dedup_migration.new_bucket_count,

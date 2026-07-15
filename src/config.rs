@@ -979,6 +979,22 @@ pub struct ChunkletConfig {
     /// MetaDB apply/checkpoint share while LV2 or LV3 writes are waiting.
     #[serde(default)]
     pub write_meta_active: u32,
+    /// Per-physical-disk cap measured in actual 4 KiB write blocks after the
+    /// chunklet LD expands RAID fanout. `0` disables nested block admission.
+    #[serde(default)]
+    pub pd_write_max_active_blocks: u64,
+    /// Guaranteed LV2 foreground floor per PD while that class is queued.
+    #[serde(default)]
+    pub pd_write_foreground_min_blocks: u64,
+    /// Guaranteed LV3 drain floor per PD while that class is queued.
+    #[serde(default)]
+    pub pd_write_lv3_min_blocks: u64,
+    /// Guaranteed MetaDB drain floor per PD while that class is queued.
+    #[serde(default)]
+    pub pd_write_meta_min_blocks: u64,
+    /// Guaranteed rebuild/rebalance floor per PD while maintenance is queued.
+    #[serde(default)]
+    pub pd_write_maintenance_min_blocks: u64,
     /// Per-PD free chunklets reserved for rebuild (percent, default 5).
     #[serde(default = "default_chunklet_spare_pct")]
     pub spare_pct: u8,
@@ -1090,6 +1106,11 @@ impl Default for ChunkletConfig {
             write_foreground_active: 0,
             write_lv3_active: 0,
             write_meta_active: 0,
+            pd_write_max_active_blocks: 0,
+            pd_write_foreground_min_blocks: 0,
+            pd_write_lv3_min_blocks: 0,
+            pd_write_meta_min_blocks: 0,
+            pd_write_maintenance_min_blocks: 0,
             spare_pct: default_chunklet_spare_pct(),
             lv3: ChunkletLdGeom::lv3_default(),
             lv2: ChunkletLdGeom::lv2_default(),
@@ -1125,21 +1146,56 @@ impl ChunkletConfig {
                     "chunklet write class shares require write_max_active > 0".into(),
                 ));
             }
+        } else {
+            if !self.enabled {
+                return Err(OnyxError::Config(
+                    "chunklet write scheduler requires [chunklet].enabled = true".into(),
+                ));
+            }
+            let sum = shares
+                .into_iter()
+                .try_fold(0u32, |total, share| total.checked_add(share));
+            if shares.into_iter().any(|share| share == 0)
+                || !sum.is_some_and(|total| total <= self.write_max_active)
+            {
+                return Err(OnyxError::Config(
+                    "chunklet write scheduler requires three non-zero reservations whose checked sum does not exceed write_max_active"
+                        .into(),
+                ));
+            }
+        }
+
+        self.validate_pd_write_scheduler()
+    }
+
+    fn validate_pd_write_scheduler(&self) -> OnyxResult<()> {
+        let minimums = [
+            self.pd_write_foreground_min_blocks,
+            self.pd_write_lv3_min_blocks,
+            self.pd_write_meta_min_blocks,
+            self.pd_write_maintenance_min_blocks,
+        ];
+        if self.pd_write_max_active_blocks == 0 {
+            if minimums.into_iter().any(|minimum| minimum != 0) {
+                return Err(OnyxError::Config(
+                    "chunklet per-PD write minimums require pd_write_max_active_blocks > 0".into(),
+                ));
+            }
             return Ok(());
         }
         if !self.enabled {
             return Err(OnyxError::Config(
-                "chunklet write scheduler requires [chunklet].enabled = true".into(),
+                "chunklet per-PD write scheduler requires [chunklet].enabled = true".into(),
             ));
         }
-        let sum = shares
+        let sum = minimums
             .into_iter()
-            .try_fold(0u32, |total, share| total.checked_add(share));
-        if shares.into_iter().any(|share| share == 0)
-            || !sum.is_some_and(|total| total <= self.write_max_active)
+            .try_fold(0u64, |total, minimum| total.checked_add(minimum));
+        if minimums.into_iter().any(|minimum| minimum == 0)
+            || !sum.is_some_and(|total| total <= self.pd_write_max_active_blocks)
         {
             return Err(OnyxError::Config(
-                "chunklet write scheduler requires three non-zero reservations whose checked sum does not exceed write_max_active"
+                "chunklet per-PD write scheduler requires four non-zero class minimums whose checked sum does not exceed pd_write_max_active_blocks"
                     .into(),
             ));
         }
@@ -2040,5 +2096,76 @@ mod service_config_tests {
         )
         .unwrap();
         assert!(OnyxConfig::load(file.path()).is_err());
+    }
+
+    #[test]
+    fn chunklet_pd_write_scheduler_defaults_parse_and_validate_independently() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(default_config.chunklet.pd_write_max_active_blocks, 0);
+        assert_eq!(default_config.chunklet.pd_write_foreground_min_blocks, 0);
+        assert_eq!(default_config.chunklet.pd_write_lv3_min_blocks, 0);
+        assert_eq!(default_config.chunklet.pd_write_meta_min_blocks, 0);
+        assert_eq!(default_config.chunklet.pd_write_maintenance_min_blocks, 0);
+
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [chunklet]
+                enabled = true
+                pd_write_max_active_blocks = 512
+                pd_write_foreground_min_blocks = 32
+                pd_write_lv3_min_blocks = 128
+                pd_write_meta_min_blocks = 64
+                pd_write_maintenance_min_blocks = 8
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.chunklet.write_max_active, 0);
+        assert_eq!(configured.chunklet.pd_write_max_active_blocks, 512);
+        assert!(configured.validate().is_ok());
+    }
+
+    #[test]
+    fn chunklet_pd_write_scheduler_rejects_orphaned_or_excess_minimums() {
+        let mut config = OnyxConfig::default();
+        config.chunklet.pd_write_lv3_min_blocks = 1;
+        assert!(config.validate().is_err());
+
+        config.chunklet.enabled = true;
+        config.chunklet.pd_write_max_active_blocks = 8;
+        config.chunklet.pd_write_foreground_min_blocks = 1;
+        config.chunklet.pd_write_lv3_min_blocks = 3;
+        config.chunklet.pd_write_meta_min_blocks = 3;
+        config.chunklet.pd_write_maintenance_min_blocks = 1;
+        assert!(config.validate().is_ok());
+
+        config.chunklet.pd_write_maintenance_min_blocks = 2;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn chunklet_pd_write_scheduler_rejects_any_zero_class_minimum() {
+        let mut config = OnyxConfig::default();
+        config.chunklet.enabled = true;
+        config.chunklet.pd_write_max_active_blocks = 8;
+        config.chunklet.pd_write_foreground_min_blocks = 1;
+        config.chunklet.pd_write_lv3_min_blocks = 3;
+        config.chunklet.pd_write_meta_min_blocks = 3;
+        config.chunklet.pd_write_maintenance_min_blocks = 1;
+        assert!(config.validate().is_ok());
+
+        config.chunklet.pd_write_foreground_min_blocks = 0;
+        assert!(config.validate().is_err());
+        config.chunklet.pd_write_foreground_min_blocks = 1;
+
+        config.chunklet.pd_write_lv3_min_blocks = 0;
+        assert!(config.validate().is_err());
+        config.chunklet.pd_write_lv3_min_blocks = 3;
+
+        config.chunklet.pd_write_meta_min_blocks = 0;
+        assert!(config.validate().is_err());
+        config.chunklet.pd_write_meta_min_blocks = 3;
+
+        config.chunklet.pd_write_maintenance_min_blocks = 0;
+        assert!(config.validate().is_err());
     }
 }

@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use onyx_chunklet::io::{IoBackendKind, RawDevice as CkRawDevice};
+use onyx_chunklet::io::{
+    IoBackendKind, IoClass as ChunkletIoClass, RawDevice as CkRawDevice, SchedulerConfig,
+};
 use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::ops;
 use onyx_chunklet::pool::LdSpec;
@@ -55,6 +57,30 @@ fn open_raw_devices(cfg: &ChunkletConfig) -> OnyxResult<Vec<CkRawDevice>> {
     Ok(raws)
 }
 
+fn pd_write_scheduler_config(cfg: &ChunkletConfig) -> Option<SchedulerConfig> {
+    (cfg.pd_write_max_active_blocks != 0).then(|| {
+        SchedulerConfig::new(cfg.pd_write_max_active_blocks)
+            .with_min_active_blocks(
+                ChunkletIoClass::Foreground,
+                cfg.pd_write_foreground_min_blocks,
+            )
+            .with_min_active_blocks(ChunkletIoClass::DrainData, cfg.pd_write_lv3_min_blocks)
+            .with_min_active_blocks(ChunkletIoClass::DrainMeta, cfg.pd_write_meta_min_blocks)
+            .with_min_active_blocks(
+                ChunkletIoClass::Maintenance,
+                cfg.pd_write_maintenance_min_blocks,
+            )
+    })
+}
+
+fn configure_pool_io_backend(pool: &Pool, cfg: &ChunkletConfig) -> OnyxResult<()> {
+    match pd_write_scheduler_config(cfg) {
+        Some(scheduler) => pool.set_scheduled_io_backend(cfg.io_backend.to_kind(), scheduler)?,
+        None => pool.set_io_backend(cfg.io_backend.to_kind()),
+    }
+    Ok(())
+}
+
 /// Open an existing pool (engine startup). Resolves the pool's PDs by on-disk
 /// identity (`discover_pool_devices`, robust to `/dev/nvmeXnY` re-enumeration)
 /// and, when `tolerant_open` is set, starts degraded if a PD is missing rather
@@ -67,7 +93,7 @@ pub fn open_pool(cfg: &ChunkletConfig) -> OnyxResult<Arc<Pool>> {
         let raws = open_raws_all(&paths)?;
         Pool::open(raws)?
     };
-    pool.set_io_backend(cfg.io_backend.to_kind());
+    configure_pool_io_backend(&pool, cfg)?;
     Ok(pool)
 }
 
@@ -240,6 +266,7 @@ pub fn init_pool(cfg: &ChunkletConfig) -> OnyxResult<(Arc<Pool>, LdId, LdId, LdI
             io_backend: cfg.io_backend.to_kind(),
         },
     )?;
+    configure_pool_io_backend(&pool, cfg)?;
     let lv3 = pool.create_ld(geom_to_spec(&cfg.lv3)?)?;
     let lv2 = pool.create_ld(geom_to_spec(&cfg.lv2)?)?;
     let meta = pool.create_ld(geom_to_spec(&cfg.meta)?)?;
@@ -304,7 +331,16 @@ pub fn role_backend_from_pool(
     role: LdRoleSel,
 ) -> OnyxResult<Arc<ChunkletBackend>> {
     let ld = resolve_ld(pool, cfg, role)?;
-    Ok(Arc::new(ChunkletBackend::with_pool(ld, pool.clone())))
+    let class = match role {
+        LdRoleSel::Lv2 => IoClass::Foreground,
+        LdRoleSel::Lv3 => IoClass::Lv3,
+        LdRoleSel::Meta => IoClass::Meta,
+    };
+    Ok(Arc::new(ChunkletBackend::with_pool_and_class(
+        ld,
+        pool.clone(),
+        class,
+    )))
 }
 
 /// Scheduled engine path. Every role derived from one Pool must receive the
@@ -512,10 +548,45 @@ mod tests {
             enabled: true,
             devices: devices.clone(),
             io_backend: ChunkletIoBackend::Sync,
+            pd_write_max_active_blocks: 64,
+            pd_write_foreground_min_blocks: 16,
+            pd_write_lv3_min_blocks: 24,
+            pd_write_meta_min_blocks: 16,
+            pd_write_maintenance_min_blocks: 8,
             spare_pct: 0,
             ..Default::default()
         };
         let (pool, lv3, _lv2, _meta) = init_pool(&cfg).unwrap();
+
+        let status = crate::metrics::EngineStatusSnapshot {
+            chunklet_pd_io_scheduler: Some(pool.io_scheduler_snapshot().unwrap().into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        let pds = json["chunklet_pd_io_scheduler"]["pds"].as_array().unwrap();
+        assert_eq!(pds.len(), devices.len());
+        assert_eq!(pds[0]["max_active_blocks"], 64);
+        assert_eq!(pds[0]["total_active_blocks"], 0);
+        assert_eq!(pds[0]["total_queued_blocks"], 0);
+        let classes = pds[0]["classes"].as_array().unwrap();
+        assert_eq!(classes.len(), ChunkletIoClass::ALL.len());
+        assert_eq!(classes[0]["class"], "foreground");
+        assert_eq!(classes[0]["configured_min_blocks"], 16);
+        assert_eq!(classes[0]["completed_blocks"], 0);
+        assert_eq!(classes[0]["service_ns"], 0);
+        assert_eq!(classes[1]["class"], "drain_data");
+        assert_eq!(classes[1]["configured_min_blocks"], 24);
+        assert_eq!(classes[2]["class"], "drain_meta");
+        assert_eq!(classes[2]["configured_min_blocks"], 16);
+        assert_eq!(classes[3]["class"], "maintenance");
+        assert_eq!(classes[3]["configured_min_blocks"], 8);
+        assert!(status
+            .render_text()
+            .contains("chunklet_pd_write_scheduler: pds=8 active_blocks=0 queued_blocks=0"));
+
+        pool.set_io_backend(IoBackendKind::Sync);
+        assert!(pool.io_scheduler_snapshot().is_none());
+        configure_pool_io_backend(&pool, &cfg).unwrap();
         drop(pool);
 
         cfg.lv3_ld_id = Some(lv3.to_string());
@@ -525,6 +596,34 @@ mod tests {
         let payload = vec![0x5au8; 64 << 10];
         backend.write_at(&payload, 0).unwrap();
         backend.flush().unwrap();
+        let scheduler = pool2.io_scheduler_snapshot().unwrap();
+        let lv3_admissions: u64 = scheduler
+            .pds
+            .iter()
+            .flat_map(|pd| &pd.classes)
+            .filter(|class| class.class == ChunkletIoClass::DrainData)
+            .map(|class| class.admission_events)
+            .sum();
+        let lv3_admitted_blocks: u64 = scheduler
+            .pds
+            .iter()
+            .flat_map(|pd| &pd.classes)
+            .filter(|class| class.class == ChunkletIoClass::DrainData)
+            .map(|class| class.admitted_blocks)
+            .sum();
+        let lv3_completed_blocks: u64 = scheduler
+            .pds
+            .iter()
+            .flat_map(|pd| &pd.classes)
+            .filter(|class| class.class == ChunkletIoClass::DrainData)
+            .map(|class| class.completed_blocks)
+            .sum();
+        assert!(
+            lv3_admissions > 0,
+            "LV3 writes must retain their nested DrainData class while the legacy Onyx scheduler is off"
+        );
+        assert!(lv3_admitted_blocks > 0);
+        assert_eq!(lv3_completed_blocks, lv3_admitted_blocks);
         let mut got = vec![0u8; payload.len()];
         backend.read_at(&mut got, 0).unwrap();
         assert_eq!(got, payload);

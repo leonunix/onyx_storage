@@ -1086,7 +1086,10 @@ mod status;
 
 pub use meta_memory::{BufferShardSnapshot, MetaMemorySnapshot};
 pub use snapshot::EngineMetricsSnapshot;
-pub use status::EngineStatusSnapshot;
+pub use status::{
+    ChunkletPdIoClassSnapshot, ChunkletPdIoPdSnapshot, ChunkletPdIoSchedulerSnapshot,
+    EngineStatusSnapshot,
+};
 
 #[cfg(test)]
 mod tests {
