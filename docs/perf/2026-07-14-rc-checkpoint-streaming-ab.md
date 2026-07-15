@@ -61,6 +61,17 @@ physical pressure 提到 10%。这样 30 秒内仍可做 overwrite collapse；�
 时才旁路 residence window，让后台立即消费全部债务。验收仍要求后台 QoS wait=0、physical fill 不越过
 10%、无 hard backpressure，同时 LV3/前台字节比和完整生命周期吞吐必须恢复。
 
+`rc-auth-on-zfs-dirty-throttle-window10-4m-600s` 同样否决 10% ceiling。它比 2% 候选改善到
+27,062 IOPS / 481.35 MB/s，但 workload + drain 的 LV3/前台字节比仍为 96.62%，p99 达 408.94 ms；
+85.1% appends 被显式节流，physical ring 归零仍需 51.011 秒。实测 4M BFG 按当前平均 entry 大约占
+整个 LV2 ring 的 13%-15%，所以 10% 连一代满 cohort 都容不下，正常 checkpoint 重叠被错误地当成
+容量危险。
+
+下一档按实际 cohort footprint 而不是拍脑袋百分比设置：20% 开始、30% 达 cap，并在 30% 才旁路
+write window。该窗口允许约一到两代 4M BFG 重叠，仍显著早于旧控制器 40%-65% 的 recovery/emergency；
+后台 admission 继续为零。只有它同时恢复 overwrite collapse、前台吞吐与 bounded physical debt，才保留
+“压前台、后台全速”的调度方向。
+
 下面的“受控 A/B”和“阶段拆解 fresh 基线”不是同一组可互换样本。后者包含额外正确性修复、指标和新
 Meta LD，用于 correctness + hotspot 定位，**不能拿它的 fio 数字与旧 A/B 直接计算优化幅度**。
 

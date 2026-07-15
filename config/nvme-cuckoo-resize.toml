@@ -118,11 +118,11 @@ sync_batch_max_bytes_mb = 1024
 # Preserve the measured four-lane topology while the new sampled wall/CPU
 # profile identifies root-write service versus scheduler delay.
 lv2_prepared_queue_depth_per_lane = 16
-# ZFS-style foreground transaction delay. Backend flush stays unthrottled; new
-# appends are paced only after the 512 GiB durable ring carries 5% physical debt.
-# Basis-point runtime sampling keeps the narrow 5%-10% curve continuous.
-throttle_min_pct = 5
-throttle_max_pct = 10
+# ZFS-style foreground transaction delay. Backend flush stays unthrottled; one
+# to two 4M BFG generations may overlap before new appends are paced. Runtime
+# sampling uses basis points so the 20%-30% curve remains continuous.
+throttle_min_pct = 20
+throttle_max_pct = 30
 throttle_scale_us = 10
 throttle_cap_us = 2000
 
@@ -145,15 +145,15 @@ skip_fully_superseded = true
 # Bypass on PHYSICAL ring occupancy so checkpoint-retained slots cannot hide
 # pressure behind a low logical-pending value.
 buffer_write_window_ms = 30000
-buffer_write_window_physical_pressure_pct = 10
+buffer_write_window_physical_pressure_pct = 30
 # Resident payload is only a memory/cache signal. At 80%, bypass the overwrite
 # residence window so the unthrottled backend can protect durable capacity.
 buffer_write_window_payload_pressure_pct = 80
 # Keep the backend healthy: it must consume durable LV2 work at its natural
 # completion-driven rate even while foreground IO is active. If that full
 # service rate cannot keep up, apply the ZFS-style hyperbolic delay to new LV2
-# appends at 5%-10% fill instead of rate-limiting the flusher. Preserve the
-# 30-second overwrite window below 10%; bypass it only at the throttle ceiling.
+# appends at 20%-30% fill instead of rate-limiting the flusher. Preserve the
+# 30-second overwrite window below 30%; bypass it only at the throttle ceiling.
 foreground_flush_target_p99_ms = 0
 foreground_flush_active_mib_s = 128
 foreground_flush_min_mib_s = 32
