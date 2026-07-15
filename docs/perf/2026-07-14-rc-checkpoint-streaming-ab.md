@@ -20,8 +20,14 @@ p99.99，后者反而上升 37.57%，不能把这轮结果描述成尾延迟已�
   单位成本降低 23.78% / 21.76%；IOPS +0.28%，p99 / p99.9 / p99.99 分别下降 26.16% / 6.30% /
   6.93%，因此保留。
 - hasher run 的 forced max 仍从 42.79 秒升到 58.16 秒，同时每轮 L2P/RC checkpoint cohort 约大
-  49%，fold/prefold 更长，而 `stage_batch` 本身没有回归。下一阶段应直接限制 **L2P fold/prefold 的
-  单轮工作量并优化 metadata page IO**；不再扩大 commit queue。
+  49%，fold/prefold 更长，而 `stage_batch` 本身没有回归。
+- generation-aware BFG admission 已把 4M 配置从一次性通知改成真实 work 上界；fresh-Meta 4M A'
+  实测最大 cohort 为 4,006,123（理论上界 4,008,191），forced max 从 58.16 秒降到 20.64 秒，write
+  IOPS / p99 为 46,878.08 / 113.77 ms。2M 虽把 forced max 继续降到 13.25 秒，但完整生命周期吞吐、
+  fio tails、归一化 drain 和 checkpoint 写放大均更差，因此拒绝。
+
+下一阶段应在保留 **4M 严格 cohort 上界**的前提下继续降低 RC sample/prefold/page-IO service max；
+不再缩 admission bound，也不扩大 commit queue。
 
 下面的“受控 A/B”和“阶段拆解 fresh 基线”不是同一组可互换样本。后者包含额外正确性修复、指标和新
 Meta LD，用于 correctness + hotspot 定位，**不能拿它的 fio 数字与旧 A/B 直接计算优化幅度**。
@@ -288,6 +294,72 @@ hasher fresh Meta 的 workload 前 strict 为 0/0/0；后验 strict exit code �
 
 ---
 
+## BFG work admission 上界
+
+### 根因与实现
+
+原 `l2p_buffer_soft_entries` 只在一个 Open BFG 首次跨过阈值时发通知；如果 quiesce worker 正阻塞在
+前一代 `promote_to_syncing`，当前 Open BFG 仍可继续接收 commit，cohort 会随 checkpoint service time
+无界增长。`l2p_buffer_hard_entries` 实际没有消费者，不能提供第二道上界。
+
+`7b5c486 perf(checkpoint): bound BFG work admission` 将计数和 admission 放在 LSN 分配前原子完成：
+
+- crossing batch 被接纳并关闭当前 generation；后续 commit 等下一 BFG 成功打开；
+- generation-tagged force notification 丢弃 stale 请求，不会误滚下一代；迟到请求也不再重置 timer；
+- shutdown / abort 会唤醒 admission waiter；snapshot live 时保持原来的 lifecycle 边界；
+- `commit_ops`、`commit_ops_unlogged`、`stage_ops` 使用同一入口，指标记录 admission wait total / max。
+
+因此单 BFG 的提交工作量上界为 `limit + max_single_batch - 1`。本实现没有改 commit worker、queue、
+pipeline depth、75ms coalesce window 或 RC streaming 的 4096-page chunk。
+
+### 2M / 4M fresh-Meta 控制
+
+同一 release binary SHA 为 `8f8da620...`；2M 与 4M A' 使用相同 seed、LV2/LV3、runner 和显式
+`RUST_LOG=onyx_storage=info,onyx_metadb=warn,onyx_chunklet=error`，只改变 fresh Meta LD 和 soft bound：
+
+| 600s 指标 | 2M | 4M A' | 4M 变化 |
+|---|---:|---:|---:|
+| write IOPS | 42,493.51 | **46,878.08** | +10.32% |
+| p99 / p99.9 / p99.99 | 116.916 / 258.998 / 434.110 ms | **113.770 / 221.250 / 404.750 ms** | -2.69% / -14.57% / -6.76% |
+| pending / physical drain | 208.664 / 233.798 s | **190.052 / 230.313 s** | -8.92% / -1.49% |
+| full forced max | **13.249 s** | 20.637 s | +55.76% |
+| full prefold wait max | **2.059 s** | 7.725 s | +275.16% |
+| observed max BFG work | 2,007,461 | 4,006,123 | both bounded |
+| RSS HWM | **62.42 GiB** | 68.72 GiB | +10.08% |
+
+两边 workload slow trace 都没有触达各自阈值（2M max 1,477,259；4M A' max 1,302,236），workload
+admission wait 也只有 3.813 / 24.808 ms。因此不能把两次 fio 差异归因于 admission gate；最初 4M A
+只有 33,331.99 IOPS，而 A' 达到 46,878.08，也证明 fresh Meta placement / 运行态方差很大。
+
+最终决策仍保留 4M，依据是完整生命周期方向一致，而不是单个 fio 数字：
+
+- 4M pending drain rate 约 67.71K entries/s，2M 为 57.88K/s；physical drain rate 也高约 16%；
+- full RC stage / action 为 3.173 / 3.361 us，full commit apply / LBA 为 8.629 / 8.797 us；
+- workload checkpoint bytes / fio bytes 为 0.1151 / 0.1255，4M 低 8.31%；full pages written / L2P
+  apply 低 12.07%；
+- 2M full forced calls 为 417 次，4M 为 312 次；累计 admission waiter time 为 482.4 / 221.8 秒。
+
+2M 的确直接缩短单次内部 checkpoint，但没有转化成更好的用户 tails 或后端 service rate。4M 已把
+hasher 的 58.155 秒 forced max 降到 20.637 秒（-64.51%），同时保住更好的持续能力；继续降到 1M/2M
+会越过当前写放大与 checkpoint 频率的收益拐点。
+
+### 正确性与 CRC 边界
+
+4M A' 的 fresh-Meta pre/post strict 均为 exit 0：pre 扫描 7,966 页，post 扫描 5,545,445 页；post
+live / free 为 3,864,169 / 1,681,364，orphan / warning / issue 全为 0。2M post strict 同样为 exit 0，
+扫描 7,147,905 页且三项为 0；其 pre strict 因另一进程持有 chunklet pool flock 返回 1，未被伪装成
+有效验收。三轮 admission artifact 的 foreground/dedup CRC、decompress 和 flush error 增量也全部为 0。
+
+这证明已知 LV2/LV3 overlap 和 premature-free CRC 类没有在本轮复现；`metadb-verify` 审计的是 Meta
+页可达性，不是全量 LV3 live-payload scrub，因此不能把它描述成一次全盘 payload CRC 证明。
+
+完整 artifact：
+
+- `.dev/prod-streaming-ab-20260714/rc-auth-on-bfg-admission-2m-600s`
+- `.dev/prod-streaming-ab-20260714/rc-auth-on-bfg-admission-4m-aprime-600s`
+
+---
+
 ## 代码与门禁
 
 本轮已落地的主要提交：
@@ -301,13 +373,16 @@ hasher fresh Meta 的 workload 前 strict 为 0/0/0；后验 strict exit code �
 | metadb | `7b521ff` | checkpoint 与 RC apply 阶段拆解 |
 | metadb | `72f05de` | staged DeltaMap/read-view mixed-u64 hashing |
 | metadb | `db701fd` / `26322e5` | checkpoint cache batching 实验及性能回退 |
+| metadb | `7b5c486` | generation-aware BFG work admission 上界 |
+| metadb | `7cf48a5` | 澄清未启用的 hard threshold 配置语义 |
 | top | `1a390a1` | 暴露 RC streaming phases |
 | top | `70cdae0` | 暴露 streaming A/B mode |
 | top | `613a24a` | shutdown terminal reclaim 持久化 |
 | top | `ea96cdb` | 暴露 RC stage breakdown |
+| top | `0058ef4` | 暴露 BFG admission wait |
 
-最终保留树的 nested metadb 全量测试为 786 passed、0 failed、3 ignored，所有 integration/doc tests
-通过；top `cargo test --lib metrics::` 8/8，analyzer unittest 2/2；本地与 nvme-box release build 均通过。
+最终保留树的 nested metadb 全量主库测试为 793 passed、0 failed、3 ignored，所有 integration/doc tests
+通过；top `cargo test --lib metrics::` 9/9，analyzer unittest 2/2；本地与 nvme-box release build 均通过。
 
 复现/分析入口：
 
@@ -325,6 +400,6 @@ target/release/onyx-storage \
   metadb-verify --strict --json
 ```
 
-一句话状态：**streaming 和 mixed-u64 hasher 已通过真实前台门槛并保留，checkpoint-free batching 因
-端到端回归已回退；剩余最大容量瓶颈是单轮过大的 L2P fold/prefold 和 metadata page IO，不是 commit
-queue，也不是 checkpoint-free cache invalidation。**
+一句话状态：**streaming、mixed-u64 hasher 和 4M strict BFG admission 已保留，2M bound 与
+checkpoint-free batching 因完整生命周期回归被拒绝；剩余最大容量瓶颈是在 4M cohort 内的 L2P
+fold/prefold、RC sample 和 metadata page IO，不是 commit queue。**
