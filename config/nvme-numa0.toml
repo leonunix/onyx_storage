@@ -61,6 +61,7 @@ dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
+l2p_buffer_soft_entries = 4000000
 # rc==0-gated reclaim (d39b398): without it the legacy referenced_extents
 # reverify scan stalls the BFG fold minutes into any sustained run (the
 # 2026-06-11 "degrades at minute 5" signature). ⚠ Requires a FRESH metadb.

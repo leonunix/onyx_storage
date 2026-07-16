@@ -51,6 +51,7 @@ dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
+l2p_buffer_soft_entries = 4000000
 # Direct apply stays ON: metadb now lives whole on the home pod (lanes,
 # drain, devices), so the home commit workers applying directly is
 # node-local. (Lane-apply across pods was tried and capped the drain at

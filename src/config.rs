@@ -809,7 +809,11 @@ fn default_l2p_buffer_enabled() -> bool {
     false
 }
 fn default_l2p_buffer_soft_entries() -> usize {
-    64_000
+    // This is a global per-BFG admission budget, not the old per-shard
+    // compactor wake threshold. The nvme-box A/B validated 4 M mutations;
+    // retaining the historical 64 K default causes checkpoint storms in any
+    // profile that enables buffered L2P without an explicit override.
+    4_000_000
 }
 fn default_l2p_buffer_hard_entries() -> usize {
     512_000
@@ -2077,6 +2081,12 @@ mod service_config_tests {
         )
         .unwrap();
         assert_eq!(legacy.meta.parallel_l2p_drain_workers, 0);
+    }
+
+    #[test]
+    fn l2p_buffer_default_uses_validated_global_bfg_budget() {
+        let config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(config.meta.l2p_buffer_soft_entries, 4_000_000);
     }
 
     #[test]

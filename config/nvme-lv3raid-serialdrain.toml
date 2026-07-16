@@ -22,6 +22,7 @@ dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
+l2p_buffer_soft_entries = 4000000
 commit_direct_apply_enabled = true
 # BFG background workers roll the open group and drain the frozen slot
 # outside the foreground checkpoint path.

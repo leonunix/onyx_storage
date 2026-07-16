@@ -26,6 +26,7 @@ dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 # Keep L2P updates buffered and apply eligible commits on the caller thread.
 l2p_buffer_enabled = true
+l2p_buffer_soft_entries = 4000000
 commit_direct_apply_enabled = true
 # Stage outcomes through the L2P compactor boundary.
 commit_deferred_outcomes_enabled = true
