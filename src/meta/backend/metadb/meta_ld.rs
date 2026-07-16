@@ -47,16 +47,15 @@ const MIN_JOURNAL_BYTES: u64 = 1024 * 1024; // 256 ring blocks
 const MAX_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024; // plan D5 production size
 /// Read batches stay large to amortise recovery/prewarm submissions.
 const MAX_DEVICE_READ_BYTES: usize = 4 * 1024 * 1024;
-/// The production meta mirror uses a 128 KiB strip. A 4 MiB logical batch
-/// therefore expands to 32 strips and 64 mirror writes, exactly filling
-/// chunklet's per-thread io_uring depth.
-const MAX_DEVICE_WRITE_BYTES: usize = 4 * 1024 * 1024;
-/// Number of independent 4 MiB chunks allowed in flight for one checkpoint
+/// The production meta mirror uses a 128 KiB strip. Keep one logical write
+/// ticket to eight strips so a caller cannot monopolise an entire depth-64
+/// io_uring after mirror expansion. Smaller tickets also let chunklet refill
+/// the per-PD queues from completions instead of waiting behind a 4 MiB owner.
+const MAX_DEVICE_WRITE_BYTES: usize = 1024 * 1024;
+/// Number of independent 1 MiB chunks allowed in flight for one checkpoint
 /// page write. Chunklet's io_uring backend owns one depth-64 ring per calling
-/// thread; a single caller therefore serialises thousands of mirrored 4 KiB
-/// writes through one shallow ring. Thirty-two scoped workers provide up to
-/// 2048 aggregate SQEs while keeping a fixed thread bound and each worker's
-/// range-lock footprint at 32 stripes.
+/// thread; thirty-two scoped workers preserve aggregate concurrency while
+/// keeping each worker's range-lock footprint at eight stripes.
 const MAX_PARALLEL_DEVICE_WRITES: usize = 32;
 /// Volume-catalog A/B slot header: `generation(8) | payload_len(4) | crc32(4)`.
 const CATALOG_SLOT_HEADER: usize = 16;
