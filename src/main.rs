@@ -280,6 +280,9 @@ fn print_verify_report_human(report: &onyx_metadb::VerifyReport) {
     if let Some(sequence) = report.manifest_sequence {
         println!("manifest_sequence: {sequence}");
     }
+    if let Some(line) = format_manifest_body_version_human(report) {
+        println!("{line}");
+    }
     if let Some(lsn) = report.checkpoint_lsn {
         println!("checkpoint_lsn: {lsn}");
     }
@@ -337,6 +340,10 @@ fn print_verify_report_json(report: &onyx_metadb::VerifyReport) {
             .unwrap_or_else(|| "null".into())
     );
     println!(
+        "  \"manifest_body_version\": {},",
+        format_manifest_body_version_json(report)
+    );
+    println!(
         "  \"checkpoint_lsn\": {},",
         report
             .checkpoint_lsn
@@ -352,6 +359,19 @@ fn print_verify_report_json(report: &onyx_metadb::VerifyReport) {
     println!("  \"warnings\": [{}],", warnings.join(", "));
     println!("  \"issues\": [{}]", issues.join(", "));
     println!("}}");
+}
+
+fn format_manifest_body_version_human(report: &onyx_metadb::VerifyReport) -> Option<String> {
+    report
+        .manifest_body_version
+        .map(|version| format!("manifest_body_version: {version}"))
+}
+
+fn format_manifest_body_version_json(report: &onyx_metadb::VerifyReport) -> String {
+    report
+        .manifest_body_version
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "null".into())
 }
 
 fn format_metadb_probe_human(
@@ -1031,5 +1051,27 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["volumes"][1]["mapping"]["pba"], 44);
         assert_eq!(json["explicit_pba"]["refcount"], 0);
+    }
+
+    #[test]
+    fn verify_report_formatters_expose_manifest_body_version() {
+        let report = onyx_metadb::VerifyReport {
+            manifest_body_version: Some(25),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            format_manifest_body_version_human(&report).as_deref(),
+            Some("manifest_body_version: 25")
+        );
+        assert_eq!(format_manifest_body_version_json(&report), "25");
+    }
+
+    #[test]
+    fn verify_report_json_uses_null_without_a_manifest() {
+        assert_eq!(
+            format_manifest_body_version_json(&onyx_metadb::VerifyReport::default()),
+            "null"
+        );
     }
 }
