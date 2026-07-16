@@ -174,6 +174,13 @@ impl MetaStore {
         self.backend.set_buffer_applied_watermark(seq);
     }
 
+    /// Buffer sequence committed in the current durable metadb manifest.
+    /// A newly initialized LV2 must allocate strictly above this value so
+    /// sequence numbers cannot be reused across the two persistence domains.
+    pub(crate) fn durable_buffer_applied_watermark(&self) -> u64 {
+        self.backend.durable_buffer_applied_watermark()
+    }
+
     /// [[no-refcount-hot-path-design]] Rc-neutral path: pull every PBA that the
     /// metadb-side Lineage GC has surfaced as freed (via
     /// `WalOp::FreePbas`) since the last call. The engine's

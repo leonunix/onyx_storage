@@ -1651,6 +1651,10 @@ impl MetadbBackend {
         self.db.set_buffer_applied_watermark(seq);
     }
 
+    pub(crate) fn durable_buffer_applied_watermark(&self) -> u64 {
+        self.db.durable_buffer_applied_watermark()
+    }
+
     pub(crate) fn request_durable_checkpoint(&self) -> OnyxResult<()> {
         self.checkpoint.request_async()
     }

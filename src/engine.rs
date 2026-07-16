@@ -626,6 +626,13 @@ impl OnyxEngine {
             buffer_uring_entries,
             buffer_runtime_limits,
         )?);
+        let durable_manifest_seq = meta.durable_buffer_applied_watermark();
+        if pool.ensure_next_seq_above(durable_manifest_seq)? {
+            tracing::warn!(
+                durable_manifest_seq,
+                "raised LV2 sequence floor from durable metadb manifest"
+            );
+        }
         pool.attach_metrics(metrics.clone());
 
         // --- Fast recovery: zero per-block IO ---
@@ -2168,6 +2175,16 @@ impl OnyxEngine {
                 .buffer_pool
                 .as_ref()
                 .map(|pool| pool.physical_fill_percentage()),
+            buffer_next_seq: self.buffer_pool.as_ref().map(|pool| pool.next_sequence()),
+            buffer_applied_frontier: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.applied_frontier()),
+            buffer_durable_seq: self
+                .buffer_pool
+                .as_ref()
+                .map(|pool| pool.durable_sequence()),
+            metadb_durable_buffer_seq: self.meta.durable_buffer_applied_watermark(),
             buffer_payload_memory_bytes: self
                 .buffer_pool
                 .as_ref()

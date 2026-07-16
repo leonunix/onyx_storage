@@ -526,6 +526,44 @@ fn packed_clean_checkpoint_reopens_empty_and_preserves_seq_floor() {
 }
 
 #[test]
+fn fresh_lv2_uses_external_durable_manifest_seq_floor() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+
+    assert!(pool.ensure_next_seq_above(u64::MAX).is_err());
+    assert!(pool.ensure_next_seq_above(20_654_109).unwrap());
+    assert_eq!(pool.applied_frontier(), 20_654_109);
+
+    let seq = pool
+        .append("vol", Lba(12), 1, &[0xD4; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    assert_eq!(seq, 20_654_110);
+    assert!(!pool.ensure_next_seq_above(41).unwrap());
+
+    pool.mark_applied(seq, Lba(12), 1).unwrap();
+    pool.durable_seq_handle()
+        .store(20_654_109, Ordering::Release);
+    assert_eq!(pool.release_below(20_654_109).unwrap(), 0);
+    assert!(!pool.physical_is_empty());
+
+    pool.durable_seq_handle().store(seq, Ordering::Release);
+    assert_eq!(pool.release_below(seq).unwrap(), 1);
+    assert!(pool.physical_is_empty());
+}
+
+#[test]
 fn global_sync_records_watermark_to_dispatcher_latency() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 32 * 1024 * 1024;

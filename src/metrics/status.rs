@@ -168,6 +168,14 @@ pub struct EngineStatusSnapshot {
     /// Fullest shard's physical ring occupancy, including applied entries
     /// retained until the next metadb checkpoint covers them.
     pub buffer_physical_fill_pct: Option<u8>,
+    /// Next LV2 sequence that will be allocated.
+    pub buffer_next_seq: Option<u64>,
+    /// Highest contiguous LV2 sequence whose mutations are applied in memory.
+    pub buffer_applied_frontier: Option<u64>,
+    /// Manifest frontier observed by the engine durability-watermark thread.
+    pub buffer_durable_seq: Option<u64>,
+    /// Buffer frontier stored in the currently committed metadb manifest.
+    pub metadb_durable_buffer_seq: u64,
     pub buffer_payload_memory_bytes: Option<u64>,
     pub buffer_payload_memory_limit_bytes: Option<u64>,
     pub chunklet_io_scheduler: Option<crate::io::block_backend::ChunkletIoSchedulerSnapshot>,
@@ -235,6 +243,20 @@ impl EngineStatusSnapshot {
         if let Some(fill_pct) = self.buffer_physical_fill_pct {
             let _ = writeln!(out, "buffer_physical_fill_pct: {}", fill_pct);
         }
+        if let Some(next_seq) = self.buffer_next_seq {
+            let _ = writeln!(out, "buffer_next_seq: {}", next_seq);
+        }
+        if let Some(frontier) = self.buffer_applied_frontier {
+            let _ = writeln!(out, "buffer_applied_frontier: {}", frontier);
+        }
+        if let Some(durable_seq) = self.buffer_durable_seq {
+            let _ = writeln!(out, "buffer_durable_seq: {}", durable_seq);
+        }
+        let _ = writeln!(
+            out,
+            "metadb_durable_buffer_seq: {}",
+            self.metadb_durable_buffer_seq
+        );
         if let Some(payload_bytes) = self.buffer_payload_memory_bytes {
             let limit = self.buffer_payload_memory_limit_bytes.unwrap_or(0);
             let _ = writeln!(
@@ -1436,6 +1458,29 @@ impl EngineStatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durability_frontiers_reach_status_json_and_text() {
+        let status = EngineStatusSnapshot {
+            buffer_next_seq: Some(44),
+            buffer_applied_frontier: Some(42),
+            buffer_durable_seq: Some(41),
+            metadb_durable_buffer_seq: 41,
+            ..EngineStatusSnapshot::default()
+        };
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["buffer_next_seq"], 44);
+        assert_eq!(json["buffer_applied_frontier"], 42);
+        assert_eq!(json["buffer_durable_seq"], 41);
+        assert_eq!(json["metadb_durable_buffer_seq"], 41);
+
+        let text = status.render_text();
+        assert!(text.contains("buffer_next_seq: 44"));
+        assert!(text.contains("buffer_applied_frontier: 42"));
+        assert!(text.contains("buffer_durable_seq: 41"));
+        assert!(text.contains("metadb_durable_buffer_seq: 41"));
+    }
 
     #[test]
     fn chunklet_execution_snapshot_reaches_json_and_text() {

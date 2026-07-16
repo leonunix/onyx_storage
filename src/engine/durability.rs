@@ -75,8 +75,10 @@ impl DurabilityWatermarkHandle {
                             Ok(Some(DurableCheckpointOutcome::Skipped)) => {
                                 // Non-blocking checkpoint found apply gate busy.
                                 // Retry on the next checkpoint interval.
-                                last_checkpoint_request_seq =
-                                    last_checkpoint_request_seq.min(requested_seq.saturating_sub(1));
+                                last_checkpoint_request_seq = Self::retry_frontier_before(
+                                    last_checkpoint_request_seq,
+                                    requested_seq,
+                                );
                                 pending_checkpoint = None;
                             }
                             Ok(None) => {}
@@ -97,6 +99,15 @@ impl DurabilityWatermarkHandle {
                                         "metadb checkpoint failed {consecutive_failures}x (last: {msg})"
                                     ));
                                 }
+                                // The request did not make this frontier
+                                // durable. Roll the optimistic request marker
+                                // back so the same idle frontier is retried;
+                                // otherwise the repeated-failure fence can
+                                // never observe a second attempt.
+                                last_checkpoint_request_seq = Self::retry_frontier_before(
+                                    last_checkpoint_request_seq,
+                                    requested_seq,
+                                );
                                 pending_checkpoint = None;
                             }
                         }
@@ -208,6 +219,10 @@ impl DurabilityWatermarkHandle {
         captured > last_checkpoint_request_seq
     }
 
+    fn retry_frontier_before(last_checkpoint_request_seq: u64, requested_seq: u64) -> u64 {
+        last_checkpoint_request_seq.min(requested_seq.saturating_sub(1))
+    }
+
     fn ring_checkpoint_needed(physical_fill_pct: u8, trigger_pct: u8) -> bool {
         trigger_pct > 0 && physical_fill_pct >= trigger_pct.min(100)
     }
@@ -242,6 +257,22 @@ mod tests {
         assert!(DurabilityWatermarkHandle::checkpoint_needed(42, 41));
         assert!(!DurabilityWatermarkHandle::checkpoint_needed(42, 42));
         assert!(!DurabilityWatermarkHandle::checkpoint_needed(41, 42));
+    }
+
+    #[test]
+    fn failed_or_skipped_checkpoint_retries_same_frontier() {
+        let requested = 42;
+        let retry_from = DurabilityWatermarkHandle::retry_frontier_before(requested, requested);
+        assert_eq!(retry_from, 41);
+        assert!(DurabilityWatermarkHandle::checkpoint_needed(
+            requested, retry_from
+        ));
+
+        // A newer marker must not be allowed to hide the failed frontier.
+        assert_eq!(
+            DurabilityWatermarkHandle::retry_frontier_before(100, requested),
+            41
+        );
     }
 
     #[test]

@@ -1051,6 +1051,31 @@ impl WriteBufferPool {
             .unwrap_or(max_allocated)
     }
 
+    /// Ensure future buffer records use a sequence strictly above a durable
+    /// metadb manifest watermark.
+    ///
+    /// The LV2 superblock normally preserves this floor. A clean LV2 rebuild
+    /// (replacement device, explicit reinitialization, or shard-layout change)
+    /// has no local history, while metadb can still contain a much higher
+    /// `last_processed_buffer_seq`. Reusing those lower sequence numbers would
+    /// make the old manifest watermark appear to cover new buffer records.
+    pub(crate) fn ensure_next_seq_above(&self, durable_manifest_seq: u64) -> OnyxResult<bool> {
+        let required_next = durable_manifest_seq.checked_add(1).ok_or_else(|| {
+            OnyxError::Config("durable buffer sequence exhausted u64 range".into())
+        })?;
+        let _frontier_guard = self.frontier_gate.write();
+        let previous = self.next_seq.fetch_max(required_next, Ordering::AcqRel);
+        Ok(previous < required_next)
+    }
+
+    pub(crate) fn next_sequence(&self) -> u64 {
+        self.next_seq.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn durable_sequence(&self) -> u64 {
+        self.durable_seq.load(Ordering::Acquire)
+    }
+
     /// Atomic shared with every shard that gates ring-reclaim: an entry is
     /// only truly reclaimable once its seq ≤ `durable_seq`. The durability
     /// watermark thread advances this after a successful sync.
