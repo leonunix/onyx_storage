@@ -15,10 +15,12 @@
 //! windows (page window, journal ring), addressed from 0. All device IO on this
 //! path is synchronous batched writes + `flush` — io_uring lives inside chunklet.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use onyx_metadb::{
     BlockPageDevice, Config as MetaDbConfig, Db, JournalDevice, MetaDbError, PageBlockIo,
@@ -47,15 +49,14 @@ const MIN_JOURNAL_BYTES: u64 = 1024 * 1024; // 256 ring blocks
 const MAX_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024; // plan D5 production size
 /// Read batches stay large to amortise recovery/prewarm submissions.
 const MAX_DEVICE_READ_BYTES: usize = 4 * 1024 * 1024;
-/// The production meta mirror uses a 128 KiB strip. Keep one logical write
-/// ticket to eight strips so a caller cannot monopolise an entire depth-64
-/// io_uring after mirror expansion. Smaller tickets also let chunklet refill
-/// the per-PD queues from completions instead of waiting behind a 4 MiB owner.
+/// Keep one page-write scheduling ticket to at most 256 4 KiB page operations.
+/// Page IDs may be sparse, so chunklet remains responsible for block-granular
+/// per-PD admission and completion refill after it expands the logical batch.
 const MAX_DEVICE_WRITE_BYTES: usize = 1024 * 1024;
-/// Number of independent 1 MiB chunks allowed in flight for one checkpoint
-/// page write. Chunklet's io_uring backend owns one depth-64 ring per calling
-/// thread; thirty-two scoped workers preserve aggregate concurrency while
-/// keeping each worker's range-lock footprint at eight stripes.
+/// Aggregate page-write workers shared by every concurrent L2P/RC caller.
+/// Chunklet's io_uring backend owns one ring per worker, so this also bounds
+/// rings used by split page writes; small single-ticket writes retain their
+/// latency-oriented caller fast path.
 const MAX_PARALLEL_DEVICE_WRITES: usize = 32;
 /// Volume-catalog A/B slot header: `generation(8) | payload_len(4) | crc32(4)`.
 const CATALOG_SLOT_HEADER: usize = 16;
@@ -194,6 +195,32 @@ fn generate_uuid() -> [u8; 16] {
 /// LD's stripe locks across a whole checkpoint.
 struct MetaWindow {
     slice: BackendSlice,
+    write_pool: ThreadPool,
+    write_tasks_active: AtomicUsize,
+    write_tasks_max: AtomicUsize,
+}
+
+impl MetaWindow {
+    fn new(slice: BackendSlice) -> OnyxResult<Self> {
+        let write_pool = ThreadPoolBuilder::new()
+            .num_threads(MAX_PARALLEL_DEVICE_WRITES)
+            .thread_name(|idx| format!("metaio-{idx}"))
+            .start_handler(|idx| {
+                crate::affinity::bind_current(crate::affinity::ThreadRole::MetadbCheckpoint, idx)
+            })
+            .build()
+            .map_err(|error| {
+                OnyxError::Io(std::io::Error::other(format!(
+                    "build metadb page-write pool: {error}"
+                )))
+            })?;
+        Ok(Self {
+            slice,
+            write_pool,
+            write_tasks_active: AtomicUsize::new(0),
+            write_tasks_max: AtomicUsize::new(0),
+        })
+    }
 }
 
 impl PageBlockIo for MetaWindow {
@@ -226,38 +253,69 @@ impl PageBlockIo for MetaWindow {
             return self.slice.write_many_at(ops).map_err(meta_err);
         }
 
-        let worker_count = batches.len().min(MAX_PARALLEL_DEVICE_WRITES);
+        let call_started = Instant::now();
+        let queue_wait_sum_ns = AtomicU64::new(0);
+        let queue_wait_max_ns = AtomicU64::new(0);
+        let service_sum_ns = AtomicU64::new(0);
+        let service_max_ns = AtomicU64::new(0);
         let failed = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for worker_idx in 0..worker_count {
-                let failed = &failed;
-                let batches = &batches;
-                handles.push(scope.spawn(move || {
-                    for batch_idx in (worker_idx..batches.len()).step_by(worker_count) {
-                        if failed.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let range = batches[batch_idx].clone();
-                        if let Err(error) = self.slice.write_many_at(&ops[range]) {
-                            failed.store(true, Ordering::Release);
-                            return Err(meta_err(error));
-                        }
-                    }
-                    Ok(())
-                }));
-            }
+        let errors = Mutex::new(Vec::<(usize, MetaDbError)>::new());
 
-            let mut first_error = None;
-            for handle in handles {
-                match handle.join().expect("metadb device write worker panicked") {
-                    Ok(()) => {}
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
-                }
+        self.write_pool.scope(|scope| {
+            for (batch_idx, range) in batches.iter().cloned().enumerate() {
+                let errors = &errors;
+                let queued_at = Instant::now();
+                let queue_wait_sum_ns = &queue_wait_sum_ns;
+                let queue_wait_max_ns = &queue_wait_max_ns;
+                let service_sum_ns = &service_sum_ns;
+                let service_max_ns = &service_max_ns;
+                let failed = &failed;
+                scope.spawn(move |_| {
+                    if failed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let queue_wait_ns = elapsed_ns(queued_at);
+                    queue_wait_sum_ns.fetch_add(queue_wait_ns, Ordering::Relaxed);
+                    queue_wait_max_ns.fetch_max(queue_wait_ns, Ordering::Relaxed);
+
+                    let active = self.write_tasks_active.fetch_add(1, Ordering::AcqRel) + 1;
+                    self.write_tasks_max.fetch_max(active, Ordering::Relaxed);
+                    let service_started = Instant::now();
+                    let result = self.slice.write_many_at(&ops[range]);
+                    let service_ns = elapsed_ns(service_started);
+                    self.write_tasks_active.fetch_sub(1, Ordering::AcqRel);
+                    service_sum_ns.fetch_add(service_ns, Ordering::Relaxed);
+                    service_max_ns.fetch_max(service_ns, Ordering::Relaxed);
+
+                    if let Err(error) = result {
+                        failed.store(true, Ordering::Release);
+                        errors.lock().push((batch_idx, meta_err(error)));
+                    }
+                });
             }
-            first_error.map_or(Ok(()), Err)
-        })
+        });
+
+        let elapsed = call_started.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            tracing::warn!(
+                bytes = ops.iter().map(|(_, data)| data.len()).sum::<usize>(),
+                batches = batches.len(),
+                elapsed_us = elapsed.as_micros() as u64,
+                queue_wait_sum_us = queue_wait_sum_ns.load(Ordering::Relaxed) / 1_000,
+                queue_wait_max_us = queue_wait_max_ns.load(Ordering::Relaxed) / 1_000,
+                service_sum_us = service_sum_ns.load(Ordering::Relaxed) / 1_000,
+                service_max_us = service_max_ns.load(Ordering::Relaxed) / 1_000,
+                pool_tasks_max = self.write_tasks_max.load(Ordering::Relaxed),
+                "slow metadb page-window write"
+            );
+        }
+
+        let mut errors = errors.into_inner();
+        errors.sort_unstable_by_key(|(batch_idx, _)| *batch_idx);
+        errors
+            .into_iter()
+            .next()
+            .map_or(Ok(()), |(_, error)| Err(error))
     }
 
     fn flush(&self) -> Result<(), MetaDbError> {
@@ -289,6 +347,10 @@ fn write_batch_ranges(ops: &[(u64, &[u8])]) -> Vec<std::ops::Range<usize>> {
         i = j;
     }
     batches
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
 /// `JournalDevice` over the meta LD's lifecycle-journal ring window.
@@ -549,7 +611,7 @@ fn open_device_parts(
     let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
     let pages_slice = BackendSlice::new(backend_dyn.clone(), sb.pages_off, sb.pages_bytes)?;
     let journal_slice = BackendSlice::new(backend_dyn.clone(), sb.journal_off, sb.journal_bytes)?;
-    let page_io: Arc<dyn PageBlockIo> = Arc::new(MetaWindow { slice: pages_slice });
+    let page_io: Arc<dyn PageBlockIo> = Arc::new(MetaWindow::new(pages_slice)?);
     let page_device: Arc<dyn PageDevice> =
         Arc::new(BlockPageDevice::new(page_io).map_err(onyx_err)?);
     let journal_device: Arc<dyn JournalDevice> = Arc::new(JournalWindow::new(journal_slice));
@@ -630,25 +692,42 @@ mod tests {
         calls: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        fail_on_call: Option<usize>,
     }
 
     impl RecordingBackend {
         fn new(size: u64) -> Self {
+            Self::with_failure(size, None)
+        }
+
+        fn failing(size: u64, fail_on_call: usize) -> Self {
+            Self::with_failure(size, Some(fail_on_call))
+        }
+
+        fn with_failure(size: u64, fail_on_call: Option<usize>) -> Self {
             Self {
                 size,
                 calls: AtomicUsize::new(0),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
+                fail_on_call,
             }
         }
 
-        fn record_write(&self, bytes: usize) {
+        fn record_write(&self, bytes: usize) -> OnyxResult<()> {
             assert!(bytes <= MAX_DEVICE_WRITE_BYTES);
-            self.calls.fetch_add(1, Ordering::Relaxed);
+            let call_idx = self.calls.fetch_add(1, Ordering::Relaxed);
             let current = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             self.max_in_flight.fetch_max(current, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(10));
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            if self.fail_on_call == Some(call_idx) {
+                Err(OnyxError::Io(std::io::Error::other(
+                    "injected page-write failure",
+                )))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -659,13 +738,11 @@ mod tests {
         }
 
         fn write_at(&self, buf: &[u8], _offset: u64) -> OnyxResult<()> {
-            self.record_write(buf.len());
-            Ok(())
+            self.record_write(buf.len())
         }
 
         fn write_many_at(&self, ops: &[(u64, &[u8])]) -> OnyxResult<()> {
-            self.record_write(ops.iter().map(|(_, buf)| buf.len()).sum());
-            Ok(())
+            self.record_write(ops.iter().map(|(_, buf)| buf.len()).sum())
         }
 
         fn flush(&self) -> OnyxResult<()> {
@@ -686,9 +763,8 @@ mod tests {
         let backend_size = (page_count * PAGE_BYTES) as u64;
         let backend = Arc::new(RecordingBackend::new(backend_size));
         let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
-        let window = MetaWindow {
-            slice: BackendSlice::new(backend_dyn, 0, backend.size).unwrap(),
-        };
+        let window =
+            MetaWindow::new(BackendSlice::new(backend_dyn, 0, backend.size).unwrap()).unwrap();
         let page = [0xA5; PAGE_BYTES];
         let ops: Vec<(u64, &[u8])> = (0..page_count)
             .map(|idx| ((idx * PAGE_BYTES) as u64, page.as_slice()))
@@ -703,5 +779,68 @@ mod tests {
             max_in_flight <= MAX_PARALLEL_DEVICE_WRITES,
             "checkpoint write concurrency exceeded its bound: {max_in_flight}"
         );
+    }
+
+    #[test]
+    fn checkpoint_page_write_pool_is_shared_across_callers() {
+        const PAGE_BYTES: usize = 4096;
+        const CALLERS: usize = 4;
+        const BATCH_COUNT: usize = MAX_PARALLEL_DEVICE_WRITES + 2;
+
+        let page_count = BATCH_COUNT * (MAX_DEVICE_WRITE_BYTES / PAGE_BYTES);
+        let backend_size = (page_count * PAGE_BYTES) as u64;
+        let backend = Arc::new(RecordingBackend::new(backend_size));
+        let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
+        let window = Arc::new(
+            MetaWindow::new(BackendSlice::new(backend_dyn, 0, backend.size).unwrap()).unwrap(),
+        );
+        let page = [0x5A; PAGE_BYTES];
+        let ops: Vec<(u64, &[u8])> = (0..page_count)
+            .map(|idx| ((idx * PAGE_BYTES) as u64, page.as_slice()))
+            .collect();
+
+        std::thread::scope(|scope| {
+            for _ in 0..CALLERS {
+                let window = &window;
+                let ops = &ops;
+                scope.spawn(move || window.write_many_at(ops).unwrap());
+            }
+        });
+
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            CALLERS * BATCH_COUNT,
+            "every caller batch must execute exactly once"
+        );
+        let max_in_flight = backend.max_in_flight.load(Ordering::Relaxed);
+        assert!(max_in_flight > 1, "independent callers must overlap");
+        assert!(
+            max_in_flight <= MAX_PARALLEL_DEVICE_WRITES,
+            "callers exceeded the shared write-pool bound: {max_in_flight}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_page_write_failure_joins_all_batches() {
+        const PAGE_BYTES: usize = 4096;
+        const BATCH_COUNT: usize = 4;
+
+        let page_count = BATCH_COUNT * (MAX_DEVICE_WRITE_BYTES / PAGE_BYTES);
+        let backend_size = (page_count * PAGE_BYTES) as u64;
+        let backend = Arc::new(RecordingBackend::failing(backend_size, 1));
+        let backend_dyn: Arc<dyn BlockBackend> = backend.clone();
+        let window =
+            MetaWindow::new(BackendSlice::new(backend_dyn, 0, backend.size).unwrap()).unwrap();
+        let page = [0xC3; PAGE_BYTES];
+        let ops: Vec<(u64, &[u8])> = (0..page_count)
+            .map(|idx| ((idx * PAGE_BYTES) as u64, page.as_slice()))
+            .collect();
+
+        let result = window.write_many_at(&ops);
+
+        assert!(matches!(result, Err(MetaDbError::Io(_))));
+        let calls = backend.calls.load(Ordering::Relaxed);
+        assert!((1..=BATCH_COUNT).contains(&calls));
+        assert_eq!(backend.in_flight.load(Ordering::Relaxed), 0);
     }
 }
