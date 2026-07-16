@@ -96,6 +96,12 @@ dedup_shards = 8
 dedup_cuckoo_buckets = 64000000
 dedup_l1_cache_entries = 256000
 l2p_buffer_enabled = true
+# Global L2P-mutation budget per Open BFG. Leaving this unset falls back to the
+# 64k default, which rolls a BFG (and forces a checkpoint) every 64k mutations —
+# a checkpoint storm on this recommended profile. 4M is the box-validated value
+# (see nvme-cuckoo-resize.toml); the crossing batch bounds submitted work to
+# limit + max_single_batch - 1.
+l2p_buffer_soft_entries = 4000000
 rc_authoritative_reclaim = true
 commit_direct_apply_enabled = true
 bfg_threads_enabled = true
