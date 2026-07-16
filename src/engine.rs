@@ -34,6 +34,11 @@ use lineage::LineageFreedPbaDrainHandle;
 /// volume rather than on every request.
 const USAGE_CACHE_TTL_SECS: u64 = 60;
 
+/// Shard-count changes are administrative startup operations and may need to
+/// replay a large LV2 backlog. This bounds the quiescence observation window;
+/// teardown can still wait on an in-flight kernel IO that cannot be cancelled.
+const SHARD_MIGRATION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// A per-handle "alive" flag. Set to false when the volume is deleted.
 /// Each OnyxVolume holds its own Arc to this flag. The engine keeps Weak
 /// references so it can invalidate all outstanding handles on delete.
@@ -557,7 +562,7 @@ impl OnyxEngine {
                     );
                     match direct {
                         Ok(pool) => drop(pool), // clean, will reopen below
-                        Err(_) => {
+                        Err(direct_error) => {
                             // Drain unflushed entries with old shard layout
                             tracing::info!(
                                 old_shards = old_count,
@@ -574,11 +579,28 @@ impl OnyxEngine {
                                 Self::buffer_backpressure_timeout(),
                             )?);
                             old_pool.attach_metrics(metrics.clone());
+                            let durable_manifest_seq = meta.durable_buffer_applied_watermark();
+                            old_pool.ensure_next_seq_above(durable_manifest_seq)?;
                             let old_pending = old_pool.pending_count();
+                            let empty_legacy_v2 = old_pending == 0
+                                && old_pool.uses_legacy_v2_layout()
+                                && old_pool.physical_is_empty();
+                            if old_pending == 0 && !empty_legacy_v2 {
+                                return Err(OnyxError::Config(format!(
+                                    "buffer shard migration refused destructive reinitialization: \
+                                     new-layout probe failed ({direct_error}), but the old layout \
+                                     recovered no pending entries"
+                                )));
+                            }
                             if old_pending > 0 {
                                 tracing::info!(
                                     count = old_pending,
                                     "draining unflushed entries before shard migration"
+                                );
+                            } else if empty_legacy_v2 {
+                                tracing::info!(
+                                    durable_manifest_seq,
+                                    "migrating an empty legacy v2 buffer under the MetaDB sequence floor"
                                 );
                             }
                             let mut temp_flusher = BufferFlusher::start_with_metrics(
@@ -596,8 +618,62 @@ impl OnyxEngine {
                                 &config.dedup,
                                 metrics.clone(),
                             );
-                            temp_flusher.drain_and_stop(&old_pool);
+                            let drain = temp_flusher
+                                .drain_with_timeout(&old_pool, SHARD_MIGRATION_DRAIN_TIMEOUT);
+                            if !drain.drained_clean() {
+                                return Err(OnyxError::Config(format!(
+                                    "buffer shard migration did not drain within {} ms: \
+                                     pending_start={} pending_exit={}",
+                                    drain.elapsed.as_millis(),
+                                    drain.pending_at_start,
+                                    drain.pending_at_exit
+                                )));
+                            }
+
+                            // The temporary pool has no durability-watermark
+                            // thread. Complete the LV2 -> MetaDB handoff here
+                            // before advertising its old layout as empty.
+                            let applied_frontier = old_pool.applied_frontier();
+                            meta.set_buffer_applied_watermark(applied_frontier);
+                            let durable_frontier = meta.sync_durable()?;
+                            if durable_frontier < applied_frontier {
+                                return Err(OnyxError::Config(format!(
+                                    "buffer shard migration checkpoint regressed: \
+                                     applied_frontier={applied_frontier} \
+                                     durable_frontier={durable_frontier}"
+                                )));
+                            }
+                            old_pool
+                                .durable_seq_handle()
+                                .fetch_max(durable_frontier, Ordering::Release);
+                            old_pool.release_below(durable_frontier)?;
+                            if !old_pool.physical_is_empty() {
+                                return Err(OnyxError::Config(format!(
+                                    "buffer shard migration retained physical ring entries \
+                                     after durable checkpoint {durable_frontier}"
+                                )));
+                            }
+                            old_pool.persist_checkpoints()?;
+                            tracing::info!(
+                                applied_frontier,
+                                durable_frontier,
+                                "buffer shard migration persisted a durable empty old layout"
+                            );
+                            drop(temp_flusher);
                             drop(old_pool);
+
+                            // Explicitly replace the drained layout instead of
+                            // asking the next open to infer cleanliness from
+                            // stale entry headers. Legacy v2 has no checkpoint
+                            // pages, so inference can never distinguish its
+                            // reclaimed records from live pending entries.
+                            let reinit_dev = RawDevice::open(buf_path)?;
+                            WriteBufferPool::reinitialize_empty_layout(
+                                &reinit_dev,
+                                config.buffer.shards,
+                                durable_frontier,
+                            )?;
+                            drop(reinit_dev);
                             tracing::info!(
                                 new_shards = config.buffer.shards,
                                 "buffer drained — reinitializing with new shard layout"

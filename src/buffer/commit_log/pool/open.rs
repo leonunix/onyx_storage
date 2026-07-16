@@ -97,44 +97,52 @@ impl WriteBufferPool {
         // ── Read or initialize superblock ────────────────────────────
         let mut sb_buf = [0u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize];
         device.read_at(&mut sb_buf, 0)?;
+        let decoded_superblock = GlobalSuperblock::decode(&sb_buf);
+        let primary_migration_marker = LayoutMigrationMarker::decode(&sb_buf);
+        let backup_migration_marker = Self::read_layout_migration_backup(device.as_ref())?;
+        let migration_marker = primary_migration_marker.or_else(|| {
+            backup_migration_marker.filter(|marker| {
+                decoded_superblock.is_none_or(|sb| {
+                    !sb.is_v3() || sb.shard_count as usize != marker.shard_count as usize
+                })
+            })
+        });
 
         // Determine if we're using v3 layout (with per-shard checkpoints).
-        let (use_v3, superblock) = match GlobalSuperblock::decode(&sb_buf) {
-            Some(sb) if sb.shard_count as usize == shard_count && sb.is_v3() => {
+        let (use_v3, superblock) = match (decoded_superblock, migration_marker) {
+            (_, Some(marker)) => {
+                tracing::warn!(
+                    marker_shards = marker.shard_count,
+                    requested_shards = shard_count,
+                    max_seq = marker.max_seq,
+                    "resuming interrupted buffer shard-layout migration"
+                );
+                let sb = GlobalSuperblock::new(shard_count);
+                Self::reinitialize_empty_layout(device.as_ref(), shard_count, marker.max_seq)?;
+                (true, sb)
+            }
+            (Some(sb), None) if sb.shard_count as usize == shard_count && sb.is_v3() => {
                 // Happy path: v3 with matching shard count.
                 (true, sb)
             }
-            Some(sb) if sb.shard_count as usize == shard_count && !sb.is_v3() => {
-                // V2 with matching shard count — try to migrate.
-                let is_clean = Self::check_old_layout_empty(&device, &sb)?;
-                if is_clean {
-                    tracing::info!("buffer is clean — upgrading v2 → v3 layout");
-                    let new_sb = GlobalSuperblock::new(shard_count);
-                    Self::init_checkpoint_blocks(device.as_ref(), shard_count)?;
-                    device.write_at(&new_sb.encode(), 0)?;
-                    device.flush()?;
-                    (true, new_sb)
-                } else {
-                    tracing::info!(
-                        "buffer has unflushed entries — using v2 layout (full scan); \
-                         will upgrade to v3 on next clean restart"
-                    );
-                    (false, sb)
-                }
+            (Some(sb), None) if sb.shard_count as usize == shard_count && !sb.is_v3() => {
+                // V2 has no reserved checkpoint page, so a standalone automatic
+                // upgrade cannot make its first metadata write torn-safe. Keep
+                // using v2; OnyxEngine performs an explicit drained migration
+                // under the durable MetaDB sequence floor when shards change.
+                (false, sb)
             }
-            Some(sb) => {
+            (Some(sb), None) if sb.is_v3() => {
                 // Shard count mismatch — check if clean for reinit.
-                let is_clean = Self::check_old_layout_empty(&device, &sb)?;
-                if is_clean {
+                let clean_max_seq = Self::check_old_layout_empty(&device, &sb)?;
+                if let Some(max_seq) = clean_max_seq {
                     tracing::info!(
                         old_shards = sb.shard_count,
                         new_shards = shard_count,
                         "buffer is clean — reinitializing with new shard layout (v3)"
                     );
                     let new_sb = GlobalSuperblock::new(shard_count);
-                    Self::init_checkpoint_blocks(device.as_ref(), shard_count)?;
-                    device.write_at(&new_sb.encode(), 0)?;
-                    device.flush()?;
+                    Self::reinitialize_empty_layout(device.as_ref(), shard_count, max_seq)?;
                     (true, new_sb)
                 } else {
                     return Err(OnyxError::Config(format!(
@@ -143,12 +151,31 @@ impl WriteBufferPool {
                     )));
                 }
             }
-            None => {
-                // Fresh device — initialize as v3.
+            (Some(sb), None) => {
+                return Err(OnyxError::Config(format!(
+                    "legacy v2 buffer shard mismatch: disk={} config={}; \
+                     engine-coordinated drained migration required",
+                    sb.shard_count, shard_count
+                )));
+            }
+            (None, None) => {
+                // Only an all-zero metadata prefix is fresh. Treating an
+                // invalid/torn superblock as first use would overwrite a valid
+                // checkpoint and hide pending LV2 entries behind authoritative
+                // empty recovery boundaries.
+                let mut checkpoint_zero = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+                device.read_at(&mut checkpoint_zero, COMMIT_LOG_SUPERBLOCK_SIZE)?;
+                if sb_buf.iter().any(|byte| *byte != 0)
+                    || checkpoint_zero.iter().any(|byte| *byte != 0)
+                {
+                    return Err(OnyxError::Config(
+                        "buffer superblock is invalid on a non-empty device; \
+                         refusing destructive fresh initialization"
+                            .into(),
+                    ));
+                }
                 let sb = GlobalSuperblock::new(shard_count);
-                Self::init_checkpoint_blocks(device.as_ref(), shard_count)?;
-                device.write_at(&sb.encode(), 0)?;
-                device.flush()?;
+                Self::reinitialize_empty_layout(device.as_ref(), shard_count, 0)?;
                 (true, sb)
             }
         };
@@ -199,6 +226,7 @@ impl WriteBufferPool {
         }
 
         let mut shard_configs = Vec::with_capacity(shard_count);
+        let mut missing_checkpoint = false;
         let mut consumed = 0u64;
         for shard_idx in 0..shard_count {
             let shard_bytes = if shard_idx + 1 == shard_count {
@@ -218,11 +246,13 @@ impl WriteBufferPool {
                         Self::read_shard_checkpoint(device.as_ref(), shard_idx)?
                     }
                 };
+                missing_checkpoint |= ckpt.is_none();
                 let ckpt_offset =
                     COMMIT_LOG_SUPERBLOCK_SIZE + shard_idx as u64 * SHARD_CHECKPOINT_SIZE;
                 let ckpt_dev = slice_backend(device.clone(), ckpt_offset, SHARD_CHECKPOINT_SIZE)?;
-                // Valid checkpoint → guided recovery.
-                // Invalid/corrupt → None → full scan fallback.
+                // A valid checkpoint enables guided recovery. Invalid/corrupt
+                // metadata is rejected below because mutable ring history cannot
+                // prove the global sequence floor of reclaimed records.
                 (ckpt, Some(ckpt_dev))
             } else {
                 (None, None)
@@ -232,6 +262,13 @@ impl WriteBufferPool {
                 checkpoint,
                 checkpoint_device,
             });
+        }
+        if use_v3 && missing_checkpoint {
+            return Err(OnyxError::Config(
+                "buffer checkpoint is corrupt; refusing to infer the sequence floor \
+                 from mutable ring history"
+                    .into(),
+            ));
         }
 
         // ── Parallel shard recovery ──────────────────────────────────

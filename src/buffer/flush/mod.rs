@@ -123,9 +123,11 @@ impl BufferReplayStats {
 ///   reconstructing, then assert state equivalence.
 /// - In replay tests that need deterministic flusher quiescence.
 ///
-/// `timeout` bounds the wait. Returns the [`BufferReplayStats`]
-/// snapshot; the caller decides what to do with a `timed_out` result
-/// (typically: retry once with a larger budget, or fail engine open).
+/// `timeout` bounds the quiescence polling window. Flusher lane teardown still
+/// joins in-flight backend calls before returning, so a kernel IO that never
+/// completes requires a process-level watchdog. Returns the
+/// [`BufferReplayStats`] snapshot; the caller decides what to do with a
+/// `timed_out` result.
 #[allow(clippy::too_many_arguments)]
 pub fn replay_buffer_pending(
     pool: Arc<WriteBufferPool>,

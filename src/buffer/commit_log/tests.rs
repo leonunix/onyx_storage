@@ -384,7 +384,7 @@ fn corrupt_packed_slot(path: &std::path::Path, size: u64, slot: usize) {
 }
 
 #[test]
-fn packed_reopen_falls_back_to_older_generation_then_full_scans_if_both_corrupt() {
+fn packed_reopen_falls_back_once_then_fails_closed_if_both_corrupt() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 64 * 1024 * 1024;
     tmp.as_file().set_len(size).unwrap();
@@ -450,12 +450,13 @@ fn packed_reopen_falls_back_to_older_generation_then_full_scans_if_both_corrupt(
             .generation,
         older_generation
     );
-    drop(reopened); // Repairs the damaged slot with the next clean generation.
+    reopened.persist_checkpoints().unwrap();
+    drop(reopened); // The explicit checkpoint repairs the damaged slot.
 
     for slot in 0..PACKED_CHECKPOINT_SLOT_COUNT {
         corrupt_packed_slot(tmp.path(), size, slot);
     }
-    let full_scan = WriteBufferPool::open_with_options_full_and_limits(
+    let result = WriteBufferPool::open_with_options_full_and_limits(
         Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
         Duration::ZERO,
         4,
@@ -464,18 +465,14 @@ fn packed_reopen_falls_back_to_older_generation_then_full_scans_if_both_corrupt(
         8 * 1024 * 1024,
         None,
         BufferRuntimeLimits::default(),
-    )
-    .unwrap();
-    assert_eq!(full_scan.pending_count(), 8);
-    assert_eq!(
-        full_scan
-            .packed_checkpoint
-            .as_ref()
-            .unwrap()
-            .lock()
-            .generation,
-        0,
-        "double corruption must rebuild from full scans, not stale legacy pages"
+    );
+    let error = match result {
+        Ok(_) => panic!("double checkpoint corruption unexpectedly inferred a sequence floor"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("mutable ring history"),
+        "unexpected double-corruption error: {error}"
     );
 }
 
@@ -561,6 +558,555 @@ fn fresh_lv2_uses_external_durable_manifest_seq_floor() {
     pool.durable_seq_handle().store(seq, Ordering::Release);
     assert_eq!(pool.release_below(seq).unwrap(), 1);
     assert!(pool.physical_is_empty());
+}
+
+#[test]
+fn invalid_superblock_with_existing_checkpoint_never_reinitializes_as_fresh() {
+    let size = 32 * 1024 * 1024;
+    let seq = 31_337;
+    let checkpoint = ShardCheckpoint {
+        head_offset: 0,
+        tail_offset: 0,
+        max_seq: seq,
+        used_bytes: 0,
+    }
+    .encode();
+
+    for zeroed_primary in [false, true] {
+        let tmp = NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(size).unwrap();
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        dev.write_at(&GlobalSuperblock::new(1).encode(), 0).unwrap();
+        dev.write_at(&checkpoint, COMMIT_LOG_SUPERBLOCK_SIZE)
+            .unwrap();
+        let damaged = if zeroed_primary {
+            [0u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize]
+        } else {
+            [0xA5; COMMIT_LOG_SUPERBLOCK_SIZE as usize]
+        };
+        dev.write_at(&damaged, 0).unwrap();
+        dev.sync().unwrap();
+        drop(dev);
+
+        let result = WriteBufferPool::open_with_options_full(
+            RawDevice::open_or_create(tmp.path(), size).unwrap(),
+            Duration::from_millis(1),
+            1,
+            256,
+            Duration::from_secs(1),
+            8 * 1024 * 1024,
+            None,
+        );
+        let error = match result {
+            Ok(_) => panic!("damaged superblock unexpectedly reinitialized as fresh"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("invalid on a non-empty device"),
+            "unexpected invalid-superblock error: {error}"
+        );
+
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let mut preserved = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+        dev.read_at(&mut preserved, COMMIT_LOG_SUPERBLOCK_SIZE)
+            .unwrap();
+        assert_eq!(preserved, checkpoint, "fail-closed path rewrote checkpoint");
+    }
+}
+
+#[test]
+fn clean_v3_shard_migration_ignores_stale_headers_and_preserves_seq_floor() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    let seq = pool
+        .append("vol", Lba(7), 1, &[0xA7; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    pool.mark_applied(seq, Lba(7), 1).unwrap();
+    pool.durable_seq_handle().store(seq, Ordering::Release);
+    assert_eq!(pool.release_below(seq).unwrap(), 1);
+    assert!(pool.physical_is_empty());
+    pool.persist_checkpoints().unwrap();
+    drop(pool);
+
+    // The reclaimed record's header is deliberately still `flushed=false`.
+    // Migration must trust the clean checkpoint instead of resurrecting that
+    // stale history with a full-device scan.
+    let migrated = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    assert_eq!(migrated.shard_count(), 2);
+    assert_eq!(migrated.pending_count(), 0);
+    assert!(migrated.physical_is_empty());
+    assert_eq!(migrated.next_sequence(), seq + 1);
+}
+
+#[test]
+fn dirty_v3_shard_migration_still_refuses_reinitialization() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    let seq = pool
+        .append("vol", Lba(11), 1, &[0xD1; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    assert_eq!(pool.pending_count(), 1);
+    drop(pool);
+
+    let result = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    );
+    let error = match result {
+        Ok(_) => panic!("dirty shard layout unexpectedly reinitialized"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("unflushed entries exist"),
+        "unexpected migration error after seq {seq}: {error}"
+    );
+}
+
+#[test]
+fn nonempty_checkpoint_with_unreadable_record_refuses_auto_reinit() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    pool.append("vol", Lba(12), 1, &[0xE1; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    pool.persist_checkpoints().unwrap();
+    drop(pool);
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let data_start = WriteBufferPool::v3_data_area_start(1);
+    let mut header = [0u8; BLOCK_SIZE as usize];
+    dev.read_at(&mut header, data_start).unwrap();
+    header[4..8].fill(0); // destroy BUFFER_ENTRY_MAGIC
+    dev.write_at(&header, data_start).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let result = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    );
+    let error = match result {
+        Ok(_) => panic!("corrupt non-empty layout unexpectedly reinitialized"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("unflushed entries exist"),
+        "unexpected migration error: {error}"
+    );
+}
+
+#[test]
+fn drained_v2_layout_can_be_explicitly_reinitialized() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let old_superblock = GlobalSuperblock {
+        shard_count: 1,
+        version: COMMIT_LOG_VERSION_V2,
+    };
+    dev.write_at(&old_superblock.encode(), 0).unwrap();
+    let payload = [0xB2; BLOCK_SIZE as usize];
+    let seq = 73;
+    let encoded = BufferEntry::encode(
+        seq,
+        "vol",
+        Lba(13),
+        1,
+        crc32fast::hash(&payload),
+        false,
+        1,
+        &payload,
+    )
+    .unwrap();
+    dev.write_at(&encoded, COMMIT_LOG_SUPERBLOCK_SIZE).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let old_pool = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        1,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    assert_eq!(old_pool.disk_version, COMMIT_LOG_VERSION_V2);
+    assert_eq!(old_pool.pending_count(), 1);
+    old_pool.mark_applied(seq, Lba(13), 1).unwrap();
+    old_pool.durable_seq_handle().store(seq, Ordering::Release);
+    assert_eq!(old_pool.release_below(seq).unwrap(), 1);
+    assert!(old_pool.physical_is_empty());
+    drop(old_pool);
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    WriteBufferPool::reinitialize_empty_layout(&dev, 2, seq).unwrap();
+    drop(dev);
+
+    let migrated = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    assert_eq!(migrated.shard_count(), 2);
+    assert_eq!(migrated.pending_count(), 0);
+    assert!(migrated.physical_is_empty());
+    assert_eq!(migrated.next_sequence(), seq + 1);
+}
+
+#[test]
+fn interrupted_layout_migration_marker_preserves_sequence_floor() {
+    let size = 32 * 1024 * 1024;
+    let seq = 9_817;
+    for state in ["backup", "primary", "checkpoints", "torn-final"] {
+        let tmp = NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(size).unwrap();
+        let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+        let old_superblock = GlobalSuperblock {
+            shard_count: 1,
+            version: COMMIT_LOG_VERSION_V2,
+        };
+        dev.write_at(&old_superblock.encode(), 0).unwrap();
+        let marker = LayoutMigrationMarker::new(2, seq);
+        let backup = marker.encode_checkpoint();
+        assert_eq!(
+            ShardCheckpoint::decode(&backup),
+            Some(ShardCheckpoint {
+                head_offset: 0,
+                tail_offset: 0,
+                max_seq: seq,
+                used_bytes: 0,
+            })
+        );
+        assert_eq!(
+            LayoutMigrationMarker::decode_checkpoint(&backup),
+            Some(marker)
+        );
+        dev.write_at(&backup, COMMIT_LOG_SUPERBLOCK_SIZE).unwrap();
+        dev.sync().unwrap();
+        if state != "backup" {
+            dev.write_at(&marker.encode(), 0).unwrap();
+            dev.sync().unwrap();
+        }
+        if matches!(state, "checkpoints" | "torn-final") {
+            WriteBufferPool::init_checkpoint_blocks(&dev, 2, seq).unwrap();
+            dev.write_at(&backup, COMMIT_LOG_SUPERBLOCK_SIZE).unwrap();
+            dev.sync().unwrap();
+        }
+        if state == "torn-final" {
+            let mut torn = GlobalSuperblock::new(2).encode();
+            torn[0..2048].fill(0xA5);
+            dev.write_at(&torn, 0).unwrap();
+            dev.sync().unwrap();
+        }
+        drop(dev);
+
+        let reopened = WriteBufferPool::open_with_options_full(
+            RawDevice::open_or_create(tmp.path(), size).unwrap(),
+            Duration::from_millis(1),
+            2,
+            256,
+            Duration::from_secs(1),
+            8 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.pending_count(), 0);
+        assert!(reopened.physical_is_empty());
+        assert_eq!(
+            reopened.next_sequence(),
+            seq + 1,
+            "sequence floor lost in migration state {state}"
+        );
+    }
+}
+
+#[test]
+fn torn_first_migration_backup_fails_closed_without_sequence_evidence() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    let seq = 44_901;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    dev.write_at(&GlobalSuperblock::new(1).encode(), 0).unwrap();
+    let old_checkpoint = ShardCheckpoint {
+        head_offset: 0,
+        tail_offset: 0,
+        max_seq: seq,
+        used_bytes: 0,
+    };
+    dev.write_at(&old_checkpoint.encode(), COMMIT_LOG_SUPERBLOCK_SIZE)
+        .unwrap();
+
+    // Simulate a torn first backup write over shard 0's checkpoint: neither a
+    // checkpoint nor a migration marker can decode from this partial page. The
+    // old superblock remains valid, but opening must fail rather than reuse seqs.
+    let marker_page = LayoutMigrationMarker::new(2, seq).encode_checkpoint();
+    let mut torn = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+    torn[..32].copy_from_slice(&marker_page[..32]);
+    dev.write_at(&torn, COMMIT_LOG_SUPERBLOCK_SIZE).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let result = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    );
+    let error = match result {
+        Ok(_) => panic!("torn checkpoint unexpectedly opened with a reusable seq range"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("authoritative on-disk sequence floor"),
+        "unexpected fail-closed error: {error}"
+    );
+}
+
+#[test]
+fn completed_superblock_uses_backup_as_checkpoint_until_normal_persist() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    let seq = 76_031;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    dev.write_at(&GlobalSuperblock::new(2).encode(), 0).unwrap();
+    let empty = ShardCheckpoint {
+        head_offset: 0,
+        tail_offset: 0,
+        max_seq: seq,
+        used_bytes: 0,
+    };
+    dev.write_at(
+        &LayoutMigrationMarker::new(2, seq).encode_checkpoint(),
+        COMMIT_LOG_SUPERBLOCK_SIZE,
+    )
+    .unwrap();
+    dev.write_at(
+        &empty.encode(),
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE,
+    )
+    .unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let reopened = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    assert_eq!(reopened.next_sequence(), seq + 1);
+    let probe = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    assert_eq!(
+        WriteBufferPool::read_layout_migration_backup(&probe).unwrap(),
+        Some(LayoutMigrationMarker::new(2, seq)),
+        "open should not rewrite the only durable migration floor"
+    );
+    drop(probe);
+    reopened.persist_checkpoints().unwrap();
+    drop(reopened);
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    assert_eq!(
+        WriteBufferPool::read_layout_migration_backup(&dev).unwrap(),
+        None
+    );
+    assert_eq!(
+        WriteBufferPool::read_shard_checkpoint(&dev, 0).unwrap(),
+        Some(empty),
+        "a normal checkpoint must replace the migration backup"
+    );
+}
+
+#[test]
+fn data_page_that_looks_like_migration_marker_is_never_control_metadata() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    let seq = 88_117;
+    tmp.as_file().set_len(size).unwrap();
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    dev.write_at(&GlobalSuperblock::new(2).encode(), 0).unwrap();
+    WriteBufferPool::init_checkpoint_blocks(&dev, 2, seq).unwrap();
+    let forged = LayoutMigrationMarker::new(1, seq + 500).encode_checkpoint();
+    let data_offset = WriteBufferPool::v3_data_area_start(2) + SHARD_CHECKPOINT_SIZE;
+    dev.write_at(&forged, data_offset).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let reopened = WriteBufferPool::open_with_options_full(
+        RawDevice::open_or_create(tmp.path(), size).unwrap(),
+        Duration::from_millis(1),
+        2,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    assert_eq!(reopened.shard_count(), 2);
+    assert_eq!(reopened.next_sequence(), seq + 1);
+    drop(reopened);
+
+    let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
+    let mut preserved = [0u8; SHARD_CHECKPOINT_SIZE as usize];
+    dev.read_at(&mut preserved, data_offset).unwrap();
+    assert_eq!(
+        preserved, forged,
+        "startup rewrote a user-controlled data page"
+    );
+}
+
+#[test]
+fn clean_packed_checkpoint_migration_preserves_seq_floor() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 128 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::from_millis(1),
+        4,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    let seq = pool
+        .append("vol", Lba(19), 1, &[0xC4; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    pool.mark_applied(seq, Lba(19), 1).unwrap();
+    pool.durable_seq_handle().store(seq, Ordering::Release);
+    assert_eq!(pool.release_below(seq).unwrap(), 1);
+    pool.persist_checkpoints().unwrap();
+    drop(pool);
+
+    let migrated = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::from_millis(1),
+        8,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(migrated.shard_count(), 8);
+    assert_eq!(migrated.pending_count(), 0);
+    assert!(migrated.physical_is_empty());
+    assert_eq!(migrated.next_sequence(), seq + 1);
+}
+
+#[test]
+fn dirty_packed_checkpoint_migration_still_refuses_reinitialization() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 128 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::from_millis(1),
+        4,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    let seq = pool
+        .append("vol", Lba(23), 1, &[0xD4; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    assert_eq!(pool.pending_count(), 1);
+    drop(pool);
+
+    let result = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::from_millis(1),
+        8,
+        256,
+        Duration::from_secs(1),
+        8 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    );
+    let error = match result {
+        Ok(_) => panic!("dirty packed checkpoint layout unexpectedly reinitialized"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("unflushed entries exist"),
+        "unexpected packed migration error after seq {seq}: {error}"
+    );
 }
 
 #[test]

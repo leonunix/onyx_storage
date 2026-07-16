@@ -1072,6 +1072,10 @@ impl WriteBufferPool {
         self.next_seq.load(Ordering::Acquire)
     }
 
+    pub(crate) fn uses_legacy_v2_layout(&self) -> bool {
+        self.disk_version == COMMIT_LOG_VERSION_V2
+    }
+
     pub(crate) fn durable_sequence(&self) -> u64 {
         self.durable_seq.load(Ordering::Acquire)
     }
@@ -1155,9 +1159,9 @@ impl Drop for WriteBufferPool {
                 let _ = handle.join();
             }
         }
-        // Best-effort fallback. Normal engine shutdown persists these
-        // explicitly before advertising a clean LV3 superblock.
-        let _ = self.persist_checkpoints();
-        let _ = self.persist_superblock(true);
+        // Do not rewrite checkpoints or the immutable global superblock here.
+        // Normal engine shutdown persists the final reclaim boundary explicitly;
+        // sync batches already checkpoint standalone writes. Best-effort Drop
+        // rewrites only add torn-write windows during process teardown.
     }
 }

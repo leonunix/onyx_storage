@@ -583,11 +583,12 @@ impl BufferFlusher {
     /// equivalent to replaying the buffer-as-journal under the current
     /// metadb state.
     ///
-    /// `timeout` is wall-clock; on hit we leave the flusher in a
-    /// running state-machine for the caller to observe (the caller can
-    /// retry `drain_with_timeout` or fall back to a forced stop). The
-    /// `pending_at_exit` field on [`BufferReplayStats`] distinguishes
-    /// "drained clean" (== 0) from "timed out with backlog".
+    /// `timeout` bounds the quiescence polling window. On hit the flusher is
+    /// stopped and its lanes are joined before returning; a lane already stuck
+    /// in an uninterruptible backend call can therefore extend wall time beyond
+    /// the supplied duration. The `pending_at_exit` field on
+    /// [`BufferReplayStats`] distinguishes "drained clean" (== 0) from "timed
+    /// out with backlog".
     pub fn drain_with_timeout(
         &mut self,
         pool: &crate::buffer::pool::WriteBufferPool,

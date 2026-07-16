@@ -21,6 +21,9 @@ use crate::types::{Lba, BLOCK_SIZE};
 const COMMIT_LOG_MAGIC: u32 = 0x4F43_4C47; // "OCLG"
 const COMMIT_LOG_VERSION: u32 = 3;
 const COMMIT_LOG_VERSION_V2: u32 = 2;
+const LAYOUT_MIGRATION_MAGIC: u32 = 0x4F4D_4947; // "OMIG"
+const LAYOUT_MIGRATION_VERSION: u32 = 1;
+const LAYOUT_MIGRATION_EXTENSION_OFFSET: usize = 64;
 const COMMIT_LOG_SUPERBLOCK_SIZE: u64 = 4096;
 const MAX_SHARDS_ON_DISK: usize = 64;
 /// DashMap internal shard count — high value reduces contention under many writers.
@@ -592,6 +595,129 @@ impl GlobalSuperblock {
             shard_count,
             version,
         })
+    }
+}
+
+/// Crash-resumable handoff between two empty shard layouts. The marker replaces
+/// the old superblock only after MetaDB covers every prior buffer sequence and
+/// carries the local sequence floor until the new checkpoints and superblock
+/// have both been published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutMigrationMarker {
+    shard_count: u32,
+    max_seq: u64,
+}
+
+impl LayoutMigrationMarker {
+    fn new(shard_count: usize, max_seq: u64) -> Self {
+        Self {
+            shard_count: shard_count as u32,
+            max_seq,
+        }
+    }
+
+    fn encode(&self) -> [u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize] {
+        let mut buf = [0u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize];
+        buf[0..4].copy_from_slice(&LAYOUT_MIGRATION_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&LAYOUT_MIGRATION_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.shard_count.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.max_seq.to_le_bytes());
+        let crc = Self::crc(&buf);
+        buf[12..16].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Encode a redundant migration record that is also a valid empty shard-0
+    /// checkpoint. The checkpoint half remains a normal recovery boundary after
+    /// the final superblock is published; its extension disappears naturally on
+    /// the next checkpoint update, so it can never become a stale migration
+    /// command once the pool starts accepting writes.
+    fn encode_checkpoint(&self) -> [u8; SHARD_CHECKPOINT_SIZE as usize] {
+        let checkpoint = ShardCheckpoint {
+            head_offset: 0,
+            tail_offset: 0,
+            max_seq: self.max_seq,
+            used_bytes: 0,
+        };
+        let mut buf = checkpoint.encode();
+        let offset = LAYOUT_MIGRATION_EXTENSION_OFFSET;
+        buf[offset..offset + 4].copy_from_slice(&LAYOUT_MIGRATION_MAGIC.to_le_bytes());
+        buf[offset + 4..offset + 8].copy_from_slice(&LAYOUT_MIGRATION_VERSION.to_le_bytes());
+        buf[offset + 8..offset + 12].copy_from_slice(&self.shard_count.to_le_bytes());
+        buf[offset + 16..offset + 24].copy_from_slice(&self.max_seq.to_le_bytes());
+        let crc = Self::checkpoint_crc(&buf);
+        buf[offset + 12..offset + 16].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    fn decode(buf: &[u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize]) -> Option<Self> {
+        let magic = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        if magic != LAYOUT_MIGRATION_MAGIC || version != LAYOUT_MIGRATION_VERSION {
+            return None;
+        }
+        let expected_crc = u32::from_le_bytes(buf[12..16].try_into().ok()?);
+        if expected_crc != Self::crc(buf) {
+            return None;
+        }
+        let shard_count = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+        let max_seq = u64::from_le_bytes(buf[16..24].try_into().ok()?);
+        if shard_count == 0 || shard_count as usize > MAX_SHARDS_ON_DISK || max_seq == u64::MAX {
+            return None;
+        }
+        Some(Self {
+            shard_count,
+            max_seq,
+        })
+    }
+
+    fn decode_checkpoint(buf: &[u8; SHARD_CHECKPOINT_SIZE as usize]) -> Option<Self> {
+        let checkpoint = ShardCheckpoint::decode(buf)?;
+        if checkpoint.head_offset != 0
+            || checkpoint.tail_offset != 0
+            || checkpoint.used_bytes != 0
+            || checkpoint.max_seq == u64::MAX
+        {
+            return None;
+        }
+
+        let offset = LAYOUT_MIGRATION_EXTENSION_OFFSET;
+        let magic = u32::from_le_bytes(buf[offset..offset + 4].try_into().ok()?);
+        let version = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().ok()?);
+        if magic != LAYOUT_MIGRATION_MAGIC || version != LAYOUT_MIGRATION_VERSION {
+            return None;
+        }
+        let expected_crc = u32::from_le_bytes(buf[offset + 12..offset + 16].try_into().ok()?);
+        if expected_crc != Self::checkpoint_crc(buf) {
+            return None;
+        }
+        let shard_count = u32::from_le_bytes(buf[offset + 8..offset + 12].try_into().ok()?);
+        let max_seq = u64::from_le_bytes(buf[offset + 16..offset + 24].try_into().ok()?);
+        if shard_count == 0
+            || shard_count as usize > MAX_SHARDS_ON_DISK
+            || max_seq != checkpoint.max_seq
+        {
+            return None;
+        }
+        Some(Self {
+            shard_count,
+            max_seq,
+        })
+    }
+
+    fn crc(buf: &[u8; COMMIT_LOG_SUPERBLOCK_SIZE as usize]) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&buf[..12]);
+        hasher.update(&buf[16..]);
+        hasher.finalize()
+    }
+
+    fn checkpoint_crc(buf: &[u8; SHARD_CHECKPOINT_SIZE as usize]) -> u32 {
+        let offset = LAYOUT_MIGRATION_EXTENSION_OFFSET;
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&buf[offset..offset + 12]);
+        hasher.update(&buf[offset + 16..offset + 24]);
+        hasher.finalize()
     }
 }
 
