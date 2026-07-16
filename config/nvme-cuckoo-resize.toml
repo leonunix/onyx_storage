@@ -100,7 +100,7 @@ commit_direct_apply_enabled = true
 # this only overlaps metadb apply latency during background drain.
 commit_deferred_outcomes_enabled = true
 bfg_threads_enabled = true
-parallel_l2p_drain_enabled = false
+parallel_l2p_drain_enabled = true
 l2p_drain_chunk_entries = 4096
 l2p_checkpoint_pipeline_enabled = true
 

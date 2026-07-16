@@ -844,16 +844,14 @@ fn default_rc_checkpoint_streaming_enabled() -> bool {
     true
 }
 fn default_parallel_l2p_drain_enabled() -> bool {
-    // DISPROVEN (2026-05-31): the spawn-per-cycle parallel drain is a 3-4x
-    // regression (spawned threads inherit the BFG sync CPU pinning; and the
-    // drain isn't the binding gate in a healthy-disk window — serial keeps the
-    // L2P buffer well under cap). Default OFF; kept behind the flag as a
-    // documented dead-end. See memory parallel_l2p_drain_impl.
-    false
+    // The bounded worker pool and per-shard NUMA binding remove the old
+    // spawn-per-cycle affinity regression. Aged A/B/A' validation retained
+    // foreground performance while substantially reducing L2P fold time.
+    true
 }
 fn default_parallel_l2p_drain_workers() -> usize {
-    // Parallel drain is still default-off, but once enabled it should leave
-    // room for RC apply. Zero remains available for an explicit legacy A/B.
+    // Leave room for RC apply while parallel L2P folds are active. Zero
+    // remains available for an explicit legacy unbounded-fan-out A/B.
     4
 }
 fn default_l2p_drain_chunk_entries() -> usize {
@@ -2071,6 +2069,7 @@ mod service_config_tests {
     #[test]
     fn parallel_l2p_drain_workers_default_bounded_and_accept_legacy_zero() {
         let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert!(default_config.meta.parallel_l2p_drain_enabled);
         assert_eq!(default_config.meta.parallel_l2p_drain_workers, 4);
 
         let legacy: OnyxConfig = toml::from_str(
