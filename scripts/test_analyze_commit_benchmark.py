@@ -39,13 +39,32 @@ class AnalyzeCommitBenchmarkTests(unittest.TestCase):
             "apply_refcount_batch_pbas": 80,
             "apply_refcount_breakdown_sampled_pbas": 40,
             "apply_refcount_pba_grouping_us": 100,
+            "apply_refcount_actions_sort_us": 40,
+            "apply_refcount_actions_sort_sampled_actions": 20,
+            "apply_refcount_stage_sampled_us": 500,
+            "apply_refcount_pbas_materialize_us": 10,
             "apply_refcount_base_page_lookup_us": 200,
+            "apply_refcount_base_profiled_pbas": 40,
+            "apply_refcount_base_page_runs": 10,
+            "apply_refcount_base_hole_runs": 2,
+            "apply_refcount_base_overlay_runs": 1,
+            "apply_refcount_base_clean_runs": 7,
+            "apply_refcount_base_output_init_us": 5,
+            "apply_refcount_base_inner_lock_wait_us": 6,
+            "apply_refcount_base_page_resolve_us": 7,
+            "apply_refcount_base_request_materialize_us": 8,
+            "apply_refcount_base_cache_probe_us": 9,
+            "apply_refcount_base_decode_us": 10,
             "apply_refcount_base_lookup_attempts": 90,
             "apply_refcount_epoch_retries": 10,
             "apply_refcount_fold_lock_wait_us": 30,
             "apply_refcount_slot_lock_wait_us": 40,
             "apply_refcount_pending_slot_scan_us": 300,
             "apply_refcount_delta_merge_us": 400,
+            "flush_rc_fold_service_us": 1000,
+            "flush_rc_fold_validate_us": 100,
+            "flush_rc_fold_stage_us": 600,
+            "flush_rc_fold_remove_us": 200,
         }
         after_status = {
             "commit_apply_us": 200,
@@ -60,13 +79,32 @@ class AnalyzeCommitBenchmarkTests(unittest.TestCase):
             "apply_refcount_batch_pbas": 100,
             "apply_refcount_breakdown_sampled_pbas": 50,
             "apply_refcount_pba_grouping_us": 160,
+            "apply_refcount_actions_sort_us": 55,
+            "apply_refcount_actions_sort_sampled_actions": 25,
+            "apply_refcount_stage_sampled_us": 620,
+            "apply_refcount_pbas_materialize_us": 14,
             "apply_refcount_base_page_lookup_us": 250,
+            "apply_refcount_base_profiled_pbas": 50,
+            "apply_refcount_base_page_runs": 14,
+            "apply_refcount_base_hole_runs": 3,
+            "apply_refcount_base_overlay_runs": 2,
+            "apply_refcount_base_clean_runs": 9,
+            "apply_refcount_base_output_init_us": 7,
+            "apply_refcount_base_inner_lock_wait_us": 9,
+            "apply_refcount_base_page_resolve_us": 10,
+            "apply_refcount_base_request_materialize_us": 12,
+            "apply_refcount_base_cache_probe_us": 14,
+            "apply_refcount_base_decode_us": 16,
             "apply_refcount_base_lookup_attempts": 113,
             "apply_refcount_epoch_retries": 13,
             "apply_refcount_fold_lock_wait_us": 37,
             "apply_refcount_slot_lock_wait_us": 49,
             "apply_refcount_pending_slot_scan_us": 370,
             "apply_refcount_delta_merge_us": 480,
+            "flush_rc_fold_service_us": 1500,
+            "flush_rc_fold_validate_us": 140,
+            "flush_rc_fold_stage_us": 900,
+            "flush_rc_fold_remove_us": 300,
         }
         fio = {
             "jobs": [
@@ -101,6 +139,27 @@ class AnalyzeCommitBenchmarkTests(unittest.TestCase):
         self.assertEqual(refcount_batch["fold_lock_wait_us"], 7)
         self.assertEqual(refcount_batch["slot_lock_wait_us"], 9)
         self.assertEqual(refcount_batch["measured_stage_total_us"], 216)
+        self.assertEqual(refcount_batch["actions_sort_us"], 15)
+        self.assertEqual(refcount_batch["actions_sort_sampled_actions"], 5)
+        self.assertEqual(refcount_batch["actions_sort_us_per_sampled_action"], 3.0)
+        self.assertEqual(refcount_batch["stage_sampled_us"], 120)
+        self.assertEqual(refcount_batch["pbas_materialize_us"], 4)
+        self.assertEqual(refcount_batch["base_profile"]["pbas"], 10)
+        self.assertEqual(refcount_batch["base_profile"]["page_runs"], 4)
+        self.assertEqual(
+            refcount_batch["base_profile"]["phase_us"]["cache_probe"], 5
+        )
+        self.assertEqual(
+            refcount_batch["base_profile"]["phase_us_per_pba"]["decode"], 0.6
+        )
+        self.assertEqual(
+            summary["rc_fold_profile"],
+            {
+                "service_us": 500,
+                "phase_us": {"validate": 40, "stage": 300, "remove": 100},
+                "unattributed_us": 60,
+            },
+        )
         self.assertEqual(
             summary["l2p_remap_breakdown"],
             {

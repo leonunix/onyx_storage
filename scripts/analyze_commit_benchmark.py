@@ -252,6 +252,50 @@ def build_summary(
         base_lookup_attempts = optional_counter_delta(
             status_after, status_before, "apply_refcount_base_lookup_attempts"
         )
+        actions_sort_us = optional_counter_delta(
+            status_after, status_before, "apply_refcount_actions_sort_us"
+        )
+        actions_sort_sampled_actions = optional_counter_delta(
+            status_after,
+            status_before,
+            "apply_refcount_actions_sort_sampled_actions",
+        )
+        stage_sampled_us = optional_counter_delta(
+            status_after, status_before, "apply_refcount_stage_sampled_us"
+        )
+        pbas_materialize_us = optional_counter_delta(
+            status_after, status_before, "apply_refcount_pbas_materialize_us"
+        )
+        base_profiled_pbas = optional_counter_delta(
+            status_after, status_before, "apply_refcount_base_profiled_pbas"
+        )
+        base_page_runs = optional_counter_delta(
+            status_after, status_before, "apply_refcount_base_page_runs"
+        )
+        base_hole_runs = optional_counter_delta(
+            status_after, status_before, "apply_refcount_base_hole_runs"
+        )
+        base_overlay_runs = optional_counter_delta(
+            status_after, status_before, "apply_refcount_base_overlay_runs"
+        )
+        base_clean_runs = optional_counter_delta(
+            status_after, status_before, "apply_refcount_base_clean_runs"
+        )
+        base_phase_us = {
+            phase: optional_counter_delta(
+                status_after,
+                status_before,
+                f"apply_refcount_base_{phase}_us",
+            )
+            for phase in (
+                "output_init",
+                "inner_lock_wait",
+                "page_resolve",
+                "request_materialize",
+                "cache_probe",
+                "decode",
+            )
+        }
         epoch_retries = optional_counter_delta(
             status_after, status_before, "apply_refcount_epoch_retries"
         )
@@ -298,6 +342,18 @@ def build_summary(
             "grouping_us": grouping_us,
             "grouping_us_per_action": optional_ratio(grouping_us, batch_actions),
             "grouping_us_per_pba": optional_ratio(grouping_us, batch_pbas),
+            # `actions_sort_us` is sampled and a subset of `grouping_us`.
+            "actions_sort_us": actions_sort_us,
+            "actions_sort_sampled_actions": actions_sort_sampled_actions,
+            "actions_sort_us_per_sampled_action": (
+                optional_ratio(actions_sort_us, actions_sort_sampled_actions)
+                if actions_sort_us is not None
+                and actions_sort_sampled_actions is not None
+                else None
+            ),
+            # `stage_sampled_us` is an envelope around the sampled stage.
+            "stage_sampled_us": stage_sampled_us,
+            "pbas_materialize_us": pbas_materialize_us,
             "base_lookup_us": base_lookup_us,
             "base_lookup_us_per_sampled_pba": optional_ratio(
                 base_lookup_us, sampled_pbas
@@ -308,6 +364,22 @@ def build_summary(
                 if base_lookup_attempts is not None
                 else None
             ),
+            "base_profile": {
+                "pbas": base_profiled_pbas,
+                "page_runs": base_page_runs,
+                "hole_runs": base_hole_runs,
+                "overlay_runs": base_overlay_runs,
+                "clean_runs": base_clean_runs,
+                "phase_us": base_phase_us,
+                "phase_us_per_pba": {
+                    phase: (
+                        optional_ratio(value, base_profiled_pbas)
+                        if value is not None and base_profiled_pbas is not None
+                        else None
+                    )
+                    for phase, value in base_phase_us.items()
+                },
+            },
             "epoch_retries": epoch_retries,
             "epoch_retries_per_batch": (
                 optional_ratio(epoch_retries, batch_count)
@@ -404,6 +476,34 @@ def build_summary(
     full_refcount_apply_us = (
         refcount_apply_us + grouping_us if refcount_apply_us is not None else None
     )
+    rc_fold_profile = None
+    if status_available:
+        fold_service_us = optional_counter_delta(
+            status_after, status_before, "flush_rc_fold_service_us"
+        )
+        fold_phase_us = {
+            phase: optional_counter_delta(
+                status_after, status_before, f"flush_rc_fold_{phase}_us"
+            )
+            for phase in ("validate", "stage", "remove")
+        }
+        if fold_service_us is not None or any(
+            value is not None for value in fold_phase_us.values()
+        ):
+            rc_fold_profile = {
+                # `service_us` is the envelope; phase counters are subsets.
+                "service_us": fold_service_us,
+                "phase_us": fold_phase_us,
+                "unattributed_us": (
+                    max(
+                        0,
+                        fold_service_us
+                        - sum(value or 0 for value in fold_phase_us.values()),
+                    )
+                    if fold_service_us is not None
+                    else None
+                ),
+            }
     other_apply_us = (
         max(0, commit_apply_us - full_refcount_apply_us - l2p_apply_us)
         if commit_apply_us is not None
@@ -464,6 +564,7 @@ def build_summary(
         "apply_totals_us": apply_totals_us,
         "apply_totals_seconds": apply_totals_seconds,
         "refcount_batch_breakdown": refcount_batch,
+        "rc_fold_profile": rc_fold_profile,
         "base_lookup_io_context": base_lookup_io_context,
         "pending_zero_seconds": pending_zero_seconds,
         "physical_ring_zero_seconds": ring_zero_seconds,

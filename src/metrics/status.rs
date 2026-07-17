@@ -536,6 +536,13 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
+                "metadb_flush_rc_fold_profile: validate_us={} stage_us={} remove_us={}",
+                metadb.flush_rc_fold_validate_us,
+                metadb.flush_rc_fold_stage_us,
+                metadb.flush_rc_fold_remove_us,
+            );
+            let _ = writeln!(
+                out,
                 "metadb_flush_sample_breakdown: lock_us={} lock_max_us={} l2p_walk_us={} l2p_walk_max_us={} rc_checkpoint_wall_us={} rc_checkpoint_wall_max_us={}",
                 metadb.flush_sample_lock_us,
                 metadb.flush_sample_lock_max_us,
@@ -784,6 +791,25 @@ impl EngineStatusSnapshot {
                 metadb.apply_refcount_pending_slot_scan_max_us,
                 metadb.apply_refcount_delta_merge_us,
                 metadb.apply_refcount_delta_merge_max_us,
+            );
+            let _ = writeln!(
+                out,
+                "metadb_apply_refcount_stage_profile: actions_sort_us={} sort_sampled_actions={} stage_sampled_us={} pbas_materialize_us={} base_pbas={} page_runs={} hole_runs={} overlay_runs={} clean_runs={} output_init_us={} inner_lock_wait_us={} page_resolve_us={} request_materialize_us={} cache_probe_us={} decode_us={}",
+                metadb.apply_refcount_actions_sort_us,
+                metadb.apply_refcount_actions_sort_sampled_actions,
+                metadb.apply_refcount_stage_sampled_us,
+                metadb.apply_refcount_pbas_materialize_us,
+                metadb.apply_refcount_base_profiled_pbas,
+                metadb.apply_refcount_base_page_runs,
+                metadb.apply_refcount_base_hole_runs,
+                metadb.apply_refcount_base_overlay_runs,
+                metadb.apply_refcount_base_clean_runs,
+                metadb.apply_refcount_base_output_init_us,
+                metadb.apply_refcount_base_inner_lock_wait_us,
+                metadb.apply_refcount_base_page_resolve_us,
+                metadb.apply_refcount_base_request_materialize_us,
+                metadb.apply_refcount_base_cache_probe_us,
+                metadb.apply_refcount_base_decode_us,
             );
             let _ = writeln!(
                 out,

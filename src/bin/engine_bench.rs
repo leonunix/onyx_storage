@@ -3315,8 +3315,68 @@ fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
         meta.apply_refcount_pba_grouping_us
     );
     println!(
+        "  \"metadb_apply_refcount_actions_sort_us\": {},",
+        meta.apply_refcount_actions_sort_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_actions_sort_sampled_actions\": {},",
+        meta.apply_refcount_actions_sort_sampled_actions
+    );
+    println!(
+        "  \"metadb_apply_refcount_stage_sampled_us\": {},",
+        meta.apply_refcount_stage_sampled_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_pbas_materialize_us\": {},",
+        meta.apply_refcount_pbas_materialize_us
+    );
+    println!(
         "  \"metadb_apply_refcount_base_page_lookup_us\": {},",
         meta.apply_refcount_base_page_lookup_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_profiled_pbas\": {},",
+        meta.apply_refcount_base_profiled_pbas
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_page_runs\": {},",
+        meta.apply_refcount_base_page_runs
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_hole_runs\": {},",
+        meta.apply_refcount_base_hole_runs
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_overlay_runs\": {},",
+        meta.apply_refcount_base_overlay_runs
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_clean_runs\": {},",
+        meta.apply_refcount_base_clean_runs
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_output_init_us\": {},",
+        meta.apply_refcount_base_output_init_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_inner_lock_wait_us\": {},",
+        meta.apply_refcount_base_inner_lock_wait_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_page_resolve_us\": {},",
+        meta.apply_refcount_base_page_resolve_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_request_materialize_us\": {},",
+        meta.apply_refcount_base_request_materialize_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_cache_probe_us\": {},",
+        meta.apply_refcount_base_cache_probe_us
+    );
+    println!(
+        "  \"metadb_apply_refcount_base_decode_us\": {},",
+        meta.apply_refcount_base_decode_us
     );
     println!(
         "  \"metadb_apply_refcount_base_lookup_attempts\": {},",
@@ -3502,6 +3562,22 @@ fn print_meta_report(meta: Option<&MetaMemorySnapshot>) {
     println!(
         "  \"metadb_flush_rc_fold_lock_wait_max_us\": {},",
         meta.flush_rc_fold_lock_wait_max_us
+    );
+    println!(
+        "  \"metadb_flush_rc_fold_service_us\": {},",
+        meta.flush_rc_fold_service_us
+    );
+    println!(
+        "  \"metadb_flush_rc_fold_validate_us\": {},",
+        meta.flush_rc_fold_validate_us
+    );
+    println!(
+        "  \"metadb_flush_rc_fold_stage_us\": {},",
+        meta.flush_rc_fold_stage_us
+    );
+    println!(
+        "  \"metadb_flush_rc_fold_remove_us\": {},",
+        meta.flush_rc_fold_remove_us
     );
     println!("  \"metadb_flush_io_us\": {},", meta.flush_io_us);
     println!(
