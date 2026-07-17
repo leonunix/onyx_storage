@@ -460,6 +460,10 @@ impl BufferShard {
                 append_ops: AtomicU64::new(0),
                 append_bytes: AtomicU64::new(0),
                 reserve_wait_ns: AtomicU64::new(0),
+                release_calls: AtomicU64::new(0),
+                released_entries: AtomicU64::new(0),
+                released_bytes: AtomicU64::new(0),
+                last_release_cap: AtomicU64::new(0),
                 pending_bytes: AtomicU64::new(pending_bytes_init),
                 flush_progress: DashMap::with_shard_amount(DASHMAP_SHARDS),
                 staging_tx,
@@ -1608,19 +1612,29 @@ impl BufferShard {
     /// The reclaim cap is `min(durable_seq, checkpoint_seq)` — both data
     /// (the LV2 fdatasync watermark) and metadb checkpoint (the manifest
     /// commit watermark) must cover an entry before its ring bytes can
-    /// be recycled. Returns the number of seqs released this pass.
-    pub(super) fn release_below(&self, checkpoint_seq: u64) -> OnyxResult<u64> {
+    /// be recycled. Returns exact `(entries, bytes)` released by this locked pass.
+    pub(super) fn release_below(&self, checkpoint_seq: u64) -> OnyxResult<(u64, u64)> {
         let durable_seq = self.durable_seq.load(Ordering::Acquire);
         let cap = durable_seq.min(checkpoint_seq);
         let mut ring = self.ring.lock();
         let before = ring.used_bytes;
+        let entries_before = ring.log_order.len();
         Self::reclaim_log_prefix(&mut ring, cap);
         if ring.used_bytes < before {
             self.ring_space_cv.notify_all();
         }
-        let advanced = ring.reclaim_ready;
+        let released_entries = entries_before.saturating_sub(ring.log_order.len()) as u64;
+        let released_bytes = before.saturating_sub(ring.used_bytes);
+        // Other reclaim entry points use this as a since-last-observation
+        // accumulator. A manifest release reports only this locked pass.
         ring.reclaim_ready = 0;
-        Ok(advanced)
+        self.release_calls.fetch_add(1, Ordering::Relaxed);
+        self.released_entries
+            .fetch_add(released_entries, Ordering::Relaxed);
+        self.released_bytes
+            .fetch_add(released_bytes, Ordering::Relaxed);
+        self.last_release_cap.store(cap, Ordering::Relaxed);
+        Ok((released_entries, released_bytes))
     }
 
     pub(super) fn advance_tail(&self) -> OnyxResult<u64> {

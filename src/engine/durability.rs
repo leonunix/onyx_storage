@@ -63,12 +63,29 @@ impl DurabilityWatermarkHandle {
                                 consecutive_failures = 0;
                                 last_checkpoint_request_seq = buffer_seq;
                                 durable_seq.fetch_max(buffer_seq, Ordering::Release);
-                                if let Err(e) = buffer_pool_thread.release_below(buffer_seq) {
-                                    tracing::warn!(
-                                        buffer_seq,
-                                        error = %e,
-                                        "release_below failed; ring reclaim deferred to next checkpoint"
-                                    );
+                                let fill_before =
+                                    buffer_pool_thread.physical_fill_percentage();
+                                match buffer_pool_thread.release_below_with_stats(buffer_seq) {
+                                    Ok((released_entries, released_bytes)) => {
+                                        tracing::info!(
+                                            token,
+                                            requested_seq,
+                                            buffer_seq,
+                                            released_entries,
+                                            released_bytes,
+                                            fill_before,
+                                            fill_after = buffer_pool_thread
+                                                .physical_fill_percentage(),
+                                            "durable checkpoint released LV2 ring prefix"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            buffer_seq,
+                                            error = %e,
+                                            "release_below failed; ring reclaim deferred to next checkpoint"
+                                        );
+                                    }
                                 }
                                 pending_checkpoint = None;
                             }
@@ -155,13 +172,25 @@ impl DurabilityWatermarkHandle {
                     if pending_checkpoint.is_some() {
                         continue;
                     }
+                    let trigger = if early_trigger {
+                        "dirty_pages"
+                    } else if ring_trigger {
+                        "ring_fill"
+                    } else {
+                        "interval"
+                    };
                     meta.set_buffer_applied_watermark(captured);
                     match meta.try_request_durable_checkpoint_token() {
                         Ok(Some(token)) => {
                             last_checkpoint_request_seq = captured;
                             pending_checkpoint = Some((token, captured));
-                            tracing::debug!(
+                            tracing::info!(
+                                token,
+                                trigger,
                                 applied_frontier = captured,
+                                physical_fill_pct = buffer_pool_thread
+                                    .physical_fill_percentage(),
+                                dirty_pages = meta.dirty_pages_estimate(),
                                 "durability watermark requested metadb checkpoint"
                             );
                         }

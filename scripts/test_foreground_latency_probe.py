@@ -165,6 +165,62 @@ class ForegroundLatencyProbeTests(unittest.TestCase):
         self.assertEqual(result["physical_fill_pct"], 30)
         self.assertEqual(result["max_shard_fill_pct"], 30)
 
+    def test_shard_interval_reports_manifest_release_and_oldest_pending(self) -> None:
+        previous = {
+            "buffer_shards": [
+                {
+                    "shard_idx": 0,
+                    "capacity_bytes": 1_000,
+                    "head_offset": 900,
+                    "tail_offset": 800,
+                    "used_bytes": 100,
+                    "append_ops": 10,
+                    "append_bytes": 1_048_576,
+                    "reserve_wait_ns": 10,
+                    "release_calls": 2,
+                    "released_entries": 20,
+                    "released_bytes": 200,
+                }
+            ]
+        }
+        current = {
+            "buffer_shards": [
+                {
+                    "shard_idx": 0,
+                    "capacity_bytes": 1_000,
+                    "head_offset": 100,
+                    "tail_offset": 950,
+                    "used_bytes": 150,
+                    "append_ops": 14,
+                    "append_bytes": 3_145_728,
+                    "reserve_wait_ns": 2_000_010,
+                    "fill_pct": 15,
+                    "head_seq": 42,
+                    "head_block_reason": "awaiting_manifest",
+                    "head_residency_ms": 5_000,
+                    "oldest_pending_seq": 77,
+                    "oldest_pending_age_ms": 250,
+                    "release_calls": 3,
+                    "released_entries": 28,
+                    "released_bytes": 350,
+                    "last_release_cap": 41,
+                }
+            ]
+        }
+
+        result = probe.shard_interval_summaries(current, previous, 2.0)[0]
+
+        self.assertEqual(result["head_delta"], 200)
+        self.assertEqual(result["tail_delta"], 150)
+        self.assertEqual(result["iops"], 2.0)
+        self.assertEqual(result["mib_s"], 1.0)
+        self.assertEqual(result["release_calls_delta"], 1)
+        self.assertEqual(result["released_entries_delta"], 8)
+        self.assertEqual(result["released_bytes_delta"], 150)
+        self.assertEqual(result["head_block_reason"], "awaiting_manifest")
+        self.assertEqual(result["oldest_pending_seq"], 77)
+        self.assertEqual(result["last_release_cap"], 41)
+
 
 if __name__ == "__main__":
     unittest.main()

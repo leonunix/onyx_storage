@@ -807,11 +807,20 @@ impl WriteBufferPool {
     /// reclaimable seqs. Returns the total number of seqs released
     /// across all shards this pass.
     pub fn release_below(&self, checkpoint_seq: u64) -> OnyxResult<u64> {
-        let mut advanced = 0u64;
+        self.release_below_with_stats(checkpoint_seq)
+            .map(|(entries, _bytes)| entries)
+    }
+
+    /// Same manifest-gated sweep with exact current-pass entry and byte totals.
+    pub(crate) fn release_below_with_stats(&self, checkpoint_seq: u64) -> OnyxResult<(u64, u64)> {
+        let mut released_entries = 0u64;
+        let mut released_bytes = 0u64;
         for shard in &self.shards {
-            advanced += shard.shard.release_below(checkpoint_seq)?;
+            let (shard_entries, shard_bytes) = shard.shard.release_below(checkpoint_seq)?;
+            released_entries = released_entries.saturating_add(shard_entries);
+            released_bytes = released_bytes.saturating_add(shard_bytes);
         }
-        Ok(advanced)
+        Ok((released_entries, released_bytes))
     }
 
     pub fn advance_tail_for_shard(&self, shard_idx: usize) -> OnyxResult<u64> {
@@ -1102,6 +1111,8 @@ impl WriteBufferPool {
                     log_order_len,
                     flushed_seqs_len,
                     head_seq,
+                    head_is_flushed,
+                    oldest_pending_seq,
                     head_became_at,
                 ) = {
                     let ring = s.ring.lock();
@@ -1113,11 +1124,32 @@ impl WriteBufferPool {
                         ring.log_order.len(),
                         ring.flushed_seqs.len(),
                         ring.log_order.front().map(|r| r.seq),
+                        ring.log_order
+                            .front()
+                            .is_some_and(|record| ring.flushed_seqs.contains(&record.seq)),
+                        ring.pending_seqs.first().copied(),
                         ring.head_became_at,
                     )
                 };
                 let (head_remaining_lbas, head_age_ms, head_residency_ms) =
                     s.head_seq_debug_state(head_seq, head_became_at);
+                let oldest_pending_age_ms = oldest_pending_seq.and_then(|seq| {
+                    s.pending_entries.get(&seq).map(|entry| {
+                        entry
+                            .enqueued_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64
+                    })
+                });
+                let durable_seq = s.durable_seq.load(Ordering::Acquire);
+                let head_block_reason = match head_seq {
+                    None => "empty",
+                    Some(seq) if s.pending_entries.contains_key(&seq) => "unapplied",
+                    Some(seq) if head_is_flushed && seq > durable_seq => "awaiting_manifest",
+                    Some(_) if head_is_flushed => "reclaimable",
+                    Some(_) => "bookkeeping_gap",
+                };
                 let fill_pct = if capacity > 0 {
                     ((used * 100) / capacity) as u8
                 } else {
@@ -1137,9 +1169,16 @@ impl WriteBufferPool {
                     log_order_len,
                     flushed_seqs_len,
                     head_seq,
+                    head_block_reason,
                     head_remaining_lbas,
                     head_age_ms,
                     head_residency_ms,
+                    oldest_pending_seq,
+                    oldest_pending_age_ms,
+                    release_calls: s.release_calls.load(Ordering::Relaxed),
+                    released_entries: s.released_entries.load(Ordering::Relaxed),
+                    released_bytes: s.released_bytes.load(Ordering::Relaxed),
+                    last_release_cap: s.last_release_cap.load(Ordering::Relaxed),
                     staged_entries: s.staging_rx.len(),
                     volatile_payloads: 0,
                 }

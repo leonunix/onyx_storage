@@ -2078,14 +2078,69 @@ fn shard_snapshot_reports_head_remaining_lbas_and_age() {
 
     let snap = &pool.shard_snapshots()[0];
     assert_eq!(snap.head_seq, Some(seq));
+    assert_eq!(snap.head_block_reason, "unapplied");
     assert_eq!(snap.head_remaining_lbas, Some(3));
     assert!(snap.head_age_ms.is_some());
     assert!(snap.head_residency_ms.is_some());
+    assert_eq!(snap.oldest_pending_seq, Some(seq));
+    assert!(snap.oldest_pending_age_ms.is_some());
 
     pool.mark_flushed(seq, Lba(32), 1).unwrap();
     let snap = &pool.shard_snapshots()[0];
     assert_eq!(snap.head_seq, Some(seq));
     assert_eq!(snap.head_remaining_lbas, Some(2));
+}
+
+#[test]
+fn shard_snapshot_distinguishes_manifest_wait_and_records_release() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let seq = pool
+        .append("test-vol", Lba(32), 1, &vec![0xAB; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+
+    pool.mark_applied(seq, Lba(32), 1).unwrap();
+    let snap = &pool.shard_snapshots()[0];
+    assert_eq!(snap.head_seq, Some(seq));
+    assert_eq!(snap.head_block_reason, "awaiting_manifest");
+    assert_eq!(snap.oldest_pending_seq, None);
+    assert_eq!(snap.release_calls, 0);
+
+    pool.durable_seq_handle().store(seq, Ordering::Release);
+    assert_eq!(pool.release_below(seq).unwrap(), 1);
+    let snap = &pool.shard_snapshots()[0];
+    assert_eq!(snap.head_seq, None);
+    assert_eq!(snap.head_block_reason, "empty");
+    assert_eq!(snap.release_calls, 1);
+    assert_eq!(snap.released_entries, 1);
+    assert!(snap.released_bytes > 0);
+    assert_eq!(snap.last_release_cap, seq);
+}
+
+#[test]
+fn release_observation_excludes_prior_inline_reclaim() {
+    let (pool, _tmp) = create_pool(4096 + 4096 + 8 * 8192, Duration::from_millis(1));
+    let seq = pool
+        .append("test-vol", Lba(32), 1, &vec![0xAB; BLOCK_SIZE as usize], 1)
+        .unwrap();
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
+    pool.durable_seq_handle().store(seq, Ordering::Release);
+    #[allow(deprecated)]
+    pool.mark_flushed(seq, Lba(32), 1).unwrap();
+    assert!(pool.physical_is_empty());
+
+    assert_eq!(pool.release_below(seq).unwrap(), 0);
+    let snap = &pool.shard_snapshots()[0];
+    assert_eq!(snap.release_calls, 1);
+    assert_eq!(snap.released_entries, 0);
+    assert_eq!(snap.released_bytes, 0);
+    assert_eq!(snap.last_release_cap, seq);
 }
 
 #[test]

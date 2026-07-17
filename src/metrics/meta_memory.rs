@@ -20,12 +20,24 @@ pub struct BufferShardSnapshot {
     pub flushed_seqs_len: usize,
     /// Seq of the front entry in log_order (the head-of-line blocker), if any.
     pub head_seq: Option<u64>,
+    /// Why the physical head cannot currently move.
+    pub head_block_reason: &'static str,
     /// Remaining unflushed 4KB blocks for the head-of-line seq, if known.
     pub head_remaining_lbas: Option<u32>,
     /// Age of the head-of-line seq in milliseconds, if known.
     pub head_age_ms: Option<u64>,
     /// How long the current seq has continuously remained at the head/front.
     pub head_residency_ms: Option<u64>,
+    /// Oldest logical entry that has not completed MetaDB apply on this shard.
+    pub oldest_pending_seq: Option<u64>,
+    /// Time since the oldest logical pending entry entered the shard.
+    pub oldest_pending_age_ms: Option<u64>,
+    /// Manifest-gated release calls and their cumulative effects.
+    pub release_calls: u64,
+    pub released_entries: u64,
+    pub released_bytes: u64,
+    /// Last manifest buffer frontier passed to `release_below`.
+    pub last_release_cap: u64,
     /// Entries staged for the sync thread but not yet part of the current
     /// fdatasync batch.
     pub staged_entries: usize,

@@ -1006,6 +1006,11 @@ struct BufferShard {
     append_ops: AtomicU64,
     append_bytes: AtomicU64,
     reserve_wait_ns: AtomicU64,
+    /// Observe manifest-gated physical reclaim without changing its cadence.
+    release_calls: AtomicU64,
+    released_entries: AtomicU64,
+    released_bytes: AtomicU64,
+    last_release_cap: AtomicU64,
     /// Bytes of ring entries that have NOT yet been mark_applied. Increments
     /// on `reserve_log_space` by `slot_bytes(slot_count)` (== `disk_len` for
     /// the new entry); decrements when an entry leaves `pending_entries`

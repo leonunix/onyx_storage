@@ -274,6 +274,83 @@ def durability_summary(
     }
 
 
+def shard_interval_summaries(
+    status: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> list[dict[str, Any]]:
+    old_shards = {
+        int(shard["shard_idx"]): shard
+        for shard in previous.get("buffer_shards", [])
+    }
+    summaries = []
+    for shard in status.get("buffer_shards", []):
+        idx = int(shard["shard_idx"])
+        old = old_shards.get(idx, {})
+        capacity = int(shard.get("capacity_bytes", 0))
+        head_delta = (
+            (int(shard.get("head_offset", 0)) - int(old.get("head_offset", 0)))
+            % capacity
+            if capacity
+            else 0
+        )
+        tail_delta = (
+            (int(shard.get("tail_offset", 0)) - int(old.get("tail_offset", 0)))
+            % capacity
+            if capacity
+            else 0
+        )
+        summaries.append(
+            {
+                "shard": idx,
+                "iops": nonnegative(
+                    int(shard.get("append_ops", 0)), int(old.get("append_ops", 0))
+                )
+                / elapsed,
+                "mib_s": nonnegative(
+                    int(shard.get("append_bytes", 0)),
+                    int(old.get("append_bytes", 0)),
+                )
+                / elapsed
+                / 1048576,
+                "capacity_bytes": capacity,
+                "head_offset": int(shard.get("head_offset", 0)),
+                "tail_offset": int(shard.get("tail_offset", 0)),
+                "used_bytes": int(shard.get("used_bytes", 0)),
+                "used_delta": int(shard.get("used_bytes", 0))
+                - int(old.get("used_bytes", 0)),
+                "head_delta": head_delta,
+                "tail_delta": tail_delta,
+                "reserve_wait_ms": nonnegative(
+                    int(shard.get("reserve_wait_ns", 0)),
+                    int(old.get("reserve_wait_ns", 0)),
+                )
+                / 1e6,
+                "fill_pct": shard.get("fill_pct", 0),
+                "head_seq": shard.get("head_seq"),
+                "head_block_reason": shard.get("head_block_reason", "unknown"),
+                "head_residency_ms": shard.get("head_residency_ms"),
+                "oldest_pending_seq": shard.get("oldest_pending_seq"),
+                "oldest_pending_age_ms": shard.get("oldest_pending_age_ms"),
+                "release_calls": int(shard.get("release_calls", 0)),
+                "release_calls_delta": nonnegative(
+                    int(shard.get("release_calls", 0)),
+                    int(old.get("release_calls", 0)),
+                ),
+                "released_entries": int(shard.get("released_entries", 0)),
+                "released_entries_delta": nonnegative(
+                    int(shard.get("released_entries", 0)),
+                    int(old.get("released_entries", 0)),
+                ),
+                "released_bytes": int(shard.get("released_bytes", 0)),
+                "released_bytes_delta": nonnegative(
+                    int(shard.get("released_bytes", 0)),
+                    int(old.get("released_bytes", 0)),
+                ),
+                "last_release_cap": int(shard.get("last_release_cap", 0)),
+            }
+        )
+    return summaries
+
+
 def percentile_ns(buckets: list[int], percentile: float) -> int:
     total = sum(buckets)
     if total == 0:
@@ -786,28 +863,7 @@ def main() -> None:
                 old_status.get("chunklet_io_execution") or {},
                 status_elapsed,
             )
-            old_shards = {int(s["shard_idx"]): s for s in old_status.get("buffer_shards", [])}
-            shards = []
-            for shard in status.get("buffer_shards", []):
-                idx = int(shard["shard_idx"])
-                old = old_shards.get(idx, {})
-                capacity = int(shard.get("capacity_bytes", 0))
-                head_delta = (int(shard.get("head_offset", 0)) - int(old.get("head_offset", 0))) % capacity if capacity else 0
-                tail_delta = (int(shard.get("tail_offset", 0)) - int(old.get("tail_offset", 0))) % capacity if capacity else 0
-                shards.append({
-                    "shard": idx,
-                    "iops": nonnegative(int(shard.get("append_ops", 0)), int(old.get("append_ops", 0))) / status_elapsed,
-                    "mib_s": nonnegative(int(shard.get("append_bytes", 0)), int(old.get("append_bytes", 0))) / status_elapsed / 1048576,
-                    "capacity_bytes": capacity,
-                    "head_offset": int(shard.get("head_offset", 0)),
-                    "tail_offset": int(shard.get("tail_offset", 0)),
-                    "used_bytes": int(shard.get("used_bytes", 0)),
-                    "used_delta": int(shard.get("used_bytes", 0)) - int(old.get("used_bytes", 0)),
-                    "head_delta": head_delta,
-                    "tail_delta": tail_delta,
-                    "reserve_wait_ms": nonnegative(int(shard.get("reserve_wait_ns", 0)), int(old.get("reserve_wait_ns", 0))) / 1e6,
-                    "fill_pct": shard.get("fill_pct", 0),
-                })
+            shards = shard_interval_summaries(status, old_status, status_elapsed)
             scheduler = {}
             for role, row in sched.items():
                 old = old_sched.get(role, {})
