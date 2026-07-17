@@ -30,6 +30,17 @@ impl MetaMemorySnapshot {
 
         Self {
             rc_checkpoint_mode: self.rc_checkpoint_mode,
+            checkpoint_sync_bfg: self.checkpoint_sync_bfg,
+            checkpoint_sync_kind: self.checkpoint_sync_kind,
+            checkpoint_sync_phase: self.checkpoint_sync_phase,
+            checkpoint_sync_transition_seq: self.checkpoint_sync_transition_seq,
+            checkpoint_sync_started_unix_us: self.checkpoint_sync_started_unix_us,
+            checkpoint_sync_phase_started_unix_us: self.checkpoint_sync_phase_started_unix_us,
+            checkpoint_quiesce_bfg: self.checkpoint_quiesce_bfg,
+            checkpoint_quiesce_phase: self.checkpoint_quiesce_phase,
+            checkpoint_quiesce_transition_seq: self.checkpoint_quiesce_transition_seq,
+            checkpoint_quiesce_started_unix_us: self.checkpoint_quiesce_started_unix_us,
+            checkpoint_quiesce_phase_started_unix_us: self.checkpoint_quiesce_phase_started_unix_us,
             block_cache_capacity_bytes: self.block_cache_capacity_bytes,
             block_cache_usage_bytes: opt_sub(
                 self.block_cache_usage_bytes,

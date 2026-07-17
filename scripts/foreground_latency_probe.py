@@ -69,6 +69,211 @@ def nonnegative(now: int, old: int) -> int:
     return max(0, now - old)
 
 
+CHECKPOINT_SYNC_PHASE_NAMES = {
+    0: "idle",
+    1: "cycle_start",
+    2: "dedup_drain",
+    3: "l2p_fold",
+    4: "sample",
+    5: "sample_wait_refcount",
+    6: "io",
+    7: "publish_barrier",
+    8: "manifest",
+    9: "install",
+    10: "prefold_wait",
+    11: "reclaim",
+    12: "complete",
+    13: "error",
+}
+
+CHECKPOINT_QUIESCE_PHASE_NAMES = {
+    0: "idle",
+    1: "quiesce",
+    2: "await_sync",
+    3: "error",
+}
+
+
+def integer(snapshot: dict[str, Any], key: str) -> int:
+    return int(snapshot.get(key, 0) or 0)
+
+
+def metadb_interval_summary(
+    status: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> dict[str, Any]:
+    current = status.get("metadb_memory") or {}
+    old = previous.get("metadb_memory") or {}
+    if not isinstance(current, dict) or not current:
+        return {"available": False}
+    if not isinstance(old, dict):
+        old = {}
+
+    def delta(key: str) -> int:
+        return nonnegative(integer(current, key), integer(old, key))
+
+    attempted = delta("commit_attempts")
+    completed = delta("commit_success")
+    errors = delta("commit_errors")
+    empty = delta("commit_empty")
+    started_ops = delta("commit_ops")
+    wait_fields = (
+        "commit_bfg_admission_wait_us",
+        "commit_apply_wait_us",
+        "commit_apply_gate_wait_us",
+        "commit_apply_l2p_wait_us",
+        "commit_apply_rc_enqueue_us",
+        "commit_apply_rc_wait_us",
+        "commit_apply_dedup_enqueue_us",
+        "commit_apply_dedup_wait_us",
+        "commit_finish_global_wait_us",
+        "apply_refcount_fold_lock_wait_us",
+    )
+    completed_phase_fields = (
+        "flush_dedup_drain_us",
+        "flush_l2p_fold_us",
+        "flush_sample_us",
+        "flush_sample_lock_us",
+        "flush_sample_l2p_walk_us",
+        "flush_sample_rc_drain_us",
+        "flush_io_us",
+        "flush_publish_barrier_wait_us",
+        "flush_manifest_us",
+        "flush_install_us",
+        "l2p_prefold_wait_us",
+        "flush_reclaim_us",
+        "flush_total_us_forced",
+    )
+    sync_phase_code = integer(current, "checkpoint_sync_phase")
+    sync_transition_seq = integer(current, "checkpoint_sync_transition_seq")
+    quiesce_phase_code = integer(current, "checkpoint_quiesce_phase")
+    quiesce_transition_seq = integer(current, "checkpoint_quiesce_transition_seq")
+    return {
+        "available": True,
+        "attempted_tx": attempted,
+        "attempted_tx_s": attempted / elapsed,
+        "completed_tx": completed,
+        "completed_tx_s": completed / elapsed,
+        "errors": errors,
+        "empty_tx": empty,
+        # commit_ops is recorded at attempt time; it is not completed work.
+        "started_ops": started_ops,
+        "started_ops_s": started_ops / elapsed,
+        "last_applied_lsn": integer(current, "last_applied_lsn"),
+        "last_applied_lsn_advance": delta("last_applied_lsn"),
+        "wait_us_delta": {key: delta(key) for key in wait_fields},
+        "pending": {
+            key: integer(current, key)
+            for key in (
+                "pending_dispatch",
+                "pending_dedup_lane_queue",
+                "pending_l2p_apply_queue",
+                "pending_l2p_pagebuf_dirty",
+                "pending_rc_apply_queue",
+                "pending_rc_pagebuf_dirty",
+            )
+        },
+        "checkpoint": {
+            "forced_counter_delta": delta("flush_calls_forced"),
+            "sync_cycle": {
+                "available": sync_transition_seq != 0,
+                "bfg": integer(current, "checkpoint_sync_bfg"),
+                "kind": integer(current, "checkpoint_sync_kind"),
+                "code": sync_phase_code,
+                "name": CHECKPOINT_SYNC_PHASE_NAMES.get(sync_phase_code, "unknown"),
+                "transition_seq": sync_transition_seq,
+                "cycle_started_unix_us": integer(
+                    current, "checkpoint_sync_started_unix_us"
+                ),
+                "phase_started_unix_us": integer(
+                    current, "checkpoint_sync_phase_started_unix_us"
+                ),
+            },
+            "quiesce": {
+                "available": quiesce_transition_seq != 0,
+                "bfg": integer(current, "checkpoint_quiesce_bfg"),
+                "code": quiesce_phase_code,
+                "name": CHECKPOINT_QUIESCE_PHASE_NAMES.get(
+                    quiesce_phase_code, "unknown"
+                ),
+                "transition_seq": quiesce_transition_seq,
+                "cycle_started_unix_us": integer(
+                    current, "checkpoint_quiesce_started_unix_us"
+                ),
+                "phase_started_unix_us": integer(
+                    current, "checkpoint_quiesce_phase_started_unix_us"
+                ),
+            },
+            # These counters advance when a phase completes, not while it runs.
+            "completed_phase_us_delta": {
+                key: delta(key) for key in completed_phase_fields
+            },
+        },
+    }
+
+
+def flush_writer_meta_summary(
+    metrics: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> dict[str, float | int]:
+    commits = nonnegative(
+        integer(metrics, "flush_writer_meta_commits"),
+        integer(previous, "flush_writer_meta_commits"),
+    )
+    lbas = nonnegative(
+        integer(metrics, "flush_writer_meta_lbas"),
+        integer(previous, "flush_writer_meta_lbas"),
+    )
+    return {
+        "completed_tx": commits,
+        "completed_tx_s": commits / elapsed,
+        "completed_lbas": lbas,
+        "completed_lbas_s": lbas / elapsed,
+    }
+
+
+def durability_summary(
+    status: dict[str, Any], previous: dict[str, Any]
+) -> dict[str, Any]:
+    def optional(key: str) -> int | None:
+        value = status.get(key)
+        return None if value is None else int(value)
+
+    def optional_delta(key: str) -> int | None:
+        current = optional(key)
+        old_value = previous.get(key)
+        if current is None or old_value is None:
+            return None
+        return nonnegative(current, int(old_value))
+
+    next_seq = optional("buffer_next_seq")
+    applied = optional("buffer_applied_frontier")
+    durable = optional("buffer_durable_seq")
+    metadb_durable = optional("metadb_durable_buffer_seq")
+    shard_fill = max(
+        (int(shard.get("fill_pct", 0)) for shard in status.get("buffer_shards", [])),
+        default=0,
+    )
+    return {
+        "buffer_next_seq": next_seq,
+        "buffer_applied_frontier": applied,
+        "buffer_durable_seq": durable,
+        "metadb_durable_buffer_seq": metadb_durable,
+        "next_seq_advance": optional_delta("buffer_next_seq"),
+        "applied_frontier_advance": optional_delta("buffer_applied_frontier"),
+        "durable_seq_advance": optional_delta("buffer_durable_seq"),
+        "metadb_durable_seq_advance": optional_delta("metadb_durable_buffer_seq"),
+        "allocated_minus_applied": None
+        if next_seq is None or applied is None
+        else max(0, next_seq - 1 - applied),
+        "applied_minus_durable": None
+        if applied is None or durable is None
+        else max(0, applied - durable),
+        "buffer_pending_entries": optional("buffer_pending_entries"),
+        "logical_fill_pct": optional("buffer_fill_pct"),
+        "physical_fill_pct": optional("buffer_physical_fill_pct"),
+        "max_shard_fill_pct": shard_fill,
+    }
+
+
 def percentile_ns(buckets: list[int], percentile: float) -> int:
     total = sum(buckets)
     if total == 0:
@@ -284,18 +489,52 @@ def main() -> None:
     args = parser.parse_args()
     pid = process_id(args.pid)
     path = pathlib.Path(args.socket_path)
-    previous: tuple[float, dict[str, Any], dict[str, Any], dict[str, dict[str, int]]] | None = None
+    previous: tuple[
+        float,
+        float,
+        float,
+        float,
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, dict[str, int]],
+    ] | None = None
     sample = 0
     while args.count == 0 or sample < args.count:
-        started = time.monotonic()
+        sample_started_monotonic = time.monotonic()
+        sample_started_epoch = time.time()
+        metrics_fetch_started_monotonic = time.monotonic()
+        metrics_fetch_started_epoch = time.time()
         metrics = command(path, "metrics-json", args.timeout)
+        metrics_fetch_ended_monotonic = time.monotonic()
+        metrics_fetch_ended_epoch = time.time()
+        status_fetch_started_monotonic = time.monotonic()
+        status_fetch_started_epoch = time.time()
         status = command(path, "status-json", args.timeout)
+        status_fetch_ended_monotonic = time.monotonic()
+        status_fetch_ended_epoch = time.time()
         status = status.get("status", status)
         sched = schedstat(pid)
-        now = time.time()
+        now_epoch = time.time()
+        now_monotonic = time.monotonic()
         if previous:
-            old_ts, old_metrics, old_status, old_sched = previous
-            elapsed = max(0.001, now - old_ts)
+            (
+                _,
+                old_monotonic,
+                old_metrics_fetch_ended_monotonic,
+                old_status_fetch_ended_monotonic,
+                old_metrics,
+                old_status,
+                old_sched,
+            ) = previous
+            elapsed = max(0.001, now_monotonic - old_monotonic)
+            metrics_elapsed = max(
+                0.001,
+                metrics_fetch_ended_monotonic - old_metrics_fetch_ended_monotonic,
+            )
+            status_elapsed = max(
+                0.001,
+                status_fetch_ended_monotonic - old_status_fetch_ended_monotonic,
+            )
             stages = {}
             for key in (
                 "ublk_write_queue_wait_latency_buckets",
@@ -439,7 +678,7 @@ def main() -> None:
                     int(metrics.get("flush_qos_admitted_bytes", 0)),
                     int(old_metrics.get("flush_qos_admitted_bytes", 0)),
                 )
-                / elapsed
+                / metrics_elapsed
                 / 1048576,
                 "wait_ms": nonnegative(
                     int(metrics.get("flush_qos_wait_ns", 0)),
@@ -540,12 +779,12 @@ def main() -> None:
             chunklet_pd_io_scheduler = pd_scheduler_summary(
                 status.get("chunklet_pd_io_scheduler") or {},
                 old_status.get("chunklet_pd_io_scheduler") or {},
-                elapsed,
+                status_elapsed,
             )
             chunklet_io_execution = execution_summary(
                 status.get("chunklet_io_execution") or {},
                 old_status.get("chunklet_io_execution") or {},
-                elapsed,
+                status_elapsed,
             )
             old_shards = {int(s["shard_idx"]): s for s in old_status.get("buffer_shards", [])}
             shards = []
@@ -557,8 +796,12 @@ def main() -> None:
                 tail_delta = (int(shard.get("tail_offset", 0)) - int(old.get("tail_offset", 0))) % capacity if capacity else 0
                 shards.append({
                     "shard": idx,
-                    "iops": nonnegative(int(shard.get("append_ops", 0)), int(old.get("append_ops", 0))) / elapsed,
-                    "mib_s": nonnegative(int(shard.get("append_bytes", 0)), int(old.get("append_bytes", 0))) / elapsed / 1048576,
+                    "iops": nonnegative(int(shard.get("append_ops", 0)), int(old.get("append_ops", 0))) / status_elapsed,
+                    "mib_s": nonnegative(int(shard.get("append_bytes", 0)), int(old.get("append_bytes", 0))) / status_elapsed / 1048576,
+                    "capacity_bytes": capacity,
+                    "head_offset": int(shard.get("head_offset", 0)),
+                    "tail_offset": int(shard.get("tail_offset", 0)),
+                    "used_bytes": int(shard.get("used_bytes", 0)),
                     "used_delta": int(shard.get("used_bytes", 0)) - int(old.get("used_bytes", 0)),
                     "head_delta": head_delta,
                     "tail_delta": tail_delta,
@@ -574,15 +817,44 @@ def main() -> None:
                     "runqueue_ms": nonnegative(row["runqueue_ns"], old.get("runqueue_ns", 0)) / 1e6,
                     "switches": nonnegative(row["switches"], old.get("switches", 0)),
                 }
+            metadb = metadb_interval_summary(status, old_status, status_elapsed)
+            flush_writer_meta = flush_writer_meta_summary(
+                metrics, old_metrics, metrics_elapsed
+            )
+            durability = durability_summary(status, old_status)
             print(
                 json.dumps(
                     {
-                        "ts": now,
+                        "ts": now_epoch,
+                        "ts_monotonic": now_monotonic,
                         "elapsed": elapsed,
+                        "fetch_window": {
+                            "sample_started_epoch": sample_started_epoch,
+                            "metrics_started_epoch": metrics_fetch_started_epoch,
+                            "metrics_ended_epoch": metrics_fetch_ended_epoch,
+                            "metrics_duration_ms": (
+                                metrics_fetch_ended_monotonic
+                                - metrics_fetch_started_monotonic
+                            )
+                            * 1000,
+                            "status_started_epoch": status_fetch_started_epoch,
+                            "status_ended_epoch": status_fetch_ended_epoch,
+                            "status_duration_ms": (
+                                status_fetch_ended_monotonic
+                                - status_fetch_started_monotonic
+                            )
+                            * 1000,
+                            "sample_ended_epoch": now_epoch,
+                            "metrics_counter_elapsed_s": metrics_elapsed,
+                            "status_counter_elapsed_s": status_elapsed,
+                        },
                         "write_p99_ns": stages,
                         "lv2_durable_stages": lv2_stages,
                         "lv2_percentiles_are_bucket_upper_bounds": True,
                         "commit_worker": commit_worker,
+                        "flush_writer_meta": flush_writer_meta,
+                        "metadb": metadb,
+                        "durability": durability,
                         "flush_qos": flush_qos,
                         "write_throttle": write_throttle,
                         "chunklet_io_scheduler": chunklet_io_scheduler,
@@ -596,9 +868,17 @@ def main() -> None:
                 ),
                 flush=True,
             )
-        previous = (now, metrics, status, sched)
+        previous = (
+            now_epoch,
+            now_monotonic,
+            metrics_fetch_ended_monotonic,
+            status_fetch_ended_monotonic,
+            metrics,
+            status,
+            sched,
+        )
         sample += 1
-        time.sleep(max(0.0, args.interval - (time.monotonic() - started)))
+        time.sleep(max(0.0, args.interval - (time.monotonic() - sample_started_monotonic)))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,19 @@ pub struct MetaMemorySnapshot {
     /// 0 = threads-off/all-slots, 1 = threads-on legacy one-shot,
     /// 2 = threads-on bounded streaming.
     pub rc_checkpoint_mode: u64,
+    /// Independent low-frequency checkpoint timelines from MetaDB. Sync N and
+    /// quiesce N+1 may overlap, so they must not share one phase gauge.
+    pub checkpoint_sync_bfg: u64,
+    pub checkpoint_sync_kind: u64,
+    pub checkpoint_sync_phase: u64,
+    pub checkpoint_sync_transition_seq: u64,
+    pub checkpoint_sync_started_unix_us: u64,
+    pub checkpoint_sync_phase_started_unix_us: u64,
+    pub checkpoint_quiesce_bfg: u64,
+    pub checkpoint_quiesce_phase: u64,
+    pub checkpoint_quiesce_transition_seq: u64,
+    pub checkpoint_quiesce_started_unix_us: u64,
+    pub checkpoint_quiesce_phase_started_unix_us: u64,
     pub block_cache_capacity_bytes: Option<u64>,
     pub block_cache_usage_bytes: Option<u64>,
     pub block_cache_pinned_usage_bytes: Option<u64>,
@@ -519,6 +532,78 @@ mod from_metadb;
 #[cfg(test)]
 mod tests {
     use super::MetaMemorySnapshot;
+
+    #[test]
+    fn checkpoint_phase_lanes_map_serialize_and_stay_gauges_in_delta() {
+        let meta = onyx_metadb::MetaMetricsSnapshot {
+            checkpoint_sync_bfg: 41,
+            checkpoint_sync_kind: 1,
+            checkpoint_sync_phase: 6,
+            checkpoint_sync_transition_seq: 99,
+            checkpoint_sync_started_unix_us: 1_700_000_000_000_000,
+            checkpoint_sync_phase_started_unix_us: 1_700_000_001_000_000,
+            checkpoint_quiesce_bfg: 42,
+            checkpoint_quiesce_phase: 2,
+            checkpoint_quiesce_transition_seq: 12,
+            checkpoint_quiesce_started_unix_us: 1_700_000_000_500_000,
+            checkpoint_quiesce_phase_started_unix_us: 1_700_000_001_500_000,
+            ..onyx_metadb::MetaMetricsSnapshot::default()
+        };
+        let current = MetaMemorySnapshot::from_metadb(
+            0,
+            0,
+            0,
+            onyx_metadb::dedup::TierSizes {
+                l0_distinct_fps: 0,
+                l0_approx_bytes: 0,
+                l1_entries: 0,
+            },
+            onyx_metadb::PageCacheStats::default(),
+            meta,
+            onyx_metadb::PendingState::default(),
+        );
+        let earlier = MetaMemorySnapshot {
+            checkpoint_sync_bfg: 40,
+            checkpoint_sync_kind: 1,
+            checkpoint_sync_phase: 4,
+            checkpoint_sync_transition_seq: 90,
+            checkpoint_sync_started_unix_us: 1_699_999_900_000_000,
+            checkpoint_sync_phase_started_unix_us: 1_699_999_901_000_000,
+            checkpoint_quiesce_bfg: 41,
+            checkpoint_quiesce_phase: 1,
+            checkpoint_quiesce_transition_seq: 10,
+            checkpoint_quiesce_started_unix_us: 1_699_999_900_500_000,
+            checkpoint_quiesce_phase_started_unix_us: 1_699_999_901_500_000,
+            ..MetaMemorySnapshot::default()
+        };
+
+        let delta = current.saturating_sub(&earlier);
+        assert_eq!(delta.checkpoint_sync_bfg, 41);
+        assert_eq!(delta.checkpoint_sync_kind, 1);
+        assert_eq!(delta.checkpoint_sync_phase, 6);
+        assert_eq!(delta.checkpoint_sync_transition_seq, 99);
+        assert_eq!(delta.checkpoint_sync_started_unix_us, 1_700_000_000_000_000);
+        assert_eq!(
+            delta.checkpoint_sync_phase_started_unix_us,
+            1_700_000_001_000_000
+        );
+        assert_eq!(delta.checkpoint_quiesce_bfg, 42);
+        assert_eq!(delta.checkpoint_quiesce_phase, 2);
+        assert_eq!(delta.checkpoint_quiesce_transition_seq, 12);
+
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["checkpoint_sync_bfg"].as_u64(), Some(41));
+        assert_eq!(json["checkpoint_sync_kind"].as_u64(), Some(1));
+        assert_eq!(json["checkpoint_sync_phase"].as_u64(), Some(6));
+        assert_eq!(json["checkpoint_sync_transition_seq"].as_u64(), Some(99));
+        assert_eq!(
+            json["checkpoint_sync_phase_started_unix_us"].as_u64(),
+            Some(1_700_000_001_000_000)
+        );
+        assert_eq!(json["checkpoint_quiesce_bfg"].as_u64(), Some(42));
+        assert_eq!(json["checkpoint_quiesce_phase"].as_u64(), Some(2));
+        assert_eq!(json["checkpoint_quiesce_transition_seq"].as_u64(), Some(12));
+    }
 
     #[test]
     fn bfg_admission_wait_metrics_serialize_and_delta() {

@@ -12,6 +12,17 @@ impl MetaMemorySnapshot {
     ) -> Self {
         Self {
             rc_checkpoint_mode: meta.rc_checkpoint_mode,
+            checkpoint_sync_bfg: meta.checkpoint_sync_bfg,
+            checkpoint_sync_kind: meta.checkpoint_sync_kind,
+            checkpoint_sync_phase: meta.checkpoint_sync_phase,
+            checkpoint_sync_transition_seq: meta.checkpoint_sync_transition_seq,
+            checkpoint_sync_started_unix_us: meta.checkpoint_sync_started_unix_us,
+            checkpoint_sync_phase_started_unix_us: meta.checkpoint_sync_phase_started_unix_us,
+            checkpoint_quiesce_bfg: meta.checkpoint_quiesce_bfg,
+            checkpoint_quiesce_phase: meta.checkpoint_quiesce_phase,
+            checkpoint_quiesce_transition_seq: meta.checkpoint_quiesce_transition_seq,
+            checkpoint_quiesce_started_unix_us: meta.checkpoint_quiesce_started_unix_us,
+            checkpoint_quiesce_phase_started_unix_us: meta.checkpoint_quiesce_phase_started_unix_us,
             block_cache_capacity_bytes: Some(cache.capacity_bytes),
             block_cache_usage_bytes: Some(cache.current_bytes),
             block_cache_pinned_usage_bytes: Some(cache.pinned_bytes),
