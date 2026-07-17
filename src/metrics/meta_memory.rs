@@ -182,23 +182,8 @@ pub struct MetaMemorySnapshot {
     pub apply_refcount_breakdown_sampled_pbas: u64,
     pub apply_refcount_pba_grouping_us: u64,
     pub apply_refcount_pba_grouping_max_us: u64,
-    pub apply_refcount_actions_sort_us: u64,
-    pub apply_refcount_actions_sort_sampled_actions: u64,
-    pub apply_refcount_stage_sampled_us: u64,
-    pub apply_refcount_pbas_materialize_us: u64,
     pub apply_refcount_base_page_lookup_us: u64,
     pub apply_refcount_base_page_lookup_max_us: u64,
-    pub apply_refcount_base_profiled_pbas: u64,
-    pub apply_refcount_base_page_runs: u64,
-    pub apply_refcount_base_hole_runs: u64,
-    pub apply_refcount_base_overlay_runs: u64,
-    pub apply_refcount_base_clean_runs: u64,
-    pub apply_refcount_base_output_init_us: u64,
-    pub apply_refcount_base_inner_lock_wait_us: u64,
-    pub apply_refcount_base_page_resolve_us: u64,
-    pub apply_refcount_base_request_materialize_us: u64,
-    pub apply_refcount_base_cache_probe_us: u64,
-    pub apply_refcount_base_decode_us: u64,
     pub apply_refcount_base_lookup_attempts: u64,
     pub apply_refcount_epoch_retries: u64,
     pub apply_refcount_fold_lock_wait_us: u64,
@@ -399,9 +384,6 @@ pub struct MetaMemorySnapshot {
     pub flush_rc_fold_lock_wait_max_us: u64,
     pub flush_rc_fold_service_us: u64,
     pub flush_rc_fold_service_max_us: u64,
-    pub flush_rc_fold_validate_us: u64,
-    pub flush_rc_fold_stage_us: u64,
-    pub flush_rc_fold_remove_us: u64,
     pub flush_rc_stream_calls: u64,
     pub flush_rc_stream_pages: u64,
     pub flush_rc_stream_service_us: u64,
@@ -612,79 +594,6 @@ mod tests {
             json["rc_apply_lane_reserved_hold_active_max"].as_u64(),
             Some(7)
         );
-    }
-
-    #[test]
-    fn rc_stage_profile_metrics_map_serialize_and_delta() {
-        let meta = onyx_metadb::MetaMetricsSnapshot {
-            apply_refcount_actions_sort_us: 101,
-            apply_refcount_actions_sort_sampled_actions: 17,
-            apply_refcount_stage_sampled_us: 103,
-            apply_refcount_pbas_materialize_us: 107,
-            apply_refcount_base_profiled_pbas: 109,
-            apply_refcount_base_page_runs: 11,
-            apply_refcount_base_hole_runs: 2,
-            apply_refcount_base_overlay_runs: 3,
-            apply_refcount_base_clean_runs: 6,
-            apply_refcount_base_output_init_us: 13,
-            apply_refcount_base_inner_lock_wait_us: 17,
-            apply_refcount_base_page_resolve_us: 19,
-            apply_refcount_base_request_materialize_us: 23,
-            apply_refcount_base_cache_probe_us: 29,
-            apply_refcount_base_decode_us: 31,
-            flush_rc_fold_validate_us: 37,
-            flush_rc_fold_stage_us: 41,
-            flush_rc_fold_remove_us: 43,
-            ..onyx_metadb::MetaMetricsSnapshot::default()
-        };
-        let current = MetaMemorySnapshot::from_metadb(
-            0,
-            0,
-            0,
-            onyx_metadb::dedup::TierSizes {
-                l0_distinct_fps: 0,
-                l0_approx_bytes: 0,
-                l1_entries: 0,
-            },
-            onyx_metadb::PageCacheStats::default(),
-            meta,
-            onyx_metadb::PendingState::default(),
-        );
-
-        assert_eq!(current.apply_refcount_actions_sort_us, 101);
-        assert_eq!(current.apply_refcount_actions_sort_sampled_actions, 17);
-        assert_eq!(current.apply_refcount_stage_sampled_us, 103);
-        assert_eq!(current.apply_refcount_base_profiled_pbas, 109);
-        assert_eq!(current.apply_refcount_base_cache_probe_us, 29);
-        assert_eq!(current.flush_rc_fold_validate_us, 37);
-        assert_eq!(current.flush_rc_fold_stage_us, 41);
-        assert_eq!(current.flush_rc_fold_remove_us, 43);
-
-        let earlier = MetaMemorySnapshot {
-            apply_refcount_actions_sort_us: 1,
-            apply_refcount_actions_sort_sampled_actions: 7,
-            apply_refcount_stage_sampled_us: 3,
-            apply_refcount_base_profiled_pbas: 9,
-            apply_refcount_base_cache_probe_us: 4,
-            flush_rc_fold_validate_us: 7,
-            flush_rc_fold_stage_us: 11,
-            flush_rc_fold_remove_us: 13,
-            ..MetaMemorySnapshot::default()
-        };
-        let delta = current.saturating_sub(&earlier);
-        assert_eq!(delta.apply_refcount_actions_sort_us, 100);
-        assert_eq!(delta.apply_refcount_actions_sort_sampled_actions, 10);
-        assert_eq!(delta.apply_refcount_stage_sampled_us, 100);
-        assert_eq!(delta.apply_refcount_base_profiled_pbas, 100);
-        assert_eq!(delta.apply_refcount_base_cache_probe_us, 25);
-        assert_eq!(delta.flush_rc_fold_validate_us, 30);
-        assert_eq!(delta.flush_rc_fold_stage_us, 30);
-        assert_eq!(delta.flush_rc_fold_remove_us, 30);
-
-        let json = serde_json::to_value(&current).unwrap();
-        assert_eq!(json["apply_refcount_base_page_runs"].as_u64(), Some(11));
-        assert_eq!(json["apply_refcount_base_decode_us"].as_u64(), Some(31));
-        assert_eq!(json["flush_rc_fold_stage_us"].as_u64(), Some(41));
     }
 
     #[test]
