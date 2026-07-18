@@ -160,6 +160,13 @@ def metadb_interval_summary(
         "started_ops_s": started_ops / elapsed,
         "last_applied_lsn": integer(current, "last_applied_lsn"),
         "last_applied_lsn_advance": delta("last_applied_lsn"),
+        "refcount_race": {
+            "read_underflow_floored": delta("rc_read_underflow_floored_total"),
+            "mutation_underflow_clamped": delta(
+                "rc_mutation_underflow_clamped_total"
+            ),
+            "staged_overlay_hits": delta("rc_staged_overlay_hits_total"),
+        },
         "wait_us_delta": {key: delta(key) for key in wait_fields},
         "pending": {
             key: integer(current, key)
