@@ -580,6 +580,12 @@ pub struct MetaConfig {
     #[serde(default = "default_rc_checkpoint_streaming_enabled")]
     pub rc_checkpoint_streaming_enabled: bool,
 
+    /// Encode candidate RC delta-run pages during checkpoint sampling and
+    /// discard them after exporting size/CPU metrics. This never changes
+    /// durable metadata and is intended only for controlled L3 measurements.
+    #[serde(default = "default_rc_delta_run_shadow_enabled")]
+    pub rc_delta_run_shadow_enabled: bool,
+
     /// Fan the per-BFG L2P syncing-slot drain out across shards instead of
     /// folding them serially on the single `metadb-bfg-sync` thread (which
     /// was the drain bottleneck capping single-volume write throughput).
@@ -722,6 +728,7 @@ impl Default for MetaConfig {
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
             bfg_threads_enabled: default_bfg_threads_enabled(),
             rc_checkpoint_streaming_enabled: default_rc_checkpoint_streaming_enabled(),
+            rc_delta_run_shadow_enabled: default_rc_delta_run_shadow_enabled(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
             parallel_l2p_drain_workers: default_parallel_l2p_drain_workers(),
             l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
@@ -842,6 +849,9 @@ fn default_bfg_threads_enabled() -> bool {
 }
 fn default_rc_checkpoint_streaming_enabled() -> bool {
     true
+}
+fn default_rc_delta_run_shadow_enabled() -> bool {
+    false
 }
 fn default_parallel_l2p_drain_enabled() -> bool {
     // The bounded worker pool and per-shard NUMA binding remove the old

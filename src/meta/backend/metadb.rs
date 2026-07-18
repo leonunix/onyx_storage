@@ -2146,6 +2146,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     // checkpoint.
     cfg.bfg_threads_enabled = config.bfg_threads_enabled;
     cfg.rc_checkpoint_streaming_enabled = config.rc_checkpoint_streaming_enabled;
+    cfg.rc_delta_run_shadow_enabled = config.rc_delta_run_shadow_enabled;
     // Keep the BFG roll timer aligned with Onyx's configured L2P buffering
     // window. Leaving this at metadb's 5 s default defeats a larger durable
     // LV2 window by forcing page-tree materialisation five times per 30 s.

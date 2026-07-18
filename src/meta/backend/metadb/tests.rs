@@ -1207,6 +1207,18 @@ fn rc_checkpoint_streaming_toggle_maps_to_metadb() {
 }
 
 #[test]
+fn rc_delta_run_shadow_toggle_maps_to_metadb() {
+    for enabled in [false, true] {
+        let cfg = MetaConfig {
+            rc_delta_run_shadow_enabled: enabled,
+            ..Default::default()
+        };
+        let mapped = super::metadb_config_from_onyx(std::path::Path::new("/tmp/metadb"), &cfg);
+        assert_eq!(mapped.rc_delta_run_shadow_enabled, enabled);
+    }
+}
+
+#[test]
 fn meta_store_exposes_terminal_durable_reclaim() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = MetaConfig {
