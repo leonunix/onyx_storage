@@ -523,7 +523,7 @@ impl EngineStatusSnapshot {
             );
             let _ = writeln!(
                 out,
-                "metadb_flush_rc_checkpoint: fold_lock_wait_us={} fold_lock_wait_max_us={} fold_service_us={} fold_service_max_us={} stream_calls={} stream_pages={} stream_service_us={} stream_max_chunk_us={} stream_max_chunk_pages={} delta_shadow_runs={} delta_shadow_records={} delta_shadow_pages={} delta_shadow_payload_bytes={} delta_shadow_encode_us={} delta_shadow_encode_max_us={} delta_shadow_verify_us={} delta_shadow_verify_max_us={} delta_shadow_errors={}",
+                "metadb_flush_rc_checkpoint: fold_lock_wait_us={} fold_lock_wait_max_us={} fold_service_us={} fold_service_max_us={} stream_calls={} stream_pages={} stream_service_us={} stream_max_chunk_us={} stream_max_chunk_pages={} delta_shadow_runs={} delta_shadow_records={} delta_shadow_pages={} delta_shadow_payload_bytes={} delta_shadow_encode_us={} delta_shadow_encode_max_us={} delta_shadow_verify_us={} delta_shadow_verify_max_us={} delta_shadow_errors={} read_underflow_floored={} mutation_underflow_clamped={} staged_overlay_hits={}",
                 metadb.flush_rc_fold_lock_wait_us,
                 metadb.flush_rc_fold_lock_wait_max_us,
                 metadb.flush_rc_fold_service_us,
@@ -541,7 +541,10 @@ impl EngineStatusSnapshot {
                 metadb.flush_rc_delta_shadow_encode_max_us,
                 metadb.flush_rc_delta_shadow_verify_us,
                 metadb.flush_rc_delta_shadow_verify_max_us,
-                metadb.flush_rc_delta_shadow_errors
+                metadb.flush_rc_delta_shadow_errors,
+                metadb.rc_read_underflow_floored_total,
+                metadb.rc_mutation_underflow_clamped_total,
+                metadb.rc_staged_overlay_hits_total
             );
             let _ = writeln!(
                 out,
