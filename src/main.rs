@@ -502,12 +502,24 @@ fn ensure_fd_limit(config: &OnyxConfig) {
     }
 }
 
+fn log_filter_from_rust_log(
+    rust_log: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<tracing_subscriber::EnvFilter> {
+    let directives = match rust_log {
+        Some(value) => value
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("RUST_LOG must be valid UTF-8"))?,
+        None => "onyx_storage=info",
+    };
+
+    tracing_subscriber::EnvFilter::try_new(directives)
+        .map_err(|error| anyhow::anyhow!("invalid RUST_LOG filter: {error}"))
+}
+
 fn main() -> anyhow::Result<()> {
+    let rust_log = std::env::var_os(tracing_subscriber::EnvFilter::DEFAULT_ENV);
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("onyx_storage=info".parse()?),
-        )
+        .with_env_filter(log_filter_from_rust_log(rust_log.as_deref())?)
         .init();
 
     let cli = Cli::parse();
@@ -979,6 +991,50 @@ mod tests {
     use onyx_storage::meta::backend::metadb::{
         MetaDbProbeMapping, MetaDbProbePba, MetaDbProbeReport, MetaDbProbeVolume,
     };
+
+    #[test]
+    fn log_filter_defaults_to_onyx_info_when_rust_log_is_unset() {
+        let filter = log_filter_from_rust_log(None).unwrap();
+
+        assert_eq!(filter.to_string(), "onyx_storage=info");
+    }
+
+    #[test]
+    fn log_filter_does_not_reenable_onyx_info_for_global_error() {
+        let filter = log_filter_from_rust_log(Some(std::ffi::OsStr::new("error"))).unwrap();
+
+        assert_eq!(filter.to_string(), "error");
+        assert!(!filter.to_string().contains("onyx_storage=info"));
+    }
+
+    #[test]
+    fn log_filter_preserves_explicit_onyx_debug() {
+        let filter =
+            log_filter_from_rust_log(Some(std::ffi::OsStr::new("onyx_storage=debug"))).unwrap();
+
+        assert_eq!(filter.to_string(), "onyx_storage=debug");
+    }
+
+    #[test]
+    fn log_filter_rejects_invalid_directives() {
+        let error =
+            log_filter_from_rust_log(Some(std::ffi::OsStr::new("onyx_storage=not-a-level")))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("invalid RUST_LOG filter"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_filter_rejects_non_utf8_rust_log() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let error =
+            log_filter_from_rust_log(Some(std::ffi::OsStr::from_bytes(b"onyx_storage=\xff")))
+                .unwrap_err();
+
+        assert_eq!(error.to_string(), "RUST_LOG must be valid UTF-8");
+    }
 
     #[test]
     fn parses_metadb_probe_arguments() {
