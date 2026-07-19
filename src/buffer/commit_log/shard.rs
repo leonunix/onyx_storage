@@ -335,6 +335,7 @@ impl BufferShard {
     }
 
     pub(super) fn open(
+        shard_idx: usize,
         device: Arc<dyn BlockBackend>,
         backpressure_timeout: Duration,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
@@ -374,6 +375,7 @@ impl BufferShard {
                 &pending_count,
             )?;
             tracing::info!(
+                shard = shard_idx,
                 elapsed_us = recover_start.elapsed().as_micros() as u64,
                 pending = pending_entries.len(),
                 head = ckpt.head_offset,
@@ -392,6 +394,7 @@ impl BufferShard {
                 &pending_count,
             )?;
             tracing::info!(
+                shard = shard_idx,
                 elapsed_us = recover_start.elapsed().as_micros() as u64,
                 pending = pending_entries.len(),
                 capacity_bytes,

@@ -317,6 +317,7 @@ impl WriteBufferPool {
                         let srtx = shard_ready_txs_for_open[idx].clone();
                         s.spawn(move || {
                             BufferShard::open(
+                                idx,
                                 cfg.data_device,
                                 backpressure_timeout,
                                 m,
@@ -346,6 +347,7 @@ impl WriteBufferPool {
                 .enumerate()
                 .map(|(idx, cfg)| {
                     BufferShard::open(
+                        idx,
                         cfg.data_device,
                         backpressure_timeout,
                         metrics.clone(),
