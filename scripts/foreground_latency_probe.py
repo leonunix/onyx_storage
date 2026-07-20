@@ -9,7 +9,7 @@ import os
 import pathlib
 import socket
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 
 def command(path: pathlib.Path, name: str, timeout: float) -> dict[str, Any]:
@@ -27,6 +27,59 @@ def command(path: pathlib.Path, name: str, timeout: float) -> dict[str, Any]:
             if line:
                 lines.append(line)
     return json.loads(lines[0]) if lines else {}
+
+
+class FetchObservation(NamedTuple):
+    value: dict[str, Any]
+    started_monotonic: float
+    started_epoch: float
+    ended_monotonic: float
+    ended_epoch: float
+
+
+def timed_command(
+    path: pathlib.Path, name: str, timeout: float
+) -> FetchObservation:
+    started_monotonic = time.monotonic()
+    started_epoch = time.time()
+    value = command(path, name, timeout)
+    ended_monotonic = time.monotonic()
+    ended_epoch = time.time()
+    return FetchObservation(
+        value=value,
+        started_monotonic=started_monotonic,
+        started_epoch=started_epoch,
+        ended_monotonic=ended_monotonic,
+        ended_epoch=ended_epoch,
+    )
+
+
+def strict_counter_elapsed(current_end: float, previous_end: float) -> float:
+    if not current_end > previous_end:
+        raise RuntimeError("fetch-end monotonic clock did not advance")
+    return current_end - previous_end
+
+
+def counter_interval_summary(
+    *,
+    previous_ended_monotonic: float,
+    previous_ended_epoch: float,
+    current_ended_monotonic: float,
+    current_ended_epoch: float,
+) -> dict[str, float]:
+    monotonic_elapsed = strict_counter_elapsed(
+        current_ended_monotonic, previous_ended_monotonic
+    )
+    if not current_ended_epoch > previous_ended_epoch:
+        raise RuntimeError("fetch-end epoch clock did not advance")
+    epoch_elapsed = current_ended_epoch - previous_ended_epoch
+    return {
+        "started_epoch": previous_ended_epoch,
+        "ended_epoch": current_ended_epoch,
+        "elapsed_seconds": monotonic_elapsed,
+        "monotonic_elapsed_seconds": monotonic_elapsed,
+        "epoch_elapsed_seconds": epoch_elapsed,
+    }
 
 
 def process_id(explicit: int | None) -> int:
@@ -67,6 +120,23 @@ def schedstat(pid: int) -> dict[str, dict[str, int]]:
 
 def nonnegative(now: int, old: int) -> int:
     return max(0, now - old)
+
+
+def strict_counter_delta(now: int, old: int, source: str) -> int:
+    if now < old:
+        raise RuntimeError(f"cumulative counter regressed: {source}")
+    return now - old
+
+
+def strict_split_counter(
+    snapshot: dict[str, Any], key: str, source: str
+) -> int:
+    if key not in snapshot:
+        raise RuntimeError(f"cumulative counter missing: {source}")
+    value = snapshot[key]
+    if type(value) is not int or value < 0:
+        raise RuntimeError(f"cumulative counter is not a nonnegative integer: {source}")
+    return value
 
 
 CHECKPOINT_SYNC_PHASE_NAMES = {
@@ -563,6 +633,356 @@ def execution_summary(
     }
 
 
+def write_throttle_interval_summary(
+    metrics: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> dict[str, float | int]:
+    count = strict_split_counter(
+        metrics, "buffer_throttle_count", "metrics-json.buffer_throttle_count"
+    )
+    old_count = strict_split_counter(
+        previous, "buffer_throttle_count", "metrics-json.buffer_throttle_count"
+    )
+    wait_us = strict_split_counter(
+        metrics, "buffer_throttle_us_total", "metrics-json.buffer_throttle_us_total"
+    )
+    old_wait_us = strict_split_counter(
+        previous,
+        "buffer_throttle_us_total",
+        "metrics-json.buffer_throttle_us_total",
+    )
+    debt_count = strict_split_counter(
+        metrics,
+        "buffer_backend_debt_throttle_count",
+        "metrics-json.buffer_backend_debt_throttle_count",
+    )
+    old_debt_count = strict_split_counter(
+        previous,
+        "buffer_backend_debt_throttle_count",
+        "metrics-json.buffer_backend_debt_throttle_count",
+    )
+    debt_wait_us = strict_split_counter(
+        metrics,
+        "buffer_backend_debt_throttle_us_total",
+        "metrics-json.buffer_backend_debt_throttle_us_total",
+    )
+    old_debt_wait_us = strict_split_counter(
+        previous,
+        "buffer_backend_debt_throttle_us_total",
+        "metrics-json.buffer_backend_debt_throttle_us_total",
+    )
+    count_delta = strict_counter_delta(
+        count, old_count, "metrics-json.buffer_throttle_count"
+    )
+    wait_us_delta = strict_counter_delta(
+        wait_us, old_wait_us, "metrics-json.buffer_throttle_us_total"
+    )
+    debt_count_delta = strict_counter_delta(
+        debt_count,
+        old_debt_count,
+        "metrics-json.buffer_backend_debt_throttle_count",
+    )
+    debt_wait_us_delta = strict_counter_delta(
+        debt_wait_us,
+        old_debt_wait_us,
+        "metrics-json.buffer_backend_debt_throttle_us_total",
+    )
+    return {
+        "interval_seconds": elapsed,
+        "count_absolute": count,
+        "count_delta": count_delta,
+        "count_rate_s": count_delta / elapsed,
+        "wait_us_absolute": wait_us,
+        "wait_us_delta": wait_us_delta,
+        "wait_us_rate_s": wait_us_delta / elapsed,
+        "wait_max_us_lifetime": strict_split_counter(
+            metrics, "buffer_throttle_us_max", "metrics-json.buffer_throttle_us_max"
+        ),
+        "backend_debt_count_absolute": debt_count,
+        "backend_debt_count_delta": debt_count_delta,
+        "backend_debt_count_rate_s": debt_count_delta / elapsed,
+        "backend_debt_wait_us_absolute": debt_wait_us,
+        "backend_debt_wait_us_delta": debt_wait_us_delta,
+        "backend_debt_wait_us_rate_s": debt_wait_us_delta / elapsed,
+        "backend_debt_wait_max_us_lifetime": strict_split_counter(
+            metrics,
+            "buffer_backend_debt_throttle_us_max",
+            "metrics-json.buffer_backend_debt_throttle_us_max",
+        ),
+    }
+
+
+def writer_commit_proxy_summary(
+    metrics: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> dict[str, Any]:
+    commits = strict_split_counter(
+        metrics,
+        "flush_writer_meta_commits",
+        "metrics-json.flush_writer_meta_commits",
+    )
+    old_commits = strict_split_counter(
+        previous,
+        "flush_writer_meta_commits",
+        "metrics-json.flush_writer_meta_commits",
+    )
+    lbas = strict_split_counter(
+        metrics, "flush_writer_meta_lbas", "metrics-json.flush_writer_meta_lbas"
+    )
+    old_lbas = strict_split_counter(
+        previous,
+        "flush_writer_meta_lbas",
+        "metrics-json.flush_writer_meta_lbas",
+    )
+    commit_delta = strict_counter_delta(
+        commits, old_commits, "metrics-json.flush_writer_meta_commits"
+    )
+    lba_delta = strict_counter_delta(
+        lbas, old_lbas, "metrics-json.flush_writer_meta_lbas"
+    )
+    return {
+        "classification": "proxy",
+        "is_actual_commit_completion": False,
+        "source": "metrics-json.flush_writer_meta_commits",
+        "lbas_source": "metrics-json.flush_writer_meta_lbas",
+        "interval_seconds": elapsed,
+        "completed_tx_absolute": commits,
+        "completed_tx_delta": commit_delta,
+        "completed_tx_rate_s": commit_delta / elapsed,
+        "lbas_absolute": lbas,
+        "lbas_delta": lba_delta,
+        "lbas_rate_s": lba_delta / elapsed,
+    }
+
+
+def authoritative_commit_summary(
+    status: dict[str, Any], previous: dict[str, Any], elapsed: float
+) -> dict[str, Any]:
+    current_meta = status.get("metadb_memory")
+    previous_meta = previous.get("metadb_memory")
+    current_available = (
+        isinstance(current_meta, dict) and "commit_success" in current_meta
+    )
+    previous_available = (
+        isinstance(previous_meta, dict) and "commit_success" in previous_meta
+    )
+    if current_available != previous_available:
+        raise RuntimeError(
+            "authoritative cumulative counter availability changed: "
+            "status-json.status.metadb_memory.commit_success"
+        )
+    if not current_available:
+        return {
+            "available": False,
+            "classification": "authoritative",
+            "is_actual_commit_completion": None,
+            "source": "status-json.status.metadb_memory.commit_success",
+            "interval_seconds": elapsed,
+        }
+    assert isinstance(current_meta, dict)
+    assert isinstance(previous_meta, dict)
+    completed = strict_split_counter(
+        current_meta,
+        "commit_success",
+        "status-json.status.metadb_memory.commit_success",
+    )
+    old_completed = strict_split_counter(
+        previous_meta,
+        "commit_success",
+        "status-json.status.metadb_memory.commit_success",
+    )
+    delta = strict_counter_delta(
+        completed,
+        old_completed,
+        "status-json.status.metadb_memory.commit_success",
+    )
+    return {
+        "available": True,
+        "classification": "authoritative",
+        "is_actual_commit_completion": True,
+        "source": "status-json.status.metadb_memory.commit_success",
+        "completed_tx_absolute": completed,
+        "completed_tx_delta": delta,
+        "completed_tx_rate_s": delta / elapsed,
+        "interval_seconds": elapsed,
+    }
+
+
+def scheduler_interval_summary(
+    current: dict[str, dict[str, int]],
+    previous: dict[str, dict[str, int]],
+    elapsed: float,
+) -> dict[str, dict[str, float | int]]:
+    result: dict[str, dict[str, float | int]] = {}
+    for role, row in current.items():
+        old = previous.get(role, {})
+        result[role] = {
+            "threads": row["threads"],
+            "cpu_pct": nonnegative(row["runtime_ns"], old.get("runtime_ns", 0))
+            / elapsed
+            / 1e7,
+            "runqueue_ms": nonnegative(
+                row["runqueue_ns"], old.get("runqueue_ns", 0)
+            )
+            / 1e6,
+            "switches": nonnegative(row["switches"], old.get("switches", 0)),
+        }
+    return result
+
+
+def status_pending_summary(
+    status: dict[str, Any], metadb: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "buffer_pending_entries": status.get("buffer_pending_entries"),
+        "logical_fill_pct": status.get("buffer_fill_pct"),
+        "physical_fill_pct": status.get("buffer_physical_fill_pct"),
+        "metadb": metadb.get("pending", {}) if metadb.get("available") else {},
+    }
+
+
+def emit_jsonl(value: dict[str, Any]) -> None:
+    print(
+        json.dumps(value, separators=(",", ":"), allow_nan=False),
+        flush=True,
+    )
+
+
+def run_metrics_stream(
+    path: pathlib.Path,
+    *,
+    count: int,
+    interval: float,
+    timeout: float,
+) -> None:
+    previous: tuple[float, float, dict[str, Any]] | None = None
+    sample = 0
+    while count == 0 or sample < count:
+        sample_started_monotonic = time.monotonic()
+        sample_started_epoch = time.time()
+        fetch = timed_command(path, "metrics-json", timeout)
+        sample_ended_epoch = time.time()
+        if previous is not None:
+            previous_fetch_end, previous_fetch_end_epoch, old_metrics = previous
+            counter_interval = counter_interval_summary(
+                previous_ended_monotonic=previous_fetch_end,
+                previous_ended_epoch=previous_fetch_end_epoch,
+                current_ended_monotonic=fetch.ended_monotonic,
+                current_ended_epoch=fetch.ended_epoch,
+            )
+            elapsed = counter_interval["elapsed_seconds"]
+            emit_jsonl(
+                {
+                    "schema": "onyx-foreground-latency-probe-metrics-v1",
+                    "stream": "metrics",
+                    "ts": sample_ended_epoch,
+                    "ts_monotonic": fetch.ended_monotonic,
+                    "elapsed": elapsed,
+                    "fetch_window": {
+                        "sample_started_epoch": sample_started_epoch,
+                        "metrics_started_epoch": fetch.started_epoch,
+                        "metrics_ended_epoch": fetch.ended_epoch,
+                        "metrics_duration_ms": (
+                            fetch.ended_monotonic - fetch.started_monotonic
+                        )
+                        * 1000,
+                        "sample_ended_epoch": sample_ended_epoch,
+                        "metrics_counter_elapsed_s": elapsed,
+                    },
+                    "counter_interval": counter_interval,
+                    "write_throttle": write_throttle_interval_summary(
+                        fetch.value, old_metrics, elapsed
+                    ),
+                    "writer_commit_proxy": writer_commit_proxy_summary(
+                        fetch.value, old_metrics, elapsed
+                    ),
+                }
+            )
+        previous = (fetch.ended_monotonic, fetch.ended_epoch, fetch.value)
+        sample += 1
+        time.sleep(
+            max(0.0, interval - (time.monotonic() - sample_started_monotonic))
+        )
+
+
+def run_status_stream(
+    path: pathlib.Path,
+    pid: int,
+    *,
+    count: int,
+    interval: float,
+    timeout: float,
+) -> None:
+    previous: tuple[
+        float,
+        float,
+        dict[str, Any],
+        dict[str, dict[str, int]],
+    ] | None = None
+    sample = 0
+    while count == 0 or sample < count:
+        sample_started_monotonic = time.monotonic()
+        sample_started_epoch = time.time()
+        fetch = timed_command(path, "status-json", timeout)
+        status = fetch.value.get("status", fetch.value)
+        sched = schedstat(pid)
+        sample_ended_epoch = time.time()
+        if previous is not None:
+            (
+                previous_fetch_end,
+                previous_fetch_end_epoch,
+                old_status,
+                old_sched,
+            ) = previous
+            counter_interval = counter_interval_summary(
+                previous_ended_monotonic=previous_fetch_end,
+                previous_ended_epoch=previous_fetch_end_epoch,
+                current_ended_monotonic=fetch.ended_monotonic,
+                current_ended_epoch=fetch.ended_epoch,
+            )
+            elapsed = counter_interval["elapsed_seconds"]
+            metadb = metadb_interval_summary(status, old_status, elapsed)
+            emit_jsonl(
+                {
+                    "schema": "onyx-foreground-latency-probe-status-v1",
+                    "stream": "status",
+                    "ts": sample_ended_epoch,
+                    "ts_monotonic": fetch.ended_monotonic,
+                    "elapsed": elapsed,
+                    "fetch_window": {
+                        "sample_started_epoch": sample_started_epoch,
+                        "status_started_epoch": fetch.started_epoch,
+                        "status_ended_epoch": fetch.ended_epoch,
+                        "status_duration_ms": (
+                            fetch.ended_monotonic - fetch.started_monotonic
+                        )
+                        * 1000,
+                        "sample_ended_epoch": sample_ended_epoch,
+                        "status_counter_elapsed_s": elapsed,
+                    },
+                    "counter_interval": counter_interval,
+                    "authoritative_metadb": metadb,
+                    "authoritative_commit": authoritative_commit_summary(
+                        status, old_status, elapsed
+                    ),
+                    "durability": durability_summary(status, old_status),
+                    "pending": status_pending_summary(status, metadb),
+                    "shards": shard_interval_summaries(status, old_status, elapsed),
+                    "scheduler": scheduler_interval_summary(
+                        sched, old_sched, elapsed
+                    ),
+                }
+            )
+        previous = (
+            fetch.ended_monotonic,
+            fetch.ended_epoch,
+            status,
+            sched,
+        )
+        sample += 1
+        time.sleep(
+            max(0.0, interval - (time.monotonic() - sample_started_monotonic))
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket-path", default="/tmp/onyx-storage-nvme.sock")
@@ -570,9 +990,31 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--count", type=int, default=0, help="0 means run until interrupted")
     parser.add_argument("--timeout", type=float, default=3.0)
+    parser.add_argument(
+        "--stream",
+        choices=("combined", "metrics", "status"),
+        default="combined",
+    )
     args = parser.parse_args()
-    pid = process_id(args.pid)
     path = pathlib.Path(args.socket_path)
+    if args.stream == "metrics":
+        run_metrics_stream(
+            path,
+            count=args.count,
+            interval=args.interval,
+            timeout=args.timeout,
+        )
+        return
+    pid = process_id(args.pid)
+    if args.stream == "status":
+        run_status_stream(
+            path,
+            pid,
+            count=args.count,
+            interval=args.interval,
+            timeout=args.timeout,
+        )
+        return
     previous: tuple[
         float,
         float,
