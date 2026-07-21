@@ -586,6 +586,28 @@ pub struct MetaConfig {
     #[serde(default = "default_rc_delta_run_shadow_enabled")]
     pub rc_delta_run_shadow_enabled: bool,
 
+    /// L3: make delta-run segments the DURABLE refcount representation between
+    /// condenses — the streaming BFG checkpoint appends a compact segment
+    /// instead of rewriting scattered base pages, and the base array is
+    /// condensed only every [`Self::rc_condense_interval_cycles`] cycles.
+    /// Requires `rc_checkpoint_streaming_enabled` + `bfg_threads_enabled`.
+    /// Default off (byte/behaviour-identical to the eager fold when off). ⚠ Do
+    /// not enable across restarts on the box until the metadb soak gate passes.
+    #[serde(default = "default_rc_delta_run_persist_enabled")]
+    pub rc_delta_run_persist_enabled: bool,
+
+    /// Condense interval K: fold a shard's accumulated segments back into the
+    /// base array once it has appended this many since the last condense. Only
+    /// consulted when [`Self::rc_delta_run_persist_enabled`] is on. Default 8.
+    #[serde(default = "default_rc_condense_interval_cycles")]
+    pub rc_condense_interval_cycles: u64,
+
+    /// Global cap on unique PBAs across every shard's segment overlay; a shard
+    /// force-condenses when its slice is exceeded. Only consulted when
+    /// [`Self::rc_delta_run_persist_enabled`] is on. Default 4_000_000.
+    #[serde(default = "default_rc_segment_overlay_max_entries")]
+    pub rc_segment_overlay_max_entries: usize,
+
     /// Fan the per-BFG L2P syncing-slot drain out across shards instead of
     /// folding them serially on the single `metadb-bfg-sync` thread (which
     /// was the drain bottleneck capping single-volume write throughput).
@@ -729,6 +751,9 @@ impl Default for MetaConfig {
             bfg_threads_enabled: default_bfg_threads_enabled(),
             rc_checkpoint_streaming_enabled: default_rc_checkpoint_streaming_enabled(),
             rc_delta_run_shadow_enabled: default_rc_delta_run_shadow_enabled(),
+            rc_delta_run_persist_enabled: default_rc_delta_run_persist_enabled(),
+            rc_condense_interval_cycles: default_rc_condense_interval_cycles(),
+            rc_segment_overlay_max_entries: default_rc_segment_overlay_max_entries(),
             parallel_l2p_drain_enabled: default_parallel_l2p_drain_enabled(),
             parallel_l2p_drain_workers: default_parallel_l2p_drain_workers(),
             l2p_drain_chunk_entries: default_l2p_drain_chunk_entries(),
@@ -852,6 +877,15 @@ fn default_rc_checkpoint_streaming_enabled() -> bool {
 }
 fn default_rc_delta_run_shadow_enabled() -> bool {
     false
+}
+fn default_rc_delta_run_persist_enabled() -> bool {
+    false
+}
+fn default_rc_condense_interval_cycles() -> u64 {
+    8
+}
+fn default_rc_segment_overlay_max_entries() -> usize {
+    4_000_000
 }
 fn default_parallel_l2p_drain_enabled() -> bool {
     // The bounded worker pool and per-shard NUMA binding remove the old

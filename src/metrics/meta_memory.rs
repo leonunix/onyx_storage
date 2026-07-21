@@ -423,6 +423,13 @@ pub struct MetaMemorySnapshot {
     pub flush_rc_delta_shadow_verify_us: u64,
     pub flush_rc_delta_shadow_verify_max_us: u64,
     pub flush_rc_delta_shadow_errors: u64,
+    /// v27 L3 durable delta-run segments (authoritative persist path).
+    pub flush_rc_segment_appends: u64,
+    pub flush_rc_segment_pages: u64,
+    pub flush_rc_segment_bytes: u64,
+    pub flush_rc_segment_dir_pages: u64,
+    pub flush_rc_segment_overlay_entries_max: u64,
+    pub flush_rc_segment_condenses: u64,
     pub rc_read_underflow_floored_total: u64,
     pub rc_mutation_underflow_clamped_total: u64,
     pub rc_staged_overlay_hits_total: u64,
