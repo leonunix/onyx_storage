@@ -906,7 +906,12 @@ fn default_l2p_drain_chunk_entries() -> usize {
     4096
 }
 fn default_l2p_checkpoint_pipeline_enabled() -> bool {
-    false
+    // Default ON. The serial successor-fold checkpoint worker is a box-measured
+    // FREE WIN on the aged/sustained-drain wall: median drain +136% (92->218
+    // MB/s), hard-stall seconds 42%->22%, write p999 4731ms->261ms (18x). It is
+    // a pure runtime worker toggle (no on-disk format gate, no fresh-pool
+    // requirement). See memory write_drain_22mbps_lv2_durability_roundtrip.
+    true
 }
 fn default_rc_authoritative_reclaim() -> bool {
     // Default OFF. Turning it on eliminates the reclaim
