@@ -130,6 +130,22 @@ rc_condense_interval_cycles = 8
 rc_segment_overlay_max_entries = 4000000
 
 [storage]
+# LV3 write-batcher coalesce window. 0 = compiled default (2 ms).
+#
+# Measured 2026-07-26 with the `lv3_batch` attribution (onyx 22b6170): under
+# the 2 ms default, 80-92 % of batches leave the aggregator on the TIMEOUT
+# carrying only 37-52 % of `lv3_batch_target_bytes`, and every request sits
+# through 1348-1519 us of that window. The window is not coalescing, it is
+# waiting.
+#
+# Steady-state A/B on this box (all four arms sampled only after the LV2 ring
+# pinned at ~100 % physical fill, so no arm is measured in its burst phase):
+#   coalesce_us = 0   ->  65.9 and 39.1 MB/s   (window 1348 / 1519 us per req)
+#   coalesce_us = 200 ->  81.9 and 92.3 MB/s   (window  218 /  200 us per req)
+# The two ranges do not overlap, but that is 2 samples per arm on a workload
+# whose fio full-run averages DO overlap. Left at the default until a wider
+# repeat; set 200 to reproduce the arm above.
+lv3_batch_coalesce_us = 0
 # data_device omitted: LV3 comes from the chunklet pool.
 block_size = 4096
 use_hugepages = false
