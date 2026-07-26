@@ -276,6 +276,36 @@ pub struct EngineMetrics {
     pub buffer_lv2_payload_profile_wall_max_ns: AtomicU64,
     pub buffer_lv2_payload_profile_cpu_max_ns: AtomicU64,
     pub buffer_lv2_payload_profile_offcpu_max_ns: AtomicU64,
+    /// Duty-cycle ledger for the three stages of the global LV2 sync pipeline
+    /// (`prepare_threads` shard preparers -> `lane_threads` write lanes -> one
+    /// durability coordinator). Each stage's wall clock is fully accounted:
+    ///
+    ///   prepare = idle + build + send_block
+    ///   lane    = idle + collect + opsbuild + write + send_block
+    ///   coord   = idle + ckpt_encode + ckpt_write + flush + publish
+    ///
+    /// `busy / (threads * interval)` is the stage's duty cycle; a residue in the
+    /// identities above means a segment is still unmeasured. The coordinator is
+    /// single-threaded, so its ratio is the one that can cap the pipeline.
+    pub buffer_lv2_prepare_threads: AtomicU64,
+    pub buffer_lv2_prepare_idle_ns: AtomicU64,
+    pub buffer_lv2_prepare_build_ns: AtomicU64,
+    pub buffer_lv2_prepare_send_block_ns: AtomicU64,
+    pub buffer_lv2_prepare_batches: AtomicU64,
+    pub buffer_lv2_lane_threads: AtomicU64,
+    pub buffer_lv2_lane_idle_ns: AtomicU64,
+    pub buffer_lv2_lane_collect_ns: AtomicU64,
+    pub buffer_lv2_lane_opsbuild_ns: AtomicU64,
+    pub buffer_lv2_lane_write_ns: AtomicU64,
+    pub buffer_lv2_lane_send_block_ns: AtomicU64,
+    pub buffer_lv2_lane_epochs: AtomicU64,
+    pub buffer_lv2_coord_idle_ns: AtomicU64,
+    pub buffer_lv2_coord_ckpt_encode_ns: AtomicU64,
+    pub buffer_lv2_coord_ckpt_write_ns: AtomicU64,
+    pub buffer_lv2_coord_flush_ns: AtomicU64,
+    pub buffer_lv2_coord_publish_ns: AtomicU64,
+    pub buffer_lv2_coord_busy_max_ns: AtomicU64,
+    pub buffer_lv2_coord_epochs: AtomicU64,
     pub buffer_backpressure_events: AtomicU64,
     pub buffer_backpressure_wait_ns: AtomicU64,
     /// Tier 1.B (ZFS-inspired) hyperbolic LV2 write throttle. `count` =
@@ -1021,6 +1051,35 @@ impl EngineMetrics {
 
     pub(crate) fn record_buffer_lv2_watermark_dispatch_ns(&self, ns: u64) {
         self.buffer_lv2_watermark_dispatch_latency.record(ns);
+    }
+
+    /// One completed coordinator epoch. `idle` is the time blocked waiting for
+    /// a written batch; the rest is the serial critical section that every
+    /// acknowledged append waits behind.
+    pub(crate) fn record_buffer_lv2_coord_epoch(
+        &self,
+        idle_ns: u64,
+        ckpt_encode_ns: u64,
+        ckpt_write_ns: u64,
+        flush_ns: u64,
+        publish_ns: u64,
+    ) {
+        self.buffer_lv2_coord_idle_ns
+            .fetch_add(idle_ns, Ordering::Relaxed);
+        self.buffer_lv2_coord_ckpt_encode_ns
+            .fetch_add(ckpt_encode_ns, Ordering::Relaxed);
+        self.buffer_lv2_coord_ckpt_write_ns
+            .fetch_add(ckpt_write_ns, Ordering::Relaxed);
+        self.buffer_lv2_coord_flush_ns
+            .fetch_add(flush_ns, Ordering::Relaxed);
+        self.buffer_lv2_coord_publish_ns
+            .fetch_add(publish_ns, Ordering::Relaxed);
+        self.buffer_lv2_coord_epochs.fetch_add(1, Ordering::Relaxed);
+        let busy = ckpt_encode_ns
+            .saturating_add(ckpt_write_ns)
+            .saturating_add(flush_ns)
+            .saturating_add(publish_ns);
+        record_counter_max(&self.buffer_lv2_coord_busy_max_ns, busy);
     }
 
     /// Get or create per-volume metrics counters.

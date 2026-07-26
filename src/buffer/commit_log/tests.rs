@@ -326,6 +326,79 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
 }
 
 #[test]
+fn global_sync_attributes_every_stage_of_the_durability_epoch() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 128 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let backend = Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0));
+    let pool = Arc::new(
+        WriteBufferPool::open_with_options_full_and_limits(
+            backend.clone(),
+            Duration::from_millis(10),
+            4,
+            1,
+            Duration::from_secs(1),
+            64 * 1024 * 1024,
+            None,
+            BufferRuntimeLimits::default(),
+        )
+        .unwrap(),
+    );
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+    let baseline = metrics.snapshot();
+
+    let start = Arc::new(std::sync::Barrier::new(33));
+    let mut writers = Vec::new();
+    for i in 0..32u64 {
+        let pool = pool.clone();
+        let start = start.clone();
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            pool.append("vol", Lba(i), 1, &[i as u8; BLOCK_SIZE as usize], 1)
+                .unwrap();
+        }));
+    }
+    start.wait();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    let stage = metrics.snapshot();
+    // Topology gauges drive the duty-cycle divisor, so a delta must carry them
+    // through instead of subtracting them to zero.
+    assert_eq!(stage.buffer_lv2_prepare_threads, 4);
+    assert_eq!(stage.buffer_lv2_lane_threads, 4);
+    let delta = stage.saturating_sub(&baseline);
+    assert_eq!(delta.buffer_lv2_prepare_threads, 4);
+    assert_eq!(delta.buffer_lv2_lane_threads, 4);
+
+    assert!(delta.buffer_lv2_prepare_batches >= 1);
+    assert!(delta.buffer_lv2_lane_epochs >= 1);
+    assert_eq!(delta.buffer_lv2_coord_epochs, delta.buffer_sync_flushes);
+    for (name, ns) in [
+        ("prepare_idle", delta.buffer_lv2_prepare_idle_ns),
+        ("prepare_build", delta.buffer_lv2_prepare_build_ns),
+        ("lane_idle", delta.buffer_lv2_lane_idle_ns),
+        ("lane_collect", delta.buffer_lv2_lane_collect_ns),
+        ("lane_write", delta.buffer_lv2_lane_write_ns),
+        ("coord_idle", delta.buffer_lv2_coord_idle_ns),
+        ("coord_ckpt_encode", delta.buffer_lv2_coord_ckpt_encode_ns),
+        ("coord_ckpt_write", delta.buffer_lv2_coord_ckpt_write_ns),
+        ("coord_flush", delta.buffer_lv2_coord_flush_ns),
+        ("coord_publish", delta.buffer_lv2_coord_publish_ns),
+    ] {
+        assert!(ns > 0, "LV2 stage segment {name} was never attributed");
+    }
+    // The coordinator's per-epoch peak cannot exceed its own busy total.
+    let coord_busy = delta.buffer_lv2_coord_ckpt_encode_ns
+        + delta.buffer_lv2_coord_ckpt_write_ns
+        + delta.buffer_lv2_coord_flush_ns
+        + delta.buffer_lv2_coord_publish_ns;
+    assert!(delta.buffer_lv2_coord_busy_max_ns <= coord_busy);
+}
+
+#[test]
 fn global_packed_checkpoint_failure_does_not_advance_durability() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 64 * 1024 * 1024;

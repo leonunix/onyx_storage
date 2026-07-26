@@ -114,6 +114,25 @@ impl EngineMetrics {
             buffer_lv2_payload_profile_offcpu_max_ns: load(
                 &self.buffer_lv2_payload_profile_offcpu_max_ns,
             ),
+            buffer_lv2_prepare_threads: load(&self.buffer_lv2_prepare_threads),
+            buffer_lv2_prepare_idle_ns: load(&self.buffer_lv2_prepare_idle_ns),
+            buffer_lv2_prepare_build_ns: load(&self.buffer_lv2_prepare_build_ns),
+            buffer_lv2_prepare_send_block_ns: load(&self.buffer_lv2_prepare_send_block_ns),
+            buffer_lv2_prepare_batches: load(&self.buffer_lv2_prepare_batches),
+            buffer_lv2_lane_threads: load(&self.buffer_lv2_lane_threads),
+            buffer_lv2_lane_idle_ns: load(&self.buffer_lv2_lane_idle_ns),
+            buffer_lv2_lane_collect_ns: load(&self.buffer_lv2_lane_collect_ns),
+            buffer_lv2_lane_opsbuild_ns: load(&self.buffer_lv2_lane_opsbuild_ns),
+            buffer_lv2_lane_write_ns: load(&self.buffer_lv2_lane_write_ns),
+            buffer_lv2_lane_send_block_ns: load(&self.buffer_lv2_lane_send_block_ns),
+            buffer_lv2_lane_epochs: load(&self.buffer_lv2_lane_epochs),
+            buffer_lv2_coord_idle_ns: load(&self.buffer_lv2_coord_idle_ns),
+            buffer_lv2_coord_ckpt_encode_ns: load(&self.buffer_lv2_coord_ckpt_encode_ns),
+            buffer_lv2_coord_ckpt_write_ns: load(&self.buffer_lv2_coord_ckpt_write_ns),
+            buffer_lv2_coord_flush_ns: load(&self.buffer_lv2_coord_flush_ns),
+            buffer_lv2_coord_publish_ns: load(&self.buffer_lv2_coord_publish_ns),
+            buffer_lv2_coord_busy_max_ns: load(&self.buffer_lv2_coord_busy_max_ns),
+            buffer_lv2_coord_epochs: load(&self.buffer_lv2_coord_epochs),
             buffer_backpressure_events: load(&self.buffer_backpressure_events),
             buffer_backpressure_wait_ns: load(&self.buffer_backpressure_wait_ns),
             buffer_throttle_count: load(&self.buffer_throttle_count),
@@ -567,6 +586,44 @@ pub struct EngineMetricsSnapshot {
     pub buffer_lv2_payload_profile_cpu_max_ns: u64,
     #[serde(default)]
     pub buffer_lv2_payload_profile_offcpu_max_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_prepare_threads: u64,
+    #[serde(default)]
+    pub buffer_lv2_prepare_idle_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_prepare_build_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_prepare_send_block_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_prepare_batches: u64,
+    #[serde(default)]
+    pub buffer_lv2_lane_threads: u64,
+    #[serde(default)]
+    pub buffer_lv2_lane_idle_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_lane_collect_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_lane_opsbuild_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_lane_write_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_lane_send_block_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_lane_epochs: u64,
+    #[serde(default)]
+    pub buffer_lv2_coord_idle_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_coord_ckpt_encode_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_coord_ckpt_write_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_coord_flush_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_coord_publish_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_coord_busy_max_ns: u64,
+    #[serde(default)]
+    pub buffer_lv2_coord_epochs: u64,
     pub buffer_backpressure_events: u64,
     pub buffer_backpressure_wait_ns: u64,
     pub buffer_throttle_count: u64,
@@ -937,6 +994,11 @@ impl EngineMetricsSnapshot {
                     $(
                     $field: self.$field.saturating_sub(earlier.$field),
                     )+
+                    // Static topology gauges: the LV2 stage duty cycles are
+                    // computed against them, so a delta must carry them through
+                    // rather than subtract them to zero.
+                    buffer_lv2_prepare_threads: self.buffer_lv2_prepare_threads,
+                    buffer_lv2_lane_threads: self.buffer_lv2_lane_threads,
                     flush_qos_mode: self.flush_qos_mode,
                     flush_qos_rate_bytes_per_sec: self.flush_qos_rate_bytes_per_sec,
                     flush_qos_foreground_bytes_per_sec: self.flush_qos_foreground_bytes_per_sec,
@@ -1061,6 +1123,24 @@ impl EngineMetricsSnapshot {
             buffer_lv2_payload_profile_wall_max_ns,
             buffer_lv2_payload_profile_cpu_max_ns,
             buffer_lv2_payload_profile_offcpu_max_ns,
+            // buffer_lv2_{prepare,lane}_threads are topology gauges preserved above.
+            buffer_lv2_prepare_idle_ns,
+            buffer_lv2_prepare_build_ns,
+            buffer_lv2_prepare_send_block_ns,
+            buffer_lv2_prepare_batches,
+            buffer_lv2_lane_idle_ns,
+            buffer_lv2_lane_collect_ns,
+            buffer_lv2_lane_opsbuild_ns,
+            buffer_lv2_lane_write_ns,
+            buffer_lv2_lane_send_block_ns,
+            buffer_lv2_lane_epochs,
+            buffer_lv2_coord_idle_ns,
+            buffer_lv2_coord_ckpt_encode_ns,
+            buffer_lv2_coord_ckpt_write_ns,
+            buffer_lv2_coord_flush_ns,
+            buffer_lv2_coord_publish_ns,
+            buffer_lv2_coord_busy_max_ns,
+            buffer_lv2_coord_epochs,
             buffer_backpressure_events,
             buffer_backpressure_wait_ns,
             buffer_throttle_count,

@@ -1059,7 +1059,15 @@ impl WriteBufferPool {
                     );
                     loop {
                         if shard.staging_rx.is_empty() {
-                            match wake_rx.recv_timeout(Duration::from_millis(50)) {
+                            let idle_started = Instant::now();
+                            let woken = wake_rx.recv_timeout(Duration::from_millis(50));
+                            if let Some(metrics) = metrics.get() {
+                                metrics.buffer_lv2_prepare_idle_ns.fetch_add(
+                                    idle_started.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            match woken {
                                 Ok(()) => {}
                                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
                                     if shutdown.load(Ordering::Relaxed)
@@ -1115,17 +1123,32 @@ impl WriteBufferPool {
                         let max_seq = all.iter().map(|entry| entry.pending.seq).max().unwrap_or(0);
                         let mut checkpoint = shard.snapshot_checkpoint();
                         checkpoint.max_seq = max_seq;
-                        if tx
-                            .send(PreparedBatch {
-                                member_idx,
-                                all,
-                                spans,
-                                checkpoint,
-                                started,
-                                prepared_at: Instant::now(),
-                            })
-                            .is_err()
-                        {
+                        // `built_at` closes the build segment and opens the send
+                        // segment: a full lane queue blocks here, which is the
+                        // signal that the write lanes are the constraint.
+                        let built_at = Instant::now();
+                        let sent = tx.send(PreparedBatch {
+                            member_idx,
+                            all,
+                            spans,
+                            checkpoint,
+                            started,
+                            prepared_at: built_at,
+                        });
+                        if let Some(metrics) = metrics.get() {
+                            metrics.buffer_lv2_prepare_build_ns.fetch_add(
+                                built_at.saturating_duration_since(started).as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                            metrics.buffer_lv2_prepare_send_block_ns.fetch_add(
+                                built_at.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                            metrics
+                                .buffer_lv2_prepare_batches
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if sent.is_err() {
                             return;
                         }
                         if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
@@ -1146,7 +1169,17 @@ impl WriteBufferPool {
                         lane_idx,
                     );
                     let mut payload_profile_sequence = 0u64;
-                    while let Ok(first) = lane_rx.recv() {
+                    loop {
+                        let idle_started = Instant::now();
+                        let Ok(first) = lane_rx.recv() else {
+                            return;
+                        };
+                        if let Some(metrics) = metrics.get() {
+                            metrics.buffer_lv2_lane_idle_ns.fetch_add(
+                                idle_started.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                         if let Some(metrics) = metrics.get() {
                             metrics.record_buffer_lv2_prepared_queue_ns(
                                 first.prepared_at.elapsed().as_nanos() as u64,
@@ -1190,13 +1223,16 @@ impl WriteBufferPool {
                             prepared.push(batch);
                         }
                         if let Some(metrics) = metrics.get() {
-                            metrics.record_buffer_lv2_group_collect_ns(
-                                collect_started.elapsed().as_nanos() as u64,
-                            );
+                            let collect_ns = collect_started.elapsed().as_nanos() as u64;
+                            metrics.record_buffer_lv2_group_collect_ns(collect_ns);
+                            metrics
+                                .buffer_lv2_lane_collect_ns
+                                .fetch_add(collect_ns, Ordering::Relaxed);
                         }
 
                         let mut consecutive_failures = 0u32;
                         loop {
+                            let opsbuild_started = Instant::now();
                             let mut ops = Vec::new();
                             for batch in &prepared {
                                 let shard_base = member_bases[batch.member_idx];
@@ -1208,6 +1244,14 @@ impl WriteBufferPool {
                                 }));
                             }
                             let write_started = Instant::now();
+                            if let Some(metrics) = metrics.get() {
+                                metrics.buffer_lv2_lane_opsbuild_ns.fetch_add(
+                                    write_started
+                                        .saturating_duration_since(opsbuild_started)
+                                        .as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                             let profile_this_write =
                                 should_sample_lv2_payload_write(&mut payload_profile_sequence);
                             let cpu_started = profile_this_write.then(thread_cpu_time).flatten();
@@ -1230,6 +1274,13 @@ impl WriteBufferPool {
                                         );
                                         metrics.record_buffer_lv2_payload_write_ns(
                                             write_elapsed.as_nanos() as u64,
+                                        );
+                                        // Failed attempts and their retry backoff
+                                        // are excluded; both are zero on a healthy
+                                        // device, so the lane ledger still closes.
+                                        metrics.buffer_lv2_lane_write_ns.fetch_add(
+                                            write_elapsed.as_nanos() as u64,
+                                            Ordering::Relaxed,
                                         );
                                         if let Some(cpu_elapsed) = cpu_started.and_then(|started| {
                                             thread_cpu_time().map(|now| now.saturating_sub(started))
@@ -1273,7 +1324,20 @@ impl WriteBufferPool {
                                 }
                             })
                             .collect();
-                        if written_tx.send(written).is_err() {
+                        // A full `written` queue means the single durability
+                        // coordinator is the constraint, not this lane.
+                        let send_started = Instant::now();
+                        let sent = written_tx.send(written);
+                        if let Some(metrics) = metrics.get() {
+                            metrics.buffer_lv2_lane_send_block_ns.fetch_add(
+                                send_started.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                            metrics
+                                .buffer_lv2_lane_epochs
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if sent.is_err() {
                             return;
                         }
                     }
@@ -1282,7 +1346,24 @@ impl WriteBufferPool {
             drop(written_tx);
 
             let mut consecutive_failures = 0u32;
-            while let Ok(mut batches) = written_rx.recv() {
+            loop {
+                // Everything from here to `publish` is serial and single
+                // threaded: every acknowledged append waits behind it, so
+                // `1 - idle/interval` is the ceiling this stage can sustain.
+                let idle_started = Instant::now();
+                let Ok(mut batches) = written_rx.recv() else {
+                    break;
+                };
+                let recv_at = Instant::now();
+                let idle_ns = recv_at.saturating_duration_since(idle_started).as_nanos() as u64;
+                if let Some(metrics) = metrics.get() {
+                    metrics
+                        .buffer_lv2_prepare_threads
+                        .store(members.len() as u64, Ordering::Relaxed);
+                    metrics
+                        .buffer_lv2_lane_threads
+                        .store(write_lane_count as u64, Ordering::Relaxed);
+                }
                 // A lane already formed the complete durability epoch for its
                 // root write. Drain any sibling epochs that finished in the
                 // meantime, then publish the shared barrier immediately.
@@ -1331,6 +1412,12 @@ impl WriteBufferPool {
                 } else {
                     None
                 };
+                // Covers everything between the first written batch arriving and
+                // the checkpoint page write: the sibling-epoch drain, the packed
+                // checkpoint mutex, `begin_next`, and `encode_pending`.
+                let ckpt_encode_ns = recv_at.elapsed().as_nanos() as u64;
+                let mut ckpt_write_ns = 0u64;
+                let mut flush_ns = 0u64;
 
                 loop {
                     let checkpoint_started = Instant::now();
@@ -1347,6 +1434,8 @@ impl WriteBufferPool {
                         None => Ok(()),
                     };
                     let checkpoint_elapsed = checkpoint_started.elapsed();
+                    ckpt_write_ns =
+                        ckpt_write_ns.saturating_add(checkpoint_elapsed.as_nanos() as u64);
                     if let Err(err) = checkpoint_result {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         tracing::warn!(
@@ -1377,6 +1466,7 @@ impl WriteBufferPool {
                     let flush_started = Instant::now();
                     let result = Self::sync_device_impl(root_device.as_ref());
                     let flush_elapsed = flush_started.elapsed();
+                    flush_ns = flush_ns.saturating_add(flush_elapsed.as_nanos() as u64);
                     match result {
                         Ok(()) => {
                             consecutive_failures = 0;
@@ -1418,6 +1508,9 @@ impl WriteBufferPool {
                     }
                 }
 
+                // Per-entry watermark advance and ready-publish, still on the
+                // single coordinator thread and still ahead of the next epoch.
+                let publish_started = Instant::now();
                 for batch in batches {
                     let shard = &members[batch.member_idx].1;
                     let pendings: Vec<Arc<PendingEntry>> = batch
@@ -1473,6 +1566,15 @@ impl WriteBufferPool {
                             .fetch_add(entries, Ordering::Relaxed);
                         BufferShard::record_metric(&metrics.buffer_sync_batch_ns, batch.started);
                     }
+                }
+                if let Some(metrics) = metrics.get() {
+                    metrics.record_buffer_lv2_coord_epoch(
+                        idle_ns,
+                        ckpt_encode_ns,
+                        ckpt_write_ns,
+                        flush_ns,
+                        publish_started.elapsed().as_nanos() as u64,
+                    );
                 }
             }
         });

@@ -1134,6 +1134,41 @@ impl EngineStatusSnapshot {
             self.metrics.buffer_sync_entries_max,
             self.metrics.buffer_sync_bytes_max
         );
+        // Duty-cycle ledger of the global LV2 sync pipeline. Each stage's wall
+        // clock is fully accounted, so `busy / (threads * interval)` says which
+        // of the three stages is the serialization point behind
+        // `append_wait_durable`. The coordinator runs on ONE thread.
+        let _ = writeln!(
+            out,
+            "lv2_prepare: threads={} idle={} build={} send_block={} batches={}",
+            self.metrics.buffer_lv2_prepare_threads,
+            self.metrics.buffer_lv2_prepare_idle_ns,
+            self.metrics.buffer_lv2_prepare_build_ns,
+            self.metrics.buffer_lv2_prepare_send_block_ns,
+            self.metrics.buffer_lv2_prepare_batches
+        );
+        let _ = writeln!(
+            out,
+            "lv2_lane: threads={} idle={} collect={} opsbuild={} write={} send_block={} epochs={}",
+            self.metrics.buffer_lv2_lane_threads,
+            self.metrics.buffer_lv2_lane_idle_ns,
+            self.metrics.buffer_lv2_lane_collect_ns,
+            self.metrics.buffer_lv2_lane_opsbuild_ns,
+            self.metrics.buffer_lv2_lane_write_ns,
+            self.metrics.buffer_lv2_lane_send_block_ns,
+            self.metrics.buffer_lv2_lane_epochs
+        );
+        let _ = writeln!(
+            out,
+            "lv2_coord: idle={} ckpt_encode={} ckpt_write={} flush={} publish={} busy_max={} epochs={}",
+            self.metrics.buffer_lv2_coord_idle_ns,
+            self.metrics.buffer_lv2_coord_ckpt_encode_ns,
+            self.metrics.buffer_lv2_coord_ckpt_write_ns,
+            self.metrics.buffer_lv2_coord_flush_ns,
+            self.metrics.buffer_lv2_coord_publish_ns,
+            self.metrics.buffer_lv2_coord_busy_max_ns,
+            self.metrics.buffer_lv2_coord_epochs
+        );
         let _ = writeln!(
             out,
             "zone: write_dispatches={} write_splits={} write_lbas={} read_dispatches={}",
