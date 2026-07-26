@@ -369,6 +369,16 @@ impl WriteBufferPool {
             shard
                 .shard
                 .prepare_append(vol_id, start_lba, lba_count, payload, vol_created_at)?;
+        // Ring backpressure is not an ordering constraint: `reserve_append`
+        // below allocates the seq under the stripe locks, which is what keeps
+        // same-LBA appends ordered, and space availability has nothing to do
+        // with the LBAs this append covers. Waiting for it here means a full
+        // ring blocks this appender alone instead of every appender whose LBAs
+        // hash to the same stripes. The wait inside `reserve_append` stays as
+        // the authority on capacity, timeout, and shutdown.
+        if self.prewait_ring_space {
+            shard.shard.wait_for_ring_space(prepared.slot_count);
+        }
         let append_order = self.lock_append_order(vol_id, start_lba, lba_count);
         // The fence may trip while this producer was throttled or queued behind
         // another append. Do not enter LV2 after fail-stop has been published.

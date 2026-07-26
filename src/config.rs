@@ -1499,6 +1499,16 @@ pub struct BufferConfig {
     /// existing depth of one slot per buffer shard.
     #[serde(default)]
     pub lv2_prepared_queue_depth_per_lane: usize,
+    /// Drain LV2 ring backpressure BEFORE taking the append-order stripe
+    /// locks, so a full ring blocks one appender instead of convoying everyone
+    /// who collides with its LBAs.
+    ///
+    /// Measured 2026-07-26, randrw 70/30 on an aged full volume: `order_hold`
+    /// 30.0 ms was within 0.1 ms of `backpressure_wait` 29.9 ms — the stripe
+    /// locks were held for the entire space wait — and the resulting
+    /// `order_wait` was 20.8 ms of a 67 ms append. Default off pending an A/B.
+    #[serde(default)]
+    pub prewait_ring_space_outside_order: bool,
     /// Tier 1.B (ZFS-inspired) hyperbolic write throttle: LV2 fill percentage
     /// at which the throttle starts paying per-append delay. 0 disables the
     /// throttle entirely (the existing condvar-based hard backpressure at
@@ -1553,6 +1563,7 @@ impl Default for BufferConfig {
             sync_batch_max_entries: 0,
             sync_batch_max_bytes_mb: 0,
             lv2_prepared_queue_depth_per_lane: 0,
+            prewait_ring_space_outside_order: false,
             throttle_min_pct: 0,
             throttle_max_pct: 0,
             throttle_scale_us: 0,

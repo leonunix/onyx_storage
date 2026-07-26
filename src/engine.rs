@@ -515,7 +515,8 @@ impl OnyxEngine {
             scale_us: config.buffer.throttle_scale_us,
             cap_us: config.buffer.throttle_cap_us,
         })
-        .with_backend_debt_throttle(config.buffer.throttle_backend_debt);
+        .with_backend_debt_throttle(config.buffer.throttle_backend_debt)
+        .with_prewait_ring_space(config.buffer.prewait_ring_space_outside_order);
 
         // Resolve the LV2 backend + whether onyx drives its own device-level
         // io_uring. A chunklet LD owns its cross-PD io_uring internally, so the

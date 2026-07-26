@@ -145,6 +145,12 @@ read_pool_workers = 32
 raid_full_stripe_writes = true
 
 [buffer]
+# A/B knob (default off in code): drain LV2 ring backpressure BEFORE taking the
+# append-order stripes. Measured 2026-07-26 randrw 70/30 on the aged full
+# volume: order_hold 30.0 ms == backpressure_wait 29.9 ms, i.e. the stripes were
+# held for the whole space wait, and the induced order_wait was 20.8 ms of a
+# 67 ms append. Flip to true only for an A/B arm until it is proven.
+prewait_ring_space_outside_order = false
 # device omitted: LV2 comes from the chunklet pool. capacity_mb is ignored in
 # the chunklet path (the ring sizes from the LD capacity).
 capacity_mb = 32768

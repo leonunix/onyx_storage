@@ -398,6 +398,86 @@ fn global_sync_attributes_every_stage_of_the_durability_epoch() {
     assert!(delta.buffer_lv2_coord_busy_max_ns <= coord_busy);
 }
 
+/// The pre-wait is a hint. `reserve_append` stays the authority on every
+/// terminal condition, so a ring that can never fit the entry must still fail
+/// with `BufferPoolFull` rather than block or succeed.
+#[test]
+fn prewait_ring_space_preserves_pool_full_semantics() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 2 * 8192 + 4096;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        1,
+        1,
+        Duration::from_millis(50),
+        64 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default().with_prewait_ring_space(true),
+    )
+    .unwrap();
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+
+    for _ in 0..2 {
+        pool.append("test-vol", Lba(0), 1, &vec![0; 4096], 0).unwrap();
+    }
+    let result = pool.append("test-vol", Lba(0), 1, &vec![0; 4096], 0);
+    assert!(
+        matches!(result, Err(OnyxError::BufferPoolFull(_))),
+        "pre-wait must not swallow the terminal capacity decision"
+    );
+    // The wait moved out of the append-order critical section, but it must
+    // still be charged to the same bucket — an A/B on this knob compares
+    // `order_wait` against a `backpressure_wait` that has not changed meaning.
+    let snapshot = metrics.snapshot();
+    assert!(
+        snapshot.buffer_backpressure_wait_ns > 0,
+        "pre-wait time must still land in buffer_backpressure_wait_ns"
+    );
+    assert!(snapshot.buffer_backpressure_events > 0);
+}
+
+/// With space available the pre-wait is a lock acquire and a bounds check: it
+/// must not park, and appends must behave exactly as with the knob off.
+#[test]
+fn prewait_ring_space_is_transparent_when_space_is_available() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        4,
+        1,
+        Duration::from_secs(1),
+        64 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default().with_prewait_ring_space(true),
+    )
+    .unwrap();
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+
+    for i in 0..64u64 {
+        pool.append("vol", Lba(i), 1, &[i as u8; BLOCK_SIZE as usize], 1)
+            .unwrap();
+    }
+    for i in 0..64u64 {
+        assert_eq!(
+            pool.lookup("vol", Lba(i)).unwrap().unwrap().payload.unwrap()[0],
+            i as u8
+        );
+    }
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.buffer_backpressure_events, 0,
+        "an unfull ring must never register a backpressure event"
+    );
+    assert_eq!(snapshot.buffer_backpressure_wait_ns, 0);
+}
+
 #[test]
 fn global_packed_checkpoint_failure_does_not_advance_durability() {
     let tmp = NamedTempFile::new().unwrap();

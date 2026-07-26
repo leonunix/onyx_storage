@@ -87,6 +87,8 @@ pub struct BufferRuntimeLimits {
     pub lv2_prepared_queue_depth_per_lane: usize,
     pub throttle: ThrottleSettings,
     pub throttle_backend_debt: bool,
+    /// Drain ring backpressure before taking the append-order stripes.
+    pub prewait_ring_space_outside_order: bool,
     /// Resolved ZFS-style adaptive commit-window percent for the LV2 sync
     /// pipeline (>= 1). See `LV2_COMMIT_TIMEOUT_PCT`.
     pub lv2_commit_timeout_pct: u64,
@@ -219,6 +221,7 @@ impl BufferRuntimeLimits {
             lv2_prepared_queue_depth_per_lane,
             throttle: defaults.throttle,
             throttle_backend_debt: defaults.throttle_backend_debt,
+            prewait_ring_space_outside_order: defaults.prewait_ring_space_outside_order,
             lv2_commit_timeout_pct: if lv2_commit_timeout_pct == 0 {
                 defaults.lv2_commit_timeout_pct
             } else {
@@ -241,6 +244,11 @@ impl BufferRuntimeLimits {
         self.throttle_backend_debt = enabled;
         self
     }
+
+    pub fn with_prewait_ring_space(mut self, enabled: bool) -> Self {
+        self.prewait_ring_space_outside_order = enabled;
+        self
+    }
 }
 
 impl Default for BufferRuntimeLimits {
@@ -252,6 +260,7 @@ impl Default for BufferRuntimeLimits {
             lv2_prepared_queue_depth_per_lane: 0,
             throttle: ThrottleSettings::default(),
             throttle_backend_debt: false,
+            prewait_ring_space_outside_order: false,
             lv2_commit_timeout_pct: LV2_COMMIT_TIMEOUT_PCT,
             lv2_sync_pipeline_depth: LV2_SYNC_PIPELINE_DEPTH,
         }
@@ -1111,6 +1120,8 @@ pub struct WriteBufferPool {
     /// are headed to rings with available space.
     throttle_states: Vec<ShardThrottleState>,
     backend_debt_throttle_enabled: bool,
+    /// Wait out LV2 ring backpressure before locking append-order stripes.
+    prewait_ring_space: bool,
     /// Hysteresis for the device-wide commit-executor debt signal. Wakeup
     /// pacing remains per shard; only the advisory pressure state is global.
     backend_throttle_control: BackendThrottleControl,

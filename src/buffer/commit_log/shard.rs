@@ -737,6 +737,55 @@ impl BufferShard {
     /// the ring mutex. The seq is allocated only after space is known to be
     /// available, so condvar waits cannot let a later seq occupy an earlier
     /// physical position.
+    /// Wait for ring space WITHOUT reserving it, holding no append-order
+    /// stripe.
+    ///
+    /// `reserve_append` below parks on the same condvar, but its caller has
+    /// already taken every LBA stripe this append covers, so a full ring turns
+    /// one blocked appender into a convoy: measured 2026-07-26 under randrw
+    /// 70/30, `order_hold` 30.0 ms was within 0.1 ms of `backpressure_wait`
+    /// 29.9 ms, and everyone colliding on those stripes paid `order_wait`
+    /// 20.8 ms behind it. Draining that wait here leaves the stripes free.
+    ///
+    /// This is a hint, not a reservation: the space can be taken by another
+    /// appender before this one reaches `reserve_append`, which then blocks as
+    /// it always did. Every terminal condition (capacity, timeout, shutdown)
+    /// is therefore left to `reserve_append` — this returns unconditionally.
+    pub(super) fn wait_for_ring_space(&self, slot_count: u32) {
+        let mut ring = self.ring.lock();
+        if Self::log_space_offset(&ring, slot_count).is_some() {
+            return;
+        }
+        if Self::slot_bytes(slot_count) > ring.capacity_bytes || self.backpressure_timeout.is_zero()
+        {
+            return; // reserve_append turns both into BufferPoolFull.
+        }
+        let wait_start = Instant::now();
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .buffer_backpressure_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // Bounded budget, never `backpressure_timeout` itself: that can be
+        // `Duration::MAX` (wait-forever mode), and the terminal decision must
+        // stay in `reserve_append` regardless. Overshooting the budget only
+        // means the appender finishes waiting under the stripe locks as before.
+        const PREWAIT_BUDGET: Duration = Duration::from_secs(2);
+        let deadline = Instant::now() + self.backpressure_timeout.min(PREWAIT_BUDGET);
+        while Self::log_space_offset(&ring, slot_count).is_none() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let slice = (deadline - now).min(BACKPRESSURE_POLL_INTERVAL);
+            let _ = self.ring_space_cv.wait_for(&mut ring, slice);
+        }
+        drop(ring);
+        // Same bucket as the in-lock wait: an A/B on this path should move the
+        // wait between `order_wait` and here, not make it disappear.
+        self.record_reserve_wait(Some(wait_start));
+    }
+
     pub(super) fn reserve_append<'a>(
         &self,
         next_seq: &AtomicU64,
