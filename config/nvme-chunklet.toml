@@ -175,6 +175,12 @@ coalesce_max_lbas = 6
 min_compression_savings_pct = 12
 skip_fully_superseded = true
 packed_meta_batch_max_lbas = 1024
+# Flush QoS OFF. The 100 ms default arms a foreground admission ladder that
+# measured as a net negative on this box: A/B over interleaved arms gave
+# OFF 233/233 MiB/s with p99 22.5 ms, ON 198 or 63.9 MiB/s with the collapsed
+# arm never recovering (p99.9 4.5 s). Mean throughput was +78 % with it off and
+# the latency was better too, so this is not a throughput-vs-latency trade.
+foreground_flush_target_p99_ms = 0
 
 [engine]
 zone_count = 64
