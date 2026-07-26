@@ -254,6 +254,53 @@ fn chunklet_owned_batch_writes_aligned_buffers_without_repacking() {
     assert_eq!(metrics.lv3_write_slab_bytes.load(Ordering::Relaxed), 12288);
 }
 
+/// A small batch cannot reach `target_bytes`, so it must leave the aggregator
+/// on the coalesce timeout — and the producer's blocked wait must be split
+/// across pickup / window / exec_queue rather than all landing on device time.
+#[test]
+fn lv3_batch_attributes_the_producer_wait_and_flags_a_timeout_dispatch() {
+    let backend = Arc::new(BatchMock {
+        write_many_calls: std::sync::atomic::AtomicUsize::new(0),
+        write_many_ops: std::sync::atomic::AtomicUsize::new(0),
+        write_many_max_ops: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metrics = Arc::new(EngineMetrics::default());
+    let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
+    let mut writes = Vec::new();
+    for idx in 0..3 {
+        let mut buffer = engine.allocate_owned_write_buffer(4096).unwrap();
+        buffer.as_mut_slice().fill((idx + 1) as u8);
+        writes.push(OwnedLvWrite {
+            pba: Pba(idx),
+            payload_len: 4096,
+            buffer,
+        });
+    }
+    engine
+        .submit_owned_write_batch_on(None, writes, false)
+        .unwrap();
+
+    assert_eq!(metrics.lv3_batch_wait_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.lv3_batch_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        metrics.lv3_batch_bytes_at_dispatch.load(Ordering::Relaxed),
+        3 * 4096
+    );
+    // 12 KiB is far below the 4 MiB target, so the aggregator can only have
+    // dispatched on the coalesce timeout.
+    assert_eq!(metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.lv3_batch_target_hits.load(Ordering::Relaxed), 0);
+    // The window this request sat through is the cost being hunted; it must be
+    // both non-zero and a real share of the producer's blocked wait.
+    let window = metrics.lv3_batch_window_ns.load(Ordering::Relaxed);
+    let wait = metrics.lv3_batch_wait_ns.load(Ordering::Relaxed);
+    assert!(window > 0, "coalesce window must be attributed");
+    assert!(
+        wait >= window,
+        "producer wait {wait} must cover the coalesce window {window}"
+    );
+}
+
 #[test]
 fn chunklet_owned_batch_splits_oversized_request_across_executors() {
     const WRITE_COUNT: u64 = CHUNKLET_BATCH_TARGET_BYTES as u64 / BLOCK_SIZE as u64 + 1;

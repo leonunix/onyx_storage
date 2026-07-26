@@ -507,6 +507,25 @@ pub struct EngineMetrics {
     pub flush_writer_submit_io_ns: AtomicU64,
     pub flush_writer_submit_rollback_ns: AtomicU64,
     pub flush_writer_submit_padding_ns: AtomicU64,
+    /// Split of the LV3 write batcher, which owns ~70 % of the flush writer's
+    /// `submit` call without being device time. A producer's blocked wait is
+    /// `pickup` (queued behind the single aggregator) + `window` (the coalesce
+    /// wait it then sat through) + `exec_queue` (waiting for one of the fixed
+    /// executors) + the device write + the return trip.
+    ///
+    /// `window_timeouts` vs `target_hits` is the load-bearing ratio: a batch
+    /// that leaves on the timeout carrying far less than `target_bytes` paid
+    /// the whole coalesce window for nothing.
+    pub lv3_batch_enqueue_ns: AtomicU64,
+    pub lv3_batch_wait_ns: AtomicU64,
+    pub lv3_batch_wait_calls: AtomicU64,
+    pub lv3_batch_pickup_ns: AtomicU64,
+    pub lv3_batch_window_ns: AtomicU64,
+    pub lv3_batch_exec_queue_ns: AtomicU64,
+    pub lv3_batch_requests: AtomicU64,
+    pub lv3_batch_bytes_at_dispatch: AtomicU64,
+    pub lv3_batch_window_timeouts: AtomicU64,
+    pub lv3_batch_target_hits: AtomicU64,
     pub flush_writer_meta_ns: AtomicU64,
     pub flush_writer_meta_build_ns: AtomicU64,
     pub flush_writer_meta_commit_ns: AtomicU64,

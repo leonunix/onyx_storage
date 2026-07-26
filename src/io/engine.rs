@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -82,10 +82,17 @@ struct ChunkletBatchRequest {
     slabs: Vec<AlignedBuf>,
     ops: Vec<OwnedBatchOp>,
     done: Sender<(Result<(), String>, Vec<AlignedBuf>)>,
+    /// Stamped by the producer before `request_tx.send`. Splits the caller's
+    /// blocked time into queueing for the aggregator, sitting in the coalesce
+    /// window, queueing for an executor, and the device write itself.
+    queued_at: Instant,
+    /// Stamped by the aggregator when it takes this request off `request_rx`.
+    picked_at: Option<Instant>,
 }
 
 struct ChunkletBatchWork {
     requests: Vec<ChunkletBatchRequest>,
+    dispatched_at: Instant,
 }
 
 /// Cross-lane combiner for chunklet writes. Buffer lanes keep preparing data
@@ -104,9 +111,10 @@ impl ChunkletWriteBatcher {
         let (request_tx, request_rx) = bounded(CHUNKLET_BATCH_QUEUE_CAP);
         let (work_tx, work_rx) = bounded(CHUNKLET_BATCH_EXECUTORS * 2);
 
+        let aggregate_metrics = metrics.clone();
         let aggregate_handle = std::thread::Builder::new()
             .name("lv3-batch-aggregate".into())
-            .spawn(move || Self::aggregate_loop(request_rx, work_tx))
+            .spawn(move || Self::aggregate_loop(request_rx, work_tx, aggregate_metrics))
             .expect("failed to spawn LV3 batch aggregator");
 
         let mut executor_handles = Vec::with_capacity(CHUNKLET_BATCH_EXECUTORS);
@@ -146,6 +154,8 @@ impl ChunkletWriteBatcher {
                 slabs,
                 ops,
                 done: done_tx,
+                queued_at: Instant::now(),
+                picked_at: None,
             })
             .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batcher disconnected")))?;
         let (result, slabs) = done_rx
@@ -161,12 +171,17 @@ impl ChunkletWriteBatcher {
     fn submit_many(
         &self,
         requests: Vec<(Vec<AlignedBuf>, Vec<OwnedBatchOp>)>,
+        metrics: Option<&Arc<EngineMetrics>>,
     ) -> OnyxResult<Vec<Vec<AlignedBuf>>> {
         let request_tx = self
             .request_tx
             .as_ref()
             .ok_or_else(|| OnyxError::Io(std::io::Error::other("LV3 batcher stopped")))?;
         let mut receivers = Vec::with_capacity(requests.len());
+        // Enqueue is separate from the wait below: a full `request_tx` means
+        // the single aggregator is the constraint, and that blocking would
+        // otherwise be indistinguishable from device time.
+        let enqueue_started = Instant::now();
         for (slabs, ops) in requests {
             let (done_tx, done_rx) = bounded(1);
             request_tx
@@ -174,9 +189,18 @@ impl ChunkletWriteBatcher {
                     slabs,
                     ops,
                     done: done_tx,
+                    queued_at: Instant::now(),
+                    picked_at: None,
                 })
                 .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batcher disconnected")))?;
             receivers.push(done_rx);
+        }
+        let wait_started = Instant::now();
+        if let Some(metrics) = metrics {
+            metrics.lv3_batch_enqueue_ns.fetch_add(
+                wait_started.saturating_duration_since(enqueue_started).as_nanos() as u64,
+                Ordering::Relaxed,
+            );
         }
 
         let mut returned = Vec::with_capacity(receivers.len());
@@ -192,6 +216,13 @@ impl ChunkletWriteBatcher {
             }
             returned.push(slabs);
         }
+        if let Some(metrics) = metrics {
+            metrics.lv3_batch_wait_ns.fetch_add(
+                wait_started.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            metrics.lv3_batch_wait_calls.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(message) = first_error {
             return Err(OnyxError::Io(std::io::Error::other(message)));
         }
@@ -201,15 +232,19 @@ impl ChunkletWriteBatcher {
     fn aggregate_loop(
         request_rx: Receiver<ChunkletBatchRequest>,
         work_tx: Sender<ChunkletBatchWork>,
+        metrics: Option<Arc<EngineMetrics>>,
     ) {
-        while let Ok(first) = request_rx.recv() {
+        while let Ok(mut first) = request_rx.recv() {
+            first.picked_at = Some(Instant::now());
             let mut byte_count: usize = first.ops.iter().map(|op| op.len).sum();
             let mut requests = vec![first];
+            let mut hit_target = false;
             let deadline = std::time::Instant::now() + lv3_batch_coalesce();
             let target_bytes = lv3_batch_target_bytes();
             while byte_count < target_bytes {
                 match request_rx.try_recv() {
-                    Ok(request) => {
+                    Ok(mut request) => {
+                        request.picked_at = Some(Instant::now());
                         byte_count += request.ops.iter().map(|op| op.len).sum::<usize>();
                         requests.push(request);
                     }
@@ -219,7 +254,8 @@ impl ChunkletWriteBatcher {
                             break;
                         }
                         match request_rx.recv_timeout(deadline.saturating_duration_since(now)) {
-                            Ok(request) => {
+                            Ok(mut request) => {
+                                request.picked_at = Some(Instant::now());
                                 byte_count += request.ops.iter().map(|op| op.len).sum::<usize>();
                                 requests.push(request);
                             }
@@ -229,7 +265,47 @@ impl ChunkletWriteBatcher {
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 }
             }
-            if work_tx.send(ChunkletBatchWork { requests }).is_err() {
+            if byte_count >= target_bytes {
+                hit_target = true;
+            }
+            let dispatched_at = Instant::now();
+            if let Some(metrics) = &metrics {
+                // `pickup` is time spent in `request_rx` behind the single
+                // aggregator; `window` is the coalesce wait this request then
+                // sat through. A batch that leaves on the timeout with far
+                // less than `target_bytes` paid that window for nothing.
+                for request in &requests {
+                    let picked = request.picked_at.unwrap_or(request.queued_at);
+                    metrics.lv3_batch_pickup_ns.fetch_add(
+                        picked.saturating_duration_since(request.queued_at).as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    metrics.lv3_batch_window_ns.fetch_add(
+                        dispatched_at.saturating_duration_since(picked).as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+                metrics
+                    .lv3_batch_requests
+                    .fetch_add(requests.len() as u64, Ordering::Relaxed);
+                metrics
+                    .lv3_batch_bytes_at_dispatch
+                    .fetch_add(byte_count as u64, Ordering::Relaxed);
+                if hit_target {
+                    metrics.lv3_batch_target_hits.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics
+                        .lv3_batch_window_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if work_tx
+                .send(ChunkletBatchWork {
+                    requests,
+                    dispatched_at,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -241,6 +317,12 @@ impl ChunkletWriteBatcher {
         metrics: Option<Arc<EngineMetrics>>,
     ) {
         while let Ok(work) = work_rx.recv() {
+            if let Some(metrics) = &metrics {
+                metrics.lv3_batch_exec_queue_ns.fetch_add(
+                    work.dispatched_at.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+            }
             let op_count: usize = work.requests.iter().map(|request| request.ops.len()).sum();
             let byte_count: usize = work
                 .requests
@@ -1068,7 +1150,7 @@ impl IoEngine {
             .chunklet_write_batcher
             .as_ref()
             .expect("checked above")
-            .submit_many(request_chunks)?;
+            .submit_many(request_chunks, self.metrics.as_ref())?;
 
         for (metas, returned) in meta_chunks.iter().zip(returned_chunks.iter()) {
             for ((pba, payload_len, total), slab) in metas.iter().zip(returned.iter()) {

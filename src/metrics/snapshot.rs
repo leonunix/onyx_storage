@@ -283,6 +283,16 @@ impl EngineMetrics {
             flush_writer_submit_io_ns: load(&self.flush_writer_submit_io_ns),
             flush_writer_submit_rollback_ns: load(&self.flush_writer_submit_rollback_ns),
             flush_writer_submit_padding_ns: load(&self.flush_writer_submit_padding_ns),
+            lv3_batch_enqueue_ns: load(&self.lv3_batch_enqueue_ns),
+            lv3_batch_wait_ns: load(&self.lv3_batch_wait_ns),
+            lv3_batch_wait_calls: load(&self.lv3_batch_wait_calls),
+            lv3_batch_pickup_ns: load(&self.lv3_batch_pickup_ns),
+            lv3_batch_window_ns: load(&self.lv3_batch_window_ns),
+            lv3_batch_exec_queue_ns: load(&self.lv3_batch_exec_queue_ns),
+            lv3_batch_requests: load(&self.lv3_batch_requests),
+            lv3_batch_bytes_at_dispatch: load(&self.lv3_batch_bytes_at_dispatch),
+            lv3_batch_window_timeouts: load(&self.lv3_batch_window_timeouts),
+            lv3_batch_target_hits: load(&self.lv3_batch_target_hits),
             flush_writer_meta_ns: load(&self.flush_writer_meta_ns),
             flush_writer_meta_build_ns: load(&self.flush_writer_meta_build_ns),
             flush_writer_meta_commit_ns: load(&self.flush_writer_meta_commit_ns),
@@ -787,6 +797,26 @@ pub struct EngineMetricsSnapshot {
     pub flush_writer_submit_rollback_ns: u64,
     #[serde(default)]
     pub flush_writer_submit_padding_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_enqueue_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_wait_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_wait_calls: u64,
+    #[serde(default)]
+    pub lv3_batch_pickup_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_window_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_exec_queue_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_requests: u64,
+    #[serde(default)]
+    pub lv3_batch_bytes_at_dispatch: u64,
+    #[serde(default)]
+    pub lv3_batch_window_timeouts: u64,
+    #[serde(default)]
+    pub lv3_batch_target_hits: u64,
     pub flush_writer_meta_ns: u64,
     pub flush_writer_meta_build_ns: u64,
     pub flush_writer_meta_commit_ns: u64,
@@ -1269,6 +1299,16 @@ impl EngineMetricsSnapshot {
             flush_writer_submit_io_ns,
             flush_writer_submit_rollback_ns,
             flush_writer_submit_padding_ns,
+            lv3_batch_enqueue_ns,
+            lv3_batch_wait_ns,
+            lv3_batch_wait_calls,
+            lv3_batch_pickup_ns,
+            lv3_batch_window_ns,
+            lv3_batch_exec_queue_ns,
+            lv3_batch_requests,
+            lv3_batch_bytes_at_dispatch,
+            lv3_batch_window_timeouts,
+            lv3_batch_target_hits,
             flush_writer_meta_ns,
             flush_writer_meta_build_ns,
             flush_writer_meta_commit_ns,
