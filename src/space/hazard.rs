@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -6,6 +7,34 @@ use crate::types::Pba;
 
 const HAZARD_SHARDS: usize = 256;
 const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Hazard-table instrumentation. `wait_for_readers` sits inside the flush
+/// writer's timed IO window, where measurement showed 750 s of "io" against
+/// only 37 s of actual LV3 batch writes in a 180 s window — so the writer's
+/// blocking needs to be attributable. Process-wide because the table is shared
+/// and cloned; read via `PbaHazards::stats`.
+static WAIT_CALLS: AtomicU64 = AtomicU64::new(0);
+static WAIT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static WAIT_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static PIN_CALLS: AtomicU64 = AtomicU64::new(0);
+static PIN_PBAS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of hazard-table activity since process start.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HazardStats {
+    /// `wait_clear` invocations (one per PBA, so `count` per extent).
+    pub wait_calls: u64,
+    /// Invocations that actually found a live pin and had to block.
+    pub wait_blocks: u64,
+    /// Cumulative time spent blocked.
+    pub wait_ns: u64,
+    /// Longest single block.
+    pub wait_ns_max: u64,
+    /// `pin_many` invocations and the total PBAs they pinned.
+    pub pin_calls: u64,
+    pub pin_pbas: u64,
+}
 
 #[derive(Default)]
 struct HazardState {
@@ -61,6 +90,8 @@ impl PbaHazards {
         let mut pbas: Vec<Pba> = pbas.into_iter().collect();
         pbas.sort_unstable();
         pbas.dedup();
+        PIN_CALLS.fetch_add(1, Ordering::Relaxed);
+        PIN_PBAS.fetch_add(pbas.len() as u64, Ordering::Relaxed);
 
         for &pba in &pbas {
             let shard = self.shard(pba);
@@ -76,9 +107,18 @@ impl PbaHazards {
     }
 
     pub fn wait_clear(&self, pba: Pba) {
+        WAIT_CALLS.fetch_add(1, Ordering::Relaxed);
         let shard = self.shard(pba);
         let mut state = shard.state.lock().unwrap();
-        let mut last_log = Instant::now();
+        if !state.counts.contains_key(&pba) {
+            // Uncontended fast path: the mutex acquisition is the whole cost.
+            // Kept separate from the blocking path so the two can be told apart
+            // in the metrics.
+            return;
+        }
+        WAIT_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        let blocked_at = Instant::now();
+        let mut last_log = blocked_at;
         while state.counts.contains_key(&pba) {
             let (next_state, _) = shard.cv.wait_timeout(state, WAIT_LOG_INTERVAL).unwrap();
             state = next_state;
@@ -86,6 +126,22 @@ impl PbaHazards {
                 tracing::debug!(pba = pba.0, "waiting for in-flight PBA readers");
                 last_log = Instant::now();
             }
+        }
+        drop(state);
+        let elapsed = blocked_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        WAIT_NS.fetch_add(elapsed, Ordering::Relaxed);
+        WAIT_NS_MAX.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    /// Cumulative hazard-table activity since process start.
+    pub fn stats() -> HazardStats {
+        HazardStats {
+            wait_calls: WAIT_CALLS.load(Ordering::Relaxed),
+            wait_blocks: WAIT_BLOCKS.load(Ordering::Relaxed),
+            wait_ns: WAIT_NS.load(Ordering::Relaxed),
+            wait_ns_max: WAIT_NS_MAX.load(Ordering::Relaxed),
+            pin_calls: PIN_CALLS.load(Ordering::Relaxed),
+            pin_pbas: PIN_PBAS.load(Ordering::Relaxed),
         }
     }
 

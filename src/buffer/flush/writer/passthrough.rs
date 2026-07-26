@@ -791,8 +791,12 @@ impl BufferFlusher {
                         "full-stripe run must be device-offset aligned"
                     );
                 }
+                let bufalloc_start = Instant::now();
+                let allocated =
+                    io_engine.allocate_owned_write_buffer(extent.count as usize * bs);
+                Self::record_elapsed(&metrics.flush_writer_bufalloc_ns, bufalloc_start);
                 let mut buf =
-                    match io_engine.allocate_owned_write_buffer(extent.count as usize * bs) {
+                    match allocated {
                         Ok(buf) => buf,
                         Err(e) => {
                             let run = write_runs[run_idx]
@@ -813,7 +817,10 @@ impl BufferFlusher {
                             continue;
                         }
                     };
+                let bufzero_start = Instant::now();
                 buf.as_mut_slice().fill(0);
+                Self::record_elapsed(&metrics.flush_writer_bufzero_ns, bufzero_start);
+                let assemble_start = Instant::now();
                 let mut off_blocks = 0usize;
                 for &m in &run.members {
                     let data_len = units[m].payload_len();
@@ -821,6 +828,7 @@ impl BufferFlusher {
                     units[m].copy_payload_to(&mut buf.as_mut_slice()[start..start + data_len]);
                     off_blocks += alloc_blocks[m] as usize;
                 }
+                Self::record_elapsed(&metrics.flush_writer_assemble_ns, assemble_start);
                 debug_assert_eq!(off_blocks, run.used_blocks as usize);
                 run_buffers.push(Some(buf));
             }
@@ -836,11 +844,21 @@ impl BufferFlusher {
             for i in 0..n {
                 if run_of[i].is_none() && !failed[i] && pbas[i].is_some() {
                     let total = alloc_blocks[i] as usize * bs;
-                    match io_engine.allocate_owned_write_buffer(total) {
+                    let bufalloc_start = Instant::now();
+                    let allocated = io_engine.allocate_owned_write_buffer(total);
+                    Self::record_elapsed(&metrics.flush_writer_bufalloc_ns, bufalloc_start);
+                    match allocated {
                         Ok(mut buf) => {
+                            let bufzero_start = Instant::now();
                             buf.as_mut_slice().fill(0);
+                            Self::record_elapsed(&metrics.flush_writer_bufzero_ns, bufzero_start);
+                            let assemble_start = Instant::now();
                             units[i]
                                 .copy_payload_to(&mut buf.as_mut_slice()[..units[i].payload_len()]);
+                            Self::record_elapsed(
+                                &metrics.flush_writer_assemble_ns,
+                                assemble_start,
+                            );
                             unit_buffers[i] = Some(buf);
                         }
                         Err(e) => {
@@ -860,6 +878,7 @@ impl BufferFlusher {
                 }
             }
 
+            let submit_start = Instant::now();
             let mut ops: Vec<OwnedLvWrite> = Vec::with_capacity(n);
             let mut op_targets: Vec<OpTarget> = Vec::with_capacity(n);
 
@@ -1054,6 +1073,7 @@ impl BufferFlusher {
                 .flush_writer_group_unused_blocks
                 .fetch_add(successful_padding_blocks, Ordering::Relaxed);
             crate::space::pba_lifecycle::rollback_uncommitted_batch(allocator, &successful_padding);
+            Self::record_elapsed(&metrics.flush_writer_submit_ns, submit_start);
         }
         let io_elapsed = io_start.elapsed();
         Self::record_elapsed(&metrics.flush_writer_io_ns, io_start);

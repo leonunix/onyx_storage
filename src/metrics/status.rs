@@ -1181,6 +1181,24 @@ impl EngineStatusSnapshot {
             self.metrics.flush_writer_mark_flushed_ns,
             self.metrics.flush_writer_precheck_live_pba_ns
         );
+        // Split of the `io` window above. Measured: only ~8 % of it is real LV3
+        // write time, so this attributes the rest.
+        let _ = writeln!(
+            out,
+            "flush_writer_io_split: bufalloc={} bufzero={} assemble={} submit={}",
+            self.metrics.flush_writer_bufalloc_ns,
+            self.metrics.flush_writer_bufzero_ns,
+            self.metrics.flush_writer_assemble_ns,
+            self.metrics.flush_writer_submit_ns
+        );
+        // `wait_for_readers` runs INSIDE the writer's `io` window above, so this
+        // is what separates real LV3 write time from hazard-table blocking.
+        let hz = crate::space::hazard::PbaHazards::stats();
+        let _ = writeln!(
+            out,
+            "hazard: wait_calls={} wait_blocks={} wait_ns={} wait_ns_max={} pin_calls={} pin_pbas={}",
+            hz.wait_calls, hz.wait_blocks, hz.wait_ns, hz.wait_ns_max, hz.pin_calls, hz.pin_pbas
+        );
         let _ = writeln!(
             out,
             "flush_writer_meta: commits={} lbas={} pt_commits={} pt_lbas={} packed_commits={} packed_lbas={}",
