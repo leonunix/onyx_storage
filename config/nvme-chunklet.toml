@@ -34,10 +34,10 @@ devices = [
     "/dev/nvme3n1",
     "/dev/nvme4n1",
     "/dev/nvme5n1",
-    "/dev/nvme6n2",
+    "/dev/nvme6n1",
     "/dev/nvme7n1",
     "/dev/nvme8n1",
-    "/dev/nvme9n2",
+    "/dev/nvme9n1",
 ]
 io_backend = "uring"
 spare_pct = 5
@@ -76,9 +76,9 @@ lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0
 # taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
-lv3_ld_id = "f8215d7c-77c2-46f7-90e6-9a1594cd2156"
-lv2_ld_id = "71b74e06-a297-4c09-a73d-7a5d7c946281"
-meta_ld_id = "045efb32-f949-4ab0-924a-6209ed240b94"
+lv3_ld_id = "49f2eeb4-d39d-42dc-8e47-bc773f492ff9"
+lv2_ld_id = "22da0250-650e-4d81-9bd2-faca84f91027"
+meta_ld_id = "0976711a-22ce-4e12-b77f-9472c8540322"
 
 [meta]
 # Phase 3f: metadb persists on the chunklet meta LD (see [chunklet].meta_ld_id),
@@ -104,7 +104,30 @@ l2p_buffer_soft_entries = 4000000
 rc_authoritative_reclaim = true
 commit_direct_apply_enabled = true
 bfg_threads_enabled = true
-parallel_l2p_drain_enabled = false
+# Parallel per-shard L2P fold. Default-ON in metadb; pinned here so the box
+# config is explicit. NOTE: the "+100% / 72x p999" figures once quoted for this
+# knob were burst-phase artifacts of measuring on a freshly created pool. Re-run
+# 2026-07-25 on an aged pool it is 25.0 vs 25.2 MiB/s — no throughput effect.
+# Keep it for fold-latency (tail) reasons only. See memory
+# write_drain_22mbps_lv2_durability_roundtrip + checkpoint_interval_duty_cycle_lockin.
+parallel_l2p_drain_enabled = true
+# Serial successor-fold worker for the L2P checkpoint. Already default-ON in
+# code (onyx 67d9f02); pinned here for explicitness. Its original "+136% median
+# drain" number came from the same fresh-pool methodology that was later shown to
+# measure burst-phase length rather than the knob, so treat it as unproven for
+# throughput. Runtime worker toggle only — no on-disk format gate.
+l2p_checkpoint_pipeline_enabled = true
+# L3 durable RC delta-run persist (metadb v27). Turns the RC checkpoint from
+# "fold deltas into base pages + rewrite every touched 4KiB page" (~70x aged
+# amplification) into log-structured: append a compact delta-run segment per
+# checkpoint, condense into base only every rc_condense_interval_cycles. Requires
+# the streaming BFG checkpoint (default on) — metadb refuses the mismatch at open.
+# Box-gate P0 (crashed-segment premature-free) fixed by stable-head directory
+# recover-ahead (metadb b51aba8); standalone soak clean. Enabled here for the
+# onyx-integration Gate 2 (re-drive no-double-count + ckpt amortization).
+rc_delta_run_persist_enabled = true
+rc_condense_interval_cycles = 8
+rc_segment_overlay_max_entries = 4000000
 
 [storage]
 # data_device omitted: LV3 comes from the chunklet pool.
