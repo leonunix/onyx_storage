@@ -118,6 +118,8 @@ fn setup_with_all_options(
             read_pool_workers: 4,
             lv3_per_shard_write_rings: true,
             raid_full_stripe_writes: false,
+            lv3_batch_coalesce_us: 0,
+            lv3_batch_target_bytes: 0,
         },
         buffer: BufferConfig {
             device: Some(buf_file.path().to_path_buf()),

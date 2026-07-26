@@ -80,6 +80,8 @@ fn uring_pool_config(cfg: &ChunkletConfig) -> UringPoolConfig {
         background_workers: cfg.pd_write_background_workers,
         foreground_cpus: crate::affinity::role_cpu_set(crate::affinity::ThreadRole::BufferSync),
         background_cpus: crate::affinity::role_cpu_set(crate::affinity::ThreadRole::Lv3Batch),
+        coalesced_wait: cfg.uring_coalesced_wait,
+        write_chunk_ops: cfg.uring_write_chunk_ops,
     }
 }
 
@@ -489,6 +491,8 @@ mod tests {
             background_workers: 2,
             foreground_cpus: vec![0, 2, 4],
             background_cpus: vec![4, 6, 8],
+            coalesced_wait: false,
+            write_chunk_ops: 0,
         };
         assert_eq!(
             validate_uring_execution_cpu_sets(&cfg, &overlapping, false).unwrap(),

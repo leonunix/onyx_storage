@@ -536,6 +536,13 @@ pub struct MetaConfig {
     #[serde(default = "default_l2p_buffer_hard_entries")]
     pub l2p_buffer_hard_entries: usize,
 
+    /// Pipeline-mode hard ceiling on admitted-but-not-yet-folded L2P entries
+    /// across all active BFG generations (forwarded to metadb
+    /// `l2p_buffer_total_hard_entries`). Bounds RAM/WAL when
+    /// `bfg_admission_pipeline_enabled` decouples admission from the fold.
+    #[serde(default = "default_l2p_buffer_total_hard_entries")]
+    pub l2p_buffer_total_hard_entries: usize,
+
     /// Maximum wall time the compactor may wait between cycles when
     /// the entry-count triggers do not fire.
     #[serde(default = "default_l2p_buffer_max_interval_ms")]
@@ -573,6 +580,14 @@ pub struct MetaConfig {
     /// Requires `l2p_buffer_enabled = true` (buffer mode).
     #[serde(default = "default_bfg_threads_enabled")]
     pub bfg_threads_enabled: bool,
+
+    /// Decouple BFG commit admission from L2P fold completion (forwarded to
+    /// metadb `bfg_admission_pipeline_enabled`). The quiesce worker rolls the
+    /// next generation without blocking on the prior fold, so a soft-limit
+    /// crossing during a fold no longer parks commits for the fold's duration.
+    /// Requires `bfg_threads_enabled` + `l2p_buffer_enabled`. Default off.
+    #[serde(default = "default_bfg_admission_pipeline_enabled")]
+    pub bfg_admission_pipeline_enabled: bool,
 
     /// Stream threads-on refcount checkpoint page writeback in bounded chunks.
     /// Disable only for a controlled A/B against the legacy one-shot path;
@@ -745,10 +760,12 @@ impl Default for MetaConfig {
             l2p_buffer_enabled: default_l2p_buffer_enabled(),
             l2p_buffer_soft_entries: default_l2p_buffer_soft_entries(),
             l2p_buffer_hard_entries: default_l2p_buffer_hard_entries(),
+            l2p_buffer_total_hard_entries: default_l2p_buffer_total_hard_entries(),
             l2p_buffer_max_interval_ms: default_l2p_buffer_max_interval_ms(),
             commit_direct_apply_enabled: default_commit_direct_apply_enabled(),
             commit_deferred_outcomes_enabled: default_commit_deferred_outcomes_enabled(),
             bfg_threads_enabled: default_bfg_threads_enabled(),
+            bfg_admission_pipeline_enabled: default_bfg_admission_pipeline_enabled(),
             rc_checkpoint_streaming_enabled: default_rc_checkpoint_streaming_enabled(),
             rc_delta_run_shadow_enabled: default_rc_delta_run_shadow_enabled(),
             rc_delta_run_persist_enabled: default_rc_delta_run_persist_enabled(),
@@ -850,6 +867,11 @@ fn default_l2p_buffer_soft_entries() -> usize {
 fn default_l2p_buffer_hard_entries() -> usize {
     512_000
 }
+fn default_l2p_buffer_total_hard_entries() -> usize {
+    // 12 M entries ~= +0.9 GB worst-case RAM over the 4 M soft budget; caps
+    // pipeline-mode outstanding work when the fold falls behind.
+    12_000_000
+}
 fn default_l2p_buffer_max_interval_ms() -> u64 {
     30_000
 }
@@ -871,6 +893,12 @@ fn default_bfg_threads_enabled() -> bool {
     // the background, which keeps buffer reclaim moving during sustained
     // write load. Only engages when `l2p_buffer_enabled = true`.
     true
+}
+fn default_bfg_admission_pipeline_enabled() -> bool {
+    // Default OFF: the legacy at-most-one-Quiescing blocking promote is the
+    // validated path. Flip on (with bfg_threads + l2p_buffer) to decouple
+    // commit admission from L2P fold completion.
+    false
 }
 fn default_rc_checkpoint_streaming_enabled() -> bool {
     true
@@ -969,6 +997,18 @@ pub struct StorageConfig {
     /// baseline). No effect on the syscall backend.
     #[serde(default = "default_lv3_per_shard_write_rings")]
     pub lv3_per_shard_write_rings: bool,
+    /// LV3 cross-lane aggregation window, microseconds. Writer lanes block
+    /// synchronously until their aggregated batch completes, so this delay is on
+    /// the drain path. `0` keeps the compiled default (2000 us). 2026-07-25
+    /// nvme-box: the aggregator emitted 259 batches/s of ~300 KiB — 13x short of
+    /// `lv3_batch_target_bytes` — so every batch left on this timeout while the
+    /// six executors ran at 3.3 % utilisation.
+    #[serde(default)]
+    pub lv3_batch_coalesce_us: u64,
+    /// Byte target that ends an LV3 aggregation window early. `0` keeps the
+    /// compiled default (4 MiB = two RAID6 full stripes).
+    #[serde(default)]
+    pub lv3_batch_target_bytes: usize,
     /// RAID-aware full-stripe writes (roadmap ③). When true, the flush writer
     /// allocates + zero-pads each LV3 passthrough write to a whole RAID stripe
     /// (`full_stripe_bytes` from the chunklet LD geometry) so a RAID5/6 backend
@@ -992,6 +1032,8 @@ impl Default for StorageConfig {
             uring_sq_entries: default_uring_sq_entries(),
             read_pool_workers: default_read_pool_workers(),
             lv3_per_shard_write_rings: default_lv3_per_shard_write_rings(),
+            lv3_batch_coalesce_us: 0,
+            lv3_batch_target_bytes: 0,
             raid_full_stripe_writes: default_raid_full_stripe_writes(),
         }
     }
@@ -1027,6 +1069,22 @@ pub struct ChunkletConfig {
     /// Cross-PD IO backend inside chunklet: `uring` (default) or `sync`.
     #[serde(default)]
     pub io_backend: ChunkletIoBackend,
+    /// Wait for a whole chunklet write batch in ONE `io_uring_enter` instead of
+    /// waking once per completion. A logical flush write fans out to hundreds of
+    /// per-strip writes whose NVMe completions arrive staggered, so the legacy
+    /// per-CQE wake costs one syscall + wakeup round-trip each (box-measured:
+    /// ~16 us per 4 KiB strip, submit = 75.6% of chunklet write time). Only the
+    /// no-observer drain path changes; streaming/scheduler observers keep their
+    /// per-arrival wake. Default off pending the box A/B.
+    #[serde(default)]
+    pub uring_coalesced_wait: bool,
+    /// SQEs per stop-and-wait wave inside chunklet's batched submit paths. A
+    /// many-strip write must fully drain each wave before the next is pushed, so
+    /// a small wave leaves the disks idle at every barrier (box-measured: an
+    /// 847 KB write fans out to ~414 strips = 7 waves at the historical 64).
+    /// `0` keeps that legacy 64; the value is capped by chunklet's ring depth.
+    #[serde(default)]
+    pub uring_write_chunk_ops: usize,
     /// Persistent chunklet io_uring workers reserved for foreground writes.
     /// `0` together with `pd_write_background_workers = 0` preserves the
     /// caller-thread execution path.
@@ -1174,6 +1232,8 @@ impl Default for ChunkletConfig {
             enabled: false,
             devices: Vec::new(),
             io_backend: ChunkletIoBackend::default(),
+            uring_coalesced_wait: false,
+            uring_write_chunk_ops: 0,
             pd_write_foreground_workers: 0,
             pd_write_background_workers: 0,
             write_max_active: 0,

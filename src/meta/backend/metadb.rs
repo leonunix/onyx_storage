@@ -2078,6 +2078,7 @@ fn metadb_config_for_offline_audit(path: &Path, config: &MetaConfig) -> MetaDbCo
 /// one place so every audit entry point stays inert after open-time recovery.
 pub(super) fn sanitize_offline_audit_config(cfg: &mut MetaDbConfig) {
     cfg.bfg_threads_enabled = false;
+    cfg.bfg_admission_pipeline_enabled = false;
     cfg.parallel_l2p_drain_enabled = false;
     cfg.l2p_checkpoint_pipeline_enabled = false;
     cfg.l2p_writeback_enabled = false;
@@ -2137,6 +2138,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     cfg.l2p_buffer_enabled = config.l2p_buffer_enabled;
     cfg.l2p_buffer_soft_entries = config.l2p_buffer_soft_entries;
     cfg.l2p_buffer_hard_entries = config.l2p_buffer_hard_entries;
+    cfg.l2p_buffer_total_hard_entries = config.l2p_buffer_total_hard_entries;
     cfg.l2p_buffer_max_interval_ms = config.l2p_buffer_max_interval_ms;
     cfg.commit_direct_apply_enabled = config.commit_direct_apply_enabled;
     cfg.commit_deferred_outcomes_enabled = config.commit_deferred_outcomes_enabled;
@@ -2145,6 +2147,7 @@ fn metadb_config_from_onyx(path: &Path, config: &MetaConfig) -> MetaDbConfig {
     // buffer-ring reclaim moving instead of tying it to one giant inline
     // checkpoint.
     cfg.bfg_threads_enabled = config.bfg_threads_enabled;
+    cfg.bfg_admission_pipeline_enabled = config.bfg_admission_pipeline_enabled;
     cfg.rc_checkpoint_streaming_enabled = config.rc_checkpoint_streaming_enabled;
     cfg.rc_delta_run_shadow_enabled = config.rc_delta_run_shadow_enabled;
     cfg.rc_delta_run_persist_enabled = config.rc_delta_run_persist_enabled;

@@ -158,6 +158,8 @@ fn full_stripe_aligned_write_round_trips_after_reopen() {
             read_pool_workers: 2,
             // The feature under test.
             raid_full_stripe_writes: true,
+            lv3_batch_coalesce_us: 0,
+            lv3_batch_target_bytes: 0,
             ..StorageConfig::default()
         },
         buffer: BufferConfig {

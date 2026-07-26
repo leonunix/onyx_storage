@@ -234,6 +234,13 @@ impl OnyxEngine {
         // so we always drive it via the Syscall submission mode regardless of
         // storage.io_backend.
         if device.uring_target().is_none() {
+            // Aggregation limits are process-wide statics read by the batcher's
+            // aggregate loop; set them before the engine (and its batcher
+            // threads) start.
+            crate::io::engine::set_lv3_batch_tuning(
+                storage.lv3_batch_coalesce_us,
+                storage.lv3_batch_target_bytes,
+            );
             return Ok(Arc::new(
                 IoEngine::new_chunklet(device, storage.use_hugepages, metrics)
                     .with_full_stripe_writes(storage.raid_full_stripe_writes),

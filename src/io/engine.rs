@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -41,6 +41,35 @@ const CHUNKLET_BATCH_EXECUTORS: usize = 6;
 // slabs are enough to reach the byte target with 2 MiB full stripes.
 const CHUNKLET_BATCH_COALESCE: Duration = Duration::from_millis(2);
 const CHUNKLET_BATCH_QUEUE_CAP: usize = 256;
+
+// Both aggregation limits are runtime-overridable so they can be A/B'd without
+// a rebuild. Measured 2026-07-25 on nvme-box: the aggregator emits 259 batches/s
+// carrying ~300 KiB each — 13x short of the byte target — so every batch leaves
+// on the coalesce timeout, while the six executors sit at 3.3 % utilisation and
+// 4.4 writer lanes stay blocked in `submit`.
+static LV3_BATCH_COALESCE_US: AtomicU64 = AtomicU64::new(0);
+static LV3_BATCH_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Override the LV3 aggregation window / byte target. `0` keeps the compiled
+/// default. Applies to subsequently started engines.
+pub fn set_lv3_batch_tuning(coalesce_us: u64, target_bytes: usize) {
+    LV3_BATCH_COALESCE_US.store(coalesce_us, Ordering::Relaxed);
+    LV3_BATCH_TARGET_BYTES.store(target_bytes, Ordering::Relaxed);
+}
+
+fn lv3_batch_coalesce() -> Duration {
+    match LV3_BATCH_COALESCE_US.load(Ordering::Relaxed) {
+        0 => CHUNKLET_BATCH_COALESCE,
+        us => Duration::from_micros(us),
+    }
+}
+
+fn lv3_batch_target_bytes() -> usize {
+    match LV3_BATCH_TARGET_BYTES.load(Ordering::Relaxed) {
+        0 => CHUNKLET_BATCH_TARGET_BYTES,
+        bytes => bytes,
+    }
+}
 
 struct OwnedBatchOp {
     device_offset: u64,
@@ -176,8 +205,9 @@ impl ChunkletWriteBatcher {
         while let Ok(first) = request_rx.recv() {
             let mut byte_count: usize = first.ops.iter().map(|op| op.len).sum();
             let mut requests = vec![first];
-            let deadline = std::time::Instant::now() + CHUNKLET_BATCH_COALESCE;
-            while byte_count < CHUNKLET_BATCH_TARGET_BYTES {
+            let deadline = std::time::Instant::now() + lv3_batch_coalesce();
+            let target_bytes = lv3_batch_target_bytes();
+            while byte_count < target_bytes {
                 match request_rx.try_recv() {
                     Ok(request) => {
                         byte_count += request.ops.iter().map(|op| op.len).sum::<usize>();
