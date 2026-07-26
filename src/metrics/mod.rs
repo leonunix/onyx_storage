@@ -497,6 +497,16 @@ pub struct EngineMetrics {
     pub flush_writer_bufzero_ns: AtomicU64,
     pub flush_writer_assemble_ns: AtomicU64,
     pub flush_writer_submit_ns: AtomicU64,
+    /// Split of `flush_writer_submit_ns`, which measured as 92 % of the io
+    /// window while `lv3_io.write_batch_ns` -- the real device write inside it
+    /// -- was only 26 % of that window. `ops` is op-vector assembly (including
+    /// `allocator.wait_for_readers`), `io` the batch submit call, `rollback`
+    /// the per-op failure unwind, and `padding` the allocator round trip that
+    /// returns never-mapped full-stripe padding.
+    pub flush_writer_submit_ops_ns: AtomicU64,
+    pub flush_writer_submit_io_ns: AtomicU64,
+    pub flush_writer_submit_rollback_ns: AtomicU64,
+    pub flush_writer_submit_padding_ns: AtomicU64,
     pub flush_writer_meta_ns: AtomicU64,
     pub flush_writer_meta_build_ns: AtomicU64,
     pub flush_writer_meta_commit_ns: AtomicU64,

@@ -981,9 +981,14 @@ impl BufferFlusher {
                 op_targets.push(OpTarget::Unit(i));
             }
 
+            Self::record_elapsed(&metrics.flush_writer_submit_ops_ns, submit_start);
+            let submit_io_start = Instant::now();
             if !ops.is_empty() {
                 io_ops_count = ops.len() as u64;
-                match io_engine.submit_owned_write_batch_on(write_session, ops, false) {
+                let batch_result = io_engine.submit_owned_write_batch_on(write_session, ops, false);
+                Self::record_elapsed(&metrics.flush_writer_submit_io_ns, submit_io_start);
+                let rollback_start = Instant::now();
+                match batch_result {
                     Ok(write_results) => {
                         for (idx, r) in write_results.into_iter().enumerate() {
                             if let LvOpResult::Write(Err(e)) = r {
@@ -1049,7 +1054,11 @@ impl BufferFlusher {
                         tracing::error!(error = %e, "writer: passthrough IO batch submit failed");
                     }
                 }
+                Self::record_elapsed(&metrics.flush_writer_submit_rollback_ns, rollback_start);
+            } else {
+                Self::record_elapsed(&metrics.flush_writer_submit_io_ns, submit_io_start);
             }
+            let padding_start = Instant::now();
 
             // Successful run IO transfers the used prefix to disjoint per-unit
             // reservations. Return only the never-mapped aligned padding; short
@@ -1073,6 +1082,7 @@ impl BufferFlusher {
                 .flush_writer_group_unused_blocks
                 .fetch_add(successful_padding_blocks, Ordering::Relaxed);
             crate::space::pba_lifecycle::rollback_uncommitted_batch(allocator, &successful_padding);
+            Self::record_elapsed(&metrics.flush_writer_submit_padding_ns, padding_start);
             Self::record_elapsed(&metrics.flush_writer_submit_ns, submit_start);
         }
         let io_elapsed = io_start.elapsed();

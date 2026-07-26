@@ -279,6 +279,10 @@ impl EngineMetrics {
             flush_writer_bufzero_ns: load(&self.flush_writer_bufzero_ns),
             flush_writer_assemble_ns: load(&self.flush_writer_assemble_ns),
             flush_writer_submit_ns: load(&self.flush_writer_submit_ns),
+            flush_writer_submit_ops_ns: load(&self.flush_writer_submit_ops_ns),
+            flush_writer_submit_io_ns: load(&self.flush_writer_submit_io_ns),
+            flush_writer_submit_rollback_ns: load(&self.flush_writer_submit_rollback_ns),
+            flush_writer_submit_padding_ns: load(&self.flush_writer_submit_padding_ns),
             flush_writer_meta_ns: load(&self.flush_writer_meta_ns),
             flush_writer_meta_build_ns: load(&self.flush_writer_meta_build_ns),
             flush_writer_meta_commit_ns: load(&self.flush_writer_meta_commit_ns),
@@ -775,6 +779,14 @@ pub struct EngineMetricsSnapshot {
     pub flush_writer_bufzero_ns: u64,
     pub flush_writer_assemble_ns: u64,
     pub flush_writer_submit_ns: u64,
+    #[serde(default)]
+    pub flush_writer_submit_ops_ns: u64,
+    #[serde(default)]
+    pub flush_writer_submit_io_ns: u64,
+    #[serde(default)]
+    pub flush_writer_submit_rollback_ns: u64,
+    #[serde(default)]
+    pub flush_writer_submit_padding_ns: u64,
     pub flush_writer_meta_ns: u64,
     pub flush_writer_meta_build_ns: u64,
     pub flush_writer_meta_commit_ns: u64,
@@ -1253,6 +1265,10 @@ impl EngineMetricsSnapshot {
             flush_writer_bufzero_ns,
             flush_writer_assemble_ns,
             flush_writer_submit_ns,
+            flush_writer_submit_ops_ns,
+            flush_writer_submit_io_ns,
+            flush_writer_submit_rollback_ns,
+            flush_writer_submit_padding_ns,
             flush_writer_meta_ns,
             flush_writer_meta_build_ns,
             flush_writer_meta_commit_ns,

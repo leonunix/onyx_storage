@@ -1226,6 +1226,17 @@ impl EngineStatusSnapshot {
             self.metrics.flush_writer_assemble_ns,
             self.metrics.flush_writer_submit_ns
         );
+        // Split of `submit` above. Compare `io` here against
+        // `lv3_io.write_batch_ns`: the difference is IoEngine-side time that is
+        // not the device write.
+        let _ = writeln!(
+            out,
+            "flush_writer_submit_split: ops={} io={} rollback={} padding={}",
+            self.metrics.flush_writer_submit_ops_ns,
+            self.metrics.flush_writer_submit_io_ns,
+            self.metrics.flush_writer_submit_rollback_ns,
+            self.metrics.flush_writer_submit_padding_ns
+        );
         // `wait_for_readers` runs INSIDE the writer's `io` window above, so this
         // is what separates real LV3 write time from hazard-table blocking.
         let hz = crate::space::hazard::PbaHazards::stats();
