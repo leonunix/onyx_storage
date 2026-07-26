@@ -911,9 +911,12 @@ fn checkpoint_guided_recovery_finds_all_entries() {
     );
 }
 
-/// Corrupt checkpoint falls back to full scan and still recovers entries.
+/// A corrupt checkpoint fails the open closed. Falling back to a full ring
+/// scan was the pre-v3 behaviour; `c5bc032` removed it because mutable ring
+/// history cannot prove the global sequence floor of already-reclaimed
+/// records, and inferring one risks replaying stale entries over live data.
 #[test]
-fn corrupt_checkpoint_falls_back_to_full_scan() {
+fn corrupt_checkpoint_fails_open_closed() {
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 20 * 8192;
     tmp.as_file().set_len(size).unwrap();
@@ -937,15 +940,17 @@ fn corrupt_checkpoint_falls_back_to_full_scan() {
         f.flush().unwrap();
     }
 
-    // Reopen — checkpoint is corrupt, should fall back to full scan.
+    // Reopen — the checkpoint is corrupt, so the open must refuse rather than
+    // reconstruct a sequence floor it cannot prove.
     let dev = RawDevice::open_or_create(tmp.path(), size).unwrap();
-    let pool = WriteBufferPool::open(dev).unwrap();
-
-    assert_eq!(pool.pending_count(), 1);
-    // Payload is lazy-loaded (not in memory after recovery).
-    // Verify via lookup which hydrates from disk.
-    let found = pool.lookup("vol", Lba(5)).unwrap().unwrap();
-    assert_eq!(&**found.payload.as_ref().unwrap(), &*data);
+    let err = match WriteBufferPool::open(dev) {
+        Ok(_) => panic!("corrupt checkpoint must fail the open"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("refusing to infer the sequence floor"),
+        "unexpected error for a corrupt checkpoint: {err}"
+    );
 }
 
 /// Stale checkpoint: entries written after the last checkpoint persist are
