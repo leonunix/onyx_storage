@@ -1009,6 +1009,16 @@ pub struct StorageConfig {
     /// compiled default (4 MiB = two RAID6 full stripes).
     #[serde(default)]
     pub lv3_batch_target_bytes: usize,
+    /// Number of LV3 batch executor threads (each owns one chunklet io_uring).
+    /// `0` keeps the compiled default (6).
+    ///
+    /// Sweep this together with `lv3_batch_coalesce_us`: shortening the window
+    /// raised batch frequency 5x on nvme-box, at which point `exec_queue` --
+    /// a producer waiting for a free executor -- became the largest non-device
+    /// term in its blocked time (1006-1934 us per request vs 347-1016 us at the
+    /// 2 ms default). Either knob alone is capped by the other.
+    #[serde(default)]
+    pub lv3_batch_executors: usize,
     /// RAID-aware full-stripe writes (roadmap ③). When true, the flush writer
     /// allocates + zero-pads each LV3 passthrough write to a whole RAID stripe
     /// (`full_stripe_bytes` from the chunklet LD geometry) so a RAID5/6 backend
@@ -1034,6 +1044,7 @@ impl Default for StorageConfig {
             lv3_per_shard_write_rings: default_lv3_per_shard_write_rings(),
             lv3_batch_coalesce_us: 0,
             lv3_batch_target_bytes: 0,
+            lv3_batch_executors: 0,
             raid_full_stripe_writes: default_raid_full_stripe_writes(),
         }
     }
@@ -2249,6 +2260,31 @@ mod service_config_tests {
         )
         .unwrap();
         assert_eq!(configured.buffer.lv2_prepared_queue_depth_per_lane, 4);
+    }
+
+    /// The three LV3 batcher knobs have to be sweepable together: the window and
+    /// the executor count cap each other (a short window multiplies batch
+    /// frequency until producers queue on the fixed executors).
+    #[test]
+    fn lv3_batch_knobs_default_to_compiled_values_and_parse_together() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(default_config.storage.lv3_batch_coalesce_us, 0);
+        assert_eq!(default_config.storage.lv3_batch_target_bytes, 0);
+        assert_eq!(default_config.storage.lv3_batch_executors, 0);
+
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [storage]
+                lv3_batch_coalesce_us = 200
+                lv3_batch_executors = 12
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.storage.lv3_batch_coalesce_us, 200);
+        assert_eq!(configured.storage.lv3_batch_executors, 12);
+        // Unset knobs must stay on the compiled default rather than zeroing the
+        // byte target, which would make every batch dispatch immediately.
+        assert_eq!(configured.storage.lv3_batch_target_bytes, 0);
     }
 
     #[test]

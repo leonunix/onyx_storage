@@ -49,18 +49,33 @@ const CHUNKLET_BATCH_QUEUE_CAP: usize = 256;
 // 4.4 writer lanes stay blocked in `submit`.
 static LV3_BATCH_COALESCE_US: AtomicU64 = AtomicU64::new(0);
 static LV3_BATCH_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
+static LV3_BATCH_EXECUTORS: AtomicUsize = AtomicUsize::new(0);
 
-/// Override the LV3 aggregation window / byte target. `0` keeps the compiled
-/// default. Applies to subsequently started engines.
-pub fn set_lv3_batch_tuning(coalesce_us: u64, target_bytes: usize) {
+/// Override the LV3 aggregation window / byte target / executor count. `0`
+/// keeps the compiled default for each. Applies to subsequently started
+/// engines.
+///
+/// The window and the executor count interact: shortening the window raises
+/// batch frequency (measured 5x at 200 us), at which point `exec_queue` --
+/// waiting for one of the fixed executors -- becomes the largest non-device
+/// term. They have to be swept together, hence one entry point.
+pub fn set_lv3_batch_tuning(coalesce_us: u64, target_bytes: usize, executors: usize) {
     LV3_BATCH_COALESCE_US.store(coalesce_us, Ordering::Relaxed);
     LV3_BATCH_TARGET_BYTES.store(target_bytes, Ordering::Relaxed);
+    LV3_BATCH_EXECUTORS.store(executors, Ordering::Relaxed);
 }
 
 fn lv3_batch_coalesce() -> Duration {
     match LV3_BATCH_COALESCE_US.load(Ordering::Relaxed) {
         0 => CHUNKLET_BATCH_COALESCE,
         us => Duration::from_micros(us),
+    }
+}
+
+fn lv3_batch_executors() -> usize {
+    match LV3_BATCH_EXECUTORS.load(Ordering::Relaxed) {
+        0 => CHUNKLET_BATCH_EXECUTORS,
+        n => n,
     }
 }
 
@@ -109,7 +124,8 @@ struct ChunkletWriteBatcher {
 impl ChunkletWriteBatcher {
     fn start(device: Arc<dyn BlockBackend>, metrics: Option<Arc<EngineMetrics>>) -> Self {
         let (request_tx, request_rx) = bounded(CHUNKLET_BATCH_QUEUE_CAP);
-        let (work_tx, work_rx) = bounded(CHUNKLET_BATCH_EXECUTORS * 2);
+        let executors = lv3_batch_executors();
+        let (work_tx, work_rx) = bounded(executors * 2);
 
         let aggregate_metrics = metrics.clone();
         let aggregate_handle = std::thread::Builder::new()
@@ -117,8 +133,8 @@ impl ChunkletWriteBatcher {
             .spawn(move || Self::aggregate_loop(request_rx, work_tx, aggregate_metrics))
             .expect("failed to spawn LV3 batch aggregator");
 
-        let mut executor_handles = Vec::with_capacity(CHUNKLET_BATCH_EXECUTORS);
-        for idx in 0..CHUNKLET_BATCH_EXECUTORS {
+        let mut executor_handles = Vec::with_capacity(executors);
+        for idx in 0..executors {
             let work_rx = work_rx.clone();
             let device = device.clone();
             let metrics = metrics.clone();

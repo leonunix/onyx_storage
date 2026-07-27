@@ -240,6 +240,7 @@ impl OnyxEngine {
             crate::io::engine::set_lv3_batch_tuning(
                 storage.lv3_batch_coalesce_us,
                 storage.lv3_batch_target_bytes,
+                storage.lv3_batch_executors,
             );
             return Ok(Arc::new(
                 IoEngine::new_chunklet(device, storage.use_hugepages, metrics)
