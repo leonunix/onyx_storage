@@ -61,6 +61,8 @@ fn make_config() -> (OnyxConfig, tempfile::TempDir, NamedTempFile, NamedTempFile
             raid_full_stripe_writes: false,
             lv3_batch_coalesce_us: 0,
             lv3_batch_target_bytes: 0,
+            lv3_batch_executors: 0,
+            stripe_group_lifetime_affinity: false,
         },
         buffer: BufferConfig {
             device: Some(buf_tmp.path().to_path_buf()),
