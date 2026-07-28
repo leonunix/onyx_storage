@@ -2306,6 +2306,7 @@ impl OnyxEngine {
             allocator_stripe_reserve_blocks: contiguity.map(|c| c.stripe_reserve_blocks),
             allocator_quarantine_target_blocks: contiguity.map(|c| c.quarantine_target_blocks),
             allocator_quarantine_free_blocks: contiguity.map(|c| c.quarantine_free_blocks),
+            allocator_supply: self.allocator.as_ref().map(|alloc| alloc.supply_stats()),
             heat: self.heat.as_ref().map(|h| h.cached_summary()),
             meta_fenced: self
                 .buffer_pool

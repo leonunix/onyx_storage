@@ -199,6 +199,11 @@ pub struct EngineStatusSnapshot {
     pub allocator_stripe_reserve_blocks: Option<u64>,
     pub allocator_quarantine_target_blocks: Option<u64>,
     pub allocator_quarantine_free_blocks: Option<u64>,
+    /// Aligned-path lane-cache supply. `allocs_per_refill` is the amplification
+    /// the lane cache actually buys; at 1.0 every full-stripe allocation
+    /// serializes on the global free lock. Monotonic counters — difference two
+    /// `status` reads.
+    pub allocator_supply: Option<crate::space::allocator::AllocSupplyStats>,
     /// Adaptive reclaim heat-map summary (None when the map is disabled or in
     /// standby). Observe-only in Stage A.
     pub heat: Option<HeatSummary>,
@@ -924,6 +929,20 @@ impl EngineStatusSnapshot {
                 self.allocator_stripe_reserve_blocks.unwrap_or(0),
                 self.allocator_quarantine_free_blocks.unwrap_or(0),
                 self.allocator_quarantine_target_blocks.unwrap_or(0),
+            );
+        }
+        if let Some(s) = self.allocator_supply {
+            let _ = writeln!(
+                out,
+                "allocator_supply: aligned_allocs={} refills={} allocs_per_refill={:.2} \
+                 blocks_per_refill={:.1} runs_per_refill={:.1} drains={} drain_blocks={}",
+                s.aligned_allocs,
+                s.refills,
+                s.allocs_per_refill(),
+                s.blocks_per_refill(),
+                s.runs_per_refill(),
+                s.drains,
+                s.drain_blocks,
             );
         }
         if let Some(ck) = &self.chunklet {

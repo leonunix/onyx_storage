@@ -41,6 +41,23 @@ if attempts:
     print("  stripe reserve miss %.2f%% of %d aligned attempts  (starved_batches %d)" % (
         d("flush_writer_alloc_split.reserve_miss_ops") / attempts * 100, attempts,
         d("defrag.stripe_starved_batches")))
+refills = d("allocator_supply.refills")
+if refills:
+    # The lane cache is supposed to absorb most allocations and touch the global
+    # free lock only to refill. allocs_per_refill IS that amplification: at ~1.0
+    # every full-stripe allocation serializes on the global lock (the aged-pool
+    # state where the stripe reserve is nothing but isolated single stripes).
+    # drains are the expensive shape: one global hold that re-inserts every
+    # cached extent from ALL lanes.
+    allocs = d("allocator_supply.aligned_allocs")
+    print("  -- lane-cache supply (global free-lock amplification) --")
+    print("  refills %d (%.0f/s)  allocs/refill %.2f  blocks/refill %.1f  runs/refill %.1f" % (
+        refills, refills / W, allocs / refills, d("allocator_supply.refill_blocks") / refills,
+        d("allocator_supply.refill_runs") / refills))
+    print("  drains %d (%.2f/s) covering %d blocks" % (
+        d("allocator_supply.drains"), d("allocator_supply.drains") / W,
+        d("allocator_supply.drain_blocks")))
+
 grp = d("flush_writer_stripe_groups.total")
 if grp:
     # Exactly-full single-volume stripes can be freed as a whole and hand their

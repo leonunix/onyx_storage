@@ -17,6 +17,22 @@ const LANE_CACHE_REFILL_SIZE: u32 = 256;
 /// Raw passthrough flushes commonly allocate 4-8 contiguous blocks per unit;
 /// serving those from a lane-local slice avoids hammering the global BTreeSet.
 const LANE_EXTENT_CACHE_REFILL_BLOCKS: u32 = 8192;
+/// Maximum number of separate contiguous runs one lane refill may take.
+///
+/// The block budget above is the *intent*, but an aged pool has no long runs
+/// left to satisfy it — the stripe reserve degrades to isolated single-stripe
+/// windows. Taking several runs per lock hold decouples the lane cache from
+/// contiguity: 64 single-stripe runs still buy 64 allocations per global-lock
+/// acquisition. Bounded because the cache is scanned linearly per carve and
+/// because cached blocks are parked away from other lanes (64 × one stripe =
+/// 1.5 MiB per lane, far under the block budget's 32 MiB).
+const LANE_EXTENT_CACHE_REFILL_RUNS: usize = 64;
+/// Hard bound on reserve entries EXAMINED by one refill's ascending walk.
+/// Without it, a wider-than-one-stripe request against a reserve of
+/// single-stripe runs would skip past every entry in a multi-million-entry set
+/// while holding the global free lock. Generous relative to the run cap so the
+/// common case (every reserve entry qualifies) always fills the batch.
+const LANE_EXTENT_CACHE_REFILL_SCAN: usize = 8 * LANE_EXTENT_CACHE_REFILL_RUNS;
 /// Per-chunk extent cap for the batched retire/reclaim paths
 /// (`retire_extents_batch`, `reclaim_retired_extents_batch`). Bounds each
 /// `retired`/`free`/lane lock hold to a small slice of in-memory BTree work
@@ -51,6 +67,58 @@ pub struct ContiguityStats {
     pub quarantine_target_blocks: u64,
     /// Already-free blocks held inside active defrag quarantines.
     pub quarantine_free_blocks: u64,
+}
+
+/// Lane-cache supply accounting for the aligned (full-stripe) alloc path.
+///
+/// The aligned fast path is meant to serve most allocations out of a lane-local
+/// cache, taking the global `free_pools` lock only to refill. Whether that
+/// actually happens depends on how much the refill manages to take: the
+/// mechanism was built around ONE contiguous run per refill, so on a fragmented
+/// pool it can silently degrade into "global lock per allocation". These
+/// counters read that out directly — `blocks_per_refill` / `allocs_per_refill`
+/// are the amplification the cache is really buying.
+///
+/// `drains` counts `drain_lane_caches` calls, which are the expensive shape:
+/// one global-lock hold that re-inserts every cached extent from ALL lanes. A
+/// nonzero-and-growing `drains` under steady write load means lanes are fighting
+/// over an empty stripe reserve, and each fight stalls all 16 writers.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct AllocSupplyStats {
+    pub aligned_allocs: u64,
+    pub refills: u64,
+    pub refill_blocks: u64,
+    pub refill_runs: u64,
+    pub drains: u64,
+    pub drain_blocks: u64,
+}
+
+impl AllocSupplyStats {
+    /// Blocks obtained per global-lock refill (the refill's real yield, as
+    /// opposed to `LANE_EXTENT_CACHE_REFILL_BLOCKS`'s intent).
+    pub fn blocks_per_refill(&self) -> f64 {
+        if self.refills == 0 {
+            return 0.0;
+        }
+        self.refill_blocks as f64 / self.refills as f64
+    }
+
+    /// Contiguous runs obtained per refill.
+    pub fn runs_per_refill(&self) -> f64 {
+        if self.refills == 0 {
+            return 0.0;
+        }
+        self.refill_runs as f64 / self.refills as f64
+    }
+
+    /// Aligned allocations served per global-lock refill. 1.0 means the lane
+    /// cache is buying nothing and every allocation serializes on `free_pools`.
+    pub fn allocs_per_refill(&self) -> f64 {
+        if self.refills == 0 {
+            return 0.0;
+        }
+        self.aligned_allocs as f64 / self.refills as f64
+    }
 }
 
 /// Free-space policy classes protected by one lock. Every free PBA belongs to
@@ -413,6 +481,14 @@ pub struct SpaceAllocator {
     /// Per-lane contiguous extent caches for raw multi-block writes.
     lane_extent_caches: Vec<Mutex<Vec<Extent>>>,
     alloc_tracker: Option<Mutex<BTreeSet<Pba>>>,
+    /// Aligned-path lane-cache supply accounting — see [`AllocSupplyStats`].
+    /// Relaxed counters, advisory only (never feed an allocation decision).
+    aligned_allocs: AtomicU64,
+    refill_ops: AtomicU64,
+    refill_blocks: AtomicU64,
+    refill_runs: AtomicU64,
+    drain_ops: AtomicU64,
+    drain_blocks: AtomicU64,
 }
 
 impl SpaceAllocator {
@@ -464,6 +540,26 @@ impl SpaceAllocator {
             lane_caches,
             lane_extent_caches,
             alloc_tracker,
+            aligned_allocs: AtomicU64::new(0),
+            refill_ops: AtomicU64::new(0),
+            refill_blocks: AtomicU64::new(0),
+            refill_runs: AtomicU64::new(0),
+            drain_ops: AtomicU64::new(0),
+            drain_blocks: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot of the aligned path's lane-cache supply — see
+    /// [`AllocSupplyStats`]. Lock-free; monotonic counters, so two reads
+    /// difference cleanly.
+    pub fn supply_stats(&self) -> AllocSupplyStats {
+        AllocSupplyStats {
+            aligned_allocs: self.aligned_allocs.load(Ordering::Relaxed),
+            refills: self.refill_ops.load(Ordering::Relaxed),
+            refill_blocks: self.refill_blocks.load(Ordering::Relaxed),
+            refill_runs: self.refill_runs.load(Ordering::Relaxed),
+            drains: self.drain_ops.load(Ordering::Relaxed),
+            drain_blocks: self.drain_blocks.load(Ordering::Relaxed),
         }
     }
 
@@ -813,19 +909,24 @@ impl SpaceAllocator {
     /// Return all cached blocks from lane caches to the global free list.
     /// Called during shutdown to prevent block leaks.
     pub fn drain_lane_caches(&self) {
+        let mut drained: u64 = 0;
         let mut pools = self.free_pools.lock().unwrap();
         for cache_mutex in &self.lane_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for pba in cache.drain(..) {
                 pools.release_extent(Extent::single(pba));
+                drained += 1;
             }
         }
         for cache_mutex in &self.lane_extent_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for extent in cache.drain(..) {
                 pools.release_extent(extent);
+                drained += u64::from(extent.count);
             }
         }
+        self.drain_ops.fetch_add(1, Ordering::Relaxed);
+        self.drain_blocks.fetch_add(drained, Ordering::Relaxed);
         // No counter adjustment needed: cached blocks were never counted as allocated
     }
 
@@ -963,6 +1064,7 @@ impl SpaceAllocator {
         if data_blocks == 0 {
             return Err(OnyxError::Config("cannot allocate 0 blocks".into()));
         }
+        self.aligned_allocs.fetch_add(1, Ordering::Relaxed);
         let need = Self::round_up_blocks(data_blocks, stripe_blocks);
         if lane >= self.lane_extent_caches.len() {
             return self.allocate_stripe_extent_global(need, stripe_blocks, phase);
@@ -1053,26 +1155,44 @@ impl SpaceAllocator {
         Some((aligned, head_pad, tail))
     }
 
-    /// Carve a stripe-aligned `need` from the first cached run that can host it,
-    /// pushing head/tail remainders back into the cache. Head is only non-empty
-    /// when a non-aligned run (e.g. a rest pushed by `allocate_extent_for_lane`)
-    /// is the only candidate; it stays lane-local for a later non-stripe alloc.
+    /// Insert into a lane extent cache, keeping it ordered by DESCENDING start.
+    ///
+    /// The cache holds several disjoint runs once a refill takes more than one,
+    /// so the order it is scanned in decides the order PBAs are handed out.
+    /// Descending-by-start + take-from-the-back means a lane emits aligned
+    /// carves in strictly ASCENDING PBA order, which keeps a leaf's PBAs
+    /// clustered (`lane_extent_cache_hands_out_ascending` pins it). An unordered
+    /// `Vec` with `swap_remove` would scramble them across the whole refill.
+    fn push_extent_cache(cache: &mut Vec<Extent>, extent: Extent) {
+        let at = cache.partition_point(|held| held.start.0 > extent.start.0);
+        cache.insert(at, extent);
+    }
+
+    /// Carve a stripe-aligned `need` from the lowest-address cached run that can
+    /// host it, pushing head/tail remainders back into the cache. Head is only
+    /// non-empty when a non-aligned run (e.g. a rest pushed by
+    /// `allocate_extent_for_lane`) is the only candidate; it stays lane-local for
+    /// a later non-stripe alloc.
+    ///
+    /// The cache is descending by start, so scanning from the BACK visits
+    /// candidates in ascending address order — first hit is the address-argmin,
+    /// mirroring the global pool's first-fit-by-address inside the lane.
     fn take_aligned_from_extent_cache(
         cache: &mut Vec<Extent>,
         need: u32,
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
-        for idx in 0..cache.len() {
+        for idx in (0..cache.len()).rev() {
             if let Some((aligned, head, tail)) =
                 Self::carve_aligned_from_run(cache[idx], need, stripe, phase)
             {
-                cache.swap_remove(idx);
+                cache.remove(idx);
                 if let Some(head) = head {
-                    cache.push(head);
+                    Self::push_extent_cache(cache, head);
                 }
                 if let Some(tail) = tail {
-                    cache.push(tail);
+                    Self::push_extent_cache(cache, tail);
                 }
                 return Some(aligned);
             }
@@ -1973,30 +2093,35 @@ impl SpaceAllocator {
 
         for cache_mutex in &self.lane_extent_caches {
             let mut cache = cache_mutex.lock().unwrap();
+            // Rebuilt through `push_extent_cache` so the descending-by-start
+            // invariant survives splitting one cached run into head + tail.
             let mut retained = Vec::with_capacity(cache.len());
             for cached in cache.drain(..) {
                 if !Self::extents_overlap(cached, target) {
-                    retained.push(cached);
+                    Self::push_extent_cache(&mut retained, cached);
                     continue;
                 }
 
                 let intersection_start = cached.start.0.max(target.start.0);
                 let intersection_end = cached.end_pba().0.min(target.end_pba().0);
                 if cached.start.0 < intersection_start {
-                    retained.push(Extent::new(
-                        cached.start,
-                        (intersection_start - cached.start.0) as u32,
-                    ));
+                    Self::push_extent_cache(
+                        &mut retained,
+                        Extent::new(cached.start, (intersection_start - cached.start.0) as u32),
+                    );
                 }
                 extracted.push(Extent::new(
                     Pba(intersection_start),
                     (intersection_end - intersection_start) as u32,
                 ));
                 if intersection_end < cached.end_pba().0 {
-                    retained.push(Extent::new(
-                        Pba(intersection_end),
-                        (cached.end_pba().0 - intersection_end) as u32,
-                    ));
+                    Self::push_extent_cache(
+                        &mut retained,
+                        Extent::new(
+                            Pba(intersection_end),
+                            (cached.end_pba().0 - intersection_end) as u32,
+                        ),
+                    );
                 }
             }
             *cache = retained;
@@ -2321,17 +2446,32 @@ impl SpaceAllocator {
         let refill = Self::take_exact_from_pools(&mut pools, count, max_count)?;
         let result = Extent::new(refill.start, count);
         if refill.count > count {
-            self.lane_extent_caches[lane]
-                .lock()
-                .unwrap()
-                .push(Extent::new(
-                    Pba(refill.start.0 + count as u64),
-                    refill.count - count,
-                ));
+            Self::push_extent_cache(
+                &mut self.lane_extent_caches[lane].lock().unwrap(),
+                Extent::new(Pba(refill.start.0 + count as u64), refill.count - count),
+            );
         }
         Some(result)
     }
 
+    /// Seed a lane's extent cache from the stripe reserve and hand back one
+    /// aligned `min_count` carve.
+    ///
+    /// Takes up to [`LANE_EXTENT_CACHE_REFILL_RUNS`] runs (bounded by the
+    /// `max_count` block budget) in ONE lock hold, because taking a single
+    /// contiguous run made the whole lane-cache mechanism **depend on contiguous
+    /// free space**: on an aged pool the reserve degrades to isolated
+    /// single-stripe windows, `take` is then exactly one stripe, and the cache
+    /// serves exactly one allocation before the next allocation retakes the
+    /// global lock — with every other writer queued behind it
+    /// (`AllocSupplyStats::allocs_per_refill` reads 1.00 in that state; the
+    /// `aged_pool_bench` `SingleStripe` shape reproduces it).
+    ///
+    /// SELECTION IS UNCHANGED. Removing an extent never coalesces, so "the
+    /// lowest-address qualifying runs, in ascending order" is exactly the
+    /// sequence K successive `first_fit(min_count)` calls would return — this is
+    /// batching, not a policy change, and `batched_refill_equals_sequential_refills`
+    /// pins it.
     fn refill_stripe_extent_lane(
         &self,
         lane: usize,
@@ -2344,23 +2484,85 @@ impl SpaceAllocator {
         if pools.geometry() != Some((stripe, phase)) {
             return None;
         }
-        let extent = pools.stripe_reserve.first_fit(min_count)?;
-        pools.stripe_reserve.remove(&extent);
-        let available = extent.count.min(max_count);
-        let take = (available / stripe) * stripe;
-        if take < min_count {
-            pools.stripe_reserve.insert(extent);
+        // PASS 1 — plan the batch. The set stays borrowed while walking it, so
+        // the whole plan (run + how much of it to take) is decided up front and
+        // pass 2 does the mutation. `take` is floored to a stripe multiple so
+        // every cached run keeps the reserve's aligned shape.
+        //
+        // The first pick is the exact address-argmin over the qualifying runs —
+        // the same extent the one-run-at-a-time refill took, found the same way.
+        let first = pools.stripe_reserve.first_fit(min_count)?;
+        let mut budget = max_count.max(min_count);
+        let mut plan: Vec<(Extent, u32)> = Vec::with_capacity(LANE_EXTENT_CACHE_REFILL_RUNS);
+        fn plan_push(
+            plan: &mut Vec<(Extent, u32)>,
+            budget: &mut u32,
+            run: Extent,
+            stripe: u32,
+            min_count: u32,
+        ) {
+            let take = (run.count.min(*budget) / stripe) * stripe;
+            if take < min_count {
+                return;
+            }
+            plan.push((run, take));
+            *budget -= take;
+        }
+        plan_push(&mut plan, &mut budget, first, stripe, min_count);
+        // Then an ascending walk for the next K-1. The walk is bounded in ENTRIES
+        // EXAMINED, not just entries taken: a request wider than one stripe on a
+        // reserve of single-stripe runs would otherwise skip past every entry in
+        // a multi-million-entry set while holding the global lock. Stopping early
+        // only costs a smaller batch — never correctness, and never worse than
+        // the single-run refill this replaced, which is what `first` already is.
+        let mut examined = 0usize;
+        for run in pools
+            .stripe_reserve
+            .by_addr()
+            .range(Extent::single(Pba(first.start.0 + 1))..)
+        {
+            if plan.len() >= LANE_EXTENT_CACHE_REFILL_RUNS
+                || budget < min_count
+                || examined >= LANE_EXTENT_CACHE_REFILL_SCAN
+            {
+                break;
+            }
+            examined += 1;
+            if run.count >= min_count {
+                plan_push(&mut plan, &mut budget, *run, stripe, min_count);
+            }
+        }
+
+        // PASS 2 — execute it.
+        let mut refill_blocks: u64 = 0;
+        let mut refill_runs: u64 = 0;
+        let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+        for (run, take) in plan {
+            // A previous iteration's reclassified remainder can, in principle,
+            // coalesce with a later pick (adjacent reserve extents exist only
+            // where `insert_split` chunked a >16 TiB aligned region). Proceed
+            // only with runs this refill actually owns — handing out a run that
+            // is still reachable in the pool would be a double allocation.
+            if !pools.stripe_reserve.remove(&run) {
+                continue;
+            }
+            if run.count > take {
+                pools.insert_classified(Extent::new(
+                    Pba(run.start.0 + take as u64),
+                    run.count - take,
+                ));
+            }
+            Self::push_extent_cache(&mut cache, Extent::new(run.start, take));
+            refill_blocks += u64::from(take);
+            refill_runs += 1;
+        }
+        if refill_blocks == 0 {
             return None;
         }
-        if extent.count > take {
-            pools.insert_classified(Extent::new(
-                Pba(extent.start.0 + take as u64),
-                extent.count - take,
-            ));
-        }
-        let refill = Extent::new(extent.start, take);
-        let mut cache = self.lane_extent_caches[lane].lock().unwrap();
-        cache.push(refill);
+        self.refill_ops.fetch_add(1, Ordering::Relaxed);
+        self.refill_blocks
+            .fetch_add(refill_blocks, Ordering::Relaxed);
+        self.refill_runs.fetch_add(refill_runs, Ordering::Relaxed);
         Some(
             Self::take_aligned_from_extent_cache(&mut cache, min_count, stripe, phase)
                 .expect("stripe-reserve refill is aligned and large enough"),
@@ -2503,12 +2705,19 @@ impl SpaceAllocator {
         }
     }
 
+    /// Front-carve `count` blocks off the lowest-address cached run that fits.
+    /// Scans from the back (the cache is descending by start), so selection is
+    /// first-fit-by-address within the lane. Front-carving keeps the remainder's
+    /// start above the taken run and below the next-higher entry, so replacing
+    /// in place preserves the ordering.
     fn take_from_extent_cache(cache: &mut Vec<Extent>, count: u32) -> Option<Extent> {
-        let idx = cache.iter().position(|extent| extent.count >= count)?;
+        let idx = (0..cache.len())
+            .rev()
+            .find(|&idx| cache[idx].count >= count)?;
         let extent = cache[idx];
         let result = Extent::new(extent.start, count);
         if extent.count == count {
-            cache.swap_remove(idx);
+            cache.remove(idx);
         } else {
             cache[idx] = Extent::new(Pba(extent.start.0 + count as u64), extent.count - count);
         }
@@ -2808,10 +3017,14 @@ mod free_pool_policy_tests {
             allocator.defrag_quarantine_progress(target.start),
             Some((STRIPE as u64, STRIPE as u64))
         );
+        // The quarantine split one cached run into a head (9) and a tail (16);
+        // both stay lane-local. Lane extent caches are ordered by DESCENDING
+        // start (carves are taken from the back so a lane emits ascending PBAs —
+        // see `push_extent_cache`), so the tail sorts ahead of the head here.
         let cached = allocator.lane_extent_caches[0].lock().unwrap().clone();
         assert_eq!(
             cached,
-            vec![Extent::single(Pba(9)), Extent::new(Pba(16), 16),]
+            vec![Extent::new(Pba(16), 16), Extent::single(Pba(9))]
         );
         assert!(allocator.complete_defrag_quarantine(target.start).unwrap());
         assert_eq!(
@@ -3855,5 +4068,656 @@ mod stripe_align_tests {
             .unwrap();
         assert_eq!(e.count, 12);
         assert_eq!((e.start.0 + PHASE as u64) % STRIPE as u64, 0);
+    }
+
+    /// Build a reserve of ISOLATED single-stripe windows (the aged-pool shape
+    /// where a one-run refill degrades to "global lock per allocation"), by
+    /// freeing every other aligned window back.
+    ///
+    /// Returns the aligned window starts in ascending order.
+    fn seed_isolated_stripe_windows(a: &SpaceAllocator, windows: usize) -> Vec<u64> {
+        let blocks = (windows as u64 + 2) * 2 * STRIPE as u64 + RESERVED_BLOCKS;
+        let usable = blocks - RESERVED_BLOCKS;
+        a.allocate_extent(usable as u32).unwrap();
+        a.set_stripe_geometry(STRIPE, PHASE);
+        let first = SpaceAllocator::align_up_pba(RESERVED_BLOCKS, STRIPE as u64, PHASE as u64);
+        let mut starts = Vec::with_capacity(windows);
+        for i in 0..windows as u64 {
+            // Stride of two stripes leaves a live stripe between every free one,
+            // so nothing can coalesce: the reserve is `windows` runs of exactly
+            // one stripe each.
+            let start = first + i * 2 * STRIPE as u64;
+            a.free_extent(Extent::new(Pba(start), STRIPE)).unwrap();
+            starts.push(start);
+        }
+        starts
+    }
+
+    fn isolated_window_allocator(windows: usize) -> (SpaceAllocator, Vec<u64>) {
+        let blocks = (windows as u64 + 2) * 2 * STRIPE as u64 + RESERVED_BLOCKS;
+        let a = new_alloc_lanes(blocks, 4);
+        let starts = seed_isolated_stripe_windows(&a, windows);
+        (a, starts)
+    }
+
+    /// Batching a refill must not change SELECTION: taking the K lowest-address
+    /// qualifying runs in one lock hold is exactly the sequence K successive
+    /// `first_fit(need)` calls return, because removing an extent never
+    /// coalesces. Pinned against the reserve's own address order.
+    #[test]
+    fn batched_refill_equals_sequential_refills() {
+        const WINDOWS: usize = LANE_EXTENT_CACHE_REFILL_RUNS * 2 + 5;
+        let (a, expected) = isolated_window_allocator(WINDOWS);
+
+        let mut got = Vec::with_capacity(WINDOWS);
+        for _ in 0..WINDOWS {
+            let e = a
+                .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+                .expect("every seeded window can serve one stripe");
+            assert_eq!(e.count, STRIPE);
+            got.push(e.start.0);
+        }
+        assert_eq!(
+            got, expected,
+            "aligned allocation must consume the reserve in ascending address \
+             order, exactly as one-run-at-a-time first-fit did"
+        );
+        // And the reserve is now empty rather than partially stranded.
+        assert_eq!(a.contiguity_stats().stripe_reserve_blocks, 0);
+    }
+
+    /// The point of the batch: one global-lock refill must serve many
+    /// allocations even when NO two free stripes are adjacent. Before this,
+    /// `allocs_per_refill` was exactly 1.00 on this shape.
+    #[test]
+    fn refill_serves_many_allocs_from_a_discontiguous_reserve() {
+        const WINDOWS: usize = LANE_EXTENT_CACHE_REFILL_RUNS * 2;
+        let (a, _) = isolated_window_allocator(WINDOWS);
+
+        for _ in 0..WINDOWS {
+            a.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+                .unwrap();
+        }
+        let supply = a.supply_stats();
+        assert_eq!(supply.aligned_allocs, WINDOWS as u64);
+        assert_eq!(
+            supply.refills, 2,
+            "K={LANE_EXTENT_CACHE_REFILL_RUNS} runs per refill ⇒ 2 refills for \
+             2K windows, not one per allocation"
+        );
+        assert_eq!(supply.refill_runs, WINDOWS as u64);
+        assert_eq!(supply.refill_blocks, WINDOWS as u64 * STRIPE as u64);
+        assert!(
+            supply.allocs_per_refill() >= LANE_EXTENT_CACHE_REFILL_RUNS as f64,
+            "allocs_per_refill was {}",
+            supply.allocs_per_refill()
+        );
+        assert_eq!(supply.drains, 0, "no lane-cache drain should be needed");
+    }
+
+    /// A lane hands out aligned carves in strictly ASCENDING PBA order even when
+    /// its cache holds many disjoint runs. This is what keeps one L2P leaf's PBAs
+    /// clustered; an unordered cache with `swap_remove` would scramble them
+    /// across the whole refill.
+    #[test]
+    fn lane_extent_cache_hands_out_ascending() {
+        let (a, _) = isolated_window_allocator(LANE_EXTENT_CACHE_REFILL_RUNS);
+        let mut last = 0u64;
+        for i in 0..LANE_EXTENT_CACHE_REFILL_RUNS {
+            let e = a
+                .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+                .unwrap();
+            assert!(
+                e.start.0 > last || i == 0,
+                "allocation {i} at {} went backwards from {last}",
+                e.start.0
+            );
+            last = e.start.0;
+        }
+    }
+
+    /// The cache stays ordered when a carve leaves head/tail remainders, and a
+    /// later unaligned take still picks the lowest-address fit.
+    #[test]
+    fn push_extent_cache_keeps_descending_order_through_splits() {
+        let mut cache = Vec::new();
+        for start in [40u64, 10, 70, 22] {
+            SpaceAllocator::push_extent_cache(&mut cache, Extent::new(Pba(start), 6));
+        }
+        assert_eq!(
+            cache.iter().map(|e| e.start.0).collect::<Vec<_>>(),
+            vec![70, 40, 22, 10]
+        );
+        // Lowest-address fit is taken first, and the front-carve remainder keeps
+        // its slot.
+        let got = SpaceAllocator::take_from_extent_cache(&mut cache, 2).unwrap();
+        assert_eq!(got, Extent::new(Pba(10), 2));
+        assert_eq!(
+            cache.iter().map(|e| e.start.0).collect::<Vec<_>>(),
+            vec![70, 40, 22, 12]
+        );
+        // A misaligned run that must yield a head pad keeps the cache ordered.
+        cache.clear();
+        SpaceAllocator::push_extent_cache(&mut cache, Extent::new(Pba(11), 3 * STRIPE));
+        let aligned =
+            SpaceAllocator::take_aligned_from_extent_cache(&mut cache, STRIPE, STRIPE, PHASE)
+                .unwrap();
+        assert_eq!((aligned.start.0 + PHASE as u64) % STRIPE as u64, 0);
+        let starts: Vec<u64> = cache.iter().map(|e| e.start.0).collect();
+        let mut sorted = starts.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(starts, sorted, "cache must stay descending by start");
+    }
+
+    /// A request wider than every reserve run must still be served from the one
+    /// run that does fit, without the ascending walk scanning the whole reserve.
+    /// (The seeded reserve is deliberately larger than
+    /// `LANE_EXTENT_CACHE_REFILL_SCAN` single-stripe runs.)
+    #[test]
+    fn wide_request_against_single_stripe_reserve_stays_bounded() {
+        const WINDOWS: usize = LANE_EXTENT_CACHE_REFILL_SCAN * 3;
+        let (a, starts) = isolated_window_allocator(WINDOWS);
+        // Widen exactly one window near the END of the reserve into two stripes,
+        // so only it can serve a 2-stripe request and the walk would have to pass
+        // every earlier entry to reach it.
+        let wide = starts[WINDOWS - 2];
+        a.free_extent(Extent::new(Pba(wide + STRIPE as u64), STRIPE))
+            .unwrap();
+
+        let e = a
+            .allocate_stripe_extent_for_lane(0, 2 * STRIPE, STRIPE, PHASE)
+            .expect("the one 2-stripe run must be found");
+        assert_eq!(e.start.0, wide);
+        assert_eq!(e.count, 2 * STRIPE);
+        let supply = a.supply_stats();
+        assert_eq!(supply.refills, 1);
+        assert_eq!(
+            supply.refill_runs, 1,
+            "only the one qualifying run is taken; the walk must not keep going"
+        );
+    }
+
+    /// The block budget still bounds a refill: one huge reserve run cannot park
+    /// more than `LANE_EXTENT_CACHE_REFILL_BLOCKS` in a single lane.
+    #[test]
+    fn refill_respects_the_block_budget() {
+        let blocks = 4 * LANE_EXTENT_CACHE_REFILL_BLOCKS as u64;
+        let a = new_alloc_lanes(blocks, 2);
+        a.set_stripe_geometry(STRIPE, PHASE);
+        a.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        let supply = a.supply_stats();
+        assert_eq!(supply.refills, 1);
+        assert_eq!(
+            supply.refill_runs, 1,
+            "one contiguous run satisfies the whole budget"
+        );
+        assert!(
+            supply.refill_blocks <= u64::from(LANE_EXTENT_CACHE_REFILL_BLOCKS),
+            "refill took {} blocks, budget is {}",
+            supply.refill_blocks,
+            LANE_EXTENT_CACHE_REFILL_BLOCKS
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod aged_pool_bench {
+    //! Local repro of the box-measured writer wall: 2026-07-28, QD256 j16d16 on
+    //! an aged 256 GiB volume, the flush writer spent **55.6% of its time in
+    //! aligned PBA allocation at 871 us/op** with `unaligned_ops = 0` and
+    //! `reserve_miss_ops = 0`. Pool state then: `free_extents = 24,669,384`,
+    //! `free_blocks_in_set = 84,000,718` (mean free extent 3.4 blocks),
+    //! `stripe_capable` flat at 27%.
+    //!
+    //! Two non-exclusive causes were open, and one single-threaded number
+    //! separates them:
+    //!   (A) the critical section itself is expensive — `first_fit` walks every
+    //!       distinct size class >= min_count under the global lock, plus three
+    //!       BTreeSet removes on a cache-cold multi-hundred-MB structure;
+    //!   (B) pure 16-way convoy on one `Mutex`.
+    //! Single-threaded ~100 us/op ⇒ (A) dominates. Single-threaded a few us with
+    //! a large multi-thread multiplier ⇒ (B) dominates.
+    //!
+    //! This also instruments the one link the box run left unmeasured: how many
+    //! blocks a `refill_stripe_extent_lane` actually takes.
+    //!
+    //! Run:
+    //! ```text
+    //! cargo test --release --lib aged_pool_bench -- --ignored --nocapture
+    //! ```
+    //! `ONYX_BENCH_SCALE=<n>` overrides the free-extent target (default: the box
+    //! figure). The full-scale pool needs ~2.5 GiB RSS and ~1 min to build.
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    const STRIPE: u32 = 6;
+    const PHASE: u32 = (RESERVED_BLOCKS % STRIPE as u64) as u32;
+    /// Box `free_extents` at the time of the 871 us/op measurement.
+    const BOX_FREE_EXTENTS: u64 = 24_669_384;
+    /// Box `free_blocks_in_set` — mean free extent 3.4 blocks.
+    const BOX_FREE_BLOCKS: u64 = 84_000_718;
+    /// Box `stripe_capable` share of `free_blocks_in_set`.
+    const BOX_STRIPE_CAPABLE_PCT: f64 = 27.0;
+
+    /// Shape of the long-run tail that carries the stripe reserve. `D` (the
+    /// number of distinct size classes `first_fit` has to walk) is an OUTPUT of
+    /// this choice, not an input, so both ends are measured: `Spread` gives a
+    /// broad size distribution (large D), `Fixed` a narrow one (small D). The
+    /// real pool sits somewhere between — background defrag publishes large
+    /// compacted runs into the reserve, which widens it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TailShape {
+        Spread,
+        Fixed,
+        /// The pessimal shape, and the one the box's own numbers point at: the
+        /// reserve is nothing but ISOLATED single-stripe windows. A refill can
+        /// then only ever take 6 blocks, so the lane cache serves exactly one
+        /// allocation and every single aligned alloc takes the global lock.
+        /// `largest_run` collapsing (box: −60% over 40 min) is what produces it.
+        SingleStripe,
+    }
+
+    /// Synthesize an aged pool whose `contiguity_stats()` match the box:
+    /// `target_extents` free runs totalling ~`3.4 * target_extents` blocks with
+    /// ~27% of those blocks in whole-stripe aligned middles.
+    ///
+    /// Mixture solved from the three box numbers: with `N_l` long runs carrying
+    /// `reserve + 3*N_l` blocks and the rest short (< one stripe, so they
+    /// contribute zero stripe capacity), `N_l = 2%` of runs at mean length ~48
+    /// lands all three at once (0.5 M x 48 = 24 M blocks, of which ~22.5 M are
+    /// aligned middles = 27% of 84 M; the remaining 24.2 M runs average 2.5).
+    pub(crate) fn build_aged_pool(
+        target_extents: u64,
+        shape: TailShape,
+        lanes: usize,
+    ) -> (SpaceAllocator, ContiguityStats) {
+        const LONG_RUN_MEAN: u64 = 48;
+        // Reserve-carrying runs per total runs. `SingleStripe` needs many more of
+        // them to reach the same 27% stripe capacity, since each carries only one
+        // stripe: 22.7 M / 6 = 3.8 M runs out of 24.7 M ≈ 1 in 7.
+        let long_run_in_n: u64 = match shape {
+            TailShape::Spread | TailShape::Fixed => 50, // 2%
+            TailShape::SingleStripe => 7,               // ~14%
+        };
+        let mut rng = StdRng::seed_from_u64(0x00a1_10ca_7ed0_u64.wrapping_mul(target_extents | 1));
+
+        // Walk PBA ascending, emitting run/gap pairs. The gap is live data, so
+        // total span = free blocks + live blocks; size the device to fit.
+        let mut runs: Vec<Extent> = Vec::with_capacity(target_extents as usize);
+        let mut cursor = RESERVED_BLOCKS;
+        for i in 0..target_extents {
+            let len = if i % long_run_in_n == 0 {
+                match shape {
+                    // Geometric-ish spread around the mean → many distinct sizes.
+                    TailShape::Spread => {
+                        let mut l = STRIPE as u64;
+                        while l < 8 * LONG_RUN_MEAN && rng.gen_bool(0.88) {
+                            l += STRIPE as u64;
+                        }
+                        l
+                    }
+                    TailShape::Fixed => LONG_RUN_MEAN,
+                    TailShape::SingleStripe => {
+                        // Start ON an alignment boundary so the whole run is the
+                        // aligned middle: reserve gets exactly one stripe, with
+                        // no head/tail spilling into general.
+                        cursor =
+                            SpaceAllocator::align_up_pba(cursor, STRIPE as u64, PHASE as u64);
+                        STRIPE as u64
+                    }
+                }
+            } else {
+                rng.gen_range(1..=4u64) // mean 2.5, all sub-stripe
+            };
+            runs.push(Extent::new(Pba(cursor), len as u32));
+            // Gap >= 1 keeps runs non-adjacent so classification never coalesces.
+            cursor += len + rng.gen_range(1..=5u64);
+        }
+
+        let device_blocks = cursor + 1024;
+        let allocator = SpaceAllocator::new(device_blocks * BLOCK_SIZE as u64, lanes);
+        {
+            let mut pools = allocator.free_pools.lock().unwrap();
+            pools.replace_general(BTreeSet::new()); // drop the fresh whole-device run
+            pools.set_geometry(STRIPE, PHASE);
+            for run in &runs {
+                pools.insert_classified(*run);
+            }
+        }
+        let free_blocks: u64 = runs.iter().map(|r| r.count as u64).sum();
+        let usable = device_blocks - RESERVED_BLOCKS;
+        allocator.free_blocks.store(free_blocks, Ordering::Relaxed);
+        allocator
+            .allocated_blocks
+            .store(usable - free_blocks, Ordering::Relaxed);
+        let stats = allocator.contiguity_stats();
+        (allocator, stats)
+    }
+
+    /// Distinct `count` values in the stripe reserve — the `D` in `first_fit`'s
+    /// O(D log N) size-class walk, and the direct predictor for hypothesis (A).
+    fn reserve_size_classes(allocator: &SpaceAllocator) -> usize {
+        let pools = allocator.free_pools.lock().unwrap();
+        let mut classes: Vec<u32> = pools
+            .stripe_reserve
+            .by_addr()
+            .iter()
+            .map(|e| e.count)
+            .collect();
+        classes.sort_unstable();
+        classes.dedup();
+        classes.len()
+    }
+
+    fn percentile(sorted_ns: &[u64], p: f64) -> f64 {
+        if sorted_ns.is_empty() {
+            return 0.0;
+        }
+        let idx = ((sorted_ns.len() - 1) as f64 * p).round() as usize;
+        sorted_ns[idx] as f64 / 1000.0
+    }
+
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_aged_pool_stripe_alloc() {
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(BOX_FREE_EXTENTS);
+        const OPS: usize = 100_000;
+        let threads: usize = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+
+        for shape in [
+            TailShape::Fixed,
+            TailShape::Spread,
+            TailShape::SingleStripe,
+        ] {
+            let build = Instant::now();
+            let (allocator, stats) = build_aged_pool(scale, shape, 16);
+            let capable = stats.stripe_capable_blocks.unwrap_or(0);
+            let classes = reserve_size_classes(&allocator);
+            println!(
+                "\n=== shape={:?} scale={} built in {:?} ===\n\
+                 free_extents={} free_blocks={} mean_extent={:.2} \
+                 stripe_capable={} ({:.1}%) reserve={} largest_run={} \
+                 reserve_size_classes(D)={}\n\
+                 box reference:  free_extents={} free_blocks={} mean_extent=3.40 \
+                 stripe_capable={:.1}%",
+                shape,
+                scale,
+                build.elapsed(),
+                stats.free_extents,
+                stats.free_blocks_in_set,
+                stats.free_blocks_in_set as f64 / stats.free_extents.max(1) as f64,
+                capable,
+                capable as f64 / stats.free_blocks_in_set.max(1) as f64 * 100.0,
+                stats.stripe_reserve_blocks,
+                stats.largest_run_blocks,
+                classes,
+                BOX_FREE_EXTENTS,
+                BOX_FREE_BLOCKS,
+                BOX_STRIPE_CAPABLE_PCT,
+            );
+
+            // (1) The raw reserve query, no lock, no allocation: isolates the
+            // size-class walk that hypothesis (A) blames.
+            let mut ff_ns = Vec::with_capacity(1000);
+            {
+                let pools = allocator.free_pools.lock().unwrap();
+                for _ in 0..1000 {
+                    let t = Instant::now();
+                    let hit = pools.stripe_reserve.first_fit(STRIPE);
+                    ff_ns.push(t.elapsed().as_nanos() as u64);
+                    assert!(hit.is_some(), "reserve must be able to serve one stripe");
+                }
+            }
+            ff_ns.sort_unstable();
+            println!(
+                "  first_fit(6) on reserve alone:      p50 {:8.2} us  p99 {:8.2} us",
+                percentile(&ff_ns, 0.5),
+                percentile(&ff_ns, 0.99)
+            );
+
+            // (2) Single-threaded end-to-end allocation = the critical section.
+            let mut ns = Vec::with_capacity(OPS);
+            let mut served = 0usize;
+            for _ in 0..OPS {
+                let t = Instant::now();
+                let got = allocator.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE);
+                ns.push(t.elapsed().as_nanos() as u64);
+                if got.is_ok() {
+                    served += 1;
+                }
+            }
+            let total_us: f64 = ns.iter().sum::<u64>() as f64 / 1000.0;
+            ns.sort_unstable();
+            println!(
+                "  1 thread  x {OPS} ops (served {served}): mean {:8.2} us  p50 {:8.2} us  \
+                 p99 {:8.2} us",
+                total_us / OPS as f64,
+                percentile(&ns, 0.5),
+                percentile(&ns, 0.99)
+            );
+
+            // (3) Same op under contention. The box ran 16 writers; this host has
+            // fewer cores, so the multiplier here is a LOWER bound on the box's.
+            let allocator = std::sync::Arc::new(allocator);
+            let wall = Instant::now();
+            let per_thread: Vec<(u64, usize)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|lane| {
+                        let allocator = allocator.clone();
+                        scope.spawn(move || {
+                            let mut sum_ns = 0u64;
+                            let mut ok = 0usize;
+                            for _ in 0..(OPS / threads) {
+                                let t = Instant::now();
+                                let got = allocator
+                                    .allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE);
+                                sum_ns += t.elapsed().as_nanos() as u64;
+                                if got.is_ok() {
+                                    ok += 1;
+                                }
+                            }
+                            (sum_ns, ok)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let wall = wall.elapsed();
+            let ops: usize = per_thread.iter().map(|(_, ok)| ok).sum();
+            let sum_ns: u64 = per_thread.iter().map(|(ns, _)| ns).sum();
+            println!(
+                "  {threads} threads x {} ops each (served {ops}): mean {:8.2} us/op  \
+                 wall {:?}  => {:.0} allocs/s = {:.1} MiB/s of 24 KiB stripes",
+                OPS / threads,
+                sum_ns as f64 / 1000.0 / ops.max(1) as f64,
+                wall,
+                ops as f64 / wall.as_secs_f64(),
+                ops as f64 / wall.as_secs_f64() * 24.0 / 1024.0,
+            );
+            println!(
+                "  box baseline for comparison:        871.00 us/op, 9333 allocs/s, \
+                 213.7 MiB/s write"
+            );
+            let supply = allocator.supply_stats();
+            println!(
+                "  supply: refills={} blocks/refill={:.1} runs/refill={:.1} \
+                 allocs/refill={:.2} drains={} drain_blocks={}",
+                supply.refills,
+                supply.blocks_per_refill(),
+                supply.runs_per_refill(),
+                supply.allocs_per_refill(),
+                supply.drains,
+                supply.drain_blocks,
+            );
+        }
+    }
+
+    /// The writers are not the only traffic on `free_pools`. Every overwrite
+    /// retires its old PBA and the GC reclaims it, and both go through the
+    /// BATCH_LOCK_CHUNK paths, whose Phase-B hold does up to 4096
+    /// `release_extent` (coalesce-insert) calls in ONE lock hold. The comment on
+    /// `reclaim_retired_extents_batch` already estimates "tens of ms on a
+    /// multi-million-extent free list" and records box-measured "22-80
+    /// thread-s/s alloc convoy spikes phase-locked to every 262K-block reclaim
+    /// batch" — this measures that hold directly, and then measures what it does
+    /// to concurrent aligned allocation.
+    ///
+    /// Run: `cargo test --release --lib bench_batch_hold_vs_alloc -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_batch_hold_vs_alloc() {
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(BOX_FREE_EXTENTS);
+        let threads: usize = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        // Steady state: 6 blocks allocated per stripe write ⇒ 6 blocks retired
+        // and reclaimed per stripe write. Model the reclaim side, which is the
+        // one that re-inserts into the free pool.
+        let (allocator, stats) = build_aged_pool(scale, TailShape::Spread, 16);
+        println!(
+            "\n=== batch-hold vs alloc: free_extents={} free_blocks={} ===",
+            stats.free_extents, stats.free_blocks_in_set
+        );
+
+        // Carve allocated (live) extents to feed the retire/reclaim cycle. The
+        // synthetic pool's gaps are live, so take a slice of them by allocating
+        // fresh — simplest faithful source is the allocator itself.
+        let mut owned: Vec<Extent> = Vec::with_capacity(BATCH_LOCK_CHUNK * 4);
+        while owned.len() < BATCH_LOCK_CHUNK * 4 {
+            match allocator.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE) {
+                Ok(e) => owned.push(e),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            owned.len() >= BATCH_LOCK_CHUNK,
+            "need at least one full chunk of live extents"
+        );
+
+        // (1) One chunk's retire hold, then one chunk's reclaim hold.
+        let chunk: Vec<Extent> = owned.drain(..BATCH_LOCK_CHUNK).collect();
+        let t = Instant::now();
+        let (newly, failed) = allocator.retire_extents_batch(&chunk, Instant::now());
+        let retire_ms = t.elapsed().as_secs_f64() * 1e3;
+        let running = AtomicBool::new(true);
+        let t = Instant::now();
+        let reclaimed = allocator
+            .reclaim_retired_extents_batch(&chunk, &running)
+            .unwrap();
+        let reclaim_ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "  one {BATCH_LOCK_CHUNK}-extent chunk: retire {:8.2} ms (newly={newly} \
+             failed={})  reclaim {:8.2} ms (blocks={} extents={})",
+            retire_ms,
+            failed.len(),
+            reclaim_ms,
+            reclaimed.0,
+            reclaimed.1,
+        );
+        println!("    (the BATCH_LOCK_CHUNK doc comment claims \"~sub-millisecond\" per hold)");
+
+        // (2) Aligned allocation latency with that batch traffic running
+        // concurrently, vs the same measurement with the background idle.
+        let allocator = std::sync::Arc::new(allocator);
+        for background in [false, true] {
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let batches = std::sync::Arc::new(AtomicU64::new(0));
+            // The real overwrite cycle: allocate → retire → GC reclaim → the
+            // blocks come back free. Re-retiring an already-free extent fails
+            // fast and does no work, so the batch MUST be freshly allocated each
+            // round or the background silently becomes a no-op.
+            let held_ns = std::sync::Arc::new(AtomicU64::new(0));
+            let bg = background.then(|| {
+                let allocator = allocator.clone();
+                let stop = stop.clone();
+                let batches = batches.clone();
+                let held_ns = held_ns.clone();
+                std::thread::spawn(move || {
+                    let running = AtomicBool::new(true);
+                    let bg_lane = 15; // not one of the measured lanes
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut batch = Vec::with_capacity(BATCH_LOCK_CHUNK);
+                        while batch.len() < BATCH_LOCK_CHUNK {
+                            match allocator
+                                .allocate_stripe_extent_for_lane(bg_lane, STRIPE, STRIPE, PHASE)
+                            {
+                                Ok(e) => batch.push(e),
+                                Err(_) => break,
+                            }
+                        }
+                        if batch.is_empty() {
+                            break;
+                        }
+                        let t = Instant::now();
+                        let (_, _) = allocator.retire_extents_batch(&batch, Instant::now());
+                        let _ = allocator.reclaim_retired_extents_batch(&batch, &running);
+                        held_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        batches.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            });
+
+            let ops_per_thread = 20_000;
+            let wall = Instant::now();
+            let samples: Vec<Vec<u64>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|lane| {
+                        let allocator = allocator.clone();
+                        scope.spawn(move || {
+                            let mut ns = Vec::with_capacity(ops_per_thread);
+                            for _ in 0..ops_per_thread {
+                                let t = Instant::now();
+                                let _ = allocator
+                                    .allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE);
+                                ns.push(t.elapsed().as_nanos() as u64);
+                            }
+                            ns
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let wall = wall.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            if let Some(bg) = bg {
+                let _ = bg.join();
+            }
+            let mut all: Vec<u64> = samples.into_iter().flatten().collect();
+            let mean = all.iter().sum::<u64>() as f64 / 1000.0 / all.len() as f64;
+            all.sort_unstable();
+            let bg_busy = held_ns.load(Ordering::Relaxed) as f64 / wall.as_nanos() as f64 * 100.0;
+            println!(
+                "  background_batches={:<5} {threads} threads: mean {:8.2} us  p50 {:8.2} us  \
+                 p99 {:8.2} us  p999 {:8.2} us  (bg rounds={} busy {:.0}% wall {:?})",
+                background,
+                mean,
+                percentile(&all, 0.5),
+                percentile(&all, 0.99),
+                percentile(&all, 0.999),
+                batches.load(Ordering::Relaxed),
+                bg_busy,
+                wall,
+            );
+        }
+        let supply = allocator.supply_stats();
+        println!(
+            "  supply: refills={} blocks/refill={:.1} allocs/refill={:.2} drains={} \
+             drain_blocks={}",
+            supply.refills,
+            supply.blocks_per_refill(),
+            supply.allocs_per_refill(),
+            supply.drains,
+            supply.drain_blocks,
+        );
     }
 }
