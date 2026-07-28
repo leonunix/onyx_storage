@@ -20,12 +20,20 @@ for k in ["total", "alloc", "io", "meta_build", "meta_commit", "meta_candidate",
     print("  %-16s %9.2f s  %5.1f%% of total" % (k, v / 1e9, v / tot * 100 if tot else 0))
 alloc = d("flush_writer_ns.alloc")
 print("  -- alloc split (which free pool served it) --")
+accounted = 0
 for label in ["aligned", "unaligned", "reserve_miss"]:
     v = d("flush_writer_alloc_split." + label + "_ns")
     ops = d("flush_writer_alloc_split." + label + "_ops")
+    accounted += v
     print("  %-16s %9.2f s  %5.1f%% of alloc  %8d ops (%6.0f/s)  %7.2f us/op" % (
         label, v / 1e9, v / alloc * 100 if alloc else 0, ops, ops / W,
         v / ops / 1000 if ops else 0))
+# The three buckets time the allocator calls; `alloc` is the whole Phase A wall
+# clock, so the residual is planning + bookkeeping, NOT a missing pool. A large
+# residual means Phase A grew a new cost centre that nothing measures.
+print("  %-16s %9.2f s  %5.1f%% of alloc   (planning/bookkeeping residual)" % (
+    "unaccounted", (alloc - accounted) / 1e9,
+    (alloc - accounted) / alloc * 100 if alloc else 0))
 attempts = d("flush_writer_alloc_split.aligned_ops") + d("flush_writer_alloc_split.reserve_miss_ops")
 if attempts:
     # A rising miss rate = the stripe reserve is draining faster than free/defrag

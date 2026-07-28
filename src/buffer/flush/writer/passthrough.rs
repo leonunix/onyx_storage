@@ -204,6 +204,10 @@ struct WriteRun {
 struct WriteRunAllocStats {
     short_extent_allocs: u64,
     unused_blocks: u64,
+    /// Allocator calls this helper made. The caller charges them to the
+    /// unaligned bucket; counting surviving runs instead would undercount the
+    /// capacity miss that ends the loop and overstate the per-op mean.
+    alloc_calls: u64,
 }
 
 /// Select whole units that fit in `capacity`, preserving the input order.
@@ -253,6 +257,7 @@ fn allocate_unaligned_write_runs(
             .map(|&member| blocks_per_unit[member])
             .fold(0u32, u32::saturating_add);
         let requested = remaining_blocks.min(stripe.max(1));
+        stats.alloc_calls += 1;
         let extent = match allocator.allocate_extent_for_lane(lane, requested) {
             Ok(extent) => extent,
             Err(OnyxError::SpaceExhausted) => break,
@@ -891,13 +896,11 @@ impl BufferFlusher {
                 &metrics.flush_writer_alloc_unaligned_ns,
                 degraded_alloc_start,
             );
-            if let Ok((runs, _, _)) = &degraded_result {
-                metrics
-                    .flush_writer_alloc_unaligned_ops
-                    .fetch_add(runs.len() as u64, Ordering::Relaxed);
-            }
             match degraded_result {
                 Ok((runs, unplaced, stats)) => {
+                    metrics
+                        .flush_writer_alloc_unaligned_ops
+                        .fetch_add(stats.alloc_calls, Ordering::Relaxed);
                     metrics
                         .flush_writer_group_short_extent_allocs
                         .fetch_add(stats.short_extent_allocs, Ordering::Relaxed);
@@ -908,6 +911,12 @@ impl BufferFlusher {
                     unplaced_members = unplaced;
                 }
                 Err(error) => {
+                    // The helper only returns Err from an allocator call, so the
+                    // elapsed time above belongs to at least one op; charging
+                    // zero would inflate the surviving ops' mean.
+                    metrics
+                        .flush_writer_alloc_unaligned_ops
+                        .fetch_add(1, Ordering::Relaxed);
                     for m in degraded_for_error {
                         failed[m] = true;
                         tracing::error!(
