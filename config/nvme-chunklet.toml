@@ -159,6 +159,17 @@ read_pool_workers = 32
 # when its block count is a multiple of the 6-block (24 KiB) stripe. Default
 # off in code; turned on here for the A/B baseline.
 raid_full_stripe_writes = true
+# A/B knob (default off in code): pack each stripe from same-volume units with
+# adjacent LBAs instead of purely by block count. The stripe reserve only gets a
+# 24 KiB window back when every block in it is free at once, and one live block
+# pins the whole window, so mixing six unrelated LBAs into a stripe is what makes
+# `stripe_capable` fall monotonically on an aged pool (43.9% -> 21.7% over 40 min,
+# measured 2026-07-27) and pushes the writer onto the general pool. Both packings
+# are planned and affinity is kept only when its padding ties or beats size-only,
+# so the knob cannot trade space for co-location. Flip to true for the B arm; judge
+# it on `flush_writer_stripe_groups` (did the plan change), `flush_writer_alloc_split`
+# (reserve miss rate) and `allocator_contiguity` (stripe_capable decay).
+stripe_group_lifetime_affinity = false
 
 [buffer]
 # A/B knob (default off in code): drain LV2 ring backpressure BEFORE taking the

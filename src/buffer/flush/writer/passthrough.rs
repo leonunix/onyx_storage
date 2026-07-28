@@ -21,6 +21,7 @@ use crate::error::OnyxError;
 /// dozens of 4 KiB RAID writes.
 pub(super) fn plan_stripe_groups(
     blocks_per_unit: &[u32],
+    affinity: Option<&[StripeAffinityKey<'_>]>,
     stripe: u32,
 ) -> (Vec<Vec<usize>>, Vec<usize>) {
     let n = blocks_per_unit.len();
@@ -29,9 +30,66 @@ pub(super) fn plan_stripe_groups(
     }
 
     // Candidates = strictly-sub-stripe units, largest-first for exact fills.
-    let mut candidates: Vec<usize> = (0..n)
+    let candidates: Vec<usize> = (0..n)
         .filter(|&i| blocks_per_unit[i] >= 1 && blocks_per_unit[i] < stripe)
         .collect();
+
+    // Every non-empty bin becomes one padded full-stripe IO. The writer tracks
+    // the used prefix and returns any unused tail after IO succeeds.
+    //
+    // The affinity arm plans BOTH ways and keeps its own only when it costs no
+    // pad space: affinity hands a SUBSET back to the size-first packer, and a
+    // packer with fewer options can pack worse. Measured counterexample:
+    // `[8,2,2,2,6,5,6,4,4,3,1,8,1]`, where taking three same-volume 2-block
+    // units as their own stripe strands the 4/4/3 units that those 2s would
+    // otherwise have topped up (pad 6 vs 0). Pad waste is space amplification --
+    // the very thing this knob exists to reduce -- so a tie keeps affinity
+    // (equal pad plus better co-location is a strict improvement) and a loss
+    // falls back. The second plan and its clone stay INSIDE this arm so the
+    // default-off path allocates and packs exactly once, as it did before.
+    let groups = match affinity.filter(|keys| keys.len() == n) {
+        Some(keys) => {
+            let size_first = pack_size_first(candidates.clone(), blocks_per_unit, stripe);
+            let mut affinity_groups: Vec<Vec<usize>> = Vec::new();
+            let rest = pack_affinity_stripes(
+                candidates,
+                blocks_per_unit,
+                keys,
+                stripe,
+                &mut affinity_groups,
+            );
+            affinity_groups.extend(pack_size_first(rest, blocks_per_unit, stripe));
+            if pad_waste(&affinity_groups, blocks_per_unit, stripe)
+                <= pad_waste(&size_first, blocks_per_unit, stripe)
+            {
+                affinity_groups
+            } else {
+                size_first
+            }
+        }
+        None => pack_size_first(candidates, blocks_per_unit, stripe),
+    };
+    let mut leftover: Vec<usize> = Vec::new();
+    // Non-candidates (0 blocks, or whole stripe multiples / oversize) are leftover.
+    for i in 0..n {
+        if blocks_per_unit[i] == 0 || blocks_per_unit[i] >= stripe {
+            leftover.push(i);
+        }
+    }
+    leftover.sort_unstable();
+    (groups, leftover)
+}
+
+/// First-fit-decreasing packing by block count alone: the original (and
+/// fallback) policy. Largest-first with an index tie-break maximises exact fills
+/// while staying pure and deterministic. A partial final bin is deliberately
+/// retained — the writer pads it to a full stripe for parity IO and returns the
+/// unused tail after IO, which beats exploding it into single-block RAID writes.
+fn pack_size_first(
+    mut candidates: Vec<usize>,
+    blocks_per_unit: &[u32],
+    stripe: u32,
+) -> Vec<Vec<usize>> {
     candidates.sort_by(|&a, &b| blocks_per_unit[b].cmp(&blocks_per_unit[a]).then(a.cmp(&b)));
 
     // Open bins: (remaining_capacity, members). First-fit placement.
@@ -51,19 +109,84 @@ pub(super) fn plan_stripe_groups(
             bins.push((stripe - b, vec![idx]));
         }
     }
+    bins.into_iter().map(|(_, members)| members).collect()
+}
 
-    // Every non-empty bin becomes one padded full-stripe IO. The writer tracks
-    // the used prefix and returns any unused tail after IO succeeds.
-    let groups: Vec<Vec<usize>> = bins.into_iter().map(|(_, members)| members).collect();
-    let mut leftover: Vec<usize> = Vec::new();
-    // Non-candidates (0 blocks, or whole stripe multiples / oversize) are leftover.
-    for i in 0..n {
-        if blocks_per_unit[i] == 0 || blocks_per_unit[i] >= stripe {
-            leftover.push(i);
+/// Blocks that will be written as stripe padding under this plan: every group
+/// costs a whole stripe of physical space regardless of how much it uses.
+fn pad_waste(groups: &[Vec<usize>], blocks_per_unit: &[u32], stripe: u32) -> u32 {
+    groups
+        .iter()
+        .map(|members| {
+            let used: u32 = members.iter().map(|&m| blocks_per_unit[m]).sum();
+            stripe.saturating_sub(used)
+        })
+        .sum()
+}
+
+/// Where a unit lives logically, for lifetime-affinity stripe packing.
+///
+/// The allocator only gets a stripe window back into its reserve when every
+/// block in that window is free at the same time, and a window is never
+/// re-folded while a single live block pins it. So the packer's choice of
+/// *which* units share a stripe decides how long that window stays pinned:
+/// same-volume neighbours are overwritten (and freed) together, six unrelated
+/// LBAs are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StripeAffinityKey<'a> {
+    pub vol: &'a str,
+    pub lba: u64,
+}
+
+/// Emit only the stripes an affinity run fills **exactly**; return every unit it
+/// could not place so the size-first packer still gets a shot at them.
+///
+/// Units are visited volume-major, LBA-ascending, and accumulated into an open
+/// bin. A volume change or an overflow closes the bin and releases its members
+/// back — a partial bin is deliberately *not* padded here, because pad waste is
+/// the one thing this pass must not add (measured `unused_blocks` is 0.004 % of
+/// LBAs today). No absolute LBA-gap cutoff is applied: after sorting, the
+/// neighbours in one flush batch are already the closest ones available, and
+/// arriving in the same batch is itself temporal locality.
+fn pack_affinity_stripes(
+    candidates: Vec<usize>,
+    blocks_per_unit: &[u32],
+    keys: &[StripeAffinityKey<'_>],
+    stripe: u32,
+    groups: &mut Vec<Vec<usize>>,
+) -> Vec<usize> {
+    let mut ordered = candidates;
+    ordered.sort_by(|&a, &b| {
+        keys[a]
+            .vol
+            .cmp(keys[b].vol)
+            .then(keys[a].lba.cmp(&keys[b].lba))
+            .then(a.cmp(&b))
+    });
+
+    let mut unplaced: Vec<usize> = Vec::new();
+    let mut bin: Vec<usize> = Vec::new();
+    let mut used = 0u32;
+    let mut bin_vol: Option<&str> = None;
+
+    for idx in ordered {
+        let blocks = blocks_per_unit[idx];
+        if bin_vol != Some(keys[idx].vol) || used + blocks > stripe {
+            unplaced.append(&mut bin);
+            used = 0;
+            bin_vol = Some(keys[idx].vol);
+        }
+        bin.push(idx);
+        used += blocks;
+        if used == stripe {
+            groups.push(std::mem::take(&mut bin));
+            used = 0;
+            bin_vol = None;
         }
     }
-    leftover.sort_unstable();
-    (groups, leftover)
+    unplaced.append(&mut bin);
+    unplaced.sort_unstable();
+    unplaced
 }
 
 #[derive(Debug)]
@@ -646,17 +769,29 @@ impl BufferFlusher {
             alloc_blocks[i] = blocks_per_unit[i];
         }
 
-        let (groups, leftover) = plan_stripe_groups(&blocks_per_unit, stripe);
+        // Lifetime affinity needs each unit's logical identity; borrow it from
+        // `units` for the duration of planning only.
+        let affinity_keys: Option<Vec<StripeAffinityKey>> =
+            io_engine.stripe_lifetime_affinity().then(|| {
+                units
+                    .iter()
+                    .map(|unit| StripeAffinityKey {
+                        vol: unit.vol_id.as_str(),
+                        lba: unit.start_lba.0,
+                    })
+                    .collect()
+            });
+        let (groups, leftover) =
+            plan_stripe_groups(&blocks_per_unit, affinity_keys.as_deref(), stripe);
         let group_used_blocks: Vec<u32> = groups
             .iter()
             .map(|members| members.iter().map(|&m| blocks_per_unit[m]).sum())
             .collect();
 
-        // Shape of what the packer actually emitted. A stripe that is exactly
-        // full AND single-volume is the one whose blocks can plausibly be freed
-        // together and hand the whole window back to the allocator's stripe
-        // reserve; a mixed one stays part-pinned by whichever member lives
-        // longest. Recorded unconditionally so it is a usable baseline.
+        // Judge the plan by its output, not by which pass produced it: a stripe
+        // that is exactly full AND single-volume is the one whose blocks can
+        // plausibly die together and return the window to the stripe reserve.
+        // Recorded on both A/B arms so the knob's effect is directly readable.
         if !groups.is_empty() {
             let single_volume = groups
                 .iter()
@@ -878,31 +1013,29 @@ impl BufferFlusher {
                     );
                 }
                 let bufalloc_start = Instant::now();
-                let allocated =
-                    io_engine.allocate_owned_write_buffer(extent.count as usize * bs);
+                let allocated = io_engine.allocate_owned_write_buffer(extent.count as usize * bs);
                 Self::record_elapsed(&metrics.flush_writer_bufalloc_ns, bufalloc_start);
-                let mut buf =
-                    match allocated {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            let run = write_runs[run_idx]
-                                .take()
-                                .expect("buffer failure consumes run ownership");
-                            let _ = crate::space::pba_lifecycle::rollback_uncommitted(
-                                allocator, run.extent,
-                            );
-                            for member in run.members {
-                                failed[member] = true;
-                            }
-                            tracing::error!(
-                                error = %e,
-                                run = run_idx,
-                                "writer: grouped run buffer allocation failed"
-                            );
-                            run_buffers.push(None);
-                            continue;
+                let mut buf = match allocated {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        let run = write_runs[run_idx]
+                            .take()
+                            .expect("buffer failure consumes run ownership");
+                        let _ = crate::space::pba_lifecycle::rollback_uncommitted(
+                            allocator, run.extent,
+                        );
+                        for member in run.members {
+                            failed[member] = true;
                         }
-                    };
+                        tracing::error!(
+                            error = %e,
+                            run = run_idx,
+                            "writer: grouped run buffer allocation failed"
+                        );
+                        run_buffers.push(None);
+                        continue;
+                    }
+                };
                 let bufzero_start = Instant::now();
                 buf.as_mut_slice().fill(0);
                 Self::record_elapsed(&metrics.flush_writer_bufzero_ns, bufzero_start);
@@ -941,10 +1074,7 @@ impl BufferFlusher {
                             let assemble_start = Instant::now();
                             units[i]
                                 .copy_payload_to(&mut buf.as_mut_slice()[..units[i].payload_len()]);
-                            Self::record_elapsed(
-                                &metrics.flush_writer_assemble_ns,
-                                assemble_start,
-                            );
+                            Self::record_elapsed(&metrics.flush_writer_assemble_ns, assemble_start);
                             unit_buffers[i] = Some(buf);
                         }
                         Err(e) => {
@@ -1323,7 +1453,10 @@ impl BufferFlusher {
 
 #[cfg(test)]
 mod stripe_group_tests {
-    use super::{allocate_unaligned_write_runs, plan_stripe_groups, take_members_for_capacity};
+    use super::{
+        allocate_unaligned_write_runs, plan_stripe_groups, take_members_for_capacity,
+        StripeAffinityKey,
+    };
     use crate::space::allocator::SpaceAllocator;
     use crate::space::extent::Extent;
     use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
@@ -1331,7 +1464,7 @@ mod stripe_group_tests {
     /// Every group must fit within one stripe, and group members + leftover
     /// must partition `0..n` exactly once.
     fn assert_partition(blocks: &[u32], stripe: u32) {
-        let (groups, leftover) = plan_stripe_groups(blocks, stripe);
+        let (groups, leftover) = plan_stripe_groups(blocks, None, stripe);
         let mut seen = vec![false; blocks.len()];
         for g in &groups {
             let sum: u32 = g.iter().map(|&i| blocks[i]).sum();
@@ -1362,7 +1495,7 @@ mod stripe_group_tests {
             vec![5, 1],
             vec![1, 1, 1, 1, 1, 1],
         ] {
-            let (groups, leftover) = plan_stripe_groups(&blocks, 6);
+            let (groups, leftover) = plan_stripe_groups(&blocks, None, 6);
             assert_eq!(groups.len(), 1, "{blocks:?} → exactly one full stripe");
             assert!(leftover.is_empty(), "{blocks:?} → no leftover");
             assert_partition(&blocks, 6);
@@ -1372,7 +1505,7 @@ mod stripe_group_tests {
     #[test]
     fn partial_bin_is_retained_for_full_stripe_padding() {
         // 3 + 2 = 5 < 6 → one padded stripe, no per-unit fallback.
-        let (groups, leftover) = plan_stripe_groups(&[3, 2], 6);
+        let (groups, leftover) = plan_stripe_groups(&[3, 2], None, 6);
         assert_eq!(groups, vec![vec![0, 1]]);
         assert!(leftover.is_empty());
     }
@@ -1381,7 +1514,7 @@ mod stripe_group_tests {
     fn whole_stripe_multiple_and_oversize_are_leftover() {
         // 6 = one stripe on its own (alloc_passthrough aligns it); 7 > stripe,
         // not a multiple → per-unit path. Neither is a packing candidate.
-        let (groups, leftover) = plan_stripe_groups(&[6, 7, 12], 6);
+        let (groups, leftover) = plan_stripe_groups(&[6, 7, 12], None, 6);
         assert!(groups.is_empty());
         assert_eq!(leftover, vec![0, 1, 2]);
     }
@@ -1389,7 +1522,7 @@ mod stripe_group_tests {
     #[test]
     fn twelve_ones_form_two_stripes() {
         let blocks = vec![1u32; 12];
-        let (groups, leftover) = plan_stripe_groups(&blocks, 6);
+        let (groups, leftover) = plan_stripe_groups(&blocks, None, 6);
         assert_eq!(groups.len(), 2);
         assert!(leftover.is_empty());
         assert_partition(&blocks, 6);
@@ -1399,8 +1532,8 @@ mod stripe_group_tests {
     fn mixed_batch_is_deterministic_and_partitions() {
         // 3,3,2,2,5,1 (blocks) + a lone 4 that can't be completed.
         let blocks = vec![3, 3, 2, 2, 5, 1, 4];
-        let (g1, l1) = plan_stripe_groups(&blocks, 6);
-        let (g2, l2) = plan_stripe_groups(&blocks, 6);
+        let (g1, l1) = plan_stripe_groups(&blocks, None, 6);
+        let (g2, l2) = plan_stripe_groups(&blocks, None, 6);
         assert_eq!(g1, g2, "pure + deterministic");
         assert_eq!(l1, l2);
         assert_partition(&blocks, 6);
@@ -1413,9 +1546,327 @@ mod stripe_group_tests {
     #[test]
     fn stripe_one_is_all_leftover() {
         let blocks = vec![1, 2, 3];
-        let (groups, leftover) = plan_stripe_groups(&blocks, 1);
+        let (groups, leftover) = plan_stripe_groups(&blocks, None, 1);
         assert!(groups.is_empty());
         assert_eq!(leftover, vec![0, 1, 2]);
+    }
+
+    /// Build affinity keys from `(volume, lba)` pairs.
+    fn keys<'a>(pairs: &'a [(&'a str, u64)]) -> Vec<StripeAffinityKey<'a>> {
+        pairs
+            .iter()
+            .map(|&(vol, lba)| StripeAffinityKey { vol, lba })
+            .collect()
+    }
+
+    /// Same invariant as `assert_partition`, with affinity on: every candidate
+    /// still lands exactly once and no group overflows the stripe.
+    fn assert_affinity_partition(blocks: &[u32], pairs: &[(&str, u64)], stripe: u32) {
+        let k = keys(pairs);
+        let (groups, leftover) = plan_stripe_groups(blocks, Some(&k), stripe);
+        let mut seen = vec![false; blocks.len()];
+        for g in &groups {
+            let sum: u32 = g.iter().map(|&i| blocks[i]).sum();
+            assert!(sum > 0 && sum <= stripe, "group {g:?} overflows {stripe}");
+            for &i in g {
+                assert!(!seen[i], "index {i} in two places");
+                seen[i] = true;
+            }
+        }
+        for &i in &leftover {
+            assert!(!seen[i], "index {i} in group and leftover");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every index placed once");
+    }
+
+    #[test]
+    fn affinity_none_is_byte_for_byte_the_size_first_plan() {
+        // The knob defaults off, so `None` must reproduce the legacy plan
+        // exactly for every shape the size-first tests above cover.
+        for blocks in [
+            vec![3, 3, 2, 2, 5, 1, 4],
+            vec![1u32; 12],
+            vec![2, 2, 2],
+            vec![6, 7, 12],
+            vec![0, 0],
+            vec![5, 1, 5, 1],
+        ] {
+            let (g_legacy, l_legacy) = plan_stripe_groups(&blocks, None, 6);
+            // An affinity slice of the wrong length is ignored (defensive
+            // guard), which must also fall back to the legacy plan.
+            let short = keys(&[("v", 0)]);
+            let (g_guard, l_guard) = plan_stripe_groups(&blocks, Some(&short), 6);
+            assert_eq!(g_legacy, g_guard, "{blocks:?} length guard → legacy plan");
+            assert_eq!(l_legacy, l_guard);
+        }
+    }
+
+    #[test]
+    fn affinity_groups_same_volume_neighbours_into_one_stripe() {
+        // Six 1-block units: three from vol-a at adjacent LBAs, three from
+        // vol-b. Size-first would mix them (all are equal size, so first-fit
+        // fills one bin in index order); affinity must not.
+        let blocks = vec![1u32; 6];
+        let pairs = [
+            ("vol-a", 0),
+            ("vol-b", 900),
+            ("vol-a", 1),
+            ("vol-b", 901),
+            ("vol-a", 2),
+            ("vol-b", 902),
+        ];
+        let k = keys(&pairs);
+        let (groups, leftover) = plan_stripe_groups(&blocks, Some(&k), 3);
+        assert!(leftover.is_empty());
+        assert_eq!(groups.len(), 2, "one stripe per volume");
+        // Each group is single-volume and LBA-ascending.
+        for g in &groups {
+            let vols: std::collections::BTreeSet<&str> = g.iter().map(|&i| pairs[i].0).collect();
+            assert_eq!(vols.len(), 1, "group {g:?} mixes volumes");
+            let lbas: Vec<u64> = g.iter().map(|&i| pairs[i].1).collect();
+            let mut sorted = lbas.clone();
+            sorted.sort_unstable();
+            assert_eq!(lbas, sorted, "group {g:?} not LBA-ascending");
+        }
+        assert_affinity_partition(&blocks, &pairs, 3);
+    }
+
+    #[test]
+    fn affinity_never_emits_a_partial_stripe_of_its_own() {
+        // vol-a can only muster 2 of the 3 blocks a stripe needs. Affinity must
+        // hand both back rather than pad a short stripe; the size-first pass
+        // then packs them with vol-b's unit (pad waste unchanged).
+        let blocks = vec![1, 1, 1];
+        let pairs = [("vol-a", 0), ("vol-a", 1), ("vol-b", 500)];
+        let k = keys(&pairs);
+        let (groups, leftover) = plan_stripe_groups(&blocks, Some(&k), 3);
+        assert!(leftover.is_empty());
+        assert_eq!(groups, vec![vec![0, 1, 2]], "one mixed stripe, still exact");
+        assert_affinity_partition(&blocks, &pairs, 3);
+    }
+
+    #[test]
+    fn affinity_falls_back_for_units_it_cannot_fill_exactly() {
+        // vol-a: 2+2 = 4 of 6 (short), vol-b: 5 of 6 (short). Neither fills a
+        // stripe alone, so all four go to the size-first packer, which forms
+        // 5+1 and 2+2 -- exactly the legacy grouping for these sizes.
+        let blocks = vec![2, 2, 5, 1];
+        let pairs = [("vol-a", 0), ("vol-a", 1), ("vol-b", 700), ("vol-b", 701)];
+        let k = keys(&pairs);
+        let (groups, leftover) = plan_stripe_groups(&blocks, Some(&k), 6);
+        let (g_legacy, l_legacy) = plan_stripe_groups(&blocks, None, 6);
+        assert_eq!(groups, g_legacy, "no exact affinity fill → legacy plan");
+        assert_eq!(leftover, l_legacy);
+        assert_affinity_partition(&blocks, &pairs, 6);
+    }
+
+    #[test]
+    fn affinity_is_deterministic_and_index_order_independent() {
+        // Same logical batch, units presented in a different order: the plan
+        // must be the same set of (volume, lba) groupings.
+        let blocks = vec![1u32; 6];
+        let a = [
+            ("vol-a", 10),
+            ("vol-a", 11),
+            ("vol-a", 12),
+            ("vol-b", 20),
+            ("vol-b", 21),
+            ("vol-b", 22),
+        ];
+        let b = [
+            ("vol-b", 22),
+            ("vol-a", 12),
+            ("vol-b", 20),
+            ("vol-a", 10),
+            ("vol-b", 21),
+            ("vol-a", 11),
+        ];
+        let group_keys = |pairs: &[(&str, u64)]| -> std::collections::BTreeSet<Vec<(String, u64)>> {
+            let k = keys(pairs);
+            let (groups, leftover) = plan_stripe_groups(&blocks, Some(&k), 3);
+            assert!(leftover.is_empty());
+            groups
+                .iter()
+                .map(|g| {
+                    let mut named: Vec<(String, u64)> = g
+                        .iter()
+                        .map(|&i| (pairs[i].0.to_string(), pairs[i].1))
+                        .collect();
+                    named.sort();
+                    named
+                })
+                .collect()
+        };
+        assert_eq!(group_keys(&a), group_keys(&b));
+        // And repeat runs are identical (pure function).
+        assert_eq!(group_keys(&a), group_keys(&a));
+    }
+
+    #[test]
+    fn affinity_pad_waste_never_exceeds_the_size_first_plan() {
+        // Pad waste = padded stripe bytes - used bytes. Affinity only emits
+        // exact fills, so its total waste must be <= legacy on every shape.
+        let cases: [(Vec<u32>, Vec<(&str, u64)>); 4] = [
+            (
+                vec![1, 1, 1, 1, 1, 1, 1],
+                vec![
+                    ("a", 0),
+                    ("a", 1),
+                    ("a", 2),
+                    ("b", 5),
+                    ("b", 6),
+                    ("b", 7),
+                    ("c", 9),
+                ],
+            ),
+            (
+                vec![3, 3, 2, 2, 5, 1],
+                vec![("a", 0), ("a", 4), ("b", 1), ("b", 2), ("c", 3), ("c", 8)],
+            ),
+            (
+                vec![2, 4, 2, 4],
+                vec![("a", 0), ("a", 1), ("b", 2), ("b", 3)],
+            ),
+            (vec![1, 5], vec![("a", 0), ("a", 1)]),
+        ];
+        let waste = |groups: &[Vec<usize>], blocks: &[u32]| -> u32 {
+            groups
+                .iter()
+                .map(|g| {
+                    let used: u32 = g.iter().map(|&i| blocks[i]).sum();
+                    6 - used
+                })
+                .sum()
+        };
+        for (blocks, pairs) in cases {
+            let k = keys(&pairs);
+            let (g_aff, _) = plan_stripe_groups(&blocks, Some(&k), 6);
+            let (g_legacy, _) = plan_stripe_groups(&blocks, None, 6);
+            assert!(
+                waste(&g_aff, &blocks) <= waste(&g_legacy, &blocks),
+                "affinity added pad waste for {blocks:?}: {} vs {}",
+                waste(&g_aff, &blocks),
+                waste(&g_legacy, &blocks)
+            );
+            assert_affinity_partition(&blocks, &pairs, 6);
+        }
+    }
+
+    #[test]
+    fn affinity_pad_waste_property_over_random_batches() {
+        // "Affinity never adds pad" is NOT proven: the affinity pass hands a
+        // SUBSET back to the size-first packer, and a packer offered fewer
+        // options can in principle do worse. Hand-picked shapes above found no
+        // counterexample, so assert it empirically over a deterministic sweep --
+        // a failure here is a real (if small) space regression, and should be
+        // read as one rather than quietly relaxed.
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        const STRIPE: u32 = 6;
+        let mut rng = StdRng::seed_from_u64(0x0aff_1114_79_5eed);
+        let vols = ["vol-a", "vol-b", "vol-c", "vol-d"];
+        let waste = |groups: &[Vec<usize>], blocks: &[u32]| -> u32 {
+            groups
+                .iter()
+                .map(|g| STRIPE - g.iter().map(|&i| blocks[i]).sum::<u32>())
+                .sum()
+        };
+
+        let mut plans_differed = 0usize;
+        for round in 0..4_000 {
+            let n = rng.gen_range(1..=24usize);
+            // 1..=8 spans candidates (1..5), the exact stripe (6) and oversize
+            // (7, 8), so the leftover path is exercised too.
+            let blocks: Vec<u32> = (0..n).map(|_| rng.gen_range(1..=8u32)).collect();
+            let pairs: Vec<(&str, u64)> = (0..n)
+                .map(|_| {
+                    (
+                        vols[rng.gen_range(0..vols.len())],
+                        rng.gen_range(0..2_000u64),
+                    )
+                })
+                .collect();
+            let k = keys(&pairs);
+            let (g_aff, l_aff) = plan_stripe_groups(&blocks, Some(&k), STRIPE);
+            let (g_leg, l_leg) = plan_stripe_groups(&blocks, None, STRIPE);
+
+            assert_affinity_partition(&blocks, &pairs, STRIPE);
+            // Leftover is a function of sizes alone, so affinity must not move it.
+            assert_eq!(
+                l_aff, l_leg,
+                "round {round}: leftover changed for {blocks:?}"
+            );
+            let (wa, wl) = (waste(&g_aff, &blocks), waste(&g_leg, &blocks));
+            assert!(
+                wa <= wl,
+                "round {round}: affinity added pad ({wa} > {wl})\n  blocks {blocks:?}\n  keys {pairs:?}"
+            );
+            if g_aff != g_leg {
+                plans_differed += 1;
+            }
+        }
+        // Guard against a vacuous sweep: affinity must actually be re-planning.
+        assert!(
+            plans_differed > 100,
+            "sweep never exercised the affinity path ({plans_differed} of 4000 plans differed)"
+        );
+    }
+
+    #[test]
+    fn affinity_reshapes_the_plan_under_a_box_shaped_batch() {
+        // The pad tie-break can only ever *reject* affinity, so guard the shape
+        // we actually ship against it silently becoming a no-op: ONE volume (the
+        // box runs a single fio-volume, so the volume dimension is constant and
+        // every bit of signal comes from LBA adjacency) and mostly 1-block units,
+        // which is what randrw 4k-32k through lz4 produces. Measured at the time
+        // of writing: affinity re-plans 98 % of these batches and 88 % of the
+        // stripes it emits are exactly full.
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        const STRIPE: u32 = 6;
+        let mut rng = StdRng::seed_from_u64(0x0b0c_5eed_0000_0001);
+        let mut differed = 0usize;
+        let mut exact_full = 0usize;
+        let mut emitted = 0usize;
+        const ROUNDS: usize = 2_000;
+        for _ in 0..ROUNDS {
+            let n = rng.gen_range(8..=40usize);
+            let blocks: Vec<u32> = (0..n)
+                .map(|_| {
+                    if rng.gen_range(0..10u32) < 7 {
+                        1
+                    } else {
+                        rng.gen_range(2..=5u32)
+                    }
+                })
+                .collect();
+            let pairs: Vec<(&str, u64)> = (0..n)
+                .map(|_| ("fio-volume", rng.gen_range(0..67_108_864u64)))
+                .collect();
+            let k = keys(&pairs);
+            let (g_aff, _) = plan_stripe_groups(&blocks, Some(&k), STRIPE);
+            let (g_leg, _) = plan_stripe_groups(&blocks, None, STRIPE);
+            if g_aff != g_leg {
+                differed += 1;
+            }
+            emitted += g_aff.len();
+            exact_full += g_aff
+                .iter()
+                .filter(|g| g.iter().map(|&i| blocks[i]).sum::<u32>() == STRIPE)
+                .count();
+        }
+        assert!(
+            differed * 100 / ROUNDS >= 90,
+            "affinity re-planned only {differed} of {ROUNDS} box-shaped batches — the pad \
+             tie-break has turned the knob into a near no-op on the shipping shape"
+        );
+        assert!(
+            exact_full * 100 / emitted >= 80,
+            "only {exact_full} of {emitted} emitted stripes are exactly full"
+        );
     }
 
     #[test]
@@ -1532,7 +1983,7 @@ mod stripe_group_tests {
     #[test]
     fn empty_units_pass_through() {
         // 0-block units are never candidates and always land in leftover.
-        let (groups, leftover) = plan_stripe_groups(&[0, 0], 6);
+        let (groups, leftover) = plan_stripe_groups(&[0, 0], None, 6);
         assert!(groups.is_empty());
         assert_eq!(leftover, vec![0, 1]);
     }

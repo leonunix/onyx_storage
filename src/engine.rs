@@ -244,7 +244,8 @@ impl OnyxEngine {
             );
             return Ok(Arc::new(
                 IoEngine::new_chunklet(device, storage.use_hugepages, metrics)
-                    .with_full_stripe_writes(storage.raid_full_stripe_writes),
+                    .with_full_stripe_writes(storage.raid_full_stripe_writes)
+                    .with_stripe_lifetime_affinity(storage.stripe_group_lifetime_affinity),
             ));
         }
         match storage.io_backend {

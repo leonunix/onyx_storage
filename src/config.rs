@@ -1029,6 +1029,26 @@ pub struct StorageConfig {
     /// waste low. Flag exists for A/B baselining + instant rollback.
     #[serde(default = "default_raid_full_stripe_writes")]
     pub raid_full_stripe_writes: bool,
+    /// Pack each RAID stripe from units of the same volume with adjacent LBAs
+    /// ("lifetime affinity") instead of purely by block count.
+    ///
+    /// The stripe reserve only regains a 24 KiB window when *every* block in it
+    /// is free at the same time, and a window is never re-folded while one live
+    /// block pins it. Size-only bin-packing mixes six unrelated LBAs into one
+    /// stripe, so their overwrite times are independent and the window stays
+    /// part-pinned indefinitely — that is what drives `stripe_capable` down
+    /// monotonically on an aged pool and pushes the writer onto the general
+    /// pool. Co-locating same-volume neighbours makes a whole stripe far more
+    /// likely to die at once and return to the reserve without any defrag IO.
+    ///
+    /// Affinity alone can cost space: it hands a subset back to the size-first
+    /// packer, and a packer with fewer options can pack worse (measured
+    /// counterexample: `[8,2,2,2,6,5,6,4,4,3,1,8,1]`, pad 6 vs 0). So both plans
+    /// are computed and affinity is kept only when its stripe padding ties or
+    /// beats size-only — the knob can never trade space for co-location.
+    /// Default false for A/B baselining and instant rollback.
+    #[serde(default)]
+    pub stripe_group_lifetime_affinity: bool,
 }
 
 impl Default for StorageConfig {
@@ -1046,6 +1066,7 @@ impl Default for StorageConfig {
             lv3_batch_target_bytes: 0,
             lv3_batch_executors: 0,
             raid_full_stripe_writes: default_raid_full_stripe_writes(),
+            stripe_group_lifetime_affinity: false,
         }
     }
 }

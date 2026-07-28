@@ -498,7 +498,21 @@ impl BufferFlusher {
                     .iter()
                     .map(|unit| unit.payload_len().div_ceil(bs) as u32)
                     .collect();
-                let (groups, _) = passthrough::plan_stripe_groups(&blocks, stripe);
+                // Plan with the same policy the writer will actually use, or
+                // this admission check would call a carry "ready" on a grouping
+                // the writer never forms.
+                let affinity_keys: Option<Vec<passthrough::StripeAffinityKey>> =
+                    io_engine.stripe_lifetime_affinity().then(|| {
+                        pt_carry
+                            .iter()
+                            .map(|unit| passthrough::StripeAffinityKey {
+                                vol: unit.vol_id.as_str(),
+                                lba: unit.start_lba.0,
+                            })
+                            .collect()
+                    });
+                let (groups, _) =
+                    passthrough::plan_stripe_groups(&blocks, affinity_keys.as_deref(), stripe);
                 let mut ready = vec![false; pt_carry.len()];
                 for members in groups {
                     let used: u32 = members.iter().map(|member| blocks[*member]).sum();

@@ -487,6 +487,12 @@ pub struct IoEngine {
     /// `storage.raid_full_stripe_writes`; false makes `stripe_blocks()` report 1
     /// (no alignment, no padding) so the writer is byte-for-byte unchanged.
     full_stripe_writes: bool,
+    /// When true, the writer packs each stripe from same-volume units with
+    /// adjacent LBAs so the whole stripe tends to be freed at once and returns
+    /// to the allocator's stripe reserve. Set from
+    /// `storage.stripe_group_lifetime_affinity`; only meaningful while
+    /// `stripe_blocks() > 1`.
+    stripe_lifetime_affinity: bool,
     chunklet_write_batcher: Option<ChunkletWriteBatcher>,
 }
 
@@ -539,6 +545,7 @@ impl IoEngine {
             backend,
             per_shard_write_sessions: false,
             full_stripe_writes: false,
+            stripe_lifetime_affinity: false,
             chunklet_write_batcher,
         }
     }
@@ -617,6 +624,21 @@ impl IoEngine {
     pub fn with_full_stripe_writes(mut self, enabled: bool) -> Self {
         self.full_stripe_writes = enabled;
         self
+    }
+
+    /// Enable/disable lifetime-affinity stripe packing. When on, the writer
+    /// prefers to fill a stripe with same-volume, LBA-adjacent units so the
+    /// stripe is freed as a whole and re-enters the allocator's stripe reserve
+    /// without defrag IO. No-op while `stripe_blocks() <= 1`.
+    pub fn with_stripe_lifetime_affinity(mut self, enabled: bool) -> Self {
+        self.stripe_lifetime_affinity = enabled;
+        self
+    }
+
+    /// Whether the writer should pack stripes by lifetime affinity. Gated on the
+    /// stripe path being live at all, so a non-parity backend never pays for it.
+    pub fn stripe_lifetime_affinity(&self) -> bool {
+        self.stripe_lifetime_affinity && self.stripe_blocks() > 1
     }
 
     /// Create a fresh, dedicated io_uring session for one flusher writer shard's
