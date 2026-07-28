@@ -244,6 +244,7 @@ impl BufferFlusher {
             let phase = io_engine.stripe_phase();
             let pba = match Self::alloc_passthrough(
                 allocator,
+                metrics,
                 shard_idx,
                 blocks_needed as u32,
                 stripe,
@@ -505,29 +506,60 @@ impl BufferFlusher {
     /// packing into full stripes is a documented follow-up.
     fn alloc_passthrough(
         allocator: &SpaceAllocator,
+        metrics: &EngineMetrics,
         lane: usize,
         blocks_needed: u32,
         stripe: u32,
         phase: u32,
     ) -> OnyxResult<Pba> {
         if stripe > 1 && blocks_needed % stripe == 0 {
+            let aligned_start = Instant::now();
             match allocator.allocate_stripe_extent_for_lane(lane, blocks_needed, stripe, phase) {
                 Ok(ext) => {
                     debug_assert_eq!(ext.count, blocks_needed, "aligned multiple must not pad");
+                    Self::record_alloc_path(
+                        &metrics.flush_writer_alloc_aligned_ns,
+                        &metrics.flush_writer_alloc_aligned_ops,
+                        aligned_start,
+                    );
                     return Ok(ext.start);
                 }
                 // Alignment fragmentation near full: fall back to unaligned so
                 // IO keeps flowing (this write misses the full-stripe path).
-                Err(crate::error::OnyxError::SpaceExhausted) => {}
-                Err(e) => return Err(e),
+                // The miss itself is the expensive case (lane-cache drain plus a
+                // global-lock retry), so it gets its own bucket rather than
+                // being charged to the aligned path that never served anything.
+                Err(crate::error::OnyxError::SpaceExhausted) => {
+                    Self::record_alloc_path(
+                        &metrics.flush_writer_alloc_reserve_miss_ns,
+                        &metrics.flush_writer_alloc_reserve_miss_ops,
+                        aligned_start,
+                    );
+                }
+                Err(e) => {
+                    Self::record_alloc_path(
+                        &metrics.flush_writer_alloc_aligned_ns,
+                        &metrics.flush_writer_alloc_aligned_ops,
+                        aligned_start,
+                    );
+                    return Err(e);
+                }
             }
         }
-        if blocks_needed == 1 {
+        let unaligned_start = Instant::now();
+        let result = if blocks_needed == 1 {
             allocator.allocate_one_for_lane(lane)
         } else {
-            let ext = allocator.allocate_exact_extent_for_lane(lane, blocks_needed)?;
-            Ok(ext.start)
-        }
+            allocator
+                .allocate_exact_extent_for_lane(lane, blocks_needed)
+                .map(|ext| ext.start)
+        };
+        Self::record_alloc_path(
+            &metrics.flush_writer_alloc_unaligned_ns,
+            &metrics.flush_writer_alloc_unaligned_ops,
+            unaligned_start,
+        );
+        result
     }
 
     /// Direct-free an uncommitted per-unit reservation (rollback / IO-failure
@@ -619,6 +651,30 @@ impl BufferFlusher {
             .iter()
             .map(|members| members.iter().map(|&m| blocks_per_unit[m]).sum())
             .collect();
+
+        // Shape of what the packer actually emitted. A stripe that is exactly
+        // full AND single-volume is the one whose blocks can plausibly be freed
+        // together and hand the whole window back to the allocator's stripe
+        // reserve; a mixed one stays part-pinned by whichever member lives
+        // longest. Recorded unconditionally so it is a usable baseline.
+        if !groups.is_empty() {
+            let single_volume = groups
+                .iter()
+                .zip(&group_used_blocks)
+                .filter(|(members, &used)| {
+                    used == stripe
+                        && members
+                            .iter()
+                            .all(|&m| units[m].vol_id == units[members[0]].vol_id)
+                })
+                .count();
+            metrics
+                .flush_writer_stripe_groups_total
+                .fetch_add(groups.len() as u64, Ordering::Relaxed);
+            metrics
+                .flush_writer_stripe_single_volume_groups
+                .fetch_add(single_volume as u64, Ordering::Relaxed);
+        }
         let mut write_runs: Vec<Option<WriteRun>> = Vec::with_capacity(groups.len());
         let mut run_of: Vec<Option<usize>> = vec![None; n];
 
@@ -635,9 +691,15 @@ impl BufferFlusher {
                 degraded_members.extend(members.iter().copied());
                 continue;
             }
+            let group_alloc_start = Instant::now();
             match allocator.allocate_stripe_extent_for_lane(shard_idx, stripe, stripe, phase) {
                 Ok(extent) => {
                     debug_assert_eq!(extent.count, stripe);
+                    Self::record_alloc_path(
+                        &metrics.flush_writer_alloc_aligned_ns,
+                        &metrics.flush_writer_alloc_aligned_ops,
+                        group_alloc_start,
+                    );
                     write_runs.push(Some(WriteRun {
                         extent,
                         used_blocks: group_used_blocks[gi],
@@ -646,6 +708,11 @@ impl BufferFlusher {
                     }));
                 }
                 Err(OnyxError::SpaceExhausted) => {
+                    Self::record_alloc_path(
+                        &metrics.flush_writer_alloc_reserve_miss_ns,
+                        &metrics.flush_writer_alloc_reserve_miss_ops,
+                        group_alloc_start,
+                    );
                     stripe_starved = true;
                     metrics
                         .flush_writer_stripe_starved_batches
@@ -653,6 +720,11 @@ impl BufferFlusher {
                     degraded_members.extend(members.iter().copied());
                 }
                 Err(error) => {
+                    Self::record_alloc_path(
+                        &metrics.flush_writer_alloc_aligned_ns,
+                        &metrics.flush_writer_alloc_aligned_ops,
+                        group_alloc_start,
+                    );
                     for &m in members {
                         failed[m] = true;
                         tracing::error!(
@@ -669,14 +741,27 @@ impl BufferFlusher {
         let mut unplaced_members = Vec::new();
         if !degraded_members.is_empty() {
             let degraded_for_error = degraded_members.clone();
-            match allocate_unaligned_write_runs(
+            // Every run here comes out of the general pool, so the whole helper
+            // is charged to the unaligned path as one op per surviving run.
+            let degraded_alloc_start = Instant::now();
+            let degraded_result = allocate_unaligned_write_runs(
                 allocator,
                 shard_idx,
                 degraded_members,
                 &blocks_per_unit,
                 stripe,
                 phase,
-            ) {
+            );
+            Self::record_elapsed(
+                &metrics.flush_writer_alloc_unaligned_ns,
+                degraded_alloc_start,
+            );
+            if let Ok((runs, _, _)) = &degraded_result {
+                metrics
+                    .flush_writer_alloc_unaligned_ops
+                    .fetch_add(runs.len() as u64, Ordering::Relaxed);
+            }
+            match degraded_result {
                 Ok((runs, unplaced, stats)) => {
                     metrics
                         .flush_writer_group_short_extent_allocs
@@ -724,7 +809,7 @@ impl BufferFlusher {
             .flush_writer_group_fallback_units
             .fetch_add(unplaced_members.len() as u64, Ordering::Relaxed);
         for m in unplaced_members {
-            match Self::alloc_passthrough(allocator, shard_idx, blocks_per_unit[m], 1, 0) {
+            match Self::alloc_passthrough(allocator, metrics, shard_idx, blocks_per_unit[m], 1, 0) {
                 Ok(pba) => pbas[m] = Some(pba),
                 Err(error) => {
                     failed[m] = true;
@@ -746,6 +831,7 @@ impl BufferFlusher {
             };
             match Self::alloc_passthrough(
                 allocator,
+                metrics,
                 shard_idx,
                 blocks_per_unit[i],
                 eff_stripe,

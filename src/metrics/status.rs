@@ -1216,6 +1216,31 @@ impl EngineStatusSnapshot {
             self.metrics.flush_writer_mark_flushed_ns,
             self.metrics.flush_writer_precheck_live_pba_ns
         );
+        // Split of the `alloc` window above by serving free pool. A rising
+        // `alloc` share is ambiguous in the aggregate: `aligned` degrades when
+        // the stripe reserve's runs shorten, `unaligned` when the general pool
+        // inflates with sub-stripe confetti, and `reserve_miss` is the direct
+        // count of aligned attempts that found no stripe-capable run (each one
+        // drains the lane caches and retries under the global free lock).
+        let _ = writeln!(
+            out,
+            "flush_writer_alloc_split: aligned_ns={} aligned_ops={} unaligned_ns={} unaligned_ops={} reserve_miss_ns={} reserve_miss_ops={}",
+            self.metrics.flush_writer_alloc_aligned_ns,
+            self.metrics.flush_writer_alloc_aligned_ops,
+            self.metrics.flush_writer_alloc_unaligned_ns,
+            self.metrics.flush_writer_alloc_unaligned_ops,
+            self.metrics.flush_writer_alloc_reserve_miss_ns,
+            self.metrics.flush_writer_alloc_reserve_miss_ops
+        );
+        // Shape of the stripes the writer actually emitted. `single_volume` are
+        // the exactly-full single-volume ones, i.e. the stripes that can be
+        // freed as a whole and re-enter the stripe reserve without defrag IO.
+        let _ = writeln!(
+            out,
+            "flush_writer_stripe_groups: total={} single_volume={}",
+            self.metrics.flush_writer_stripe_groups_total,
+            self.metrics.flush_writer_stripe_single_volume_groups
+        );
         // Split of the `io` window above. Measured: only ~8 % of it is real LV3
         // write time, so this attributes the rest.
         let _ = writeln!(

@@ -329,6 +329,19 @@ impl BufferFlusher {
         counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
     }
 
+    /// Charge one PBA allocation attempt to the free pool that served it. `ns`
+    /// and `ops` are always bumped together so a status delta yields a per-op
+    /// mean, which is what separates "the pool got slower" from "we did more
+    /// allocations".
+    fn record_alloc_path(
+        ns: &std::sync::atomic::AtomicU64,
+        ops: &std::sync::atomic::AtomicU64,
+        start: Instant,
+    ) {
+        Self::record_elapsed(ns, start);
+        ops.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn is_full_raw_unit(unit: &CompressedUnit) -> bool {
         let bs = BLOCK_SIZE as usize;
         unit.compression == 0

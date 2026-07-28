@@ -18,6 +18,28 @@ tot = d("flush_writer_ns.total")
 for k in ["total", "alloc", "io", "meta_build", "meta_commit", "meta_candidate", "cleanup", "mark_flushed"]:
     v = d("flush_writer_ns." + k)
     print("  %-16s %9.2f s  %5.1f%% of total" % (k, v / 1e9, v / tot * 100 if tot else 0))
+alloc = d("flush_writer_ns.alloc")
+print("  -- alloc split (which free pool served it) --")
+for label in ["aligned", "unaligned", "reserve_miss"]:
+    v = d("flush_writer_alloc_split." + label + "_ns")
+    ops = d("flush_writer_alloc_split." + label + "_ops")
+    print("  %-16s %9.2f s  %5.1f%% of alloc  %8d ops (%6.0f/s)  %7.2f us/op" % (
+        label, v / 1e9, v / alloc * 100 if alloc else 0, ops, ops / W,
+        v / ops / 1000 if ops else 0))
+attempts = d("flush_writer_alloc_split.aligned_ops") + d("flush_writer_alloc_split.reserve_miss_ops")
+if attempts:
+    # A rising miss rate = the stripe reserve is draining faster than free/defrag
+    # refills it, which is what pushes the writer onto the general pool.
+    print("  stripe reserve miss %.2f%% of %d aligned attempts  (starved_batches %d)" % (
+        d("flush_writer_alloc_split.reserve_miss_ops") / attempts * 100, attempts,
+        d("defrag.stripe_starved_batches")))
+grp = d("flush_writer_stripe_groups.total")
+if grp:
+    # Exactly-full single-volume stripes can be freed as a whole and hand their
+    # 24 KiB window back to the reserve; mixed ones stay part-pinned.
+    sv = d("flush_writer_stripe_groups.single_volume")
+    print("  stripes emitted %d (%.0f/s)  single-volume exact %d (%.1f%%)" % (
+        grp, grp / W, sv, sv / grp * 100))
 io = d("flush_writer_ns.io")
 print("  -- io split --")
 for k in ["bufalloc", "bufzero", "assemble", "submit"]:

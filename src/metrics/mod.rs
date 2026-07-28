@@ -489,6 +489,30 @@ pub struct EngineMetrics {
     pub flush_qos_rate_decreases: AtomicU64,
     pub flush_writer_total_ns: AtomicU64,
     pub flush_writer_alloc_ns: AtomicU64,
+    /// Split of `flush_writer_alloc_ns` by which free pool served the request.
+    /// The two pools degrade for different reasons and need different fixes, so
+    /// the aggregate cannot attribute a rising allocation cost: `aligned` comes
+    /// out of the stripe reserve (full-stripe writes), `unaligned` out of the
+    /// general sub-stripe pool, and `reserve_miss` counts aligned attempts that
+    /// found no stripe-capable run -- the direct read of reserve exhaustion, and
+    /// the expensive path (it drains every lane cache and retries under the
+    /// global free lock before giving up). `stripe_starved_batches` only counts
+    /// the first miss per batch, so it understates the real reserve pressure.
+    pub flush_writer_alloc_aligned_ns: AtomicU64,
+    pub flush_writer_alloc_aligned_ops: AtomicU64,
+    pub flush_writer_alloc_unaligned_ns: AtomicU64,
+    pub flush_writer_alloc_unaligned_ops: AtomicU64,
+    pub flush_writer_alloc_reserve_miss_ns: AtomicU64,
+    pub flush_writer_alloc_reserve_miss_ops: AtomicU64,
+    /// Outcome of stripe bin-packing, recorded whether or not
+    /// `storage.stripe_group_lifetime_affinity` is on, so the two A/B arms are
+    /// directly comparable. `single_volume` counts stripes that are both exactly
+    /// full and built from one volume -- the shape whose blocks can plausibly be
+    /// freed together and hand the whole 24 KiB window back to the stripe
+    /// reserve. The ratio against `total` is the direct read of whether affinity
+    /// packing is actually changing the stripes the writer emits.
+    pub flush_writer_stripe_groups_total: AtomicU64,
+    pub flush_writer_stripe_single_volume_groups: AtomicU64,
     pub flush_writer_io_ns: AtomicU64,
     /// Split of the writer's `io` window: buffer allocation, the blanket
     /// zero-fill, payload assembly, and the actual submit. Measurement showed

@@ -343,9 +343,15 @@ impl BufferFlusher {
             let sw = stripe as usize;
             let mut i = 0;
             while i + sw <= n {
+                let group_alloc_start = Instant::now();
                 match allocator.allocate_stripe_extent_for_lane(shard_idx, stripe, stripe, phase) {
                     Ok(ext) => {
                         debug_assert_eq!(ext.count, stripe);
+                        Self::record_alloc_path(
+                            &metrics.flush_writer_alloc_aligned_ns,
+                            &metrics.flush_writer_alloc_aligned_ops,
+                            group_alloc_start,
+                        );
                         let members: Vec<usize> = (i..i + sw).collect();
                         for (j, &s) in members.iter().enumerate() {
                             let old = sealed_slots[s].pba;
@@ -361,7 +367,14 @@ impl BufferFlusher {
                     }
                     // Near-full alignment fragmentation: stop grouping; the
                     // remaining slots keep their packer PBAs (per-slot path).
-                    Err(_) => break,
+                    Err(_) => {
+                        Self::record_alloc_path(
+                            &metrics.flush_writer_alloc_reserve_miss_ns,
+                            &metrics.flush_writer_alloc_reserve_miss_ops,
+                            group_alloc_start,
+                        );
+                        break;
+                    }
                 }
             }
         }

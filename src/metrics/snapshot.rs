@@ -274,6 +274,16 @@ impl EngineMetrics {
             flush_qos_rate_decreases: load(&self.flush_qos_rate_decreases),
             flush_writer_total_ns: load(&self.flush_writer_total_ns),
             flush_writer_alloc_ns: load(&self.flush_writer_alloc_ns),
+            flush_writer_alloc_aligned_ns: load(&self.flush_writer_alloc_aligned_ns),
+            flush_writer_alloc_aligned_ops: load(&self.flush_writer_alloc_aligned_ops),
+            flush_writer_alloc_unaligned_ns: load(&self.flush_writer_alloc_unaligned_ns),
+            flush_writer_alloc_unaligned_ops: load(&self.flush_writer_alloc_unaligned_ops),
+            flush_writer_alloc_reserve_miss_ns: load(&self.flush_writer_alloc_reserve_miss_ns),
+            flush_writer_alloc_reserve_miss_ops: load(&self.flush_writer_alloc_reserve_miss_ops),
+            flush_writer_stripe_groups_total: load(&self.flush_writer_stripe_groups_total),
+            flush_writer_stripe_single_volume_groups: load(
+                &self.flush_writer_stripe_single_volume_groups,
+            ),
             flush_writer_io_ns: load(&self.flush_writer_io_ns),
             flush_writer_bufalloc_ns: load(&self.flush_writer_bufalloc_ns),
             flush_writer_bufzero_ns: load(&self.flush_writer_bufzero_ns),
@@ -784,6 +794,22 @@ pub struct EngineMetricsSnapshot {
     pub flush_qos_rate_decreases: u64,
     pub flush_writer_total_ns: u64,
     pub flush_writer_alloc_ns: u64,
+    #[serde(default)]
+    pub flush_writer_alloc_aligned_ns: u64,
+    #[serde(default)]
+    pub flush_writer_alloc_aligned_ops: u64,
+    #[serde(default)]
+    pub flush_writer_alloc_unaligned_ns: u64,
+    #[serde(default)]
+    pub flush_writer_alloc_unaligned_ops: u64,
+    #[serde(default)]
+    pub flush_writer_alloc_reserve_miss_ns: u64,
+    #[serde(default)]
+    pub flush_writer_alloc_reserve_miss_ops: u64,
+    #[serde(default)]
+    pub flush_writer_stripe_groups_total: u64,
+    #[serde(default)]
+    pub flush_writer_stripe_single_volume_groups: u64,
     pub flush_writer_io_ns: u64,
     pub flush_writer_bufalloc_ns: u64,
     pub flush_writer_bufzero_ns: u64,
@@ -1290,6 +1316,14 @@ impl EngineMetricsSnapshot {
             flush_qos_rate_decreases,
             flush_writer_total_ns,
             flush_writer_alloc_ns,
+            flush_writer_alloc_aligned_ns,
+            flush_writer_alloc_aligned_ops,
+            flush_writer_alloc_unaligned_ns,
+            flush_writer_alloc_unaligned_ops,
+            flush_writer_alloc_reserve_miss_ns,
+            flush_writer_alloc_reserve_miss_ops,
+            flush_writer_stripe_groups_total,
+            flush_writer_stripe_single_volume_groups,
             flush_writer_io_ns,
             flush_writer_bufalloc_ns,
             flush_writer_bufzero_ns,
