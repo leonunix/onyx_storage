@@ -221,6 +221,23 @@ impl FreeSet {
     /// the distinct size classes in `by_size` (each class's first entry is that
     /// class's lowest address) instead of walking the fragment belt.
     pub(crate) fn first_fit(&self, min_count: u32) -> Option<Extent> {
+        // When even the SMALLEST extent in the set is big enough, the candidate
+        // set is the whole set and the address-argmin is simply the lowest-address
+        // extent — two descents instead of one per distinct size class.
+        //
+        // This is not a corner case, it is the hot path: `stripe_reserve` holds
+        // only stripe-aligned extents whose count is a multiple of `stripe` (the
+        // `insert_classified` invariant), and the flush writer asks for exactly
+        // one stripe, so every reserve extent qualifies on every call. Box-scale
+        // bench (`aged_pool_bench`, 24.6 M extents): the walk cost 7.3 us/call at
+        // 64 distinct reserve size classes, all of it inside the global free lock.
+        if self
+            .by_size
+            .first()
+            .is_some_and(|&(smallest, _)| smallest >= min_count)
+        {
+            return self.first();
+        }
         let mut best: Option<(u64, u32)> = None;
         let mut lower = Bound::Included((min_count, 0u64));
         while let Some(&(count, start)) = self.by_size.range((lower, Bound::Unbounded)).next() {
@@ -296,6 +313,17 @@ impl FreeSet {
     pub(crate) fn first_fit_aligned(&self, need: u32, stripe: u32, phase: u32) -> Option<Extent> {
         debug_assert!(stripe > 1 && need > 0 && need.is_multiple_of(stripe));
         if self.geom == Some((stripe, phase)) {
+            // Same short-circuit as `first_fit`, over the hosting predicate:
+            // hosting ⟺ `eff >= need`, so if the smallest `eff` in the set
+            // already hosts, every extent hosts and the answer is the
+            // lowest-address one.
+            if self
+                .by_eff
+                .first()
+                .is_some_and(|&(smallest_eff, _)| smallest_eff >= need)
+            {
+                return self.first();
+            }
             // Cursor jump over distinct eff classes >= need; each class's
             // first entry is that class's lowest address; argmin over classes.
             let mut best: Option<(u64, u32)> = None;
@@ -491,6 +519,65 @@ mod tests {
         fs.insert(Extent::new(Pba(100), 50));
         fs.insert(Extent::new(Pba(200), 10));
         assert_eq!(fs.first_fit(10), Some(Extent::new(Pba(100), 50)));
+    }
+
+    /// The hot-path short-circuit: on a stripe-reserve-shaped set (every extent
+    /// a stripe multiple, so every extent qualifies for a one-stripe request)
+    /// `first_fit` must skip the size-class walk and still answer exactly what
+    /// the walk answered — the lowest-address extent.
+    #[test]
+    fn first_fit_short_circuit_matches_the_size_class_walk() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let mut fs = FreeSet::new();
+        let mut shadow = BTreeSet::new();
+        // Aligned starts satisfy (start + 2) % 6 == 0: 4, 10, 16, ...
+        // Deliberately many distinct size classes, inserted out of address order.
+        for (start, count) in [(100u64, 6u32), (4, 60), (40, 12), (58, 24), (16, 18)] {
+            let e = Extent::new(Pba(start), count);
+            fs.insert(e);
+            shadow.insert(e);
+        }
+        fs.set_geometry(STRIPE, PHASE);
+
+        // Every extent is >= one stripe ⇒ short-circuit territory.
+        assert_eq!(fs.first_fit(STRIPE), shadow_first_fit(&shadow, STRIPE));
+        assert_eq!(fs.first_fit(STRIPE), Some(Extent::new(Pba(4), 60)));
+        assert_eq!(
+            fs.first_fit_aligned(STRIPE, STRIPE, PHASE),
+            shadow_first_fit_aligned(&shadow, STRIPE, STRIPE, PHASE)
+        );
+        // A request bigger than the smallest extent falls back to the walk and
+        // must still agree.
+        for need in [12u32, 18, 24, 60, 66] {
+            assert_eq!(
+                fs.first_fit(need),
+                shadow_first_fit(&shadow, need),
+                "need {need}"
+            );
+            assert_eq!(
+                fs.first_fit_aligned(need, STRIPE, PHASE),
+                shadow_first_fit_aligned(&shadow, need, STRIPE, PHASE),
+                "aligned need {need}"
+            );
+        }
+        // Short-circuit must NOT fire when a sub-stripe fragment is present: the
+        // lowest-address extent no longer qualifies.
+        let confetti = Extent::new(Pba(200), 1);
+        fs.insert(confetti);
+        shadow.insert(confetti);
+        assert_eq!(fs.first_fit(STRIPE), shadow_first_fit(&shadow, STRIPE));
+        let low = Extent::new(Pba(2), 1);
+        fs.insert(low);
+        shadow.insert(low);
+        assert_eq!(
+            fs.first_fit(STRIPE),
+            shadow_first_fit(&shadow, STRIPE),
+            "a 1-block extent at the lowest address must not be handed out for a \
+             stripe request"
+        );
+        assert_eq!(fs.first_fit(1), Some(low));
+        fs.assert_consistent();
     }
 
     #[test]
