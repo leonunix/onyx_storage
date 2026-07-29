@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -34,11 +34,46 @@ const LANE_EXTENT_CACHE_REFILL_RUNS: usize = 64;
 /// common case (every reserve entry qualifies) always fills the batch.
 const LANE_EXTENT_CACHE_REFILL_SCAN: usize = 8 * LANE_EXTENT_CACHE_REFILL_RUNS;
 /// Per-chunk extent cap for the batched retire/reclaim paths
-/// (`retire_extents_batch`, `reclaim_retired_extents_batch`). Bounds each
-/// `retired`/`free`/lane lock hold to a small slice of in-memory BTree work
-/// (~sub-millisecond) so the foreground alloc/retire path interleaves between
-/// chunks instead of stalling on a single large hold.
+/// (`retire_extents_batch`, `reclaim_retired_extents_batch`). Bounds how much
+/// work ONE lane-cache snapshot (`2 × num_lanes` mutexes) and hazard barrier is
+/// amortized over, and how often the inter-chunk breather runs.
+///
+/// ⚠ This does NOT bound the lock hold — see [`FREE_LOCK_HOLD_EXTENTS`]. The
+/// comment here used to claim "~sub-millisecond per hold", which was wrong by
+/// 12-25×: one 4096-extent Phase-B hold measures **retire 3.3 ms / reclaim
+/// 12.9 ms** on a box-scale free list (`bench_batch_hold_vs_alloc`).
 const BATCH_LOCK_CHUNK: usize = 4096;
+/// Max extents processed per SINGLE acquisition of `free_pools` /
+/// `retired_extents` inside the batched paths. This is what bounds how long the
+/// foreground can be shut out of the free lock, and it is a different concern
+/// from [`BATCH_LOCK_CHUNK`] (which amortizes the lane snapshot).
+///
+/// Splitting the hold costs no reclaim throughput because GC's **total** demand
+/// on this lock is tiny — it is the burst shape that hurts. At the box's
+/// 56 K blocks/s reclaim rate with ~6-block extents that is ~9.3 K extents/s,
+/// i.e. ~2.3 chunks/s × 12.9 ms ≈ **3% lock occupancy**, yet any writer landing
+/// inside a hold waits up to the full 12.9 ms. Mean wait for a random arrival is
+/// `occupancy × hold/2`, so it falls linearly with the hold: ~190 µs at 4096
+/// extents/hold, ~6 µs at 128. Capacity stays far above demand — 128 extents per
+/// (0.4 ms hold + 0.5 ms breather) is ~142 K extents/s vs the ~9.3 K/s needed.
+///
+/// Runtime-settable (not a `const`) for one reason: A/B'ing it by restarting the
+/// process is worthless. The 2026-07-28 box A/B of the refill change measured two
+/// IDENTICAL arms 2.13× apart on run-order drift alone, so the only way to get a
+/// signal is to alternate the setting INSIDE one process against one pool state.
+static FREE_LOCK_HOLD_EXTENTS: AtomicUsize = AtomicUsize::new(128);
+
+/// Read the current free-lock hold bound (see [`FREE_LOCK_HOLD_EXTENTS`]). One
+/// relaxed load per hold-chunk, i.e. per ~128 extents — not per extent.
+fn free_lock_hold_extents() -> usize {
+    FREE_LOCK_HOLD_EXTENTS.load(Ordering::Relaxed).max(1)
+}
+
+/// Override the free-lock hold bound. Benches use this to compare hold sizes
+/// within a single process; production leaves the default.
+pub fn set_free_lock_hold_extents(extents: usize) {
+    FREE_LOCK_HOLD_EXTENTS.store(extents.max(1), Ordering::Relaxed);
+}
 
 /// One original retire operation's age, tracked at retire granularity in the
 /// `retired_age` log so coalescing the `retired_extents` set can never re-age it.
@@ -118,6 +153,158 @@ impl AllocSupplyStats {
             return 0.0;
         }
         self.aligned_allocs as f64 / self.refills as f64
+    }
+}
+
+/// Which call path acquired `free_pools`.
+///
+/// This split exists to answer one question no other metric can: **when a flush
+/// writer waits on the free lock, who is holding it?** `flush_writer_alloc_split`
+/// only says the writer spent 181-760 µs inside the allocator, and the local
+/// `aged_pool_bench` says the allocator's own work is 0.1-8.7 µs — so nearly all
+/// of it is wait, attributable to someone else's hold. The 2026-07-29 attempt to
+/// shorten the batch hold could not be validated precisely because this
+/// attribution did not exist (the "~3% GC lock occupancy" that motivated it was
+/// estimated from GC block rates, never measured).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeLockSite {
+    /// `refill_stripe_extent_lane` + the aligned global fallback — the hot
+    /// full-stripe writer path (100% of box `aligned_ops`).
+    WriterRefill = 0,
+    /// `refill_extent_lane` — the unaligned writer path (0 ops on the box).
+    WriterUnaligned,
+    /// Single-block / non-lane allocation, incl. the packer's lane refill.
+    SmallAlloc,
+    RetireBatch,
+    RetireOne,
+    ReclaimBatch,
+    ReclaimOne,
+    FreeBatch,
+    FreeOne,
+    /// `drain_lane_caches` — one hold that re-inserts every lane's cache.
+    Drain,
+    Quarantine,
+    /// Read-only status / GC queries (`contiguity_stats`, `is_free`, …).
+    Audit,
+    /// Startup / rebuild / geometry / grow.
+    Setup,
+}
+
+/// Number of variants in [`FreeLockSite`].
+const FREE_LOCK_SITES: usize = 13;
+
+impl FreeLockSite {
+    pub const ALL: [FreeLockSite; FREE_LOCK_SITES] = [
+        Self::WriterRefill,
+        Self::WriterUnaligned,
+        Self::SmallAlloc,
+        Self::RetireBatch,
+        Self::RetireOne,
+        Self::ReclaimBatch,
+        Self::ReclaimOne,
+        Self::FreeBatch,
+        Self::FreeOne,
+        Self::Drain,
+        Self::Quarantine,
+        Self::Audit,
+        Self::Setup,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::WriterRefill => "writer_refill",
+            Self::WriterUnaligned => "writer_unaligned",
+            Self::SmallAlloc => "small_alloc",
+            Self::RetireBatch => "retire_batch",
+            Self::RetireOne => "retire_one",
+            Self::ReclaimBatch => "reclaim_batch",
+            Self::ReclaimOne => "reclaim_one",
+            Self::FreeBatch => "free_batch",
+            Self::FreeOne => "free_one",
+            Self::Drain => "drain",
+            Self::Quarantine => "quarantine",
+            Self::Audit => "audit",
+            Self::Setup => "setup",
+        }
+    }
+}
+
+/// Per-site wait/hold accounting for `free_pools`. Monotonic counters, so two
+/// reads difference cleanly; `hold_ns_max` is a high-water mark and does NOT
+/// difference (it answers "what is the worst shut-out window this site ever
+/// caused", which is the figure the batch-hold work never managed to isolate).
+struct FreeLockStats {
+    acquisitions: [AtomicU64; FREE_LOCK_SITES],
+    wait_ns: [AtomicU64; FREE_LOCK_SITES],
+    hold_ns: [AtomicU64; FREE_LOCK_SITES],
+    hold_ns_max: [AtomicU64; FREE_LOCK_SITES],
+}
+
+impl FreeLockStats {
+    fn new() -> Self {
+        Self {
+            acquisitions: std::array::from_fn(|_| AtomicU64::new(0)),
+            wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            hold_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            hold_ns_max: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+/// One site's `free_pools` wait/hold snapshot.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct FreeLockSiteStats {
+    pub site: &'static str,
+    pub acquisitions: u64,
+    pub wait_ns: u64,
+    pub hold_ns: u64,
+    pub hold_ns_max: u64,
+}
+
+impl FreeLockSiteStats {
+    /// Mean wait per acquisition, µs.
+    pub fn wait_us(&self) -> f64 {
+        if self.acquisitions == 0 {
+            return 0.0;
+        }
+        self.wait_ns as f64 / 1000.0 / self.acquisitions as f64
+    }
+
+    /// Mean hold per acquisition, µs.
+    pub fn hold_us(&self) -> f64 {
+        if self.acquisitions == 0 {
+            return 0.0;
+        }
+        self.hold_ns as f64 / 1000.0 / self.acquisitions as f64
+    }
+}
+
+/// RAII `free_pools` guard that charges its hold to a [`FreeLockSite`].
+struct FreeLockGuard<'a> {
+    pools: std::sync::MutexGuard<'a, FreePools>,
+    stats: &'a FreeLockStats,
+    site: usize,
+    acquired: Instant,
+}
+
+impl Drop for FreeLockGuard<'_> {
+    fn drop(&mut self) {
+        let held = self.acquired.elapsed().as_nanos() as u64;
+        self.stats.hold_ns[self.site].fetch_add(held, Ordering::Relaxed);
+        self.stats.hold_ns_max[self.site].fetch_max(held, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for FreeLockGuard<'_> {
+    type Target = FreePools;
+    fn deref(&self) -> &FreePools {
+        &self.pools
+    }
+}
+
+impl std::ops::DerefMut for FreeLockGuard<'_> {
+    fn deref_mut(&mut self) -> &mut FreePools {
+        &mut self.pools
     }
 }
 
@@ -475,6 +662,8 @@ pub struct SpaceAllocator {
     hazards: PbaHazards,
     allocated_blocks: AtomicU64,
     free_blocks: AtomicU64,
+    /// Per-site wait/hold accounting for `free_pools` — see [`FreeLockSite`].
+    free_lock: FreeLockStats,
     /// Per-lane single-block caches. Each flush lane pops from its own cache
     /// to avoid contending on `free_extents`. Refilled in bulk from global.
     lane_caches: Vec<Mutex<Vec<Pba>>>,
@@ -537,6 +726,7 @@ impl SpaceAllocator {
             hazards: PbaHazards::new(),
             allocated_blocks: AtomicU64::new(0),
             free_blocks: AtomicU64::new(usable_blocks),
+            free_lock: FreeLockStats::new(),
             lane_caches,
             lane_extent_caches,
             alloc_tracker,
@@ -552,6 +742,43 @@ impl SpaceAllocator {
     /// Snapshot of the aligned path's lane-cache supply — see
     /// [`AllocSupplyStats`]. Lock-free; monotonic counters, so two reads
     /// difference cleanly.
+    /// Acquire `free_pools`, charging the wait to `site` and (on drop) the hold.
+    /// Two clock reads per acquisition against a critical section measured in
+    /// µs-to-ms, i.e. well under 1%.
+    fn lock_free_pools(&self, site: FreeLockSite) -> FreeLockGuard<'_> {
+        let idx = site as usize;
+        let queued = Instant::now();
+        let pools = self.free_pools.lock().unwrap();
+        let waited = queued.elapsed().as_nanos() as u64;
+        self.free_lock.acquisitions[idx].fetch_add(1, Ordering::Relaxed);
+        self.free_lock.wait_ns[idx].fetch_add(waited, Ordering::Relaxed);
+        FreeLockGuard {
+            pools,
+            stats: &self.free_lock,
+            site: idx,
+            acquired: Instant::now(),
+        }
+    }
+
+    /// Per-site `free_pools` wait/hold snapshot, one entry per
+    /// [`FreeLockSite`] (including never-acquired sites, so the shape is stable
+    /// across two reads for differencing).
+    pub fn free_lock_stats(&self) -> Vec<FreeLockSiteStats> {
+        FreeLockSite::ALL
+            .iter()
+            .map(|&site| {
+                let i = site as usize;
+                FreeLockSiteStats {
+                    site: site.name(),
+                    acquisitions: self.free_lock.acquisitions[i].load(Ordering::Relaxed),
+                    wait_ns: self.free_lock.wait_ns[i].load(Ordering::Relaxed),
+                    hold_ns: self.free_lock.hold_ns[i].load(Ordering::Relaxed),
+                    hold_ns_max: self.free_lock.hold_ns_max[i].load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
     pub fn supply_stats(&self) -> AllocSupplyStats {
         AllocSupplyStats {
             aligned_allocs: self.aligned_allocs.load(Ordering::Relaxed),
@@ -617,7 +844,7 @@ impl SpaceAllocator {
         let alloc_count = allocated.len() as u64;
         let free_count = usable_blocks - alloc_count;
 
-        self.free_pools.lock().unwrap().replace_general(free);
+        self.lock_free_pools(FreeLockSite::Setup).replace_general(free);
         self.retired_extents.lock().unwrap().clear();
         self.retired_age.lock().unwrap().clear();
         self.retired_blocks.store(0, Ordering::Relaxed);
@@ -637,7 +864,7 @@ impl SpaceAllocator {
             allocated = alloc_count,
             free = free_count,
             extents = {
-                let pools = self.free_pools.lock().unwrap();
+                let pools = self.lock_free_pools(FreeLockSite::Setup);
                 pools.general.len() + pools.stripe_reserve.len()
             },
             "space allocator rebuilt from metadata"
@@ -657,9 +884,7 @@ impl SpaceAllocator {
     /// once at startup before flush traffic; idempotent; `stripe <= 1`
     /// (non-RAID backends) clears it.
     pub fn set_stripe_geometry(&self, stripe_blocks: u32, phase: u32) {
-        self.free_pools
-            .lock()
-            .unwrap()
+        self.lock_free_pools(FreeLockSite::Setup)
             .set_geometry(stripe_blocks, phase);
     }
 
@@ -670,7 +895,7 @@ impl SpaceAllocator {
     pub fn begin_defrag_quarantine(&self, target: Extent) -> OnyxResult<()> {
         self.validate_extent_shape(target, "begin_defrag_quarantine")?;
         {
-            let mut pools = self.free_pools.lock().unwrap();
+            let mut pools = self.lock_free_pools(FreeLockSite::Quarantine);
             let (stripe, phase) = pools.geometry().ok_or_else(|| {
                 OnyxError::Config("begin_defrag_quarantine requires stripe geometry".into())
             })?;
@@ -719,7 +944,7 @@ impl SpaceAllocator {
     }
 
     pub fn defrag_quarantine_progress(&self, start: Pba) -> Option<(u64, u64)> {
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Quarantine);
         let target = pools.quarantines.get(&start.0)?;
         Some((target.free_parts.blocks_total(), target.range.count as u64))
     }
@@ -727,7 +952,7 @@ impl SpaceAllocator {
     /// Publish a fully-free quarantine as stripe reserve. A partially-free
     /// target remains active and returns `Ok(false)`.
     pub fn complete_defrag_quarantine(&self, start: Pba) -> OnyxResult<bool> {
-        let mut pools = self.free_pools.lock().unwrap();
+        let mut pools = self.lock_free_pools(FreeLockSite::Quarantine);
         let Some(target) = pools.quarantines.get(&start.0) else {
             return Ok(false);
         };
@@ -746,7 +971,7 @@ impl SpaceAllocator {
     /// the canonical general/reserve partition. Live/retired pieces were never
     /// removed from their ownership states.
     pub fn cancel_defrag_quarantine(&self, start: Pba) -> bool {
-        let mut pools = self.free_pools.lock().unwrap();
+        let mut pools = self.lock_free_pools(FreeLockSite::Quarantine);
         let Some(target) = pools.quarantines.remove(&start.0) else {
             return false;
         };
@@ -758,9 +983,7 @@ impl SpaceAllocator {
     }
 
     pub fn is_defrag_quarantined(&self, extent: Extent) -> bool {
-        self.free_pools
-            .lock()
-            .unwrap()
+        self.lock_free_pools(FreeLockSite::Quarantine)
             .overlapping_quarantine(extent)
             .is_some()
     }
@@ -774,7 +997,7 @@ impl SpaceAllocator {
             return None;
         }
         let extent = Extent::new(start, count);
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Quarantine);
         if pools.overlapping_quarantine(extent).is_some() {
             return None;
         }
@@ -841,7 +1064,7 @@ impl SpaceAllocator {
     /// Allocate a single block. Returns PBA.
     pub fn allocate_one(&self) -> OnyxResult<Pba> {
         {
-            let mut pools = self.free_pools.lock().unwrap();
+            let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
             if let Some(pba) = Self::alloc_one_from_pools(&mut pools) {
                 self.track_alloc(Extent::single(pba), "allocate_one")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
@@ -852,7 +1075,7 @@ impl SpaceAllocator {
         // Global pool empty — drain lane caches and retry
         if !self.lane_caches.is_empty() {
             self.drain_lane_caches();
-            let mut pools = self.free_pools.lock().unwrap();
+            let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
             if let Some(pba) = Self::alloc_one_from_pools(&mut pools) {
                 self.track_alloc(Extent::single(pba), "allocate_one_retry")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
@@ -910,7 +1133,7 @@ impl SpaceAllocator {
     /// Called during shutdown to prevent block leaks.
     pub fn drain_lane_caches(&self) {
         let mut drained: u64 = 0;
-        let mut pools = self.free_pools.lock().unwrap();
+        let mut pools = self.lock_free_pools(FreeLockSite::Drain);
         for cache_mutex in &self.lane_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for pba in cache.drain(..) {
@@ -942,7 +1165,7 @@ impl SpaceAllocator {
     /// or sitting in a lane cache (allocated from the free list but not yet
     /// handed out to a caller).
     pub fn is_free(&self, pba: Pba) -> bool {
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Audit);
         if pools.overlapping_free(Extent::single(pba)).is_some() {
             return true;
         }
@@ -983,7 +1206,7 @@ impl SpaceAllocator {
         if lane >= self.lane_extent_caches.len() {
             for attempt in 0..2 {
                 if let Some(extent) = {
-                    let mut pools = self.free_pools.lock().unwrap();
+                    let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
                     Self::take_exact_from_pools(&mut pools, count, count)
                 } {
                     self.track_alloc(extent, "allocate_exact_extent_global")?;
@@ -1230,7 +1453,7 @@ impl SpaceAllocator {
 
         // Try allocation from global free list. If insufficient, drain lane caches and retry.
         for attempt in 0..2 {
-            let mut pools = self.free_pools.lock().unwrap();
+            let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
 
             if let Some(result) = Self::take_exact_from_pools(&mut pools, count, count) {
                 self.track_alloc(result, "allocate_extent")?;
@@ -1301,7 +1524,7 @@ impl SpaceAllocator {
         self.ensure_not_in_lane_cache(extent, "retire_extent")?;
 
         let newly = {
-            let pools = self.free_pools.lock().unwrap();
+            let pools = self.lock_free_pools(FreeLockSite::RetireOne);
             if let Some(e) = pools.overlapping_free(extent) {
                 return Err(OnyxError::Config(format!(
                     "retire_extent: extent {:?} overlaps free extent {:?}",
@@ -1381,51 +1604,54 @@ impl SpaceAllocator {
             let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
             let mut chunk_newly: u64 = 0;
             let mut chunk_retired: Vec<Extent> = Vec::new();
-            // Lock order: free (outermost) → retired → retired_age, held across
-            // the chunk (matches `retire_extent_at`).
-            let pools = self.free_pools.lock().unwrap();
-            let mut retired = self.retired_extents.lock().unwrap();
-            let mut age = self.retired_age.lock().unwrap();
-            for &extent in chunk {
-                if self
-                    .validate_extent_shape(extent, "retire_extents_batch")
-                    .is_err()
-                {
-                    failed.push(extent);
-                    continue;
-                }
-                let in_lane = (0..extent.count)
-                    .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
-                    || Self::sorted_extents_overlap(&lane_exts, extent);
-                if in_lane
-                    || pools.overlapping_free(extent).is_some()
-                    || u64::from(extent.count) > current_alloc
-                {
-                    failed.push(extent);
-                    continue;
-                }
-                // Genuinely-new sub-ranges (computed before coalescing so
-                // already-retired sub-ranges keep their original age).
-                let gaps = Self::uncovered_subranges(&retired, extent);
-                let newly: u32 = gaps.iter().map(|g| g.count).sum();
-                Self::coalesce_and_insert_any_overlap(&mut retired, extent);
-                chunk_retired.push(extent);
-                if newly > 0 {
-                    for g in gaps {
-                        age.insert(
-                            g.start.0,
-                            RetiredRun {
-                                count: g.count,
-                                retired_at: now,
-                            },
-                        );
+            // Lock order: free (outermost) → retired → retired_age, matching
+            // `retire_extent_at`. Released and retaken every
+            // FREE_LOCK_HOLD_EXTENTS so the foreground gets the free lock back
+            // instead of waiting out the whole chunk; every check below is
+            // per-extent independent, so where the hold boundaries fall does not
+            // change the outcome (pinned by `batch_retire_equals_sequence`).
+            for hold in chunk.chunks(free_lock_hold_extents()) {
+                let pools = self.lock_free_pools(FreeLockSite::RetireBatch);
+                let mut retired = self.retired_extents.lock().unwrap();
+                let mut age = self.retired_age.lock().unwrap();
+                for &extent in hold {
+                    if self
+                        .validate_extent_shape(extent, "retire_extents_batch")
+                        .is_err()
+                    {
+                        failed.push(extent);
+                        continue;
                     }
-                    chunk_newly += u64::from(newly);
+                    let in_lane = (0..extent.count)
+                        .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
+                        || Self::sorted_extents_overlap(&lane_exts, extent);
+                    if in_lane
+                        || pools.overlapping_free(extent).is_some()
+                        || u64::from(extent.count) > current_alloc
+                    {
+                        failed.push(extent);
+                        continue;
+                    }
+                    // Genuinely-new sub-ranges (computed before coalescing so
+                    // already-retired sub-ranges keep their original age).
+                    let gaps = Self::uncovered_subranges(&retired, extent);
+                    let newly: u32 = gaps.iter().map(|g| g.count).sum();
+                    Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+                    chunk_retired.push(extent);
+                    if newly > 0 {
+                        for g in gaps {
+                            age.insert(
+                                g.start.0,
+                                RetiredRun {
+                                    count: g.count,
+                                    retired_at: now,
+                                },
+                            );
+                        }
+                        chunk_newly += u64::from(newly);
+                    }
                 }
             }
-            drop(age);
-            drop(retired);
-            drop(pools);
             // Diagnostic trace outside the lock section (see retire_extent_at).
             for &extent in &chunk_retired {
                 crate::space::free_trace::trace_retire(extent, "retire_batch");
@@ -1478,10 +1704,14 @@ impl SpaceAllocator {
 
             let mut chunk_freed: u64 = 0;
             let mut chunk_released: Vec<Extent> = Vec::with_capacity(chunk.len());
-            {
-                let mut pools = self.free_pools.lock().unwrap();
+            // free → retired, released and retaken every FREE_LOCK_HOLD_EXTENTS
+            // (see that const). `chunk_freed` keeps accumulating across holds so
+            // the underflow guard stays honest; every other check is per-extent
+            // independent (pinned by `batch_free_equals_sequence`).
+            for hold in chunk.chunks(free_lock_hold_extents()) {
+                let mut pools = self.lock_free_pools(FreeLockSite::FreeBatch);
                 let retired = self.retired_extents.lock().unwrap();
-                for &extent in chunk {
+                for &extent in hold {
                     if self
                         .validate_extent_shape(extent, "free_extents_batch")
                         .is_err()
@@ -1516,6 +1746,7 @@ impl SpaceAllocator {
                     chunk_freed += u64::from(extent.count);
                 }
             }
+
             // Diagnostic trace outside the lock section (see retire_extent_at).
             for &extent in &chunk_released {
                 crate::space::free_trace::trace_free(extent, "free_batch");
@@ -1750,7 +1981,7 @@ impl SpaceAllocator {
             self.hazards.wait_extent_clear(extent.start, extent.count);
             self.ensure_not_in_lane_cache(extent, "reclaim_retired_extent")?;
 
-            let mut pools = self.free_pools.lock().unwrap();
+            let mut pools = self.lock_free_pools(FreeLockSite::ReclaimOne);
             if let Some(e) = pools.overlapping_free(extent) {
                 return Err(OnyxError::Config(format!(
                     "reclaim_retired_extent: extent {:?} overlaps free extent {:?}",
@@ -1847,10 +2078,10 @@ impl SpaceAllocator {
             // containment, split out the covering coalesced extent, keep the
             // remainders retired. Collect the validated extents for Phase B.
             let mut removed: Vec<Extent> = Vec::with_capacity(chunk.len());
-            {
+            for hold in chunk.chunks(free_lock_hold_extents()) {
                 let mut retired = self.retired_extents.lock().unwrap();
                 let mut age = self.retired_age.lock().unwrap();
-                for &extent in chunk {
+                for &extent in hold {
                     if self
                         .validate_extent_shape(extent, "reclaim_retired_extents_batch")
                         .is_err()
@@ -1887,9 +2118,13 @@ impl SpaceAllocator {
             let mut conflicts: Vec<Extent> = Vec::new();
             let mut chunk_reclaimed: Vec<Extent> = Vec::new();
             let mut chunk_freed: u64 = 0;
-            {
-                let mut pools = self.free_pools.lock().unwrap();
-                for &extent in &removed {
+            // The 12.9 ms hold this whole exercise is about: up to 4096
+            // `release_extent` (coalesce-insert into 3 indexes) calls used to run
+            // under ONE acquisition. Now bounded to FREE_LOCK_HOLD_EXTENTS per
+            // hold — same total work, same order, ~32× shorter shut-out window.
+            for hold in removed.chunks(free_lock_hold_extents()) {
+                let mut pools = self.lock_free_pools(FreeLockSite::ReclaimBatch);
+                for &extent in hold {
                     let in_lane = (0..extent.count)
                         .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
                         || Self::sorted_extents_overlap(&lane_exts, extent);
@@ -1984,7 +2219,7 @@ impl SpaceAllocator {
         self.hazards.wait_extent_clear(extent.start, extent.count);
 
         {
-            let mut pools = self.free_pools.lock().unwrap();
+            let mut pools = self.lock_free_pools(FreeLockSite::FreeOne);
             self.ensure_not_free_or_retired_after_wait(extent, &pools)?;
             pools.release_extent(extent);
             self.track_release(extent, "free_extent");
@@ -2002,7 +2237,7 @@ impl SpaceAllocator {
         self.validate_extent_shape(extent, "free_extent")?;
         self.ensure_not_in_lane_cache(extent, "free_extent")?;
 
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::FreeOne);
 
         // Check no overlap with existing free extents
         if let Some(e) = pools.overlapping_free(extent) {
@@ -2133,7 +2368,7 @@ impl SpaceAllocator {
     /// Return true if the whole extent is already covered by a free extent
     /// or all its blocks are sitting in lane caches.
     pub fn is_extent_free(&self, extent: Extent) -> bool {
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Audit);
         if pools.covers_free(extent) {
             return true;
         }
@@ -2189,7 +2424,7 @@ impl SpaceAllocator {
         self.total_blocks.store(new_total, Ordering::Release);
         let added = new_total - old_total;
         {
-            let mut pools = self.free_pools.lock().unwrap();
+            let mut pools = self.lock_free_pools(FreeLockSite::Setup);
             let mut start = old_total;
             let mut remaining = added;
             while remaining > 0 {
@@ -2216,7 +2451,7 @@ impl SpaceAllocator {
     /// signal. Active quarantine-free blocks remain in the denominator but are
     /// intentionally unavailable in the numerator until publication.
     pub fn contiguity_stats(&self) -> ContiguityStats {
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Audit);
         let quarantine_free_blocks: u64 = pools
             .quarantines
             .values()
@@ -2255,7 +2490,7 @@ impl SpaceAllocator {
 
     /// The configured RAID geometry `(stripe_blocks, phase)`, if any.
     pub fn stripe_geometry(&self) -> Option<(u32, u32)> {
-        self.free_pools.lock().unwrap().geometry()
+        self.lock_free_pools(FreeLockSite::Audit).geometry()
     }
 
     /// Blocks of `range` covered by free extents — the defrag target "done"
@@ -2263,7 +2498,7 @@ impl SpaceAllocator {
     pub(crate) fn free_overlap_blocks(&self, range: Extent) -> u64 {
         let s = range.start.0;
         let e = range.end_pba().0;
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Audit);
         let overlap = |set: &FreeSet| {
             let mut covered = 0u64;
             if let Some(prev) = set
@@ -2307,7 +2542,7 @@ impl SpaceAllocator {
         if max == 0 {
             return Vec::new();
         }
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Audit);
         pools
             .general
             .by_addr()
@@ -2345,7 +2580,7 @@ impl SpaceAllocator {
     /// (alignment pads must not fragment the free list into per-alloc slivers).
     #[cfg(test)]
     pub(crate) fn free_extent_run_count(&self) -> usize {
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.lock_free_pools(FreeLockSite::Audit);
         pools.general.len() + pools.stripe_reserve.len()
     }
 
@@ -2428,7 +2663,7 @@ impl SpaceAllocator {
     /// longer free; every remaining block is visible in the lane cache before
     /// `FreePools` is unlocked.
     fn refill_one_lane_from_global(&self, lane: usize, max_count: u32) -> Option<Pba> {
-        let mut pools = self.free_pools.lock().unwrap();
+        let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
         let refill = Self::take_first_from_pools(&mut pools, max_count)?;
         if refill.count > 1 {
             let mut cache = self.lane_caches[lane].lock().unwrap();
@@ -2442,7 +2677,7 @@ impl SpaceAllocator {
     /// Take exactly `count` blocks for the caller and publish the rest of the
     /// refill into its extent cache before releasing `FreePools`.
     fn refill_extent_lane(&self, lane: usize, count: u32, max_count: u32) -> Option<Extent> {
-        let mut pools = self.free_pools.lock().unwrap();
+        let mut pools = self.lock_free_pools(FreeLockSite::WriterUnaligned);
         let refill = Self::take_exact_from_pools(&mut pools, count, max_count)?;
         let result = Extent::new(refill.start, count);
         if refill.count > count {
@@ -2480,7 +2715,7 @@ impl SpaceAllocator {
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
-        let mut pools = self.free_pools.lock().unwrap();
+        let mut pools = self.lock_free_pools(FreeLockSite::WriterRefill);
         if pools.geometry() != Some((stripe, phase)) {
             return None;
         }
@@ -2580,7 +2815,7 @@ impl SpaceAllocator {
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
-        let mut pools = self.free_pools.lock().unwrap();
+        let mut pools = self.lock_free_pools(FreeLockSite::WriterRefill);
         let reserve_only = pools.geometry() == Some((stripe, phase));
         let (from_reserve, run) = if reserve_only {
             (true, pools.stripe_reserve.first_fit(need)?)
@@ -2766,6 +3001,53 @@ mod free_pool_policy_tests {
 
     fn allocator(blocks: u64, lanes: usize) -> SpaceAllocator {
         SpaceAllocator::new(blocks * BLOCK_SIZE as u64, lanes)
+    }
+
+    /// The wait/hold attribution must charge the acquiring PATH, not a default
+    /// bucket, and every acquisition must record a hold — otherwise the box read
+    /// silently attributes everything to one site.
+    #[test]
+    fn free_lock_attribution_charges_the_acquiring_site() {
+        let a = allocator(4096, 2);
+        let acq = |sites: &[FreeLockSiteStats], name: &str| {
+            sites
+                .iter()
+                .find(|s| s.site == name)
+                .expect("every site is always reported")
+                .acquisitions
+        };
+        // Shape is stable across reads (all sites always present) so two status
+        // samples can be differenced field-by-field.
+        let s0 = a.free_lock_stats();
+        assert_eq!(s0.len(), FREE_LOCK_SITES);
+
+        a.allocate_one().unwrap();
+        let s1 = a.free_lock_stats();
+        assert!(acq(&s1, "small_alloc") > acq(&s0, "small_alloc"));
+        assert_eq!(acq(&s1, "audit"), acq(&s0, "audit"), "alloc is not an audit");
+
+        a.contiguity_stats();
+        let s2 = a.free_lock_stats();
+        assert!(acq(&s2, "audit") > acq(&s1, "audit"));
+        assert_eq!(
+            acq(&s2, "small_alloc"),
+            acq(&s1, "small_alloc"),
+            "a status read must not be charged to allocation"
+        );
+
+        a.set_stripe_geometry(STRIPE, PHASE);
+        a.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        let s3 = a.free_lock_stats();
+        assert!(
+            acq(&s3, "writer_refill") > 0,
+            "the aligned writer path must be attributed to writer_refill"
+        );
+
+        for s in s3.iter().filter(|s| s.acquisitions > 0) {
+            assert!(s.hold_ns > 0, "site {} recorded no hold", s.site);
+            assert!(s.hold_ns_max > 0, "site {} recorded no max hold", s.site);
+        }
     }
 
     #[test]
@@ -4573,6 +4855,14 @@ pub(crate) mod aged_pool_bench {
     #[test]
     #[ignore = "perf microbench"]
     fn bench_batch_hold_vs_alloc() {
+        // Sleep multiplier that pins the background batch thread to roughly the
+        // box's measured lock duty cycle: sleep = busy × N ⇒ occupancy ≈ 1/(1+N).
+        // N = 32 ⇒ ~3%. Override with ONYX_BENCH_BG_DUTY_DIVISOR to sweep.
+        const BG_DUTY_DIVISOR_DEFAULT: u32 = 32;
+        let bg_duty_divisor: u32 = std::env::var("ONYX_BENCH_BG_DUTY_DIVISOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(BG_DUTY_DIVISOR_DEFAULT);
         let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -4629,7 +4919,25 @@ pub(crate) mod aged_pool_bench {
         // (2) Aligned allocation latency with that batch traffic running
         // concurrently, vs the same measurement with the background idle.
         let allocator = std::sync::Arc::new(allocator);
-        for background in [false, true] {
+        // Interleave the two hold sizes several times. Foreground ops here leak
+        // blocks (nothing frees them), so the pool reshapes as the bench runs and
+        // a single A-then-B comparison would carry exactly the run-order confound
+        // that invalidated the 2026-07-28 box A/B. Paired rounds make any drift
+        // visible instead of silent.
+        //
+        // hold = BATCH_LOCK_CHUNK reproduces the pre-fix behaviour (one hold per
+        // chunk); hold = 128 is the shipped default.
+        let rounds: [(usize, bool); 7] = [
+            (128, false),
+            (BATCH_LOCK_CHUNK, true),
+            (128, true),
+            (BATCH_LOCK_CHUNK, true),
+            (128, true),
+            (BATCH_LOCK_CHUNK, true),
+            (128, true),
+        ];
+        for (hold, background) in rounds {
+            set_free_lock_hold_extents(hold);
             let stop = std::sync::Arc::new(AtomicBool::new(false));
             let batches = std::sync::Arc::new(AtomicU64::new(0));
             // The real overwrite cycle: allocate → retire → GC reclaim → the
@@ -4642,6 +4950,7 @@ pub(crate) mod aged_pool_bench {
                 let stop = stop.clone();
                 let batches = batches.clone();
                 let held_ns = held_ns.clone();
+                let bg_duty_divisor = bg_duty_divisor;
                 std::thread::spawn(move || {
                     let running = AtomicBool::new(true);
                     let bg_lane = 15; // not one of the measured lanes
@@ -4661,13 +4970,20 @@ pub(crate) mod aged_pool_bench {
                         let t = Instant::now();
                         let (_, _) = allocator.retire_extents_batch(&batch, Instant::now());
                         let _ = allocator.reclaim_retired_extents_batch(&batch, &running);
-                        held_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        let busy = t.elapsed();
+                        held_ns.fetch_add(busy.as_nanos() as u64, Ordering::Relaxed);
                         batches.fetch_add(1, Ordering::Relaxed);
+                        // Pace to the BOX's duty cycle, not back-to-back. At the
+                        // box's 56 K blocks/s reclaim rate the GC occupies this
+                        // lock only ~3% of wall time; an unpaced loop sits at
+                        // 84-94% and starves the foreground regardless of hold
+                        // size, which measures the wrong regime entirely.
+                        std::thread::sleep(busy * bg_duty_divisor);
                     }
                 })
             });
 
-            let ops_per_thread = 20_000;
+            let ops_per_thread = 40_000;
             let wall = Instant::now();
             let samples: Vec<Vec<u64>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..threads)
@@ -4696,17 +5012,46 @@ pub(crate) mod aged_pool_bench {
             let mean = all.iter().sum::<u64>() as f64 / 1000.0 / all.len() as f64;
             all.sort_unstable();
             let bg_busy = held_ns.load(Ordering::Relaxed) as f64 / wall.as_nanos() as f64 * 100.0;
+            // max / p9999 are the statistics that matter here: the question is
+            // how long ONE writer can be shut out by ONE hold, not the average.
             println!(
-                "  background_batches={:<5} {threads} threads: mean {:8.2} us  p50 {:8.2} us  \
-                 p99 {:8.2} us  p999 {:8.2} us  (bg rounds={} busy {:.0}% wall {:?})",
+                "  bg={:<5} hold={:<5} mean {:7.2} us  p99 {:7.2} us  p999 {:8.2} us  \
+                 p9999 {:8.2} us  max {:8.2} us  (bg batches={} busy {:.0}% wall {:?})",
                 background,
+                hold,
                 mean,
-                percentile(&all, 0.5),
                 percentile(&all, 0.99),
                 percentile(&all, 0.999),
+                percentile(&all, 0.9999),
+                all.last().copied().unwrap_or(0) as f64 / 1000.0,
                 batches.load(Ordering::Relaxed),
                 bg_busy,
                 wall,
+            );
+        }
+        // The attribution this whole exercise was missing: of the foreground's
+        // wait, whose hold was it? Sorted by total hold so the monopolist is top.
+        let mut sites = allocator.free_lock_stats();
+        sites.retain(|s| s.acquisitions > 0);
+        sites.sort_by(|x, y| y.hold_ns.cmp(&x.hold_ns));
+        let total_hold: u64 = sites.iter().map(|s| s.hold_ns).sum();
+        println!("  -- free_pools attribution (who held it) --");
+        for s in &sites {
+            println!(
+                "  {:<17} acq {:9}  wait {:9.2} ms ({:8.2} us/acq)  hold {:9.2} ms \
+                 ({:8.2} us/acq) {:5.1}% of holds  hold_max {:8.2} ms",
+                s.site,
+                s.acquisitions,
+                s.wait_ns as f64 / 1e6,
+                s.wait_us(),
+                s.hold_ns as f64 / 1e6,
+                s.hold_us(),
+                if total_hold > 0 {
+                    s.hold_ns as f64 / total_hold as f64 * 100.0
+                } else {
+                    0.0
+                },
+                s.hold_ns_max as f64 / 1e6,
             );
         }
         let supply = allocator.supply_stats();

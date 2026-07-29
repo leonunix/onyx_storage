@@ -58,6 +58,28 @@ if refills:
         d("allocator_supply.drains"), d("allocator_supply.drains") / W,
         d("allocator_supply.drain_blocks")))
 
+# Per-site free_pools wait/hold attribution. THE question this answers: of the
+# writer's alloc time, how much is waiting, and whose hold was it? `wait_ns` and
+# `hold_ns` are monotonic so they difference; hold_max_us is a high-water mark
+# (reported from the LAST sample, not differenced).
+sites = sorted({k.split(".")[1] for k in b if k.startswith("free_lock.") and k.endswith(".acquisitions")})
+if sites:
+    print("  -- free_pools lock attribution (who holds it while the writer waits) --")
+    tot_hold = sum(d("free_lock.%s.hold_ns" % s) for s in sites)
+    for s in sorted(sites, key=lambda s: -d("free_lock.%s.hold_ns" % s)):
+        acq = d("free_lock.%s.acquisitions" % s)
+        if acq == 0 and d("free_lock.%s.hold_ns" % s) == 0:
+            continue
+        hold = d("free_lock.%s.hold_ns" % s)
+        wait = d("free_lock.%s.wait_ns" % s)
+        print("  %-17s acq %9d (%7.0f/s)  wait %8.2f s (%8.2f us/acq)  "
+              "hold %8.2f s (%8.2f us/acq) %5.1f%% of holds  hold_max %8.2f ms" % (
+              s, acq, acq / W, wait / 1e9, (wait / 1e3 / acq) if acq else 0.0,
+              hold / 1e9, (hold / 1e3 / acq) if acq else 0.0,
+              (hold / tot_hold * 100) if tot_hold else 0.0,
+              b.get("free_lock.%s.hold_ns_max" % s, 0) / 1e6))
+    print("  lock busy %.1f%% of wall (sum of holds / %ds)" % (tot_hold / 1e9 / W * 100, W))
+
 grp = d("flush_writer_stripe_groups.total")
 if grp:
     # Exactly-full single-volume stripes can be freed as a whole and hand their

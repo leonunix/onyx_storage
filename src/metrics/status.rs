@@ -204,6 +204,10 @@ pub struct EngineStatusSnapshot {
     /// serializes on the global free lock. Monotonic counters — difference two
     /// `status` reads.
     pub allocator_supply: Option<crate::space::allocator::AllocSupplyStats>,
+    /// Per-site `free_pools` wait/hold attribution — see
+    /// `crate::space::allocator::FreeLockSite`. Answers "who held the free lock
+    /// while the writer waited", which no other metric can.
+    pub free_lock: Option<Vec<crate::space::allocator::FreeLockSiteStats>>,
     /// Adaptive reclaim heat-map summary (None when the map is disabled or in
     /// standby). Observe-only in Stage A.
     pub heat: Option<HeatSummary>,
@@ -934,16 +938,47 @@ impl EngineStatusSnapshot {
         if let Some(s) = self.allocator_supply {
             let _ = writeln!(
                 out,
-                "allocator_supply: aligned_allocs={} refills={} allocs_per_refill={:.2} \
-                 blocks_per_refill={:.1} runs_per_refill={:.1} drains={} drain_blocks={}",
+                // Raw monotonic counters first so two `status` reads can be
+                // differenced (`tools/flush_delta.py` only parses integer tokens);
+                // the ratios are for eyeballing a single read and are NOT
+                // differenceable.
+                "allocator_supply: aligned_allocs={} refills={} refill_blocks={} \
+                 refill_runs={} drains={} drain_blocks={} allocs_per_refill={:.2} \
+                 blocks_per_refill={:.1} runs_per_refill={:.1}",
                 s.aligned_allocs,
                 s.refills,
+                s.refill_blocks,
+                s.refill_runs,
+                s.drains,
+                s.drain_blocks,
                 s.allocs_per_refill(),
                 s.blocks_per_refill(),
                 s.runs_per_refill(),
-                s.drains,
-                s.drain_blocks,
             );
+        }
+        if let Some(sites) = &self.free_lock {
+            // One line per site that ever took the lock. `acq`/`wait_ns`/`hold_ns`
+            // are monotonic (difference two reads); `hold_max_us` is a high-water
+            // mark and does NOT difference.
+            for s in sites.iter().filter(|s| s.acquisitions > 0) {
+                let _ = writeln!(
+                    out,
+                    // Site goes in the LINE PREFIX, not a `site=` token: the
+                    // status parsers key on `<prefix>.<field>`, so 13 lines
+                    // sharing one prefix would silently overwrite each other and
+                    // leave only the last site.
+                    "free_lock.{}: acquisitions={} wait_ns={} hold_ns={} \
+                     hold_ns_max={} wait_us={:.2} hold_us={:.2} hold_max_ms={:.2}",
+                    s.site,
+                    s.acquisitions,
+                    s.wait_ns,
+                    s.hold_ns,
+                    s.hold_ns_max,
+                    s.wait_us(),
+                    s.hold_us(),
+                    s.hold_ns_max as f64 / 1e6,
+                );
+            }
         }
         if let Some(ck) = &self.chunklet {
             let _ = writeln!(
