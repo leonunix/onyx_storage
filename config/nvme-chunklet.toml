@@ -170,6 +170,29 @@ raid_full_stripe_writes = true
 # it on `flush_writer_stripe_groups` (did the plan change), `flush_writer_alloc_split`
 # (reserve miss rate) and `allocator_contiguity` (stripe_capable decay).
 stripe_group_lifetime_affinity = false
+# Shard the PBA allocator's free space into N address regions, each with its own
+# lock. 1 = one global lock (code default), 0 = compiled default (2048).
+#
+# 2026-07-29 attribution on this box (`free_lock.<site>` in `status`, decomposed
+# by tools/flush_delta.py, QD256 j16d16, aged 256 GiB volume, 480 s window):
+#   lock busy                          68.4% of wall  (ONE mutex)
+#   retire_batch   658 acq/s  hold 691 us   218.3 s = 66.4% of all holding
+#   reclaim_batch  184 acq/s  hold 1174 us  103.9 s = 31.6% of all holding
+#   writer_refill  153 acq/s  WAIT 22.94 ms/acq -> 1685.92 s
+# writer_refill's wait is 98.8% of the flush writer's ENTIRE allocation time
+# (1685.92 of 1705.73 s) while its own holding is 1.9%. So the writer is not slow,
+# it is queued behind GC. Sharding shortens no hold and weakens no invariant (the
+# free-check/retired-insert atomicity that blocks every cheaper fix is preserved
+# exactly) — it only splits the lock the two sides collide on.
+#
+# ⚠ Judge this on the attribution, NOT on throughput: `lock busy ... per region`
+# should fall far below 68.4% and `writer_refill wait/acq` far below 22.94 ms.
+# Those are decomposition quantities, readable from ONE arm, drift-insensitive.
+# Throughput is a secondary gate and restart-per-arm A/B is INVALID on this box
+# (two identical arms measured 2.13x apart on run-order drift alone) — use the
+# in-process gate instead, and remember the queue may simply move downstream to
+# the LV3 aggregation window.
+allocator_regions = 0
 
 [buffer]
 # A/B knob (default off in code): drain LV2 ring backpressure BEFORE taking the

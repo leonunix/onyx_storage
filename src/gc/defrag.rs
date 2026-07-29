@@ -555,10 +555,20 @@ mod tests {
         // boundaries. Claim before enabling geometry so the setup itself does
         // not depend on the allocator's documented short-extent fallback.
         a.set_stripe_geometry(1, 0);
-        let claimed = a.allocate_extent(total as u32).unwrap();
-        assert_eq!(claimed, Extent::new(Pba(RESERVED_BLOCKS), total as u32));
+        // No single extent can be wider than one allocator address region, so
+        // claim by repeated request; `allocate_extent` hands back the largest
+        // available fragment when the exact width is unavailable.
+        // The order the fragments come back in is NOT address order: with the
+        // exact width unavailable, `allocate_extent` returns the LARGEST available
+        // fragment. All that matters here is that nothing is left free.
+        let mut claimed = 0u64;
+        while claimed < total {
+            let extent = a.allocate_extent((total - claimed) as u32).unwrap();
+            claimed += u64::from(extent.count);
+        }
+        assert_eq!(a.free_block_count(), 0, "pool not fully claimed");
         a.set_stripe_geometry(STRIPE, PHASE);
-        claimed.start.0
+        RESERVED_BLOCKS
     }
 
     #[test]

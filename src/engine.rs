@@ -982,10 +982,11 @@ impl OnyxEngine {
         // offset), not the raw device size — otherwise the top RESERVED_BLOCKS
         // PBAs would translate past the device end and a boundary write (esp. a
         // multi-block full-stripe write) fails with chunklet "IO out of range".
-        let allocator = Arc::new(SpaceAllocator::new_with_hazards(
+        let allocator = Arc::new(SpaceAllocator::new_with_regions(
             device_size
                 .saturating_sub(crate::types::RESERVED_BLOCKS * crate::types::BLOCK_SIZE as u64),
             config.buffer.shards,
+            config.storage.allocator_regions,
         ));
         // Fixed LV3 RAID geometry → effective-capacity index for stripe-aligned
         // first-fit (set BEFORE rebuild so the rebuilt free list is indexed too;
@@ -1929,10 +1930,11 @@ impl OnyxEngine {
         // offset), not the raw device size — otherwise the top RESERVED_BLOCKS
         // PBAs would translate past the device end and a boundary write (esp. a
         // multi-block full-stripe write) fails with chunklet "IO out of range".
-        let allocator = Arc::new(SpaceAllocator::new_with_hazards(
+        let allocator = Arc::new(SpaceAllocator::new_with_regions(
             device_size
                 .saturating_sub(crate::types::RESERVED_BLOCKS * crate::types::BLOCK_SIZE as u64),
             config.buffer.shards,
+            config.storage.allocator_regions,
         ));
         allocator.set_stripe_geometry(io_engine.stripe_blocks(), io_engine.stripe_phase());
         allocator.rebuild_from_metadata(&meta)?;
@@ -2307,6 +2309,7 @@ impl OnyxEngine {
             allocator_quarantine_target_blocks: contiguity.map(|c| c.quarantine_target_blocks),
             allocator_quarantine_free_blocks: contiguity.map(|c| c.quarantine_free_blocks),
             allocator_supply: self.allocator.as_ref().map(|alloc| alloc.supply_stats()),
+            allocator_regions: self.allocator.as_ref().map(|alloc| alloc.region_stats()),
             free_lock: self
                 .allocator
                 .as_ref()

@@ -75,6 +75,137 @@ pub fn set_free_lock_hold_extents(extents: usize) {
     FREE_LOCK_HOLD_EXTENTS.store(extents.max(1), Ordering::Relaxed);
 }
 
+/// Target number of address regions when `storage.allocator_regions` is 0.
+///
+/// Over the box's 600 GiB LV3 (157 M blocks) that is ~76 K blocks / 300 MiB per
+/// region: large enough that one lane refill (64 stripe windows) is served from
+/// a single region, small enough that the GC's address-scattered retire/reclaim
+/// holds land on the region a writer is refilling from only ~1/N of the time.
+/// The 2026-07-29 box attribution measured the single lock **68.4% busy with 98%
+/// of the holding coming from GC**, while the writer's own hold was 1.9% and
+/// 98.8% of its allocation time was WAIT — so the fix is not to make the writer
+/// faster but to stop it queueing behind GC.
+const DEFAULT_ALLOCATOR_REGIONS: usize = 2048;
+/// Never shard below this many blocks per region: a region has to be able to
+/// hold a useful number of whole stripes, and each one costs a mutex plus two
+/// hint atomics. Small test allocators therefore stay single-region.
+const MIN_REGION_BLOCKS: u64 = 4096;
+/// How many alternative regions a lane refill tries before giving up to the
+/// lane-cache drain / global aligned search.
+const REGION_REFILL_TRIES: usize = 4;
+
+/// Serialize every region acquisition behind one gate, reproducing the
+/// pre-region single-global-lock contention shape at runtime.
+static REGION_SERIALIZE: AtomicBool = AtomicBool::new(false);
+
+/// Arm/disarm the region serialization gate — the ONLY way to A/B region
+/// sharding against the old single lock **inside one process**, which is the
+/// only A/B this box supports: on 2026-07-28 two byte-identical arms measured
+/// 119.2 vs 253.3 MB/s (2.13x) purely on run-order drift, so restart-per-arm
+/// comparisons resolve nothing here.
+///
+/// When armed, every region acquisition first takes a single process-wide gate
+/// held for the whole critical section, so N region locks behave as one lock
+/// with the same hold durations. Region *routing* is unchanged, so arming and
+/// disarming is safe at any time and needs no pool state change.
+pub fn set_region_serialize(on: bool) {
+    REGION_SERIALIZE.store(on, Ordering::Relaxed);
+}
+
+/// Whether the serialization gate is currently armed.
+pub fn region_serialize() -> bool {
+    REGION_SERIALIZE.load(Ordering::Relaxed)
+}
+
+/// Address-region layout snapshot. Immutable for the duration of one allocator
+/// operation: the layout is only ever rewritten by `set_geometry`, which holds
+/// every region lock while it re-routes the whole free set.
+///
+/// Region `i` owns `[base + i*blocks, base + (i+1)*blocks)`, with two
+/// deliberate asymmetries:
+///   - region 0 also owns everything BELOW `base` (the reserved prefix plus the
+///     ≤ stripe-1 blocks between `RESERVED_BLOCKS` and the first aligned PBA),
+///   - the LAST region owns everything above its start, so an online
+///     `grow_capacity` needs no re-layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionLayout {
+    base: u64,
+    blocks: u64,
+    count: usize,
+}
+
+impl RegionLayout {
+    /// Single-region (sharding off) — byte-for-byte the pre-region behaviour.
+    fn single() -> Self {
+        Self {
+            base: 0,
+            blocks: 0,
+            count: 1,
+        }
+    }
+
+    fn sharded(&self) -> bool {
+        self.count > 1 && self.blocks > 0
+    }
+
+    /// Owning region of a PBA. Total over all u64 (clamped both ends), so no
+    /// caller has to bounds-check before routing.
+    fn of(&self, pba: u64) -> usize {
+        if !self.sharded() {
+            return 0;
+        }
+        ((pba.saturating_sub(self.base)) / self.blocks).min(self.count as u64 - 1) as usize
+    }
+
+    fn start(&self, idx: usize) -> u64 {
+        if idx == 0 || !self.sharded() {
+            0
+        } else {
+            self.base + idx as u64 * self.blocks
+        }
+    }
+
+    fn end(&self, idx: usize) -> u64 {
+        if !self.sharded() || idx + 1 >= self.count {
+            u64::MAX
+        } else {
+            self.base + (idx + 1) as u64 * self.blocks
+        }
+    }
+
+    /// Inclusive region index range spanned by `extent`. Zero-count extents
+    /// (rejected downstream by `validate_extent_shape`) route to their start's
+    /// region so the caller can still take a lock and report the failure.
+    fn span(&self, extent: Extent) -> (usize, usize) {
+        let lo = self.of(extent.start.0);
+        let last = extent.end_pba().0.max(extent.start.0 + 1) - 1;
+        (lo, self.of(last).max(lo))
+    }
+
+    /// `extent` clipped to region `idx`, or `None` if it does not reach into it.
+    fn clip(&self, idx: usize, extent: Extent) -> Option<Extent> {
+        let s = extent.start.0.max(self.start(idx));
+        let e = extent.end_pba().0.min(self.end(idx));
+        (s < e).then(|| Extent::new(Pba(s), (e - s) as u32))
+    }
+
+    /// Blocks per region for a device of `usable_blocks`, aiming at `regions`
+    /// shards. Returns `None` when the device is too small to shard usefully.
+    /// The result is a multiple of `stripe` so no region boundary can split a
+    /// stripe window — without that, every boundary would strand up to
+    /// `stripe - 1` blocks in the general pool instead of the reserve.
+    fn plan(usable_blocks: u64, regions: usize, stripe: u32) -> Option<(u64, usize)> {
+        if regions <= 1 || usable_blocks == 0 {
+            return None;
+        }
+        let stripe = u64::from(stripe.max(1));
+        let want = usable_blocks.div_ceil(regions as u64).max(MIN_REGION_BLOCKS);
+        let blocks = want.div_ceil(stripe) * stripe;
+        let count = usable_blocks.div_ceil(blocks) as usize;
+        (count > 1).then_some((blocks, count))
+    }
+}
+
 /// One original retire operation's age, tracked at retire granularity in the
 /// `retired_age` log so coalescing the `retired_extents` set can never re-age it.
 #[derive(Debug, Clone, Copy)]
@@ -115,9 +246,13 @@ pub struct ContiguityStats {
 /// are the amplification the cache is really buying.
 ///
 /// `drains` counts `drain_lane_caches` calls, which are the expensive shape:
-/// one global-lock hold that re-inserts every cached extent from ALL lanes. A
-/// nonzero-and-growing `drains` under steady write load means lanes are fighting
-/// over an empty stripe reserve, and each fight stalls all 16 writers.
+/// one hold that re-inserts every cached extent from ALL lanes — and with region
+/// sharding it holds EVERY region lock for the duration, so this is the one path
+/// sharding makes *more* expensive, not less. A nonzero-and-growing `drains`
+/// under steady write load means lanes are fighting over an empty stripe reserve,
+/// and each fight stalls all 16 writers. Sharded, a lane tries
+/// [`REGION_REFILL_TRIES`] other regions before it resorts to a drain, so this
+/// should sit at 0 even more firmly than it already did.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct AllocSupplyStats {
     pub aligned_allocs: u64,
@@ -126,6 +261,26 @@ pub struct AllocSupplyStats {
     pub refill_runs: u64,
     pub drains: u64,
     pub drain_blocks: u64,
+}
+
+/// Address-region sharding shape and traffic — see [`RegionPools`].
+///
+/// `regions` is the divisor `tools/flush_delta.py` needs to turn the summed
+/// `free_lock.*.hold_ns` into a PER-LOCK occupancy: with one lock, "sum of holds
+/// / wall" was the busy fraction of that lock (68.4% on the box); with N locks it
+/// is the busy fraction of the average lock only after dividing by N.
+///
+/// `switches` and `refill_misses` are the health signal: a lane that keeps
+/// changing region, or refills that keep coming up empty, means the regions are
+/// too small (or the reserve too starved) for the lanes to own one each — the
+/// wrong shape, not the wrong idea. Compare against `allocator_supply.refills`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct AllocRegionStats {
+    pub regions: usize,
+    pub region_blocks: u64,
+    pub switches: u64,
+    pub refill_misses: u64,
+    pub serialized: bool,
 }
 
 impl AllocSupplyStats {
@@ -279,16 +434,35 @@ impl FreeLockSiteStats {
     }
 }
 
-/// RAII `free_pools` guard that charges its hold to a [`FreeLockSite`].
+/// RAII guard over ONE region's `FreePools` that charges its hold to a
+/// [`FreeLockSite`] and refreshes that region's advisory hints on release.
 struct FreeLockGuard<'a> {
     pools: std::sync::MutexGuard<'a, FreePools>,
     stats: &'a FreeLockStats,
     site: usize,
     acquired: Instant,
+    /// Advisory aggregates for this region, refreshed on drop — see
+    /// [`RegionPools::free_hint`].
+    free_hint: &'a AtomicU64,
+    stripe_hint: &'a AtomicU64,
 }
 
 impl Drop for FreeLockGuard<'_> {
     fn drop(&mut self) {
+        // Refresh BEFORE the hold is charged so the hints are always published
+        // by a thread that still holds the region lock: a reader can therefore
+        // only ever see a value that was true at some point while the lock was
+        // held, never a torn or future one. Both reads are O(1) maintained
+        // aggregates (plus the normally-empty quarantine map).
+        self.free_hint
+            .store(self.pools.free_blocks_in_pools(), Ordering::Relaxed);
+        self.stripe_hint.store(
+            self.pools
+                .stripe_reserve
+                .largest()
+                .map_or(0, |run| u64::from(run.count)),
+            Ordering::Relaxed,
+        );
         let held = self.acquired.elapsed().as_nanos() as u64;
         self.stats.hold_ns[self.site].fetch_add(held, Ordering::Relaxed);
         self.stats.hold_ns_max[self.site].fetch_max(held, Ordering::Relaxed);
@@ -343,11 +517,11 @@ impl FreePools {
         set
     }
 
-    fn set_geometry(&mut self, stripe: u32, phase: u32) {
-        let requested = (stripe > 1).then_some((stripe, phase));
-        if self.geometry() == requested {
-            return;
-        }
+    /// Empty every policy class and hand back the free runs they held, including
+    /// the already-free parts of active quarantines (which are dropped — the
+    /// pre-region `set_geometry` did the same, pinned by
+    /// `geometry_change_preserves_quarantined_free_blocks`).
+    fn take_all_runs(&mut self) -> Vec<Extent> {
         let mut runs: Vec<Extent> = self.general.by_addr().iter().copied().collect();
         runs.extend(self.stripe_reserve.by_addr().iter().copied());
         runs.extend(
@@ -357,13 +531,17 @@ impl FreePools {
         );
         self.general = FreeSet::new();
         self.stripe_reserve = FreeSet::new();
+        self.quarantines.clear();
+        runs
+    }
+
+    /// Install a geometry on an already-emptied pool.
+    fn reset_geometry(&mut self, stripe: u32, phase: u32) {
+        self.general = FreeSet::new();
+        self.stripe_reserve = FreeSet::new();
         self.general.set_geometry(stripe, phase);
         self.stripe_reserve.set_geometry(stripe, phase);
         self.quarantines.clear();
-        runs.sort_unstable_by_key(|extent| extent.start.0);
-        for run in runs {
-            self.insert_classified(run);
-        }
     }
 
     fn replace_general(&mut self, free: BTreeSet<Extent>) {
@@ -632,16 +810,293 @@ impl FreePools {
     }
 }
 
+/// The free space, sharded by PBA address into independently-locked regions.
+///
+/// Each region holds a complete [`FreePools`] (general / stripe reserve /
+/// quarantines) restricted to its own address range — **every insert path
+/// clips to the region**, so a region's sets never contain an out-of-region
+/// extent. That single invariant is what makes every query composable: a
+/// containment or overlap question about an extent is answered by asking only
+/// the regions it spans.
+///
+/// Why shard by address rather than shorten the holds: the 2026-07-29 box
+/// attribution showed 98% of the holding comes from GC retire/reclaim, whose
+/// per-extent cost is dominated by work on the RETIRED structures that must
+/// stay atomic with the free-side overlap check (a concurrent `free_extent`
+/// and a retire that both pass their checks would produce double ownership —
+/// the project's two premature-free P0s were exactly this class of bug). So the
+/// holds are kept EXACTLY as they were, atomicity included, and only the lock
+/// they serialize on is split: one 68%-busy mutex becomes N at 68/N%.
+///
+/// Region boundaries are stripe-aligned, so `insert_classified`'s
+/// general/reserve classification behaves identically inside a region as it did
+/// globally. The only thing lost is coalescing ACROSS a boundary: one seam per
+/// region (≤ 2048 extents against the box's 24.6 M) never folds.
+struct RegionPools {
+    pools: Vec<Mutex<FreePools>>,
+    /// Routing divisor in blocks; 0 = single region (sharding off). Only
+    /// rewritten by `set_geometry`, which holds every region lock.
+    region_blocks: AtomicU64,
+    /// First stripe-aligned PBA. Region boundaries sit at
+    /// `region_base + i*region_blocks` so none of them splits a stripe window.
+    region_base: AtomicU64,
+    /// Advisory per-region free-block totals, refreshed under the region lock by
+    /// [`FreeLockGuard::drop`].
+    ///
+    /// Read lock-free ONLY to skip a region in an ascending walk or to pick a
+    /// lane's region. A stale-zero read is indistinguishable from having taken
+    /// that region's lock a moment earlier — the same benign race the single
+    /// global lock always had between a free and a concurrent allocation — so it
+    /// can never produce a wrong answer, only a slightly older one. The
+    /// ENOSPC boundary keeps its `drain_lane_caches` + retry, unchanged.
+    free_hint: Vec<AtomicU64>,
+    /// Advisory per-region LARGEST stripe-reserve run, same discipline.
+    ///
+    /// Largest-run rather than summed capacity because the question every reader
+    /// asks is "can this region serve a `need`-block aligned carve", and for the
+    /// reserve that is EXACTLY `largest >= need`: every reserve extent is
+    /// stripe-aligned with a stripe-multiple count (the `insert_classified`
+    /// invariant), so its effective capacity equals its count. A summed hint
+    /// answers a different question and says yes to a region holding a hundred
+    /// single stripes when the request needs two contiguous ones.
+    stripe_hint: Vec<AtomicU64>,
+    /// Preferred owner of each region as `lane + 1` (0 = unclaimed).
+    ///
+    /// ZFS's metaslab insight is that the win comes from EXCLUSIVITY, not from
+    /// contiguity: a lane that owns its region neither waits for nor is waited
+    /// on by the other lanes. Purely advisory here — when no unclaimed region
+    /// can serve a refill, lanes share rather than starve (which also covers
+    /// `num_lanes > num_regions` on small devices).
+    owner: Vec<AtomicUsize>,
+    /// A/B gate — see [`set_region_serialize`]. Taken outermost, once per
+    /// acquisition group, so arming it can never deadlock.
+    gate: Mutex<()>,
+}
+
+impl RegionPools {
+    fn new(usable_blocks: u64, regions: usize) -> Self {
+        // Geometry is configured after construction (`set_stripe_geometry`), so
+        // plan against stripe=1 now; `set_geometry` re-plans and re-routes.
+        let (region_blocks, count) =
+            RegionLayout::plan(usable_blocks, regions, 1).unwrap_or((0, 1));
+        Self {
+            pools: (0..count).map(|_| Mutex::new(FreePools::new())).collect(),
+            region_blocks: AtomicU64::new(region_blocks),
+            region_base: AtomicU64::new(RESERVED_BLOCKS),
+            free_hint: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            stripe_hint: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            owner: (0..count).map(|_| AtomicUsize::new(0)).collect(),
+            gate: Mutex::new(()),
+        }
+    }
+
+    fn layout(&self) -> RegionLayout {
+        RegionLayout {
+            base: self.region_base.load(Ordering::Relaxed),
+            blocks: self.region_blocks.load(Ordering::Relaxed),
+            count: self.pools.len(),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.pools.len()
+    }
+
+    /// The layout this pool WOULD use for `(stripe, phase)`.
+    ///
+    /// The region count is fixed at construction (it sizes the mutex vector), so
+    /// re-planning only moves the boundaries: `region_base` becomes the first
+    /// stripe-aligned PBA and `region_blocks` is rounded up to a stripe
+    /// multiple. Both keep every boundary stripe-aligned, which is what stops a
+    /// boundary from stranding a partial stripe window in the general pool.
+    /// Rounding up can leave the top regions unused (`RegionLayout::of` clamps),
+    /// which costs nothing but an idle mutex.
+    fn planned_layout(&self, stripe: u32, phase: u32) -> RegionLayout {
+        let blocks = self.region_blocks.load(Ordering::Relaxed);
+        if self.pools.len() <= 1 || blocks == 0 {
+            return RegionLayout::single();
+        }
+        let stripe64 = u64::from(stripe.max(1));
+        RegionLayout {
+            base: SpaceAllocator::align_up_pba(RESERVED_BLOCKS, stripe64, u64::from(phase)),
+            blocks: blocks.div_ceil(stripe64) * stripe64,
+            count: self.pools.len(),
+        }
+    }
+
+    /// Publish a re-planned layout. The caller MUST hold every region lock and
+    /// must have emptied the regions first — an extent left behind under the old
+    /// boundaries could otherwise end up in a region that does not own it,
+    /// breaking the "a region only holds its own addresses" invariant every
+    /// query depends on.
+    fn publish_layout(&self, layout: RegionLayout) {
+        self.region_base.store(layout.base, Ordering::Relaxed);
+        self.region_blocks.store(layout.blocks, Ordering::Relaxed);
+    }
+
+    /// Take the A/B gate when armed. Callers hold the returned guard for the
+    /// whole critical section, which is what makes N region locks behave as one.
+    fn gate(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        REGION_SERIALIZE
+            .load(Ordering::Relaxed)
+            .then(|| self.gate.lock().unwrap())
+    }
+}
+
+/// The regions spanned by one extent, locked in ascending index order.
+///
+/// Almost always exactly one region: extents on the hot paths are 1-6 blocks
+/// against a ~76 K-block region. The multi-region case exists for correctness
+/// (a free run released across a boundary, a rebuild, a grow) and is handled by
+/// clipping the extent per region — never by widening what a region owns.
+struct SpanGuard<'a> {
+    layout: RegionLayout,
+    lo: usize,
+    guards: Vec<FreeLockGuard<'a>>,
+    /// Declared last so it drops AFTER `guards` (Rust drops fields in
+    /// declaration order), keeping the gate outermost.
+    _gate: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl SpanGuard<'_> {
+    fn region(&self, idx: usize) -> &FreePools {
+        &self.guards[idx - self.lo]
+    }
+
+    fn region_mut(&mut self, idx: usize) -> &mut FreePools {
+        &mut self.guards[idx - self.lo]
+    }
+
+    fn spans_one_region(&self) -> bool {
+        self.guards.len() == 1
+    }
+
+    /// The one region this span covers, or `None` when it straddles a boundary.
+    fn single_mut(&mut self) -> Option<&mut FreePools> {
+        (self.guards.len() == 1).then(|| &mut *self.guards[0])
+    }
+
+    fn geometry(&self) -> Option<(u32, u32)> {
+        self.guards[0].geometry()
+    }
+
+    fn empty_set_with_geometry(&self) -> FreeSet {
+        self.guards[0].empty_set_with_geometry()
+    }
+
+    fn overlapping_free(&self, extent: Extent) -> Option<Extent> {
+        let (lo, hi) = self.layout.span(extent);
+        (lo..=hi).find_map(|idx| {
+            let part = self.layout.clip(idx, extent)?;
+            self.region(idx).overlapping_free(part)
+        })
+    }
+
+    /// Whether the union of every spanned region's pools covers `extent`. Each
+    /// region answers for its own slice; a region that owns none of the extent
+    /// cannot withhold coverage.
+    fn covers_free(&self, extent: Extent) -> bool {
+        let (lo, hi) = self.layout.span(extent);
+        (lo..=hi).all(|idx| match self.layout.clip(idx, extent) {
+            Some(part) => self.region(idx).covers_free(part),
+            None => true,
+        })
+    }
+
+    fn overlaps_reserve(&self, extent: Extent) -> bool {
+        let (lo, hi) = self.layout.span(extent);
+        (lo..=hi).any(|idx| match self.layout.clip(idx, extent) {
+            Some(part) => self.region(idx).overlaps_reserve(part),
+            None => false,
+        })
+    }
+
+    fn overlapping_quarantine(&self, extent: Extent) -> Option<Extent> {
+        let (lo, hi) = self.layout.span(extent);
+        (lo..=hi).find_map(|idx| {
+            let part = self.layout.clip(idx, extent)?;
+            self.region(idx).overlapping_quarantine(part)
+        })
+    }
+
+    fn release_extent(&mut self, extent: Extent) {
+        let (lo, hi) = self.layout.span(extent);
+        for idx in lo..=hi {
+            if let Some(part) = self.layout.clip(idx, extent) {
+                self.region_mut(idx).release_extent(part);
+            }
+        }
+    }
+
+    fn insert_classified(&mut self, extent: Extent) {
+        let (lo, hi) = self.layout.span(extent);
+        for idx in lo..=hi {
+            if let Some(part) = self.layout.clip(idx, extent) {
+                self.region_mut(idx).insert_classified(part);
+            }
+        }
+    }
+
+    fn extract_from_general(&mut self, range: Extent) -> Vec<Extent> {
+        let (lo, hi) = self.layout.span(range);
+        let mut out = Vec::new();
+        for idx in lo..=hi {
+            if let Some(part) = self.layout.clip(idx, range) {
+                out.extend(self.region_mut(idx).extract_from_general(part));
+            }
+        }
+        out
+    }
+}
+
+/// Split a batch into maximal runs of consecutive extents that share the SAME
+/// region span, capped at `cap` entries per run.
+///
+/// With one region this is exactly `extents.chunks(cap)`, so unsharded behaviour
+/// — including where the [`FREE_LOCK_HOLD_EXTENTS`] boundaries fall — is
+/// unchanged. Sharded, an address-sorted batch (which is what
+/// `buffer/flush/cleanup.rs::retire_dead_pbas` and the GC reclaim loop both
+/// produce) yields one hold per region, so the lane-snapshot amortization
+/// survives while the hold itself moves off a lock the writers share. An
+/// unsorted batch simply gets shorter holds — correct, just more acquisitions.
+///
+/// Grouping (rather than one hold per extent) is what keeps the documented
+/// `free -> retired -> retired_age` order intact: the region lock stays
+/// outermost for a whole group, so the free-side overlap check remains atomic
+/// with the retired insert. Flipping to a per-extent region lock inside a held
+/// `retired` would invert that order against `validate_free_extent`.
+fn region_holds<'e>(
+    layout: RegionLayout,
+    extents: &'e [Extent],
+    cap: usize,
+) -> Vec<(usize, usize, &'e [Extent])> {
+    let cap = cap.max(1);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < extents.len() {
+        let span = layout.span(extents[i]);
+        let mut j = i + 1;
+        while j < extents.len() && j - i < cap && layout.span(extents[j]) == span {
+            j += 1;
+        }
+        out.push((span.0, span.1, &extents[i..j]));
+        i = j;
+    }
+    out
+}
+
 pub struct SpaceAllocator {
     /// IO-addressable capacity in blocks. Atomic so an online `grow_capacity`
     /// (chunklet `extend_ld` on LV3) can publish the larger frontier while
     /// concurrent bounds checks / status reads run lock-free. Only ever grows.
     total_blocks: AtomicU64,
-    /// Address-ordered free list + (count, start) side index. First-fit
-    /// SELECTION is unchanged (lowest-address extent that fits — the metadb
-    /// L2P leaf codec's dense-PBA contract); the side index only makes finding
-    /// it O(D·log N) instead of an O(N) belt walk under this lock.
-    free_pools: Mutex<FreePools>,
+    /// Address-ordered free list + (count, start) side index, sharded by PBA
+    /// address into independently-locked regions (see [`RegionPools`]).
+    /// First-fit SELECTION is unchanged for every path that spans regions (they
+    /// walk regions in ascending address order, so "first region that can serve"
+    /// IS the global address-argmin); the one deliberate exception is the flush
+    /// writer's lane refill, which is first-fit WITHIN the lane's active region.
+    regions: RegionPools,
     /// Coalesced retired set — authority for containment/overlap (`is_retired`,
     /// `overlapping_retired_extent`, `retired_block_count`). NEVER carries age.
     retired_extents: Mutex<BTreeSet<Extent>>,
@@ -669,6 +1124,10 @@ pub struct SpaceAllocator {
     lane_caches: Vec<Mutex<Vec<Pba>>>,
     /// Per-lane contiguous extent caches for raw multi-block writes.
     lane_extent_caches: Vec<Mutex<Vec<Extent>>>,
+    /// The region each lane currently refills its aligned extent cache from
+    /// (`usize::MAX` = not yet chosen). Advisory: a lane that cannot be served
+    /// switches, and lanes may share a region rather than starve.
+    lane_regions: Vec<AtomicUsize>,
     alloc_tracker: Option<Mutex<BTreeSet<Pba>>>,
     /// Aligned-path lane-cache supply accounting — see [`AllocSupplyStats`].
     /// Relaxed counters, advisory only (never feed an allocation decision).
@@ -678,6 +1137,14 @@ pub struct SpaceAllocator {
     refill_runs: AtomicU64,
     drain_ops: AtomicU64,
     drain_blocks: AtomicU64,
+    /// Times a lane moved its aligned refill to a different region.
+    region_switches: AtomicU64,
+    /// Refill attempts that found nothing usable in the region they tried.
+    region_refill_misses: AtomicU64,
+    /// `(stripe, phase)` packed as `stripe << 32 | phase`, 0 = unset. Lets the
+    /// public `stripe_geometry()` answer without taking a region lock (the GC
+    /// defrag scanner asks once per candidate cluster).
+    geometry_cache: AtomicU64,
 }
 
 impl SpaceAllocator {
@@ -686,6 +1153,27 @@ impl SpaceAllocator {
     /// Allocatable space starts at PBA RESERVED_BLOCKS.
     pub fn new(device_size_bytes: u64, num_lanes: usize) -> Self {
         Self::new_with_hazards(device_size_bytes, num_lanes)
+    }
+
+    /// Number of address regions the free space is sharded into (1 = off).
+    pub fn region_count(&self) -> usize {
+        self.regions.count()
+    }
+
+    /// Blocks per region (0 when unsharded).
+    pub fn region_blocks(&self) -> u64 {
+        self.regions.region_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Region sharding shape + traffic — see [`AllocRegionStats`].
+    pub fn region_stats(&self) -> AllocRegionStats {
+        AllocRegionStats {
+            regions: self.regions.count(),
+            region_blocks: self.regions.region_blocks.load(Ordering::Relaxed),
+            switches: self.region_switches.load(Ordering::Relaxed),
+            refill_misses: self.region_refill_misses.load(Ordering::Relaxed),
+            serialized: region_serialize(),
+        }
     }
 
     /// `device_size_bytes` is the IO-ADDRESSABLE capacity, NOT the raw device
@@ -697,17 +1185,64 @@ impl SpaceAllocator {
     /// range: offset == capacity"). The bottom RESERVED_BLOCKS reserved below is
     /// the superblock / heartbeat / HA-lock region in the allocator's own space.
     pub fn new_with_hazards(device_size_bytes: u64, num_lanes: usize) -> Self {
+        // Region sharding is OFF unless a caller asks for it, so every existing
+        // construction site keeps byte-identical single-lock behaviour.
+        Self::new_with_regions(device_size_bytes, num_lanes, 1)
+    }
+
+    /// `new_with_hazards` with an explicit region count (see [`RegionPools`]).
+    /// `0` selects the compiled default, `1` disables sharding. The device may
+    /// still end up unsharded when it is too small (see [`MIN_REGION_BLOCKS`]).
+    pub fn new_with_regions(device_size_bytes: u64, num_lanes: usize, regions: usize) -> Self {
+        // Diagnostic override, same shape as `ONYX_ALLOC_TRACK`: it exists so the
+        // WHOLE suite can be re-run against the sharded paths
+        // (`ONYX_ALLOCATOR_REGIONS=8 cargo test`) instead of only the dedicated
+        // region tests, which is the only way to find a routing mistake in a
+        // consumer nobody thought to region-test. It overrides the config, so
+        // production must not set it.
+        let regions = std::env::var("ONYX_ALLOCATOR_REGIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(regions);
+        Self::new_with_exact_regions(device_size_bytes, num_lanes, regions)
+    }
+
+    /// [`Self::new_with_regions`] without the `ONYX_ALLOCATOR_REGIONS` override,
+    /// so a test that compares a sharded pool against an unsharded one still
+    /// gets both arms while the suite is being swept sharded.
+    fn new_with_exact_regions(device_size_bytes: u64, num_lanes: usize, regions: usize) -> Self {
         let total_blocks = device_size_bytes / BLOCK_SIZE as u64;
         let usable_blocks = total_blocks.saturating_sub(RESERVED_BLOCKS);
-        let mut free_pools = FreePools::new();
+        let regions = if regions == 0 {
+            DEFAULT_ALLOCATOR_REGIONS
+        } else {
+            regions
+        };
+        let region_pools = RegionPools::new(usable_blocks, regions);
         if usable_blocks > 0 {
-            free_pools.general.insert(Extent::new(
+            // Same total as the pre-region constructor (which clamped one
+            // extent to u32::MAX), just routed to the owning regions.
+            let layout = region_pools.layout();
+            let seed = Extent::new(
                 Pba(RESERVED_BLOCKS),
                 usable_blocks.min(u32::MAX as u64) as u32,
-            ));
+            );
+            let (lo, hi) = layout.span(seed);
+            for idx in lo..=hi {
+                if let Some(part) = layout.clip(idx, seed) {
+                    let mut pools = region_pools.pools[idx].lock().unwrap();
+                    pools.general.insert(part);
+                    // Seed the advisory hints too: the ascending region walks
+                    // skip regions whose hint reads zero, so a never-published
+                    // hint would make a freshly-built allocator look empty.
+                    region_pools.free_hint[idx]
+                        .store(pools.free_blocks_in_pools(), Ordering::Relaxed);
+                }
+            }
         }
         let lane_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
         let lane_extent_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
+        let lane_regions = (0..num_lanes).map(|_| AtomicUsize::new(usize::MAX)).collect();
         let alloc_tracker = std::env::var("ONYX_ALLOC_TRACK")
             .map(|value| {
                 matches!(
@@ -719,7 +1254,7 @@ impl SpaceAllocator {
             .then(|| Mutex::new(BTreeSet::new()));
         Self {
             total_blocks: AtomicU64::new(total_blocks),
-            free_pools: Mutex::new(free_pools),
+            regions: region_pools,
             retired_extents: Mutex::new(BTreeSet::new()),
             retired_age: Mutex::new(BTreeMap::new()),
             retired_blocks: AtomicU64::new(0),
@@ -729,6 +1264,7 @@ impl SpaceAllocator {
             free_lock: FreeLockStats::new(),
             lane_caches,
             lane_extent_caches,
+            lane_regions,
             alloc_tracker,
             aligned_allocs: AtomicU64::new(0),
             refill_ops: AtomicU64::new(0),
@@ -736,6 +1272,9 @@ impl SpaceAllocator {
             refill_runs: AtomicU64::new(0),
             drain_ops: AtomicU64::new(0),
             drain_blocks: AtomicU64::new(0),
+            region_switches: AtomicU64::new(0),
+            region_refill_misses: AtomicU64::new(0),
+            geometry_cache: AtomicU64::new(0),
         }
     }
 
@@ -745,10 +1284,10 @@ impl SpaceAllocator {
     /// Acquire `free_pools`, charging the wait to `site` and (on drop) the hold.
     /// Two clock reads per acquisition against a critical section measured in
     /// µs-to-ms, i.e. well under 1%.
-    fn lock_free_pools(&self, site: FreeLockSite) -> FreeLockGuard<'_> {
+    fn lock_region_raw(&self, site: FreeLockSite, region: usize) -> FreeLockGuard<'_> {
         let idx = site as usize;
         let queued = Instant::now();
-        let pools = self.free_pools.lock().unwrap();
+        let pools = self.regions.pools[region].lock().unwrap();
         let waited = queued.elapsed().as_nanos() as u64;
         self.free_lock.acquisitions[idx].fetch_add(1, Ordering::Relaxed);
         self.free_lock.wait_ns[idx].fetch_add(waited, Ordering::Relaxed);
@@ -757,7 +1296,112 @@ impl SpaceAllocator {
             stats: &self.free_lock,
             site: idx,
             acquired: Instant::now(),
+            free_hint: &self.regions.free_hint[region],
+            stripe_hint: &self.regions.stripe_hint[region],
         }
+    }
+
+    /// Lock ONE region (plus the A/B gate when armed). Callers that walk regions
+    /// take these one at a time and never hold two, so the walk order is free.
+    fn lock_region(&self, site: FreeLockSite, region: usize) -> SpanGuard<'_> {
+        let gate = self.regions.gate();
+        SpanGuard {
+            layout: self.regions.layout(),
+            lo: region,
+            guards: vec![self.lock_region_raw(site, region)],
+            _gate: gate,
+        }
+    }
+
+    /// Lock every region this extent reaches into, ASCENDING by index.
+    ///
+    /// Ascending order is the allocator-wide rule for holding more than one
+    /// region, so multi-region holds can never deadlock against each other.
+    /// The overwhelmingly common result is a single guard.
+    fn lock_span(&self, site: FreeLockSite, extent: Extent) -> SpanGuard<'_> {
+        let layout = self.regions.layout();
+        let (lo, hi) = layout.span(extent);
+        let gate = self.regions.gate();
+        SpanGuard {
+            layout,
+            lo,
+            guards: (lo..=hi)
+                .map(|idx| self.lock_region_raw(site, idx))
+                .collect(),
+            _gate: gate,
+        }
+    }
+
+    /// Lock the inclusive region range `[lo, hi]`, ASCENDING — the batch-path
+    /// analogue of [`Self::lock_span`], where the range comes from a group of
+    /// extents rather than one.
+    fn lock_span_range(&self, site: FreeLockSite, lo: usize, hi: usize) -> SpanGuard<'_> {
+        let gate = self.regions.gate();
+        SpanGuard {
+            layout: self.regions.layout(),
+            lo,
+            guards: (lo..=hi)
+                .map(|idx| self.lock_region_raw(site, idx))
+                .collect(),
+            _gate: gate,
+        }
+    }
+
+    /// Lock EVERY region ascending. Only for paths that must see the whole
+    /// space atomically — today just `drain_lane_caches`, which folds lane
+    /// caches back and therefore has to hold the region locks across the lane
+    /// locks to keep the `FreePools -> lane cache` order.
+    fn lock_all_regions(&self, site: FreeLockSite) -> SpanGuard<'_> {
+        let layout = self.regions.layout();
+        let gate = self.regions.gate();
+        SpanGuard {
+            layout,
+            lo: 0,
+            guards: (0..layout.count)
+                .map(|idx| self.lock_region_raw(site, idx))
+                .collect(),
+            _gate: gate,
+        }
+    }
+
+    /// Regions in ascending address order, optionally skipping those the
+    /// advisory hints report empty.
+    ///
+    /// Selection identity: regions partition the address space in ascending
+    /// order, so "the first region that can serve the request" IS the global
+    /// lowest-address answer — the same extent the single global pool's
+    /// first-fit would have returned. Skipping hint-empty regions cannot change
+    /// that (a region with no free blocks has no candidate).
+    ///
+    /// `min_hint = 0` forces the full walk. Every ENOSPC boundary uses it on its
+    /// final attempt, so a hint that went stale exactly while another thread was
+    /// freeing can never turn into a spurious `SpaceExhausted`. Against
+    /// `stripe_hint` a `min_hint` of the request width is exact (largest-run
+    /// semantics); against `free_hint` only `1` is meaningful, because a summed
+    /// total says nothing about run widths.
+    fn walk_regions(
+        &self,
+        need_stripe: bool,
+        min_hint: u64,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let hints = if need_stripe {
+            &self.regions.stripe_hint
+        } else {
+            &self.regions.free_hint
+        };
+        let count = self.regions.count();
+        (0..count).filter(move |&idx| {
+            min_hint == 0 || count == 1 || hints[idx].load(Ordering::Relaxed) >= min_hint
+        })
+    }
+
+    /// Test-only direct handle on ONE region's pools, for the tests that inject
+    /// a specific free-list shape or a deliberate free/retired inconsistency.
+    /// Goes through the real guard so the region's advisory hints are refreshed
+    /// on release exactly as a production mutation would refresh them.
+    #[cfg(test)]
+    fn test_region_pools(&self, region: usize) -> FreeLockGuard<'_> {
+        self.lock_region_raw(FreeLockSite::Setup, region)
     }
 
     /// Per-site `free_pools` wait/hold snapshot, one entry per
@@ -844,7 +1488,7 @@ impl SpaceAllocator {
         let alloc_count = allocated.len() as u64;
         let free_count = usable_blocks - alloc_count;
 
-        self.lock_free_pools(FreeLockSite::Setup).replace_general(free);
+        self.replace_general_regionwise(&free);
         self.retired_extents.lock().unwrap().clear();
         self.retired_age.lock().unwrap().clear();
         self.retired_blocks.store(0, Ordering::Relaxed);
@@ -863,14 +1507,55 @@ impl SpaceAllocator {
             total = self.total_blocks.load(Ordering::Relaxed),
             allocated = alloc_count,
             free = free_count,
-            extents = {
-                let pools = self.lock_free_pools(FreeLockSite::Setup);
-                pools.general.len() + pools.stripe_reserve.len()
-            },
+            extents = self.pool_extent_count(),
+            regions = self.regions.count(),
             "space allocator rebuilt from metadata"
         );
 
         Ok(())
+    }
+
+    /// Reset every region to hold exactly the free runs in `free`, clipped to the
+    /// region that owns each piece. Regions are visited ascending and locked ONE
+    /// AT A TIME: this is the startup/rebuild path, and `free` can hold tens of
+    /// millions of extents, so holding all region locks across it would be a
+    /// long global stall for no benefit (no allocator client is running yet).
+    fn replace_general_regionwise(&self, free: &BTreeSet<Extent>) {
+        let layout = self.regions.layout();
+        let mut runs = free.iter().peekable();
+        for idx in 0..layout.count {
+            let mut guard = self.lock_region(FreeLockSite::Setup, idx);
+            let pools = guard.region_mut(idx);
+            pools.replace_general(BTreeSet::new());
+            let end = layout.end(idx);
+            while let Some(&&run) = runs.peek() {
+                if run.start.0 >= end {
+                    break;
+                }
+                if let Some(part) = layout.clip(idx, run) {
+                    pools.insert_classified(part);
+                }
+                if run.end_pba().0 <= end {
+                    runs.next();
+                } else {
+                    // Straddles the boundary — the remainder belongs to the next
+                    // region, so leave it in place for the next iteration.
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Free extents across all regions (general + reserve). One region lock at a
+    /// time — advisory aggregate, never a decision input.
+    fn pool_extent_count(&self) -> usize {
+        (0..self.regions.count())
+            .map(|idx| {
+                let guard = self.lock_region(FreeLockSite::Audit, idx);
+                let pools = guard.region(idx);
+                pools.general.len() + pools.stripe_reserve.len()
+            })
+            .sum()
     }
 
     pub fn hazards(&self) -> PbaHazards {
@@ -883,9 +1568,38 @@ impl SpaceAllocator {
     /// free lock — the 2026-07-03 throughput-oscillation root cause). Call
     /// once at startup before flush traffic; idempotent; `stripe <= 1`
     /// (non-RAID backends) clears it.
+    /// Also the point where the region boundaries are finalized: they must be
+    /// stripe-aligned, and the stripe is not known when the allocator is built.
+    /// Every region lock is held across the re-layout, and the regions are
+    /// emptied before the new boundaries are published, so no extent can be left
+    /// sitting in a region that no longer owns its address.
     pub fn set_stripe_geometry(&self, stripe_blocks: u32, phase: u32) {
-        self.lock_free_pools(FreeLockSite::Setup)
-            .set_geometry(stripe_blocks, phase);
+        let requested = (stripe_blocks > 1).then_some((stripe_blocks, phase));
+        let planned = self.regions.planned_layout(stripe_blocks, phase);
+        let mut guard = self.lock_all_regions(FreeLockSite::Setup);
+        if guard.geometry() == requested && guard.layout == planned {
+            return;
+        }
+        let mut runs = Vec::new();
+        for region in &mut guard.guards {
+            runs.extend(region.take_all_runs());
+        }
+        self.regions.publish_layout(planned);
+        guard.layout = planned;
+        for region in &mut guard.guards {
+            region.reset_geometry(stripe_blocks, phase);
+        }
+        runs.sort_unstable_by_key(|extent| extent.start.0);
+        for run in runs {
+            guard.insert_classified(run);
+        }
+        drop(guard);
+        self.geometry_cache.store(
+            requested.map_or(0, |(stripe, phase)| {
+                u64::from(stripe) << 32 | u64::from(phase)
+            }),
+            Ordering::Relaxed,
+        );
     }
 
     /// Remove an aligned physical range from ordinary allocation while the
@@ -895,8 +1609,8 @@ impl SpaceAllocator {
     pub fn begin_defrag_quarantine(&self, target: Extent) -> OnyxResult<()> {
         self.validate_extent_shape(target, "begin_defrag_quarantine")?;
         {
-            let mut pools = self.lock_free_pools(FreeLockSite::Quarantine);
-            let (stripe, phase) = pools.geometry().ok_or_else(|| {
+            let mut span = self.lock_span(FreeLockSite::Quarantine, target);
+            let (stripe, phase) = span.geometry().ok_or_else(|| {
                 OnyxError::Config("begin_defrag_quarantine requires stripe geometry".into())
             })?;
             if stripe <= 1
@@ -908,13 +1622,27 @@ impl SpaceAllocator {
                     target, stripe, phase
                 )));
             }
-            if let Some(existing) = pools.overlapping_quarantine(target) {
+            // A quarantine is tracked in exactly ONE region so that
+            // progress/complete/cancel stay single-lock lookups keyed by the
+            // target's start PBA. Region boundaries are stripe-aligned and every
+            // real defrag target is exactly one stripe
+            // (`GcDefragState::qualify_and_emit`), so this is unreachable in
+            // production — rejecting here is still better than silently
+            // splitting one target's completion accounting across two locks.
+            // Checked BEFORE anything is extracted so there is nothing to undo.
+            if !span.spans_one_region() {
+                return Err(OnyxError::Config(format!(
+                    "defrag quarantine {:?} crosses an allocator region boundary",
+                    target
+                )));
+            }
+            if let Some(existing) = span.overlapping_quarantine(target) {
                 return Err(OnyxError::Config(format!(
                     "defrag quarantine {:?} overlaps target {:?}",
                     target, existing
                 )));
             }
-            if pools.overlaps_reserve(target) {
+            if span.overlaps_reserve(target) {
                 return Err(OnyxError::Config(format!(
                     "defrag quarantine {:?} overlaps stripe reserve",
                     target
@@ -924,12 +1652,15 @@ impl SpaceAllocator {
             // never hold a lane lock while acquiring FreePools. Cached blocks
             // are logically free, so detach only the target intersections and
             // leave any head/tail pieces in their originating lane.
-            let mut free_parts = pools.extract_from_general(target);
+            let mut free_parts = span.extract_from_general(target);
             free_parts.extend(self.extract_lane_cache_free_parts(target));
-            let mut target_free = pools.empty_set_with_geometry();
+            let mut target_free = span.empty_set_with_geometry();
             for extent in free_parts {
                 target_free.coalesce_insert(extent);
             }
+            let pools = span
+                .single_mut()
+                .expect("cross-region target rejected above");
             pools.quarantines.insert(
                 target.start.0,
                 QuarantineTarget {
@@ -944,15 +1675,18 @@ impl SpaceAllocator {
     }
 
     pub fn defrag_quarantine_progress(&self, start: Pba) -> Option<(u64, u64)> {
-        let pools = self.lock_free_pools(FreeLockSite::Quarantine);
-        let target = pools.quarantines.get(&start.0)?;
+        let idx = self.regions.layout().of(start.0);
+        let guard = self.lock_region(FreeLockSite::Quarantine, idx);
+        let target = guard.region(idx).quarantines.get(&start.0)?;
         Some((target.free_parts.blocks_total(), target.range.count as u64))
     }
 
     /// Publish a fully-free quarantine as stripe reserve. A partially-free
     /// target remains active and returns `Ok(false)`.
     pub fn complete_defrag_quarantine(&self, start: Pba) -> OnyxResult<bool> {
-        let mut pools = self.lock_free_pools(FreeLockSite::Quarantine);
+        let idx = self.regions.layout().of(start.0);
+        let mut guard = self.lock_region(FreeLockSite::Quarantine, idx);
+        let pools = guard.region_mut(idx);
         let Some(target) = pools.quarantines.get(&start.0) else {
             return Ok(false);
         };
@@ -963,6 +1697,8 @@ impl SpaceAllocator {
             .quarantines
             .remove(&start.0)
             .expect("target checked above");
+        // The target lives inside one region (enforced at begin), so publishing
+        // it back needs no cross-region split.
         pools.insert_classified(target.range);
         Ok(true)
     }
@@ -971,7 +1707,9 @@ impl SpaceAllocator {
     /// the canonical general/reserve partition. Live/retired pieces were never
     /// removed from their ownership states.
     pub fn cancel_defrag_quarantine(&self, start: Pba) -> bool {
-        let mut pools = self.lock_free_pools(FreeLockSite::Quarantine);
+        let idx = self.regions.layout().of(start.0);
+        let mut guard = self.lock_region(FreeLockSite::Quarantine, idx);
+        let pools = guard.region_mut(idx);
         let Some(target) = pools.quarantines.remove(&start.0) else {
             return false;
         };
@@ -983,7 +1721,7 @@ impl SpaceAllocator {
     }
 
     pub fn is_defrag_quarantined(&self, extent: Extent) -> bool {
-        self.lock_free_pools(FreeLockSite::Quarantine)
+        self.lock_span(FreeLockSite::Quarantine, extent)
             .overlapping_quarantine(extent)
             .is_some()
     }
@@ -997,8 +1735,8 @@ impl SpaceAllocator {
             return None;
         }
         let extent = Extent::new(start, count);
-        let pools = self.lock_free_pools(FreeLockSite::Quarantine);
-        if pools.overlapping_quarantine(extent).is_some() {
+        let span = self.lock_span(FreeLockSite::Quarantine, extent);
+        if span.overlapping_quarantine(extent).is_some() {
             return None;
         }
         Some(
@@ -1063,34 +1801,111 @@ impl SpaceAllocator {
 
     /// Allocate a single block. Returns PBA.
     pub fn allocate_one(&self) -> OnyxResult<Pba> {
-        {
-            let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
-            if let Some(pba) = Self::alloc_one_from_pools(&mut pools) {
-                self.track_alloc(Extent::single(pba), "allocate_one")?;
-                self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
-                self.free_blocks.fetch_sub(1, Ordering::Relaxed);
-                return Ok(pba);
-            }
+        if let Some(pba) = self.take_first_regionwise(FreeLockSite::SmallAlloc, 1, true) {
+            self.track_alloc(Extent::single(pba.start), "allocate_one")?;
+            self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
+            self.free_blocks.fetch_sub(1, Ordering::Relaxed);
+            return Ok(pba.start);
         }
-        // Global pool empty — drain lane caches and retry
+        // Global pool empty — drain lane caches and retry. The retry walks EVERY
+        // region (no hint skipping) so this ENOSPC verdict never rests on a
+        // stale advisory hint.
         if !self.lane_caches.is_empty() {
             self.drain_lane_caches();
-            let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
-            if let Some(pba) = Self::alloc_one_from_pools(&mut pools) {
-                self.track_alloc(Extent::single(pba), "allocate_one_retry")?;
-                self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
-                self.free_blocks.fetch_sub(1, Ordering::Relaxed);
-                return Ok(pba);
-            }
+        }
+        if let Some(pba) = self.take_first_regionwise(FreeLockSite::SmallAlloc, 1, false) {
+            self.track_alloc(Extent::single(pba.start), "allocate_one_retry")?;
+            self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
+            self.free_blocks.fetch_sub(1, Ordering::Relaxed);
+            return Ok(pba.start);
         }
         Err(OnyxError::SpaceExhausted)
     }
 
-    /// Small allocations preserve allocator-wide first-fit-by-address across
-    /// both policy pools. This ordering is a MetaDB L2P codec correctness
-    /// contract; the reserve controls aligned ownership, never address order.
-    fn alloc_one_from_pools(pools: &mut FreePools) -> Option<Pba> {
-        Self::take_first_from_pools(pools, 1).map(|extent| extent.start)
+    /// Lowest-address free extent anywhere, capped at `max_count`.
+    ///
+    /// Small allocations preserve allocator-wide first-fit-by-address across both
+    /// policy pools AND across regions — regions are address-ordered and
+    /// disjoint, so the first region that has anything holds the global argmin.
+    /// This ordering is a MetaDB L2P codec correctness contract; the reserve
+    /// controls aligned ownership, never address order.
+    fn take_first_regionwise(
+        &self,
+        site: FreeLockSite,
+        max_count: u32,
+        skip_empty: bool,
+    ) -> Option<Extent> {
+        for idx in self.walk_regions(false, u64::from(skip_empty)) {
+            let mut guard = self.lock_region(site, idx);
+            if let Some(extent) = Self::take_first_from_pools(guard.region_mut(idx), max_count) {
+                return Some(extent);
+            }
+        }
+        None
+    }
+
+    /// Lowest-address free extent that can serve `min_count`, capped at
+    /// `max_count`. Same ascending-region argument as
+    /// [`Self::take_first_regionwise`].
+    fn take_exact_regionwise(
+        &self,
+        site: FreeLockSite,
+        min_count: u32,
+        max_count: u32,
+        skip_empty: bool,
+    ) -> Option<Extent> {
+        for idx in self.walk_regions(false, u64::from(skip_empty)) {
+            let mut guard = self.lock_region(site, idx);
+            if let Some(extent) =
+                Self::take_exact_from_pools(guard.region_mut(idx), min_count, max_count)
+            {
+                return Some(extent);
+            }
+        }
+        None
+    }
+
+    /// Largest free extent anywhere — the `allocate_extent` short-fragment
+    /// fallback.
+    ///
+    /// Two phases so no more than one region lock is ever held: read each
+    /// region's `largest()`, then re-take the winner under its own lock. A
+    /// concurrent allocation can empty the winner between the phases, so a region
+    /// that comes back empty is dropped and the scan repeats — bounded by the
+    /// region count, and only reachable while another thread is allocating (in
+    /// which case an eventual `None` is a truthful "nothing left").
+    fn take_largest_regionwise(&self, site: FreeLockSite) -> Option<Extent> {
+        let mut exhausted: Vec<usize> = Vec::new();
+        for _ in 0..=self.regions.count() {
+            let mut best: Option<(u32, u64, usize)> = None;
+            for idx in self.walk_regions(false, 1) {
+                if exhausted.contains(&idx) {
+                    continue;
+                }
+                let guard = self.lock_region(site, idx);
+                let pools = guard.region(idx);
+                let candidate = match (pools.general.largest(), pools.stripe_reserve.largest()) {
+                    (Some(g), Some(r)) if (r.count, r.start.0) > (g.count, g.start.0) => Some(r),
+                    (Some(g), Some(_)) => Some(g),
+                    (Some(g), None) => Some(g),
+                    (None, r) => r,
+                };
+                if let Some(candidate) = candidate {
+                    let key = (candidate.count, candidate.start.0, idx);
+                    if best.is_none_or(|current| key > current) {
+                        best = Some(key);
+                    }
+                }
+            }
+            let (_, _, idx) = best?;
+            let mut guard = self.lock_region(site, idx);
+            if let Some(extent) = Self::take_largest_from_pools(guard.region_mut(idx)) {
+                return Some(extent);
+            }
+            drop(guard);
+            exhausted.push(idx);
+        }
+        None
     }
 
     /// Allocate a single block using the per-lane cache to avoid global lock contention.
@@ -1131,9 +1946,14 @@ impl SpaceAllocator {
 
     /// Return all cached blocks from lane caches to the global free list.
     /// Called during shutdown to prevent block leaks.
+    /// Holds EVERY region lock across the lane locks. That is the one place the
+    /// all-regions guard is needed: the allocator-wide order is
+    /// `FreePools -> lane cache`, and which regions the cached extents land in is
+    /// only known after the lane locks are taken, so the region side has to be
+    /// acquired first and in full.
     pub fn drain_lane_caches(&self) {
         let mut drained: u64 = 0;
-        let mut pools = self.lock_free_pools(FreeLockSite::Drain);
+        let mut pools = self.lock_all_regions(FreeLockSite::Drain);
         for cache_mutex in &self.lane_caches {
             let mut cache = cache_mutex.lock().unwrap();
             for pba in cache.drain(..) {
@@ -1148,6 +1968,7 @@ impl SpaceAllocator {
                 drained += u64::from(extent.count);
             }
         }
+        drop(pools);
         self.drain_ops.fetch_add(1, Ordering::Relaxed);
         self.drain_blocks.fetch_add(drained, Ordering::Relaxed);
         // No counter adjustment needed: cached blocks were never counted as allocated
@@ -1165,11 +1986,12 @@ impl SpaceAllocator {
     /// or sitting in a lane cache (allocated from the free list but not yet
     /// handed out to a caller).
     pub fn is_free(&self, pba: Pba) -> bool {
-        let pools = self.lock_free_pools(FreeLockSite::Audit);
-        if pools.overlapping_free(Extent::single(pba)).is_some() {
+        let extent = Extent::single(pba);
+        let span = self.lock_span(FreeLockSite::Audit, extent);
+        if span.overlapping_free(extent).is_some() {
             return true;
         }
-        drop(pools);
+        drop(span);
         for cache_mutex in &self.lane_caches {
             let cache = cache_mutex.lock().unwrap();
             if cache.contains(&pba) {
@@ -1205,10 +2027,12 @@ impl SpaceAllocator {
         }
         if lane >= self.lane_extent_caches.len() {
             for attempt in 0..2 {
-                if let Some(extent) = {
-                    let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
-                    Self::take_exact_from_pools(&mut pools, count, count)
-                } {
+                if let Some(extent) = self.take_exact_regionwise(
+                    FreeLockSite::SmallAlloc,
+                    count,
+                    count,
+                    attempt == 0,
+                ) {
                     self.track_alloc(extent, "allocate_exact_extent_global")?;
                     self.allocated_blocks
                         .fetch_add(count as u64, Ordering::Relaxed);
@@ -1453,9 +2277,9 @@ impl SpaceAllocator {
 
         // Try allocation from global free list. If insufficient, drain lane caches and retry.
         for attempt in 0..2 {
-            let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
-
-            if let Some(result) = Self::take_exact_from_pools(&mut pools, count, count) {
+            if let Some(result) =
+                self.take_exact_regionwise(FreeLockSite::SmallAlloc, count, count, attempt == 0)
+            {
                 self.track_alloc(result, "allocate_extent")?;
                 self.allocated_blocks
                     .fetch_add(count as u64, Ordering::Relaxed);
@@ -1467,13 +2291,12 @@ impl SpaceAllocator {
             // enough free contiguous space, so fold them back once before
             // falling back to the largest global fragment.
             if attempt == 0 && self.has_lane_cached_blocks() {
-                drop(pools);
                 self.drain_lane_caches();
                 continue;
             }
 
             // No contiguous extent large enough — return the largest available
-            if let Some(extent) = Self::take_largest_from_pools(&mut pools) {
+            if let Some(extent) = self.take_largest_regionwise(FreeLockSite::SmallAlloc) {
                 self.track_alloc(extent, "allocate_extent_largest")?;
                 self.allocated_blocks
                     .fetch_add(extent.count as u64, Ordering::Relaxed);
@@ -1483,7 +2306,6 @@ impl SpaceAllocator {
             }
 
             // No free extents at all — drain lane caches and retry once
-            drop(pools);
             if attempt == 0 && self.has_lane_cached_blocks() {
                 self.drain_lane_caches();
                 continue;
@@ -1524,7 +2346,7 @@ impl SpaceAllocator {
         self.ensure_not_in_lane_cache(extent, "retire_extent")?;
 
         let newly = {
-            let pools = self.lock_free_pools(FreeLockSite::RetireOne);
+            let pools = self.lock_span(FreeLockSite::RetireOne, extent);
             if let Some(e) = pools.overlapping_free(extent) {
                 return Err(OnyxError::Config(format!(
                     "retire_extent: extent {:?} overlaps free extent {:?}",
@@ -1606,12 +2428,14 @@ impl SpaceAllocator {
             let mut chunk_retired: Vec<Extent> = Vec::new();
             // Lock order: free (outermost) → retired → retired_age, matching
             // `retire_extent_at`. Released and retaken every
-            // FREE_LOCK_HOLD_EXTENTS so the foreground gets the free lock back
-            // instead of waiting out the whole chunk; every check below is
-            // per-extent independent, so where the hold boundaries fall does not
-            // change the outcome (pinned by `batch_retire_equals_sequence`).
-            for hold in chunk.chunks(free_lock_hold_extents()) {
-                let pools = self.lock_free_pools(FreeLockSite::RetireBatch);
+            // FREE_LOCK_HOLD_EXTENTS *and* at every region boundary, so the hold
+            // only ever covers regions this group actually touches; every check
+            // below is per-extent independent, so where the hold boundaries fall
+            // does not change the outcome (pinned by
+            // `batch_retire_equals_sequence`).
+            let layout = self.regions.layout();
+            for (lo, hi, hold) in region_holds(layout, chunk, free_lock_hold_extents()) {
+                let pools = self.lock_span_range(FreeLockSite::RetireBatch, lo, hi);
                 let mut retired = self.retired_extents.lock().unwrap();
                 let mut age = self.retired_age.lock().unwrap();
                 for &extent in hold {
@@ -1705,11 +2529,13 @@ impl SpaceAllocator {
             let mut chunk_freed: u64 = 0;
             let mut chunk_released: Vec<Extent> = Vec::with_capacity(chunk.len());
             // free → retired, released and retaken every FREE_LOCK_HOLD_EXTENTS
-            // (see that const). `chunk_freed` keeps accumulating across holds so
-            // the underflow guard stays honest; every other check is per-extent
-            // independent (pinned by `batch_free_equals_sequence`).
-            for hold in chunk.chunks(free_lock_hold_extents()) {
-                let mut pools = self.lock_free_pools(FreeLockSite::FreeBatch);
+            // and at every region boundary (see [`region_holds`]).
+            // `chunk_freed` keeps accumulating across holds so the underflow
+            // guard stays honest; every other check is per-extent independent
+            // (pinned by `batch_free_equals_sequence`).
+            let layout = self.regions.layout();
+            for (lo, hi, hold) in region_holds(layout, chunk, free_lock_hold_extents()) {
+                let mut pools = self.lock_span_range(FreeLockSite::FreeBatch, lo, hi);
                 let retired = self.retired_extents.lock().unwrap();
                 for &extent in hold {
                     if self
@@ -1981,7 +2807,7 @@ impl SpaceAllocator {
             self.hazards.wait_extent_clear(extent.start, extent.count);
             self.ensure_not_in_lane_cache(extent, "reclaim_retired_extent")?;
 
-            let mut pools = self.lock_free_pools(FreeLockSite::ReclaimOne);
+            let mut pools = self.lock_span(FreeLockSite::ReclaimOne, extent);
             if let Some(e) = pools.overlapping_free(extent) {
                 return Err(OnyxError::Config(format!(
                     "reclaim_retired_extent: extent {:?} overlaps free extent {:?}",
@@ -2120,10 +2946,12 @@ impl SpaceAllocator {
             let mut chunk_freed: u64 = 0;
             // The 12.9 ms hold this whole exercise is about: up to 4096
             // `release_extent` (coalesce-insert into 3 indexes) calls used to run
-            // under ONE acquisition. Now bounded to FREE_LOCK_HOLD_EXTENTS per
-            // hold — same total work, same order, ~32× shorter shut-out window.
-            for hold in removed.chunks(free_lock_hold_extents()) {
-                let mut pools = self.lock_free_pools(FreeLockSite::ReclaimBatch);
+            // under ONE acquisition of ONE global lock. Now bounded to
+            // FREE_LOCK_HOLD_EXTENTS per hold AND confined to the regions the
+            // group actually touches — same total work, same order.
+            let layout = self.regions.layout();
+            for (lo, hi, hold) in region_holds(layout, &removed, free_lock_hold_extents()) {
+                let mut pools = self.lock_span_range(FreeLockSite::ReclaimBatch, lo, hi);
                 for &extent in hold {
                     let in_lane = (0..extent.count)
                         .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
@@ -2219,7 +3047,7 @@ impl SpaceAllocator {
         self.hazards.wait_extent_clear(extent.start, extent.count);
 
         {
-            let mut pools = self.lock_free_pools(FreeLockSite::FreeOne);
+            let mut pools = self.lock_span(FreeLockSite::FreeOne, extent);
             self.ensure_not_free_or_retired_after_wait(extent, &pools)?;
             pools.release_extent(extent);
             self.track_release(extent, "free_extent");
@@ -2237,7 +3065,7 @@ impl SpaceAllocator {
         self.validate_extent_shape(extent, "free_extent")?;
         self.ensure_not_in_lane_cache(extent, "free_extent")?;
 
-        let pools = self.lock_free_pools(FreeLockSite::FreeOne);
+        let pools = self.lock_span(FreeLockSite::FreeOne, extent);
 
         // Check no overlap with existing free extents
         if let Some(e) = pools.overlapping_free(extent) {
@@ -2368,7 +3196,7 @@ impl SpaceAllocator {
     /// Return true if the whole extent is already covered by a free extent
     /// or all its blocks are sitting in lane caches.
     pub fn is_extent_free(&self, extent: Extent) -> bool {
-        let pools = self.lock_free_pools(FreeLockSite::Audit);
+        let pools = self.lock_span(FreeLockSite::Audit, extent);
         if pools.covers_free(extent) {
             return true;
         }
@@ -2424,12 +3252,18 @@ impl SpaceAllocator {
         self.total_blocks.store(new_total, Ordering::Release);
         let added = new_total - old_total;
         {
-            let mut pools = self.lock_free_pools(FreeLockSite::Setup);
+            // The grown tail routes to whichever regions own it; because the
+            // LAST region is unbounded above, growth never needs a re-layout.
+            // One `lock_span` per u32-sized chunk rather than one all-regions
+            // hold: growth is rare and there is no atomicity requirement across
+            // chunks (the frontier was already published above).
             let mut start = old_total;
             let mut remaining = added;
             while remaining > 0 {
                 let count = remaining.min(u32::MAX as u64) as u32;
-                pools.insert_classified(Extent::new(Pba(start), count));
+                let extent = Extent::new(Pba(start), count);
+                self.lock_span(FreeLockSite::Setup, extent)
+                    .insert_classified(extent);
                 start += count as u64;
                 remaining -= count as u64;
             }
@@ -2450,47 +3284,67 @@ impl SpaceAllocator {
     /// `stripe_capable_blocks / free_blocks_in_set` is the defrag trigger
     /// signal. Active quarantine-free blocks remain in the denominator but are
     /// intentionally unavailable in the numerator until publication.
+    /// Sharded, this sums region by region taking ONE region lock at a time, so
+    /// the snapshot is no longer a single instant. Every consumer is advisory
+    /// (the defrag trigger, `status`), and holding N locks to freeze the whole
+    /// space would stall every writer for the duration.
     pub fn contiguity_stats(&self) -> ContiguityStats {
-        let pools = self.lock_free_pools(FreeLockSite::Audit);
-        let quarantine_free_blocks: u64 = pools
-            .quarantines
-            .values()
-            .map(|target| target.free_parts.blocks_total())
-            .sum();
-        let quarantine_target_blocks: u64 = pools
-            .quarantines
-            .values()
-            .map(|target| target.range.count as u64)
-            .sum();
-        let geometry = pools.geometry();
-        ContiguityStats {
-            free_blocks_in_set: pools.free_blocks_in_pools(),
-            free_extents: (pools.general.len()
+        let mut out = ContiguityStats {
+            free_blocks_in_set: 0,
+            free_extents: 0,
+            largest_run_blocks: 0,
+            stripe_capable_blocks: None,
+            stripe_reserve_blocks: 0,
+            quarantine_target_blocks: 0,
+            quarantine_free_blocks: 0,
+        };
+        for idx in 0..self.regions.count() {
+            let guard = self.lock_region(FreeLockSite::Audit, idx);
+            let pools = guard.region(idx);
+            out.quarantine_free_blocks += pools
+                .quarantines
+                .values()
+                .map(|target| target.free_parts.blocks_total())
+                .sum::<u64>();
+            out.quarantine_target_blocks += pools
+                .quarantines
+                .values()
+                .map(|target| target.range.count as u64)
+                .sum::<u64>();
+            out.free_blocks_in_set += pools.free_blocks_in_pools();
+            out.free_extents += (pools.general.len()
                 + pools.stripe_reserve.len()
                 + pools
                     .quarantines
                     .values()
                     .map(|target| target.free_parts.len())
-                    .sum::<usize>()) as u64,
-            largest_run_blocks: pools
-                .general
-                .largest()
-                .into_iter()
-                .chain(pools.stripe_reserve.largest())
-                .map(|extent| extent.count)
-                .max()
-                .unwrap_or(0),
-            stripe_capable_blocks: geometry
-                .map(|_| pools.general.stripe_capacity() + pools.stripe_reserve.stripe_capacity()),
-            stripe_reserve_blocks: pools.stripe_reserve.blocks_total(),
-            quarantine_target_blocks,
-            quarantine_free_blocks,
+                    .sum::<usize>()) as u64;
+            out.largest_run_blocks = out.largest_run_blocks.max(
+                pools
+                    .general
+                    .largest()
+                    .into_iter()
+                    .chain(pools.stripe_reserve.largest())
+                    .map(|extent| extent.count)
+                    .max()
+                    .unwrap_or(0),
+            );
+            if pools.geometry().is_some() {
+                let capable = pools.general.stripe_capacity() + pools.stripe_reserve.stripe_capacity();
+                out.stripe_capable_blocks =
+                    Some(out.stripe_capable_blocks.unwrap_or(0) + capable);
+            }
+            out.stripe_reserve_blocks += pools.stripe_reserve.blocks_total();
         }
+        out
     }
 
-    /// The configured RAID geometry `(stripe_blocks, phase)`, if any.
+    /// The configured RAID geometry `(stripe_blocks, phase)`, if any. Served from
+    /// an atomic written by `set_stripe_geometry`, so the GC defrag scanner's
+    /// per-cluster query takes no region lock.
     pub fn stripe_geometry(&self) -> Option<(u32, u32)> {
-        self.lock_free_pools(FreeLockSite::Audit).geometry()
+        let packed = self.geometry_cache.load(Ordering::Relaxed);
+        (packed != 0).then(|| ((packed >> 32) as u32, packed as u32))
     }
 
     /// Blocks of `range` covered by free extents — the defrag target "done"
@@ -2498,7 +3352,8 @@ impl SpaceAllocator {
     pub(crate) fn free_overlap_blocks(&self, range: Extent) -> u64 {
         let s = range.start.0;
         let e = range.end_pba().0;
-        let pools = self.lock_free_pools(FreeLockSite::Audit);
+        let span = self.lock_span(FreeLockSite::Audit, range);
+        let (lo, hi) = span.layout.span(range);
         let overlap = |set: &FreeSet| {
             let mut covered = 0u64;
             if let Some(prev) = set
@@ -2516,21 +3371,26 @@ impl SpaceAllocator {
             }
             covered
         };
-        overlap(&pools.general)
-            + overlap(&pools.stripe_reserve)
-            + pools
-                .quarantine_starts_overlapping(range)
-                .into_iter()
-                .map(|start| {
-                    overlap(
-                        &pools
-                            .quarantines
-                            .get(&start)
-                            .expect("quarantine key remains present")
-                            .free_parts,
-                    )
-                })
-                .sum::<u64>()
+        (lo..=hi)
+            .map(|idx| {
+                let pools = span.region(idx);
+                overlap(&pools.general)
+                    + overlap(&pools.stripe_reserve)
+                    + pools
+                        .quarantine_starts_overlapping(range)
+                        .into_iter()
+                        .map(|start| {
+                            overlap(
+                                &pools
+                                    .quarantines
+                                    .get(&start)
+                                    .expect("quarantine key remains present")
+                                    .free_parts,
+                            )
+                        })
+                        .sum::<u64>()
+            })
+            .sum()
     }
 
     /// Snapshot up to `max` free extents strictly below `below`, DESCENDING by
@@ -2542,15 +3402,29 @@ impl SpaceAllocator {
         if max == 0 {
             return Vec::new();
         }
-        let pools = self.lock_free_pools(FreeLockSite::Audit);
-        pools
-            .general
-            .by_addr()
-            .range(..Extent::single(below))
-            .rev()
-            .take(max)
-            .copied()
-            .collect()
+        // Descending by address = descending region index, so walking regions
+        // down from the cursor's own region yields the same sequence the single
+        // pool did. One region lock at a time; the snapshot is advisory (the
+        // scanner re-validates everything downstream).
+        let layout = self.regions.layout();
+        let mut out = Vec::with_capacity(max);
+        for idx in (0..=layout.of(below.0)).rev() {
+            if out.len() >= max {
+                break;
+            }
+            let guard = self.lock_region(FreeLockSite::Audit, idx);
+            out.extend(
+                guard
+                    .region(idx)
+                    .general
+                    .by_addr()
+                    .range(..Extent::single(below))
+                    .rev()
+                    .take(max - out.len())
+                    .copied(),
+            );
+        }
+        out
     }
 
     /// Blocks of `range` covered by retired extents. Takes ONLY the retired
@@ -2580,8 +3454,7 @@ impl SpaceAllocator {
     /// (alignment pads must not fragment the free list into per-alloc slivers).
     #[cfg(test)]
     pub(crate) fn free_extent_run_count(&self) -> usize {
-        let pools = self.lock_free_pools(FreeLockSite::Audit);
-        pools.general.len() + pools.stripe_reserve.len()
+        self.pool_extent_count()
     }
 
     fn coalesce_and_insert_any_overlap(set: &mut BTreeSet<Extent>, new: Extent) {
@@ -2631,7 +3504,7 @@ impl SpaceAllocator {
     fn ensure_not_free_or_retired_after_wait(
         &self,
         extent: Extent,
-        pools: &FreePools,
+        pools: &SpanGuard<'_>,
     ) -> OnyxResult<()> {
         if let Some(e) = pools.overlapping_free(extent) {
             return Err(OnyxError::Config(format!(
@@ -2663,30 +3536,45 @@ impl SpaceAllocator {
     /// longer free; every remaining block is visible in the lane cache before
     /// `FreePools` is unlocked.
     fn refill_one_lane_from_global(&self, lane: usize, max_count: u32) -> Option<Pba> {
-        let mut pools = self.lock_free_pools(FreeLockSite::SmallAlloc);
-        let refill = Self::take_first_from_pools(&mut pools, max_count)?;
-        if refill.count > 1 {
-            let mut cache = self.lane_caches[lane].lock().unwrap();
-            for i in 1..refill.count {
-                cache.push(Pba(refill.start.0 + i as u64));
+        // The refill's removal and the lane-tail publication must share ONE
+        // critical section so a defrag quarantine cannot miss an in-flight
+        // refill. Sharded, that section is the region the refill came from —
+        // which is also the only region whose blocks are being published.
+        for idx in self.walk_regions(false, 1) {
+            let mut guard = self.lock_region(FreeLockSite::SmallAlloc, idx);
+            let Some(refill) = Self::take_first_from_pools(guard.region_mut(idx), max_count) else {
+                continue;
+            };
+            if refill.count > 1 {
+                let mut cache = self.lane_caches[lane].lock().unwrap();
+                for i in 1..refill.count {
+                    cache.push(Pba(refill.start.0 + i as u64));
+                }
             }
+            return Some(refill.start);
         }
-        Some(refill.start)
+        None
     }
 
     /// Take exactly `count` blocks for the caller and publish the rest of the
     /// refill into its extent cache before releasing `FreePools`.
     fn refill_extent_lane(&self, lane: usize, count: u32, max_count: u32) -> Option<Extent> {
-        let mut pools = self.lock_free_pools(FreeLockSite::WriterUnaligned);
-        let refill = Self::take_exact_from_pools(&mut pools, count, max_count)?;
-        let result = Extent::new(refill.start, count);
-        if refill.count > count {
-            Self::push_extent_cache(
-                &mut self.lane_extent_caches[lane].lock().unwrap(),
-                Extent::new(Pba(refill.start.0 + count as u64), refill.count - count),
-            );
+        for idx in self.walk_regions(false, 1) {
+            let mut guard = self.lock_region(FreeLockSite::WriterUnaligned, idx);
+            let Some(refill) = Self::take_exact_from_pools(guard.region_mut(idx), count, max_count)
+            else {
+                continue;
+            };
+            let result = Extent::new(refill.start, count);
+            if refill.count > count {
+                Self::push_extent_cache(
+                    &mut self.lane_extent_caches[lane].lock().unwrap(),
+                    Extent::new(Pba(refill.start.0 + count as u64), refill.count - count),
+                );
+            }
+            return Some(result);
         }
-        Some(result)
+        None
     }
 
     /// Seed a lane's extent cache from the stripe reserve and hand back one
@@ -2707,6 +3595,23 @@ impl SpaceAllocator {
     /// sequence K successive `first_fit(min_count)` calls would return — this is
     /// batching, not a policy change, and `batched_refill_equals_sequential_refills`
     /// pins it.
+    /// Sharded, a lane refills from ONE region at a time — its "active" region —
+    /// and only moves when that region cannot serve it.
+    ///
+    /// ⚠ This is the one DELIBERATE selection change region sharding makes:
+    /// aligned allocation is first-fit-by-address **within the lane's region**
+    /// instead of globally. It is safe for the metadb L2P leaf codec because the
+    /// codec's real requirement is that ONE LEAF's PBAs stay near each other,
+    /// and routing already guarantees leaf ⊂ zone ⊂ shard ⊂ lane
+    /// (`shard_for_lba` divides by zone before the modulo), so a leaf's blocks
+    /// all come from one lane — hence one region — and `push_extent_cache` hands
+    /// them out in ascending order. Leaf v5's `MAX_UNITS_PER_LEAF = 128 =
+    /// LEAF_ENTRY_COUNT` makes the historical unit-dict overflow structurally
+    /// impossible; the only surviving constraint is a 4 G-block (16 TiB) PBA span
+    /// per leaf, and region selection prefers LOW addresses precisely to keep the
+    /// working set clustered. `region_pools_equal_single_pool` pins that the free
+    /// COVERAGE is identical to the unsharded pool; the emission ORDER is what
+    /// changes.
     fn refill_stripe_extent_lane(
         &self,
         lane: usize,
@@ -2715,7 +3620,112 @@ impl SpaceAllocator {
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
-        let mut pools = self.lock_free_pools(FreeLockSite::WriterRefill);
+        let layout = self.regions.layout();
+        if !layout.sharded() {
+            return self.refill_stripe_from_region(lane, 0, min_count, max_count, stripe, phase);
+        }
+        let mut idx = self.lane_region(lane, u64::from(min_count), layout);
+        for attempt in 0..REGION_REFILL_TRIES {
+            if let Some(extent) =
+                self.refill_stripe_from_region(lane, idx, min_count, max_count, stripe, phase)
+            {
+                return Some(extent);
+            }
+            // No need to remember which regions were tried: the failed attempt
+            // just released that region's lock, and the guard's drop refreshed
+            // its `stripe_hint` with the truth, so `switch_lane_region` cannot
+            // pick it again for a width it cannot serve. A retry loop is only
+            // reachable while another thread is consuming the same regions.
+            self.region_refill_misses.fetch_add(1, Ordering::Relaxed);
+            if attempt + 1 == REGION_REFILL_TRIES {
+                break;
+            }
+            idx = self.switch_lane_region(lane, idx, u64::from(min_count), layout)?;
+        }
+        None
+    }
+
+    /// The region a lane should refill from, switching if its current one can no
+    /// longer serve `need` whole-stripe blocks.
+    fn lane_region(&self, lane: usize, need: u64, layout: RegionLayout) -> usize {
+        let current = self.lane_regions[lane].load(Ordering::Relaxed);
+        if current < layout.count
+            && self.regions.stripe_hint[current].load(Ordering::Relaxed) >= need.max(1)
+        {
+            return current;
+        }
+        match self.switch_lane_region(lane, current, need, layout) {
+            Some(next) => next,
+            // Nothing anywhere looks servable; try the current region (or region
+            // 0 for a lane that never had one) so the caller still reaches its
+            // drain + global-fallback boundary rather than short-circuiting.
+            None if current < layout.count => current,
+            None => 0,
+        }
+    }
+
+    /// Move `lane` off region `from`.
+    ///
+    /// Prefers the LOWEST-address region that both looks able to serve `need` and
+    /// is unclaimed: low addresses keep the whole working set dense (the leaf
+    /// clustering argument above), and exclusivity is where the sharding win
+    /// comes from — ZFS's metaslab result is that the benefit is owning a region,
+    /// not the region being contiguous. Claims are advisory, so when every
+    /// servable region is taken (including `num_lanes > num_regions`) lanes share
+    /// rather than starve.
+    fn switch_lane_region(
+        &self,
+        lane: usize,
+        from: usize,
+        need: u64,
+        layout: RegionLayout,
+    ) -> Option<usize> {
+        let mine = lane + 1;
+        let mut shared = None;
+        let mut exclusive = None;
+        for idx in 0..layout.count {
+            if idx == from
+                || self.regions.stripe_hint[idx].load(Ordering::Relaxed) < need.max(1)
+            {
+                continue;
+            }
+            let owner = self.regions.owner[idx].load(Ordering::Relaxed);
+            if owner == 0 || owner == mine {
+                exclusive = Some(idx);
+                break;
+            }
+            if shared.is_none() {
+                shared = Some(idx);
+            }
+        }
+        let next = exclusive.or(shared)?;
+        self.regions.owner[next].store(mine, Ordering::Relaxed);
+        if from < layout.count {
+            let _ = self.regions.owner[from].compare_exchange(
+                mine,
+                0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        self.lane_regions[lane].store(next, Ordering::Relaxed);
+        self.region_switches.fetch_add(1, Ordering::Relaxed);
+        Some(next)
+    }
+
+    /// One region's share of the aligned lane refill — the pre-region body,
+    /// unchanged except that the pool it walks is one region's reserve.
+    fn refill_stripe_from_region(
+        &self,
+        lane: usize,
+        region: usize,
+        min_count: u32,
+        max_count: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<Extent> {
+        let mut guard = self.lock_region(FreeLockSite::WriterRefill, region);
+        let pools = guard.region_mut(region);
         if pools.geometry() != Some((stripe, phase)) {
             return None;
         }
@@ -2815,7 +3825,31 @@ impl SpaceAllocator {
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
-        let mut pools = self.lock_free_pools(FreeLockSite::WriterRefill);
+        // Ascending regions ⇒ still the global lowest-address hosting run.
+        // Skipping regions whose reserve capacity reads zero is exact for the
+        // production (geometry-matched) branch, and it is what keeps a
+        // fully-exhausted reserve from costing one lock per region on every
+        // writer allocation.
+        let stripe_hinted = self.stripe_geometry() == Some((stripe, phase));
+        for idx in self
+            .walk_regions(stripe_hinted, if stripe_hinted { u64::from(need) } else { 0 })
+        {
+            if let Some(extent) = self.take_aligned_extent_from_region(idx, need, stripe, phase) {
+                return Some(extent);
+            }
+        }
+        None
+    }
+
+    fn take_aligned_extent_from_region(
+        &self,
+        region: usize,
+        need: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<Extent> {
+        let mut guard = self.lock_region(FreeLockSite::WriterRefill, region);
+        let pools = guard.region_mut(region);
         let reserve_only = pools.geometry() == Some((stripe, phase));
         let (from_reserve, run) = if reserve_only {
             (true, pools.stripe_reserve.first_fit(need)?)
@@ -3003,6 +4037,19 @@ mod free_pool_policy_tests {
         SpaceAllocator::new(blocks * BLOCK_SIZE as u64, lanes)
     }
 
+    /// The per-region geometry change `SpaceAllocator::set_stripe_geometry`
+    /// performs: drain every policy class, install the new geometry, re-insert.
+    /// Kept as a test helper rather than a `FreePools` method so the production
+    /// sequence has exactly one implementation.
+    fn regeometry(pools: &mut FreePools, stripe: u32, phase: u32) {
+        let mut runs = pools.take_all_runs();
+        pools.reset_geometry(stripe, phase);
+        runs.sort_unstable_by_key(|extent| extent.start.0);
+        for run in runs {
+            pools.insert_classified(run);
+        }
+    }
+
     /// The wait/hold attribution must charge the acquiring PATH, not a default
     /// bucket, and every acquisition must record a hold — otherwise the box read
     /// silently attributes everything to one site.
@@ -3053,7 +4100,7 @@ mod free_pool_policy_tests {
     #[test]
     fn sub_stripe_release_before_next_alignment_never_expands() {
         let mut pools = FreePools::new();
-        pools.set_geometry(STRIPE, PHASE);
+        pools.reset_geometry(STRIPE, PHASE);
         let released = Extent::new(Pba(12_954), 2);
 
         pools.insert_classified(released);
@@ -3072,7 +4119,7 @@ mod free_pool_policy_tests {
     #[test]
     fn adjacent_u32_sized_releases_coalesce_without_count_truncation() {
         let mut pools = FreePools::new();
-        pools.set_geometry(STRIPE, 0);
+        pools.reset_geometry(STRIPE, 0);
         let start = 12u64;
         let first = Extent::new(Pba(start), u32::MAX);
         let second = Extent::new(Pba(start + u32::MAX as u64), 100);
@@ -3105,7 +4152,7 @@ mod free_pool_policy_tests {
     #[test]
     fn geometry_change_preserves_quarantined_free_blocks() {
         let mut pools = FreePools::new();
-        pools.set_geometry(STRIPE, PHASE);
+        pools.reset_geometry(STRIPE, PHASE);
         pools.insert_classified(Extent::new(Pba(30), 5));
         let mut free_parts = pools.empty_set_with_geometry();
         free_parts.insert(Extent::new(Pba(100), 3));
@@ -3118,7 +4165,7 @@ mod free_pool_policy_tests {
         );
         let before = pools.free_blocks_in_pools();
 
-        pools.set_geometry(4, 0);
+        regeometry(&mut pools, 4, 0);
 
         assert!(pools.quarantines.is_empty());
         assert_eq!(pools.free_blocks_in_pools(), before);
@@ -3154,7 +4201,7 @@ mod free_pool_policy_tests {
     fn exact_miss_coalesces_global_and_lane_boundary_before_enospc() {
         let allocator = allocator(32, 1);
         {
-            let mut pools = allocator.free_pools.lock().unwrap();
+            let mut pools = allocator.test_region_pools(0);
             *pools = FreePools::new();
             pools.general.insert(Extent::single(Pba(13)));
         }
@@ -3176,7 +4223,7 @@ mod free_pool_policy_tests {
         pools.stripe_reserve.insert(Extent::new(Pba(10), 24));
 
         assert_eq!(
-            SpaceAllocator::alloc_one_from_pools(&mut pools),
+            SpaceAllocator::take_first_from_pools(&mut pools, 1).map(|e| e.start),
             Some(Pba(10))
         );
         assert_eq!(
@@ -3185,10 +4232,7 @@ mod free_pool_policy_tests {
         );
 
         let allocator = allocator(128, 1);
-        {
-            let mut allocator_pools = allocator.free_pools.lock().unwrap();
-            *allocator_pools = pools;
-        }
+        *allocator.test_region_pools(0) = pools;
         assert_eq!(
             allocator.refill_extent_lane(0, 2, 8),
             Some(Extent::new(Pba(15), 2))
@@ -3200,10 +4244,9 @@ mod free_pool_policy_tests {
         let allocator = Arc::new(allocator(128, 1));
         let target = Extent::new(Pba(10), STRIPE);
         {
-            let mut pools = allocator.free_pools.lock().unwrap();
+            let mut pools = allocator.test_region_pools(0);
             *pools = FreePools::new();
-            pools.general.set_geometry(STRIPE, PHASE);
-            pools.stripe_reserve.set_geometry(STRIPE, PHASE);
+            pools.reset_geometry(STRIPE, PHASE);
             pools.stripe_reserve.insert(target);
         }
 
@@ -3219,7 +4262,7 @@ mod free_pool_policy_tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if matches!(
-                allocator.free_pools.try_lock(),
+                allocator.regions.pools[0].try_lock(),
                 Err(std::sync::TryLockError::WouldBlock)
             ) {
                 break;
@@ -3435,8 +4478,12 @@ mod age_tests {
         let a = new_alloc(8192);
         let s0 = a.contiguity_stats();
         assert_eq!(s0.free_blocks_in_set, 8192 - RESERVED_BLOCKS);
-        assert_eq!(s0.free_extents, 1);
-        assert_eq!(s0.largest_run_blocks as u64, 8192 - RESERVED_BLOCKS);
+        // A fresh pool is one run per address region (regions never coalesce
+        // across their boundary), so both of these are region-relative.
+        assert_eq!(s0.free_extents, a.region_count() as u64);
+        if a.region_count() == 1 {
+            assert_eq!(s0.largest_run_blocks as u64, 8192 - RESERVED_BLOCKS);
+        }
         assert_eq!(s0.stripe_capable_blocks, None, "no geometry configured");
 
         a.set_stripe_geometry(6, 2);
@@ -3452,7 +4499,14 @@ mod age_tests {
             }
         };
         let eff = 8192 - RESERVED_BLOCKS - head;
-        assert_eq!(s1.stripe_capable_blocks, Some(eff / 6 * 6));
+        if a.region_count() == 1 {
+            assert_eq!(s1.stripe_capable_blocks, Some(eff / 6 * 6));
+        } else {
+            // Sharded, each boundary is stripe-aligned, so no whole stripe is
+            // lost — only the per-region head pads differ from one big run.
+            let capable = s1.stripe_capable_blocks.unwrap();
+            assert!(capable <= eff / 6 * 6 && capable + 6 * a.region_count() as u64 >= eff);
+        }
 
         // Punch holes: allocate 3 blocks (front carve keeps one run), then
         // free-with-gap via retire is separate — just re-check counts move.
@@ -3847,9 +4901,7 @@ mod age_tests {
         let t0 = Instant::now();
         a.retire_extent_at(Extent::single(p), t0).unwrap();
         // Inject the inconsistency: the same PBA is also in the free list.
-        a.free_pools
-            .lock()
-            .unwrap()
+        a.test_region_pools(0)
             .general
             .insert_for_test(Extent::single(p));
         let (blocks, cnt) = a
@@ -3896,9 +4948,7 @@ mod age_tests {
         let t0 = Instant::now();
         a.retire_extent_at(Extent::new(Pba(n), 4), t0).unwrap();
         a.retire_extent_at(Extent::single(Pba(n + 8)), t0).unwrap();
-        a.free_pools
-            .lock()
-            .unwrap()
+        a.test_region_pools(0)
             .general
             .insert_for_test(Extent::single(Pba(n + 8))); // conflict on n+8
         let batch = [
@@ -4022,8 +5072,8 @@ mod age_tests {
             a_seq.allocated_block_count(),
             a_batch.allocated_block_count()
         );
-        let seq_pools = a_seq.free_pools.lock().unwrap();
-        let batch_pools = a_batch.free_pools.lock().unwrap();
+        let seq_pools = a_seq.test_region_pools(0);
+        let batch_pools = a_batch.test_region_pools(0);
         assert_eq!(
             *seq_pools.general.by_addr(),
             *batch_pools.general.by_addr(),
@@ -4360,7 +5410,9 @@ mod stripe_align_tests {
     fn seed_isolated_stripe_windows(a: &SpaceAllocator, windows: usize) -> Vec<u64> {
         let blocks = (windows as u64 + 2) * 2 * STRIPE as u64 + RESERVED_BLOCKS;
         let usable = blocks - RESERVED_BLOCKS;
-        a.allocate_extent(usable as u32).unwrap();
+        // No single extent can be wider than one address region, so claim by
+        // repeated request rather than in one call.
+        claim_whole_pool(a, usable);
         a.set_stripe_geometry(STRIPE, PHASE);
         let first = SpaceAllocator::align_up_pba(RESERVED_BLOCKS, STRIPE as u64, PHASE as u64);
         let mut starts = Vec::with_capacity(windows);
@@ -4373,6 +5425,20 @@ mod stripe_align_tests {
             starts.push(start);
         }
         starts
+    }
+
+    /// Allocate until nothing is free. `allocate_extent` returns the largest
+    /// available fragment when the exact width is unavailable, which is exactly
+    /// what a region-sharded pool offers for a device-wide request.
+    fn claim_whole_pool(a: &SpaceAllocator, usable: u64) {
+        let mut claimed = 0u64;
+        while claimed < usable {
+            let extent = a
+                .allocate_extent((usable - claimed).min(u32::MAX as u64) as u32)
+                .expect("the pool still had free blocks");
+            claimed += u64::from(extent.count);
+        }
+        assert_eq!(a.free_block_count(), 0, "pool not fully claimed");
     }
 
     fn isolated_window_allocator(windows: usize) -> (SpaceAllocator, Vec<u64>) {
@@ -4660,14 +5726,8 @@ pub(crate) mod aged_pool_bench {
 
         let device_blocks = cursor + 1024;
         let allocator = SpaceAllocator::new(device_blocks * BLOCK_SIZE as u64, lanes);
-        {
-            let mut pools = allocator.free_pools.lock().unwrap();
-            pools.replace_general(BTreeSet::new()); // drop the fresh whole-device run
-            pools.set_geometry(STRIPE, PHASE);
-            for run in &runs {
-                pools.insert_classified(*run);
-            }
-        }
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        allocator.replace_general_regionwise(&runs.iter().copied().collect());
         let free_blocks: u64 = runs.iter().map(|r| r.count as u64).sum();
         let usable = device_blocks - RESERVED_BLOCKS;
         allocator.free_blocks.store(free_blocks, Ordering::Relaxed);
@@ -4681,12 +5741,13 @@ pub(crate) mod aged_pool_bench {
     /// Distinct `count` values in the stripe reserve — the `D` in `first_fit`'s
     /// O(D log N) size-class walk, and the direct predictor for hypothesis (A).
     fn reserve_size_classes(allocator: &SpaceAllocator) -> usize {
-        let pools = allocator.free_pools.lock().unwrap();
-        let mut classes: Vec<u32> = pools
-            .stripe_reserve
-            .by_addr()
-            .iter()
-            .map(|e| e.count)
+        let mut classes: Vec<u32> = (0..allocator.region_count())
+            .flat_map(|idx| {
+                let pools = allocator.test_region_pools(idx);
+                let counts: Vec<u32> =
+                    pools.stripe_reserve.by_addr().iter().map(|e| e.count).collect();
+                counts
+            })
             .collect();
         classes.sort_unstable();
         classes.dedup();
@@ -4749,7 +5810,7 @@ pub(crate) mod aged_pool_bench {
             // size-class walk that hypothesis (A) blames.
             let mut ff_ns = Vec::with_capacity(1000);
             {
-                let pools = allocator.free_pools.lock().unwrap();
+                let pools = allocator.test_region_pools(0);
                 for _ in 0..1000 {
                     let t = Instant::now();
                     let hit = pools.stripe_reserve.first_fit(STRIPE);
@@ -5064,5 +6125,713 @@ pub(crate) mod aged_pool_bench {
             supply.drains,
             supply.drain_blocks,
         );
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    //! Address-region sharding.
+    //!
+    //! The load-bearing invariant is that **a region only ever holds extents it
+    //! owns**. Everything else composes from it: an overlap or containment
+    //! question about an extent is answered by asking exactly the regions it
+    //! spans, so the sharded pool gives the same answers the single pool did.
+    //! `region_sharded_traffic_preserves_block_ownership` checks it at the block
+    //! level after every kind of traffic, because a violation here is a
+    //! double-ownership bug — the class that produced this project's two
+    //! premature-free P0s.
+    use std::collections::HashSet;
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    use super::*;
+
+    const STRIPE: u32 = 6;
+    const PHASE: u32 = (RESERVED_BLOCKS % STRIPE as u64) as u32;
+    /// Small enough to bitmap, big enough that `RegionLayout::plan` shards it.
+    const DEVICE_BLOCKS: u64 = 16_392;
+
+    fn sharded(lanes: usize, regions: usize) -> SpaceAllocator {
+        // `new_with_exact_regions`, not `new_with_regions`: the region count must
+        // be exactly what the test asks for even while the whole suite is being
+        // swept with `ONYX_ALLOCATOR_REGIONS`.
+        let allocator = SpaceAllocator::new_with_exact_regions(
+            DEVICE_BLOCKS * BLOCK_SIZE as u64,
+            lanes,
+            regions,
+        );
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        assert!(
+            allocator.region_count() > 1,
+            "this test needs a sharded pool, got {} region(s)",
+            allocator.region_count()
+        );
+        allocator
+    }
+
+    fn layout_of(allocator: &SpaceAllocator) -> RegionLayout {
+        allocator.regions.layout()
+    }
+
+    /// Free runs a region currently holds, across all three policy classes.
+    fn region_runs(allocator: &SpaceAllocator, idx: usize) -> Vec<Extent> {
+        let pools = allocator.test_region_pools(idx);
+        let mut runs: Vec<Extent> = pools.general.by_addr().iter().copied().collect();
+        runs.extend(pools.stripe_reserve.by_addr().iter().copied());
+        runs.extend(
+            pools
+                .quarantines
+                .values()
+                .flat_map(|target| target.free_parts.by_addr().iter().copied()),
+        );
+        runs.sort_unstable_by_key(|extent| extent.start.0);
+        runs
+    }
+
+    /// THE invariant: no region holds an address it does not own. A violation
+    /// silently breaks every overlap query, because `lock_span` would not even
+    /// take the lock of the region actually holding the extent.
+    fn assert_region_containment(allocator: &SpaceAllocator) {
+        let layout = layout_of(allocator);
+        for idx in 0..allocator.region_count() {
+            let (lo, hi) = (layout.start(idx), layout.end(idx));
+            for run in region_runs(allocator, idx) {
+                assert!(
+                    run.start.0 >= lo && run.end_pba().0 <= hi,
+                    "region {idx} [{lo},{hi}) holds out-of-range run {run:?}"
+                );
+            }
+        }
+    }
+
+    /// Every usable block is in EXACTLY ONE state: free in a region's pools,
+    /// parked in a lane cache (still logically free), live, or retired.
+    fn assert_block_ownership(allocator: &SpaceAllocator, live: &[Extent], retired: &[Extent]) {
+        let total = allocator.total_block_count();
+        let mut owner: Vec<u8> = vec![0; total as usize];
+        let mut claim = |extent: Extent, tag: u8, what: &str| {
+            for offset in 0..extent.count {
+                let pba = extent.start.0 + offset as u64;
+                assert!(
+                    pba >= RESERVED_BLOCKS && pba < total,
+                    "{what} {extent:?} escapes the usable range"
+                );
+                assert_eq!(
+                    owner[pba as usize], 0,
+                    "pba {pba} claimed twice: already {} now {what}",
+                    owner[pba as usize]
+                );
+                owner[pba as usize] = tag;
+            }
+        };
+        for idx in 0..allocator.region_count() {
+            for run in region_runs(allocator, idx) {
+                claim(run, 1, "free");
+            }
+        }
+        for cache in &allocator.lane_caches {
+            for &pba in cache.lock().unwrap().iter() {
+                claim(Extent::single(pba), 2, "lane block cache");
+            }
+        }
+        for cache in &allocator.lane_extent_caches {
+            for &extent in cache.lock().unwrap().iter() {
+                claim(extent, 2, "lane extent cache");
+            }
+        }
+        for &extent in live {
+            claim(extent, 3, "live");
+        }
+        for &extent in retired {
+            claim(extent, 4, "retired");
+        }
+        let unclaimed = (RESERVED_BLOCKS..total)
+            .filter(|&pba| owner[pba as usize] == 0)
+            .count();
+        assert_eq!(unclaimed, 0, "{unclaimed} usable blocks belong to nobody");
+        // Counter closure: retiring does not change the allocated total, so
+        // free + allocated must still cover the whole usable range.
+        assert_eq!(
+            allocator.free_block_count() + allocator.allocated_block_count(),
+            total - RESERVED_BLOCKS,
+            "free + allocated no longer covers the device"
+        );
+    }
+
+    /// Region boundaries must be stripe-aligned and stripe-multiple sized. If
+    /// they were not, each boundary would strand up to `stripe - 1` blocks in the
+    /// general pool instead of the reserve, quietly leaking aligned capacity at
+    /// every one of the (2048 on the box) seams.
+    #[test]
+    fn region_boundaries_are_stripe_aligned_after_geometry_is_known() {
+        let allocator = sharded(2, 4);
+        let layout = layout_of(allocator_ref(&allocator));
+        assert_eq!(layout.blocks % u64::from(STRIPE), 0, "blocks per region");
+        for idx in 0..allocator.region_count() {
+            let start = layout.start(idx);
+            if idx == 0 {
+                continue; // region 0 starts at 0 and owns the reserved prefix
+            }
+            assert_eq!(
+                (start + u64::from(PHASE)) % u64::from(STRIPE),
+                0,
+                "region {idx} starts at {start}, which is not stripe-aligned"
+            );
+        }
+        // Routing is total and monotone: consecutive PBAs never move backwards.
+        let mut previous = 0usize;
+        for pba in (0..DEVICE_BLOCKS).step_by(97) {
+            let idx = layout.of(pba);
+            assert!(idx >= previous && idx < allocator.region_count());
+            previous = idx;
+        }
+    }
+
+    fn allocator_ref(allocator: &SpaceAllocator) -> &SpaceAllocator {
+        allocator
+    }
+
+    /// Re-planning the layout in `set_stripe_geometry` must not lose or duplicate
+    /// a single free block, because it moves extents between regions.
+    #[test]
+    fn geometry_replan_reroutes_every_block_exactly_once() {
+        let allocator =
+            SpaceAllocator::new_with_exact_regions(DEVICE_BLOCKS * BLOCK_SIZE as u64, 2, 4);
+        let before = allocator.contiguity_stats().free_blocks_in_set;
+        assert_eq!(before, DEVICE_BLOCKS - RESERVED_BLOCKS);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        assert_eq!(
+            allocator.contiguity_stats().free_blocks_in_set,
+            before,
+            "re-layout changed the free total"
+        );
+        assert_region_containment(&allocator);
+        assert_block_ownership(&allocator, &[], &[]);
+        // Idempotent: a second call with the same geometry must be a no-op.
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        assert_eq!(allocator.contiguity_stats().free_blocks_in_set, before);
+        assert_eq!(allocator.stripe_geometry(), Some((STRIPE, PHASE)));
+    }
+
+    /// A free run released across a boundary is split, so each region keeps only
+    /// its own slice — yet every read-side query must still see one free range.
+    #[test]
+    fn a_release_across_a_boundary_splits_but_still_reads_as_free() {
+        let allocator = sharded(0, 4);
+        let layout = layout_of(&allocator);
+        let boundary = layout.end(0);
+        // Straddle the boundary by one stripe on each side.
+        let straddle = Extent::new(Pba(boundary - u64::from(STRIPE)), 2 * STRIPE);
+        // Take it out of the pool first (exact-width, no lanes → global path).
+        let mut held = Vec::new();
+        while let Ok(extent) = allocator.allocate_extent(STRIPE) {
+            held.push(extent);
+            if extent.end_pba().0 > straddle.end_pba().0 {
+                break;
+            }
+        }
+        assert!(
+            held.iter().any(|e| e.start.0 <= straddle.start.0
+                && e.end_pba().0 >= straddle.end_pba().0)
+                || held.len() > 1,
+            "the straddling range must have been allocated away"
+        );
+        // Free everything back and confirm the boundary range reads as free from
+        // every angle.
+        for extent in held {
+            allocator.free_extent(extent).unwrap();
+        }
+        assert!(allocator.is_extent_free(straddle));
+        assert_eq!(
+            allocator.free_overlap_blocks(straddle),
+            u64::from(straddle.count)
+        );
+        for offset in 0..straddle.count {
+            assert!(allocator.is_free(Pba(straddle.start.0 + offset as u64)));
+        }
+        // ...and that it is genuinely split: neither region holds the whole thing.
+        assert_region_containment(&allocator);
+        assert!(
+            region_runs(&allocator, 0)
+                .iter()
+                .all(|run| run.end_pba().0 <= boundary),
+            "region 0 must not reach past the boundary"
+        );
+    }
+
+    /// The one deliberate selection change: a lane refills from its own region
+    /// and only moves when that region can no longer serve it.
+    #[test]
+    fn a_lane_refills_from_one_region_until_it_starves() {
+        let allocator = sharded(2, 4);
+        let layout = layout_of(&allocator);
+        let mut first_region = None;
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let extent = allocator
+                .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+                .expect("fresh pool serves a stripe");
+            let idx = layout.of(extent.start.0);
+            seen.insert(idx);
+            if first_region.is_none() {
+                first_region = Some(idx);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            1,
+            "one lane's consecutive stripe allocations should stay in one region, saw {seen:?}"
+        );
+        let (switches_before, _) = {
+            let stats = allocator.region_stats();
+            (stats.switches, stats.refill_misses)
+        };
+        // Drain the lane's whole region, then confirm it moves rather than failing.
+        let mut extents = Vec::new();
+        while let Ok(extent) = allocator.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE) {
+            extents.push(extent);
+            if layout.of(extent.start.0) != first_region.unwrap() {
+                break;
+            }
+        }
+        let stats = allocator.region_stats();
+        assert!(
+            stats.switches > switches_before,
+            "the lane never switched region"
+        );
+        assert!(
+            extents
+                .last()
+                .is_some_and(|e| layout.of(e.start.0) != first_region.unwrap()),
+            "the lane never left its exhausted region"
+        );
+        assert_region_containment(&allocator);
+    }
+
+    /// Two lanes should end up in different regions — the exclusivity that makes
+    /// sharding worth anything (ZFS's metaslab result: the win is ownership, not
+    /// contiguity).
+    #[test]
+    fn distinct_lanes_prefer_distinct_regions() {
+        let allocator = sharded(4, 4);
+        let layout = layout_of(&allocator);
+        let mut regions = HashSet::new();
+        for lane in 0..4 {
+            let extent = allocator
+                .allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE)
+                .expect("fresh pool serves a stripe");
+            regions.insert(layout.of(extent.start.0));
+        }
+        assert!(
+            regions.len() > 1,
+            "all four lanes landed in the same region ({regions:?}); \
+             claiming is not taking effect"
+        );
+    }
+
+    /// Real defrag targets are exactly one stripe and region boundaries are
+    /// stripe-aligned, so a target can never straddle one. The API still accepts
+    /// wider aligned extents, and those must be refused rather than silently
+    /// split across two locks (which would break completion accounting).
+    #[test]
+    fn a_cross_region_quarantine_is_refused_and_changes_nothing() {
+        let allocator = sharded(0, 4);
+        let boundary = layout_of(&allocator).end(0);
+        let straddle = Extent::new(Pba(boundary - u64::from(STRIPE)), 2 * STRIPE);
+        assert_eq!(
+            (straddle.start.0 + u64::from(PHASE)) % u64::from(STRIPE),
+            0,
+            "the probe must be stripe-aligned or it is rejected for the wrong reason"
+        );
+        let free_before = allocator.contiguity_stats();
+        let error = allocator
+            .begin_defrag_quarantine(straddle)
+            .expect_err("a cross-region target must be refused");
+        assert!(
+            format!("{error}").contains("region boundary"),
+            "unexpected rejection: {error}"
+        );
+        let after = allocator.contiguity_stats();
+        assert_eq!(after.free_blocks_in_set, free_before.free_blocks_in_set);
+        assert_eq!(after.quarantine_target_blocks, 0);
+        assert_region_containment(&allocator);
+
+        // A one-stripe target inside a region still works end to end. The target
+        // has to be LIVE first: `begin_defrag_quarantine` refuses a range that
+        // overlaps the stripe reserve, and on a fresh pool every aligned block is
+        // in the reserve.
+        let inside = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        assert_eq!(layout_of(&allocator).span(inside).0, 0);
+        allocator.begin_defrag_quarantine(inside).unwrap();
+        assert!(allocator.is_defrag_quarantined(inside));
+        assert_eq!(
+            allocator.defrag_quarantine_progress(inside.start),
+            Some((0, u64::from(STRIPE))),
+            "a fully-live target has evacuated nothing yet"
+        );
+        // Freeing inside an active quarantine must route into that quarantine's
+        // free parts, not back into the region's reserve — the routing decision
+        // and the region lock are the same critical section.
+        allocator.free_extent(inside).unwrap();
+        assert_eq!(
+            allocator.defrag_quarantine_progress(inside.start),
+            Some((u64::from(STRIPE), u64::from(STRIPE)))
+        );
+        assert!(allocator.complete_defrag_quarantine(inside.start).unwrap());
+        assert!(!allocator.is_defrag_quarantined(inside));
+        assert_eq!(
+            allocator.contiguity_stats().free_blocks_in_set,
+            free_before.free_blocks_in_set
+        );
+        assert_region_containment(&allocator);
+    }
+
+    /// An ENOSPC verdict must never rest on an advisory hint. The final attempt
+    /// walks every region, so even a hint forced to a stale zero cannot make a
+    /// pool with space look empty.
+    #[test]
+    fn enospc_never_rests_on_a_stale_region_hint() {
+        let allocator = sharded(0, 4);
+        // Drain every region except the last, then lie about the last one.
+        let mut held = Vec::new();
+        let last = allocator.region_count() - 1;
+        let layout = layout_of(&allocator);
+        while let Ok(extent) = allocator.allocate_extent(STRIPE) {
+            if layout.of(extent.start.0) == last {
+                allocator.free_extent(extent).unwrap();
+                break;
+            }
+            held.push(extent);
+        }
+        allocator.regions.free_hint[last].store(0, Ordering::Relaxed);
+        allocator.regions.stripe_hint[last].store(0, Ordering::Relaxed);
+        // Exact-width, no lanes: `take_exact_regionwise` only, so nothing but the
+        // hint stands between this call and the last region. (`allocate_extent`
+        // would mask the point by falling back to the largest short fragment.)
+        let extent = allocator
+            .allocate_exact_extent_for_lane(0, STRIPE)
+            .expect("the forced-stale hint must not cause a spurious ENOSPC");
+        assert_eq!(layout.of(extent.start.0), last);
+        allocator.free_extent(extent).unwrap();
+        for extent in held {
+            allocator.free_extent(extent).unwrap();
+        }
+    }
+
+    /// Arming the A/B serialization gate must change TIMING only. If it changed
+    /// results, an A/B run using it would be comparing two different allocators.
+    #[test]
+    fn the_serialization_gate_does_not_change_results() {
+        for serialize in [false, true] {
+            set_region_serialize(serialize);
+            let allocator = sharded(2, 4);
+            let mut extents = Vec::new();
+            for lane in 0..2 {
+                for _ in 0..32 {
+                    extents.push(
+                        allocator
+                            .allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE)
+                            .unwrap(),
+                    );
+                }
+            }
+            assert_eq!(allocator.region_stats().serialized, serialize);
+            assert_block_ownership(&allocator, &extents, &[]);
+            let now = Instant::now();
+            let (newly, failed) = allocator.retire_extents_batch(&extents, now);
+            assert!(failed.is_empty(), "batch retire failed: {failed:?}");
+            assert_eq!(newly, extents.iter().map(|e| u64::from(e.count)).sum::<u64>());
+            assert_block_ownership(&allocator, &[], &extents);
+            let running = AtomicBool::new(true);
+            let (freed, count) = allocator
+                .reclaim_retired_extents_batch(&extents, &running)
+                .unwrap();
+            assert_eq!(count, extents.len());
+            assert_eq!(freed, newly);
+            assert_block_ownership(&allocator, &[], &[]);
+            assert_region_containment(&allocator);
+        }
+        set_region_serialize(false);
+    }
+
+    /// `region_holds` is what keeps the batch paths' `free -> retired -> age`
+    /// order intact while shortening the hold. With one region it must reproduce
+    /// `chunks(cap)` exactly, or the unsharded arm of any A/B is not the old
+    /// behaviour.
+    #[test]
+    fn region_holds_degenerates_to_plain_chunks_when_unsharded() {
+        let extents: Vec<Extent> = (0..10)
+            .map(|i| Extent::new(Pba(RESERVED_BLOCKS + i * 100), 4))
+            .collect();
+        let grouped = region_holds(RegionLayout::single(), &extents, 4);
+        let plain: Vec<&[Extent]> = extents.chunks(4).collect();
+        assert_eq!(grouped.len(), plain.len());
+        for ((lo, hi, slice), expected) in grouped.iter().zip(plain) {
+            assert_eq!((*lo, *hi), (0, 0));
+            assert_eq!(*slice, expected);
+        }
+        // Sharded, a group breaks at every region boundary as well as at `cap`.
+        let layout = RegionLayout {
+            base: RESERVED_BLOCKS,
+            blocks: 128,
+            count: 8,
+        };
+        let grouped = region_holds(layout, &extents, 4);
+        assert!(
+            grouped.len() > plain_len(&extents, 4),
+            "sharded grouping must be at least as fine as chunks(cap)"
+        );
+        for (lo, hi, slice) in grouped {
+            assert!(!slice.is_empty() && slice.len() <= 4);
+            for extent in slice {
+                assert_eq!(layout.span(*extent), (lo, hi));
+            }
+        }
+    }
+
+    fn plain_len(extents: &[Extent], cap: usize) -> usize {
+        extents.chunks(cap).count()
+    }
+
+    /// Mixed traffic across every ownership-changing path, checked at the block
+    /// level. This is the test that would catch a routing mistake handing the
+    /// same block out twice.
+    #[test]
+    fn region_sharded_traffic_preserves_block_ownership() {
+        const LANES: usize = 4;
+        let allocator = sharded(LANES, 4);
+        let mut rng = StdRng::seed_from_u64(0x5eed_7e91_a110_c8);
+        let mut live: Vec<Extent> = Vec::new();
+        let mut retired: Vec<Extent> = Vec::new();
+
+        for round in 0..3_000usize {
+            match rng.gen_range(0..100u32) {
+                0..=49 => {
+                    let lane = rng.gen_range(0..LANES);
+                    let data = rng.gen_range(1..=2 * STRIPE);
+                    if let Ok(extent) =
+                        allocator.allocate_stripe_extent_for_lane(lane, data, STRIPE, PHASE)
+                    {
+                        assert_eq!(
+                            (extent.start.0 + u64::from(PHASE)) % u64::from(STRIPE),
+                            0,
+                            "aligned allocation lost its alignment"
+                        );
+                        assert!(extent.count.is_multiple_of(STRIPE));
+                        live.push(extent);
+                    }
+                }
+                50..=59 => {
+                    let lane = rng.gen_range(0..LANES);
+                    let count = rng.gen_range(1..=8u32);
+                    if let Ok(extent) = allocator.allocate_extent_for_lane(lane, count) {
+                        live.push(extent);
+                    }
+                }
+                60..=64 => {
+                    let lane = rng.gen_range(0..LANES);
+                    if let Ok(pba) = allocator.allocate_one_for_lane(lane) {
+                        live.push(Extent::single(pba));
+                    }
+                }
+                65..=79 => {
+                    if !live.is_empty() {
+                        let extent = live.swap_remove(rng.gen_range(0..live.len()));
+                        allocator
+                            .free_extent(extent)
+                            .unwrap_or_else(|e| panic!("free {extent:?}: {e}"));
+                    }
+                }
+                80..=91 => {
+                    if !live.is_empty() {
+                        let extent = live.swap_remove(rng.gen_range(0..live.len()));
+                        allocator
+                            .retire_extent(extent)
+                            .unwrap_or_else(|e| panic!("retire {extent:?}: {e}"));
+                        retired.push(extent);
+                    }
+                }
+                _ => {
+                    if !retired.is_empty() {
+                        let extent = retired.swap_remove(rng.gen_range(0..retired.len()));
+                        assert!(
+                            allocator.reclaim_retired_extent(extent).unwrap(),
+                            "reclaim of {extent:?} found it not retired"
+                        );
+                    }
+                }
+            }
+            if round % 250 == 0 {
+                assert_region_containment(&allocator);
+                assert_block_ownership(&allocator, &live, &retired);
+            }
+        }
+
+        assert_region_containment(&allocator);
+        assert_block_ownership(&allocator, &live, &retired);
+        // Unwind fully: everything must be reclaimable back to a whole free pool.
+        let running = AtomicBool::new(true);
+        allocator
+            .reclaim_retired_extents_batch(&{
+                retired.sort_unstable_by_key(|extent| extent.start.0);
+                retired.clone()
+            }, &running)
+            .unwrap();
+        retired.clear();
+        live.sort_unstable_by_key(|extent| extent.start.0);
+        let (_, failed) = allocator.free_extents_batch(&live);
+        assert!(failed.is_empty(), "batch free failed: {failed:?}");
+        live.clear();
+        allocator.drain_lane_caches();
+        assert_block_ownership(&allocator, &[], &[]);
+        assert_eq!(
+            allocator.contiguity_stats().free_blocks_in_set,
+            DEVICE_BLOCKS - RESERVED_BLOCKS,
+            "the whole device must be free again"
+        );
+        assert_eq!(allocator.allocated_block_count(), 0);
+    }
+
+    /// Single-block first-fit must be BYTE-IDENTICAL sharded or not.
+    ///
+    /// A one-block request can never straddle a region boundary, so there is no
+    /// escape hatch here: if the ascending-region walk were not exactly global
+    /// first-fit-by-address, this diverges immediately. That is the property the
+    /// metadb L2P leaf codec's dense-PBA contract rests on for every non-lane
+    /// allocation.
+    #[test]
+    fn single_block_first_fit_is_identical_sharded_or_not() {
+        let single = SpaceAllocator::new_with_exact_regions(DEVICE_BLOCKS * BLOCK_SIZE as u64, 0, 1);
+        let many = SpaceAllocator::new_with_exact_regions(DEVICE_BLOCKS * BLOCK_SIZE as u64, 0, 4);
+        single.set_stripe_geometry(STRIPE, PHASE);
+        many.set_stripe_geometry(STRIPE, PHASE);
+        assert_eq!(single.region_count(), 1);
+        assert!(many.region_count() > 1);
+
+        let mut rng = StdRng::seed_from_u64(0xf1f5_7f17);
+        let mut held: Vec<Pba> = Vec::new();
+        for _ in 0..4_000 {
+            if rng.gen_bool(0.7) || held.is_empty() {
+                let a = single.allocate_one();
+                let b = many.allocate_one();
+                match (a, b) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a, b, "sharded walk is not global first-fit");
+                        held.push(a);
+                    }
+                    (Err(_), Err(_)) => {}
+                    (a, b) => panic!("divergent outcome: {a:?} vs {b:?}"),
+                }
+            } else {
+                let pba = held.swap_remove(rng.gen_range(0..held.len()));
+                single.free_one(pba).unwrap();
+                many.free_one(pba).unwrap();
+            }
+            assert_eq!(single.free_block_count(), many.free_block_count());
+        }
+        assert_eq!(
+            single.contiguity_stats().free_blocks_in_set,
+            many.contiguity_stats().free_blocks_in_set
+        );
+    }
+
+    /// Multi-block first-fit over the sharded set, against an oracle that scans
+    /// every region's runs in address order.
+    ///
+    /// ⚠ This also pins the ONE thing sharding costs: a run is never coalesced
+    /// across a region boundary, so a request wider than a region's tail run
+    /// cannot be served from the seam and moves to the next region — where the
+    /// unsharded pool would have served it from the merged run. That is at most
+    /// one un-mergeable seam per region (≤ 2048 against the box's 24.6 M
+    /// extents), and it is why this test compares against a region-aware oracle
+    /// instead of against the single pool.
+    #[test]
+    fn region_walk_picks_the_lowest_address_run_that_fits() {
+        let allocator = sharded(0, 4);
+        let layout = layout_of(&allocator);
+        let mut rng = StdRng::seed_from_u64(0x0dd_f17);
+        let mut held: Vec<Extent> = Vec::new();
+
+        let oracle = |need: u32| -> Option<Extent> {
+            (0..allocator.region_count())
+                .flat_map(|idx| region_runs(&allocator, idx))
+                .find(|run| run.count >= need)
+        };
+
+        for _ in 0..800 {
+            if rng.gen_bool(0.65) || held.is_empty() {
+                let need = rng.gen_range(1..=24u32);
+                let expected = oracle(need);
+                match allocator.allocate_exact_extent_for_lane(0, need) {
+                    Ok(extent) => {
+                        let run = expected.expect("allocation succeeded where the oracle saw none");
+                        assert_eq!(
+                            extent.start, run.start,
+                            "picked {extent:?} but the lowest fitting run was {run:?}"
+                        );
+                        assert_eq!(extent.count, need);
+                        assert_eq!(
+                            layout.span(extent),
+                            (layout.of(extent.start.0), layout.of(extent.start.0)),
+                            "an allocation must never straddle a region boundary"
+                        );
+                        held.push(extent);
+                    }
+                    Err(OnyxError::SpaceExhausted) => {
+                        assert!(
+                            expected.is_none(),
+                            "reported ENOSPC while {expected:?} could serve {need}"
+                        );
+                    }
+                    Err(error) => panic!("unexpected error: {error}"),
+                }
+            } else {
+                let extent = held.swap_remove(rng.gen_range(0..held.len()));
+                allocator.free_extent(extent).unwrap();
+            }
+        }
+        assert_region_containment(&allocator);
+    }
+
+    /// Growth lands in the top region without a re-layout, because the last
+    /// region is unbounded above.
+    #[test]
+    fn grow_capacity_lands_in_the_top_region() {
+        let allocator = sharded(0, 4);
+        let before = allocator.contiguity_stats().free_blocks_in_set;
+        let regions_before = allocator.region_count();
+        let grown = allocator
+            .grow_capacity((DEVICE_BLOCKS + 4_096) * BLOCK_SIZE as u64)
+            .unwrap();
+        assert_eq!(grown, DEVICE_BLOCKS + 4_096);
+        assert_eq!(allocator.region_count(), regions_before, "no re-layout");
+        assert_eq!(
+            allocator.contiguity_stats().free_blocks_in_set,
+            before + 4_096
+        );
+        assert_region_containment(&allocator);
+        let layout = layout_of(&allocator);
+        assert_eq!(
+            layout.of(DEVICE_BLOCKS + 4_095),
+            regions_before - 1,
+            "grown tail must route into the last region"
+        );
+    }
+
+    /// A device too small to shard usefully must stay single-region rather than
+    /// producing thousands of tiny pools.
+    #[test]
+    fn a_small_device_refuses_to_shard() {
+        let tiny = SpaceAllocator::new_with_exact_regions(1_024 * BLOCK_SIZE as u64, 1, 2_048);
+        assert_eq!(tiny.region_count(), 1);
+        assert_eq!(tiny.region_blocks(), 0);
+        assert!(RegionLayout::plan(4_000, 2_048, 6).is_none());
+        // Just over two minimum-sized regions does shard.
+        let (blocks, count) = RegionLayout::plan(2 * MIN_REGION_BLOCKS + 10, 2_048, 6).unwrap();
+        assert_eq!(blocks % 6, 0);
+        assert!(count > 1);
     }
 }

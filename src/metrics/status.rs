@@ -204,6 +204,9 @@ pub struct EngineStatusSnapshot {
     /// serializes on the global free lock. Monotonic counters — difference two
     /// `status` reads.
     pub allocator_supply: Option<crate::space::allocator::AllocSupplyStats>,
+    /// Address-region sharding shape + traffic. `regions` is what turns the
+    /// summed `free_lock` holds into a per-lock occupancy.
+    pub allocator_regions: Option<crate::space::allocator::AllocRegionStats>,
     /// Per-site `free_pools` wait/hold attribution — see
     /// `crate::space::allocator::FreeLockSite`. Answers "who held the free lock
     /// while the writer waited", which no other metric can.
@@ -954,6 +957,21 @@ impl EngineStatusSnapshot {
                 s.allocs_per_refill(),
                 s.blocks_per_refill(),
                 s.runs_per_refill(),
+            );
+        }
+        if let Some(r) = self.allocator_regions {
+            // `regions` is NOT a counter to difference — it is the divisor
+            // `tools/flush_delta.py` needs to report `lock busy` per lock instead
+            // of as a sum over N locks.
+            let _ = writeln!(
+                out,
+                "allocator_regions: regions={} region_blocks={} switches={} \
+                 refill_misses={} serialized={}",
+                r.regions,
+                r.region_blocks,
+                r.switches,
+                r.refill_misses,
+                u8::from(r.serialized),
             );
         }
         if let Some(sites) = &self.free_lock {

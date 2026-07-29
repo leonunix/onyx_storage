@@ -93,6 +93,7 @@ impl EngineHarness {
                 lv3_batch_target_bytes: 0,
                 lv3_batch_executors: 0,
                 stripe_group_lifetime_affinity: false,
+                allocator_regions: 1,
             },
             buffer: BufferConfig {
                 device: Some(buffer_file.path().to_path_buf()),

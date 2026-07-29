@@ -1049,6 +1049,26 @@ pub struct StorageConfig {
     /// Default false for A/B baselining and instant rollback.
     #[serde(default)]
     pub stripe_group_lifetime_affinity: bool,
+    /// Shard the PBA allocator's free space into this many address regions, each
+    /// with its own lock. `1` (default) = one global lock, i.e. exactly the
+    /// pre-region behaviour. `0` = compiled default (2048).
+    ///
+    /// 2026-07-29 nvme-box attribution (`free_lock.<site>` in `status`, QD256
+    /// j16d16, 480 s window): the single free lock was **68.4% busy**, **98% of
+    /// all holding came from GC retire/reclaim**, and **98.8% of the flush
+    /// writer's whole allocation time was WAIT** (1685.92 s of wait against
+    /// 1705.73 s of alloc) while the writer's own holding was 1.9%. Sharding by
+    /// address does not make any hold shorter — it decouples GC's holding from
+    /// the writer's acquisition, turning one 68%-busy mutex into N at 68/N%.
+    ///
+    /// Aligned allocation becomes first-fit WITHIN a lane's active region rather
+    /// than globally (every other path still walks regions in ascending address
+    /// order, which is identical to global first-fit). Default off because
+    /// whether removing this wait raises THROUGHPUT is unproven: the box's
+    /// best-throughput arm also had its worst allocation latency, and the queue
+    /// may simply move to the LV3 aggregation window downstream.
+    #[serde(default = "default_allocator_regions")]
+    pub allocator_regions: usize,
 }
 
 impl Default for StorageConfig {
@@ -1067,8 +1087,13 @@ impl Default for StorageConfig {
             lv3_batch_executors: 0,
             raid_full_stripe_writes: default_raid_full_stripe_writes(),
             stripe_group_lifetime_affinity: false,
+            allocator_regions: default_allocator_regions(),
         }
     }
+}
+
+fn default_allocator_regions() -> usize {
+    1
 }
 
 fn default_uring_sq_entries() -> u32 {

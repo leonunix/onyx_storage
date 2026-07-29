@@ -78,7 +78,25 @@ if sites:
               hold / 1e9, (hold / 1e3 / acq) if acq else 0.0,
               (hold / tot_hold * 100) if tot_hold else 0.0,
               b.get("free_lock.%s.hold_ns_max" % s, 0) / 1e6))
+    # With one global lock, sum-of-holds / wall IS that lock's busy fraction
+    # (68.4% on the 2026-07-29 box read). Sharded into N address regions the sum
+    # spans N independent locks, so the comparable number -- "how busy is the lock
+    # a writer actually queues on" -- is that sum divided by N. Both are printed:
+    # the total still says how much allocator work there is, the per-lock number
+    # is the one to compare against the 68.4% baseline.
+    regions = max(1, b.get("allocator_regions.regions", 1))
     print("  lock busy %.1f%% of wall (sum of holds / %ds)" % (tot_hold / 1e9 / W * 100, W))
+    if regions > 1:
+        print("  lock busy %.2f%% per region (%d regions, blocks/region %d, serialized=%d)" % (
+            tot_hold / 1e9 / W * 100 / regions, regions,
+            b.get("allocator_regions.region_blocks", 0),
+            b.get("allocator_regions.serialized", 0)))
+        # A lane that keeps moving region, or refills that keep coming up empty,
+        # means the regions are mis-sized for the lane count -- the wrong shape,
+        # not the wrong idea.
+        print("  region switches %d (%.2f/s)  refill misses %d" % (
+            d("allocator_regions.switches"), d("allocator_regions.switches") / W,
+            d("allocator_regions.refill_misses")))
 
 grp = d("flush_writer_stripe_groups.total")
 if grp:
