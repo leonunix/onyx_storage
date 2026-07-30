@@ -58,26 +58,43 @@ if refills:
         d("allocator_supply.drains"), d("allocator_supply.drains") / W,
         d("allocator_supply.drain_blocks")))
 
-# Per-site free_pools wait/hold attribution. THE question this answers: of the
-# writer's alloc time, how much is waiting, and whose hold was it? `wait_ns` and
-# `hold_ns` are monotonic so they difference; hold_max_us is a high-water mark
-# (reported from the LAST sample, not differenced).
-sites = sorted({k.split(".")[1] for k in b if k.startswith("free_lock.") and k.endswith(".acquisitions")})
-if sites:
-    print("  -- free_pools lock attribution (who holds it while the writer waits) --")
-    tot_hold = sum(d("free_lock.%s.hold_ns" % s) for s in sites)
-    for s in sorted(sites, key=lambda s: -d("free_lock.%s.hold_ns" % s)):
-        acq = d("free_lock.%s.acquisitions" % s)
-        if acq == 0 and d("free_lock.%s.hold_ns" % s) == 0:
+# Per-site wait/hold attribution for the three allocator locks. THE question the
+# free_pools table answers: of the writer's alloc time, how much is waiting, and
+# whose hold was it? `retired_lock`/`age_lock` answer the follow-up: the retire
+# and free batch paths take `retired_extents` INSIDE their region hold, so a wait
+# there is reported as region hold. `wait_ns`/`hold_ns`/`items` are monotonic so
+# they difference; the `_max` fields are high-water marks (reported from the LAST
+# sample, not differenced).
+def site_table(prefix, title):
+    sites = sorted({k.split(".")[1] for k in b
+                    if k.startswith(prefix + ".") and k.endswith(".acquisitions")})
+    if not sites:
+        return None
+    print("  -- %s --" % title)
+    tot_hold = sum(d("%s.%s.hold_ns" % (prefix, s)) for s in sites)
+    for s in sorted(sites, key=lambda s: -d("%s.%s.hold_ns" % (prefix, s))):
+        acq = d("%s.%s.acquisitions" % (prefix, s))
+        hold = d("%s.%s.hold_ns" % (prefix, s))
+        if acq == 0 and hold == 0:
             continue
-        hold = d("free_lock.%s.hold_ns" % s)
-        wait = d("free_lock.%s.wait_ns" % s)
+        wait = d("%s.%s.wait_ns" % (prefix, s))
+        items = d("%s.%s.items" % (prefix, s))
+        # us/item is the drift-insensitive one: sharding cuts one hold into many,
+        # so us/acq moves even when the per-extent work is identical.
         print("  %-17s acq %9d (%7.0f/s)  wait %8.2f s (%8.2f us/acq)  "
-              "hold %8.2f s (%8.2f us/acq) %5.1f%% of holds  hold_max %8.2f ms" % (
+              "hold %8.2f s (%8.2f us/acq) %5.1f%% of holds  hold_max %8.2f ms"
+              "  wait_max %8.2f ms  items/acq %6.1f  hold %7.2f us/item" % (
               s, acq, acq / W, wait / 1e9, (wait / 1e3 / acq) if acq else 0.0,
               hold / 1e9, (hold / 1e3 / acq) if acq else 0.0,
               (hold / tot_hold * 100) if tot_hold else 0.0,
-              b.get("free_lock.%s.hold_ns_max" % s, 0) / 1e6))
+              b.get("%s.%s.hold_ns_max" % (prefix, s), 0) / 1e6,
+              b.get("%s.%s.wait_ns_max" % (prefix, s), 0) / 1e6,
+              (items / acq) if acq else 0.0,
+              (hold / 1e3 / items) if items else 0.0))
+    return tot_hold
+
+tot_hold = site_table("free_lock", "free_pools lock attribution (who holds it while the writer waits)")
+if tot_hold is not None:
     # With one global lock, sum-of-holds / wall IS that lock's busy fraction
     # (68.4% on the 2026-07-29 box read). Sharded into N address regions the sum
     # spans N independent locks, so the comparable number -- "how busy is the lock
@@ -97,6 +114,43 @@ if sites:
         print("  region switches %d (%.2f/s)  refill misses %d" % (
             d("allocator_regions.switches"), d("allocator_regions.switches") / W,
             d("allocator_regions.refill_misses")))
+
+ret_hold = site_table("retired_lock", "retired_extents lock attribution (global, NOT sharded)")
+if ret_hold is not None:
+    # One global mutex, so sum-of-holds / wall IS its busy fraction -- directly
+    # comparable to the free lock's pre-sharding 68.4%.
+    print("  retired lock busy %.1f%% of wall (sum of holds / %ds)" % (ret_hold / 1e9 / W * 100, W))
+age_hold = site_table("age_lock", "retired_age lock attribution (nested inside retired_extents)")
+if age_hold is not None:
+    print("  age lock busy %.1f%% of wall" % (age_hold / 1e9 / W * 100))
+
+# THE discriminating ledger. `retire_extents_batch` and `free_extents_batch` hold
+# a region lock across their `retired`(+`age`) acquisition, so their region hold
+# decomposes into: wait for `retired` + hold of `retired` (which itself contains
+# the age lock) + residual = the per-extent work done under the region lock only.
+#   residual dominant  -> the work itself got more expensive (colder/more sets):
+#                         fix = fewer regions / a different structure.
+#   retired wait dominant -> the region hold is just queueing behind one global
+#                         mutex: fix = stop waiting for `retired` under a region
+#                         lock (shard `retired`, or take it outside).
+for site in ("retire_batch", "free_batch"):
+    region_hold = d("free_lock.%s.hold_ns" % site)
+    if not region_hold:
+        continue
+    rwait = d("retired_lock.%s.wait_ns" % site)
+    rhold = d("retired_lock.%s.hold_ns" % site)
+    agewait = d("age_lock.%s.wait_ns" % site)
+    ahold = d("age_lock.%s.hold_ns" % site)
+    print("  -- %s nested ledger (region hold = retired wait + retired hold + residual) --" % site)
+    for label, v in (("region hold", region_hold),
+                     ("  retired wait", rwait),
+                     ("  retired hold", rhold),
+                     ("    age wait", agewait),
+                     ("    age hold", ahold),
+                     ("  residual (work under region lock only)",
+                      region_hold - rwait - rhold)):
+        print("  %-42s %9.2f s  %6.1f%% of region hold" % (
+            label, v / 1e9, v / region_hold * 100))
 
 grp = d("flush_writer_stripe_groups.total")
 if grp:

@@ -384,39 +384,158 @@ impl FreeLockSite {
     }
 }
 
-/// Per-site wait/hold accounting for `free_pools`. Monotonic counters, so two
-/// reads difference cleanly; `hold_ns_max` is a high-water mark and does NOT
-/// difference (it answers "what is the worst shut-out window this site ever
-/// caused", which is the figure the batch-hold work never managed to isolate).
-struct FreeLockStats {
-    acquisitions: [AtomicU64; FREE_LOCK_SITES],
-    wait_ns: [AtomicU64; FREE_LOCK_SITES],
-    hold_ns: [AtomicU64; FREE_LOCK_SITES],
-    hold_ns_max: [AtomicU64; FREE_LOCK_SITES],
+/// Which call path acquired `retired_extents` (and, nested inside it,
+/// `retired_age`).
+///
+/// This exists to settle one question the `free_pools` attribution raised but
+/// could not answer: after region sharding, `retire_batch`'s summed region hold
+/// went 218 s -> 1670 s while its per-acquisition cost went 5.4 -> 185 µs.
+/// `retire_extents_batch` takes `retired` INSIDE the region hold, so a wait on
+/// `retired` is reported as region hold time. Either that wait is most of the
+/// 1670 s (fix: stop waiting for `retired` under a region lock) or the per-extent
+/// work itself got more expensive (fix: fewer/warmer regions) — opposite
+/// directions, and the `free_pools` table alone cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiredLockSite {
+    /// `retire_extents_batch` — one acquisition per region hold.
+    RetireBatch = 0,
+    RetireOne,
+    /// `reclaim_retired_extents_batch` Phase A (validate + split out the cover).
+    ReclaimPhaseA,
+    /// `reclaim_retired_extents_batch`'s conflict re-insert.
+    ReclaimReinsert,
+    ReclaimOne,
+    /// `free_extents_batch` — taken inside the region hold, like retire.
+    FreeBatch,
+    /// The single free path's `overlapping_retired_extent` double-free guard.
+    FreeOne,
+    /// `aged_candidates` — the GC reclaim selector. Walks the retired set and
+    /// prunes the age log under both locks, so a long hold here blocks every
+    /// retire that already owns a region lock.
+    AgedCandidates,
+    IsRetired,
+    /// `retired_overlap_blocks` — GC defrag's per-cluster query.
+    OverlapBlocks,
+    /// `retired_candidates` — audit / accounting snapshot.
+    Candidates,
+    Audit,
+    /// Startup / rebuild.
+    Setup,
 }
 
-impl FreeLockStats {
-    fn new() -> Self {
-        Self {
-            acquisitions: std::array::from_fn(|_| AtomicU64::new(0)),
-            wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
-            hold_ns: std::array::from_fn(|_| AtomicU64::new(0)),
-            hold_ns_max: std::array::from_fn(|_| AtomicU64::new(0)),
+/// Number of variants in [`RetiredLockSite`].
+const RETIRED_LOCK_SITES: usize = 13;
+
+impl RetiredLockSite {
+    pub const ALL: [RetiredLockSite; RETIRED_LOCK_SITES] = [
+        Self::RetireBatch,
+        Self::RetireOne,
+        Self::ReclaimPhaseA,
+        Self::ReclaimReinsert,
+        Self::ReclaimOne,
+        Self::FreeBatch,
+        Self::FreeOne,
+        Self::AgedCandidates,
+        Self::IsRetired,
+        Self::OverlapBlocks,
+        Self::Candidates,
+        Self::Audit,
+        Self::Setup,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RetireBatch => "retire_batch",
+            Self::RetireOne => "retire_one",
+            Self::ReclaimPhaseA => "reclaim_phase_a",
+            Self::ReclaimReinsert => "reclaim_reinsert",
+            Self::ReclaimOne => "reclaim_one",
+            Self::FreeBatch => "free_batch",
+            Self::FreeOne => "free_one",
+            Self::AgedCandidates => "aged_candidates",
+            Self::IsRetired => "is_retired",
+            Self::OverlapBlocks => "overlap_blocks",
+            Self::Candidates => "candidates",
+            Self::Audit => "audit",
+            Self::Setup => "setup",
         }
     }
 }
 
-/// One site's `free_pools` wait/hold snapshot.
+/// Per-site wait/hold accounting for ONE mutex. Monotonic counters, so two
+/// reads difference cleanly; the `_max` fields are high-water marks and do NOT
+/// difference (`hold_ns_max` answers "what is the worst shut-out window this
+/// site ever caused"; `wait_ns_max` separates steady queueing from a single
+/// blackout by a long holder).
+struct SiteLockStats<const N: usize> {
+    acquisitions: [AtomicU64; N],
+    /// Extents processed under the hold, charged by the batch paths only. This
+    /// is what turns a per-hold cost into a per-EXTENT cost: sharding cuts one
+    /// hold into many, so per-acquisition numbers move even when the work per
+    /// extent is unchanged.
+    items: [AtomicU64; N],
+    wait_ns: [AtomicU64; N],
+    wait_ns_max: [AtomicU64; N],
+    hold_ns: [AtomicU64; N],
+    hold_ns_max: [AtomicU64; N],
+}
+
+impl<const N: usize> SiteLockStats<N> {
+    fn new() -> Self {
+        Self {
+            acquisitions: std::array::from_fn(|_| AtomicU64::new(0)),
+            items: std::array::from_fn(|_| AtomicU64::new(0)),
+            wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            wait_ns_max: std::array::from_fn(|_| AtomicU64::new(0)),
+            hold_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            hold_ns_max: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    /// Charge the wait for one acquisition of `site`.
+    fn charge_wait(&self, site: usize, waited: u64) {
+        self.acquisitions[site].fetch_add(1, Ordering::Relaxed);
+        self.wait_ns[site].fetch_add(waited, Ordering::Relaxed);
+        self.wait_ns_max[site].fetch_max(waited, Ordering::Relaxed);
+    }
+
+    /// Charge the hold for one release of `site`.
+    fn charge_hold(&self, site: usize, held: u64) {
+        self.hold_ns[site].fetch_add(held, Ordering::Relaxed);
+        self.hold_ns_max[site].fetch_max(held, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, names: [&'static str; N]) -> Vec<LockSiteStats> {
+        (0..N)
+            .map(|i| LockSiteStats {
+                site: names[i],
+                acquisitions: self.acquisitions[i].load(Ordering::Relaxed),
+                items: self.items[i].load(Ordering::Relaxed),
+                wait_ns: self.wait_ns[i].load(Ordering::Relaxed),
+                wait_ns_max: self.wait_ns_max[i].load(Ordering::Relaxed),
+                hold_ns: self.hold_ns[i].load(Ordering::Relaxed),
+                hold_ns_max: self.hold_ns_max[i].load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
+type FreeLockStats = SiteLockStats<FREE_LOCK_SITES>;
+type RetiredLockStats = SiteLockStats<RETIRED_LOCK_SITES>;
+
+/// One site's wait/hold snapshot for one lock.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct FreeLockSiteStats {
+pub struct LockSiteStats {
     pub site: &'static str,
     pub acquisitions: u64,
+    pub items: u64,
     pub wait_ns: u64,
+    pub wait_ns_max: u64,
     pub hold_ns: u64,
     pub hold_ns_max: u64,
 }
 
-impl FreeLockSiteStats {
+impl LockSiteStats {
     /// Mean wait per acquisition, µs.
     pub fn wait_us(&self) -> f64 {
         if self.acquisitions == 0 {
@@ -431,6 +550,58 @@ impl FreeLockSiteStats {
             return 0.0;
         }
         self.hold_ns as f64 / 1000.0 / self.acquisitions as f64
+    }
+}
+
+/// RAII guard over one plain `Mutex` that charges its hold to a site — the
+/// `retired_extents` / `retired_age` analogue of [`FreeLockGuard`] (which
+/// additionally refreshes per-region hints on release).
+struct TimedGuard<'a, T, const N: usize> {
+    inner: std::sync::MutexGuard<'a, T>,
+    stats: &'a SiteLockStats<N>,
+    site: usize,
+    acquired: Instant,
+}
+
+impl<'a, T, const N: usize> TimedGuard<'a, T, N> {
+    /// Acquire `lock`, charging the wait to `site` and (on drop) the hold. Two
+    /// clock reads per acquisition; the `retired` critical sections this wraps
+    /// are tens of µs, so the overhead is well under 1%.
+    fn new(stats: &'a SiteLockStats<N>, site: usize, lock: &'a Mutex<T>) -> Self {
+        let queued = Instant::now();
+        let inner = lock.lock().unwrap();
+        stats.charge_wait(site, queued.elapsed().as_nanos() as u64);
+        Self {
+            inner,
+            stats,
+            site,
+            acquired: Instant::now(),
+        }
+    }
+
+    /// Record how many extents this hold covered (batch paths only).
+    fn charge_items(&self, n: u64) {
+        self.stats.items[self.site].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+impl<T, const N: usize> Drop for TimedGuard<'_, T, N> {
+    fn drop(&mut self) {
+        self.stats
+            .charge_hold(self.site, self.acquired.elapsed().as_nanos() as u64);
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for TimedGuard<'_, T, N> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T, const N: usize> std::ops::DerefMut for TimedGuard<'_, T, N> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
     }
 }
 
@@ -463,9 +634,15 @@ impl Drop for FreeLockGuard<'_> {
                 .map_or(0, |run| u64::from(run.count)),
             Ordering::Relaxed,
         );
-        let held = self.acquired.elapsed().as_nanos() as u64;
-        self.stats.hold_ns[self.site].fetch_add(held, Ordering::Relaxed);
-        self.stats.hold_ns_max[self.site].fetch_max(held, Ordering::Relaxed);
+        self.stats
+            .charge_hold(self.site, self.acquired.elapsed().as_nanos() as u64);
+    }
+}
+
+impl FreeLockGuard<'_> {
+    /// Record how many extents this hold covered (batch paths only).
+    fn charge_items(&self, n: u64) {
+        self.stats.items[self.site].fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -963,6 +1140,16 @@ impl SpanGuard<'_> {
         &self.guards[idx - self.lo]
     }
 
+    /// Record how many extents this hold covered. Charged once per HOLD (not per
+    /// region guard): the counter is per-site, and what the box read needs is
+    /// "extents per hold", the divisor that converts a per-acquisition cost into
+    /// a per-extent one.
+    fn charge_items(&self, n: u64) {
+        if let Some(first) = self.guards.first() {
+            first.charge_items(n);
+        }
+    }
+
     fn region_mut(&mut self, idx: usize) -> &mut FreePools {
         &mut self.guards[idx - self.lo]
     }
@@ -1119,6 +1306,16 @@ pub struct SpaceAllocator {
     free_blocks: AtomicU64,
     /// Per-site wait/hold accounting for `free_pools` — see [`FreeLockSite`].
     free_lock: FreeLockStats,
+    /// Per-site wait/hold accounting for `retired_extents` and, nested inside
+    /// it, `retired_age` — see [`RetiredLockSite`]. Both tables use the same
+    /// site enum because every `retired_age` acquisition happens under a
+    /// `retired_extents` hold by the same call path. The ledger nests:
+    /// `free_lock.<site>.hold` ⊇ `retired_lock.<site>.{wait,hold}` ⊇
+    /// `age_lock.<site>.{wait,hold}` for the paths that take the free lock
+    /// outermost (retire, free), which is exactly what makes the residual
+    /// readable as "real work".
+    retired_lock: RetiredLockStats,
+    age_lock: RetiredLockStats,
     /// Per-lane single-block caches. Each flush lane pops from its own cache
     /// to avoid contending on `free_extents`. Refilled in bulk from global.
     lane_caches: Vec<Mutex<Vec<Pba>>>,
@@ -1262,6 +1459,8 @@ impl SpaceAllocator {
             allocated_blocks: AtomicU64::new(0),
             free_blocks: AtomicU64::new(usable_blocks),
             free_lock: FreeLockStats::new(),
+            retired_lock: RetiredLockStats::new(),
+            age_lock: RetiredLockStats::new(),
             lane_caches,
             lane_extent_caches,
             lane_regions,
@@ -1288,9 +1487,8 @@ impl SpaceAllocator {
         let idx = site as usize;
         let queued = Instant::now();
         let pools = self.regions.pools[region].lock().unwrap();
-        let waited = queued.elapsed().as_nanos() as u64;
-        self.free_lock.acquisitions[idx].fetch_add(1, Ordering::Relaxed);
-        self.free_lock.wait_ns[idx].fetch_add(waited, Ordering::Relaxed);
+        self.free_lock
+            .charge_wait(idx, queued.elapsed().as_nanos() as u64);
         FreeLockGuard {
             pools,
             stats: &self.free_lock,
@@ -1407,20 +1605,41 @@ impl SpaceAllocator {
     /// Per-site `free_pools` wait/hold snapshot, one entry per
     /// [`FreeLockSite`] (including never-acquired sites, so the shape is stable
     /// across two reads for differencing).
-    pub fn free_lock_stats(&self) -> Vec<FreeLockSiteStats> {
-        FreeLockSite::ALL
-            .iter()
-            .map(|&site| {
-                let i = site as usize;
-                FreeLockSiteStats {
-                    site: site.name(),
-                    acquisitions: self.free_lock.acquisitions[i].load(Ordering::Relaxed),
-                    wait_ns: self.free_lock.wait_ns[i].load(Ordering::Relaxed),
-                    hold_ns: self.free_lock.hold_ns[i].load(Ordering::Relaxed),
-                    hold_ns_max: self.free_lock.hold_ns_max[i].load(Ordering::Relaxed),
-                }
-            })
-            .collect()
+    pub fn free_lock_stats(&self) -> Vec<LockSiteStats> {
+        self.free_lock.snapshot(FreeLockSite::ALL.map(|s| s.name()))
+    }
+
+    /// Per-site `retired_extents` wait/hold snapshot — see [`RetiredLockSite`].
+    /// Same shape guarantee as [`Self::free_lock_stats`].
+    pub fn retired_lock_stats(&self) -> Vec<LockSiteStats> {
+        self.retired_lock
+            .snapshot(RetiredLockSite::ALL.map(|s| s.name()))
+    }
+
+    /// Per-site `retired_age` wait/hold snapshot. Sites are the same enum: the
+    /// age log is only ever taken under a `retired_extents` hold by the same
+    /// call path, so these rows nest inside [`Self::retired_lock_stats`].
+    pub fn age_lock_stats(&self) -> Vec<LockSiteStats> {
+        self.age_lock.snapshot(RetiredLockSite::ALL.map(|s| s.name()))
+    }
+
+    /// Acquire `retired_extents`, charging the wait to `site` and the hold on
+    /// drop. Every acquisition in the file goes through here so the table is
+    /// exhaustive by construction.
+    fn lock_retired(
+        &self,
+        site: RetiredLockSite,
+    ) -> TimedGuard<'_, BTreeSet<Extent>, RETIRED_LOCK_SITES> {
+        TimedGuard::new(&self.retired_lock, site as usize, &self.retired_extents)
+    }
+
+    /// Acquire `retired_age`. Lock order: ALWAYS under a `retired_extents` hold
+    /// held by the same `site`.
+    fn lock_age(
+        &self,
+        site: RetiredLockSite,
+    ) -> TimedGuard<'_, BTreeMap<u64, RetiredRun>, RETIRED_LOCK_SITES> {
+        TimedGuard::new(&self.age_lock, site as usize, &self.retired_age)
     }
 
     pub fn supply_stats(&self) -> AllocSupplyStats {
@@ -1489,8 +1708,8 @@ impl SpaceAllocator {
         let free_count = usable_blocks - alloc_count;
 
         self.replace_general_regionwise(&free);
-        self.retired_extents.lock().unwrap().clear();
-        self.retired_age.lock().unwrap().clear();
+        self.lock_retired(RetiredLockSite::Setup).clear();
+        self.lock_age(RetiredLockSite::Setup).clear();
         self.retired_blocks.store(0, Ordering::Relaxed);
         self.clear_lane_caches();
         if let Some(tracker) = &self.alloc_tracker {
@@ -2364,7 +2583,8 @@ impl SpaceAllocator {
 
             // Lock order: retired_extents (set) BEFORE retired_age. Free held across
             // (outermost) so the overlap check can't race a concurrent free.
-            let mut retired = self.retired_extents.lock().unwrap();
+            let mut retired = self.lock_retired(RetiredLockSite::RetireOne);
+            retired.charge_items(1);
             // Sub-ranges of `extent` not already covered by the coalesced set = the
             // genuinely-new blocks. Computed BEFORE coalescing so already-retired
             // sub-ranges keep their original age (never refreshed).
@@ -2372,7 +2592,8 @@ impl SpaceAllocator {
             let newly: u32 = gaps.iter().map(|g| g.count).sum();
             Self::coalesce_and_insert_any_overlap(&mut retired, extent);
             if newly > 0 {
-                let mut age = self.retired_age.lock().unwrap();
+                let mut age = self.lock_age(RetiredLockSite::RetireOne);
+                age.charge_items(1);
                 for g in gaps {
                     age.insert(
                         g.start.0,
@@ -2436,8 +2657,11 @@ impl SpaceAllocator {
             let layout = self.regions.layout();
             for (lo, hi, hold) in region_holds(layout, chunk, free_lock_hold_extents()) {
                 let pools = self.lock_span_range(FreeLockSite::RetireBatch, lo, hi);
-                let mut retired = self.retired_extents.lock().unwrap();
-                let mut age = self.retired_age.lock().unwrap();
+                pools.charge_items(hold.len() as u64);
+                let mut retired = self.lock_retired(RetiredLockSite::RetireBatch);
+                retired.charge_items(hold.len() as u64);
+                let mut age = self.lock_age(RetiredLockSite::RetireBatch);
+                age.charge_items(hold.len() as u64);
                 for &extent in hold {
                     if self
                         .validate_extent_shape(extent, "retire_extents_batch")
@@ -2536,7 +2760,9 @@ impl SpaceAllocator {
             let layout = self.regions.layout();
             for (lo, hi, hold) in region_holds(layout, chunk, free_lock_hold_extents()) {
                 let mut pools = self.lock_span_range(FreeLockSite::FreeBatch, lo, hi);
-                let retired = self.retired_extents.lock().unwrap();
+                pools.charge_items(hold.len() as u64);
+                let retired = self.lock_retired(RetiredLockSite::FreeBatch);
+                retired.charge_items(hold.len() as u64);
                 for &extent in hold {
                     if self
                         .validate_extent_shape(extent, "free_extents_batch")
@@ -2636,9 +2862,7 @@ impl SpaceAllocator {
         if limit == 0 {
             return Vec::new();
         }
-        self.retired_extents
-            .lock()
-            .unwrap()
+        self.lock_retired(RetiredLockSite::Candidates)
             .iter()
             .take(limit)
             .copied()
@@ -2665,8 +2889,8 @@ impl SpaceAllocator {
         if limit_blocks == 0 {
             return (Vec::new(), 0);
         }
-        let retired = self.retired_extents.lock().unwrap();
-        let mut age = self.retired_age.lock().unwrap();
+        let retired = self.lock_retired(RetiredLockSite::AgedCandidates);
+        let mut age = self.lock_age(RetiredLockSite::AgedCandidates);
         // Time-window: drop entries that have aged past the grace — they no
         // longer gate anything (their covering retired extent is fully eligible).
         age.retain(|_, run| now.duration_since(run.retired_at) < grace);
@@ -2744,7 +2968,7 @@ impl SpaceAllocator {
     }
 
     pub fn is_retired(&self, pba: Pba) -> bool {
-        let retired = self.retired_extents.lock().unwrap();
+        let retired = self.lock_retired(RetiredLockSite::IsRetired);
         Self::covering_extent(&retired, pba).is_some()
     }
 
@@ -2760,9 +2984,7 @@ impl SpaceAllocator {
     /// this; tests assert the two agree.
     #[cfg(test)]
     pub fn retired_block_count_exact(&self) -> u64 {
-        self.retired_extents
-            .lock()
-            .unwrap()
+        self.lock_retired(RetiredLockSite::Audit)
             .iter()
             .map(|extent| extent.count as u64)
             .sum()
@@ -2776,7 +2998,8 @@ impl SpaceAllocator {
         self.validate_extent_shape(extent, "reclaim_retired_extent")?;
 
         {
-            let mut retired = self.retired_extents.lock().unwrap();
+            let mut retired = self.lock_retired(RetiredLockSite::ReclaimOne);
+            retired.charge_items(1);
             // The candidate must be fully contained in one coalesced retired
             // extent. Fail closed (Ok(false)) if it is no longer (fully) retired
             // — a raced reclaim / re-alloc — never free a span we didn't verify.
@@ -2799,7 +3022,8 @@ impl SpaceAllocator {
             }
             // Defensive: drop any young age entries inside the reclaimed range
             // (aged candidates are carved between young entries, so normally none).
-            let mut age = self.retired_age.lock().unwrap();
+            let mut age = self.lock_age(RetiredLockSite::ReclaimOne);
+            age.charge_items(1);
             Self::purge_age_range(&mut age, extent);
         }
 
@@ -2836,7 +3060,8 @@ impl SpaceAllocator {
             // (plain insert would leave adjacent fragments). The age log is NOT
             // touched: `extent` was already aged, so it stays immediately
             // eligible next cycle — no re-aging on the error path.
-            let mut retired = self.retired_extents.lock().unwrap();
+            let mut retired = self.lock_retired(RetiredLockSite::ReclaimReinsert);
+            retired.charge_items(1);
             Self::coalesce_and_insert_any_overlap(&mut retired, extent);
         }
         if result.is_ok() {
@@ -2905,8 +3130,10 @@ impl SpaceAllocator {
             // remainders retired. Collect the validated extents for Phase B.
             let mut removed: Vec<Extent> = Vec::with_capacity(chunk.len());
             for hold in chunk.chunks(free_lock_hold_extents()) {
-                let mut retired = self.retired_extents.lock().unwrap();
-                let mut age = self.retired_age.lock().unwrap();
+                let mut retired = self.lock_retired(RetiredLockSite::ReclaimPhaseA);
+                retired.charge_items(hold.len() as u64);
+                let mut age = self.lock_age(RetiredLockSite::ReclaimPhaseA);
+                age.charge_items(hold.len() as u64);
                 for &extent in hold {
                     if self
                         .validate_extent_shape(extent, "reclaim_retired_extents_batch")
@@ -2952,6 +3179,7 @@ impl SpaceAllocator {
             let layout = self.regions.layout();
             for (lo, hi, hold) in region_holds(layout, &removed, free_lock_hold_extents()) {
                 let mut pools = self.lock_span_range(FreeLockSite::ReclaimBatch, lo, hi);
+                pools.charge_items(hold.len() as u64);
                 for &extent in hold {
                     let in_lane = (0..extent.count)
                         .any(|i| lane_pbas.contains(&Pba(extent.start.0 + i as u64)))
@@ -2994,7 +3222,8 @@ impl SpaceAllocator {
             // Re-insert conflicts: they stay retired (coalescing back with the
             // remainders), age untouched — matches the single path's error path.
             if !conflicts.is_empty() {
-                let mut retired = self.retired_extents.lock().unwrap();
+                let mut retired = self.lock_retired(RetiredLockSite::ReclaimReinsert);
+                retired.charge_items(conflicts.len() as u64);
                 for extent in conflicts {
                     Self::coalesce_and_insert_any_overlap(&mut retired, extent);
                 }
@@ -3434,7 +3663,7 @@ impl SpaceAllocator {
     pub(crate) fn retired_overlap_blocks(&self, range: Extent) -> u64 {
         let s = range.start.0;
         let e = range.end_pba().0;
-        let retired = self.retired_extents.lock().unwrap();
+        let retired = self.lock_retired(RetiredLockSite::OverlapBlocks);
         let mut covered = 0u64;
         // The last extent starting at/before `s` may reach into the range.
         if let Some(prev) = retired.range(..=Extent::single(range.start)).next_back() {
@@ -4017,7 +4246,7 @@ impl SpaceAllocator {
     }
 
     fn overlapping_retired_extent(&self, extent: Extent) -> Option<Extent> {
-        let retired = self.retired_extents.lock().unwrap();
+        let retired = self.lock_retired(RetiredLockSite::FreeOne);
         Self::overlapping_extent(&retired, extent)
     }
 }
@@ -4056,7 +4285,7 @@ mod free_pool_policy_tests {
     #[test]
     fn free_lock_attribution_charges_the_acquiring_site() {
         let a = allocator(4096, 2);
-        let acq = |sites: &[FreeLockSiteStats], name: &str| {
+        let acq = |sites: &[LockSiteStats], name: &str| {
             sites
                 .iter()
                 .find(|s| s.site == name)
@@ -4094,6 +4323,66 @@ mod free_pool_policy_tests {
         for s in s3.iter().filter(|s| s.acquisitions > 0) {
             assert!(s.hold_ns > 0, "site {} recorded no hold", s.site);
             assert!(s.hold_ns_max > 0, "site {} recorded no max hold", s.site);
+        }
+    }
+
+    /// The `retired_extents` / `retired_age` attribution has to charge the
+    /// acquiring path too, and — the whole point — the retire BATCH path must
+    /// record its `retired` acquisition as nested INSIDE its region hold, with an
+    /// `items` count, so a box read can split "region hold" into "waited for the
+    /// global retired set" vs "did per-extent work".
+    #[test]
+    fn retired_lock_attribution_charges_the_acquiring_site() {
+        let a = allocator(4096, 2);
+        let find = |sites: &[LockSiteStats], name: &str| {
+            *sites
+                .iter()
+                .find(|s| s.site == name)
+                .expect("every site is always reported")
+        };
+        let r0 = a.retired_lock_stats();
+        assert_eq!(r0.len(), RETIRED_LOCK_SITES);
+        assert_eq!(a.age_lock_stats().len(), RETIRED_LOCK_SITES);
+
+        // Single retire → retire_one on both the set and the age log.
+        let one = a.allocate_extent(1).unwrap();
+        a.retire_extent(one).unwrap();
+        let r1 = a.retired_lock_stats();
+        assert!(find(&r1, "retire_one").acquisitions > 0);
+        assert_eq!(find(&r1, "retire_one").items, 1);
+        assert!(find(&a.age_lock_stats(), "retire_one").acquisitions > 0);
+        assert_eq!(find(&r1, "retire_batch").acquisitions, 0);
+
+        // Batch retire → retire_batch, and its `items` must equal the extents
+        // processed, NOT the acquisition count (they differ once the hold is cut
+        // at region boundaries, which is exactly the effect being measured).
+        let batch: Vec<Extent> = (0..8).map(|_| a.allocate_extent(1).unwrap()).collect();
+        a.retire_extents_batch(&batch, Instant::now());
+        let r2 = a.retired_lock_stats();
+        let rb = find(&r2, "retire_batch");
+        assert_eq!(rb.items, batch.len() as u64, "items must count extents");
+        assert!(rb.acquisitions > 0 && rb.acquisitions <= batch.len() as u64);
+        assert!(rb.hold_ns > 0, "retire_batch recorded no retired hold");
+        // The nesting that makes the ledger readable: the region hold has to
+        // cover the retired acquisition it performs inside itself.
+        let fb = find(&a.free_lock_stats(), "retire_batch");
+        assert_eq!(fb.items, batch.len() as u64);
+        assert!(
+            fb.hold_ns >= rb.hold_ns,
+            "region hold {} must contain the retired hold {} taken inside it",
+            fb.hold_ns,
+            rb.hold_ns
+        );
+
+        // A read-only query is charged to its own site, never to a mutator.
+        let before = find(&a.retired_lock_stats(), "retire_batch").acquisitions;
+        a.is_retired(one.start);
+        let r3 = a.retired_lock_stats();
+        assert!(find(&r3, "is_retired").acquisitions > 0);
+        assert_eq!(find(&r3, "retire_batch").acquisitions, before);
+
+        for s in r3.iter().filter(|s| s.acquisitions > 0) {
+            assert!(s.hold_ns > 0, "site {} recorded no hold", s.site);
         }
     }
 
@@ -5681,6 +5970,25 @@ pub(crate) mod aged_pool_bench {
         shape: TailShape,
         lanes: usize,
     ) -> (SpaceAllocator, ContiguityStats) {
+        let (allocator, stats, _live) = build_aged_pool_parts(target_extents, shape, lanes, None);
+        (allocator, stats)
+    }
+
+    /// [`build_aged_pool`] with an explicit region count (so one process can run
+    /// both a sharded and an unsharded arm on byte-identical pool shapes — the
+    /// only A/B form this project trusts) and the LIVE extents returned.
+    ///
+    /// The live set is the synthetic pool's gaps: `build_aged_pool` emits
+    /// run/gap pairs and accounts every gap block as allocated, so the gaps are
+    /// exactly the live blocks — scattered over the whole address space, which is
+    /// what makes them a faithful stand-in for the box's retire candidates (old
+    /// PBAs of overwritten LBAs, written long ago and therefore everywhere).
+    pub(crate) fn build_aged_pool_parts(
+        target_extents: u64,
+        shape: TailShape,
+        lanes: usize,
+        regions: Option<usize>,
+    ) -> (SpaceAllocator, ContiguityStats, Vec<Extent>) {
         const LONG_RUN_MEAN: u64 = 48;
         // Reserve-carrying runs per total runs. `SingleStripe` needs many more of
         // them to reach the same 27% stripe capacity, since each carries only one
@@ -5725,7 +6033,14 @@ pub(crate) mod aged_pool_bench {
         }
 
         let device_blocks = cursor + 1024;
-        let allocator = SpaceAllocator::new(device_blocks * BLOCK_SIZE as u64, lanes);
+        let allocator = match regions {
+            Some(n) => SpaceAllocator::new_with_exact_regions(
+                device_blocks * BLOCK_SIZE as u64,
+                lanes,
+                n,
+            ),
+            None => SpaceAllocator::new(device_blocks * BLOCK_SIZE as u64, lanes),
+        };
         allocator.set_stripe_geometry(STRIPE, PHASE);
         allocator.replace_general_regionwise(&runs.iter().copied().collect());
         let free_blocks: u64 = runs.iter().map(|r| r.count as u64).sum();
@@ -5735,7 +6050,15 @@ pub(crate) mod aged_pool_bench {
             .allocated_blocks
             .store(usable - free_blocks, Ordering::Relaxed);
         let stats = allocator.contiguity_stats();
-        (allocator, stats)
+        // The gaps between consecutive free runs are the live blocks.
+        let live: Vec<Extent> = runs
+            .windows(2)
+            .map(|pair| {
+                let end = pair[0].end_pba().0;
+                Extent::new(Pba(end), (pair[1].start.0 - end) as u32)
+            })
+            .collect();
+        (allocator, stats, live)
     }
 
     /// Distinct `count` values in the stripe reserve — the `D` in `first_fit`'s
@@ -6125,6 +6448,199 @@ pub(crate) mod aged_pool_bench {
             supply.drains,
             supply.drain_blocks,
         );
+    }
+
+    fn site_of(sites: &[LockSiteStats], name: &str) -> LockSiteStats {
+        *sites.iter().find(|s| s.site == name).expect("known site")
+    }
+
+    /// Local repro of the 2026-07-29 post-sharding anomaly.
+    ///
+    /// Region sharding cut the writer's free-lock wait 169× (22936 → 136 µs/acq),
+    /// but `retire_batch`'s SUMMED region hold went **218 s → 1670 s** and its
+    /// per-acquisition hold 5.4 → 185 µs. The acquisition COUNT rise is explained
+    /// (`region_holds` breaks at every region boundary, and GC's ~28-extent retire
+    /// batches are scattered over the whole address space, so a 28-extent hold
+    /// becomes ~28 one-extent holds). The per-acquisition COST rise was not:
+    ///
+    ///   (1) `retire_extents_batch` acquires the ONE global `retired_extents`
+    ///       lock INSIDE its region hold, so waiting for it is REPORTED as region
+    ///       hold — and it is now acquired ~28× more often.
+    ///   (2) 2048 independent BTreeSets are colder than one, i.e. the per-extent
+    ///       work itself got dearer.
+    ///
+    /// The `retired_lock` / `age_lock` attribution splits the two. This bench runs
+    /// both arms in ONE process on byte-identical synthetic pools — the box cannot
+    /// do that (restart-per-arm A/B measured 2.13× between identical arms).
+    ///
+    /// Traffic: `retire_threads` cleanup threads retiring scattered live extents
+    /// in ~28-extent batches (the box shape) plus one GC thread running
+    /// `aged_candidates` → `reclaim_retired_extents_batch`.
+    ///
+    /// Run: `cargo test --release --lib bench_retired_lock_convoy -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_retired_lock_convoy() {
+        /// Box `retire_dead_pbas` batch shape: 18846 acq/s ÷ 658 holds/s ≈ 28.6.
+        const BATCH: usize = 28;
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4_000_000);
+        let secs: u64 = std::env::var("ONYX_BENCH_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        // The box runs 16 buffer shards' cleanup threads against this lock.
+        let retire_threads: usize = std::env::var("ONYX_BENCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+
+        for regions in [1usize, 64, 2048] {
+            let (allocator, stats, mut live) =
+                build_aged_pool_parts(scale, TailShape::Spread, 16, Some(regions));
+            // Scatter: the box's retire candidates are old PBAs of overwritten
+            // LBAs, i.e. uniform over the address space. Shuffle so consecutive
+            // batches are not address-adjacent, then sort WITHIN each batch —
+            // exactly what `retire_dead_pbas` does before calling the allocator.
+            let mut rng = StdRng::seed_from_u64(0x5EED_9C0F);
+            for i in (1..live.len()).rev() {
+                live.swap(i, rng.gen_range(0..=i));
+            }
+            let allocator = std::sync::Arc::new(allocator);
+            let live = std::sync::Arc::new(live);
+            let cursor = std::sync::Arc::new(AtomicUsize::new(0));
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let retired_extents = std::sync::Arc::new(AtomicU64::new(0));
+
+            let wall = Instant::now();
+            let mut workers = Vec::new();
+            for _ in 0..retire_threads {
+                let (allocator, live, cursor, stop, retired_extents) = (
+                    allocator.clone(),
+                    live.clone(),
+                    cursor.clone(),
+                    stop.clone(),
+                    retired_extents.clone(),
+                );
+                workers.push(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let lo = cursor.fetch_add(BATCH, Ordering::Relaxed);
+                        if lo + BATCH >= live.len() {
+                            break; // ran out of live extents to retire
+                        }
+                        let mut batch: Vec<Extent> = live[lo..lo + BATCH].to_vec();
+                        batch.sort_unstable_by_key(|e| e.start.0);
+                        allocator.retire_extents_batch(&batch, Instant::now());
+                        retired_extents.fetch_add(BATCH as u64, Ordering::Relaxed);
+                    }
+                }));
+            }
+            // GC: select aged candidates and reclaim them, like `GcRunner`.
+            let gc = {
+                let (allocator, stop) = (allocator.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let running = AtomicBool::new(true);
+                    let mut reclaimed = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        // grace = 0: every retired block is immediately eligible,
+                        // so the selector keeps up with the retire threads (the
+                        // box's steady state, where retire_in ≈ reclaimed).
+                        // `gc::runner::MAX_RETIRED_RECLAIM_BLOCKS_PER_CYCLE`
+                        // (private to that module).
+                        let (cands, _) =
+                            allocator.aged_candidates(1_048_576, Duration::ZERO, Instant::now());
+                        if cands.is_empty() {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        if let Ok((blocks, _)) =
+                            allocator.reclaim_retired_extents_batch(&cands, &running)
+                        {
+                            reclaimed += blocks;
+                        }
+                    }
+                    reclaimed
+                })
+            };
+            std::thread::sleep(Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+            for w in workers {
+                let _ = w.join();
+            }
+            let reclaimed = gc.join().unwrap_or(0);
+            let wall_ns = wall.elapsed().as_nanos() as f64;
+
+            let free = allocator.free_lock_stats();
+            let ret = allocator.retired_lock_stats();
+            let age = allocator.age_lock_stats();
+            let (fr, rr, ar) = (
+                site_of(&free, "retire_batch"),
+                site_of(&ret, "retire_batch"),
+                site_of(&age, "retire_batch"),
+            );
+            let ret_busy: u64 = ret.iter().map(|s| s.hold_ns).sum();
+            println!(
+                "\n=== regions={regions:<5} free_extents={} retired {} extents, reclaimed {} \
+                 blocks in {:.1}s ===",
+                stats.free_extents,
+                retired_extents.load(Ordering::Relaxed),
+                reclaimed,
+                wall_ns / 1e9,
+            );
+            println!(
+                "  retire_batch  region: acq {:8} ({:7.0}/s) items/acq {:5.1}  hold {:8.2} s \
+                 ({:8.2} µs/acq, {:6.2} µs/item)",
+                fr.acquisitions,
+                fr.acquisitions as f64 / wall_ns * 1e9,
+                if fr.acquisitions > 0 {
+                    fr.items as f64 / fr.acquisitions as f64
+                } else {
+                    0.0
+                },
+                fr.hold_ns as f64 / 1e9,
+                fr.hold_us(),
+                if fr.items > 0 {
+                    fr.hold_ns as f64 / 1e3 / fr.items as f64
+                } else {
+                    0.0
+                },
+            );
+            // THE ledger: the region hold contains the retired acquisition, so it
+            // splits into wait + hold + residual. `residual` is the work that runs
+            // under the region lock ONLY — the quantity hypothesis (2) predicts
+            // must grow, and hypothesis (1) predicts must not.
+            let residual = fr.hold_ns as f64 - rr.wait_ns as f64 - rr.hold_ns as f64;
+            for (label, v) in [
+                ("region hold", fr.hold_ns as f64),
+                ("  retired wait", rr.wait_ns as f64),
+                ("  retired hold", rr.hold_ns as f64),
+                ("    age wait", ar.wait_ns as f64),
+                ("    age hold", ar.hold_ns as f64),
+                ("  residual (region-lock-only work)", residual),
+            ] {
+                println!(
+                    "  {:<36} {:8.2} s  {:5.1}% of region hold",
+                    label,
+                    v / 1e9,
+                    if fr.hold_ns > 0 {
+                        v / fr.hold_ns as f64 * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+            }
+            println!(
+                "  retired lock busy {:5.1}% of wall   (per-site holds: {})",
+                ret_busy as f64 / wall_ns * 100.0,
+                ret.iter()
+                    .filter(|s| s.hold_ns > 0)
+                    .map(|s| format!("{}={:.2}s", s.site, s.hold_ns as f64 / 1e9))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
     }
 }
 

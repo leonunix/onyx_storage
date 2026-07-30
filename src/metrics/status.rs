@@ -210,7 +210,16 @@ pub struct EngineStatusSnapshot {
     /// Per-site `free_pools` wait/hold attribution — see
     /// `crate::space::allocator::FreeLockSite`. Answers "who held the free lock
     /// while the writer waited", which no other metric can.
-    pub free_lock: Option<Vec<crate::space::allocator::FreeLockSiteStats>>,
+    pub free_lock: Option<Vec<crate::space::allocator::LockSiteStats>>,
+    /// Per-site `retired_extents` wait/hold attribution — see
+    /// `crate::space::allocator::RetiredLockSite`. The retire/free batch paths
+    /// take this lock INSIDE their region hold, so their wait here is reported
+    /// as `free_lock` hold: this table is what splits a region hold into "waited
+    /// for the global retired set" vs "did work".
+    pub retired_lock: Option<Vec<crate::space::allocator::LockSiteStats>>,
+    /// Per-site `retired_age` attribution, nested one level further in (the age
+    /// log is only taken under a `retired_extents` hold by the same site).
+    pub age_lock: Option<Vec<crate::space::allocator::LockSiteStats>>,
     /// Adaptive reclaim heat-map summary (None when the map is disabled or in
     /// standby). Observe-only in Stage A.
     pub heat: Option<HeatSummary>,
@@ -974,10 +983,19 @@ impl EngineStatusSnapshot {
                 u8::from(r.serialized),
             );
         }
-        if let Some(sites) = &self.free_lock {
-            // One line per site that ever took the lock. `acq`/`wait_ns`/`hold_ns`
-            // are monotonic (difference two reads); `hold_max_us` is a high-water
-            // mark and does NOT difference.
+        // One line per site that ever took the lock, for each of the three
+        // allocator locks. `acquisitions`/`items`/`wait_ns`/`hold_ns` are
+        // monotonic (difference two reads); the `_max` fields are high-water
+        // marks and do NOT difference. `items` is the extent count covered by
+        // the hold — the divisor that turns a per-acquisition cost into a
+        // per-extent one, which is what separates "the hold got cut into more
+        // pieces" from "the work got more expensive".
+        for (prefix, table) in [
+            ("free_lock", &self.free_lock),
+            ("retired_lock", &self.retired_lock),
+            ("age_lock", &self.age_lock),
+        ] {
+            let Some(sites) = table else { continue };
             for s in sites.iter().filter(|s| s.acquisitions > 0) {
                 let _ = writeln!(
                     out,
@@ -985,15 +1003,20 @@ impl EngineStatusSnapshot {
                     // status parsers key on `<prefix>.<field>`, so 13 lines
                     // sharing one prefix would silently overwrite each other and
                     // leave only the last site.
-                    "free_lock.{}: acquisitions={} wait_ns={} hold_ns={} \
-                     hold_ns_max={} wait_us={:.2} hold_us={:.2} hold_max_ms={:.2}",
+                    "{}.{}: acquisitions={} items={} wait_ns={} wait_ns_max={} \
+                     hold_ns={} hold_ns_max={} wait_us={:.2} hold_us={:.2} \
+                     wait_max_ms={:.2} hold_max_ms={:.2}",
+                    prefix,
                     s.site,
                     s.acquisitions,
+                    s.items,
                     s.wait_ns,
+                    s.wait_ns_max,
                     s.hold_ns,
                     s.hold_ns_max,
                     s.wait_us(),
                     s.hold_us(),
+                    s.wait_ns_max as f64 / 1e6,
                     s.hold_ns_max as f64 / 1e6,
                 );
             }
