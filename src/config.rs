@@ -1049,24 +1049,37 @@ pub struct StorageConfig {
     /// Default false for A/B baselining and instant rollback.
     #[serde(default)]
     pub stripe_group_lifetime_affinity: bool,
-    /// Shard the PBA allocator's free space into this many address regions, each
-    /// with its own lock. `1` (default) = one global lock, i.e. exactly the
-    /// pre-region behaviour. `0` = compiled default (2048).
+    /// Shard the PBA allocator's free space AND its retired set into this many
+    /// address regions, each with its own lock. `0` (default) = compiled default
+    /// (2048). `1` = one global lock per structure, i.e. exactly the pre-region
+    /// behaviour, kept as the rollback path.
     ///
-    /// 2026-07-29 nvme-box attribution (`free_lock.<site>` in `status`, QD256
-    /// j16d16, 480 s window): the single free lock was **68.4% busy**, **98% of
-    /// all holding came from GC retire/reclaim**, and **98.8% of the flush
-    /// writer's whole allocation time was WAIT** (1685.92 s of wait against
-    /// 1705.73 s of alloc) while the writer's own holding was 1.9%. Sharding by
-    /// address does not make any hold shorter — it decouples GC's holding from
-    /// the writer's acquisition, turning one 68%-busy mutex into N at 68/N%.
+    /// **On by default since 2026-08-01**, on two nvme-box reads of the same aged
+    /// 256 GiB volume (QD256 j16d16, 480 s window deltas, `free_lock.<site>` /
+    /// `retired_lock.<site>` in `status`):
     ///
-    /// Aligned allocation becomes first-fit WITHIN a lane's active region rather
-    /// than globally (every other path still walks regions in ascending address
-    /// order, which is identical to global first-fit). Default off because
-    /// whether removing this wait raises THROUGHPUT is unproven: the box's
-    /// best-throughput arm also had its worst allocation latency, and the queue
-    /// may simply move to the LV3 aggregation window downstream.
+    /// - the single free lock was **68.4% busy with 98% of all holding coming from
+    ///   GC retire/reclaim**, and **98.8% of the flush writer's whole allocation
+    ///   time was WAIT** while its own holding was 1.9%. Sharding makes no hold
+    ///   shorter — it decouples GC's holding from the writer's acquisition:
+    ///   `writer_refill` wait **22936 → 136 µs/acq**, `aligned` **871 → 2.13
+    ///   µs/op**, writer `alloc` **21.0% → 0.2%** of its time.
+    /// - the retired set was a second global mutex behind it (**49.1% busy at
+    ///   17567 acq/s**), which sharding on the same layout removed:
+    ///   `retire_batch`'s summed region hold **1588 → 153 s** and its wait share
+    ///   **87.3% → 2.2%**, `writer_refill wait_max` **1359 → 1.33 ms**.
+    ///
+    /// ⚠ THROUGHPUT IS FLAT (253.4 → 252.2 MB/s) and always was: the writer spends
+    /// 85% in `io`, of which 99.7% is `submit.io` and only 5.7% the real device
+    /// write, so the queue lives downstream in LV3 aggregation. What this buys is
+    /// ~3 cores of blocked cleanup-thread time and the removal of 1.4-1.65 s tail
+    /// events that did reach the writer. Do not expect (or gate on) bandwidth.
+    ///
+    /// The one deliberate semantic change: aligned allocation becomes first-fit
+    /// WITHIN a lane's active region rather than globally. Every other path still
+    /// walks regions in ascending address order, which is identical to global
+    /// first-fit, and the metadb L2P leaf codec only needs PBAs of one leaf to
+    /// stay near each other (leaf ⊂ zone ⊂ lane ⊂ region).
     #[serde(default = "default_allocator_regions")]
     pub allocator_regions: usize,
 }
@@ -1092,8 +1105,11 @@ impl Default for StorageConfig {
     }
 }
 
+/// `0` = the allocator's compiled region target (2048). See
+/// [`StorageConfig::allocator_regions`] for the box evidence behind turning this
+/// on by default; `1` is the single-lock rollback.
 fn default_allocator_regions() -> usize {
-    1
+    0
 }
 
 fn default_uring_sq_entries() -> u32 {

@@ -87,7 +87,8 @@ pub fn set_free_lock_hold_extents(extents: usize) {
 /// amortizing the acquisition over enough entries to be free.
 const AGED_SCAN_SLICE: usize = 4096;
 
-/// Target number of address regions when `storage.allocator_regions` is 0.
+/// Target number of address regions when `storage.allocator_regions` is 0 — which
+/// is the production default since 2026-08-01.
 ///
 /// Over the box's 600 GiB LV3 (157 M blocks) that is ~76 K blocks / 300 MiB per
 /// region: large enough that one lane refill (64 stripe windows) is served from
@@ -1538,8 +1539,8 @@ pub struct SpaceAllocator {
     regions: RegionPools,
     /// Coalesced retired set + young-age log, sharded by PBA on the SAME
     /// [`RegionLayout`] as `regions` — see [`RetiredShard`]. One shard when
-    /// sharding is off (`storage.allocator_regions = 1`), i.e. byte-for-byte the
-    /// pre-sharding structure behind one mutex.
+    /// sharding is turned off (`storage.allocator_regions = 1`, the rollback
+    /// path), i.e. byte-for-byte the pre-sharding structure behind one mutex.
     retired: RetiredRegions,
     /// O(1) running total of blocks in `retired_extents`. The depth gauge is
     /// read once per GC cycle; summing the (potentially millions of) coalesced
@@ -1627,8 +1628,11 @@ impl SpaceAllocator {
     /// range: offset == capacity"). The bottom RESERVED_BLOCKS reserved below is
     /// the superblock / heartbeat / HA-lock region in the allocator's own space.
     pub fn new_with_hazards(device_size_bytes: u64, num_lanes: usize) -> Self {
-        // Region sharding is OFF unless a caller asks for it, so every existing
-        // construction site keeps byte-identical single-lock behaviour.
+        // Unsharded. NOT the production default (that is
+        // `storage.allocator_regions`, which selects 2048 — see `StorageConfig`);
+        // this is the direct-construction entry point used by the unit tests, and
+        // keeping it single-lock is what lets a test compare the two arms and what
+        // makes `ONYX_ALLOCATOR_REGIONS=<n> cargo test` a meaningful sweep.
         Self::new_with_regions(device_size_bytes, num_lanes, 1)
     }
 

@@ -170,28 +170,31 @@ raid_full_stripe_writes = true
 # it on `flush_writer_stripe_groups` (did the plan change), `flush_writer_alloc_split`
 # (reserve miss rate) and `allocator_contiguity` (stripe_capable decay).
 stripe_group_lifetime_affinity = false
-# Shard the PBA allocator's free space into N address regions, each with its own
-# lock. 1 = one global lock (code default), 0 = compiled default (2048).
+# Shard the PBA allocator's free space AND its retired set into N address regions,
+# each with its own lock. 0 = compiled default (2048), which is ALSO the code
+# default since 2026-08-01; 1 = one global lock per structure (rollback path).
 #
-# 2026-07-29 attribution on this box (`free_lock.<site>` in `status`, decomposed
-# by tools/flush_delta.py, QD256 j16d16, aged 256 GiB volume, 480 s window):
-#   lock busy                          68.4% of wall  (ONE mutex)
-#   retire_batch   658 acq/s  hold 691 us   218.3 s = 66.4% of all holding
-#   reclaim_batch  184 acq/s  hold 1174 us  103.9 s = 31.6% of all holding
-#   writer_refill  153 acq/s  WAIT 22.94 ms/acq -> 1685.92 s
-# writer_refill's wait is 98.8% of the flush writer's ENTIRE allocation time
-# (1685.92 of 1705.73 s) while its own holding is 1.9%. So the writer is not slow,
-# it is queued behind GC. Sharding shortens no hold and weakens no invariant (the
-# free-check/retired-insert atomicity that blocks every cheaper fix is preserved
-# exactly) — it only splits the lock the two sides collide on.
+# Two attributions on this box settled it (`free_lock.<site>` / `retired_lock.<site>`
+# in `status`, decomposed by tools/flush_delta.py, QD256 j16d16, aged 256 GiB
+# volume, 480 s window deltas). BEFORE -> AFTER:
+#   free lock busy            68.4% of ONE mutex     ->  0.02% per region
+#   writer_refill WAIT        22.94 ms/acq           ->  0.76 us/acq
+#   writer_refill wait_max    1358.82 ms             ->  1.33 ms
+#   aligned alloc             871 us/op              ->  2.13 us/op
+#   writer `alloc` share      21.0% of writer time   ->  0.2%
+#   retire_batch region hold  1588.29 s (87.3% WAIT) ->  153.01 s (2.2% wait)
+#   aged_candidates hold/acq  1.169 SECONDS          ->  246 us (max 12.3 ms)
+# Sharding shortens no hold and weakens no invariant: the free-check/retired-insert
+# atomicity that blocks every cheaper fix is preserved exactly (both structures use
+# the SAME region layout, so {pool[i], retired[i]} is the atomic unit) — it only
+# splits the locks the two sides collide on.
 #
-# ⚠ Judge this on the attribution, NOT on throughput: `lock busy ... per region`
-# should fall far below 68.4% and `writer_refill wait/acq` far below 22.94 ms.
-# Those are decomposition quantities, readable from ONE arm, drift-insensitive.
-# Throughput is a secondary gate and restart-per-arm A/B is INVALID on this box
-# (two identical arms measured 2.13x apart on run-order drift alone) — use the
-# in-process gate instead, and remember the queue may simply move downstream to
-# the LV3 aggregation window.
+# ⚠ Judge this on the attribution, NOT on throughput. Throughput is FLAT
+# (253.4 -> 252.2 MB/s) because the writer spends 85% in `io`, 99.7% of that in
+# `submit.io`, and only 5.7% in the real device write: the queue lives downstream
+# in LV3 aggregation. The decomposition quantities above are drift-insensitive and
+# readable from ONE arm; restart-per-arm throughput A/B is INVALID on this box (two
+# identical arms measured 2.13x apart on run-order drift alone).
 allocator_regions = 0
 
 [buffer]
