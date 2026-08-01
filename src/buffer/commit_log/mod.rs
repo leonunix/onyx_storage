@@ -94,6 +94,9 @@ pub struct BufferRuntimeLimits {
     pub lv2_commit_timeout_pct: u64,
     /// Resolved LV2 sync pipeline depth (>= 1). See `LV2_SYNC_PIPELINE_DEPTH`.
     pub lv2_sync_pipeline_depth: usize,
+    /// Durability epochs per packed-checkpoint page write (>= 1). `1` writes one
+    /// page per epoch (the long-shipped behaviour).
+    pub lv2_checkpoint_epoch_interval: usize,
 }
 
 /// ZFS-style hyperbolic write throttle on LV2 buffer fill.
@@ -232,6 +235,7 @@ impl BufferRuntimeLimits {
             } else {
                 lv2_sync_pipeline_depth
             },
+            lv2_checkpoint_epoch_interval: defaults.lv2_checkpoint_epoch_interval,
         }
     }
 
@@ -249,6 +253,12 @@ impl BufferRuntimeLimits {
         self.prewait_ring_space_outside_order = enabled;
         self
     }
+
+    /// `0` keeps one page write per epoch.
+    pub fn with_checkpoint_epoch_interval(mut self, epochs: usize) -> Self {
+        self.lv2_checkpoint_epoch_interval = epochs.max(1);
+        self
+    }
 }
 
 impl Default for BufferRuntimeLimits {
@@ -263,6 +273,7 @@ impl Default for BufferRuntimeLimits {
             prewait_ring_space_outside_order: false,
             lv2_commit_timeout_pct: LV2_COMMIT_TIMEOUT_PCT,
             lv2_sync_pipeline_depth: LV2_SYNC_PIPELINE_DEPTH,
+            lv2_checkpoint_epoch_interval: 1,
         }
     }
 }
@@ -890,9 +901,25 @@ impl PackedCheckpointState {
 
     fn begin_next(&mut self) -> OnyxResult<u64> {
         self.pending_checkpoints.clone_from(&self.checkpoints);
+        self.next_generation()
+    }
+
+    /// Next generation WITHOUT resetting `pending`, for the amortised page
+    /// write: several durability epochs fold their shards' positions into
+    /// `pending` and only one of them encodes + writes, so the reset that
+    /// [`Self::begin_next`] does would drop the skipped epochs' positions.
+    fn next_generation(&self) -> OnyxResult<u64> {
         self.generation
             .checked_add(1)
             .ok_or_else(|| OnyxError::Config("packed checkpoint generation exhausted".into()))
+    }
+
+    /// Fold one epoch's shard position into `pending`, newest `max_seq` wins.
+    fn fold_pending(&mut self, member_idx: usize, checkpoint: ShardCheckpoint) {
+        let slot = &mut self.pending_checkpoints[member_idx];
+        if checkpoint.max_seq >= slot.max_seq {
+            *slot = checkpoint;
+        }
     }
 
     fn encode_pending(&mut self, generation: u64) -> OnyxResult<()> {
@@ -906,6 +933,11 @@ impl PackedCheckpointState {
     fn commit_pending(&mut self, generation: u64) {
         self.generation = generation;
         std::mem::swap(&mut self.checkpoints, &mut self.pending_checkpoints);
+        // The swap leaves `pending` holding the PREVIOUS committed table. Later
+        // epochs fold into `pending` directly (no `begin_next` reset), so
+        // re-seed it from what was just committed or those folds would land on
+        // a stale base.
+        self.pending_checkpoints.clone_from(&self.checkpoints);
     }
 }
 

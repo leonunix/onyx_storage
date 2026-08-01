@@ -1566,6 +1566,18 @@ pub struct BufferConfig {
     /// 0 = engine default.
     #[serde(default)]
     pub sync_batch_max_bytes_mb: usize,
+    /// Durability epochs per LV2 packed-checkpoint page write. `0`/`1` writes one
+    /// page per epoch (the long-shipped behaviour).
+    ///
+    /// Box-measured 2026-08-01 (QD256, aged 256 GiB volume): that 4 KiB mirrored
+    /// write cost 101 us and **44 % of the single durability coordinator's whole
+    /// capacity** at 4387 epochs/s, with the thread 79 % busy — the front-end
+    /// ceiling in the healthy regime. The page is a RECOVERY START POINT, not a
+    /// durability record (its only runtime reader is pool open), so raising this
+    /// trades pool-open replay distance for coordinator capacity. At 4387
+    /// epochs/s, N=4 widens the replay window by ~0.9 ms of appends.
+    #[serde(default)]
+    pub lv2_checkpoint_epoch_interval: usize,
     /// Prepared-batch channel depth for each LV2 global root-write lane.
     /// Smaller values propagate a slow root write back to shard staging sooner,
     /// allowing later entries to coalesce before encoding. 0 preserves the
@@ -1636,6 +1648,7 @@ impl Default for BufferConfig {
             sync_batch_max_entries: 0,
             sync_batch_max_bytes_mb: 0,
             lv2_prepared_queue_depth_per_lane: 0,
+            lv2_checkpoint_epoch_interval: 0,
             prewait_ring_space_outside_order: false,
             throttle_min_pct: 0,
             throttle_max_pct: 0,

@@ -1003,6 +1003,7 @@ impl WriteBufferPool {
         members: Vec<(u64, Arc<BufferShard>, Receiver<()>)>,
         group_commit_wait: Duration,
         lv2_prepared_queue_depth_per_lane: usize,
+        checkpoint_epoch_interval: usize,
         shutdown: Arc<AtomicBool>,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
         packed_checkpoint: Option<Arc<parking_lot::Mutex<PackedCheckpointState>>>,
@@ -1346,6 +1347,9 @@ impl WriteBufferPool {
             drop(written_tx);
 
             let mut consecutive_failures = 0u32;
+            // Epochs since the last packed-checkpoint page write. Coordinator-local:
+            // this is the only thread that advances hot-path generations.
+            let mut epochs_since_checkpoint = 0usize;
             loop {
                 // Everything from here to `publish` is serial and single
                 // threaded: every acknowledged append waits behind it, so
@@ -1382,36 +1386,62 @@ impl WriteBufferPool {
                 // persistence. The mutex is otherwise uncontended: only this
                 // coordinator advances hot-path generations.
                 let mut packed_guard = packed_checkpoint.as_ref().map(|state| state.lock());
+                // EVERY epoch folds its shards' positions into `pending`; only
+                // every `checkpoint_epoch_interval`-th epoch encodes and writes
+                // the page. Box-measured 2026-08-01: that 4 KiB mirrored write
+                // cost 101 us and 44 % of this single thread's whole capacity at
+                // 4387 epochs/s, with the thread 79 % busy — the front-end
+                // ceiling in the healthy regime.
+                //
+                // Safe because the page is a RECOVERY START POINT, not a
+                // durability record: the payloads it describes were written by
+                // the lanes above and are made durable by this epoch's own
+                // `sync_device_impl` either way, and `read_packed_checkpoint`
+                // has exactly one runtime caller — pool open. A generation that
+                // lags N epochs costs replay distance, never correctness. Clean
+                // shutdown still writes a complete table (`persist_checkpoints`
+                // re-snapshots every shard, so it never reads `pending`).
+                epochs_since_checkpoint = epochs_since_checkpoint.saturating_add(1);
+                let write_checkpoint = epochs_since_checkpoint >= checkpoint_epoch_interval;
                 let pending_generation = if let Some(state) = packed_guard.as_mut() {
-                    let mut prepare_failures = 0u32;
-                    Some(loop {
-                        let prepared = (|| -> OnyxResult<u64> {
-                            let generation = state.begin_next()?;
-                            for batch in &batches {
-                                let slot = &mut state.pending_checkpoints[batch.member_idx];
-                                if batch.max_seq >= slot.max_seq {
-                                    *slot = batch.checkpoint;
+                    for batch in &batches {
+                        state.fold_pending(batch.member_idx, batch.checkpoint);
+                    }
+                    if !write_checkpoint {
+                        None
+                    } else {
+                        let mut prepare_failures = 0u32;
+                        Some(loop {
+                            let prepared = state.next_generation().and_then(|generation| {
+                                state.encode_pending(generation).map(|()| generation)
+                            });
+                            match prepared {
+                                Ok(generation) => break generation,
+                                Err(error) => {
+                                    prepare_failures = prepare_failures.saturating_add(1);
+                                    tracing::error!(
+                                        error = %error,
+                                        prepare_failures,
+                                        "global packed checkpoint encode failed; retrying epoch"
+                                    );
+                                    thread::sleep(Self::sync_retry_backoff(prepare_failures));
                                 }
                             }
-                            state.encode_pending(generation)?;
-                            Ok(generation)
-                        })();
-                        match prepared {
-                            Ok(generation) => break generation,
-                            Err(error) => {
-                                prepare_failures = prepare_failures.saturating_add(1);
-                                tracing::error!(
-                                    error = %error,
-                                    prepare_failures,
-                                    "global packed checkpoint encode failed; retrying epoch"
-                                );
-                                thread::sleep(Self::sync_retry_backoff(prepare_failures));
-                            }
-                        }
-                    })
+                        })
+                    }
                 } else {
                     None
                 };
+                if write_checkpoint {
+                    epochs_since_checkpoint = 0;
+                }
+                if pending_generation.is_none() {
+                    if let Some(metrics) = metrics.get() {
+                        metrics
+                            .buffer_lv2_checkpoint_skipped_epochs
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 // Covers everything between the first written batch arriving and
                 // the checkpoint page write: the sibling-epoch drain, the packed
                 // checkpoint mutex, `begin_next`, and `encode_pending`.

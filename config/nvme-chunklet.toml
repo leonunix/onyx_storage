@@ -208,7 +208,21 @@ prewait_ring_space_outside_order = false
 # the chunklet path (the ring sizes from the LD capacity).
 capacity_mb = 32768
 flush_watermark_pct = 80
+# ⚠ Do NOT lower this to chase append latency. Arm `gcw20` (2026-08-01, with
+# lv2_checkpoint_epoch_interval = 8): 100 -> 20 us halved the ack latency again
+# (append_wait_durable 1333 -> 604 us, every stage duty down: lane 67 -> 41 %,
+# coord 40 -> 30 %) and made every USER-VISIBLE number worse — total user IOPS
+# 49487 -> 42389, read latency 3666 -> 4361 us, LV3 213.7 vs 246.0 MB/s. The
+# front end is not the constraint any more, so buying front-end latency with more
+# device ops is a net loss. See memory lv2_epoch_pipeline_handoff.
 group_commit_wait_us = 100
+# Durability epochs per LV2 packed-checkpoint page write. The page is a recovery
+# START POINT (only pool open reads it), so this trades a little replay distance
+# for coordinator capacity. Box-accepted 2026-08-01 (arm `ckpt8`): the single
+# durability coordinator went 79 % -> 40.4 % duty, ckpt_write 44 % -> 7.4 % of its
+# capacity, append_wait_durable 1557-1666 -> 1333 us, user IOPS and read latency
+# unchanged-to-better. 87.5 % of epochs skip the write (exactly 7/8).
+lv2_checkpoint_epoch_interval = 8
 shards = 16
 max_memory_mb = 16384
 volatile_memory_mb = 49152

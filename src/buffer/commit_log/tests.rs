@@ -3356,3 +3356,121 @@ fn global_write_lanes_scale_with_members_up_to_eight() {
     assert_eq!(WriteBufferPool::resolve_global_write_lane_count(8), 8);
     assert_eq!(WriteBufferPool::resolve_global_write_lane_count(16), 8);
 }
+
+/// `fold_pending` must accumulate across epochs AND survive a commit. The
+/// amortised page write (`lv2_checkpoint_epoch_interval > 1`) folds several
+/// epochs into one page, so `begin_next`'s reset cannot be used — and
+/// `commit_pending`'s swap leaves `pending` holding the PREVIOUS committed table,
+/// which would silently roll a later fold back onto a stale base.
+#[test]
+fn packed_checkpoint_fold_accumulates_across_epochs_and_survives_commit() {
+    let mut state = PackedCheckpointState::new(1, packed_test_checkpoints(4, 100)).unwrap();
+
+    let bump = |seq: u64| ShardCheckpoint {
+        head_offset: seq,
+        tail_offset: seq,
+        max_seq: seq,
+        used_bytes: seq,
+    };
+    // Two epochs fold before a single write.
+    state.fold_pending(0, bump(200));
+    state.fold_pending(1, bump(300));
+    let generation = state.next_generation().unwrap();
+    assert_eq!(generation, 2);
+    state.encode_pending(generation).unwrap();
+    let encoded = PackedCheckpointTable::decode(state.scratch.as_slice().try_into().unwrap()).unwrap();
+    assert_eq!(encoded.generation, 2);
+    assert_eq!(encoded.checkpoints[0].max_seq, 200);
+    assert_eq!(encoded.checkpoints[1].max_seq, 300);
+    assert_eq!(encoded.checkpoints[2].max_seq, 102, "untouched shard kept");
+    state.commit_pending(generation);
+
+    // A later epoch's fold must land on top of what was just committed, not on
+    // the pre-swap table.
+    state.fold_pending(2, bump(400));
+    let generation = state.next_generation().unwrap();
+    assert_eq!(generation, 3);
+    state.encode_pending(generation).unwrap();
+    let encoded = PackedCheckpointTable::decode(state.scratch.as_slice().try_into().unwrap()).unwrap();
+    assert_eq!(encoded.checkpoints[0].max_seq, 200, "earlier fold retained");
+    assert_eq!(encoded.checkpoints[1].max_seq, 300, "earlier fold retained");
+    assert_eq!(encoded.checkpoints[2].max_seq, 400);
+
+    // Older positions never move a slot backwards.
+    state.fold_pending(2, bump(1));
+    state.encode_pending(state.next_generation().unwrap()).unwrap();
+    let encoded = PackedCheckpointTable::decode(state.scratch.as_slice().try_into().unwrap()).unwrap();
+    assert_eq!(encoded.checkpoints[2].max_seq, 400);
+}
+
+/// With the page write amortised, FEWER pages than barriers are written and every
+/// acked entry must still come back after a checkpoint-less teardown (`Drop`
+/// deliberately does not persist), because the page is only a replay start point.
+#[test]
+fn amortised_checkpoint_writes_fewer_pages_and_still_recovers_every_entry() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 128 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let backend = Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0));
+    let limits = BufferRuntimeLimits::default().with_checkpoint_epoch_interval(4);
+    let pool = Arc::new(
+        WriteBufferPool::open_with_options_full_and_limits(
+            backend.clone(),
+            Duration::from_millis(10),
+            4,
+            1,
+            Duration::from_secs(1),
+            64 * 1024 * 1024,
+            None,
+            limits,
+        )
+        .unwrap(),
+    );
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+    backend.reset_io_counts();
+
+    for i in 0..64u64 {
+        pool.append("vol", Lba(i), 1, &[i as u8; BLOCK_SIZE as usize], 1)
+            .unwrap();
+    }
+
+    let flushes = backend.flushes.load(Ordering::Relaxed);
+    let checkpoint_writes = backend.checkpoint_writes.lock().unwrap().len() as u64;
+    let skipped = metrics
+        .buffer_lv2_checkpoint_skipped_epochs
+        .load(Ordering::Relaxed);
+    assert!(flushes > 0, "every epoch still fdatasyncs");
+    assert!(
+        checkpoint_writes < flushes,
+        "page writes must be amortised: writes={checkpoint_writes} flushes={flushes}"
+    );
+    assert!(skipped > 0, "skipped epochs must be attributed");
+    drop(pool);
+
+    // No `persist_checkpoints`: recovery starts from a LAGGING generation and
+    // scans forward. Every acked append must still be there.
+    let reopened = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::from_millis(10),
+        4,
+        1,
+        Duration::from_secs(1),
+        64 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(reopened.pending_count(), 64);
+    for i in 0..64u64 {
+        assert_eq!(
+            reopened
+                .lookup("vol", Lba(i))
+                .unwrap()
+                .unwrap()
+                .payload
+                .unwrap()[0],
+            i as u8
+        );
+    }
+}

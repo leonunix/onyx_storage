@@ -512,6 +512,7 @@ impl WriteBufferPool {
                         global_members,
                         group_commit_wait,
                         runtime_limits.lv2_prepared_queue_depth_per_lane,
+                        runtime_limits.lv2_checkpoint_epoch_interval,
                         shutdown,
                         metrics_for_loop,
                         packed_for_loop,

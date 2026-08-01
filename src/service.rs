@@ -399,6 +399,13 @@ impl ServiceController {
                 "buffer.lv2_prepared_queue_depth_per_lane changed — requires restart to take effect"
             );
         }
+        if old_config.buffer.lv2_checkpoint_epoch_interval
+            != new_config.buffer.lv2_checkpoint_epoch_interval
+        {
+            tracing::warn!(
+                "buffer.lv2_checkpoint_epoch_interval changed — requires restart to take effect"
+            );
+        }
         if old_config.buffer.throttle_min_pct != new_config.buffer.throttle_min_pct
             || old_config.buffer.throttle_max_pct != new_config.buffer.throttle_max_pct
             || old_config.buffer.throttle_scale_us != new_config.buffer.throttle_scale_us
