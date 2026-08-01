@@ -2318,7 +2318,6 @@ impl OnyxEngine {
                 .allocator
                 .as_ref()
                 .map(|alloc| alloc.retired_lock_stats()),
-            age_lock: self.allocator.as_ref().map(|alloc| alloc.age_lock_stats()),
             heat: self.heat.as_ref().map(|h| h.cached_summary()),
             meta_fenced: self
                 .buffer_pool

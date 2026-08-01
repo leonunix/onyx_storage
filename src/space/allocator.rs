@@ -75,6 +75,18 @@ pub fn set_free_lock_hold_extents(extents: usize) {
     FREE_LOCK_HOLD_EXTENTS.store(extents.max(1), Ordering::Relaxed);
 }
 
+/// Entries (age log) or extents (retired set) one [`SpaceAllocator::aged_candidates`]
+/// slice examines before releasing the shard lock.
+///
+/// The box-measured cost of that selector was **1.169 s per GC cycle under one
+/// acquisition** — 10% of wall with the retired lock fully closed, and the source
+/// of the 1.4-1.65 s tails every other site saw. The work itself is necessary
+/// (~1 M candidates per cycle, because retire extents average ~1 block), so what
+/// gets fixed is the monopoly, not the total: 4096 entries is ~0.2-0.5 ms of walk
+/// per hold, three orders of magnitude below the whole-cycle hold, while still
+/// amortizing the acquisition over enough entries to be free.
+const AGED_SCAN_SLICE: usize = 4096;
+
 /// Target number of address regions when `storage.allocator_regions` is 0.
 ///
 /// Over the box's 600 GiB LV3 (157 M blocks) that is ~76 K blocks / 300 MiB per
@@ -1272,6 +1284,246 @@ fn region_holds<'e>(
     out
 }
 
+/// The coalesced retired extents belonging to ONE PBA region, plus the young-age
+/// log for the same address range, under ONE mutex.
+///
+/// **Sharded on the same [`RegionLayout`] as [`RegionPools`]** — deliberately the
+/// same, because the atomicity the retire path needs is exactly "the free-overlap
+/// check and the retired insert for extent E happen together". With one shared
+/// layout that pair is `{pools[i], retired[i]}` for a single `i`, and different
+/// `i` are independent. That is the only way to take this lock off the global
+/// path without touching the check↔insert atomicity which prevents double
+/// ownership — the property that ruled out the three cheaper alternatives (see
+/// the 2026-07-29 note on `reclaim_retired_extents_batch`).
+///
+/// Merging the age log into the same mutex is a RESULT of the 2026-07-30 box
+/// attribution, not a shortcut: `retired_age` was only ever acquired under a
+/// `retired_extents` hold **by the same call path**, and its measured wait was
+/// 0.13 µs/acq = 0.1% of the retire batch's region hold. A second lock bought
+/// nothing and cost an extra 17567 acquisitions/s.
+///
+/// INVARIANT (load-bearing, mirroring `RegionPools`): every extent in `set` and
+/// every entry in `age` lies entirely inside this shard's region range. Every
+/// insert clips to the region, so a containment/overlap question about an extent
+/// is answered by asking exactly the shards it spans — and coalescing therefore
+/// stops at region boundaries (one unfoldable seam per boundary, the same
+/// accepted cost the free pool pays).
+#[derive(Default)]
+struct RetiredShard {
+    /// Authority for containment/overlap (`is_retired`,
+    /// `overlapping_retired_extent`, reclaim validation). NEVER carries age.
+    set: BTreeSet<Extent>,
+    /// Advisory young-age log (start pba → run) holding ONLY entries younger than
+    /// the reclaim grace — `aged_candidates` prunes the rest, which is the
+    /// time-window that bounds its memory. Gates reclaim eligibility only: a
+    /// retired sub-range is reclaimable iff no entry here covers it.
+    ///
+    /// ⚠ [`SpaceAllocator::aged_subranges`] treats every PRESENT entry as young
+    /// without re-reading its timestamp, so the prune for a shard must complete
+    /// before that shard is walked for candidates.
+    age: BTreeMap<u64, RetiredRun>,
+}
+
+impl RetiredShard {
+    fn covering(&self, pba: Pba) -> Option<Extent> {
+        SpaceAllocator::covering_extent(&self.set, pba)
+    }
+
+    fn overlapping(&self, extent: Extent) -> Option<Extent> {
+        SpaceAllocator::overlapping_extent(&self.set, extent)
+    }
+
+    /// Retire `part` (already clipped to this shard): stamp the genuinely-new
+    /// sub-ranges with `now` and coalesce `part` into the set. Returns the newly
+    /// retired block count (0 = idempotent re-retire).
+    ///
+    /// The gaps are computed BEFORE coalescing so already-retired sub-ranges keep
+    /// their original age and can never be refreshed.
+    fn retire(&mut self, part: Extent, now: Instant) -> u32 {
+        let gaps = SpaceAllocator::uncovered_subranges(&self.set, part);
+        let newly: u32 = gaps.iter().map(|g| g.count).sum();
+        SpaceAllocator::coalesce_and_insert_any_overlap(&mut self.set, part);
+        for g in gaps {
+            self.age.insert(
+                g.start.0,
+                RetiredRun {
+                    count: g.count,
+                    retired_at: now,
+                },
+            );
+        }
+        newly
+    }
+
+    /// Reclaim-side removal of `part`: require it to be FULLY contained in one
+    /// coalesced retired extent, split the cover and keep the remainders retired.
+    /// `false` = no longer (fully) retired — a raced reclaim/realloc; **fail
+    /// closed**, never release a span we did not verify.
+    fn take_for_reclaim(&mut self, part: Extent) -> bool {
+        let cover = match self.covering(part.start) {
+            Some(c) if c.end_pba().0 >= part.end_pba().0 => c,
+            _ => return false,
+        };
+        self.set.remove(&cover);
+        if part.start.0 > cover.start.0 {
+            self.set.insert(Extent::new(
+                cover.start,
+                (part.start.0 - cover.start.0) as u32,
+            ));
+        }
+        if cover.end_pba().0 > part.end_pba().0 {
+            self.set.insert(Extent::new(
+                part.end_pba(),
+                (cover.end_pba().0 - part.end_pba().0) as u32,
+            ));
+        }
+        // Defensive: aged candidates are carved between young entries, so
+        // normally there is nothing to purge.
+        SpaceAllocator::purge_age_range(&mut self.age, part);
+        true
+    }
+
+    /// Re-insert a reclaim that failed downstream, COALESCING it back with the
+    /// split remainders. The age log is NOT touched: `part` was already aged, so
+    /// it stays immediately eligible next cycle — no re-aging on the error path.
+    fn reinsert(&mut self, part: Extent) {
+        SpaceAllocator::coalesce_and_insert_any_overlap(&mut self.set, part);
+    }
+
+    #[cfg(test)]
+    fn blocks(&self) -> u64 {
+        self.set.iter().map(|e| u64::from(e.count)).sum()
+    }
+}
+
+/// Retired shards, one per PBA region — the `retired_extents` analogue of
+/// [`RegionPools`]. The shard count is fixed at construction (it sizes the mutex
+/// vector) and equals the region count, so `RegionLayout::of` routes both.
+struct RetiredRegions {
+    shards: Vec<Mutex<RetiredShard>>,
+}
+
+impl RetiredRegions {
+    fn new(count: usize) -> Self {
+        Self {
+            shards: (0..count.max(1))
+                .map(|_| Mutex::new(RetiredShard::default()))
+                .collect(),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.shards.len()
+    }
+}
+
+/// The retired shards spanned by one extent, locked in ASCENDING index order —
+/// the `retired` analogue of [`SpanGuard`], with the same clipping discipline.
+///
+/// Lock order across the allocator is uniformly `free region -> retired shard`
+/// (no path takes a retired shard and then a free region), and multi-shard holds
+/// are always ascending, so neither can deadlock against the other.
+struct RetiredSpan<'a> {
+    layout: RegionLayout,
+    lo: usize,
+    guards: Vec<TimedGuard<'a, RetiredShard, RETIRED_LOCK_SITES>>,
+}
+
+impl RetiredSpan<'_> {
+    fn shard(&self, idx: usize) -> &RetiredShard {
+        &self.guards[idx - self.lo]
+    }
+
+    fn shard_mut(&mut self, idx: usize) -> &mut RetiredShard {
+        &mut self.guards[idx - self.lo]
+    }
+
+    /// Charged once per HOLD (not per shard guard) — see
+    /// [`SpanGuard::charge_items`].
+    fn charge_items(&self, n: u64) {
+        if let Some(first) = self.guards.first() {
+            first.charge_items(n);
+        }
+    }
+
+    /// First retired extent overlapping `extent`, asking exactly the shards it
+    /// spans. The double-free guard on the free path.
+    fn overlapping(&self, extent: Extent) -> Option<Extent> {
+        let (lo, hi) = self.layout.span(extent);
+        (lo..=hi).find_map(|idx| {
+            let part = self.layout.clip(idx, extent)?;
+            self.shard(idx).overlapping(part)
+        })
+    }
+
+    /// Retire `extent` across the shards it spans; returns newly-retired blocks.
+    fn retire(&mut self, extent: Extent, now: Instant) -> u32 {
+        let (lo, hi) = self.layout.span(extent);
+        let mut newly = 0u32;
+        for idx in lo..=hi {
+            if let Some(part) = self.layout.clip(idx, extent) {
+                newly += self.shard_mut(idx).retire(part, now);
+            }
+        }
+        newly
+    }
+
+    /// Reclaim-side removal across shards, per clipped part, fail-closed per
+    /// part. Returns the parts actually removed (empty = nothing was verifiable).
+    ///
+    /// Per-part is not a weakening: a candidate is caller-proven rc==0 and
+    /// unreferenced for its WHOLE span, so releasing a verified sub-range is
+    /// exactly what the single path has always done when a cover only partly
+    /// matched; an unverifiable part simply stays retired for the next cycle.
+    fn take_for_reclaim(&mut self, extent: Extent) -> Vec<Extent> {
+        let (lo, hi) = self.layout.span(extent);
+        let mut taken = Vec::new();
+        for idx in lo..=hi {
+            if let Some(part) = self.layout.clip(idx, extent) {
+                if self.shard_mut(idx).take_for_reclaim(part) {
+                    taken.push(part);
+                }
+            }
+        }
+        taken
+    }
+
+    fn reinsert(&mut self, extent: Extent) {
+        let (lo, hi) = self.layout.span(extent);
+        for idx in lo..=hi {
+            if let Some(part) = self.layout.clip(idx, extent) {
+                self.shard_mut(idx).reinsert(part);
+            }
+        }
+    }
+
+    /// Blocks of `range` covered by retired extents. Retired extents never
+    /// overlap each other (coalesced set, and shards partition the address
+    /// space), so summing clamped intersections is exact.
+    fn overlap_blocks(&self, range: Extent) -> u64 {
+        let (lo, hi) = self.layout.span(range);
+        let mut covered = 0u64;
+        for idx in lo..=hi {
+            let Some(part) = self.layout.clip(idx, range) else {
+                continue;
+            };
+            let (s, e) = (part.start.0, part.end_pba().0);
+            let shard = self.shard(idx);
+            // The last extent starting at/before `s` may reach into the range.
+            if let Some(prev) = shard.set.range(..=Extent::single(part.start)).next_back() {
+                covered += prev.end_pba().0.min(e).saturating_sub(s);
+            }
+            for ext in shard.set.range(Extent::single(Pba(s + 1))..) {
+                if ext.start.0 >= e {
+                    break;
+                }
+                covered += ext.end_pba().0.min(e) - ext.start.0;
+            }
+        }
+        covered
+    }
+}
+
 pub struct SpaceAllocator {
     /// IO-addressable capacity in blocks. Atomic so an online `grow_capacity`
     /// (chunklet `extend_ld` on LV3) can publish the larger frontier while
@@ -1284,16 +1536,11 @@ pub struct SpaceAllocator {
     /// IS the global address-argmin); the one deliberate exception is the flush
     /// writer's lane refill, which is first-fit WITHIN the lane's active region.
     regions: RegionPools,
-    /// Coalesced retired set — authority for containment/overlap (`is_retired`,
-    /// `overlapping_retired_extent`, `retired_block_count`). NEVER carries age.
-    retired_extents: Mutex<BTreeSet<Extent>>,
-    /// Advisory young-age log (start pba → run), holds ONLY entries younger than
-    /// the reclaim grace (time-windowed → memory bounded to grace × retire-rate).
-    /// Gates reclaim eligibility only: a retired sub-range is reclaimable iff it
-    /// is NOT covered by a young entry here. Per-entry `retired_at` is fixed at
-    /// retire time and never refreshed, so coalescing the set above cannot
-    /// re-age it. Lock order: `retired_extents` BEFORE `retired_age`.
-    retired_age: Mutex<BTreeMap<u64, RetiredRun>>,
+    /// Coalesced retired set + young-age log, sharded by PBA on the SAME
+    /// [`RegionLayout`] as `regions` — see [`RetiredShard`]. One shard when
+    /// sharding is off (`storage.allocator_regions = 1`), i.e. byte-for-byte the
+    /// pre-sharding structure behind one mutex.
+    retired: RetiredRegions,
     /// O(1) running total of blocks in `retired_extents`. The depth gauge is
     /// read once per GC cycle; summing the (potentially millions of) coalesced
     /// extents under the set lock was ~360 ms/cycle at 60M-deep AND contended
@@ -1306,16 +1553,14 @@ pub struct SpaceAllocator {
     free_blocks: AtomicU64,
     /// Per-site wait/hold accounting for `free_pools` — see [`FreeLockSite`].
     free_lock: FreeLockStats,
-    /// Per-site wait/hold accounting for `retired_extents` and, nested inside
-    /// it, `retired_age` — see [`RetiredLockSite`]. Both tables use the same
-    /// site enum because every `retired_age` acquisition happens under a
-    /// `retired_extents` hold by the same call path. The ledger nests:
-    /// `free_lock.<site>.hold` ⊇ `retired_lock.<site>.{wait,hold}` ⊇
-    /// `age_lock.<site>.{wait,hold}` for the paths that take the free lock
-    /// outermost (retire, free), which is exactly what makes the residual
-    /// readable as "real work".
+    /// Per-site wait/hold accounting for the retired shards — see
+    /// [`RetiredLockSite`]. The ledger nests: `free_lock.<site>.hold` ⊇
+    /// `retired_lock.<site>.{wait,hold}` for the paths that take the free lock
+    /// outermost (retire, free), which is what makes the residual readable as
+    /// "real work". (There is no separate `age_lock` table any more: the age log
+    /// now lives under the same shard mutex, because its measured wait was 0.1%
+    /// of the retire batch's region hold.)
     retired_lock: RetiredLockStats,
-    age_lock: RetiredLockStats,
     /// Per-lane single-block caches. Each flush lane pops from its own cache
     /// to avoid contending on `free_extents`. Refilled in bulk from global.
     lane_caches: Vec<Mutex<Vec<Pba>>>,
@@ -1449,18 +1694,17 @@ impl SpaceAllocator {
             })
             .unwrap_or(false)
             .then(|| Mutex::new(BTreeSet::new()));
+        let retired = RetiredRegions::new(region_pools.count());
         Self {
             total_blocks: AtomicU64::new(total_blocks),
             regions: region_pools,
-            retired_extents: Mutex::new(BTreeSet::new()),
-            retired_age: Mutex::new(BTreeMap::new()),
+            retired,
             retired_blocks: AtomicU64::new(0),
             hazards: PbaHazards::new(),
             allocated_blocks: AtomicU64::new(0),
             free_blocks: AtomicU64::new(usable_blocks),
             free_lock: FreeLockStats::new(),
             retired_lock: RetiredLockStats::new(),
-            age_lock: RetiredLockStats::new(),
             lane_caches,
             lane_extent_caches,
             lane_regions,
@@ -1616,30 +1860,56 @@ impl SpaceAllocator {
             .snapshot(RetiredLockSite::ALL.map(|s| s.name()))
     }
 
-    /// Per-site `retired_age` wait/hold snapshot. Sites are the same enum: the
-    /// age log is only ever taken under a `retired_extents` hold by the same
-    /// call path, so these rows nest inside [`Self::retired_lock_stats`].
-    pub fn age_lock_stats(&self) -> Vec<LockSiteStats> {
-        self.age_lock.snapshot(RetiredLockSite::ALL.map(|s| s.name()))
-    }
-
-    /// Acquire `retired_extents`, charging the wait to `site` and the hold on
-    /// drop. Every acquisition in the file goes through here so the table is
-    /// exhaustive by construction.
-    fn lock_retired(
+    /// Acquire ONE retired shard, charging the wait to `site` and the hold on
+    /// drop. Every acquisition in the file goes through here (or the span
+    /// helpers below), so the table is exhaustive by construction.
+    fn lock_retired_shard(
         &self,
         site: RetiredLockSite,
-    ) -> TimedGuard<'_, BTreeSet<Extent>, RETIRED_LOCK_SITES> {
-        TimedGuard::new(&self.retired_lock, site as usize, &self.retired_extents)
+        idx: usize,
+    ) -> TimedGuard<'_, RetiredShard, RETIRED_LOCK_SITES> {
+        TimedGuard::new(&self.retired_lock, site as usize, &self.retired.shards[idx])
     }
 
-    /// Acquire `retired_age`. Lock order: ALWAYS under a `retired_extents` hold
-    /// held by the same `site`.
-    fn lock_age(
+    /// The retired shards' layout — ALWAYS the free pool's, so that
+    /// `{pools[i], retired[i]}` is exactly the atomic unit the retire path needs.
+    fn retired_layout(&self) -> RegionLayout {
+        self.regions.layout()
+    }
+
+    /// Lock every retired shard `extent` reaches into, ASCENDING.
+    fn lock_retired_span(&self, site: RetiredLockSite, extent: Extent) -> RetiredSpan<'_> {
+        let (lo, hi) = self.retired_layout().span(extent);
+        self.lock_retired_span_range(site, lo, hi)
+    }
+
+    /// Lock EVERY retired shard, ASCENDING. Only for paths that must see the
+    /// whole retired space atomically — today just the geometry re-shard.
+    fn lock_all_retired(
         &self,
         site: RetiredLockSite,
-    ) -> TimedGuard<'_, BTreeMap<u64, RetiredRun>, RETIRED_LOCK_SITES> {
-        TimedGuard::new(&self.age_lock, site as usize, &self.retired_age)
+    ) -> Vec<TimedGuard<'_, RetiredShard, RETIRED_LOCK_SITES>> {
+        (0..self.retired.count())
+            .map(|idx| self.lock_retired_shard(site, idx))
+            .collect()
+    }
+
+    /// Lock the inclusive shard range `[lo, hi]`, ASCENDING — the batch-path
+    /// analogue of [`Self::lock_retired_span`], where the range comes from a
+    /// group of extents rather than from one.
+    fn lock_retired_span_range(
+        &self,
+        site: RetiredLockSite,
+        lo: usize,
+        hi: usize,
+    ) -> RetiredSpan<'_> {
+        RetiredSpan {
+            layout: self.retired_layout(),
+            lo,
+            guards: (lo..=hi)
+                .map(|idx| self.lock_retired_shard(site, idx))
+                .collect(),
+        }
     }
 
     pub fn supply_stats(&self) -> AllocSupplyStats {
@@ -1708,8 +1978,11 @@ impl SpaceAllocator {
         let free_count = usable_blocks - alloc_count;
 
         self.replace_general_regionwise(&free);
-        self.lock_retired(RetiredLockSite::Setup).clear();
-        self.lock_age(RetiredLockSite::Setup).clear();
+        for idx in 0..self.retired.count() {
+            let mut shard = self.lock_retired_shard(RetiredLockSite::Setup, idx);
+            shard.set.clear();
+            shard.age.clear();
+        }
         self.retired_blocks.store(0, Ordering::Relaxed);
         self.clear_lane_caches();
         if let Some(tracker) = &self.alloc_tracker {
@@ -1803,6 +2076,20 @@ impl SpaceAllocator {
         for region in &mut guard.guards {
             runs.extend(region.take_all_runs());
         }
+        // The retired shards route on the SAME layout, so moving the boundaries
+        // has to re-shard them too — an extent left behind under the old
+        // boundaries could otherwise sit in a shard that does not own it, which
+        // breaks every containment query. Every shard lock is held from drain to
+        // re-insert (lock order stays free -> retired), so no reader can observe
+        // the emptied window. Normally a no-op: geometry is configured at startup,
+        // before anything has been retired.
+        let mut shards = self.lock_all_retired(RetiredLockSite::Setup);
+        let mut retired_runs = Vec::new();
+        let mut retired_age = Vec::new();
+        for shard in &mut shards {
+            retired_runs.extend(std::mem::take(&mut shard.set));
+            retired_age.extend(std::mem::take(&mut shard.age));
+        }
         self.regions.publish_layout(planned);
         guard.layout = planned;
         for region in &mut guard.guards {
@@ -1812,6 +2099,19 @@ impl SpaceAllocator {
         for run in runs {
             guard.insert_classified(run);
         }
+        retired_runs.sort_unstable_by_key(|extent| extent.start.0);
+        for run in retired_runs {
+            let (lo, hi) = planned.span(run);
+            for idx in lo..=hi {
+                if let Some(part) = planned.clip(idx, run) {
+                    shards[idx].reinsert(part);
+                }
+            }
+        }
+        for (start, run) in retired_age {
+            shards[planned.of(start)].age.insert(start, run);
+        }
+        drop(shards);
         drop(guard);
         self.geometry_cache.store(
             requested.map_or(0, |(stripe, phase)| {
@@ -2581,28 +2881,12 @@ impl SpaceAllocator {
                 )));
             }
 
-            // Lock order: retired_extents (set) BEFORE retired_age. Free held across
-            // (outermost) so the overlap check can't race a concurrent free.
-            let mut retired = self.lock_retired(RetiredLockSite::RetireOne);
+            // Lock order: free region span (outermost, held across) -> retired
+            // shard span, so the overlap check can't race a concurrent free.
+            let mut retired = self.lock_retired_span(RetiredLockSite::RetireOne, extent);
             retired.charge_items(1);
-            // Sub-ranges of `extent` not already covered by the coalesced set = the
-            // genuinely-new blocks. Computed BEFORE coalescing so already-retired
-            // sub-ranges keep their original age (never refreshed).
-            let gaps = Self::uncovered_subranges(&retired, extent);
-            let newly: u32 = gaps.iter().map(|g| g.count).sum();
-            Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+            let newly = retired.retire(extent, now);
             if newly > 0 {
-                let mut age = self.lock_age(RetiredLockSite::RetireOne);
-                age.charge_items(1);
-                for g in gaps {
-                    age.insert(
-                        g.start.0,
-                        RetiredRun {
-                            count: g.count,
-                            retired_at: now,
-                        },
-                    );
-                }
                 // Keep the O(1) depth gauge in lockstep with the set (only the
                 // genuinely-new blocks; idempotent re-retire adds nothing).
                 self.retired_blocks
@@ -2647,8 +2931,10 @@ impl SpaceAllocator {
             let current_alloc = self.allocated_blocks.load(Ordering::Relaxed);
             let mut chunk_newly: u64 = 0;
             let mut chunk_retired: Vec<Extent> = Vec::new();
-            // Lock order: free (outermost) → retired → retired_age, matching
-            // `retire_extent_at`. Released and retaken every
+            // Lock order: free region span (outermost) → retired shard span,
+            // matching `retire_extent_at` — and the two spans are the SAME index
+            // range, which is what keeps the free-overlap check atomic with the
+            // retired insert without any global lock. Released and retaken every
             // FREE_LOCK_HOLD_EXTENTS *and* at every region boundary, so the hold
             // only ever covers regions this group actually touches; every check
             // below is per-extent independent, so where the hold boundaries fall
@@ -2658,10 +2944,8 @@ impl SpaceAllocator {
             for (lo, hi, hold) in region_holds(layout, chunk, free_lock_hold_extents()) {
                 let pools = self.lock_span_range(FreeLockSite::RetireBatch, lo, hi);
                 pools.charge_items(hold.len() as u64);
-                let mut retired = self.lock_retired(RetiredLockSite::RetireBatch);
+                let mut retired = self.lock_retired_span_range(RetiredLockSite::RetireBatch, lo, hi);
                 retired.charge_items(hold.len() as u64);
-                let mut age = self.lock_age(RetiredLockSite::RetireBatch);
-                age.charge_items(hold.len() as u64);
                 for &extent in hold {
                     if self
                         .validate_extent_shape(extent, "retire_extents_batch")
@@ -2680,24 +2964,8 @@ impl SpaceAllocator {
                         failed.push(extent);
                         continue;
                     }
-                    // Genuinely-new sub-ranges (computed before coalescing so
-                    // already-retired sub-ranges keep their original age).
-                    let gaps = Self::uncovered_subranges(&retired, extent);
-                    let newly: u32 = gaps.iter().map(|g| g.count).sum();
-                    Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+                    chunk_newly += u64::from(retired.retire(extent, now));
                     chunk_retired.push(extent);
-                    if newly > 0 {
-                        for g in gaps {
-                            age.insert(
-                                g.start.0,
-                                RetiredRun {
-                                    count: g.count,
-                                    retired_at: now,
-                                },
-                            );
-                        }
-                        chunk_newly += u64::from(newly);
-                    }
                 }
             }
             // Diagnostic trace outside the lock section (see retire_extent_at).
@@ -2761,7 +3029,7 @@ impl SpaceAllocator {
             for (lo, hi, hold) in region_holds(layout, chunk, free_lock_hold_extents()) {
                 let mut pools = self.lock_span_range(FreeLockSite::FreeBatch, lo, hi);
                 pools.charge_items(hold.len() as u64);
-                let retired = self.lock_retired(RetiredLockSite::FreeBatch);
+                let retired = self.lock_retired_span_range(RetiredLockSite::FreeBatch, lo, hi);
                 retired.charge_items(hold.len() as u64);
                 for &extent in hold {
                     if self
@@ -2776,7 +3044,7 @@ impl SpaceAllocator {
                         || Self::sorted_extents_overlap(&lane_exts, extent);
                     if in_lane
                         || pools.overlapping_free(extent).is_some()
-                        || Self::overlapping_extent(&retired, extent).is_some()
+                        || retired.overlapping(extent).is_some()
                     {
                         failed.push(extent);
                         continue;
@@ -2862,24 +3130,65 @@ impl SpaceAllocator {
         if limit == 0 {
             return Vec::new();
         }
-        self.lock_retired(RetiredLockSite::Candidates)
-            .iter()
-            .take(limit)
-            .copied()
-            .collect()
+        // Shard-by-shard ascending, one lock at a time: this is an audit /
+        // accounting snapshot, so a torn read across shards is acceptable and
+        // strictly preferable to holding every shard at once.
+        let mut out = Vec::new();
+        for idx in 0..self.retired.count() {
+            let shard = self.lock_retired_shard(RetiredLockSite::Candidates, idx);
+            out.extend(shard.set.iter().take(limit - out.len()).copied());
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
     }
 
     /// Reclaim candidates: retired sub-ranges that have settled ≥ `grace` (i.e.
-    /// are NOT covered by a young `retired_age` entry), emitted as coalesced
-    /// extents (fat where retires were contiguous → throughput) up to a
-    /// `limit_blocks` BLOCK budget (NOT an extent count — a per-extent cap would
-    /// collapse throughput under fragmented retires). Prunes aged-out entries
-    /// from the age log as it scans (the time-window that bounds its memory).
-    /// Every emitted block individually satisfies the grace, so freeing it
-    /// honors the settle-window safety invariant.
+    /// are NOT covered by a young age entry), emitted as coalesced extents (fat
+    /// where retires were contiguous → throughput) up to a `limit_blocks` BLOCK
+    /// budget (NOT an extent count — a per-extent cap would collapse throughput
+    /// under fragmented retires). Prunes aged-out entries from the age log as it
+    /// scans (the time-window that bounds its memory). Every emitted block
+    /// individually satisfies the grace, so freeing it honors the settle-window
+    /// safety invariant.
+    ///
     /// Returns `(candidates, deferred_blocks)` where `deferred_blocks` is the
     /// total retired-but-still-young block count (held back by the grace) — the
     /// diagnostic that, vs rc-rejected, localized the re-aging bottleneck.
+    ///
+    /// ## The hold is SLICED (2026-07-30)
+    ///
+    /// This used to run under ONE acquisition of the global retired+age locks for
+    /// its whole duration, box-measured at **1.169 s per GC cycle, 41 cycles in a
+    /// 480 s window = 10% of wall with the lock fully closed**. Every cleanup
+    /// thread that had already taken a free-pool region lock piled up behind it
+    /// still holding that region — which is how a selector ended up as the
+    /// `writer_refill wait_max = 1358 ms` the flush writers saw.
+    ///
+    /// So it now works one shard at a time and releases the shard lock every
+    /// [`AGED_SCAN_SLICE`] entries, resuming from a PBA cursor. Two passes per
+    /// shard, in this order:
+    ///
+    /// 1. **prune** — always runs to the end of the shard's age log (so the log
+    ///    stays time-windowed and `deferred_blocks` stays a true total), summing
+    ///    the still-young blocks;
+    /// 2. **emit** — walks the retired set until the block budget is spent.
+    ///
+    /// Prune-before-emit per shard is REQUIRED: [`Self::aged_subranges`] treats
+    /// every present age entry as young without re-reading its timestamp.
+    ///
+    /// Releasing the lock mid-walk is safe without new proof. A concurrent retire
+    /// or reclaim can only make the walk **skip** blocks (picked up next cycle) or
+    /// **re-emit** one (`reclaim_retired_extent` / Phase A re-validate containment
+    /// under the shard lock and fail closed, so a stale candidate is a no-op).
+    /// `deferred_blocks` becomes a slightly torn total, which it already was
+    /// relative to the retire path — it feeds a metric, never a free decision.
+    ///
+    /// ⚠ Sliced, not asymptotically cheaper: the prune is still O(age entries) per
+    /// cycle, just never in one hold. If |age| grows enough for that CPU cost to
+    /// matter on its own (box: ~1.6 M entries ≈ 152 ms/cycle ≈ 1.3% of wall), the
+    /// next step is a time-ordered index so pruning becomes O(expiring).
     pub fn aged_candidates(
         &self,
         limit_blocks: usize,
@@ -2889,29 +3198,70 @@ impl SpaceAllocator {
         if limit_blocks == 0 {
             return (Vec::new(), 0);
         }
-        let retired = self.lock_retired(RetiredLockSite::AgedCandidates);
-        let mut age = self.lock_age(RetiredLockSite::AgedCandidates);
-        // Time-window: drop entries that have aged past the grace — they no
-        // longer gate anything (their covering retired extent is fully eligible).
-        age.retain(|_, run| now.duration_since(run.retired_at) < grace);
-        let deferred_blocks: u64 = age.values().map(|run| run.count as u64).sum();
-
+        let layout = self.retired_layout();
         let mut out = Vec::new();
         let mut emitted: usize = 0;
-        for ext in retired.iter() {
-            if emitted >= limit_blocks {
-                break;
+        let mut deferred_blocks: u64 = 0;
+        for idx in 0..self.retired.count() {
+            // Pass 1 — prune this shard's age log, slice by slice.
+            let mut cursor = layout.start(idx);
+            loop {
+                let mut shard = self.lock_retired_shard(RetiredLockSite::AgedCandidates, idx);
+                let mut expired: Vec<u64> = Vec::new();
+                let mut last: Option<u64> = None;
+                let mut seen = 0usize;
+                for (&start, run) in shard.age.range(cursor..) {
+                    if now.duration_since(run.retired_at) >= grace {
+                        expired.push(start);
+                    } else {
+                        deferred_blocks += u64::from(run.count);
+                    }
+                    last = Some(start);
+                    seen += 1;
+                    if seen >= AGED_SCAN_SLICE {
+                        break;
+                    }
+                }
+                shard.charge_items(seen as u64);
+                for start in expired {
+                    shard.age.remove(&start);
+                }
+                match last {
+                    Some(start) if seen >= AGED_SCAN_SLICE => cursor = start + 1,
+                    _ => break,
+                }
             }
-            for aged in Self::aged_subranges(&age, *ext) {
-                if emitted >= limit_blocks {
-                    break;
+
+            // Pass 2 — emit aged sub-ranges until the block budget is spent.
+            let mut cursor = layout.start(idx);
+            while emitted < limit_blocks {
+                let shard = self.lock_retired_shard(RetiredLockSite::AgedCandidates, idx);
+                let mut seen = 0usize;
+                let mut next: Option<u64> = None;
+                for ext in shard.set.range(Extent::single(Pba(cursor))..) {
+                    if emitted >= limit_blocks || seen >= AGED_SCAN_SLICE {
+                        break;
+                    }
+                    for aged in Self::aged_subranges(&shard.age, *ext) {
+                        if emitted >= limit_blocks {
+                            break;
+                        }
+                        let take = (aged.count as usize).min(limit_blocks - emitted);
+                        if take == 0 {
+                            continue;
+                        }
+                        out.push(Extent::new(aged.start, take as u32));
+                        emitted += take;
+                    }
+                    next = Some(ext.end_pba().0);
+                    seen += 1;
                 }
-                let take = (aged.count as usize).min(limit_blocks - emitted);
-                if take == 0 {
-                    continue;
+                shard.charge_items(seen as u64);
+                match next {
+                    // Only re-acquire if the slice cap (not the budget) stopped us.
+                    Some(end) if seen >= AGED_SCAN_SLICE && emitted < limit_blocks => cursor = end,
+                    _ => break,
                 }
-                out.push(Extent::new(aged.start, take as u32));
-                emitted += take;
             }
         }
         (out, deferred_blocks)
@@ -2968,8 +3318,10 @@ impl SpaceAllocator {
     }
 
     pub fn is_retired(&self, pba: Pba) -> bool {
-        let retired = self.lock_retired(RetiredLockSite::IsRetired);
-        Self::covering_extent(&retired, pba).is_some()
+        let idx = self.retired_layout().of(pba.0);
+        self.lock_retired_shard(RetiredLockSite::IsRetired, idx)
+            .covering(pba)
+            .is_some()
     }
 
     /// O(1) total of retired blocks (advisory gauge). Maintained in lockstep
@@ -2984,9 +3336,11 @@ impl SpaceAllocator {
     /// this; tests assert the two agree.
     #[cfg(test)]
     pub fn retired_block_count_exact(&self) -> u64 {
-        self.lock_retired(RetiredLockSite::Audit)
-            .iter()
-            .map(|extent| extent.count as u64)
+        (0..self.retired.count())
+            .map(|idx| {
+                self.lock_retired_shard(RetiredLockSite::Audit, idx)
+                    .blocks()
+            })
             .sum()
     }
 
@@ -2998,33 +3352,22 @@ impl SpaceAllocator {
         self.validate_extent_shape(extent, "reclaim_retired_extent")?;
 
         {
-            let mut retired = self.lock_retired(RetiredLockSite::ReclaimOne);
+            let mut retired = self.lock_retired_span(RetiredLockSite::ReclaimOne, extent);
             retired.charge_items(1);
             // The candidate must be fully contained in one coalesced retired
-            // extent. Fail closed (Ok(false)) if it is no longer (fully) retired
-            // — a raced reclaim / re-alloc — never free a span we didn't verify.
-            let cover = match Self::covering_extent(&retired, extent.start) {
-                Some(c) if c.end_pba().0 >= extent.end_pba().0 => c,
-                _ => return Ok(false),
-            };
-            retired.remove(&cover);
-            if extent.start.0 > cover.start.0 {
-                retired.insert(Extent::new(
-                    cover.start,
-                    (extent.start.0 - cover.start.0) as u32,
-                ));
+            // extent per shard it spans. Fail closed (Ok(false)) if it is no
+            // longer (fully) retired — a raced reclaim / re-alloc — never free a
+            // span we didn't verify. ALL-OR-NOTHING here (the batch path frees
+            // per verified part instead): this keeps the single path's contract
+            // byte-identical to the pre-sharding one.
+            let taken = retired.take_for_reclaim(extent);
+            let covered: u32 = taken.iter().map(|t| t.count).sum();
+            if covered != extent.count {
+                for part in taken {
+                    retired.reinsert(part);
+                }
+                return Ok(false);
             }
-            if cover.end_pba().0 > extent.end_pba().0 {
-                retired.insert(Extent::new(
-                    extent.end_pba(),
-                    (cover.end_pba().0 - extent.end_pba().0) as u32,
-                ));
-            }
-            // Defensive: drop any young age entries inside the reclaimed range
-            // (aged candidates are carved between young entries, so normally none).
-            let mut age = self.lock_age(RetiredLockSite::ReclaimOne);
-            age.charge_items(1);
-            Self::purge_age_range(&mut age, extent);
         }
 
         let result = (|| -> OnyxResult<()> {
@@ -3060,9 +3403,9 @@ impl SpaceAllocator {
             // (plain insert would leave adjacent fragments). The age log is NOT
             // touched: `extent` was already aged, so it stays immediately
             // eligible next cycle — no re-aging on the error path.
-            let mut retired = self.lock_retired(RetiredLockSite::ReclaimReinsert);
+            let mut retired = self.lock_retired_span(RetiredLockSite::ReclaimReinsert, extent);
             retired.charge_items(1);
-            Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+            retired.reinsert(extent);
         }
         if result.is_ok() {
             // `extent` left the retired set for the free list — decrement the
@@ -3125,15 +3468,17 @@ impl SpaceAllocator {
                 self.hazards.wait_extent_clear(extent.start, extent.count);
             }
 
-            // Phase A — `retired` (+ `retired_age`) lock ONCE: validate
-            // containment, split out the covering coalesced extent, keep the
-            // remainders retired. Collect the validated extents for Phase B.
+            // Phase A — retired shards ONCE per group: validate containment, split
+            // out the covering coalesced extent, keep the remainders retired.
+            // Collect the validated extents for Phase B. Grouped by shard span
+            // (`region_holds`) rather than by count, so a sharded pool takes one
+            // hold per shard instead of one per `free_lock_hold_extents()`; with
+            // one shard it is exactly `chunk.chunks(cap)` as before.
+            let layout = self.retired_layout();
             let mut removed: Vec<Extent> = Vec::with_capacity(chunk.len());
-            for hold in chunk.chunks(free_lock_hold_extents()) {
-                let mut retired = self.lock_retired(RetiredLockSite::ReclaimPhaseA);
+            for (lo, hi, hold) in region_holds(layout, chunk, free_lock_hold_extents()) {
+                let mut retired = self.lock_retired_span_range(RetiredLockSite::ReclaimPhaseA, lo, hi);
                 retired.charge_items(hold.len() as u64);
-                let mut age = self.lock_age(RetiredLockSite::ReclaimPhaseA);
-                age.charge_items(hold.len() as u64);
                 for &extent in hold {
                     if self
                         .validate_extent_shape(extent, "reclaim_retired_extents_batch")
@@ -3141,26 +3486,10 @@ impl SpaceAllocator {
                     {
                         continue; // defensive: GC candidates are always well-formed
                     }
-                    // Fail closed if no longer fully retired (raced reclaim/realloc).
-                    let cover = match Self::covering_extent(&retired, extent.start) {
-                        Some(c) if c.end_pba().0 >= extent.end_pba().0 => c,
-                        _ => continue,
-                    };
-                    retired.remove(&cover);
-                    if extent.start.0 > cover.start.0 {
-                        retired.insert(Extent::new(
-                            cover.start,
-                            (extent.start.0 - cover.start.0) as u32,
-                        ));
-                    }
-                    if cover.end_pba().0 > extent.end_pba().0 {
-                        retired.insert(Extent::new(
-                            extent.end_pba(),
-                            (cover.end_pba().0 - extent.end_pba().0) as u32,
-                        ));
-                    }
-                    Self::purge_age_range(&mut age, extent);
-                    removed.push(extent);
+                    // Fail closed per shard part if no longer fully retired
+                    // (raced reclaim/realloc); Phase B then frees exactly the
+                    // parts that were verified here.
+                    removed.extend(retired.take_for_reclaim(extent));
                 }
             }
 
@@ -3176,7 +3505,6 @@ impl SpaceAllocator {
             // under ONE acquisition of ONE global lock. Now bounded to
             // FREE_LOCK_HOLD_EXTENTS per hold AND confined to the regions the
             // group actually touches — same total work, same order.
-            let layout = self.regions.layout();
             for (lo, hi, hold) in region_holds(layout, &removed, free_lock_hold_extents()) {
                 let mut pools = self.lock_span_range(FreeLockSite::ReclaimBatch, lo, hi);
                 pools.charge_items(hold.len() as u64);
@@ -3222,10 +3550,13 @@ impl SpaceAllocator {
             // Re-insert conflicts: they stay retired (coalescing back with the
             // remainders), age untouched — matches the single path's error path.
             if !conflicts.is_empty() {
-                let mut retired = self.lock_retired(RetiredLockSite::ReclaimReinsert);
-                retired.charge_items(conflicts.len() as u64);
-                for extent in conflicts {
-                    Self::coalesce_and_insert_any_overlap(&mut retired, extent);
+                for (lo, hi, hold) in region_holds(layout, &conflicts, free_lock_hold_extents()) {
+                    let mut retired =
+                        self.lock_retired_span_range(RetiredLockSite::ReclaimReinsert, lo, hi);
+                    retired.charge_items(hold.len() as u64);
+                    for &extent in hold {
+                        retired.reinsert(extent);
+                    }
                 }
             }
         }
@@ -3661,21 +3992,8 @@ impl SpaceAllocator {
     /// lock order one-directional). Retired extents never overlap each other
     /// (coalesced set), so summing clamped intersections is exact.
     pub(crate) fn retired_overlap_blocks(&self, range: Extent) -> u64 {
-        let s = range.start.0;
-        let e = range.end_pba().0;
-        let retired = self.lock_retired(RetiredLockSite::OverlapBlocks);
-        let mut covered = 0u64;
-        // The last extent starting at/before `s` may reach into the range.
-        if let Some(prev) = retired.range(..=Extent::single(range.start)).next_back() {
-            covered += prev.end_pba().0.min(e).saturating_sub(s);
-        }
-        for ext in retired.range(Extent::single(Pba(s + 1))..) {
-            if ext.start.0 >= e {
-                break;
-            }
-            covered += ext.end_pba().0.min(e) - ext.start.0;
-        }
-        covered
+        self.lock_retired_span(RetiredLockSite::OverlapBlocks, range)
+            .overlap_blocks(range)
     }
 
     /// Number of distinct runs in the global free set. Test-only: the stripe
@@ -4246,8 +4564,8 @@ impl SpaceAllocator {
     }
 
     fn overlapping_retired_extent(&self, extent: Extent) -> Option<Extent> {
-        let retired = self.lock_retired(RetiredLockSite::FreeOne);
-        Self::overlapping_extent(&retired, extent)
+        self.lock_retired_span(RetiredLockSite::FreeOne, extent)
+            .overlapping(extent)
     }
 }
 
@@ -4326,11 +4644,11 @@ mod free_pool_policy_tests {
         }
     }
 
-    /// The `retired_extents` / `retired_age` attribution has to charge the
-    /// acquiring path too, and — the whole point — the retire BATCH path must
-    /// record its `retired` acquisition as nested INSIDE its region hold, with an
-    /// `items` count, so a box read can split "region hold" into "waited for the
-    /// global retired set" vs "did per-extent work".
+    /// The retired-shard attribution has to charge the acquiring path too, and —
+    /// the whole point — the retire BATCH path must record its `retired`
+    /// acquisition as nested INSIDE its region hold, with an `items` count, so a
+    /// box read can split "region hold" into "waited for the retired set" vs "did
+    /// per-extent work".
     #[test]
     fn retired_lock_attribution_charges_the_acquiring_site() {
         let a = allocator(4096, 2);
@@ -4342,15 +4660,13 @@ mod free_pool_policy_tests {
         };
         let r0 = a.retired_lock_stats();
         assert_eq!(r0.len(), RETIRED_LOCK_SITES);
-        assert_eq!(a.age_lock_stats().len(), RETIRED_LOCK_SITES);
 
-        // Single retire → retire_one on both the set and the age log.
+        // Single retire → retire_one.
         let one = a.allocate_extent(1).unwrap();
         a.retire_extent(one).unwrap();
         let r1 = a.retired_lock_stats();
         assert!(find(&r1, "retire_one").acquisitions > 0);
         assert_eq!(find(&r1, "retire_one").items, 1);
-        assert!(find(&a.age_lock_stats(), "retire_one").acquisitions > 0);
         assert_eq!(find(&r1, "retire_batch").acquisitions, 0);
 
         // Batch retire → retire_batch, and its `items` must equal the extents
@@ -5005,16 +5321,19 @@ mod age_tests {
                 let a = SpaceAllocator::new(dev, 0);
                 let young_front = 400_000u64.min(n);
                 {
-                    let mut retired = a.retired_extents.lock().unwrap();
-                    let mut age = a.retired_age.lock().unwrap();
+                    // Direct-insert into the owning shard (the invariant every
+                    // containment query depends on), bypassing the retire path.
+                    let layout = a.retired_layout();
+                    let mut shards = a.lock_all_retired(RetiredLockSite::Setup);
                     for i in 0..n {
                         let pba = RESERVED_BLOCKS + 2 * i; // stride 2 → N separate extents (max frag)
-                        retired.insert(Extent::new(Pba(pba), 1));
+                        let shard = &mut shards[layout.of(pba)];
+                        shard.set.insert(Extent::new(Pba(pba), 1));
                         match mode {
                             "aged_only" => {}
                             "front_young" => {
                                 if i < young_front {
-                                    age.insert(
+                                    shard.age.insert(
                                         pba,
                                         RetiredRun {
                                             count: 1,
@@ -5025,7 +5344,7 @@ mod age_tests {
                             }
                             "all_in_age" => {
                                 let retired_at = if i < young_front { now } else { base };
-                                age.insert(
+                                shard.age.insert(
                                     pba,
                                     RetiredRun {
                                         count: 1,
@@ -6574,11 +6893,9 @@ pub(crate) mod aged_pool_bench {
 
             let free = allocator.free_lock_stats();
             let ret = allocator.retired_lock_stats();
-            let age = allocator.age_lock_stats();
-            let (fr, rr, ar) = (
+            let (fr, rr) = (
                 site_of(&free, "retire_batch"),
                 site_of(&ret, "retire_batch"),
-                site_of(&age, "retire_batch"),
             );
             let ret_busy: u64 = ret.iter().map(|s| s.hold_ns).sum();
             println!(
@@ -6616,8 +6933,6 @@ pub(crate) mod aged_pool_bench {
                 ("region hold", fr.hold_ns as f64),
                 ("  retired wait", rr.wait_ns as f64),
                 ("  retired hold", rr.hold_ns as f64),
-                ("    age wait", ar.wait_ns as f64),
-                ("    age hold", ar.hold_ns as f64),
                 ("  residual (region-lock-only work)", residual),
             ] {
                 println!(
@@ -6719,6 +7034,59 @@ mod region_tests {
                 );
             }
         }
+    }
+
+    /// Retired extents and age entries a shard currently holds.
+    fn shard_contents(
+        allocator: &SpaceAllocator,
+        idx: usize,
+    ) -> (Vec<Extent>, Vec<(u64, u32)>) {
+        let shard = allocator.lock_retired_shard(RetiredLockSite::Audit, idx);
+        (
+            shard.set.iter().copied().collect(),
+            shard.age.iter().map(|(&k, run)| (k, run.count)).collect(),
+        )
+    }
+
+    /// THE retired-side invariant, the mirror of [`assert_region_containment`]: no
+    /// shard holds an address it does not own. A violation silently breaks every
+    /// containment query, because `lock_retired_span` would not even take the lock
+    /// of the shard actually holding the extent — the double-ownership class that
+    /// produced this project's two premature-free P0s.
+    fn assert_retired_containment(allocator: &SpaceAllocator) {
+        let layout = layout_of(allocator);
+        for idx in 0..allocator.retired.count() {
+            let (lo, hi) = (layout.start(idx), layout.end(idx));
+            let (set, age) = shard_contents(allocator, idx);
+            for extent in set {
+                assert!(
+                    extent.start.0 >= lo && extent.end_pba().0 <= hi,
+                    "retired shard {idx} [{lo},{hi}) holds out-of-range {extent:?}"
+                );
+            }
+            for (start, count) in age {
+                assert!(
+                    start >= lo && start + u64::from(count) <= hi,
+                    "age shard {idx} [{lo},{hi}) holds out-of-range run {start}+{count}"
+                );
+            }
+        }
+    }
+
+    /// The allocator's own retired set must cover exactly the blocks the caller
+    /// believes it retired — sharding must not lose or duplicate one.
+    fn assert_retired_matches(allocator: &SpaceAllocator, expected: &[Extent]) {
+        let mut want: Vec<u64> = expected
+            .iter()
+            .flat_map(|e| (0..u64::from(e.count)).map(move |o| e.start.0 + o))
+            .collect();
+        want.sort_unstable();
+        let mut got: Vec<u64> = (0..allocator.retired.count())
+            .flat_map(|idx| shard_contents(allocator, idx).0)
+            .flat_map(|e| (0..u64::from(e.count)).map(move |o| e.start.0 + o))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, want, "retired coverage diverged from the expected set");
     }
 
     /// Every usable block is in EXACTLY ONE state: free in a region's pools,
@@ -7182,11 +7550,15 @@ mod region_tests {
             }
             if round % 250 == 0 {
                 assert_region_containment(&allocator);
+                assert_retired_containment(&allocator);
+                assert_retired_matches(&allocator, &retired);
                 assert_block_ownership(&allocator, &live, &retired);
             }
         }
 
         assert_region_containment(&allocator);
+        assert_retired_containment(&allocator);
+        assert_retired_matches(&allocator, &retired);
         assert_block_ownership(&allocator, &live, &retired);
         // Unwind fully: everything must be reclaimable back to a whole free pool.
         let running = AtomicBool::new(true);
@@ -7251,6 +7623,209 @@ mod region_tests {
         assert_eq!(
             single.contiguity_stats().free_blocks_in_set,
             many.contiguity_stats().free_blocks_in_set
+        );
+    }
+
+    /// The retired set + age log sharded must answer EXACTLY what one shard
+    /// answers, over a mixed retire/reclaim/free/query sequence.
+    ///
+    /// This is the retired-side `region_pools_equal_single_pool`: the only thing
+    /// sharding is allowed to change is which mutex an address lives behind, never
+    /// which blocks are retired, which are reclaimable, or what a query returns.
+    /// A divergence here is a double-ownership bug, not a performance regression.
+    #[test]
+    fn retired_shards_equal_single_shard() {
+        const GRACE: Duration = Duration::from_secs(10);
+        let single = SpaceAllocator::new_with_exact_regions(DEVICE_BLOCKS * BLOCK_SIZE as u64, 0, 1);
+        let many = SpaceAllocator::new_with_exact_regions(DEVICE_BLOCKS * BLOCK_SIZE as u64, 0, 4);
+        single.set_stripe_geometry(STRIPE, PHASE);
+        many.set_stripe_geometry(STRIPE, PHASE);
+        assert_eq!(single.retired.count(), 1);
+        assert!(many.retired.count() > 1);
+
+        let t0 = Instant::now();
+        let mut rng = StdRng::seed_from_u64(0x4e71_2ed0);
+        // Build the SAME live set on both by allocating single blocks — the one
+        // request width that is byte-identical sharded or not (multi-block
+        // first-fit is deliberately allowed to differ at a region seam, see
+        // `region_walk_picks_the_lowest_address_run_that_fits`), then grouping
+        // consecutive PBAs into multi-block extents so boundary-straddling
+        // extents really do occur.
+        let mut pbas: Vec<u64> = Vec::new();
+        for _ in 0..3_000 {
+            match (single.allocate_one(), many.allocate_one()) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "single-block allocation diverged");
+                    pbas.push(a.0);
+                }
+                (Err(_), Err(_)) => break,
+                (a, b) => panic!("divergent allocation: {a:?} vs {b:?}"),
+            }
+        }
+        pbas.sort_unstable();
+        let mut live: Vec<Extent> = Vec::new();
+        let mut i = 0;
+        while i < pbas.len() {
+            let want = rng.gen_range(1..=3 * STRIPE) as usize;
+            let mut n = 1;
+            while n < want && i + n < pbas.len() && pbas[i + n] == pbas[i + n - 1] + 1 {
+                n += 1;
+            }
+            live.push(Extent::new(Pba(pbas[i]), n as u32));
+            i += n;
+        }
+        let mut retired: Vec<Extent> = Vec::new();
+
+        for round in 0..4_000usize {
+            // Same op, same extent, on both allocators.
+            match rng.gen_range(0..100u32) {
+                0..=44 => {
+                    if !live.is_empty() {
+                        let extent = live.swap_remove(rng.gen_range(0..live.len()));
+                        let at = t0 + Duration::from_millis(round as u64);
+                        assert_eq!(
+                            single.retire_extent_at(extent, at).unwrap(),
+                            many.retire_extent_at(extent, at).unwrap(),
+                            "newly-retired count diverged for {extent:?}"
+                        );
+                        retired.push(extent);
+                    }
+                }
+                45..=59 => {
+                    if !live.is_empty() {
+                        let extent = live.swap_remove(rng.gen_range(0..live.len()));
+                        assert_eq!(
+                            single.free_extent(extent).is_ok(),
+                            many.free_extent(extent).is_ok(),
+                            "free outcome diverged for {extent:?}"
+                        );
+                    }
+                }
+                60..=89 => {
+                    if !retired.is_empty() {
+                        let extent = retired.swap_remove(rng.gen_range(0..retired.len()));
+                        assert_eq!(
+                            single.reclaim_retired_extent(extent).unwrap(),
+                            many.reclaim_retired_extent(extent).unwrap(),
+                            "reclaim outcome diverged for {extent:?}"
+                        );
+                    }
+                }
+                _ => {
+                    // Selector: the emitted candidate SET (not the extent
+                    // boundaries — sharding legitimately splits at seams) plus the
+                    // deferred total must match.
+                    let now = t0 + Duration::from_millis(round as u64) + GRACE;
+                    let (ca, da) = single.aged_candidates(64, GRACE, now);
+                    let (cb, db) = many.aged_candidates(64, GRACE, now);
+                    assert_eq!(da, db, "deferred_blocks diverged");
+                    assert_eq!(
+                        blocks_of(&ca),
+                        blocks_of(&cb),
+                        "aged candidate coverage diverged"
+                    );
+                }
+            }
+            if round % 200 == 0 {
+                assert_retired_containment(&many);
+                assert_eq!(
+                    retired_blocks_of(&single),
+                    retired_blocks_of(&many),
+                    "retired coverage diverged at round {round}"
+                );
+                assert_eq!(single.retired_block_count(), many.retired_block_count());
+                assert_eq!(single.free_block_count(), many.free_block_count());
+                for extent in &live {
+                    assert_eq!(
+                        single.is_retired(extent.start),
+                        many.is_retired(extent.start)
+                    );
+                }
+            }
+        }
+        assert_retired_containment(&many);
+        assert_eq!(retired_blocks_of(&single), retired_blocks_of(&many));
+        assert_eq!(
+            single.retired_block_count_exact(),
+            many.retired_block_count_exact()
+        );
+    }
+
+    fn blocks_of(extents: &[Extent]) -> Vec<u64> {
+        let mut out: Vec<u64> = extents
+            .iter()
+            .flat_map(|e| (0..u64::from(e.count)).map(move |o| e.start.0 + o))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn retired_blocks_of(allocator: &SpaceAllocator) -> Vec<u64> {
+        let all: Vec<Extent> = (0..allocator.retired.count())
+            .flat_map(|idx| shard_contents(allocator, idx).0)
+            .collect();
+        blocks_of(&all)
+    }
+
+    /// `aged_candidates` releases its shard lock every [`AGED_SCAN_SLICE`] entries
+    /// and resumes from a PBA cursor. The resume must be exact: a retired set and
+    /// an age log both several slices deep have to produce the same answer a
+    /// single-hold walk would, with every expired age entry pruned.
+    ///
+    /// This is the correctness half of the fix for the box-measured 1.169 s
+    /// per-cycle monopoly on the retired lock.
+    #[test]
+    fn aged_candidates_resumes_across_slices() {
+        const GRACE: Duration = Duration::from_secs(10);
+        // Several slices' worth of single-block retired extents, plus enough age
+        // entries to force the prune pass to slice too.
+        let n = (2 * AGED_SCAN_SLICE + 37) as u64;
+        let young_from = n - 500;
+        let dev = (2 * n + RESERVED_BLOCKS + 64) * BLOCK_SIZE as u64;
+        let a = SpaceAllocator::new_with_exact_regions(dev, 0, 4);
+        let base = Instant::now();
+        let now = base + Duration::from_secs(100);
+        {
+            let layout = a.retired_layout();
+            let mut shards = a.lock_all_retired(RetiredLockSite::Setup);
+            for i in 0..n {
+                let pba = RESERVED_BLOCKS + 2 * i; // stride 2 → n separate extents
+                let shard = &mut shards[layout.of(pba)];
+                shard.set.insert(Extent::single(Pba(pba)));
+                // Every block gets an age entry; the tail is still young, so it
+                // must be withheld and counted as deferred, and the rest must be
+                // pruned by the sliced prune pass.
+                shard.age.insert(
+                    pba,
+                    RetiredRun {
+                        count: 1,
+                        retired_at: if i >= young_from { now } else { base },
+                    },
+                );
+            }
+        }
+        a.allocated_blocks.store(2 * n, Ordering::Relaxed);
+        a.retired_blocks.store(n, Ordering::Relaxed);
+
+        // Budget above the aged population: everything aged must come out, in
+        // ascending address order, and nothing young may.
+        let (cands, deferred) = a.aged_candidates(4 * AGED_SCAN_SLICE, GRACE, now);
+        assert_eq!(deferred, n - young_from, "young blocks must be deferred");
+        let got = blocks_of(&cands);
+        let want: Vec<u64> = (0..young_from).map(|i| RESERVED_BLOCKS + 2 * i).collect();
+        assert_eq!(got, want, "sliced walk lost or reordered candidates");
+        // The prune pass must have run to the END of every shard's age log, not
+        // just as far as the emit budget reached.
+        let left: usize = (0..a.retired.count())
+            .map(|idx| shard_contents(&a, idx).1.len())
+            .sum();
+        assert_eq!(left as u64, n - young_from, "expired age entries survived");
+
+        // A budget that stops mid-walk must emit exactly the lowest addresses.
+        let (capped, _) = a.aged_candidates(100, GRACE, now);
+        assert_eq!(
+            blocks_of(&capped),
+            (0..100u64).map(|i| RESERVED_BLOCKS + 2 * i).collect::<Vec<_>>()
         );
     }
 

@@ -58,12 +58,12 @@ if refills:
         d("allocator_supply.drains"), d("allocator_supply.drains") / W,
         d("allocator_supply.drain_blocks")))
 
-# Per-site wait/hold attribution for the three allocator locks. THE question the
+# Per-site wait/hold attribution for the two allocator locks. THE question the
 # free_pools table answers: of the writer's alloc time, how much is waiting, and
-# whose hold was it? `retired_lock`/`age_lock` answer the follow-up: the retire
-# and free batch paths take `retired_extents` INSIDE their region hold, so a wait
-# there is reported as region hold. `wait_ns`/`hold_ns`/`items` are monotonic so
-# they difference; the `_max` fields are high-water marks (reported from the LAST
+# whose hold was it? `retired_lock` answers the follow-up: the retire and free
+# batch paths take a retired shard INSIDE their region hold, so a wait there is
+# reported as region hold. `wait_ns`/`hold_ns`/`items` are monotonic so they
+# difference; the `_max` fields are high-water marks (reported from the LAST
 # sample, not differenced).
 def site_table(prefix, title):
     sites = sorted({k.split(".")[1] for k in b
@@ -115,19 +115,23 @@ if tot_hold is not None:
             d("allocator_regions.switches"), d("allocator_regions.switches") / W,
             d("allocator_regions.refill_misses")))
 
-ret_hold = site_table("retired_lock", "retired_extents lock attribution (global, NOT sharded)")
+ret_hold = site_table("retired_lock", "retired shard attribution (retired set + age log, same layout as free_lock)")
 if ret_hold is not None:
-    # One global mutex, so sum-of-holds / wall IS its busy fraction -- directly
-    # comparable to the free lock's pre-sharding 68.4%.
+    # Sharded on the same layout as the free pool, so the comparable number --
+    # "how busy is the shard a retire actually queues on" -- is the sum divided by
+    # the region count. Both are printed: the total says how much retired-side work
+    # there is, the per-shard number is what to compare against the 49.1% that one
+    # global retired mutex measured on 2026-07-30.
+    regions = max(1, b.get("allocator_regions.regions", 1))
     print("  retired lock busy %.1f%% of wall (sum of holds / %ds)" % (ret_hold / 1e9 / W * 100, W))
-age_hold = site_table("age_lock", "retired_age lock attribution (nested inside retired_extents)")
-if age_hold is not None:
-    print("  age lock busy %.1f%% of wall" % (age_hold / 1e9 / W * 100))
+    if regions > 1:
+        print("  retired lock busy %.3f%% per shard (%d shards)" % (
+            ret_hold / 1e9 / W * 100 / regions, regions))
 
 # THE discriminating ledger. `retire_extents_batch` and `free_extents_batch` hold
-# a region lock across their `retired`(+`age`) acquisition, so their region hold
-# decomposes into: wait for `retired` + hold of `retired` (which itself contains
-# the age lock) + residual = the per-extent work done under the region lock only.
+# a region lock across their retired-shard acquisition, so their region hold
+# decomposes into: wait for the shard + hold of the shard + residual = the
+# per-extent work done under the region lock only.
 #   residual dominant  -> the work itself got more expensive (colder/more sets):
 #                         fix = fewer regions / a different structure.
 #   retired wait dominant -> the region hold is just queueing behind one global
@@ -139,14 +143,10 @@ for site in ("retire_batch", "free_batch"):
         continue
     rwait = d("retired_lock.%s.wait_ns" % site)
     rhold = d("retired_lock.%s.hold_ns" % site)
-    agewait = d("age_lock.%s.wait_ns" % site)
-    ahold = d("age_lock.%s.hold_ns" % site)
     print("  -- %s nested ledger (region hold = retired wait + retired hold + residual) --" % site)
     for label, v in (("region hold", region_hold),
                      ("  retired wait", rwait),
                      ("  retired hold", rhold),
-                     ("    age wait", agewait),
-                     ("    age hold", ahold),
                      ("  residual (work under region lock only)",
                       region_hold - rwait - rhold)):
         print("  %-42s %9.2f s  %6.1f%% of region hold" % (

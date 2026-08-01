@@ -211,15 +211,14 @@ pub struct EngineStatusSnapshot {
     /// `crate::space::allocator::FreeLockSite`. Answers "who held the free lock
     /// while the writer waited", which no other metric can.
     pub free_lock: Option<Vec<crate::space::allocator::LockSiteStats>>,
-    /// Per-site `retired_extents` wait/hold attribution — see
+    /// Per-site retired-shard wait/hold attribution — see
     /// `crate::space::allocator::RetiredLockSite`. The retire/free batch paths
     /// take this lock INSIDE their region hold, so their wait here is reported
     /// as `free_lock` hold: this table is what splits a region hold into "waited
-    /// for the global retired set" vs "did work".
+    /// for the retired set" vs "did work". Sharded on the same layout as
+    /// `free_lock`, so divide the summed holds by `allocator_regions.regions` for
+    /// a per-lock busy fraction.
     pub retired_lock: Option<Vec<crate::space::allocator::LockSiteStats>>,
-    /// Per-site `retired_age` attribution, nested one level further in (the age
-    /// log is only taken under a `retired_extents` hold by the same site).
-    pub age_lock: Option<Vec<crate::space::allocator::LockSiteStats>>,
     /// Adaptive reclaim heat-map summary (None when the map is disabled or in
     /// standby). Observe-only in Stage A.
     pub heat: Option<HeatSummary>,
@@ -993,7 +992,6 @@ impl EngineStatusSnapshot {
         for (prefix, table) in [
             ("free_lock", &self.free_lock),
             ("retired_lock", &self.retired_lock),
-            ("age_lock", &self.age_lock),
         ] {
             let Some(sites) = table else { continue };
             for s in sites.iter().filter(|s| s.acquisitions > 0) {
