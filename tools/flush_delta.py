@@ -178,27 +178,104 @@ print("  -- submit split (%.1f%% of io) --" % (sub / io * 100 if io else 0))
 for k in ["ops", "io", "rollback", "padding"]:
     v = d("flush_writer_submit_split." + k)
     print("  %-16s %9.2f s  %5.1f%% of submit" % (k, v / 1e9, v / sub * 100 if sub else 0))
-print("  %-16s %9.2f s  %5.1f%% of submit   (device write inside submit.io)"
+# ⚠ Un-amortised: this counts each batch's device call ONCE while `submit` counts
+# it once per blocked request. The comparable number is in the ledger below.
+print("  %-16s %9.2f s  %5.1f%% of submit   (device wall, NOT its share of blocked time)"
       % ("of which lv3", lv3 / 1e9, lv3 / sub * 100 if sub else 0))
 
 print("== LV3 write batcher ==")
 reqs = d("lv3_batch.requests")
 batches = d("lv3_batch.window_timeouts") + d("lv3_batch.target_hits")
 wait = d("lv3_batch.wait")
-print("  producer wait   %9.2f s over %d submit_many calls" % (wait / 1e9, d("lv3_batch.wait_calls")))
-for label, key in [("enqueue", "lv3_batch.enqueue"), ("pickup", "lv3_batch.pickup"),
-                   ("window", "lv3_batch.window"), ("exec_queue", "lv3_batch.exec_queue")]:
-    v = d(key)
-    print("    %-12s %9.2f s  %5.1f%% of wait" % (label, v / 1e9, v / wait * 100 if wait else 0))
-print("    %-12s %9.2f s  %5.1f%% of wait   (device)" % ("lv3 write", lv3 / 1e9, lv3 / wait * 100 if wait else 0))
+calls = d("lv3_batch.wait_calls")
+print("  producer wait   %9.2f s over %d submit_many calls" % (wait / 1e9, calls))
 if batches:
-    print("  batches %d (%.0f/s)  requests %d (%.2f per batch)" % (batches, batches / W, reqs, reqs / batches))
+    print("  batches %d (%.0f/s)  requests %d (%.2f per batch)  device %.2f ms/batch" % (
+        batches, batches / W, reqs, reqs / batches, lv3 / batches / 1e6))
     print("  dispatch reason: TIMEOUT %d (%.1f%%)  target_hit %d" % (
         d("lv3_batch.window_timeouts"), d("lv3_batch.window_timeouts") / batches * 100,
         d("lv3_batch.target_hits")))
     print("  bytes at dispatch %.0f KiB avg (target 4096 KiB)" % (
         d("lv3_batch.bytes_at_dispatch") / batches / 1024))
-if reqs:
-    print("  per request: pickup %.0f us  window %.0f us  exec_queue %.0f us" % (
-        d("lv3_batch.pickup") / reqs / 1000, d("lv3_batch.window") / reqs / 1000,
-        d("lv3_batch.exec_queue") / reqs / 1000))
+    print("  device concurrency %.2f calls in flight (write_batch_ns / wall)" % (lv3 / 1e9 / W))
+# THE ledger, and the one place the bases must not be mixed. `pickup` / `window`
+# / `reply` are accumulated once per REQUEST; `exec_queue` / `exec_prep` and
+# `lv3_write_batch_ns` once per BATCH. Every request in a batch blocks for that
+# batch's WHOLE device call, so the device's share of blocked time is
+# `write_batch_ns * requests/batches` -- reading it raw is what made the device
+# leg look like 5.8% of `submit.io` when it is 57%. A large `residual` means the
+# blocked path grew a leg nothing measures.
+if reqs and batches and wait:
+    fan = reqs / batches
+    terms = [
+        ("pickup", d("lv3_batch.pickup"), "req"),
+        ("window", d("lv3_batch.window"), "req"),
+        ("exec_queue", d("lv3_batch.exec_queue") * fan, "batch*fan"),
+        ("exec_prep", d("lv3_batch.exec_prep") * fan, "batch*fan"),
+        # Request-weighted when the counter exists (post-2026-08-01 builds);
+        # older samples fall back to the biased-low mean*fan estimate.
+        ("device", d("lv3_batch.device") or lv3 * fan,
+         "per-req" if d("lv3_batch.device") else "batch*fan (biased low)"),
+        ("reply", d("lv3_batch.reply"), "req"),
+    ]
+    print("  -- blocked-time ledger (amortised to per-request) --")
+    accounted = 0
+    for label, v, base in terms:
+        accounted += v
+        print("    %-12s %9.2f s  %5.1f%% of wait  %8.2f ms/request   [%s]" % (
+            label, v / 1e9, v / wait * 100, v / reqs / 1e6, base))
+    print("    %-12s %9.2f s  %5.1f%% of wait  %8.2f ms/request" % (
+        "residual", (wait - accounted) / 1e9, (wait - accounted) / wait * 100,
+        (wait - accounted) / reqs / 1e6))
+    print("    %-12s %9.2f s               %8.2f ms/request   (submit.io per request)" % (
+        "TOTAL wait", wait / 1e9, wait / reqs / 1e6))
+
+# chunklet's own view of the same call. `lv3_io.write_batch_ns` is the caller's
+# wall clock around `write_many_at`; these are the phases INSIDE it, so
+# `r6_total` should track it within a percent. The discriminating questions:
+#   compute dominant  -> P/Q recompute is the cost (SIMD / strip width).
+#   lock dominant     -> stripe-bucket queueing (readers or another executor).
+#   write dominant    -> the submit waves; then `waves/call` and `sqes/wave`
+#                        say whether it is barrier count or per-IO service time.
+r6c = d("chunklet_r6_batch.calls")
+if r6c:
+    r6_total = d("chunklet_r6_batch.total_ns")
+    print("== chunklet RAID6 batched write (inside lv3 write_batch) ==")
+    print("  calls %d (%.0f/s)  ops/call %.1f  stripes/call %.1f  serial_bails %d" % (
+        r6c, r6c / W, d("chunklet_r6_batch.ops") / r6c,
+        d("chunklet_r6_batch.stripes") / r6c, d("chunklet_r6_batch.serial_bails")))
+    print("  total %.2f ms/call   (caller-side lv3 write_batch %.2f ms/call)" % (
+        r6_total / r6c / 1e6,
+        lv3 / d("lv3_io.write_batch_calls") / 1e6 if d("lv3_io.write_batch_calls") else 0))
+    acc = 0
+    for label in ["plan", "lock", "read", "compute", "write"]:
+        v = d("chunklet_r6_batch.%s_ns" % label)
+        acc += v
+        print("    %-10s %9.2f s  %5.1f%% of total  %8.3f ms/call" % (
+            label, v / 1e9, v / r6_total * 100 if r6_total else 0, v / r6c / 1e6))
+    print("    %-10s %9.2f s  %5.1f%% of total  %8.3f ms/call  (unmeasured)" % (
+        "residual", (r6_total - acc) / 1e9,
+        (r6_total - acc) / r6_total * 100 if r6_total else 0, (r6_total - acc) / r6c / 1e6))
+    print("  total_ns_max %.2f ms (high-water, last sample)" % (
+        b.get("chunklet_r6_batch.total_ns_max", 0) / 1e6))
+# Per IoClass, because LV3 (drain_data), LV2 (foreground) and metadb (drain_meta)
+# share one backend and one global set would report a wave width belonging to no
+# caller. LV3's row is the one that composes with the r6 phases above.
+print("  -- submit waves per IoClass (uring_write_chunk_ops / uring_coalesced_wait) --")
+for cls in ["drain_data", "foreground", "drain_meta", "maintenance"]:
+    pre = "chunklet_submit_" + cls
+    sc = d(pre + ".calls")
+    if not sc:
+        continue
+    waves = d(pre + ".waves")
+    sqes = d(pre + ".sqes")
+    ops = d(pre + ".ops")
+    wait = d(pre + ".wait_ns")
+    print("  %-11s calls %8d (%6.0f/s)  waves/call %5.2f  strip ops/call %6.1f  sqes/call %6.1f"
+          "  merge %5.2fx" % (
+        cls, sc, sc / W, waves / sc, ops / sc, sqes / sc, ops / sqes if sqes else 0))
+    print("  %-11s sqes/wave %5.1f  wait %7.3f ms/wave (%7.3f ms/call)  %6.1f us/sqe"
+          "  bounce %6.0f KiB/call in %6.3f ms" % (
+        "", sqes / waves if waves else 0, wait / waves / 1e6 if waves else 0, wait / sc / 1e6,
+        wait / sqes / 1e3 if sqes else 0,
+        d(pre + ".bounce_bytes") / sc / 1024, d(pre + ".bounce_ns") / sc / 1e6))

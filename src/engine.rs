@@ -2242,6 +2242,11 @@ impl OnyxEngine {
             .as_ref()
             .and_then(|pool| pool.io_execution_snapshot())
             .map(Into::into);
+        // Process-global counters, so they only mean anything when a chunklet
+        // pool is actually carrying the write path.
+        let chunklet_write_path = chunklet_pool
+            .as_ref()
+            .map(|_| onyx_chunklet::write_path_stats().into());
         Ok(EngineStatusSnapshot {
             mode: if self.zone_manager.is_some() {
                 "active".to_string()
@@ -2287,6 +2292,7 @@ impl OnyxEngine {
                 .map(|scheduler| scheduler.snapshot()),
             chunklet_pd_io_scheduler,
             chunklet_io_execution,
+            chunklet_write_path,
             metadb_memory: self.meta.memory_stats().ok(),
             buffer_shards: self
                 .buffer_pool

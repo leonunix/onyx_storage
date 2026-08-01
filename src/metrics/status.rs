@@ -119,6 +119,75 @@ pub struct ChunkletIoExecutionSnapshot {
     pub classes: Vec<ChunkletIoExecutionClassSnapshot>,
 }
 
+/// chunklet's batched-write attribution (`onyx_chunklet::write_path`). Sums over
+/// the process lifetime, so difference two `status` reads.
+///
+/// ⚠ The phases are per RAID6 BATCH while `lv3_batch`/`submit.io` on the onyx
+/// side are per blocked REQUEST. `r6_total_ns / r6_batch_calls` is the number
+/// that lines up with `lv3_io.write_batch_ns / write_batch_calls`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChunkletWritePathSnapshot {
+    pub r6_batch_calls: u64,
+    pub r6_batch_ops: u64,
+    pub r6_batch_stripes: u64,
+    pub r6_batch_serial_bails: u64,
+    pub r6_plan_ns: u64,
+    pub r6_lock_ns: u64,
+    pub r6_read_ns: u64,
+    pub r6_compute_ns: u64,
+    pub r6_write_ns: u64,
+    pub r6_total_ns: u64,
+    pub r6_total_ns_max: u64,
+    /// One entry per chunklet `IoClass`: LV2 (foreground), LV3 (drain_data),
+    /// metadb (drain_meta), maintenance. Mixing them would report a merge factor
+    /// and wave width belonging to no actual caller.
+    pub submit: Vec<ChunkletSubmitClassSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChunkletSubmitClassSnapshot {
+    pub class: String,
+    pub calls: u64,
+    pub waves: u64,
+    pub ops: u64,
+    pub sqes: u64,
+    pub bounce_bytes: u64,
+    pub bounce_ns: u64,
+    pub wait_ns: u64,
+}
+
+impl From<onyx_chunklet::WritePathStats> for ChunkletWritePathSnapshot {
+    fn from(s: onyx_chunklet::WritePathStats) -> Self {
+        Self {
+            r6_batch_calls: s.r6_batch_calls,
+            r6_batch_ops: s.r6_batch_ops,
+            r6_batch_stripes: s.r6_batch_stripes,
+            r6_batch_serial_bails: s.r6_batch_serial_bails,
+            r6_plan_ns: s.r6_plan_ns,
+            r6_lock_ns: s.r6_lock_ns,
+            r6_read_ns: s.r6_read_ns,
+            r6_compute_ns: s.r6_compute_ns,
+            r6_write_ns: s.r6_write_ns,
+            r6_total_ns: s.r6_total_ns,
+            r6_total_ns_max: s.r6_total_ns_max,
+            submit: onyx_chunklet::io::IoClass::ALL
+                .iter()
+                .zip(s.submit.iter())
+                .map(|(class, c)| ChunkletSubmitClassSnapshot {
+                    class: chunklet_io_class_label(*class).to_string(),
+                    calls: c.calls,
+                    waves: c.waves,
+                    ops: c.ops,
+                    sqes: c.sqes,
+                    bounce_bytes: c.bounce_bytes,
+                    bounce_ns: c.bounce_ns,
+                    wait_ns: c.wait_ns,
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<onyx_chunklet::io::IoExecutionSnapshot> for ChunkletIoExecutionSnapshot {
     fn from(snapshot: onyx_chunklet::io::IoExecutionSnapshot) -> Self {
         Self {
@@ -184,6 +253,8 @@ pub struct EngineStatusSnapshot {
     pub chunklet_pd_io_scheduler: Option<ChunkletPdIoSchedulerSnapshot>,
     /// Persistent chunklet io_uring execution pools and per-class work totals.
     pub chunklet_io_execution: Option<ChunkletIoExecutionSnapshot>,
+    /// Phase split inside chunklet's batched RAID6 write + its submit waves.
+    pub chunklet_write_path: Option<ChunkletWritePathSnapshot>,
     pub metadb_memory: Option<MetaMemorySnapshot>,
     pub buffer_shards: Vec<BufferShardSnapshot>,
     pub allocator_free_blocks: Option<u64>,
@@ -347,6 +418,35 @@ impl EngineStatusSnapshot {
                 queue_wait_ns,
                 execute_ns,
             );
+        }
+        if let Some(wp) = &self.chunklet_write_path {
+            // Phases must SUM to `total`: a growing residual means the batched
+            // write grew a leg nothing measures.
+            let _ = writeln!(
+                out,
+                "chunklet_r6_batch: calls={} ops={} stripes={} serial_bails={} plan_ns={} lock_ns={} read_ns={} compute_ns={} write_ns={} total_ns={} total_ns_max={}",
+                wp.r6_batch_calls,
+                wp.r6_batch_ops,
+                wp.r6_batch_stripes,
+                wp.r6_batch_serial_bails,
+                wp.r6_plan_ns,
+                wp.r6_lock_ns,
+                wp.r6_read_ns,
+                wp.r6_compute_ns,
+                wp.r6_write_ns,
+                wp.r6_total_ns,
+                wp.r6_total_ns_max,
+            );
+            // `waves/calls` = stop-and-wait barriers per batch
+            // (`uring_write_chunk_ops`); `ops/sqes` = adjacency merge factor.
+            for c in wp.submit.iter().filter(|c| c.calls > 0) {
+                let _ = writeln!(
+                    out,
+                    "chunklet_submit_{}: calls={} waves={} ops={} sqes={} bounce_bytes={} bounce_ns={} wait_ns={}",
+                    c.class, c.calls, c.waves, c.ops, c.sqes, c.bounce_bytes, c.bounce_ns,
+                    c.wait_ns,
+                );
+            }
         }
         if let Some(metadb) = &self.metadb_memory {
             let rc_checkpoint_mode = match metadb.rc_checkpoint_mode {
@@ -1201,7 +1301,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "front_write_ns: zone_submit={} zone_worker={} append_total={} append_prepare={} append_order_wait={} append_order_hold={} append_order_wait_max={} append_order_hold_max={} append_log_write={} append_wait_durable={} append_backpressure_wait={} sync_batches={} sync_flushes={} sync_batch_ns={} sync_sleep_ns={} sync_epochs={}",
+            "front_write_ns: zone_submit={} zone_worker={} append_total={} append_prepare={} append_order_wait={} append_order_hold={} append_order_wait_max={} append_order_hold_max={} append_log_write={} append_wait_durable={} append_backpressure_wait={} sync_batches={} sync_flushes={} sync_batch_ns={} sync_sleep_ns={} sync_epochs={} ckpt_skipped_epochs={}",
             self.metrics.zone_submit_write_ns,
             self.metrics.zone_worker_write_ns,
             self.metrics.buffer_append_total_ns,
@@ -1217,7 +1317,8 @@ impl EngineStatusSnapshot {
             self.metrics.buffer_sync_flushes,
             self.metrics.buffer_sync_batch_ns,
             self.metrics.buffer_sync_sleep_ns,
-            self.metrics.buffer_sync_epochs_committed
+            self.metrics.buffer_sync_epochs_committed,
+            self.metrics.buffer_lv2_checkpoint_skipped_epochs
         );
         let _ = writeln!(
             out,
@@ -1349,13 +1450,16 @@ impl EngineStatusSnapshot {
         // not the device write.
         let _ = writeln!(
             out,
-            "lv3_batch: enqueue={} wait={} wait_calls={} pickup={} window={} exec_queue={} requests={} bytes_at_dispatch={} window_timeouts={} target_hits={}",
+            "lv3_batch: enqueue={} wait={} wait_calls={} pickup={} window={} exec_queue={} exec_prep={} device={} reply={} requests={} bytes_at_dispatch={} window_timeouts={} target_hits={}",
             self.metrics.lv3_batch_enqueue_ns,
             self.metrics.lv3_batch_wait_ns,
             self.metrics.lv3_batch_wait_calls,
             self.metrics.lv3_batch_pickup_ns,
             self.metrics.lv3_batch_window_ns,
             self.metrics.lv3_batch_exec_queue_ns,
+            self.metrics.lv3_batch_exec_prep_ns,
+            self.metrics.lv3_batch_device_ns,
+            self.metrics.lv3_batch_reply_ns,
             self.metrics.lv3_batch_requests,
             self.metrics.lv3_batch_bytes_at_dispatch,
             self.metrics.lv3_batch_window_timeouts,

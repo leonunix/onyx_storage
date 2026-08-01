@@ -93,10 +93,17 @@ struct OwnedBatchOp {
     len: usize,
 }
 
+/// Reply an executor hands back to one blocked producer. The `Instant` is
+/// stamped right after the device call so the producer can charge the return
+/// trip (reply-loop position + its own wake-up) instead of leaving it as an
+/// unattributed residual of `submit.io` — box-measured 2026-08-01 at 27.7 % of
+/// the writer's blocked time, second only to the device call itself.
+type BatchReply = (Result<(), String>, Vec<AlignedBuf>, Instant);
+
 struct ChunkletBatchRequest {
     slabs: Vec<AlignedBuf>,
     ops: Vec<OwnedBatchOp>,
-    done: Sender<(Result<(), String>, Vec<AlignedBuf>)>,
+    done: Sender<BatchReply>,
     /// Stamped by the producer before `request_tx.send`. Splits the caller's
     /// blocked time into queueing for the aggregator, sitting in the coalesce
     /// window, queueing for an executor, and the device write itself.
@@ -174,7 +181,7 @@ impl ChunkletWriteBatcher {
                 picked_at: None,
             })
             .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batcher disconnected")))?;
-        let (result, slabs) = done_rx
+        let (result, slabs, _replied_at) = done_rx
             .recv()
             .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batch result lost")))?;
         result
@@ -221,10 +228,12 @@ impl ChunkletWriteBatcher {
 
         let mut returned = Vec::with_capacity(receivers.len());
         let mut first_error = None;
+        let mut reply_ns = 0u64;
         for done_rx in receivers {
-            let (result, slabs) = done_rx
+            let (result, slabs, replied_at) = done_rx
                 .recv()
                 .map_err(|_| OnyxError::Io(std::io::Error::other("LV3 batch result lost")))?;
+            reply_ns += replied_at.elapsed().as_nanos() as u64;
             if let Err(message) = result {
                 if first_error.is_none() {
                     first_error = Some(message);
@@ -238,6 +247,9 @@ impl ChunkletWriteBatcher {
                 Ordering::Relaxed,
             );
             metrics.lv3_batch_wait_calls.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .lv3_batch_reply_ns
+                .fetch_add(reply_ns, Ordering::Relaxed);
         }
         if let Some(message) = first_error {
             return Err(OnyxError::Io(std::io::Error::other(message)));
@@ -333,9 +345,10 @@ impl ChunkletWriteBatcher {
         metrics: Option<Arc<EngineMetrics>>,
     ) {
         while let Ok(work) = work_rx.recv() {
+            let taken_at = Instant::now();
             if let Some(metrics) = &metrics {
                 metrics.lv3_batch_exec_queue_ns.fetch_add(
-                    work.dispatched_at.elapsed().as_nanos() as u64,
+                    taken_at.saturating_duration_since(work.dispatched_at).as_nanos() as u64,
                     Ordering::Relaxed,
                 );
             }
@@ -377,6 +390,15 @@ impl ChunkletWriteBatcher {
                 crate::metrics::record_counter_max(&metrics.lv3_write_batch_inflight_max, inflight);
             }
             let call_start = std::time::Instant::now();
+            if let Some(metrics) = &metrics {
+                // Slice assembly between dequeue and the device call. Only a
+                // residual is expected; a large value means the executor grew a
+                // per-op cost that the device timer does not see.
+                metrics.lv3_batch_exec_prep_ns.fetch_add(
+                    call_start.saturating_duration_since(taken_at).as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+            }
             let result = device
                 .write_many_at(&write_ops)
                 .map_err(|error| error.to_string());
@@ -385,19 +407,31 @@ impl ChunkletWriteBatcher {
                 metrics
                     .lv3_write_batch_ns
                     .fetch_add(elapsed_ns, Ordering::Relaxed);
+                // Same call, charged once per BLOCKED REQUEST. Batch size and
+                // batch duration are correlated (more ops = longer call), so
+                // `mean(device) * requests/batch` is biased low — that bias was
+                // the whole 2.2-4.1 ms "residual" in the blocked-time ledger.
+                metrics.lv3_batch_device_ns.fetch_add(
+                    elapsed_ns.saturating_mul(work.requests.len() as u64),
+                    Ordering::Relaxed,
+                );
                 crate::metrics::record_counter_max(&metrics.lv3_write_batch_ns_max, elapsed_ns);
                 metrics
                     .lv3_write_batch_inflight
                     .fetch_sub(1, Ordering::Relaxed);
             }
             drop(write_ops);
+            // One stamp for the whole reply loop: a request late in the loop
+            // really does wait out the earlier sends, so charging all of them
+            // from the same instant is the latency the producer observes.
+            let replied_at = Instant::now();
             for mut request in work.requests {
                 let reply = match &result {
                     Ok(()) => Ok(()),
                     Err(message) => Err(message.clone()),
                 };
                 let slabs = std::mem::take(&mut request.slabs);
-                let _ = request.done.send((reply, slabs));
+                let _ = request.done.send((reply, slabs, replied_at));
             }
         }
     }

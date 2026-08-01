@@ -299,6 +299,21 @@ fn lv3_batch_attributes_the_producer_wait_and_flags_a_timeout_dispatch() {
         wait >= window,
         "producer wait {wait} must cover the coalesce window {window}"
     );
+    // The return trip (executor reply -> producer wake) and the executor's
+    // pre-call slice assembly are the two legs that used to fall out of the
+    // ledger as an unattributed residual. Both must now be inside `wait`.
+    let reply = metrics.lv3_batch_reply_ns.load(Ordering::Relaxed);
+    let prep = metrics.lv3_batch_exec_prep_ns.load(Ordering::Relaxed);
+    assert!(reply > 0, "reply leg must be attributed");
+    assert!(
+        wait >= window + reply,
+        "producer wait {wait} must cover window {window} + reply {reply}"
+    );
+    let device = metrics.lv3_write_batch_ns.load(Ordering::Relaxed);
+    assert!(
+        wait >= prep + device,
+        "producer wait {wait} must cover exec_prep {prep} + device {device}"
+    );
 }
 
 #[test]

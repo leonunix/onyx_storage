@@ -74,6 +74,7 @@ impl EngineMetrics {
                 .snapshot(),
             buffer_sync_batches: load(&self.buffer_sync_batches),
             buffer_sync_flushes: load(&self.buffer_sync_flushes),
+            buffer_lv2_checkpoint_skipped_epochs: load(&self.buffer_lv2_checkpoint_skipped_epochs),
             buffer_sync_batch_ns: load(&self.buffer_sync_batch_ns),
             buffer_sync_sleep_ns: load(&self.buffer_sync_sleep_ns),
             buffer_sync_epochs_committed: load(&self.buffer_sync_epochs_committed),
@@ -299,6 +300,9 @@ impl EngineMetrics {
             lv3_batch_pickup_ns: load(&self.lv3_batch_pickup_ns),
             lv3_batch_window_ns: load(&self.lv3_batch_window_ns),
             lv3_batch_exec_queue_ns: load(&self.lv3_batch_exec_queue_ns),
+            lv3_batch_exec_prep_ns: load(&self.lv3_batch_exec_prep_ns),
+            lv3_batch_device_ns: load(&self.lv3_batch_device_ns),
+            lv3_batch_reply_ns: load(&self.lv3_batch_reply_ns),
             lv3_batch_requests: load(&self.lv3_batch_requests),
             lv3_batch_bytes_at_dispatch: load(&self.lv3_batch_bytes_at_dispatch),
             lv3_batch_window_timeouts: load(&self.lv3_batch_window_timeouts),
@@ -578,6 +582,8 @@ pub struct EngineMetricsSnapshot {
     pub buffer_append_wait_durable_foreground_fine_latency_buckets: Vec<u64>,
     pub buffer_sync_batches: u64,
     pub buffer_sync_flushes: u64,
+    #[serde(default)]
+    pub buffer_lv2_checkpoint_skipped_epochs: u64,
     pub buffer_sync_batch_ns: u64,
     pub buffer_sync_sleep_ns: u64,
     pub buffer_sync_epochs_committed: u64,
@@ -835,6 +841,12 @@ pub struct EngineMetricsSnapshot {
     pub lv3_batch_window_ns: u64,
     #[serde(default)]
     pub lv3_batch_exec_queue_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_exec_prep_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_device_ns: u64,
+    #[serde(default)]
+    pub lv3_batch_reply_ns: u64,
     #[serde(default)]
     pub lv3_batch_requests: u64,
     #[serde(default)]
@@ -1177,6 +1189,7 @@ impl EngineMetricsSnapshot {
             buffer_append_wait_durable_ns,
             buffer_sync_batches,
             buffer_sync_flushes,
+            buffer_lv2_checkpoint_skipped_epochs,
             buffer_sync_batch_ns,
             buffer_sync_sleep_ns,
             buffer_sync_epochs_committed,
@@ -1339,6 +1352,9 @@ impl EngineMetricsSnapshot {
             lv3_batch_pickup_ns,
             lv3_batch_window_ns,
             lv3_batch_exec_queue_ns,
+            lv3_batch_exec_prep_ns,
+            lv3_batch_device_ns,
+            lv3_batch_reply_ns,
             lv3_batch_requests,
             lv3_batch_bytes_at_dispatch,
             lv3_batch_window_timeouts,

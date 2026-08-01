@@ -248,6 +248,10 @@ pub struct EngineMetrics {
     /// is lower than `buffer_sync_batches` because one root flush covers a
     /// cross-shard group-commit epoch.
     pub buffer_sync_flushes: AtomicU64,
+    /// Durability epochs that skipped the packed-checkpoint page write because
+    /// `lv2_checkpoint_epoch_interval > 1`. The page is a recovery start point,
+    /// so this is replay distance, not lost durability.
+    pub buffer_lv2_checkpoint_skipped_epochs: AtomicU64,
     pub buffer_sync_batch_ns: AtomicU64,
     pub buffer_sync_sleep_ns: AtomicU64,
     pub buffer_sync_epochs_committed: AtomicU64,
@@ -540,12 +544,23 @@ pub struct EngineMetrics {
     /// `window_timeouts` vs `target_hits` is the load-bearing ratio: a batch
     /// that leaves on the timeout carrying far less than `target_bytes` paid
     /// the whole coalesce window for nothing.
+    ///
+    /// ⚠ Mixed bases when reading these: `pickup` / `window` / `reply` are
+    /// summed per REQUEST, `exec_queue` / `exec_prep` / `lv3_write_batch_ns`
+    /// per BATCH. A request blocks for its whole batch's device call, so the
+    /// device share of blocked time is `write_batch_ns * requests / batches`,
+    /// not `write_batch_ns` — reading it un-amortised is what made the device
+    /// leg look like 5.8 % of `submit.io` when it is really 57 %.
     pub lv3_batch_enqueue_ns: AtomicU64,
     pub lv3_batch_wait_ns: AtomicU64,
     pub lv3_batch_wait_calls: AtomicU64,
     pub lv3_batch_pickup_ns: AtomicU64,
     pub lv3_batch_window_ns: AtomicU64,
     pub lv3_batch_exec_queue_ns: AtomicU64,
+    pub lv3_batch_exec_prep_ns: AtomicU64,
+    /// Device call time charged once per blocked request (not per batch).
+    pub lv3_batch_device_ns: AtomicU64,
+    pub lv3_batch_reply_ns: AtomicU64,
     pub lv3_batch_requests: AtomicU64,
     pub lv3_batch_bytes_at_dispatch: AtomicU64,
     pub lv3_batch_window_timeouts: AtomicU64,
