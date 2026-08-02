@@ -196,6 +196,35 @@ stripe_group_lifetime_affinity = false
 # readable from ONE arm; restart-per-arm throughput A/B is INVALID on this box (two
 # identical arms measured 2.13x apart on run-order drift alone).
 allocator_regions = 0
+# A/B knob (default 0 = off in code). Whole stripes an aligned lane refill prefers
+# a stripe-reserve run to be long enough for before it settles for a one-stripe run.
+#
+# WHY: the refill asks the reserve for `first_fit(one stripe)`, and at a one-stripe
+# floor first-fit-by-address degenerates into "take the lowest-address run" — which
+# on this aged pool is a 24 KiB window pinned by a single live block. Measured
+# 2026-08-01: `allocator_supply` blocks_per_refill 269.9 / runs_per_refill 43.9 =
+# **6.15 blocks per run**, i.e. 64 isolated windows in the lane cache. So the
+# writer's consecutive stripes land at unrelated PBAs, chunklet's per-PD adjacency
+# merge collapses to **1.02x**, and one flusher batch becomes **563 separate 4 KiB
+# device writes** (78% of the RAID6 call, 84.6% of `submit.io`) — while
+# `largest_run = 76800` (a whole region) of intact material sat unused higher up.
+#
+# The floor only FILTERS which runs qualify; the pick stays first-fit-by-address and
+# a qualifying run is still drained to the refill block budget, so one hit typically
+# parks a single multi-thousand-block run and every later carve is adjacent. A miss
+# falls back to the legacy one-stripe floor verbatim, so this cannot cause ENOSPC.
+#
+# GATE (single-arm decomposition, NOT bandwidth — see allocator_regions above):
+#   allocator_supply blocks_per_run   6.15  -> >= 48   (+ wide_hits >> wide_misses)
+#   chunklet_submit_drain_data merge  1.02x -> ~8x     sqes/call 563 -> ~70
+#   chunklet_r6_batch write / total   4.56 / 5.87 ms -> ~0.6 / ~2 ms
+# ⚠ Also watch `submit_bounce_bytes`: chunklet materialises a merged group into one
+# bounce buffer, so merging raises bounced bytes from 3.5% to ~100% of the batch
+# (~2.3 MiB memcpy). Expected to be a large net win against 490 fewer 7.1 us IOs,
+# but it is a NEW cost — if it dominates, the follow-up is writev with per-strip
+# iovecs instead of the bounce copy.
+# Flip to 8 for the B arm.
+stripe_refill_run_stripes = 0
 
 [buffer]
 # A/B knob (default off in code): drain LV2 ring backpressure BEFORE taking the

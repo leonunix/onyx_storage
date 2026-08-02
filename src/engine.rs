@@ -993,6 +993,7 @@ impl OnyxEngine {
         // first-fit (set BEFORE rebuild so the rebuilt free list is indexed too;
         // rebuild preserves it).
         allocator.set_stripe_geometry(io_engine.stripe_blocks(), io_engine.stripe_phase());
+        allocator.set_stripe_refill_run_stripes(config.storage.stripe_refill_run_stripes);
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool (with shard migration if needed)
@@ -1938,6 +1939,7 @@ impl OnyxEngine {
             config.storage.allocator_regions,
         ));
         allocator.set_stripe_geometry(io_engine.stripe_blocks(), io_engine.stripe_phase());
+        allocator.set_stripe_refill_run_stripes(config.storage.stripe_refill_run_stripes);
         allocator.rebuild_from_metadata(&meta)?;
 
         // Write buffer pool (with shard migration if needed)

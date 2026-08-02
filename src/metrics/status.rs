@@ -1054,17 +1054,24 @@ impl EngineStatusSnapshot {
                 // the ratios are for eyeballing a single read and are NOT
                 // differenceable.
                 "allocator_supply: aligned_allocs={} refills={} refill_blocks={} \
-                 refill_runs={} drains={} drain_blocks={} allocs_per_refill={:.2} \
-                 blocks_per_refill={:.1} runs_per_refill={:.1}",
+                 refill_runs={} drains={} drain_blocks={} wide_hits={} wide_misses={} \
+                 allocs_per_refill={:.2} blocks_per_refill={:.1} runs_per_refill={:.1} \
+                 blocks_per_run={:.1}",
                 s.aligned_allocs,
                 s.refills,
                 s.refill_blocks,
                 s.refill_runs,
                 s.drains,
                 s.drain_blocks,
+                s.wide_hits,
+                s.wide_misses,
                 s.allocs_per_refill(),
                 s.blocks_per_refill(),
                 s.runs_per_refill(),
+                // The contiguity the write path actually consumes: one stripe per
+                // run (6.15 on the 2026-08-01 box) is what collapses chunklet's
+                // adjacency merge to 1.02x. See `storage.stripe_refill_run_stripes`.
+                s.blocks_per_run(),
             );
         }
         if let Some(r) = self.allocator_regions {

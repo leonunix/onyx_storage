@@ -1082,6 +1082,35 @@ pub struct StorageConfig {
     /// stay near each other (leaf ⊂ zone ⊂ lane ⊂ region).
     #[serde(default = "default_allocator_regions")]
     pub allocator_regions: usize,
+    /// Prefer stripe-reserve runs at least this many whole stripes long when
+    /// refilling a flush lane's aligned extent cache. `0` = off (the pre-2026-08-02
+    /// behaviour, kept as the rollback path).
+    ///
+    /// **Why this knob exists.** The aligned refill asks the reserve for
+    /// `first_fit(one stripe)`, and at a one-stripe floor first-fit-by-address
+    /// degenerates into "take the lowest-address run", which on an aged pool is a
+    /// window pinned by a single live block. The 2026-08-01 box read: **43.9 runs
+    /// per refill at 6.15 blocks/run** — i.e. 64 isolated 24 KiB windows in the
+    /// lane cache, so the writer's consecutive stripes land at unrelated PBAs,
+    /// chunklet's per-PD adjacency merge collapses to **1.02x**, and one flusher
+    /// batch becomes **563 separate 4 KiB device writes** (78% of the RAID6 call,
+    /// 84.6% of `submit.io`). Meanwhile `largest_run = 76800` (a whole region) sat
+    /// unused at higher addresses. See `submit_io_is_a_563_way_4k_fanout`.
+    ///
+    /// The floor only *filters* which runs qualify — a qualifying run is still
+    /// drained up to the refill block budget, so one hit typically parks a single
+    /// multi-thousand-block run in the lane cache and every subsequent carve is
+    /// strictly adjacent to the last. That is what chunklet needs: the merge is
+    /// computed across ops by device offset, so contiguous PBAs alone raise it —
+    /// no change to the write path.
+    ///
+    /// A miss falls straight back to the one-stripe floor (byte-identical to the
+    /// legacy path), so this can never turn a servable request into `ENOSPC`; it
+    /// only changes which free run is picked first. 8 stripes is the width that
+    /// makes the merge ~8x; wider is not worse (the take is budget-bound either
+    /// way) but needs more of the reserve intact to hit.
+    #[serde(default = "default_stripe_refill_run_stripes")]
+    pub stripe_refill_run_stripes: u32,
 }
 
 impl Default for StorageConfig {
@@ -1101,8 +1130,15 @@ impl Default for StorageConfig {
             raid_full_stripe_writes: default_raid_full_stripe_writes(),
             stripe_group_lifetime_affinity: false,
             allocator_regions: default_allocator_regions(),
+            stripe_refill_run_stripes: default_stripe_refill_run_stripes(),
         }
     }
+}
+
+/// `0` = off. Default off pending the nvme-box A/B — see
+/// [`StorageConfig::stripe_refill_run_stripes`] for what it does and why.
+fn default_stripe_refill_run_stripes() -> u32 {
+    0
 }
 
 /// `0` = the allocator's compiled region target (2048). See

@@ -266,6 +266,13 @@ pub struct ContiguityStats {
 /// and each fight stalls all 16 writers. Sharded, a lane tries
 /// [`REGION_REFILL_TRIES`] other regions before it resorts to a drain, so this
 /// should sit at 0 even more firmly than it already did.
+///
+/// `wide_hits` / `wide_misses` are the direct read of
+/// `storage.stripe_refill_run_stripes`: a miss means no region the lane could see
+/// held a run of the preferred width, so the refill fell back to the legacy
+/// one-stripe floor. Both zero = knob off. A miss-dominated pool is the signal
+/// that the reserve has no intact material left and the lever moves to defrag,
+/// not to the refill.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct AllocSupplyStats {
     pub aligned_allocs: u64,
@@ -274,6 +281,8 @@ pub struct AllocSupplyStats {
     pub refill_runs: u64,
     pub drains: u64,
     pub drain_blocks: u64,
+    pub wide_hits: u64,
+    pub wide_misses: u64,
 }
 
 /// Address-region sharding shape and traffic — see [`RegionPools`].
@@ -312,6 +321,17 @@ impl AllocSupplyStats {
             return 0.0;
         }
         self.refill_runs as f64 / self.refills as f64
+    }
+
+    /// Blocks per contiguous run the refill took — the write path's contiguity in
+    /// one number, and the local stand-in for chunklet's per-PD adjacency merge.
+    /// One stripe's worth (6.15 blocks on the 2026-08-01 box, stripe = 6) means
+    /// every LV3 op lands at an unrelated PBA and the merge is ~1x.
+    pub fn blocks_per_run(&self) -> f64 {
+        if self.refill_runs == 0 {
+            return 0.0;
+        }
+        self.refill_blocks as f64 / self.refill_runs as f64
     }
 
     /// Aligned allocations served per global-lock refill. 1.0 means the lane
@@ -670,6 +690,24 @@ impl std::ops::DerefMut for FreeLockGuard<'_> {
     fn deref_mut(&mut self) -> &mut FreePools {
         &mut self.pools
     }
+}
+
+/// One aligned lane refill's request shape — see
+/// [`SpaceAllocator::refill_stripe_extent_lane`].
+#[derive(Debug, Clone, Copy)]
+struct StripeRefill {
+    /// Blocks the refill must hand back (already a whole number of stripes).
+    min_count: u32,
+    /// Block budget for the whole refill, i.e. how much may be parked in the
+    /// lane cache.
+    max_count: u32,
+    /// RAID geometry the reserve is indexed for; a region whose pools carry a
+    /// different `(stripe, phase)` is skipped.
+    stripe: u32,
+    phase: u32,
+    /// Minimum width a reserve run must have to QUALIFY as a candidate. Always
+    /// `>= min_count`; equal to it on the legacy path.
+    floor: u32,
 }
 
 /// Free-space policy classes protected by one lock. Every free PBA belongs to
@@ -1584,6 +1622,23 @@ pub struct SpaceAllocator {
     region_switches: AtomicU64,
     /// Refill attempts that found nothing usable in the region they tried.
     region_refill_misses: AtomicU64,
+    /// Whole stripes an aligned lane refill prefers a reserve run to be long
+    /// enough for before it will settle for a one-stripe run. `0` = off, which
+    /// is byte-for-byte the pre-2026-08-02 refill. See
+    /// [`crate::config::StorageConfig::stripe_refill_run_stripes`] and
+    /// [`Self::refill_stripe_extent_lane`].
+    ///
+    /// Runtime-settable for the same reason as [`FREE_LOCK_HOLD_EXTENTS`]: this
+    /// box measured two byte-identical arms 2.13x apart on run-order drift, so
+    /// the only trustworthy A/B alternates the setting inside ONE process
+    /// against ONE pool state.
+    stripe_refill_run_stripes: AtomicU64,
+    /// Refills that were served by a run meeting the wide floor above.
+    refill_wide_hits: AtomicU64,
+    /// Refills that fell back to the one-stripe floor (no wide run anywhere the
+    /// lane looked). `hits + misses` counts only refills attempted while the
+    /// knob is on, so a zero/zero pair means "knob off", not "no traffic".
+    refill_wide_misses: AtomicU64,
     /// `(stripe, phase)` packed as `stripe << 32 | phase`, 0 = unset. Lets the
     /// public `stripe_geometry()` answer without taking a region lock (the GC
     /// defrag scanner asks once per candidate cluster).
@@ -1721,8 +1776,41 @@ impl SpaceAllocator {
             drain_blocks: AtomicU64::new(0),
             region_switches: AtomicU64::new(0),
             region_refill_misses: AtomicU64::new(0),
+            stripe_refill_run_stripes: AtomicU64::new(0),
+            refill_wide_hits: AtomicU64::new(0),
+            refill_wide_misses: AtomicU64::new(0),
             geometry_cache: AtomicU64::new(0),
         }
+    }
+
+    /// Set the aligned refill's preferred run width in whole stripes (`0` = off).
+    /// See [`crate::config::StorageConfig::stripe_refill_run_stripes`]; the engine
+    /// sets this once at open, next to [`Self::set_stripe_geometry`].
+    pub fn set_stripe_refill_run_stripes(&self, stripes: u32) {
+        self.stripe_refill_run_stripes
+            .store(u64::from(stripes), Ordering::Relaxed);
+    }
+
+    /// The configured preferred run width in whole stripes (`0` = off).
+    pub fn stripe_refill_run_stripes(&self) -> u32 {
+        self.stripe_refill_run_stripes.load(Ordering::Relaxed) as u32
+    }
+
+    /// Block floor a refill prefers its reserve runs to meet, or `None` when the
+    /// knob is off or the floor would not be wider than the request itself.
+    ///
+    /// Clamped to `max_count` (the refill's block budget): asking for a run wider
+    /// than we are willing to take would reject runs that could serve the whole
+    /// budget contiguously, which is the entire point.
+    fn wide_refill_floor(&self, min_count: u32, max_count: u32, stripe: u32) -> Option<u32> {
+        let stripes = self.stripe_refill_run_stripes();
+        if stripes == 0 {
+            return None;
+        }
+        let floor = stripe
+            .saturating_mul(stripes)
+            .min(max_count.max(min_count));
+        (floor > min_count).then_some(floor)
     }
 
     /// Snapshot of the aligned path's lane-cache supply — see
@@ -1924,6 +2012,8 @@ impl SpaceAllocator {
             refill_runs: self.refill_runs.load(Ordering::Relaxed),
             drains: self.drain_ops.load(Ordering::Relaxed),
             drain_blocks: self.drain_blocks.load(Ordering::Relaxed),
+            wide_hits: self.refill_wide_hits.load(Ordering::Relaxed),
+            wide_misses: self.refill_wide_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -4163,6 +4253,26 @@ impl SpaceAllocator {
     /// working set clustered. `region_pools_equal_single_pool` pins that the free
     /// COVERAGE is identical to the unsharded pool; the emission ORDER is what
     /// changes.
+    ///
+    /// ## Wide-run preference (`storage.stripe_refill_run_stripes`)
+    ///
+    /// At a one-stripe floor, `first_fit(min_count)` degenerates into "take the
+    /// lowest-address run", and on an aged pool the lowest addresses are windows
+    /// pinned by a single live block — 6.15 blocks/run box-measured, i.e. 64
+    /// isolated 24 KiB windows per refill, so the writer's consecutive stripes
+    /// land at unrelated PBAs and chunklet's adjacency merge collapses to 1.02x
+    /// ([[submit_io_is_a_563_way_4k_fanout]]). When the knob is on, a first pass
+    /// only considers runs at least `floor` blocks wide (and only regions whose
+    /// `stripe_hint` says they have one), which routes the lane to intact
+    /// material and typically parks ONE budget-sized run in the lane cache, so
+    /// every subsequent carve is adjacent to the last.
+    ///
+    /// The pass is a pure preference: on a miss the second pass is the legacy
+    /// one-stripe-floor refill, unchanged, and the caller's drain + global
+    /// fallback (hence the ENOSPC boundary) is untouched. Selection stays
+    /// first-fit-BY-ADDRESS in both passes — the floor changes the candidate set,
+    /// never the ordering, so this is not the best-fit policy that once corrupted
+    /// the metadb L2P leaf.
     fn refill_stripe_extent_lane(
         &self,
         lane: usize,
@@ -4171,15 +4281,43 @@ impl SpaceAllocator {
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
+        let legacy = StripeRefill {
+            min_count,
+            max_count,
+            stripe,
+            phase,
+            floor: min_count,
+        };
+        if let Some(floor) = self.wide_refill_floor(min_count, max_count, stripe) {
+            if let Some(extent) = self.refill_stripe_floored(lane, StripeRefill { floor, ..legacy })
+            {
+                self.refill_wide_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(extent);
+            }
+            self.refill_wide_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        self.refill_stripe_floored(lane, legacy)
+    }
+
+    /// [`Self::refill_stripe_extent_lane`] restricted to reserve runs of at least
+    /// `req.floor` blocks. `floor == min_count` is the legacy behaviour.
+    fn refill_stripe_floored(&self, lane: usize, req: StripeRefill) -> Option<Extent> {
         let layout = self.regions.layout();
         if !layout.sharded() {
-            return self.refill_stripe_from_region(lane, 0, min_count, max_count, stripe, phase);
+            return self.refill_stripe_from_region(lane, 0, req);
         }
-        let mut idx = self.lane_region(lane, u64::from(min_count), layout);
+        // A wide pass must not fall back to "try the current region anyway": that
+        // fallback exists to reach the caller's ENOSPC boundary, which the second
+        // pass reaches on its own. Probing a region the hints say cannot serve
+        // the floor would just cost a lock hold per refill on a pool with no wide
+        // material left.
+        let mut idx = if req.floor > req.min_count {
+            self.wide_refill_region(lane, u64::from(req.floor), layout)?
+        } else {
+            self.lane_region(lane, u64::from(req.min_count), layout)
+        };
         for attempt in 0..REGION_REFILL_TRIES {
-            if let Some(extent) =
-                self.refill_stripe_from_region(lane, idx, min_count, max_count, stripe, phase)
-            {
+            if let Some(extent) = self.refill_stripe_from_region(lane, idx, req) {
                 return Some(extent);
             }
             // No need to remember which regions were tried: the failed attempt
@@ -4191,9 +4329,22 @@ impl SpaceAllocator {
             if attempt + 1 == REGION_REFILL_TRIES {
                 break;
             }
-            idx = self.switch_lane_region(lane, idx, u64::from(min_count), layout)?;
+            idx = self.switch_lane_region(lane, idx, u64::from(req.floor), layout)?;
         }
         None
+    }
+
+    /// [`Self::lane_region`] without the "nothing qualifies → try the current
+    /// region anyway" fallback: `None` means no region's `stripe_hint` claims a
+    /// run of `need` blocks, so there is nothing for a wide pass to lock.
+    fn wide_refill_region(&self, lane: usize, need: u64, layout: RegionLayout) -> Option<usize> {
+        let current = self.lane_regions[lane].load(Ordering::Relaxed);
+        if current < layout.count
+            && self.regions.stripe_hint[current].load(Ordering::Relaxed) >= need.max(1)
+        {
+            return Some(current);
+        }
+        self.switch_lane_region(lane, current, need, layout)
     }
 
     /// The region a lane should refill from, switching if its current one can no
@@ -4266,15 +4417,25 @@ impl SpaceAllocator {
 
     /// One region's share of the aligned lane refill — the pre-region body,
     /// unchanged except that the pool it walks is one region's reserve.
+    ///
+    /// `req.floor` is the minimum width a reserve run must have to QUALIFY. It
+    /// filters candidates only — the pick is still the address-argmin among them,
+    /// and a qualifying run is still drained up to the block budget, which is what
+    /// turns one wide hit into a single contiguous cached run.
     fn refill_stripe_from_region(
         &self,
         lane: usize,
         region: usize,
-        min_count: u32,
-        max_count: u32,
-        stripe: u32,
-        phase: u32,
+        req: StripeRefill,
     ) -> Option<Extent> {
+        let StripeRefill {
+            min_count,
+            max_count,
+            stripe,
+            phase,
+            floor,
+        } = req;
+        debug_assert!(floor >= min_count, "a run floor cannot be under the request");
         let mut guard = self.lock_region(FreeLockSite::WriterRefill, region);
         let pools = guard.region_mut(region);
         if pools.geometry() != Some((stripe, phase)) {
@@ -4287,7 +4448,7 @@ impl SpaceAllocator {
         //
         // The first pick is the exact address-argmin over the qualifying runs —
         // the same extent the one-run-at-a-time refill took, found the same way.
-        let first = pools.stripe_reserve.first_fit(min_count)?;
+        let first = pools.stripe_reserve.first_fit(floor)?;
         let mut budget = max_count.max(min_count);
         let mut plan: Vec<(Extent, u32)> = Vec::with_capacity(LANE_EXTENT_CACHE_REFILL_RUNS);
         fn plan_push(
@@ -4311,6 +4472,10 @@ impl SpaceAllocator {
         // a multi-million-entry set while holding the global lock. Stopping early
         // only costs a smaller batch — never correctness, and never worse than
         // the single-run refill this replaced, which is what `first` already is.
+        //
+        // A wide pass keeps the SAME entry bound for the same reason, and one wide
+        // hit usually consumes the whole budget on its own, so the walk normally
+        // exits on `budget` after zero iterations.
         let mut examined = 0usize;
         for run in pools
             .stripe_reserve
@@ -4324,7 +4489,7 @@ impl SpaceAllocator {
                 break;
             }
             examined += 1;
-            if run.count >= min_count {
+            if run.count >= floor {
                 plan_push(&mut plan, &mut budget, *run, stripe, min_count);
             }
         }
@@ -6219,6 +6384,250 @@ mod stripe_align_tests {
             LANE_EXTENT_CACHE_REFILL_BLOCKS
         );
     }
+
+    // ---------------------------------------------------------------------
+    // `storage.stripe_refill_run_stripes` — prefer intact reserve runs.
+    // ---------------------------------------------------------------------
+
+    /// Whole stripes the wide pass asks for in these tests (the shipped default
+    /// when the knob is on, and the width that makes chunklet's merge ~8x).
+    const WIDE: u32 = 8;
+
+    /// The 2026-08-01 box shape: a fragmented LOW area of isolated single-stripe
+    /// windows (pinned 24 KiB windows) plus INTACT material higher up, which
+    /// address-first-fit at a one-stripe floor never reaches.
+    ///
+    /// Returns the confetti window starts (ascending) and the intact run. Sized
+    /// to stay under [`MIN_REGION_BLOCKS`] so the pool is single-region under an
+    /// `ONYX_ALLOCATOR_REGIONS` sweep too — region routing is not what these
+    /// tests are about, and a run cannot straddle a region.
+    fn pinned_windows_plus_intact_run(
+        windows: usize,
+        wide_stripes: u32,
+    ) -> (SpaceAllocator, Vec<u64>, Extent) {
+        let confetti_blocks = (windows as u64 + 1) * 2 * STRIPE as u64;
+        let wide_blocks = u64::from(wide_stripes) * STRIPE as u64;
+        let blocks = RESERVED_BLOCKS + confetti_blocks + 4 * STRIPE as u64 + wide_blocks;
+        assert!(
+            blocks <= MIN_REGION_BLOCKS,
+            "keep the fixture single-region: {blocks} blocks"
+        );
+        let a = new_alloc_lanes(blocks, 2);
+        claim_whole_pool(&a, blocks - RESERVED_BLOCKS);
+        a.set_stripe_geometry(STRIPE, PHASE);
+
+        let first = SpaceAllocator::align_up_pba(RESERVED_BLOCKS, STRIPE as u64, PHASE as u64);
+        let mut starts = Vec::with_capacity(windows);
+        for i in 0..windows as u64 {
+            let start = first + i * 2 * STRIPE as u64;
+            a.free_extent(Extent::new(Pba(start), STRIPE)).unwrap();
+            starts.push(start);
+        }
+        // Two live stripes of separation so the intact run cannot coalesce with
+        // the last confetti window.
+        let wide_start = first + (windows as u64 + 2) * 2 * STRIPE as u64;
+        let wide = Extent::new(Pba(wide_start), (wide_blocks) as u32);
+        a.free_extent(wide).unwrap();
+        (a, starts, wide)
+    }
+
+    /// chunklet's per-PD adjacency merge, computed over the PBAs one lane was
+    /// handed: `ops / maximal contiguous groups`. This is the local stand-in for
+    /// the box's `chunklet_submit_drain_data merge` — the device-side merge is a
+    /// pure function of whether consecutive stripes are adjacent, so a lane whose
+    /// carves are adjacent merges and one whose carves scatter does not.
+    fn adjacency_merge_factor(starts: &[u64], width: u32) -> f64 {
+        assert!(!starts.is_empty());
+        let mut sorted = starts.to_vec();
+        sorted.sort_unstable();
+        let groups = 1 + sorted
+            .windows(2)
+            .filter(|pair| pair[0] + u64::from(width) != pair[1])
+            .count();
+        starts.len() as f64 / groups as f64
+    }
+
+    fn drain_stripes(a: &SpaceAllocator, lane: usize, count: usize) -> Vec<u64> {
+        (0..count)
+            .map(|i| {
+                a.allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE)
+                    .unwrap_or_else(|e| panic!("allocation {i} failed: {e}"))
+                    .start
+                    .0
+            })
+            .collect()
+    }
+
+    /// The knob's whole purpose, stated as the box gate: with it off, consecutive
+    /// stripes scatter across pinned windows and the merge is ~1x; with it on the
+    /// lane is routed to intact material and the same allocations are adjacent.
+    #[test]
+    fn wide_refill_turns_scattered_carves_into_one_contiguous_run() {
+        const OPS: usize = 72; // one box-sized flusher batch
+        let (off, _, _) = pinned_windows_plus_intact_run(OPS, OPS as u32);
+        let legacy = drain_stripes(&off, 0, OPS);
+        let legacy_merge = adjacency_merge_factor(&legacy, STRIPE);
+        assert!(
+            legacy_merge < 1.05,
+            "fixture is not the box shape: legacy merge was {legacy_merge}"
+        );
+
+        let (on, _, wide) = pinned_windows_plus_intact_run(OPS, OPS as u32);
+        on.set_stripe_refill_run_stripes(WIDE);
+        let wide_arm = drain_stripes(&on, 0, OPS);
+        assert_eq!(
+            adjacency_merge_factor(&wide_arm, STRIPE),
+            OPS as f64,
+            "all {OPS} carves should come from the one intact run"
+        );
+        assert_eq!(wide_arm[0], wide.start.0);
+        let supply = on.supply_stats();
+        assert_eq!(supply.refills, 1, "one refill parks the whole intact run");
+        assert_eq!(supply.refill_runs, 1);
+        assert_eq!(supply.wide_hits, 1);
+        assert_eq!(supply.wide_misses, 0);
+        assert!(
+            supply.blocks_per_run() >= f64::from(WIDE * STRIPE),
+            "blocks_per_run was {} (gate: >= {})",
+            supply.blocks_per_run(),
+            WIDE * STRIPE
+        );
+    }
+
+    /// The floor filters CANDIDATES, it does not reorder them: among runs that
+    /// qualify the pick is still the lowest address, so the wide pass consumes
+    /// intact material in ascending order exactly as first-fit always did. (This
+    /// is the property that keeps the change out of the best-fit family that once
+    /// corrupted the metadb L2P leaf codec.)
+    #[test]
+    fn wide_refill_is_still_first_fit_by_address() {
+        let a = new_alloc_lanes(1024, 2);
+        claim_whole_pool(&a, 1024 - RESERVED_BLOCKS);
+        a.set_stripe_geometry(STRIPE, PHASE);
+        let base = SpaceAllocator::align_up_pba(RESERVED_BLOCKS, STRIPE as u64, PHASE as u64);
+        // Two qualifying runs, separated by live blocks; the HIGHER one is freed
+        // first so insertion order cannot be what decides the pick.
+        let high = Extent::new(Pba(base + 40 * STRIPE as u64), WIDE * STRIPE);
+        let low = Extent::new(Pba(base + 20 * STRIPE as u64), WIDE * STRIPE);
+        a.free_extent(high).unwrap();
+        a.free_extent(low).unwrap();
+
+        a.set_stripe_refill_run_stripes(WIDE);
+        let got = drain_stripes(&a, 0, WIDE as usize);
+        assert_eq!(got[0], low.start.0, "lowest qualifying address wins");
+        assert!(
+            got.iter().all(|&s| s < high.start.0),
+            "the lower intact run must be fully consumed first: {got:?}"
+        );
+    }
+
+    /// A pool with no intact run left must behave EXACTLY like the legacy path:
+    /// same PBAs, same supply accounting. The wide pass is a preference, and a
+    /// preference that cannot be met has to cost nothing but a counter.
+    #[test]
+    fn wide_refill_falls_back_to_the_legacy_selection_verbatim() {
+        const WINDOWS: usize = LANE_EXTENT_CACHE_REFILL_RUNS + 7;
+        let (off, _) = isolated_window_allocator(WINDOWS);
+        let legacy = drain_stripes(&off, 0, WINDOWS);
+
+        let (on, _) = isolated_window_allocator(WINDOWS);
+        on.set_stripe_refill_run_stripes(WIDE);
+        let got = drain_stripes(&on, 0, WINDOWS);
+
+        assert_eq!(got, legacy, "fallback must not change selection");
+        let (a, b) = (off.supply_stats(), on.supply_stats());
+        assert_eq!((a.refills, a.refill_runs, a.refill_blocks, a.drains),
+                   (b.refills, b.refill_runs, b.refill_blocks, b.drains));
+        assert_eq!(b.wide_hits, 0);
+        assert_eq!(
+            b.wide_misses, b.refills,
+            "every refill on a pinned-window pool is a wide miss"
+        );
+    }
+
+    /// `0` is the rollback: on a pool where the knob WOULD change the answer, an
+    /// allocator left at the default emits the legacy sequence.
+    #[test]
+    fn wide_refill_knob_off_is_the_legacy_path() {
+        const OPS: usize = 24;
+        let (a, windows, _) = pinned_windows_plus_intact_run(OPS, WIDE);
+        assert_eq!(a.stripe_refill_run_stripes(), 0, "default must be off");
+        let got = drain_stripes(&a, 0, OPS);
+        assert_eq!(
+            got,
+            windows[..OPS].to_vec(),
+            "knob off must consume the pinned windows lowest-address-first"
+        );
+        assert_eq!(a.supply_stats().wide_hits + a.supply_stats().wide_misses, 0);
+    }
+
+    /// The wide pass must never turn a servable request into `SpaceExhausted`:
+    /// the same pool drains to the same last block with the knob on.
+    #[test]
+    fn wide_refill_never_costs_capacity() {
+        const WINDOWS: usize = 40;
+        let (off, _, _) = pinned_windows_plus_intact_run(WINDOWS, WIDE);
+        let (on, _, _) = pinned_windows_plus_intact_run(WINDOWS, WIDE);
+        on.set_stripe_refill_run_stripes(WIDE);
+
+        let drain_all = |a: &SpaceAllocator| {
+            let mut got = Vec::new();
+            while let Ok(e) = a.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE) {
+                got.push(e.start.0);
+            }
+            got.sort_unstable();
+            got
+        };
+        let legacy = drain_all(&off);
+        let wide = drain_all(&on);
+        assert_eq!(
+            legacy, wide,
+            "the wide pass reordered emission, not the reachable set"
+        );
+        assert_eq!(off.free_block_count(), on.free_block_count());
+    }
+
+    /// A wide floor on a reserve that holds only single-stripe runs must not walk
+    /// the set: the size index has no class at or above the floor, so the probe is
+    /// two descents. Pinned by the entry bound the legacy walk already carries —
+    /// a reserve deliberately larger than [`LANE_EXTENT_CACHE_REFILL_SCAN`].
+    #[test]
+    fn wide_refill_probe_is_bounded_on_a_huge_pinned_reserve() {
+        const WINDOWS: usize = LANE_EXTENT_CACHE_REFILL_SCAN * 3;
+        let (a, starts) = isolated_window_allocator(WINDOWS);
+        a.set_stripe_refill_run_stripes(WIDE);
+        let e = a
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .expect("a one-stripe request is still servable");
+        assert_eq!(e.start.0, starts[0], "fallback keeps first-fit-by-address");
+        let supply = a.supply_stats();
+        assert_eq!(supply.wide_misses, 1);
+        assert_eq!(supply.refill_runs, LANE_EXTENT_CACHE_REFILL_RUNS as u64);
+    }
+
+    /// The floor is clamped to the refill budget and never below the request:
+    /// asking for a run wider than we would take would reject runs that can serve
+    /// the whole budget contiguously.
+    #[test]
+    fn wide_refill_floor_table() {
+        let a = new_alloc_lanes(64, 1);
+        assert_eq!(a.wide_refill_floor(STRIPE, 8192, STRIPE), None, "knob off");
+
+        a.set_stripe_refill_run_stripes(WIDE);
+        assert_eq!(
+            a.wide_refill_floor(STRIPE, 8192, STRIPE),
+            Some(WIDE * STRIPE)
+        );
+        // Clamped to the budget.
+        assert_eq!(a.wide_refill_floor(STRIPE, 12, STRIPE), Some(12));
+        // A request already wider than the floor gets no wide pass.
+        assert_eq!(a.wide_refill_floor(WIDE * STRIPE, 8192, STRIPE), None);
+        assert_eq!(a.wide_refill_floor(100 * STRIPE, 8192, STRIPE), None);
+        // Never under the request, even with an absurd stripe width.
+        a.set_stripe_refill_run_stripes(u32::MAX);
+        let floor = a.wide_refill_floor(STRIPE, 8192, STRIPE).unwrap();
+        assert!((STRIPE..=8192).contains(&floor));
+    }
 }
 
 #[cfg(test)]
@@ -7295,6 +7704,65 @@ mod region_tests {
             "the lane never left its exhausted region"
         );
         assert_region_containment(&allocator);
+    }
+
+    /// `storage.stripe_refill_run_stripes` on the shape that ships: 2048 regions,
+    /// the LOW regions aged into pinned single-stripe windows and intact material
+    /// only higher up. The wide pass has to MIGRATE the lane, because
+    /// `stripe_hint` (largest reserve run) is what selects a region, and the low
+    /// regions' hint is one stripe.
+    ///
+    /// Without the migration the knob would be a no-op in production — the
+    /// unsharded tests cannot see this.
+    #[test]
+    fn a_wide_refill_migrates_the_lane_to_a_region_with_intact_material() {
+        const WIDE: u32 = 8;
+        let allocator = sharded(2, 4);
+        let layout = layout_of(&allocator);
+        // Claim everything, then hand back pinned windows in region 0 and one
+        // intact run in region 2.
+        let mut held = Vec::new();
+        while let Ok(extent) = allocator.allocate_extent(u32::MAX) {
+            held.push(extent);
+        }
+        let low_base = SpaceAllocator::align_up_pba(RESERVED_BLOCKS, STRIPE as u64, PHASE as u64);
+        for i in 0..16u64 {
+            allocator
+                .free_extent(Extent::new(Pba(low_base + i * 2 * u64::from(STRIPE)), STRIPE))
+                .unwrap();
+        }
+        let intact_start = SpaceAllocator::align_up_pba(
+            layout.start(2) + u64::from(STRIPE),
+            STRIPE as u64,
+            PHASE as u64,
+        );
+        let intact = Extent::new(Pba(intact_start), WIDE * STRIPE);
+        allocator.free_extent(intact).unwrap();
+        assert_eq!(layout.of(intact.start.0), 2, "fixture must seed region 2");
+
+        allocator.set_stripe_refill_run_stripes(WIDE);
+        // Pin the lane to region 0 first, the way steady-state writing would.
+        allocator.lane_regions[0].store(0, Ordering::Relaxed);
+        let first = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .expect("intact material exists");
+        assert_eq!(
+            first.start.0, intact.start.0,
+            "the wide pass must leave region 0's pinned windows for region 2's run"
+        );
+        let supply = allocator.supply_stats();
+        assert_eq!(supply.wide_hits, 1);
+        assert_eq!(supply.wide_misses, 0);
+        // And the rest of the run follows contiguously out of the lane cache.
+        for i in 1..WIDE as u64 {
+            let next = allocator
+                .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+                .unwrap();
+            assert_eq!(next.start.0, intact.start.0 + i * u64::from(STRIPE));
+        }
+        assert_eq!(allocator.supply_stats().refills, 1);
+        assert_region_containment(&allocator);
+        drop(held);
     }
 
     /// Two lanes should end up in different regions — the exclusivity that makes

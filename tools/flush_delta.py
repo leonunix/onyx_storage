@@ -57,6 +57,23 @@ if refills:
     print("  drains %d (%.2f/s) covering %d blocks" % (
         d("allocator_supply.drains"), d("allocator_supply.drains") / W,
         d("allocator_supply.drain_blocks")))
+    # blocks/run is the contiguity the WRITE path consumes, and it is the upstream
+    # cause of chunklet's per-PD adjacency merge: one stripe per run (6.15 blocks
+    # measured 2026-08-01, stripe = 6) means every LV3 op lands at an unrelated PBA,
+    # merge collapses to 1.02x and one batch becomes ~563 separate 4 KiB writes.
+    # wide_hits/misses is the direct read of storage.stripe_refill_run_stripes:
+    # both 0 = knob off; miss-dominated = the reserve has no intact runs left and
+    # the lever is defrag, not the refill.
+    runs = d("allocator_supply.refill_runs")
+    hits = d("allocator_supply.wide_hits")
+    misses = d("allocator_supply.wide_misses")
+    print("  blocks/run %.1f  (merge ceiling; 1 stripe/run == no adjacency merge)"
+          % (d("allocator_supply.refill_blocks") / runs if runs else 0))
+    if hits or misses:
+        print("  wide refill: hits %d  misses %d  (%.1f%% hit)" % (
+            hits, misses, hits / (hits + misses) * 100))
+    else:
+        print("  wide refill: OFF (storage.stripe_refill_run_stripes = 0)")
 
 # Per-site wait/hold attribution for the two allocator locks. THE question the
 # free_pools table answers: of the writer's alloc time, how much is waiting, and
