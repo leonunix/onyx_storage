@@ -1194,6 +1194,19 @@ pub struct ChunkletConfig {
     /// `0` keeps that legacy 64; the value is capped by chunklet's ring depth.
     #[serde(default)]
     pub uring_write_chunk_ops: usize,
+    /// Submit an adjacency-merged strip group as one `IORING_OP_WRITEV` with an
+    /// iovec per strip, instead of copying the strips into one bounce buffer.
+    /// Default off (bounce, the long-shipped path).
+    ///
+    /// Per-PD strip data is strided in memory (24 KiB apart for a 6+2 RAID6
+    /// stripe), so a merged group can never be contiguous in the caller's buffer
+    /// — the copy is inherent to merging. That is what made merging a net loss on
+    /// the box: raising the LV3 merge saved 0.29 ms/call of SQE wait but added
+    /// 0.94 ms/call to the materialise stage, so `write` went 0.981 → 1.660 ms.
+    /// Any strip that is not itself block aligned (parity strips are plain
+    /// `Vec<u8>`) falls its whole group back to the bounce path.
+    #[serde(default)]
+    pub uring_writev_coalesce: bool,
     /// Persistent chunklet io_uring workers reserved for foreground writes.
     /// `0` together with `pd_write_background_workers = 0` preserves the
     /// caller-thread execution path.
@@ -1343,6 +1356,7 @@ impl Default for ChunkletConfig {
             io_backend: ChunkletIoBackend::default(),
             uring_coalesced_wait: false,
             uring_write_chunk_ops: 0,
+            uring_writev_coalesce: false,
             pd_write_foreground_workers: 0,
             pd_write_background_workers: 0,
             write_max_active: 0,

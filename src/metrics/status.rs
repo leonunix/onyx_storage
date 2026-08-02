@@ -152,6 +152,16 @@ pub struct ChunkletSubmitClassSnapshot {
     pub ops: u64,
     pub sqes: u64,
     pub bounce_bytes: u64,
+    /// Bounce buffers allocated. `copy_ns / bounce_allocs` separates "the copy is
+    /// slow" from "the allocation is slow".
+    pub bounce_allocs: u64,
+    /// `bounce_ns` split into its three mutually-exclusive parts: adjacency
+    /// grouping, bounce alloc + copy, and building the per-SQE descriptors. Was
+    /// one opaque counter until 2026-08-02, when the LV2 class measured 205
+    /// µs/call — ~10x what a linear copy of `bounce_bytes` can explain.
+    pub group_ns: u64,
+    pub copy_ns: u64,
+    pub build_ns: u64,
     pub bounce_ns: u64,
     pub wait_ns: u64,
 }
@@ -180,7 +190,11 @@ impl From<onyx_chunklet::WritePathStats> for ChunkletWritePathSnapshot {
                     ops: c.ops,
                     sqes: c.sqes,
                     bounce_bytes: c.bounce_bytes,
-                    bounce_ns: c.bounce_ns,
+                    bounce_allocs: c.bounce_allocs,
+                    group_ns: c.group_ns,
+                    copy_ns: c.copy_ns,
+                    build_ns: c.build_ns,
+                    bounce_ns: c.bounce_ns(),
                     wait_ns: c.wait_ns,
                 })
                 .collect(),
@@ -439,12 +453,16 @@ impl EngineStatusSnapshot {
             );
             // `waves/calls` = stop-and-wait barriers per batch
             // (`uring_write_chunk_ops`); `ops/sqes` = adjacency merge factor.
+            // `group/copy/build_ns` are the pre-submit stage split (they sum to
+            // `bounce_ns`); `bounce_allocs` turns `copy_ns` into a per-allocation
+            // cost, which is what separates a slow copy from a slow allocator.
             for c in wp.submit.iter().filter(|c| c.calls > 0) {
                 let _ = writeln!(
                     out,
-                    "chunklet_submit_{}: calls={} waves={} ops={} sqes={} bounce_bytes={} bounce_ns={} wait_ns={}",
-                    c.class, c.calls, c.waves, c.ops, c.sqes, c.bounce_bytes, c.bounce_ns,
-                    c.wait_ns,
+                    "chunklet_submit_{}: calls={} waves={} ops={} sqes={} bounce_bytes={} \
+                     bounce_allocs={} group_ns={} copy_ns={} build_ns={} bounce_ns={} wait_ns={}",
+                    c.class, c.calls, c.waves, c.ops, c.sqes, c.bounce_bytes, c.bounce_allocs,
+                    c.group_ns, c.copy_ns, c.build_ns, c.bounce_ns, c.wait_ns,
                 );
             }
         }

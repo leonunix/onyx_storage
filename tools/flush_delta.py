@@ -296,3 +296,19 @@ for cls in ["drain_data", "foreground", "drain_meta", "maintenance"]:
         "", sqes / waves if waves else 0, wait / waves / 1e6 if waves else 0, wait / sc / 1e6,
         wait / sqes / 1e3 if sqes else 0,
         d(pre + ".bounce_bytes") / sc / 1024, d(pre + ".bounce_ns") / sc / 1e6))
+    # The pre-submit stage, split. It is NOT a rounding error: measured 2026-08-02
+    # this stage cost 826.8 s per 480 s window on `foreground` (1.72 cores) --
+    # MORE than that class spent waiting for the device -- and 505 us/call on
+    # drain_data while merging almost nothing. group = adjacency grouping,
+    # copy = bounce alloc + memcpy, build = per-SQE descriptor build. copy/alloc
+    # is what separates a slow gather-copy from a slow allocator; both should go
+    # to ~0 with `[chunklet] uring_writev_coalesce = true`.
+    group, copy, build = (d(pre + ".group_ns"), d(pre + ".copy_ns"), d(pre + ".build_ns"))
+    stage = group + copy + build
+    allocs = d(pre + ".bounce_allocs")
+    if stage:
+        print("  %-11s stage %7.1f us/call = group %5.1f + copy %5.1f + build %5.1f"
+              "  (%4.1f%% of call)  %d allocs (%6.1f us each)" % (
+            "", stage / sc / 1e3, group / sc / 1e3, copy / sc / 1e3, build / sc / 1e3,
+            stage / (stage + wait) * 100 if (stage + wait) else 0,
+            allocs, copy / allocs / 1e3 if allocs else 0))
