@@ -1164,6 +1164,12 @@ fn default_read_pool_workers() -> usize {
     4
 }
 
+/// On since 2026-08-02 — see [`ChunkletConfig::uring_writev_coalesce`] for the
+/// box acceptance; `false` is the rollback.
+fn default_uring_writev_coalesce() -> bool {
+    true
+}
+
 /// chunklet RAID backend wiring (roadmap ③ RAID-aware / Phase 8 integration).
 /// When `enabled`, LV3 (and later LV2 / metadb) sit on chunklet `LogicalDisk`s
 /// carved from one Pool over `devices`, replacing the single-device paths.
@@ -1196,16 +1202,32 @@ pub struct ChunkletConfig {
     pub uring_write_chunk_ops: usize,
     /// Submit an adjacency-merged strip group as one `IORING_OP_WRITEV` with an
     /// iovec per strip, instead of copying the strips into one bounce buffer.
-    /// Default off (bounce, the long-shipped path).
     ///
-    /// Per-PD strip data is strided in memory (24 KiB apart for a 6+2 RAID6
-    /// stripe), so a merged group can never be contiguous in the caller's buffer
-    /// — the copy is inherent to merging. That is what made merging a net loss on
-    /// the box: raising the LV3 merge saved 0.29 ms/call of SQE wait but added
-    /// 0.94 ms/call to the materialise stage, so `write` went 0.981 → 1.660 ms.
-    /// Any strip that is not itself block aligned (parity strips are plain
-    /// `Vec<u8>`) falls its whole group back to the bounce path.
-    #[serde(default)]
+    /// **On by default since 2026-08-02** (box-accepted). Per-PD strip data is
+    /// strided in memory (24 KiB apart for a 6+2 RAID6 stripe), so a merged group
+    /// can never be contiguous in the caller's buffer — the copy is inherent to
+    /// merging, and it is what made merging a net loss (raising the LV3 merge
+    /// saved 0.29 ms/call of SQE wait but added 0.94 ms/call of materialise).
+    ///
+    /// Measured with the once-per-op grouping key of the same session, as the
+    /// pre-submit stage per submit call (`chunklet_submit_<class>` in `status`,
+    /// split printed by `tools/flush_delta.py`):
+    ///
+    /// | class | before | grouping fix only | + writev |
+    /// |---|---|---|---|
+    /// | foreground (LV2) | 205.3 µs | 37.9 µs | **4.7 µs** |
+    /// | drain_data (LV3) | 505 µs | 179.5 µs | **52.2 µs** |
+    /// | drain_meta | 1262 µs | 499.0 µs | **131.8 µs** |
+    ///
+    /// `bounce_bytes`/`bounce_allocs` go to 0 and `sqes`/merge per call are
+    /// unchanged. The payoff is CPU, not bandwidth: the LV2 `lane` duty fell
+    /// 56.4 → 41.6 % and `coord` 41.7 → 28.8 %, i.e. ~1.3 cores returned to the
+    /// ack path, while throughput stayed inside this box's drift band.
+    ///
+    /// `false` is the rollback. Any strip that is not itself block aligned (parity
+    /// strips are plain `Vec<u8>`) falls its whole group back to the bounce path,
+    /// so correctness never depends on this knob.
+    #[serde(default = "default_uring_writev_coalesce")]
     pub uring_writev_coalesce: bool,
     /// Persistent chunklet io_uring workers reserved for foreground writes.
     /// `0` together with `pd_write_background_workers = 0` preserves the
@@ -1356,7 +1378,7 @@ impl Default for ChunkletConfig {
             io_backend: ChunkletIoBackend::default(),
             uring_coalesced_wait: false,
             uring_write_chunk_ops: 0,
-            uring_writev_coalesce: false,
+            uring_writev_coalesce: default_uring_writev_coalesce(),
             pd_write_foreground_workers: 0,
             pd_write_background_workers: 0,
             write_max_active: 0,

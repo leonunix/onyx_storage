@@ -40,29 +40,36 @@ devices = [
     "/dev/nvme9n1",
 ]
 io_backend = "uring"
-# A/B knob (default off in code). Submit an adjacency-merged strip group as one
-# IORING_OP_WRITEV with an iovec per strip instead of copying the strips into one
-# bounce buffer.
+# Submit an adjacency-merged strip group as one IORING_OP_WRITEV with an iovec per
+# strip instead of copying the strips into one bounce buffer. ON BY DEFAULT in code
+# since 2026-08-02; `false` is the rollback.
 #
 # WHY: per-PD strip data is 24 KiB-strided in memory for a 6+2 stripe, so a merged
 # group can never be contiguous in the caller's buffer — the copy is inherent to
-# merging, and it is what made merging a NET LOSS. Measured 2026-08-02 with the LV3
-# wide-run refill on: the merge saved 0.29 ms/call of SQE wait but the materialise
-# stage grew 0.075 -> 1.019 ms/call, so chunklet_r6_batch `write` went 0.981 ->
-# 1.660 ms (+69%). The same stage costs 826.8 s per 480 s window on the LV2
-# (`foreground`) class = 1.72 cores, MORE than that class spends waiting for the
-# device, and it runs inline on the LV2 lane threads (ack path).
+# merging, and it is what made merging a NET LOSS (with the LV3 wide-run refill on,
+# the merge saved 0.29 ms/call of SQE wait but the materialise stage grew 0.075 ->
+# 1.019 ms/call, so chunklet_r6_batch `write` went 0.981 -> 1.660 ms).
 #
-# GATE (single-arm decomposition, never bandwidth): `chunklet_submit_<class>`
-# stage split printed by tools/flush_delta.py —
-#   foreground stage  205 us/call -> < 20    (group + copy + build)
-#   drain_data stage  505 us/call -> < 50
-#   bounce_bytes / bounce_allocs  -> ~0
-#   sqes and ops per call UNCHANGED (this must not alter IO shape)
-# Any strip that is not itself block aligned (parity strips are plain Vec<u8>)
-# falls its whole group back to the bounce path, so correctness never depends on
-# the knob. Flip to true for the B arm.
-uring_writev_coalesce = false
+# BOX ACCEPTANCE 2026-08-02, 4 arms x (400 s burn + 480 s window), read as the
+# pre-submit stage per submit call (`chunklet_submit_<class>` split printed by
+# tools/flush_delta.py). Paired with the once-per-op grouping key landed the same
+# session (chunklet 91b87aa) — the two are complementary, neither alone is enough:
+#
+#   class              before   grouping fix   + writev    stage share of the call
+#   foreground (LV2)   205.3      37.9 us       4.7 us      56.8%  ->   4.9%
+#   drain_data (LV3)   505        179.5 us     52.2 us      34.0%  ->   3.6%
+#   drain_meta        1262        499.0 us    131.8 us      53.6%  ->   5.0%
+#
+# bounce_bytes and bounce_allocs go to 0; sqes/call and the merge factor are
+# UNCHANGED (this must not alter IO shape); 0 errors / 0 CRC events on both writev
+# arms. ⚠ The payoff is CPU on the ack path, NOT bandwidth: LV2 `lane` duty
+# 56.4 -> 41.6% and `coord` 41.7 -> 28.8% (~1.3 cores returned), while throughput
+# stayed inside this box's drift band (235.7 / 259.2 / 287.5 / 222.8 MB/s across the
+# four arms, NOT monotone in the fix — do not read a bandwidth effect into it).
+#
+# Any strip that is not itself block aligned (parity strips are plain Vec<u8>) falls
+# its whole group back to the bounce path, so correctness never depends on this.
+uring_writev_coalesce = true
 spare_pct = 5
 # Phase 4d online-failover acceptance: watchdog probes every live PD's head
 # superblock (O_DIRECT), N consecutive misses -> mark_pd_failed -> (auto_failover)
