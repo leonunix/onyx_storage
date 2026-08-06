@@ -76,15 +76,19 @@ impl BufferFlusher {
         };
         let ready_timeout = Duration::from_millis(10);
         let retry_snapshot_interval = Duration::from_millis(100);
-        // With a residence window, ready notifications are intentionally
-        // consumed before entries mature. Once they do mature, recover the
-        // full 16 MiB coalesce admission window per retry pass rather than the
-        // legacy 64-entry starvation sample (which would cap 4 KiB draining).
-        let retry_snapshot_topup_limit = if write_window.is_zero() {
-            64usize
-        } else {
-            Self::COALESCE_READY_WINDOW_BYTES / BLOCK_SIZE as usize
-        };
+        // A cycle is bounded by the 16 MiB admission window; this entry count
+        // only bounds how deep into the ring head we walk in order to fill it.
+        // Deriving it from the window is therefore the only self-consistent
+        // choice, and it used to hold for the residence-window case only: the
+        // `write_window == 0` default kept a legacy 64-entry sample, which caps
+        // 4 KiB draining at 64 entries per cycle no matter how much is pending.
+        // Most of those 64 are seqs still traversing the pipeline (skipped as
+        // SkipReason::InFlight), so only ~4 fresh entries were admitted per
+        // cycle. Measured on nvme-box, 4 KiB random, 480 s windows: units per
+        // coalesce run 3.89 -> 407, drain 6.20 -> 257.69 MiB/s, and metadata
+        // write amplification 3.15x -> 1.11x because coalescing could finally
+        // find adjacent work.
+        let retry_snapshot_topup_limit = Self::COALESCE_READY_WINDOW_BYTES / BLOCK_SIZE as usize;
         let mut last_retry_snapshot = Instant::now();
         let mut write_window_cutoff = Instant::now().checked_sub(write_window);
         let mut next_cutoff_refresh = Instant::now() + WRITE_WINDOW_RELEASE_QUANTUM;
@@ -146,11 +150,11 @@ impl BufferFlusher {
             } else {
                 Self::COALESCE_READY_WINDOW_BYTES
             };
-            let admission_topup_limit = if write_window.is_zero() {
-                retry_snapshot_topup_limit
-            } else {
-                admission_window_bytes / BLOCK_SIZE as usize
-            };
+            // Same reasoning as `retry_snapshot_topup_limit`: the window is the
+            // real bound, so the entry count should just track it. Keeping a
+            // separate constant for `write_window == 0` is what capped the
+            // default configuration.
+            let admission_topup_limit = admission_window_bytes / BLOCK_SIZE as usize;
             if !write_window.is_zero() && !bypass_write_window {
                 let now = Instant::now();
                 if now >= next_cutoff_refresh {
