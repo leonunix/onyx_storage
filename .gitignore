@@ -13,4 +13,5 @@ src/bin/*
 .dev/
 *.pyc
 /metadb/
+/chunklet/
 .codex

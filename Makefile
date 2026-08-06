@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := all
 
-.PHONY: all dev engine-build engine-test engine-release dashboard-backend dashboard-frontend dashboard-build dashboard-backend-build dashboard-frontend-build dashboard-release
+.PHONY: all dev engine-build engine-test engine-release fio-engine dashboard-backend dashboard-frontend dashboard-build dashboard-backend-build dashboard-frontend-build dashboard-release
 
 all: engine-build
 
@@ -25,6 +25,9 @@ engine-test:
 
 engine-release:
 	cargo build --release
+
+fio-engine:
+	$(MAKE) -C fio FIO_SOURCE_DIR="$(FIO_SOURCE_DIR)"
 
 dashboard-backend:
 	cd dashboard/backend && go run ./cmd/dashboardd
