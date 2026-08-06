@@ -684,6 +684,19 @@ impl EngineStatusSnapshot {
                 metadb.rc_mutation_underflow_clamped_total,
                 metadb.rc_staged_overlay_hits_total
             );
+            // condense vs append is the only way to tell whether the delta-run
+            // amortisation (rc_condense_interval_cycles) is actually holding, or
+            // whether every forced flush is folding the whole base array anyway.
+            let _ = writeln!(
+                out,
+                "metadb_flush_rc_segments: appends={} condenses={} pages={} bytes={} dir_pages={} overlay_entries_max={}",
+                metadb.flush_rc_segment_appends,
+                metadb.flush_rc_segment_condenses,
+                metadb.flush_rc_segment_pages,
+                metadb.flush_rc_segment_bytes,
+                metadb.flush_rc_segment_dir_pages,
+                metadb.flush_rc_segment_overlay_entries_max
+            );
             let _ = writeln!(
                 out,
                 "metadb_flush_sample_breakdown: lock_us={} lock_max_us={} l2p_walk_us={} l2p_walk_max_us={} rc_checkpoint_wall_us={} rc_checkpoint_wall_max_us={}",
