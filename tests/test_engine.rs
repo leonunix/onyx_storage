@@ -337,6 +337,119 @@ fn shutdown_drains_pending_flush_retries_before_exit() {
     assert_eq!(reopened_vol.read(0, 4096).unwrap(), data);
 }
 
+/// The P0 this pins: a shutdown that cannot drain the ring used to log a WARN,
+/// discard the drain result, stamp the LV3 superblock CLEAN and report success —
+/// which handed the whole backlog to the startup replay, the half that
+/// hard-fails. A stuck drain must now fail the stop AND leave the marker dirty.
+#[test]
+#[serial]
+fn shutdown_that_cannot_drain_fails_and_leaves_the_superblock_dirty() {
+    let (mut config, _md, _bf, df) = make_config();
+    config.dedup.enabled = false;
+    // Give up on the stall quickly so the test does not sit through the 60 s
+    // production detector.
+    config.engine.shutdown_drain_stall_timeout_ms = 500;
+
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-shutdown-stuck", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    let vol = engine.open_volume("vol-shutdown-stuck").unwrap();
+    let data = vec![0x5A; 4096];
+
+    // Unlimited hits: this entry can never reach metadb, so the drain can never
+    // reach quiescence.
+    install_test_failpoint(
+        "vol-shutdown-stuck",
+        Lba(0),
+        FlushFailStage::BeforeMetaWrite,
+        None,
+    );
+    vol.write(0, &data).unwrap();
+    drop(vol);
+
+    let pool = engine.buffer_pool().unwrap();
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) && pool.pending_count() == 0 {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        pool.pending_count() > 0,
+        "metadata failpoint should leave at least one pending buffer entry"
+    );
+    drop(pool);
+
+    let err = engine
+        .shutdown()
+        .expect_err("shutdown must not report success over an undrained ring");
+    assert!(
+        matches!(err, OnyxError::ShutdownIncomplete(_)),
+        "expected ShutdownIncomplete, got {err:?}"
+    );
+    // Idempotent re-call must report the same failure, not launder it into Ok.
+    assert!(matches!(
+        engine.shutdown(),
+        Err(OnyxError::ShutdownIncomplete(_))
+    ));
+    drop(engine);
+
+    let device = RawDevice::open(df.path()).unwrap();
+    let sb = onyx_storage::io::superblock::read_superblock(&device)
+        .unwrap()
+        .expect("LV3 superblock must still be readable");
+    assert!(
+        !sb.is_clean_shutdown(),
+        "an undrained shutdown must leave the dirty marker so the next open replays the ring"
+    );
+    drop(device);
+
+    // With the failpoint gone the entry replays on reopen: the write was never
+    // lost, it was only unapplied.
+    clear_test_failpoint(
+        "vol-shutdown-stuck",
+        Lba(0),
+        FlushFailStage::BeforeMetaWrite,
+    );
+    let reopened = OnyxEngine::open(&config).unwrap();
+    assert_eq!(
+        reopened.buffer_pool().unwrap().pending_count(),
+        0,
+        "engine-open replay must drain the tail the failed shutdown left behind"
+    );
+    let reopened_vol = reopened.open_volume("vol-shutdown-stuck").unwrap();
+    assert_eq!(reopened_vol.read(0, 4096).unwrap(), data);
+    drop(reopened_vol);
+    reopened.shutdown().unwrap();
+}
+
+/// The clean half of the same contract: a drain that finishes stamps the marker
+/// and returns Ok.
+#[test]
+#[serial]
+fn clean_shutdown_still_marks_the_superblock_clean() {
+    let (mut config, _md, _bf, df) = make_config();
+    config.dedup.enabled = false;
+    let engine = OnyxEngine::open(&config).unwrap();
+    engine
+        .create_volume("vol-shutdown-clean", 64 * 4096, CompressionAlgo::None)
+        .unwrap();
+    {
+        let vol = engine.open_volume("vol-shutdown-clean").unwrap();
+        vol.write(0, &vec![0x11; 4096]).unwrap();
+    }
+    engine.shutdown().unwrap();
+    drop(engine);
+
+    let device = RawDevice::open(df.path()).unwrap();
+    let sb = onyx_storage::io::superblock::read_superblock(&device)
+        .unwrap()
+        .expect("LV3 superblock must be readable");
+    assert!(
+        sb.is_clean_shutdown(),
+        "a drained shutdown must still mark the superblock clean"
+    );
+}
+
 #[test]
 fn full_engine_restore_snapshot_rolls_back() {
     let (mut config, _md, _bf, _df) = make_config();

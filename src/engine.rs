@@ -125,6 +125,11 @@ pub struct OnyxEngine {
     chunklet_io_scheduler: Option<Arc<ChunkletIoScheduler>>,
     config: OnyxConfig,
     shutdown_done: Mutex<bool>,
+    /// Set when `shutdown()` could not drain the LV2 ring. `shutdown()` is
+    /// idempotent, so the reason is remembered here and re-reported on every
+    /// later call — a second `shutdown()` must not turn a dirty stop into a
+    /// clean one.
+    shutdown_incomplete: Mutex<Option<String>>,
 }
 
 impl OnyxEngine {
@@ -1020,6 +1025,15 @@ impl OnyxEngine {
         //    before standing up the long-lived one so clients never see
         //    a state that contradicts the post-checkpoint buffer tail.
         //    On a clean shutdown this is a no-op (pending == 0).
+        //    The budget is progress-gated by default (`recovery_timeout_ms = 0`):
+        //    a deep ring legitimately takes minutes to replay, so aborting on a
+        //    constant turned "slow open" into "cannot open at all". Only a
+        //    genuine stall (pending not falling for
+        //    `recovery_stall_timeout_ms`) refuses the open now.
+        let recovery_budget = crate::buffer::flush::DrainBudget::from_config_ms(
+            config.engine.recovery_timeout_ms,
+            config.engine.recovery_stall_timeout_ms,
+        );
         let recovery_stats = crate::buffer::flush::replay_buffer_pending(
             buffer_pool.clone(),
             meta.clone(),
@@ -1030,15 +1044,35 @@ impl OnyxEngine {
             &config.flush,
             &config.dedup,
             metrics.clone(),
-            std::time::Duration::from_millis(config.engine.recovery_timeout_ms),
+            recovery_budget,
         );
         if recovery_stats.timed_out {
-            return Err(OnyxError::Config(format!(
-                "buffer replay did not reach quiescence in {} ms (pending {} of {}); raise engine.recovery_timeout_ms or investigate stuck entries",
-                config.engine.recovery_timeout_ms,
-                recovery_stats.pending_at_exit,
-                recovery_stats.pending_at_start,
-            )));
+            let rate = recovery_stats
+                .entries_per_sec()
+                .map(|r| format!("{r:.0} entries/s"))
+                .unwrap_or_else(|| "unmeasured".to_string());
+            return Err(OnyxError::Config(if recovery_stats.stalled {
+                format!(
+                    "buffer replay stalled: pending {} of {} stopped falling for {} ms \
+                     (drained {} in {} ms, {rate}); the remaining entries are stuck — \
+                     investigate the flusher lanes, do NOT just raise the budget",
+                    recovery_stats.pending_at_exit,
+                    recovery_stats.pending_at_start,
+                    config.engine.recovery_stall_timeout_ms,
+                    recovery_stats.drained(),
+                    recovery_stats.elapsed.as_millis(),
+                )
+            } else {
+                format!(
+                    "buffer replay hit the absolute engine.recovery_timeout_ms cap of {} ms \
+                     while still making progress (pending {} of {}, drained {} at {rate}); \
+                     set engine.recovery_timeout_ms = 0 to let a healthy replay finish",
+                    config.engine.recovery_timeout_ms,
+                    recovery_stats.pending_at_exit,
+                    recovery_stats.pending_at_start,
+                    recovery_stats.drained(),
+                )
+            }));
         }
         if recovery_stats.pending_at_start > 0 {
             tracing::info!(
@@ -1196,6 +1230,7 @@ impl OnyxEngine {
             chunklet_io_scheduler,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
+            shutdown_incomplete: Mutex::new(None),
         })
     }
 
@@ -1250,6 +1285,7 @@ impl OnyxEngine {
             chunklet_io_scheduler,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
+            shutdown_incomplete: Mutex::new(None),
         })
     }
 
@@ -1668,10 +1704,18 @@ impl OnyxEngine {
     }
 
     /// Graceful shutdown: stop flusher, then zone manager.
+    ///
+    /// Returns [`OnyxError::ShutdownIncomplete`] when the LV2 ring could not be
+    /// drained. The entries stay durable in the ring and the LV3 superblock is
+    /// deliberately left dirty in that case, but the caller MUST NOT report a
+    /// successful stop: the previous behaviour (discard the drain result, stamp
+    /// the superblock clean, print "engine stopped") silently handed a
+    /// six-figure backlog to the startup replay, which then refused to open.
     pub fn shutdown(&self) -> OnyxResult<()> {
         let mut done = self.shutdown_done.lock().unwrap();
         if *done {
-            return Ok(());
+            // Idempotent — but a repeat call must not launder a dirty stop.
+            return self.shutdown_outcome();
         }
         *done = true;
 
@@ -1703,14 +1747,58 @@ impl OnyxEngine {
             gc.stop();
         }
 
-        // Then stop flusher and give graceful shutdown a chance to drain the
-        // buffer so recovered pending entries do not accumulate across restarts.
-        if let Some(mut flusher) = self.flusher.lock().unwrap().take() {
+        // Then stop the flusher, draining the buffer so recovered pending
+        // entries do not accumulate across restarts. The budget is
+        // progress-gated by default: the drain runs to completion however deep
+        // the ring is, and only a genuine stall aborts it. The result is
+        // load-bearing from here on — it decides the clean marker and this
+        // function's return value.
+        let drain_stats = if let Some(mut flusher) = self.flusher.lock().unwrap().take() {
             if let Some(pool) = self.buffer_pool.as_ref() {
-                flusher.drain_and_stop(pool);
+                let budget = crate::buffer::flush::DrainBudget::from_config_ms(
+                    self.config.engine.shutdown_drain_timeout_ms,
+                    self.config.engine.shutdown_drain_stall_timeout_ms,
+                );
+                Some(flusher.drain_with_budget(pool, budget))
             } else {
                 flusher.stop();
+                None
             }
+        } else {
+            None
+        };
+        let ring_dirty = drain_stats
+            .as_ref()
+            .is_some_and(|stats| !stats.drained_clean());
+        if let Some(stats) = drain_stats.as_ref().filter(|_| ring_dirty) {
+            let reason = format!(
+                "buffer drain did not finish: pending {} of {} still unflushed after {} ms \
+                 ({}; drained {} at {}); the LV2 ring stays dirty and the next open will \
+                 replay it",
+                stats.pending_at_exit,
+                stats.pending_at_start,
+                stats.elapsed.as_millis(),
+                if stats.stalled {
+                    "the drain STALLED — entries are stuck"
+                } else {
+                    "the absolute engine.shutdown_drain_timeout_ms cap expired while still \
+                     progressing"
+                },
+                stats.drained(),
+                stats
+                    .entries_per_sec()
+                    .map(|r| format!("{r:.0} entries/s"))
+                    .unwrap_or_else(|| "an unmeasured rate".to_string()),
+            );
+            tracing::error!(
+                pending_at_exit = stats.pending_at_exit,
+                pending_at_start = stats.pending_at_start,
+                stalled = stats.stalled,
+                elapsed_ms = stats.elapsed.as_millis() as u64,
+                entries_per_s = stats.entries_per_sec().unwrap_or(0.0) as u64,
+                "shutdown drain incomplete — leaving the LV2 ring dirty and failing the stop"
+            );
+            *self.shutdown_incomplete.lock().unwrap() = Some(reason);
         }
 
         // Drain per-lane allocator caches back to the global free list
@@ -1754,7 +1842,7 @@ impl OnyxEngine {
                     error = %e,
                     "failed to sync_durable at shutdown — forcing dirty recovery on next boot"
                 );
-                return Ok(());
+                return self.shutdown_outcome();
             }
         };
 
@@ -1768,7 +1856,7 @@ impl OnyxEngine {
                 error = %e,
                 "failed to durably drain deferred metadb reclaim at shutdown -- forcing dirty recovery on next boot"
             );
-            return Ok(());
+            return self.shutdown_outcome();
         }
 
         // Drive one final reclaim pass. The durability watermark thread has
@@ -1796,7 +1884,7 @@ impl OnyxEngine {
                     error = %e,
                     "failed to persist final LV2 shard checkpoints — forcing dirty recovery on next boot"
                 );
-                return Ok(());
+                return self.shutdown_outcome();
             }
         }
 
@@ -1804,7 +1892,16 @@ impl OnyxEngine {
         // can skip dirty recovery. This is the last persistent act of the
         // engine — by this point flusher has drained, cleanup_tx is idle, and
         // the refcount CF is consistent with the per-volume blockmap CFs.
-        if let Some(ref io_engine) = self.io_engine {
+        //
+        // A drain that did not finish must NOT land here: the ring still holds
+        // unapplied entries, so the on-disk state is by definition not the clean
+        // one the marker advertises.
+        if ring_dirty {
+            tracing::warn!(
+                "leaving the LV3 superblock DIRTY — the buffer drain did not finish, so the \
+                 next open must run the dirty-recovery path and replay the ring tail"
+            );
+        } else if let Some(ref io_engine) = self.io_engine {
             match superblock::read_superblock(io_engine.device().as_ref()) {
                 Ok(Some(mut sb)) => {
                     sb.set_clean_shutdown(true);
@@ -1827,8 +1924,23 @@ impl OnyxEngine {
             }
         }
 
+        if self.shutdown_incomplete.lock().unwrap().is_some() {
+            return self.shutdown_outcome();
+        }
+
         tracing::info!("onyx engine shut down");
         Ok(())
+    }
+
+    /// The recorded verdict of this engine's shutdown: `Err` iff the LV2 ring
+    /// could not be drained. Every exit path out of [`Self::shutdown`] goes
+    /// through here, including the early ones, so a metadb/checkpoint failure
+    /// during teardown can never mask an undrained ring.
+    fn shutdown_outcome(&self) -> OnyxResult<()> {
+        match self.shutdown_incomplete.lock().unwrap().as_ref() {
+            Some(reason) => Err(OnyxError::ShutdownIncomplete(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     /// Upgrade from a meta-only engine to full mode, reusing the existing MetaStore.
@@ -2093,6 +2205,7 @@ impl OnyxEngine {
             chunklet_io_scheduler,
             config: config.clone(),
             shutdown_done: Mutex::new(false),
+            shutdown_incomplete: Mutex::new(None),
         })
     }
 

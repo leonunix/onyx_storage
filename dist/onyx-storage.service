@@ -12,6 +12,14 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 
+# `stop` blocks until the engine has drained the LV2 ring, which on a deep ring
+# is minutes of work (~1300 entries/s; a full ring is ~15 min). systemd's default
+# 90 s would SIGKILL mid-drain and hand the backlog to the next start's replay —
+# exactly the failure the progress-gated drain exists to avoid. A genuinely stuck
+# drain still self-terminates via engine.shutdown_drain_stall_timeout_ms, so this
+# only covers the healthy-but-slow case.
+TimeoutStopSec=1800
+
 # Resource limits
 LimitNOFILE=1048576
 LimitMEMLOCK=infinity

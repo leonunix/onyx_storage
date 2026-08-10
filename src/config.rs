@@ -1908,14 +1908,43 @@ pub struct EngineConfig {
     /// Blocks per zone (default 256)
     #[serde(default = "default_zone_size_blocks")]
     pub zone_size_blocks: u64,
-    /// Max wall time `Engine::open` will spend draining any buffer
-    /// entries that exist past the last checkpoint before accepting
-    /// client IO. Post-WAL, the buffer ring is the only durable record
-    /// of commits between checkpoints, so a graceful start MUST replay
-    /// them through the flush pipeline. Default 60000 ms; bump if
-    /// you've configured a very deep ring.
+    /// ABSOLUTE cap on the wall time `Engine::open` will spend draining any
+    /// buffer entries that exist past the last checkpoint before accepting
+    /// client IO. Post-WAL, the buffer ring is the only durable record of
+    /// commits between checkpoints, so a graceful start MUST replay them
+    /// through the flush pipeline.
+    ///
+    /// **Default 0 = no absolute cap**: replay runs as long as it keeps making
+    /// progress and only fails when it stalls (see
+    /// `recovery_stall_timeout_ms`). A constant here can never be right — ring
+    /// capacity and replay rate are independent, and a ring holding ~1.16 M
+    /// entries needs ~15 min at the measured ~1300 entries/s, so every constant
+    /// small enough to bound a hang was also small enough to abort a healthy
+    /// replay. Set non-zero only when you need a hard bound on open time and
+    /// accept that hitting it refuses the open.
     #[serde(default = "default_recovery_timeout_ms")]
     pub recovery_timeout_ms: u64,
+    /// Engine-open replay gives up once the pending count has not decreased for
+    /// this long — the "entries are genuinely stuck" detector that replaces the
+    /// absolute cap. Default 60000 ms. 0 falls back to
+    /// `recovery_timeout_ms` (or 60 s when that is also 0).
+    #[serde(default = "default_drain_stall_timeout_ms")]
+    pub recovery_stall_timeout_ms: u64,
+    /// ABSOLUTE cap on the graceful-shutdown buffer drain. **Default 0 = no
+    /// cap** (progress-gated, see `shutdown_drain_stall_timeout_ms`).
+    ///
+    /// This was a hardcoded 60 s whose result was discarded, so a `stop` under
+    /// load abandoned hundreds of thousands of entries, still stamped the LV3
+    /// superblock clean, and reported success — handing the whole backlog to the
+    /// startup replay, which is the half that hard-fails. A drain that does not
+    /// finish now leaves the ring dirty and fails the shutdown loudly.
+    #[serde(default = "default_shutdown_drain_timeout_ms")]
+    pub shutdown_drain_timeout_ms: u64,
+    /// Graceful-shutdown drain gives up once the pending count has not
+    /// decreased for this long. Default 60000 ms. 0 falls back to
+    /// `shutdown_drain_timeout_ms` (or 60 s when that is also 0).
+    #[serde(default = "default_drain_stall_timeout_ms")]
+    pub shutdown_drain_stall_timeout_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -1924,11 +1953,22 @@ impl Default for EngineConfig {
             zone_count: default_zone_count(),
             zone_size_blocks: default_zone_size_blocks(),
             recovery_timeout_ms: default_recovery_timeout_ms(),
+            recovery_stall_timeout_ms: default_drain_stall_timeout_ms(),
+            shutdown_drain_timeout_ms: default_shutdown_drain_timeout_ms(),
+            shutdown_drain_stall_timeout_ms: default_drain_stall_timeout_ms(),
         }
     }
 }
 
 fn default_recovery_timeout_ms() -> u64 {
+    0
+}
+
+fn default_shutdown_drain_timeout_ms() -> u64 {
+    0
+}
+
+fn default_drain_stall_timeout_ms() -> u64 {
     60_000
 }
 

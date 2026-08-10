@@ -200,7 +200,17 @@ commit_worker_pipeline_depth = 4
 [engine]
 zone_count = 256
 zone_size_blocks = 256
-recovery_timeout_ms = 600000
+# 0 = no absolute cap on engine-open replay: a deep ring legitimately takes
+# minutes (~1300 entries/s, a full ring is ~15 min), so any constant small
+# enough to bound a hang also aborts a healthy replay. A stall — pending not
+# falling for recovery_stall_timeout_ms — is what refuses the open now.
+recovery_timeout_ms = 0
+recovery_stall_timeout_ms = 60000
+# Graceful shutdown drains the ring on the same progress-gated rule. It used to
+# be a hardcoded 60 s whose result was DISCARDED, so `stop` under load abandoned
+# the backlog, stamped the superblock clean and reported success.
+shutdown_drain_timeout_ms = 0
+shutdown_drain_stall_timeout_ms = 60000
 
 [gc]
 enabled = true

@@ -83,9 +83,9 @@ struct FlusherLane {
 }
 
 /// Buffer-as-sole-journal Phase A drain summary. Returned from
-/// [`BufferFlusher::drain_with_timeout`] and the higher-level
-/// [`replay_buffer_pending`] helper so callers can confirm replay
-/// quiescence before accepting client IO or comparing shadow state.
+/// [`BufferFlusher::drain_with_budget`] / [`BufferFlusher::drain_with_timeout`]
+/// and the higher-level [`replay_buffer_pending`] helper so callers can confirm
+/// replay quiescence before accepting client IO or comparing shadow state.
 #[derive(Debug, Clone)]
 pub struct BufferReplayStats {
     /// Pending-entry count observed when the drain loop started.
@@ -96,17 +96,106 @@ pub struct BufferReplayStats {
     /// Wall-clock duration spent inside the drain loop (not including
     /// flusher startup or teardown).
     pub elapsed: std::time::Duration,
-    /// Set if the loop hit the supplied deadline before reaching
-    /// quiescence. The caller decides whether to retry or escalate.
+    /// Set if the loop gave up before reaching quiescence — either the
+    /// absolute cap expired or the drain stalled (see `stalled`). The
+    /// caller decides whether to retry or escalate.
     pub timed_out: bool,
+    /// Set when the give-up decision came from the **stall** detector
+    /// (`pending_count()` failed to fall for `DrainBudget::stall`) rather
+    /// than from an absolute cap. A stalled drain means "entries are
+    /// stuck", which is actionable; an exhausted cap only means "the
+    /// budget was smaller than the backlog".
+    pub stalled: bool,
 }
 
 impl BufferReplayStats {
     /// `true` iff replay reached quiescence inside the supplied
-    /// timeout. Callers gating client IO on a successful replay use
+    /// budget. Callers gating client IO on a successful replay use
     /// this as the go/no-go signal.
     pub fn drained_clean(&self) -> bool {
         !self.timed_out && self.pending_at_exit == 0
+    }
+
+    /// Entries drained during the loop. Saturating because a producer that
+    /// outlives the drain can push `pending_at_exit` above the start sample.
+    pub fn drained(&self) -> u64 {
+        self.pending_at_start.saturating_sub(self.pending_at_exit)
+    }
+
+    /// Observed drain rate in entries/s, or `None` when the window is too
+    /// short to divide by. Used in the shutdown/recovery log lines so the
+    /// operator can size the remaining wait instead of guessing.
+    pub fn entries_per_sec(&self) -> Option<f64> {
+        let secs = self.elapsed.as_secs_f64();
+        if secs <= 0.0 {
+            return None;
+        }
+        Some(self.drained() as f64 / secs)
+    }
+}
+
+/// Termination policy for a flusher drain (shutdown, engine-open replay,
+/// shard migration).
+///
+/// The P0 this replaces: shutdown drained with a hardcoded 60 s while the ring
+/// can hold ~1.16 M entries at ~1300 entries/s (≈15 min), so the budget covered
+/// 6.8 % of the work — and the constant was wrong *because* it was a constant.
+/// Ring capacity and drain budget are independent quantities, so a fixed
+/// wall-clock cap can never be right. The primary termination signal is
+/// therefore **progress**: keep draining while `pending_count()` falls, and only
+/// give up when it stops falling for `stall`.
+#[derive(Debug, Clone, Copy)]
+pub struct DrainBudget {
+    /// Absolute wall-clock cap. `None` = no cap; the drain runs as long as it
+    /// keeps making progress. Configured via `engine.shutdown_drain_timeout_ms`
+    /// / `engine.recovery_timeout_ms` (0 = `None`).
+    pub max_total: Option<Duration>,
+    /// Give up once `pending_count()` has not decreased for this long. This is
+    /// the "entries are genuinely stuck" detector.
+    pub stall: Duration,
+    /// Progress-log cadence. A 15-minute replay must not look like a hang.
+    pub log_every: Duration,
+}
+
+impl DrainBudget {
+    pub const DEFAULT_LOG_EVERY: Duration = Duration::from_secs(10);
+
+    /// Progress-gated: no absolute cap, give up after `stall` without progress.
+    pub fn progress_gated(stall: Duration) -> Self {
+        Self {
+            max_total: None,
+            stall,
+            log_every: Self::DEFAULT_LOG_EVERY,
+        }
+    }
+
+    /// Legacy fixed-deadline behaviour, kept for callers that genuinely want a
+    /// hard wall-clock bound (shard migration, tests). Stall == the same
+    /// deadline, so the drain can never end earlier than the old code did.
+    pub fn fixed(timeout: Duration) -> Self {
+        Self {
+            max_total: Some(timeout),
+            stall: timeout,
+            log_every: Self::DEFAULT_LOG_EVERY,
+        }
+    }
+
+    /// Build from the config pair `(absolute_ms, stall_ms)`, where
+    /// `absolute_ms == 0` means "no absolute cap" and `stall_ms == 0` falls
+    /// back to the absolute cap (or a 60 s default when both are 0) so a
+    /// mis-typed config can never produce an unbounded no-progress wait.
+    pub fn from_config_ms(absolute_ms: u64, stall_ms: u64) -> Self {
+        let max_total = (absolute_ms > 0).then(|| Duration::from_millis(absolute_ms));
+        let stall = match (stall_ms, max_total) {
+            (0, Some(cap)) => cap,
+            (0, None) => Duration::from_secs(60),
+            (ms, _) => Duration::from_millis(ms),
+        };
+        Self {
+            max_total,
+            stall,
+            log_every: Self::DEFAULT_LOG_EVERY,
+        }
     }
 }
 
@@ -123,9 +212,10 @@ impl BufferReplayStats {
 ///   reconstructing, then assert state equivalence.
 /// - In replay tests that need deterministic flusher quiescence.
 ///
-/// `timeout` bounds the quiescence polling window. Flusher lane teardown still
-/// joins in-flight backend calls before returning, so a kernel IO that never
-/// completes requires a process-level watchdog. Returns the
+/// `budget` bounds the quiescence polling window (see [`DrainBudget`]: progress
+/// is the primary signal, an absolute cap is optional). Flusher lane teardown
+/// still joins in-flight backend calls before returning, so a kernel IO that
+/// never completes requires a process-level watchdog. Returns the
 /// [`BufferReplayStats`] snapshot; the caller decides what to do with a
 /// `timed_out` result.
 #[allow(clippy::too_many_arguments)]
@@ -139,7 +229,7 @@ pub fn replay_buffer_pending(
     config: &FlushConfig,
     dedup_config: &DedupConfig,
     metrics: Arc<EngineMetrics>,
-    timeout: std::time::Duration,
+    budget: DrainBudget,
 ) -> BufferReplayStats {
     let mut flusher = BufferFlusher::start_with_metrics(
         pool.clone(),
@@ -152,7 +242,7 @@ pub fn replay_buffer_pending(
         dedup_config,
         metrics,
     );
-    flusher.drain_with_timeout(&pool, timeout)
+    flusher.drain_with_budget(&pool, budget)
 }
 
 #[derive(Debug, Clone)]

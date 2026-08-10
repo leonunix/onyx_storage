@@ -1,6 +1,6 @@
 //! Buffer-as-sole-journal Phase A.4: replay-driver end-to-end tests.
 //!
-//! `replay_buffer_pending` lifts the existing `drain_and_stop` pattern
+//! `replay_buffer_pending` lifts the old shutdown drain-and-stop pattern
 //! into a public, stats-returning entry point. These tests pin its
 //! contract:
 //!
@@ -72,7 +72,7 @@ fn replay_drains_pending_entries_appended_before_flusher_start() {
         &flush_cfg,
         &dedup_cfg,
         metrics,
-        Duration::from_secs(30),
+        crate::buffer::flush::DrainBudget::fixed(Duration::from_secs(30)),
     );
 
     assert!(
@@ -120,6 +120,7 @@ fn drained_clean_helper_distinguishes_success_from_timeout() {
         pending_at_exit: 0,
         elapsed: Duration::from_millis(10),
         timed_out: false,
+        stalled: false,
     };
     assert!(ok.drained_clean());
 
@@ -128,6 +129,7 @@ fn drained_clean_helper_distinguishes_success_from_timeout() {
         pending_at_exit: 3,
         elapsed: Duration::from_millis(100),
         timed_out: true,
+        stalled: true,
     };
     assert!(!timed_out.drained_clean());
 
@@ -138,6 +140,7 @@ fn drained_clean_helper_distinguishes_success_from_timeout() {
         pending_at_exit: 0,
         elapsed: Duration::from_millis(100),
         timed_out: true,
+        stalled: false,
     };
     assert!(!weird.drained_clean());
 }

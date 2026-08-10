@@ -20,6 +20,81 @@ fn write_window_pressure_thresholds(config: &FlushConfig) -> (u8, u8) {
     (physical, payload)
 }
 
+/// One sampling decision inside a [`BufferFlusher::drain_with_budget`] loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainVerdict {
+    /// Keep polling.
+    Continue,
+    /// Keep polling, and emit a progress line (the log cadence elapsed).
+    Log,
+    /// `pending == 0`: quiescence reached.
+    Clean,
+    /// `pending` has not decreased for `budget.stall` — the entries are stuck,
+    /// not merely numerous. This is the actionable failure.
+    Stalled,
+    /// The optional absolute cap expired while the drain was still progressing.
+    Exhausted,
+}
+
+/// Termination policy for a drain loop, split out from the loop itself so it is
+/// unit-testable without a flusher, a pool, or a device: `observe()` is pure
+/// apart from the `Instant` the caller passes in.
+///
+/// Progress is the primary signal (see [`DrainBudget`]). The absolute cap is
+/// checked only after the stall check so that a stuck drain is always reported
+/// as `Stalled` — that is the diagnosis the operator needs.
+pub(crate) struct DrainProgress {
+    budget: DrainBudget,
+    started_at: Instant,
+    last_pending: u64,
+    last_progress_at: Instant,
+    last_log_at: Instant,
+}
+
+impl DrainProgress {
+    pub(crate) fn new(budget: DrainBudget, pending_at_start: u64, now: Instant) -> Self {
+        Self {
+            budget,
+            started_at: now,
+            last_pending: pending_at_start,
+            last_progress_at: now,
+            last_log_at: now,
+        }
+    }
+
+    /// How long the drain has gone without `pending` decreasing.
+    pub(crate) fn stall_elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_progress_at)
+    }
+
+    pub(crate) fn observe(&mut self, pending: u64, now: Instant) -> DrainVerdict {
+        if pending == 0 {
+            return DrainVerdict::Clean;
+        }
+        // Any decrease is progress and re-arms the stall window. A pending count
+        // that GROWS is not progress (a producer outliving the drain must not
+        // buy it unbounded time), but it does not reset the baseline either —
+        // `last_pending` only ratchets down.
+        if pending < self.last_pending {
+            self.last_pending = pending;
+            self.last_progress_at = now;
+        }
+        if self.stall_elapsed(now) >= self.budget.stall {
+            return DrainVerdict::Stalled;
+        }
+        if let Some(cap) = self.budget.max_total {
+            if now.saturating_duration_since(self.started_at) >= cap {
+                return DrainVerdict::Exhausted;
+            }
+        }
+        if now.saturating_duration_since(self.last_log_at) >= self.budget.log_every {
+            self.last_log_at = now;
+            return DrainVerdict::Log;
+        }
+        DrainVerdict::Continue
+    }
+}
+
 impl BufferFlusher {
     pub fn start(
         pool: Arc<WriteBufferPool>,
@@ -562,13 +637,6 @@ impl BufferFlusher {
             .wait_volume_generation_idle(vol_id, vol_created_at, timeout)
     }
 
-    /// Wait for all pending buffer entries to be flushed, then stop.
-    /// Used during graceful shutdown to ensure the buffer device is clean
-    /// (e.g. before a shard count change on next startup).
-    pub fn drain_and_stop(&mut self, pool: &crate::buffer::pool::WriteBufferPool) {
-        let _ = self.drain_with_timeout(pool, std::time::Duration::from_secs(60));
-    }
-
     /// Buffer-as-sole-journal Phase A: drive the flusher until every
     /// pending buffer entry has been processed (or `timeout` elapses),
     /// then stop. Returns drain statistics for callers that want to
@@ -583,54 +651,101 @@ impl BufferFlusher {
     /// equivalent to replaying the buffer-as-journal under the current
     /// metadb state.
     ///
-    /// `timeout` bounds the quiescence polling window. On hit the flusher is
-    /// stopped and its lanes are joined before returning; a lane already stuck
-    /// in an uninterruptible backend call can therefore extend wall time beyond
-    /// the supplied duration. The `pending_at_exit` field on
-    /// [`BufferReplayStats`] distinguishes "drained clean" (== 0) from "timed
-    /// out with backlog".
+    /// `timeout` bounds the quiescence polling window as a hard wall-clock cap
+    /// (legacy behaviour, [`DrainBudget::fixed`]). Prefer
+    /// [`Self::drain_with_budget`] with a progress-gated budget for the
+    /// shutdown / engine-open paths, where the backlog size is unbounded and a
+    /// constant cap is therefore never right.
     pub fn drain_with_timeout(
         &mut self,
         pool: &crate::buffer::pool::WriteBufferPool,
         timeout: std::time::Duration,
     ) -> BufferReplayStats {
+        self.drain_with_budget(pool, DrainBudget::fixed(timeout))
+    }
+
+    /// Same drain, driven by a [`DrainBudget`]: the loop continues for as long
+    /// as `pool.pending_count()` keeps falling and only gives up when it has
+    /// stopped falling for `budget.stall` (or when an optional absolute cap
+    /// expires). On exit the flusher is stopped and its lanes are joined; a lane
+    /// already stuck in an uninterruptible backend call can therefore extend
+    /// wall time beyond the budget. The `pending_at_exit` / `stalled` fields on
+    /// [`BufferReplayStats`] distinguish "drained clean" (== 0) from "stuck"
+    /// and "budget too small".
+    pub fn drain_with_budget(
+        &mut self,
+        pool: &crate::buffer::pool::WriteBufferPool,
+        budget: DrainBudget,
+    ) -> BufferReplayStats {
         let started_at = std::time::Instant::now();
         let pending_at_start = pool.pending_count();
-        let deadline = started_at + timeout;
+        let mut progress = DrainProgress::new(budget, pending_at_start, started_at);
         loop {
             let pending = pool.pending_count();
-            if pending == 0 {
-                tracing::info!(
-                    pending_at_start,
-                    duration_ms = started_at.elapsed().as_millis() as u64,
-                    "flusher drain complete — buffer is clean"
-                );
-                let stats = BufferReplayStats {
-                    pending_at_start,
-                    pending_at_exit: 0,
-                    elapsed: started_at.elapsed(),
-                    timed_out: false,
-                };
-                self.running.store(false, Ordering::Relaxed);
-                self.join_lanes();
-                return stats;
-            }
-            if std::time::Instant::now() > deadline {
-                tracing::warn!(
-                    pending,
-                    pending_at_start,
-                    duration_ms = started_at.elapsed().as_millis() as u64,
-                    "flusher drain timed out — stopping with unflushed entries"
-                );
-                let stats = BufferReplayStats {
-                    pending_at_start,
-                    pending_at_exit: pending,
-                    elapsed: started_at.elapsed(),
-                    timed_out: true,
-                };
-                self.running.store(false, Ordering::Relaxed);
-                self.join_lanes();
-                return stats;
+            let now = std::time::Instant::now();
+            let elapsed = now.saturating_duration_since(started_at);
+            match progress.observe(pending, now) {
+                DrainVerdict::Continue => {}
+                DrainVerdict::Log => {
+                    let rate = if elapsed.as_secs_f64() > 0.0 {
+                        pending_at_start.saturating_sub(pending) as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    tracing::info!(
+                        pending,
+                        pending_at_start,
+                        drained = pending_at_start.saturating_sub(pending),
+                        entries_per_s = rate as u64,
+                        eta_secs = if rate > 0.0 {
+                            (pending as f64 / rate) as u64
+                        } else {
+                            u64::MAX
+                        },
+                        no_progress_ms = progress.stall_elapsed(now).as_millis() as u64,
+                        duration_ms = elapsed.as_millis() as u64,
+                        "flusher drain in progress"
+                    );
+                }
+                DrainVerdict::Clean => {
+                    tracing::info!(
+                        pending_at_start,
+                        duration_ms = elapsed.as_millis() as u64,
+                        "flusher drain complete — buffer is clean"
+                    );
+                    let stats = BufferReplayStats {
+                        pending_at_start,
+                        pending_at_exit: 0,
+                        elapsed,
+                        timed_out: false,
+                        stalled: false,
+                    };
+                    self.running.store(false, Ordering::Relaxed);
+                    self.join_lanes();
+                    return stats;
+                }
+                verdict @ (DrainVerdict::Stalled | DrainVerdict::Exhausted) => {
+                    let stalled = matches!(verdict, DrainVerdict::Stalled);
+                    tracing::warn!(
+                        pending,
+                        pending_at_start,
+                        stalled,
+                        no_progress_ms = progress.stall_elapsed(now).as_millis() as u64,
+                        stall_budget_ms = budget.stall.as_millis() as u64,
+                        duration_ms = elapsed.as_millis() as u64,
+                        "flusher drain gave up — stopping with unflushed entries"
+                    );
+                    let stats = BufferReplayStats {
+                        pending_at_start,
+                        pending_at_exit: pending,
+                        elapsed,
+                        timed_out: true,
+                        stalled,
+                    };
+                    self.running.store(false, Ordering::Relaxed);
+                    self.join_lanes();
+                    return stats;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -709,5 +824,177 @@ mod pressure_config_tests {
             ..FlushConfig::default()
         };
         assert_eq!(write_window_pressure_thresholds(&config), (40, 80));
+    }
+}
+
+/// Termination-policy tests for the drain driver. These pin the property the
+/// shutdown P0 was missing: a drain that is still making progress must never be
+/// abandoned just because a constant elapsed. No flusher/pool/device involved —
+/// `DrainProgress::observe` takes the clock as an argument.
+#[cfg(test)]
+mod drain_budget_tests {
+    use super::*;
+
+    fn progress_gated() -> DrainBudget {
+        DrainBudget {
+            max_total: None,
+            stall: Duration::from_secs(60),
+            log_every: Duration::from_secs(10),
+        }
+    }
+
+    /// `Continue` and `Log` are the same decision (keep draining); `Log` only
+    /// adds an operator line. Terminal verdicts are asserted exactly.
+    fn keeps_draining(verdict: DrainVerdict) -> bool {
+        matches!(verdict, DrainVerdict::Continue | DrainVerdict::Log)
+    }
+
+    #[test]
+    fn steady_progress_is_never_abandoned() {
+        let t0 = Instant::now();
+        let mut progress = DrainProgress::new(progress_gated(), 1_160_000, t0);
+        // ~1300 entries/s for ~15 minutes — the real box shape (a ring holding
+        // 1.16 M entries). The old code gave up at 60 s, i.e. 6.8 % in.
+        let mut pending = 1_160_000u64;
+        let mut ticks = 0u64;
+        loop {
+            ticks += 1;
+            pending = pending.saturating_sub(1300);
+            let verdict = progress.observe(pending, t0 + Duration::from_secs(ticks));
+            if pending == 0 {
+                assert_eq!(verdict, DrainVerdict::Clean);
+                break;
+            }
+            assert!(
+                keeps_draining(verdict),
+                "abandoned a progressing drain at t={ticks}s: {verdict:?}"
+            );
+            assert!(ticks < 2000, "drain never converged");
+        }
+        assert!(
+            ticks > 800,
+            "test must run past the old 60 s constant, only reached {ticks}s"
+        );
+    }
+
+    #[test]
+    fn stall_is_detected_after_the_stall_budget() {
+        let t0 = Instant::now();
+        let mut progress = DrainProgress::new(progress_gated(), 100, t0);
+        assert!(keeps_draining(
+            progress.observe(100, t0 + Duration::from_secs(59))
+        ));
+        assert_eq!(
+            progress.observe(100, t0 + Duration::from_secs(60)),
+            DrainVerdict::Stalled
+        );
+    }
+
+    #[test]
+    fn progress_rearms_the_stall_window() {
+        let t0 = Instant::now();
+        let mut progress = DrainProgress::new(progress_gated(), 100, t0);
+        // 59 s of nothing, then one entry drains: the window restarts.
+        assert!(keeps_draining(
+            progress.observe(100, t0 + Duration::from_secs(59))
+        ));
+        assert!(keeps_draining(
+            progress.observe(99, t0 + Duration::from_secs(59))
+        ));
+        assert!(keeps_draining(
+            progress.observe(99, t0 + Duration::from_secs(118))
+        ));
+        assert_eq!(
+            progress.observe(99, t0 + Duration::from_secs(119)),
+            DrainVerdict::Stalled
+        );
+    }
+
+    #[test]
+    fn growing_pending_does_not_count_as_progress() {
+        let t0 = Instant::now();
+        let mut progress = DrainProgress::new(progress_gated(), 100, t0);
+        // A producer that outlives the drain must not buy unbounded time.
+        assert!(keeps_draining(
+            progress.observe(500, t0 + Duration::from_secs(30))
+        ));
+        assert_eq!(
+            progress.observe(900, t0 + Duration::from_secs(60)),
+            DrainVerdict::Stalled
+        );
+    }
+
+    #[test]
+    fn absolute_cap_reports_exhausted_while_progressing() {
+        let t0 = Instant::now();
+        let budget = DrainBudget {
+            max_total: Some(Duration::from_secs(30)),
+            stall: Duration::from_secs(60),
+            log_every: Duration::from_secs(10),
+        };
+        let mut progress = DrainProgress::new(budget, 100, t0);
+        assert!(keeps_draining(
+            progress.observe(90, t0 + Duration::from_secs(29))
+        ));
+        assert_eq!(
+            progress.observe(80, t0 + Duration::from_secs(30)),
+            DrainVerdict::Exhausted
+        );
+    }
+
+    #[test]
+    fn quiescence_wins_over_every_deadline() {
+        let t0 = Instant::now();
+        let budget = DrainBudget {
+            max_total: Some(Duration::from_millis(1)),
+            stall: Duration::from_millis(1),
+            log_every: Duration::from_secs(10),
+        };
+        let mut progress = DrainProgress::new(budget, 100, t0);
+        assert_eq!(
+            progress.observe(0, t0 + Duration::from_secs(3600)),
+            DrainVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn progress_log_fires_on_cadence_then_rearms() {
+        let t0 = Instant::now();
+        let mut progress = DrainProgress::new(progress_gated(), 100, t0);
+        assert_eq!(
+            progress.observe(99, t0 + Duration::from_secs(9)),
+            DrainVerdict::Continue
+        );
+        assert_eq!(
+            progress.observe(98, t0 + Duration::from_secs(10)),
+            DrainVerdict::Log
+        );
+        assert_eq!(
+            progress.observe(97, t0 + Duration::from_secs(11)),
+            DrainVerdict::Continue
+        );
+        assert_eq!(
+            progress.observe(96, t0 + Duration::from_secs(20)),
+            DrainVerdict::Log
+        );
+    }
+
+    #[test]
+    fn from_config_ms_maps_zero_to_unbounded_and_never_leaves_stall_open() {
+        let budget = DrainBudget::from_config_ms(0, 60_000);
+        assert!(budget.max_total.is_none());
+        assert_eq!(budget.stall, Duration::from_secs(60));
+
+        // Absolute cap only: stall falls back to the cap, so behaviour matches
+        // the legacy fixed-deadline drain.
+        let budget = DrainBudget::from_config_ms(600_000, 0);
+        assert_eq!(budget.max_total, Some(Duration::from_secs(600)));
+        assert_eq!(budget.stall, Duration::from_secs(600));
+
+        // Both zeroed (mis-typed config): a 60 s stall detector still applies —
+        // never an unbounded no-progress wait.
+        let budget = DrainBudget::from_config_ms(0, 0);
+        assert!(budget.max_total.is_none());
+        assert_eq!(budget.stall, Duration::from_secs(60));
     }
 }

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::{fs, path::Path};
 
@@ -38,7 +39,17 @@ enum Command {
         volume: Vec<String>,
     },
     /// Stop a running storage engine (via Unix socket IPC)
-    Stop,
+    Stop {
+        /// Return as soon as the stop is requested instead of waiting for the
+        /// engine to finish draining the LV2 ring. The drain can take minutes on
+        /// a deep ring, and its outcome then only shows up in the service log.
+        #[arg(long)]
+        no_wait: bool,
+        /// Give up waiting after this many seconds (0 = wait indefinitely).
+        /// Giving up is reported as a failure — the engine is still draining.
+        #[arg(long, default_value_t = 0)]
+        wait_timeout_secs: u64,
+    },
     /// Reload configuration (equivalent to SIGHUP)
     Reload,
     /// Create a new volume
@@ -553,9 +564,47 @@ fn main() -> anyhow::Result<()> {
             controller.run(&volume)?;
             tracing::info!("engine stopped");
         }
-        Command::Stop => {
-            service::send_stop_command(&config.service.socket_path)?;
-            println!("engine stopped");
+        Command::Stop {
+            no_wait,
+            wait_timeout_secs,
+        } => {
+            let sock = &config.service.socket_path;
+            service::send_stop_command(sock)?;
+            if no_wait {
+                println!("stop requested — the engine is still draining; watch the service log");
+                return Ok(());
+            }
+
+            // The engine drains the LV2 ring inside its shutdown, which on a
+            // deep ring is minutes of work. Returning before that finishes is
+            // how `stop` used to report success over an abandoned backlog.
+            println!("stop requested — waiting for the engine to drain...");
+            let timeout = (wait_timeout_secs > 0).then(|| Duration::from_secs(wait_timeout_secs));
+            let exited = service::wait_for_service_exit(sock, timeout, |elapsed| {
+                println!("  ... still draining ({}s elapsed)", elapsed.as_secs());
+            });
+            if !exited {
+                eprintln!(
+                    "engine did NOT stop within {}s — it is still draining; \
+                     re-run `stop` or watch the service log",
+                    wait_timeout_secs
+                );
+                std::process::exit(1);
+            }
+            match service::read_shutdown_outcome(sock) {
+                Some(service::ShutdownOutcome::Clean) => println!("engine stopped"),
+                Some(service::ShutdownOutcome::Incomplete(reason)) => {
+                    eprintln!("engine stopped WITHOUT a clean shutdown: {reason}");
+                    eprintln!(
+                        "the LV2 ring still holds unflushed entries (they are durable); \
+                         the next start will replay them"
+                    );
+                    std::process::exit(1);
+                }
+                None => println!(
+                    "engine stopped, but it left no shutdown record — check the service log"
+                ),
+            }
         }
         Command::Reload => {
             service::send_reload_command(&config.service.socket_path)?;

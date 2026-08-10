@@ -90,6 +90,9 @@ impl ServiceController {
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+        // Drop any outcome record from a previous run so `stop` can never read a
+        // stale "clean" verdict for this one.
+        let _ = std::fs::remove_file(shutdown_outcome_path(&self.socket_path));
 
         // The binary data-plane listener must stop and join every session
         // before engine shutdown. Start it first so a control-socket bind
@@ -166,14 +169,18 @@ impl ServiceController {
         // LV2 durability watermark cannot block engine shutdown forever.
         direct_io_server.shutdown_and_join();
 
-        // Graceful shutdown
-        {
+        // Graceful shutdown. A failed shutdown (undrained LV2 ring) must still
+        // run the rest of the teardown — socket listener, ublk threads — so we
+        // hold the error and return it at the very end instead of `?`-ing out
+        // here and leaking those threads.
+        let shutdown_err = {
             let guard = self.engine.load();
             let opt: &Option<OnyxEngine> = &guard;
-            if let Some(eng) = opt.as_ref() {
-                eng.shutdown()?;
+            match opt.as_ref() {
+                Some(eng) => eng.shutdown().err(),
+                None => None,
             }
-        }
+        };
 
         // Stop socket listener
         let _ = UnixStream::connect(&self.socket_path);
@@ -192,6 +199,17 @@ impl ServiceController {
             if let Err(e) = handle.join() {
                 tracing::error!("ublk device thread panicked: {:?}", e);
             }
+        }
+
+        // Record the verdict where the `stop` CLI can read it: that process has
+        // no other way to learn whether the drain finished, and printing
+        // "engine stopped" over an undrained ring is exactly the lie this fix
+        // removes.
+        write_shutdown_outcome(&self.socket_path, shutdown_err.as_ref());
+
+        if let Some(err) = shutdown_err {
+            tracing::error!(error = %err, "service stopped WITHOUT a clean shutdown");
+            return Err(err);
         }
 
         tracing::info!("service stopped");
@@ -1358,6 +1376,83 @@ pub fn send_stop_command(socket_path: &Path) -> OnyxResult<()> {
     Ok(())
 }
 
+/// Where the service records how its last shutdown went. The `stop` CLI is a
+/// separate process and the control socket is gone by the time the drain
+/// finishes, so this file is the only channel that can carry the verdict.
+pub fn shutdown_outcome_path(socket_path: &Path) -> PathBuf {
+    let mut name = socket_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".last-shutdown");
+    socket_path.with_file_name(name)
+}
+
+/// Verdict of the most recent shutdown, as recorded by the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// Ring drained, superblock marked clean.
+    Clean,
+    /// The shutdown did not complete; the string is the service's reason.
+    Incomplete(String),
+}
+
+fn write_shutdown_outcome(socket_path: &Path, err: Option<&OnyxError>) {
+    let body = match err {
+        None => "clean\n".to_string(),
+        Some(err) => format!("incomplete {err}\n"),
+    };
+    let path = shutdown_outcome_path(socket_path);
+    if let Err(e) = std::fs::write(&path, body) {
+        tracing::warn!(path = ?path, error = %e, "could not record the shutdown outcome");
+    }
+}
+
+/// Read the recorded verdict. `None` = no record (killed, crashed, or a build
+/// that predates the record), which the caller must NOT treat as clean.
+pub fn read_shutdown_outcome(socket_path: &Path) -> Option<ShutdownOutcome> {
+    let body = std::fs::read_to_string(shutdown_outcome_path(socket_path)).ok()?;
+    let trimmed = body.trim();
+    if trimmed == "clean" {
+        return Some(ShutdownOutcome::Clean);
+    }
+    let reason = trimmed
+        .strip_prefix("incomplete")
+        .map(|rest| rest.trim().to_string())?;
+    Some(ShutdownOutcome::Incomplete(reason))
+}
+
+/// Block until the service stops accepting control connections, i.e. until the
+/// engine has actually finished shutting down.
+///
+/// Liveness is probed with `connect`, not `Path::exists`: a graceful shutdown
+/// deliberately leaves the socket file in place (see the note in
+/// [`ServiceController::run`]), so file presence says nothing. `on_progress` is
+/// invoked roughly every 5 s with the elapsed wait so callers can show that a
+/// multi-minute drain is progressing. Returns `false` iff `timeout` elapsed with
+/// the service still up.
+pub fn wait_for_service_exit(
+    socket_path: &Path,
+    timeout: Option<std::time::Duration>,
+    mut on_progress: impl FnMut(std::time::Duration),
+) -> bool {
+    let started = std::time::Instant::now();
+    let mut last_progress = started;
+    loop {
+        if UnixStream::connect(socket_path).is_err() {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if let Some(cap) = timeout {
+            if elapsed >= cap {
+                return false;
+            }
+        }
+        if last_progress.elapsed() >= std::time::Duration::from_secs(5) {
+            last_progress = std::time::Instant::now();
+            on_progress(elapsed);
+        }
+        thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 pub fn send_reload_command(socket_path: &Path) -> OnyxResult<()> {
     send_ipc_command(socket_path, "reload")?;
     Ok(())
@@ -1468,4 +1563,36 @@ pub fn send_volume_usage(socket_path: &Path, volume: &str) -> OnyxResult<String>
 pub fn send_mode_command(socket_path: &Path) -> OnyxResult<String> {
     let lines = send_ipc_command(socket_path, "mode")?;
     Ok(lines.into_iter().find(|l| l != "ok").unwrap_or_default())
+}
+
+#[cfg(test)]
+mod shutdown_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn outcome_file_sits_next_to_the_socket() {
+        let path = shutdown_outcome_path(Path::new("/run/onyx/onyx.sock"));
+        assert_eq!(path, Path::new("/run/onyx/onyx.sock.last-shutdown"));
+    }
+
+    #[test]
+    fn clean_and_incomplete_verdicts_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("onyx.sock");
+
+        // No record yet: absence must never read as clean.
+        assert_eq!(read_shutdown_outcome(&sock), None);
+
+        write_shutdown_outcome(&sock, None);
+        assert_eq!(read_shutdown_outcome(&sock), Some(ShutdownOutcome::Clean));
+
+        let err = OnyxError::ShutdownIncomplete("pending 632549 of 711230".into());
+        write_shutdown_outcome(&sock, Some(&err));
+        match read_shutdown_outcome(&sock) {
+            Some(ShutdownOutcome::Incomplete(reason)) => {
+                assert!(reason.contains("632549"), "lost the reason: {reason}");
+            }
+            other => panic!("expected an incomplete verdict, got {other:?}"),
+        }
+    }
 }

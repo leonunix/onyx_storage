@@ -50,6 +50,14 @@ pub enum OnyxError {
 
     #[error("metadb persistence fenced: writes rejected until restart ({0})")]
     MetaFenced(String),
+
+    /// Graceful shutdown could not drain the LV2 ring. The entries are still
+    /// durable (that is what the ring is), the LV3 superblock is deliberately
+    /// left dirty, and the next open will replay them — but `stop` must NOT
+    /// report success, because the operator's next action (reboot, cable pull,
+    /// pool re-init) depends on knowing the ring is not clean.
+    #[error("shutdown incomplete: {0}")]
+    ShutdownIncomplete(String),
 }
 
 pub type OnyxResult<T> = Result<T, OnyxError>;
