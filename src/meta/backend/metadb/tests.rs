@@ -1270,3 +1270,42 @@ fn offline_audit_config_disables_continuous_mutators() {
     assert_eq!(audit.dedup_shards, 8);
     assert!(audit.l2p_buffer_enabled);
 }
+
+/// REGRESSION: the offline-audit config assembly must produce a config metadb
+/// will actually OPEN. `sanitize_offline_audit_config` disarms
+/// `bfg_threads_enabled` (no background mutators during an audit) while
+/// `rc_delta_run_persist_enabled` stays as configured, and metadb's production
+/// cross-check refuses exactly that pair — so with
+/// `config/nvme-chunklet.toml`'s `rc_delta_run_persist_enabled = true`,
+/// `metadb-verify` and `metadb-probe` failed at open with
+/// "rc_delta_run_persist_enabled requires bfg_threads_enabled +
+/// rc_checkpoint_streaming_enabled". That is the one path that can count orphan
+/// pages on a live pool, so it silently had no coverage.
+#[test]
+fn offline_audit_config_opens_with_delta_run_persist_on() {
+    for persist in [false, true] {
+        let cfg = MetaConfig {
+            rc_delta_run_persist_enabled: persist,
+            ..Default::default()
+        };
+        let mapped =
+            super::metadb_config_for_offline_audit(std::path::Path::new("/tmp/metadb"), &cfg);
+        assert_eq!(mapped.rc_delta_run_persist_enabled, persist);
+        assert!(!mapped.bfg_threads_enabled, "no background mutators");
+        assert!(mapped.offline_audit, "metadb must know this is an audit");
+
+        // Create the store the way production would, then re-open it the way
+        // the audit does. Only the second open exercises the cross-check that
+        // used to make every audit entry point unopenable.
+        let dir = tempfile::tempdir().unwrap();
+        let mut prod_cfg = super::metadb_config_from_onyx(dir.path(), &cfg);
+        prod_cfg.path = dir.path().to_path_buf();
+        drop(onyx_metadb::Db::create_with_config(prod_cfg).expect("production create"));
+
+        let mut audit_cfg = mapped.clone();
+        audit_cfg.path = dir.path().to_path_buf();
+        let db = onyx_metadb::Db::open_with_config(audit_cfg)
+            .unwrap_or_else(|err| panic!("audit open rejected (persist={persist}): {err}"));
+        drop(db);
+    }
+}

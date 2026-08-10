@@ -2077,6 +2077,19 @@ fn metadb_config_for_offline_audit(path: &Path, config: &MetaConfig) -> MetaDbCo
 /// Turn a production MetaDB config into an offline-audit config. Keep this in
 /// one place so every audit entry point stays inert after open-time recovery.
 pub(super) fn sanitize_offline_audit_config(cfg: &mut MetaDbConfig) {
+    // Tell metadb this is an audit open BEFORE disarming anything. Turning
+    // `bfg_threads_enabled` off while `rc_delta_run_persist_enabled` stays on is
+    // a combination the production cross-check refuses ("durable delta-run
+    // segments are emitted only by the streaming BFG checkpoint"), and it is not
+    // avoidable by flipping the persist flag instead: a manifest that carries
+    // un-condensed segments cannot be opened with the persist arm disarmed
+    // either. So the audit config was simply unopenable, and
+    // `onyx-storage metadb-verify` / `metadb-probe` died at open on every config
+    // that turns persist on — `config/nvme-chunklet.toml`, i.e. exactly the
+    // configs whose orphan-page count we have no other way to measure (see the
+    // `metadb-verify` section of CLAUDE.md). The flag exempts that one check;
+    // the segment READ/drain path never needed the workers.
+    cfg.offline_audit = true;
     cfg.bfg_threads_enabled = false;
     cfg.bfg_admission_pipeline_enabled = false;
     cfg.parallel_l2p_drain_enabled = false;
