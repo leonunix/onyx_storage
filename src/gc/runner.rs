@@ -738,6 +738,23 @@ impl GcRunner {
                             .fetch_add(rewritten as u64, Ordering::Relaxed);
                     }
                 }
+                // Two normal "stop rewriting now" signals, neither an error and
+                // neither worth 27 K warnings — the remaining candidates are
+                // re-selected on the next lap:
+                //
+                //  * `RelocationCancelled` — shutdown.
+                //  * `BufferPoolFull` — the relocation's bounded wait expired, so
+                //    the ring is not draining. Breaking here is what keeps
+                //    mandatory reclaim (same thread, between cycles) running
+                //    instead of stopping behind an optional rewrite.
+                Err(crate::error::OnyxError::RelocationCancelled) => break,
+                Err(crate::error::OnyxError::BufferPoolFull(used)) => {
+                    metrics
+                        .gc_rewrite_ring_full_aborts
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(used, "compactor: ring full, ending rewrite pass");
+                    break;
+                }
                 Err(e) => {
                     metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(

@@ -561,6 +561,7 @@ impl WriteBufferPool {
             prewait_ring_space: runtime_limits.prewait_ring_space_outside_order,
             backend_throttle_control: BackendThrottleControl::default(),
             meta_fence: OnceLock::new(),
+            relocation_cancelled: AtomicBool::new(false),
         };
 
         let expected_sb = GlobalSuperblock {

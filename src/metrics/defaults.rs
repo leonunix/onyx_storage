@@ -385,6 +385,7 @@ impl Default for EngineMetrics {
             gc_defrag_scan_timeboxed: AtomicU64::new(0),
             gc_defrag_scan_lock_skipped: AtomicU64::new(0),
             gc_defrag_walk_skipped: AtomicU64::new(0),
+            gc_rewrite_ring_full_aborts: AtomicU64::new(0),
             gc_defrag_targets_stale: AtomicU64::new(0),
             gc_defrag_clusters_qualified: AtomicU64::new(0),
             gc_defrag_clusters_rejected: AtomicU64::new(0),

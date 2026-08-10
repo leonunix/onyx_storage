@@ -43,6 +43,71 @@ impl WriteBufferPool {
         value ^ (value >> 31)
     }
 
+    /// Like [`Self::lock_append_order`] but gives up after `budget` instead of
+    /// blocking.
+    ///
+    /// This exists for RELOCATION appends only, and it closes the last blocking
+    /// point on the gc-runner's path. The ring-space wait happens INSIDE these
+    /// stripe locks whenever `prewait_ring_space_outside_order` is off (the
+    /// default), so a FOREGROUND appender parked on a full ring holds them for as
+    /// long as it waits — which for foreground is forever, by design. Box
+    /// 2026-08-10 measured `append_order_hold_max = 14.17 s` against
+    /// `append_order_wait_max = 14.16 s`, i.e. one holder shutting everyone else
+    /// out, and the gc-runner stuck on this lock rather than on the ring: bounding
+    /// only `reserve_append` was not enough (`ring_full_aborts` fired once and
+    /// then `gc: cycles` froze again).
+    fn try_lock_append_order(
+        &self,
+        vol_id: &str,
+        start_lba: Lba,
+        lba_count: u32,
+        budget: Duration,
+    ) -> Option<AppendOrderGuardSet<'_>> {
+        let wait_started = Instant::now();
+        let mut guards = Vec::new();
+        for index in self.append_order_indices(vol_id, start_lba, lba_count) {
+            // Ascending index order is preserved by `append_order_indices`, so
+            // partial acquisition here cannot invert the lock order; the guards
+            // collected so far drop on the early return.
+            let remaining = budget.saturating_sub(wait_started.elapsed());
+            let Some(guard) = self.append_order_stripes[index].lock.try_lock_for(remaining) else {
+                return None;
+            };
+            guards.push(guard);
+        }
+        let metrics = self.metrics.get().map(Arc::as_ref);
+        if let Some(metrics) = metrics {
+            metrics.record_buffer_append_order_wait_ns(
+                wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+        }
+        Some(AppendOrderGuardSet {
+            _guards: guards,
+            metrics,
+            hold_started: Instant::now(),
+        })
+    }
+
+    /// The ascending, deduplicated append-order stripe indices an append covers.
+    fn append_order_indices(&self, vol_id: &str, start_lba: Lba, lba_count: u32) -> Vec<usize> {
+        use std::hash::{Hash, Hasher};
+
+        debug_assert!(APPEND_ORDER_STRIPES.is_power_of_two());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        vol_id.hash(&mut hasher);
+        let volume_hash = hasher.finish();
+        let mut indices = Vec::with_capacity(lba_count as usize);
+        for offset in 0..lba_count {
+            let lba = start_lba.0 + offset as u64;
+            let mixed =
+                Self::append_order_hash(volume_hash ^ lba.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            indices.push((mixed as usize) & (APPEND_ORDER_STRIPES - 1));
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
     fn lock_append_order(
         &self,
         vol_id: &str,
@@ -265,6 +330,27 @@ impl WriteBufferPool {
         self.meta_fence.get().map(String::as_str)
     }
 
+    /// Stop relocation (GC rewrite) appends from parking on ring space, and wake
+    /// the ones already parked so they fail instead of waiting.
+    ///
+    /// Shutdown MUST call this before joining the GC runner: a parked relocation
+    /// append has no other escape, `GcRunner::stop()` cannot interrupt a join,
+    /// and the drain that would free the ring runs after that join — see
+    /// [`WriteBufferPool::relocation_cancelled`]. Latched; foreground appends are
+    /// unaffected.
+    pub fn cancel_relocation_appends(&self) {
+        self.relocation_cancelled.store(true, Ordering::Release);
+        // The flag alone is sufficient — the wait loop re-checks it every 50 ms
+        // poll — so this notify only removes that last poll interval.
+        for shard in &self.shards {
+            shard.shard.wake_ring_waiters();
+        }
+    }
+
+    pub(crate) fn relocation_appends_cancelled(&self) -> bool {
+        self.relocation_cancelled.load(Ordering::Acquire)
+    }
+
     pub fn append(
         &self,
         vol_id: &str,
@@ -354,6 +440,12 @@ impl WriteBufferPool {
         if let Some(reason) = self.meta_fence.get() {
             return Err(OnyxError::MetaFenced(reason.clone()));
         }
+        // Relocation appends are cancelled from shutdown onward: they are
+        // optional background work and the only appender that can be pinned
+        // forever on a ring the flusher can no longer drain.
+        if relocation_source.is_some() && self.relocation_appends_cancelled() {
+            return Err(OnyxError::RelocationCancelled);
+        }
         let total_start = Instant::now();
         let shard_idx = self.shard_for_lba(start_lba);
         if relocation_source.is_some()
@@ -379,7 +471,28 @@ impl WriteBufferPool {
         if self.prewait_ring_space {
             shard.shard.wait_for_ring_space(prepared.slot_count);
         }
-        let append_order = self.lock_append_order(vol_id, start_lba, lba_count);
+        // The pre-wait is bounded, so a cancel that landed during it is picked up
+        // here rather than after the stripe locks are taken.
+        let relocation_cancel =
+            relocation_source.is_some().then_some(&self.relocation_cancelled);
+        // Relocation appends must not block indefinitely on the stripe locks
+        // either — see `try_lock_append_order`.
+        let append_order = match relocation_cancel {
+            Some(_) => {
+                match self.try_lock_append_order(
+                    vol_id,
+                    start_lba,
+                    lba_count,
+                    RELOCATION_ORDER_LOCK_BUDGET,
+                ) {
+                    Some(guard) => guard,
+                    // The congestion itself is the signal; an exact byte count
+                    // would need the ring lock we just failed to reach.
+                    None => return Err(OnyxError::BufferPoolFull(0)),
+                }
+            }
+            None => self.lock_append_order(vol_id, start_lba, lba_count),
+        };
         // The fence may trip while this producer was throttled or queued behind
         // another append. Do not enter LV2 after fail-stop has been published.
         let append_result = (|| {
@@ -393,6 +506,7 @@ impl WriteBufferPool {
                 &self.next_seq,
                 &self.frontier_gate,
                 prepared.slot_count,
+                relocation_cancel,
             )?;
             let seq = reservation.seq;
             let pending = shard

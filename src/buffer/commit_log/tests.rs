@@ -439,6 +439,142 @@ fn prewait_ring_space_preserves_pool_full_semantics() {
     assert!(snapshot.buffer_backpressure_events > 0);
 }
 
+/// Shutdown must be able to unpark a GC relocation append that is waiting on a
+/// full ring, and must NOT touch foreground appends.
+///
+/// Production runs `backpressure_timeout = Duration::MAX`, so that wait has no
+/// other escape: box 2026-08-10 measured the gc-runner at 10 ms of CPU per minute
+/// with zero GC cycles for 10 minutes, and `stop` — whose `GcRunner::stop()` join
+/// cannot interrupt the park, and whose ring-freeing drain runs after that join —
+/// was still waiting 50 minutes later.
+#[test]
+fn cancel_unparks_relocation_appends_but_not_foreground() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 2 * 8192 + 4096;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = Arc::new(
+        WriteBufferPool::open_with_options_full_and_limits(
+            Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+            Duration::ZERO,
+            1,
+            1,
+            // Wait-forever mode, exactly as production configures it.
+            Duration::MAX,
+            64 * 1024 * 1024,
+            None,
+            BufferRuntimeLimits::default(),
+        )
+        .unwrap(),
+    );
+    pool.attach_metrics(Arc::new(EngineMetrics::default()));
+
+    // Fill the ring so the next append has to park.
+    for _ in 0..2 {
+        pool.append("test-vol", Lba(0), 1, &vec![0; 4096], 0).unwrap();
+    }
+
+    // Park a relocation append on the full ring.
+    let parked = {
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            pool.append_relocation_deferred_checked(
+                "test-vol",
+                Lba(64),
+                1,
+                &vec![0u8; 4096],
+                0,
+                crate::space::extent::Extent::new(crate::types::Pba(4096), 1),
+                || Ok(true),
+            )
+            .map(|opt| opt.is_some())
+        })
+    };
+    // Give it time to reach the wait. It must NOT complete on its own within this
+    // window — kept well inside `RELOCATION_BACKPRESSURE_BUDGET` (1 s) so the
+    // cancel, not the budget, is what ends the wait.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!parked.is_finished(), "relocation append should be parked");
+
+    pool.cancel_relocation_appends();
+    let result = parked
+        .join()
+        .expect("parked relocation thread must not panic");
+    assert!(
+        matches!(result, Err(OnyxError::RelocationCancelled)),
+        "cancel must unpark the relocation append, got {result:?}"
+    );
+
+    // Latched: a later relocation append fails fast instead of parking again.
+    let after = pool.append_relocation_deferred_checked(
+        "test-vol",
+        Lba(65),
+        1,
+        &vec![0u8; 4096],
+        0,
+        crate::space::extent::Extent::new(crate::types::Pba(4097), 1),
+        || Ok(true),
+    );
+    assert!(matches!(after, Err(OnyxError::RelocationCancelled)));
+    assert!(pool.relocation_appends_cancelled());
+}
+
+/// A relocation append must give up on its own in wait-forever mode, WITHOUT any
+/// shutdown involved — the cancel flag only covers shutdown, and the runtime case
+/// is the one that stops reclaim.
+///
+/// Box 2026-08-10 caught this the hard way: with only the shutdown cancel in
+/// place, `gc: cycles` still froze (156 -> 160 -> 160 -> 160 over 4 minutes)
+/// while the writer failed 257,476 allocations, because during normal operation
+/// the flag is false and the park is unchanged.
+#[test]
+fn relocation_append_gives_up_on_a_full_ring_without_shutdown() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 4096 + 4096 + 2 * 8192 + 4096;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = WriteBufferPool::open_with_options_full_and_limits(
+        Arc::new(NoUringCountingBackend::open(tmp.path(), size, 0)),
+        Duration::ZERO,
+        1,
+        1,
+        // Wait-forever, exactly as production configures it.
+        Duration::MAX,
+        64 * 1024 * 1024,
+        None,
+        BufferRuntimeLimits::default(),
+    )
+    .unwrap();
+    pool.attach_metrics(Arc::new(EngineMetrics::default()));
+    for _ in 0..2 {
+        pool.append("test-vol", Lba(0), 1, &vec![0; 4096], 0).unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let result = pool.append_relocation_deferred_checked(
+        "test-vol",
+        Lba(64),
+        1,
+        &vec![0u8; 4096],
+        0,
+        crate::space::extent::Extent::new(crate::types::Pba(4096), 1),
+        || Ok(true),
+    );
+    let waited = started.elapsed();
+    assert!(
+        matches!(result, Err(OnyxError::BufferPoolFull(_))),
+        "relocation must abandon a full ring, got {:?}",
+        result.as_ref().err()
+    );
+    assert!(
+        !pool.relocation_appends_cancelled(),
+        "no shutdown was involved"
+    );
+    // Bounded by RELOCATION_BACKPRESSURE_BUDGET, not by the configured MAX.
+    assert!(
+        waited < Duration::from_secs(5),
+        "relocation waited {waited:?} — the budget did not bind"
+    );
+}
+
 /// With space available the pre-wait is a lock acquire and a bounds check: it
 /// must not park, and appends must behave exactly as with the knob off.
 #[test]

@@ -1747,7 +1747,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "defrag: mode={} targets={} target_blocks={} quarantine_free={} reserve={} completed={} cancelled={} stale={} cycles={} laps={} retired_windows={} scan_timeboxed={} scan_lock_skip={} walk_skip={} classified={} clusters_ok={} clusters_rej={} candidates={} selected={} reappended={} dedup_rejected={} stripe_starved_batches={} group_aligned={} group_unaligned={} group_short={} group_fallback_units={} group_unused_blocks={}",
+            "defrag: mode={} targets={} target_blocks={} quarantine_free={} reserve={} completed={} cancelled={} stale={} cycles={} laps={} retired_windows={} scan_timeboxed={} scan_lock_skip={} walk_skip={} ring_full_aborts={} classified={} clusters_ok={} clusters_rej={} candidates={} selected={} reappended={} dedup_rejected={} stripe_starved_batches={} group_aligned={} group_unaligned={} group_short={} group_fallback_units={} group_unused_blocks={}",
             self.metrics.gc_defrag_mode_active,
             self.metrics.gc_defrag_targets_active,
             self.metrics.gc_defrag_target_blocks,
@@ -1762,6 +1762,7 @@ impl EngineStatusSnapshot {
             self.metrics.gc_defrag_scan_timeboxed,
             self.metrics.gc_defrag_scan_lock_skipped,
             self.metrics.gc_defrag_walk_skipped,
+            self.metrics.gc_rewrite_ring_full_aborts,
             self.metrics.gc_defrag_windows_classified,
             self.metrics.gc_defrag_clusters_qualified,
             self.metrics.gc_defrag_clusters_rejected,

@@ -43,6 +43,29 @@ const PACKED_CHECKPOINT_RECORD_SIZE: usize = 32;
 const PACKED_CHECKPOINT_CRC_OFFSET: usize = 24;
 const PACKED_CHECKPOINT_SLOT_COUNT: usize = 2;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Hard ceiling on how long a GC RELOCATION append will wait for ring space,
+/// regardless of the configured backpressure timeout.
+///
+/// Production configures wait-forever backpressure (`Duration::MAX`), which is
+/// right for foreground appends and wrong for relocations: a rewrite append runs
+/// on the gc-runner thread, and mandatory reclaim shares that thread, so a
+/// relocation parked on an undrainable ring stops reclaim entirely. 1 s sits
+/// inside `COMPACTOR_REWRITE_TIMEBOX_MS` (2 s, checked between candidates) so one
+/// maximal park cannot overrun the cycle, and dropping the rewrite is free — the
+/// candidate is re-selected next lap.
+const RELOCATION_BACKPRESSURE_BUDGET: Duration = Duration::from_secs(1);
+/// Ceiling on how long a GC RELOCATION append will wait for the append-order
+/// stripe locks.
+///
+/// With `prewait_ring_space_outside_order` off (the default) the ring-space wait
+/// happens INSIDE those locks, so a foreground appender parked on a full ring
+/// holds them for as long as it waits — i.e. indefinitely. That makes the stripe
+/// lock, not the ring, the FIRST place a relocation blocks, which is why bounding
+/// `reserve_append` alone was not enough: box 2026-08-10 measured
+/// `append_order_hold_max = 14.17 s` against `append_order_wait_max = 14.16 s`
+/// and `gc: cycles` froze again after a single `ring_full_aborts`. 100 ms is far
+/// above a healthy hold (microseconds) and far below anything that stalls reclaim.
+const RELOCATION_ORDER_LOCK_BUDGET: Duration = Duration::from_millis(100);
 const BACKEND_THROTTLE_ARM_NS: u64 = 30_000_000;
 const BACKEND_THROTTLE_RELEASE_NS: u64 = 500_000_000;
 const STAGING_CHANNEL_CAPACITY: usize = 32 * 1024;
@@ -1185,6 +1208,24 @@ pub struct WriteBufferPool {
     /// longer be drained — the ENOSPC "ack is a lie" hole. Reads are never
     /// fenced. The fence only clears on process restart.
     meta_fence: OnceLock<String>,
+    /// Cancels RELOCATION appends (GC rewrites) that are parked on ring space.
+    ///
+    /// Production runs the ring in wait-forever backpressure mode
+    /// (`Engine::buffer_backpressure_timeout` = `Duration::MAX`), so an appender
+    /// that finds the ring full parks until the flusher frees space — with no
+    /// shutdown escape. On a pool whose allocator can no longer serve a
+    /// stripe-width run, the flusher cannot free space, and the gc-runner ends up
+    /// pinned inside a rewrite append: box 2026-08-10 measured **10 ms of CPU in
+    /// 60 s and zero GC cycles for 10 minutes** while the writer failed 652,404
+    /// allocations. `GcRunner::stop()` is a join it cannot interrupt, and the
+    /// shutdown drain that would free the ring runs AFTER that join, so `stop`
+    /// inherited the same wait (>50 min observed).
+    ///
+    /// Relocation appends are optional background work — a dropped GC rewrite is
+    /// re-selected on the next lap — so they are the safe thing to cancel.
+    /// FOREGROUND appends are never cancelled: `ack` means durable, and that
+    /// contract cannot be weakened by shutdown.
+    relocation_cancelled: AtomicBool,
 }
 
 /// A prepared LV2 append that becomes acknowledgeable once its shard's

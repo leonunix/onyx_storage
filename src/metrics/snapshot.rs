@@ -463,6 +463,7 @@ impl EngineMetrics {
             gc_defrag_scan_timeboxed: load(&self.gc_defrag_scan_timeboxed),
             gc_defrag_scan_lock_skipped: load(&self.gc_defrag_scan_lock_skipped),
             gc_defrag_walk_skipped: load(&self.gc_defrag_walk_skipped),
+            gc_rewrite_ring_full_aborts: load(&self.gc_rewrite_ring_full_aborts),
             gc_defrag_targets_stale: load(&self.gc_defrag_targets_stale),
             gc_defrag_clusters_qualified: load(&self.gc_defrag_clusters_qualified),
             gc_defrag_clusters_rejected: load(&self.gc_defrag_clusters_rejected),
@@ -1013,6 +1014,8 @@ pub struct EngineMetricsSnapshot {
     #[serde(default)]
     pub gc_defrag_walk_skipped: u64,
     #[serde(default)]
+    pub gc_rewrite_ring_full_aborts: u64,
+    #[serde(default)]
     pub gc_defrag_targets_stale: u64,
     pub gc_defrag_clusters_qualified: u64,
     pub gc_defrag_clusters_rejected: u64,
@@ -1503,6 +1506,7 @@ impl EngineMetricsSnapshot {
             gc_defrag_scan_timeboxed,
             gc_defrag_scan_lock_skipped,
             gc_defrag_walk_skipped,
+            gc_rewrite_ring_full_aborts,
             gc_defrag_targets_stale,
             gc_defrag_clusters_qualified,
             gc_defrag_clusters_rejected,

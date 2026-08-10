@@ -751,6 +751,17 @@ impl BufferShard {
     /// appender before this one reaches `reserve_append`, which then blocks as
     /// it always did. Every terminal condition (capacity, timeout, shutdown)
     /// is therefore left to `reserve_append` — this returns unconditionally.
+    /// Wake every appender parked on this shard's ring-space condvar.
+    ///
+    /// `WriteBufferPool::cancel_relocation_appends` calls this purely to cut
+    /// latency: the wait-forever loop already re-checks its cancel flag every
+    /// [`BACKPRESSURE_POLL_INTERVAL`] (50 ms), so correctness does not depend on
+    /// the notify — it only turns "cancelled within 50 ms" into "cancelled now".
+    pub(super) fn wake_ring_waiters(&self) {
+        let _guard = self.ring.lock();
+        self.ring_space_cv.notify_all();
+    }
+
     pub(super) fn wait_for_ring_space(&self, slot_count: u32) {
         let mut ring = self.ring.lock();
         if Self::log_space_offset(&ring, slot_count).is_some() {
@@ -786,11 +797,18 @@ impl BufferShard {
         self.record_reserve_wait(Some(wait_start));
     }
 
+    /// `relocation_cancel` is `Some` only for GC relocation appends. It is the
+    /// ONLY escape from the wait-forever backpressure mode production runs in
+    /// (`backpressure_timeout = Duration::MAX`): without it a parked rewrite
+    /// append pins the gc-runner, `GcRunner::stop()`'s join inherits the wait, and
+    /// the shutdown drain that would free the ring never starts. Foreground
+    /// appends pass `None` and keep waiting — `ack` means durable.
     pub(super) fn reserve_append<'a>(
         &self,
         next_seq: &AtomicU64,
         frontier_gate: &'a parking_lot::RwLock<()>,
         slot_count: u32,
+        relocation_cancel: Option<&AtomicBool>,
     ) -> OnyxResult<(AppendReservation, parking_lot::RwLockReadGuard<'a, ()>)> {
         // ── Ring lock: reserve space, wait if shard is temporarily full ──
         // The flush lane will drain entries and notify ring_space_cv.
@@ -799,6 +817,19 @@ impl BufferShard {
         // log-write/durability buckets — and without this bucket the stall is
         // invisible in `front_write_ns` (the 2026-07-03 gap hunt found ~45% of
         // append wall-time unaccounted, all of it this wait).
+        // A RELOCATION append never waits forever, even outside shutdown. It runs
+        // on the gc-runner thread, and mandatory reclaim runs on that same thread
+        // between candidates — so a rewrite parked on a ring the flusher cannot
+        // drain stops reclaim outright (box 2026-08-10: `gc: cycles` frozen for
+        // minutes at a time while the writer failed hundreds of thousands of
+        // allocations). Giving up is free: the candidate is re-selected on the
+        // next lap, and `gc.defrag_fill_stop_pct` already encodes the same policy
+        // ("do not relocate into a nearly-full buffer"). Foreground appends keep
+        // the configured behaviour, wait-forever included — `ack` means durable.
+        let effective_timeout = match relocation_cancel {
+            Some(_) => self.backpressure_timeout.min(RELOCATION_BACKPRESSURE_BUDGET),
+            None => self.backpressure_timeout,
+        };
         let mut ring = self.ring.lock();
         let mut wait_start: Option<Instant> = None;
         loop {
@@ -832,7 +863,7 @@ impl BufferShard {
                 return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
             }
             // No backpressure configured (tests) → fail immediately.
-            if self.backpressure_timeout.is_zero() {
+            if effective_timeout.is_zero() {
                 return Err(OnyxError::BufferPoolFull(ring.used_bytes as usize));
             }
             if wait_start.is_none() {
@@ -843,16 +874,21 @@ impl BufferShard {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            if self.backpressure_waits_forever() {
+            if let Some(cancel) = relocation_cancel {
+                if cancel.load(Ordering::Acquire) {
+                    drop(ring);
+                    self.record_reserve_wait(wait_start);
+                    return Err(OnyxError::RelocationCancelled);
+                }
+            }
+            if effective_timeout == Duration::MAX {
                 let _ = self
                     .ring_space_cv
                     .wait_for(&mut ring, BACKPRESSURE_POLL_INTERVAL);
                 continue;
             }
             // Wait for flush lane to free space (condvar releases ring lock).
-            let wait = self
-                .ring_space_cv
-                .wait_for(&mut ring, self.backpressure_timeout);
+            let wait = self.ring_space_cv.wait_for(&mut ring, effective_timeout);
             if wait.timed_out() {
                 let used_bytes = ring.used_bytes as usize;
                 drop(ring);

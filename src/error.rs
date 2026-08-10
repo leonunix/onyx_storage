@@ -51,6 +51,15 @@ pub enum OnyxError {
     #[error("metadb persistence fenced: writes rejected until restart ({0})")]
     MetaFenced(String),
 
+    /// A GC relocation append was cancelled instead of parking on ring space.
+    /// Shutdown latches this (`WriteBufferPool::cancel_relocation_appends`)
+    /// because a parked rewrite append pins the gc-runner, `GcRunner::stop()`
+    /// cannot interrupt its own join, and the drain that would free the ring runs
+    /// after that join. Never an error condition: the candidate is simply
+    /// re-selected on the next compactor lap.
+    #[error("GC relocation append cancelled (shutting down)")]
+    RelocationCancelled,
+
     /// Graceful shutdown could not drain the LV2 ring. The entries are still
     /// durable (that is what the ring is), the LV3 superblock is deliberately
     /// left dirty, and the next open will replay them — but `stop` must NOT

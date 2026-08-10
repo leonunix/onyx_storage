@@ -810,6 +810,11 @@ pub struct EngineMetrics {
     /// does not, the resident thread is spending real time inside
     /// `begin_defrag_quarantine`'s hazard wait.
     pub gc_defrag_scan_lock_skipped: AtomicU64,
+    /// Rewrite passes ended early because a relocation append's bounded ring-space
+    /// wait expired. Expected to be non-zero on a pool the flusher cannot drain —
+    /// that is the point: it means reclaim kept its cadence instead of stopping
+    /// behind the rewrite.
+    pub gc_rewrite_ring_full_aborts: AtomicU64,
     /// Resident cycles that skipped the retired-set walk entirely because the
     /// retired set was too small to hold a whole window, or because consecutive
     /// empty laps backed the walk off. This is what keeps the walk from costing

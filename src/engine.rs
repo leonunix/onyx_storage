@@ -1766,6 +1766,18 @@ impl OnyxEngine {
             scanner.stop();
         }
 
+        // Cancel GC relocation appends BEFORE joining the GC runner. In
+        // wait-forever backpressure mode a rewrite append that finds the ring
+        // full parks with no shutdown escape, `gc.stop()` below is a join that
+        // cannot interrupt it, and the drain that would free the ring runs after
+        // that join — box 2026-08-10: the gc-runner sat at 10 ms of CPU per
+        // minute and `stop` was still waiting 50 minutes later. A dropped
+        // relocation is free (re-selected next lap); foreground appends are
+        // untouched, because `ack` means durable.
+        if let Some(pool) = self.buffer_pool.as_ref() {
+            pool.cancel_relocation_appends();
+        }
+
         // Stop GC (it injects into buffer pool)
         if let Some(mut gc) = self.gc_runner.lock().unwrap().take() {
             gc.stop();
