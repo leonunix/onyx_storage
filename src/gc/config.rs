@@ -85,7 +85,29 @@ pub struct GcConfig {
 
     // --- Defrag: physical-neighborhood compaction (evacuate the few live
     //     blocks pinning confetti clusters so reclaim can rebuild large,
-    //     stripe-capable free runs; per-unit dead-ratio can never see these) ---
+    //     stripe-capable free runs; per-unit dead-ratio can never see these).
+    //
+    //     Selection is split in two by whether a window has a LIVE pinner.
+    //     Retired-pinned windows (whole remainder free-or-retired) need no
+    //     rewrite at all — reclaim finishes them — so they are selected by the
+    //     RESIDENT defragger thread straight off the retired set, with no
+    //     metadata scan (`defrag_interval_ms`,
+    //     `defrag_classify_max_windows_per_cycle`). Live-pinned windows need a
+    //     PBA -> LBA answer, which only the compactor's forward L2P scan gives,
+    //     so they stay SCAN-DRIVEN on the gc-runner thread, downshifted to one
+    //     pass every `defrag_scan_interval_cycles` with its own
+    //     `defrag_scan_timebox_ms`.
+    //
+    //     The pre-2026-08-06 design instead walked the free list DESCENDING and
+    //     pre-picked <= 32 targets, then hoped a later scan lap would stumble on
+    //     their live pinners — a reverse lookup served by a full forward scan,
+    //     which measured as literally zero work over 480 s on the box.
+    //     `defrag_gap_max_blocks` / `defrag_scan_extents_per_cycle` /
+    //     `defrag_max_active_targets` (the 32-slot cap) belonged to that walk and
+    //     are gone: the budgets are now block/span/rate bounds, never a slot
+    //     count (memory: `coalesce_admission_cap_64_is_the_drain_wall` — an
+    //     arbitrary per-cycle count cap on admitted work becomes the next wall).
+    //     ---
     /// Master switch for defrag target selection (default true). Trigger-gated:
     /// inert until the free pool's stripe-capable fraction
     /// (`eff_capacity / free_blocks`) drops below
@@ -102,35 +124,103 @@ pub struct GcConfig {
     /// movement only competes for the last blocks.
     #[serde(default = "default_defrag_min_free_pct")]
     pub defrag_min_free_pct: u8,
-    /// A confetti cluster qualifies as a defrag target iff
-    /// `(free + retired) blocks / span >= this percent` (default 50) — i.e.
-    /// the live pinners to evacuate are at most half the span.
+    /// A stripe window qualifies as a defrag target iff
+    /// `(free + retired) blocks / stripe >= this percent` (default 50) — i.e.
+    /// the live pinners to evacuate are at most half the window.
     #[serde(default = "default_defrag_min_free_density_pct")]
     pub defrag_min_free_density_pct: u8,
-    /// Max gap (allocated/retired blocks) between two free extents still
-    /// considered the same cluster (default 64).
-    #[serde(default = "default_defrag_gap_max_blocks")]
-    pub defrag_gap_max_blocks: u32,
     /// Cap on the total span (blocks) of active defrag target ranges
-    /// (default 262_144 = 1 GiB at 4 KiB). Bounds the scanner's per-entry
-    /// range check and the treadmill exposure.
+    /// (default 32_768 = 128 MiB at 4 KiB). Bounds the scanner's per-entry range
+    /// check and — the part that actually bites — how much free space a
+    /// quarantine can hold OUT of the allocatable pools at once.
+    ///
+    /// ⚠ Was 262_144 (1 GiB) until 2026-08-10. A quarantine is not free: its
+    /// window's already-free fragments leave the general pool until the whole
+    /// stripe clears, so this is a direct upper bound on the free space the
+    /// flusher cannot see. The 2026-08-07 box run measured `SpaceExhausted`
+    /// amplified 2.7× with defrag on; the dominant channel was reclaim
+    /// starvation (+23.7 GiB of `retired_depth`) rather than the quarantine's
+    /// own 1 GiB, but 1 GiB was still the wrong standing exposure for a
+    /// best-effort optimiser. With the resident defragger the exposure is also
+    /// short-lived by construction (its targets wait only for reclaim, not for a
+    /// rewrite lap), so a smaller budget costs nothing but bounds the worst case
+    /// 8× tighter. See memory `defrag_gc_lever`,
+    /// `gc_reclaim_defrag_criticality_inversion`.
     #[serde(default = "default_defrag_max_target_blocks")]
     pub defrag_max_target_blocks: u64,
-    /// Maximum number of stripe-aligned evacuation targets active at once.
-    /// Keeping this bounded concentrates the logical L2P walk on segments that
-    /// can actually finish instead of spreading work over hundreds of ranges.
-    #[serde(default = "default_defrag_max_active_targets")]
-    pub defrag_max_active_targets: usize,
+    /// Resident defragger cadence in milliseconds (default 1000, floor 50).
+    ///
+    /// The allocator-side half of defrag runs on its OWN thread
+    /// (`gc::defrag_runner`) so that mandatory reclaim's cadence on the
+    /// `gc-runner` thread can never be stretched by an optional optimiser
+    /// (memory: `gc_reclaim_defrag_criticality_inversion` — 8.6 → 13.7 s cost
+    /// 23.7 GiB of unallocatable `retired_depth`). Together with
+    /// `defrag_classify_max_windows_per_cycle` this is the RATE CAP that is the
+    /// design's real gate.
+    #[serde(default = "default_defrag_interval_ms")]
+    pub defrag_interval_ms: u64,
+    /// How often the resident defragger re-evaluates its TRIGGER LATCH, in
+    /// milliseconds (default 5000 = the old GC cycle). Target
+    /// completion/cancellation still runs every `defrag_interval_ms`; only the
+    /// enter/exit decision is on this slower clock.
+    ///
+    /// ⚠ This split is not cosmetic. The latch needs
+    /// `SpaceAllocator::contiguity_stats`, which takes **one lock per address
+    /// region — 2048 at the default `storage.allocator_regions`** — and it also
+    /// publishes the `allocator_*` contiguity gauges. Running it at the
+    /// selection cadence made that walk 5× more frequent than it was as a GC
+    /// phase (box, 2026-08-10: `free_lock.audit acquisitions=354304` in ~170 s ≈
+    /// 2048/s), which is precisely the lock-COUNT increase the design is gated on
+    /// (memory: `fragmentation_unaligned_alloc_1889_locks`). Keeping it at 5000
+    /// leaves that traffic exactly where mainline had it while the cheap part of
+    /// maintenance (O(active targets) single-region lookups) still runs at 1 Hz.
+    #[serde(default = "default_defrag_trigger_interval_ms")]
+    pub defrag_trigger_interval_ms: u64,
+    /// Stripe windows the resident defragger classifies per cycle (default
+    /// 4096). `0` disables allocator-side selection (maintenance/publication
+    /// still runs, so existing targets still complete).
+    ///
+    /// ⚠ THIS IS THE GATE, and its verdict is a lock-attribution number, not a
+    /// throughput number: `free_lock.defrag_classify` and
+    /// `retired_lock.defrag_windows` acquisitions must not appear inside a flush
+    /// writer's `writer_refill` / `writer_unaligned` wait. Lock COUNT is what the
+    /// writers pay — one unaligned allocation already takes 1,889 acquisitions
+    /// (memory: `fragmentation_unaligned_alloc_1889_locks`) — so classification
+    /// is batched per region (~128 windows per hold) and capped here. At the
+    /// defaults that is tens of acquisitions per second. Only raise it against
+    /// two `status` samples showing the writers' wait unchanged.
+    #[serde(default = "default_defrag_classify_max_windows_per_cycle")]
+    pub defrag_classify_max_windows_per_cycle: usize,
+    /// Run the compactor's SCAN-DRIVEN defrag selection only every Nth GC cycle
+    /// (default 8; `1` = every cycle, `0` disables it entirely).
+    ///
+    /// That half needs an extra bounded L2P window pre-scan to find the live
+    /// pinners a stripe window is stuck behind, and it runs on the gc-runner
+    /// thread that mandatory reclaim shares. It is also the narrower of the two
+    /// halves: on the box only 1.3% of its selected candidates were actually
+    /// rewritten within the budget, so it over-produced against its consumer
+    /// (memory: `defrag_gc_lever`). Downshifting it keeps the capability for the
+    /// windows nothing else can reach — permanently live-pinned ones — at an
+    /// eighth of the cycle cost.
+    #[serde(default = "default_defrag_scan_interval_cycles")]
+    pub defrag_scan_interval_cycles: u64,
+    /// Wall-clock cap on the compactor's defrag selection loop, milliseconds
+    /// (default 200; `0` = uncapped). Independent of, and additive with,
+    /// `COMPACTOR_REWRITE_TIMEBOX_MS`: this bounds SELECTION (classify +
+    /// quarantine lock trips), that one bounds the rewrites. Both exist so one
+    /// oversized batch cannot eat the cycle reclaim needs.
+    #[serde(default = "default_defrag_scan_timebox_ms")]
+    pub defrag_scan_timebox_ms: u64,
     /// Cancel a target that has made no physical-free progress for this many
-    /// seconds. Cancellation only releases its quarantined free fragments; live
-    /// mappings remain authoritative, so it is always safe.
+    /// seconds (default 120). Cancellation only releases its quarantined free
+    /// fragments; live mappings remain authoritative, so it is always safe.
+    /// The old 3600 was sized for "quarantine the window and wait for its pin
+    /// to die on its own"; under scan-driven selection a target's pinners are
+    /// rewritten in the same cycle it is picked, so its whole lifetime is
+    /// rewrite + a few reclaim cycles. Re-selection is now cheap, so releasing
+    /// a stuck target's free blocks back to the pool beats holding them.
     #[serde(default = "default_defrag_target_stall_secs")]
     pub defrag_target_stall_secs: u64,
-    /// Free extents the target-selection walk visits per GC cycle
-    /// (default 32_768 = 8 × 4096-extent lock holds; a 2M-extent belt is
-    /// covered in ~60 cycles ≈ 5 min at the 5 s cadence).
-    #[serde(default = "default_defrag_scan_extents_per_cycle")]
-    pub defrag_scan_extents_per_cycle: usize,
     /// Blocks of defrag candidates rewritten per GC cycle at full effort
     /// (default 32_768 = 128 MiB ≈ 25 MB/s idle movement), scaled by the
     /// per-cycle `effort`. Sized so the sequential rewrite loop (one
@@ -144,6 +234,20 @@ pub struct GcConfig {
     /// the trigger is latched; the urgency/idle formula is untouched.
     #[serde(default = "default_defrag_min_effort")]
     pub defrag_min_effort: f64,
+    /// Skip defrag REWRITES while the write buffer is at or above this fill
+    /// percent (default 90). Relocation goes through the ordinary write path,
+    /// so it competes for ring space; an unbounded rewrite loop on a full ring
+    /// starved reclaim on the same GC thread and wedged the engine once
+    /// (2026-07-03, fixed by the still-present rewrite timebox).
+    ///
+    /// ⚠ Load-bearing relationship with `defrag_min_effort`: that floor only
+    /// changes the outcome when `compute_effort < 0.15`, i.e. when
+    /// `fill_pct > 0.85 * buffer_usage_max_pct` (68 at the defaults). The old
+    /// hardcoded 70 therefore blocked every defrag rewrite in all but a
+    /// 2-point sliver of the exact regime the floor exists to serve — the two
+    /// gates cancelled each other. Keep this ABOVE that crossover.
+    #[serde(default = "default_defrag_fill_stop_pct")]
+    pub defrag_fill_stop_pct: u8,
 
     // --- Adaptive reclaim heat map (Stage A: observe-only) ---
     /// Master switch for the background PBA heat-map refresh (default true).
@@ -269,13 +373,16 @@ impl Default for GcConfig {
             defrag_stripe_capable_min_pct: default_defrag_stripe_capable_min_pct(),
             defrag_min_free_pct: default_defrag_min_free_pct(),
             defrag_min_free_density_pct: default_defrag_min_free_density_pct(),
-            defrag_gap_max_blocks: default_defrag_gap_max_blocks(),
             defrag_max_target_blocks: default_defrag_max_target_blocks(),
-            defrag_max_active_targets: default_defrag_max_active_targets(),
+            defrag_interval_ms: default_defrag_interval_ms(),
+            defrag_trigger_interval_ms: default_defrag_trigger_interval_ms(),
+            defrag_classify_max_windows_per_cycle: default_defrag_classify_max_windows_per_cycle(),
+            defrag_scan_interval_cycles: default_defrag_scan_interval_cycles(),
+            defrag_scan_timebox_ms: default_defrag_scan_timebox_ms(),
             defrag_target_stall_secs: default_defrag_target_stall_secs(),
-            defrag_scan_extents_per_cycle: default_defrag_scan_extents_per_cycle(),
             defrag_max_rewrite_blocks_per_cycle: default_defrag_max_rewrite_blocks_per_cycle(),
             defrag_min_effort: default_defrag_min_effort(),
+            defrag_fill_stop_pct: default_defrag_fill_stop_pct(),
             heat_enabled: default_heat_enabled(),
             heat_bucket_size_blocks: default_heat_bucket_size_blocks(),
             heat_refresh_max_lbas_per_cycle: default_heat_refresh_max_lbas_per_cycle(),
@@ -347,26 +454,35 @@ fn default_defrag_min_free_pct() -> u8 {
 fn default_defrag_min_free_density_pct() -> u8 {
     50
 }
-fn default_defrag_gap_max_blocks() -> u32 {
-    64
-}
 fn default_defrag_max_target_blocks() -> u64 {
-    262_144 // 1 GiB at 4 KiB blocks
+    32_768 // 128 MiB at 4 KiB blocks
 }
-fn default_defrag_max_active_targets() -> usize {
-    32
+fn default_defrag_interval_ms() -> u64 {
+    1000
+}
+fn default_defrag_trigger_interval_ms() -> u64 {
+    5000 // the cadence contiguity_stats ran at as a GC phase
+}
+fn default_defrag_classify_max_windows_per_cycle() -> usize {
+    4096
+}
+fn default_defrag_scan_interval_cycles() -> u64 {
+    8
+}
+fn default_defrag_scan_timebox_ms() -> u64 {
+    200
 }
 fn default_defrag_target_stall_secs() -> u64 {
-    3600
-}
-fn default_defrag_scan_extents_per_cycle() -> usize {
-    32_768
+    120
 }
 fn default_defrag_max_rewrite_blocks_per_cycle() -> u64 {
     32_768 // 128 MiB/cycle at full effort ≈ 25 MB/s movement
 }
 fn default_defrag_min_effort() -> f64 {
     0.15
+}
+fn default_defrag_fill_stop_pct() -> u8 {
+    90
 }
 fn default_heat_enabled() -> bool {
     true

@@ -787,7 +787,36 @@ pub struct EngineMetrics {
     pub gc_defrag_mode_active: AtomicU64,
     pub gc_defrag_targets_active: AtomicU64,
     pub gc_defrag_target_blocks: AtomicU64,
-    pub gc_defrag_walk_extents: AtomicU64,
+    /// Stripe windows handed to `classify_stripe_windows` (the denominator the
+    /// old free-list walk never had: qualify rate = clusters_qualified /
+    /// windows_classified). Summed over BOTH selectors.
+    pub gc_defrag_windows_classified: AtomicU64,
+    /// Resident-defragger cycles (its own cadence, `defrag_interval_ms`) — the
+    /// denominator for reading every other counter as a rate.
+    pub gc_defrag_cycles: AtomicU64,
+    /// Completed laps of the resident defragger's cursor over the retired set.
+    /// 0 for a long time means the retired set is deeper than the per-cycle
+    /// window budget can sweep, i.e. discovery latency is a lap, not a cycle.
+    pub gc_defrag_retired_laps: AtomicU64,
+    /// Windows quarantined by the RESIDENT (allocator-side, zero-scan) selector,
+    /// i.e. retired-pinned windows that reclaim alone will finish. The rest of
+    /// `clusters_qualified` came from the scan-driven selector.
+    pub gc_defrag_retired_windows_selected: AtomicU64,
+    /// Cycles in which the compactor's scan-driven selection hit
+    /// `defrag_scan_timebox_ms` and gave the cycle back mid-batch.
+    pub gc_defrag_scan_timeboxed: AtomicU64,
+    /// Cycles in which the compactor SKIPPED its scan-driven selection because
+    /// the resident defragger held the target-set mutex. Must stay small; if it
+    /// does not, the resident thread is spending real time inside
+    /// `begin_defrag_quarantine`'s hazard wait.
+    pub gc_defrag_scan_lock_skipped: AtomicU64,
+    /// Resident cycles that skipped the retired-set walk entirely because the
+    /// retired set was too small to hold a whole window, or because consecutive
+    /// empty laps backed the walk off. This is what keeps the walk from costing
+    /// one lock per address region per second for zero yield (box 2026-08-10:
+    /// `retired_lock.defrag_windows` 1,050,624 acquisitions, 0 selections).
+    pub gc_defrag_walk_skipped: AtomicU64,
+    /// Windows selected + quarantined for evacuation.
     pub gc_defrag_clusters_qualified: AtomicU64,
     pub gc_defrag_clusters_rejected: AtomicU64,
     pub gc_defrag_candidates: AtomicU64,
@@ -799,6 +828,10 @@ pub struct EngineMetrics {
     /// Quarantine targets released without completion (mode exit or no-progress
     /// watchdog). Cancellation is safe and loses only cleaner progress.
     pub gc_defrag_segments_cancelled: AtomicU64,
+    /// Targets that vanished from the allocator without going through our own
+    /// completion or cancellation. Must stay 0; it used to be miscounted as a
+    /// completion, i.e. as "defrag published a stripe to the reserve".
+    pub gc_defrag_targets_stale: AtomicU64,
     /// Dedup hits deliberately converted to fresh writes because the candidate
     /// was the relocation source or overlapped an active quarantine target.
     pub gc_defrag_dedup_hits_rejected: AtomicU64,

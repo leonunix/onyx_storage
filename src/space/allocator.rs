@@ -87,6 +87,16 @@ pub fn set_free_lock_hold_extents(extents: usize) {
 /// amortizing the acquisition over enough entries to be free.
 const AGED_SCAN_SLICE: usize = 4096;
 
+/// Retired extents [`SpaceAllocator::retired_stripe_windows`] examines before
+/// releasing the shard lock.
+///
+/// The window walk needs its own slice bound because its output is deduplicated
+/// by WINDOW while its cost is per EXTENT: under the ~1-block retires that
+/// scattered overwrite produces, up to `stripe` extents collapse into one
+/// window, so a windows-only budget would let one hold walk `windows × stripe`
+/// entries. Same reasoning and same order of magnitude as [`AGED_SCAN_SLICE`].
+const RETIRED_WINDOW_SCAN_SLICE: usize = 4096;
+
 /// Target number of address regions when `storage.allocator_regions` is 0 — which
 /// is the production default since 2026-08-01.
 ///
@@ -372,6 +382,11 @@ pub enum FreeLockSite {
     /// `drain_lane_caches` — one hold that re-inserts every lane's cache.
     Drain,
     Quarantine,
+    /// `classify_stripe_windows` — the scan-driven defrag selector's per-cycle
+    /// window classification. Kept separate from `Audit` because it is the one
+    /// GC query whose trip count scales with the compactor's scan budget, so it
+    /// is the site to watch if defrag starts showing up in the writer's wait.
+    DefragClassify,
     /// Read-only status / GC queries (`contiguity_stats`, `is_free`, …).
     Audit,
     /// Startup / rebuild / geometry / grow.
@@ -379,7 +394,7 @@ pub enum FreeLockSite {
 }
 
 /// Number of variants in [`FreeLockSite`].
-const FREE_LOCK_SITES: usize = 13;
+const FREE_LOCK_SITES: usize = 14;
 
 impl FreeLockSite {
     pub const ALL: [FreeLockSite; FREE_LOCK_SITES] = [
@@ -394,6 +409,7 @@ impl FreeLockSite {
         Self::FreeOne,
         Self::Drain,
         Self::Quarantine,
+        Self::DefragClassify,
         Self::Audit,
         Self::Setup,
     ];
@@ -411,6 +427,7 @@ impl FreeLockSite {
             Self::FreeOne => "free_one",
             Self::Drain => "drain",
             Self::Quarantine => "quarantine",
+            Self::DefragClassify => "defrag_classify",
             Self::Audit => "audit",
             Self::Setup => "setup",
         }
@@ -451,13 +468,19 @@ pub enum RetiredLockSite {
     OverlapBlocks,
     /// `retired_candidates` — audit / accounting snapshot.
     Candidates,
+    /// `retired_stripe_windows` — the resident defragger's window enumeration.
+    /// Separate from `Candidates` because it is a STANDING background walk on
+    /// its own cadence, so it is the retired-side counterpart of
+    /// [`FreeLockSite::DefragClassify`]: if defrag ever shows up in a writer's
+    /// wait, these two sites are where to look first.
+    DefragWindows,
     Audit,
     /// Startup / rebuild.
     Setup,
 }
 
 /// Number of variants in [`RetiredLockSite`].
-const RETIRED_LOCK_SITES: usize = 13;
+const RETIRED_LOCK_SITES: usize = 14;
 
 impl RetiredLockSite {
     pub const ALL: [RetiredLockSite; RETIRED_LOCK_SITES] = [
@@ -472,6 +495,7 @@ impl RetiredLockSite {
         Self::IsRetired,
         Self::OverlapBlocks,
         Self::Candidates,
+        Self::DefragWindows,
         Self::Audit,
         Self::Setup,
     ];
@@ -489,6 +513,7 @@ impl RetiredLockSite {
             Self::IsRetired => "is_retired",
             Self::OverlapBlocks => "overlap_blocks",
             Self::Candidates => "candidates",
+            Self::DefragWindows => "defrag_windows",
             Self::Audit => "audit",
             Self::Setup => "setup",
         }
@@ -942,6 +967,27 @@ impl FreePools {
         candidate.filter(|range| SpaceAllocator::extents_overlap(*range, extent))
     }
 
+    /// Blocks of `range` covered by this region's free space — general +
+    /// stripe reserve + the already-free parts of any active quarantine.
+    /// Shared by the single-window [`SpaceAllocator::free_overlap_blocks`] and
+    /// the batched [`SpaceAllocator::classify_stripe_windows`], so the two can
+    /// never disagree.
+    fn overlap_free_blocks(&self, range: Extent) -> u64 {
+        let mut covered = free_set_overlap_blocks(&self.general, range)
+            + free_set_overlap_blocks(&self.stripe_reserve, range);
+        for start in self.quarantine_starts_overlapping(range) {
+            covered += free_set_overlap_blocks(
+                &self
+                    .quarantines
+                    .get(&start)
+                    .expect("quarantine key remains present")
+                    .free_parts,
+                range,
+            );
+        }
+        covered
+    }
+
     fn quarantine_starts_overlapping(&self, extent: Extent) -> Vec<u64> {
         let mut starts = Vec::new();
         if let Some((&start, target)) = self.quarantines.range(..extent.start.0).next_back() {
@@ -1036,6 +1082,30 @@ impl FreePools {
             self.insert_classified(Extent::new(Pba(cursor), (end - cursor) as u32));
         }
     }
+}
+
+/// Blocks of `range` covered by `set` — O(log N + overlaps in range). Callers
+/// hand in the UNCLIPPED range and apply it per region: a region's sets only
+/// hold in-region extents, so clamping to the full range is equivalent to
+/// clipping first (see [`RegionPools`]'s containment invariant).
+fn free_set_overlap_blocks(set: &FreeSet, range: Extent) -> u64 {
+    let (s, e) = (range.start.0, range.end_pba().0);
+    let mut covered = 0u64;
+    // The last extent starting at/before `s` may reach into the range.
+    if let Some(prev) = set
+        .by_addr()
+        .range(..=Extent::single(range.start))
+        .next_back()
+    {
+        covered += prev.end_pba().0.min(e).saturating_sub(s);
+    }
+    for ext in set.by_addr().range(Extent::single(Pba(s + 1))..) {
+        if ext.start.0 >= e {
+            break;
+        }
+        covered += ext.end_pba().0.min(e) - ext.start.0;
+    }
+    covered
 }
 
 /// The free space, sharded by PBA address into independently-locked regions.
@@ -3238,6 +3308,110 @@ impl SpaceAllocator {
         out
     }
 
+    /// Stripe-aligned window starts containing at least one RETIRED block,
+    /// ascending and deduplicated, resuming from `*cursor` and advancing it past
+    /// the last window emitted. Returns `(windows, lapped)`, where `lapped` is
+    /// true when the walk ran off the end of the address space and reset the
+    /// cursor to 0.
+    ///
+    /// This is the resident defragger's enumeration source, and the reason that
+    /// half of defrag needs no L2P scan at all. A window whose non-free
+    /// remainder is entirely RETIRED has no live pinner: nothing has to be
+    /// rewritten for it to become one whole free stripe — reclaim alone finishes
+    /// it, and all the defragger has to do is hold its free fragments out of
+    /// allocation until then. Retired blocks are the only place such a window
+    /// can be discovered from, and this walk costs no metadata IO.
+    ///
+    /// Windows with a LIVE pinner are deliberately NOT discoverable here: the
+    /// only PBA → LBA map in the system is the compactor's forward L2P scan, so
+    /// those stay the scan-driven selector's job
+    /// (`DefragState::select_from_scan`). Trying to serve them from a reverse
+    /// walk is the mistake the pre-2026-08-06 free-list walk made.
+    ///
+    /// The shard lock is released every [`RETIRED_WINDOW_SCAN_SLICE`] extents.
+    /// A concurrent retire/reclaim can only make the walk skip a window (picked
+    /// up next lap) or return a stale one (`classify_stripe_windows` re-reads
+    /// occupancy and `begin_defrag_quarantine` re-validates under the free
+    /// lock), so slicing needs no new proof.
+    pub(crate) fn retired_stripe_windows(
+        &self,
+        cursor: &mut u64,
+        stripe: u32,
+        phase: u32,
+        max_windows: usize,
+    ) -> (Vec<u64>, bool) {
+        if max_windows == 0 || stripe <= 1 {
+            return (Vec::new(), false);
+        }
+        let stripe64 = u64::from(stripe);
+        let phase64 = u64::from(phase);
+        // Start of the stripe window containing `pba`, or None for the grid's
+        // partial head window (no whole stripe to clear). Mirrors
+        // `gc::defrag::window_start`.
+        let window_of = |pba: u64| pba.checked_sub((pba + phase64) % stripe64);
+
+        let layout = self.retired_layout();
+        let mut out: Vec<u64> = Vec::new();
+        let mut from = *cursor;
+        for idx in layout.of(from)..self.retired.count() {
+            from = from.max(layout.start(idx));
+            let region_end = layout.end(idx);
+            loop {
+                let shard = self.lock_retired_shard(RetiredLockSite::DefragWindows, idx);
+                let mut examined = 0usize;
+                let mut advanced = false;
+                for extent in shard.set.range(Extent::single(Pba(from))..) {
+                    if extent.start.0 >= region_end {
+                        break;
+                    }
+                    examined += 1;
+                    // One retired extent can straddle several windows; emit each
+                    // one it touches. `out` stays ascending and deduplicated
+                    // because the set is address-ordered and window starts are
+                    // monotone in the address.
+                    let first = window_of(extent.start.0);
+                    let last = window_of(extent.end_pba().0 - 1);
+                    if let (Some(first), Some(last)) = (first, last) {
+                        let mut w = first;
+                        while w <= last {
+                            if out.last() != Some(&w) {
+                                out.push(w);
+                            }
+                            w += stripe64;
+                        }
+                    }
+                    from = extent.end_pba().0;
+                    advanced = true;
+                    if out.len() >= max_windows || examined >= RETIRED_WINDOW_SCAN_SLICE {
+                        break;
+                    }
+                }
+                drop(shard);
+                if out.len() >= max_windows {
+                    // Resume at the next WINDOW boundary, not at the next
+                    // extent: scattered overwrite retires ~1 block at a time, so
+                    // several extents share the last emitted window and a
+                    // per-extent cursor would re-emit it forever. Every extent
+                    // the skipped remainder of that window holds is already
+                    // accounted for by the window we emitted.
+                    *cursor = out
+                        .last()
+                        .map_or(from, |&last| (last + stripe64).max(from));
+                    return (out, false);
+                }
+                // Slice exhausted mid-shard: re-lock and resume. Otherwise this
+                // shard is done.
+                if !(advanced && examined >= RETIRED_WINDOW_SCAN_SLICE) {
+                    break;
+                }
+            }
+            from = region_end;
+        }
+        // Ran off the end: one full lap of the retired set is done.
+        *cursor = 0;
+        (out, true)
+    }
+
     /// Reclaim candidates: retired sub-ranges that have settled ≥ `grace` (i.e.
     /// are NOT covered by a young age entry), emitted as coalesced extents (fat
     /// where retires were contiguous → throughput) up to a `limit_blocks` BLOCK
@@ -4004,79 +4178,69 @@ impl SpaceAllocator {
     /// Blocks of `range` covered by free extents — the defrag target "done"
     /// recheck. One brief free-lock hold, O(log N + overlaps in range).
     pub(crate) fn free_overlap_blocks(&self, range: Extent) -> u64 {
-        let s = range.start.0;
-        let e = range.end_pba().0;
         let span = self.lock_span(FreeLockSite::Audit, range);
         let (lo, hi) = span.layout.span(range);
-        let overlap = |set: &FreeSet| {
-            let mut covered = 0u64;
-            if let Some(prev) = set
-                .by_addr()
-                .range(..=Extent::single(range.start))
-                .next_back()
-            {
-                covered += prev.end_pba().0.min(e).saturating_sub(s);
-            }
-            for ext in set.by_addr().range(Extent::single(Pba(s + 1))..) {
-                if ext.start.0 >= e {
-                    break;
-                }
-                covered += ext.end_pba().0.min(e) - ext.start.0;
-            }
-            covered
-        };
         (lo..=hi)
-            .map(|idx| {
-                let pools = span.region(idx);
-                overlap(&pools.general)
-                    + overlap(&pools.stripe_reserve)
-                    + pools
-                        .quarantine_starts_overlapping(range)
-                        .into_iter()
-                        .map(|start| {
-                            overlap(
-                                &pools
-                                    .quarantines
-                                    .get(&start)
-                                    .expect("quarantine key remains present")
-                                    .free_parts,
-                            )
-                        })
-                        .sum::<u64>()
-            })
+            .map(|idx| span.region(idx).overlap_free_blocks(range))
             .sum()
     }
 
-    /// Snapshot up to `max` free extents strictly below `below`, DESCENDING by
-    /// address — the defrag target-selection walk. ONE bounded lock hold
-    /// (`max` is chunk-sized by the caller); the snapshot is advisory, so
-    /// concurrent mutation between chunks is fine (the scanner/rewriter
-    /// re-validate everything downstream).
-    pub(crate) fn free_extents_below_desc(&self, below: Pba, max: usize) -> Vec<Extent> {
-        if max == 0 {
+    /// Free/retired occupancy of stripe-aligned windows, BATCHED.
+    ///
+    /// `starts` must be ascending, deduplicated stripe-aligned window starts
+    /// (the caller derives them from [`Self::stripe_geometry`]); the result is
+    /// one `(free_blocks, retired_blocks)` per input, in input order.
+    ///
+    /// This is the scan-driven defrag selector's classify step. The compactor's
+    /// L2P window scan streams thousands of candidate windows per cycle, so
+    /// calling `free_overlap_blocks` + `retired_overlap_blocks` per window
+    /// (two lock acquisitions each) would add ~10^5 region-lock trips per
+    /// second to the very locks the flusher-writers contend
+    /// (`fragmentation_unaligned_alloc_1889_locks`: lock COUNT, not wait, is
+    /// what costs the writer). Grouping by region collapses that to one hold
+    /// per region per pass, reusing [`region_holds`] exactly like the retire /
+    /// reclaim batch paths.
+    ///
+    /// Free and retired are two SEPARATE passes so the one-directional
+    /// `free -> retired` lock order is never inverted (see
+    /// [`Self::retired_overlap_blocks`]). The halves are therefore not one
+    /// atomic snapshot, which is fine: selection is advisory —
+    /// `begin_defrag_quarantine` re-validates under the free lock and the
+    /// rewriter re-validates every LBA against the live blockmap.
+    pub(crate) fn classify_stripe_windows(&self, starts: &[u64], stripe: u32) -> Vec<(u32, u32)> {
+        if starts.is_empty() || stripe == 0 {
             return Vec::new();
         }
-        // Descending by address = descending region index, so walking regions
-        // down from the cursor's own region yields the same sequence the single
-        // pool did. One region lock at a time; the snapshot is advisory (the
-        // scanner re-validates everything downstream).
+        let windows: Vec<Extent> = starts
+            .iter()
+            .map(|&start| Extent::new(Pba(start), stripe))
+            .collect();
         let layout = self.regions.layout();
-        let mut out = Vec::with_capacity(max);
-        for idx in (0..=layout.of(below.0)).rev() {
-            if out.len() >= max {
-                break;
+        let cap = free_lock_hold_extents();
+        let mut out = vec![(0u32, 0u32); windows.len()];
+
+        let mut base = 0usize;
+        for (lo, hi, hold) in region_holds(layout, &windows, cap) {
+            let span = self.lock_span_range(FreeLockSite::DefragClassify, lo, hi);
+            span.charge_items(hold.len() as u64);
+            for (i, &window) in hold.iter().enumerate() {
+                let (wlo, whi) = layout.span(window);
+                let free: u64 = (wlo..=whi)
+                    .map(|idx| span.region(idx).overlap_free_blocks(window))
+                    .sum();
+                out[base + i].0 = free as u32;
             }
-            let guard = self.lock_region(FreeLockSite::Audit, idx);
-            out.extend(
-                guard
-                    .region(idx)
-                    .general
-                    .by_addr()
-                    .range(..Extent::single(below))
-                    .rev()
-                    .take(max - out.len())
-                    .copied(),
-            );
+            base += hold.len();
+        }
+
+        // Second pass, free locks all released: retired occupancy.
+        let mut base = 0usize;
+        for (lo, hi, hold) in region_holds(self.retired_layout(), &windows, cap) {
+            let span = self.lock_retired_span_range(RetiredLockSite::OverlapBlocks, lo, hi);
+            for (i, &window) in hold.iter().enumerate() {
+                out[base + i].1 = span.overlap_blocks(window) as u32;
+            }
+            base += hold.len();
         }
         out
     }
@@ -5100,6 +5264,61 @@ mod free_pool_policy_tests {
         assert_eq!(extent.start.0 % 4, 0);
     }
 
+    /// The resident defragger's enumeration source. Its contract is narrow: one
+    /// window start per stripe window that holds a retired block, ascending,
+    /// deduplicated, resumable, and capped.
+    #[test]
+    fn retired_stripe_windows_enumerates_deduped_and_resumes() {
+        let allocator = allocator(4096, 0);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let grid = |w: u64| {
+            let first = RESERVED_BLOCKS + (u64::from(STRIPE) - (RESERVED_BLOCKS + u64::from(PHASE)) % u64::from(STRIPE)) % u64::from(STRIPE);
+            first + w * u64::from(STRIPE)
+        };
+        let claimed = allocator.allocate_extent(2048).unwrap();
+        assert!(claimed.start.0 <= grid(0));
+
+        // Two retired blocks inside ONE window must collapse to one start; a
+        // window with none must not appear at all.
+        allocator.retire_one(Pba(grid(0))).unwrap();
+        allocator.retire_one(Pba(grid(0) + 2)).unwrap();
+        allocator.retire_one(Pba(grid(3) + 1)).unwrap();
+
+        let mut cursor = 0u64;
+        let (windows, lapped) = allocator.retired_stripe_windows(&mut cursor, STRIPE, PHASE, 64);
+        assert_eq!(windows, vec![grid(0), grid(3)], "deduped, ascending");
+        assert!(lapped, "the walk ran to the end of the address space");
+        assert_eq!(cursor, 0, "a completed lap resets the cursor");
+
+        // Capped: one window per call, resuming where it stopped.
+        let mut cursor = 0u64;
+        let (first, lapped) = allocator.retired_stripe_windows(&mut cursor, STRIPE, PHASE, 1);
+        assert_eq!(first, vec![grid(0)]);
+        assert!(!lapped);
+        let (second, _) = allocator.retired_stripe_windows(&mut cursor, STRIPE, PHASE, 1);
+        assert_eq!(second, vec![grid(3)], "resumed past the first window");
+
+        // A retired extent straddling two windows yields both.
+        allocator
+            .retire_extent(Extent::new(Pba(grid(6) + 5), 2))
+            .unwrap();
+        let mut cursor = grid(6);
+        let (straddle, _) = allocator.retired_stripe_windows(&mut cursor, STRIPE, PHASE, 64);
+        assert_eq!(straddle, vec![grid(6), grid(7)]);
+
+        // No geometry / degenerate stripe: nothing to clear, no lock trips.
+        let mut cursor = 0u64;
+        assert_eq!(
+            allocator.retired_stripe_windows(&mut cursor, 1, 0, 64),
+            (Vec::new(), false)
+        );
+        let mut cursor = 0u64;
+        assert_eq!(
+            allocator.retired_stripe_windows(&mut cursor, STRIPE, PHASE, 0),
+            (Vec::new(), false)
+        );
+    }
+
     #[test]
     fn quarantine_extracts_and_splits_lane_extent_cache() {
         let allocator = allocator(32, 1);
@@ -5317,41 +5536,85 @@ mod age_tests {
         assert_eq!(a.free_block_count(), old_free + 8192);
     }
 
-    /// free_extents_below_desc returns strictly-below extents in descending
-    /// address order, capped at `max`.
+    /// The batched window classifier must agree, window for window, with the
+    /// per-window `free_overlap_blocks` / `retired_overlap_blocks` pair it
+    /// replaces — including free blocks parked inside an active quarantine's
+    /// `free_parts` (which are still physically free, just unallocatable) and
+    /// windows spread across several allocator regions.
     #[test]
-    fn free_extents_below_desc_orders_and_caps() {
-        let a = new_alloc(64);
-        // Carve the single run into three fragments by allocating separators.
-        // Layout after: free runs are rebuilt via direct set manipulation —
-        // simpler: allocate everything, then free selected extents back.
-        let total = 64 - RESERVED_BLOCKS;
-        let first = a.allocate_extent(total as u32).unwrap();
-        assert_eq!(first.start.0, RESERVED_BLOCKS);
-        for e in [
-            Extent::new(Pba(10), 2),
-            Extent::new(Pba(20), 3),
-            Extent::new(Pba(40), 4),
-        ] {
-            a.free_extent(e).unwrap();
+    fn classify_stripe_windows_matches_per_window_ground_truth() {
+        const STRIPE: u32 = 6;
+        let a = new_alloc(8192);
+        a.set_stripe_geometry(STRIPE, 0);
+        // Claim everything, then carve a varied free/retired/live pattern.
+        let total = 8192 - RESERVED_BLOCKS;
+        let mut claimed = 0u64;
+        while claimed < total {
+            claimed += u64::from(a.allocate_extent((total - claimed) as u32).unwrap().count);
         }
-        let all = a.free_extents_below_desc(Pba(u64::MAX), 16);
-        assert_eq!(
-            all,
-            vec![
-                Extent::new(Pba(40), 4),
-                Extent::new(Pba(20), 3),
-                Extent::new(Pba(10), 2)
-            ]
-        );
-        // Strictly below 40: excludes the extent starting at 40.
-        let below = a.free_extents_below_desc(Pba(40), 16);
-        assert_eq!(below.len(), 2);
-        assert_eq!(below[0].start.0, 20);
-        // Cap.
-        let capped = a.free_extents_below_desc(Pba(u64::MAX), 1);
-        assert_eq!(capped, vec![Extent::new(Pba(40), 4)]);
-        assert!(a.free_extents_below_desc(Pba(u64::MAX), 0).is_empty());
+        let t0 = Instant::now();
+        let base = (RESERVED_BLOCKS / u64::from(STRIPE) + 1) * u64::from(STRIPE);
+        for w in 0..64u64 {
+            let start = base + w * u64::from(STRIPE);
+            match w % 4 {
+                // Fully free window.
+                0 => a.free_extent(Extent::new(Pba(start), STRIPE)).unwrap(),
+                // Mostly free, one live pinner in the middle.
+                1 => {
+                    a.free_extent(Extent::new(Pba(start), 3)).unwrap();
+                    a.free_extent(Extent::new(Pba(start + 4), 2)).unwrap();
+                }
+                // Free head + retired tail (reclaimable, no live pinner).
+                2 => {
+                    a.free_extent(Extent::new(Pba(start), 4)).unwrap();
+                    a.retire_extent_at(Extent::new(Pba(start + 4), 2), t0)
+                        .unwrap();
+                }
+                // Fully live.
+                _ => {}
+            }
+        }
+        // Quarantine one of the mostly-free windows: its free blocks move into
+        // `free_parts` and must still be counted as free.
+        let quarantined = Extent::new(Pba(base + u64::from(STRIPE)), STRIPE);
+        a.begin_defrag_quarantine(quarantined).unwrap();
+
+        let starts: Vec<u64> = (0..64).map(|w| base + w * u64::from(STRIPE)).collect();
+        let batched = a.classify_stripe_windows(&starts, STRIPE);
+        assert_eq!(batched.len(), starts.len());
+        for (i, &start) in starts.iter().enumerate() {
+            let window = Extent::new(Pba(start), STRIPE);
+            assert_eq!(
+                (u64::from(batched[i].0), u64::from(batched[i].1)),
+                (
+                    a.free_overlap_blocks(window),
+                    a.retired_overlap_blocks(window),
+                ),
+                "window {start} disagrees with the per-window query"
+            );
+            assert!(
+                batched[i].0 + batched[i].1 <= STRIPE,
+                "window {start} over-counts its own span"
+            );
+        }
+        // Non-vacuity: the pattern really does produce all three shapes.
+        assert!(batched.iter().any(|&(free, _)| free == STRIPE));
+        assert!(batched
+            .iter()
+            .any(|&(free, retired)| free > 0 && free + retired < STRIPE));
+        assert!(batched.iter().any(|&(_, retired)| retired > 0));
+        assert!(batched
+            .iter()
+            .any(|&(free, retired)| free == 0 && retired == 0));
+        // The quarantined window's free blocks were NOT lost by the classifier.
+        let qi = starts
+            .iter()
+            .position(|&s| s == quarantined.start.0)
+            .unwrap();
+        assert_eq!(batched[qi].0, 5, "quarantined free_parts must still count");
+
+        assert!(a.classify_stripe_windows(&[], STRIPE).is_empty());
+        assert!(a.classify_stripe_windows(&starts, 0).is_empty());
     }
 
     /// retired_overlap_blocks sums clamped intersections, including a retired

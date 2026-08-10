@@ -10,7 +10,7 @@ use crossbeam_channel::Sender;
 use crate::buffer::pool::WriteBufferPool;
 use crate::dedup::ColdTailTarget;
 use crate::gc::config::GcConfig;
-use crate::gc::defrag::DefragState;
+use crate::gc::defrag::Defragger;
 use crate::gc::heatmap::HeatMap;
 use crate::gc::ref_bitmap::RefBitmap;
 use crate::gc::rewriter::rewrite_candidate;
@@ -60,35 +60,12 @@ const COMPACTOR_MIN_WINDOW_LBAS: u64 = 64;
 /// append waits on (engine wedge, box 2026-07-03). 2 s of a 5 s cycle leaves
 /// reclaim its cadence; dropped candidates are re-selected next lap.
 const COMPACTOR_REWRITE_TIMEBOX_MS: u64 = 2_000;
-/// Stop DEFRAG rewrites (optional work) once the buffer is this full — they
-/// would only deepen the very backlog the effort model is trying to relieve.
-/// Legacy/slot-evac candidates (space-pressure work) are not fill-gated.
-const COMPACTOR_REWRITE_FILL_STOP_PCT: u8 = 70;
-
-/// Owns the loop-local defrag state and releases allocator quarantines on every
-/// exit path, including normal stop and panic unwind. Quarantined free blocks
-/// must be available before the flusher performs its shutdown drain.
-struct DefragLoopState<'a> {
-    state: DefragState,
-    allocator: &'a SpaceAllocator,
-    metrics: &'a EngineMetrics,
-}
-
-impl<'a> DefragLoopState<'a> {
-    fn new(allocator: &'a SpaceAllocator, metrics: &'a EngineMetrics) -> Self {
-        Self {
-            state: DefragState::new(),
-            allocator,
-            metrics,
-        }
-    }
-}
-
-impl Drop for DefragLoopState<'_> {
-    fn drop(&mut self) {
-        self.state.deactivate(self.allocator, self.metrics);
-    }
-}
+// Defrag rewrites are additionally fill-gated by `gc.defrag_fill_stop_pct`
+// (default 90). It used to be a hardcoded 70, which cancelled out
+// `defrag_min_effort`: that floor only changes the outcome above
+// fill ~= 0.85 * buffer_usage_max_pct (68 at the defaults), so the pair left a
+// 2-point sliver in which defrag could move anything at all. See the knob's doc
+// comment. Legacy/slot-evac candidates (space-pressure work) stay un-gated.
 
 /// Background GC runner thread.
 pub struct GcRunner {
@@ -129,8 +106,45 @@ impl GcRunner {
         )
     }
 
+    /// Start with an engine-shared metrics handle and a defragger of its own.
+    ///
+    /// Production goes through [`Self::start_with_defragger`] instead, so that
+    /// the compactor and the resident [`crate::gc::defrag_runner::DefragRunner`]
+    /// share one target set. This entry point exists for callers that only want
+    /// the GC loop (integration tests): the scan-driven defrag half works
+    /// standalone, it just has no resident partner publishing completed stripes.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_metrics(
+        metrics: Arc<EngineMetrics>,
+        meta: Arc<MetaStore>,
+        io_engine: Arc<IoEngine>,
+        buffer_pool: Arc<WriteBufferPool>,
+        lifecycle: Arc<VolumeLifecycleManager>,
+        allocator: Arc<SpaceAllocator>,
+        heat: HeatMap,
+        ref_bitmap: Option<RefBitmap>,
+        cold_tx: Option<Sender<ColdTailTarget>>,
+        pba_lifecycle: PbaLifecycle,
+        config: GcConfig,
+    ) -> Self {
+        Self::start_with_defragger(
+            metrics,
+            meta,
+            io_engine,
+            buffer_pool,
+            lifecycle,
+            allocator,
+            heat,
+            ref_bitmap,
+            cold_tx,
+            pba_lifecycle,
+            Arc::new(Defragger::new()),
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_with_defragger(
         metrics: Arc<EngineMetrics>,
         meta: Arc<MetaStore>,
         io_engine: Arc<IoEngine>,
@@ -143,6 +157,11 @@ impl GcRunner {
         ref_bitmap: Option<RefBitmap>,
         cold_tx: Option<Sender<ColdTailTarget>>,
         pba_lifecycle: PbaLifecycle,
+        // Shared with the resident `DefragRunner`, which OWNS the target
+        // lifecycle (latch, allocator-side selection, publication). The
+        // compactor only contributes the live-pinned targets that need its L2P
+        // scan to be discoverable at all.
+        defragger: Arc<Defragger>,
         config: GcConfig,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -165,6 +184,7 @@ impl GcRunner {
                     ref_bitmap.as_ref(),
                     cold_tx.as_ref(),
                     &pba_lifecycle,
+                    &defragger,
                     &config_clone,
                     &running_clone,
                 );
@@ -216,12 +236,12 @@ impl GcRunner {
         ref_bitmap: Option<&RefBitmap>,
         cold_tx: Option<&Sender<ColdTailTarget>>,
         pba_lifecycle: &PbaLifecycle,
+        defragger: &Defragger,
         config: &ArcSwap<GcConfig>,
         running: &AtomicBool,
     ) {
         let mut compactor_cursor = CompactorCursor::default();
         let mut heat_cursor = HeatCursor::default();
-        let mut defrag_state = DefragLoopState::new(allocator, metrics);
         // Reclaim-age grace now lives in the allocator's per-original-retire age
         // log (`aged_candidates`), which is immune to the coalesce re-aging the
         // old runner-side `retired_first_seen: BTreeMap<Extent, Instant>` map
@@ -302,10 +322,11 @@ impl GcRunner {
             let heat_ms = t_heat.elapsed().as_millis();
 
             if !cfg.enabled || cfg.compactor_scan_max_lbas_per_cycle == 0 {
-                // A runtime kill-switch must also return allocator-owned
-                // quarantine fragments to the ordinary free pools. Skipping
-                // DefragState entirely would strand them until restart.
-                defrag_state.state.deactivate(allocator, metrics);
+                // Only the COMPACTOR is killed here. The resident defragger has
+                // its own thread, its own `defrag_enabled` gate, and its own
+                // quarantine release path — `gc.enabled = false` no longer has to
+                // stand in for both, so this arm must NOT deactivate it (doing so
+                // would fight the resident thread every cycle).
                 tracing::debug!(
                     cycle,
                     reclaim_ms,
@@ -346,19 +367,13 @@ impl GcRunner {
                 .max(buffer_pool.payload_fill_percentage());
             let mut effort = compute_effort(fill_pct, free_pct, cfg.buffer_usage_max_pct);
 
-            // Defrag maintenance: trigger latch + target selection walk. Runs
-            // BEFORE the idle check because the fragmented steady state is
-            // exactly "buffer full AND free% > 50" → effort < 0.01 → compactor
-            // idled — the effort floor below un-idles it while defrag is
-            // latched (the urgency/idle formula itself is untouched).
-            let t_defrag = Instant::now();
-            // `maintain` owns the enable/disable transition so a hot reload of
-            // `defrag_enabled=false` cancels every active quarantine.
-            let defrag_cycle = defrag_state
-                .state
-                .maintain(allocator, &cfg, free_pct, metrics);
-            let defrag_ms = t_defrag.elapsed().as_millis();
-            if defrag_cycle.active {
+            // Defrag trigger latch. Owned by the resident defragger thread now;
+            // read here (lock-free) BEFORE the idle check because the fragmented
+            // steady state is exactly "buffer full AND free% > 50" → effort <
+            // 0.01 → compactor idled — the effort floor below un-idles it while
+            // defrag is latched (the urgency/idle formula itself is untouched).
+            let defrag_active = defragger.is_active();
+            if defrag_active {
                 effort = effort.max(cfg.defrag_min_effort.clamp(0.01, 1.0));
             }
 
@@ -370,7 +385,6 @@ impl GcRunner {
                     cycle,
                     reclaim_ms,
                     heat_ms,
-                    defrag_ms,
                     compactor_ms = 0u128,
                     effort,
                     depth = allocator.retired_block_count(),
@@ -399,17 +413,36 @@ impl GcRunner {
                 block_size: BLOCK_SIZE,
             };
 
-            // Defrag rewrite budget in BLOCKS (independent of the legacy unit
-            // budget above); `.ceil()` so any effort > 0 makes progress.
-            let defrag_scan = if defrag_cycle.active {
-                DefragScanParams {
-                    targets: defrag_cycle.targets.clone(),
-                    max_blocks: (cfg.defrag_max_rewrite_blocks_per_cycle as f64 * effort).ceil()
-                        as u64,
-                }
-            } else {
-                DefragScanParams::disabled()
-            };
+            // Defrag relocation budget in BLOCKS (independent of the legacy unit
+            // budget above); `.ceil()` so any effort > 0 makes progress. It is
+            // the ONLY per-cycle cap on the scan-driven half: it bounds both how
+            // many live blocks the selector commits to and how many the rewrite
+            // loop moves.
+            //
+            // Zeroed when the fill gate would block the rewrites anyway: a
+            // quarantine holds its window's free blocks OUT of the allocatable
+            // pools until the whole stripe clears, so selecting targets we
+            // cannot evacuate would park up to `defrag_max_target_blocks` of
+            // free space behind the stall watchdog for nothing. Selecting and
+            // rewriting are gated together; the rewrite loop re-checks per
+            // candidate because fill can rise mid-cycle.
+            //
+            // Also zeroed on the 7 of every 8 cycles the scan-driven pass is
+            // DOWNSHIFTED out of (`defrag_scan_interval_cycles`). That pass costs
+            // an extra bounded L2P window pre-scan on the thread mandatory
+            // reclaim shares, and on the box only 1.3% of what it selected was
+            // rewritten inside the budget — it over-produced against its own
+            // consumer (memory: `defrag_gc_lever`). The resident defragger keeps
+            // running at full cadence on its own thread meanwhile; what is
+            // downshifted is only the live-pinned half.
+            let scan_cycle_due = cfg.defrag_scan_interval_cycles > 0
+                && cycle % cfg.defrag_scan_interval_cycles == 0;
+            let defrag_block_budget =
+                if defrag_active && scan_cycle_due && fill_pct < cfg.defrag_fill_stop_pct {
+                    (cfg.defrag_max_rewrite_blocks_per_cycle as f64 * effort).ceil() as u64
+                } else {
+                    0
+                };
 
             let t_comp = Instant::now();
             Self::compactor_step(
@@ -424,19 +457,20 @@ impl GcRunner {
                 scan_budget,
                 rewrite_budget,
                 slot_evac,
-                &defrag_scan,
+                &cfg,
+                defragger,
+                defrag_block_budget,
                 running,
             );
             tracing::debug!(
                 cycle,
                 reclaim_ms,
                 heat_ms,
-                defrag_ms,
                 compactor_ms = t_comp.elapsed().as_millis(),
                 effort,
                 scan_budget,
                 rewrite_budget,
-                defrag_block_budget = defrag_scan.max_blocks,
+                defrag_block_budget,
                 depth = allocator.retired_block_count(),
                 "gc cycle timing"
             );
@@ -462,7 +496,9 @@ impl GcRunner {
         scan_budget: u64,
         rewrite_budget: usize,
         slot_evac: SlotEvacParams,
-        defrag: &DefragScanParams,
+        cfg: &GcConfig,
+        defragger: &Defragger,
+        defrag_block_budget: u64,
         running: &AtomicBool,
     ) {
         if scan_budget == 0 || rewrite_budget == 0 {
@@ -523,6 +559,77 @@ impl GcRunner {
             return;
         }
 
+        // Defrag pass 1 (LIVE-PINNED windows only): the compactor's L2P window
+        // scan is the ONLY PBA -> LBA map in the system (`referenced_extents` is
+        // itself a full scan, and rc-authoritative reclaim skips even that), so
+        // selecting a window that is stuck behind LIVE blocks has to happen ON
+        // this window. Collect the physical footprints it touches, let the
+        // selector classify their stripe windows against the allocator and
+        // quarantine the best ones, and the candidate scan below then promotes
+        // exactly those windows' live fragments.
+        //
+        // That ordering is the whole point: targets picked from THIS window are
+        // reachable by THIS scan. The old design pre-picked targets from a
+        // descending free-list walk and waited for a later lap (11-37 min at
+        // defrag effort) to stumble on their pinners, which measured as zero
+        // work over 480 s on the box.
+        //
+        // Retired-pinned windows do NOT come through here — they need no rewrite
+        // and no reverse lookup, so the resident defragger takes them straight
+        // off the retired set on its own thread (`gc::defrag_runner`).
+        //
+        // Cost: one extra bounded range scan (watch `compactor_ms`). Paid only
+        // while the trigger is latched AND on the 1-in-N cycles the caller
+        // budgets for (`defrag_scan_interval_cycles`).
+        let defrag = if defrag_block_budget > 0 {
+            let mut pbas: Vec<u64> = Vec::new();
+            let scanned = meta.scan_blockmap_range(
+                &vol.id,
+                Lba(phys_start),
+                chunk,
+                &mut |_lba, bv: BlockmapValue| {
+                    if bv.is_zero() {
+                        return;
+                    }
+                    pbas.push(bv.pba.0);
+                    // A multi-block passthrough unit can straddle two stripe
+                    // windows; clearing either end needs the whole unit moved,
+                    // and `ranges_overlap_unit` matches on the full footprint.
+                    let blocks = bv.physical_blocks(BLOCK_SIZE);
+                    if blocks > 1 {
+                        pbas.push(bv.pba.0 + u64::from(blocks - 1));
+                    }
+                },
+            );
+            if let Err(e) = scanned {
+                metrics.gc_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(vol = %vol.id.0, error = %e, "defrag: window pre-scan failed");
+                DefragScanParams::disabled()
+            } else {
+                let deadline = (cfg.defrag_scan_timebox_ms > 0)
+                    .then(|| Instant::now() + Duration::from_millis(cfg.defrag_scan_timebox_ms));
+                let targets = defragger.select_from_scan(
+                    allocator,
+                    cfg,
+                    &mut pbas,
+                    defrag_block_budget,
+                    deadline,
+                    metrics,
+                );
+                DefragScanParams {
+                    targets,
+                    max_blocks: defrag_block_budget,
+                }
+            }
+        } else {
+            // Downshifted (or unlatched) cycle: no target promotion at all.
+            // Promoting pinners without a block budget would be pure cost — the
+            // rewrite loop breaks on the first defrag candidate — and carried-over
+            // targets are re-emitted by the next budgeted cycle, which re-derives
+            // the full active list from `Defragger`.
+            DefragScanParams::disabled()
+        };
+
         let (candidates, dead_estimate, slot_stats, defrag_stats) = match scan_gc_candidates_window(
             meta,
             &vol.id,
@@ -531,7 +638,7 @@ impl GcRunner {
             threshold,
             rewrite_budget,
             slot_evac,
-            defrag,
+            &defrag,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -605,7 +712,7 @@ impl GcRunner {
                     || buffer_pool
                         .fill_percentage()
                         .max(buffer_pool.payload_fill_percentage())
-                        >= COMPACTOR_REWRITE_FILL_STOP_PCT)
+                        >= cfg.defrag_fill_stop_pct)
             {
                 break; // defrag candidates are the vec's tail — nothing after
             }
@@ -1632,7 +1739,7 @@ fn try_push_cold_tail(
 mod tests {
     use super::{
         advance_sweep, compute_effort, lap_barrier_satisfied, next_compactor_window,
-        split_refresh_budget, CompactorCursor, CompactorLap, DefragLoopState, HeatLap,
+        split_refresh_budget, CompactorCursor, CompactorLap, HeatLap,
     };
     use std::collections::HashMap;
 
@@ -1672,6 +1779,46 @@ mod tests {
         assert!((compute_effort(100, 99, 0) - 1.0).abs() < 1e-9);
     }
 
+    /// REGRESSION: the defrag effort floor and the defrag rewrite fill gate must
+    /// not cancel each other out.
+    ///
+    /// `defrag_min_effort` exists because the fragmented steady state is "buffer
+    /// busy AND free% > 50", which drives `compute_effort` to ~0 and idles the
+    /// compactor exactly when defrag is needed. So the floor only CHANGES the
+    /// outcome above some fill (68% at the defaults). The rewrite gate used to be
+    /// a hardcoded 70, which meant defrag could actually move a block only in the
+    /// 2-point sliver (68, 70) — the box measured `blocks_moved = 0` for 480 s.
+    /// The gate must therefore sit strictly above the floor's engage point, with
+    /// real room between them.
+    #[test]
+    fn defrag_fill_gate_does_not_cancel_the_effort_floor() {
+        let cfg = crate::gc::config::GcConfig::default();
+        // Lowest fill at which the floor is what keeps the compactor alive
+        // (plentiful space, so urgency contributes nothing).
+        let engage = (0..=100u8)
+            .find(|&fill| {
+                compute_effort(fill, 99, cfg.buffer_usage_max_pct) < cfg.defrag_min_effort
+            })
+            .expect("the floor must engage somewhere below full");
+        assert!(
+            cfg.defrag_fill_stop_pct > engage,
+            "fill gate {} must exceed the effort-floor engage point {engage}",
+            cfg.defrag_fill_stop_pct
+        );
+        assert!(
+            u32::from(cfg.defrag_fill_stop_pct - engage) >= 10,
+            "only {} points between engage {engage} and gate {} — the two gates \
+             effectively cancel out",
+            cfg.defrag_fill_stop_pct - engage,
+            cfg.defrag_fill_stop_pct
+        );
+        // And the regime the floor serves must actually be un-gated: at a fill
+        // just past the engage point the compactor runs on the floor AND defrag
+        // rewrites are allowed.
+        assert!(compute_effort(engage, 99, cfg.buffer_usage_max_pct) < cfg.defrag_min_effort);
+        assert!(engage < cfg.defrag_fill_stop_pct);
+    }
+
     // ---- resident compactor: dynamic threshold curve ----
 
     #[test]
@@ -1688,35 +1835,8 @@ mod tests {
         assert_eq!(super::GcRunner::dynamic_threshold(&cfg, 5), 0.25);
     }
 
-    #[test]
-    fn dropping_gc_loop_state_releases_active_quarantine_before_flusher_drain() {
-        use std::sync::atomic::Ordering;
-
-        use crate::metrics::EngineMetrics;
-        use crate::space::allocator::SpaceAllocator;
-        use crate::types::{BLOCK_SIZE, RESERVED_BLOCKS};
-
-        const STRIPE: u32 = 6;
-        let phase = (RESERVED_BLOCKS % u64::from(STRIPE)) as u32;
-        let allocator = SpaceAllocator::new(128 * BLOCK_SIZE as u64, 0);
-        allocator.set_stripe_geometry(STRIPE, phase);
-        let target = allocator
-            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, phase)
-            .unwrap();
-        allocator.begin_defrag_quarantine(target).unwrap();
-        let metrics = EngineMetrics::default();
-
-        {
-            let mut loop_state = DefragLoopState::new(&allocator, &metrics);
-            loop_state.state.track_target_for_exit_test(target);
-        }
-
-        assert!(!allocator.is_defrag_quarantined(target));
-        assert_eq!(
-            metrics.gc_defrag_segments_cancelled.load(Ordering::Relaxed),
-            1
-        );
-    }
+    // The quarantine-release-on-exit guard moved with the defrag loop —
+    // see `gc::defrag_runner::tests`.
 
     // ---- resident compactor: lap window ----
 

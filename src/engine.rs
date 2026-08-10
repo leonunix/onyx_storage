@@ -7,6 +7,7 @@ use crate::chunklet_watchdog::{ChunkletWatchdog, WatchdogConfig};
 use crate::config::{IoBackend as IoBackendConfig, OnyxConfig, StorageConfig};
 use crate::dedup::scanner::DedupScanner;
 use crate::error::{OnyxError, OnyxResult};
+use crate::gc::defrag_runner::DefragRunner;
 use crate::gc::runner::GcRunner;
 use crate::gc::{HeatMap, RefBitmap};
 use crate::io::block_backend::{BlockBackend, ChunkletIoScheduler};
@@ -77,6 +78,14 @@ pub struct OnyxEngine {
     buffer_pool: Option<Arc<WriteBufferPool>>,
     flusher: Mutex<Option<BufferFlusher>>,
     gc_runner: Mutex<Option<GcRunner>>,
+    /// Resident defragger. Its own thread on purpose: reclaim (mandatory space
+    /// safety) and defrag (an optional optimiser) shared the `gc-runner` cycle
+    /// until 2026-08-10, and defrag stretching that cycle 8.6 -> 13.7 s cost
+    /// 23.7 GiB of unallocatable `retired_depth` — it starved the very reclaim
+    /// its own targets wait on (memory:
+    /// `gc_reclaim_defrag_criticality_inversion`). Stopped BEFORE the flusher so
+    /// its quarantined free blocks are back in the pools for the shutdown drain.
+    defrag_runner: Mutex<Option<DefragRunner>>,
     dedup_scanner: Mutex<Option<DedupScanner>>,
     /// Phase 4d: background PD-health watchdog. `Some` only in full mode with a
     /// chunklet backend and `[chunklet].watchdog_enabled`. Probes each live PD
@@ -1153,7 +1162,12 @@ impl OnyxEngine {
 
         // 10. GC runner (after flusher). It always runs the physical
         // retired-PBA reclaimer; `gc.enabled` only gates rewrite scanning.
-        let gc_runner = Some(GcRunner::start_with_metrics(
+        //
+        // The defragger is shared with the resident defrag thread below: that
+        // thread owns the target lifecycle, the compactor only contributes the
+        // live-pinned targets its L2P scan is the sole way to discover.
+        let defragger = Arc::new(crate::gc::defrag::Defragger::new());
+        let gc_runner = Some(GcRunner::start_with_defragger(
             metrics.clone(),
             meta.clone(),
             io_engine.clone(),
@@ -1164,6 +1178,14 @@ impl OnyxEngine {
             ref_bitmap,
             cold_tail_tx,
             pba_lifecycle.clone(),
+            defragger.clone(),
+            config.gc.clone(),
+        ));
+        // 10b. Resident defragger (allocator-side only, own cadence).
+        let defrag_runner = Some(DefragRunner::start(
+            defragger,
+            allocator.clone(),
+            metrics.clone(),
             config.gc.clone(),
         ));
         let heat = config.gc.heat_enabled.then_some(heat);
@@ -1212,6 +1234,7 @@ impl OnyxEngine {
             buffer_pool: Some(buffer_pool),
             flusher: Mutex::new(Some(flusher)),
             gc_runner: Mutex::new(gc_runner),
+            defrag_runner: Mutex::new(defrag_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             chunklet_watchdog: Mutex::new(chunklet_watchdog),
             chunklet_isolation: Mutex::new(chunklet_isolation),
@@ -1267,6 +1290,7 @@ impl OnyxEngine {
             buffer_pool: None,
             flusher: Mutex::new(None),
             gc_runner: Mutex::new(None),
+            defrag_runner: Mutex::new(None),
             dedup_scanner: Mutex::new(None),
             chunklet_watchdog: Mutex::new(None),
             chunklet_isolation: Mutex::new(None),
@@ -1747,6 +1771,15 @@ impl OnyxEngine {
             gc.stop();
         }
 
+        // Then the resident defragger, in this order: it shares the target set
+        // with the compactor, so stopping the compactor first means nothing can
+        // re-quarantine after the defragger releases. It MUST stop before the
+        // flusher's drain below — a quarantine holds its window's free blocks out
+        // of the allocatable pools, and the drain needs them back.
+        if let Some(mut defrag) = self.defrag_runner.lock().unwrap().take() {
+            defrag.stop();
+        }
+
         // Then stop the flusher, draining the buffer so recovered pending
         // entries do not accumulate across restarts. The budget is
         // progress-gated by default: the drain runs to completion however deep
@@ -2134,7 +2167,8 @@ impl OnyxEngine {
 
         // GC runner. It always runs the physical retired-PBA reclaimer;
         // `gc.enabled` only gates rewrite scanning.
-        let gc_runner = Some(GcRunner::start_with_metrics(
+        let defragger = Arc::new(crate::gc::defrag::Defragger::new());
+        let gc_runner = Some(GcRunner::start_with_defragger(
             metrics.clone(),
             meta.clone(),
             io_engine.clone(),
@@ -2145,6 +2179,13 @@ impl OnyxEngine {
             ref_bitmap,
             cold_tail_tx,
             pba_lifecycle.clone(),
+            defragger.clone(),
+            config.gc.clone(),
+        ));
+        let defrag_runner = Some(DefragRunner::start(
+            defragger,
+            allocator.clone(),
+            metrics.clone(),
             config.gc.clone(),
         ));
         let heat = config.gc.heat_enabled.then_some(heat);
@@ -2187,6 +2228,7 @@ impl OnyxEngine {
             buffer_pool: Some(buffer_pool),
             flusher: Mutex::new(Some(flusher)),
             gc_runner: Mutex::new(gc_runner),
+            defrag_runner: Mutex::new(defrag_runner),
             dedup_scanner: Mutex::new(dedup_scanner),
             chunklet_watchdog: Mutex::new(chunklet_watchdog),
             chunklet_isolation: Mutex::new(chunklet_isolation),
@@ -2209,8 +2251,13 @@ impl OnyxEngine {
         })
     }
 
-    /// Update GC config on a running engine (hot-reload).
+    /// Update GC config on a running engine (hot-reload). Both defrag halves are
+    /// gated by the same trigger latch and knobs, so the resident defragger gets
+    /// the same config.
     pub fn update_gc_config(&self, config: crate::gc::config::GcConfig) {
+        if let Some(defrag) = self.defrag_runner.lock().unwrap().as_ref() {
+            defrag.update_config(config.clone());
+        }
         if let Some(gc) = self.gc_runner.lock().unwrap().as_ref() {
             gc.update_config(config);
         }

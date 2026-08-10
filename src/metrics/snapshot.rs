@@ -456,7 +456,14 @@ impl EngineMetrics {
             gc_defrag_mode_active: load(&self.gc_defrag_mode_active),
             gc_defrag_targets_active: load(&self.gc_defrag_targets_active),
             gc_defrag_target_blocks: load(&self.gc_defrag_target_blocks),
-            gc_defrag_walk_extents: load(&self.gc_defrag_walk_extents),
+            gc_defrag_windows_classified: load(&self.gc_defrag_windows_classified),
+            gc_defrag_cycles: load(&self.gc_defrag_cycles),
+            gc_defrag_retired_laps: load(&self.gc_defrag_retired_laps),
+            gc_defrag_retired_windows_selected: load(&self.gc_defrag_retired_windows_selected),
+            gc_defrag_scan_timeboxed: load(&self.gc_defrag_scan_timeboxed),
+            gc_defrag_scan_lock_skipped: load(&self.gc_defrag_scan_lock_skipped),
+            gc_defrag_walk_skipped: load(&self.gc_defrag_walk_skipped),
+            gc_defrag_targets_stale: load(&self.gc_defrag_targets_stale),
             gc_defrag_clusters_qualified: load(&self.gc_defrag_clusters_qualified),
             gc_defrag_clusters_rejected: load(&self.gc_defrag_clusters_rejected),
             gc_defrag_candidates: load(&self.gc_defrag_candidates),
@@ -991,7 +998,22 @@ pub struct EngineMetricsSnapshot {
     pub gc_defrag_mode_active: u64,
     pub gc_defrag_targets_active: u64,
     pub gc_defrag_target_blocks: u64,
-    pub gc_defrag_walk_extents: u64,
+    #[serde(default)]
+    pub gc_defrag_windows_classified: u64,
+    #[serde(default)]
+    pub gc_defrag_cycles: u64,
+    #[serde(default)]
+    pub gc_defrag_retired_laps: u64,
+    #[serde(default)]
+    pub gc_defrag_retired_windows_selected: u64,
+    #[serde(default)]
+    pub gc_defrag_scan_timeboxed: u64,
+    #[serde(default)]
+    pub gc_defrag_scan_lock_skipped: u64,
+    #[serde(default)]
+    pub gc_defrag_walk_skipped: u64,
+    #[serde(default)]
+    pub gc_defrag_targets_stale: u64,
     pub gc_defrag_clusters_qualified: u64,
     pub gc_defrag_clusters_rejected: u64,
     pub gc_defrag_candidates: u64,
@@ -1474,7 +1496,14 @@ impl EngineMetricsSnapshot {
             gc_defrag_mode_active,
             gc_defrag_targets_active,
             gc_defrag_target_blocks,
-            gc_defrag_walk_extents,
+            gc_defrag_windows_classified,
+            gc_defrag_cycles,
+            gc_defrag_retired_laps,
+            gc_defrag_retired_windows_selected,
+            gc_defrag_scan_timeboxed,
+            gc_defrag_scan_lock_skipped,
+            gc_defrag_walk_skipped,
+            gc_defrag_targets_stale,
             gc_defrag_clusters_qualified,
             gc_defrag_clusters_rejected,
             gc_defrag_candidates,
