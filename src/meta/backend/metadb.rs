@@ -2048,6 +2048,527 @@ pub fn probe_meta_ld(
     })
 }
 
+/// Byte-occupancy granularity of the per-block claim mask: one bit per
+/// `BLOCK_SIZE / 64` bytes, so a 4 KiB block maps onto a `u64`.
+const CLAIM_MASK_GRANULES: usize = 64;
+
+/// One L2P or dedup_index entry whose physical unit covers an audited PBA.
+///
+/// `start_pba` + `slot_offset` is the *physical unit identity*: two claims that
+/// agree on it (and on `unit_compressed_size` / `crc32`) are the same unit seen
+/// through two references — normal dedup sharing. Two claims that disagree on
+/// it while occupying overlapping bytes of the same block cannot both be right.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbPbaClaim {
+    /// `"l2p"` or `"dedup_index"`.
+    pub source: &'static str,
+    pub volume_ordinal: Option<VolumeOrdinal>,
+    pub lba: Option<u64>,
+    pub dedup_hash: Option<String>,
+    pub start_pba: u64,
+    pub slot_offset: u16,
+    pub unit_compressed_size: u32,
+    pub unit_original_size: u32,
+    pub unit_lba_count: u16,
+    pub offset_in_unit: u16,
+    pub compression: u8,
+    pub flags: u8,
+    pub crc32: u32,
+    pub commit_seq: u64,
+    pub birth_lsn: u64,
+    pub covered_blocks: u32,
+    /// Which 64-byte granules of the audited block this claim occupies.
+    pub block_mask: u64,
+}
+
+impl MetaDbPbaClaim {
+    /// Physical unit identity — equal for two references to one unit.
+    fn unit_key(&self) -> (u64, u16, u32, u32) {
+        (
+            self.start_pba,
+            self.slot_offset,
+            self.unit_compressed_size,
+            self.crc32,
+        )
+    }
+}
+
+/// Every claim covering one audited PBA, plus the conflict verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbPbaClaims {
+    pub pba: u64,
+    pub refcount: u32,
+    pub claims: Vec<MetaDbPbaClaim>,
+    /// Distinct physical units (by [`MetaDbPbaClaim::unit_key`]) on this block.
+    pub distinct_units: usize,
+    /// Two distinct units occupy overlapping bytes of this block. Only a
+    /// double allocation can produce this; packed fragments share a block at
+    /// disjoint `slot_offset`s and dedup sharing repeats one identical unit.
+    pub conflicting: bool,
+}
+
+/// Result of one offline physical-claim audit over a caller-supplied PBA set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbClaimAuditReport {
+    pub volumes_scanned: usize,
+    pub l2p_entries_scanned: u64,
+    pub dedup_entries_scanned: u64,
+    pub requested_pbas: usize,
+    /// Audited PBAs no live L2P entry and no dedup entry covers.
+    pub unclaimed: Vec<u64>,
+    /// Audited PBAs with exactly one physical unit on them.
+    pub single_unit: Vec<u64>,
+    /// Audited PBAs where two distinct units overlap — proven double allocation.
+    pub conflicting: Vec<u64>,
+    pub results: Vec<MetaDbPbaClaims>,
+}
+
+/// Offline reverse lookup: which L2P / dedup_index entries physically cover
+/// each PBA in `pbas`?
+///
+/// This is the discriminator for a foreground `CRC mismatch` on a mapped LBA.
+/// The mapping exists and points at a block whose bytes do not hash to the
+/// recorded `crc32`, which leaves exactly two shapes, and they need different
+/// fixes:
+///
+/// * **two overlapping units on the block** (`conflicting`) — the allocator
+///   handed the same block to two writers, so one of them ran over live data.
+///   The bug is on the free-list side (rebuild gap, premature reclaim, or a
+///   double hand-out).
+/// * **one unit on the block** (`single_unit`) — nothing else claims it, so the
+///   block was written by something that never committed a mapping (a rolled-back
+///   transient allocation, a replay write, a GC rewrite) or the read came back
+///   wrong from below onyx (chunklet reconstruct / a lost write).
+///
+/// One full `tree ∪ l2p_buffer` scan per volume plus one dedup_index scan; the
+/// per-PBA state is bounded by `pbas`, so memory stays proportional to the
+/// audited set, not to the pool.
+pub fn audit_pba_claims(
+    config: &MetaConfig,
+    meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
+    pbas: &[u64],
+) -> OnyxResult<MetaDbClaimAuditReport> {
+    let db = open_meta_ld_for_offline_audit(config, meta_backend)?;
+
+    let mut wanted: Vec<u64> = pbas.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let wanted_set: std::collections::HashSet<u64> = wanted.iter().copied().collect();
+    let mut claims: HashMap<u64, Vec<MetaDbPbaClaim>> =
+        wanted.iter().map(|&pba| (pba, Vec::new())).collect();
+
+    let mut l2p_entries_scanned: u64 = 0;
+    let volumes = db.manifest().volumes;
+    for volume in &volumes {
+        let ord = volume.ord;
+        let mut decode_error = None;
+        let scan = db.scan_l2p_live_consistent(ord, |lba, raw| {
+            l2p_entries_scanned += 1;
+            let value = match decode_l2p_value(raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    decode_error = Some(err);
+                    return Err(onyx_metadb::MetaDbError::Corruption(
+                        "onyx blockmap decode failed".into(),
+                    ));
+                }
+            };
+            if value.is_zero() {
+                return Ok(());
+            }
+            for (pba, mask) in claim_block_masks(&value) {
+                if !wanted_set.contains(&pba) {
+                    continue;
+                }
+                let commit_seq = u64::from_be_bytes(
+                    raw.0[L2P_SEQ_OFFSET..L2P_BIRTH_OFFSET]
+                        .try_into()
+                        .expect("MetaDB L2P seq field has fixed length"),
+                );
+                let birth_lsn = u64::from_be_bytes(
+                    raw.0[L2P_BIRTH_OFFSET..]
+                        .try_into()
+                        .expect("MetaDB L2P birth field has fixed length"),
+                );
+                claims.entry(pba).or_default().push(MetaDbPbaClaim {
+                    source: "l2p",
+                    volume_ordinal: Some(ord),
+                    lba: Some(lba),
+                    dedup_hash: None,
+                    start_pba: value.pba.0,
+                    slot_offset: value.slot_offset,
+                    unit_compressed_size: value.unit_compressed_size,
+                    unit_original_size: value.unit_original_size,
+                    unit_lba_count: value.unit_lba_count,
+                    offset_in_unit: value.offset_in_unit,
+                    compression: value.compression,
+                    flags: value.flags,
+                    crc32: value.crc32,
+                    commit_seq,
+                    birth_lsn,
+                    covered_blocks: value.physical_blocks(crate::types::BLOCK_SIZE),
+                    block_mask: mask,
+                });
+            }
+            Ok(())
+        });
+        if let Some(err) = decode_error {
+            return Err(err);
+        }
+        scan?;
+    }
+
+    let mut dedup_entries_scanned: u64 = 0;
+    let mut cursor = onyx_metadb::DedupScanCursor::default();
+    loop {
+        let batch = db.scan_dedup_from(cursor, 4096)?;
+        let empty = batch.entries.is_empty();
+        for (hash, raw) in batch.entries {
+            dedup_entries_scanned += 1;
+            let entry = decode_dedup_value(raw)?;
+            let value = entry.to_blockmap_value();
+            for (pba, mask) in claim_block_masks(&value) {
+                if !wanted_set.contains(&pba) {
+                    continue;
+                }
+                claims.entry(pba).or_default().push(MetaDbPbaClaim {
+                    source: "dedup_index",
+                    volume_ordinal: None,
+                    lba: None,
+                    dedup_hash: Some(hex_hash(&hash)),
+                    start_pba: value.pba.0,
+                    slot_offset: value.slot_offset,
+                    unit_compressed_size: value.unit_compressed_size,
+                    unit_original_size: value.unit_original_size,
+                    unit_lba_count: value.unit_lba_count,
+                    offset_in_unit: value.offset_in_unit,
+                    compression: value.compression,
+                    flags: value.flags,
+                    crc32: value.crc32,
+                    commit_seq: 0,
+                    birth_lsn: 0,
+                    covered_blocks: value.physical_blocks(crate::types::BLOCK_SIZE),
+                    block_mask: mask,
+                });
+            }
+        }
+        cursor = batch.next;
+        if batch.wrapped || empty {
+            break;
+        }
+    }
+
+    let refcounts = db.multi_get_refcount_consistent(&wanted)?;
+    let refcounts: HashMap<u64, u32> = wanted.iter().copied().zip(refcounts).collect();
+
+    let mut unclaimed = Vec::new();
+    let mut single_unit = Vec::new();
+    let mut conflicting = Vec::new();
+    let mut results = Vec::with_capacity(wanted.len());
+    for pba in wanted {
+        let mut pba_claims = claims.remove(&pba).unwrap_or_default();
+        pba_claims.sort_by_key(|claim| (claim.start_pba, claim.slot_offset, claim.lba));
+        let mut units: Vec<((u64, u16, u32, u32), u64)> = Vec::new();
+        let mut conflict = false;
+        for claim in &pba_claims {
+            let key = claim.unit_key();
+            match units.iter_mut().find(|(existing, _)| *existing == key) {
+                Some((_, mask)) => *mask |= claim.block_mask,
+                None => {
+                    if units
+                        .iter()
+                        .any(|(_, mask)| mask & claim.block_mask != 0)
+                    {
+                        conflict = true;
+                    }
+                    units.push((key, claim.block_mask));
+                }
+            }
+        }
+        if pba_claims.is_empty() {
+            unclaimed.push(pba);
+        } else if units.len() == 1 {
+            single_unit.push(pba);
+        }
+        if conflict {
+            conflicting.push(pba);
+        }
+        results.push(MetaDbPbaClaims {
+            pba,
+            refcount: refcounts.get(&pba).copied().unwrap_or(0),
+            distinct_units: units.len(),
+            conflicting: conflict,
+            claims: pba_claims,
+        });
+    }
+
+    Ok(MetaDbClaimAuditReport {
+        volumes_scanned: volumes.len(),
+        l2p_entries_scanned,
+        dedup_entries_scanned,
+        requested_pbas: results.len(),
+        unclaimed,
+        single_unit,
+        conflicting,
+        results,
+    })
+}
+
+/// Pool-wide double-allocation census produced by [`census_pba_conflicts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetaDbConflictCensus {
+    pub volumes_scanned: usize,
+    pub l2p_entries_scanned: u64,
+    pub dedup_entries_scanned: u64,
+    /// One record per (claim, covered block) pair.
+    pub claim_records: u64,
+    pub distinct_blocks: u64,
+    /// Blocks with several claim records that all resolve to one unit, or to
+    /// units at disjoint byte ranges — normal dedup sharing / packed slots.
+    pub shared_blocks: u64,
+    pub conflict_blocks: u64,
+    /// Conflicting blocks, ascending; truncated to `limit`.
+    pub conflict_pbas: Vec<u64>,
+    pub truncated: bool,
+    /// `(block >> 20, count)` — where the conflicts sit in PBA space.
+    pub conflict_buckets_1m: Vec<(u64, u64)>,
+    pub max_commit_seq: u64,
+    pub conflict_seq_min: u64,
+    pub conflict_seq_max: u64,
+    /// Ascending deciles of the commit seq of every claim on a conflicting block.
+    pub conflict_seq_deciles: Vec<u64>,
+}
+
+/// Pool-wide version of [`audit_pba_claims`]: walk every live L2P entry and
+/// dedup_index entry once and report every physical block that two distinct
+/// units overlap on.
+///
+/// Memory is one 32-byte record per (claim, covered block) pair — ~2 GiB at
+/// 67 M live blocks — so this is an offline-audit tool, not something to wire
+/// into open.
+pub fn census_pba_conflicts(
+    config: &MetaConfig,
+    meta_backend: Arc<crate::io::block_backend::ChunkletBackend>,
+    limit: usize,
+) -> OnyxResult<MetaDbConflictCensus> {
+    /// One claim's footprint on one physical block.
+    struct Rec {
+        pba: u64,
+        /// Physical unit identity digest — equal iff the same unit.
+        unit: u64,
+        mask: u64,
+        seq: u64,
+    }
+
+    let db = open_meta_ld_for_offline_audit(config, meta_backend)?;
+    let mut recs: Vec<Rec> = Vec::new();
+    let mut l2p_entries_scanned: u64 = 0;
+    let mut max_commit_seq: u64 = 0;
+
+    let volumes = db.manifest().volumes;
+    for volume in &volumes {
+        let ord = volume.ord;
+        let mut decode_error = None;
+        let scan = db.scan_l2p_live_consistent(ord, |_lba, raw| {
+            l2p_entries_scanned += 1;
+            let value = match decode_l2p_value(raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    decode_error = Some(err);
+                    return Err(onyx_metadb::MetaDbError::Corruption(
+                        "onyx blockmap decode failed".into(),
+                    ));
+                }
+            };
+            if value.is_zero() {
+                return Ok(());
+            }
+            let seq = u64::from_be_bytes(
+                raw.0[L2P_SEQ_OFFSET..L2P_BIRTH_OFFSET]
+                    .try_into()
+                    .expect("MetaDB L2P seq field has fixed length"),
+            );
+            max_commit_seq = max_commit_seq.max(seq);
+            let unit = unit_digest(&value);
+            for (pba, mask) in claim_block_masks(&value) {
+                recs.push(Rec {
+                    pba,
+                    unit,
+                    mask,
+                    seq,
+                });
+            }
+            Ok(())
+        });
+        if let Some(err) = decode_error {
+            return Err(err);
+        }
+        scan?;
+    }
+
+    let mut dedup_entries_scanned: u64 = 0;
+    let mut cursor = onyx_metadb::DedupScanCursor::default();
+    loop {
+        let batch = db.scan_dedup_from(cursor, 4096)?;
+        let empty = batch.entries.is_empty();
+        for (_hash, raw) in batch.entries {
+            dedup_entries_scanned += 1;
+            let value = decode_dedup_value(raw)?.to_blockmap_value();
+            let unit = unit_digest(&value);
+            for (pba, mask) in claim_block_masks(&value) {
+                recs.push(Rec {
+                    pba,
+                    unit,
+                    mask,
+                    seq: 0,
+                });
+            }
+        }
+        cursor = batch.next;
+        if batch.wrapped || empty {
+            break;
+        }
+    }
+
+    let claim_records = recs.len() as u64;
+    recs.sort_unstable_by_key(|rec| rec.pba);
+
+    let mut distinct_blocks: u64 = 0;
+    let mut shared_blocks: u64 = 0;
+    let mut conflict_blocks: u64 = 0;
+    let mut conflict_pbas: Vec<u64> = Vec::new();
+    let mut truncated = false;
+    let mut buckets: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let mut conflict_seqs: Vec<u64> = Vec::new();
+
+    let mut idx = 0usize;
+    while idx < recs.len() {
+        let pba = recs[idx].pba;
+        let mut end = idx + 1;
+        while end < recs.len() && recs[end].pba == pba {
+            end += 1;
+        }
+        distinct_blocks += 1;
+        let group = &recs[idx..end];
+        // Fold to distinct units, OR-ing each unit's mask; a new unit that
+        // overlaps an already-seen unit's bytes is a double allocation.
+        let mut units: Vec<(u64, u64)> = Vec::new();
+        let mut conflict = false;
+        for rec in group {
+            match units.iter_mut().find(|(unit, _)| *unit == rec.unit) {
+                Some((_, mask)) => *mask |= rec.mask,
+                None => {
+                    if units.iter().any(|(_, mask)| mask & rec.mask != 0) {
+                        conflict = true;
+                    }
+                    units.push((rec.unit, rec.mask));
+                }
+            }
+        }
+        if units.len() > 1 && !conflict {
+            shared_blocks += 1;
+        } else if group.len() > 1 && units.len() == 1 {
+            shared_blocks += 1;
+        }
+        if conflict {
+            conflict_blocks += 1;
+            *buckets.entry(pba >> 20).or_default() += 1;
+            for rec in group {
+                if rec.seq != 0 {
+                    conflict_seqs.push(rec.seq);
+                }
+            }
+            if conflict_pbas.len() < limit {
+                conflict_pbas.push(pba);
+            } else {
+                truncated = true;
+            }
+        }
+        idx = end;
+    }
+
+    conflict_seqs.sort_unstable();
+    let deciles = if conflict_seqs.is_empty() {
+        Vec::new()
+    } else {
+        (0..=10)
+            .map(|i| {
+                let pos = (conflict_seqs.len() - 1) * i / 10;
+                conflict_seqs[pos]
+            })
+            .collect()
+    };
+
+    Ok(MetaDbConflictCensus {
+        volumes_scanned: volumes.len(),
+        l2p_entries_scanned,
+        dedup_entries_scanned,
+        claim_records,
+        distinct_blocks,
+        shared_blocks,
+        conflict_blocks,
+        conflict_pbas,
+        truncated,
+        conflict_buckets_1m: buckets.into_iter().collect(),
+        max_commit_seq,
+        conflict_seq_min: conflict_seqs.first().copied().unwrap_or(0),
+        conflict_seq_max: conflict_seqs.last().copied().unwrap_or(0),
+        conflict_seq_deciles: deciles,
+    })
+}
+
+/// Physical unit identity digest: equal iff two claims name the same unit.
+fn unit_digest(value: &BlockmapValue) -> u64 {
+    let mut hash = value.pba.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hash ^= (value.slot_offset as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    hash ^= (value.unit_compressed_size as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+    hash ^= (value.crc32 as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    hash
+}
+
+/// `(pba, occupancy mask)` for every physical block this unit covers.
+///
+/// A packed fragment occupies `[slot_offset, slot_offset + unit_compressed_size)`
+/// of its single block; an unpacked unit starts at byte 0 and runs across
+/// `covered_blocks`, with only the tail block partially filled.
+fn claim_block_masks(value: &BlockmapValue) -> Vec<(u64, u64)> {
+    let block_size = crate::types::BLOCK_SIZE as usize;
+    let blocks = value.physical_blocks(crate::types::BLOCK_SIZE);
+    let mut out = Vec::with_capacity(blocks as usize);
+    if blocks == 1 {
+        let (start, end) = value.compressed_slice_range();
+        out.push((value.pba.0, byte_mask(start, end, block_size)));
+        return out;
+    }
+    let total = value.unit_compressed_size as usize;
+    for idx in 0..blocks as usize {
+        let consumed = idx * block_size;
+        let end = total.saturating_sub(consumed).min(block_size);
+        out.push((value.pba.0 + idx as u64, byte_mask(0, end, block_size)));
+    }
+    out
+}
+
+/// Occupancy mask of `[start, end)` within one block, one bit per granule.
+fn byte_mask(start: usize, end: usize, block_size: usize) -> u64 {
+    let end = end.min(block_size);
+    if start >= end {
+        return 0;
+    }
+    let granule = (block_size / CLAIM_MASK_GRANULES).max(1);
+    let first = (start / granule).min(CLAIM_MASK_GRANULES - 1);
+    let last = ((end - 1) / granule).min(CLAIM_MASK_GRANULES - 1);
+    let mut mask = 0u64;
+    for bit in first..=last {
+        mask |= 1u64 << bit;
+    }
+    mask
+}
+
+fn hex_hash(hash: &ContentHash) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Build and open the shared offline-audit MetaDB view used by point probes
 /// and full verification.
 ///

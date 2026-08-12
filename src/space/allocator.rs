@@ -2366,6 +2366,24 @@ impl SpaceAllocator {
 
     /// Publish a fully-free quarantine as stripe reserve. A partially-free
     /// target remains active and returns `Ok(false)`.
+    ///
+    /// ⚠ This is the ONLY place that inserts a whole stripe-aligned window into
+    /// the allocatable pool in one shot, without having verified each block
+    /// individually — every other insert path only ever returns blocks a caller
+    /// just proved dead. That makes its gate load-bearing for data integrity:
+    /// publishing a window that still holds a LIVE block hands that block to the
+    /// next writer, which overwrites it while its L2P mapping is intact, and the
+    /// reader gets `CRC mismatch` on an LBA that was never touched. Box forensics
+    /// 2026-08-12: 476 double-claimed blocks, and all 126 of their consecutive
+    /// runs sat inside ONE stripe-aligned window each (1–5 of 6 blocks, never a
+    /// whole stripe) — the fingerprint of exactly this publish.
+    ///
+    /// So the gate is STRUCTURAL, not a block count. `free_parts` is built only
+    /// through `coalesce_insert`, so a genuinely-complete window is one folded
+    /// extent equal to `range`; requiring that cannot be satisfied by a drifted
+    /// aggregate. A `blocks_total` that claims completeness while the set does
+    /// not is an upstream accounting bug: cancel the target (which returns only
+    /// the pieces that really are free) instead of publishing, and say so.
     pub fn complete_defrag_quarantine(&self, start: Pba) -> OnyxResult<bool> {
         let idx = self.regions.layout().of(start.0);
         let mut guard = self.lock_region(FreeLockSite::Quarantine, idx);
@@ -2373,7 +2391,20 @@ impl SpaceAllocator {
         let Some(target) = pools.quarantines.get(&start.0) else {
             return Ok(false);
         };
-        if target.free_parts.blocks_total() != target.range.count as u64 {
+        let range = target.range;
+        if !target.free_parts.is_exactly(range) {
+            if target.free_parts.blocks_total() >= range.count as u64 {
+                tracing::error!(
+                    start = start.0,
+                    blocks = range.count,
+                    free_blocks = target.free_parts.blocks_total(),
+                    free_extents = target.free_parts.by_addr().len(),
+                    "defrag quarantine reports itself complete but its free parts do not \
+                     cover the window — refusing to publish, cancelling instead"
+                );
+                drop(guard);
+                self.cancel_defrag_quarantine(start);
+            }
             return Ok(false);
         }
         let target = pools
@@ -2401,6 +2432,58 @@ impl SpaceAllocator {
             pools.insert_classified(extent);
         }
         true
+    }
+
+    /// Test-only: build an allocator with the live-PBA duplicate-allocation
+    /// tracker armed regardless of `ONYX_ALLOC_TRACK`, so a stress test does not
+    /// have to mutate process-global env.
+    #[cfg(test)]
+    pub(crate) fn new_tracked(device_size_bytes: u64, num_lanes: usize, regions: usize) -> Self {
+        let mut me = Self::new_with_regions(device_size_bytes, num_lanes, regions);
+        me.alloc_tracker = Some(Mutex::new(BTreeSet::new()));
+        me
+    }
+
+    /// Test-only: every free set the allocator owns, checked against its own
+    /// invariants (index agreement, aggregate totals, disjointness).
+    #[cfg(test)]
+    pub(crate) fn assert_free_sets_consistent(&self) {
+        for idx in 0..self.regions.count() {
+            let guard = self.lock_region(FreeLockSite::Setup, idx);
+            let pools = guard.region(idx);
+            pools.general.assert_consistent();
+            pools.stripe_reserve.assert_consistent();
+            for target in pools.quarantines.values() {
+                target.free_parts.assert_consistent();
+            }
+        }
+    }
+
+    /// Test-only: snapshot of the live-PBA tracker.
+    #[cfg(test)]
+    pub(crate) fn tracked_live_pbas(&self) -> BTreeSet<Pba> {
+        self.alloc_tracker
+            .as_ref()
+            .expect("tracker armed")
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    /// Test-only: add an extent to an active quarantine's free-parts set without
+    /// going through `release_extent`, so a test can model the accounting drift
+    /// the structural completion gate exists to catch — a `blocks_total` that
+    /// reaches the window size while the set does not actually cover it.
+    #[cfg(test)]
+    pub(crate) fn inject_quarantine_free_part_for_test(&self, start: Pba, extent: Extent) {
+        let idx = self.regions.layout().of(start.0);
+        let mut guard = self.lock_region(FreeLockSite::Quarantine, idx);
+        let target = guard
+            .region_mut(idx)
+            .quarantines
+            .get_mut(&start.0)
+            .expect("quarantine target exists");
+        target.free_parts.insert_for_test(extent);
     }
 
     pub fn is_defrag_quarantined(&self, extent: Extent) -> bool {
@@ -4668,7 +4751,20 @@ impl SpaceAllocator {
             // where `insert_split` chunked a >16 TiB aligned region). Proceed
             // only with runs this refill actually owns — handing out a run that
             // is still reachable in the pool would be a double allocation.
-            if !pools.stripe_reserve.remove(&run) {
+            //
+            // `take` matches by START, so "owns it" also means the stored span is
+            // still the one that was planned. A coalesce that changed the span
+            // while keeping the start would otherwise have this loop slice up a
+            // run of a different length: re-inserting `[start+take, count-take)`
+            // computed from the PLANNED count can manufacture free blocks past
+            // the end of the run that actually existed, and those blocks are
+            // live. Skipping just yields a smaller batch, which this refill
+            // already tolerates everywhere else.
+            let Some(stored) = pools.stripe_reserve.take(&run) else {
+                continue;
+            };
+            if stored.count != run.count {
+                pools.insert_classified(stored);
                 continue;
             }
             if run.count > take {
@@ -5403,6 +5499,233 @@ mod free_pool_policy_tests {
         assert!(allocator.complete_defrag_quarantine(target.start).unwrap());
         assert!(!allocator.is_defrag_quarantined(target));
         assert!(allocator.contiguity_stats().stripe_reserve_blocks >= STRIPE as u64);
+    }
+
+    /// Concurrent allocate / free / retire / reclaim / defrag-quarantine traffic
+    /// on a pool small enough to run out of space, with the allocator's live-PBA
+    /// tracker armed.
+    ///
+    /// This is the shape that produced the box corruption: a fully-fragmented
+    /// pool under sustained `SpaceExhausted` (millions of `passthrough alloc
+    /// failed` in the hour the first CRC error appeared), 16 flush lanes
+    /// allocating through their per-lane caches, reclaim returning retired
+    /// extents, and the resident defrag thread quarantining and publishing
+    /// stripe windows. The exhaustion boundary is where the lane caches get
+    /// drained back into the pools, so it is the one place where "logically
+    /// free" blocks change owner without a per-block proof.
+    ///
+    /// `track_alloc` fails the allocation the moment a block is handed out
+    /// twice, so any duplicate surfaces as an error containing "duplicate
+    /// allocation" rather than as silent data loss.
+    #[test]
+    fn concurrent_exhaustion_and_quarantine_never_double_allocate() {
+        const LANES: usize = 8;
+        const BLOCKS: u64 = 4096;
+        const ITERS: usize = 3000;
+
+        let allocator = Arc::new(SpaceAllocator::new_tracked(
+            BLOCKS * BLOCK_SIZE as u64,
+            LANES,
+            8,
+        ));
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let dupes = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let mut workers = Vec::new();
+        for lane in 0..LANES {
+            let allocator = allocator.clone();
+            let dupes = dupes.clone();
+            workers.push(thread::spawn(move || {
+                // Per-lane LCG: deterministic mix, different stream per lane.
+                let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ ((lane as u64 + 1) << 32);
+                let mut next = move || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+                let mut held: Vec<Extent> = Vec::new();
+                let mut record = |err: &OnyxError| {
+                    let text = err.to_string();
+                    if text.contains("duplicate allocation") {
+                        dupes.lock().unwrap().push(text);
+                    }
+                };
+                for _ in 0..ITERS {
+                    let roll = next() % 100;
+                    let got = if roll < 40 {
+                        allocator.allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE)
+                    } else if roll < 70 {
+                        allocator
+                            .allocate_extent_for_lane(lane, 1 + (next() % STRIPE as u64) as u32)
+                    } else {
+                        allocator.allocate_one_for_lane(lane).map(Extent::single)
+                    };
+                    match got {
+                        Ok(extent) => held.push(extent),
+                        Err(OnyxError::SpaceExhausted) => {}
+                        Err(error) => record(&error),
+                    }
+                    // Give space back so the pool keeps churning at the
+                    // exhaustion boundary instead of just filling up once.
+                    if held.len() > 4 && next() % 100 < 60 {
+                        let extent = held.swap_remove((next() as usize) % held.len());
+                        if next() % 2 == 0 {
+                            if let Err(error) = allocator.free_extent(extent) {
+                                record(&error);
+                                held.push(extent);
+                            }
+                        } else {
+                            match allocator.retire_extent(extent) {
+                                Ok(_) => {
+                                    // Reclaim is the GC gate's job; model both the
+                                    // single and the batch entry point.
+                                    let running = AtomicBool::new(true);
+                                    let reclaimed = if next() % 2 == 0 {
+                                        allocator
+                                            .reclaim_retired_extent(extent)
+                                            .map(|freed| u64::from(freed) * u64::from(extent.count))
+                                    } else {
+                                        allocator
+                                            .reclaim_retired_extents_batch(&[extent], &running)
+                                            .map(|(blocks, _)| blocks)
+                                    };
+                                    match reclaimed {
+                                        Ok(0) => held.push(extent),
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            record(&error);
+                                            held.push(extent);
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    record(&error);
+                                    held.push(extent);
+                                }
+                            }
+                        }
+                    }
+                }
+                held
+            }));
+        }
+
+        // Defrag: quarantine stripe-aligned windows, publish or cancel them.
+        let quarantiner = {
+            let allocator = allocator.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut start = RESERVED_BLOCKS;
+                let mut published = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let aligned =
+                        SpaceAllocator::align_up_pba(start, STRIPE as u64, PHASE as u64);
+                    if aligned + STRIPE as u64 >= BLOCKS - RESERVED_BLOCKS {
+                        start = RESERVED_BLOCKS;
+                        continue;
+                    }
+                    let target = Extent::new(Pba(aligned), STRIPE);
+                    start = aligned + STRIPE as u64;
+                    if allocator.begin_defrag_quarantine(target).is_err() {
+                        continue;
+                    }
+                    for _ in 0..4 {
+                        match allocator.complete_defrag_quarantine(target.start) {
+                            Ok(true) => {
+                                published += 1;
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(_) => break,
+                        }
+                        std::thread::yield_now();
+                    }
+                    allocator.cancel_defrag_quarantine(target.start);
+                }
+                published
+            })
+        };
+
+        let mut still_held: Vec<Extent> = Vec::new();
+        for worker in workers {
+            still_held.extend(worker.join().expect("worker panicked"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        quarantiner.join().expect("quarantiner panicked");
+
+        let dupes = dupes.lock().unwrap();
+        assert!(
+            dupes.is_empty(),
+            "allocator handed the same block to two callers: {:?}",
+            &dupes[..dupes.len().min(8)]
+        );
+        allocator.assert_free_sets_consistent();
+
+        // End state: the tracker must hold exactly the blocks the workers still
+        // own. Anything else means an allocation or a release went unaccounted,
+        // which is the same drift that lets a quarantine publish a live block.
+        let expected: BTreeSet<Pba> = still_held
+            .iter()
+            .flat_map(|extent| (0..extent.count).map(|i| Pba(extent.start.0 + i as u64)))
+            .collect();
+        let tracked = allocator.tracked_live_pbas();
+        assert_eq!(
+            tracked, expected,
+            "live-PBA tracker disagrees with what the workers hold"
+        );
+    }
+
+    /// Publishing a quarantine is the only path that returns a whole stripe
+    /// window to the allocatable pool without having verified each block, so its
+    /// gate must be structural. It used to be `free_parts.blocks_total() ==
+    /// range.count`; when that aggregate drifted upward, a window with LIVE
+    /// blocks in it got published, the next writer overwrote them, and reads of
+    /// the untouched LBAs failed onyx's own CRC check (box, 2026-08-12: 476
+    /// double-claimed blocks, every consecutive run of them inside one
+    /// stripe-aligned window, 1-5 of 6 blocks each).
+    #[test]
+    fn quarantine_never_publishes_a_window_that_still_holds_a_live_block() {
+        let allocator = allocator(128, 0);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let target = allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .unwrap();
+        // Keep the last block of the window LIVE; free the rest.
+        let live = Pba(target.start.0 + (STRIPE - 1) as u64);
+        allocator.begin_defrag_quarantine(target).unwrap();
+        allocator
+            .free_extent(Extent::new(target.start, STRIPE - 1))
+            .unwrap();
+        assert!(!allocator.complete_defrag_quarantine(target.start).unwrap());
+
+        // Drift the block counter up to the window size without making the set
+        // cover it. The old counter gate would publish here.
+        let outside = Extent::single(Pba(target.end_pba().0 + 1));
+        allocator.inject_quarantine_free_part_for_test(target.start, outside);
+        assert_eq!(
+            allocator.defrag_quarantine_progress(target.start),
+            Some((STRIPE as u64, STRIPE as u64)),
+            "counter now claims the window is complete"
+        );
+
+        assert!(
+            !allocator.complete_defrag_quarantine(target.start).unwrap(),
+            "must refuse to publish a window it cannot prove is fully free"
+        );
+        // Refusing is not enough — the target must not stay parked forever
+        // either, so the refusal cancels it and hands back the real free parts.
+        assert!(!allocator.is_defrag_quarantined(target));
+        assert!(
+            allocator.free_overlap_blocks(Extent::single(live)) == 0,
+            "the live block must never become allocatable"
+        );
+        assert_eq!(
+            allocator.free_overlap_blocks(Extent::new(target.start, STRIPE - 1)),
+            (STRIPE - 1) as u64,
+            "the genuinely-free part of the window comes back"
+        );
     }
 
     #[test]

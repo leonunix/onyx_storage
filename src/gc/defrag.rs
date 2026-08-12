@@ -832,9 +832,13 @@ mod tests {
     /// trigger on EVERY call (`0` = always due). The production 5000 ms sampling
     /// cadence is covered on its own by
     /// `trigger_latch_is_sampled_on_its_own_interval`.
+    /// `defrag_enabled` is default-OFF in production (see
+    /// `default_defrag_enabled`), so every test of the mechanism opts in
+    /// explicitly rather than inheriting the default.
     fn cfg() -> GcConfig {
         GcConfig {
             defrag_trigger_interval_ms: 0,
+            defrag_enabled: true,
             ..GcConfig::default()
         }
     }
@@ -1213,7 +1217,10 @@ mod tests {
         let m = metrics();
         let mut st = DefragState::new();
         // Production cadence: the first call evaluates (no previous sample).
-        let slow = GcConfig::default();
+        let slow = GcConfig {
+            defrag_enabled: true,
+            ..GcConfig::default()
+        };
         assert!(slow.defrag_trigger_interval_ms >= 5000);
         assert!(st.maintain(&a, &slow, 50, &m).active, "first call must latch");
 

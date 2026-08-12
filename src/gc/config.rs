@@ -443,7 +443,19 @@ fn default_compactor_slot_evac_max_live() -> u16 {
     16
 }
 fn default_defrag_enabled() -> bool {
-    true
+    // Default OFF since 2026-08-12. Publishing a quarantined window is the only
+    // path that hands a whole stripe back to the allocatable pool without a
+    // per-block proof, and on the box it published a window that still held live
+    // blocks: 20 hours of clean running, first `defrag published stripes` at
+    // 04:51:36, first foreground `CRC mismatch` at 05:02:21 — 10.75 minutes
+    // later — then 476 double-claimed blocks whose consecutive runs each sat
+    // inside ONE stripe-aligned window (memory: `defrag_stripe_publish_crc_p0`).
+    // `complete_defrag_quarantine`'s gate is structural now, so the specific
+    // publish is blocked, but the upstream accounting drift that made the window
+    // look complete is NOT root-caused yet. Selection also measured ZERO benefit
+    // on the box (`gc_reclaim_defrag_criticality_inversion`), so there is nothing
+    // to trade against the residual risk. Re-enable per-config to test it.
+    false
 }
 fn default_defrag_stripe_capable_min_pct() -> u8 {
     30

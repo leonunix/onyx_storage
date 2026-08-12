@@ -171,6 +171,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Offline reverse lookup: which L2P / dedup_index entries physically claim
+    /// the given PBAs? Discriminates a foreground `CRC mismatch` on a mapped LBA
+    /// between a double allocation (two overlapping units on one block) and a
+    /// block overwritten with no competing mapping. Offline-only, read-only
+    /// beyond the open's own recovery.
+    MetadbClaims {
+        /// PBA to audit; repeat or comma-separate.
+        #[arg(long, value_delimiter = ',')]
+        pba: Vec<u64>,
+        /// File with one PBA per line (blank lines and `#` comments ignored).
+        #[arg(long)]
+        pba_file: Option<PathBuf>,
+        /// Census EVERY live block instead of an explicit PBA set. Costs one
+        /// 32-byte record per claimed block (~2 GiB at 67 M blocks).
+        #[arg(long)]
+        all: bool,
+        /// With `--all`, how many conflicting PBAs to list.
+        #[arg(long, default_value_t = 4096)]
+        limit: usize,
+        /// Print the report as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -383,6 +406,68 @@ fn format_manifest_body_version_json(report: &onyx_metadb::VerifyReport) -> Stri
         .manifest_body_version
         .map(|version| version.to_string())
         .unwrap_or_else(|| "null".into())
+}
+
+fn format_metadb_claims_human(
+    report: &onyx_storage::meta::backend::metadb::MetaDbClaimAuditReport,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    writeln!(out, "volumes_scanned: {}", report.volumes_scanned).unwrap();
+    writeln!(out, "l2p_entries_scanned: {}", report.l2p_entries_scanned).unwrap();
+    writeln!(
+        out,
+        "dedup_entries_scanned: {}",
+        report.dedup_entries_scanned
+    )
+    .unwrap();
+    writeln!(out, "requested_pbas: {}", report.requested_pbas).unwrap();
+    writeln!(out, "unclaimed: {}", report.unclaimed.len()).unwrap();
+    writeln!(out, "single_unit: {}", report.single_unit.len()).unwrap();
+    writeln!(
+        out,
+        "conflicting (proven double allocation): {}",
+        report.conflicting.len()
+    )
+    .unwrap();
+    for entry in &report.results {
+        writeln!(
+            out,
+            "pba {} rc={} units={}{}",
+            entry.pba,
+            entry.refcount,
+            entry.distinct_units,
+            if entry.conflicting { " CONFLICT" } else { "" }
+        )
+        .unwrap();
+        for claim in &entry.claims {
+            let who = match (claim.volume_ordinal, claim.lba, &claim.dedup_hash) {
+                (Some(ord), Some(lba), _) => format!("vol {ord} lba {lba}"),
+                (_, _, Some(hash)) => format!("hash {hash}"),
+                _ => "?".to_string(),
+            };
+            writeln!(
+                out,
+                "  [{}] {who} start_pba={} slot_offset={} ucs={} uos={} ulc={} oiu={} \
+                 crc32={:#010x} commit_seq={} birth_lsn={} blocks={} mask={:#018x}",
+                claim.source,
+                claim.start_pba,
+                claim.slot_offset,
+                claim.unit_compressed_size,
+                claim.unit_original_size,
+                claim.unit_lba_count,
+                claim.offset_in_unit,
+                claim.crc32,
+                claim.commit_seq,
+                claim.birth_lsn,
+                claim.covered_blocks,
+                claim.block_mask,
+            )
+            .unwrap();
+        }
+    }
+    out
 }
 
 fn format_metadb_probe_human(
@@ -969,6 +1054,67 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", format_metadb_probe_human(&report));
+            }
+        }
+        Command::MetadbClaims {
+            pba,
+            pba_file,
+            all,
+            limit,
+            json,
+        } => {
+            if config.meta.backend != onyx_storage::config::MetaBackendKind::Chunklet {
+                anyhow::bail!("metadb-claims requires [meta] backend = \"chunklet\"");
+            }
+            let mut pbas = pba;
+            if let Some(path) = &pba_file {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|err| anyhow::anyhow!("cannot read {}: {err}", path.display()))?;
+                for line in text.lines() {
+                    let line = line.split('#').next().unwrap_or("").trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    pbas.push(line.parse::<u64>().map_err(|err| {
+                        anyhow::anyhow!("{}: not a PBA: {line:?} ({err})", path.display())
+                    })?);
+                }
+            }
+            if pbas.is_empty() && !all {
+                anyhow::bail!("metadb-claims needs --all, at least one --pba, or a --pba-file");
+            }
+            let (_pool, meta_backend) = onyx_storage::chunklet_pool::open_role_backend(
+                &config.chunklet,
+                onyx_storage::chunklet_pool::LdRoleSel::Meta,
+            )
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "{err} — metadb-claims is offline-only; stop the engine first \
+                     so it can acquire the chunklet pool lock"
+                )
+            })?;
+            if all {
+                let report = onyx_storage::meta::backend::metadb::census_pba_conflicts(
+                    &config.meta,
+                    meta_backend,
+                    limit,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{report:#?}");
+                }
+            } else {
+                let report = onyx_storage::meta::backend::metadb::audit_pba_claims(
+                    &config.meta,
+                    meta_backend,
+                    &pbas,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", format_metadb_claims_human(&report));
+                }
             }
         }
         Command::Chunklet { op } => {

@@ -147,6 +147,21 @@ impl FreeSet {
         self.blocks_total
     }
 
+    /// True when this set holds exactly `range` and nothing else.
+    ///
+    /// Structural counterpart to `blocks_total() == range.count`. Every insert
+    /// here goes through [`Self::coalesce_insert`], so a fully-covered range is
+    /// always ONE folded extent — which makes this the check to gate anything
+    /// that publishes a whole range as free on. A block counter is a derived
+    /// aggregate and can drift; the set contents are the authority.
+    pub(crate) fn is_exactly(&self, range: Extent) -> bool {
+        self.by_addr.len() == 1
+            && self
+                .by_addr
+                .first()
+                .is_some_and(|e| e.start == range.start && e.count == range.count)
+    }
+
     /// Whole-stripe aligned capacity for the configured geometry — O(1)
     /// maintained aggregate; 0 when no geometry is set.
     pub(crate) fn stripe_capacity(&self) -> u64 {
@@ -155,13 +170,40 @@ impl FreeSet {
 
     /// Plain insert (no coalescing) — for split remainders that are never
     /// adjacent to another free extent by construction.
+    /// Insert an extent whose start is not already present.
+    ///
+    /// The precondition used to be a `debug_assert!` only, which made a
+    /// violation SILENT in release: `Extent`'s `Ord` is start-only, so
+    /// `by_addr.insert` kept the OLD extent while `by_size` / `by_eff` /
+    /// `blocks_total` all took the NEW one. That leaves two corruptions the
+    /// callers cannot see —
+    ///
+    /// * a ghost `(count, start)` in `by_size` for a span `by_addr` does not
+    ///   hold, so `first_fit` hands out an extent that is not free (the exact
+    ///   double-allocation the [`Self::remove`] doc warns about), and
+    /// * an inflated `blocks_total`, which is what a defrag quarantine's
+    ///   completion gate reads — an over-count lets a window with LIVE blocks
+    ///   in it look fully free and get published into the allocatable pool.
+    ///
+    /// Both end in foreground `CRC mismatch` on an LBA whose mapping is intact.
+    /// So the collision is handled explicitly now: keep the larger span (the
+    /// only choice that cannot shrink free space below what a caller already
+    /// believes is free), count it exactly once, and log — a collision is
+    /// always an upstream bug worth seeing, never a routine event.
     pub(crate) fn insert(&mut self, extent: Extent) {
-        let inserted = self.by_addr.insert(extent);
-        debug_assert!(
-            inserted,
-            "FreeSet::insert: duplicate start {}",
-            extent.start.0
-        );
+        if let Some(existing) = self.by_addr.get(&extent).copied() {
+            tracing::error!(
+                start = extent.start.0,
+                existing_blocks = existing.count,
+                new_blocks = extent.count,
+                "FreeSet::insert: duplicate start — folding instead of corrupting the indexes"
+            );
+            if extent.count <= existing.count {
+                return;
+            }
+            self.remove(&existing);
+        }
+        self.by_addr.insert(extent);
         self.by_size.insert((extent.count, extent.start.0));
         self.blocks_total += extent.count as u64;
         if let Some((stripe, phase)) = self.geom {
@@ -178,13 +220,28 @@ impl FreeSet {
     /// `(count, start)` behind (a stale entry would let `first_fit` hand out a
     /// ghost extent → double allocation).
     pub(crate) fn remove(&mut self, extent: &Extent) -> bool {
+        self.take(extent).is_some()
+    }
+
+    /// [`Self::remove`], returning the extent that was ACTUALLY stored.
+    ///
+    /// Callers that decided what to do with a run before removing it (the
+    /// plan-then-mutate refill) must act on the stored span, not the one they
+    /// planned: the probe only matches by start, so an intervening coalesce can
+    /// leave a different span at that address. Acting on the planned count would
+    /// hand out or re-insert blocks that were never in the run — a double
+    /// allocation. The count mismatch used to be a `debug_assert` only.
+    pub(crate) fn take(&mut self, extent: &Extent) -> Option<Extent> {
         match self.by_addr.take(extent) {
             Some(taken) => {
-                debug_assert_eq!(
-                    taken.count, extent.count,
-                    "FreeSet::remove: probe count mismatch at start {}",
-                    extent.start.0
-                );
+                if taken.count != extent.count {
+                    tracing::warn!(
+                        start = extent.start.0,
+                        probe_blocks = extent.count,
+                        stored_blocks = taken.count,
+                        "FreeSet::take: probe count differs from the stored run"
+                    );
+                }
                 let removed = self.by_size.remove(&(taken.count, taken.start.0));
                 debug_assert!(
                     removed,
@@ -203,9 +260,9 @@ impl FreeSet {
                     self.stripe_capacity -= Self::stripe_floor(eff, stripe);
                 }
                 debug_assert_eq!(self.by_addr.len(), self.by_size.len());
-                true
+                Some(taken)
             }
-            None => false,
+            None => None,
         }
     }
 
@@ -376,25 +433,64 @@ impl FreeSet {
 
     /// Insert an extent and merge it with the adjacent-before/after free runs
     /// (identical semantics to the old `coalesce_and_insert`).
+    /// Insert `new`, folding it together with every stored run it touches.
+    ///
+    /// Folds OVERLAP as well as adjacency. Stored runs are disjoint by
+    /// invariant, so an overlap means a caller released a block that was
+    /// already free here; absorbing it keeps the set disjoint and
+    /// `blocks_total` equal to the number of distinct free blocks. The old
+    /// adjacency-only version left the overlapping pair in place, which both
+    /// over-counted `blocks_total` (a defrag quarantine could then look
+    /// complete while still holding a live block) and let `first_fit` hand the
+    /// shared blocks to two writers. An overlap is always an upstream bug, so
+    /// it is logged rather than absorbed quietly.
     pub(crate) fn coalesce_insert(&mut self, new: Extent) {
         let mut merged_start = new.start.0;
         let mut merged_end = new.end_pba().0;
+        let mut overlapped = false;
 
-        let before = self.by_addr.range(..=new).next_back().copied();
-        if let Some(extent) = before {
-            if extent.end_pba().0 == merged_start {
-                merged_start = extent.start.0;
-                self.remove(&extent);
+        // At most one stored run can reach into `merged_start` from below.
+        // `Extent`'s Ord is start-only, so `..=` also catches a run stored at
+        // exactly `merged_start` (the duplicate-start case).
+        if let Some(before) = self
+            .by_addr
+            .range(..=Extent::single(Pba(merged_start)))
+            .next_back()
+            .copied()
+        {
+            if before.end_pba().0 >= merged_start {
+                overlapped |= before.end_pba().0 > merged_start;
+                merged_start = before.start.0;
+                merged_end = merged_end.max(before.end_pba().0);
+                self.remove(&before);
             }
         }
 
-        let probe = Extent::new(Pba(merged_end), 0);
-        let after = self.by_addr.range(probe..).next().copied();
-        if let Some(extent) = after {
-            if extent.start.0 == merged_end {
-                merged_end = extent.end_pba().0;
-                self.remove(&extent);
+        // Absorb every run that starts at or before the growing end. Each
+        // iteration removes one stored run, so this terminates.
+        while let Some(after) = self
+            .by_addr
+            .range(Extent::single(Pba(merged_start + 1))..)
+            .next()
+            .copied()
+        {
+            if after.start.0 > merged_end {
+                break;
             }
+            overlapped |= after.start.0 < merged_end;
+            merged_end = merged_end.max(after.end_pba().0);
+            self.remove(&after);
+        }
+
+        if overlapped {
+            tracing::error!(
+                start = new.start.0,
+                blocks = new.count,
+                folded_start = merged_start,
+                folded_blocks = merged_end - merged_start,
+                "FreeSet::coalesce_insert: released run overlaps an already-free run — \
+                 folding; the caller freed a block twice"
+            );
         }
 
         self.insert(Extent::new(
@@ -427,6 +523,19 @@ impl FreeSet {
             self.by_addr.iter().map(|e| e.count as u64).sum::<u64>(),
             "blocks_total aggregate drifted"
         );
+        // Disjointness. Overlapping stored runs make `blocks_total` count a
+        // block twice and let `first_fit` hand the same block to two callers,
+        // which is a data-integrity bug, not an accounting one.
+        let mut prev_end = 0u64;
+        for e in &self.by_addr {
+            assert!(
+                e.start.0 >= prev_end,
+                "overlapping stored runs: {:?} starts before {}",
+                e,
+                prev_end
+            );
+            prev_end = e.end_pba().0;
+        }
         if let Some((stripe, phase)) = self.geom {
             assert_eq!(self.by_addr.len(), self.by_eff.len());
             for e in &self.by_addr {
@@ -533,7 +642,10 @@ mod tests {
         let mut shadow = BTreeSet::new();
         // Aligned starts satisfy (start + 2) % 6 == 0: 4, 10, 16, ...
         // Deliberately many distinct size classes, inserted out of address order.
-        for (start, count) in [(100u64, 6u32), (4, 60), (40, 12), (58, 24), (16, 18)] {
+        // Disjoint, because a FreeSet's stored runs always are — overlapping runs
+        // would double-count `blocks_total` and let `first_fit` hand the same
+        // block to two callers.
+        for (start, count) in [(118u64, 6u32), (4, 60), (64, 12), (94, 24), (76, 18)] {
             let e = Extent::new(Pba(start), count);
             fs.insert(e);
             shadow.insert(e);
@@ -578,6 +690,83 @@ mod tests {
         );
         assert_eq!(fs.first_fit(1), Some(low));
         fs.assert_consistent();
+    }
+
+    /// A same-start insert used to keep the OLD extent in `by_addr` while
+    /// pushing the NEW count into `by_size` / `by_eff` / `blocks_total`. In
+    /// release (where the `debug_assert` is gone) that left a ghost size entry
+    /// `first_fit` would hand out and an inflated block count that a defrag
+    /// quarantine reads as "this window is fully free". Both surfaced as
+    /// foreground `CRC mismatch` on intact mappings (box, 2026-08-12).
+    #[test]
+    fn duplicate_start_insert_folds_instead_of_corrupting_indexes() {
+        const STRIPE: u32 = 6;
+        let mut fs = FreeSet::new();
+        fs.set_geometry(STRIPE, 2);
+        fs.insert(Extent::new(Pba(100), 2));
+
+        // Bigger span at the same start wins; counted once, not twice.
+        fs.insert(Extent::new(Pba(100), 6));
+        fs.assert_consistent();
+        assert_eq!(fs.blocks_total(), 6);
+        assert_eq!(fs.first_fit(6), Some(Extent::new(Pba(100), 6)));
+
+        // Smaller span at the same start is dropped, and must not shrink the
+        // stored run or the count.
+        fs.insert(Extent::new(Pba(100), 1));
+        fs.assert_consistent();
+        assert_eq!(fs.blocks_total(), 6);
+        assert_eq!(fs.first_fit(6), Some(Extent::new(Pba(100), 6)));
+    }
+
+    /// `coalesce_insert` folded only ADJACENT runs, so releasing a run that
+    /// overlapped an already-free one stored both — double-counting the shared
+    /// blocks and making them allocatable twice.
+    #[test]
+    fn coalesce_insert_folds_overlapping_runs() {
+        let mut fs = FreeSet::new();
+        fs.insert(Extent::new(Pba(100), 4)); // 100..104
+
+        // Overlaps the tail of the stored run and extends past it.
+        fs.coalesce_insert(Extent::new(Pba(102), 4)); // 102..106
+        fs.assert_consistent();
+        assert_eq!(fs.blocks_total(), 6, "100..106 is six distinct blocks");
+        assert_eq!(fs.first_fit(1), Some(Extent::new(Pba(100), 6)));
+
+        // Fully-contained re-release changes nothing.
+        fs.coalesce_insert(Extent::new(Pba(101), 2));
+        fs.assert_consistent();
+        assert_eq!(fs.blocks_total(), 6);
+
+        // An exact duplicate of the stored run changes nothing.
+        fs.coalesce_insert(Extent::new(Pba(100), 6));
+        fs.assert_consistent();
+        assert_eq!(fs.blocks_total(), 6);
+
+        // Bridging two stored runs still folds all three into one.
+        fs.insert(Extent::new(Pba(110), 2)); // 110..112
+        fs.coalesce_insert(Extent::new(Pba(105), 6)); // 105..111 overlaps both
+        fs.assert_consistent();
+        assert_eq!(fs.blocks_total(), 12, "100..112");
+        assert_eq!(fs.first_fit(1), Some(Extent::new(Pba(100), 12)));
+    }
+
+    #[test]
+    fn is_exactly_requires_one_run_covering_the_whole_range() {
+        let range = Extent::new(Pba(60), 6);
+        let mut fs = FreeSet::new();
+        assert!(!fs.is_exactly(range), "empty set covers nothing");
+
+        // Same block count, but split — a hole means it is NOT complete.
+        fs.insert(Extent::new(Pba(60), 3));
+        fs.insert(Extent::new(Pba(64), 3));
+        assert_eq!(fs.blocks_total(), 6, "the counter alone says complete");
+        assert!(!fs.is_exactly(range), "structure says otherwise");
+
+        let mut fs = FreeSet::new();
+        fs.coalesce_insert(Extent::new(Pba(60), 3));
+        fs.coalesce_insert(Extent::new(Pba(63), 3));
+        assert!(fs.is_exactly(range));
     }
 
     #[test]
