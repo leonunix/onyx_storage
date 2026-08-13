@@ -885,9 +885,22 @@ struct FreeLockGuard<'a> {
     site: usize,
     /// `None` when this acquisition was sampled away — see [`LOCK_STAT_SHARDS`].
     acquired: Option<Instant>,
+    /// Whether this hold ever handed out `&mut FreePools`, i.e. whether the
+    /// advisory hints can possibly have gone stale. Set by `DerefMut`, which is
+    /// the ONLY way to reach a mutation: the `MutexGuard` is private to this
+    /// guard, and `FreePools` has no interior mutability, so a hold that never
+    /// took a `&mut` cannot have changed anything the hints summarise.
+    ///
+    /// This matters because most acquisitions are read-only probes — audits,
+    /// `is_free`, and above all `take_largest_regionwise`'s scan phase, which
+    /// takes one lock per region — and each of them used to pay for the full hint
+    /// recomputation plus two stores to cache lines that every other region
+    /// walker is reading.
+    dirty: bool,
     /// Advisory aggregates for this region, refreshed on drop — see
     /// [`RegionPools::free_hint`].
     free_hint: &'a AtomicU64,
+    largest_hint: &'a AtomicU64,
     stripe_hint: &'a AtomicU64,
 }
 
@@ -898,15 +911,23 @@ impl Drop for FreeLockGuard<'_> {
         // only ever see a value that was true at some point while the lock was
         // held, never a torn or future one. Both reads are O(1) maintained
         // aggregates (plus the normally-empty quarantine map).
-        self.free_hint
-            .store(self.pools.free_blocks_in_pools(), Ordering::Relaxed);
-        self.stripe_hint.store(
-            self.pools
-                .stripe_reserve
-                .largest()
-                .map_or(0, |run| u64::from(run.count)),
-            Ordering::Relaxed,
-        );
+        if self.dirty {
+            self.free_hint
+                .store(self.pools.free_blocks_in_pools(), Ordering::Relaxed);
+            self.largest_hint.store(
+                self.pools
+                    .largest_allocatable()
+                    .map_or(0, |(run, _)| u64::from(run.count)),
+                Ordering::Relaxed,
+            );
+            self.stripe_hint.store(
+                self.pools
+                    .stripe_reserve
+                    .largest()
+                    .map_or(0, |run| u64::from(run.count)),
+                Ordering::Relaxed,
+            );
+        }
         if let Some(acquired) = self.acquired {
             self.shard
                 .charge_hold(self.site, acquired.elapsed().as_nanos() as u64);
@@ -919,6 +940,16 @@ impl FreeLockGuard<'_> {
     fn charge_items(&self, n: u64) {
         self.shard.charge_items(self.site, n);
     }
+
+    /// Republish the hints on release even though this hold mutated nothing.
+    ///
+    /// For the one caller that learns a hint was WRONG without changing the pool:
+    /// [`SpaceAllocator::take_largest_regionwise`] picks a region by hint and can
+    /// find it empty, and without this the `dirty` skip would leave the bad hint
+    /// in place for the next argmax to pick again.
+    fn mark_hints_stale(&mut self) {
+        self.dirty = true;
+    }
 }
 
 impl std::ops::Deref for FreeLockGuard<'_> {
@@ -930,6 +961,7 @@ impl std::ops::Deref for FreeLockGuard<'_> {
 
 impl std::ops::DerefMut for FreeLockGuard<'_> {
     fn deref_mut(&mut self) -> &mut FreePools {
+        self.dirty = true;
         &mut self.pools
     }
 }
@@ -1108,6 +1140,28 @@ impl FreePools {
             set.insert(Extent::new(Pba(start), take as u32));
             start += take;
             count -= take;
+        }
+    }
+
+    /// The extent [`SpaceAllocator::take_largest_from_pools`] would hand out, and
+    /// which pool it came from. Quarantined free parts are excluded because they
+    /// are not allocatable, which is exactly what makes this usable as the
+    /// `largest_hint` source: the hint and the take can never disagree about what
+    /// this region can serve, because they are the same function.
+    fn largest_allocatable(&self) -> Option<(Extent, bool)> {
+        let general = self.general.largest();
+        let reserve = self.stripe_reserve.largest();
+        match (general, reserve) {
+            (None, None) => None,
+            (None, Some(r)) => Some((r, true)),
+            (Some(g), None) => Some((g, false)),
+            (Some(g), Some(r)) => {
+                if (r.count, r.start.0) > (g.count, g.start.0) {
+                    Some((r, true))
+                } else {
+                    Some((g, false))
+                }
+            }
         }
     }
 
@@ -1365,6 +1419,24 @@ struct RegionPools {
     /// can never produce a wrong answer, only a slightly older one. The
     /// ENOSPC boundary keeps its `drain_lane_caches` + retry, unchanged.
     free_hint: Vec<AtomicU64>,
+    /// Advisory per-region largest ALLOCATABLE run, in blocks — i.e. the width of
+    /// the extent [`FreePools::largest_allocatable`] would return, across both
+    /// policy pools.
+    ///
+    /// This one is not just a skip filter: it is what makes
+    /// [`SpaceAllocator::take_largest_regionwise`] an argmax over `count` relaxed
+    /// loads instead of `count` MUTEX acquisitions. Two properties make that
+    /// substitution exact rather than advisory:
+    ///   - it is derived from the same function the take uses, so hint and take
+    ///     cannot disagree about what a region can serve, and
+    ///   - it is never stale-LOW while no mutation is in flight: the seeding
+    ///     constructor publishes it, and every mutation publishes it on release
+    ///     (see [`FreeLockGuard`]'s `dirty` flag).
+    /// A mutation that has not yet released can leave it trailing, which is the
+    /// same benign "a concurrent free just landed" race `free_hint` already has:
+    /// the caller sees the pool as it was a moment earlier, never as something it
+    /// never was.
+    largest_hint: Vec<AtomicU64>,
     /// Advisory per-region LARGEST stripe-reserve run, same discipline.
     ///
     /// Largest-run rather than summed capacity because the question every reader
@@ -1399,6 +1471,7 @@ impl RegionPools {
             region_blocks: AtomicU64::new(region_blocks),
             region_base: AtomicU64::new(RESERVED_BLOCKS),
             free_hint: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            largest_hint: (0..count).map(|_| AtomicU64::new(0)).collect(),
             stripe_hint: (0..count).map(|_| AtomicU64::new(0)).collect(),
             owner: (0..count).map(|_| AtomicUsize::new(0)).collect(),
             gate: Mutex::new(()),
@@ -1494,6 +1567,14 @@ impl SpanGuard<'_> {
 
     fn spans_one_region(&self) -> bool {
         self.guards.len() == 1
+    }
+
+    /// Force every held region to republish its hints on release — see
+    /// [`FreeLockGuard::mark_hints_stale`].
+    fn mark_hints_stale(&mut self) {
+        for guard in &mut self.guards {
+            guard.mark_hints_stale();
+        }
     }
 
     /// The one region this span covers, or `None` when it straddles a boundary.
@@ -2040,6 +2121,12 @@ impl SpaceAllocator {
                     // hint would make a freshly-built allocator look empty.
                     region_pools.free_hint[idx]
                         .store(pools.free_blocks_in_pools(), Ordering::Relaxed);
+                    region_pools.largest_hint[idx].store(
+                        pools
+                            .largest_allocatable()
+                            .map_or(0, |(run, _)| u64::from(run.count)),
+                        Ordering::Relaxed,
+                    );
                 }
             }
         }
@@ -2145,7 +2232,9 @@ impl SpaceAllocator {
             shard,
             site: idx,
             acquired,
+            dirty: false,
             free_hint: &self.regions.free_hint[region],
+            largest_hint: &self.regions.largest_hint[region],
             stripe_hint: &self.regions.stripe_hint[region],
         }
     }
@@ -2878,13 +2967,60 @@ impl SpaceAllocator {
     /// Largest free extent anywhere — the `allocate_extent` short-fragment
     /// fallback.
     ///
-    /// Two phases so no more than one region lock is ever held: read each
-    /// region's `largest()`, then re-take the winner under its own lock. A
-    /// concurrent allocation can empty the winner between the phases, so a region
-    /// that comes back empty is dropped and the scan repeats — bounded by the
-    /// region count, and only reachable while another thread is allocating (in
-    /// which case an eventual `None` is a truthful "nothing left").
+    /// Selection is an argmax over [`RegionPools::largest_hint`], which is derived
+    /// from the same [`FreePools::largest_allocatable`] the take uses, so the
+    /// answer is the same one a full scan would give — for `count` relaxed loads
+    /// instead of `count` MUTEX ACQUISITIONS. That matters because this runs on
+    /// the unaligned writer path, is reached once per `allocate_extent` miss, and
+    /// used to lock EVERY region just to read a `largest()` it then threw away
+    /// (and re-scanned from scratch on each retry, filtering through an O(n²)
+    /// `exhausted` vector).
+    ///
+    /// Only the winner is locked. A concurrent allocation can empty it between the
+    /// read and the lock; the take then comes back `None`, its release republishes
+    /// the truth (`mark_hints_stale` forces that even though nothing was
+    /// mutated), so the next argmax cannot pick it again and the retry makes
+    /// progress. Bounded by the region count, and an eventual `None` is a
+    /// truthful "nothing left".
+    ///
+    /// Ties now go to the LOWEST region index, where the full scan's
+    /// `(count, start, idx)` key gave them to the highest address. Width is this
+    /// API's whole contract (address order is
+    /// [`Self::take_first_regionwise`]'s), and low-address-first is the density
+    /// direction the L2P leaf codec wants anyway.
     fn take_largest_regionwise(&self, site: FreeLockSite) -> Option<Extent> {
+        for _ in 0..=self.regions.count() {
+            let mut best: Option<(u64, usize)> = None;
+            for (idx, hint) in self.regions.largest_hint.iter().enumerate() {
+                let width = hint.load(Ordering::Relaxed);
+                if width > 0 && best.is_none_or(|(current, _)| width > current) {
+                    best = Some((width, idx));
+                }
+            }
+            let (_, idx) = best?;
+            let mut guard = self.lock_region(site, idx);
+            if let Some(extent) = Self::take_largest_from_pools(guard.region_mut(idx)) {
+                return Some(extent);
+            }
+            // Stale-high hint: the region emptied since the load. Nothing was
+            // mutated, so force the republish the `dirty` flag would otherwise
+            // skip, or the next argmax picks the same region again.
+            guard.mark_hints_stale();
+            drop(guard);
+        }
+        None
+    }
+
+    /// The pre-2026-08-13 implementation of [`Self::take_largest_regionwise`]:
+    /// lock EVERY non-empty region to read a `largest()` it then discards, argmax,
+    /// re-take under the winner's lock, and remember the losers in an O(n²)
+    /// `exhausted` vector.
+    ///
+    /// Kept because it is the oracle: `hint_argmax_matches_the_full_scan` asserts
+    /// the two pick the same extent over randomised pool shapes, and
+    /// `bench_largest_scan_vs_hint` prices them against each other in one process.
+    #[cfg(test)]
+    fn take_largest_regionwise_scanning(&self, site: FreeLockSite) -> Option<Extent> {
         let mut exhausted: Vec<usize> = Vec::new();
         for _ in 0..=self.regions.count() {
             let mut best: Option<(u32, u64, usize)> = None;
@@ -2893,14 +3029,7 @@ impl SpaceAllocator {
                     continue;
                 }
                 let guard = self.lock_region(site, idx);
-                let pools = guard.region(idx);
-                let candidate = match (pools.general.largest(), pools.stripe_reserve.largest()) {
-                    (Some(g), Some(r)) if (r.count, r.start.0) > (g.count, g.start.0) => Some(r),
-                    (Some(g), Some(_)) => Some(g),
-                    (Some(g), None) => Some(g),
-                    (None, r) => r,
-                };
-                if let Some(candidate) = candidate {
+                if let Some((candidate, _)) = guard.region(idx).largest_allocatable() {
                     let key = (candidate.count, candidate.start.0, idx);
                     if best.is_none_or(|current| key > current) {
                         best = Some(key);
@@ -5296,22 +5425,13 @@ impl SpaceAllocator {
     }
 
     fn take_largest_from_pools(pools: &mut FreePools) -> Option<Extent> {
-        let general = pools.general.largest();
-        let reserve = pools.stripe_reserve.largest();
-        let take_reserve = match (general, reserve) {
-            (None, Some(_)) => true,
-            (Some(g), Some(r)) => (r.count, r.start.0) > (g.count, g.start.0),
-            _ => false,
-        };
-        if take_reserve {
-            let extent = reserve.expect("selected reserve candidate");
+        let (extent, from_reserve) = pools.largest_allocatable()?;
+        if from_reserve {
             pools.stripe_reserve.remove(&extent);
-            Some(extent)
         } else {
-            let extent = general?;
             pools.general.remove(&extent);
-            Some(extent)
         }
+        Some(extent)
     }
 
     /// Front-carve `count` blocks off the lowest-address cached run that fits.
@@ -5671,6 +5791,25 @@ mod free_pool_policy_tests {
         assert!(allocator.lane_extent_caches[0].lock().unwrap().is_empty());
     }
 
+    /// A pool that really does shard into 16 regions: `RegionLayout::plan` floors
+    /// a region at [`MIN_REGION_BLOCKS`], so a device under `16 * 4096` usable
+    /// blocks silently collapses to ONE region and any region test on it is
+    /// vacuous.
+    fn sharded_16_regions() -> SpaceAllocator {
+        const PER_REGION: u64 = 4200;
+        let allocator = SpaceAllocator::new_with_exact_regions(
+            (16 * PER_REGION + RESERVED_BLOCKS) * BLOCK_SIZE as u64,
+            1,
+            16,
+        );
+        assert_eq!(
+            allocator.region_count(),
+            16,
+            "region planning changed; re-pick PER_REGION"
+        );
+        allocator
+    }
+
     /// True blocks parked in every lane cache, read the expensive way.
     fn lane_cached_truth(allocator: &SpaceAllocator) -> Vec<u64> {
         allocator
@@ -5770,6 +5909,211 @@ mod free_pool_policy_tests {
         );
         assert_depths_exact(&allocator, "a drain");
         assert_eq!(allocator.lane_cached_blocks(), 0);
+    }
+
+    /// `largest_hint` is not a skip filter — `take_largest_regionwise` picks the
+    /// winner from it WITHOUT locking anyone else, so a hint that reads LOW while
+    /// the region holds a wide run would hide that run from the unaligned path.
+    /// Pin the exactness after every mutating shape: seeding, allocation, free,
+    /// retire/reclaim, geometry change, quarantine, and drain.
+    #[test]
+    fn largest_hint_equals_the_truth_after_every_mutation() {
+        let allocator = allocator(RESERVED_BLOCKS + 512, 2);
+        let check = |context: &str| {
+            for idx in 0..allocator.region_count() {
+                let guard = allocator.lock_region(FreeLockSite::Audit, idx);
+                let truth = guard
+                    .region(idx)
+                    .largest_allocatable()
+                    .map_or(0, |(run, _)| u64::from(run.count));
+                drop(guard);
+                assert_eq!(
+                    allocator.regions.largest_hint[idx].load(Ordering::Relaxed),
+                    truth,
+                    "region {idx} largest_hint is wrong after {context}"
+                );
+            }
+        };
+        check("seeding");
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        check("a geometry install");
+
+        let mut held = Vec::new();
+        for _ in 0..40 {
+            if let Ok(extent) = allocator.allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            {
+                held.push(extent);
+            }
+        }
+        check("aligned allocations");
+        allocator.drain_lane_caches();
+        check("a drain");
+
+        let mid = held.len() / 2;
+        for extent in held.drain(..mid) {
+            allocator.free_extent(extent).unwrap();
+        }
+        check("frees");
+
+        let running = AtomicBool::new(true);
+        for extent in held.drain(..) {
+            allocator.retire_extent(extent).unwrap();
+            let _ = allocator.reclaim_retired_extents_batch(&[extent], &running);
+        }
+        check("retire + reclaim");
+
+        let target = Extent::new(
+            Pba(SpaceAllocator::align_up_pba(
+                RESERVED_BLOCKS + 64,
+                u64::from(STRIPE),
+                u64::from(PHASE),
+            )),
+            STRIPE,
+        );
+        if allocator.begin_defrag_quarantine(target).is_ok() {
+            check("a quarantine open");
+            allocator.cancel_defrag_quarantine(target.start);
+            check("a quarantine cancel");
+        }
+    }
+
+    /// The hint argmax must return the extent the full scan would have returned.
+    /// Randomised region shapes, both implementations run against byte-identical
+    /// pools, until every region is empty — so the whole drain sequence is
+    /// compared, not just the first pick.
+    #[test]
+    fn hint_argmax_matches_the_full_scan() {
+        let build = |seed: u64| {
+            let allocator = sharded_16_regions();
+            let mut rng = seed | 1;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for idx in 0..allocator.region_count() {
+                let mut guard = allocator.lock_region(FreeLockSite::Setup, idx);
+                let layout = allocator.regions.layout();
+                let pools = guard.region_mut(idx);
+                *pools = FreePools::new();
+                // 0-3 runs per region, widths 1-9, inside the region's own span.
+                let base = layout.start(idx).max(RESERVED_BLOCKS);
+                let mut at = base;
+                for _ in 0..(next() % 4) {
+                    let width = 1 + (next() % 9) as u32;
+                    let gap = 1 + (next() % 5);
+                    if at + u64::from(width) + gap >= layout.end(idx) {
+                        break;
+                    }
+                    if next() % 2 == 0 {
+                        pools.general.insert(Extent::new(Pba(at), width));
+                    } else {
+                        pools.stripe_reserve.insert(Extent::new(Pba(at), width));
+                    }
+                    at += u64::from(width) + gap;
+                }
+                drop(guard);
+            }
+            allocator
+        };
+
+        for seed in 1..25u64 {
+            let hinted = build(seed);
+            let scanned = build(seed);
+            loop {
+                let a = hinted.take_largest_regionwise(FreeLockSite::SmallAlloc);
+                let b = scanned.take_largest_regionwise_scanning(FreeLockSite::SmallAlloc);
+                match (a, b) {
+                    (None, None) => break,
+                    (Some(a), Some(b)) => assert_eq!(
+                        a.count, b.count,
+                        "seed {seed}: hint argmax took {a:?}, full scan took {b:?}"
+                    ),
+                    (a, b) => panic!("seed {seed}: hint {a:?} vs scan {b:?}"),
+                }
+            }
+        }
+    }
+
+    /// The two halves of this fix, as behaviour rather than timing: picking the
+    /// largest fragment must cost ONE region lock instead of one per region, and a
+    /// read-only hold must not republish hints (which is what made the old scan
+    /// phase expensive on both counts).
+    #[test]
+    fn largest_pick_locks_one_region_and_read_only_holds_publish_nothing() {
+        let allocator = sharded_16_regions();
+        let regions = allocator.region_count();
+        assert!(regions >= 8, "this test needs a sharded pool, got {regions}");
+        let acqs = |a: &SpaceAllocator| {
+            a.free_lock_stats()
+                .iter()
+                .find(|s| s.site == "small_alloc")
+                .expect("every site is always reported")
+                .acquisitions
+        };
+
+        let before = acqs(&allocator);
+        assert!(allocator
+            .take_largest_regionwise(FreeLockSite::SmallAlloc)
+            .is_some());
+        let hinted_locks = acqs(&allocator) - before;
+        assert!(
+            hinted_locks <= 2,
+            "the hint argmax took {hinted_locks} region locks (want 1, the winner)"
+        );
+
+        let before = acqs(&allocator);
+        assert!(allocator
+            .take_largest_regionwise_scanning(FreeLockSite::SmallAlloc)
+            .is_some());
+        let scan_locks = acqs(&allocator) - before;
+        assert!(
+            scan_locks > hinted_locks * 2,
+            "the full scan should cost one lock per non-empty region, took {scan_locks}"
+        );
+
+        // A read-only hold leaves a deliberately wrong hint alone; a mutating one
+        // corrects it. This is the `dirty` flag, and the reason
+        // `take_largest_regionwise` has to ask for a republish explicitly.
+        allocator.regions.free_hint[0].store(123_456, Ordering::Relaxed);
+        allocator.contiguity_stats();
+        allocator.is_free(Pba(RESERVED_BLOCKS));
+        assert_eq!(
+            allocator.regions.free_hint[0].load(Ordering::Relaxed),
+            123_456,
+            "a read-only hold recomputed the hints"
+        );
+        allocator.allocate_one().unwrap();
+        assert_ne!(
+            allocator.regions.free_hint[0].load(Ordering::Relaxed),
+            123_456,
+            "a mutating hold must republish the hints"
+        );
+    }
+
+    /// A stale-HIGH hint (the region emptied after the load) must not livelock the
+    /// argmax: the failed probe republishes the truth, so the retry picks someone
+    /// else and the caller still gets the real largest run.
+    #[test]
+    fn stale_high_largest_hint_self_corrects() {
+        let allocator = sharded_16_regions();
+        // Empty region 1, then lie about it being the widest in the pool.
+        {
+            let mut guard = allocator.lock_region(FreeLockSite::Setup, 1);
+            *guard.region_mut(1) = FreePools::new();
+        }
+        allocator.regions.largest_hint[1].store(u64::MAX, Ordering::Relaxed);
+
+        let picked = allocator
+            .take_largest_regionwise(FreeLockSite::SmallAlloc)
+            .expect("the rest of the pool still has runs");
+        assert!(!Extent::new(Pba(0), 1).contains(picked.start));
+        assert_eq!(
+            allocator.regions.largest_hint[1].load(Ordering::Relaxed),
+            0,
+            "the failed probe must have republished region 1's truth"
+        );
     }
 
     /// The point of the guard: at the exhaustion boundary with empty lanes, the
@@ -8639,6 +8983,106 @@ pub(crate) mod aged_pool_bench {
                 (a + b) / 2.0,
                 a,
                 b,
+            );
+        }
+    }
+
+    /// What the unaligned path's "give me the largest fragment" scan cost, hint
+    /// argmax vs the pre-2026-08-13 lock-every-region scan, alternated in ONE
+    /// process on the SAME pool.
+    ///
+    /// This is `allocate_extent`'s short-fragment fallback, i.e. where an
+    /// unaligned writer allocation lands once the reserve is gone. The scan locked
+    /// every non-empty region to read a `largest()` it then discarded.
+    ///
+    /// Run:
+    /// ```text
+    /// cargo test --release --lib bench_largest_scan_vs_hint -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_largest_scan_vs_hint() {
+        let per_thread: u64 = std::env::var("ONYX_BENCH_PICKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let threads: usize = std::thread::available_parallelism()
+            .map(|n| n.get().min(16))
+            .unwrap_or(8);
+
+        let (allocator, stats, _live) =
+            build_aged_pool_parts(scale, TailShape::Spread, 16, Some(DEFAULT_ALLOCATOR_REGIONS));
+        let regions = allocator.region_count();
+        let allocator = std::sync::Arc::new(allocator);
+        println!(
+            "\n=== largest-fragment pick: {threads} threads x {per_thread} picks, {regions} \
+             regions, free_extents={} ===",
+            stats.free_extents
+        );
+
+        // Take and immediately give back, so both arms see the same pool shape and
+        // neither drains it — the cost being priced is the SEARCH, not the churn.
+        let arm = |hinted: bool| -> (f64, u64) {
+            let before: u64 = allocator
+                .free_lock_stats()
+                .iter()
+                .find(|s| s.site == "small_alloc")
+                .map_or(0, |s| s.acquisitions);
+            let start = Instant::now();
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let allocator = allocator.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..per_thread {
+                            let picked = if hinted {
+                                allocator.take_largest_regionwise(FreeLockSite::SmallAlloc)
+                            } else {
+                                allocator
+                                    .take_largest_regionwise_scanning(FreeLockSite::SmallAlloc)
+                            };
+                            if let Some(extent) = std::hint::black_box(picked) {
+                                let mut guard =
+                                    allocator.lock_span(FreeLockSite::FreeOne, extent);
+                                guard.release_extent(extent);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            let ns = start.elapsed().as_nanos() as f64 / (threads as u64 * per_thread) as f64;
+            let locks: u64 = allocator
+                .free_lock_stats()
+                .iter()
+                .find(|s| s.site == "small_alloc")
+                .map_or(0, |s| s.acquisitions)
+                - before;
+            (ns, locks)
+        };
+
+        let (scan1, scan1_locks) = arm(false);
+        let (hint1, hint1_locks) = arm(true);
+        let (hint2, hint2_locks) = arm(true);
+        let (scan2, scan2_locks) = arm(false);
+        for (label, a, b, la, lb) in [
+            ("full scan (pre-fix)", scan1, scan2, scan1_locks, scan2_locks),
+            ("hint argmax (shipped)", hint1, hint2, hint1_locks, hint2_locks),
+        ] {
+            let picks = (threads as u64 * per_thread) as f64;
+            println!(
+                "  {label:<24} {:9.1} ns/pick  (pass1 {:9.1} / pass2 {:9.1})  \
+                 region locks/pick {:6.1} / {:6.1}",
+                (a + b) / 2.0,
+                a,
+                b,
+                la as f64 / picks,
+                lb as f64 / picks,
             );
         }
     }
