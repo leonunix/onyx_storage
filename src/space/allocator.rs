@@ -520,29 +520,101 @@ impl RetiredLockSite {
     }
 }
 
-/// Per-site wait/hold accounting for ONE mutex. Monotonic counters, so two
-/// reads difference cleanly; the `_max` fields are high-water marks and do NOT
-/// difference (`hold_ns_max` answers "what is the worst shut-out window this
-/// site ever caused"; `wait_ns_max` separates steady queueing from a single
-/// blackout by a long holder).
-struct SiteLockStats<const N: usize> {
+/// Per-thread accounting shards, and how many acquisitions share one timing
+/// sample — the two constants that keep this instrumentation off the wall it
+/// measures.
+///
+/// The 2026-08-12 profile of the exhausted regime found ~66% of the flush
+/// writers' CPU in region-lock acquire/release machinery against 15% in the
+/// actual free-space search, and the accounting was a load-bearing part of it:
+/// at ~10^4 acquisitions per unaligned allocation, 16 writers were executing
+/// five read-modify-writes on ONE set of shared cache lines (`charge_wait` alone
+/// = 10.35% of `lock_region_raw`'s own time, half of that the shared `fetch_max`)
+/// plus four `Instant::now()` calls (vdso `clock_gettime` = 6.57% of the whole
+/// cycle). Both charges land INSIDE the critical section, so they also inflated
+/// the `wait_ns`/`hold_ns` this table reports — every decision ever made from
+/// `free_lock.*` was made on numbers the measurement itself had padded.
+///
+/// Threads take a slot round-robin at first use; more threads than slots share
+/// one (still correct, just contended again). 64 covers the box's 16 flush
+/// writers + coalescers + dedup + GC + defrag with room to spare.
+const LOCK_STAT_SHARDS: usize = 64;
+
+/// Default sampling stride: time 1 acquisition in this many, per (shard, site).
+///
+/// Tests default to 1 (time everything) so the accounting tests stay exact; a
+/// dedicated test covers the sampled path.
+const DEFAULT_LOCK_STAT_STRIDE: u64 = if cfg!(test) { 1 } else { 16 };
+
+/// Resolved sampling stride; `0` = not yet read from the environment.
+static LOCK_STAT_STRIDE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This thread's accounting shard, assigned once on first use.
+    static LOCK_STAT_SLOT: usize = {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed) % LOCK_STAT_SHARDS
+    };
+}
+
+/// The stride in force, resolving `ONYX_LOCK_STATS_STRIDE` on first use.
+fn lock_stat_stride() -> u64 {
+    let cached = LOCK_STAT_STRIDE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let resolved = std::env::var("ONYX_LOCK_STATS_STRIDE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_LOCK_STAT_STRIDE);
+    LOCK_STAT_STRIDE.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
+/// Set the lock-accounting sampling stride at runtime (`1` = time every
+/// acquisition, the pre-sampling behaviour).
+///
+/// Exists so the cost of the instrumentation can be A/B'd **inside one process**:
+/// per [`set_region_serialize`], restart-per-arm comparisons resolve nothing on
+/// this box. Safe at any time — it only changes how often the clock is read, and
+/// `snapshot` scales the sums by the sample rate either way, so a stride change
+/// mid-run costs accuracy on the straddling interval and nothing else.
+pub fn set_lock_stats_stride(stride: u64) {
+    LOCK_STAT_STRIDE.store(stride.max(1), Ordering::Relaxed);
+}
+
+/// The sampling stride currently in force — see [`set_lock_stats_stride`].
+pub fn lock_stats_stride() -> u64 {
+    lock_stat_stride()
+}
+
+/// One thread-slot's copy of the per-site counters. Cache-line aligned so two
+/// slots never share a line; sites WITHIN a slot may share one, which costs
+/// nothing because only that slot's thread writes them.
+#[repr(align(64))]
+struct LockStatShard<const N: usize> {
     acquisitions: [AtomicU64; N],
     /// Extents processed under the hold, charged by the batch paths only. This
     /// is what turns a per-hold cost into a per-EXTENT cost: sharding cuts one
     /// hold into many, so per-acquisition numbers move even when the work per
     /// extent is unchanged.
     items: [AtomicU64; N],
+    /// Acquisitions that actually carried a timing sample — the divisor
+    /// `snapshot` scales `wait_ns` / `hold_ns` by.
+    timed: [AtomicU64; N],
     wait_ns: [AtomicU64; N],
     wait_ns_max: [AtomicU64; N],
     hold_ns: [AtomicU64; N],
     hold_ns_max: [AtomicU64; N],
 }
 
-impl<const N: usize> SiteLockStats<N> {
+impl<const N: usize> LockStatShard<N> {
     fn new() -> Self {
         Self {
             acquisitions: std::array::from_fn(|_| AtomicU64::new(0)),
             items: std::array::from_fn(|_| AtomicU64::new(0)),
+            timed: std::array::from_fn(|_| AtomicU64::new(0)),
             wait_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             wait_ns_max: std::array::from_fn(|_| AtomicU64::new(0)),
             hold_ns: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -550,29 +622,152 @@ impl<const N: usize> SiteLockStats<N> {
         }
     }
 
-    /// Charge the wait for one acquisition of `site`.
+    /// Count one acquisition of `site` and decide whether to time it.
+    ///
+    /// The stride is applied to this shard's own acquisition count, so sample
+    /// number 1 is ALWAYS timed: a site acquired once still reports a hold, which
+    /// is what the accounting tests (and any "did this path run at all" read)
+    /// depend on.
+    fn count(&self, site: usize, stride: u64) -> bool {
+        let n = self.acquisitions[site].fetch_add(1, Ordering::Relaxed) + 1;
+        stride <= 1 || n % stride == 1
+    }
+
+    /// Charge the wait for one TIMED acquisition of `site`.
     fn charge_wait(&self, site: usize, waited: u64) {
-        self.acquisitions[site].fetch_add(1, Ordering::Relaxed);
+        self.timed[site].fetch_add(1, Ordering::Relaxed);
         self.wait_ns[site].fetch_add(waited, Ordering::Relaxed);
         self.wait_ns_max[site].fetch_max(waited, Ordering::Relaxed);
     }
 
-    /// Charge the hold for one release of `site`.
+    /// Charge the hold for one TIMED release of `site`.
     fn charge_hold(&self, site: usize, held: u64) {
         self.hold_ns[site].fetch_add(held, Ordering::Relaxed);
         self.hold_ns_max[site].fetch_max(held, Ordering::Relaxed);
     }
 
+    fn charge_items(&self, site: usize, n: u64) {
+        self.items[site].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Per-site wait/hold accounting for ONE mutex, sharded per thread. Monotonic
+/// counters, so two reads difference cleanly; the `_max` fields are high-water
+/// marks and do NOT difference (`hold_ns_max` answers "what is the worst
+/// shut-out window this site ever caused"; `wait_ns_max` separates steady
+/// queueing from a single blackout by a long holder).
+struct SiteLockStats<const N: usize> {
+    shards: Vec<LockStatShard<N>>,
+    /// Per-instance stride, `0` = follow the process-wide one. Test-only: the
+    /// suite runs in parallel in one process, so a test must not perturb another
+    /// test's accounting through [`set_lock_stats_stride`].
+    #[cfg(test)]
+    stride_override: AtomicU64,
+    /// Test-only: force every thread onto ONE shard, reproducing the pre-sharding
+    /// single-cache-line shape so `bench_lock_stats_overhead` can A/B it inside
+    /// one process — the same in-process A/B discipline as
+    /// [`set_region_serialize`]. `usize::MAX` = per-thread (production).
+    #[cfg(test)]
+    shard_pin: AtomicUsize,
+}
+
+impl<const N: usize> SiteLockStats<N> {
+    fn new() -> Self {
+        Self {
+            shards: (0..LOCK_STAT_SHARDS).map(|_| LockStatShard::new()).collect(),
+            #[cfg(test)]
+            stride_override: AtomicU64::new(0),
+            #[cfg(test)]
+            shard_pin: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn stride(&self) -> u64 {
+        lock_stat_stride()
+    }
+
+    #[cfg(test)]
+    fn stride(&self) -> u64 {
+        match self.stride_override.load(Ordering::Relaxed) {
+            0 => lock_stat_stride(),
+            n => n,
+        }
+    }
+
+    /// This thread's shard.
+    #[cfg(not(test))]
+    fn shard(&self) -> &LockStatShard<N> {
+        &self.shards[LOCK_STAT_SLOT.with(|slot| *slot)]
+    }
+
+    #[cfg(test)]
+    fn shard(&self) -> &LockStatShard<N> {
+        match self.shard_pin.load(Ordering::Relaxed) {
+            usize::MAX => &self.shards[LOCK_STAT_SLOT.with(|slot| *slot)],
+            pinned => &self.shards[pinned],
+        }
+    }
+
+    /// Take this thread's shard and count one acquisition of `site`, returning
+    /// the wait's start instant only when this acquisition is being timed.
+    ///
+    /// One TLS read and one private-line `fetch_add` on the untimed path; the
+    /// caller keeps the shard reference so the release side needs neither.
+    ///
+    /// The count is taken BEFORE the lock (it has to be, to decide whether to
+    /// read the clock), so `acquisitions` counts attempts rather than completed
+    /// acquisitions. Every attempt here does complete — these are plain blocking
+    /// `lock()` calls, no `try_lock` and no timeout — so the two differ only by
+    /// the handful currently in flight.
+    fn begin(&self, site: usize) -> (&LockStatShard<N>, Option<Instant>) {
+        let shard = self.shard();
+        let queued = shard.count(site, self.stride()).then(Instant::now);
+        (shard, queued)
+    }
+
     fn snapshot(&self, names: [&'static str; N]) -> Vec<LockSiteStats> {
         (0..N)
-            .map(|i| LockSiteStats {
-                site: names[i],
-                acquisitions: self.acquisitions[i].load(Ordering::Relaxed),
-                items: self.items[i].load(Ordering::Relaxed),
-                wait_ns: self.wait_ns[i].load(Ordering::Relaxed),
-                wait_ns_max: self.wait_ns_max[i].load(Ordering::Relaxed),
-                hold_ns: self.hold_ns[i].load(Ordering::Relaxed),
-                hold_ns_max: self.hold_ns_max[i].load(Ordering::Relaxed),
+            .map(|i| {
+                let mut out = LockSiteStats {
+                    site: names[i],
+                    acquisitions: 0,
+                    items: 0,
+                    timed: 0,
+                    wait_ns: 0,
+                    wait_ns_max: 0,
+                    hold_ns: 0,
+                    hold_ns_max: 0,
+                };
+                for shard in &self.shards {
+                    let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+                    out.acquisitions += load(&shard.acquisitions[i]);
+                    out.items += load(&shard.items[i]);
+                    out.timed += load(&shard.timed[i]);
+                    out.wait_ns += load(&shard.wait_ns[i]);
+                    out.hold_ns += load(&shard.hold_ns[i]);
+                    out.wait_ns_max = out.wait_ns_max.max(load(&shard.wait_ns_max[i]));
+                    out.hold_ns_max = out.hold_ns_max.max(load(&shard.hold_ns_max[i]));
+                }
+                // Sampling measures `timed` of `acquisitions` acquisitions, so
+                // scale the sums back up: the table keeps meaning "total ns at
+                // this site" and stays comparable with the pre-sampling history
+                // (and with `hold_ns / wall` occupancy reads). Means are
+                // unbiased — the sample is chosen by acquisition COUNT, which is
+                // independent of how long any one of them waits. The `_max`
+                // fields stay raw: a high-water mark cannot be extrapolated, so
+                // under sampling they are a lower bound.
+                let scale = |sum: u64| {
+                    if out.timed == 0 || out.acquisitions <= out.timed {
+                        sum
+                    } else {
+                        ((u128::from(sum) * u128::from(out.acquisitions))
+                            / u128::from(out.timed)) as u64
+                    }
+                };
+                out.wait_ns = scale(out.wait_ns);
+                out.hold_ns = scale(out.hold_ns);
+                out
             })
             .collect()
     }
@@ -582,11 +777,17 @@ type FreeLockStats = SiteLockStats<FREE_LOCK_SITES>;
 type RetiredLockStats = SiteLockStats<RETIRED_LOCK_SITES>;
 
 /// One site's wait/hold snapshot for one lock.
+///
+/// `wait_ns` / `hold_ns` are totals extrapolated from `timed` samples out of
+/// `acquisitions` acquisitions (see [`SiteLockStats::snapshot`]); `timed ==
+/// acquisitions` means nothing was sampled away. The `_max` fields are raw
+/// observed maxima, i.e. a lower bound when sampling is on.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct LockSiteStats {
     pub site: &'static str,
     pub acquisitions: u64,
     pub items: u64,
+    pub timed: u64,
     pub wait_ns: u64,
     pub wait_ns_max: u64,
     pub hold_ns: u64,
@@ -616,37 +817,45 @@ impl LockSiteStats {
 /// additionally refreshes per-region hints on release).
 struct TimedGuard<'a, T, const N: usize> {
     inner: std::sync::MutexGuard<'a, T>,
-    stats: &'a SiteLockStats<N>,
+    shard: &'a LockStatShard<N>,
     site: usize,
-    acquired: Instant,
+    /// `None` when this acquisition was sampled away — see
+    /// [`LOCK_STAT_SHARDS`].
+    acquired: Option<Instant>,
 }
 
 impl<'a, T, const N: usize> TimedGuard<'a, T, N> {
     /// Acquire `lock`, charging the wait to `site` and (on drop) the hold. Two
-    /// clock reads per acquisition; the `retired` critical sections this wraps
-    /// are tens of µs, so the overhead is well under 1%.
+    /// clock reads on a timed acquisition, none otherwise; the post-lock read
+    /// serves as both the wait's end and the hold's start.
     fn new(stats: &'a SiteLockStats<N>, site: usize, lock: &'a Mutex<T>) -> Self {
-        let queued = Instant::now();
+        let (shard, queued) = stats.begin(site);
         let inner = lock.lock().unwrap();
-        stats.charge_wait(site, queued.elapsed().as_nanos() as u64);
+        let acquired = queued.map(|queued| {
+            let now = Instant::now();
+            shard.charge_wait(site, now.duration_since(queued).as_nanos() as u64);
+            now
+        });
         Self {
             inner,
-            stats,
+            shard,
             site,
-            acquired: Instant::now(),
+            acquired,
         }
     }
 
     /// Record how many extents this hold covered (batch paths only).
     fn charge_items(&self, n: u64) {
-        self.stats.items[self.site].fetch_add(n, Ordering::Relaxed);
+        self.shard.charge_items(self.site, n);
     }
 }
 
 impl<T, const N: usize> Drop for TimedGuard<'_, T, N> {
     fn drop(&mut self) {
-        self.stats
-            .charge_hold(self.site, self.acquired.elapsed().as_nanos() as u64);
+        if let Some(acquired) = self.acquired {
+            self.shard
+                .charge_hold(self.site, acquired.elapsed().as_nanos() as u64);
+        }
     }
 }
 
@@ -667,9 +876,10 @@ impl<T, const N: usize> std::ops::DerefMut for TimedGuard<'_, T, N> {
 /// [`FreeLockSite`] and refreshes that region's advisory hints on release.
 struct FreeLockGuard<'a> {
     pools: std::sync::MutexGuard<'a, FreePools>,
-    stats: &'a FreeLockStats,
+    shard: &'a LockStatShard<FREE_LOCK_SITES>,
     site: usize,
-    acquired: Instant,
+    /// `None` when this acquisition was sampled away — see [`LOCK_STAT_SHARDS`].
+    acquired: Option<Instant>,
     /// Advisory aggregates for this region, refreshed on drop — see
     /// [`RegionPools::free_hint`].
     free_hint: &'a AtomicU64,
@@ -692,15 +902,17 @@ impl Drop for FreeLockGuard<'_> {
                 .map_or(0, |run| u64::from(run.count)),
             Ordering::Relaxed,
         );
-        self.stats
-            .charge_hold(self.site, self.acquired.elapsed().as_nanos() as u64);
+        if let Some(acquired) = self.acquired {
+            self.shard
+                .charge_hold(self.site, acquired.elapsed().as_nanos() as u64);
+        }
     }
 }
 
 impl FreeLockGuard<'_> {
     /// Record how many extents this hold covered (batch paths only).
     fn charge_items(&self, n: u64) {
-        self.stats.items[self.site].fetch_add(n, Ordering::Relaxed);
+        self.shard.charge_items(self.site, n);
     }
 }
 
@@ -1887,19 +2099,25 @@ impl SpaceAllocator {
     /// [`AllocSupplyStats`]. Lock-free; monotonic counters, so two reads
     /// difference cleanly.
     /// Acquire `free_pools`, charging the wait to `site` and (on drop) the hold.
-    /// Two clock reads per acquisition against a critical section measured in
-    /// µs-to-ms, i.e. well under 1%.
+    ///
+    /// This is THE hot path of the whole allocator — ~10^4 acquisitions per
+    /// unaligned allocation in the exhausted regime — so the accounting is
+    /// deliberately minimal: one TLS read, one `fetch_add` on a per-thread cache
+    /// line, and (on 1 acquisition in [`lock_stat_stride`]) two clock reads.
     fn lock_region_raw(&self, site: FreeLockSite, region: usize) -> FreeLockGuard<'_> {
         let idx = site as usize;
-        let queued = Instant::now();
+        let (shard, queued) = self.free_lock.begin(idx);
         let pools = self.regions.pools[region].lock().unwrap();
-        self.free_lock
-            .charge_wait(idx, queued.elapsed().as_nanos() as u64);
+        let acquired = queued.map(|queued| {
+            let now = Instant::now();
+            shard.charge_wait(idx, now.duration_since(queued).as_nanos() as u64);
+            now
+        });
         FreeLockGuard {
             pools,
-            stats: &self.free_lock,
+            shard,
             site: idx,
-            acquired: Instant::now(),
+            acquired,
             free_hint: &self.regions.free_hint[region],
             stripe_hint: &self.regions.stripe_hint[region],
         }
@@ -5131,6 +5349,82 @@ mod free_pool_policy_tests {
         }
     }
 
+    /// Sampling must never cost a COUNT: `acquisitions` and `items` stay exact at
+    /// any stride (they are what every rate and per-extent read divides by), only
+    /// the time is sampled — and the reported time is scaled back up so the table
+    /// still means "total ns at this site" and stays comparable with the
+    /// pre-sampling history. The first sample of a (shard, site) is always timed,
+    /// so a site that was acquired at all always reports a hold.
+    #[test]
+    fn lock_stats_sampling_keeps_counts_exact_and_scales_the_time() {
+        let stats = SiteLockStats::<2>::new();
+        stats.stride_override.store(4, Ordering::Relaxed);
+
+        for _ in 0..9 {
+            let (shard, queued) = stats.begin(0);
+            if queued.is_some() {
+                shard.charge_wait(0, 100);
+                shard.charge_hold(0, 1000);
+            }
+            shard.charge_items(0, 3);
+        }
+        // Site 1 is acquired exactly once: the "always time the first" rule is
+        // what keeps a rarely-taken site from reporting a hold of zero.
+        let (shard, queued) = stats.begin(1);
+        assert!(queued.is_some(), "the first acquisition is always timed");
+        shard.charge_wait(1, 7);
+        shard.charge_hold(1, 11);
+
+        let snap = stats.snapshot(["hot", "rare"]);
+        let hot = snap[0];
+        assert_eq!(hot.acquisitions, 9, "counts are never sampled");
+        assert_eq!(hot.items, 27, "items are never sampled");
+        // Timed acquisitions are 1, 5, 9 — ceil(9/4).
+        assert_eq!(hot.timed, 3);
+        assert_eq!(hot.wait_ns, 300 * 9 / 3, "wait scaled by acquisitions/timed");
+        assert_eq!(hot.hold_ns, 3000 * 9 / 3);
+        assert_eq!(hot.wait_ns_max, 100, "maxima stay raw (a lower bound)");
+        assert_eq!(hot.hold_ns_max, 1000);
+        assert!((hot.hold_us() - 1.0).abs() < 1e-9, "mean per acquisition holds");
+
+        let rare = snap[1];
+        assert_eq!((rare.acquisitions, rare.timed), (1, 1));
+        assert_eq!((rare.wait_ns, rare.hold_ns), (7, 11), "nothing to scale");
+    }
+
+    /// Every thread accounts to its own shard, so the snapshot has to sum them —
+    /// a per-thread counter that only ever reported one shard would silently
+    /// under-count everything the box reads.
+    #[test]
+    fn lock_stats_shards_are_summed_across_threads() {
+        let stats = std::sync::Arc::new(SiteLockStats::<1>::new());
+        // Write directly to two distinct slots: slot assignment is process-global
+        // round-robin, so this is the only way to pin the merge deterministically.
+        stats.shards[0].charge_items(0, 5);
+        stats.shards[LOCK_STAT_SHARDS - 1].charge_items(0, 7);
+        assert_eq!(stats.snapshot(["x"])[0].items, 12);
+
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let stats = std::sync::Arc::clone(&stats);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        let (shard, queued) = stats.begin(0);
+                        if let Some(queued) = queued {
+                            shard.charge_wait(0, queued.elapsed().as_nanos() as u64);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let snap = stats.snapshot(["x"])[0];
+        assert_eq!(snap.acquisitions, 4000, "no thread's count may be lost");
+        assert!(snap.timed > 0 && snap.timed <= snap.acquisitions);
+    }
+
     #[test]
     fn sub_stripe_release_before_next_alignment_never_expands() {
         let mut pools = FreePools::new();
@@ -7955,6 +8249,124 @@ pub(crate) mod aged_pool_bench {
                     .join(" "),
             );
         }
+    }
+
+    /// What the lock ACCOUNTING costs per region acquire+release — four arms in
+    /// ONE process, alternated and repeated so run-order drift is visible rather
+    /// than silent.
+    ///
+    /// The 2026-08-12 box profile put ~66% of the flush writers' CPU in region
+    /// acquire/release machinery with contention at only 10.2%, so this bench runs
+    /// each thread on its OWN region: what is left is exactly the uncontended
+    /// acquire + guard-drop path the profile blamed.
+    ///
+    /// | arm | shape |
+    /// |---|---|
+    /// | `shared+every` | every thread on one counter set, clock on every acquisition — the pre-fix shape |
+    /// | `shared+sampled` | isolates the clock reads alone |
+    /// | `sharded+every` | isolates the shared-cache-line RMWs alone |
+    /// | `sharded+sampled` | shipped default |
+    ///
+    /// Run:
+    /// ```text
+    /// cargo test --release --lib bench_lock_stats_overhead -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_lock_stats_overhead() {
+        /// The production stride. Named here because `DEFAULT_LOCK_STAT_STRIDE`
+        /// is 1 under `cfg(test)` (the accounting tests need exact timing).
+        const BENCH_STRIDE: u64 = 16;
+        let per_thread: u64 = std::env::var("ONYX_BENCH_ACQUISITIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500_000);
+        // Small enough to build in seconds; the arms differ only in accounting, so
+        // the pool shape is a shared constant, not a variable.
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let threads: usize = std::thread::available_parallelism()
+            .map(|n| n.get().min(16))
+            .unwrap_or(8);
+
+        // Explicit region count: `build_aged_pool`'s default constructor is
+        // single-region, and this bench needs one region per thread so the mutex
+        // itself never contends.
+        let (allocator, stats, _live) =
+            build_aged_pool_parts(scale, TailShape::Spread, 16, Some(64));
+        let regions = allocator.region_count();
+        let allocator = std::sync::Arc::new(allocator);
+        println!(
+            "\n=== lock-stats overhead: {threads} threads x {per_thread} acquisitions, \
+             {regions} regions, free_extents={} ===",
+            stats.free_extents
+        );
+        assert!(
+            regions >= threads,
+            "each thread needs its own region to isolate the uncontended path"
+        );
+
+        // ns per acquire+release, with the accounting configured as asked.
+        let arm = |pinned: bool, stride: u64| -> f64 {
+            allocator.free_lock.stride_override.store(stride, Ordering::Relaxed);
+            allocator
+                .free_lock
+                .shard_pin
+                .store(if pinned { 0 } else { usize::MAX }, Ordering::Relaxed);
+            let start = Instant::now();
+            let workers: Vec<_> = (0..threads)
+                .map(|tid| {
+                    let allocator = allocator.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..per_thread {
+                            let guard =
+                                allocator.lock_region_raw(FreeLockSite::Audit, tid % regions);
+                            std::hint::black_box(guard.free_blocks_in_pools());
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            let elapsed = start.elapsed().as_nanos() as f64;
+            elapsed / (threads as u64 * per_thread) as f64
+        };
+
+        let arms: [(&str, bool, u64); 4] = [
+            ("shared  + every  (pre-fix)", true, 1),
+            ("shared  + sampled", true, BENCH_STRIDE),
+            ("sharded + every", false, 1),
+            ("sharded + sampled (shipped)", false, BENCH_STRIDE),
+        ];
+        // Forward then reverse: if the two passes of one arm disagree by more than
+        // the arm-to-arm spread, the result is drift and not the knob.
+        let mut fwd = [0.0; 4];
+        let mut rev = [0.0; 4];
+        for (i, (_, pinned, stride)) in arms.iter().enumerate() {
+            fwd[i] = arm(*pinned, *stride);
+        }
+        for (i, (_, pinned, stride)) in arms.iter().enumerate().rev() {
+            rev[i] = arm(*pinned, *stride);
+        }
+        let base = (fwd[0] + rev[0]) / 2.0;
+        for (i, (label, _, _)) in arms.iter().enumerate() {
+            let mean = (fwd[i] + rev[i]) / 2.0;
+            println!(
+                "  {label:<28} {mean:7.1} ns/acq  (pass1 {:7.1} / pass2 {:7.1})  {:+6.1}% vs pre-fix",
+                fwd[i],
+                rev[i],
+                (mean - base) / base * 100.0,
+            );
+        }
+        // Restore production behaviour for anything that shares this process.
+        allocator.free_lock.stride_override.store(0, Ordering::Relaxed);
+        allocator
+            .free_lock
+            .shard_pin
+            .store(usize::MAX, Ordering::Relaxed);
     }
 }
 

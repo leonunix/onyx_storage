@@ -734,6 +734,34 @@ impl ServiceController {
                     let _ = stream.write_all(b"ok\n");
                     let _ = stream.flush();
                 }
+                // Read or set the allocator's lock-accounting sampling stride.
+                // Process-global (no engine needed) and safe at any time — see
+                // `space::allocator::set_lock_stats_stride`. It lives on the IPC
+                // surface rather than behind a restart because on this box an
+                // arm-per-restart A/B measures run-order drift, not the knob.
+                "lock-stats-stride" => {
+                    if let Some(arg) = parts.get(1) {
+                        match arg.parse::<u64>() {
+                            Ok(n) if n > 0 => {
+                                crate::space::allocator::set_lock_stats_stride(n);
+                                tracing::info!(stride = n, "lock accounting stride set");
+                            }
+                            _ => {
+                                let _ = stream.write_all(
+                                    b"error: usage: lock-stats-stride [<stride >= 1>]\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "{}\nok\n",
+                        crate::space::allocator::lock_stats_stride()
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 "mode" => {
                     let guard = engine.load();
                     let opt: &Option<OnyxEngine> = &guard;

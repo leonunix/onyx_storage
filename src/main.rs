@@ -135,6 +135,17 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Read or set the running engine's allocator lock-accounting sampling
+    /// stride (`1` = time every acquisition, the pre-2026-08-12 behaviour).
+    ///
+    /// The instrumentation is itself a measurable part of the allocator's cost at
+    /// ~10^4 region acquisitions per allocation, so this is the A/B for it — and
+    /// it has to be done inside ONE process, because on the perf box an
+    /// arm-per-restart comparison measures run-order drift, not the knob.
+    LockStatsStride {
+        /// New stride; omit to just read the current one.
+        stride: Option<u64>,
+    },
     /// chunklet RAID pool online operations (status / scrub / rebuild / job).
     /// Requires a running engine — the pool is flock-held by `start`, so these
     /// are routed to it over the IPC socket, never a second `Pool::open`.
@@ -1115,6 +1126,23 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     print!("{}", format_metadb_claims_human(&report));
                 }
+            }
+        }
+        Command::LockStatsStride { stride } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "lock-stats-stride talks to a running engine (socket {:?} not found) — \
+                     start it first, or set ONYX_LOCK_STATS_STRIDE in its environment",
+                    sock
+                );
+            }
+            let cmd = match stride {
+                Some(n) => format!("lock-stats-stride {n}"),
+                None => "lock-stats-stride".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
             }
         }
         Command::Chunklet { op } => {
