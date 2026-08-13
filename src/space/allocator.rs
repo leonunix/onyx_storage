@@ -291,6 +291,11 @@ pub struct AllocSupplyStats {
     pub refill_runs: u64,
     pub drains: u64,
     pub drain_blocks: u64,
+    /// All-region drains the empty-lane guard skipped — see
+    /// [`SpaceAllocator::drain_lane_caches_if_populated`]. `drain_skips` climbing
+    /// while `drains` stays flat is the exhausted regime: every allocation was
+    /// asking for a fold of caches that hold nothing.
+    pub drain_skips: u64,
     pub wide_hits: u64,
     pub wide_misses: u64,
 }
@@ -1887,6 +1892,12 @@ pub struct SpaceAllocator {
     lane_caches: Vec<Mutex<Vec<Pba>>>,
     /// Per-lane contiguous extent caches for raw multi-block writes.
     lane_extent_caches: Vec<Mutex<Vec<Extent>>>,
+    /// Free blocks parked in each lane cache — i.e. exactly what a
+    /// [`Self::drain_lane_caches`] would hand back. See
+    /// [`Self::lane_cached_blocks`] for why these exist and why reading them
+    /// lock-free is sound.
+    lane_cache_depth: Vec<AtomicU64>,
+    lane_extent_cache_depth: Vec<AtomicU64>,
     /// The region each lane currently refills its aligned extent cache from
     /// (`usize::MAX` = not yet chosen). Advisory: a lane that cannot be served
     /// switches, and lanes may share a region rather than starve.
@@ -1900,6 +1911,15 @@ pub struct SpaceAllocator {
     refill_runs: AtomicU64,
     drain_ops: AtomicU64,
     drain_blocks: AtomicU64,
+    /// Drains skipped because every lane cache was empty — see
+    /// [`Self::drain_lane_caches_if_populated`]. Read against `drain_ops`: a
+    /// large ratio is the guard earning its keep, and `drain_ops` staying high
+    /// while allocations fail means the lanes really do hold the space.
+    drain_skips: AtomicU64,
+    /// Test-only: restore the pre-2026-08-13 unconditional drain, so
+    /// `bench_empty_drain_guard` can price the guard inside ONE process.
+    #[cfg(test)]
+    drain_guard_off: AtomicBool,
     /// Times a lane moved its aligned refill to a different region.
     region_switches: AtomicU64,
     /// Refill attempts that found nothing usable in the region they tried.
@@ -2025,6 +2045,8 @@ impl SpaceAllocator {
         }
         let lane_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
         let lane_extent_caches = (0..num_lanes).map(|_| Mutex::new(Vec::new())).collect();
+        let lane_cache_depth = (0..num_lanes).map(|_| AtomicU64::new(0)).collect();
+        let lane_extent_cache_depth = (0..num_lanes).map(|_| AtomicU64::new(0)).collect();
         let lane_regions = (0..num_lanes).map(|_| AtomicUsize::new(usize::MAX)).collect();
         let alloc_tracker = std::env::var("ONYX_ALLOC_TRACK")
             .map(|value| {
@@ -2048,6 +2070,8 @@ impl SpaceAllocator {
             retired_lock: RetiredLockStats::new(),
             lane_caches,
             lane_extent_caches,
+            lane_cache_depth,
+            lane_extent_cache_depth,
             lane_regions,
             alloc_tracker,
             aligned_allocs: AtomicU64::new(0),
@@ -2056,6 +2080,9 @@ impl SpaceAllocator {
             refill_runs: AtomicU64::new(0),
             drain_ops: AtomicU64::new(0),
             drain_blocks: AtomicU64::new(0),
+            drain_skips: AtomicU64::new(0),
+            #[cfg(test)]
+            drain_guard_off: AtomicBool::new(false),
             region_switches: AtomicU64::new(0),
             region_refill_misses: AtomicU64::new(0),
             stripe_refill_run_stripes: AtomicU64::new(0),
@@ -2300,6 +2327,7 @@ impl SpaceAllocator {
             refill_runs: self.refill_runs.load(Ordering::Relaxed),
             drains: self.drain_ops.load(Ordering::Relaxed),
             drain_blocks: self.drain_blocks.load(Ordering::Relaxed),
+            drain_skips: self.drain_skips.load(Ordering::Relaxed),
             wide_hits: self.refill_wide_hits.load(Ordering::Relaxed),
             wide_misses: self.refill_wide_misses.load(Ordering::Relaxed),
         }
@@ -2794,9 +2822,7 @@ impl SpaceAllocator {
         // Global pool empty — drain lane caches and retry. The retry walks EVERY
         // region (no hint skipping) so this ENOSPC verdict never rests on a
         // stale advisory hint.
-        if !self.lane_caches.is_empty() {
-            self.drain_lane_caches();
-        }
+        self.drain_lane_caches_if_populated();
         if let Some(pba) = self.take_first_regionwise(FreeLockSite::SmallAlloc, 1, false) {
             self.track_alloc(Extent::single(pba.start), "allocate_one_retry")?;
             self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
@@ -2902,6 +2928,7 @@ impl SpaceAllocator {
         {
             let mut cache = self.lane_caches[lane].lock().unwrap();
             if let Some(pba) = cache.pop() {
+                self.publish_lane_depth(lane, &cache);
                 // Count as allocated only when given to caller
                 self.track_alloc(Extent::single(pba), "allocate_one_for_lane_cache")?;
                 self.allocated_blocks.fetch_add(1, Ordering::Relaxed);
@@ -2915,7 +2942,7 @@ impl SpaceAllocator {
         let first_pba = match self.refill_one_lane_from_global(lane, LANE_CACHE_REFILL_SIZE) {
             Some(pba) => pba,
             None => {
-                self.drain_lane_caches();
+                self.drain_lane_caches_if_populated();
                 self.refill_one_lane_from_global(lane, LANE_CACHE_REFILL_SIZE)
                     .ok_or(OnyxError::SpaceExhausted)?
             }
@@ -2935,24 +2962,71 @@ impl SpaceAllocator {
     /// `FreePools -> lane cache`, and which regions the cached extents land in is
     /// only known after the lane locks are taken, so the region side has to be
     /// acquired first and in full.
+    /// [`Self::drain_lane_caches`], but only when the lanes actually hold
+    /// something. Returns whether the drain ran, so a caller can skip the retry
+    /// that only makes sense after blocks came back.
+    ///
+    /// EVERY allocation-path drain goes through this. The drain is the single
+    /// most expensive operation in the allocator (every region lock in one hold),
+    /// it is reached only at ENOSPC boundaries, and at those boundaries the lanes
+    /// are usually empty — which is *why* the allocation is failing. Before this
+    /// guard, five of the seven call sites ran it unconditionally and one
+    /// unaligned allocation could pay for it three times over: reserve-miss,
+    /// refill-miss, then `allocate_extent`'s two retries.
+    ///
+    /// See [`Self::lane_cached_blocks`] for why the lock-free check is sound.
+    fn drain_lane_caches_if_populated(&self) -> bool {
+        #[cfg(test)]
+        if self.drain_guard_off.load(Ordering::Relaxed) {
+            // `bench_empty_drain_guard`'s pre-fix arm.
+            self.drain_lane_caches();
+            return true;
+        }
+        if !self.has_lane_cached_blocks() {
+            self.drain_skips.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.drain_lane_caches();
+        true
+    }
+
     pub fn drain_lane_caches(&self) {
         let mut drained: u64 = 0;
         let mut pools = self.lock_all_regions(FreeLockSite::Drain);
-        for cache_mutex in &self.lane_caches {
+        // Sampled INSIDE the all-regions hold, which is what makes the invariant
+        // below checkable: outside it a refill may legally push (see
+        // `lane_cached_blocks`), so a sample taken before the locks would trail
+        // the truth for a perfectly correct reason.
+        let claimed = self.lane_cached_blocks();
+        for (lane, cache_mutex) in self.lane_caches.iter().enumerate() {
             let mut cache = cache_mutex.lock().unwrap();
             for pba in cache.drain(..) {
                 pools.release_extent(Extent::single(pba));
                 drained += 1;
             }
+            self.publish_lane_depth(lane, &cache);
         }
-        for cache_mutex in &self.lane_extent_caches {
+        for (lane, cache_mutex) in self.lane_extent_caches.iter().enumerate() {
             let mut cache = cache_mutex.lock().unwrap();
             for extent in cache.drain(..) {
                 pools.release_extent(extent);
                 drained += u64::from(extent.count);
             }
+            self.publish_lane_extent_depth(lane, &cache);
         }
         drop(pools);
+        // The depth counters must never UNDER-report: the whole point is that a
+        // caller may skip this drain when they read zero, so a missing publish
+        // would turn into a spurious `SpaceExhausted`. `claimed >= drained` is
+        // the race-tolerant form of that invariant — a pop that landed while the
+        // drain was running (pops need no region lock) can only make `claimed`
+        // the larger of the two, while a forgotten publish on a PUSH is exactly
+        // what makes it smaller. Pushes cannot race the drain itself: they
+        // publish under a region lock and this holds every one of them.
+        debug_assert!(
+            claimed >= drained,
+            "lane depth counters under-reported: claimed {claimed} < drained {drained}"
+        );
         self.drain_ops.fetch_add(1, Ordering::Relaxed);
         self.drain_blocks.fetch_add(drained, Ordering::Relaxed);
         // No counter adjustment needed: cached blocks were never counted as allocated
@@ -3024,7 +3098,7 @@ impl SpaceAllocator {
                     return Ok(extent);
                 }
                 if attempt == 0 {
-                    self.drain_lane_caches();
+                    self.drain_lane_caches_if_populated();
                     continue;
                 }
                 break;
@@ -3035,6 +3109,7 @@ impl SpaceAllocator {
         {
             let mut cache = self.lane_extent_caches[lane].lock().unwrap();
             if let Some(extent) = Self::take_from_extent_cache(&mut cache, count) {
+                self.publish_lane_extent_depth(lane, &cache);
                 self.track_alloc(extent, "allocate_extent_for_lane_cache")?;
                 self.allocated_blocks
                     .fetch_add(count as u64, Ordering::Relaxed);
@@ -3048,9 +3123,12 @@ impl SpaceAllocator {
         if result.is_none() {
             // A global fragment can become usable only after it coalesces with
             // short pieces held by one or more lanes. Exact allocation is the
-            // ENOSPC boundary, so pay for one bounded drain and retry here.
-            self.drain_lane_caches();
-            result = self.refill_extent_lane(lane, count, target);
+            // ENOSPC boundary, so pay for one bounded drain and retry here —
+            // unless the lanes hold nothing, in which case the coalesce this is
+            // hoping for cannot exist.
+            if self.drain_lane_caches_if_populated() {
+                result = self.refill_extent_lane(lane, count, target);
+            }
         }
 
         let Some(result) = result else {
@@ -3110,6 +3188,7 @@ impl SpaceAllocator {
             if let Some(extent) =
                 Self::take_aligned_from_extent_cache(&mut cache, need, stripe_blocks, phase)
             {
+                self.publish_lane_extent_depth(lane, &cache);
                 self.track_alloc(extent, "allocate_stripe_extent_for_lane_cache")?;
                 self.allocated_blocks
                     .fetch_add(need as u64, Ordering::Relaxed);
@@ -3127,8 +3206,14 @@ impl SpaceAllocator {
             // A cold lane may hold the only remaining aligned refill. Reclaim
             // all lane caches once at the reserve-miss boundary, then let the
             // requesting lane seed itself from the reconstituted reserve.
-            self.drain_lane_caches();
-            extent = self.refill_stripe_extent_lane(lane, need, want, stripe_blocks, phase);
+            //
+            // This is the hottest of the drain sites — on the box the exhausted
+            // regime took this branch 3.37 M times at 5.34 ms each — and also the
+            // one where the drain is most often pointless: a reserve miss under a
+            // starved pool means the lanes are empty too.
+            if self.drain_lane_caches_if_populated() {
+                extent = self.refill_stripe_extent_lane(lane, need, want, stripe_blocks, phase);
+            }
         }
         let Some(extent) = extent else {
             return self.allocate_stripe_extent_global(need, stripe_blocks, phase);
@@ -3274,8 +3359,7 @@ impl SpaceAllocator {
             // No contiguous extent large enough. Cached lane extents may hold
             // enough free contiguous space, so fold them back once before
             // falling back to the largest global fragment.
-            if attempt == 0 && self.has_lane_cached_blocks() {
-                self.drain_lane_caches();
+            if attempt == 0 && self.drain_lane_caches_if_populated() {
                 continue;
             }
 
@@ -3290,8 +3374,7 @@ impl SpaceAllocator {
             }
 
             // No free extents at all — drain lane caches and retry once
-            if attempt == 0 && self.has_lane_cached_blocks() {
-                self.drain_lane_caches();
+            if attempt == 0 && self.drain_lane_caches_if_populated() {
                 continue;
             }
             break;
@@ -4271,7 +4354,7 @@ impl SpaceAllocator {
     fn extract_lane_cache_free_parts(&self, target: Extent) -> Vec<Extent> {
         let mut extracted = Vec::new();
 
-        for cache_mutex in &self.lane_caches {
+        for (lane, cache_mutex) in self.lane_caches.iter().enumerate() {
             let mut cache = cache_mutex.lock().unwrap();
             cache.retain(|pba| {
                 if target.contains(*pba) {
@@ -4281,9 +4364,10 @@ impl SpaceAllocator {
                     true
                 }
             });
+            self.publish_lane_depth(lane, &cache);
         }
 
-        for cache_mutex in &self.lane_extent_caches {
+        for (lane, cache_mutex) in self.lane_extent_caches.iter().enumerate() {
             let mut cache = cache_mutex.lock().unwrap();
             // Rebuilt through `push_extent_cache` so the descending-by-start
             // invariant survives splitting one cached run into head + tail.
@@ -4317,6 +4401,7 @@ impl SpaceAllocator {
                 }
             }
             *cache = retained;
+            self.publish_lane_extent_depth(lane, &cache);
         }
 
         extracted
@@ -4599,11 +4684,15 @@ impl SpaceAllocator {
     }
 
     fn clear_lane_caches(&self) {
-        for cache in &self.lane_caches {
-            cache.lock().unwrap().clear();
+        for (lane, cache) in self.lane_caches.iter().enumerate() {
+            let mut cache = cache.lock().unwrap();
+            cache.clear();
+            self.publish_lane_depth(lane, &cache);
         }
-        for cache in &self.lane_extent_caches {
-            cache.lock().unwrap().clear();
+        for (lane, cache) in self.lane_extent_caches.iter().enumerate() {
+            let mut cache = cache.lock().unwrap();
+            cache.clear();
+            self.publish_lane_extent_depth(lane, &cache);
         }
     }
 
@@ -4627,14 +4716,66 @@ impl SpaceAllocator {
         Ok(())
     }
 
-    fn has_lane_cached_blocks(&self) -> bool {
-        self.lane_caches
+    /// Publish `lane`'s single-block cache depth. Every entry is one block, so
+    /// this is O(1). MUST be called under that lane's cache lock, by every path
+    /// that changes the cache — the value is DERIVED from the cache rather than
+    /// accumulated as a delta, so a site that forgets to publish can only be
+    /// stale for one lane until its next mutation, and can never drift or go
+    /// negative.
+    fn publish_lane_depth(&self, lane: usize, cache: &[Pba]) {
+        self.lane_cache_depth[lane].store(cache.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Publish `lane`'s extent cache depth in BLOCKS. Same discipline as
+    /// [`Self::publish_lane_depth`]; the sum is over the handful of runs one
+    /// refill parks (bounded by [`LANE_EXTENT_CACHE_REFILL_RUNS`]).
+    fn publish_lane_extent_depth(&self, lane: usize, cache: &[Extent]) {
+        let blocks = cache.iter().map(|e| u64::from(e.count)).sum();
+        self.lane_extent_cache_depth[lane].store(blocks, Ordering::Relaxed);
+    }
+
+    /// Park `extent` in a lane's extent cache the way a refill would — including
+    /// the depth publish, without which the allocation paths would (correctly)
+    /// treat the lane as empty and skip the drain that folds it back.
+    #[cfg(test)]
+    fn seed_lane_extent_cache(&self, lane: usize, extent: Extent) {
+        let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+        Self::push_extent_cache(&mut cache, extent);
+        self.publish_lane_extent_depth(lane, &cache);
+    }
+
+    /// Blocks a [`Self::drain_lane_caches`] would hand back, from `2 * lanes`
+    /// relaxed loads instead of `2 * lanes` MUTEX acquisitions.
+    ///
+    /// This is what lets the ENOSPC paths skip a drain that is provably a no-op.
+    /// The drain is the most expensive operation in the allocator — it takes
+    /// EVERY region lock (2048 by default) in one hold plus a 2048-entry guard
+    /// vector — and in the exhausted regime it is also the most useless: the
+    /// lanes are empty precisely because allocation is failing, yet five of its
+    /// seven call sites used to run it unconditionally, several of them twice
+    /// within one allocation.
+    ///
+    /// **Why a lock-free read is sound.** Blocks only enter a lane cache from a
+    /// refill, and every refill publishes into the cache while holding a REGION
+    /// lock; `drain_lane_caches` holds EVERY region lock for its whole duration.
+    /// So no push can be in flight while a drain runs, and a reader that sees 0
+    /// cannot be missing blocks that a drain would have recovered. Blocks that
+    /// appear after the read came from a refill that took them out of the same
+    /// pool the reader had just found empty — the identical race the
+    /// unconditional drain already had, since it too would have run either
+    /// before or after that refill's lock hold. Pops need no region lock, but a
+    /// pop only lowers the truth, so a stale-high read costs one wasted drain
+    /// (i.e. exactly the old behaviour) and never a wrong answer.
+    fn lane_cached_blocks(&self) -> u64 {
+        self.lane_cache_depth
             .iter()
-            .any(|cache| !cache.lock().unwrap().is_empty())
-            || self
-                .lane_extent_caches
-                .iter()
-                .any(|cache| !cache.lock().unwrap().is_empty())
+            .chain(self.lane_extent_cache_depth.iter())
+            .map(|depth| depth.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn has_lane_cached_blocks(&self) -> bool {
+        self.lane_cached_blocks() > 0
     }
 
     /// Transfer a global refill into a single-block lane cache atomically with
@@ -4656,6 +4797,7 @@ impl SpaceAllocator {
                 for i in 1..refill.count {
                     cache.push(Pba(refill.start.0 + i as u64));
                 }
+                self.publish_lane_depth(lane, &cache);
             }
             return Some(refill.start);
         }
@@ -4673,10 +4815,12 @@ impl SpaceAllocator {
             };
             let result = Extent::new(refill.start, count);
             if refill.count > count {
+                let mut cache = self.lane_extent_caches[lane].lock().unwrap();
                 Self::push_extent_cache(
-                    &mut self.lane_extent_caches[lane].lock().unwrap(),
+                    &mut cache,
                     Extent::new(Pba(refill.start.0 + count as u64), refill.count - count),
                 );
+                self.publish_lane_extent_depth(lane, &cache);
             }
             return Some(result);
         }
@@ -5002,10 +5146,12 @@ impl SpaceAllocator {
         self.refill_blocks
             .fetch_add(refill_blocks, Ordering::Relaxed);
         self.refill_runs.fetch_add(refill_runs, Ordering::Relaxed);
-        Some(
-            Self::take_aligned_from_extent_cache(&mut cache, min_count, stripe, phase)
-                .expect("stripe-reserve refill is aligned and large enough"),
-        )
+        let carved = Self::take_aligned_from_extent_cache(&mut cache, min_count, stripe, phase)
+            .expect("stripe-reserve refill is aligned and large enough");
+        // One publish for the whole refill: the push loop and the carve both ran
+        // under this single lane-lock hold.
+        self.publish_lane_extent_depth(lane, &cache);
+        Some(carved)
     }
 
     /// Take an aligned extent while preserving the legacy API contract that
@@ -5525,6 +5671,156 @@ mod free_pool_policy_tests {
         assert!(allocator.lane_extent_caches[0].lock().unwrap().is_empty());
     }
 
+    /// True blocks parked in every lane cache, read the expensive way.
+    fn lane_cached_truth(allocator: &SpaceAllocator) -> Vec<u64> {
+        allocator
+            .lane_caches
+            .iter()
+            .map(|c| c.lock().unwrap().len() as u64)
+            .chain(allocator.lane_extent_caches.iter().map(|c| {
+                c.lock()
+                    .unwrap()
+                    .iter()
+                    .map(|e| u64::from(e.count))
+                    .sum::<u64>()
+            }))
+            .collect()
+    }
+
+    fn assert_depths_exact(allocator: &SpaceAllocator, context: &str) {
+        let published: Vec<u64> = allocator
+            .lane_cache_depth
+            .iter()
+            .chain(allocator.lane_extent_cache_depth.iter())
+            .map(|d| d.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            published,
+            lane_cached_truth(allocator),
+            "lane depth counters disagree with the caches after {context}"
+        );
+    }
+
+    /// Every ENOSPC path now asks the depth counters — instead of `2 * lanes`
+    /// mutexes — whether an all-regions drain is worth doing, so a publish that
+    /// goes missing at any mutation site would make the allocator skip a drain
+    /// that had blocks to give (a spurious `SpaceExhausted`). Single-threaded, so
+    /// the counters must match the caches EXACTLY after every operation, and the
+    /// traffic below is chosen to touch all of them: both refill kinds, both pop
+    /// kinds, the drain, the quarantine extraction, and the rebuild's clear.
+    #[test]
+    fn lane_depth_counters_track_the_caches_through_mixed_traffic() {
+        const LANES: usize = 4;
+        let allocator = allocator(RESERVED_BLOCKS + 1024, LANES);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        assert_depths_exact(&allocator, "geometry install");
+
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut held: Vec<Extent> = Vec::new();
+        for step in 0..600usize {
+            let lane = step % LANES;
+            let roll = next() % 100;
+            let got = if roll < 40 {
+                allocator.allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE)
+            } else if roll < 70 {
+                allocator.allocate_extent_for_lane(lane, 1 + (next() % 4) as u32)
+            } else {
+                allocator.allocate_one_for_lane(lane).map(Extent::single)
+            };
+            if let Ok(extent) = got {
+                held.push(extent);
+            }
+            assert_depths_exact(&allocator, "an allocation");
+            if held.len() > 8 && next() % 2 == 0 {
+                let extent = held.swap_remove(next() as usize % held.len());
+                allocator.free_extent(extent).unwrap();
+                assert_depths_exact(&allocator, "a free");
+            }
+        }
+
+        // Quarantine detaches the parts of the lane caches it covers.
+        let target = Extent::new(
+            Pba(SpaceAllocator::align_up_pba(
+                RESERVED_BLOCKS + 256,
+                u64::from(STRIPE),
+                u64::from(PHASE),
+            )),
+            STRIPE,
+        );
+        if allocator.begin_defrag_quarantine(target).is_ok() {
+            assert_depths_exact(&allocator, "a quarantine open");
+            allocator.cancel_defrag_quarantine(target.start);
+        }
+
+        // The drain zeroes every counter, and does so having folded back exactly
+        // as many blocks as they claimed.
+        let claimed: u64 = lane_cached_truth(&allocator).iter().sum();
+        let drained_before = allocator.supply_stats().drain_blocks;
+        allocator.drain_lane_caches();
+        assert_eq!(
+            allocator.supply_stats().drain_blocks - drained_before,
+            claimed,
+            "the drain folded back a different number of blocks than the caches held"
+        );
+        assert_depths_exact(&allocator, "a drain");
+        assert_eq!(allocator.lane_cached_blocks(), 0);
+    }
+
+    /// The point of the guard: at the exhaustion boundary with empty lanes, the
+    /// allocator must stop paying for an all-regions drain that can only return
+    /// nothing. `free_lock.drain` acquisitions are the proof — one drain costs one
+    /// per region.
+    #[test]
+    fn enospc_with_empty_lanes_takes_no_region_locks_for_the_drain() {
+        let allocator = allocator(RESERVED_BLOCKS + 8, 2);
+        let drain_acqs = |a: &SpaceAllocator| {
+            a.free_lock_stats()
+                .iter()
+                .find(|s| s.site == "drain")
+                .expect("every site is always reported")
+                .acquisitions
+        };
+        // Consume the pool through the non-lane path so nothing is ever cached.
+        while allocator.allocate_extent(1).is_ok() {}
+        assert_eq!(allocator.lane_cached_blocks(), 0);
+        let before = drain_acqs(&allocator);
+
+        for _ in 0..4 {
+            assert!(matches!(
+                allocator.allocate_one(),
+                Err(OnyxError::SpaceExhausted)
+            ));
+            assert!(matches!(
+                allocator.allocate_extent(4),
+                Err(OnyxError::SpaceExhausted)
+            ));
+            assert!(matches!(
+                allocator.allocate_exact_extent_for_lane(0, 4),
+                Err(OnyxError::SpaceExhausted)
+            ));
+        }
+        assert_eq!(
+            drain_acqs(&allocator),
+            before,
+            "a provably empty drain still took region locks"
+        );
+        let supply = allocator.supply_stats();
+        assert_eq!(supply.drains, 0, "no drain should have run");
+        assert!(supply.drain_skips >= 12, "skips: {}", supply.drain_skips);
+
+        // Positive control: with a lane holding space, the drain must still run.
+        allocator.seed_lane_extent_cache(1, Extent::new(Pba(RESERVED_BLOCKS + 1), 2));
+        assert!(allocator.allocate_extent(2).is_ok());
+        assert_eq!(allocator.supply_stats().drains, 1);
+        assert!(drain_acqs(&allocator) > before);
+    }
+
     #[test]
     fn exact_miss_coalesces_global_and_lane_boundary_before_enospc() {
         let allocator = allocator(32, 1);
@@ -5533,10 +5829,7 @@ mod free_pool_policy_tests {
             *pools = FreePools::new();
             pools.general.insert(Extent::single(Pba(13)));
         }
-        allocator.lane_extent_caches[0]
-            .lock()
-            .unwrap()
-            .push(Extent::new(Pba(14), 2));
+        allocator.seed_lane_extent_cache(0, Extent::new(Pba(14), 2));
 
         assert_eq!(
             allocator.allocate_exact_extent_for_lane(0, 3).unwrap(),
@@ -8247,6 +8540,105 @@ pub(crate) mod aged_pool_bench {
                     .map(|s| format!("{}={:.2}s", s.site, s.hold_ns as f64 / 1e9))
                     .collect::<Vec<_>>()
                     .join(" "),
+            );
+        }
+    }
+
+    /// What the unconditional all-regions drain cost at the exhaustion boundary,
+    /// as two arms in ONE process.
+    ///
+    /// The exhausted regime is where the box spends its time: the reserve is gone,
+    /// so `allocate_stripe_extent_for_lane` misses, and before 2026-08-13 that
+    /// miss paid for `drain_lane_caches()` — every region lock in one hold plus a
+    /// `regions`-entry guard vector — to fold back lane caches that are empty
+    /// precisely BECAUSE allocation is failing.
+    ///
+    /// Run:
+    /// ```text
+    /// cargo test --release --lib bench_empty_drain_guard -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_empty_drain_guard() {
+        let per_thread: u64 = std::env::var("ONYX_BENCH_ALLOCS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let threads: usize = std::thread::available_parallelism()
+            .map(|n| n.get().min(16))
+            .unwrap_or(8);
+
+        // Production region count, because the whole cost being priced is "one
+        // lock per region".
+        let (allocator, _stats, _live) =
+            build_aged_pool_parts(scale, TailShape::Spread, 16, Some(DEFAULT_ALLOCATOR_REGIONS));
+        let regions = allocator.region_count();
+        // Drain the reserve so every aligned allocation takes the miss branch,
+        // then empty the lane caches — the exhausted regime's shape.
+        while allocator
+            .allocate_stripe_extent_for_lane(0, STRIPE, STRIPE, PHASE)
+            .is_ok()
+        {}
+        allocator.drain_lane_caches();
+        let allocator = std::sync::Arc::new(allocator);
+        println!(
+            "\n=== empty-drain guard: {threads} threads x {per_thread} failing aligned allocs, \
+             {regions} regions ==="
+        );
+
+        let arm = |guard_off: bool| -> (f64, u64) {
+            allocator.free_lock.shards.iter().for_each(|shard| {
+                shard.acquisitions[FreeLockSite::Drain as usize].store(0, Ordering::Relaxed);
+            });
+            allocator
+                .drain_guard_off
+                .store(guard_off, Ordering::Relaxed);
+            let start = Instant::now();
+            let workers: Vec<_> = (0..threads)
+                .map(|tid| {
+                    let allocator = allocator.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..per_thread {
+                            let _ = std::hint::black_box(
+                                allocator
+                                    .allocate_stripe_extent_for_lane(tid, STRIPE, STRIPE, PHASE),
+                            );
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            let ns = start.elapsed().as_nanos() as f64 / (threads as u64 * per_thread) as f64;
+            let locks: u64 = allocator
+                .free_lock_stats()
+                .iter()
+                .find(|s| s.site == "drain")
+                .map_or(0, |s| s.acquisitions);
+            (ns, locks)
+        };
+
+        // Alternate so drift shows up instead of hiding in an A-then-B order.
+        let (off1, off1_locks) = arm(true);
+        let (on1, on1_locks) = arm(false);
+        let (on2, on2_locks) = arm(false);
+        let (off2, off2_locks) = arm(true);
+        allocator.drain_guard_off.store(false, Ordering::Relaxed);
+        for (label, a, b, la, lb) in [
+            ("unconditional (pre-fix)", off1, off2, off1_locks, off2_locks),
+            ("guarded (shipped)", on1, on2, on1_locks, on2_locks),
+        ] {
+            println!(
+                "  {label:<26} {:10.1} ns/alloc  (pass1 {:10.1} / pass2 {:10.1})  \
+                 drain region locks {la} / {lb}",
+                (a + b) / 2.0,
+                a,
+                b,
             );
         }
     }

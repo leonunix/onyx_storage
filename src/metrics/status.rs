@@ -1085,15 +1085,16 @@ impl EngineStatusSnapshot {
                 // the ratios are for eyeballing a single read and are NOT
                 // differenceable.
                 "allocator_supply: aligned_allocs={} refills={} refill_blocks={} \
-                 refill_runs={} drains={} drain_blocks={} wide_hits={} wide_misses={} \
-                 allocs_per_refill={:.2} blocks_per_refill={:.1} runs_per_refill={:.1} \
-                 blocks_per_run={:.1}",
+                 refill_runs={} drains={} drain_blocks={} drain_skips={} wide_hits={} \
+                 wide_misses={} allocs_per_refill={:.2} blocks_per_refill={:.1} \
+                 runs_per_refill={:.1} blocks_per_run={:.1}",
                 s.aligned_allocs,
                 s.refills,
                 s.refill_blocks,
                 s.refill_runs,
                 s.drains,
                 s.drain_blocks,
+                s.drain_skips,
                 s.wide_hits,
                 s.wide_misses,
                 s.allocs_per_refill(),
