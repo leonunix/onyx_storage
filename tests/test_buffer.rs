@@ -717,12 +717,20 @@ fn append_retries_transient_sync_failure_without_losing_pending_entry() {
 
 #[test]
 fn append_is_durable_and_published_on_return() {
-    // Pre-ack-after-LV2 design had a window where the entry was visible
-    // in lba_index but the ready channel hadn't been signaled yet. Under
-    // the new design `pool.append()` blocks until both LV2 fdatasync
-    // covers the seq AND the seq has been pushed onto the ready channels,
-    // so the legacy "visible before ready" ordering is no longer
-    // observable. Both should be true the instant append returns.
+    // What `append()` actually guarantees on return is DURABILITY: it parks in
+    // `wait_for_durable` until the LV2 fdatasync covers its seq, so ack = durable
+    // and the entry is visible in `lba_index`.
+    //
+    // The ready-channel publish is NOT ordered before that return, and must not
+    // be: the LV2 sync thread calls `lv2_durability.advance()` — which releases
+    // every parked appender — and only then `publish_ready()`. Publishing first
+    // would let the flusher pull a seq off the channel that is not yet durable,
+    // and the channel path (`try_enqueue_pending_seq`) has no durability gate of
+    // its own; only the snapshot path (`is_seq_ready_for_flush`) does. So the
+    // appender can legitimately win that race and see an empty channel — this
+    // test asserted `try_recv` and flaked about once in ten suite runs
+    // (2026-08-14). What IS guaranteed is that the publish follows immediately,
+    // so wait for it with a bound instead.
     let tmp = NamedTempFile::new().unwrap();
     let size = 4096 + 4096 + 8 * 8192;
     tmp.as_file().set_len(size).unwrap();
@@ -736,8 +744,11 @@ fn append_is_durable_and_published_on_return() {
     let found = pool.lookup("test-vol", Lba(9)).unwrap().unwrap();
     assert_eq!(&**found.payload.as_ref().unwrap(), &*data);
 
-    // Append guarantees publish-before-return now.
-    assert_eq!(pool.try_recv_ready().unwrap(), seq);
+    // Durable on return, and published right after.
+    assert_eq!(
+        pool.recv_ready_timeout(Duration::from_secs(2)).unwrap(),
+        seq
+    );
 }
 
 #[test]
