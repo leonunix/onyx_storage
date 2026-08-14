@@ -117,6 +117,16 @@ const MIN_REGION_BLOCKS: u64 = 4096;
 /// lane-cache drain / global aligned search.
 const REGION_REFILL_TRIES: usize = 4;
 
+/// How many peek-then-fold rounds a per-lane drain will do.
+///
+/// One round folds back everything the lane held when it peeked. A second is only
+/// needed when a concurrent refill parked something in a region the round had
+/// already passed — and a refill can only do that by taking blocks OUT of the
+/// pool, so leaving them for the next drain costs nothing. At shutdown, where the
+/// drain must not leak blocks, there are no concurrent refills and the first
+/// round takes everything.
+const LANE_DRAIN_ROUNDS: usize = 2;
+
 /// Serialize every region acquisition behind one gate, reproducing the
 /// pre-region single-global-lock contention shape at runtime.
 static REGION_SERIALIZE: AtomicBool = AtomicBool::new(false);
@@ -2285,10 +2295,15 @@ impl SpaceAllocator {
         }
     }
 
-    /// Lock EVERY region ascending. Only for paths that must see the whole
-    /// space atomically — today just `drain_lane_caches`, which folds lane
-    /// caches back and therefore has to hold the region locks across the lane
-    /// locks to keep the `FreePools -> lane cache` order.
+    /// Lock EVERY region ascending. Only for paths that must see the whole space
+    /// atomically — today just `set_geometry`, which re-plans the region
+    /// boundaries and therefore has to empty and re-route every region at once.
+    ///
+    /// ⚠ Nothing on an ALLOCATION path may use this. It is `regions` mutex
+    /// acquisitions plus a `regions`-entry guard vector in one exclusive hold, and
+    /// every version of "the allocator is slow" measured since 2026-08-12 has come
+    /// back to some path doing per-region work per allocation. `drain_lane_caches`
+    /// used to be here and now folds one region at a time.
     fn lock_all_regions(&self, site: FreeLockSite) -> SpanGuard<'_> {
         let layout = self.regions.layout();
         let gate = self.regions.gate();
@@ -3113,13 +3128,6 @@ impl SpaceAllocator {
         Ok(first_pba)
     }
 
-    /// Return all cached blocks from lane caches to the global free list.
-    /// Called during shutdown to prevent block leaks.
-    /// Holds EVERY region lock across the lane locks. That is the one place the
-    /// all-regions guard is needed: the allocator-wide order is
-    /// `FreePools -> lane cache`, and which regions the cached extents land in is
-    /// only known after the lane locks are taken, so the region side has to be
-    /// acquired first and in full.
     /// [`Self::drain_lane_caches`], but only when the lanes actually hold
     /// something. Returns whether the drain ran, so a caller can skip the retry
     /// that only makes sense after blocks came back.
@@ -3148,14 +3156,48 @@ impl SpaceAllocator {
         true
     }
 
+    /// Return all cached blocks from the lane caches to the global free list.
+    /// Also called at shutdown, to prevent block leaks.
+    ///
+    /// Locks ONE REGION AT A TIME, not all of them. The old all-regions hold was
+    /// there because "which regions the cached extents land in is only known after
+    /// the lane locks are taken, so the region side has to be acquired first and
+    /// in full" — true, but a lane refills from one region at a time
+    /// (`lane_regions`), so its cache almost always sits in a single region, and
+    /// the set can simply be PEEKED first (lane lock only, released before any
+    /// region lock is taken, which is the `FreePools -> lane cache` order every
+    /// allocation path already follows).
+    ///
+    /// This matters because the drain became the allocator's biggest region-lock
+    /// consumer once the futile walks were gone: on the 2026-08-14 box it ran
+    /// 5,768 times in 493 s, and each run took 2048 region locks in one exclusive
+    /// hold **to recover 5.1 blocks**.
+    ///
+    /// ⚠ The move out of a cache and into a pool MUST happen with the owning
+    /// region locked and the lane locked, in that order. Popping first and
+    /// releasing afterwards would leave the blocks in neither place for a moment,
+    /// and a defrag quarantine publishing in that window would miss them —
+    /// exactly the "quarantine cannot miss an in-flight refill" invariant the
+    /// refill paths are built around, and the class of bug that produced the
+    /// stripe-publish CRC P0.
     pub fn drain_lane_caches(&self) {
         let mut drained: u64 = 0;
+        for lane in 0..self.lane_caches.len() {
+            drained += self.drain_lane_pbas(lane);
+            drained += self.drain_lane_extents(lane);
+        }
+        self.drain_ops.fetch_add(1, Ordering::Relaxed);
+        self.drain_blocks.fetch_add(drained, Ordering::Relaxed);
+        // No counter adjustment needed: cached blocks were never counted as allocated
+    }
+
+    /// The pre-2026-08-14 drain: every region lock in ONE hold, across every lane
+    /// lock. Kept as the differential oracle (`per_lane_drain_matches_the_all_regions_drain`)
+    /// and the pre-fix arm of `bench_per_lane_drain`.
+    #[cfg(test)]
+    fn drain_lane_caches_all_regions(&self) {
+        let mut drained: u64 = 0;
         let mut pools = self.lock_all_regions(FreeLockSite::Drain);
-        // Sampled INSIDE the all-regions hold, which is what makes the invariant
-        // below checkable: outside it a refill may legally push (see
-        // `lane_cached_blocks`), so a sample taken before the locks would trail
-        // the truth for a perfectly correct reason.
-        let claimed = self.lane_cached_blocks();
         for (lane, cache_mutex) in self.lane_caches.iter().enumerate() {
             let mut cache = cache_mutex.lock().unwrap();
             for pba in cache.drain(..) {
@@ -3173,21 +3215,98 @@ impl SpaceAllocator {
             self.publish_lane_extent_depth(lane, &cache);
         }
         drop(pools);
-        // The depth counters must never UNDER-report: the whole point is that a
-        // caller may skip this drain when they read zero, so a missing publish
-        // would turn into a spurious `SpaceExhausted`. `claimed >= drained` is
-        // the race-tolerant form of that invariant — a pop that landed while the
-        // drain was running (pops need no region lock) can only make `claimed`
-        // the larger of the two, while a forgotten publish on a PUSH is exactly
-        // what makes it smaller. Pushes cannot race the drain itself: they
-        // publish under a region lock and this holds every one of them.
-        debug_assert!(
-            claimed >= drained,
-            "lane depth counters under-reported: claimed {claimed} < drained {drained}"
-        );
         self.drain_ops.fetch_add(1, Ordering::Relaxed);
         self.drain_blocks.fetch_add(drained, Ordering::Relaxed);
-        // No counter adjustment needed: cached blocks were never counted as allocated
+    }
+
+    /// Fold one lane's single-block cache back, one region at a time.
+    fn drain_lane_pbas(&self, lane: usize) -> u64 {
+        let mut drained = 0;
+        for _ in 0..LANE_DRAIN_ROUNDS {
+            // PEEK: which regions does this lane hold blocks in? The lane lock is
+            // released before any region lock is taken.
+            let mut regions: Vec<usize> = {
+                let cache = self.lane_caches[lane].lock().unwrap();
+                if cache.is_empty() {
+                    return drained;
+                }
+                // Both sides of this are read under the lane lock, so it is exact
+                // — and it is the property `drain_lane_caches_if_populated` bets
+                // on when it skips a drain.
+                debug_assert_eq!(
+                    self.lane_cache_depth[lane].load(Ordering::Relaxed),
+                    cache.len() as u64,
+                    "lane {lane} pba depth disagrees with its cache"
+                );
+                let layout = self.regions.layout();
+                cache.iter().map(|pba| layout.of(pba.0)).collect()
+            };
+            regions.sort_unstable();
+            regions.dedup();
+            for region in regions {
+                let mut pools = self.lock_region(FreeLockSite::Drain, region);
+                let mut cache = self.lane_caches[lane].lock().unwrap();
+                let layout = pools.layout;
+                let mut kept = Vec::with_capacity(cache.len());
+                for pba in cache.drain(..) {
+                    if layout.of(pba.0) == region {
+                        pools.release_extent(Extent::single(pba));
+                        drained += 1;
+                    } else {
+                        kept.push(pba);
+                    }
+                }
+                *cache = kept;
+                self.publish_lane_depth(lane, &cache);
+            }
+        }
+        drained
+    }
+
+    /// Fold one lane's extent cache back, one region span at a time. An extent
+    /// that straddles a boundary needs both regions, which is what
+    /// [`Self::lock_span_range`] gives — ascending, so it cannot deadlock against
+    /// another multi-region hold.
+    fn drain_lane_extents(&self, lane: usize) -> u64 {
+        let mut drained = 0;
+        for _ in 0..LANE_DRAIN_ROUNDS {
+            let mut spans: Vec<(usize, usize)> = {
+                let cache = self.lane_extent_caches[lane].lock().unwrap();
+                if cache.is_empty() {
+                    return drained;
+                }
+                debug_assert_eq!(
+                    self.lane_extent_cache_depth[lane].load(Ordering::Relaxed),
+                    cache.iter().map(|e| u64::from(e.count)).sum::<u64>(),
+                    "lane {lane} extent depth disagrees with its cache"
+                );
+                let layout = self.regions.layout();
+                cache.iter().map(|extent| layout.span(*extent)).collect()
+            };
+            spans.sort_unstable();
+            spans.dedup();
+            for (lo, hi) in spans {
+                let mut pools = self.lock_span_range(FreeLockSite::Drain, lo, hi);
+                let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+                let layout = pools.layout;
+                // Rebuilt through `push_extent_cache` so the descending-by-start
+                // invariant survives, exactly as `extract_lane_cache_free_parts`
+                // has to do.
+                let mut kept: Vec<Extent> = Vec::with_capacity(cache.len());
+                for extent in cache.drain(..) {
+                    let (elo, ehi) = layout.span(extent);
+                    if elo >= lo && ehi <= hi {
+                        pools.release_extent(extent);
+                        drained += u64::from(extent.count);
+                    } else {
+                        Self::push_extent_cache(&mut kept, extent);
+                    }
+                }
+                *cache = kept;
+                self.publish_lane_extent_depth(lane, &cache);
+            }
+        }
+        drained
     }
 
     /// Free a single block.
@@ -5839,11 +5958,11 @@ mod free_pool_policy_tests {
     /// a region at [`MIN_REGION_BLOCKS`], so a device under `16 * 4096` usable
     /// blocks silently collapses to ONE region and any region test on it is
     /// vacuous.
-    fn sharded_16_regions() -> SpaceAllocator {
+    fn sharded_16_regions_lanes(lanes: usize) -> SpaceAllocator {
         const PER_REGION: u64 = 4200;
         let allocator = SpaceAllocator::new_with_exact_regions(
             (16 * PER_REGION + RESERVED_BLOCKS) * BLOCK_SIZE as u64,
-            1,
+            lanes,
             16,
         );
         assert_eq!(
@@ -5852,6 +5971,10 @@ mod free_pool_policy_tests {
             "region planning changed; re-pick PER_REGION"
         );
         allocator
+    }
+
+    fn sharded_16_regions() -> SpaceAllocator {
+        sharded_16_regions_lanes(1)
     }
 
     /// True blocks parked in every lane cache, read the expensive way.
@@ -6133,6 +6256,159 @@ mod free_pool_policy_tests {
             allocator.regions.free_hint[0].load(Ordering::Relaxed),
             123_456,
             "a mutating hold must republish the hints"
+        );
+    }
+
+    /// The per-lane drain must be indistinguishable from the all-regions one in
+    /// WHAT it folds back — only in how much it locks. Randomised lane contents,
+    /// both implementations on byte-identical pools, compared on the resulting
+    /// free-space shape.
+    #[test]
+    fn per_lane_drain_matches_the_all_regions_drain() {
+        let build = |seed: u64| {
+            let allocator = sharded_16_regions_lanes(4);
+            allocator.set_stripe_geometry(STRIPE, PHASE);
+            let mut rng = seed | 1;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            // Mixed traffic so the lanes hold both single blocks and extents, in
+            // several regions, with some of it handed out and freed again.
+            let mut held = Vec::new();
+            for step in 0..120 {
+                let lane = step % 4;
+                match next() % 3 {
+                    0 => {
+                        if let Ok(pba) = allocator.allocate_one_for_lane(lane) {
+                            held.push(Extent::single(pba));
+                        }
+                    }
+                    1 => {
+                        if let Ok(e) = allocator.allocate_extent_for_lane(lane, 1 + (next() % 5) as u32)
+                        {
+                            held.push(e);
+                        }
+                    }
+                    _ => {
+                        if let Ok(e) =
+                            allocator.allocate_stripe_extent_for_lane(lane, STRIPE, STRIPE, PHASE)
+                        {
+                            held.push(e);
+                        }
+                    }
+                }
+                if held.len() > 6 && next() % 2 == 0 {
+                    let e = held.swap_remove(next() as usize % held.len());
+                    allocator.free_extent(e).unwrap();
+                }
+            }
+            allocator
+        };
+
+        for seed in 1..14u64 {
+            let per_lane = build(seed);
+            let all_regions = build(seed);
+            assert_eq!(
+                per_lane.lane_cached_blocks(),
+                all_regions.lane_cached_blocks(),
+                "seed {seed}: the two pools diverged before the drain"
+            );
+            per_lane.drain_lane_caches();
+            all_regions.drain_lane_caches_all_regions();
+            assert_eq!(per_lane.lane_cached_blocks(), 0);
+            assert_eq!(all_regions.lane_cached_blocks(), 0);
+            assert_eq!(
+                per_lane.free_block_count(),
+                all_regions.free_block_count(),
+                "seed {seed}: different free totals after the drain"
+            );
+            let (a, b) = (per_lane.contiguity_stats(), all_regions.contiguity_stats());
+            assert_eq!(
+                (a.free_blocks_in_set, a.free_extents, a.largest_run_blocks, a.stripe_reserve_blocks),
+                (b.free_blocks_in_set, b.free_extents, b.largest_run_blocks, b.stripe_reserve_blocks),
+                "seed {seed}: the folded-back free space has a different SHAPE (coalescing differs)"
+            );
+        }
+    }
+
+    /// The drain must fold everything back while locking only the regions the
+    /// lanes actually hold blocks in — it used to take every region lock in the
+    /// pool. Both halves matter: the block count is a leak check (shutdown calls
+    /// this), the lock count is the fix.
+    #[test]
+    fn drain_folds_every_block_back_but_locks_only_the_regions_involved() {
+        let allocator = sharded_16_regions_lanes(2);
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let free_before = allocator.free_block_count();
+
+        // Seed two lanes from the pool: one single-block cache, one extent cache.
+        let mut handed_out: u64 = 0;
+        for _ in 0..3 {
+            allocator.allocate_one_for_lane(0).unwrap();
+            handed_out += 1;
+        }
+        handed_out += u64::from(
+            allocator
+                .allocate_stripe_extent_for_lane(1, STRIPE, STRIPE, PHASE)
+                .unwrap()
+                .count,
+        );
+        let cached = allocator.lane_cached_blocks();
+        assert!(cached > 0, "the lanes must hold something to drain");
+        let touched: usize = {
+            let layout = allocator.regions.layout();
+            let mut regions: Vec<usize> = allocator.lane_caches[0]
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|pba| layout.of(pba.0))
+                .collect();
+            regions.extend(
+                allocator.lane_extent_caches[1]
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|e| layout.of(e.start.0)),
+            );
+            regions.sort_unstable();
+            regions.dedup();
+            regions.len()
+        };
+
+        let drain_acqs = |a: &SpaceAllocator| {
+            a.free_lock_stats()
+                .iter()
+                .find(|s| s.site == "drain")
+                .expect("every site is always reported")
+                .acquisitions
+        };
+        let before = drain_acqs(&allocator);
+        let blocks_before = allocator.supply_stats().drain_blocks;
+        allocator.drain_lane_caches();
+        let locks = drain_acqs(&allocator) - before;
+
+        assert_eq!(
+            allocator.supply_stats().drain_blocks - blocks_before,
+            cached,
+            "the drain must fold back exactly what the lanes held"
+        );
+        assert_eq!(allocator.lane_cached_blocks(), 0);
+        // Every handed-out block is still allocated, and the cached remainder is
+        // free again: no block was lost or double-counted.
+        assert_eq!(allocator.free_block_count(), free_before - handed_out);
+        // The whole point: one lock per region involved, not one per region.
+        assert!(
+            locks <= (touched as u64) * LANE_DRAIN_ROUNDS as u64,
+            "drain took {locks} region locks for {touched} involved regions \
+             (pool has {})",
+            allocator.region_count()
+        );
+        assert!(
+            locks < allocator.region_count() as u64,
+            "drain still locks the whole pool: {locks} locks"
         );
     }
 
@@ -9125,6 +9401,88 @@ pub(crate) mod aged_pool_bench {
                 (a + b) / 2.0,
                 a,
                 b,
+            );
+        }
+    }
+
+    /// What the lane-cache drain costs per-lane vs the old all-regions hold, both
+    /// arms in ONE process on the same pool.
+    ///
+    /// The box turned this into the allocator's biggest region-lock consumer once
+    /// the futile walks were gone: 5,768 drains in 493 s, 2048 region locks each,
+    /// recovering 5.1 blocks per drain.
+    ///
+    /// Run:
+    /// ```text
+    /// cargo test --release --lib bench_per_lane_drain -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_per_lane_drain() {
+        let rounds: u64 = std::env::var("ONYX_BENCH_DRAINS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_300_000);
+        let lanes = 16usize;
+
+        let (allocator, _stats, _live) =
+            build_aged_pool_parts(scale, TailShape::Spread, lanes, Some(DEFAULT_ALLOCATOR_REGIONS));
+        let regions = allocator.region_count();
+        println!(
+            "\n=== lane-cache drain: {rounds} drains, {lanes} lanes, {regions} regions ==="
+        );
+
+        // Each round seeds the lanes the way the writers do, then drains. Seeding
+        // is charged to neither arm: it is measured once and subtracted.
+        let seed = |a: &SpaceAllocator| {
+            for lane in 0..lanes {
+                let _ = std::hint::black_box(a.allocate_one_for_lane(lane));
+            }
+        };
+        let arm = |per_lane: bool| -> (f64, u64, u64) {
+            let acqs = || -> u64 {
+                allocator
+                    .free_lock_stats()
+                    .iter()
+                    .find(|s| s.site == "drain")
+                    .map_or(0, |s| s.acquisitions)
+            };
+            let blocks = || allocator.supply_stats().drain_blocks;
+            let (locks_before, blocks_before) = (acqs(), blocks());
+            let start = Instant::now();
+            for _ in 0..rounds {
+                seed(&allocator);
+                if per_lane {
+                    allocator.drain_lane_caches();
+                } else {
+                    allocator.drain_lane_caches_all_regions();
+                }
+            }
+            let ns = start.elapsed().as_nanos() as f64 / rounds as f64;
+            (ns, acqs() - locks_before, blocks() - blocks_before)
+        };
+
+        let (old1, old1_locks, old1_blocks) = arm(false);
+        let (new1, new1_locks, new1_blocks) = arm(true);
+        let (new2, new2_locks, _) = arm(true);
+        let (old2, old2_locks, _) = arm(false);
+        for (label, a, b, la, lb, blocks) in [
+            ("all regions (pre-fix)", old1, old2, old1_locks, old2_locks, old1_blocks),
+            ("per lane (shipped)", new1, new2, new1_locks, new2_locks, new1_blocks),
+        ] {
+            println!(
+                "  {label:<24} {:10.1} ns/drain  (pass1 {:10.1} / pass2 {:10.1})  \
+                 region locks/drain {:7.1} / {:7.1}  blocks recovered/drain {:.1}",
+                (a + b) / 2.0,
+                a,
+                b,
+                la as f64 / rounds as f64,
+                lb as f64 / rounds as f64,
+                blocks as f64 / rounds as f64,
             );
         }
     }
