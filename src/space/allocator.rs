@@ -2333,6 +2333,31 @@ impl SpaceAllocator {
         })
     }
 
+    /// Regions that could hold a CONTIGUOUS run of `min_width` blocks, ascending.
+    ///
+    /// This is the width-aware counterpart of [`Self::walk_regions`], and the
+    /// difference is not cosmetic: `free_hint` is a SUM, so it says yes to a
+    /// region holding a thousand single blocks when the caller needs six
+    /// contiguous ones. On the box's exhausted pool (`largest_run = 5`) that made
+    /// `refill_extent_lane` lock **1,989 regions per unaligned allocation**, every
+    /// one of them futile, which is ~82% of that path's cost — the same
+    /// lock-COUNT shape as the drain and the largest-pick scans.
+    ///
+    /// Filtering on `largest_hint` is EXACT rather than advisory (see
+    /// [`RegionPools::largest_hint`]): it is derived from the same function the
+    /// take uses and is never stale-LOW while no mutation is in flight. A
+    /// mutation that has not published yet can still hide a region for a moment,
+    /// so `filtered = false` gives the unfiltered walk every ENOSPC boundary ends
+    /// with — the same discipline `walk_regions(_, 0)` already has.
+    fn walk_regions_wide(&self, min_width: u32, filtered: bool) -> impl Iterator<Item = usize> + '_ {
+        let hints = &self.regions.largest_hint;
+        let count = self.regions.count();
+        let need = u64::from(min_width);
+        (0..count).filter(move |&idx| {
+            !filtered || count == 1 || hints[idx].load(Ordering::Relaxed) >= need
+        })
+    }
+
     /// Test-only direct handle on ONE region's pools, for the tests that inject
     /// a specific free-list shape or a deliberate free/retired inconsistency.
     /// Goes through the real guard so the region's advisory hints are refreshed
@@ -2946,6 +2971,10 @@ impl SpaceAllocator {
     /// Lowest-address free extent that can serve `min_count`, capped at
     /// `max_count`. Same ascending-region argument as
     /// [`Self::take_first_regionwise`].
+    ///
+    /// `skip_empty` selects the width-aware walk: a region whose largest run is
+    /// under `min_count` cannot serve this request, so locking it is pure cost.
+    /// `false` is the unfiltered ENOSPC pass — see [`Self::walk_regions_wide`].
     fn take_exact_regionwise(
         &self,
         site: FreeLockSite,
@@ -2953,7 +2982,7 @@ impl SpaceAllocator {
         max_count: u32,
         skip_empty: bool,
     ) -> Option<Extent> {
-        for idx in self.walk_regions(false, u64::from(skip_empty)) {
+        for idx in self.walk_regions_wide(min_count, skip_empty) {
             let mut guard = self.lock_region(site, idx);
             if let Some(extent) =
                 Self::take_exact_from_pools(guard.region_mut(idx), min_count, max_count)
@@ -3248,7 +3277,7 @@ impl SpaceAllocator {
         }
 
         let target = LANE_EXTENT_CACHE_REFILL_BLOCKS.max(count);
-        let mut result = self.refill_extent_lane(lane, count, target);
+        let mut result = self.refill_extent_lane(lane, count, target, true);
         if result.is_none() {
             // A global fragment can become usable only after it coalesces with
             // short pieces held by one or more lanes. Exact allocation is the
@@ -3256,7 +3285,10 @@ impl SpaceAllocator {
             // unless the lanes hold nothing, in which case the coalesce this is
             // hoping for cannot exist.
             if self.drain_lane_caches_if_populated() {
-                result = self.refill_extent_lane(lane, count, target);
+                // Unfiltered: a drain republished every region it touched, and
+                // drains are rare now, so the one full walk is cheap insurance
+                // against an ENOSPC verdict that rests on a hint.
+                result = self.refill_extent_lane(lane, count, target, false);
             }
         }
 
@@ -4935,8 +4967,20 @@ impl SpaceAllocator {
 
     /// Take exactly `count` blocks for the caller and publish the rest of the
     /// refill into its extent cache before releasing `FreePools`.
-    fn refill_extent_lane(&self, lane: usize, count: u32, max_count: u32) -> Option<Extent> {
-        for idx in self.walk_regions(false, 1) {
+    ///
+    /// `filtered` walks only regions whose largest run can host `count` — the
+    /// unaligned writer path's hot loop, and on an exhausted pool the difference
+    /// between 1,989 futile region locks per allocation and none (see
+    /// [`Self::walk_regions_wide`]). The caller's post-drain retry passes `false`
+    /// so the ENOSPC verdict never rests on a hint.
+    fn refill_extent_lane(
+        &self,
+        lane: usize,
+        count: u32,
+        max_count: u32,
+        filtered: bool,
+    ) -> Option<Extent> {
+        for idx in self.walk_regions_wide(count, filtered) {
             let mut guard = self.lock_region(FreeLockSite::WriterUnaligned, idx);
             let Some(refill) = Self::take_exact_from_pools(guard.region_mut(idx), count, max_count)
             else {
@@ -6092,6 +6136,104 @@ mod free_pool_policy_tests {
         );
     }
 
+    /// The width filter must never HIDE a region that could have served the
+    /// request — that would be a spurious `SpaceExhausted` (or a needlessly short
+    /// fragment). Randomised shapes, every width, checked against the truth.
+    #[test]
+    fn width_filter_never_hides_a_region_that_could_serve_the_request() {
+        let allocator = sharded_16_regions();
+        let mut rng = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for round in 0..12 {
+            let layout = allocator.regions.layout();
+            for idx in 0..allocator.region_count() {
+                let mut guard = allocator.lock_region(FreeLockSite::Setup, idx);
+                let pools = guard.region_mut(idx);
+                *pools = FreePools::new();
+                let mut at = layout.start(idx).max(RESERVED_BLOCKS);
+                for _ in 0..(next() % 4) {
+                    let width = 1 + (next() % 11) as u32;
+                    if at + u64::from(width) + 2 >= layout.end(idx) {
+                        break;
+                    }
+                    pools.general.insert(Extent::new(Pba(at), width));
+                    at += u64::from(width) + 1 + (next() % 3);
+                }
+            }
+            for width in 1..=12u32 {
+                let visible: Vec<usize> = allocator.walk_regions_wide(width, true).collect();
+                for idx in 0..allocator.region_count() {
+                    let guard = allocator.lock_region(FreeLockSite::Audit, idx);
+                    let serves = guard
+                        .region(idx)
+                        .largest_allocatable()
+                        .is_some_and(|(run, _)| run.count >= width);
+                    drop(guard);
+                    assert!(
+                        !serves || visible.contains(&idx),
+                        "round {round} width {width}: region {idx} can serve it but the \
+                         filtered walk skipped it"
+                    );
+                }
+                // And the unfiltered walk always offers everyone.
+                assert_eq!(
+                    allocator.walk_regions_wide(width, false).count(),
+                    allocator.region_count()
+                );
+            }
+        }
+    }
+
+    /// The point of the filter, as lock COUNT: a request wider than any region's
+    /// largest run must cost ZERO region locks instead of one per region.
+    #[test]
+    fn a_too_wide_refill_takes_no_region_locks() {
+        let allocator = sharded_16_regions();
+        let layout = allocator.regions.layout();
+        for idx in 0..allocator.region_count() {
+            let mut guard = allocator.lock_region(FreeLockSite::Setup, idx);
+            let pools = guard.region_mut(idx);
+            *pools = FreePools::new();
+            // Every region holds free space, but no run wider than 5 blocks —
+            // the box's exhausted shape (`largest_run = 5`).
+            let base = layout.start(idx).max(RESERVED_BLOCKS);
+            for k in 0..4u64 {
+                pools
+                    .general
+                    .insert(Extent::new(Pba(base + k * 8), 5));
+            }
+        }
+        let acqs = |a: &SpaceAllocator| {
+            a.free_lock_stats()
+                .iter()
+                .find(|s| s.site == "writer_unaligned")
+                .expect("every site is always reported")
+                .acquisitions
+        };
+
+        let before = acqs(&allocator);
+        assert!(allocator.refill_extent_lane(0, 6, 8, true).is_none());
+        assert_eq!(
+            acqs(&allocator),
+            before,
+            "a 6-block request against a 5-block pool must not lock a single region"
+        );
+
+        // The unfiltered ENOSPC pass still walks everyone...
+        assert!(allocator.refill_extent_lane(0, 6, 8, false).is_none());
+        assert_eq!(acqs(&allocator) - before, allocator.region_count() as u64);
+
+        // ...and a width the pool CAN serve is found under exactly one lock.
+        let before = acqs(&allocator);
+        assert!(allocator.refill_extent_lane(0, 5, 8, true).is_some());
+        assert_eq!(acqs(&allocator) - before, 1);
+    }
+
     /// A stale-HIGH hint (the region emptied after the load) must not livelock the
     /// argmax: the failed probe republishes the truth, so the retry picks someone
     /// else and the caller still gets the real largest run.
@@ -6199,7 +6341,7 @@ mod free_pool_policy_tests {
         let allocator = allocator(128, 1);
         *allocator.test_region_pools(0) = pools;
         assert_eq!(
-            allocator.refill_extent_lane(0, 2, 8),
+            allocator.refill_extent_lane(0, 2, 8, true),
             Some(Extent::new(Pba(15), 2))
         );
     }
@@ -8983,6 +9125,108 @@ pub(crate) mod aged_pool_bench {
                 (a + b) / 2.0,
                 a,
                 b,
+            );
+        }
+    }
+
+    /// What the unaligned refill's region walk costs with and without the width
+    /// filter, alternated in ONE process on the SAME pool.
+    ///
+    /// The box measured `refill_extent_lane` at **1,989 region locks per unaligned
+    /// allocation** in the exhausted regime — every lock futile, because
+    /// `free_hint` is a SUM and says yes to a region holding only runs narrower
+    /// than the request. `ONYX_BENCH_WIDTH` picks the request width; the default
+    /// is wider than most of the aged pool's runs, which is the box's condition.
+    ///
+    /// Run:
+    /// ```text
+    /// cargo test --release --lib bench_unaligned_refill_width_filter -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "perf microbench"]
+    fn bench_unaligned_refill_width_filter() {
+        let per_thread: u64 = std::env::var("ONYX_BENCH_REFILLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let scale: u64 = std::env::var("ONYX_BENCH_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_300_000);
+        let width: u32 = std::env::var("ONYX_BENCH_WIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let threads: usize = std::thread::available_parallelism()
+            .map(|n| n.get().min(16))
+            .unwrap_or(8);
+
+        let (allocator, stats, _live) =
+            build_aged_pool_parts(scale, TailShape::Spread, 16, Some(DEFAULT_ALLOCATOR_REGIONS));
+        let regions = allocator.region_count();
+        let allocator = std::sync::Arc::new(allocator);
+        println!(
+            "\n=== unaligned refill, {width}-block request: {threads} threads x {per_thread}, \
+             {regions} regions, free_extents={} ===",
+            stats.free_extents
+        );
+
+        let arm = |filtered: bool| -> (f64, u64) {
+            let site_acqs = || -> u64 {
+                allocator
+                    .free_lock_stats()
+                    .iter()
+                    .find(|s| s.site == "writer_unaligned")
+                    .map_or(0, |s| s.acquisitions)
+            };
+            let before = site_acqs();
+            let start = Instant::now();
+            let workers: Vec<_> = (0..threads)
+                .map(|tid| {
+                    let allocator = allocator.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..per_thread {
+                            let got = allocator.refill_extent_lane(
+                                tid,
+                                width,
+                                width.max(LANE_EXTENT_CACHE_REFILL_BLOCKS),
+                                filtered,
+                            );
+                            // Give it straight back so both arms see one shape.
+                            if let Some(extent) = std::hint::black_box(got) {
+                                let mut guard =
+                                    allocator.lock_span(FreeLockSite::FreeOne, extent);
+                                guard.release_extent(extent);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            let ns = start.elapsed().as_nanos() as f64 / (threads as u64 * per_thread) as f64;
+            (ns, site_acqs() - before)
+        };
+
+        let (unf1, unf1_locks) = arm(false);
+        let (fil1, fil1_locks) = arm(true);
+        let (fil2, fil2_locks) = arm(true);
+        let (unf2, unf2_locks) = arm(false);
+        allocator.drain_lane_caches();
+        let picks = (threads as u64 * per_thread) as f64;
+        for (label, a, b, la, lb) in [
+            ("free_hint walk (pre-fix)", unf1, unf2, unf1_locks, unf2_locks),
+            ("width filter (shipped)", fil1, fil2, fil1_locks, fil2_locks),
+        ] {
+            println!(
+                "  {label:<26} {:9.1} ns/refill  (pass1 {:9.1} / pass2 {:9.1})  \
+                 region locks/refill {:7.1} / {:7.1}",
+                (a + b) / 2.0,
+                a,
+                b,
+                la as f64 / picks,
+                lb as f64 / picks,
             );
         }
     }
