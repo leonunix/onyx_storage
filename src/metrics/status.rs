@@ -127,6 +127,18 @@ pub struct ChunkletIoExecutionSnapshot {
 /// that lines up with `lv3_io.write_batch_ns / write_batch_calls`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChunkletWritePathSnapshot {
+    /// `RuntimeLogicalDisk::write_many_at` — the wrapper OUTSIDE the RAID6
+    /// ledger, covering every raid level. Box-measured 2026-08-14 as 23.84 of
+    /// 54.22 ms per LV3 call (44 %) that no counter could see, because it was
+    /// instrumented only as a `tracing::warn!`. `rt_total_ns - rt_inner_ns` is
+    /// that gap; the four legs must cover it.
+    pub rt_write_many_calls: u64,
+    pub rt_write_many_keys: u64,
+    pub rt_lifecycle_ns: u64,
+    pub rt_key_build_ns: u64,
+    pub rt_range_lock_ns: u64,
+    pub rt_inner_ns: u64,
+    pub rt_total_ns: u64,
     pub r6_batch_calls: u64,
     pub r6_batch_ops: u64,
     pub r6_batch_stripes: u64,
@@ -169,6 +181,13 @@ pub struct ChunkletSubmitClassSnapshot {
 impl From<onyx_chunklet::WritePathStats> for ChunkletWritePathSnapshot {
     fn from(s: onyx_chunklet::WritePathStats) -> Self {
         Self {
+            rt_write_many_calls: s.rt_write_many_calls,
+            rt_write_many_keys: s.rt_write_many_keys,
+            rt_lifecycle_ns: s.rt_lifecycle_ns,
+            rt_key_build_ns: s.rt_key_build_ns,
+            rt_range_lock_ns: s.rt_range_lock_ns,
+            rt_inner_ns: s.rt_inner_ns,
+            rt_total_ns: s.rt_total_ns,
             r6_batch_calls: s.r6_batch_calls,
             r6_batch_ops: s.r6_batch_ops,
             r6_batch_stripes: s.r6_batch_stripes,
@@ -434,6 +453,20 @@ impl EngineStatusSnapshot {
             );
         }
         if let Some(wp) = &self.chunklet_write_path {
+            // The wrapper ABOVE the per-level ledger. `total - inner` is what
+            // `chunklet_r6_batch` structurally cannot see, and `keys/calls` is the
+            // outer range-lock footprint that made concurrent batches serialize.
+            let _ = writeln!(
+                out,
+                "chunklet_rt_write_many: calls={} keys={} lifecycle_ns={} key_build_ns={} range_lock_ns={} inner_ns={} total_ns={}",
+                wp.rt_write_many_calls,
+                wp.rt_write_many_keys,
+                wp.rt_lifecycle_ns,
+                wp.rt_key_build_ns,
+                wp.rt_range_lock_ns,
+                wp.rt_inner_ns,
+                wp.rt_total_ns,
+            );
             // Phases must SUM to `total`: a growing residual means the batched
             // write grew a leg nothing measures.
             let _ = writeln!(

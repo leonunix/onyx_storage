@@ -259,6 +259,30 @@ if reqs and batches and wait:
 #   lock dominant     -> stripe-bucket queueing (readers or another executor).
 #   write dominant    -> the submit waves; then `waves/call` and `sqes/wave`
 #                        say whether it is barrier count or per-IO service time.
+# The wrapper ABOVE the per-level ledger, and the reason `chunklet_r6_batch` used
+# to leave 44% of the LV3 call unattributed: `RuntimeLogicalDisk::write_many_at`
+# takes a SECOND batch of range locks (one bucket per key, held across the whole
+# inner call) before the RAID6 stripe locks. `keys/call` is that footprint.
+rtc = d("chunklet_rt_write_many.calls")
+if rtc:
+    rt_total = d("chunklet_rt_write_many.total_ns")
+    rt_inner = d("chunklet_rt_write_many.inner_ns")
+    print("== chunklet RuntimeLd write_many (wrapper, ALL raid levels) ==")
+    print("  calls %d (%.0f/s)  keys/call %.1f  total %.3f ms/call" % (
+        rtc, rtc / W, d("chunklet_rt_write_many.keys") / rtc, rt_total / rtc / 1e6))
+    for label, key in (("lifecycle", "lifecycle_ns"), ("key_build", "key_build_ns"),
+                       ("range_lock", "range_lock_ns"), ("inner (per-level)", "inner_ns")):
+        v = d("chunklet_rt_write_many." + key)
+        print("    %-18s %9.2f s  %5.1f%% of wrapper  %8.3f ms/call" % (
+            label, v / 1e9, v / rt_total * 100 if rt_total else 0, v / rtc / 1e6))
+    resid = rt_total - rt_inner - sum(d("chunklet_rt_write_many." + k) for k in
+                                     ("lifecycle_ns", "key_build_ns", "range_lock_ns"))
+    print("    %-18s %9.2f s  %5.1f%% of wrapper  %8.3f ms/call" % (
+        "residual", resid / 1e9, resid / rt_total * 100 if rt_total else 0, resid / rtc / 1e6))
+    print("  outside the per-level ledger: %.3f ms/call (%.1f%%)" % (
+        (rt_total - rt_inner) / rtc / 1e6,
+        (rt_total - rt_inner) / rt_total * 100 if rt_total else 0))
+
 r6c = d("chunklet_r6_batch.calls")
 if r6c:
     r6_total = d("chunklet_r6_batch.total_ns")
