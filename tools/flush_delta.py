@@ -202,16 +202,21 @@ print("  %-16s %9.2f s  %5.1f%% of submit   (device wall, NOT its share of block
 
 print("== LV3 write batcher ==")
 reqs = d("lv3_batch.requests")
-batches = d("lv3_batch.window_timeouts") + d("lv3_batch.target_hits")
+batches = (d("lv3_batch.window_timeouts") + d("lv3_batch.target_hits")
+           + d("lv3_batch.idle_dispatches"))
 wait = d("lv3_batch.wait")
 calls = d("lv3_batch.wait_calls")
 print("  producer wait   %9.2f s over %d submit_many calls" % (wait / 1e9, calls))
 if batches:
     print("  batches %d (%.0f/s)  requests %d (%.2f per batch)  device %.2f ms/batch" % (
         batches, batches / W, reqs, reqs / batches, lv3 / batches / 1e6))
-    print("  dispatch reason: TIMEOUT %d (%.1f%%)  target_hit %d" % (
+    # `idle_dispatch` = the aggregator skipped the window because an executor had
+    # nothing to do. That is the GOOD reason: a TIMEOUT share near 100% means the
+    # window is being paid while the device sits idle, which costs concurrency.
+    print("  dispatch reason: TIMEOUT %d (%.1f%%)  target_hit %d  idle_dispatch %d (%.1f%%)" % (
         d("lv3_batch.window_timeouts"), d("lv3_batch.window_timeouts") / batches * 100,
-        d("lv3_batch.target_hits")))
+        d("lv3_batch.target_hits"),
+        d("lv3_batch.idle_dispatches"), d("lv3_batch.idle_dispatches") / batches * 100))
     print("  bytes at dispatch %.0f KiB avg (target 4096 KiB)" % (
         d("lv3_batch.bytes_at_dispatch") / batches / 1024))
     print("  device concurrency %.2f calls in flight (write_batch_ns / wall)" % (lv3 / 1e9 / W))

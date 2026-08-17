@@ -254,11 +254,15 @@ fn chunklet_owned_batch_writes_aligned_buffers_without_repacking() {
     assert_eq!(metrics.lv3_write_slab_bytes.load(Ordering::Relaxed), 12288);
 }
 
-/// A small batch cannot reach `target_bytes`, so it must leave the aggregator
-/// on the coalesce timeout — and the producer's blocked wait must be split
+/// A small batch cannot reach `target_bytes`, but with every executor idle it
+/// must NOT pay the coalesce window for that: waiting for company is only free
+/// when the device is saturated. The producer's blocked wait must still be split
 /// across pickup / window / exec_queue rather than all landing on device time.
 #[test]
-fn lv3_batch_attributes_the_producer_wait_and_flags_a_timeout_dispatch() {
+#[serial_test::serial]
+fn lv3_batch_skips_the_window_when_an_executor_is_idle() {
+    set_lv3_batch_tuning(0, 0, 0, true);
+    let _restore = ResetLv3Tuning;
     let backend = Arc::new(BatchMock {
         write_many_calls: std::sync::atomic::AtomicUsize::new(0),
         write_many_ops: std::sync::atomic::AtomicUsize::new(0),
@@ -286,15 +290,24 @@ fn lv3_batch_attributes_the_producer_wait_and_flags_a_timeout_dispatch() {
         metrics.lv3_batch_bytes_at_dispatch.load(Ordering::Relaxed),
         3 * 4096
     );
-    // 12 KiB is far below the 4 MiB target, so the aggregator can only have
-    // dispatched on the coalesce timeout.
-    assert_eq!(metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed), 1);
+    // 12 KiB is far below the 4 MiB target, and no other request is in flight,
+    // so the aggregator must have skipped the window rather than timed out on it.
+    assert_eq!(
+        metrics.lv3_batch_idle_dispatches.load(Ordering::Relaxed),
+        1,
+        "an idle executor must take the batch immediately"
+    );
+    assert_eq!(metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.lv3_batch_target_hits.load(Ordering::Relaxed), 0);
-    // The window this request sat through is the cost being hunted; it must be
-    // both non-zero and a real share of the producer's blocked wait.
+    // `window` is still attributed, but it is now only the dispatch bookkeeping
+    // rather than a wait — it must be nowhere near the coalesce window itself.
     let window = metrics.lv3_batch_window_ns.load(Ordering::Relaxed);
     let wait = metrics.lv3_batch_wait_ns.load(Ordering::Relaxed);
-    assert!(window > 0, "coalesce window must be attributed");
+    assert!(
+        window < lv3_batch_coalesce().as_nanos() as u64 / 4,
+        "skipped window {window} ns must be far below the {:?} coalesce window",
+        lv3_batch_coalesce()
+    );
     assert!(
         wait >= window,
         "producer wait {wait} must cover the coalesce window {window}"
@@ -314,6 +327,119 @@ fn lv3_batch_attributes_the_producer_wait_and_flags_a_timeout_dispatch() {
         wait >= prep + device,
         "producer wait {wait} must cover exec_prep {prep} + device {device}"
     );
+}
+
+/// A backend whose `write_many_at` parks until the test releases it, so a test
+/// can hold every executor busy and observe the aggregator's other branch.
+struct GatedBatchMock {
+    released: std::sync::atomic::AtomicBool,
+    entered: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::io::block_backend::BlockBackend for GatedBatchMock {
+    fn read_at(&self, _buf: &mut [u8], _off: u64) -> OnyxResult<()> {
+        Ok(())
+    }
+
+    fn write_at(&self, _buf: &[u8], _off: u64) -> OnyxResult<()> {
+        panic!("chunklet-style batch must not fall back to write_at")
+    }
+
+    fn write_many_at(&self, _ops: &[(u64, &[u8])]) -> OnyxResult<()> {
+        self.entered.fetch_add(1, Ordering::Relaxed);
+        while !self.released.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> OnyxResult<()> {
+        Ok(())
+    }
+
+    fn size(&self) -> u64 {
+        1 << 30
+    }
+}
+
+/// The other half of [`lv3_batch_skips_the_window_when_an_executor_is_idle`]:
+/// once every executor is occupied the batch is going to queue regardless, so
+/// the aggregator must go back to spending the coalesce window on growing it.
+/// Pinned to one executor because that makes saturation deterministic.
+#[test]
+#[serial_test::serial]
+fn lv3_batch_coalesces_again_once_every_executor_is_busy() {
+    set_lv3_batch_tuning(2_000, 0, 1, true);
+    let restore = ResetLv3Tuning;
+    let backend = Arc::new(GatedBatchMock {
+        released: std::sync::atomic::AtomicBool::new(false),
+        entered: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metrics = Arc::new(EngineMetrics::default());
+    let engine = Arc::new(IoEngine::new_chunklet(
+        backend.clone(),
+        false,
+        metrics.clone(),
+    ));
+
+    let submit = |engine: Arc<IoEngine>| {
+        std::thread::spawn(move || {
+            let mut buffer = engine.allocate_owned_write_buffer(4096).unwrap();
+            buffer.as_mut_slice().fill(0x5a);
+            engine
+                .submit_owned_write_batch_on(
+                    None,
+                    vec![OwnedLvWrite {
+                        pba: Pba(0),
+                        payload_len: 4096,
+                        buffer,
+                    }],
+                    false,
+                )
+                .unwrap();
+        })
+    };
+
+    // First request: nothing outstanding, so it dispatches immediately and then
+    // parks inside the mock, occupying the only executor.
+    let first = submit(engine.clone());
+    wait_for(|| backend.entered.load(Ordering::Relaxed) == 1, "device entry");
+    assert_eq!(metrics.lv3_batch_idle_dispatches.load(Ordering::Relaxed), 1);
+
+    // Second request: the executor is busy, so this one must sit out the window
+    // and leave on the timeout.
+    let second = submit(engine.clone());
+    wait_for(
+        || metrics.lv3_batch_window_timeouts.load(Ordering::Relaxed) >= 1,
+        "timeout dispatch under saturation",
+    );
+
+    backend.released.store(true, Ordering::Release);
+    first.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(metrics.lv3_batch_idle_dispatches.load(Ordering::Relaxed), 1);
+    drop(restore);
+}
+
+/// Puts the global LV3 tuning back on its compiled defaults even if the test
+/// panics, so a `#[serial]` failure cannot leak into the next test.
+struct ResetLv3Tuning;
+
+impl Drop for ResetLv3Tuning {
+    fn drop(&mut self) {
+        set_lv3_batch_tuning(0, 0, 0, false);
+    }
+}
+
+fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+    panic!("timed out waiting for {what}");
 }
 
 #[test]

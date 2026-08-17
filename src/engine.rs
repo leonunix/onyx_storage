@@ -255,6 +255,7 @@ impl OnyxEngine {
                 storage.lv3_batch_coalesce_us,
                 storage.lv3_batch_target_bytes,
                 storage.lv3_batch_executors,
+                storage.lv3_batch_idle_dispatch,
             );
             return Ok(Arc::new(
                 IoEngine::new_chunklet(device, storage.use_hugepages, metrics)

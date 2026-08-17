@@ -121,6 +121,7 @@ fn setup_with_all_options(
             lv3_batch_coalesce_us: 0,
             lv3_batch_target_bytes: 0,
             lv3_batch_executors: 0,
+            lv3_batch_idle_dispatch: false,
             stripe_group_lifetime_affinity: false,
             allocator_regions: 0,
             stripe_refill_run_stripes: 0,

@@ -257,6 +257,7 @@ impl Default for EngineMetrics {
             lv3_batch_bytes_at_dispatch: AtomicU64::new(0),
             lv3_batch_window_timeouts: AtomicU64::new(0),
             lv3_batch_target_hits: AtomicU64::new(0),
+            lv3_batch_idle_dispatches: AtomicU64::new(0),
             flush_writer_meta_ns: AtomicU64::new(0),
             flush_writer_meta_build_ns: AtomicU64::new(0),
             flush_writer_meta_commit_ns: AtomicU64::new(0),

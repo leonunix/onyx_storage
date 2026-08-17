@@ -565,6 +565,9 @@ pub struct EngineMetrics {
     pub lv3_batch_bytes_at_dispatch: AtomicU64,
     pub lv3_batch_window_timeouts: AtomicU64,
     pub lv3_batch_target_hits: AtomicU64,
+    /// Batches dispatched immediately because an executor was idle, i.e. the
+    /// coalesce window was skipped as the device was not yet saturated.
+    pub lv3_batch_idle_dispatches: AtomicU64,
     pub flush_writer_meta_ns: AtomicU64,
     pub flush_writer_meta_build_ns: AtomicU64,
     pub flush_writer_meta_commit_ns: AtomicU64,

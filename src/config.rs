@@ -1019,6 +1019,28 @@ pub struct StorageConfig {
     /// 2 ms default). Either knob alone is capped by the other.
     #[serde(default)]
     pub lv3_batch_executors: usize,
+    /// Skip the coalesce window whenever an executor is idle, so a batch is only
+    /// grown while the device is already saturated.
+    ///
+    /// ⛔ DEFAULT OFF — box-measured 2026-08-14 as a **net regression** in the
+    /// healthy regime, and the reason is instructive. It does exactly what it
+    /// says: dispatch reason went TIMEOUT 92.2% -> idle_dispatch 100%, the window
+    /// went 1.43 ms -> 0.00 ms per request, producer wait 10.47 -> 0.65 ms, LV3
+    /// device concurrency 0.97 -> 1.35 calls. But the window was also, by
+    /// accident, the thing that let a writer lane ACCUMULATE a work quantum: with
+    /// it gone the writer cycles 5x faster and carries 5x less, so chunklet saw
+    /// 68.4 -> 2.4 stripes per call, its adjacency merge collapsed 2.93x -> 1.05x,
+    /// and total device time ROSE 268 -> 444 s for less data. metadb commits went
+    /// 583 -> 2949/s and `meta_commit` went 14.3% -> 53.0% of the writer. End to
+    /// end: fio 1007 -> 771 MiB/s aggregate.
+    ///
+    /// Kept as a knob because the defect it targets is real (five of six
+    /// executors permanently idle) and it is the right shape for a drain-BOUND
+    /// pool; it just must not be paired with a demand-driven quantum. Judge it on
+    /// `lv3_batch.idle_dispatches`, `chunklet_r6_batch.ops/call`, and
+    /// `flush_writer_ns.meta_commit` — never on latency alone.
+    #[serde(default)]
+    pub lv3_batch_idle_dispatch: bool,
     /// RAID-aware full-stripe writes (roadmap ③). When true, the flush writer
     /// allocates + zero-pads each LV3 passthrough write to a whole RAID stripe
     /// (`full_stripe_bytes` from the chunklet LD geometry) so a RAID5/6 backend
@@ -1127,6 +1149,7 @@ impl Default for StorageConfig {
             lv3_batch_coalesce_us: 0,
             lv3_batch_target_bytes: 0,
             lv3_batch_executors: 0,
+            lv3_batch_idle_dispatch: false,
             raid_full_stripe_writes: default_raid_full_stripe_writes(),
             stripe_group_lifetime_affinity: false,
             allocator_regions: default_allocator_regions(),

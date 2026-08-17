@@ -50,6 +50,7 @@ const CHUNKLET_BATCH_QUEUE_CAP: usize = 256;
 static LV3_BATCH_COALESCE_US: AtomicU64 = AtomicU64::new(0);
 static LV3_BATCH_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LV3_BATCH_EXECUTORS: AtomicUsize = AtomicUsize::new(0);
+static LV3_BATCH_IDLE_DISPATCH: AtomicBool = AtomicBool::new(false);
 
 /// Override the LV3 aggregation window / byte target / executor count. `0`
 /// keeps the compiled default for each. Applies to subsequently started
@@ -59,10 +60,22 @@ static LV3_BATCH_EXECUTORS: AtomicUsize = AtomicUsize::new(0);
 /// batch frequency (measured 5x at 200 us), at which point `exec_queue` --
 /// waiting for one of the fixed executors -- becomes the largest non-device
 /// term. They have to be swept together, hence one entry point.
-pub fn set_lv3_batch_tuning(coalesce_us: u64, target_bytes: usize, executors: usize) {
+pub fn set_lv3_batch_tuning(
+    coalesce_us: u64,
+    target_bytes: usize,
+    executors: usize,
+    idle_dispatch: bool,
+) {
     LV3_BATCH_COALESCE_US.store(coalesce_us, Ordering::Relaxed);
     LV3_BATCH_TARGET_BYTES.store(target_bytes, Ordering::Relaxed);
     LV3_BATCH_EXECUTORS.store(executors, Ordering::Relaxed);
+    LV3_BATCH_IDLE_DISPATCH.store(idle_dispatch, Ordering::Relaxed);
+}
+
+/// See [`crate::config::StorageConfig::lv3_batch_idle_dispatch`] for why this is
+/// off by default despite the defect it targets being real.
+fn lv3_batch_idle_dispatch() -> bool {
+    LV3_BATCH_IDLE_DISPATCH.load(Ordering::Relaxed)
 }
 
 fn lv3_batch_coalesce() -> Duration {
@@ -117,6 +130,31 @@ struct ChunkletBatchWork {
     dispatched_at: Instant,
 }
 
+/// Batches queued for, or running on, an executor. The aggregator bumps it at
+/// dispatch and the executor drops it when its device call is done, so
+/// `outstanding < executors` means "at least one executor has nothing to do".
+///
+/// This is what makes the coalesce window pay for itself. The window is only
+/// free when the device is already saturated; below that it converts producer
+/// concurrency into serialization, because every writer lane that joins a batch
+/// stops being an independent device call. Box-measured 2026-08-14: the LV3
+/// batch carried 5.91 of the 16 writer lanes and 87.3 % of batches left on the
+/// timeout, so 16 producers offered chunklet ~1 concurrent call. The same
+/// chunklet LD, same RAID6 6+2 geometry, same 24 KiB full-stripe ops, does
+/// 1738 MiB/s at 6 concurrent callers with ONE stripe per call and 2206 MiB/s
+/// at 67 — i.e. batching a call 67x wider is worth +27 % while the 6x
+/// concurrency it costs is worth 6x.
+type OutstandingBatches = Arc<AtomicUsize>;
+
+/// Drops an executor's `outstanding` reservation however the iteration ends.
+struct OutstandingSlot<'a>(&'a AtomicUsize);
+
+impl Drop for OutstandingSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Cross-lane combiner for chunklet writes. Buffer lanes keep preparing data
 /// concurrently, while this layer restores the batch shape that the LD's
 /// thread-local rings need: one full stripe per call across six fixed executor
@@ -133,11 +171,21 @@ impl ChunkletWriteBatcher {
         let (request_tx, request_rx) = bounded(CHUNKLET_BATCH_QUEUE_CAP);
         let executors = lv3_batch_executors();
         let (work_tx, work_rx) = bounded(executors * 2);
+        let outstanding: OutstandingBatches = Arc::new(AtomicUsize::new(0));
 
         let aggregate_metrics = metrics.clone();
+        let aggregate_outstanding = outstanding.clone();
         let aggregate_handle = std::thread::Builder::new()
             .name("lv3-batch-aggregate".into())
-            .spawn(move || Self::aggregate_loop(request_rx, work_tx, aggregate_metrics))
+            .spawn(move || {
+                Self::aggregate_loop(
+                    request_rx,
+                    work_tx,
+                    aggregate_metrics,
+                    aggregate_outstanding,
+                    executors,
+                )
+            })
             .expect("failed to spawn LV3 batch aggregator");
 
         let mut executor_handles = Vec::with_capacity(executors);
@@ -145,12 +193,13 @@ impl ChunkletWriteBatcher {
             let work_rx = work_rx.clone();
             let device = device.clone();
             let metrics = metrics.clone();
+            let outstanding = outstanding.clone();
             executor_handles.push(
                 std::thread::Builder::new()
                     .name(format!("lv3-batch-exec-{idx}"))
                     .spawn(move || {
                         crate::affinity::bind_current(crate::affinity::ThreadRole::Lv3Batch, idx);
-                        Self::executor_loop(work_rx, device, metrics)
+                        Self::executor_loop(work_rx, device, metrics, outstanding)
                     })
                     .expect("failed to spawn LV3 batch executor"),
             );
@@ -261,41 +310,56 @@ impl ChunkletWriteBatcher {
         request_rx: Receiver<ChunkletBatchRequest>,
         work_tx: Sender<ChunkletBatchWork>,
         metrics: Option<Arc<EngineMetrics>>,
+        outstanding: OutstandingBatches,
+        executors: usize,
     ) {
+        let idle_dispatch_enabled = lv3_batch_idle_dispatch();
         while let Ok(mut first) = request_rx.recv() {
             first.picked_at = Some(Instant::now());
             let mut byte_count: usize = first.ops.iter().map(|op| op.len).sum();
             let mut requests = vec![first];
-            let mut hit_target = false;
+            let mut idle_dispatch = false;
             let deadline = std::time::Instant::now() + lv3_batch_coalesce();
             let target_bytes = lv3_batch_target_bytes();
-            while byte_count < target_bytes {
+            loop {
+                if byte_count >= target_bytes {
+                    break;
+                }
                 match request_rx.try_recv() {
                     Ok(mut request) => {
                         request.picked_at = Some(Instant::now());
                         byte_count += request.ops.iter().map(|op| op.len).sum::<usize>();
                         requests.push(request);
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        let now = std::time::Instant::now();
-                        if now >= deadline {
-                            break;
-                        }
-                        match request_rx.recv_timeout(deadline.saturating_duration_since(now)) {
-                            Ok(mut request) => {
-                                request.picked_at = Some(Instant::now());
-                                byte_count += request.ops.iter().map(|op| op.len).sum::<usize>();
-                                requests.push(request);
-                            }
-                            Err(_) => break,
-                        }
+                        continue;
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                }
+                // Nothing queued right now. Waiting for company is only free
+                // when every executor is already busy — then this batch would
+                // sit in `work_tx` anyway, so growing it is pure gain. With an
+                // executor idle the wait instead leaves a device slot empty for
+                // up to `lv3_batch_coalesce()` AND folds the next arriving
+                // writer lane into this call instead of letting it be a second
+                // concurrent one. See `OutstandingBatches`.
+                if idle_dispatch_enabled && outstanding.load(Ordering::Acquire) < executors {
+                    idle_dispatch = true;
+                    break;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match request_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                    Ok(mut request) => {
+                        request.picked_at = Some(Instant::now());
+                        byte_count += request.ops.iter().map(|op| op.len).sum::<usize>();
+                        requests.push(request);
+                    }
+                    Err(_) => break,
                 }
             }
-            if byte_count >= target_bytes {
-                hit_target = true;
-            }
+            let hit_target = byte_count >= target_bytes;
             let dispatched_at = Instant::now();
             if let Some(metrics) = &metrics {
                 // `pickup` is time spent in `request_rx` behind the single
@@ -321,12 +385,20 @@ impl ChunkletWriteBatcher {
                     .fetch_add(byte_count as u64, Ordering::Relaxed);
                 if hit_target {
                     metrics.lv3_batch_target_hits.fetch_add(1, Ordering::Relaxed);
+                } else if idle_dispatch {
+                    metrics
+                        .lv3_batch_idle_dispatches
+                        .fetch_add(1, Ordering::Relaxed);
                 } else {
                     metrics
                         .lv3_batch_window_timeouts
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+            // Counted BEFORE the send so the executor's matching decrement can
+            // never be observed first; an over-count only makes the aggregator
+            // coalesce more, never less.
+            outstanding.fetch_add(1, Ordering::AcqRel);
             if work_tx
                 .send(ChunkletBatchWork {
                     requests,
@@ -334,6 +406,7 @@ impl ChunkletWriteBatcher {
                 })
                 .is_err()
             {
+                outstanding.fetch_sub(1, Ordering::AcqRel);
                 break;
             }
         }
@@ -343,8 +416,13 @@ impl ChunkletWriteBatcher {
         work_rx: Receiver<ChunkletBatchWork>,
         device: Arc<dyn BlockBackend>,
         metrics: Option<Arc<EngineMetrics>>,
+        outstanding: OutstandingBatches,
     ) {
         while let Ok(work) = work_rx.recv() {
+            // Released once this item is fully done (device call + replies), so
+            // the aggregator's `outstanding < executors` test means "an executor
+            // could start a batch now", not "an executor has dequeued one".
+            let _slot = OutstandingSlot(&outstanding);
             let taken_at = Instant::now();
             if let Some(metrics) = &metrics {
                 metrics.lv3_batch_exec_queue_ns.fetch_add(

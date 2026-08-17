@@ -1489,7 +1489,7 @@ impl EngineStatusSnapshot {
         // not the device write.
         let _ = writeln!(
             out,
-            "lv3_batch: enqueue={} wait={} wait_calls={} pickup={} window={} exec_queue={} exec_prep={} device={} reply={} requests={} bytes_at_dispatch={} window_timeouts={} target_hits={}",
+            "lv3_batch: enqueue={} wait={} wait_calls={} pickup={} window={} exec_queue={} exec_prep={} device={} reply={} requests={} bytes_at_dispatch={} window_timeouts={} target_hits={} idle_dispatches={}",
             self.metrics.lv3_batch_enqueue_ns,
             self.metrics.lv3_batch_wait_ns,
             self.metrics.lv3_batch_wait_calls,
@@ -1502,7 +1502,8 @@ impl EngineStatusSnapshot {
             self.metrics.lv3_batch_requests,
             self.metrics.lv3_batch_bytes_at_dispatch,
             self.metrics.lv3_batch_window_timeouts,
-            self.metrics.lv3_batch_target_hits
+            self.metrics.lv3_batch_target_hits,
+            self.metrics.lv3_batch_idle_dispatches
         );
         let _ = writeln!(
             out,

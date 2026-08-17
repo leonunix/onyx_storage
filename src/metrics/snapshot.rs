@@ -307,6 +307,7 @@ impl EngineMetrics {
             lv3_batch_bytes_at_dispatch: load(&self.lv3_batch_bytes_at_dispatch),
             lv3_batch_window_timeouts: load(&self.lv3_batch_window_timeouts),
             lv3_batch_target_hits: load(&self.lv3_batch_target_hits),
+            lv3_batch_idle_dispatches: load(&self.lv3_batch_idle_dispatches),
             flush_writer_meta_ns: load(&self.flush_writer_meta_ns),
             flush_writer_meta_build_ns: load(&self.flush_writer_meta_build_ns),
             flush_writer_meta_commit_ns: load(&self.flush_writer_meta_commit_ns),
@@ -863,6 +864,7 @@ pub struct EngineMetricsSnapshot {
     pub lv3_batch_window_timeouts: u64,
     #[serde(default)]
     pub lv3_batch_target_hits: u64,
+    pub lv3_batch_idle_dispatches: u64,
     pub flush_writer_meta_ns: u64,
     pub flush_writer_meta_build_ns: u64,
     pub flush_writer_meta_commit_ns: u64,
@@ -1384,6 +1386,7 @@ impl EngineMetricsSnapshot {
             lv3_batch_bytes_at_dispatch,
             lv3_batch_window_timeouts,
             lv3_batch_target_hits,
+            lv3_batch_idle_dispatches,
             flush_writer_meta_ns,
             flush_writer_meta_build_ns,
             flush_writer_meta_commit_ns,
