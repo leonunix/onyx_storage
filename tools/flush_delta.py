@@ -183,6 +183,30 @@ for k in ["bufalloc", "bufzero", "assemble", "submit"]:
     print("  %-16s %9.2f s  %5.1f%% of io" % (k, v / 1e9, v / io * 100 if io else 0))
 lv3 = d("lv3_io.write_batch_ns")
 print("  %-16s %9.2f s  %5.1f%% of io   (real LV3 device write)" % ("lv3 write_batch", lv3 / 1e9, lv3 / io * 100 if io else 0))
+# Where `bufalloc` went. Before the slab arena this leg was 10.58 ms/cycle at a
+# 2.7% pool hit-rate ceiling; the arena's own hit rate is the number to read here.
+# `overflow` counting up means a lane hit `mem.arena_max_bytes_per_lane` or asked
+# for a size past the class table and silently went back to the heap -- that is
+# the only way `bufalloc` can regress without the code changing.
+takes = d("mem_arena.takes")
+cycles = d("flush_writer_batch.cycles")
+if takes:
+    hits = d("mem_arena.hits")
+    grows = d("mem_arena.grows")
+    ba = d("flush_writer_io_split.bufalloc")
+    print("  -- slab arena --")
+    print("    takes %d (%.0f/cycle)  hit %.3f%%  grows %d  overflow %d" % (
+        takes, takes / cycles if cycles else 0, hits / takes * 100, grows,
+        d("mem_arena.overflow")))
+    print("    bufalloc %.2f us/take   resident %.1f MiB (cumulative grow, arenas never shrink)" % (
+        ba / takes / 1000, b.get("mem_arena.grow_bytes", 0) / 1048576.0))
+    # Gap zeroing that replaced the blanket fill(0). Incompressible payloads are
+    # whole blocks, so this goes to 0; compressible ones leave a sub-block tail.
+    # It is always a strict subset of what fill(0) used to touch.
+    slab = d("lv3_io.write_slab_bytes")
+    print("    zero_bytes %.1f MiB (%.2f%% of slab bytes)" % (
+        d("mem_arena.zero_bytes") / 1048576.0,
+        d("mem_arena.zero_bytes") / slab * 100 if slab else 0))
 print("== throughput ==")
 print("  lv3 write bytes %.1f MB/s  ops %.0f/s  batch calls %.0f/s" % (
     d("lv3_io.write_compressed_bytes") / W / 1e6, d("lv3_io.write_ops") / W, d("lv3_io.write_batch_calls") / W))

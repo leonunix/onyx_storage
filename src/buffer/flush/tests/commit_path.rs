@@ -1093,6 +1093,7 @@ fn passthrough_send_disconnect_rolls_back_and_fences() {
         &allocator,
         &io_engine,
         None,
+        Some(&test_arena()),
         &metrics,
         &in_flight,
         &done_tx,
@@ -1307,6 +1308,7 @@ fn writer_flushes_packed_open_slot_while_lane_stays_busy() {
             &allocator_w,
             &io_engine_w,
             None,
+            Some(&test_arena()),
             &done_tx,
             &running_w,
             &in_flight,
@@ -1662,6 +1664,7 @@ fn passthrough_groups_sub_stripe_units_into_one_full_stripe() {
         &allocator,
         &io_engine,
         None,
+        Some(&test_arena()),
         &metrics,
         &in_flight,
         &done_tx,
@@ -1705,6 +1708,121 @@ fn passthrough_groups_sub_stripe_units_into_one_full_stripe() {
     }
 }
 
+/// ⛔ RED LINE: an arena slot comes back **dirty**, and the chunklet write path
+/// submits the whole buffer length (`OwnedBatchOp::len = buffer.len()`), not just
+/// the payload prefix. So every gap the run layout leaves — here each unit's
+/// sub-block tail, because a compressed payload is not a whole number of blocks —
+/// must reach the device as zeroes, never as the previous tenant's bytes. Writing
+/// recycled heap content to LV3 would be an information leak (possibly another
+/// volume's plaintext) and would make on-disk padding nondeterministic.
+///
+/// The check is end to end on purpose: `StripeMockDevice` reports a 6-block
+/// stripe and routes writes through `write_many_at`, so this exercises the same
+/// full-buffer submission a real chunklet LD gets.
+#[test]
+fn arena_recycled_slot_does_not_leak_into_stripe_padding() {
+    let (_meta, pool, _lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+    let data_tmp = NamedTempFile::new().unwrap();
+    data_tmp.as_file().set_len(4096 * 20000).unwrap();
+    let io_engine = stripe_io_engine(data_tmp.path(), 6, metrics.clone());
+
+    // Dirty every slot of the 6-block class before the writer gets one, so a
+    // missing gap-zero shows up as 0xEE on the device rather than as a zero that
+    // happened to already be there.
+    let arena = test_arena();
+    let mut dirty = Vec::new();
+    for _ in 0..8 {
+        let mut buf = arena.take(6 * BLOCK_SIZE as usize).unwrap();
+        buf.as_mut_slice().fill(0xEE);
+        dirty.push(buf);
+    }
+    drop(dirty);
+
+    // Six 1-block units whose payloads are NOT block multiples: each leaves a
+    // 4096 - 3000 = 1096-byte tail gap inside its own block.
+    const PAYLOAD_LEN: usize = 3000;
+    let mut units = Vec::new();
+    let mut seqs_per_unit = Vec::new();
+    for (idx, lba) in [200u64, 201, 202, 203, 204, 205].into_iter().enumerate() {
+        let seq = idx as u64 + 1;
+        pool.note_latest_lba_seq_for_test("flush-race", Lba(lba), seq, 1);
+        let data = vec![0xC0 + idx as u8; PAYLOAD_LEN];
+        units.push(CompressedUnit {
+            vol_id: "flush-race".into(),
+            start_lba: Lba(lba),
+            lba_count: 1,
+            original_size: BLOCK_SIZE,
+            payload: CompressedPayload::Contiguous(data.clone()),
+            compression: crate::types::CompressionAlgo::Lz4.to_u8(),
+            crc32: crc32fast::hash(&data),
+            vol_created_at: 1,
+            seq_lba_ranges: vec![(seq, Lba(lba), 1)],
+            block_hashes: None,
+            dedup_stale_repairs: None,
+            dedup_skipped: false,
+            compression_bypassed: false,
+            dedup_completion: None,
+        });
+        seqs_per_unit.push(vec![seq]);
+    }
+    let completions_per_unit = vec![None; units.len()];
+
+    let in_flight = Arc::new(super::FlusherInFlightTracker::default());
+    let (done_tx, _done_rx) = unbounded::<Vec<u64>>();
+    let (cw_tx, cw_rx) = unbounded::<super::writer::CommitJob>();
+    BufferFlusher::write_units_batch(
+        0,
+        units,
+        seqs_per_unit,
+        completions_per_unit,
+        &pool,
+        &allocator,
+        &io_engine,
+        None,
+        Some(&arena),
+        &metrics,
+        &in_flight,
+        &done_tx,
+        std::slice::from_ref(&cw_tx),
+        1,
+    );
+    drop(cw_tx);
+
+    // Read the reserved blocks straight off the device and check every gap.
+    let mut checked = 0usize;
+    for job in cw_rx.iter() {
+        let super::writer::CommitJob::Passthrough(job) = job else {
+            panic!("expected passthrough commit job");
+        };
+        for unit in &job.units {
+            let block = io_engine
+                .read_blocks(unit.pba, unit.alloc_blocks as usize * BLOCK_SIZE as usize)
+                .unwrap();
+            assert_eq!(
+                &block[..PAYLOAD_LEN],
+                unit.unit.payload.as_contiguous().unwrap()
+            );
+            assert!(
+                block[PAYLOAD_LEN..].iter().all(|&b| b == 0),
+                "pba {} padding leaked recycled bytes: {:?}",
+                unit.pba.0,
+                &block[PAYLOAD_LEN..PAYLOAD_LEN + 16]
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 6, "every unit must have been written");
+    assert_eq!(
+        metrics
+            .mem_slab_zero_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        6 * (BLOCK_SIZE as usize - PAYLOAD_LEN) as u64,
+        "gap zeroing must be exactly the sub-block tails, nothing more"
+    );
+    assert_eq!(arena.live_slots(), 0, "every slot returned to the arena");
+}
+
 #[test]
 fn passthrough_partial_group_pads_io_and_returns_unused_extent() {
     let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
@@ -1736,6 +1854,7 @@ fn passthrough_partial_group_pads_io_and_returns_unused_extent() {
         &allocator,
         &io_engine,
         None,
+        Some(&test_arena()),
         &metrics,
         &in_flight,
         &done_tx,
@@ -1809,6 +1928,7 @@ fn passthrough_group_io_failure_rolls_back_whole_stripe_without_leak() {
         &allocator,
         &io_engine,
         None,
+        Some(&test_arena()),
         &metrics,
         &in_flight,
         &done_tx,

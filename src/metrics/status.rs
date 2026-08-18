@@ -1326,6 +1326,23 @@ impl EngineStatusSnapshot {
             self.metrics.lv3_write_slab_allocs,
             self.metrics.lv3_write_slab_bytes
         );
+        // Slab arena health. `hits/takes` is the reuse rate that replaced the
+        // 2.7 %-ceiling thread-local parking lot; `grow_bytes` is cumulative and
+        // therefore also the arenas' resident footprint, since they never shrink.
+        // `overflow` counting up means a lane hit its cap or asked for a size past
+        // the class table and silently went back to the heap. `zero_bytes` is what
+        // the run layout actually left as a gap — the work the removed blanket
+        // `fill(0)` used to do on every byte.
+        let _ = writeln!(
+            out,
+            "mem_arena: takes={} hits={} grows={} grow_bytes={} overflow={} zero_bytes={}",
+            self.metrics.mem_arena_takes,
+            self.metrics.mem_arena_hits,
+            self.metrics.mem_arena_grows,
+            self.metrics.mem_arena_grow_bytes,
+            self.metrics.mem_arena_overflow,
+            self.metrics.mem_slab_zero_bytes
+        );
         let _ = writeln!(
             out,
             "read_pool: requests={} batches={} batch_ops={} queue_wait_ns={} coalesce_wait_ns={} alloc_ns={} submit_wait_ns={} decode_ns={}",

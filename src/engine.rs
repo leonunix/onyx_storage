@@ -361,6 +361,20 @@ impl OnyxEngine {
         Ok(())
     }
 
+    /// Publish `[mem]` to the process-wide knobs `crate::mem` reads.
+    ///
+    /// Same shape as `io::engine::set_lv3_batch_tuning`: the arenas are created
+    /// later, inside each writer thread, so this only has to run before the
+    /// flusher starts. `0` on a numeric field keeps the compiled default.
+    fn apply_mem_tuning(config: &OnyxConfig) {
+        crate::mem::set_mem_tuning(
+            config.mem.arena_enabled,
+            config.mem.arena_max_bytes_per_lane,
+            config.mem.arena_max_class_blocks,
+            config.mem.arena_hugepage,
+        );
+    }
+
     fn configured_chunklet_io_scheduler(
         config: &OnyxConfig,
     ) -> OnyxResult<Option<Arc<ChunkletIoScheduler>>> {
@@ -905,6 +919,7 @@ impl OnyxEngine {
         Self::validate_data_buffer_devices_disjoint(config)?;
         Self::validate_dedup_read_pool(config)?;
         Self::validate_meta_backend(config)?;
+        Self::apply_mem_tuning(config);
 
         // 1. Chunklet RAID Pool (opened once; meta + LV3 + LV2 all share it) —
         //    None when [chunklet] is disabled. Opened BEFORE metadb because the
@@ -2000,6 +2015,7 @@ impl OnyxEngine {
     pub fn upgrade_from_meta_only(meta: Arc<MetaStore>, config: &OnyxConfig) -> OnyxResult<Self> {
         Self::validate_dedup_read_pool(config)?;
         Self::validate_meta_backend(config)?;
+        Self::apply_mem_tuning(config);
         let lifecycle = Arc::new(VolumeLifecycleManager::default());
         let metrics = Arc::new(EngineMetrics::default());
         let generation_clock = Self::seed_generation_clock(&meta)?;

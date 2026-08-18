@@ -1213,8 +1213,27 @@ impl IoEngine {
         }
     }
 
-    pub(crate) fn allocate_owned_write_buffer(&self, size: usize) -> OnyxResult<AlignedBuf> {
-        AlignedBuf::new(size, self.use_hugepages)
+    /// Allocate one O_DIRECT buffer for [`Self::submit_owned_write_batch_on`].
+    ///
+    /// `arena` is the calling writer lane's slab arena
+    /// ([`crate::mem::MemRole::Lv3Writer`]). It is `None` for callers that have no
+    /// lane of their own (tests, the single-device path) and when
+    /// `mem.arena_enabled` is off, which is the A/B baseline arm; both then take
+    /// the historic heap path. `storage.use_hugepages` only governs that heap
+    /// path; the arena has its own `mem.arena_hugepage` knob.
+    ///
+    /// ⚠ An arena slot is **dirty**. Every caller must cover every byte it
+    /// submits — the chunklet path writes `buffer.len()`, not `payload_len` — for
+    /// which [`crate::mem::SlabFill`] exists.
+    pub(crate) fn allocate_owned_write_buffer(
+        &self,
+        size: usize,
+        arena: Option<&Arc<crate::mem::SlabArena>>,
+    ) -> OnyxResult<AlignedBuf> {
+        match arena {
+            Some(arena) => arena.take(size),
+            None => AlignedBuf::new(size, self.use_hugepages),
+        }
     }
 
     /// Submit buffers the caller already assembled in O_DIRECT-aligned memory.

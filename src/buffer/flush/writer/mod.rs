@@ -168,6 +168,10 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         write_session: Option<&Arc<crate::io::uring::IoUringSession>>,
+        // This lane's slab arena for LV3 run / unit buffers. `None` when
+        // `mem.arena_enabled` is off (the A/B baseline arm) — the writer then
+        // allocates from the heap exactly as it did before.
+        arena: Option<&Arc<crate::mem::SlabArena>>,
         done_tx: &Sender<Vec<u64>>,
         running: &AtomicBool,
         in_flight_tracker: &FlusherInFlightTracker,
@@ -216,6 +220,7 @@ impl BufferFlusher {
                         allocator,
                         io_engine,
                         write_session,
+                        arena,
                         metrics,
                         in_flight_tracker,
                         done_tx,

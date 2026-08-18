@@ -22,6 +22,7 @@ pub mod frontend;
 pub mod gc;
 pub mod io;
 pub mod lifecycle;
+pub mod mem;
 pub mod meta;
 pub mod metrics;
 pub mod numa;

@@ -164,6 +164,11 @@ impl BufferFlusher {
         );
         let running = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(FlusherInFlightTracker::default());
+        // Owner of the per-lane LV3 write buffer arenas. Created here (one per
+        // engine) but the arenas themselves are materialised inside each writer
+        // thread, after its affinity bind, so their pre-faulted pages are
+        // NUMA-local to the lane that will fill them.
+        let mem_registry = crate::mem::MemRegistry::new(Some(metrics.clone()));
         let lane_count = pool.shard_count().max(1);
         let compress_workers =
             Self::per_lane_worker_count(config.compress_workers.max(1), lane_count);
@@ -417,6 +422,7 @@ impl BufferFlusher {
             let in_flight_w = in_flight.clone();
             let candidate_w = candidate.clone();
             let commit_worker_txs_w = commit_worker_txs.clone();
+            let mem_registry_w = mem_registry.clone();
             let writer_handle = thread::Builder::new()
                 .name(format!("flusher-writer-{}", shard_idx))
                 .spawn(move || {
@@ -437,6 +443,11 @@ impl BufferFlusher {
                             None
                         }
                     };
+                    // Same reason as the ring above: the arena's first growth
+                    // mmaps with MAP_POPULATE, so faulting it in from this thread
+                    // (already bound) keeps the LV3 stripe buffers on the local
+                    // NUMA node instead of wherever `start_with_metrics` ran.
+                    let arena = mem_registry_w.arena(crate::mem::MemRole::Lv3Writer, shard_idx);
                     let mut packer = Packer::new_with_lane(allocator_w.clone(), shard_idx);
                     Self::writer_loop(
                         shard_idx,
@@ -447,6 +458,7 @@ impl BufferFlusher {
                         &allocator_w,
                         &io_engine_w,
                         write_session.as_ref(),
+                        arena.as_ref(),
                         &done_tx,
                         &running_w,
                         &in_flight_w,

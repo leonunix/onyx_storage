@@ -1,7 +1,9 @@
 use std::alloc::{self, Layout};
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use crate::error::{OnyxError, OnyxResult};
+use crate::mem::SlabArena;
 use crate::types::BLOCK_SIZE;
 
 thread_local! {
@@ -23,13 +25,34 @@ thread_local! {
 
 const THREAD_POOL_MAX_BUFFERS: usize = 8;
 
+/// Where an [`AlignedBuf`]'s memory came from, and therefore how it must be
+/// returned. Provenance is carried in the handle rather than inferred, because
+/// the LV3 write path hands buffers across threads: the batch executor's reply is
+/// `let _ = request.done.send(..)`, so a buffer can be dropped on an executor
+/// thread when its producer has already left. A thread-local pool silently loses
+/// such a buffer; an `Arc<SlabArena>` cannot.
+enum Backing {
+    /// `alloc_zeroed`; may be parked in the thread-local pool on drop.
+    Heap,
+    /// `mmap(MAP_HUGETLB)`; munmapped on drop, never pooled.
+    Hugepage,
+    /// One slot of a [`SlabArena`]; the slot goes back to that arena on drop,
+    /// from whichever thread holds the buffer at the time.
+    Arena { arena: Arc<SlabArena>, class: u16 },
+}
+
 /// 4KB-aligned buffer for O_DIRECT IO.
-/// Optionally backed by hugepages.
+/// Optionally backed by hugepages or by a [`SlabArena`] slot.
 pub struct AlignedBuf {
     ptr: *mut u8,
+    /// Logical length: what callers see and — critically — what the LV3 run path
+    /// passes to the device as its op length. **Never** the slot/allocation
+    /// capacity: an arena slot may be wider than the request, and writing the
+    /// extra blocks would land on a neighbouring PBA.
     len: usize,
+    /// Capacity descriptor. `layout.size() >= len` for every backing.
     layout: Layout,
-    is_hugepage: bool,
+    backing: Backing,
 }
 
 // SAFETY: AlignedBuf owns its memory and the pointer is not shared
@@ -86,13 +109,42 @@ impl AlignedBuf {
         })
     }
 
+    /// Wrap one [`SlabArena`] slot.
+    ///
+    /// `len` is the caller's requested (block-aligned) size and stays the buffer's
+    /// logical length even when the slot is wider — see the field comment on
+    /// [`AlignedBuf::len`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the start of a `class`-sized slot of `arena`, at least `len`
+    /// bytes long, BLOCK_SIZE-aligned, and not reachable from anywhere else until
+    /// this buffer is dropped.
+    pub(crate) unsafe fn from_arena_slot(
+        ptr: *mut u8,
+        len: usize,
+        arena: Arc<SlabArena>,
+        class: u16,
+    ) -> Self {
+        let capacity = arena.slot_bytes(class);
+        debug_assert!(capacity >= len);
+        let layout = Layout::from_size_align(capacity, BLOCK_SIZE as usize)
+            .expect("arena slot capacity is a BLOCK_SIZE multiple");
+        Self {
+            ptr,
+            len,
+            layout,
+            backing: Backing::Arena { arena, class },
+        }
+    }
+
     /// Try to park `self`'s allocation in the thread-local pool.
     /// Returns `true` iff the pool took ownership of the allocation;
     /// in that case the caller MUST clear `self.ptr` so the Drop
     /// tail does not double-free. Hugepage-backed bufs and a pool
     /// that's already at `THREAD_POOL_MAX_BUFFERS` both decline.
     fn try_park_alloc(&mut self) -> bool {
-        if self.is_hugepage || self.ptr.is_null() {
+        if !matches!(self.backing, Backing::Heap) || self.ptr.is_null() {
             return false;
         }
         ALIGNED_BUF_POOL
@@ -111,7 +163,7 @@ impl AlignedBuf {
                     ptr: self.ptr,
                     len: self.layout.size(),
                     layout: self.layout,
-                    is_hugepage: false,
+                    backing: Backing::Heap,
                 };
                 pool.push(parked);
                 true
@@ -134,7 +186,7 @@ impl AlignedBuf {
             ptr,
             len: size,
             layout,
-            is_hugepage: false,
+            backing: Backing::Heap,
         })
     }
 
@@ -161,7 +213,7 @@ impl AlignedBuf {
                     ptr: p.as_ptr() as *mut u8,
                     len: size,
                     layout,
-                    is_hugepage: true,
+                    backing: Backing::Hugepage,
                 })
             }
             Err(_) => {
@@ -250,6 +302,12 @@ impl AlignedBufPool {
     /// resident buffers to bound steady-state memory; excess buffers
     /// are dropped (and their backing allocation freed) on return.
     pub fn put(&mut self, mut buf: AlignedBuf, max_keep: usize) {
+        // Arena-backed buffers belong to their arena, not to this pool: dropping
+        // hands the slot straight back. Parking one here would also corrupt its
+        // logical length, which the LV3 write path uses as a device op length.
+        if !matches!(buf.backing, Backing::Heap) {
+            return;
+        }
         // Restore len to layout-size so `take`'s capacity check is
         // accurate next time.
         buf.len = buf.layout.size();
@@ -276,14 +334,25 @@ impl AlignedBufPool {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        if self.is_hugepage {
-            unsafe {
-                let _ = nix::sys::mman::munmap(
-                    std::ptr::NonNull::new(self.ptr as *mut _).unwrap(),
-                    self.len,
-                );
+        match &self.backing {
+            Backing::Hugepage => {
+                unsafe {
+                    let _ = nix::sys::mman::munmap(
+                        std::ptr::NonNull::new(self.ptr as *mut _).unwrap(),
+                        self.len,
+                    );
+                }
+                return;
             }
-            return;
+            Backing::Arena { arena, class } => {
+                // Correct on any thread: the handle owns an `Arc` to its own
+                // arena. Nothing is zeroed, madvised or unmapped here — the slot
+                // is simply available again.
+                arena.release(self.ptr as usize, *class);
+                self.ptr = std::ptr::null_mut();
+                return;
+            }
+            Backing::Heap => {}
         }
         if self.try_park_alloc() {
             // The pool now owns our allocation. Null the ptr so the

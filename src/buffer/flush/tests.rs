@@ -123,6 +123,16 @@ fn stripe_io_engine(
     Arc::new(IoEngine::new_chunklet(Arc::new(dev), false, metrics).with_full_stripe_writes(true))
 }
 
+/// One writer lane's slab arena, as `runtime.rs` builds it. Kept small: these
+/// tests only need a handful of slots, and a growth step is one mmap.
+///
+/// Passing this into `write_units_batch` (rather than `None`) is deliberate — it
+/// makes the existing passthrough tests exercise the arena path that production
+/// uses, including recycling a dirty slot between cycles.
+fn test_arena() -> Arc<crate::mem::SlabArena> {
+    crate::mem::SlabArena::new(8 * 1024 * 1024, 64, false, None)
+}
+
 /// Build a `PbaLifecycle` for tests that exercise the cleanup/retire path
 /// directly. Each call gets a fresh candidate cache (matching the old
 /// per-call `CandidateCache::new` behaviour these tests relied on).

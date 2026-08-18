@@ -234,7 +234,7 @@ fn chunklet_owned_batch_writes_aligned_buffers_without_repacking() {
     let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
     let mut writes = Vec::new();
     for idx in 0..3 {
-        let mut buffer = engine.allocate_owned_write_buffer(4096).unwrap();
+        let mut buffer = engine.allocate_owned_write_buffer(4096, None).unwrap();
         buffer.as_mut_slice().fill((idx + 1) as u8);
         writes.push(OwnedLvWrite {
             pba: Pba(idx),
@@ -272,7 +272,7 @@ fn lv3_batch_skips_the_window_when_an_executor_is_idle() {
     let engine = IoEngine::new_chunklet(backend.clone(), false, metrics.clone());
     let mut writes = Vec::new();
     for idx in 0..3 {
-        let mut buffer = engine.allocate_owned_write_buffer(4096).unwrap();
+        let mut buffer = engine.allocate_owned_write_buffer(4096, None).unwrap();
         buffer.as_mut_slice().fill((idx + 1) as u8);
         writes.push(OwnedLvWrite {
             pba: Pba(idx),
@@ -384,7 +384,7 @@ fn lv3_batch_coalesces_again_once_every_executor_is_busy() {
 
     let submit = |engine: Arc<IoEngine>| {
         std::thread::spawn(move || {
-            let mut buffer = engine.allocate_owned_write_buffer(4096).unwrap();
+            let mut buffer = engine.allocate_owned_write_buffer(4096, None).unwrap();
             buffer.as_mut_slice().fill(0x5a);
             engine
                 .submit_owned_write_batch_on(
@@ -455,7 +455,7 @@ fn chunklet_owned_batch_splits_oversized_request_across_executors() {
     let mut writes = Vec::new();
     for idx in 0..WRITE_COUNT {
         let mut buffer = engine
-            .allocate_owned_write_buffer(BLOCK_SIZE as usize)
+            .allocate_owned_write_buffer(BLOCK_SIZE as usize, None)
             .unwrap();
         buffer.as_mut_slice().fill(idx as u8);
         writes.push(OwnedLvWrite {

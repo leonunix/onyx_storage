@@ -386,6 +386,21 @@ pub struct EngineMetrics {
     pub lv3_write_batch_inflight_max: AtomicU64,
     pub lv3_write_slab_allocs: AtomicU64,
     pub lv3_write_slab_bytes: AtomicU64,
+    /// `crate::mem` slab arena accounting, summed over every lane's arena.
+    /// `takes - hits` is how often a take had to map memory or fall back; a warm
+    /// steady state has `hits/takes` ~ 1, `grows` flat and `overflow` at 0.
+    /// `grow_bytes` is cumulative and, because arenas never shrink, is also the
+    /// arenas' resident footprint.
+    pub mem_arena_takes: AtomicU64,
+    pub mem_arena_hits: AtomicU64,
+    pub mem_arena_grows: AtomicU64,
+    pub mem_arena_grow_bytes: AtomicU64,
+    pub mem_arena_overflow: AtomicU64,
+    /// Bytes the LV3 writer had to zero because the run layout left a gap. The
+    /// old blanket `fill(0)` zeroed the whole buffer instead; box-measured
+    /// `payload/slab = 100 %`, so in the healthy full-stripe shape this stays
+    /// near 0 and the 10.56 ms/cycle it replaces is gone.
+    pub mem_slab_zero_bytes: AtomicU64,
     pub read_unmapped: AtomicU64,
     pub read_crc_errors: AtomicU64,
     pub read_crc_errors_foreground: AtomicU64,

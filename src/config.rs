@@ -36,6 +36,55 @@ pub struct OnyxConfig {
     pub numa: NumaConfig,
     #[serde(default)]
     pub chunklet: ChunkletConfig,
+    #[serde(default)]
+    pub mem: MemConfig,
+}
+
+/// Hot-path memory scheduling ([`crate::mem`]).
+///
+/// Onyx's steady state recycles a few buffer shapes between a fixed set of
+/// threads thousands of times per second, and routing that through the general
+/// allocator cost more than the work it wrapped: box-measured 2026-08-17, the LV3
+/// flush writer spent **21.1 ms of every 59.66 ms `io` leg** on per-buffer
+/// allocation plus a redundant `fill(0)`. The slab arena replaces that with a
+/// pre-faulted, grow-only, size-classed slot pool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemConfig {
+    /// Serve LV3 writer buffers from a per-lane slab arena. `false` restores the
+    /// previous heap + thread-local-pool path — that is the A/B baseline arm, and
+    /// it needs no rebuild.
+    #[serde(default = "default_true")]
+    pub arena_enabled: bool,
+    /// Resident ceiling per lane, bytes. `0` keeps the compiled default (64 MiB).
+    ///
+    /// Arenas grow on demand and never shrink, so this is a ceiling, not a
+    /// reservation: a warm writer lane measured a 7.2 MiB working set. Past the
+    /// ceiling a take falls back to the heap and bumps `mem_arena.overflow`, so
+    /// a too-small value costs throughput, never correctness.
+    #[serde(default)]
+    pub arena_max_bytes_per_lane: usize,
+    /// Largest arena-served request, in 4 KiB blocks. `0` keeps the compiled
+    /// default (64 = 256 KiB), which covers a full stripe and the largest
+    /// possible compressed unit (`flush.coalesce_max_raw_bytes`). Anything larger
+    /// goes to the heap.
+    #[serde(default)]
+    pub arena_max_class_blocks: usize,
+    /// `MADV_HUGEPAGE` on arena regions. Default off: THP can introduce
+    /// allocation stalls that would be charged to whatever else is being
+    /// measured, so it has to be its own arm.
+    #[serde(default)]
+    pub arena_hugepage: bool,
+}
+
+impl Default for MemConfig {
+    fn default() -> Self {
+        Self {
+            arena_enabled: true,
+            arena_max_bytes_per_lane: 0,
+            arena_max_class_blocks: 0,
+            arena_hugepage: false,
+        }
+    }
 }
 
 /// NUMA awareness mode (docs/numa-aware-design.md §3.3).

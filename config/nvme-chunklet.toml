@@ -357,3 +357,18 @@ enabled = false
 node_id = 0
 heartbeat_interval_ms = 3000
 lease_duration_secs = 30
+
+# Hot-path memory scheduling (src/mem). The LV3 writer's run/unit buffers come
+# from a per-lane, pre-faulted, grow-only slab arena instead of per-buffer
+# alloc_zeroed + fill(0), which box-measured 21.1 ms of every 59.66 ms `io` leg
+# (2026-08-17). Watch `mem_arena:` in `onyx status`: hits/takes should sit at
+# ~100%, grows should stop after warm-up, overflow must stay 0.
+#
+# Defaults are deliberate; the two reasons to touch this section:
+#   arena_enabled = false  -> the A/B baseline arm (old heap path, no rebuild)
+#   arena_hugepage = true  -> its own separate arm (THP can add alloc stalls)
+[mem]
+arena_enabled = true
+arena_max_bytes_per_lane = 0   # 0 = 64 MiB ceiling per lane; grows on demand
+arena_max_class_blocks = 0     # 0 = 64 blocks (256 KiB), covers stripe + max unit
+arena_hugepage = false

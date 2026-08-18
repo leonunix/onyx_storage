@@ -715,6 +715,11 @@ impl BufferFlusher {
     ///
     /// IO failures are handled inline (free PBA, defer_retry, send
     /// `done_tx`) so the shard writer's retry path stays simple.
+    ///
+    /// `arena` is this lane's [`crate::mem::SlabArena`], which owns the run and
+    /// unit buffers this cycle assembles. `None` = heap path (tests, the A/B
+    /// baseline arm).
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::buffer::flush) fn write_units_batch(
         shard_idx: usize,
         units: Vec<CompressedUnit>,
@@ -724,6 +729,7 @@ impl BufferFlusher {
         allocator: &SpaceAllocator,
         io_engine: &IoEngine,
         write_session: Option<&Arc<crate::io::uring::IoUringSession>>,
+        arena: Option<&Arc<crate::mem::SlabArena>>,
         metrics: &EngineMetrics,
         in_flight_tracker: &FlusherInFlightTracker,
         done_tx: &Sender<Vec<u64>>,
@@ -1022,7 +1028,8 @@ impl BufferFlusher {
                     );
                 }
                 let bufalloc_start = Instant::now();
-                let allocated = io_engine.allocate_owned_write_buffer(extent.count as usize * bs);
+                let allocated =
+                    io_engine.allocate_owned_write_buffer(extent.count as usize * bs, arena);
                 Self::record_elapsed(&metrics.flush_writer_bufalloc_ns, bufalloc_start);
                 let mut buf = match allocated {
                     Ok(buf) => buf,
@@ -1045,18 +1052,34 @@ impl BufferFlusher {
                         continue;
                     }
                 };
-                let bufzero_start = Instant::now();
-                buf.as_mut_slice().fill(0);
-                Self::record_elapsed(&metrics.flush_writer_bufzero_ns, bufzero_start);
+                // Cover-or-zero instead of a blanket `fill(0)`: the buffer may be a
+                // recycled arena slot, and the chunklet path submits its whole
+                // length, so every byte must be either payload or zeroed here.
+                // `SlabFill` derives the gaps from the run layout — each member's
+                // `alloc_blocks*bs - payload_len` tail plus the run's padded tail —
+                // so there is no offset arithmetic left to get wrong, and the bytes
+                // it zeroes are always a strict subset of what the old blanket
+                // `fill(0)` touched.
+                //
+                // Timer split: inter-member gaps are charged to `assemble`, the
+                // trailing padding to `bufzero`. `mem_arena.zero_bytes` is the
+                // volume of both. With incompressible input every payload is a
+                // whole number of blocks, so both go to zero.
                 let assemble_start = Instant::now();
                 let mut off_blocks = 0usize;
+                let mut fill = crate::mem::SlabFill::new(buf.as_mut_slice());
                 for &m in &run.members {
                     let data_len = units[m].payload_len();
-                    let start = off_blocks * bs;
-                    units[m].copy_payload_to(&mut buf.as_mut_slice()[start..start + data_len]);
+                    units[m].copy_payload_to(fill.region(off_blocks * bs, data_len));
                     off_blocks += alloc_blocks[m] as usize;
                 }
                 Self::record_elapsed(&metrics.flush_writer_assemble_ns, assemble_start);
+                let bufzero_start = Instant::now();
+                let zeroed = fill.finish();
+                Self::record_elapsed(&metrics.flush_writer_bufzero_ns, bufzero_start);
+                metrics
+                    .mem_slab_zero_bytes
+                    .fetch_add(zeroed as u64, Ordering::Relaxed);
                 debug_assert_eq!(off_blocks, run.used_blocks as usize);
                 run_buffers.push(Some(buf));
             }
@@ -1073,17 +1096,22 @@ impl BufferFlusher {
                 if run_of[i].is_none() && !failed[i] && pbas[i].is_some() {
                     let total = alloc_blocks[i] as usize * bs;
                     let bufalloc_start = Instant::now();
-                    let allocated = io_engine.allocate_owned_write_buffer(total);
+                    let allocated = io_engine.allocate_owned_write_buffer(total, arena);
                     Self::record_elapsed(&metrics.flush_writer_bufalloc_ns, bufalloc_start);
                     match allocated {
                         Ok(mut buf) => {
-                            let bufzero_start = Instant::now();
-                            buf.as_mut_slice().fill(0);
-                            Self::record_elapsed(&metrics.flush_writer_bufzero_ns, bufzero_start);
+                            // Same cover-or-zero contract as the run path above;
+                            // here the only gap is the unit's own sub-block tail.
                             let assemble_start = Instant::now();
-                            units[i]
-                                .copy_payload_to(&mut buf.as_mut_slice()[..units[i].payload_len()]);
+                            let mut fill = crate::mem::SlabFill::new(buf.as_mut_slice());
+                            units[i].copy_payload_to(fill.region(0, units[i].payload_len()));
                             Self::record_elapsed(&metrics.flush_writer_assemble_ns, assemble_start);
+                            let bufzero_start = Instant::now();
+                            let zeroed = fill.finish();
+                            Self::record_elapsed(&metrics.flush_writer_bufzero_ns, bufzero_start);
+                            metrics
+                                .mem_slab_zero_bytes
+                                .fetch_add(zeroed as u64, Ordering::Relaxed);
                             unit_buffers[i] = Some(buf);
                         }
                         Err(e) => {
