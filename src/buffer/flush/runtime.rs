@@ -447,6 +447,8 @@ impl BufferFlusher {
                     // mmaps with MAP_POPULATE, so faulting it in from this thread
                     // (already bound) keeps the LV3 stripe buffers on the local
                     // NUMA node instead of wherever `start_with_metrics` ran.
+                    // Held unconditionally; `mem.arena_enabled` / `mem-arena` is
+                    // checked per allocation so the A/B can flip without a restart.
                     let arena = mem_registry_w.arena(crate::mem::MemRole::Lv3Writer, shard_idx);
                     let mut packer = Packer::new_with_lane(allocator_w.clone(), shard_idx);
                     Self::writer_loop(
@@ -458,7 +460,7 @@ impl BufferFlusher {
                         &allocator_w,
                         &io_engine_w,
                         write_session.as_ref(),
-                        arena.as_ref(),
+                        Some(&arena),
                         &done_tx,
                         &running_w,
                         &in_flight_w,

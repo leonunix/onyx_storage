@@ -146,6 +146,16 @@ enum Command {
         /// New stride; omit to just read the current one.
         stride: Option<u64>,
     },
+    /// Read or flip the running engine's LV3 slab arena (`src/mem`).
+    ///
+    /// `off` puts the flush writer back on the heap + thread-local-pool path, so
+    /// this is the A/B for the arena — and like `lock-stats-stride` it has to be
+    /// done inside ONE process, because on the perf box an arm-per-restart
+    /// comparison measures run-order drift rather than the knob.
+    MemArena {
+        /// `on` / `off`; omit to just read the current state.
+        state: Option<String>,
+    },
     /// chunklet RAID pool online operations (status / scrub / rebuild / job).
     /// Requires a running engine — the pool is flock-held by `start`, so these
     /// are routed to it over the IPC socket, never a second `Pool::open`.
@@ -1140,6 +1150,23 @@ fn main() -> anyhow::Result<()> {
             let cmd = match stride {
                 Some(n) => format!("lock-stats-stride {n}"),
                 None => "lock-stats-stride".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::MemArena { state } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "mem-arena talks to a running engine (socket {:?} not found) — \
+                     start it first, or set [mem].arena_enabled in its config",
+                    sock
+                );
+            }
+            let cmd = match state {
+                Some(s) => format!("mem-arena {s}"),
+                None => "mem-arena".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

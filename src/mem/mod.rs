@@ -69,8 +69,27 @@ pub fn set_mem_tuning(
     ARENA_HUGEPAGE.store(hugepage, Ordering::Relaxed);
 }
 
+/// Whether arena-backed buffers are in force **right now**.
+///
+/// Read at every allocation rather than captured at startup, so the A/B can
+/// alternate inside ONE process. That is not a preference: on the perf box an
+/// arm-per-restart comparison measures run-order drift, not the knob — two
+/// identical baseline arms once came out 2.13x apart (119.2 vs 253.3 MB/s), see
+/// memory `allocator_global_lock_is_the_writer_wall`. The load is a relaxed
+/// atomic against a ~90 ns arena take, and it is on the same path that used to
+/// cost 35-50 µs.
 pub fn arena_enabled() -> bool {
     ARENA_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Flip arena-backed buffers on/off in a running engine (IPC `mem-arena on|off`).
+///
+/// Safe at any moment: the two paths differ only in where a buffer's memory came
+/// from, and each buffer's provenance travels with it, so buffers allocated under
+/// one setting are released correctly after a flip. Turning it off leaves the
+/// arenas mapped and idle — flipping back needs no re-fault.
+pub fn set_arena_enabled(enabled: bool) {
+    ARENA_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 fn arena_max_bytes_per_lane() -> usize {

@@ -1216,11 +1216,15 @@ impl IoEngine {
     /// Allocate one O_DIRECT buffer for [`Self::submit_owned_write_batch_on`].
     ///
     /// `arena` is the calling writer lane's slab arena
-    /// ([`crate::mem::MemRole::Lv3Writer`]). It is `None` for callers that have no
-    /// lane of their own (tests, the single-device path) and when
-    /// `mem.arena_enabled` is off, which is the A/B baseline arm; both then take
-    /// the historic heap path. `storage.use_hugepages` only governs that heap
-    /// path; the arena has its own `mem.arena_hugepage` knob.
+    /// ([`crate::mem::MemRole::Lv3Writer`]); `None` for callers with no lane of
+    /// their own (tests, the single-device path).
+    ///
+    /// The enable check is read **here, per allocation**, not captured at
+    /// startup, so `mem-arena on|off` over IPC alternates the two arms inside one
+    /// process — the only valid way to A/B this on the perf box, where
+    /// arm-per-restart measures run-order drift (see
+    /// [`crate::mem::arena_enabled`]). `storage.use_hugepages` governs only the
+    /// heap path; the arena has its own `mem.arena_hugepage` knob.
     ///
     /// ⚠ An arena slot is **dirty**. Every caller must cover every byte it
     /// submits — the chunklet path writes `buffer.len()`, not `payload_len` — for
@@ -1231,8 +1235,8 @@ impl IoEngine {
         arena: Option<&Arc<crate::mem::SlabArena>>,
     ) -> OnyxResult<AlignedBuf> {
         match arena {
-            Some(arena) => arena.take(size),
-            None => AlignedBuf::new(size, self.use_hugepages),
+            Some(arena) if crate::mem::arena_enabled() => arena.take(size),
+            _ => AlignedBuf::new(size, self.use_hugepages),
         }
     }
 

@@ -106,9 +106,9 @@ lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0
 # taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
-lv3_ld_id = "8bf9eb9a-a55d-4b5c-9403-575c38fe382d"
-lv2_ld_id = "09c51104-6963-4f07-a6ad-b12751eaf34f"
-meta_ld_id = "73579d63-ca64-464a-a88d-7e6f3ccd3893"
+lv3_ld_id = "f75e1a33-9b2d-4b08-a081-0e4cbe73bdc9"
+lv2_ld_id = "89d9fcb7-6498-45fa-b252-0fb057a2764b"
+meta_ld_id = "5f8f11b0-ba24-4db9-8b07-9ae6141c55ef"
 
 [meta]
 # Phase 3f: metadb persists on the chunklet meta LD (see [chunklet].meta_ld_id),

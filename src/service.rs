@@ -762,6 +762,43 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // Read or flip arena-backed LV3 write buffers. Same reasoning as
+                // `lock-stats-stride` above: this knob's whole point is to be
+                // A/B'd inside ONE process, because an arm-per-restart on the
+                // perf box measures run-order drift (two identical baseline arms
+                // once landed 2.13x apart). Safe at any moment — provenance
+                // travels with each buffer, so buffers taken before a flip are
+                // still released to the right place after it.
+                "mem-arena" => {
+                    if let Some(arg) = parts.get(1) {
+                        match *arg {
+                            "on" | "true" | "1" => {
+                                crate::mem::set_arena_enabled(true);
+                                tracing::info!("LV3 slab arena enabled");
+                            }
+                            "off" | "false" | "0" => {
+                                crate::mem::set_arena_enabled(false);
+                                tracing::info!("LV3 slab arena disabled (heap path)");
+                            }
+                            _ => {
+                                let _ = stream
+                                    .write_all(b"error: usage: mem-arena [on|off]\n");
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "{}\nok\n",
+                        if crate::mem::arena_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 "mode" => {
                     let guard = engine.load();
                     let opt: &Option<OnyxEngine> = &guard;
