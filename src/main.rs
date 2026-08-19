@@ -156,6 +156,26 @@ enum Command {
         /// `on` / `off`; omit to just read the current state.
         state: Option<String>,
     },
+    /// Read or flip chunklet's coalesced completion wait (`uring_coalesced_wait`).
+    ///
+    /// `on` waits for a whole submit wave in ONE `io_uring_enter`; `off` (the
+    /// long-shipped behaviour) wakes once per completion, which box-measured as
+    /// 91.3% of a chunklet write call. Runtime-flippable so the A/B stays inside
+    /// ONE process at one pool age.
+    UringWait {
+        /// `on` / `off`; omit to just read the current state.
+        state: Option<String>,
+    },
+    /// Read or set chunklet's submit wave size (`uring_write_chunk_ops`).
+    ///
+    /// A many-strip write drains each wave before pushing the next, so the wave
+    /// size is the barrier count. `0` restores chunklet's historical 64; the value
+    /// is clamped to the ring depth. ⛔ Only meaningful with `uring-wait on` —
+    /// with a per-completion wake the enter count tracks total SQEs regardless.
+    UringWave {
+        /// New wave size in ops; omit to just read the current one.
+        ops: Option<usize>,
+    },
     /// chunklet RAID pool online operations (status / scrub / rebuild / job).
     /// Requires a running engine — the pool is flock-held by `start`, so these
     /// are routed to it over the IPC socket, never a second `Pool::open`.
@@ -1167,6 +1187,40 @@ fn main() -> anyhow::Result<()> {
             let cmd = match state {
                 Some(s) => format!("mem-arena {s}"),
                 None => "mem-arena".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::UringWait { state } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "uring-wait talks to a running engine (socket {:?} not found) — \
+                     start it first, or set [chunklet].uring_coalesced_wait in its config",
+                    sock
+                );
+            }
+            let cmd = match state {
+                Some(s) => format!("uring-wait {s}"),
+                None => "uring-wait".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::UringWave { ops } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "uring-wave talks to a running engine (socket {:?} not found) — \
+                     start it first, or set [chunklet].uring_write_chunk_ops in its config",
+                    sock
+                );
+            }
+            let cmd = match ops {
+                Some(n) => format!("uring-wave {n}"),
+                None => "uring-wave".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

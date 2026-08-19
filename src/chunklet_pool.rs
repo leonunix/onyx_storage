@@ -146,6 +146,42 @@ pub fn open_pool(cfg: &ChunkletConfig) -> OnyxResult<Arc<Pool>> {
     Ok(pool)
 }
 
+/// Runtime access to chunklet's two batched-submit knobs
+/// (`uring_coalesced_wait`, `uring_write_chunk_ops`).
+///
+/// Both are process-global atomics inside chunklet, read once per drain, so they
+/// can be flipped while IO is in flight: a wave already submitted completes under
+/// the value it started with. They are reachable at runtime — not only through
+/// `[chunklet]` at pool-configure time — because their A/B has to happen inside
+/// ONE process (an arm-per-restart on the perf box measures run-order drift, see
+/// `mem-arena`). Linux-only: chunklet's `uring_backend` does not exist elsewhere.
+#[cfg(target_os = "linux")]
+pub mod uring_submit {
+    use onyx_chunklet::io::uring_backend as ub;
+
+    /// Upper bound `set_wave_ops` clamps to (chunklet's ring depth).
+    pub const MAX_WAVE_OPS: usize = ub::URING_DEPTH as usize;
+
+    pub fn coalesced_wait() -> bool {
+        ub::coalesced_wait_enabled()
+    }
+
+    pub fn set_coalesced_wait(enabled: bool) {
+        ub::set_coalesced_wait(enabled);
+    }
+
+    pub fn wave_ops() -> usize {
+        ub::write_chunk_ops()
+    }
+
+    /// `0` restores chunklet's historical wave size; anything else is clamped to
+    /// `1..=MAX_WAVE_OPS`. Returns the effective value.
+    pub fn set_wave_ops(ops: usize) -> usize {
+        ub::set_write_chunk_ops(ops);
+        ub::write_chunk_ops()
+    }
+}
+
 /// Resolve the set of raw-device paths that make up this pool.
 ///
 /// With `device_discovery` on (default) and a `device_glob` set, every matching

@@ -799,6 +799,90 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // Read or flip chunklet's batched-submit knobs. `uring-wait` is
+                // one `io_uring_enter` per wave instead of one per completion;
+                // `uring-wave` is how many SQEs a wave carries. Box-measured
+                // 2026-08-18: 91.3% of a chunklet write call is completion wait,
+                // ~1186 enters per call because the wait is per-CQE.
+                //
+                // ⛔ `uring-wave` ALONE is near-useless: with a per-CQE wake the
+                // total enters ≈ total SQEs no matter how wide the wave is, so
+                // `uring-wait on` is the prerequisite for it to mean anything.
+                //
+                // Runtime-flippable for the same reason as `mem-arena`: the A/B
+                // must stay inside one process at one pool age. Safe mid-IO —
+                // both are read once per drain, and a wave already in flight
+                // finishes under the value it started with.
+                #[cfg(target_os = "linux")]
+                "uring-wait" => {
+                    use crate::chunklet_pool::uring_submit;
+                    if let Some(arg) = parts.get(1) {
+                        match *arg {
+                            "on" | "true" | "1" => {
+                                uring_submit::set_coalesced_wait(true);
+                                tracing::info!("chunklet coalesced CQE wait enabled");
+                            }
+                            "off" | "false" | "0" => {
+                                uring_submit::set_coalesced_wait(false);
+                                tracing::info!(
+                                    "chunklet coalesced CQE wait disabled (per-completion wake)"
+                                );
+                            }
+                            _ => {
+                                let _ = stream
+                                    .write_all(b"error: usage: uring-wait [on|off]\n");
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "{}\nok\n",
+                        if uring_submit::coalesced_wait() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
+                #[cfg(target_os = "linux")]
+                "uring-wave" => {
+                    use crate::chunklet_pool::uring_submit;
+                    if let Some(arg) = parts.get(1) {
+                        match arg.parse::<usize>() {
+                            // `0` is chunklet's "restore the historical wave"
+                            // sentinel, so it is a legal argument here.
+                            Ok(ops) => {
+                                let effective = uring_submit::set_wave_ops(ops);
+                                tracing::info!(
+                                    requested = ops,
+                                    effective,
+                                    "chunklet submit wave size set"
+                                );
+                            }
+                            Err(_) => {
+                                let msg = format!(
+                                    "error: usage: uring-wave [<ops 0..={}>]\n",
+                                    uring_submit::MAX_WAVE_OPS
+                                );
+                                let _ = stream.write_all(msg.as_bytes());
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!("{}\nok\n", uring_submit::wave_ops());
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
+                #[cfg(not(target_os = "linux"))]
+                "uring-wait" | "uring-wave" => {
+                    let _ = stream
+                        .write_all(b"error: chunklet io_uring submit is Linux-only\n");
+                    let _ = stream.flush();
+                }
                 "mode" => {
                     let guard = engine.load();
                     let opt: &Option<OnyxEngine> = &guard;

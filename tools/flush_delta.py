@@ -349,6 +349,18 @@ for cls in ["drain_data", "foreground", "drain_meta", "maintenance"]:
         "", sqes / waves if waves else 0, wait / waves / 1e6 if waves else 0, wait / sc / 1e6,
         wait / sqes / 1e3 if sqes else 0,
         d(pre + ".bounce_bytes") / sc / 1024, d(pre + ".bounce_ns") / sc / 1e6))
+    # `enters` is the direct read on `uring_coalesced_wait`: one `io_uring_enter`
+    # per wave when coalesced, one per staggered NVMe completion when not (box
+    # 2026-08-18: ~1186 enters/call on drain_data, 91.3% of the r6 write leg).
+    # It separates "the syscalls went away" from "the device got faster" -- wait_ns
+    # contains the device time either way, enters does not.
+    enters = d(pre + ".enters")
+    if enters:
+        print("  %-11s enters %8.1f /call  %6.2f /wave  %6.2f /sqe  %7.1f us/enter"
+              "  [coalesced wait %s]" % (
+            "", enters / sc, enters / waves if waves else 0,
+            enters / sqes if sqes else 0, wait / enters / 1e3,
+            "ON" if waves and enters / waves < 2 else "off"))
     # The pre-submit stage, split. It is NOT a rounding error: measured 2026-08-02
     # this stage cost 826.8 s per 480 s window on `foreground` (1.72 cores) --
     # MORE than that class spent waiting for the device -- and 505 us/call on
