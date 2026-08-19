@@ -686,3 +686,235 @@ fn wide_refill_floor_table() {
     let floor = a.wide_refill_floor(STRIPE, 8192, STRIPE).unwrap();
     assert!((STRIPE..=8192).contains(&floor));
 }
+
+// ---------------------------------------------------------------------
+// `flush.stripe_run_max_stripes` (design D1) — bundle N stripes into ONE
+// contiguous extent, and `storage.stripe_refill_width_bias` (D2), its supply.
+// ---------------------------------------------------------------------
+
+/// Whole stripes a bundle asks for in these tests.
+const BUNDLE: u32 = 8;
+
+fn drain_bundles(
+    a: &SpaceAllocator,
+    lane: usize,
+    max_stripes: u32,
+    calls: usize,
+) -> Vec<Extent> {
+    (0..calls)
+        .map(|i| {
+            a.allocate_stripe_run_for_lane(lane, max_stripes, STRIPE, PHASE)
+                .unwrap_or_else(|e| panic!("bundle {i} failed: {e}"))
+        })
+        .collect()
+}
+
+/// The point of D1: given ONE intact run, a bundle takes it whole instead of
+/// carving one stripe at a time, so the batch's stripes are adjacent BY
+/// CONSTRUCTION rather than by luck.
+#[test]
+fn stripe_run_bundles_consecutive_stripes_from_one_run() {
+    const WINDOWS: usize = 4;
+    let (a, _, wide) = pinned_windows_plus_intact_run(WINDOWS, BUNDLE);
+    // The very first call finds an empty cache and takes the ordinary one-stripe
+    // path (which is what refills); from then on the bundle path picks the widest
+    // cached run, so the intact material comes out as ONE bundle. Exactly
+    // `WINDOWS + 1` calls consume the fixture.
+    let bundles = drain_bundles(&a, 0, BUNDLE, WINDOWS + 1);
+    let widest = bundles.iter().map(|e| e.count).max().unwrap();
+    assert!(
+        widest >= BUNDLE * STRIPE,
+        "no bundle reached the cap: widths {:?}",
+        bundles.iter().map(|e| e.count).collect::<Vec<_>>()
+    );
+    let bundle = bundles.iter().find(|e| e.count == BUNDLE * STRIPE).unwrap();
+    assert_eq!(bundle.start.0, wide.start.0, "the bundle IS the intact run");
+
+    let supply = a.supply_stats();
+    assert_eq!(supply.stripe_run_allocs, bundles.len() as u64);
+    assert!(
+        supply.stripes_per_run() > 1.0,
+        "stripes/run {} should be above the pre-D1 1.0",
+        supply.stripes_per_run()
+    );
+    // Histogram: 8 stripes lands in the 8-15 bucket (index 3).
+    assert!(supply.stripe_run_width_hist[3] >= 1);
+}
+
+/// The safety property the whole design rests on: greedy is never demanding.
+/// On a pool of isolated single-stripe windows — the aged-box shape — a bundle
+/// request must still serve every window, one stripe at a time, exactly as the
+/// exact one-stripe call does. If this regresses, D1 turns servable writes into
+/// `SpaceExhausted`.
+#[test]
+fn stripe_run_never_fails_where_one_stripe_succeeds() {
+    const WINDOWS: usize = 24;
+    let (exact, _) = isolated_window_allocator(WINDOWS);
+    let exact_starts = drain_stripes(&exact, 0, WINDOWS);
+
+    let (greedy, _) = isolated_window_allocator(WINDOWS);
+    let bundles = drain_bundles(&greedy, 0, BUNDLE, WINDOWS);
+    assert_eq!(
+        bundles.iter().map(|e| e.start.0).collect::<Vec<_>>(),
+        exact_starts,
+        "greedy must hand out the same PBAs when nothing is contiguous"
+    );
+    assert!(
+        bundles.iter().all(|e| e.count == STRIPE),
+        "a pinned window can only ever serve one stripe"
+    );
+    // And the pool is equally exhausted afterwards.
+    assert!(greedy
+        .allocate_stripe_run_for_lane(0, BUNDLE, STRIPE, PHASE)
+        .is_err());
+}
+
+/// Every bundle is a whole number of stripes AND device-offset aligned — the
+/// two properties chunklet needs to treat the op as N zero-RMW full stripes.
+#[test]
+fn stripe_run_extents_are_whole_stripes_and_aligned() {
+    let (a, _, _) = pinned_windows_plus_intact_run(6, 32);
+    for extent in drain_bundles(&a, 0, BUNDLE, 8) {
+        assert_eq!(extent.count % STRIPE, 0, "{extent:?} is not whole stripes");
+        assert!(extent.count >= STRIPE);
+        assert_eq!(
+            (extent.start.0 + PHASE as u64) % STRIPE as u64,
+            0,
+            "{extent:?} is not stripe-aligned"
+        );
+    }
+}
+
+/// Cap 1 is the shipped path, byte for byte: one stripe per call and not even a
+/// counter moved. This is what makes the knob's default a no-op rather than a
+/// "probably equivalent" rewrite.
+#[test]
+fn stripe_run_cap_one_is_the_legacy_path() {
+    let (a, _, _) = pinned_windows_plus_intact_run(4, 32);
+    for extent in drain_bundles(&a, 0, 1, 6) {
+        assert_eq!(extent.count, STRIPE);
+    }
+    let supply = a.supply_stats();
+    assert_eq!(supply.stripe_run_allocs, 0, "cap 1 must not even count");
+    assert_eq!(supply.stripe_run_stripes, 0);
+}
+
+/// D2: the refill's SELECTION is what caps bundle width on an aged pool. With
+/// address-first-fit the lane gets the low pinned windows (2.1 stripes/run on
+/// the box); width-biased it gets the region's intact material, so the SAME
+/// bundle cap now actually fills.
+#[test]
+fn width_biased_refill_feeds_wide_bundles_where_address_order_cannot() {
+    // More pinned windows than one refill may take runs, so the ADDRESS-ordered
+    // walk spends its whole run budget on windows and never reaches the intact
+    // material — the aged-pool shape. The widest-first walk sees it immediately.
+    const WINDOWS: usize = LANE_EXTENT_CACHE_REFILL_RUNS + 8;
+    // Call 0 always takes the ordinary one-stripe path (the cache is empty and
+    // that is what refills it), so the arms are compared on call 1.
+    let (off, _, _) = pinned_windows_plus_intact_run(WINDOWS, BUNDLE);
+    let narrow = drain_bundles(&off, 0, BUNDLE, 2);
+    assert!(
+        narrow.iter().all(|e| e.count == STRIPE),
+        "address-first-fit can only offer pinned windows: {:?}",
+        narrow.iter().map(|e| e.count).collect::<Vec<_>>()
+    );
+
+    let (on, _, wide) = pinned_windows_plus_intact_run(WINDOWS, BUNDLE);
+    on.set_stripe_refill_width_bias(true);
+    let biased = drain_bundles(&on, 0, BUNDLE, 2);
+    assert_eq!(
+        biased[1].start.0, wide.start.0,
+        "width bias must put the intact run in the cache for the first bundle"
+    );
+    assert_eq!(biased[1].count, BUNDLE * STRIPE, "and fill the whole bundle");
+    assert!(on.stripe_refill_width_bias());
+}
+
+/// D2 is a best-fit selection, and a GLOBAL best-fit is what once corrupted the
+/// metadb L2P leaf codec by scattering one leaf's PBAs. The bound that makes it
+/// safe is structural: selection happens inside the lane's region, so the PBA
+/// span of one lane's allocations cannot exceed one region.
+#[test]
+fn width_biased_refill_keeps_one_lane_inside_one_region() {
+    let regions = 4;
+    let blocks = RESERVED_BLOCKS + regions as u64 * MIN_REGION_BLOCKS;
+    let a = SpaceAllocator::new_with_regions(blocks * BLOCK_SIZE as u64, 2, regions);
+    a.set_stripe_geometry(STRIPE, PHASE);
+    a.set_stripe_refill_width_bias(true);
+    let region_blocks = a.region_stats().region_blocks;
+    assert!(region_blocks > 0, "fixture must actually be sharded");
+
+    let starts: Vec<u64> = drain_bundles(&a, 0, BUNDLE, 64)
+        .iter()
+        .map(|e| e.start.0)
+        .collect();
+    let span = starts.iter().max().unwrap() - starts.iter().min().unwrap();
+    assert!(
+        span < region_blocks,
+        "lane span {span} blocks escaped its {region_blocks}-block region"
+    );
+}
+
+/// The pure carve, tabulated: it takes the widest whole-stripe multiple in
+/// `min..=max` and reports head/tail exactly like the exact variant.
+#[test]
+fn carve_aligned_upto_from_run_table() {
+    let run = Extent::new(Pba(4), 30); // aligned at phase 2, 5 stripes
+    let (aligned, head, tail) =
+        SpaceAllocator::carve_aligned_upto_from_run(run, STRIPE, 3 * STRIPE, STRIPE, PHASE)
+            .expect("5 stripes can serve 3");
+    assert_eq!(aligned, Extent::new(Pba(4), 3 * STRIPE));
+    assert!(head.is_none());
+    assert_eq!(tail, Some(Extent::new(Pba(22), 2 * STRIPE)));
+
+    // Capped by what the run has, not by `max`.
+    let (aligned, _, tail) =
+        SpaceAllocator::carve_aligned_upto_from_run(run, STRIPE, 99 * STRIPE, STRIPE, PHASE)
+            .unwrap();
+    assert_eq!(aligned.count, 5 * STRIPE);
+    assert!(tail.is_none());
+
+    // A misaligned run pays head pad and the WIDTH IS MEASURED FROM THE ALIGNED
+    // START: 26 blocks from pba 6 aligns at 10 and leaves 22, which is 3 whole
+    // stripes plus a 4-block tail — not 4 stripes.
+    let (aligned, head, tail) =
+        SpaceAllocator::carve_aligned_upto_from_run(Extent::new(Pba(6), 26), STRIPE, 99, STRIPE, PHASE)
+            .unwrap();
+    assert_eq!(head, Some(Extent::new(Pba(6), 4)));
+    assert_eq!(aligned, Extent::new(Pba(10), 3 * STRIPE));
+    assert_eq!(tail, Some(Extent::new(Pba(28), 4)));
+
+    // Below the minimum is a miss, exactly where the exact carve would miss.
+    assert!(SpaceAllocator::carve_aligned_upto_from_run(
+        Extent::new(Pba(4), STRIPE - 1),
+        STRIPE,
+        4 * STRIPE,
+        STRIPE,
+        PHASE
+    )
+    .is_none());
+}
+
+/// One bundle call is ONE aligned allocation, whichever branch served it. The
+/// cold branch delegates to `allocate_stripe_extent_for_lane`, which counts its
+/// own, so a naive bump at the top of the greedy path double-counts every cold
+/// call and silently deflates `allocs_per_refill` — the ratio that says whether
+/// the lane cache is buying anything.
+#[test]
+fn stripe_run_counts_one_aligned_alloc_per_call() {
+    let (a, _, _) = pinned_windows_plus_intact_run(2, 16);
+    let calls = 4;
+    let bundles = drain_bundles(&a, 0, BUNDLE, calls);
+    let supply = a.supply_stats();
+    assert_eq!(supply.aligned_allocs, calls as u64);
+    assert_eq!(supply.stripe_run_allocs, calls as u64);
+    assert_eq!(
+        supply.stripe_run_stripes,
+        bundles.iter().map(|e| u64::from(e.count / STRIPE)).sum::<u64>()
+    );
+    // And the histogram accounts for every call exactly once.
+    assert_eq!(
+        supply.stripe_run_width_hist.iter().sum::<u64>(),
+        calls as u64
+    );
+}

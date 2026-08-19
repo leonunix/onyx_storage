@@ -154,7 +154,25 @@ impl SpaceAllocator {
             refill_wide_hits: AtomicU64::new(0),
             refill_wide_misses: AtomicU64::new(0),
             geometry_cache: AtomicU64::new(0),
+            stripe_refill_width_bias: AtomicBool::new(false),
+            stripe_run_allocs: AtomicU64::new(0),
+            stripe_run_stripes: AtomicU64::new(0),
+            stripe_run_width_hist: std::array::from_fn(|_| AtomicU64::new(0)),
         }
+    }
+
+    /// Prefer wider reserve runs over lower-address ones when refilling a lane
+    /// (design D2). See [`crate::config::StorageConfig::stripe_refill_width_bias`];
+    /// the engine sets this once at open, next to
+    /// [`Self::set_stripe_refill_run_stripes`].
+    pub fn set_stripe_refill_width_bias(&self, enabled: bool) {
+        self.stripe_refill_width_bias
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the reserve refill is currently width-biased.
+    pub fn stripe_refill_width_bias(&self) -> bool {
+        self.stripe_refill_width_bias.load(Ordering::Relaxed)
     }
 
     /// Set the aligned refill's preferred run width in whole stripes (`0` = off).
@@ -443,6 +461,11 @@ impl SpaceAllocator {
             drain_skips: self.drain_skips.load(Ordering::Relaxed),
             wide_hits: self.refill_wide_hits.load(Ordering::Relaxed),
             wide_misses: self.refill_wide_misses.load(Ordering::Relaxed),
+            stripe_run_allocs: self.stripe_run_allocs.load(Ordering::Relaxed),
+            stripe_run_stripes: self.stripe_run_stripes.load(Ordering::Relaxed),
+            stripe_run_width_hist: std::array::from_fn(|i| {
+                self.stripe_run_width_hist[i].load(Ordering::Relaxed)
+            }),
         }
     }
 

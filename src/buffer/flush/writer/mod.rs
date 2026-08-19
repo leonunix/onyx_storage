@@ -13,6 +13,59 @@ pub(in crate::buffer::flush) use commit_worker::{
 };
 pub(in crate::buffer::flush) use post_commit::{PostCommitJob, POST_COMMIT_QUEUE_CAP};
 
+/// Whole RAID stripes one LV3 write op may cover — `flush.stripe_run_max_stripes`
+/// (design D1). `1` = the shipped one-stripe-per-op shape.
+///
+/// Process-global and read once per batch rather than captured at open, for the
+/// same reason as `crate::mem::arena_enabled`: on the perf box an arm-per-restart
+/// A/B measures run-order drift, not the knob (two byte-identical baseline arms
+/// once came out 2.13x apart), so the only trustworthy comparison alternates the
+/// setting inside ONE process against ONE pool age. Flipping mid-run is safe — it
+/// only changes how the NEXT batch groups its allocations; bundles already in
+/// flight carry their own width.
+static STRIPE_RUN_MAX_STRIPES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1);
+
+/// Diagnostic override, same shape as `ONYX_ALLOCATOR_REGIONS` and chunklet's
+/// `CHUNKLET_WRITEV_COALESCE`: it exists so the WHOLE suite can be re-run with
+/// bundling on (`ONYX_STRIPE_RUN_MAX_STRIPES=8 cargo test --release`) instead of
+/// only the dedicated bundling tests, which is the only way to find a mistake in a
+/// caller nobody thought to bundle-test. Overrides config and IPC, so production
+/// must not set it.
+pub fn stripe_run_env_override() -> Option<u32> {
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("ONYX_STRIPE_RUN_MAX_STRIPES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|stripes| stripes.clamp(1, MAX_STRIPE_RUN_STRIPES))
+    })
+}
+
+/// Whole stripes per LV3 write bundle in force right now (always >= 1).
+pub fn stripe_run_max_stripes() -> u32 {
+    stripe_run_env_override().unwrap_or_else(|| {
+        STRIPE_RUN_MAX_STRIPES
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1)
+    })
+}
+
+/// Set the bundle width cap (`0` and `1` both mean "one stripe per op"). Clamped
+/// to [`MAX_STRIPE_RUN_STRIPES`] — past chunklet's 256 KiB-per-drive merge window a
+/// wider bundle just splits again, so accepting a bigger number would only make the
+/// knob's reported value a lie.
+pub fn set_stripe_run_max_stripes(stripes: u32) -> u32 {
+    let clamped = stripes.clamp(1, MAX_STRIPE_RUN_STRIPES);
+    STRIPE_RUN_MAX_STRIPES.store(clamped, std::sync::atomic::Ordering::Relaxed);
+    clamped
+}
+
+/// Widest bundle worth asking for: chunklet merges at most
+/// `MAX_COALESCED_WRITE_BYTES` (256 KiB) per drive, which is 64 × 4 KiB strips,
+/// i.e. 64 consecutive stripes.
+pub const MAX_STRIPE_RUN_STRIPES: u32 = 64;
+
 impl BufferFlusher {
     /// Maximum units a single writer cycle drains from `write_rx` and
     /// folds into one combined metadb commit (packed slots through

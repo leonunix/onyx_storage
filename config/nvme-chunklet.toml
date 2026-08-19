@@ -255,6 +255,12 @@ allocator_regions = 0
 # iovecs instead of the bounce copy.
 # Flip to 8 for the B arm.
 stripe_refill_run_stripes = 0
+# Design D2 (supply for D1): refill a lane from its region's WIDEST free runs
+# instead of its lowest-address ones. Off at open; `tools/stripe_run_ab.sh` flips it
+# per arm over IPC (`refill-width-bias`). ⚠ It consumes the pool's intact material
+# first, so an arm that looks good for one window can be eating its own supply —
+# watch `allocator_contiguity largest_run` across segments, not just throughput.
+stripe_refill_width_bias = false
 
 [buffer]
 # A/B knob (default off in code): drain LV2 ring backpressure BEFORE taking the
@@ -307,6 +313,14 @@ coalesce_max_lbas = 6
 min_compression_savings_pct = 12
 skip_fully_superseded = true
 packed_meta_batch_max_lbas = 1024
+# Design D1 — whole stripes ONE LV3 write op may cover. Pinned here NOT because 32
+# is the chosen default (the shipped default is 1) but because the value at OPEN is
+# what sizes the slab arena's class table: a 32-stripe bundle is 192 blocks and the
+# arena's own default tops out at 64, so without this every bundle would fall back
+# to the heap and re-pay what the arena removed (41.03 → 0.67 µs/buffer).
+# `tools/stripe_run_ab.sh` flips the live value per arm over IPC (`stripe-run`),
+# which is the only valid A/B shape on this box.
+stripe_run_max_stripes = 32
 # Flush QoS OFF. The 100 ms default arms a foreground admission ladder that
 # measured as a net negative on this box: A/B over interleaved arms gave
 # OFF 233/233 MiB/s with p99 22.5 ms, ON 198 or 63.9 MiB/s with the collapsed

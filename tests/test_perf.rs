@@ -209,6 +209,7 @@ fn setup_perf_env(cfg: &PerfConfig) -> PerfEnv {
             stripe_group_lifetime_affinity: false,
             allocator_regions: 0,
             stripe_refill_run_stripes: 0,
+            stripe_refill_width_bias: false,
         },
         buffer: BufferConfig {
             device: Some(buf_file.path().to_path_buf()),

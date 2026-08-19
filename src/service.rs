@@ -799,6 +799,89 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // Read or set the LV3 write-bundle width (design D1,
+                // `flush.stripe_run_max_stripes`): how many consecutive exactly-full
+                // stripe groups share one contiguous extent and therefore one write
+                // op. `1` is the shipped one-stripe-per-op shape.
+                //
+                // Flippable at runtime because that is the only valid A/B on this
+                // box (see `mem-arena`), and safe mid-run: it changes how the NEXT
+                // batch groups its allocations, and a bundle already in flight
+                // carries its own width. ⚠ The ARENA class table is only widened at
+                // open (`apply_stripe_run_tuning`), so raising this past the
+                // configured cap in a running engine can push bundle buffers to the
+                // heap — watch `mem_arena.overflow`.
+                "stripe-run" => {
+                    if let Some(arg) = parts.get(1) {
+                        match arg.parse::<u32>() {
+                            Ok(stripes) => {
+                                let effective =
+                                    crate::buffer::flush::set_stripe_run_max_stripes(stripes);
+                                tracing::info!(
+                                    requested = stripes,
+                                    effective,
+                                    "LV3 write bundle width set"
+                                );
+                            }
+                            Err(_) => {
+                                let msg = format!(
+                                    "error: usage: stripe-run [<stripes 1..={}>]\n",
+                                    crate::buffer::flush::MAX_STRIPE_RUN_STRIPES
+                                );
+                                let _ = stream.write_all(msg.as_bytes());
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!("{}\nok\n", crate::buffer::flush::stripe_run_max_stripes());
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
+                // Read or flip the width-biased stripe-reserve refill (design D2,
+                // `storage.stripe_refill_width_bias`) — the SUPPLY half of
+                // `stripe-run`: without it a bundle is only as wide as the
+                // low-address window a live block has pinned (box: 2.1 stripes).
+                // Needs a running engine because it lives on the allocator instance.
+                "refill-width-bias" => {
+                    let guard = engine.load();
+                    let opt: &Option<OnyxEngine> = &guard;
+                    let Some(allocator) = opt.as_ref().and_then(|e| e.allocator()) else {
+                        let _ = stream.write_all(
+                            b"error: refill-width-bias needs a started engine\n",
+                        );
+                        let _ = stream.flush();
+                        continue;
+                    };
+                    if let Some(arg) = parts.get(1) {
+                        match *arg {
+                            "on" | "true" | "1" => {
+                                allocator.set_stripe_refill_width_bias(true);
+                                tracing::info!("stripe-reserve refill: widest run first");
+                            }
+                            "off" | "false" | "0" => {
+                                allocator.set_stripe_refill_width_bias(false);
+                                tracing::info!("stripe-reserve refill: lowest address first");
+                            }
+                            _ => {
+                                let _ = stream
+                                    .write_all(b"error: usage: refill-width-bias [on|off]\n");
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "{}\nok\n",
+                        if allocator.stripe_refill_width_bias() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 // Read or flip chunklet's batched-submit knobs. `uring-wait` is
                 // one `io_uring_enter` per wave instead of one per completion;
                 // `uring-wave` is how many SQEs a wave carries. Box-measured

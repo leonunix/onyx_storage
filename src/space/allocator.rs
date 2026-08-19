@@ -260,7 +260,28 @@ pub struct SpaceAllocator {
     /// public `stripe_geometry()` answer without taking a region lock (the GC
     /// defrag scanner asks once per candidate cluster).
     geometry_cache: AtomicU64,
+    /// Prefer WIDER reserve runs over lower-address ones when refilling a lane
+    /// (`storage.stripe_refill_width_bias`, design D2). `false` = the shipped
+    /// first-fit-by-address refill, byte for byte.
+    ///
+    /// Only the stripe-reserve refill consults this; small/unaligned allocation and
+    /// every ENOSPC fallback stay address-ordered. Runtime-settable for the same
+    /// reason as `stripe_refill_run_stripes`.
+    stripe_refill_width_bias: AtomicBool,
+    /// [`Self::allocate_stripe_run_for_lane`] calls that returned an extent.
+    stripe_run_allocs: AtomicU64,
+    /// Whole stripes those calls returned. `stripes / allocs` is the mean bundle
+    /// width — the mechanism read for design D1, and the local stand-in for
+    /// chunklet's per-PD adjacency merge (1.0 = the pre-D1 behaviour).
+    stripe_run_stripes: AtomicU64,
+    /// Bundle widths bucketed by `floor(log2(stripes))`: 1, 2-3, 4-7, 8-15, 16-31,
+    /// 32-63, 64+. The mean alone cannot tell "every bundle is 2 stripes" from
+    /// "most are 1 and a few are 30", and those imply different next steps.
+    stripe_run_width_hist: [AtomicU64; STRIPE_RUN_WIDTH_BUCKETS],
 }
+
+/// Buckets in [`SpaceAllocator::stripe_run_width_hist`].
+pub(crate) const STRIPE_RUN_WIDTH_BUCKETS: usize = 7;
 
 #[cfg(test)]
 #[path = "allocator/tests/free_pool_policy.rs"]

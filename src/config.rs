@@ -1182,6 +1182,28 @@ pub struct StorageConfig {
     /// way) but needs more of the reserve intact to hit.
     #[serde(default = "default_stripe_refill_run_stripes")]
     pub stripe_refill_run_stripes: u32,
+    /// Refill a flush lane's aligned extent cache from the region's **widest**
+    /// stripe-reserve runs instead of its lowest-address ones. `false` = the
+    /// shipped first-fit-by-address refill, byte for byte.
+    ///
+    /// This is the supply half of design D1 (`flush.stripe_run_max_stripes`). The
+    /// consumer can only bundle as many consecutive stripes as the lane cache holds
+    /// contiguously, and address-argmin on an aged pool means "the low-address
+    /// window one live block has pinned" — box-measured **13 blocks per run (2.1
+    /// stripes)** while `largest_run` was 4506 blocks at higher addresses. The width
+    /// floor above filters candidates and then gives up when nothing qualifies;
+    /// this reorders them, so it degrades to "the widest of whatever is left"
+    /// instead of to the legacy pick.
+    ///
+    /// ⚠ Two known costs, both to be read off the box A/B rather than assumed:
+    /// consuming the widest material first is a one-time budget on an aged pool
+    /// (watch `allocator_contiguity largest_run` decay), and widest-first is a
+    /// *best-fit* selection — safe here only because it stays inside ONE region, so
+    /// a metadb L2P leaf's PBA span is region-bounded (~200 MiB at 2048 regions)
+    /// rather than global, which is what made the historical global best-fit
+    /// corrupt the leaf codec.
+    #[serde(default)]
+    pub stripe_refill_width_bias: bool,
 }
 
 impl Default for StorageConfig {
@@ -1203,6 +1225,7 @@ impl Default for StorageConfig {
             stripe_group_lifetime_affinity: false,
             allocator_regions: default_allocator_regions(),
             stripe_refill_run_stripes: default_stripe_refill_run_stripes(),
+            stripe_refill_width_bias: false,
         }
     }
 }
@@ -1916,6 +1939,38 @@ pub struct FlushConfig {
     /// drain throughput. Set 0 to use the built-in default.
     #[serde(default = "default_packed_meta_batch_max_lbas")]
     pub packed_meta_batch_max_lbas: usize,
+    /// Whole RAID stripes one LV3 write op may cover (design D1). `1` = the shipped
+    /// one-stripe-per-op shape.
+    ///
+    /// **Why.** A passthrough batch emits one write op per stripe group, each with
+    /// its own stripe-wide allocation, so consecutive stripes land at unrelated
+    /// PBAs: box-measured **285 ops → 2277 × 4 KiB strip writes → 1245 SQEs**, an
+    /// adjacency merge of only 1.9x, and `r6.write` = 16.2 ms of a 28.8 ms RAID6
+    /// call. Neither of the syscall-shaped fixes moved it (`uring_coalesced_wait`
+    /// regressed 9 %; `uring_write_chunk_ops = 256` cut barriers 3.8x and gave the
+    /// leg back to parity compute) because both changed how the same IOs are waited
+    /// on, not how many there are.
+    ///
+    /// With this set to `W`, up to `W` consecutive **exactly-full** stripe groups
+    /// share ONE contiguous extent, ONE buffer and ONE op. Contiguous PBAs are
+    /// contiguous inside every member's chunklet, so chunklet's existing
+    /// `(pd, chunklet)` adjacency merge collapses the bundle into one writev per
+    /// drive — fewer device IOs, less per-op CPU (plan / grouping / SQE build), and
+    /// **identical parity work** (same stripes, same stripe locks).
+    ///
+    /// The allocation is greedy, never demanding: a bundle is as wide as the lane
+    /// cache can serve right now and a miss falls back to one stripe, so this cannot
+    /// turn a servable write into `SpaceExhausted`. That also means the achieved
+    /// width is capped by SUPPLY (`allocator_supply blocks_per_run`, 13 blocks =
+    /// 2.1 stripes on the box) — widening supply is
+    /// `storage.stripe_refill_width_bias`'s job.
+    ///
+    /// Values above 64 are pointless: chunklet merges at most 256 KiB per drive, so
+    /// a wider bundle just splits again. Partial stripe groups keep the per-group
+    /// path, which is what keeps the padded-tail accounting (and therefore the space
+    /// amplification) exactly as it was.
+    #[serde(default = "default_stripe_run_max_stripes")]
+    pub stripe_run_max_stripes: u32,
     /// Number of commit executor threads. All executors consume one shared,
     /// bounded MPMC queue, so queued jobs from every writer shard can be
     /// coalesced before MetaDB apply. Capped at NUM_COMMIT_WORKERS.
@@ -2064,6 +2119,7 @@ impl Default for FlushConfig {
             foreground_flush_recovery_pct: 0,
             foreground_flush_emergency_pct: 0,
             packed_meta_batch_max_lbas: default_packed_meta_batch_max_lbas(),
+            stripe_run_max_stripes: default_stripe_run_max_stripes(),
             commit_workers_per_volume: default_commit_workers_per_volume(),
             commit_target_lbas_per_tx: default_commit_target_lbas_per_tx(),
             commit_coalesce_lba_budget: default_commit_coalesce_lba_budget(),
@@ -2097,6 +2153,12 @@ fn default_foreground_flush_target_p99_ms() -> u64 {
 }
 fn default_packed_meta_batch_max_lbas() -> usize {
     DEFAULT_PACKED_META_BATCH_LBA_LIMIT
+}
+/// One stripe per LV3 op — the shipped shape. Design D1 is opt-in until the box
+/// A/B says otherwise, and it is IPC-flippable (`stripe-run`) so that decision
+/// needs no rebuild.
+fn default_stripe_run_max_stripes() -> u32 {
+    1
 }
 fn default_commit_workers_per_volume() -> usize {
     8
@@ -2544,6 +2606,50 @@ mod service_config_tests {
         // Unset knobs must stay on the compiled default rather than zeroing the
         // byte target, which would make every batch dispatch immediately.
         assert_eq!(configured.storage.lv3_batch_target_bytes, 0);
+    }
+
+    /// Design D's two knobs default OFF — that is what makes the box A/B a
+    /// comparison against the shipped shape rather than against another new path —
+    /// and the width cap is clamped to chunklet's per-drive merge window so the
+    /// value the engine reports back over IPC is the value in force.
+    #[test]
+    fn stripe_run_knobs_default_off_and_clamp() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert_eq!(default_config.flush.stripe_run_max_stripes, 1);
+        assert!(!default_config.storage.stripe_refill_width_bias);
+
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [flush]
+                stripe_run_max_stripes = 32
+
+                [storage]
+                stripe_refill_width_bias = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.flush.stripe_run_max_stripes, 32);
+        assert!(configured.storage.stripe_refill_width_bias);
+
+        use crate::buffer::flush::{
+            set_stripe_run_max_stripes, stripe_run_env_override, stripe_run_max_stripes,
+            MAX_STRIPE_RUN_STRIPES,
+        };
+        if stripe_run_env_override().is_some() {
+            // The whole-suite bundling arm pins the width; the setter is still
+            // exercised by the run without the override.
+            return;
+        }
+        let restore = stripe_run_max_stripes();
+        assert_eq!(set_stripe_run_max_stripes(0), 1, "0 means one stripe per op");
+        assert_eq!(set_stripe_run_max_stripes(32), 32);
+        assert_eq!(stripe_run_max_stripes(), 32);
+        assert_eq!(
+            set_stripe_run_max_stripes(u32::MAX),
+            MAX_STRIPE_RUN_STRIPES,
+            "past chunklet's 256 KiB/drive merge window a wider bundle just splits"
+        );
+        set_stripe_run_max_stripes(restore);
     }
 
     #[test]

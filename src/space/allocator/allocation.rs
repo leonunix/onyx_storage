@@ -563,6 +563,87 @@ impl SpaceAllocator {
         Ok(extent)
     }
 
+    /// Allocate **as many whole stripes as this lane already has contiguously**,
+    /// up to `max_stripes`, for one LV3 write bundle (design D1).
+    ///
+    /// This is [`Self::allocate_stripe_extent_for_lane`]'s greedy sibling. The
+    /// writer used to take one stripe per group, so consecutive stripes in a batch
+    /// landed at unrelated PBAs and each member drive received hundreds of
+    /// scattered 4 KiB strips: box-measured 285 ops -> 2277 strips -> 1245 SQEs, an
+    /// adjacency merge of only 1.9x. A bundle whose stripes are contiguous in PBA
+    /// is contiguous in every member's chunklet too, so chunklet's existing
+    /// `(pd, chunklet)` adjacency merge collapses it into ONE writev per drive.
+    ///
+    /// ⭐ Greedy, never demanding: the width is whatever the lane cache can serve
+    /// right now, and a cache miss falls through to the ordinary one-stripe
+    /// allocation. The refill's requirement is therefore never widened, so this
+    /// call **cannot fail anywhere `allocate_stripe_extent_for_lane(_, stripe, ..)`
+    /// would succeed** — no new `SpaceExhausted` surface, no extra drain, no extra
+    /// lock hold. It converts whatever contiguity the pool has (box: `blocks_per_run
+    /// = 13`, i.e. ~2.1 stripes) and nothing more; widening the SUPPLY is
+    /// `storage.stripe_refill_width_bias`'s job.
+    ///
+    /// `max_stripes <= 1`, `stripe_blocks <= 1` → byte-for-byte the old path.
+    pub fn allocate_stripe_run_for_lane(
+        &self,
+        lane: usize,
+        max_stripes: u32,
+        stripe_blocks: u32,
+        phase: u32,
+    ) -> OnyxResult<Extent> {
+        if max_stripes <= 1 || stripe_blocks <= 1 || lane >= self.lane_extent_caches.len() {
+            return self.allocate_stripe_extent_for_lane(lane, stripe_blocks, stripe_blocks, phase);
+        }
+        let max_need = stripe_blocks.saturating_mul(max_stripes);
+        {
+            let mut cache = self.lane_extent_caches[lane].lock().unwrap();
+            if let Some(extent) = Self::take_aligned_upto_from_extent_cache(
+                &mut cache,
+                stripe_blocks,
+                max_need,
+                stripe_blocks,
+                phase,
+            ) {
+                self.publish_lane_extent_depth(lane, &cache);
+                drop(cache);
+                // Counted here and NOT before the cache probe: the cold branch
+                // below delegates to `allocate_stripe_extent_for_lane`, which
+                // counts its own, and double-counting would silently corrupt
+                // `allocs_per_refill` — the ratio that says whether the lane cache
+                // is buying anything at all.
+                self.aligned_allocs.fetch_add(1, Ordering::Relaxed);
+                self.track_alloc(extent, "allocate_stripe_run_for_lane_cache")?;
+                self.allocated_blocks
+                    .fetch_add(extent.count as u64, Ordering::Relaxed);
+                self.free_blocks
+                    .fetch_sub(extent.count as u64, Ordering::Relaxed);
+                self.record_stripe_run(extent.count / stripe_blocks);
+                return Ok(extent);
+            }
+        }
+        // Cache miss: take the ordinary one-stripe path, which refills the cache.
+        // The next bundle finds the parked remainder and carves wide — measured
+        // `allocs_per_refill = 118.5`, so the cache path is >99% of the traffic and
+        // this branch is the cold one.
+        let extent = self.allocate_stripe_extent_for_lane(lane, stripe_blocks, stripe_blocks, phase);
+        if extent.is_ok() {
+            self.record_stripe_run(1);
+        }
+        extent
+    }
+
+    /// Width histogram for [`Self::allocate_stripe_run_for_lane`], in stripes.
+    /// `stripes` is >= 1; the bucket is `floor(log2(stripes))` clamped to the last
+    /// slot, so buckets are 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64+.
+    fn record_stripe_run(&self, stripes: u32) {
+        self.stripe_run_allocs.fetch_add(1, Ordering::Relaxed);
+        self.stripe_run_stripes
+            .fetch_add(u64::from(stripes), Ordering::Relaxed);
+        let bucket = (u32::BITS - 1 - stripes.max(1).leading_zeros()) as usize;
+        let bucket = bucket.min(self.stripe_run_width_hist.len() - 1);
+        self.stripe_run_width_hist[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Smallest multiple of `stripe` that is `>= data` (`stripe <= 1` → `data`).
     pub(super) fn round_up_blocks(data: u32, stripe: u32) -> u32 {
         if stripe <= 1 {
@@ -607,6 +688,89 @@ impl SpaceAllocator {
         let tail = (tail_start < run_end)
             .then(|| Extent::new(Pba(tail_start), (run_end - tail_start) as u32));
         Some((aligned, head_pad, tail))
+    }
+
+    /// [`Self::carve_aligned_from_run`] taking as much as it can instead of an
+    /// exact width: the aligned extent is the largest multiple of `stripe` in
+    /// `min_need..=max_need` that `run` can host. Both bounds MUST be multiples of
+    /// `stripe`. `None` means the run cannot even host `min_need`, which is exactly
+    /// when `carve_aligned_from_run(run, min_need, ..)` would also fail — so a
+    /// greedy caller never loses an allocation the exact caller would have made.
+    pub(super) fn carve_aligned_upto_from_run(
+        run: Extent,
+        min_need: u32,
+        max_need: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<(Extent, Option<Extent>, Option<Extent>)> {
+        let aligned_start = Self::align_up_pba(run.start.0, stripe as u64, phase as u64);
+        let run_end = run.start.0 + run.count as u64;
+        if aligned_start + min_need as u64 > run_end {
+            return None;
+        }
+        let available = (run_end - aligned_start).min(u32::MAX as u64) as u32;
+        let whole = available / stripe * stripe;
+        let need = whole.min(max_need).max(min_need);
+        Self::carve_aligned_from_run(run, need, stripe, phase)
+    }
+
+    /// [`Self::take_aligned_from_extent_cache`] for a bundle: take the WIDEST
+    /// cached run (lowest address breaking ties) and drain it up to `max_need`
+    /// instead of carving an exact width out of the address-argmin run.
+    ///
+    /// ⚠ Widest-first, not address-first, and that difference is the whole point.
+    /// A refill parks a mix of widths — the pinned single-stripe windows an aged
+    /// pool is full of, plus whatever intact material it found — so an
+    /// address-argmin carve hands out the narrow windows first and a bundle can
+    /// never be wider than one stripe no matter what the refill fetched. That is
+    /// exactly what made `storage.stripe_refill_width_bias` a no-op in
+    /// `width_biased_refill_feeds_wide_bundles_where_address_order_cannot` before
+    /// this ordering existed.
+    ///
+    /// The clustering argument still holds: the cache only ever holds runs from
+    /// this lane's own region, so reordering inside it moves a metadb L2P leaf's
+    /// PBAs by at most one region (~200 MiB at 2048 regions) — orders of magnitude
+    /// under leaf v5's 16 TiB span limit — and each bundle is itself contiguous.
+    /// The exact-width path keeps its strict ascending order untouched
+    /// (`lane_extent_cache_hands_out_ascending`); ties break low so a pool with no
+    /// width to offer degrades to exactly that order.
+    pub(super) fn take_aligned_upto_from_extent_cache(
+        cache: &mut Vec<Extent>,
+        min_need: u32,
+        max_need: u32,
+        stripe: u32,
+        phase: u32,
+    ) -> Option<Extent> {
+        let mut best: Option<(usize, Extent, Option<Extent>, Option<Extent>)> = None;
+        // Back-to-front = ascending address, so a strict `>` keeps the lowest
+        // address among equally wide candidates.
+        for idx in (0..cache.len()).rev() {
+            let Some(carved) =
+                Self::carve_aligned_upto_from_run(cache[idx], min_need, max_need, stripe, phase)
+            else {
+                continue;
+            };
+            let wider = best
+                .as_ref()
+                .is_none_or(|(_, aligned, _, _)| carved.0.count > aligned.count);
+            if wider {
+                let full_width = carved.0.count >= max_need;
+                best = Some((idx, carved.0, carved.1, carved.2));
+                // Nothing can beat a run that already fills the request.
+                if full_width {
+                    break;
+                }
+            }
+        }
+        let (idx, aligned, head, tail) = best?;
+        cache.remove(idx);
+        if let Some(head) = head {
+            Self::push_extent_cache(cache, head);
+        }
+        if let Some(tail) = tail {
+            Self::push_extent_cache(cache, tail);
+        }
+        Some(aligned)
     }
 
     /// Insert into a lane extent cache, keeping it ordered by DESCENDING start.
@@ -1112,7 +1276,19 @@ impl SpaceAllocator {
         //
         // The first pick is the exact address-argmin over the qualifying runs —
         // the same extent the one-run-at-a-time refill took, found the same way.
-        let first = pools.stripe_reserve.first_fit(floor)?;
+        //
+        // Width bias (design D2) replaces that argmin with the region's WIDEST
+        // qualifying run, because address-argmin on an aged pool means "the
+        // low-address window a single live block has pinned": box-measured 13
+        // blocks/run, which caps every write bundle at ~2 stripes regardless of
+        // `flush.stripe_run_max_stripes`. Still confined to the lane's region, so a
+        // leaf's PBA span stays region-bounded — see `FreeSet::widest_first`.
+        let width_biased = self.stripe_refill_width_bias();
+        let first = if width_biased {
+            pools.stripe_reserve.widest_first(floor).next()?
+        } else {
+            pools.stripe_reserve.first_fit(floor)?
+        };
         let mut budget = max_count.max(min_count);
         let mut plan: Vec<(Extent, u32)> = Vec::with_capacity(LANE_EXTENT_CACHE_REFILL_RUNS);
         fn plan_push(
@@ -1140,12 +1316,30 @@ impl SpaceAllocator {
         // A wide pass keeps the SAME entry bound for the same reason, and one wide
         // hit usually consumes the whole budget on its own, so the walk normally
         // exits on `budget` after zero iterations.
+        //
+        // Width-biased, the same walk runs over `by_size` descending instead, and
+        // it skips the run already planned rather than starting past an address.
         let mut examined = 0usize;
-        for run in pools
-            .stripe_reserve
-            .by_addr()
-            .range(Extent::single(Pba(first.start.0 + 1))..)
-        {
+        let ascending = (!width_biased)
+            .then(|| {
+                pools
+                    .stripe_reserve
+                    .by_addr()
+                    .range(Extent::single(Pba(first.start.0 + 1))..)
+                    .copied()
+            })
+            .into_iter()
+            .flatten();
+        let widest = width_biased
+            .then(|| {
+                pools
+                    .stripe_reserve
+                    .widest_first(floor)
+                    .filter(move |run| run.start != first.start)
+            })
+            .into_iter()
+            .flatten();
+        for run in ascending.chain(widest) {
             if plan.len() >= LANE_EXTENT_CACHE_REFILL_RUNS
                 || budget < min_count
                 || examined >= LANE_EXTENT_CACHE_REFILL_SCAN
@@ -1154,7 +1348,7 @@ impl SpaceAllocator {
             }
             examined += 1;
             if run.count >= floor {
-                plan_push(&mut plan, &mut budget, *run, stripe, min_count);
+                plan_push(&mut plan, &mut budget, run, stripe, min_count);
             }
         }
 

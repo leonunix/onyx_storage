@@ -96,6 +96,7 @@ impl EngineHarness {
                 stripe_group_lifetime_affinity: false,
                 allocator_regions: 0,
                 stripe_refill_run_stripes: 0,
+                stripe_refill_width_bias: false,
             },
             buffer: BufferConfig {
                 device: Some(buffer_file.path().to_path_buf()),

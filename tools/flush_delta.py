@@ -75,6 +75,19 @@ if refills:
     else:
         print("  wide refill: OFF (storage.stripe_refill_run_stripes = 0)")
 
+    # Design D1: how many consecutive stripes ONE LV3 write op covered. This is the
+    # consumer side of blocks/run above -- a bundle can only be as wide as the lane
+    # cache holds contiguously, so `stripes/run` well under the configured cap means
+    # SUPPLY is binding (storage.stripe_refill_width_bias), not the cap.
+    sr_allocs = d("allocator_stripe_runs.allocs")
+    if sr_allocs:
+        hist = [d("allocator_stripe_runs.hist_%d" % b) for b in (1, 2, 4, 8, 16, 32, 64)]
+        print("  stripe runs: %d bundles  %.2f stripes/bundle  hist 1:%d 2-3:%d 4-7:%d"
+              " 8-15:%d 16-31:%d 32-63:%d 64+:%d" % (
+            sr_allocs, d("allocator_stripe_runs.stripes") / sr_allocs, *hist))
+    else:
+        print("  stripe runs: OFF (flush.stripe_run_max_stripes = 1)")
+
 # Per-site wait/hold attribution for the two allocator locks. THE question the
 # free_pools table answers: of the writer's alloc time, how much is waiting, and
 # whose hold was it? `retired_lock` answers the follow-up: the retire and free

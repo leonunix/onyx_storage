@@ -1157,6 +1157,25 @@ impl EngineStatusSnapshot {
                 // adjacency merge to 1.02x. See `storage.stripe_refill_run_stripes`.
                 s.blocks_per_run(),
             );
+            // Design D1's mechanism read, on its own line so the histogram can grow
+            // without disturbing the `allocator_supply` token order that
+            // `tools/flush_delta.py` differences. `stripes_per_run` 1.0 (or all-zero
+            // counters) = one stripe per LV3 op, the pre-D1 shape.
+            let _ = writeln!(
+                out,
+                "allocator_stripe_runs: allocs={} stripes={} stripes_per_run={:.2} \
+                 hist_1={} hist_2={} hist_4={} hist_8={} hist_16={} hist_32={} hist_64={}",
+                s.stripe_run_allocs,
+                s.stripe_run_stripes,
+                s.stripes_per_run(),
+                s.stripe_run_width_hist[0],
+                s.stripe_run_width_hist[1],
+                s.stripe_run_width_hist[2],
+                s.stripe_run_width_hist[3],
+                s.stripe_run_width_hist[4],
+                s.stripe_run_width_hist[5],
+                s.stripe_run_width_hist[6],
+            );
         }
         if let Some(r) = self.allocator_regions {
             // `regions` is NOT a counter to difference — it is the divisor

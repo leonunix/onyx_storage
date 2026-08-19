@@ -361,6 +361,24 @@ impl OnyxEngine {
         Ok(())
     }
 
+    /// Publish `flush.stripe_run_max_stripes` (design D1) and make the slab arena
+    /// able to serve the bundles it implies.
+    ///
+    /// A bundle buffer is `stripe_blocks * max_stripes` blocks, which is past the
+    /// arena's default largest class (64 blocks = 256 KiB) as soon as the cap is
+    /// more than ~10 stripes. Without the raise every bundle would fall back to the
+    /// heap and bump `mem_arena.overflow` — i.e. D1 would silently re-pay the
+    /// per-buffer cost the arena was landed to remove (41.03 -> 0.67 µs/buffer), and
+    /// the A/B would measure the two changes fighting each other.
+    fn apply_stripe_run_tuning(config: &OnyxConfig, stripe_blocks: u32) {
+        let cap = crate::buffer::flush::set_stripe_run_max_stripes(
+            config.flush.stripe_run_max_stripes,
+        );
+        if cap > 1 && stripe_blocks > 1 {
+            crate::mem::raise_arena_max_class_blocks(stripe_blocks.saturating_mul(cap));
+        }
+    }
+
     /// Publish `[mem]` to the process-wide knobs `crate::mem` reads.
     ///
     /// Same shape as `io::engine::set_lv3_batch_tuning`: the arenas are created
@@ -1024,6 +1042,8 @@ impl OnyxEngine {
         // rebuild preserves it).
         allocator.set_stripe_geometry(io_engine.stripe_blocks(), io_engine.stripe_phase());
         allocator.set_stripe_refill_run_stripes(config.storage.stripe_refill_run_stripes);
+        allocator.set_stripe_refill_width_bias(config.storage.stripe_refill_width_bias);
+        Self::apply_stripe_run_tuning(config, io_engine.stripe_blocks());
         allocator.rebuild_from_metadata(&meta)?;
 
         // 4. Write buffer pool (with shard migration if needed)
@@ -2114,6 +2134,8 @@ impl OnyxEngine {
         ));
         allocator.set_stripe_geometry(io_engine.stripe_blocks(), io_engine.stripe_phase());
         allocator.set_stripe_refill_run_stripes(config.storage.stripe_refill_run_stripes);
+        allocator.set_stripe_refill_width_bias(config.storage.stripe_refill_width_bias);
+        Self::apply_stripe_run_tuning(config, io_engine.stripe_blocks());
         allocator.rebuild_from_metadata(&meta)?;
 
         // Write buffer pool (with shard migration if needed)

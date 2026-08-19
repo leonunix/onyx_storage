@@ -156,6 +156,27 @@ enum Command {
         /// `on` / `off`; omit to just read the current state.
         state: Option<String>,
     },
+    /// Read or set the LV3 write-bundle width (`flush.stripe_run_max_stripes`).
+    ///
+    /// How many consecutive exactly-full stripe groups share one contiguous extent
+    /// and therefore ONE write op, so each member drive gets one sequential write
+    /// instead of one 4 KiB strip per stripe. `1` = the shipped shape. The achieved
+    /// width is capped by the pool's contiguity — see `refill-width-bias` for the
+    /// supply half. Runtime-settable so the A/B stays inside ONE process.
+    StripeRun {
+        /// New cap in whole stripes; omit to just read the current one.
+        stripes: Option<u32>,
+    },
+    /// Read or flip the width-biased stripe-reserve refill
+    /// (`storage.stripe_refill_width_bias`).
+    ///
+    /// `on` refills a flush lane from its region's WIDEST free runs instead of its
+    /// lowest-address ones, which is what lets `stripe-run` build wide bundles on an
+    /// aged pool. Requires a started engine.
+    RefillWidthBias {
+        /// `on` / `off`; omit to just read the current state.
+        state: Option<String>,
+    },
     /// Read or flip chunklet's coalesced completion wait (`uring_coalesced_wait`).
     ///
     /// `on` waits for a whole submit wave in ONE `io_uring_enter`; `off` (the
@@ -1187,6 +1208,40 @@ fn main() -> anyhow::Result<()> {
             let cmd = match state {
                 Some(s) => format!("mem-arena {s}"),
                 None => "mem-arena".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::StripeRun { stripes } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "stripe-run talks to a running engine (socket {:?} not found) — \
+                     start it first, or set [flush].stripe_run_max_stripes in its config",
+                    sock
+                );
+            }
+            let cmd = match stripes {
+                Some(n) => format!("stripe-run {n}"),
+                None => "stripe-run".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::RefillWidthBias { state } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "refill-width-bias talks to a running engine (socket {:?} not found) — \
+                     start it first, or set [storage].stripe_refill_width_bias in its config",
+                    sock
+                );
+            }
+            let cmd = match state {
+                Some(s) => format!("refill-width-bias {s}"),
+                None => "refill-width-bias".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

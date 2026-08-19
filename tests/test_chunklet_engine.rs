@@ -165,6 +165,7 @@ fn full_stripe_aligned_write_round_trips_after_reopen() {
             stripe_group_lifetime_affinity: false,
             allocator_regions: 0,
             stripe_refill_run_stripes: 0,
+            stripe_refill_width_bias: false,
             ..StorageConfig::default()
         },
         buffer: BufferConfig {

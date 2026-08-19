@@ -423,6 +423,27 @@ impl FreeSet {
         best
     }
 
+    /// Runs of at least `min_count` blocks, WIDEST FIRST.
+    ///
+    /// The supply side of design D1: a first-fit-by-address refill on an aged pool
+    /// picks up the low-address singletons that a live block has pinned, which
+    /// box-measured as 13 blocks (2.1 stripes) per run — so the write bundles it
+    /// can then build are 2 stripes wide no matter how big the cap is. Walking
+    /// `by_size` backwards hands the refill the region's intact material instead.
+    ///
+    /// ⚠ Only the stripe-reserve refill may use this, and only inside ONE region
+    /// (`storage.stripe_refill_width_bias`). A GLOBAL widest-first pick is the
+    /// best-fit policy that once corrupted the metadb L2P leaf codec by scattering
+    /// a leaf's PBAs across the whole address space; confined to a region the span
+    /// is bounded by the region (~200 MiB at 2048 regions), orders of magnitude
+    /// under leaf v5's 16 TiB limit.
+    pub(crate) fn widest_first(&self, min_count: u32) -> impl Iterator<Item = Extent> + '_ {
+        self.by_size
+            .range((min_count, 0)..)
+            .rev()
+            .map(|&(count, start)| Extent::new(Pba(start), count))
+    }
+
     /// Largest extent. Matches the old `iter().max_by_key(|e| e.count)`
     /// last-wins tie semantics: `by_size.last()` is (max count, max start).
     pub(crate) fn largest(&self) -> Option<Extent> {

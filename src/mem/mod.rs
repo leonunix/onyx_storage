@@ -99,6 +99,19 @@ fn arena_max_bytes_per_lane() -> usize {
     }
 }
 
+/// Raise the largest arena-served request to at least `blocks`, never lowering it.
+///
+/// Used by `flush.stripe_run_max_stripes` (design D1): a bundle buffer is wider than
+/// any single stripe, and a request past the top class falls back to the heap. The
+/// cap is a class-table bound, not a reservation — `mem.arena_max_bytes_per_lane`
+/// still bounds resident bytes, so widening the table costs nothing until a wide
+/// buffer is actually asked for.
+pub fn raise_arena_max_class_blocks(blocks: u32) {
+    let blocks = usize::from(blocks != 0) * blocks as usize;
+    ARENA_MAX_CLASS_BLOCKS
+        .fetch_max(blocks.max(DEFAULT_ARENA_MAX_CLASS_BLOCKS as usize), Ordering::Relaxed);
+}
+
 fn arena_max_class_blocks() -> u32 {
     match ARENA_MAX_CLASS_BLOCKS.load(Ordering::Relaxed) {
         0 => DEFAULT_ARENA_MAX_CLASS_BLOCKS,

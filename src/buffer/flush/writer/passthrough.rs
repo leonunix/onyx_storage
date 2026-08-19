@@ -233,6 +233,135 @@ fn take_members_for_capacity(
     (selected, used)
 }
 
+/// What [`allocate_stripe_bundles`] decided for one batch's stripe groups.
+#[derive(Debug, Default)]
+struct StripeBundlePlan {
+    /// One run per bundle. A run's members are the concatenation of the groups it
+    /// covers, in plan order, which is what makes each member's sub-extent land on
+    /// its own stripe inside the bundle.
+    runs: Vec<WriteRun>,
+    /// Members to retry through the unaligned path (the reserve came up empty).
+    degraded_members: Vec<usize>,
+    /// Members whose allocation failed for a non-capacity reason, with the error
+    /// text; the caller owns the logging because it has the unit identities.
+    failed_members: Vec<(usize, String)>,
+    /// The reserve missed at least once, so alignment probing stopped for this
+    /// batch (a miss can drain lane caches and serialize every writer).
+    starved: bool,
+}
+
+/// Reserve stripe-aligned extents for a batch's stripe groups, bundling up to
+/// `max_stripes` CONSECUTIVE exactly-full groups into one contiguous extent.
+///
+/// `max_stripes == 1` is the shipped shape: one stripe per group, one op per
+/// group. Above 1 (design D1, `flush.stripe_run_max_stripes`) a bundle becomes ONE
+/// write op covering N stripes, and because its PBAs are contiguous they are
+/// contiguous inside every RAID member's chunklet too — so chunklet's adjacency
+/// merge turns the bundle into one sequential writev per drive instead of one
+/// 4 KiB strip per stripe per drive (box: 285 ops → 2277 strips → 1245 SQEs).
+///
+/// Two restrictions carry the correctness:
+/// - only **exactly-full** groups bundle, so a bundle has no interior pad and the
+///   padded-tail accounting of a partial group is untouched;
+/// - the request is never wider than the number of consecutive full groups
+///   available, so every allocated stripe is used and no allocated stripe has to
+///   be handed back.
+///
+/// The allocation itself is greedy (see
+/// [`SpaceAllocator::allocate_stripe_run_for_lane`]): a narrower-than-requested
+/// result simply covers fewer groups and the walk continues, so this cannot fail
+/// where the one-stripe-per-group loop would have succeeded.
+#[allow(clippy::too_many_arguments)]
+fn allocate_stripe_bundles(
+    allocator: &SpaceAllocator,
+    metrics: &EngineMetrics,
+    lane: usize,
+    groups: &[Vec<usize>],
+    group_used_blocks: &[u32],
+    stripe: u32,
+    phase: u32,
+    max_stripes: u32,
+) -> StripeBundlePlan {
+    let mut plan = StripeBundlePlan::default();
+    let mut gi = 0usize;
+    while gi < groups.len() {
+        if plan.starved {
+            plan.degraded_members.extend(groups[gi].iter().copied());
+            gi += 1;
+            continue;
+        }
+        let want = bundle_width(group_used_blocks, gi, stripe, max_stripes);
+        let group_alloc_start = Instant::now();
+        match allocator.allocate_stripe_run_for_lane(lane, want, stripe, phase) {
+            Ok(extent) => {
+                debug_assert_eq!(extent.count % stripe, 0, "a bundle is whole stripes");
+                debug_assert!(extent.count >= stripe);
+                BufferFlusher::record_alloc_path(
+                    &metrics.flush_writer_alloc_aligned_ns,
+                    &metrics.flush_writer_alloc_aligned_ops,
+                    group_alloc_start,
+                );
+                let got = (extent.count / stripe) as usize;
+                debug_assert!(got <= want as usize && got >= 1);
+                let members: Vec<usize> = groups[gi..gi + got]
+                    .iter()
+                    .flat_map(|group| group.iter().copied())
+                    .collect();
+                let used_blocks: u32 = group_used_blocks[gi..gi + got].iter().sum();
+                plan.runs.push(WriteRun {
+                    extent,
+                    used_blocks,
+                    members,
+                    full_stripe: true,
+                });
+                gi += got;
+            }
+            Err(OnyxError::SpaceExhausted) => {
+                BufferFlusher::record_alloc_path(
+                    &metrics.flush_writer_alloc_reserve_miss_ns,
+                    &metrics.flush_writer_alloc_reserve_miss_ops,
+                    group_alloc_start,
+                );
+                plan.starved = true;
+                metrics
+                    .flush_writer_stripe_starved_batches
+                    .fetch_add(1, Ordering::Relaxed);
+                plan.degraded_members.extend(groups[gi].iter().copied());
+                gi += 1;
+            }
+            Err(error) => {
+                BufferFlusher::record_alloc_path(
+                    &metrics.flush_writer_alloc_aligned_ns,
+                    &metrics.flush_writer_alloc_aligned_ops,
+                    group_alloc_start,
+                );
+                let text = error.to_string();
+                plan.failed_members
+                    .extend(groups[gi].iter().map(|&m| (m, text.clone())));
+                gi += 1;
+            }
+        }
+    }
+    plan
+}
+
+/// Stripes to ask for at group `gi`: the length of the maximal run of
+/// consecutive exactly-full groups starting there, capped by `max_stripes`.
+///
+/// `1` whenever bundling is off or group `gi` is partial — a partial group would
+/// put an interior pad hole inside the bundle, and only the LAST stripe of a run
+/// may carry pad.
+fn bundle_width(group_used_blocks: &[u32], gi: usize, stripe: u32, max_stripes: u32) -> u32 {
+    if max_stripes <= 1 || group_used_blocks.get(gi) != Some(&stripe) {
+        return 1;
+    }
+    let consecutive = group_used_blocks[gi..]
+        .iter()
+        .take_while(|&&used| used == stripe)
+        .count() as u32;
+    consecutive.min(max_stripes)
+}
+
 /// Reserve as few unaligned contiguous runs as the fragmented pool permits.
 /// `allocate_extent_for_lane` is intentionally an up-to allocation: a short
 /// result is consumed only up to whole-unit boundaries, and its unused tail is
@@ -832,56 +961,27 @@ impl BufferFlusher {
         let mut stripe_starved = false;
         let mut degraded_members = Vec::new();
 
-        for (gi, members) in groups.iter().enumerate() {
-            if stripe_starved {
-                degraded_members.extend(members.iter().copied());
-                continue;
-            }
-            let group_alloc_start = Instant::now();
-            match allocator.allocate_stripe_extent_for_lane(shard_idx, stripe, stripe, phase) {
-                Ok(extent) => {
-                    debug_assert_eq!(extent.count, stripe);
-                    Self::record_alloc_path(
-                        &metrics.flush_writer_alloc_aligned_ns,
-                        &metrics.flush_writer_alloc_aligned_ops,
-                        group_alloc_start,
-                    );
-                    write_runs.push(Some(WriteRun {
-                        extent,
-                        used_blocks: group_used_blocks[gi],
-                        members: members.clone(),
-                        full_stripe: true,
-                    }));
-                }
-                Err(OnyxError::SpaceExhausted) => {
-                    Self::record_alloc_path(
-                        &metrics.flush_writer_alloc_reserve_miss_ns,
-                        &metrics.flush_writer_alloc_reserve_miss_ops,
-                        group_alloc_start,
-                    );
-                    stripe_starved = true;
-                    metrics
-                        .flush_writer_stripe_starved_batches
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    degraded_members.extend(members.iter().copied());
-                }
-                Err(error) => {
-                    Self::record_alloc_path(
-                        &metrics.flush_writer_alloc_aligned_ns,
-                        &metrics.flush_writer_alloc_aligned_ops,
-                        group_alloc_start,
-                    );
-                    for &m in members {
-                        failed[m] = true;
-                        tracing::error!(
-                            vol = %units[m].vol_id,
-                            start_lba = units[m].start_lba.0,
-                            error = %error,
-                            "writer: aligned grouped allocation failed"
-                        );
-                    }
-                }
-            }
+        let plan = allocate_stripe_bundles(
+            allocator,
+            metrics,
+            shard_idx,
+            &groups,
+            &group_used_blocks,
+            stripe,
+            phase,
+            super::stripe_run_max_stripes(),
+        );
+        write_runs.extend(plan.runs.into_iter().map(Some));
+        degraded_members.extend(plan.degraded_members);
+        stripe_starved = plan.starved;
+        for (m, error) in plan.failed_members {
+            failed[m] = true;
+            tracing::error!(
+                vol = %units[m].vol_id,
+                start_lba = units[m].start_lba.0,
+                error = %error,
+                "writer: aligned grouped allocation failed"
+            );
         }
 
         let mut unplaced_members = Vec::new();
@@ -1021,7 +1121,10 @@ impl BufferFlusher {
                 };
                 let extent = run.extent;
                 if run.full_stripe {
-                    debug_assert_eq!(extent.count, stripe);
+                    // A bundle is N whole stripes (design D1); the aligned START
+                    // makes every interior stripe boundary aligned too, so chunklet
+                    // still sees N zero-RMW full-stripe writes.
+                    debug_assert_eq!(extent.count % stripe, 0);
                     debug_assert!(
                         (extent.start.0 + phase as u64).is_multiple_of(stripe as u64),
                         "full-stripe run must be device-offset aligned"
@@ -1491,12 +1594,14 @@ impl BufferFlusher {
 #[cfg(test)]
 mod stripe_group_tests {
     use super::{
-        allocate_unaligned_write_runs, plan_stripe_groups, take_members_for_capacity,
-        StripeAffinityKey,
+        allocate_stripe_bundles, allocate_unaligned_write_runs, bundle_width, plan_stripe_groups,
+        take_members_for_capacity, StripeAffinityKey,
     };
+    use crate::metrics::EngineMetrics;
     use crate::space::allocator::SpaceAllocator;
     use crate::space::extent::Extent;
     use crate::types::{Pba, BLOCK_SIZE, RESERVED_BLOCKS};
+    use std::sync::atomic::Ordering;
 
     /// Every group must fit within one stripe, and group members + leftover
     /// must partition `0..n` exactly once.
@@ -2023,5 +2128,239 @@ mod stripe_group_tests {
         let (groups, leftover) = plan_stripe_groups(&[0, 0], None, 6);
         assert!(groups.is_empty());
         assert_eq!(leftover, vec![0, 1]);
+    }
+
+    // -----------------------------------------------------------------
+    // Design D1: bundling consecutive exactly-full stripe groups into ONE
+    // contiguous extent (= one write op = one sequential write per drive).
+    // -----------------------------------------------------------------
+
+    /// The width decision, tabulated. Only consecutive exactly-full groups may
+    /// share a bundle — a partial group in the middle would put an interior pad
+    /// hole inside it, which is what would break the padded-tail accounting.
+    #[test]
+    fn bundle_width_table() {
+        const STRIPE: u32 = 6;
+        let full = [6, 6, 6, 6];
+        // Off (cap 1) is one stripe per group whatever the plan looks like.
+        assert_eq!(bundle_width(&full, 0, STRIPE, 1), 1);
+        // Cap 8 over 4 consecutive full groups: take all 4, not 8.
+        assert_eq!(bundle_width(&full, 0, STRIPE, 8), 4);
+        assert_eq!(bundle_width(&full, 2, STRIPE, 8), 2);
+        // The cap binds when there is more material than cap.
+        assert_eq!(bundle_width(&[6; 20], 0, STRIPE, 8), 8);
+        // A partial group stops the run, and starting on one means width 1.
+        let mixed = [6, 6, 4, 6, 6, 6];
+        assert_eq!(bundle_width(&mixed, 0, STRIPE, 8), 2);
+        assert_eq!(bundle_width(&mixed, 2, STRIPE, 8), 1);
+        assert_eq!(bundle_width(&mixed, 3, STRIPE, 8), 3);
+        // Out of range and empty are width 1 (the caller stops on its own).
+        assert_eq!(bundle_width(&mixed, 99, STRIPE, 8), 1);
+        assert_eq!(bundle_width(&[], 0, STRIPE, 8), 1);
+    }
+
+    /// Lowest PBA `>= from` that a stripe may start at (the allocator's own
+    /// `align_up_pba`, which is crate-private to the space module).
+    fn align_up(from: u64, stripe: u64, phase: u64) -> u64 {
+        let r = (from + phase) % stripe;
+        if r == 0 {
+            from
+        } else {
+            from + (stripe - r)
+        }
+    }
+
+    /// Fixture: a pool whose whole free space is ONE aligned run, so bundling is
+    /// limited only by the plan and the cap.
+    ///
+    /// ⚠ The lane cache is WARMED with one throwaway stripe, because a bundle
+    /// request against an EMPTY cache takes the ordinary one-stripe path — that is
+    /// what refills the cache, and it is the honest steady-state behaviour (one
+    /// narrow bundle per refill, ~1 in 15 with an 8-stripe cap on the box's
+    /// 725-block refills). Without the warm-up every test here would be measuring
+    /// that cold call instead of the bundling.
+    fn one_run_allocator(stripes: u32, stripe: u32, phase: u32) -> SpaceAllocator {
+        let blocks = RESERVED_BLOCKS + u64::from(stripes + 3) * u64::from(stripe);
+        let allocator = SpaceAllocator::new(blocks * BLOCK_SIZE as u64, 1);
+        let whole = allocator
+            .allocate_extent((blocks - RESERVED_BLOCKS) as u32)
+            .unwrap();
+        assert_eq!(whole.start, Pba(RESERVED_BLOCKS));
+        allocator.set_stripe_geometry(stripe, phase);
+        let start = align_up(RESERVED_BLOCKS, stripe.into(), phase.into());
+        allocator
+            .free_extent(Extent::new(Pba(start), (stripes + 1) * stripe))
+            .unwrap();
+        let warm = allocator
+            .allocate_stripe_run_for_lane(0, 1, stripe, phase)
+            .expect("warm-up stripe");
+        assert_eq!(warm.count, stripe);
+        allocator
+    }
+
+    fn groups_of(count: usize, per_group: usize) -> Vec<Vec<usize>> {
+        (0..count)
+            .map(|g| (g * per_group..(g + 1) * per_group).collect())
+            .collect()
+    }
+
+    /// The shipped shape must stay bit-for-bit: cap 1 emits one run per group,
+    /// each exactly one stripe wide.
+    #[test]
+    fn stripe_bundles_cap_one_is_one_run_per_group() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let allocator = one_run_allocator(8, STRIPE, PHASE);
+        let metrics = EngineMetrics::default();
+        let groups = groups_of(4, 2);
+        let used = vec![STRIPE; 4];
+
+        let plan = allocate_stripe_bundles(
+            &allocator, &metrics, 0, &groups, &used, STRIPE, PHASE, 1,
+        );
+        assert_eq!(plan.runs.len(), 4);
+        assert!(plan.runs.iter().all(|run| run.extent.count == STRIPE));
+        assert!(plan.degraded_members.is_empty() && plan.failed_members.is_empty());
+        assert!(!plan.starved);
+    }
+
+    /// Cap 4 over 4 full groups: ONE run, ONE op, members laid out so each group
+    /// occupies its own stripe inside the bundle — which is the property that
+    /// makes chunklet see N consecutive full stripes and merge them per drive.
+    #[test]
+    fn stripe_bundles_pack_consecutive_full_groups_into_one_extent() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let allocator = one_run_allocator(16, STRIPE, PHASE);
+        let metrics = EngineMetrics::default();
+        let groups = groups_of(4, 3);
+        let used = vec![STRIPE; 4];
+
+        let plan = allocate_stripe_bundles(
+            &allocator, &metrics, 0, &groups, &used, STRIPE, PHASE, 4,
+        );
+        assert_eq!(plan.runs.len(), 1, "4 full groups should share one extent");
+        let run = &plan.runs[0];
+        assert_eq!(run.extent.count, 4 * STRIPE);
+        assert_eq!(run.used_blocks, 4 * STRIPE, "no interior pad");
+        assert_eq!(run.members, (0..12).collect::<Vec<_>>());
+        assert!(run.full_stripe);
+        assert_eq!((run.extent.start.0 + u64::from(PHASE)) % u64::from(STRIPE), 0);
+        // Every group's first member starts on a stripe boundary of the bundle.
+        let per_member = STRIPE / 3;
+        for (at, &member) in run.members.iter().enumerate() {
+            let offset = at as u32 * per_member;
+            assert_eq!(member, at);
+            if offset % STRIPE == 0 {
+                assert_eq!(offset % STRIPE, 0, "group boundary is a stripe boundary");
+            }
+        }
+    }
+
+    /// A partial group splits the bundle: it can only ever be the last stripe of
+    /// its own run, so the padded-tail path stays exactly as it was.
+    #[test]
+    fn stripe_bundles_never_span_a_partial_group() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let allocator = one_run_allocator(16, STRIPE, PHASE);
+        let metrics = EngineMetrics::default();
+        let groups = groups_of(5, 1);
+        // full, full, PARTIAL, full, full
+        let used = vec![STRIPE, STRIPE, 4, STRIPE, STRIPE];
+
+        let plan = allocate_stripe_bundles(
+            &allocator, &metrics, 0, &groups, &used, STRIPE, PHASE, 8,
+        );
+        let widths: Vec<u32> = plan.runs.iter().map(|run| run.extent.count).collect();
+        assert_eq!(widths, vec![2 * STRIPE, STRIPE, 2 * STRIPE]);
+        assert_eq!(plan.runs[1].used_blocks, 4, "the partial group keeps its pad");
+        assert_eq!(plan.runs[1].members, vec![2]);
+    }
+
+    /// A narrower-than-requested greedy result must cover fewer groups and let the
+    /// walk continue — never drop a group, never leave an allocated stripe unused.
+    #[test]
+    fn stripe_bundles_split_when_the_pool_is_narrower_than_the_cap() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        // Two separated 2-stripe runs: a 4-stripe request can never be served.
+        let blocks = RESERVED_BLOCKS + 12 * u64::from(STRIPE);
+        let allocator = SpaceAllocator::new(blocks * BLOCK_SIZE as u64, 1);
+        allocator
+            .allocate_extent((blocks - RESERVED_BLOCKS) as u32)
+            .unwrap();
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        let first = align_up(RESERVED_BLOCKS, STRIPE.into(), PHASE.into());
+        allocator
+            .free_extent(Extent::new(Pba(first), 2 * STRIPE))
+            .unwrap();
+        allocator
+            .free_extent(Extent::new(
+                Pba(first + 4 * u64::from(STRIPE)),
+                2 * STRIPE,
+            ))
+            .unwrap();
+        let free_before = allocator.free_block_count();
+
+        let metrics = EngineMetrics::default();
+        let groups = groups_of(4, 1);
+        let used = vec![STRIPE; 4];
+        let plan = allocate_stripe_bundles(
+            &allocator, &metrics, 0, &groups, &used, STRIPE, PHASE, 4,
+        );
+
+        // Every group placed, in order, and every allocated block used.
+        let placed: Vec<usize> = plan
+            .runs
+            .iter()
+            .flat_map(|run| run.members.iter().copied())
+            .collect();
+        assert_eq!(placed, vec![0, 1, 2, 3]);
+        assert!(plan.runs.iter().all(|run| run.used_blocks == run.extent.count));
+        let allocated: u64 = plan.runs.iter().map(|run| u64::from(run.extent.count)).sum();
+        assert_eq!(allocated, free_before - allocator.free_block_count());
+        assert!(plan.runs.len() >= 2, "a 4-stripe run does not exist here");
+
+        // Rolling the bundles back returns exactly what was taken.
+        let extents: Vec<Extent> = plan.runs.iter().map(|run| run.extent).collect();
+        crate::space::pba_lifecycle::rollback_uncommitted_batch(&allocator, &extents);
+        assert_eq!(allocator.free_block_count(), free_before);
+    }
+
+    /// An exhausted reserve degrades to the unaligned path exactly as before, and
+    /// only once per batch: the first miss latches `starved` because a reserve
+    /// miss can drain every lane cache.
+    #[test]
+    fn stripe_bundles_starve_to_the_degraded_path() {
+        const STRIPE: u32 = 6;
+        const PHASE: u32 = 2;
+        let blocks = RESERVED_BLOCKS + 8 * u64::from(STRIPE);
+        let allocator = SpaceAllocator::new(blocks * BLOCK_SIZE as u64, 1);
+        allocator
+            .allocate_extent((blocks - RESERVED_BLOCKS) as u32)
+            .unwrap();
+        allocator.set_stripe_geometry(STRIPE, PHASE);
+        // Free space exists but none of it is a whole aligned stripe.
+        allocator
+            .free_extent(Extent::new(Pba(RESERVED_BLOCKS + 1), STRIPE - 2))
+            .unwrap();
+
+        let metrics = EngineMetrics::default();
+        let groups = groups_of(3, 1);
+        let used = vec![STRIPE; 3];
+        let plan = allocate_stripe_bundles(
+            &allocator, &metrics, 0, &groups, &used, STRIPE, PHASE, 8,
+        );
+        assert!(plan.runs.is_empty());
+        assert!(plan.starved);
+        assert_eq!(plan.degraded_members, vec![0, 1, 2]);
+        assert_eq!(
+            metrics
+                .flush_writer_stripe_starved_batches
+                .load(Ordering::Relaxed),
+            1,
+            "the miss must latch once, not once per group"
+        );
     }
 }

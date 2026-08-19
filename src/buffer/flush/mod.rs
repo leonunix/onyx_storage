@@ -362,6 +362,13 @@ use qos::{FlushAdmissionQos, FlushAdmissionQosConfig};
 mod tests;
 
 pub(crate) use writer::TARGET_OPS_PER_COMMIT;
+/// LV3 write-bundle width (design D1) — see
+/// [`crate::config::FlushConfig::stripe_run_max_stripes`]. Public because the IPC
+/// surface flips it in a running engine; the A/B has to happen inside one process.
+pub use writer::{
+    set_stripe_run_max_stripes, stripe_run_env_override, stripe_run_max_stripes,
+    MAX_STRIPE_RUN_STRIPES,
+};
 
 pub use failpoints::{
     clear_test_dedup_hit_failpoint, clear_test_failpoint, clear_test_packed_pause_hook,

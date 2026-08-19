@@ -80,6 +80,7 @@ fn write_and_abort(
             stripe_group_lifetime_affinity: false,
             allocator_regions: 1,
             stripe_refill_run_stripes: 0,
+            stripe_refill_width_bias: false,
         },
         buffer: BufferConfig {
             device: Some(buffer),

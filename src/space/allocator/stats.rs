@@ -61,6 +61,16 @@ pub struct AllocSupplyStats {
     pub drain_skips: u64,
     pub wide_hits: u64,
     pub wide_misses: u64,
+    /// `allocate_stripe_run_for_lane` calls and the whole stripes they served —
+    /// the direct read of `flush.stripe_run_max_stripes` (design D1). `stripes /
+    /// allocs` is the mean bundle width, i.e. how many consecutive stripes one LV3
+    /// op covers; 1.0 means the knob is off or the pool has no contiguity left.
+    pub stripe_run_allocs: u64,
+    pub stripe_run_stripes: u64,
+    /// Bundle widths bucketed by `floor(log2(stripes))`: 1, 2-3, 4-7, 8-15, 16-31,
+    /// 32-63, 64+. The mean hides the shape, and the shape is what says whether the
+    /// SUPPLY or the CAP is binding.
+    pub stripe_run_width_hist: [u64; super::STRIPE_RUN_WIDTH_BUCKETS],
 }
 
 /// Address-region sharding shape and traffic — see [`RegionPools`].
@@ -110,6 +120,15 @@ impl AllocSupplyStats {
             return 0.0;
         }
         self.refill_blocks as f64 / self.refill_runs as f64
+    }
+
+    /// Mean whole stripes per LV3 write bundle. `1.0` = one stripe per op, the
+    /// pre-D1 shape whose per-PD adjacency merge measured 1.9x.
+    pub fn stripes_per_run(&self) -> f64 {
+        if self.stripe_run_allocs == 0 {
+            return 0.0;
+        }
+        self.stripe_run_stripes as f64 / self.stripe_run_allocs as f64
     }
 
     /// Aligned allocations served per global-lock refill. 1.0 means the lane
