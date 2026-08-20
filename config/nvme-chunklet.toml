@@ -257,9 +257,11 @@ allocator_regions = 0
 stripe_refill_run_stripes = 0
 # Design D2 (supply for D1): refill a lane from its region's WIDEST free runs
 # instead of its lowest-address ones. Off at open; `tools/stripe_run_ab.sh` flips it
-# per arm over IPC (`refill-width-bias`). ⚠ It consumes the pool's intact material
-# first, so an arm that looks good for one window can be eating its own supply —
-# watch `allocator_contiguity largest_run` across segments, not just throughput.
+# per arm over IPC (`refill-width-bias`). ⛔ Box 2026-08-20: no signal —
+# blocks_per_run 12.1 → 11.2-11.9, because this pool's entire largest_run was 1494
+# blocks and its reserve runs were ~2 stripes, so there was no wider run to prefer.
+# A selector cannot manufacture contiguity. ⚠ It also consumes intact material
+# first, so watch `allocator_contiguity largest_run` across segments, not throughput.
 stripe_refill_width_bias = false
 
 [buffer]
@@ -313,14 +315,16 @@ coalesce_max_lbas = 6
 min_compression_savings_pct = 12
 skip_fully_superseded = true
 packed_meta_batch_max_lbas = 1024
-# Design D1 — whole stripes ONE LV3 write op may cover. Pinned here NOT because 32
-# is the chosen default (the shipped default is 1) but because the value at OPEN is
-# what sizes the slab arena's class table: a 32-stripe bundle is 192 blocks and the
-# arena's own default tops out at 64, so without this every bundle would fall back
-# to the heap and re-pay what the arena removed (41.03 → 0.67 µs/buffer).
-# `tools/stripe_run_ab.sh` flips the live value per arm over IPC (`stripe-run`),
-# which is the only valid A/B shape on this box.
-stripe_run_max_stripes = 32
+# Design D1 — whole stripes ONE LV3 write op may cover. ⛔ MEASURED A DEAD END
+# (box 2026-08-20): chunklet's adjacency merge already works ACROSS ops — the
+# baseline arm has one 24 KiB stripe per op and still merges 1.79x — so a wider op
+# changes nothing at the device. 3 interleaved pairs: r6 ops/call 291 → 209 but
+# sqes/call 1278-1308 → 1335-1359 (UP), write leg +0.5..+1.1 ms, host −1.3..−2.4%.
+# Keep at 1. Raising it for another arm must happen HERE, not over IPC, because the
+# value at open sizes the slab arena's class table (a 32-stripe bundle is 192 blocks
+# against the arena's default 64; over IPC alone the bundles fall back to the heap
+# and bump mem_arena.overflow). Driver: tools/stripe_run_ab.sh.
+stripe_run_max_stripes = 1
 # Flush QoS OFF. The 100 ms default arms a foreground admission ladder that
 # measured as a net negative on this box: A/B over interleaved arms gave
 # OFF 233/233 MiB/s with p99 22.5 ms, ON 198 or 63.9 MiB/s with the collapsed

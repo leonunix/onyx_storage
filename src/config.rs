@@ -1202,6 +1202,15 @@ pub struct StorageConfig {
     /// a metadb L2P leaf's PBA span is region-bounded (~200 MiB at 2048 regions)
     /// rather than global, which is what made the historical global best-fit
     /// corrupt the leaf codec.
+    ///
+    /// ⛔ **Box 2026-08-20: no signal, because there was nothing to select.** Two
+    /// interleaved arms moved `blocks_per_run` 12.1 → 11.2-11.9, i.e. not at all:
+    /// the aged pool's whole `largest_run` was 1494 blocks (249 stripes) and its
+    /// reserve runs were ~2 stripes each, so "prefer the widest run in this region"
+    /// had no wider run to prefer. The arms did come out marginally best on the
+    /// write leg (19.56-20.33 ms vs 20.32-21.84), but inside the noise band. This
+    /// knob is a SELECTOR, and a selector cannot manufacture contiguity — see
+    /// `stripe_run_max_stripes` for the arithmetic that closes the whole axis.
     #[serde(default)]
     pub stripe_refill_width_bias: bool,
 }
@@ -1941,6 +1950,32 @@ pub struct FlushConfig {
     pub packed_meta_batch_max_lbas: usize,
     /// Whole RAID stripes one LV3 write op may cover (design D1). `1` = the shipped
     /// one-stripe-per-op shape.
+    ///
+    /// ⛔⛔ **MEASURED A DEAD END — box 2026-08-20, keep this at 1.** The premise was
+    /// that a wider op means fewer device IOs. It does not: chunklet's adjacency
+    /// merge works ACROSS ops, and the baseline arm proves it — every LV3 op there is
+    /// exactly one 24 KiB stripe, yet `chunklet_submit_drain_data` reports a merge of
+    /// **1.79x, not 1.0x**, so 1.79 strips per SQE were already being merged BETWEEN
+    /// separate ops. Bundling therefore changes only how the same PBAs are expressed:
+    /// 3 interleaved pairs measured `r6 ops/call` 291 → 209 (−28 %) with `sqes/call`
+    /// 1278-1308 → 1335-1359 (**up** 4-6 %), merge 1.79 → 1.68, the write leg +0.5 to
+    /// +1.1 ms/call, and host throughput −1.3 to −2.4 %. Device cost is per SQE and
+    /// flat at 16.0 µs on both arms.
+    ///
+    /// What the same run DID settle: at `blocks_per_run = 12` (≈2 stripes) the merge
+    /// ceiling the free-space supply allows is ~2.0, and the shipped path already
+    /// achieves 1.79 — **90 % of it**. The consumer side of this axis is done; the
+    /// only lever left is a contiguity PRODUCER (compaction / segment cleaning), and
+    /// no knob on the write path can substitute for one.
+    ///
+    /// Kept (default off) because it is the instrument that would re-measure this the
+    /// day a producer exists, and because it is the evidence: `allocator_stripe_runs`
+    /// plus the baseline merge is what closes the axis.
+    ///
+    /// ⚠ Raising it needs the value set at OPEN, not over IPC, when the arena has to
+    /// serve the wider buffers (`apply_stripe_run_tuning` sizes the class table from
+    /// this field). Over IPC alone, wide bundles fall back to the heap and bump
+    /// `mem_arena.overflow`.
     ///
     /// **Why.** A passthrough batch emits one write op per stripe group, each with
     /// its own stripe-wide allocation, so consecutive stripes land at unrelated

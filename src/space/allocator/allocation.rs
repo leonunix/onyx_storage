@@ -714,26 +714,33 @@ impl SpaceAllocator {
         Self::carve_aligned_from_run(run, need, stripe, phase)
     }
 
-    /// [`Self::take_aligned_from_extent_cache`] for a bundle: take the WIDEST
-    /// cached run (lowest address breaking ties) and drain it up to `max_need`
-    /// instead of carving an exact width out of the address-argmin run.
+    /// [`Self::take_aligned_from_extent_cache`] for a bundle: take the
+    /// lowest-address run that can serve the WHOLE request, and failing that the
+    /// lowest-address run that can serve anything, drained up to `max_need`.
     ///
-    /// ⚠ Widest-first, not address-first, and that difference is the whole point.
-    /// A refill parks a mix of widths — the pinned single-stripe windows an aged
-    /// pool is full of, plus whatever intact material it found — so an
-    /// address-argmin carve hands out the narrow windows first and a bundle can
-    /// never be wider than one stripe no matter what the refill fetched. That is
-    /// exactly what made `storage.stripe_refill_width_bias` a no-op in
-    /// `width_biased_refill_feeds_wide_bundles_where_address_order_cannot` before
-    /// this ordering existed.
+    /// ⚠⚠ The selection rule is the load-bearing part, and the obvious rule is
+    /// WRONG. A first cut took the widest cached run, on the reasoning that a
+    /// refill parks a mix of widths and address order hands out the pinned
+    /// single-stripe windows first. Box 2026-08-19 measured the cost: bundling
+    /// worked (`r6 ops/stripe` 1.00 → 0.73) but chunklet's adjacency merge FELL,
+    /// 1.77 → 1.40, and SQEs per call ROSE 1309 → 1603. The reason is that the
+    /// shipped address-ordered carve was **already** buying cross-op adjacency for
+    /// free — consecutive allocations walk one cached run in ascending order, which
+    /// is why the merge was 1.77 and not 1.0 — and widest-first destroys that chain
+    /// to win width inside a single op. Per-op width and cross-op adjacency are in
+    /// tension, and the merge only cares about the union of the two.
     ///
-    /// The clustering argument still holds: the cache only ever holds runs from
-    /// this lane's own region, so reordering inside it moves a metadb L2P leaf's
-    /// PBAs by at most one region (~200 MiB at 2048 regions) — orders of magnitude
-    /// under leaf v5's 16 TiB span limit — and each bundle is itself contiguous.
-    /// The exact-width path keeps its strict ascending order untouched
-    /// (`lane_extent_cache_hands_out_ascending`); ties break low so a pool with no
-    /// width to offer degrades to exactly that order.
+    /// So deviate from address order ONLY when a run can serve the entire request:
+    /// that run gives width AND stays a chain (the next bundle continues inside it,
+    /// since it is still the lowest-address run that can serve a full width). When
+    /// nothing can, this is exactly the shipped address-argmin carve with a greedy
+    /// width, so a pool with no intact material behaves as it always did.
+    ///
+    /// The clustering argument for the deviation: the cache only ever holds runs
+    /// from this lane's own region, so a jump inside it moves a metadb L2P leaf's
+    /// PBAs by at most one region (~200 MiB at 2048 regions), orders of magnitude
+    /// under leaf v5's 16 TiB span limit. The exact-width path keeps its strict
+    /// ascending order untouched (`lane_extent_cache_hands_out_ascending`).
     pub(super) fn take_aligned_upto_from_extent_cache(
         cache: &mut Vec<Extent>,
         min_need: u32,
@@ -741,28 +748,25 @@ impl SpaceAllocator {
         stripe: u32,
         phase: u32,
     ) -> Option<Extent> {
-        let mut best: Option<(usize, Extent, Option<Extent>, Option<Extent>)> = None;
-        // Back-to-front = ascending address, so a strict `>` keeps the lowest
-        // address among equally wide candidates.
+        let mut chain: Option<(usize, Extent, Option<Extent>, Option<Extent>)> = None;
+        let mut full: Option<(usize, Extent, Option<Extent>, Option<Extent>)> = None;
+        // Back-to-front = ascending address, so the FIRST hit in each category is
+        // that category's address-argmin.
         for idx in (0..cache.len()).rev() {
             let Some(carved) =
                 Self::carve_aligned_upto_from_run(cache[idx], min_need, max_need, stripe, phase)
             else {
                 continue;
             };
-            let wider = best
-                .as_ref()
-                .is_none_or(|(_, aligned, _, _)| carved.0.count > aligned.count);
-            if wider {
-                let full_width = carved.0.count >= max_need;
-                best = Some((idx, carved.0, carved.1, carved.2));
-                // Nothing can beat a run that already fills the request.
-                if full_width {
-                    break;
-                }
+            if carved.0.count >= max_need {
+                full = Some((idx, carved.0, carved.1, carved.2));
+                break;
+            }
+            if chain.is_none() {
+                chain = Some((idx, carved.0, carved.1, carved.2));
             }
         }
-        let (idx, aligned, head, tail) = best?;
+        let (idx, aligned, head, tail) = full.or(chain)?;
         cache.remove(idx);
         if let Some(head) = head {
             Self::push_extent_cache(cache, head);

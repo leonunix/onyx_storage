@@ -918,3 +918,50 @@ fn stripe_run_counts_one_aligned_alloc_per_call() {
         calls as u64
     );
 }
+
+/// The box lesson, pinned as a test: when NO cached run can serve the whole
+/// request, the carve must stay in ascending address order. Picking the widest
+/// partial run instead won width inside one op and lost the cross-op adjacency
+/// the shipped path was already getting for free — box 2026-08-19 measured
+/// chunklet's merge falling 1.77 -> 1.40 and SQEs/call rising 1309 -> 1603 while
+/// `r6 ops/stripe` improved 1.00 -> 0.73. Per-op width and cross-op adjacency are
+/// in tension; the device only sees their union.
+#[test]
+fn bundle_carve_keeps_the_address_chain_when_no_run_serves_the_full_width() {
+    // Low run 2 stripes, higher run 3 stripes: with a request for 8 neither is
+    // full width, so the LOW one must win despite being narrower.
+    let mut cache = vec![
+        Extent::new(Pba(4 + 10 * STRIPE as u64), 3 * STRIPE),
+        Extent::new(Pba(4), 2 * STRIPE),
+    ];
+    let taken = SpaceAllocator::take_aligned_upto_from_extent_cache(
+        &mut cache,
+        STRIPE,
+        8 * STRIPE,
+        STRIPE,
+        PHASE,
+    )
+    .expect("both runs can serve one stripe");
+    assert_eq!(
+        taken,
+        Extent::new(Pba(4), 2 * STRIPE),
+        "a wider run at a higher address must not break the chain"
+    );
+
+    // But a run that can serve the WHOLE request is worth the jump: it gives
+    // width AND remains the chain, because the next bundle continues inside it.
+    let mut cache = vec![
+        Extent::new(Pba(4 + 10 * STRIPE as u64), 8 * STRIPE),
+        Extent::new(Pba(4), 2 * STRIPE),
+    ];
+    let taken = SpaceAllocator::take_aligned_upto_from_extent_cache(
+        &mut cache,
+        STRIPE,
+        8 * STRIPE,
+        STRIPE,
+        PHASE,
+    )
+    .unwrap();
+    assert_eq!(taken, Extent::new(Pba(4 + 10 * STRIPE as u64), 8 * STRIPE));
+    assert_eq!(cache, vec![Extent::new(Pba(4), 2 * STRIPE)], "chain intact");
+}

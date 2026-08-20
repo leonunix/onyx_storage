@@ -4,6 +4,18 @@
 #
 #   stripe_run_ab.sh <tag> [config]
 #
+# ⛔ RESULT (box 2026-08-20, 8 clean segments, /root/lv3run/dsr_r2): BOTH ARMS ARE
+# DEAD. D1's mechanism works — `r6 ops/call` 291 → 209, `ops/stripe` 1.00 → 0.74,
+# `stripes/call` unchanged — and buys nothing, because chunklet's adjacency merge
+# already works ACROSS ops: the BASELINE arm has one 24 KiB stripe per op and still
+# merges 1.79x. So `sqes/call` went UP (1278-1308 → 1335-1359), the write leg +0.5
+# to +1.1 ms/call, host throughput −1.3 to −2.4 %. D2 moved `blocks_per_run` 12.1 →
+# 11.2-11.9, i.e. nothing, because the pool's whole `largest_run` was 1494 blocks.
+# The same run settled the ceiling: at ~2 stripes per free run the supply allows a
+# merge of ~2.0 and the shipped path already gets 1.79 — 90 % of it. The consumer
+# side of this axis is finished; only a contiguity PRODUCER is left. This script is
+# kept as the instrument to re-measure the day one exists.
+#
 # What is under test. A passthrough batch used to emit one write op per RAID
 # stripe, each with its own stripe-wide allocation, so consecutive stripes landed
 # at unrelated PBAs: box 2026-08-19 measured 285 ops -> 2277 x 4 KiB strip writes
