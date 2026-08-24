@@ -106,9 +106,9 @@ lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0
 # taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
-lv3_ld_id = "f75e1a33-9b2d-4b08-a081-0e4cbe73bdc9"
-lv2_ld_id = "89d9fcb7-6498-45fa-b252-0fb057a2764b"
-meta_ld_id = "5f8f11b0-ba24-4db9-8b07-9ae6141c55ef"
+lv3_ld_id = "9a912452-e9e8-49f6-9683-5ec93643ff1a"
+lv2_ld_id = "e57dc0c2-33c9-47b0-8491-b2e1a8b3666d"
+meta_ld_id = "d163e445-8671-4f5b-9aee-85cd9660d181"
 
 [meta]
 # Phase 3f: metadb persists on the chunklet meta LD (see [chunklet].meta_ld_id),
@@ -302,6 +302,23 @@ nr_queues = 32
 queue_depth = 256
 io_buf_bytes = 1048576
 queue_workers = 4
+# Serve all 32 queues from ONE pool of nr_queues*queue_workers = 128 threads
+# instead of pinning 4 private threads to each queue. Same thread count, but
+# every worker is reachable from every queue.
+#
+# WHY (box 2026-08-24, QD256 j16d16 randrw 70/30 on a filled 256 GiB volume):
+# with private pools the whole host load funnels into 3-4 hardware queues,
+# because the kernel picks the queue from the SUBMITTING CPU and `[numa]
+# confine` leaves the reserve cores as the only idle CPUs for fio's threads
+# (`/sys/block/ublkb0/mq/27/cpu_list` = 44,46,92 — 44/46 are the reserved
+# pair). Measured on the private-pool arms: mean in-service concurrency 13.9
+# and 14.8 against a 128-thread cap, per-queue worker CPU over one 60 s window
+# 703/526/478 ticks for q27/q31/q29 vs 0-4 for ALL of q0..q15, and
+# `ublk_read_split_ns` queue_wait = 19.6-21.3 ms = 92% of read / 98% of write
+# host latency. Doubling fio's job count (j32d16) doubled concurrency to 28.1 —
+# concurrency tracks the number of SUBMITTER CPUS, which is the signature of
+# this funnel and of nothing else.
+shared_io_workers = true
 
 [flush]
 compress_workers = 2

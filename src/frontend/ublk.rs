@@ -51,6 +51,19 @@ struct QueuedIo {
     nr_sectors: u32,
     data: QueuedIoData,
     queued_at: Instant,
+    /// Where this request's result goes. Carried per request (not per worker)
+    /// so one shared worker pool can serve every queue: a worker never needs
+    /// to know which queue it is currently working for.
+    sinks: Arc<QueueSinks>,
+}
+
+/// Reply path of one ublk queue: completions land on `completion_tx`, writes
+/// that still owe durability go to that queue's dispatcher, and `event_fd`
+/// wakes the queue thread so it drains them.
+struct QueueSinks {
+    completion_tx: Sender<CompletedIo>,
+    durability_tx: Sender<PendingDurableIo>,
+    event_fd: RawFd,
 }
 
 enum QueuedIoData {
@@ -438,31 +451,37 @@ fn record_completed_io_metrics(
     }
 }
 
-fn spawn_queue_workers(
-    qid: u16,
+/// Spawn IO worker threads that drain `request_rx`.
+///
+/// `name_prefix` / `affinity_base` differ between the two topologies:
+/// * private pool — one call per queue, `ublk-q<qid>-worker-<i>`, affinity index
+///   `qid * workers + i` (decodable back to qid for NUMA pod routing);
+/// * shared pool — one call for the device, `ublk-io-worker-<i>`, affinity index
+///   `i`, and every worker can serve every queue.
+fn spawn_io_workers(
+    name_prefix: String,
     workers: usize,
+    affinity_base: usize,
     ctx: IoWorkerContext,
     request_rx: Receiver<QueuedIo>,
-    completion_tx: Sender<CompletedIo>,
-    durability_tx: Sender<PendingDurableIo>,
-    event_fd: RawFd,
 ) -> Vec<JoinHandle<()>> {
     (0..workers)
         .map(|worker_idx| {
             let rx = request_rx.clone();
-            let tx = completion_tx.clone();
-            let durable_tx = durability_tx.clone();
             let ctx = ctx.clone();
+            let name = format!("{name_prefix}{worker_idx}");
             thread::Builder::new()
-                .name(format!("ublk-q{qid}-worker-{worker_idx}"))
+                .name(name)
                 .spawn(move || {
-                    // qid * workers + worker_idx: decodable back to qid for
-                    // NUMA pod routing (a plain sum is lossy).
                     crate::affinity::bind_current(
                         crate::affinity::ThreadRole::Ublk,
-                        qid as usize * workers + worker_idx,
+                        affinity_base + worker_idx,
                     );
                     while let Ok(mut req) = rx.recv() {
+                        let sinks = req.sinks.clone();
+                        let tx = &sinks.completion_tx;
+                        let durable_tx = &sinks.durability_tx;
+                        let event_fd = sinks.event_fd;
                         let worker_start = Instant::now();
                         let queue_wait_ns = req.queued_at.elapsed().as_nanos() as u64;
                         let result = match &mut req.data {
@@ -690,6 +709,29 @@ impl OnyxUblkTarget {
             sector_size: SECTOR_SIZE as u64,
         };
         let queue_workers = self.config.queue_workers.max(1);
+        // One pool for the whole device, or one private pool per queue. The
+        // shared pool is sized to the same total thread count by default, so
+        // the difference is purely *reachability*: see UblkConfig docs for the
+        // measured skew that makes private pools bound concurrency at 3-4
+        // queues' worth of threads.
+        let shared_pool = if self.config.shared_io_workers {
+            let total = if self.config.io_workers > 0 {
+                self.config.io_workers
+            } else {
+                queue_workers * nr_queues as usize
+            };
+            let (tx, rx) = crossbeam_channel::unbounded::<QueuedIo>();
+            let handles = spawn_io_workers("ublk-io-worker-".to_string(), total, 0, worker_ctx.clone(), rx);
+            tracing::info!(
+                workers = total,
+                nr_queues,
+                "ublk shared io worker pool started (every queue served by every worker)"
+            );
+            Some((tx, handles))
+        } else {
+            None
+        };
+        let shared_tx = shared_pool.as_ref().map(|(tx, _)| tx.clone());
 
         let q_handler = move |qid: u16, dev: &UblkDev| {
             crate::affinity::bind_current(
@@ -699,7 +741,6 @@ impl OnyxUblkTarget {
             let bufs = Rc::new(RefCell::new(dev.alloc_queue_io_bufs()));
             let io_bufs = bufs.clone();
             let queue_thread_bound = Rc::new(Cell::new(false));
-            let (request_tx, request_rx) = crossbeam_channel::unbounded::<QueuedIo>();
             let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<CompletedIo>();
             let (durability_tx, durability_rx) = crossbeam_channel::unbounded::<PendingDurableIo>();
             let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
@@ -710,19 +751,37 @@ impl OnyxUblkTarget {
                 );
                 return;
             }
-            let workers = queue_workers;
             let durability_handle =
                 spawn_durability_dispatcher(qid, durability_rx, completion_tx.clone(), event_fd);
-            let worker_handles = spawn_queue_workers(
-                qid,
-                workers,
-                worker_ctx.clone(),
-                request_rx,
+            let sinks = Arc::new(QueueSinks {
                 completion_tx,
-                durability_tx.clone(),
+                durability_tx,
                 event_fd,
-            );
-            let submit_tx = request_tx.clone();
+            });
+            // Private pool: this queue owns `queue_workers` threads and the
+            // sender that feeds them. Shared pool: no per-queue threads and no
+            // per-queue sender — the request carries `sinks` so any worker in
+            // the device-wide pool can reply to this queue.
+            let (private_tx, worker_handles) = match shared_tx.as_ref() {
+                Some(_) => (None, Vec::new()),
+                None => {
+                    let (tx, rx) = crossbeam_channel::unbounded::<QueuedIo>();
+                    let handles = spawn_io_workers(
+                        format!("ublk-q{qid}-worker-"),
+                        queue_workers,
+                        qid as usize * queue_workers,
+                        worker_ctx.clone(),
+                        rx,
+                    );
+                    (Some(tx), handles)
+                }
+            };
+            let submit_tx = match (&private_tx, shared_tx.as_ref()) {
+                (Some(tx), _) => tx.clone(),
+                (None, Some(tx)) => tx.clone(),
+                (None, None) => unreachable!("one of the two pools is always present"),
+            };
+            let sinks_for_io = sinks.clone();
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 if !queue_thread_bound.get() {
                     crate::affinity::bind_current(
@@ -815,6 +874,7 @@ impl OnyxUblkTarget {
                         nr_sectors,
                         data,
                         queued_at,
+                        sinks: sinks_for_io.clone(),
                     };
                     drop(bufs);
                     if submit_tx.send(queued).is_err() {
@@ -838,6 +898,7 @@ impl OnyxUblkTarget {
                     nr_sectors,
                     data: QueuedIoData::Owned(Vec::new()),
                     queued_at,
+                    sinks: sinks_for_io.clone(),
                 };
                 if submit_tx.send(queued).is_err() {
                     tracing::warn!(qid, tag, "ublk queue workers stopped");
@@ -867,11 +928,16 @@ impl OnyxUblkTarget {
 
             submit_eventfd_poll(&queue, event_fd, qid);
             queue.wait_and_handle_io(io_handler);
-            drop(request_tx);
+            // Private pool: dropping this queue's sender is what ends its
+            // workers. Shared pool: `private_tx` is None and the device-wide
+            // pool outlives every queue (joined by the caller).
+            drop(private_tx);
             for handle in worker_handles {
                 let _ = handle.join();
             }
-            drop(durability_tx);
+            // Last `QueueSinks` reference: releases this queue's durability
+            // sender so its dispatcher can finish.
+            drop(sinks);
             let _ = durability_handle.join();
             unsafe {
                 libc::close(event_fd);
@@ -886,8 +952,19 @@ impl OnyxUblkTarget {
             }
         };
 
-        sess.run_target(tgt_init, q_handler, dev_handler)
-            .map_err(|e| OnyxError::Ublk(format!("ublk run_target failed: {:?}", e)))?;
+        let run_result = sess
+            .run_target(tgt_init, q_handler, dev_handler)
+            .map_err(|e| OnyxError::Ublk(format!("ublk run_target failed: {:?}", e)));
+
+        // Every queue handler is finished, so the last request senders are gone
+        // with the handler closure; draining the shared pool now is bounded.
+        if let Some((tx, handles)) = shared_pool {
+            drop(tx);
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+        run_result?;
 
         Ok(())
     }

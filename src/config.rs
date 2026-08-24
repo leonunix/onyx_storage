@@ -1852,6 +1852,43 @@ pub struct UblkConfig {
     /// completing commands on the queue thread.
     #[serde(default = "default_queue_workers")]
     pub queue_workers: usize,
+    /// Serve every ublk queue from ONE shared worker pool instead of giving
+    /// each queue its own private `queue_workers` threads.
+    ///
+    /// WHY (box 2026-08-24, QD256 randrw 70/30 on a filled 256 GiB volume):
+    /// the kernel maps a submitting CPU to exactly one ublk hardware queue
+    /// (`/sys/block/ublkb0/mq/<q>/cpu_list`), and with `[numa] mode = "confine"`
+    /// the free-est CPUs on the home node are the `reserve_cores_per_node`
+    /// ones — so CFS parks the fio submitters there and the whole host load
+    /// funnels into 3-4 queues. With private pools that is 12-16 reachable
+    /// worker threads out of 128: measured `ublk_read_split_ns` queue_wait was
+    /// **19.6 ms = 92% of read and 98% of write host latency** while mean
+    /// worker busy was 13.9 of a 128 cap, and per-queue worker CPU over one
+    /// 60 s window was 703/526/478 ticks for q27/q31/q29 against 0-4 for all
+    /// of q0..q15. A shared pool makes every worker reachable from every
+    /// queue, so the placement skew stops bounding concurrency.
+    ///
+    /// BOX ACCEPTANCE 2026-08-24, two 220 s windows per arm, one process per arm
+    /// (a restart is unavoidable — the pools are built when the device starts):
+    ///
+    ///   arm       host MiB/s   read lat   write lat   in-service   read queue_wait
+    ///   private   212.9/194.1  21.2/23.2  20.0/21.8   13.9/14.8    92.4/91.8 %
+    ///   shared    270.2/246.8  19.4/21.5   9.3/ 9.5   126.6/127.9  40.2/40.3 %
+    ///
+    /// +27 % host throughput with the arms' ranges disjoint (private max 212.9 <
+    /// shared min 246.8), write latency more than halved, and the mechanism moved
+    /// where the diagnosis says it should: queue_wait 19.6 -> 7.8 ms and worker
+    /// service 1.6 -> 11.6 ms, i.e. the wait became work. `false` is the rollback.
+    ///
+    /// ⚠ The shared pool then runs 98.9-99.9 % saturated, so the pool SIZE is the
+    /// next constraint — see `io_workers`.
+    #[serde(default = "default_shared_io_workers")]
+    pub shared_io_workers: bool,
+    /// Size of the shared pool when `shared_io_workers` is set.
+    /// 0 = `nr_queues * queue_workers`, i.e. exactly today's thread count,
+    /// which keeps the pooling A/B free of a thread-count confound.
+    #[serde(default)]
+    pub io_workers: usize,
 }
 
 impl Default for UblkConfig {
@@ -1861,6 +1898,8 @@ impl Default for UblkConfig {
             queue_depth: default_queue_depth(),
             io_buf_bytes: default_io_buf_bytes(),
             queue_workers: default_queue_workers(),
+            shared_io_workers: default_shared_io_workers(),
+            io_workers: 0,
         }
     }
 }
@@ -2538,6 +2577,9 @@ fn default_io_buf_bytes() -> u32 {
 }
 fn default_queue_workers() -> usize {
     1
+}
+fn default_shared_io_workers() -> bool {
+    true
 }
 
 // OnyxConfig::load and should_standby are defined in the impl block above.
