@@ -962,8 +962,82 @@ impl ServiceController {
                     let _ = stream.write_all(msg.as_bytes());
                     let _ = stream.flush();
                 }
+                // The two SHAPE knobs, as opposed to the two syscall knobs above.
+                // `uring-window` replaces the per-wave barrier with a sliding
+                // window that refills on each completion; `r6-pipeline` overlaps
+                // stripe i+1's parity compute with stripe i's device time.
+                //
+                // Box 2026-08-24, RWMIX=0 QD256 (the only load where LV3's device
+                // leg dominates — at 70/30 the ring sits at 4% and these are
+                // unmeasurable): a 22.3 ms RAID6 call is plan 1.70 + compute 3.92
+                // + write 16.49 ms, and 15.2 ms of that write leg is 37 SEQUENTIAL
+                // waves each waiting 0.41 ms for 34 SQEs while the drives answer
+                // in 0.02-0.06 ms with aqu-sz 0.17-1.83. Both knobs attack that.
+                //
+                // ⚠ `uring-window` is in SQEs and must EXCEED the wave size (34
+                // measured) to deepen the queue — the value 8 used to re-run the
+                // chunklet test suite is a correctness stress value, not a perf
+                // one. Runtime-flippable so the arms stay in one process at one
+                // pool age; both are read once per batch, so a batch already in
+                // flight finishes under the value it started with.
+                #[cfg(target_os = "linux")]
+                "uring-window" => {
+                    use crate::chunklet_pool::uring_submit;
+                    if let Some(arg) = parts.get(1) {
+                        match arg.parse::<usize>() {
+                            // `0` is chunklet's "restore the barrier" sentinel.
+                            Ok(sqes) => {
+                                let effective = uring_submit::set_write_window_sqes(sqes);
+                                tracing::info!(
+                                    requested = sqes,
+                                    effective,
+                                    "chunklet windowed submit set"
+                                );
+                            }
+                            Err(_) => {
+                                let msg = format!(
+                                    "error: usage: uring-window [<sqes 0..={}>]\n",
+                                    uring_submit::MAX_WAVE_OPS
+                                );
+                                let _ = stream.write_all(msg.as_bytes());
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!("{}\nok\n", uring_submit::write_window_sqes());
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
+                #[cfg(target_os = "linux")]
+                "r6-pipeline" => {
+                    use crate::chunklet_pool::uring_submit;
+                    if let Some(arg) = parts.get(1) {
+                        match arg.parse::<usize>() {
+                            // `0` restores the two-phase writer.
+                            Ok(stripes) => {
+                                let effective = uring_submit::set_r6_pipeline_stripes(stripes);
+                                tracing::info!(
+                                    requested = stripes,
+                                    effective,
+                                    "chunklet RAID6 pipelined writer set"
+                                );
+                            }
+                            Err(_) => {
+                                let _ = stream.write_all(
+                                    b"error: usage: r6-pipeline [<stripes, 0 = two-phase>]\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    let msg = format!("{}\nok\n", uring_submit::r6_pipeline_stripes());
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                }
                 #[cfg(not(target_os = "linux"))]
-                "uring-wait" | "uring-wave" => {
+                "uring-wait" | "uring-wave" | "uring-window" | "r6-pipeline" => {
                     let _ = stream
                         .write_all(b"error: chunklet io_uring submit is Linux-only\n");
                     let _ = stream.flush();

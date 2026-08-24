@@ -180,6 +180,40 @@ pub mod uring_submit {
         ub::set_write_chunk_ops(ops);
         ub::write_chunk_ops()
     }
+
+    /// SQEs a batched write may keep published-but-unreaped. `0` is the
+    /// historical stop-and-wait barrier: hand the kernel a whole wave, then wait
+    /// for ALL of it, so the wait is the max of that wave's latencies. Non-zero
+    /// disables wave chunking entirely and publishes the whole batch through a
+    /// sliding window that refills on every completion.
+    ///
+    /// ⚠ The unit is SQEs, and it must exceed the wave size to raise in-flight
+    /// depth: onyx's LV3 drain measured 34 SQEs per wave, so a window of 8 would
+    /// be NARROWER than the barrier it replaces.
+    pub fn write_window_sqes() -> usize {
+        ub::write_window_sqes()
+    }
+
+    /// Clamped to `MAX_WAVE_OPS` (the window must fit the SQ). Returns the
+    /// effective value.
+    pub fn set_write_window_sqes(sqes: usize) -> usize {
+        ub::set_write_window_sqes(sqes);
+        ub::write_window_sqes()
+    }
+
+    /// Stripes the RAID6 writer hands to the backend before waiting, so stripe
+    /// i+1's syndrome compute overlaps stripe i's device time. `0` is the
+    /// two-phase writer: compute EVERY stripe's parity first, then submit — on
+    /// the box that leaves the drives idle through `plan + compute`, measured at
+    /// 5.6 ms of a 22.3 ms call.
+    pub fn r6_pipeline_stripes() -> usize {
+        onyx_chunklet::ld::raid6::pipeline_window_stripes()
+    }
+
+    pub fn set_r6_pipeline_stripes(stripes: usize) -> usize {
+        onyx_chunklet::ld::raid6::set_pipeline_window_stripes(stripes);
+        onyx_chunklet::ld::raid6::pipeline_window_stripes()
+    }
 }
 
 /// Resolve the set of raw-device paths that make up this pool.

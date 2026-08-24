@@ -38,6 +38,41 @@ impl BufferFlusher {
         lease_age >= IN_FLIGHT_LEASE_TIMEOUT && writer_idle >= IN_FLIGHT_RESCUE_IDLE
     }
 
+    /// The admission walk, lifted out of `coalesce_loop` so it can be timed as
+    /// one thing (`flush_coalesce_walk_*`).
+    ///
+    /// Probe the oldest entry first: if it has not matured, cloning a full
+    /// snapshot is pure work because the admission loop stops at that first
+    /// entry anyway. Once the head is admissible, expand to the normal byte
+    /// window so mature-window drain throughput is unchanged. Recovered entries
+    /// have no resident payload and bypass the residence window.
+    fn admission_walk(
+        shard_idx: usize,
+        pool: &WriteBufferPool,
+        admission_topup_limit: usize,
+        admission_window_bytes: usize,
+        bypass_write_window: bool,
+        write_window: Duration,
+        write_window_cutoff: Option<Instant>,
+    ) -> Vec<Arc<crate::buffer::commit_log::PendingEntry>> {
+        let probe = pool.oldest_ready_pending_arcs_for_shard(shard_idx, 1);
+        let head_is_admissible = probe.first().is_some_and(|entry| {
+            bypass_write_window
+                || write_window.is_zero()
+                || entry.payload.is_none()
+                || write_window_cutoff.is_some_and(|cutoff| entry.enqueued_at <= cutoff)
+        });
+        if head_is_admissible && admission_topup_limit > 1 {
+            pool.oldest_ready_pending_arcs_for_shard_with_budget(
+                shard_idx,
+                admission_topup_limit,
+                admission_window_bytes,
+            )
+        } else {
+            probe
+        }
+    }
+
     pub(in crate::buffer::flush) fn coalesce_loop(
         shard_idx: usize,
         pool: &WriteBufferPool,
@@ -107,6 +142,7 @@ impl BufferFlusher {
 
         while running.load(Ordering::Relaxed) {
             let iter_start = Instant::now();
+            let loop_start = iter_start;
             let mut this_iter_idle_ns: u64 = 0;
             // Drain completed seqs from writer feedback — decrement refcounts
             while let Ok(seqs) = done_rx.try_recv() {
@@ -175,24 +211,23 @@ impl BufferFlusher {
             // mature-window drain throughput is unchanged. Recovered entries
             // have no resident payload and must bypass the residence window.
             let oldest_admission_snapshot = || {
-                let probe = pool.oldest_ready_pending_arcs_for_shard(shard_idx, 1);
-                let head_is_admissible = probe.first().is_some_and(|entry| {
-                    bypass_write_window
-                        || write_window.is_zero()
-                        || entry.payload.is_none()
-                        || write_window_cutoff.is_some_and(|cutoff| entry.enqueued_at <= cutoff)
-                });
-                if head_is_admissible && admission_topup_limit > 1 {
-                    pool.oldest_ready_pending_arcs_for_shard_with_budget(
-                        shard_idx,
-                        admission_topup_limit,
-                        admission_window_bytes,
-                    )
-                } else {
-                    probe
-                }
+                // Timed because this is the walk that restarts at the oldest
+                // pending seq every cycle: `arcs` vs `admit_queued` is how much
+                // of it was re-examining entries already in flight.
+                let walk_start = Instant::now();
+                let out = Self::admission_walk(shard_idx, pool, admission_topup_limit,
+                    admission_window_bytes, bypass_write_window, write_window,
+                    write_window_cutoff);
+                metrics
+                    .flush_coalesce_walk_ns
+                    .fetch_add(walk_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed);
+                metrics.flush_coalesce_walk_calls.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .flush_coalesce_walk_arcs
+                    .fetch_add(out.len() as u64, Ordering::Relaxed);
+                out
             };
-
             // Completion feedback is an optimisation, not durability state.
             // If the whole writer has been idle long enough, any old in-flight
             // pending seq is orphaned: no downstream stage is still making
@@ -606,6 +641,16 @@ impl BufferFlusher {
                 iter_total.saturating_sub(this_iter_idle_ns),
                 Ordering::Relaxed,
             );
+            // Whole-iteration wall. `active + idle` already claims to cover it,
+            // but that pair is what disagreed with the OS (24-44% active vs 93%
+            // thread CPU), so keep an independent total to anchor the residual.
+            metrics.flush_coalesce_loop_ns.fetch_add(
+                loop_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            metrics
+                .flush_coalesce_loop_iters
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }

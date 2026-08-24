@@ -708,6 +708,30 @@ pub struct EngineMetrics {
     pub flush_coalesce_phase2_dedup_ns: AtomicU64,
     pub flush_coalesce_phase3_sort_ns: AtomicU64,
     pub flush_coalesce_phase4_merge_ns: AtomicU64,
+    /// ADMISSION side of the coalesce loop, i.e. everything before
+    /// `coalesce_pending`. Added 2026-08-24 because the four counters above
+    /// accounted for only **7.6%** of a coalesce thread's wall time while the OS
+    /// reported those 16 threads at 93% busy (14.9 cores) — the drain's binding
+    /// stage was almost entirely unmeasured.
+    ///
+    /// `walk_*` times `oldest_pending_arcs_with_budget`, which restarts at the
+    /// OLDEST pending seq on every call. Entries stay in `pending_seqs` until
+    /// mark_flushed, so the in-flight admission window sits at the head and is
+    /// re-walked (BTree range + DashMap probe + Arc clone) every cycle, only to
+    /// be rejected by `try_enqueue_pending_seq` as `InFlight`. `arcs` vs
+    /// `queued` is that waste ratio; the `skip_*` split says which rejection.
+    pub flush_coalesce_walk_ns: AtomicU64,
+    pub flush_coalesce_walk_calls: AtomicU64,
+    pub flush_coalesce_walk_arcs: AtomicU64,
+    pub flush_coalesce_admit_queued: AtomicU64,
+    pub flush_coalesce_admit_skip_inflight: AtomicU64,
+    pub flush_coalesce_admit_skip_seen: AtomicU64,
+    pub flush_coalesce_admit_skip_window: AtomicU64,
+    pub flush_coalesce_admit_skip_other: AtomicU64,
+    /// Whole-iteration wall of the coalesce loop, so the residual against every
+    /// counter above is visible instead of being inferred from `top`.
+    pub flush_coalesce_loop_ns: AtomicU64,
+    pub flush_coalesce_loop_iters: AtomicU64,
     pub flush_dedup_worker_active_ns: AtomicU64,
     pub flush_dedup_worker_idle_ns: AtomicU64,
     pub flush_dedup_worker_iters: AtomicU64,

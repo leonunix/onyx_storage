@@ -641,17 +641,34 @@ impl BufferFlusher {
         write_window_cutoff: Option<Instant>,
         bypass_write_window: bool,
     ) -> EnqueuePendingSeq {
+        // Counted here rather than at the four call sites so the admission
+        // ledger covers every path into the loop. `InFlight` is the one that
+        // matters: an entry stays in the shard's `pending_seqs` index until it
+        // is mark_flushed, so the whole in-flight admission window is re-walked
+        // (and its Arcs re-cloned) on every cycle just to land here.
         if in_flight.contains_key(&seq) {
+            metrics
+                .flush_coalesce_admit_skip_inflight
+                .fetch_add(1, Ordering::Relaxed);
             return EnqueuePendingSeq::Skipped(SkipReason::InFlight);
         }
         if !in_flight_tracker.retry_ready(seq) {
+            metrics
+                .flush_coalesce_admit_skip_other
+                .fetch_add(1, Ordering::Relaxed);
             return EnqueuePendingSeq::Skipped(SkipReason::RetryDeferred);
         }
         if !seen.insert(seq) {
+            metrics
+                .flush_coalesce_admit_skip_seen
+                .fetch_add(1, Ordering::Relaxed);
             return EnqueuePendingSeq::Skipped(SkipReason::AlreadySeen);
         }
 
         let Some(meta) = pool.get_pending_arc(seq) else {
+            metrics
+                .flush_coalesce_admit_skip_other
+                .fetch_add(1, Ordering::Relaxed);
             return EnqueuePendingSeq::Skipped(SkipReason::NoPendingEntry);
         };
 
@@ -665,6 +682,9 @@ impl BufferFlusher {
             && meta.payload.is_some()
             && write_window_cutoff.is_none_or(|cutoff| meta.enqueued_at > cutoff)
         {
+            metrics
+                .flush_coalesce_admit_skip_window
+                .fetch_add(1, Ordering::Relaxed);
             return EnqueuePendingSeq::Skipped(SkipReason::WriteWindow);
         }
 
@@ -699,6 +719,9 @@ impl BufferFlusher {
                 metrics
                     .coalesce_superseded_lbas
                     .fetch_add(meta.lba_count as u64, Ordering::Relaxed);
+                metrics
+                    .flush_coalesce_admit_skip_other
+                    .fetch_add(1, Ordering::Relaxed);
                 return EnqueuePendingSeq::Skipped(SkipReason::Superseded);
             }
         }
@@ -712,6 +735,9 @@ impl BufferFlusher {
 
         *queued_bytes = queued_bytes.saturating_add(Self::pending_entry_bytes(meta.as_ref()));
         new_entries.push(meta);
+        metrics
+            .flush_coalesce_admit_queued
+            .fetch_add(1, Ordering::Relaxed);
         EnqueuePendingSeq::Queued
     }
 

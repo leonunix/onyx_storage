@@ -197,6 +197,27 @@ enum Command {
         /// New wave size in ops; omit to just read the current one.
         ops: Option<usize>,
     },
+    /// Read or set chunklet's windowed submit cap (`uring_write_window_sqes`).
+    ///
+    /// `0` is the historical per-wave barrier: publish a whole wave, then wait for
+    /// ALL of it, so the wait is the max of that wave's latencies and a drive that
+    /// finishes early idles through the tail. Non-zero disables wave chunking and
+    /// publishes the batch through a sliding window that refills on every
+    /// completion. ⚠ The unit is SQEs and it must EXCEED the wave size (34
+    /// measured on the LV3 drain) to deepen the device queue.
+    UringWindow {
+        /// New window in SQEs; omit to just read the current one.
+        sqes: Option<usize>,
+    },
+    /// Read or set chunklet's RAID6 pipelined writer (`raid6_pipeline_window_stripes`).
+    ///
+    /// `0` is the two-phase writer: compute EVERY stripe's syndrome, then submit
+    /// every write — box-measured as 5.6 ms of a 22.3 ms call with the drives
+    /// idle. Non-zero hands segments to the backend as their syndromes finish.
+    R6Pipeline {
+        /// New window in stripes; omit to just read the current one.
+        stripes: Option<usize>,
+    },
     /// chunklet RAID pool online operations (status / scrub / rebuild / job).
     /// Requires a running engine — the pool is flock-held by `start`, so these
     /// are routed to it over the IPC socket, never a second `Pool::open`.
@@ -1276,6 +1297,40 @@ fn main() -> anyhow::Result<()> {
             let cmd = match ops {
                 Some(n) => format!("uring-wave {n}"),
                 None => "uring-wave".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::UringWindow { sqes } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "uring-window talks to a running engine (socket {:?} not found) — \
+                     start it first",
+                    sock
+                );
+            }
+            let cmd = match sqes {
+                Some(n) => format!("uring-window {n}"),
+                None => "uring-window".to_string(),
+            };
+            for line in service::send_chunklet_command(sock, &cmd)? {
+                println!("{line}");
+            }
+        }
+        Command::R6Pipeline { stripes } => {
+            let sock = &config.service.socket_path;
+            if !sock.exists() {
+                anyhow::bail!(
+                    "r6-pipeline talks to a running engine (socket {:?} not found) — \
+                     start it first",
+                    sock
+                );
+            }
+            let cmd = match stripes {
+                Some(n) => format!("r6-pipeline {n}"),
+                None => "r6-pipeline".to_string(),
             };
             for line in service::send_chunklet_command(sock, &cmd)? {
                 println!("{line}");

@@ -1744,6 +1744,20 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "flush_coalesce_admit: walk_ns={} walk_calls={} walk_arcs={} queued={} skip_inflight={} skip_seen={} skip_window={} skip_other={} loop_ns={} loop_iters={}",
+            self.metrics.flush_coalesce_walk_ns,
+            self.metrics.flush_coalesce_walk_calls,
+            self.metrics.flush_coalesce_walk_arcs,
+            self.metrics.flush_coalesce_admit_queued,
+            self.metrics.flush_coalesce_admit_skip_inflight,
+            self.metrics.flush_coalesce_admit_skip_seen,
+            self.metrics.flush_coalesce_admit_skip_window,
+            self.metrics.flush_coalesce_admit_skip_other,
+            self.metrics.flush_coalesce_loop_ns,
+            self.metrics.flush_coalesce_loop_iters,
+        );
+        let _ = writeln!(
+            out,
             "flush_compress_inside: raw_build_ns={} codec_ns={} crc_ns={}",
             self.metrics.flush_compress_raw_build_ns,
             self.metrics.flush_compress_codec_ns,
