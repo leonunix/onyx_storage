@@ -228,20 +228,34 @@ struct SubmitLanes {
 }
 
 impl SubmitLanes {
+    /// `shared` collapses the per-lane partition into ONE queue served by all
+    /// `nr_queues * queue_workers` threads. A session is otherwise pinned to
+    /// `session_id % nr_queues` for life, so one fio job could never use more
+    /// than `queue_workers` (4) threads no matter its iodepth — the same static
+    /// partition that bounded the ublk frontend at 3-4 queues' worth of workers
+    /// (see `UblkConfig::shared_io_workers`). Keeping the harness's own
+    /// concurrency unbounded is what makes it usable as an instrument.
     fn start(
         nr_queues: usize,
         queue_workers: usize,
+        shared: bool,
         direct_io_cpus: Arc<Vec<usize>>,
     ) -> io::Result<Self> {
-        let sessions_per_lane = MAX_DIRECT_IO_SESSIONS.div_ceil(nr_queues);
+        let lanes = if shared { 1 } else { nr_queues };
+        let sessions_per_lane = MAX_DIRECT_IO_SESSIONS.div_ceil(lanes);
         let lane_capacity = MAX_DIRECT_IO_OUTSTANDING.saturating_mul(sessions_per_lane.max(1));
-        let mut senders = Vec::with_capacity(nr_queues);
-        let mut worker_handles = Vec::with_capacity(nr_queues.saturating_mul(queue_workers));
+        let workers_per_lane = if shared {
+            nr_queues.saturating_mul(queue_workers)
+        } else {
+            queue_workers
+        };
+        let mut senders = Vec::with_capacity(lanes);
+        let mut worker_handles = Vec::with_capacity(lanes.saturating_mul(workers_per_lane));
 
-        for lane_id in 0..nr_queues {
+        for lane_id in 0..lanes {
             let (tx, rx) = crossbeam_channel::bounded::<SubmitTask>(lane_capacity);
             senders.push(tx);
-            for worker_id in 0..queue_workers {
+            for worker_id in 0..workers_per_lane {
                 let worker_rx = rx.clone();
                 let worker_cpus = direct_io_cpus.clone();
                 let handle = thread::Builder::new()
@@ -250,7 +264,7 @@ impl SubmitLanes {
                         bind_direct_io_thread(
                             &worker_cpus,
                             lane_id
-                                .saturating_mul(queue_workers)
+                                .saturating_mul(workers_per_lane)
                                 .saturating_add(worker_id),
                         );
                         submit_worker_loop(worker_rx);
@@ -300,6 +314,7 @@ impl DirectIoServer {
         engine: Arc<ArcSwap<Option<OnyxEngine>>>,
         nr_queues: usize,
         queue_workers: usize,
+        shared_submit_pool: bool,
         direct_io_cpus: Vec<usize>,
     ) -> io::Result<Self> {
         let nr_queues = nr_queues.max(1);
@@ -317,7 +332,12 @@ impl DirectIoServer {
 
         let direct_io_cpus = Arc::new(direct_io_cpus);
         let logged_direct_io_cpus = direct_io_cpus.clone();
-        let submit_lanes = SubmitLanes::start(nr_queues, queue_workers, direct_io_cpus.clone())?;
+        let submit_lanes = SubmitLanes::start(
+            nr_queues,
+            queue_workers,
+            shared_submit_pool,
+            direct_io_cpus.clone(),
+        )?;
         let lane_senders = submit_lanes.senders.clone();
         let shutdown = Arc::new(ShutdownState::new());
         let thread_shutdown = shutdown.clone();
@@ -1290,7 +1310,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("control.sock");
         let engine = Arc::new(ArcSwap::from_pointee(None::<OnyxEngine>));
-        let mut server = DirectIoServer::start(&control_path, engine, 2, 3, Vec::new()).unwrap();
+        let mut server =
+            DirectIoServer::start(&control_path, engine, 2, 3, true, Vec::new()).unwrap();
 
         let mut client = UnixStream::connect(server.socket_path()).unwrap();
         let volume = b"test-volume";

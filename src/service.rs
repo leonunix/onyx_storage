@@ -97,11 +97,12 @@ impl ServiceController {
         // The binary data-plane listener must stop and join every session
         // before engine shutdown. Start it first so a control-socket bind
         // failure can still unwind it cleanly through Drop.
-        let (nr_queues, queue_workers, direct_io_cpus) = {
+        let (nr_queues, queue_workers, shared_io_workers, direct_io_cpus) = {
             let config = self.config.read();
             (
                 config.ublk.nr_queues as usize,
                 config.ublk.queue_workers,
+                config.ublk.shared_io_workers,
                 config.service.direct_io_cpu_set()?,
             )
         };
@@ -110,6 +111,7 @@ impl ServiceController {
             self.engine.clone(),
             nr_queues,
             queue_workers,
+            shared_io_workers,
             direct_io_cpus,
         )
         .map_err(OnyxError::Io)?;
