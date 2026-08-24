@@ -1244,17 +1244,26 @@ impl BufferShard {
     /// entries are pruned after the walk, so an arbitrarily long stale prefix
     /// cannot hide live work or force future calls to rescan it.
     pub(super) fn oldest_pending_arcs(&self, limit: usize) -> Vec<Arc<PendingEntry>> {
-        self.oldest_pending_arcs_with_budget(limit, usize::MAX)
+        self.oldest_pending_arcs_with_budget(limit, usize::MAX, None)
     }
 
     /// Byte-bounded oldest-pending snapshot for flusher admission. The entry
     /// count remains a hard safety cap; `byte_limit` avoids cloning thousands
     /// of random-write Arcs when a few hundred entries already fill the 16 MiB
     /// coalesce window.
+    /// `after_seq` is an EXCLUSIVE lower bound on the walk. `None` starts at the
+    /// oldest pending seq, which is what every caller used to do — and what made
+    /// the coalescer re-walk its whole in-flight admission window every cycle
+    /// (box 2026-08-24: 526.7 M Arcs cloned to admit 4.37 M, a 120.6x waste, with
+    /// 1.67 M/s `SkipReason::InFlight` rejections). An entry stays in
+    /// `pending_seqs` until `mark_flushed`, so "oldest pending" is NOT the same
+    /// as "oldest admissible"; a caller that already knows how far it got can say
+    /// so here.
     pub(super) fn oldest_pending_arcs_with_budget(
         &self,
         limit: usize,
         byte_limit: usize,
+        after_seq: Option<u64>,
     ) -> Vec<Arc<PendingEntry>> {
         if limit == 0 || byte_limit == 0 || self.pending_count.load(Ordering::Relaxed) == 0 {
             return Vec::new();
@@ -1263,7 +1272,7 @@ impl BufferShard {
         let mut result = Vec::with_capacity(limit);
         let mut result_bytes = 0usize;
         let mut stale = Vec::new();
-        let mut after = None;
+        let mut after = after_seq;
 
         // Copy only a bounded slice of the ordered index at a time. The old
         // whole-set snapshot made every 16 MiB coalesce admission O(all

@@ -775,18 +775,21 @@ impl WriteBufferPool {
             .unwrap_or_default()
     }
 
+    /// `after_seq` = exclusive lower bound; `None` starts at the oldest pending
+    /// seq. See `CommitLogShard::oldest_pending_arcs_with_budget`.
     pub fn oldest_ready_pending_arcs_for_shard_with_budget(
         &self,
         shard_idx: usize,
         limit: usize,
         byte_limit: usize,
+        after_seq: Option<u64>,
     ) -> Vec<Arc<PendingEntry>> {
         self.shards
             .get(shard_idx)
             .map(|shard| {
                 shard
                     .shard
-                    .oldest_pending_arcs_with_budget(limit, byte_limit)
+                    .oldest_pending_arcs_with_budget(limit, byte_limit, after_seq)
             })
             .unwrap_or_default()
     }

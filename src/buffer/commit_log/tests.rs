@@ -3270,10 +3270,54 @@ fn oldest_pending_arcs_byte_budget_stops_after_covering_window() {
         seqs.push(pool.append("test-vol", Lba(i * 4), 4, &payload, 0).unwrap());
     }
 
-    let snapshot = shard.oldest_pending_arcs_with_budget(100, 5 * BLOCK_SIZE as usize);
+    let snapshot = shard.oldest_pending_arcs_with_budget(100, 5 * BLOCK_SIZE as usize, None);
     assert_eq!(snapshot.len(), 2);
     assert_eq!(snapshot[0].seq, seqs[0]);
     assert_eq!(snapshot[1].seq, seqs[1]);
+}
+
+#[test]
+fn oldest_pending_arcs_after_seq_skips_the_walked_prefix() {
+    // The admission cursor's contract. Without an exclusive lower bound the
+    // coalescer re-walked its whole in-flight prefix every cycle: box
+    // 2026-08-24 measured 526.7 M Arc clones to admit 4.37 M entries (120.6x)
+    // because every one of them came back as `SkipReason::InFlight`.
+    let slot = BufferShard::slot_size();
+    let (pool, _tmp) = create_pool(
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE + 64 * slot,
+        Duration::from_millis(1),
+    );
+    let shard = &pool.shards[0].shard;
+    let payload = vec![0x5A; BLOCK_SIZE as usize];
+    let mut seqs = Vec::new();
+    for i in 0..4 {
+        seqs.push(pool.append("test-vol", Lba(i), 1, &payload, 0).unwrap());
+    }
+
+    let all = shard.oldest_pending_arcs_with_budget(100, usize::MAX, None);
+    assert_eq!(
+        all.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        seqs,
+        "no bound must still start at the oldest pending seq"
+    );
+
+    // Exclusive: the bound itself is not returned.
+    let after_first = shard.oldest_pending_arcs_with_budget(100, usize::MAX, Some(seqs[0]));
+    assert_eq!(
+        after_first.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        seqs[1..].to_vec()
+    );
+
+    let after_last = shard.oldest_pending_arcs_with_budget(100, usize::MAX, Some(seqs[3]));
+    assert!(
+        after_last.is_empty(),
+        "a cursor past the newest pending seq must walk nothing at all"
+    );
+
+    // The byte budget still applies on top of the bound.
+    let bounded =
+        shard.oldest_pending_arcs_with_budget(100, 2 * BLOCK_SIZE as usize, Some(seqs[0]));
+    assert_eq!(bounded.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![seqs[1], seqs[2]]);
 }
 
 #[test]

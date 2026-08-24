@@ -46,6 +46,7 @@ impl BufferFlusher {
     /// entry anyway. Once the head is admissible, expand to the normal byte
     /// window so mature-window drain throughput is unchanged. Recovered entries
     /// have no resident payload and bypass the residence window.
+    #[allow(clippy::too_many_arguments)]
     fn admission_walk(
         shard_idx: usize,
         pool: &WriteBufferPool,
@@ -54,6 +55,7 @@ impl BufferFlusher {
         bypass_write_window: bool,
         write_window: Duration,
         write_window_cutoff: Option<Instant>,
+        after_seq: Option<u64>,
     ) -> Vec<Arc<crate::buffer::commit_log::PendingEntry>> {
         let probe = pool.oldest_ready_pending_arcs_for_shard(shard_idx, 1);
         let head_is_admissible = probe.first().is_some_and(|entry| {
@@ -67,6 +69,18 @@ impl BufferFlusher {
                 shard_idx,
                 admission_topup_limit,
                 admission_window_bytes,
+                after_seq,
+            )
+        } else if after_seq.is_some() {
+            // The head probe is only about the RESIDENCE window, and the head is
+            // by definition at or below the cursor. Falling back to `probe` here
+            // would hand the caller an entry it has already passed, so the
+            // cursored walk must go to the index instead.
+            pool.oldest_ready_pending_arcs_for_shard_with_budget(
+                shard_idx,
+                admission_topup_limit.max(1),
+                admission_window_bytes,
+                after_seq,
             )
         } else {
             probe
@@ -137,6 +151,17 @@ impl BufferFlusher {
         //   in_flight_count == 0 && flushed_count < lba_count → some LBA was
         //                          never mark_flushed (no enqueue, no supersede)
         let mut last_diag_log: Option<Instant> = None;
+        // Admission cursor: exclusive lower bound for the fast-path walk.
+        // `oldest_pending_arcs_with_budget` used to restart at the oldest pending
+        // seq on every call, but an entry stays in `pending_seqs` until
+        // mark_flushed, so the whole in-flight window was re-walked ~229 times a
+        // second per shard and rejected as `SkipReason::InFlight` (box
+        // 2026-08-24: 526.7 M Arcs cloned to admit 4.37 M, 1.67 M/s InFlight
+        // skips, and those 16 threads at 93% CPU while every existing counter
+        // accounted for 7.6% of it). The cursor is reset to `None` by the
+        // `retry_snapshot_interval` pass below, so it can delay an entry by at
+        // most that interval and cannot strand one.
+        let mut admit_cursor: Option<u64> = None;
         const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(30);
         const DIAG_AGE_THRESHOLD_MS: u64 = 3000;
 
@@ -210,14 +235,16 @@ impl BufferFlusher {
             // the head is admissible, expand to the normal 16 MiB batch so
             // mature-window drain throughput is unchanged. Recovered entries
             // have no resident payload and must bypass the residence window.
-            let oldest_admission_snapshot = || {
-                // Timed because this is the walk that restarts at the oldest
-                // pending seq every cycle: `arcs` vs `admit_queued` is how much
-                // of it was re-examining entries already in flight.
+            // `after` is the admission cursor: `None` walks from the oldest
+            // pending seq, `Some(seq)` resumes after it. See `admit_cursor`.
+            let oldest_admission_snapshot = |after: Option<u64>| {
+                // Timed because this is the walk that used to restart at the
+                // oldest pending seq every cycle: `arcs` vs `admit_queued` is how
+                // much of it was re-examining entries already in flight.
                 let walk_start = Instant::now();
                 let out = Self::admission_walk(shard_idx, pool, admission_topup_limit,
                     admission_window_bytes, bypass_write_window, write_window,
-                    write_window_cutoff);
+                    write_window_cutoff, after);
                 metrics
                     .flush_coalesce_walk_ns
                     .fetch_add(walk_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -412,8 +439,14 @@ impl BufferFlusher {
             // channel non-empty forever while crash-recovered payload-less
             // entries rely on periodic snapshots to make progress.
             let mut queued_oldest_snapshot = false;
-            for entry in oldest_admission_snapshot() {
+            // Cursor bookkeeping for this pass. `passed` is the highest seq we
+            // may safely resume after; `blocked` is the lowest seq that must be
+            // re-examined next time, and it wins.
+            let mut passed: Option<u64> = None;
+            let mut blocked: Option<u64> = None;
+            for entry in oldest_admission_snapshot(admit_cursor) {
                 if queued_bytes >= admission_window_bytes {
+                    blocked = Some(blocked.map_or(entry.seq, |b: u64| b.min(entry.seq)));
                     break;
                 }
                 match Self::try_enqueue_pending_seq(
@@ -431,17 +464,45 @@ impl BufferFlusher {
                     write_window_cutoff,
                     bypass_write_window,
                 ) {
-                    EnqueuePendingSeq::Queued => queued_oldest_snapshot = true,
-                    EnqueuePendingSeq::WindowFull => break,
+                    EnqueuePendingSeq::Queued => {
+                        queued_oldest_snapshot = true;
+                        passed = Some(passed.map_or(entry.seq, |p: u64| p.max(entry.seq)));
+                    }
+                    EnqueuePendingSeq::WindowFull => {
+                        // This entry did not fit; it is still admissible.
+                        blocked = Some(blocked.map_or(entry.seq, |b: u64| b.min(entry.seq)));
+                        break;
+                    }
                     EnqueuePendingSeq::Skipped(SkipReason::WriteWindow) => {
                         // oldest_pending_arcs is seq ordered. A live oldest
                         // entry that has not matured proves newer live entries
                         // are not ready either; avoid repeatedly walking them.
+                        // Transient: the cursor must not pass it.
+                        blocked = Some(blocked.map_or(entry.seq, |b: u64| b.min(entry.seq)));
                         break;
                     }
-                    EnqueuePendingSeq::Skipped(_) => {}
+                    EnqueuePendingSeq::Skipped(SkipReason::RetryDeferred) => {
+                        // Also transient — a backoff timer, not a pipeline state.
+                        blocked = Some(blocked.map_or(entry.seq, |b: u64| b.min(entry.seq)));
+                    }
+                    EnqueuePendingSeq::Skipped(_) => {
+                        // InFlight / AlreadySeen / Superseded / NoPendingEntry:
+                        // either the pipeline owns the seq and will hand it back
+                        // through `done_rx`, or it is gone. Safe to resume after.
+                        passed = Some(passed.map_or(entry.seq, |p: u64| p.max(entry.seq)));
+                    }
                 }
             }
+            // A transient block wins over anything we walked past, so the next
+            // pass re-examines it. Otherwise resume after the furthest seq this
+            // pass settled. `saturating_sub(1)` on seq 0 leaves the cursor at 0,
+            // which the exclusive bound turns into "skip seq 0" — seq numbering
+            // starts at 1, so nothing is lost.
+            admit_cursor = match (blocked, passed) {
+                (Some(b), _) => b.checked_sub(1),
+                (None, Some(p)) => Some(p),
+                (None, None) => admit_cursor,
+            };
 
             // If the oldest-pending snapshot produced work, keep this cycle
             // focused on that priority batch. Otherwise a sustained foreground
@@ -491,8 +552,15 @@ impl BufferFlusher {
                 && queued_bytes < admission_window_bytes
             {
                 last_retry_snapshot = Instant::now();
+                // From the HEAD, unconditionally. This is the bound on how long
+                // the cursor may hide an entry it walked past: at most
+                // `retry_snapshot_interval`. Anything the cursored fast path
+                // skipped for a reason that later stopped applying is picked up
+                // here, which is why the cursor needs no liveness proof of its
+                // own.
+                admit_cursor = None;
                 let mut topped_up = 0usize;
-                for entry in oldest_admission_snapshot() {
+                for entry in oldest_admission_snapshot(None) {
                     if topped_up >= admission_topup_limit || queued_bytes >= admission_window_bytes
                     {
                         break;
