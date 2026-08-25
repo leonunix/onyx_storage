@@ -291,6 +291,27 @@ group_commit_wait_us = 100
 # unchanged-to-better. 87.5 % of epochs skip the write (exactly 7/8).
 lv2_checkpoint_epoch_interval = 8
 shards = 16
+# LV2 global root-write lanes. 0 = compiled default = ONE LANE PER SHARD (16
+# here). The old default capped it at 8, which paired two shards per lane.
+#
+# A/B driver: tools/lv2_lanes_ab.sh (restart per arm — the knob is read at pool
+# open). Box-measured 2026-08-25, RWMIX=0 QD256 j16d16 on the aged 256 GiB
+# volume, arms 8/16/8 each after its own 430 s burn:
+#
+#   metric                  lanes=8   lanes=16   lanes=8
+#   append_total          8570 us    5386 us    9153 us   -39%
+#   wait_durable p99     37749 us   12059 us   39846 us   -68%
+#   entry_write           3304 us    1091 us    3561 us   -67%
+#   prepared_queue        1503 us     448 us    1627 us   -70%
+#
+# ⚠ Throughput was FLAT (610/568/579 MB/s, inside the 8-arms' own 5.3% spread)
+# and drive util stayed ~20%: in-flight appends fell 159 -> 93 at fixed QD256, so
+# the appends stopped being the queue. Judge this knob on latency, not bandwidth.
+#
+# ⚠ A shard maps to a lane by `shard_idx % lanes`, so any value keeps a shard's
+# batches on ONE lane. That is required: the LV2 durability watermark is a PREFIX
+# marker, so out-of-order publication would ack an unwritten append.
+lv2_write_lanes = 0
 max_memory_mb = 16384
 volatile_memory_mb = 49152
 staging_queue_entries = 1048576

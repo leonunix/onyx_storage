@@ -990,12 +990,44 @@ impl WriteBufferPool {
     }
 
     pub(in crate::buffer::commit_log) fn resolve_global_write_lane_count(
+        configured: usize,
         member_count: usize,
     ) -> usize {
-        // Match the eight foreground ublk queues in the production profile.
-        // Each lane owns one chunklet io_uring, so this reserves enough sync
-        // submission concurrency without increasing per-lane queue depth.
-        member_count.min(8).max(1)
+        // ONE LANE PER SHARD. The previous default capped this at 8 to "match
+        // the eight foreground ublk queues"; that queue model was replaced by a
+        // single shared io-worker pool in 086a47a, so the cap only paired two
+        // shards onto one lane with no work stealing.
+        //
+        // Box-measured 2026-08-25, RWMIX=0 QD256 j16d16 on an aged 256 GiB
+        // volume, three arms 8/16/8 each with its own 430 s burn (the knob is
+        // read at pool open, so arms cannot be interleaved). 16 shards:
+        //
+        //   metric                  lanes=8   lanes=16   lanes=8
+        //   append_total          8570 us    5386 us    9153 us   -39%
+        //   wait_durable mean     6556 us    2938 us    7064 us   -57%
+        //   wait_durable p99     37749 us   12059 us   39846 us   -68%
+        //   entry_write           3304 us    1091 us    3561 us   -67%
+        //   prepared_queue        1503 us     448 us    1627 us   -70%
+        //   lane epochs            758 k     1792 k      738 k    2.4x
+        //
+        // The two 8-arms bracket the 16-arm and agree within 7-8%, so a 2.3-3.3x
+        // move is the knob, not this box's drift. ⚠ THROUGHPUT IS FLAT
+        // (610 / 568 / 579 MB/s, inside the 8-arms' own 5.3% spread) and drive
+        // util stayed ~20%: in-flight appends fell 159 -> 93 at fixed QD256, so
+        // the appends stopped being the queue and the demand is now held
+        // elsewhere. This lands for the latency, not for bandwidth.
+        //
+        // ⚠ INVARIANT: a shard maps to a lane by `shard_idx % lanes`, so every
+        // value keeps a shard's batches on ONE lane. The LV2 durability
+        // watermark is a PREFIX marker, so two lanes publishing one shard's
+        // batches out of seq order would ack an append whose payload is not on
+        // the device yet. Do not replace the per-lane channels with a shared
+        // queue without adding per-shard reordering at publish.
+        if configured == 0 {
+            member_count.max(1)
+        } else {
+            configured.max(1)
+        }
     }
 
     pub(super) fn global_sync_loop(
@@ -1003,6 +1035,7 @@ impl WriteBufferPool {
         members: Vec<(u64, Arc<BufferShard>, Receiver<()>)>,
         group_commit_wait: Duration,
         lv2_prepared_queue_depth_per_lane: usize,
+        lv2_write_lanes: usize,
         checkpoint_epoch_interval: usize,
         shutdown: Arc<AtomicBool>,
         metrics: Arc<OnceLock<Arc<EngineMetrics>>>,
@@ -1023,6 +1056,13 @@ impl WriteBufferPool {
             max_seq: u64,
             checkpoint: ShardCheckpoint,
             started: Instant,
+            /// Stamped when the lane hands the batch to the coordinator. The
+            /// lane->coord queue and the coordinator's serial service were the
+            /// only segments of `append_wait_durable` with no counter, and they
+            /// are where 40% of it hid (box 2026-08-25: 2.80 ms of a 7.02 ms
+            /// mean unaccounted, measured with UPPER-BOUND means for every other
+            /// stage).
+            written_at: Instant,
         }
 
         let queue_depth = members.len().max(1);
@@ -1034,7 +1074,8 @@ impl WriteBufferPool {
         // coordinator publishes completed epochs. The group-commit wait lives
         // only here (not in shard preparation or the coordinator), so each
         // request pays one window rather than three.
-        let write_lane_count = Self::resolve_global_write_lane_count(members.len());
+        let write_lane_count =
+            Self::resolve_global_write_lane_count(lv2_write_lanes, members.len());
         tracing::info!(
             write_lane_count,
             prepared_queue_depth,
@@ -1283,6 +1324,23 @@ impl WriteBufferPool {
                                             write_elapsed.as_nanos() as u64,
                                             Ordering::Relaxed,
                                         );
+                                        // Same latency, ENTRY-weighted. The
+                                        // per-epoch histogram above answers
+                                        // "how long is an epoch write"; an
+                                        // append waits for the epoch it landed
+                                        // in, and big epochs hold more entries
+                                        // AND take longer, so the epoch-weighted
+                                        // mean understates what an average entry
+                                        // pays. That inspection bias is what
+                                        // left 37% of `append_wait_durable`
+                                        // looking unaccounted.
+                                        let epoch_entries: usize =
+                                            prepared.iter().map(|b| b.all.len()).sum();
+                                        for _ in 0..epoch_entries {
+                                            metrics.record_buffer_lv2_entry_write_ns(
+                                                write_elapsed.as_nanos() as u64,
+                                            );
+                                        }
                                         if let Some(cpu_elapsed) = cpu_started.and_then(|started| {
                                             thread_cpu_time().map(|now| now.saturating_sub(started))
                                         }) {
@@ -1307,6 +1365,7 @@ impl WriteBufferPool {
                             }
                         }
 
+                        let written_at = Instant::now();
                         let written = prepared
                             .into_iter()
                             .map(|batch| {
@@ -1322,6 +1381,7 @@ impl WriteBufferPool {
                                     max_seq,
                                     checkpoint: batch.checkpoint,
                                     started: batch.started,
+                                    written_at,
                                 }
                             })
                             .collect();
@@ -1371,7 +1431,23 @@ impl WriteBufferPool {
                 // A lane already formed the complete durability epoch for its
                 // root write. Drain any sibling epochs that finished in the
                 // meantime, then publish the shared barrier immediately.
+                if let Some(metrics) = metrics.get() {
+                    for batch in &batches {
+                        metrics.record_buffer_lv2_written_queue_ns(
+                            recv_at.saturating_duration_since(batch.written_at).as_nanos() as u64,
+                        );
+                    }
+                }
                 while let Ok(epoch) = written_rx.try_recv() {
+                    if let Some(metrics) = metrics.get() {
+                        let drained_at = Instant::now();
+                        for batch in &epoch {
+                            metrics.record_buffer_lv2_written_queue_ns(
+                                drained_at.saturating_duration_since(batch.written_at).as_nanos()
+                                    as u64,
+                            );
+                        }
+                    }
                     batches.extend(epoch);
                 }
 
@@ -1561,14 +1637,36 @@ impl WriteBufferPool {
                         .map(|entry| entry.pending.seq)
                         .max()
                         .unwrap_or(0);
-                    let advanced_at_ns = lv2_metric_timestamp_ns(Instant::now());
+                    let advance_at = Instant::now();
+                    let advanced_at_ns = lv2_metric_timestamp_ns(advance_at);
                     for entry in &batch.all {
                         entry
                             .pending
                             .durability_advanced_at_ns
                             .store(advanced_at_ns, Ordering::Release);
                     }
+                    if let Some(metrics) = metrics.get() {
+                        // The whole in-pipeline span, per entry: staged until
+                        // this entry's watermark advance. `append_wait_durable`
+                        // minus `watermark_dispatch` must equal this, so it is
+                        // the anchor the per-stage ledger has to add up to.
+                        for entry in &batch.all {
+                            metrics.record_buffer_lv2_staged_to_durable_ns(
+                                advance_at.saturating_duration_since(entry.staged_at).as_nanos()
+                                    as u64,
+                            );
+                        }
+                    }
                     shard.lv2_durability.advance(max_seq);
+                    if let Some(metrics) = metrics.get() {
+                        // Lane write done -> this batch's watermark advance.
+                        // Together with `written_queue` this splits the
+                        // coordinator's contribution into "waiting for the
+                        // coordinator" and "the coordinator's own serial work".
+                        metrics.record_buffer_lv2_written_to_durable_ns(
+                            batch.written_at.elapsed().as_nanos() as u64,
+                        );
+                    }
                     for entry in &batch.all {
                         shard.publish_ready(entry.pending.seq);
                     }

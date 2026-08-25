@@ -99,6 +99,18 @@ impl EngineMetrics {
                 .buffer_lv2_checkpoint_write_latency
                 .snapshot(),
             buffer_lv2_root_flush_latency_buckets: self.buffer_lv2_root_flush_latency.snapshot(),
+            buffer_lv2_written_queue_latency_buckets: self
+                .buffer_lv2_written_queue_latency
+                .snapshot(),
+            buffer_lv2_written_to_durable_latency_buckets: self
+                .buffer_lv2_written_to_durable_latency
+                .snapshot(),
+            buffer_lv2_entry_write_latency_buckets: self
+                .buffer_lv2_entry_write_latency
+                .snapshot(),
+            buffer_lv2_staged_to_durable_latency_buckets: self
+                .buffer_lv2_staged_to_durable_latency
+                .snapshot(),
             buffer_lv2_watermark_dispatch_latency_buckets: self
                 .buffer_lv2_watermark_dispatch_latency
                 .snapshot(),
@@ -412,6 +424,11 @@ impl EngineMetrics {
             flush_coalesce_walk_ns: load(&self.flush_coalesce_walk_ns),
             flush_coalesce_walk_calls: load(&self.flush_coalesce_walk_calls),
             flush_coalesce_walk_arcs: load(&self.flush_coalesce_walk_arcs),
+            flush_coalesce_walk_stop_exhausted: load(&self.flush_coalesce_walk_stop_exhausted),
+            flush_coalesce_walk_stop_budget: load(&self.flush_coalesce_walk_stop_budget),
+            flush_coalesce_walk_undurable_debt_sum: load(
+                &self.flush_coalesce_walk_undurable_debt_sum,
+            ),
             flush_coalesce_admit_queued: load(&self.flush_coalesce_admit_queued),
             flush_coalesce_admit_skip_inflight: load(&self.flush_coalesce_admit_skip_inflight),
             flush_coalesce_admit_skip_seen: load(&self.flush_coalesce_admit_skip_seen),
@@ -626,6 +643,10 @@ pub struct EngineMetricsSnapshot {
     pub buffer_lv2_payload_write_latency_buckets: Vec<u64>,
     pub buffer_lv2_checkpoint_write_latency_buckets: Vec<u64>,
     pub buffer_lv2_root_flush_latency_buckets: Vec<u64>,
+    pub buffer_lv2_written_queue_latency_buckets: Vec<u64>,
+    pub buffer_lv2_written_to_durable_latency_buckets: Vec<u64>,
+    pub buffer_lv2_entry_write_latency_buckets: Vec<u64>,
+    pub buffer_lv2_staged_to_durable_latency_buckets: Vec<u64>,
     pub buffer_lv2_watermark_dispatch_latency_buckets: Vec<u64>,
     #[serde(default)]
     pub buffer_lv2_payload_profile_samples: u64,
@@ -974,6 +995,9 @@ pub struct EngineMetricsSnapshot {
     pub flush_coalesce_walk_ns: u64,
     pub flush_coalesce_walk_calls: u64,
     pub flush_coalesce_walk_arcs: u64,
+    pub flush_coalesce_walk_stop_exhausted: u64,
+    pub flush_coalesce_walk_stop_budget: u64,
+    pub flush_coalesce_walk_undurable_debt_sum: u64,
     pub flush_coalesce_admit_queued: u64,
     pub flush_coalesce_admit_skip_inflight: u64,
     pub flush_coalesce_admit_skip_seen: u64,
@@ -1203,6 +1227,10 @@ impl EngineMetricsSnapshot {
                     buffer_lv2_payload_write_latency_buckets: sub_latency_buckets(&self.buffer_lv2_payload_write_latency_buckets, &earlier.buffer_lv2_payload_write_latency_buckets),
                     buffer_lv2_checkpoint_write_latency_buckets: sub_latency_buckets(&self.buffer_lv2_checkpoint_write_latency_buckets, &earlier.buffer_lv2_checkpoint_write_latency_buckets),
                     buffer_lv2_root_flush_latency_buckets: sub_latency_buckets(&self.buffer_lv2_root_flush_latency_buckets, &earlier.buffer_lv2_root_flush_latency_buckets),
+                    buffer_lv2_written_queue_latency_buckets: sub_latency_buckets(&self.buffer_lv2_written_queue_latency_buckets, &earlier.buffer_lv2_written_queue_latency_buckets),
+                    buffer_lv2_written_to_durable_latency_buckets: sub_latency_buckets(&self.buffer_lv2_written_to_durable_latency_buckets, &earlier.buffer_lv2_written_to_durable_latency_buckets),
+                    buffer_lv2_entry_write_latency_buckets: sub_latency_buckets(&self.buffer_lv2_entry_write_latency_buckets, &earlier.buffer_lv2_entry_write_latency_buckets),
+                    buffer_lv2_staged_to_durable_latency_buckets: sub_latency_buckets(&self.buffer_lv2_staged_to_durable_latency_buckets, &earlier.buffer_lv2_staged_to_durable_latency_buckets),
                     buffer_lv2_watermark_dispatch_latency_buckets: sub_latency_buckets(&self.buffer_lv2_watermark_dispatch_latency_buckets, &earlier.buffer_lv2_watermark_dispatch_latency_buckets),
                 }
             };
@@ -1491,6 +1519,9 @@ impl EngineMetricsSnapshot {
             flush_coalesce_walk_ns,
             flush_coalesce_walk_calls,
             flush_coalesce_walk_arcs,
+            flush_coalesce_walk_stop_exhausted,
+            flush_coalesce_walk_stop_budget,
+            flush_coalesce_walk_undurable_debt_sum,
             flush_coalesce_admit_queued,
             flush_coalesce_admit_skip_inflight,
             flush_coalesce_admit_skip_seen,

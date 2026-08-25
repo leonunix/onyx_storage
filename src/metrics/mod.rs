@@ -269,6 +269,26 @@ pub struct EngineMetrics {
     pub(crate) buffer_lv2_payload_write_latency: FineLatencyHistogram,
     pub(crate) buffer_lv2_checkpoint_write_latency: FineLatencyHistogram,
     pub(crate) buffer_lv2_root_flush_latency: FineLatencyHistogram,
+    /// Lane write done -> the durability coordinator picked the batch up. This
+    /// and `written_to_durable` were the only unmeasured segments of
+    /// `append_wait_durable`, which is where 40% of it was hiding (box
+    /// 2026-08-25: 2.80 ms of a 7.02 ms mean unaccounted, with every other stage
+    /// charged at its UPPER-BOUND mean and the per-epoch stages charged in full
+    /// to every entry).
+    pub(crate) buffer_lv2_written_queue_latency: FineLatencyHistogram,
+    /// Lane write done -> this batch's LV2 watermark advance. Minus
+    /// `written_queue`, that is the coordinator's own serial service.
+    pub(crate) buffer_lv2_written_to_durable_latency: FineLatencyHistogram,
+    /// `payload_write`, ENTRY-weighted (recorded once per entry in the epoch
+    /// instead of once per epoch). Entries are distributed over epochs in
+    /// proportion to epoch size and big epochs are also slower, so the
+    /// epoch-weighted histogram understates what an average append pays -- the
+    /// inspection bias that made 37% of `append_wait_durable` look unaccounted.
+    pub(crate) buffer_lv2_entry_write_latency: FineLatencyHistogram,
+    /// Per entry: staged until ITS watermark advance, i.e. the entire
+    /// in-pipeline span. `append_wait_durable - watermark_dispatch` must equal
+    /// this, which makes it the anchor the per-stage ledger has to close against.
+    pub(crate) buffer_lv2_staged_to_durable_latency: FineLatencyHistogram,
     pub(crate) buffer_lv2_watermark_dispatch_latency: FineLatencyHistogram,
     /// Sampled (1/64 root writes) wall/CPU split for the chunklet LV2 payload
     /// write. `offcpu_ns = wall_ns - cpu_ns` covers scheduler, lock, and device
@@ -723,6 +743,20 @@ pub struct EngineMetrics {
     pub flush_coalesce_walk_ns: AtomicU64,
     pub flush_coalesce_walk_calls: AtomicU64,
     pub flush_coalesce_walk_arcs: AtomicU64,
+    /// Why the walk stopped. The walk range is clamped at the shard's LV2
+    /// `synced_seq`, so these two split the drain question that `walk_arcs`
+    /// cannot: `stop_exhausted` = no durable pending work left, the coalescer is
+    /// PACED BY LV2 DURABILITY; `stop_budget` = the entry cap or the 16 MiB byte
+    /// window cut the walk short, so an admissible backlog exists and the
+    /// constraint is downstream. Added 2026-08-24 after the cursor fix freed 3.4
+    /// coalesce cores without moving the drain (436 -> 400 MiB/s), leaving
+    /// "nothing is saturated and the ring still backs up" unresolved.
+    pub flush_coalesce_walk_stop_exhausted: AtomicU64,
+    pub flush_coalesce_walk_stop_budget: AtomicU64,
+    /// Sum of `newest pending seq - synced_seq` samples, one per walk. Divide by
+    /// `walk_calls` for the average LV2 durability debt: entries that are in the
+    /// ring but not yet admissible at any price.
+    pub flush_coalesce_walk_undurable_debt_sum: AtomicU64,
     pub flush_coalesce_admit_queued: AtomicU64,
     pub flush_coalesce_admit_skip_inflight: AtomicU64,
     pub flush_coalesce_admit_skip_seen: AtomicU64,
@@ -1195,6 +1229,22 @@ impl EngineMetrics {
 
     pub(crate) fn record_buffer_lv2_root_flush_ns(&self, ns: u64) {
         self.buffer_lv2_root_flush_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_entry_write_ns(&self, ns: u64) {
+        self.buffer_lv2_entry_write_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_staged_to_durable_ns(&self, ns: u64) {
+        self.buffer_lv2_staged_to_durable_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_written_queue_ns(&self, ns: u64) {
+        self.buffer_lv2_written_queue_latency.record(ns);
+    }
+
+    pub(crate) fn record_buffer_lv2_written_to_durable_ns(&self, ns: u64) {
+        self.buffer_lv2_written_to_durable_latency.record(ns);
     }
 
     pub(crate) fn record_buffer_lv2_watermark_dispatch_ns(&self, ns: u64) {

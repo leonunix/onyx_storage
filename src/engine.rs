@@ -566,6 +566,7 @@ impl OnyxEngine {
         })
         .with_backend_debt_throttle(config.buffer.throttle_backend_debt)
         .with_prewait_ring_space(config.buffer.prewait_ring_space_outside_order)
+        .with_write_lanes(config.buffer.lv2_write_lanes)
         .with_checkpoint_epoch_interval(config.buffer.lv2_checkpoint_epoch_interval);
 
         // Resolve the LV2 backend + whether onyx drives its own device-level

@@ -56,7 +56,7 @@ impl BufferFlusher {
         write_window: Duration,
         write_window_cutoff: Option<Instant>,
         after_seq: Option<u64>,
-    ) -> Vec<Arc<crate::buffer::commit_log::PendingEntry>> {
+    ) -> AdmissionWalk {
         let probe = pool.oldest_ready_pending_arcs_for_shard(shard_idx, 1);
         let head_is_admissible = probe.first().is_some_and(|entry| {
             bypass_write_window
@@ -65,7 +65,7 @@ impl BufferFlusher {
                 || write_window_cutoff.is_some_and(|cutoff| entry.enqueued_at <= cutoff)
         });
         if head_is_admissible && admission_topup_limit > 1 {
-            pool.oldest_ready_pending_arcs_for_shard_with_budget(
+            pool.admission_walk_for_shard(
                 shard_idx,
                 admission_topup_limit,
                 admission_window_bytes,
@@ -76,14 +76,21 @@ impl BufferFlusher {
             // by definition at or below the cursor. Falling back to `probe` here
             // would hand the caller an entry it has already passed, so the
             // cursored walk must go to the index instead.
-            pool.oldest_ready_pending_arcs_for_shard_with_budget(
+            pool.admission_walk_for_shard(
                 shard_idx,
                 admission_topup_limit.max(1),
                 admission_window_bytes,
                 after_seq,
             )
         } else {
-            probe
+            // Residence-window probe, not a budgeted walk: the stop reason would
+            // be meaningless, so report it as budget-limited to keep it out of
+            // the RangeExhausted tally.
+            AdmissionWalk {
+                stop: crate::buffer::commit_log::AdmissionWalkStop::EntryLimit,
+                undurable_debt: 0,
+                entries: probe,
+            }
         }
     }
 
@@ -252,8 +259,24 @@ impl BufferFlusher {
                 metrics.flush_coalesce_walk_calls.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .flush_coalesce_walk_arcs
-                    .fetch_add(out.len() as u64, Ordering::Relaxed);
-                out
+                    .fetch_add(out.entries.len() as u64, Ordering::Relaxed);
+                // The discriminator for "nothing is saturated and the ring still
+                // backs up": `stop_exhausted` means the coalescer ran out of
+                // LV2-durable work and is paced by durability, while
+                // `stop_budget` means admissible work was left on the table and
+                // the constraint is downstream. `undurable_debt` sizes the
+                // appended-but-not-durable backlog it cannot touch.
+                match out.stop {
+                    AdmissionWalkStop::RangeExhausted => &metrics.flush_coalesce_walk_stop_exhausted,
+                    AdmissionWalkStop::EntryLimit | AdmissionWalkStop::ByteLimit => {
+                        &metrics.flush_coalesce_walk_stop_budget
+                    }
+                }
+                .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .flush_coalesce_walk_undurable_debt_sum
+                    .fetch_add(out.undurable_debt, Ordering::Relaxed);
+                out.entries
             };
             // Completion feedback is an optimisation, not durability state.
             // If the whole writer has been idle long enough, any old in-flight

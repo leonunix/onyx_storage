@@ -784,14 +784,23 @@ impl WriteBufferPool {
         byte_limit: usize,
         after_seq: Option<u64>,
     ) -> Vec<Arc<PendingEntry>> {
+        self.admission_walk_for_shard(shard_idx, limit, byte_limit, after_seq)
+            .entries
+    }
+
+    /// Instrumented variant: also reports why the walk stopped and the LV2
+    /// durability debt. See `CommitLogShard::admission_walk`.
+    pub fn admission_walk_for_shard(
+        &self,
+        shard_idx: usize,
+        limit: usize,
+        byte_limit: usize,
+        after_seq: Option<u64>,
+    ) -> AdmissionWalk {
         self.shards
             .get(shard_idx)
-            .map(|shard| {
-                shard
-                    .shard
-                    .oldest_pending_arcs_with_budget(limit, byte_limit, after_seq)
-            })
-            .unwrap_or_default()
+            .map(|shard| shard.shard.admission_walk(limit, byte_limit, after_seq))
+            .unwrap_or_else(AdmissionWalk::empty)
     }
 
     pub fn head_stuck_seq_for_shard(&self, shard_idx: usize, min_age: Duration) -> Option<u64> {

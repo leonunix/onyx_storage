@@ -10,6 +10,7 @@ use crate::affinity::{self, ThreadRole};
 use crate::buffer::pipeline::{
     coalesce_pending, CoalesceUnit, CompressedPayload, CompressedUnit, RawBlockPayload,
 };
+use crate::buffer::commit_log::{AdmissionWalk, AdmissionWalkStop};
 use crate::buffer::pool::WriteBufferPool;
 use crate::config::FlushConfig;
 use crate::dedup::config::DedupConfig;

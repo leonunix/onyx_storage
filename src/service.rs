@@ -419,6 +419,9 @@ impl ServiceController {
                 "buffer.lv2_prepared_queue_depth_per_lane changed — requires restart to take effect"
             );
         }
+        if old_config.buffer.lv2_write_lanes != new_config.buffer.lv2_write_lanes {
+            tracing::warn!("buffer.lv2_write_lanes changed — requires restart to take effect");
+        }
         if old_config.buffer.lv2_checkpoint_epoch_interval
             != new_config.buffer.lv2_checkpoint_epoch_interval
         {

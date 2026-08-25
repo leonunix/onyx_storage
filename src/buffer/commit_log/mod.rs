@@ -108,6 +108,10 @@ pub struct BufferRuntimeLimits {
     /// Prepared-batch channel depth for each global root-write lane. Zero keeps
     /// the legacy dynamic depth of one slot per buffer shard.
     pub lv2_prepared_queue_depth_per_lane: usize,
+    /// Number of LV2 global root-write lanes. Zero keeps the compiled default,
+    /// `min(shards, 8)`. A shard always maps to exactly one lane
+    /// (`shard_idx % lanes`), which the scalar prefix watermark requires.
+    pub lv2_write_lanes: usize,
     pub throttle: ThrottleSettings,
     pub throttle_backend_debt: bool,
     /// Drain ring backpressure before taking the append-order stripes.
@@ -245,6 +249,7 @@ impl BufferRuntimeLimits {
                 sync_batch_max_bytes
             },
             lv2_prepared_queue_depth_per_lane,
+            lv2_write_lanes: defaults.lv2_write_lanes,
             throttle: defaults.throttle,
             throttle_backend_debt: defaults.throttle_backend_debt,
             prewait_ring_space_outside_order: defaults.prewait_ring_space_outside_order,
@@ -277,6 +282,12 @@ impl BufferRuntimeLimits {
         self
     }
 
+    /// `0` keeps the compiled `min(shards, 8)` lane count.
+    pub fn with_write_lanes(mut self, lanes: usize) -> Self {
+        self.lv2_write_lanes = lanes;
+        self
+    }
+
     /// `0` keeps one page write per epoch.
     pub fn with_checkpoint_epoch_interval(mut self, epochs: usize) -> Self {
         self.lv2_checkpoint_epoch_interval = epochs.max(1);
@@ -291,6 +302,7 @@ impl Default for BufferRuntimeLimits {
             sync_batch_max_entries: SYNC_BATCH_MAX_ENTRIES,
             sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
             lv2_prepared_queue_depth_per_lane: 0,
+            lv2_write_lanes: 0,
             throttle: ThrottleSettings::default(),
             throttle_backend_debt: false,
             prewait_ring_space_outside_order: false,
@@ -1051,6 +1063,40 @@ struct RingState {
 
 struct LifecycleState {
     cancelled: HashSet<u64>,
+}
+
+// ── Flusher admission walk ──────────────────────────────────────────
+
+/// Why an admission walk stopped. See `BufferShard::admission_walk`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionWalkStop {
+    /// No pending seq left at or below the LV2 durable watermark. The caller has
+    /// admitted everything it is allowed to; the pace is set by LV2 durability.
+    RangeExhausted,
+    /// The caller's entry cap was reached — admissible work remains.
+    EntryLimit,
+    /// The caller's byte budget was filled — admissible work remains.
+    ByteLimit,
+}
+
+/// Result of `BufferShard::admission_walk`: the entries plus the two facts the
+/// plain entry list cannot express.
+pub struct AdmissionWalk {
+    pub entries: Vec<Arc<PendingEntry>>,
+    pub stop: AdmissionWalkStop,
+    /// `newest pending seq - synced_seq`: appends that are in the ring but not
+    /// yet LV2-durable, so not yet admissible.
+    pub undurable_debt: u64,
+}
+
+impl AdmissionWalk {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            stop: AdmissionWalkStop::RangeExhausted,
+            undurable_debt: 0,
+        }
+    }
 }
 
 // ── BufferShard ─────────────────────────────────────────────────────

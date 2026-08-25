@@ -3321,6 +3321,87 @@ fn oldest_pending_arcs_after_seq_skips_the_walked_prefix() {
 }
 
 #[test]
+fn admission_walk_stop_reason_separates_durability_pacing_from_budget() {
+    // The discriminator for the open LV3 drain question: `RangeExhausted` means
+    // the coalescer consumed every LV2-durable entry and is paced by durability;
+    // a budget stop means admissible work was left behind and the constraint is
+    // downstream. `walk_arcs` alone cannot tell these apart, which is why
+    // "nothing is saturated and the ring still backs up" stayed open after the
+    // admission cursor freed 3.4 coalesce cores for no throughput.
+    let slot = BufferShard::slot_size();
+    let (pool, _tmp) = create_pool(
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE + 64 * slot,
+        Duration::from_millis(1),
+    );
+    let shard = &pool.shards[0].shard;
+    let payload = vec![0x5A; BLOCK_SIZE as usize];
+    let mut seqs = Vec::new();
+    for i in 0..4 {
+        seqs.push(pool.append("test-vol", Lba(i), 1, &payload, 0).unwrap());
+    }
+
+    // Everything fits: the walk ran out of durable pending work.
+    let walk = shard.admission_walk(100, usize::MAX, None);
+    assert_eq!(walk.entries.len(), 4);
+    assert_eq!(walk.stop, AdmissionWalkStop::RangeExhausted);
+    assert_eq!(
+        walk.undurable_debt, 0,
+        "every append acked, so nothing is pending beyond the watermark"
+    );
+
+    // Byte budget cuts it short: admissible work remains.
+    let walk = shard.admission_walk(100, 2 * BLOCK_SIZE as usize, None);
+    assert_eq!(walk.entries.len(), 2);
+    assert_eq!(walk.stop, AdmissionWalkStop::ByteLimit);
+
+    // Entry cap cuts it short.
+    let walk = shard.admission_walk(3, usize::MAX, None);
+    assert_eq!(walk.entries.len(), 3);
+    assert_eq!(walk.stop, AdmissionWalkStop::EntryLimit);
+
+    // A cursor past the newest pending seq: exhausted, nothing walked.
+    let walk = shard.admission_walk(100, usize::MAX, Some(seqs[3]));
+    assert!(walk.entries.is_empty());
+    assert_eq!(walk.stop, AdmissionWalkStop::RangeExhausted);
+}
+
+#[test]
+fn admission_walk_reports_undurable_debt_beyond_the_lv2_watermark() {
+    // Appends that are in the ring but not yet LV2-durable are not admissible at
+    // any budget. Sizing that gap is what says whether the drain is starved by
+    // LV2 durability rather than by anything downstream.
+    let slot = BufferShard::slot_size();
+    let (pool, _tmp) = create_pool(
+        COMMIT_LOG_SUPERBLOCK_SIZE + SHARD_CHECKPOINT_SIZE + 64 * slot,
+        Duration::from_millis(1),
+    );
+    let shard = &pool.shards[0].shard;
+    let payload = vec![0x5A; BLOCK_SIZE as usize];
+    for i in 0..4 {
+        pool.append("test-vol", Lba(i), 1, &payload, 0).unwrap();
+    }
+
+    // Rewind the durable watermark to simulate LV2 lagging behind the ring.
+    let synced = shard.lv2_durability.synced_seq.load(Ordering::Acquire);
+    shard
+        .lv2_durability
+        .synced_seq
+        .store(synced - 2, Ordering::Release);
+
+    let walk = shard.admission_walk(100, usize::MAX, None);
+    assert_eq!(
+        walk.entries.len(),
+        2,
+        "only entries at or below the watermark are admissible"
+    );
+    assert_eq!(walk.stop, AdmissionWalkStop::RangeExhausted);
+    assert_eq!(
+        walk.undurable_debt, 2,
+        "two appends sit in the ring beyond the LV2 watermark"
+    );
+}
+
+#[test]
 fn shard_ready_channel_coalesces_wakes_without_hiding_pending_entries() {
     let slot = BufferShard::slot_size();
     let (pool, _tmp) = create_pool(
@@ -3531,10 +3612,18 @@ fn global_prepared_queue_depth_preserves_auto_default_and_explicit_override() {
 
 #[test]
 fn global_write_lanes_scale_with_members_up_to_eight() {
-    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(0), 1);
-    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(4), 4);
-    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(8), 8);
-    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(16), 8);
+    // Default is ONE LANE PER SHARD. The old `min(8)` cap paired two of 16
+    // shards onto a lane; box 2026-08-25 measured that cap costing 39% of the
+    // append latency and 68% of its p99.
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(0, 0), 1);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(0, 4), 4);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(0, 8), 8);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(0, 16), 16);
+    // An explicit count overrides the min(8) cap in both directions, and never
+    // resolves to zero lanes.
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(16, 16), 16);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(2, 16), 2);
+    assert_eq!(WriteBufferPool::resolve_global_write_lane_count(32, 16), 32);
 }
 
 /// `fold_pending` must accumulate across epochs AND survive a commit. The

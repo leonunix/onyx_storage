@@ -1760,6 +1760,27 @@ pub struct BufferConfig {
     /// existing depth of one slot per buffer shard.
     #[serde(default)]
     pub lv2_prepared_queue_depth_per_lane: usize,
+    /// Number of LV2 global root-write lanes. `0` = the compiled default, ONE
+    /// LANE PER `buffer.shards`.
+    ///
+    /// A shard maps to a lane by `shard_idx % lanes`, so ANY value keeps a
+    /// shard's batches on ONE lane — which the scalar LV2 durability watermark
+    /// requires: it is a prefix marker, so publishing a shard's batches out of
+    /// seq order would ack an append whose payload is not written yet.
+    ///
+    /// The previous default capped this at 8 to "match the eight foreground ublk
+    /// queues"; that queue model was replaced by a single shared io-worker pool
+    /// in 086a47a, so the cap only paired two of 16 shards onto one lane with no
+    /// work stealing.
+    ///
+    /// Box-measured 2026-08-25 (RWMIX=0, QD256 j16d16, aged 256 GiB volume,
+    /// arms 8/16/8 each with its own 430 s burn): lifting the cap cut
+    /// `append_total` 8.6 -> 5.4 ms (**-39%**) and its p99 37.7 -> 12.1 ms
+    /// (**-68%**), with the two 8-arms bracketing the 16-arm inside 8%.
+    /// ⚠ Throughput was FLAT (610/568/579 MB/s) and drive util stayed ~20%; this
+    /// is a latency knob. See `resolve_global_write_lane_count` for the table.
+    #[serde(default)]
+    pub lv2_write_lanes: usize,
     /// Drain LV2 ring backpressure BEFORE taking the append-order stripe
     /// locks, so a full ring blocks one appender instead of convoying everyone
     /// who collides with its LBAs.
@@ -1824,6 +1845,7 @@ impl Default for BufferConfig {
             sync_batch_max_entries: 0,
             sync_batch_max_bytes_mb: 0,
             lv2_prepared_queue_depth_per_lane: 0,
+            lv2_write_lanes: 0,
             lv2_checkpoint_epoch_interval: 0,
             prewait_ring_space_outside_order: false,
             throttle_min_pct: 0,

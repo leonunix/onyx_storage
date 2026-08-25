@@ -1265,14 +1265,37 @@ impl BufferShard {
         byte_limit: usize,
         after_seq: Option<u64>,
     ) -> Vec<Arc<PendingEntry>> {
+        self.admission_walk(limit, byte_limit, after_seq).entries
+    }
+
+    /// Same walk as [`oldest_pending_arcs_with_budget`], but it also reports
+    /// **why** it stopped and how much appended-but-not-yet-LV2-durable work sits
+    /// beyond the watermark.
+    ///
+    /// This is the discriminator for the open LV3 drain question: the walk is
+    /// clamped at `lv2_durability.synced_seq`, so a walk that ends in
+    /// [`AdmissionWalkStop::RangeExhausted`] means the coalescer has consumed
+    /// every admissible entry and is **paced by LV2 durability**, whereas one
+    /// that ends on the entry/byte budget means there is an admissible backlog
+    /// and the constraint lives downstream. Both look identical in the existing
+    /// `walk_arcs` counter, which is why "nothing is saturated and the ring
+    /// still backs up" could not be resolved from it.
+    pub(super) fn admission_walk(
+        &self,
+        limit: usize,
+        byte_limit: usize,
+        after_seq: Option<u64>,
+    ) -> AdmissionWalk {
         if limit == 0 || byte_limit == 0 || self.pending_count.load(Ordering::Relaxed) == 0 {
-            return Vec::new();
+            return AdmissionWalk::empty();
         }
         let synced = self.lv2_durability.synced_seq.load(Ordering::Acquire);
         let mut result = Vec::with_capacity(limit);
         let mut result_bytes = 0usize;
         let mut stale = Vec::new();
         let mut after = after_seq;
+        let mut stop = AdmissionWalkStop::RangeExhausted;
+        let mut undurable_debt: Option<u64> = None;
 
         // Copy only a bounded slice of the ordered index at a time. The old
         // whole-set snapshot made every 16 MiB coalesce admission O(all
@@ -1290,11 +1313,11 @@ impl BufferShard {
             } else {
                 remaining.saturating_mul(2).clamp(64, 256)
             };
-            let candidates: Vec<u64> = {
+            let (candidates, newest_pending): (Vec<u64>, Option<u64>) = {
                 use std::ops::Bound::{Excluded, Included, Unbounded};
 
                 let ring = self.ring.lock();
-                match after {
+                let candidates = match after {
                     Some(seq) => ring
                         .pending_seqs
                         .range((Excluded(seq), Included(synced)))
@@ -1307,9 +1330,25 @@ impl BufferShard {
                         .take(scan_limit)
                         .copied()
                         .collect(),
-                }
+                };
+                // Sampled inside the lock hold we are already paying for, once
+                // per walk. The newest pending seq is the newest append that has
+                // not been flushed, so `newest - synced` is the LV2 durability
+                // debt: work the coalescer cannot admit yet no matter how idle
+                // every downstream stage is.
+                let newest = match undurable_debt {
+                    Some(_) => None,
+                    None => ring.pending_seqs.last().copied(),
+                };
+                (candidates, newest)
             };
+            if let Some(newest) = newest_pending {
+                undurable_debt = Some(newest.saturating_sub(synced));
+            }
             let Some(last) = candidates.last().copied() else {
+                // Nothing left at or below the LV2 watermark: the coalescer is
+                // caught up with durability, not budget-limited.
+                stop = AdmissionWalkStop::RangeExhausted;
                 break;
             };
             after = Some(last);
@@ -1320,7 +1359,12 @@ impl BufferShard {
                     result_bytes =
                         result_bytes.saturating_add(entry.lba_count as usize * BLOCK_SIZE as usize);
                     result.push(entry);
-                    if result.len() >= limit || result_bytes >= byte_limit {
+                    if result_bytes >= byte_limit {
+                        stop = AdmissionWalkStop::ByteLimit;
+                        break;
+                    }
+                    if result.len() >= limit {
+                        stop = AdmissionWalkStop::EntryLimit;
                         break;
                     }
                 } else {
@@ -1328,6 +1372,7 @@ impl BufferShard {
                 }
             }
             if result_bytes >= byte_limit {
+                stop = AdmissionWalkStop::ByteLimit;
                 break;
             }
         }
@@ -1338,7 +1383,11 @@ impl BufferShard {
                 ring.pending_seqs.remove(&seq);
             }
         }
-        result
+        AdmissionWalk {
+            entries: result,
+            stop,
+            undurable_debt: undurable_debt.unwrap_or(0),
+        }
     }
 
     pub(super) fn head_pending_seq_if_stuck(&self, min_age: Duration) -> Option<u64> {
