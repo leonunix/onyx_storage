@@ -68,9 +68,23 @@ FIELDS = [
 ]
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 PATS = {f: re.compile(r"\b" + f + r"=(\d+)") for f in FIELDS}
+TS = re.compile(r"^(\d{4}-\d\d-\d\dT[\d:.]+)")
 
 
-def main(paths):
+def main(argv):
+    """`--from`/`--to` take the ISO timestamp prefix the log itself carries
+    (e.g. `--from 2026-08-26T06:15`). They exist so a knob that is
+    RUNTIME-flippable can be A/B'd inside ONE process at ONE pool age, which is
+    the only way to escape this box's restart-order drift."""
+    paths, lo, hi = [], None, None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--from":
+            lo = argv[i + 1]; i += 2
+        elif argv[i] == "--to":
+            hi = argv[i + 1]; i += 2
+        else:
+            paths.append(argv[i]); i += 1
     if not paths:
         print(__doc__)
         return 1
@@ -81,6 +95,15 @@ def main(paths):
             if "slow mirror write_many" not in raw:
                 continue
             line = ANSI.sub("", raw)
+            if lo is not None or hi is not None:
+                m = TS.match(line)
+                if not m:
+                    continue
+                stamp = m.group(1)
+                if lo is not None and stamp < lo:
+                    continue
+                if hi is not None and stamp >= hi:
+                    continue
             row = {}
             for f, pat in PATS.items():
                 m = pat.search(line)
@@ -92,12 +115,14 @@ def main(paths):
             for f in FIELDS:
                 acc[f].append(row[f])
     if n == 0:
-        print("no `slow mirror write_many` lines found. Either the run was healthy "
-              "(no call reached the 5 ms warn threshold) or the log is not from "
-              "RUST_LOG=info.")
+        print("no `slow mirror write_many` lines in range. Either the run was "
+              "healthy (no call reached the 5 ms warn threshold), the log is not "
+              "from RUST_LOG=info, or --from/--to excluded everything.")
         return 1
 
     total = sum(acc["total_us"])
+    if lo is not None or hi is not None:
+        print("window: %s .. %s" % (lo or "-inf", hi or "+inf"))
     print("slow mirror write_many events: %d   (>= 5 ms only -- this is the TAIL)" % n)
     print("aggregate wall in them: %.1f s   bytes: %.1f GiB" % (
         total / 1e6, sum(acc["bytes"]) / 2**30))
