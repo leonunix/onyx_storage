@@ -683,6 +683,10 @@ pub struct MetaConfig {
     /// Maximum concurrently executing L2P shard folds when parallel drain is
     /// enabled. `0` preserves the legacy unbounded fan-out; positive values are
     /// a hard cap. Set this explicitly for production A/B runs.
+    ///
+    /// This cap sits on the LV2 ring's critical path: the ring is released only
+    /// by a metadb checkpoint and this fold is ~48% of a checkpoint's wall time.
+    /// See `default_parallel_l2p_drain_workers` for the measured scaling.
     #[serde(default = "default_parallel_l2p_drain_workers")]
     pub parallel_l2p_drain_workers: usize,
 
@@ -971,9 +975,30 @@ fn default_parallel_l2p_drain_enabled() -> bool {
     true
 }
 fn default_parallel_l2p_drain_workers() -> usize {
-    // Leave room for RC apply while parallel L2P folds are active. Zero
-    // remains available for an explicit legacy unbounded-fan-out A/B.
-    4
+    // 8, raised from 4 on 2026-08-26. LV2 ring bytes are released only when a
+    // metadb checkpoint lands, and the checkpoint's biggest phase is this fold:
+    // box-measured 16 shard folds per checkpoint at ~520 ms each, 3315 ms of CPU
+    // squeezed into 843 ms of wall = achieved concurrency 3.93 of the old cap 4
+    // (98% — hard-binding, on a 96-core box where every other stage was under
+    // 20% duty).
+    //
+    // A/B `tools/l2p_fold_workers_ab.sh`, bracketed arms 4/8/4: concurrency
+    // 3.91 -> 7.69, fold wall -38%, flush wall -18%, and the checkpoint's
+    // request->release latency -22% at BOTH p50 (4565 -> 3311 ms) and p99-ish
+    // p95 (8616 -> 6528 ms). The RC apply this cap was originally sized to
+    // protect did not regress (`fold_lock_wait` 16.0 -> 4.7 ms/checkpoint).
+    //
+    // ⚠ This buys TAIL LATENCY ONLY. Host throughput and `append_total` moved
+    // monotonically with arm ORDER, not with the knob, so the foreground effect
+    // is indistinguishable from this box's drift. It is worth having because
+    // those multi-second ring stalls are what produce the append's multi-second
+    // p99, not because it makes anything faster on average.
+    //
+    // Not higher: per-shard fold time rose 524 -> 624 ms (+19%) at 8-wide, so
+    // the fan-out is already paying for contention (page_store refill / memory
+    // bandwidth) and 16 would scale sub-linearly. Zero remains available for an
+    // explicit legacy unbounded-fan-out A/B.
+    8
 }
 fn default_l2p_drain_chunk_entries() -> usize {
     // Bounded fold lock-holds default-ON (semantics-preserving: same lock,
@@ -2621,7 +2646,7 @@ mod service_config_tests {
     fn parallel_l2p_drain_workers_default_bounded_and_accept_legacy_zero() {
         let default_config: OnyxConfig = toml::from_str("").unwrap();
         assert!(default_config.meta.parallel_l2p_drain_enabled);
-        assert_eq!(default_config.meta.parallel_l2p_drain_workers, 4);
+        assert_eq!(default_config.meta.parallel_l2p_drain_workers, 8);
 
         let legacy: OnyxConfig = toml::from_str(
             r#"

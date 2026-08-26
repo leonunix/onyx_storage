@@ -141,11 +141,25 @@ bfg_threads_enabled = true
 # Keep it for fold-latency (tail) reasons only. See memory
 # write_drain_22mbps_lv2_durability_roundtrip + checkpoint_interval_duty_cycle_lockin.
 parallel_l2p_drain_enabled = true
+# Fan-out cap for the fold above. 8 is also the code default since 2026-08-26;
+# pinned here because this profile is the one it was measured on. The fold is
+# ~48% of a checkpoint's wall time and the checkpoint is the ONLY thing that
+# releases LV2 ring space, so this cap sits directly on the foreground's
+# `backpressure_wait`. Bracketed A/B 4/8/4 (tools/l2p_fold_workers_ab.sh):
+# concurrency 3.91 -> 7.69, fold wall -38%, checkpoint request->release -22% at
+# both p50 and p95. ⚠ TAIL ONLY — host throughput tracked arm ORDER, not the
+# knob. Do not raise to 16: per-shard fold time already rose 19% at 8-wide.
+parallel_l2p_drain_workers = 8
 # Serial successor-fold worker for the L2P checkpoint. Already default-ON in
 # code (onyx 67d9f02); pinned here for explicitness. Its original "+136% median
 # drain" number came from the same fresh-pool methodology that was later shown to
 # measure burst-phase length rather than the knob, so treat it as unproven for
 # throughput. Runtime worker toggle only — no on-disk format gate.
+# ⛔ 2026-08-26: measured `metadb_l2p_checkpoint_pipeline: attempts=0` — this has
+# NEVER fired on the box. Its gate wants the successor BFG already Quiescing when
+# the checkpoint reaches its IO phase (~950 ms in), but the roll timer is 30 s
+# (meta.l2p_buffer_max_interval_ms) against a 5.6 s checkpoint cadence. Left on;
+# it is inert, not harmful.
 l2p_checkpoint_pipeline_enabled = true
 # L3 durable RC delta-run persist (metadb v27). Turns the RC checkpoint from
 # "fold deltas into base pages + rewrite every touched 4KiB page" (~70x aged
