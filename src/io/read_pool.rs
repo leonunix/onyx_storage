@@ -25,6 +25,14 @@
 //!
 //! Buffer hits and unmapped reads are *not* sent through the pool — those
 //! paths are zero-IO and stay inline on the caller thread.
+//!
+//! ## Accounting
+//!
+//! Every timing counter is recorded twice: once into the legacy pool-wide
+//! `read_pool_*` counters and once into `read_pool_class[class]`. The pool-wide
+//! mean queue wait is not interpretable on its own — a DedupScanner read has no
+//! latency SLO and may sit in its channel for milliseconds, which drags the
+//! aggregate away from the only number the foreground path cares about.
 
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
@@ -41,7 +49,7 @@ use crate::io::block_backend::BlockBackend;
 use crate::io::device::RawDevice;
 use crate::io::uring::{IoUringSession, UringOp};
 use crate::meta::schema::BlockmapValue;
-use crate::metrics::EngineMetrics;
+use crate::metrics::{EngineMetrics, ReadPoolClass};
 use crate::types::BLOCK_SIZE;
 use crate::zone::read::{
     decode_unit_with_crc_accounting, extract_lba_from_compressed_with_crc_accounting,
@@ -89,6 +97,26 @@ impl ReadPurpose {
     fn is_foreground(self) -> bool {
         matches!(self, Self::Foreground)
     }
+
+    /// Which queue (and therefore which metrics class) this purpose routes to.
+    fn class(self) -> ReadPoolClass {
+        if self.is_foreground() {
+            ReadPoolClass::Foreground
+        } else {
+            ReadPoolClass::Background
+        }
+    }
+
+    /// Index into `EngineMetrics::read_pool_purpose_requests`.
+    fn metrics_index(self) -> usize {
+        match self {
+            Self::Foreground => 0,
+            Self::DedupVerify => 1,
+            Self::DedupVerifyIndex => 2,
+            Self::DedupVerifyCandidate => 3,
+            Self::DedupScanner => 4,
+        }
+    }
 }
 
 struct ReadRequest {
@@ -130,6 +158,9 @@ struct RequestSenders {
 pub struct ReadPool {
     senders: Option<RequestSenders>,
     workers: Vec<WorkerHandle>,
+    /// Held on the submit side too, so enqueue can charge offered load and the
+    /// live channel depth to the request's class.
+    metrics: Arc<EngineMetrics>,
 }
 
 impl ReadPool {
@@ -215,6 +246,7 @@ impl ReadPool {
             background_channel_cap = channel_cap,
             "read pool started with foreground isolation"
         );
+        metrics.set_read_pool_geometry(workers, foreground_workers);
 
         Ok(Self {
             senders: Some(RequestSenders {
@@ -222,6 +254,7 @@ impl ReadPool {
                 background: background_tx,
             }),
             workers: handles,
+            metrics,
         })
     }
 
@@ -293,6 +326,7 @@ impl ReadPool {
             background_channel_cap = channel_cap,
             "read pool started with foreground isolation (chunklet backend)"
         );
+        metrics.set_read_pool_geometry(workers, foreground_workers);
 
         Ok(Self {
             senders: Some(RequestSenders {
@@ -300,6 +334,7 @@ impl ReadPool {
                 background: background_tx,
             }),
             workers: handles,
+            metrics,
         })
     }
 
@@ -377,6 +412,8 @@ impl ReadPool {
         } else {
             &senders.background
         };
+        self.metrics
+            .record_read_pool_enqueued(purpose.class(), purpose.metrics_index());
         sender
             .send(ReadRequest {
                 mapping,
@@ -401,6 +438,10 @@ impl ReadPool {
             .as_ref()
             .ok_or_else(|| OnyxError::Io(std::io::Error::other("read-pool already shut down")))?
             .foreground;
+        self.metrics.record_read_pool_enqueued(
+            ReadPurpose::Foreground.class(),
+            ReadPurpose::Foreground.metrics_index(),
+        );
         sender
             .send(ReadRequest {
                 mapping: first,
@@ -542,6 +583,7 @@ fn worker_loop(
             }
             Err(_) => return,
         };
+        let class = first.purpose.class();
         let batch_rx = if first.purpose.is_foreground() {
             &foreground_rx
         } else {
@@ -551,6 +593,10 @@ fn worker_loop(
         };
         batch.clear();
         batch.push(first);
+        // The worker is unavailable to any other batch from here until the last
+        // reply goes out, coalescing included — that whole span is what
+        // "mean busy workers" has to count.
+        let busy_start = Instant::now();
         let coalesce_start = Instant::now();
         let deadline = Instant::now() + BATCH_COALESCE_WINDOW;
         loop {
@@ -578,10 +624,15 @@ fn worker_loop(
                 Err(_) => break,
             }
         }
+        let coalesce_ns = elapsed_ns(coalesce_start);
         ctx.metrics
             .read_pool_coalesce_wait_ns
-            .fetch_add(elapsed_ns(coalesce_start), Ordering::Relaxed);
-        process_batch(&ctx, &mut scratch, &mut batch);
+            .fetch_add(coalesce_ns, Ordering::Relaxed);
+        ctx.metrics
+            .record_read_pool_class_coalesce_wait_ns(class, coalesce_ns);
+        process_batch(&ctx, &mut scratch, &mut batch, class);
+        ctx.metrics
+            .record_read_pool_worker_busy_ns(class, elapsed_ns(busy_start));
     }
 }
 
@@ -634,7 +685,12 @@ fn receive_next(
     }
 }
 
-fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<ReadRequest>) {
+fn process_batch(
+    ctx: &WorkerCtx,
+    scratch: &mut BatchScratch,
+    batch: &mut Vec<ReadRequest>,
+    class: ReadPoolClass,
+) {
     let bs = ctx.block_size as usize;
     scratch.clear();
     let request_count = batch.len() as u64;
@@ -649,6 +705,7 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
         .fetch_add(request_count, Ordering::Relaxed);
     ctx.metrics
         .record_read_pool_worker_batch(ctx.worker_idx, request_count);
+    ctx.metrics.record_read_pool_class_batch(class);
 
     for req in batch.drain(..) {
         let read_size = req.read_size(bs);
@@ -681,8 +738,8 @@ fn process_batch(ctx: &WorkerCtx, scratch: &mut BatchScratch, batch: &mut Vec<Re
 
     // The SQE / read_many_at op is built per IO mode so no fd is baked in here.
     match &ctx.io {
-        WorkerIo::Uring { ring, fd, .. } => process_uring_submit(ctx, scratch, ring, *fd),
-        WorkerIo::Backend { backend } => process_backend_submit(ctx, scratch, backend),
+        WorkerIo::Uring { ring, fd, .. } => process_uring_submit(ctx, scratch, ring, *fd, class),
+        WorkerIo::Backend { backend } => process_backend_submit(ctx, scratch, backend, class),
     }
 }
 
@@ -694,6 +751,7 @@ fn process_uring_submit(
     scratch: &mut BatchScratch,
     ring: &IoUringSession,
     fd: RawFd,
+    class: ReadPoolClass,
 ) {
     scratch.ops.clear();
     for i in 0..scratch.requests.len() {
@@ -710,8 +768,11 @@ fn process_uring_submit(
     let cqes = match unsafe { ring.submit_batch(&scratch.ops) } {
         Ok(c) => c,
         Err(e) => {
-            ctx.metrics
-                .record_read_pool_submit_wait_ns(ctx.worker_idx, elapsed_ns(submit_start));
+            ctx.metrics.record_read_pool_submit_wait_ns(
+                ctx.worker_idx,
+                class,
+                elapsed_ns(submit_start),
+            );
             for req in &scratch.requests {
                 let _ = req
                     .reply
@@ -723,7 +784,7 @@ fn process_uring_submit(
         }
     };
     ctx.metrics
-        .record_read_pool_submit_wait_ns(ctx.worker_idx, elapsed_ns(submit_start));
+        .record_read_pool_submit_wait_ns(ctx.worker_idx, class, elapsed_ns(submit_start));
 
     for i in 0..scratch.requests.len() {
         let exp_bytes = scratch.expected[i];
@@ -751,6 +812,7 @@ fn process_uring_submit(
             &scratch.requests[i],
             scratch.bufs[i].buf.as_slice(),
             exp_bytes,
+            class,
         );
     }
 }
@@ -762,6 +824,7 @@ fn process_backend_submit(
     ctx: &WorkerCtx,
     scratch: &mut BatchScratch,
     backend: &Arc<dyn BlockBackend>,
+    class: ReadPoolClass,
 ) {
     let n = scratch.requests.len();
     let offsets: Vec<u64> = scratch.offsets[..n].to_vec();
@@ -782,7 +845,7 @@ fn process_backend_submit(
         backend.read_many_at(&mut ops)
     };
     ctx.metrics
-        .record_read_pool_submit_wait_ns(ctx.worker_idx, elapsed_ns(submit_start));
+        .record_read_pool_submit_wait_ns(ctx.worker_idx, class, elapsed_ns(submit_start));
 
     if let Err(e) = res {
         for req in &scratch.requests {
@@ -800,13 +863,20 @@ fn process_backend_submit(
             &scratch.requests[i],
             scratch.bufs[i].buf.as_slice(),
             expected[i],
+            class,
         );
     }
 }
 
 /// Shared CRC + decompress + reply for one successfully-read buffer. Identical
 /// for the io_uring and chunklet paths once the bytes are in `buf`.
-fn finish_request(ctx: &WorkerCtx, req: &ReadRequest, buf: &[u8], exp_bytes: u32) {
+fn finish_request(
+    ctx: &WorkerCtx,
+    req: &ReadRequest,
+    buf: &[u8],
+    exp_bytes: u32,
+    class: ReadPoolClass,
+) {
     ctx.metrics.lv3_read_ops.fetch_add(1, Ordering::Relaxed);
     ctx.metrics
         .lv3_read_compressed_bytes
@@ -872,7 +942,7 @@ fn finish_request(ctx: &WorkerCtx, req: &ReadRequest, buf: &[u8], exp_bytes: u32
         }
     }
     ctx.metrics
-        .record_read_pool_decode_ns(elapsed_ns(decode_start));
+        .record_read_pool_decode_ns(class, elapsed_ns(decode_start));
     let _ = req.reply.send(result);
 }
 
@@ -924,6 +994,7 @@ fn elapsed_ns(start: Instant) -> u64 {
 fn record_queue_wait(metrics: &EngineMetrics, worker_idx: usize, req: &ReadRequest) {
     metrics.record_read_pool_worker_queue_wait_ns(
         worker_idx,
+        req.purpose.class(),
         Instant::now()
             .saturating_duration_since(req.enqueued_at)
             .as_nanos() as u64,

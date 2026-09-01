@@ -137,6 +137,79 @@ pub(crate) fn record_counter_max(counter: &AtomicU64, value: u64) {
     }
 }
 
+/// Number of read-pool request classes. The pool already routes on this axis
+/// (one bounded channel each, plus workers reserved for foreground), so every
+/// read-pool latency counter is also kept per class.
+pub const READ_POOL_CLASSES: usize = 2;
+/// Number of `ReadPurpose` variants (foreground + four background purposes).
+pub const READ_POOL_PURPOSES: usize = 5;
+
+/// Which read-pool queue a request travelled through. Kept here rather than
+/// derived from `ReadPurpose` so `metrics` stays independent of `io`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPoolClass {
+    Foreground,
+    Background,
+}
+
+impl ReadPoolClass {
+    fn index(self) -> usize {
+        match self {
+            Self::Foreground => 0,
+            Self::Background => 1,
+        }
+    }
+}
+
+/// Read-pool timing for one request class.
+///
+/// Two normalisations coexist on purpose. `queue_wait_ns` and `decode_ns` are
+/// accumulated **per request**; `submit_wait_ns`, `coalesce_wait_ns` and
+/// `worker_busy_ns` are accumulated **per batch**, so `submit_batches` is kept
+/// alongside to divide by. Charging a per-batch total to a per-request count is
+/// exactly the inspection bias that inflated earlier LV2 numbers.
+#[derive(Debug)]
+pub struct ReadPoolClassMetrics {
+    pub requests: AtomicU64,
+    pub batches: AtomicU64,
+    pub queue_wait_ns: AtomicU64,
+    pub queue_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub submit_wait_ns: AtomicU64,
+    pub submit_batches: AtomicU64,
+    pub submit_wait_latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    pub decode_ns: AtomicU64,
+    pub coalesce_wait_ns: AtomicU64,
+    /// Wall time a worker spends owning a batch: first request dequeued through
+    /// the last reply sent. `sum / window` is the mean number of busy workers
+    /// (Little's law), which is what separates "the pool is at capacity" from
+    /// "the requests wait for something other than a free worker".
+    pub worker_busy_ns: AtomicU64,
+    /// Live channel depth: bumped at enqueue, dropped when a worker dequeues.
+    /// Requests still queued when the pool shuts down are dropped without a
+    /// decrement, so only a running pool's reading is meaningful.
+    pub queued: AtomicU64,
+    pub queued_peak: AtomicU64,
+}
+
+impl Default for ReadPoolClassMetrics {
+    fn default() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
+            queue_wait_ns: AtomicU64::new(0),
+            queue_wait_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            submit_wait_ns: AtomicU64::new(0),
+            submit_batches: AtomicU64::new(0),
+            submit_wait_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            decode_ns: AtomicU64::new(0),
+            coalesce_wait_ns: AtomicU64::new(0),
+            worker_busy_ns: AtomicU64::new(0),
+            queued: AtomicU64::new(0),
+            queued_peak: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Per-volume IO counters.
 #[derive(Debug)]
 pub struct VolumeMetrics {
@@ -395,6 +468,20 @@ pub struct EngineMetrics {
     pub read_pool_worker_batches: [AtomicU64; MAX_READ_POOL_WORKERS],
     pub read_pool_worker_queue_wait_ns: [AtomicU64; MAX_READ_POOL_WORKERS],
     pub read_pool_worker_submit_wait_ns: [AtomicU64; MAX_READ_POOL_WORKERS],
+    /// The same timing split, but kept **per request class** — see
+    /// `ReadPoolClassMetrics`. The counters above aggregate foreground reads
+    /// with DedupScanner / dedup-verify traffic, which makes their mean queue
+    /// wait unusable: a background read has no latency SLO and may legitimately
+    /// sit in its channel for milliseconds.
+    pub read_pool_class: [ReadPoolClassMetrics; READ_POOL_CLASSES],
+    /// Offered load per `ReadPurpose`, counted at enqueue. Answers "who is the
+    /// background load" (cold-tail scanner vs. flush-path verify) without
+    /// carrying per-purpose latency state.
+    pub read_pool_purpose_requests: [AtomicU64; READ_POOL_PURPOSES],
+    /// Pool geometry, published at start so a `status` sample can normalise
+    /// `worker_busy_ns` into "mean busy workers" without reading the config.
+    pub read_pool_worker_count: AtomicU64,
+    pub read_pool_foreground_worker_count: AtomicU64,
     pub lv3_write_ops: AtomicU64,
     pub lv3_write_compressed_bytes: AtomicU64,
     pub lv3_write_batch_calls: AtomicU64,
@@ -1301,31 +1388,102 @@ impl EngineMetrics {
         self.volume_metrics.remove(vol_id);
     }
 
+    pub fn read_pool_class(&self, class: ReadPoolClass) -> &ReadPoolClassMetrics {
+        &self.read_pool_class[class.index()]
+    }
+
+    /// Publish the pool geometry so a `status` sample can turn `worker_busy_ns`
+    /// into a mean-busy-worker count without consulting the config.
+    pub fn set_read_pool_geometry(&self, workers: usize, foreground_workers: usize) {
+        self.read_pool_worker_count
+            .store(workers as u64, Ordering::Relaxed);
+        self.read_pool_foreground_worker_count
+            .store(foreground_workers as u64, Ordering::Relaxed);
+    }
+
+    /// Caller-side enqueue: offered load per purpose plus the live depth gauge
+    /// for the class whose channel the request just entered.
+    pub fn record_read_pool_enqueued(&self, class: ReadPoolClass, purpose_index: usize) {
+        if let Some(counter) = self.read_pool_purpose_requests.get(purpose_index) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        let class_metrics = self.read_pool_class(class);
+        let depth = class_metrics.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        record_counter_max(&class_metrics.queued_peak, depth);
+    }
+
     pub fn record_read_pool_queue_wait_ns(&self, ns: u64) {
         self.read_pool_queue_wait_ns
             .fetch_add(ns, Ordering::Relaxed);
         record_latency_bucket(&self.read_pool_queue_wait_latency_buckets, ns);
     }
 
-    pub fn record_read_pool_worker_queue_wait_ns(&self, worker_idx: usize, ns: u64) {
+    pub fn record_read_pool_worker_queue_wait_ns(
+        &self,
+        worker_idx: usize,
+        class: ReadPoolClass,
+        ns: u64,
+    ) {
         if let Some(counter) = self.read_pool_worker_queue_wait_ns.get(worker_idx) {
             counter.fetch_add(ns, Ordering::Relaxed);
         }
+        let class_metrics = self.read_pool_class(class);
+        class_metrics.requests.fetch_add(1, Ordering::Relaxed);
+        class_metrics.queue_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        record_latency_bucket(&class_metrics.queue_wait_latency_buckets, ns);
+        // Paired with the `record_read_pool_enqueued` bump; the request has left
+        // the channel and is now the worker's.
+        let _ = class_metrics
+            .queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                Some(depth.saturating_sub(1))
+            });
         self.record_read_pool_queue_wait_ns(ns);
     }
 
-    pub fn record_read_pool_submit_wait_ns(&self, worker_idx: usize, ns: u64) {
+    pub fn record_read_pool_submit_wait_ns(
+        &self,
+        worker_idx: usize,
+        class: ReadPoolClass,
+        ns: u64,
+    ) {
         self.read_pool_submit_wait_ns
             .fetch_add(ns, Ordering::Relaxed);
         record_latency_bucket(&self.read_pool_submit_wait_latency_buckets, ns);
         if let Some(counter) = self.read_pool_worker_submit_wait_ns.get(worker_idx) {
             counter.fetch_add(ns, Ordering::Relaxed);
         }
+        let class_metrics = self.read_pool_class(class);
+        class_metrics.submit_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        class_metrics.submit_batches.fetch_add(1, Ordering::Relaxed);
+        record_latency_bucket(&class_metrics.submit_wait_latency_buckets, ns);
     }
 
-    pub fn record_read_pool_decode_ns(&self, ns: u64) {
+    pub fn record_read_pool_decode_ns(&self, class: ReadPoolClass, ns: u64) {
         self.read_pool_decode_ns.fetch_add(ns, Ordering::Relaxed);
         record_latency_bucket(&self.read_pool_decode_latency_buckets, ns);
+        self.read_pool_class(class)
+            .decode_ns
+            .fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// One coalesced batch is about to be issued for `class`.
+    pub fn record_read_pool_class_batch(&self, class: ReadPoolClass) {
+        self.read_pool_class(class)
+            .batches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_read_pool_class_coalesce_wait_ns(&self, class: ReadPoolClass, ns: u64) {
+        self.read_pool_class(class)
+            .coalesce_wait_ns
+            .fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn record_read_pool_worker_busy_ns(&self, class: ReadPoolClass, ns: u64) {
+        self.read_pool_class(class)
+            .worker_busy_ns
+            .fetch_add(ns, Ordering::Relaxed);
     }
 
     pub fn record_read_pool_worker_batch(&self, worker_idx: usize, requests: u64) {

@@ -84,6 +84,7 @@ fn full_background_queue_cannot_block_reserved_foreground_worker() {
             background: background_tx,
         }),
         workers: vec![WorkerHandle { join: Some(worker) }],
+        metrics: Arc::new(EngineMetrics::default()),
     };
 
     let _background_reply = pool
@@ -144,6 +145,80 @@ fn shutdown_drains_both_priority_queues_without_hanging() {
             payload
         );
     }
+}
+
+/// Foreground and background work must land in separate metrics classes: the
+/// aggregate mean queue wait is unusable while a DedupScanner read (no latency
+/// SLO) can drag it, which is the whole reason this split exists.
+#[test]
+fn class_metrics_separate_foreground_from_background() {
+    let (dev, tmp) = fresh_device();
+    let engine = IoEngine::new_raw(dev, false);
+    let payload = vec![0x3Cu8; BLOCK_SIZE as usize];
+    write_uncompressed(&engine, Pba(0), &payload);
+    let mapping = make_mapping(Pba(0), BLOCK_SIZE, crc32fast::hash(&payload));
+
+    let pool_dev = RawDevice::open_or_create(tmp.path(), 4 * 1024 * 1024).unwrap();
+    let metrics = Arc::new(EngineMetrics::default());
+    let mut pool =
+        ReadPool::start(2, 16, &pool_dev, 0, BLOCK_SIZE, false, metrics.clone()).unwrap();
+    assert_eq!(metrics.read_pool_worker_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        metrics
+            .read_pool_foreground_worker_count
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    let mut replies = Vec::new();
+    for _ in 0..4 {
+        replies.push(pool.submit_read_async(mapping).unwrap());
+    }
+    for _ in 0..3 {
+        replies.push(
+            pool.submit_read_async_for(mapping, ReadPurpose::DedupScanner)
+                .unwrap(),
+        );
+    }
+    for reply in replies {
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+            payload
+        );
+    }
+    pool.shutdown();
+
+    let fg = metrics.read_pool_class(ReadPoolClass::Foreground);
+    let bg = metrics.read_pool_class(ReadPoolClass::Background);
+    assert_eq!(fg.requests.load(Ordering::Relaxed), 4);
+    assert_eq!(bg.requests.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        metrics.read_pool_purpose_requests[ReadPurpose::Foreground.metrics_index()]
+            .load(Ordering::Relaxed),
+        4
+    );
+    assert_eq!(
+        metrics.read_pool_purpose_requests[ReadPurpose::DedupScanner.metrics_index()]
+            .load(Ordering::Relaxed),
+        3
+    );
+    // Every request was dequeued by a worker, so the depth gauge must be back
+    // at zero — a leak here would make the live reading useless on the box.
+    assert_eq!(fg.queued.load(Ordering::Relaxed), 0);
+    assert_eq!(bg.queued.load(Ordering::Relaxed), 0);
+    assert!(fg.queued_peak.load(Ordering::Relaxed) >= 1);
+    assert!(fg.batches.load(Ordering::Relaxed) >= 1);
+    assert!(bg.batches.load(Ordering::Relaxed) >= 1);
+    assert!(fg.worker_busy_ns.load(Ordering::Relaxed) > 0);
+    assert!(bg.worker_busy_ns.load(Ordering::Relaxed) > 0);
+    assert!(fg.submit_batches.load(Ordering::Relaxed) >= 1);
+
+    // The snapshot / metrics-json path carries both classes.
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.read_pool_class.len(), 2);
+    assert_eq!(snapshot.read_pool_class[0].requests, 4);
+    assert_eq!(snapshot.read_pool_class[1].requests, 3);
+    assert_eq!(snapshot.read_pool_worker_count, 2);
 }
 
 #[test]

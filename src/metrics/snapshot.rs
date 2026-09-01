@@ -204,6 +204,31 @@ impl EngineMetrics {
             read_pool_worker_submit_wait_ns: load_atomic_slice(
                 &self.read_pool_worker_submit_wait_ns,
             ),
+            read_pool_class: self
+                .read_pool_class
+                .iter()
+                .map(|class| ReadPoolClassSnapshot {
+                    requests: load(&class.requests),
+                    batches: load(&class.batches),
+                    queue_wait_ns: load(&class.queue_wait_ns),
+                    queue_wait_latency_buckets: load_latency_buckets(
+                        &class.queue_wait_latency_buckets,
+                    ),
+                    submit_wait_ns: load(&class.submit_wait_ns),
+                    submit_batches: load(&class.submit_batches),
+                    submit_wait_latency_buckets: load_latency_buckets(
+                        &class.submit_wait_latency_buckets,
+                    ),
+                    decode_ns: load(&class.decode_ns),
+                    coalesce_wait_ns: load(&class.coalesce_wait_ns),
+                    worker_busy_ns: load(&class.worker_busy_ns),
+                    queued: load(&class.queued),
+                    queued_peak: load(&class.queued_peak),
+                })
+                .collect(),
+            read_pool_purpose_requests: load_atomic_slice(&self.read_pool_purpose_requests),
+            read_pool_worker_count: load(&self.read_pool_worker_count),
+            read_pool_foreground_worker_count: load(&self.read_pool_foreground_worker_count),
             lv3_write_ops: load(&self.lv3_write_ops),
             lv3_write_compressed_bytes: load(&self.lv3_write_compressed_bytes),
             lv3_write_batch_calls: load(&self.lv3_write_batch_calls),
@@ -566,6 +591,58 @@ impl EngineMetrics {
     }
 }
 
+/// One read-pool request class (foreground / background) out of
+/// `ReadPoolClassMetrics`. Kept nested so the two classes stay side by side in
+/// metrics-json instead of becoming 24 prefixed scalars.
+///
+/// Mind the two normalisations: `queue_wait_ns` / `decode_ns` are per request,
+/// `submit_wait_ns` / `coalesce_wait_ns` / `worker_busy_ns` are per batch
+/// (divide by `submit_batches` / `batches`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadPoolClassSnapshot {
+    pub requests: u64,
+    pub batches: u64,
+    pub queue_wait_ns: u64,
+    pub queue_wait_latency_buckets: Vec<u64>,
+    pub submit_wait_ns: u64,
+    pub submit_batches: u64,
+    pub submit_wait_latency_buckets: Vec<u64>,
+    pub decode_ns: u64,
+    pub coalesce_wait_ns: u64,
+    pub worker_busy_ns: u64,
+    pub queued: u64,
+    pub queued_peak: u64,
+}
+
+impl ReadPoolClassSnapshot {
+    fn saturating_sub(&self, earlier: &Self) -> Self {
+        Self {
+            requests: self.requests.saturating_sub(earlier.requests),
+            batches: self.batches.saturating_sub(earlier.batches),
+            queue_wait_ns: self.queue_wait_ns.saturating_sub(earlier.queue_wait_ns),
+            queue_wait_latency_buckets: sub_latency_buckets(
+                &self.queue_wait_latency_buckets,
+                &earlier.queue_wait_latency_buckets,
+            ),
+            submit_wait_ns: self.submit_wait_ns.saturating_sub(earlier.submit_wait_ns),
+            submit_batches: self.submit_batches.saturating_sub(earlier.submit_batches),
+            submit_wait_latency_buckets: sub_latency_buckets(
+                &self.submit_wait_latency_buckets,
+                &earlier.submit_wait_latency_buckets,
+            ),
+            decode_ns: self.decode_ns.saturating_sub(earlier.decode_ns),
+            coalesce_wait_ns: self
+                .coalesce_wait_ns
+                .saturating_sub(earlier.coalesce_wait_ns),
+            worker_busy_ns: self.worker_busy_ns.saturating_sub(earlier.worker_busy_ns),
+            // Live depth and its high-water mark are gauges: a delta carries the
+            // later reading rather than subtracting two occupancies.
+            queued: self.queued,
+            queued_peak: self.queued_peak,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineMetricsSnapshot {
     pub uptime_secs: u64,
@@ -747,6 +824,19 @@ pub struct EngineMetricsSnapshot {
     pub read_pool_worker_batches: Vec<u64>,
     pub read_pool_worker_queue_wait_ns: Vec<u64>,
     pub read_pool_worker_submit_wait_ns: Vec<u64>,
+    /// Index 0 = foreground, 1 = background. The aggregate `read_pool_*`
+    /// counters above mix the two and their mean queue wait is therefore not a
+    /// foreground statistic.
+    #[serde(default)]
+    pub read_pool_class: Vec<ReadPoolClassSnapshot>,
+    /// Offered load indexed by `ReadPurpose`: foreground, dedup_verify,
+    /// dedup_verify_index, dedup_verify_candidate, dedup_scanner.
+    #[serde(default)]
+    pub read_pool_purpose_requests: Vec<u64>,
+    #[serde(default)]
+    pub read_pool_worker_count: u64,
+    #[serde(default)]
+    pub read_pool_foreground_worker_count: u64,
     pub lv3_write_ops: u64,
     pub lv3_write_compressed_bytes: u64,
     pub lv3_write_batch_calls: u64,
@@ -1207,6 +1297,24 @@ impl EngineMetricsSnapshot {
                         &self.read_pool_worker_submit_wait_ns,
                         &earlier.read_pool_worker_submit_wait_ns,
                     ),
+                    read_pool_class: self
+                        .read_pool_class
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, class)| match earlier.read_pool_class.get(idx) {
+                            Some(before) => class.saturating_sub(before),
+                            None => class.clone(),
+                        })
+                        .collect(),
+                    read_pool_purpose_requests: sub_latency_buckets(
+                        &self.read_pool_purpose_requests,
+                        &earlier.read_pool_purpose_requests,
+                    ),
+                    // Pool geometry is static topology, like the LV2 thread
+                    // counts above: a delta must carry it so `worker_busy_ns`
+                    // can still be normalised into busy workers.
+                    read_pool_worker_count: self.read_pool_worker_count,
+                    read_pool_foreground_worker_count: self.read_pool_foreground_worker_count,
                     read_submit_unit_io_latency_buckets: sub_latency_buckets(
                         &self.read_submit_unit_io_latency_buckets,
                         &earlier.read_submit_unit_io_latency_buckets,

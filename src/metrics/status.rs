@@ -1383,7 +1383,7 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
-            "read_pool: requests={} batches={} batch_ops={} queue_wait_ns={} coalesce_wait_ns={} alloc_ns={} submit_wait_ns={} decode_ns={}",
+            "read_pool: requests={} batches={} batch_ops={} queue_wait_ns={} coalesce_wait_ns={} alloc_ns={} submit_wait_ns={} decode_ns={} workers={} fg_workers={}",
             self.metrics.read_pool_requests,
             self.metrics.read_pool_batches,
             self.metrics.read_pool_batch_ops,
@@ -1391,7 +1391,51 @@ impl EngineStatusSnapshot {
             self.metrics.read_pool_coalesce_wait_ns,
             self.metrics.read_pool_alloc_ns,
             self.metrics.read_pool_submit_wait_ns,
-            self.metrics.read_pool_decode_ns
+            self.metrics.read_pool_decode_ns,
+            self.metrics.read_pool_worker_count,
+            self.metrics.read_pool_foreground_worker_count
+        );
+        // Per-class split. The line above aggregates foreground reads with
+        // DedupScanner / dedup-verify traffic, so its mean queue wait says
+        // nothing about the foreground path on its own. `worker_busy_ns` divided
+        // by the sample window is the mean number of busy workers, which is what
+        // separates "the pool is at capacity" from "the requests are waiting on
+        // something other than a free worker".
+        for (label, class) in [("fg", 0usize), ("bg", 1usize)] {
+            let Some(class) = self.metrics.read_pool_class.get(class) else {
+                continue;
+            };
+            let _ = writeln!(
+                out,
+                "read_pool_{}: requests={} batches={} queue_wait_ns={} submit_wait_ns={} submit_batches={} decode_ns={} coalesce_wait_ns={} worker_busy_ns={} queued={} queued_peak={}",
+                label,
+                class.requests,
+                class.batches,
+                class.queue_wait_ns,
+                class.submit_wait_ns,
+                class.submit_batches,
+                class.decode_ns,
+                class.coalesce_wait_ns,
+                class.worker_busy_ns,
+                class.queued,
+                class.queued_peak
+            );
+        }
+        let purpose = |idx: usize| {
+            self.metrics
+                .read_pool_purpose_requests
+                .get(idx)
+                .copied()
+                .unwrap_or(0)
+        };
+        let _ = writeln!(
+            out,
+            "read_pool_purpose: foreground={} dedup_verify={} dedup_verify_index={} dedup_verify_candidate={} dedup_scanner={}",
+            purpose(0),
+            purpose(1),
+            purpose(2),
+            purpose(3),
+            purpose(4)
         );
         let _ = writeln!(
             out,
@@ -1945,6 +1989,50 @@ mod tests {
         assert!(text.contains("buffer_applied_frontier: 42"));
         assert!(text.contains("buffer_durable_seq: 41"));
         assert!(text.contains("metadb_durable_buffer_seq: 41"));
+    }
+
+    #[test]
+    fn read_pool_class_split_reaches_status_text() {
+        let status = EngineStatusSnapshot {
+            metrics: EngineMetricsSnapshot {
+                read_pool_requests: 7,
+                read_pool_worker_count: 32,
+                read_pool_foreground_worker_count: 16,
+                read_pool_class: vec![
+                    crate::metrics::snapshot::ReadPoolClassSnapshot {
+                        requests: 4,
+                        batches: 2,
+                        queue_wait_ns: 400,
+                        submit_wait_ns: 200,
+                        submit_batches: 2,
+                        worker_busy_ns: 900,
+                        queued: 3,
+                        queued_peak: 9,
+                        ..Default::default()
+                    },
+                    crate::metrics::snapshot::ReadPoolClassSnapshot {
+                        requests: 3,
+                        batches: 1,
+                        queue_wait_ns: 30_000,
+                        ..Default::default()
+                    },
+                ],
+                read_pool_purpose_requests: vec![4, 0, 0, 0, 3],
+                ..EngineMetricsSnapshot::default()
+            },
+            ..EngineStatusSnapshot::default()
+        };
+
+        let text = status.render_text();
+        assert!(text.contains("workers=32 fg_workers=16"));
+        assert!(text.contains(
+            "read_pool_fg: requests=4 batches=2 queue_wait_ns=400 submit_wait_ns=200 \
+             submit_batches=2 decode_ns=0 coalesce_wait_ns=0 worker_busy_ns=900 queued=3 \
+             queued_peak=9"
+        ));
+        assert!(text.contains("read_pool_bg: requests=3 batches=1 queue_wait_ns=30000"));
+        assert!(text.contains("read_pool_purpose: foreground=4 dedup_verify=0"));
+        assert!(text.contains("dedup_scanner=3"));
     }
 
     #[test]

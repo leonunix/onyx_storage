@@ -36,6 +36,62 @@ def parse(path):
     return d
 
 
+def read_pool_classes(latest, d, w):
+    """Per-class read_pool budget.
+
+    The pool-wide counters average a foreground read (which owns a host IO slot)
+    together with DedupScanner / dedup-verify reads (which have no latency SLO
+    and may sit in their channel for milliseconds), so the aggregate mean queue
+    wait cannot be attributed to the read path. This splits them.
+
+    Two normalisations are printed on purpose: queue_wait and decode accumulate
+    per request, while submit / coalesce / worker_busy accumulate per batch.
+    Charging a per-batch total to a per-request count is the inspection bias
+    that has inflated stage costs here before.
+
+    `mean busy workers` = sum(worker_busy_ns) / window: the mean number of
+    workers that own a batch (first dequeue through last reply). Pinned at the
+    worker count => the pool is at capacity. Well below it while queue_wait
+    stays high => the wait is not "no free worker" and the lever is elsewhere.
+    """
+    workers = latest.get("read_pool.workers", 0)
+    fg_workers = latest.get("read_pool.fg_workers", 0)
+    for label, reachable in (("fg", workers), ("bg", max(0, workers - fg_workers))):
+        pre = "read_pool_" + label
+        reqs = d(pre + ".requests")
+        if not reqs:
+            continue
+        batches = max(1, d(pre + ".batches"))
+        sbatches = max(1, d(pre + ".submit_batches"))
+        qw = d(pre + ".queue_wait_ns")
+        sw = d(pre + ".submit_wait_ns")
+        dec = d(pre + ".decode_ns")
+        coal = d(pre + ".coalesce_wait_ns")
+        busy = d(pre + ".worker_busy_ns")
+        print("read_pool[%s]: %d requests, %d batches, %.2f ops/batch" % (
+            label, reqs, d(pre + ".batches"), reqs / batches))
+        print("  queue_wait    %9.1f us/request   (per-request accounting)" % (qw / reqs / 1000))
+        print("  submit        %9.1f us/request  %9.1f us/batch" % (
+            sw / reqs / 1000, sw / sbatches / 1000))
+        print("  decode        %9.1f us/request   coalesce %8.1f us/batch" % (
+            dec / reqs / 1000, coal / batches / 1000))
+        mean_busy = busy / w / 1e9
+        print("  mean busy workers %6.2f%s" % (
+            mean_busy,
+            "  of %d reachable  => %.1f%% saturated" % (
+                reachable, 100.0 * mean_busy / reachable) if reachable else ""))
+        print("  queued now %d, peak %d  (gauges, not deltas)" % (
+            latest.get(pre + ".queued", 0), latest.get(pre + ".queued_peak", 0)))
+    purposes = [("foreground", "foreground"), ("dedup_verify", "verify"),
+                ("dedup_verify_index", "verify_index"),
+                ("dedup_verify_candidate", "verify_cand"),
+                ("dedup_scanner", "scanner")]
+    offered = [(short, d("read_pool_purpose." + key)) for key, short in purposes]
+    if any(count for _, count in offered):
+        print("  offered by purpose: " + "  ".join(
+            "%s=%d" % (short, count) for short, count in offered))
+
+
 def main():
     a, b = parse(sys.argv[1]), parse(sys.argv[2])
     w = float(sys.argv[3])
@@ -104,6 +160,8 @@ def main():
             reqs, batches, bops / max(1, batches)))
         for k in ("queue_wait_ns", "coalesce_wait_ns", "alloc_ns", "submit_wait_ns", "decode_ns"):
             print("  %-18s %9.1f us/request" % (k[:-3], d("read_pool." + k) / reqs / 1000))
+        print("  ^ MIXES foreground with DedupScanner/verify; read the per-class split below")
+    read_pool_classes(b, d, w)
 
     hits = d("read_path.buffer_hits")
     lv3 = d("read_path.lv3_hits")
