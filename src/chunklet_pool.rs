@@ -137,12 +137,37 @@ fn configure_pool_io_backend(pool: &Pool, cfg: &ChunkletConfig) -> OnyxResult<()
 pub fn open_pool(cfg: &ChunkletConfig) -> OnyxResult<Arc<Pool>> {
     let paths = discover_pool_devices(cfg)?;
     let overrides = lock_group_overrides(cfg)?;
+    let requested: Vec<(LdId, u32)> = overrides.iter().map(|(id, s)| (*id, *s)).collect();
     let pool = if cfg.tolerant_open {
         open_pool_tolerant(&paths, overrides)?
     } else {
         let raws = open_raws_all(&paths)?;
         Pool::open_with_lock_group_overrides(raws, overrides)?
     };
+    // Read the shift back off the LIVE lock table, not off the config. An A/B
+    // arm whose override silently failed to reach the LD (wrong/absent
+    // `lv2_ld_id`) would otherwise be indistinguishable from a null arm, which
+    // is the one failure mode that invalidates the whole comparison.
+    for (ld_id, want) in requested {
+        match pool.lock_group_shift_of(ld_id) {
+            Some(got) if got == want => tracing::info!(
+                ld = %ld_id,
+                lock_group_shift = got,
+                "chunklet LD stripe-lock grouping active"
+            ),
+            Some(got) => {
+                return Err(OnyxError::Config(format!(
+                    "chunklet LD {ld_id} lock_group_shift is {got}, requested {want}"
+                )))
+            }
+            None => {
+                return Err(OnyxError::Config(format!(
+                    "chunklet.lv2_lock_group_shift names LD {ld_id}, which this pool does not \
+                     contain; check chunklet.lv2_ld_id"
+                )))
+            }
+        }
+    }
     configure_pool_io_backend(&pool, cfg)?;
     Ok(pool)
 }
