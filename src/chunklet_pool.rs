@@ -17,7 +17,7 @@ use onyx_chunklet::ld::LogicalDisk;
 use onyx_chunklet::ops;
 use onyx_chunklet::pool::LdSpec;
 use onyx_chunklet::types::LdId;
-use onyx_chunklet::{Pool, PoolConfig};
+use onyx_chunklet::{LockGroupOverrides, Pool, PoolConfig, MAX_LOCK_GROUP_SHIFT};
 
 use crate::config::{ChunkletConfig, ChunkletIoBackend, ChunkletLdGeom};
 use crate::error::{OnyxError, OnyxResult};
@@ -136,14 +136,50 @@ fn configure_pool_io_backend(pool: &Pool, cfg: &ChunkletConfig) -> OnyxResult<()
 /// than refusing to boot.
 pub fn open_pool(cfg: &ChunkletConfig) -> OnyxResult<Arc<Pool>> {
     let paths = discover_pool_devices(cfg)?;
+    let overrides = lock_group_overrides(cfg)?;
     let pool = if cfg.tolerant_open {
-        open_pool_tolerant(&paths)?
+        open_pool_tolerant(&paths, overrides)?
     } else {
         let raws = open_raws_all(&paths)?;
-        Pool::open(raws)?
+        Pool::open_with_lock_group_overrides(raws, overrides)?
     };
     configure_pool_io_backend(&pool, cfg)?;
     Ok(pool)
+}
+
+/// Per-LD stripe-lock grouping handed to chunklet at pool open.
+///
+/// Only LV2 has a knob today (`[chunklet] lv2_lock_group_shift`, default 0 = no
+/// change): its mirror writes fan one 1 MiB logical write out to ~512 contiguous
+/// 4 KiB keys, and chunklet holds every bucket a batch touches for the whole
+/// call, so the footprint — not the submit shape — is what caps concurrency on
+/// this path. See the field docs on `ChunkletConfig::lv2_lock_group_shift`.
+///
+/// The shift is an OPEN-TIME value inside chunklet (a mid-flight change would
+/// leave two callers excluding on different buckets), so this resolves
+/// `lv2_ld_id` from config alone — `resolve_ld`'s "pool has exactly one LD"
+/// fallback cannot run before the pool exists, hence the hard error rather than
+/// a silent no-op that would look like a null A/B arm.
+fn lock_group_overrides(cfg: &ChunkletConfig) -> OnyxResult<LockGroupOverrides> {
+    let mut overrides = LockGroupOverrides::new();
+    let shift = cfg.lv2_lock_group_shift;
+    if shift == 0 {
+        return Ok(overrides);
+    }
+    if shift > MAX_LOCK_GROUP_SHIFT {
+        return Err(OnyxError::Config(format!(
+            "chunklet.lv2_lock_group_shift = {shift} exceeds the maximum {MAX_LOCK_GROUP_SHIFT}"
+        )));
+    }
+    let Some(id) = cfg.lv2_ld_id.as_deref() else {
+        return Err(OnyxError::Config(
+            "chunklet.lv2_lock_group_shift is set but chunklet.lv2_ld_id is not; the LD id \
+             must be known before the pool is opened"
+                .into(),
+        ));
+    };
+    overrides.insert(ops::parse_ld_id(id)?, shift);
+    Ok(overrides)
 }
 
 /// Runtime access to chunklet's two batched-submit knobs
@@ -304,15 +340,17 @@ fn open_raws_all(paths: &[PathBuf]) -> OnyxResult<Vec<CkRawDevice>> {
 /// fall back to a degraded `open_with_missing`. `open_available_pool_devices`
 /// opens only the reachable majority-pool devices, so a pulled disk simply
 /// isn't in the set.
-fn open_pool_tolerant(paths: &[PathBuf]) -> OnyxResult<Arc<Pool>> {
+fn open_pool_tolerant(paths: &[PathBuf], overrides: LockGroupOverrides) -> OnyxResult<Arc<Pool>> {
     let (raws, _probes, _pool_id) = ops::open_available_pool_devices(paths)?;
-    match Pool::open(raws) {
+    match Pool::open_with_lock_group_overrides(raws, overrides.clone()) {
         Ok(pool) => Ok(pool),
         Err(_strict_err) => {
             // The first raws were consumed by the failed strict open; re-probe
             // for the degraded retry (flocks were released on drop).
             let (raws2, _p, _id) = ops::open_available_pool_devices(paths)?;
-            Ok(Pool::open_with_missing(raws2)?)
+            Ok(Pool::open_with_missing_and_lock_group_overrides(
+                raws2, overrides,
+            )?)
         }
     }
 }
@@ -531,6 +569,33 @@ mod tests {
             num_rows: rows,
             strip_kib: kib,
         }
+    }
+
+    #[test]
+    fn lv2_lock_group_shift_maps_to_the_lv2_ld_only() {
+        let lv2 = onyx_chunklet::types::LdId::new_v4();
+        let mut cfg = ChunkletConfig {
+            lv2_ld_id: Some(lv2.to_string()),
+            lv3_ld_id: Some(onyx_chunklet::types::LdId::new_v4().to_string()),
+            ..Default::default()
+        };
+
+        // Default 0 = ask chunklet for nothing, so every LD keeps its
+        // per-RAID-level policy.
+        assert!(lock_group_overrides(&cfg).unwrap().is_empty());
+
+        cfg.lv2_lock_group_shift = 10;
+        let overrides = lock_group_overrides(&cfg).unwrap();
+        assert_eq!(overrides.len(), 1, "only LV2 may be overridden");
+        assert_eq!(overrides.get(&lv2), Some(&10));
+
+        // Out of range, and the id-less case: both must fail loudly rather than
+        // silently produce a no-op arm.
+        cfg.lv2_lock_group_shift = MAX_LOCK_GROUP_SHIFT + 1;
+        assert!(lock_group_overrides(&cfg).is_err());
+        cfg.lv2_lock_group_shift = 10;
+        cfg.lv2_ld_id = None;
+        assert!(lock_group_overrides(&cfg).is_err());
     }
 
     #[test]

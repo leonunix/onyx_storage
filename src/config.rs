@@ -1419,6 +1419,32 @@ pub struct ChunkletConfig {
     pub lv2_ld_id: Option<String>,
     #[serde(default)]
     pub meta_ld_id: Option<String>,
+    /// Stripe-lock key grouping for the LV2 LD: chunklet hashes `key >> shift`,
+    /// so `10` collapses a run of 1024 contiguous 4 KiB keys (4 MiB) onto ONE
+    /// lock bucket. `0` (default) = one bucket per key, chunklet's per-RAID-level
+    /// default for a mirror LD.
+    ///
+    /// Why LV2 wants it: a chunklet batched write holds EVERY bucket it touches
+    /// for the whole call, so two calls of N keys are disjoint only with
+    /// probability `exp(-N²/65536)` — 1.8 % at the ~512 keys one 1 MiB LV2 mirror
+    /// write fans out to (LV2's RAID10 LD runs `strip_kib = 0` = one 4 KiB block
+    /// per strip). That is the measured reason queue depth does not convert to
+    /// throughput on this path: box 2026-08-26, raising submit depth moved
+    /// `aqu-sz` 1.42 → 2.19 while `stripe_wait` p50 blew up 84 → 1919 µs and host
+    /// throughput FELL 592 → 437 MB/s. Bounding the footprint has to come first.
+    ///
+    /// Why it is per-LD and not per-RAID-level: the metadb page window is also
+    /// RAID10, but writes scattered single pages, where grouping would only
+    /// manufacture false sharing. LV2's concurrent callers are one write lane per
+    /// buffer shard on disjoint 768 MiB slices, so a 4 MiB group can never be
+    /// shared by two lanes.
+    ///
+    /// Read once at pool open and immutable for the LD's life — two callers under
+    /// different shifts would map one key to different buckets, i.e. not exclude
+    /// at all. Requires `lv2_ld_id` to be set (the id cannot be resolved before
+    /// the pool is open).
+    #[serde(default)]
+    pub lv2_lock_group_shift: u32,
     /// Runtime PD health watchdog (Phase 4d): a background thread periodically
     /// probes each live PD (`Pool::probe_pd_liveness`) and auto-marks
     /// unresponsive ones Failed after `watchdog_fail_threshold` consecutive
@@ -1526,6 +1552,7 @@ impl Default for ChunkletConfig {
             lv3_ld_id: None,
             lv2_ld_id: None,
             meta_ld_id: None,
+            lv2_lock_group_shift: 0,
             watchdog_enabled: false,
             watchdog_interval_secs: default_watchdog_interval_secs(),
             watchdog_fail_threshold: default_watchdog_fail_threshold(),
@@ -2765,7 +2792,11 @@ mod service_config_tests {
             return;
         }
         let restore = stripe_run_max_stripes();
-        assert_eq!(set_stripe_run_max_stripes(0), 1, "0 means one stripe per op");
+        assert_eq!(
+            set_stripe_run_max_stripes(0),
+            1,
+            "0 means one stripe per op"
+        );
         assert_eq!(set_stripe_run_max_stripes(32), 32);
         assert_eq!(stripe_run_max_stripes(), 32);
         assert_eq!(

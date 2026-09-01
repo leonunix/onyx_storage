@@ -109,6 +109,20 @@ meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib =
 lv3_ld_id = "9a912452-e9e8-49f6-9683-5ec93643ff1a"
 lv2_ld_id = "e57dc0c2-33c9-47b0-8491-b2e1a8b3666d"
 meta_ld_id = "d163e445-8671-4f5b-9aee-85cd9660d181"
+# Stripe-lock key grouping for the LV2 LD ONLY: chunklet hashes `key >> shift`,
+# so 10 collapses 1024 contiguous 4 KiB keys (4 MiB) onto one lock bucket, and
+# a ~512-key mirror write stops holding ~512 of the 65536 buckets for the whole
+# call. Box 2026-08-26: at 512 keys two concurrent calls are disjoint with
+# probability 1.8 %, which is why raising submit depth moved aqu-sz 1.42 -> 2.19
+# but blew `stripe_wait` p50 84 -> 1919 us and host throughput 592 -> 437 MB/s
+# (memory stripe_lock_footprint_blocks_queue_depth). Same fix RAID6/LV3 already
+# has by default; per-id because the metadb LD is also RAID10 but writes
+# scattered single pages, where grouping would only manufacture false sharing.
+# 0 = off (chunklet's per-RAID-level default for a mirror). Read at pool open, so
+# an A/B is arms 0 / 10 / 0 with a restart each, judged on tools/mirror_delta.py
+# `stripe_wait` mean AND p50 first, then total_us, then submit_us — NOT on host
+# throughput. Requires lv2_ld_id above (the id must be known before open).
+lv2_lock_group_shift = 0
 
 [meta]
 # Phase 3f: metadb persists on the chunklet meta LD (see [chunklet].meta_ld_id),
