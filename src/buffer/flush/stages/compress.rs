@@ -3,7 +3,7 @@ use super::*;
 impl BufferFlusher {
     pub(in crate::buffer::flush) fn compress_loop(
         rx: &Receiver<CoalesceUnit>,
-        tx: &Sender<CompressedUnit>,
+        route: &CompressRoute,
         running: &AtomicBool,
         metrics: &EngineMetrics,
         min_compression_savings_pct: u8,
@@ -37,6 +37,7 @@ impl BufferFlusher {
                         .fetch_add(idle_ns, Ordering::Relaxed);
                     let active_start = Instant::now();
                     let CoalesceUnit {
+                        shard_idx,
                         vol_id,
                         start_lba,
                         lba_count,
@@ -197,6 +198,7 @@ impl BufferFlusher {
                     );
 
                     let cu = CompressedUnit {
+                        shard_idx,
                         vol_id,
                         start_lba,
                         lba_count,
@@ -213,9 +215,9 @@ impl BufferFlusher {
                         dedup_completion,
                     };
 
-                    let len_before = tx.len();
+                    let len_before = route.len();
                     let started = Instant::now();
-                    let result = tx.send(cu);
+                    let result = route.send(cu);
                     Self::record_stage_send(
                         &metrics.flush_stage_compress_send_ns,
                         &metrics.flush_stage_compress_send_ops,

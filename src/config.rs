@@ -2003,8 +2003,55 @@ impl Default for UblkConfig {
 pub struct FlushConfig {
     /// Number of compression worker threads **per flush lane** (default 2).
     /// Each buffer shard has its own flush lane. Total compress threads = shards × compress_workers.
+    /// Ignored when `shared_compress_pool` is set — see that field.
     #[serde(default = "default_compress_workers")]
     pub compress_workers: usize,
+    /// Serve every shard's compression stage from ONE shared pool of
+    /// `compress_pool_workers` threads instead of `compress_workers`
+    /// dedicated threads per shard.
+    ///
+    /// WHY: `compress_loop` (`src/buffer/flush/stages/compress.rs`) is
+    /// stateless beyond a per-worker scratch buffer — it takes one
+    /// `CoalesceUnit`, emits one self-describing `CompressedUnit`
+    /// (`start_lba`/`lba_count`/`seq_lba_ranges` identify it), with no
+    /// ordering assumption. 2 compress workers already race concurrently on
+    /// one shard's own queue today with no FIFO guarantee, so widening that
+    /// same race across shards changes nothing in kind — only how many
+    /// dedicated OS threads exist. Box schedstat (2026-09-02, QD256 j16d16
+    /// randrw 70/30): the engine runs 638 OS threads confined by
+    /// `[numa] mode=confine` to ~44 cores (schedstat run-queue wait 40-52%
+    /// on every hot thread group, 22-95 µs/switch — see memory
+    /// `cpu_oversubscription_is_the_real_wake_floor`), and `compress_workers`
+    /// × `buffer.shards` is 32 of those threads on the canonical config.
+    /// Mirrors the exact pattern already landed twice for the ublk frontend
+    /// (`shared_io_workers`, `durability_dispatchers`): a job carries its
+    /// own routing (`CoalesceUnit`/`CompressedUnit.shard_idx`) so a shared
+    /// pool can route each result to the shard it belongs to.
+    /// `false` (default) reproduces today's per-lane behavior exactly.
+    #[serde(default)]
+    pub shared_compress_pool: bool,
+    /// Shared pool size when `shared_compress_pool` is set. 0 = a small
+    /// fixed default (8).
+    #[serde(default)]
+    pub compress_pool_workers: usize,
+    /// Serve every shard's post-write cleanup stage (`cleanup_loop` in
+    /// `src/buffer/flush/cleanup.rs`) from ONE shared pool of
+    /// `cleanup_pool_workers` threads instead of one dedicated thread per
+    /// shard.
+    ///
+    /// WHY: cleanup already operates on a single engine-wide
+    /// `PbaLifecycle` instance shared by every shard's cleanup thread today
+    /// ("one instance ⇒ one retire-retry queue") and a `CleanupBatch` is a
+    /// plain `Vec<RemapCleanup>` with no shard affinity and no downstream
+    /// per-shard destination (it is the terminal stage) — sharing this pool
+    /// needs no per-item routing at all, unlike compress. `false` (default)
+    /// reproduces today's one-thread-per-shard behavior exactly.
+    #[serde(default)]
+    pub shared_cleanup_pool: bool,
+    /// Shared pool size when `shared_cleanup_pool` is set. 0 = a small fixed
+    /// default (4) — cleanup does less CPU work per item than compress.
+    #[serde(default)]
+    pub cleanup_pool_workers: usize,
     /// Max raw bytes to coalesce before compressing (default 128KB)
     #[serde(default = "default_coalesce_max_raw_bytes")]
     pub coalesce_max_raw_bytes: usize,
@@ -2272,6 +2319,10 @@ impl Default for FlushConfig {
     fn default() -> Self {
         Self {
             compress_workers: default_compress_workers(),
+            shared_compress_pool: false,
+            compress_pool_workers: 0,
+            shared_cleanup_pool: false,
+            cleanup_pool_workers: 0,
             coalesce_max_raw_bytes: default_coalesce_max_raw_bytes(),
             coalesce_max_lbas: default_coalesce_max_lbas(),
             min_compression_savings_pct: default_min_compression_savings_pct(),

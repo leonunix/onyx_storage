@@ -488,6 +488,7 @@ fn dedup_worker_batches_hits_across_units() {
         pool.note_latest_lba_seq_for_test("flush-race", lba, i, 1);
         dedup_tx
             .send(CoalesceUnit {
+                shard_idx: 0,
                 vol_id: "flush-race".into(),
                 start_lba: lba,
                 lba_count: 1,
@@ -596,6 +597,7 @@ fn dedup_worker_routes_relocation_self_hit_to_miss() {
     let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
     dedup_tx
         .send(CoalesceUnit {
+            shard_idx: 0,
             vol_id: "flush-race".into(),
             start_lba: lba,
             lba_count: 1,
@@ -664,6 +666,7 @@ fn dedup_worker_keeps_unsplit_all_miss_on_direct_completion_path() {
         setup_flush_test_env();
     let payload = Arc::<[u8]>::from(vec![0x5Au8; BLOCK_SIZE as usize * 2]);
     let unit = CoalesceUnit {
+        shard_idx: 0,
         vol_id: "flush-race".into(),
         start_lba: Lba(42),
         lba_count: 2,

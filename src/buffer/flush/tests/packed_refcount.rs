@@ -643,6 +643,7 @@ fn packed_slot_full_pipeline_concurrent_drift() {
                     data: slot_data,
                     fragments: vec![crate::packer::packer::SlotFragment {
                         unit: CompressedUnit {
+                            shard_idx: 0,
                             vol_id: vol_id.to_string(),
                             start_lba: Lba(0),
                             lba_count: 8,
@@ -998,6 +999,7 @@ fn packed_slot_overlapping_lba_race() {
             data: slot,
             fragments: vec![crate::packer::packer::SlotFragment {
                 unit: CompressedUnit {
+                    shard_idx: 0,
                     vol_id: vol_id.to_string(),
                     start_lba: Lba(0),
                     lba_count: 4,

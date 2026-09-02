@@ -394,6 +394,7 @@ fn passthrough_commit_job_keeps_500_lbas_in_one_transaction() {
         let fill = (u as u8).wrapping_add(1);
         let data = vec![fill; 1];
         let unit = CompressedUnit {
+            shard_idx: 0,
             vol_id: "flush-race".into(),
             start_lba,
             lba_count: lbas_per_unit,
@@ -1749,6 +1750,7 @@ fn arena_recycled_slot_does_not_leak_into_stripe_padding() {
         pool.note_latest_lba_seq_for_test("flush-race", Lba(lba), seq, 1);
         let data = vec![0xC0 + idx as u8; PAYLOAD_LEN];
         units.push(CompressedUnit {
+            shard_idx: 0,
             vol_id: "flush-race".into(),
             start_lba: Lba(lba),
             lba_count: 1,

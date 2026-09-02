@@ -654,7 +654,7 @@ impl BufferFlusher {
             // outer `coalesce_active_ns` so we can distinguish "stuck on
             // channel send" from "actually burning CPU in coalesce_slices".
             let coalesce_pending_start = Instant::now();
-            let units = coalesce_pending(
+            let mut units = coalesce_pending(
                 &new_entries,
                 max_raw,
                 max_lbas,
@@ -662,6 +662,12 @@ impl BufferFlusher {
                 &skip_offsets,
                 Some(metrics),
             );
+            // Stamp this lane's identity so a shared compress pool
+            // (FlushConfig::shared_compress_pool) can route its output back
+            // to the right shard.
+            for unit in &mut units {
+                unit.shard_idx = shard_idx;
+            }
             let coalesce_pending_ns = coalesce_pending_start
                 .elapsed()
                 .as_nanos()

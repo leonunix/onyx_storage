@@ -28,6 +28,37 @@ use crate::types::{CompressionAlgo, Lba, Pba, VolumeId, BLOCK_SIZE};
 
 type CleanupBatch = Vec<RemapCleanup>;
 
+/// Where a compress worker sends its output.
+///
+/// `Fixed` reproduces the historical one-lane-per-worker wiring exactly
+/// (private per-shard pool, `FlushConfig::shared_compress_pool = false`).
+/// `Shared` is for `shared_compress_pool = true`: a pool of workers reads
+/// every shard's coalesced units off one channel, so a single worker's next
+/// unit can belong to any shard — it routes by the unit's own `shard_idx`
+/// (set by the coalescer) instead of by which lane it was spawned for.
+pub(crate) enum CompressRoute {
+    Fixed(Sender<CompressedUnit>),
+    Shared(Arc<[Sender<CompressedUnit>]>),
+}
+
+impl CompressRoute {
+    fn send(&self, unit: CompressedUnit) -> Result<(), crossbeam_channel::SendError<CompressedUnit>> {
+        match self {
+            CompressRoute::Fixed(tx) => tx.send(unit),
+            CompressRoute::Shared(txs) => txs[unit.shard_idx].send(unit),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            CompressRoute::Fixed(tx) => tx.len(),
+            // Only used for a send-latency metric; approximate with the
+            // first lane rather than summing every shard's queue depth.
+            CompressRoute::Shared(txs) => txs.first().map(Sender::len).unwrap_or(0),
+        }
+    }
+}
+
 pub(crate) const DEFAULT_PACKED_META_BATCH_LBA_LIMIT: usize = 1024;
 
 /// 3-stage flusher pipeline:
@@ -73,6 +104,12 @@ pub struct BufferFlusher {
     /// hot path. Joined after commit workers (their senders drop on
     /// commit-worker exit, signalling drain).
     post_commit_handles: Vec<JoinHandle<()>>,
+    /// Non-empty only when `FlushConfig::shared_compress_pool` is set —
+    /// every lane's `FlusherLane::compress_handles` is empty in that mode.
+    shared_compress_handles: Vec<JoinHandle<()>>,
+    /// Non-empty only when `FlushConfig::shared_cleanup_pool` is set —
+    /// every lane's `FlusherLane::cleanup_handle` is `None` in that mode.
+    shared_cleanup_handles: Vec<JoinHandle<()>>,
 }
 
 struct FlusherLane {

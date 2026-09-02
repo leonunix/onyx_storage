@@ -1273,6 +1273,7 @@ impl BufferFlusher {
         let block_hashes_slice = hashes[start_idx..end_idx].to_vec();
         let repair_slice = stale_repairs[start_idx..end_idx].to_vec();
         CoalesceUnit {
+            shard_idx: original.shard_idx,
             vol_id: original.vol_id.clone(),
             start_lba,
             lba_count,
@@ -1361,6 +1362,7 @@ mod relocation_tests {
             .pin_dedup_target_if_allowed(guarded_pba, 1)
             .unwrap();
         let unit = CoalesceUnit {
+            shard_idx: 0,
             vol_id: "guard-vol".into(),
             start_lba: Lba(1),
             lba_count: 1,

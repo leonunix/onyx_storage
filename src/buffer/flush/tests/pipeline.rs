@@ -35,6 +35,7 @@ fn compress_loop_keeps_none_payload_scattered_until_writer() {
         })
         .collect();
     tx.send(CoalesceUnit {
+        shard_idx: 0,
         vol_id: "flush-race".into(),
         start_lba: Lba(20_000),
         lba_count: 4,
@@ -50,7 +51,8 @@ fn compress_loop_keeps_none_payload_scattered_until_writer() {
     .unwrap();
     drop(tx);
 
-    BufferFlusher::compress_loop(&rx, &out_tx, &running, &metrics, 12);
+    let route = CompressRoute::Fixed(out_tx.clone());
+    BufferFlusher::compress_loop(&rx, &route, &running, &metrics, 12);
     drop(out_tx);
 
     let unit = out_rx.try_recv().expect("raw unit should be emitted");
@@ -85,6 +87,7 @@ fn compress_loop_bypasses_low_savings_units() {
         .collect();
 
     tx.send(CoalesceUnit {
+        shard_idx: 0,
         vol_id: "flush-race".into(),
         start_lba: Lba(10_000),
         lba_count: 8,
@@ -100,7 +103,8 @@ fn compress_loop_bypasses_low_savings_units() {
     .unwrap();
     drop(tx);
 
-    BufferFlusher::compress_loop(&rx, &out_tx, &running, &metrics, 12);
+    let route = CompressRoute::Fixed(out_tx.clone());
+    BufferFlusher::compress_loop(&rx, &route, &running, &metrics, 12);
     drop(out_tx);
 
     let unit = out_rx

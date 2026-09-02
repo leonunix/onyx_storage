@@ -160,6 +160,7 @@ fn cleanup_for_pba(pba: Pba, blocks: u32) -> RemapCleanup {
 fn make_unit(fill: u8, seq: u64) -> CompressedUnit {
     let data = vec![fill; BLOCK_SIZE as usize];
     CompressedUnit {
+        shard_idx: 0,
         vol_id: "flush-race".into(),
         start_lba: Lba(0),
         lba_count: 1,
@@ -191,6 +192,7 @@ fn make_raw_unit_at(start_lba: u64, lba_count: u32, first_byte: u8, seq: u64) ->
         })
         .collect();
     CompressedUnit {
+        shard_idx: 0,
         vol_id: "flush-race".into(),
         start_lba: Lba(start_lba),
         lba_count,
@@ -211,6 +213,7 @@ fn make_raw_unit_at(start_lba: u64, lba_count: u32, first_byte: u8, seq: u64) ->
 fn make_packed_unit(fill: u8, seq: u64) -> CompressedUnit {
     let data = vec![fill; 512];
     CompressedUnit {
+        shard_idx: 0,
         vol_id: "flush-race".into(),
         start_lba: Lba(0),
         lba_count: 1,
@@ -231,6 +234,7 @@ fn make_packed_unit(fill: u8, seq: u64) -> CompressedUnit {
 fn make_packed_unit_at(fill: u8, seq: u64, lba: u64) -> CompressedUnit {
     let data = vec![fill; 128];
     CompressedUnit {
+        shard_idx: 0,
         vol_id: "flush-race".into(),
         start_lba: Lba(lba),
         lba_count: 1,

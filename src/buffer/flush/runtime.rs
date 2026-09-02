@@ -223,6 +223,38 @@ impl BufferFlusher {
         // indices.
         let mut lane_done_txs: Vec<Sender<Vec<u64>>> = Vec::with_capacity(lane_count);
         let mut lane_cleanup_txs: Vec<Sender<CleanupBatch>> = Vec::with_capacity(lane_count);
+        // Every shard's write_tx, collected regardless of pooling mode —
+        // only read after the loop, and only when `shared_compress_pool` is
+        // set, to build the shared compress pool's output routing table
+        // (`CompressRoute::Shared`, indexed by `CompressedUnit::shard_idx`).
+        let mut lane_write_txs: Vec<Sender<CompressedUnit>> = Vec::with_capacity(lane_count);
+
+        // See `FlushConfig::shared_compress_pool` / `shared_cleanup_pool`.
+        // Each shared channel is built once here; every shard below clones
+        // its sender instead of creating a fresh per-shard channel. The
+        // pools themselves are spawned after the loop (compress needs
+        // `lane_write_txs` fully populated first; cleanup has no such
+        // dependency but is spawned in the same place for symmetry).
+        let shared_compress_pool = config.shared_compress_pool;
+        let compress_pool_workers = if config.compress_pool_workers > 0 {
+            config.compress_pool_workers
+        } else {
+            8
+        };
+        let shared_cleanup_pool = config.shared_cleanup_pool;
+        let cleanup_pool_workers = if config.cleanup_pool_workers > 0 {
+            config.cleanup_pool_workers
+        } else {
+            4
+        };
+        let shared_compress_channel = shared_compress_pool.then(|| {
+            bounded::<CoalesceUnit>(
+                Self::WRITER_BATCH_SIZE
+                    .saturating_mul(4)
+                    .saturating_mul(lane_count),
+            )
+        });
+        let shared_cleanup_channel = shared_cleanup_pool.then(unbounded::<CleanupBatch>);
 
         // Raw MPMC producer queue followed by a single aggregator and an
         // executor queue of already-formed transactions. Directly sharing the
@@ -280,18 +312,36 @@ impl BufferFlusher {
             let upstream_queue_cap = Self::WRITER_BATCH_SIZE.saturating_mul(4);
             let (dedup_tx, dedup_rx) =
                 bounded::<CoalesceUnit>(upstream_queue_cap.max(dedup_workers.saturating_mul(32)));
-            // Stage 1.5 → Stage 2
-            let (compress_tx, compress_rx) = bounded::<CoalesceUnit>(
-                upstream_queue_cap.max(compress_workers.saturating_mul(32)),
-            );
+            // Stage 1.5 → Stage 2. Shared pool: every shard feeds the ONE
+            // channel built before this loop, and no per-shard compress_rx
+            // exists — the shared workers are spawned after the loop.
+            let mut private_compress_rx: Option<Receiver<CoalesceUnit>> = None;
+            let compress_tx = if let Some((shared_tx, _)) = shared_compress_channel.as_ref() {
+                shared_tx.clone()
+            } else {
+                let (tx, rx) = bounded::<CoalesceUnit>(
+                    upstream_queue_cap.max(compress_workers.saturating_mul(32)),
+                );
+                private_compress_rx = Some(rx);
+                tx
+            };
             // Stage 2 → Stage 3 — sized to one full writer batch so a
             // single writer cycle can drain to capacity.
             let (write_tx, write_rx) =
                 bounded::<CompressedUnit>(Self::WRITER_BATCH_SIZE.max(compress_workers * 4));
             // Stage 3 → Stage 1 (feedback: completed seqs)
             let (done_tx, done_rx) = unbounded::<Vec<u64>>();
-            // Writer/dedup → cleanup thread (async dead PBA reclamation)
-            let (cleanup_tx, cleanup_rx) = unbounded::<CleanupBatch>();
+            // Writer/dedup → cleanup thread (async dead PBA reclamation).
+            // Shared pool: every shard feeds the ONE channel built before
+            // this loop; no per-shard cleanup_rx exists to spawn against.
+            let mut private_cleanup_rx: Option<Receiver<CleanupBatch>> = None;
+            let cleanup_tx = if let Some((shared_tx, _)) = shared_cleanup_channel.as_ref() {
+                shared_tx.clone()
+            } else {
+                let (tx, rx) = unbounded::<CleanupBatch>();
+                private_cleanup_rx = Some(rx);
+                tx
+            };
 
             // Capture lane-local senders for the commit workers (they
             // route done_tx / cleanup_tx by `CommitJob.shard_idx`).
@@ -385,32 +435,39 @@ impl BufferFlusher {
             drop(dedup_tx);
             drop(compress_tx);
 
-            let mut compress_handles = Vec::with_capacity(compress_workers);
-            for worker_idx in 0..compress_workers {
-                let rx = compress_rx.clone();
-                let tx = write_tx.clone();
-                let running_w = running.clone();
-                let metrics_w = metrics.clone();
-                let h = thread::Builder::new()
-                    .name(format!("flusher-compress-{}-{}", shard_idx, worker_idx))
-                    .spawn(move || {
-                        affinity::bind_current(
-                            ThreadRole::FlusherCompress,
-                            shard_idx * compress_workers + worker_idx,
-                        );
-                        Self::compress_loop(
-                            &rx,
-                            &tx,
-                            &running_w,
-                            &metrics_w,
-                            min_compression_savings_pct,
-                        );
-                    })
-                    .expect("failed to spawn compress worker");
-                compress_handles.push(h);
+            // Private pool only — shared mode leaves this empty and the
+            // shared compress pool (spawned after this loop, once
+            // `lane_write_txs` is complete) does the work instead.
+            let mut compress_handles = Vec::new();
+            if let Some(compress_rx) = private_compress_rx {
+                compress_handles.reserve(compress_workers);
+                for worker_idx in 0..compress_workers {
+                    let rx = compress_rx.clone();
+                    let route = CompressRoute::Fixed(write_tx.clone());
+                    let running_w = running.clone();
+                    let metrics_w = metrics.clone();
+                    let h = thread::Builder::new()
+                        .name(format!("flusher-compress-{}-{}", shard_idx, worker_idx))
+                        .spawn(move || {
+                            affinity::bind_current(
+                                ThreadRole::FlusherCompress,
+                                shard_idx * compress_workers + worker_idx,
+                            );
+                            Self::compress_loop(
+                                &rx,
+                                &route,
+                                &running_w,
+                                &metrics_w,
+                                min_compression_savings_pct,
+                            );
+                        })
+                        .expect("failed to spawn compress worker");
+                    compress_handles.push(h);
+                }
             }
-            drop(compress_rx);
-            drop(write_tx);
+            // Collected regardless of mode (see the declaration above this
+            // loop) — only consumed after the loop, and only in shared mode.
+            lane_write_txs.push(write_tx);
 
             let running_w = running.clone();
             let pool_w = pool.clone();
@@ -476,31 +533,97 @@ impl BufferFlusher {
                 })
                 .expect("failed to spawn writer thread");
 
-            let running_cl = running.clone();
-            let pba_lifecycle_cl = pba_lifecycle.clone();
-            let metrics_cl = metrics.clone();
-            let cleanup_handle = thread::Builder::new()
-                .name(format!("flusher-cleanup-{}", shard_idx))
-                .spawn(move || {
-                    affinity::bind_current(ThreadRole::FlusherCleanup, shard_idx);
-                    Self::cleanup_loop(
-                        shard_idx,
-                        &cleanup_rx,
-                        &pba_lifecycle_cl,
-                        &running_cl,
-                        &metrics_cl,
-                    );
-                })
-                .expect("failed to spawn cleanup thread");
+            // Private pool only — shared mode leaves this `None` and the
+            // shared cleanup pool (spawned after this loop) does the work.
+            let cleanup_handle = private_cleanup_rx.map(|cleanup_rx| {
+                let running_cl = running.clone();
+                let pba_lifecycle_cl = pba_lifecycle.clone();
+                let metrics_cl = metrics.clone();
+                thread::Builder::new()
+                    .name(format!("flusher-cleanup-{}", shard_idx))
+                    .spawn(move || {
+                        affinity::bind_current(ThreadRole::FlusherCleanup, shard_idx);
+                        Self::cleanup_loop(
+                            shard_idx,
+                            &cleanup_rx,
+                            &pba_lifecycle_cl,
+                            &running_cl,
+                            &metrics_cl,
+                        );
+                    })
+                    .expect("failed to spawn cleanup thread")
+            });
 
             lanes.push(FlusherLane {
                 coalesce_handle: Some(coalesce_handle),
                 dedup_handles,
                 compress_handles,
                 writer_handle: Some(writer_handle),
-                cleanup_handle: Some(cleanup_handle),
+                cleanup_handle,
             });
         }
+
+        // Shared pools, spawned once every shard's channels/senders exist.
+        // Compress needs `lane_write_txs` complete first (routing table);
+        // cleanup has no such dependency but is spawned here too, for
+        // symmetry and so both pools' setup lives in one place.
+        let shared_compress_handles = if let Some((compress_tx, compress_rx)) =
+            shared_compress_channel
+        {
+            drop(compress_tx);
+            let write_txs = Arc::<[Sender<CompressedUnit>]>::from(lane_write_txs);
+            (0..compress_pool_workers)
+                .map(|worker_idx| {
+                    let rx = compress_rx.clone();
+                    let route = CompressRoute::Shared(write_txs.clone());
+                    let running_w = running.clone();
+                    let metrics_w = metrics.clone();
+                    thread::Builder::new()
+                        .name(format!("flusher-compress-shared-{worker_idx}"))
+                        .spawn(move || {
+                            affinity::bind_current(ThreadRole::FlusherCompress, worker_idx);
+                            Self::compress_loop(
+                                &rx,
+                                &route,
+                                &running_w,
+                                &metrics_w,
+                                min_compression_savings_pct,
+                            );
+                        })
+                        .expect("failed to spawn shared compress worker")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let shared_cleanup_handles = if let Some((cleanup_tx, cleanup_rx)) = shared_cleanup_channel
+        {
+            drop(cleanup_tx);
+            (0..cleanup_pool_workers)
+                .map(|worker_idx| {
+                    let rx = cleanup_rx.clone();
+                    let running_cl = running.clone();
+                    let pba_lifecycle_cl = pba_lifecycle.clone();
+                    let metrics_cl = metrics.clone();
+                    thread::Builder::new()
+                        .name(format!("flusher-cleanup-shared-{worker_idx}"))
+                        .spawn(move || {
+                            affinity::bind_current(ThreadRole::FlusherCleanup, worker_idx);
+                            Self::cleanup_loop(
+                                worker_idx,
+                                &rx,
+                                &pba_lifecycle_cl,
+                                &running_cl,
+                                &metrics_cl,
+                            );
+                        })
+                        .expect("failed to spawn shared cleanup worker")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // The aggregator owns the only batch sender. It exits only after every
         // raw sender is dropped, forwarding the final partial transaction
@@ -613,6 +736,8 @@ impl BufferFlusher {
             commit_worker_handles,
             commit_worker_txs,
             post_commit_handles,
+            shared_compress_handles,
+            shared_cleanup_handles,
         }
     }
 
@@ -766,6 +891,10 @@ impl BufferFlusher {
     }
 
     fn join_lanes(&mut self) {
+        // Pass 1: coalesce + dedup for every lane — the producers into the
+        // compress stage (a private per-lane queue, or the one shared
+        // channel). Must fully exit before that channel's senders are
+        // considered dropped.
         for lane in &mut self.lanes {
             if let Some(h) = lane.coalesce_handle.take() {
                 let _ = h.join();
@@ -773,9 +902,24 @@ impl BufferFlusher {
             for h in lane.dedup_handles.drain(..) {
                 let _ = h.join();
             }
+        }
+        // Compress: either every lane's own dedicated handles (private
+        // mode) or the one shared pool (shared mode) — whichever is
+        // non-empty is live, the other loop is a no-op. The shared pool can
+        // only drain once every lane's coalesce+dedup above has exited, so
+        // it must join AFTER that pass, not interleaved into it the way the
+        // private per-lane handles used to be.
+        for lane in &mut self.lanes {
             for h in lane.compress_handles.drain(..) {
                 let _ = h.join();
             }
+        }
+        for h in self.shared_compress_handles.drain(..) {
+            let _ = h.join();
+        }
+        // Writer: per-lane, always (not pooled this phase) — safe once
+        // compress has fully exited above, in either mode.
+        for lane in &mut self.lanes {
             if let Some(h) = lane.writer_handle.take() {
                 let _ = h.join();
             }
@@ -799,13 +943,17 @@ impl BufferFlusher {
         for h in self.post_commit_handles.drain(..) {
             let _ = h.join();
         }
-        // Per-lane cleanup workers drain after the commit workers
-        // finish (commit workers may push cleanup payloads through
-        // each lane's cleanup_tx during their own drain).
+        // Per-lane cleanup workers (private mode) or the shared pool
+        // (shared mode) drain after the commit workers finish (commit
+        // workers may push cleanup payloads through cleanup_tx during
+        // their own drain).
         for lane in &mut self.lanes {
             if let Some(h) = lane.cleanup_handle.take() {
                 let _ = h.join();
             }
+        }
+        for h in self.shared_cleanup_handles.drain(..) {
+            let _ = h.join();
         }
     }
 }

@@ -53,6 +53,12 @@ impl DedupCompletion {
 /// Ready to be compressed as a single unit.
 #[derive(Debug, Clone)]
 pub struct CoalesceUnit {
+    /// Which flush lane produced this unit. Set by the coalescer to its own
+    /// `shard_idx` after `coalesce_pending` returns; downstream stages that
+    /// run as a shared pool across shards (see `FlushConfig::shared_compress_pool`)
+    /// use it to route their output to the right shard instead of relying on
+    /// which thread happened to process the unit.
+    pub shard_idx: usize,
     pub vol_id: String,
     pub start_lba: Lba,
     pub lba_count: u32,
@@ -222,6 +228,9 @@ impl CompressedPayload {
 
 #[derive(Debug, Clone)]
 pub struct CompressedUnit {
+    /// See `CoalesceUnit::shard_idx` — carried through unchanged by the
+    /// compress stage so a shared compress pool can route its output.
+    pub shard_idx: usize,
     pub vol_id: String,
     pub start_lba: Lba,
     pub lba_count: u32,
@@ -480,6 +489,10 @@ fn coalesce_slices(
                 add_seq_lba(&mut seq_lba_ranges, seq, ds.latest.lba);
             }
             current = Some(CoalesceUnit {
+                // Real shard identity isn't known this deep in the merge —
+                // `coalesce_loop` stamps its own `shard_idx` onto every unit
+                // this function returns.
+                shard_idx: 0,
                 vol_id: ds.latest.vol_id.to_string(),
                 start_lba: ds.latest.lba,
                 lba_count: 1,
