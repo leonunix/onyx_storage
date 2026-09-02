@@ -228,13 +228,24 @@ impl BufferFlusher {
         // set, to build the shared compress pool's output routing table
         // (`CompressRoute::Shared`, indexed by `CompressedUnit::shard_idx`).
         let mut lane_write_txs: Vec<Sender<CompressedUnit>> = Vec::with_capacity(lane_count);
+        // Every shard's resolved compress_tx, collected regardless of
+        // pooling mode — only read after the loop, and only when
+        // `DedupConfig::shared_pool` is set, to build the shared dedup
+        // pool's miss-routing table (`MissRoute::Shared`, indexed by
+        // `CoalesceUnit::shard_idx`). Note this is whichever channel this
+        // shard resolved for compress (private per-shard, or a clone of the
+        // shared compress channel) — dedup's shared pool doesn't need to
+        // know or care which.
+        let mut lane_compress_txs: Vec<Sender<CoalesceUnit>> = Vec::with_capacity(lane_count);
 
-        // See `FlushConfig::shared_compress_pool` / `shared_cleanup_pool`.
-        // Each shared channel is built once here; every shard below clones
-        // its sender instead of creating a fresh per-shard channel. The
-        // pools themselves are spawned after the loop (compress needs
-        // `lane_write_txs` fully populated first; cleanup has no such
-        // dependency but is spawned in the same place for symmetry).
+        // See `FlushConfig::shared_compress_pool` / `shared_cleanup_pool` /
+        // `DedupConfig::shared_pool`. Each shared channel is built once
+        // here; every shard below clones its sender instead of creating a
+        // fresh per-shard channel. The pools themselves are spawned after
+        // the loop (compress needs `lane_write_txs` fully populated first;
+        // dedup needs `lane_compress_txs` and `lane_done_txs` fully
+        // populated first; cleanup has no such dependency but is spawned in
+        // the same place for symmetry).
         let shared_compress_pool = config.shared_compress_pool;
         let compress_pool_workers = if config.compress_pool_workers > 0 {
             config.compress_pool_workers
@@ -247,6 +258,12 @@ impl BufferFlusher {
         } else {
             4
         };
+        let shared_dedup_pool = dedup_config.shared_pool;
+        let dedup_pool_workers = if dedup_config.pool_workers > 0 {
+            dedup_config.pool_workers
+        } else {
+            8
+        };
         let shared_compress_channel = shared_compress_pool.then(|| {
             bounded::<CoalesceUnit>(
                 Self::WRITER_BATCH_SIZE
@@ -255,6 +272,13 @@ impl BufferFlusher {
             )
         });
         let shared_cleanup_channel = shared_cleanup_pool.then(unbounded::<CleanupBatch>);
+        let shared_dedup_channel = shared_dedup_pool.then(|| {
+            bounded::<CoalesceUnit>(
+                Self::WRITER_BATCH_SIZE
+                    .saturating_mul(4)
+                    .saturating_mul(lane_count),
+            )
+        });
 
         // Raw MPMC producer queue followed by a single aggregator and an
         // executor queue of already-formed transactions. Directly sharing the
@@ -310,8 +334,24 @@ impl BufferFlusher {
             // coalescer blocked after one eighth of a 512-unit writer batch and
             // fed LV3 in increasingly fragmented waves.
             let upstream_queue_cap = Self::WRITER_BATCH_SIZE.saturating_mul(4);
-            let (dedup_tx, dedup_rx) =
-                bounded::<CoalesceUnit>(upstream_queue_cap.max(dedup_workers.saturating_mul(32)));
+            // Stage 1 → Stage 1.5 (dedup). Shared pool: every shard feeds
+            // the ONE channel built before this loop, and no per-shard
+            // dedup_rx exists — the shared workers are spawned after the
+            // loop. When dedup is disabled entirely, this is a throwaway
+            // channel nothing ever sends on (`coalesce_out_tx` routes
+            // straight to `compress_tx` below).
+            let mut private_dedup_rx: Option<Receiver<CoalesceUnit>> = None;
+            let dedup_tx = if !dedup_enabled {
+                bounded::<CoalesceUnit>(1).0
+            } else if let Some((shared_tx, _)) = shared_dedup_channel.as_ref() {
+                shared_tx.clone()
+            } else {
+                let (tx, rx) = bounded::<CoalesceUnit>(
+                    upstream_queue_cap.max(dedup_workers.saturating_mul(32)),
+                );
+                private_dedup_rx = Some(rx);
+                tx
+            };
             // Stage 1.5 → Stage 2. Shared pool: every shard feeds the ONE
             // channel built before this loop, and no per-shard compress_rx
             // exists — the shared workers are spawned after the loop.
@@ -325,6 +365,11 @@ impl BufferFlusher {
                 private_compress_rx = Some(rx);
                 tx
             };
+            // Collected regardless of mode (see the declaration above this
+            // loop) — only consumed after the loop, and only when
+            // `DedupConfig::shared_pool` is set, to build the shared dedup
+            // pool's miss-routing table.
+            lane_compress_txs.push(compress_tx.clone());
             // Stage 2 → Stage 3 — sized to one full writer batch so a
             // single writer cycle can drain to capacity.
             let (write_tx, write_rx) =
@@ -383,17 +428,21 @@ impl BufferFlusher {
                 })
                 .expect("failed to spawn coalescer thread");
 
+            // Private pool only — shared mode leaves this empty and the
+            // shared dedup pool (spawned after this loop, once
+            // `lane_compress_txs` / `lane_done_txs` are complete) does the
+            // work instead.
             let mut dedup_handles = Vec::new();
-            if dedup_enabled {
+            if let Some(dedup_rx) = private_dedup_rx {
                 for worker_idx in 0..dedup_workers {
                     let rx = dedup_rx.clone();
-                    let miss_tx = compress_tx.clone();
+                    let miss_route = MissRoute::Fixed(compress_tx.clone());
                     let running_d = running.clone();
                     let meta_d = meta.clone();
                     let pool_d = pool.clone();
                     let lifecycle_d = lifecycle.clone();
                     let allocator_d = allocator.clone();
-                    let done_tx_d = done_tx.clone();
+                    let done_route = DoneRoute::Fixed(done_tx.clone());
                     let metrics_d = metrics.clone();
                     let cleanup_tx_d = cleanup_tx.clone();
                     let candidate_d = candidate.clone();
@@ -409,12 +458,12 @@ impl BufferFlusher {
                             Self::dedup_loop(
                                 shard_idx,
                                 &rx,
-                                &miss_tx,
+                                &miss_route,
                                 &meta_d,
                                 &pool_d,
                                 &lifecycle_d,
                                 &allocator_d,
-                                &done_tx_d,
+                                &done_route,
                                 &running_d,
                                 dedup_skip_threshold,
                                 dedup_pending_skip_threshold,
@@ -431,7 +480,6 @@ impl BufferFlusher {
                     dedup_handles.push(h);
                 }
             }
-            drop(dedup_rx);
             drop(dedup_tx);
             drop(compress_tx);
 
@@ -625,6 +673,74 @@ impl BufferFlusher {
             Vec::new()
         };
 
+        // Dedup's shared pool needs both routing tables built first:
+        // `lane_compress_txs` (miss routing, mirrors compress's
+        // `lane_write_txs`) and `lane_done_txs` (completion routing — see
+        // `DoneRoute`'s doc comment for why misrouting this is a
+        // correctness bug, not just a load-balance nuance). Cloning
+        // `lane_done_txs` here rather than moving it — the commit workers
+        // below still need their own clones of it.
+        let shared_dedup_handles = if let Some((dedup_tx, dedup_rx)) = shared_dedup_channel {
+            drop(dedup_tx);
+            let miss_route = MissRoute::Shared(Arc::<[Sender<CoalesceUnit>]>::from(
+                lane_compress_txs,
+            ));
+            let done_route = DoneRoute::Shared(Arc::<[Sender<Vec<u64>>]>::from(
+                lane_done_txs.clone(),
+            ));
+            (0..dedup_pool_workers)
+                .map(|worker_idx| {
+                    let rx = dedup_rx.clone();
+                    let miss_route = miss_route.clone();
+                    let done_route = done_route.clone();
+                    let running_d = running.clone();
+                    let meta_d = meta.clone();
+                    let pool_d = pool.clone();
+                    let lifecycle_d = lifecycle.clone();
+                    let allocator_d = allocator.clone();
+                    let metrics_d = metrics.clone();
+                    // Cleanup is shard-agnostic (one engine-wide
+                    // `PbaLifecycle`, no per-item routing — see
+                    // `FlushConfig::shared_cleanup_pool`'s doc comment), so
+                    // any lane's cleanup_tx is a valid destination; spread
+                    // shared dedup workers round-robin across lanes rather
+                    // than funnelling them all into lane 0's queue.
+                    let cleanup_tx_d = lane_cleanup_txs[worker_idx % lane_count].clone();
+                    let candidate_d = candidate.clone();
+                    let read_pool_d = read_pool.clone();
+                    let commit_worker_txs_d = commit_worker_txs.clone();
+                    thread::Builder::new()
+                        .name(format!("flusher-dedup-shared-{worker_idx}"))
+                        .spawn(move || {
+                            affinity::bind_current(ThreadRole::FlusherDedup, worker_idx);
+                            Self::dedup_loop(
+                                worker_idx,
+                                &rx,
+                                &miss_route,
+                                &meta_d,
+                                &pool_d,
+                                &lifecycle_d,
+                                &allocator_d,
+                                &done_route,
+                                &running_d,
+                                dedup_skip_threshold,
+                                dedup_pending_skip_threshold,
+                                &metrics_d,
+                                &cleanup_tx_d,
+                                &candidate_d,
+                                read_pool_d.as_deref(),
+                                &commit_worker_txs_d,
+                                commit_workers_per_volume,
+                                commit_worker_pipeline_depth.max(8),
+                            );
+                        })
+                        .expect("failed to spawn shared dedup worker")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // The aggregator owns the only batch sender. It exits only after every
         // raw sender is dropped, forwarding the final partial transaction
         // before it disconnects the executor queue.
@@ -738,6 +854,7 @@ impl BufferFlusher {
             post_commit_handles,
             shared_compress_handles,
             shared_cleanup_handles,
+            shared_dedup_handles,
         }
     }
 
@@ -891,17 +1008,28 @@ impl BufferFlusher {
     }
 
     fn join_lanes(&mut self) {
-        // Pass 1: coalesce + dedup for every lane — the producers into the
-        // compress stage (a private per-lane queue, or the one shared
+        // Pass 1: coalesce for every lane — the sole producer into the
+        // dedup stage (a private per-shard queue, or the one shared
         // channel). Must fully exit before that channel's senders are
         // considered dropped.
         for lane in &mut self.lanes {
             if let Some(h) = lane.coalesce_handle.take() {
                 let _ = h.join();
             }
+        }
+        // Dedup: either every lane's own dedicated handles (private mode)
+        // or the one shared pool (shared mode) — whichever is non-empty is
+        // live, the other loop is a no-op. Same "private handles then
+        // shared handles, after this stage's producers have exited" rule
+        // as compress/cleanup below — the shared dedup channel only closes
+        // once every lane's coalescer (joined above) has dropped its clone.
+        for lane in &mut self.lanes {
             for h in lane.dedup_handles.drain(..) {
                 let _ = h.join();
             }
+        }
+        for h in self.shared_dedup_handles.drain(..) {
+            let _ = h.join();
         }
         // Compress: either every lane's own dedicated handles (private
         // mode) or the one shared pool (shared mode) — whichever is

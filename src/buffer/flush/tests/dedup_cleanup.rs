@@ -510,15 +510,17 @@ fn dedup_worker_batches_hits_across_units() {
     drop(dedup_tx);
 
     let candidate = crate::dedup::CandidateCache::new(8, 64);
+    let miss_route = MissRoute::Fixed(miss_tx.clone());
+    let done_route = DoneRoute::Fixed(done_tx.clone());
     BufferFlusher::dedup_loop(
         0,
         &dedup_rx,
-        &miss_tx,
+        &miss_route,
         &meta,
         &pool,
         &lifecycle,
         &allocator,
-        &done_tx,
+        &done_route,
         &running,
         100,
         0,
@@ -619,15 +621,17 @@ fn dedup_worker_routes_relocation_self_hit_to_miss() {
 
     let running = AtomicBool::new(true);
     let candidate = crate::dedup::CandidateCache::new(1, 4);
+    let miss_route = MissRoute::Fixed(miss_tx.clone());
+    let done_route = DoneRoute::Fixed(done_tx.clone());
     BufferFlusher::dedup_loop(
         0,
         &dedup_rx,
-        &miss_tx,
+        &miss_route,
         &meta,
         &pool,
         &lifecycle,
         &allocator,
-        &done_tx,
+        &done_route,
         &running,
         100,
         0,
@@ -701,12 +705,12 @@ fn dedup_worker_keeps_unsplit_all_miss_on_direct_completion_path() {
     BufferFlusher::dedup_loop(
         0,
         &dedup_rx,
-        &miss_tx,
+        &MissRoute::Fixed(miss_tx.clone()),
         &meta,
         &pool,
         &lifecycle,
         &allocator,
-        &done_tx,
+        &DoneRoute::Fixed(done_tx.clone()),
         &AtomicBool::new(true),
         100,
         0,
@@ -734,6 +738,147 @@ fn dedup_worker_keeps_unsplit_all_miss_on_direct_completion_path() {
         done_rx.is_empty(),
         "dedup must not complete a miss before write"
     );
+}
+
+/// A shared dedup pool worker (`DedupConfig::shared_pool`) processes units
+/// from ANY shard on one channel — it must route a miss to the shard that
+/// produced it (`MissRoute::Shared`, indexed by `unit.shard_idx`), and a
+/// completion to that same shard's `coalesce_loop` feedback channel
+/// (`DoneRoute::Shared`) rather than to whichever lane the worker happened
+/// to be spawned for. A misrouted `done_tx` in particular is silent: the
+/// wrong `coalesce_loop`'s local `in_flight` map simply doesn't contain the
+/// seq, so the decrement is a no-op and the ORIGINAL shard's seq never
+/// clears — see `DoneRoute`'s doc comment. This test feeds ONE `dedup_loop`
+/// call a two-shard mixed batch and asserts both routes land on the correct
+/// lane, not just any lane.
+#[test]
+fn dedup_worker_shared_pool_routes_miss_and_done_by_unit_shard_idx() {
+    let (meta, pool, lifecycle, allocator, _io_engine, metrics, _meta_dir, _buf_tmp, _data_tmp) =
+        setup_flush_test_env();
+
+    let (dedup_tx, dedup_rx) = bounded::<CoalesceUnit>(8);
+    // Two independent "lanes", each with its own miss/done channel — this
+    // is what `lane_compress_txs` / `lane_done_txs` would build in
+    // `runtime.rs` for a real shared pool.
+    let (miss_tx_0, miss_rx_0) = bounded::<CoalesceUnit>(4);
+    let (miss_tx_1, miss_rx_1) = bounded::<CoalesceUnit>(4);
+    let (done_tx_0, done_rx_0) = unbounded::<Vec<u64>>();
+    let (done_tx_1, done_rx_1) = unbounded::<Vec<u64>>();
+    let (cleanup_tx, _cleanup_rx) = unbounded::<CleanupBatch>();
+    let miss_route = MissRoute::Shared(Arc::<[Sender<CoalesceUnit>]>::from(vec![
+        miss_tx_0, miss_tx_1,
+    ]));
+    let done_route = DoneRoute::Shared(Arc::<[Sender<Vec<u64>>]>::from(vec![
+        done_tx_0, done_tx_1,
+    ]));
+
+    // Unit A (shard 0): an all-zero block on a volume that was never
+    // created. `commit_prepared_zero_blocks`'s generation check (`meta
+    // .get_volume` -> `Ok(None)`) takes the "dead generation" shortcut,
+    // which marks the LBA a hit unconditionally without touching
+    // metadb — the simplest way to force an all-hit (no-miss) unit so
+    // `finish_prepared_dedup_unit` takes the `done_route.send(...)` path.
+    let zero_payload = Arc::<[u8]>::from(vec![0u8; BLOCK_SIZE as usize]);
+    let unit_a = CoalesceUnit {
+        shard_idx: 0,
+        vol_id: "shared-pool-route-test-a".into(),
+        start_lba: Lba(1),
+        lba_count: 1,
+        raw_blocks: vec![crate::buffer::pipeline::RawBlockRef {
+            payload: zero_payload,
+            offset: 0,
+            relocation_source: None,
+        }],
+        compression: CompressionAlgo::None,
+        vol_created_at: 1,
+        seq_lba_ranges: vec![(1, Lba(1), 1)],
+        dedup_skipped: false,
+        block_hashes: None,
+        dedup_stale_repairs: None,
+        dedup_completion: None,
+    };
+
+    // Unit B (shard 1): a unique non-zero block with no dedup_index /
+    // candidate-cache entry anywhere — a fresh miss, routed through the
+    // unsplit all-miss path straight to `miss_route.send(unit)`.
+    let miss_payload = Arc::<[u8]>::from(vec![0x7Cu8; BLOCK_SIZE as usize]);
+    let unit_b = CoalesceUnit {
+        shard_idx: 1,
+        vol_id: "shared-pool-route-test-b".into(),
+        start_lba: Lba(2),
+        lba_count: 1,
+        raw_blocks: vec![crate::buffer::pipeline::RawBlockRef {
+            payload: miss_payload,
+            offset: 0,
+            relocation_source: None,
+        }],
+        compression: CompressionAlgo::None,
+        vol_created_at: 1,
+        seq_lba_ranges: vec![(2, Lba(2), 1)],
+        dedup_skipped: false,
+        block_hashes: None,
+        dedup_stale_repairs: None,
+        dedup_completion: None,
+    };
+
+    dedup_tx.send(unit_a).unwrap();
+    dedup_tx.send(unit_b).unwrap();
+    drop(dedup_tx);
+
+    let candidate = crate::dedup::CandidateCache::new(1, 16);
+    BufferFlusher::dedup_loop(
+        // Worker's own captured index — in shared-pool mode this is the
+        // pool worker_idx, deliberately NEITHER unit's true shard (0/1),
+        // to prove routing follows `unit.shard_idx`, not this parameter.
+        7,
+        &dedup_rx,
+        &miss_route,
+        &meta,
+        &pool,
+        &lifecycle,
+        &allocator,
+        &done_route,
+        &AtomicBool::new(true),
+        100,
+        0,
+        &metrics,
+        &cleanup_tx,
+        &candidate,
+        None,
+        &[],
+        1,
+        1,
+    );
+    drop(miss_route);
+    drop(done_route);
+
+    // Unit A: hit, so it must complete on shard 0's done channel — not
+    // shard 1's, and not as a miss on either compress lane.
+    let done_a = done_rx_0
+        .try_recv()
+        .expect("shard 0's completion must land on shard 0's done channel");
+    assert_eq!(done_a, vec![1u64]);
+    assert!(
+        done_rx_1.is_empty(),
+        "shard 0's completion must not leak onto shard 1's done channel"
+    );
+    assert!(
+        miss_rx_0.is_empty(),
+        "shard 0's hit must not also appear as a miss anywhere"
+    );
+
+    // Unit B: miss, so it must be routed to shard 1's compress input —
+    // not shard 0's.
+    let miss_b = miss_rx_1
+        .try_recv()
+        .expect("shard 1's miss must land on shard 1's compress input");
+    assert_eq!(miss_b.start_lba, Lba(2));
+    assert_eq!(miss_b.shard_idx, 1);
+    assert!(
+        miss_rx_0.is_empty(),
+        "shard 1's miss must not leak onto shard 0's compress input"
+    );
+    assert!(done_rx_0.try_recv().is_err());
 }
 
 // ---------- Stage-B: reclaim consumes the heat map ----------

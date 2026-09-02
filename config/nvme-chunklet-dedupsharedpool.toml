@@ -1,0 +1,163 @@
+# Shared dedup pool twin of nvme-chunklet-sharedpool.toml (2026-09-02).
+# PURPOSE: verify DedupConfig::shared_pool — Phase 2 of the thread-count
+# reduction plan (Phase 1 was compress/cleanup, this file's base). Same
+# chunklet pool/LD ids as the canonical config (no chunklet-init needed).
+# ONLY the added [dedup] shared_pool/pool_workers differ from
+# nvme-chunklet-sharedpool.toml. Distinct socket_path.
+
+[numa]
+mode = "confine"
+home_node = 0
+reserve_cores_per_node = 2
+cold_cache_policy = "auto"
+
+[chunklet]
+enabled = true
+devices = [
+    "/dev/nvme0n1",
+    "/dev/nvme1n1",
+    "/dev/nvme2n1",
+    "/dev/nvme3n1",
+    "/dev/nvme4n1",
+    "/dev/nvme5n1",
+    "/dev/nvme6n1",
+    "/dev/nvme7n1",
+    "/dev/nvme8n1",
+    "/dev/nvme9n1",
+]
+io_backend = "uring"
+uring_writev_coalesce = true
+spare_pct = 5
+watchdog_enabled = true
+watchdog_interval_secs = 10
+watchdog_fail_threshold = 3
+auto_failover = true
+lv3 = { raid = "raid6", set_size = 6, row_size = 1, num_rows = 100, strip_kib = 4 }
+lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0 }
+meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
+lv3_ld_id = "9a912452-e9e8-49f6-9683-5ec93643ff1a"
+lv2_ld_id = "e57dc0c2-33c9-47b0-8491-b2e1a8b3666d"
+meta_ld_id = "d163e445-8671-4f5b-9aee-85cd9660d181"
+lv2_lock_group_shift = 0
+
+[meta]
+backend = "chunklet"
+path = "/mnt/onyx-meta/metadb"
+block_cache_mb = 32768
+memtable_budget_mb = 8192
+index_pin_mb = 8192
+lsm_bloom_bits_per_entry = 20
+checkpoint_interval_ms = 5000
+group_commit_timeout_us = 1
+dedup_shards = 8
+dedup_cuckoo_buckets = 64000000
+dedup_l1_cache_entries = 256000
+l2p_buffer_enabled = true
+l2p_buffer_soft_entries = 4000000
+rc_authoritative_reclaim = true
+commit_direct_apply_enabled = true
+bfg_threads_enabled = true
+parallel_l2p_drain_enabled = true
+parallel_l2p_drain_workers = 8
+l2p_checkpoint_pipeline_enabled = true
+rc_delta_run_persist_enabled = true
+rc_condense_interval_cycles = 8
+rc_segment_overlay_max_entries = 4000000
+
+[storage]
+lv3_batch_coalesce_us = 0
+block_size = 4096
+use_hugepages = false
+default_compression = "Lz4"
+io_backend = "uring"
+uring_sq_entries = 1024
+read_pool_workers = 32
+raid_full_stripe_writes = true
+stripe_group_lifetime_affinity = false
+allocator_regions = 0
+stripe_refill_run_stripes = 0
+stripe_refill_width_bias = false
+
+[buffer]
+prewait_ring_space_outside_order = false
+capacity_mb = 32768
+flush_watermark_pct = 80
+group_commit_wait_us = 100
+lv2_checkpoint_epoch_interval = 8
+shards = 16
+lv2_write_lanes = 0
+max_memory_mb = 16384
+volatile_memory_mb = 49152
+staging_queue_entries = 1048576
+sync_batch_max_entries = 131072
+sync_batch_max_bytes_mb = 1024
+
+[ublk]
+nr_queues = 32
+queue_depth = 256
+io_buf_bytes = 1048576
+queue_workers = 4
+shared_io_workers = true
+
+[flush]
+compress_workers = 2
+coalesce_max_raw_bytes = 24576
+coalesce_max_lbas = 6
+min_compression_savings_pct = 12
+skip_fully_superseded = true
+packed_meta_batch_max_lbas = 1024
+stripe_run_max_stripes = 1
+foreground_flush_target_p99_ms = 0
+shared_compress_pool = true
+compress_pool_workers = 0
+shared_cleanup_pool = true
+cleanup_pool_workers = 0
+
+[engine]
+zone_count = 64
+zone_size_blocks = 256
+recovery_timeout_ms = 0
+recovery_stall_timeout_ms = 60000
+shutdown_drain_timeout_ms = 0
+shutdown_drain_stall_timeout_ms = 60000
+
+[gc]
+enabled = true
+scan_interval_ms = 5000
+dead_ratio_threshold = 0.25
+buffer_usage_max_pct = 80
+buffer_usage_resume_pct = 50
+max_rewrite_per_cycle = 1024
+
+[dedup]
+enabled = true
+workers = 2
+# The A/B variable this file adds: 32 flusher-dedup threads (2/shard x 16
+# shards) -> pool_workers shared threads (0 = auto: 8). See
+# DedupConfig::shared_pool's doc comment for why this needed real routing
+# fixes (done_tx / miss_tx / backpressure), not just a pool-sizing change.
+shared_pool = true
+pool_workers = 0
+buffer_skip_threshold_pct = 90
+pending_skip_threshold_entries = 0
+rescan_interval_ms = 30000
+max_rescan_per_cycle = 4096
+cold_tail_max_per_cycle = 4096
+
+[threading]
+enabled = false
+
+[service]
+socket_path = "/tmp/onyx-storage-dedupsharedpool.sock"
+
+[ha]
+enabled = false
+node_id = 0
+heartbeat_interval_ms = 3000
+lease_duration_secs = 30
+
+[mem]
+arena_enabled = true
+arena_max_bytes_per_lane = 0
+arena_max_class_blocks = 0
+arena_hugepage = false

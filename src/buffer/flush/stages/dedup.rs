@@ -52,12 +52,12 @@ impl BufferFlusher {
     pub(in crate::buffer::flush) fn dedup_loop(
         shard_idx: usize,
         rx: &Receiver<CoalesceUnit>,
-        miss_tx: &Sender<CoalesceUnit>,
+        miss_route: &MissRoute,
         meta: &MetaStore,
         pool: &WriteBufferPool,
         lifecycle: &VolumeLifecycleManager,
         allocator: &SpaceAllocator,
-        done_tx: &Sender<Vec<u64>>,
+        done_route: &DoneRoute,
         _running: &AtomicBool,
         skip_threshold_pct: u8,
         pending_skip_threshold_entries: u64,
@@ -77,7 +77,7 @@ impl BufferFlusher {
                     .pop_front()
                     .expect("dedup commit pipeline depth checked non-zero");
                 if !Self::finish_pending_prepared_batch(
-                    shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx, candidate,
+                    shard_idx, pending, miss_route, pool, done_route, metrics, cleanup_tx, candidate,
                 ) {
                     return;
                 }
@@ -99,7 +99,7 @@ impl BufferFlusher {
                         .fetch_add(idle_ns, Ordering::Relaxed);
                     if let Some(pending) = pending_batches.pop_front() {
                         if !Self::finish_pending_prepared_batch(
-                            shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx,
+                            shard_idx, pending, miss_route, pool, done_route, metrics, cleanup_tx,
                             candidate,
                         ) {
                             return;
@@ -110,7 +110,7 @@ impl BufferFlusher {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     while let Some(pending) = pending_batches.pop_front() {
                         if !Self::finish_pending_prepared_batch(
-                            shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx,
+                            shard_idx, pending, miss_route, pool, done_route, metrics, cleanup_tx,
                             candidate,
                         ) {
                             return;
@@ -135,22 +135,29 @@ impl BufferFlusher {
 
             let mut prepared = Vec::with_capacity(batch.len());
             for mut unit in batch {
-                // Backpressure: skip dedup if this shard's buffer is
-                // filling up. Optionally also skip when the queue is deep:
-                // large LV2 buffers can have tens of thousands of pending
-                // entries while fill% is still low. Keep the pending gate
-                // configurable so Optane/NVMe deployments can preserve a
-                // stricter dedup-first foreground path.
+                // Backpressure: skip dedup if this UNIT's own shard's buffer
+                // is filling up — not this worker's captured `shard_idx`,
+                // which in shared-pool mode (`DedupConfig::shared_pool`) is
+                // just the pool worker index and may differ from the shard
+                // that actually produced `unit`. CLAUDE.md documents this
+                // gate as per-shard fill%; per-unit is what preserves that
+                // in both private and shared mode. Optionally also skip when
+                // the queue is deep: large LV2 buffers can have tens of
+                // thousands of pending entries while fill% is still low.
+                // Keep the pending gate configurable so Optane/NVMe
+                // deployments can preserve a stricter dedup-first
+                // foreground path.
                 let pending_gate_tripped = pending_skip_threshold_entries > 0
-                    && pool.pending_count_for_shard(shard_idx) > pending_skip_threshold_entries;
-                if pool.fill_percentage_for_shard(shard_idx) > skip_threshold_pct as u8
+                    && pool.pending_count_for_shard(unit.shard_idx)
+                        > pending_skip_threshold_entries;
+                if pool.fill_percentage_for_shard(unit.shard_idx) > skip_threshold_pct as u8
                     || pending_gate_tripped
                 {
                     unit.dedup_skipped = true;
                     metrics.dedup_skipped_units.fetch_add(1, Ordering::Relaxed);
-                    let len_before = miss_tx.len();
+                    let len_before = miss_route.len();
                     let started = Instant::now();
-                    let result = miss_tx.send(unit);
+                    let result = miss_route.send(unit);
                     Self::record_stage_send(
                         &metrics.flush_stage_dedup_send_ns,
                         &metrics.flush_stage_dedup_send_ops,
@@ -203,7 +210,7 @@ impl BufferFlusher {
             let pending = PendingPreparedDedupBatch { prepared, chunks };
             if pending.chunks.is_empty() {
                 if !Self::finish_pending_prepared_batch(
-                    shard_idx, pending, miss_tx, pool, done_tx, metrics, cleanup_tx, candidate,
+                    shard_idx, pending, miss_route, pool, done_route, metrics, cleanup_tx, candidate,
                 ) {
                     return;
                 }
@@ -1080,9 +1087,9 @@ impl BufferFlusher {
     fn finish_pending_prepared_batch(
         shard_idx: usize,
         mut pending: PendingPreparedDedupBatch,
-        miss_tx: &Sender<CoalesceUnit>,
+        miss_route: &MissRoute,
         pool: &WriteBufferPool,
-        done_tx: &Sender<Vec<u64>>,
+        done_route: &DoneRoute,
         metrics: &EngineMetrics,
         cleanup_tx: &Sender<CleanupBatch>,
         candidate: &crate::dedup::CandidateCache,
@@ -1100,9 +1107,9 @@ impl BufferFlusher {
             if !Self::finish_prepared_dedup_unit(
                 shard_idx,
                 prepared_unit,
-                miss_tx,
+                miss_route,
                 pool,
-                done_tx,
+                done_route,
                 metrics,
             ) {
                 return false;
@@ -1114,9 +1121,9 @@ impl BufferFlusher {
     fn finish_prepared_dedup_unit(
         _shard_idx: usize,
         prepared: PreparedDedupUnit,
-        miss_tx: &Sender<CoalesceUnit>,
+        miss_route: &MissRoute,
         pool: &WriteBufferPool,
-        done_tx: &Sender<Vec<u64>>,
+        done_route: &DoneRoute,
         metrics: &EngineMetrics,
     ) -> bool {
         let PreparedDedupUnit {
@@ -1153,7 +1160,7 @@ impl BufferFlusher {
         );
         if !has_misses {
             let seqs: Vec<u64> = unit.seq_lba_ranges.iter().map(|(s, _, _)| *s).collect();
-            let _ = done_tx.send(seqs);
+            let _ = done_route.send(unit.shard_idx, seqs);
             return true;
         }
 
@@ -1189,9 +1196,9 @@ impl BufferFlusher {
             } else {
                 None
             };
-            let len_before = miss_tx.len();
+            let len_before = miss_route.len();
             let started = Instant::now();
-            let result = miss_tx.send(unit);
+            let result = miss_route.send(unit);
             Self::record_stage_send(
                 &metrics.flush_stage_dedup_send_ns,
                 &metrics.flush_stage_dedup_send_ops,
@@ -1216,9 +1223,9 @@ impl BufferFlusher {
                 &stale_index_repairs,
                 Some(completion.clone()),
             );
-            let len_before = miss_tx.len();
+            let len_before = miss_route.len();
             let started = Instant::now();
-            let result = miss_tx.send(miss_unit);
+            let result = miss_route.send(miss_unit);
             Self::record_stage_send(
                 &metrics.flush_stage_dedup_send_ns,
                 &metrics.flush_stage_dedup_send_ops,
@@ -1401,6 +1408,8 @@ mod relocation_tests {
         let pool = WriteBufferPool::open_with_group_commit_wait(device, Duration::ZERO).unwrap();
         let (miss_tx, miss_rx) = bounded(1);
         let (done_tx, _done_rx) = bounded(1);
+        let miss_route = MissRoute::Fixed(miss_tx);
+        let done_route = DoneRoute::Fixed(done_tx);
         let metrics = Arc::new(EngineMetrics::default());
         let (cleanup_tx, _cleanup_rx) = bounded(1);
         let candidate = crate::dedup::CandidateCache::new(1, 4);
@@ -1410,9 +1419,9 @@ mod relocation_tests {
             BufferFlusher::finish_pending_prepared_batch(
                 0,
                 pending,
-                &miss_tx,
+                &miss_route,
                 &pool,
-                &done_tx,
+                &done_route,
                 &worker_metrics,
                 &cleanup_tx,
                 &candidate,

@@ -13,8 +13,39 @@ pub struct DedupConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Number of dedup worker threads (default 2).
+    /// Each buffer shard has its own flush lane. Total dedup threads = shards × workers.
+    /// Ignored when `shared_pool` is set — see that field.
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// Serve every shard's dedup stage from ONE shared pool of `pool_workers`
+    /// threads instead of `workers` dedicated threads per shard.
+    ///
+    /// WHY: same 638-OS-thread / ~44-core oversubscription motivation as
+    /// `FlushConfig::shared_compress_pool` (see
+    /// `cpu_oversubscription_is_the_real_wake_floor`), but dedup's worker
+    /// loop (`dedup_loop`, `src/buffer/flush/stages/dedup.rs`) is NOT purely
+    /// a routing change like compress was — it reads the shard it was
+    /// spawned for from three places that must be corrected to read the
+    /// *unit's own* `shard_idx` instead when workers become shared:
+    /// (1) the backpressure gate (`pool.pending_count_for_shard`/
+    /// `fill_percentage_for_shard`) — CLAUDE.md documents this as
+    /// per-shard-fill%, not per-worker; (2) `miss_tx`, which must route a
+    /// dedup miss back to the *originating* shard's compress input, not
+    /// whichever shard this worker happened to be spawned for; (3) `done_tx`,
+    /// which must land on the originating shard's `coalesce_loop`
+    /// `in_flight` map — misrouting this silently drops the seq's
+    /// completion and can stall the shutdown drain. `pending_batches`
+    /// (the per-iteration commit pipeline queue) does NOT need to become
+    /// shard-indexed shared state: each queued unit already carries its own
+    /// `shard_idx`, so it stays worker-local as long as (1)-(3) route by
+    /// that field. `false` (default) reproduces today's per-lane behavior
+    /// exactly.
+    #[serde(default)]
+    pub shared_pool: bool,
+    /// Shared pool size when `shared_pool` is set. 0 = a small fixed default
+    /// (8).
+    #[serde(default)]
+    pub pool_workers: usize,
     /// Skip dedup when buffer usage exceeds this percentage (default 90).
     #[serde(default = "default_buffer_skip_threshold_pct")]
     pub buffer_skip_threshold_pct: u8,
@@ -130,6 +161,8 @@ impl Default for DedupConfig {
         Self {
             enabled: default_enabled(),
             workers: default_workers(),
+            shared_pool: false,
+            pool_workers: 0,
             buffer_skip_threshold_pct: default_buffer_skip_threshold_pct(),
             pending_skip_threshold_entries: 0,
             rescan_interval_ms: default_rescan_interval_ms(),

@@ -59,6 +59,66 @@ impl CompressRoute {
     }
 }
 
+/// Where a dedup worker sends a miss (a `CoalesceUnit` that still needs
+/// compression). Same shape as [`CompressRoute`]: `Fixed` is this shard's own
+/// compress input (`DedupConfig::shared_pool = false` — the historical
+/// wiring); `Shared` is for `shared_pool = true`, where a pool worker's next
+/// unit can belong to any shard and must be routed by the unit's own
+/// `shard_idx` to the correct shard's compress input (whether that input
+/// happens to itself be `CompressRoute::Fixed` or `::Shared` underneath is
+/// irrelevant here — this table is built from each shard's resolved
+/// `compress_tx`).
+#[derive(Clone)]
+pub(crate) enum MissRoute {
+    Fixed(Sender<CoalesceUnit>),
+    Shared(Arc<[Sender<CoalesceUnit>]>),
+}
+
+impl MissRoute {
+    fn send(&self, unit: CoalesceUnit) -> Result<(), crossbeam_channel::SendError<CoalesceUnit>> {
+        match self {
+            MissRoute::Fixed(tx) => tx.send(unit),
+            MissRoute::Shared(txs) => txs[unit.shard_idx].send(unit),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            MissRoute::Fixed(tx) => tx.len(),
+            MissRoute::Shared(txs) => txs.first().map(Sender::len).unwrap_or(0),
+        }
+    }
+}
+
+/// Where a dedup worker reports a completed seq batch. `Fixed` is this
+/// shard's own `coalesce_loop` feedback channel (private mode). `Shared` is
+/// for `DedupConfig::shared_pool = true`: a pool worker finishing a unit that
+/// originated on shard N must land on shard N's `coalesce_loop` — that
+/// thread's local `in_flight` map only tracks seqs *it* put in flight, so a
+/// misrouted `done_tx` silently drops the completion and can stall the
+/// shutdown drain. Unlike [`MissRoute`], the caller must pass the
+/// originating `shard_idx` explicitly (`finish_prepared_dedup_unit` has it on
+/// hand via `PreparedDedupUnit.unit.shard_idx`) rather than reading it off
+/// the payload, since `Vec<u64>` carries no shard identity of its own.
+#[derive(Clone)]
+pub(crate) enum DoneRoute {
+    Fixed(Sender<Vec<u64>>),
+    Shared(Arc<[Sender<Vec<u64>>]>),
+}
+
+impl DoneRoute {
+    fn send(
+        &self,
+        shard_idx: usize,
+        seqs: Vec<u64>,
+    ) -> Result<(), crossbeam_channel::SendError<Vec<u64>>> {
+        match self {
+            DoneRoute::Fixed(tx) => tx.send(seqs),
+            DoneRoute::Shared(txs) => txs[shard_idx].send(seqs),
+        }
+    }
+}
+
 pub(crate) const DEFAULT_PACKED_META_BATCH_LBA_LIMIT: usize = 1024;
 
 /// 3-stage flusher pipeline:
@@ -110,6 +170,9 @@ pub struct BufferFlusher {
     /// Non-empty only when `FlushConfig::shared_cleanup_pool` is set —
     /// every lane's `FlusherLane::cleanup_handle` is `None` in that mode.
     shared_cleanup_handles: Vec<JoinHandle<()>>,
+    /// Non-empty only when `DedupConfig::shared_pool` is set — every lane's
+    /// `FlusherLane::dedup_handles` is empty in that mode.
+    shared_dedup_handles: Vec<JoinHandle<()>>,
 }
 
 struct FlusherLane {
