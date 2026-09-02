@@ -1963,6 +1963,26 @@ pub struct UblkConfig {
     /// which keeps the pooling A/B free of a thread-count confound.
     #[serde(default)]
     pub io_workers: usize,
+    /// Number of shared durability-dispatcher threads when `shared_io_workers`
+    /// is set. 0 = a small fixed default (8).
+    ///
+    /// The durability dispatcher (waits for a write's LV2 durability ticket
+    /// before acking it to ublk) stayed ONE PRIVATE THREAD PER QUEUE even
+    /// after `shared_io_workers` made the read/write reply path shared —
+    /// `PendingDurableIo` now carries its own `QueueSinks`, so a shared pool
+    /// can complete on whichever queue an item actually belongs to. This
+    /// matters because the kernel still maps a submitting CPU to exactly one
+    /// hardware queue (the root cause `shared_io_workers` documents above),
+    /// so a private-per-queue dispatcher inherits the same funnel: box
+    /// schedstat sampling (2026-09-02, QD256 j16d16 randrw 70/30) showed
+    /// `ublk-q27-durable` at 6.5 core-seconds of CPU in a 20 s+ window against
+    /// `ublk-q16..q30-durable` at 0.01-0.07 — a >100x skew across queues that
+    /// are otherwise identical. A shared pool spreads dispatch load the same
+    /// way the shared IO worker pool already spreads read/write load.
+    /// `false` (private mode) is unaffected: it still spawns one dispatcher
+    /// per queue, matching pre-existing behavior exactly.
+    #[serde(default)]
+    pub durability_dispatchers: usize,
 }
 
 impl Default for UblkConfig {
@@ -1974,6 +1994,7 @@ impl Default for UblkConfig {
             queue_workers: default_queue_workers(),
             shared_io_workers: default_shared_io_workers(),
             io_workers: 0,
+            durability_dispatchers: 0,
         }
     }
 }

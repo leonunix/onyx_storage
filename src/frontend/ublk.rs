@@ -107,6 +107,11 @@ struct PendingDurableIo {
     queue_wait_ns: u64,
     worker_ns: u64,
     tickets: Vec<BufferAppendTicket>,
+    /// Carried per-item (like `QueuedIo::sinks`) so a durability dispatcher
+    /// pool shared across queues can complete each item on the queue it
+    /// actually belongs to, rather than the dispatcher needing to be that
+    /// queue's own private thread.
+    sinks: Arc<QueueSinks>,
 }
 
 const OPPORTUNISTIC_COMPLETION_DRAIN_MAX: usize = 8;
@@ -516,6 +521,7 @@ fn spawn_io_workers(
                                         queue_wait_ns,
                                         worker_ns,
                                         tickets,
+                                        sinks: sinks.clone(),
                                     })
                                     .is_err()
                                 {
@@ -544,18 +550,25 @@ fn spawn_io_workers(
         .collect()
 }
 
+/// Spawn one durability-dispatcher thread that watches `rx` for writes still
+/// owing an LV2 durability ticket and completes each once durable.
+///
+/// `rx` is private (one queue's own channel) in private-pool mode, or shared
+/// across every queue in shared-pool mode — the dispatcher doesn't need to
+/// know which; each `PendingDurableIo` carries its own `sinks` (the queue it
+/// actually belongs to), so completion always targets the right queue
+/// regardless of how many dispatcher threads are pulling from `rx`.
 fn spawn_durability_dispatcher(
-    qid: u16,
+    name: String,
+    affinity_idx: usize,
     rx: Receiver<PendingDurableIo>,
-    completion_tx: Sender<CompletedIo>,
-    event_fd: RawFd,
 ) -> JoinHandle<()> {
     // Wakes are edge-coalesced: every wake scans all pending durability watermarks.
     let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
     thread::Builder::new()
-        .name(format!("ublk-q{qid}-durable"))
+        .name(name)
         .spawn(move || {
-            crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, qid as usize);
+            crate::affinity::bind_current(crate::affinity::ThreadRole::Ublk, affinity_idx);
             let mut pending = Vec::<PendingDurableIo>::new();
             let mut input_open = true;
             while input_open || !pending.is_empty() {
@@ -613,7 +626,8 @@ fn spawn_durability_dispatcher(
                             worker_ns: item.worker_ns,
                             completed_at: Instant::now(),
                         };
-                        if completion_tx.send(completed).is_err() {
+                        let event_fd = item.sinks.event_fd;
+                        if item.sinks.completion_tx.send(completed).is_err() {
                             return;
                         }
                         eventfd_write(event_fd);
@@ -733,6 +747,29 @@ impl OnyxUblkTarget {
         };
         let shared_tx = shared_pool.as_ref().map(|(tx, _)| tx.clone());
 
+        // Same shared-vs-private split as the IO worker pool above, for the
+        // durability dispatcher: see UblkConfig::durability_dispatchers.
+        let shared_durability_pool = if self.config.shared_io_workers {
+            let total = if self.config.durability_dispatchers > 0 {
+                self.config.durability_dispatchers
+            } else {
+                8
+            };
+            let (tx, rx) = crossbeam_channel::unbounded::<PendingDurableIo>();
+            let handles = (0..total)
+                .map(|i| spawn_durability_dispatcher(format!("ublk-durable-{i}"), i, rx.clone()))
+                .collect::<Vec<_>>();
+            tracing::info!(
+                dispatchers = total,
+                nr_queues,
+                "ublk shared durability dispatcher pool started (every queue served by every dispatcher)"
+            );
+            Some((tx, handles))
+        } else {
+            None
+        };
+        let shared_durability_tx = shared_durability_pool.as_ref().map(|(tx, _)| tx.clone());
+
         let q_handler = move |qid: u16, dev: &UblkDev| {
             crate::affinity::bind_current(
                 crate::affinity::ThreadRole::Ublk,
@@ -742,7 +779,6 @@ impl OnyxUblkTarget {
             let io_bufs = bufs.clone();
             let queue_thread_bound = Rc::new(Cell::new(false));
             let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<CompletedIo>();
-            let (durability_tx, durability_rx) = crossbeam_channel::unbounded::<PendingDurableIo>();
             let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
             if event_fd < 0 {
                 tracing::error!(
@@ -751,8 +787,20 @@ impl OnyxUblkTarget {
                 );
                 return;
             }
-            let durability_handle =
-                spawn_durability_dispatcher(qid, durability_rx, completion_tx.clone(), event_fd);
+            // Shared pool: this queue's items ride the device-wide durability
+            // channel, completed by whichever shared dispatcher picks them up
+            // (via the item's own `sinks`, not this thread's identity).
+            // Private pool: this queue owns its own single dispatcher, exactly
+            // as before `durability_dispatchers` existed.
+            let (durability_tx, private_durability_handle) = match shared_durability_tx.as_ref() {
+                Some(tx) => (tx.clone(), None),
+                None => {
+                    let (tx, rx) = crossbeam_channel::unbounded::<PendingDurableIo>();
+                    let handle =
+                        spawn_durability_dispatcher(format!("ublk-q{qid}-durable"), qid as usize, rx);
+                    (tx, Some(handle))
+                }
+            };
             let sinks = Arc::new(QueueSinks {
                 completion_tx,
                 durability_tx,
@@ -942,9 +990,13 @@ impl OnyxUblkTarget {
                 let _ = handle.join();
             }
             // Last `QueueSinks` reference: releases this queue's durability
-            // sender so its dispatcher can finish.
+            // sender. Private pool: that was the dispatcher's only sender, so
+            // it can now finish. Shared pool: the device-wide pool outlives
+            // every queue and is joined by the caller.
             drop(sinks);
-            let _ = durability_handle.join();
+            if let Some(handle) = private_durability_handle {
+                let _ = handle.join();
+            }
             unsafe {
                 libc::close(event_fd);
             }
@@ -963,8 +1015,14 @@ impl OnyxUblkTarget {
             .map_err(|e| OnyxError::Ublk(format!("ublk run_target failed: {:?}", e)));
 
         // Every queue handler is finished, so the last request senders are gone
-        // with the handler closure; draining the shared pool now is bounded.
+        // with the handler closure; draining the shared pools now is bounded.
         if let Some((tx, handles)) = shared_pool {
+            drop(tx);
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+        if let Some((tx, handles)) = shared_durability_pool {
             drop(tx);
             for handle in handles {
                 let _ = handle.join();
