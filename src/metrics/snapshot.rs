@@ -18,6 +18,18 @@ impl EngineMetrics {
             ublk_read_queue_wait_ns: load(&self.ublk_read_queue_wait_ns),
             ublk_read_worker_ns: load(&self.ublk_read_worker_ns),
             ublk_read_completion_wait_ns: load(&self.ublk_read_completion_wait_ns),
+            ublk_completion_drain_eventfd_calls: load(&self.ublk_completion_drain_eventfd_calls),
+            ublk_completion_drain_eventfd_items: load(&self.ublk_completion_drain_eventfd_items),
+            ublk_completion_drain_eventfd_wait_ns: load(&self.ublk_completion_drain_eventfd_wait_ns),
+            ublk_completion_drain_opportunistic_calls: load(
+                &self.ublk_completion_drain_opportunistic_calls,
+            ),
+            ublk_completion_drain_opportunistic_items: load(
+                &self.ublk_completion_drain_opportunistic_items,
+            ),
+            ublk_completion_drain_opportunistic_wait_ns: load(
+                &self.ublk_completion_drain_opportunistic_wait_ns,
+            ),
             volume_partial_read_ops: load(&self.volume_partial_read_ops),
             volume_write_ops: load(&self.volume_write_ops),
             volume_write_bytes: load(&self.volume_write_bytes),
@@ -655,6 +667,18 @@ pub struct EngineMetricsSnapshot {
     pub ublk_read_queue_wait_ns: u64,
     pub ublk_read_worker_ns: u64,
     pub ublk_read_completion_wait_ns: u64,
+    #[serde(default)]
+    pub ublk_completion_drain_eventfd_calls: u64,
+    #[serde(default)]
+    pub ublk_completion_drain_eventfd_items: u64,
+    #[serde(default)]
+    pub ublk_completion_drain_eventfd_wait_ns: u64,
+    #[serde(default)]
+    pub ublk_completion_drain_opportunistic_calls: u64,
+    #[serde(default)]
+    pub ublk_completion_drain_opportunistic_items: u64,
+    #[serde(default)]
+    pub ublk_completion_drain_opportunistic_wait_ns: u64,
     pub volume_partial_read_ops: u64,
     pub volume_write_ops: u64,
     pub volume_write_bytes: u64,
@@ -1355,6 +1379,12 @@ impl EngineMetricsSnapshot {
             ublk_read_queue_wait_ns,
             ublk_read_worker_ns,
             ublk_read_completion_wait_ns,
+            ublk_completion_drain_eventfd_calls,
+            ublk_completion_drain_eventfd_items,
+            ublk_completion_drain_eventfd_wait_ns,
+            ublk_completion_drain_opportunistic_calls,
+            ublk_completion_drain_opportunistic_items,
+            ublk_completion_drain_opportunistic_wait_ns,
             volume_partial_read_ops,
             volume_write_ops,
             volume_write_bytes,

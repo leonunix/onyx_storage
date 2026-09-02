@@ -273,6 +273,18 @@ pub struct EngineMetrics {
     pub ublk_read_queue_wait_ns: AtomicU64,
     pub ublk_read_worker_ns: AtomicU64,
     pub ublk_read_completion_wait_ns: AtomicU64,
+    /// Split of `ublk_*_completion_wait_ns` by which drain path picked the
+    /// item up: the per-queue eventfd poll firing (full drain, unbounded) vs.
+    /// the opportunistic sweep run before handling a fresh io command (capped
+    /// at `OPPORTUNISTIC_COMPLETION_DRAIN_MAX`). Diagnostic for isolating
+    /// where ublk `completion_wait` time goes; combined across read+write
+    /// since the drain path does not distinguish op type.
+    pub ublk_completion_drain_eventfd_calls: AtomicU64,
+    pub ublk_completion_drain_eventfd_items: AtomicU64,
+    pub ublk_completion_drain_eventfd_wait_ns: AtomicU64,
+    pub ublk_completion_drain_opportunistic_calls: AtomicU64,
+    pub ublk_completion_drain_opportunistic_items: AtomicU64,
+    pub ublk_completion_drain_opportunistic_wait_ns: AtomicU64,
     pub volume_partial_read_ops: AtomicU64,
     pub volume_write_ops: AtomicU64,
     pub volume_write_bytes: AtomicU64,
@@ -1216,6 +1228,31 @@ impl EngineMetrics {
             &self.ublk_write_completion_wait_latency_buckets,
             completion_wait_ns,
         );
+    }
+
+    /// Records one call to the ublk completion drain loop. `items` is how
+    /// many completions it picked up and `wait_ns` is their summed
+    /// `completion_wait_ns`; a call that found nothing is not recorded.
+    pub fn record_ublk_completion_drain(&self, via_eventfd: bool, items: u64, wait_ns: u64) {
+        if items == 0 {
+            return;
+        }
+        let (calls, item_counter, wait_counter) = if via_eventfd {
+            (
+                &self.ublk_completion_drain_eventfd_calls,
+                &self.ublk_completion_drain_eventfd_items,
+                &self.ublk_completion_drain_eventfd_wait_ns,
+            )
+        } else {
+            (
+                &self.ublk_completion_drain_opportunistic_calls,
+                &self.ublk_completion_drain_opportunistic_items,
+                &self.ublk_completion_drain_opportunistic_wait_ns,
+            )
+        };
+        calls.fetch_add(1, Ordering::Relaxed);
+        item_counter.fetch_add(items, Ordering::Relaxed);
+        wait_counter.fetch_add(wait_ns, Ordering::Relaxed);
     }
 
     pub fn record_buffer_append_prepare_ns(&self, ns: u64) {

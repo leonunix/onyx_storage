@@ -1472,6 +1472,16 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "ublk_completion_drain: eventfd_calls={} eventfd_items={} eventfd_wait_ns={} opportunistic_calls={} opportunistic_items={} opportunistic_wait_ns={}",
+            self.metrics.ublk_completion_drain_eventfd_calls,
+            self.metrics.ublk_completion_drain_eventfd_items,
+            self.metrics.ublk_completion_drain_eventfd_wait_ns,
+            self.metrics.ublk_completion_drain_opportunistic_calls,
+            self.metrics.ublk_completion_drain_opportunistic_items,
+            self.metrics.ublk_completion_drain_opportunistic_wait_ns
+        );
+        let _ = writeln!(
+            out,
             "front_write_ns: zone_submit={} zone_worker={} append_total={} append_prepare={} append_order_wait={} append_order_hold={} append_order_wait_max={} append_order_hold_max={} append_log_write={} append_wait_durable={} append_backpressure_wait={} sync_batches={} sync_flushes={} sync_batch_ns={} sync_sleep_ns={} sync_epochs={} ckpt_skipped_epochs={}",
             self.metrics.zone_submit_write_ns,
             self.metrics.zone_worker_write_ns,

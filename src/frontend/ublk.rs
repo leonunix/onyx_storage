@@ -797,6 +797,7 @@ impl OnyxUblkTarget {
                     }
                     let bufs = io_bufs.borrow();
                     let mut completed = 0usize;
+                    let mut wait_sum_ns = 0u64;
                     while let Ok(done) = completion_rx.try_recv() {
                         let completion_wait_ns = done.completed_at.elapsed().as_nanos() as u64;
                         let elapsed_ns = done.elapsed_ns.saturating_add(completion_wait_ns);
@@ -809,6 +810,7 @@ impl OnyxUblkTarget {
                             done.worker_ns,
                             completion_wait_ns,
                         );
+                        wait_sum_ns += completion_wait_ns;
 
                         if let Err(err) = q.complete_io_cmd_unified(
                             done.tag,
@@ -822,6 +824,10 @@ impl OnyxUblkTarget {
                             break;
                         }
                     }
+                    worker_ctx
+                        .zone_manager
+                        .metrics()
+                        .record_ublk_completion_drain(drain_wakeup, completed as u64, wait_sum_ns);
                 };
 
                 if tag == qid && _io.is_tgt_io() {
