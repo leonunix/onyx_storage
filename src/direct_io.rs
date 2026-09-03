@@ -512,7 +512,11 @@ struct SubmitTask {
     server_started: Instant,
     queued_at: Instant,
     pending_tx: Sender<PendingWrite>,
-    outbound_tx: Sender<Outbound>,
+    /// Header-only responses (write acks, errors, close) — the fast lane.
+    ack_tx: Sender<Outbound>,
+    /// Read completions, which carry a 4 KiB payload — see `writer_loop`'s
+    /// doc comment for why these are kept off the ack lane.
+    payload_tx: Sender<Outbound>,
     recycle_tx: Sender<Vec<u8>>,
 }
 
@@ -608,7 +612,10 @@ fn handle_session(
 
     let alive = Arc::new(AtomicBool::new(true));
     let active_ids = Arc::new(Mutex::new(HashSet::<u64>::new()));
-    let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(MAX_DIRECT_IO_OUTSTANDING);
+    // Two lanes so a large read payload in flight can't strand a pending
+    // write ack behind it — see `writer_loop`'s doc comment.
+    let (ack_tx, ack_rx) = crossbeam_channel::bounded(MAX_DIRECT_IO_OUTSTANDING);
+    let (payload_tx, payload_rx) = crossbeam_channel::bounded(MAX_DIRECT_IO_OUTSTANDING);
     let writer_stream = match stream.try_clone() {
         Ok(stream) => stream,
         Err(_) => return,
@@ -620,7 +627,13 @@ fn handle_session(
         .name(format!("direct-io-writer-{session_id}"))
         .spawn(move || {
             bind_direct_io_thread(&writer_cpus, session_id.saturating_mul(3).saturating_add(1));
-            writer_loop(writer_stream, outbound_rx, writer_alive, writer_active_ids)
+            writer_loop(
+                writer_stream,
+                ack_rx,
+                payload_rx,
+                writer_alive,
+                writer_active_ids,
+            )
         });
     let writer_handle = match writer_handle {
         Ok(handle) => handle,
@@ -629,7 +642,7 @@ fn handle_session(
 
     let (pending_tx, pending_rx) = crossbeam_channel::bounded(MAX_DIRECT_IO_OUTSTANDING);
     let (recycle_tx, recycle_rx) = crossbeam_channel::bounded(MAX_DIRECT_IO_OUTSTANDING);
-    let dispatcher_tx = outbound_tx.clone();
+    let dispatcher_tx = ack_tx.clone();
     let dispatcher_alive = alive.clone();
     let dispatcher_shutdown = shutdown.clone();
     let dispatcher_cpus = direct_io_cpus.clone();
@@ -651,7 +664,8 @@ fn handle_session(
         Ok(handle) => handle,
         Err(_) => {
             alive.store(false, Ordering::Release);
-            drop(outbound_tx);
+            drop(ack_tx);
+            drop(payload_tx);
             let _ = writer_handle.join();
             return;
         }
@@ -682,7 +696,7 @@ fn handle_session(
         let server_started = Instant::now();
 
         if header.flags != 0 {
-            send_immediate_error(&outbound_tx, &header, -libc::EINVAL, server_started, false);
+            send_immediate_error(&ack_tx, &header, -libc::EINVAL, server_started, false);
             continue;
         }
         match header.opcode {
@@ -691,7 +705,7 @@ fn handle_session(
                     || header.offset.checked_add(header.io_len as u64).is_none()
                 {
                     send_immediate_error(
-                        &outbound_tx,
+                        &ack_tx,
                         &header,
                         -libc::EINVAL,
                         server_started,
@@ -704,7 +718,7 @@ fn handle_session(
                 if ids.contains(&header.request_id) {
                     drop(ids);
                     send_immediate_error(
-                        &outbound_tx,
+                        &ack_tx,
                         &header,
                         -libc::EALREADY,
                         server_started,
@@ -715,7 +729,7 @@ fn handle_session(
                 if ids.len() >= MAX_DIRECT_IO_OUTSTANDING {
                     drop(ids);
                     send_immediate_error(
-                        &outbound_tx,
+                        &ack_tx,
                         &header,
                         -libc::EAGAIN,
                         server_started,
@@ -728,7 +742,7 @@ fn handle_session(
             OP_CLOSE => {
                 if header.payload_len != 0 || header.io_len != 0 || header.offset != 0 {
                     send_immediate_error(
-                        &outbound_tx,
+                        &ack_tx,
                         &header,
                         -libc::EINVAL,
                         server_started,
@@ -738,7 +752,7 @@ fn handle_session(
                 }
                 if active_ids.lock().unwrap().contains(&header.request_id) {
                     send_immediate_error(
-                        &outbound_tx,
+                        &ack_tx,
                         &header,
                         -libc::EALREADY,
                         server_started,
@@ -750,7 +764,7 @@ fn handle_session(
                 break;
             }
             _ => {
-                send_immediate_error(&outbound_tx, &header, -libc::EPROTO, server_started, false);
+                send_immediate_error(&ack_tx, &header, -libc::EPROTO, server_started, false);
                 break;
             }
         }
@@ -762,7 +776,8 @@ fn handle_session(
             server_started,
             queued_at: Instant::now(),
             pending_tx: pending_tx.clone(),
-            outbound_tx: outbound_tx.clone(),
+            ack_tx: ack_tx.clone(),
+            payload_tx: payload_tx.clone(),
             recycle_tx: recycle_tx.clone(),
         };
         if let Err(error) = submit_tx.send(task) {
@@ -770,7 +785,7 @@ fn handle_session(
             let payload = std::mem::take(&mut task.payload);
             let _ = task.recycle_tx.try_send(payload);
             send_immediate_error(
-                &task.outbound_tx,
+                &task.ack_tx,
                 &task.header,
                 -libc::ESHUTDOWN,
                 task.server_started,
@@ -786,7 +801,7 @@ fn handle_session(
     }
 
     if let Some((request_id, started)) = close_request {
-        let _ = outbound_tx.send(Outbound {
+        let _ = ack_tx.send(Outbound {
             header: response(
                 OP_CLOSE,
                 request_id,
@@ -801,7 +816,8 @@ fn handle_session(
             clear_active_id: false,
         });
     }
-    drop(outbound_tx);
+    drop(ack_tx);
+    drop(payload_tx);
     if let Err(error) = writer_handle.join() {
         tracing::error!(?error, "direct IO writer panicked");
     }
@@ -859,7 +875,7 @@ fn handle_submit_write(mut task: SubmitTask, submit_queue_ns: u64) {
         let payload = std::mem::take(&mut task.payload);
         let _ = task.recycle_tx.try_send(payload);
         send_timed_error(
-            &task.outbound_tx,
+            &task.ack_tx,
             &header,
             -libc::EINVAL,
             task.server_started,
@@ -895,7 +911,7 @@ fn handle_submit_write(mut task: SubmitTask, submit_queue_ns: u64) {
             if let Err(error) = task.pending_tx.send(pending) {
                 error.0.ticket.abandon();
                 send_timed_error(
-                    &task.outbound_tx,
+                    &task.ack_tx,
                     &header,
                     -libc::ESHUTDOWN,
                     task.server_started,
@@ -906,7 +922,7 @@ fn handle_submit_write(mut task: SubmitTask, submit_queue_ns: u64) {
             }
         }
         Err(error) => send_timed_error(
-            &task.outbound_tx,
+            &task.ack_tx,
             &header,
             status_from_error(&error),
             task.server_started,
@@ -929,7 +945,7 @@ fn handle_submit_read(mut task: SubmitTask, submit_queue_ns: u64) {
         let payload = std::mem::take(&mut task.payload);
         let _ = task.recycle_tx.try_send(payload);
         send_timed_error(
-            &task.outbound_tx,
+            &task.ack_tx,
             &header,
             -libc::EINVAL,
             task.server_started,
@@ -947,7 +963,7 @@ fn handle_submit_read(mut task: SubmitTask, submit_queue_ns: u64) {
     match task.volume.read_into(header.offset, &mut data) {
         Ok(()) => {
             let engine_submit_ns = submit_started.elapsed().as_nanos() as u64;
-            let _ = task.outbound_tx.send(Outbound {
+            let _ = task.payload_tx.send(Outbound {
                 header: response(
                     OP_READ,
                     header.request_id,
@@ -965,7 +981,7 @@ fn handle_submit_read(mut task: SubmitTask, submit_queue_ns: u64) {
         Err(error) => {
             let engine_submit_ns = submit_started.elapsed().as_nanos() as u64;
             send_timed_error(
-                &task.outbound_tx,
+                &task.ack_tx,
                 &header,
                 status_from_error(&error),
                 task.server_started,
@@ -1112,23 +1128,108 @@ fn arm_pending(item: PendingWrite, wake_tx: &Sender<()>, pending: &mut Vec<Pendi
     pending.push(item);
 }
 
+/// Writes one response and clears its `active_ids` entry. Returns `false` on
+/// a write failure, at which point the caller must stop (the session is
+/// being torn down).
+fn write_and_clear(
+    stream: &mut UnixStream,
+    outbound: Outbound,
+    alive: &AtomicBool,
+    active_ids: &Mutex<HashSet<u64>>,
+) -> bool {
+    let request_id = outbound.header.request_id;
+    let clear_active_id = outbound.clear_active_id;
+    if write_response(stream, &outbound).is_err() {
+        alive.store(false, Ordering::Release);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return false;
+    }
+    if clear_active_id {
+        active_ids.lock().unwrap().remove(&request_id);
+    }
+    true
+}
+
+/// Drains `ack` (header-only: write completions, errors, close) ahead of
+/// `payload` (read completions, which carry a 4 KiB body) whenever both are
+/// ready.
+///
+/// Both lanes funnel into ONE socket via one thread, so without this split a
+/// read's payload write — several times the byte count of an ack — can sit
+/// ahead of an already-ready write ack in strict arrival order. That ack is
+/// what lets the CLIENT reuse the fio slot the completed write occupied,
+/// so delaying it throttles the client's effective queue depth on every
+/// write in flight behind a read, not just its own latency. This only shows
+/// up under a mixed read+write workload — measured on nvme-box at QD1024:
+/// pure read and pure write each matched ublk, but randrw 70/30 lagged it
+/// ~1.7x before this split (see memory `direct_io_diverges_from_ublk_above_qd256`).
 fn writer_loop(
     mut stream: UnixStream,
-    input: Receiver<Outbound>,
+    ack_rx: Receiver<Outbound>,
+    payload_rx: Receiver<Outbound>,
     alive: Arc<AtomicBool>,
     active_ids: Arc<Mutex<HashSet<u64>>>,
 ) {
     let _ = stream.set_write_timeout(Some(IO_WRITE_TIMEOUT));
-    while let Ok(outbound) = input.recv() {
-        let request_id = outbound.header.request_id;
-        let clear_active_id = outbound.clear_active_id;
-        if write_response(&mut stream, &outbound).is_err() {
-            alive.store(false, Ordering::Release);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            break;
+    let mut ack_open = true;
+    let mut payload_open = true;
+    loop {
+        let mut drained_ack = false;
+        loop {
+            match ack_rx.try_recv() {
+                Ok(outbound) => {
+                    drained_ack = true;
+                    if !write_and_clear(&mut stream, outbound, &alive, &active_ids) {
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    ack_open = false;
+                    break;
+                }
+            }
         }
-        if clear_active_id {
-            active_ids.lock().unwrap().remove(&request_id);
+        if drained_ack {
+            continue;
+        }
+
+        match (ack_open, payload_open) {
+            (false, false) => return,
+            (true, false) => match ack_rx.recv() {
+                Ok(outbound) => {
+                    if !write_and_clear(&mut stream, outbound, &alive, &active_ids) {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            },
+            (false, true) => match payload_rx.recv() {
+                Ok(outbound) => {
+                    if !write_and_clear(&mut stream, outbound, &alive, &active_ids) {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            },
+            (true, true) => crossbeam_channel::select! {
+                recv(ack_rx) -> outbound => match outbound {
+                    Ok(outbound) => {
+                        if !write_and_clear(&mut stream, outbound, &alive, &active_ids) {
+                            return;
+                        }
+                    }
+                    Err(_) => ack_open = false,
+                },
+                recv(payload_rx) -> outbound => match outbound {
+                    Ok(outbound) => {
+                        if !write_and_clear(&mut stream, outbound, &alive, &active_ids) {
+                            return;
+                        }
+                    }
+                    Err(_) => payload_open = false,
+                },
+            },
         }
     }
 }
