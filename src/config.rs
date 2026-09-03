@@ -2555,6 +2555,21 @@ pub struct ServiceConfig {
     /// service restart.
     #[serde(default)]
     pub direct_io_cpus: String,
+    /// Override the direct-IO submit pool's thread count (shared-pool mode
+    /// only — see `direct_io::SubmitLanes::start`). 0 (default) preserves
+    /// the historical behavior of sizing this pool identically to the
+    /// unrelated ublk-frontend pool (`ublk.nr_queues * ublk.queue_workers`,
+    /// 128 on the canonical box config) — this pool serves the separate
+    /// `<socket>.io` benchmark IPC protocol (`onyx-fio-engine`/
+    /// `engine_bench`), not real ublk block IO, and a pure-ublk fio run
+    /// never connects to it (`cpu_oversubscription_is_the_real_wake_floor`
+    /// memory flagged these 128 threads as a candidate idle-thread-count
+    /// contributor worth measuring directly rather than assuming). Set to a
+    /// smaller value (e.g. 32) to A/B whether this idle pool's thread count
+    /// actually affects the 44-core scheduling contention measured for the
+    /// engine's other thread groups.
+    #[serde(default)]
+    pub direct_io_workers: usize,
 }
 
 impl ServiceConfig {
@@ -2573,6 +2588,7 @@ impl Default for ServiceConfig {
         Self {
             socket_path: default_socket_path(),
             direct_io_cpus: String::new(),
+            direct_io_workers: 0,
         }
     }
 }

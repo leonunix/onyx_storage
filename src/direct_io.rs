@@ -225,6 +225,7 @@ fn bind_direct_io_thread(cpus: &[usize], ordinal: usize) {
 struct SubmitLanes {
     senders: Arc<Vec<Sender<SubmitTask>>>,
     worker_handles: Vec<JoinHandle<()>>,
+    workers_per_lane: usize,
 }
 
 impl SubmitLanes {
@@ -239,15 +240,20 @@ impl SubmitLanes {
         nr_queues: usize,
         queue_workers: usize,
         shared: bool,
+        submit_workers_override: Option<usize>,
         direct_io_cpus: Arc<Vec<usize>>,
     ) -> io::Result<Self> {
         let lanes = if shared { 1 } else { nr_queues };
         let sessions_per_lane = MAX_DIRECT_IO_SESSIONS.div_ceil(lanes);
         let lane_capacity = MAX_DIRECT_IO_OUTSTANDING.saturating_mul(sessions_per_lane.max(1));
-        let workers_per_lane = if shared {
-            nr_queues.saturating_mul(queue_workers)
-        } else {
-            queue_workers
+        // `submit_workers_override` only applies in shared mode, where the
+        // whole pool is one number by construction (`lanes == 1`) — see
+        // `ServiceConfig::direct_io_workers`'s doc comment for why this
+        // pool's size is being decoupled from `nr_queues * queue_workers`.
+        let workers_per_lane = match (shared, submit_workers_override) {
+            (true, Some(override_count)) => override_count.max(1),
+            (true, None) => nr_queues.saturating_mul(queue_workers),
+            (false, _) => queue_workers,
         };
         let mut senders = Vec::with_capacity(lanes);
         let mut worker_handles = Vec::with_capacity(lanes.saturating_mul(workers_per_lane));
@@ -286,6 +292,7 @@ impl SubmitLanes {
         Ok(Self {
             senders: Arc::new(senders),
             worker_handles,
+            workers_per_lane,
         })
     }
 
@@ -315,6 +322,7 @@ impl DirectIoServer {
         nr_queues: usize,
         queue_workers: usize,
         shared_submit_pool: bool,
+        submit_workers_override: Option<usize>,
         direct_io_cpus: Vec<usize>,
     ) -> io::Result<Self> {
         let nr_queues = nr_queues.max(1);
@@ -336,6 +344,7 @@ impl DirectIoServer {
             nr_queues,
             queue_workers,
             shared_submit_pool,
+            submit_workers_override,
             direct_io_cpus.clone(),
         )?;
         let lane_senders = submit_lanes.senders.clone();
@@ -365,8 +374,8 @@ impl DirectIoServer {
 
         tracing::info!(
             path = %socket_path.display(),
-            submit_lanes = nr_queues,
-            workers_per_lane = queue_workers,
+            submit_lanes = submit_lanes.senders.len(),
+            workers_per_lane = submit_lanes.workers_per_lane,
             direct_io_cpus = ?logged_direct_io_cpus,
             "direct IO socket listening"
         );
@@ -1311,7 +1320,7 @@ mod tests {
         let control_path = dir.path().join("control.sock");
         let engine = Arc::new(ArcSwap::from_pointee(None::<OnyxEngine>));
         let mut server =
-            DirectIoServer::start(&control_path, engine, 2, 3, true, Vec::new()).unwrap();
+            DirectIoServer::start(&control_path, engine, 2, 3, true, None, Vec::new()).unwrap();
 
         let mut client = UnixStream::connect(server.socket_path()).unwrap();
         let volume = b"test-volume";
