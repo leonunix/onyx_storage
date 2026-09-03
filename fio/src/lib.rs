@@ -92,6 +92,71 @@ struct Slot {
     opcode: u16,
 }
 
+/// Per-opcode accumulation of the server-side stage timings every response
+/// already carries (`ResponseHeader`'s last five fields) — computed once per
+/// IO on the engine side and otherwise thrown away by `collect_one`. Mean +
+/// max only (no percentiles): enough to see which stage dominates without a
+/// histogram allocation per response.
+#[derive(Clone, Copy, Default)]
+struct LatencyAccum {
+    count: u64,
+    server_total_ns: u64,
+    submit_queue_ns: u64,
+    engine_submit_ns: u64,
+    durable_wait_ns: u64,
+    completion_dispatch_ns: u64,
+    server_total_max: u64,
+    submit_queue_max: u64,
+    engine_submit_max: u64,
+    durable_wait_max: u64,
+    completion_dispatch_max: u64,
+}
+
+impl LatencyAccum {
+    fn record(
+        &mut self,
+        server_total: u64,
+        submit_queue: u64,
+        engine_submit: u64,
+        durable_wait: u64,
+        completion_dispatch: u64,
+    ) {
+        self.count += 1;
+        self.server_total_ns += server_total;
+        self.submit_queue_ns += submit_queue;
+        self.engine_submit_ns += engine_submit;
+        self.durable_wait_ns += durable_wait;
+        self.completion_dispatch_ns += completion_dispatch;
+        self.server_total_max = self.server_total_max.max(server_total);
+        self.submit_queue_max = self.submit_queue_max.max(submit_queue);
+        self.engine_submit_max = self.engine_submit_max.max(engine_submit);
+        self.durable_wait_max = self.durable_wait_max.max(durable_wait);
+        self.completion_dispatch_max = self.completion_dispatch_max.max(completion_dispatch);
+    }
+
+    fn log(&self, label: &str) {
+        if self.count == 0 {
+            return;
+        }
+        let n = self.count as f64;
+        eprintln!(
+            "onyx-stage {label} n={} total_ns avg={:.0} max={} queue_ns avg={:.0} max={} \
+             engine_ns avg={:.0} max={} durable_ns avg={:.0} max={} dispatch_ns avg={:.0} max={}",
+            self.count,
+            self.server_total_ns as f64 / n,
+            self.server_total_max,
+            self.submit_queue_ns as f64 / n,
+            self.submit_queue_max,
+            self.engine_submit_ns as f64 / n,
+            self.engine_submit_max,
+            self.durable_wait_ns as f64 / n,
+            self.durable_wait_max,
+            self.completion_dispatch_ns as f64 / n,
+            self.completion_dispatch_max,
+        );
+    }
+}
+
 struct Client {
     stream: UnixStream,
     next_id: u64,
@@ -109,6 +174,8 @@ struct Client {
     /// partial-write bookkeeping is easy to get silently wrong in a measurement
     /// tool, so the contiguous buffer + `write_all` is the deliberate choice.
     pending: Vec<u8>,
+    read_stats: LatencyAccum,
+    write_stats: LatencyAccum,
 }
 
 fn request(opcode: u16, payload_len: u32, id: u64, offset: u64, len: u32) -> [u8; REQUEST_LEN] {
@@ -148,6 +215,8 @@ impl Client {
             slots: [Slot::default(); MAX_DEPTH],
             completed: Vec::with_capacity(depth),
             pending: Vec::with_capacity(depth * (REQUEST_LEN + BLOCK_SIZE as usize)),
+            read_stats: LatencyAccum::default(),
+            write_stats: LatencyAccum::default(),
         })
     }
 
@@ -217,6 +286,18 @@ impl Client {
             let payload = unsafe { std::slice::from_raw_parts_mut(slot.buffer, payload_len as usize) };
             self.stream.read_exact(payload).map_err(|e| errno(&e))?;
         }
+        let accum = match slot.opcode {
+            OP_READ => &mut self.read_stats,
+            OP_WRITE => &mut self.write_stats,
+            _ => unreachable!("only read/write slots are tracked"),
+        };
+        accum.record(
+            u64_at(&response, 32),
+            u64_at(&response, 40),
+            u64_at(&response, 48),
+            u64_at(&response, 56),
+            u64_at(&response, 64),
+        );
         self.slots[index] = Slot::default();
         self.completed.push(slot.io_u);
         Ok(())
@@ -294,6 +375,8 @@ pub unsafe extern "C" fn onyx_rs_cleanup(client: *mut c_void) {
     let mut client = unsafe { Box::from_raw(client.cast::<Client>()) };
     let close = request(OP_CLOSE, 0, client.next_id, 0, 0);
     let _ = client.stream.write_all(&close);
+    client.read_stats.log("read");
+    client.write_stats.log("write");
 }
 
 mod libc_errno {
@@ -342,6 +425,8 @@ mod tests {
             slots: [Slot::default(); MAX_DEPTH],
             completed: Vec::new(),
             pending: Vec::new(),
+            read_stats: LatencyAccum::default(),
+            write_stats: LatencyAccum::default(),
         };
         let mut payload = [0xABu8; BLOCK_SIZE as usize];
         payload[0] = 0x5A;
