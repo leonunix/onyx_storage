@@ -12,6 +12,20 @@ const RESPONSE_LEN: usize = 96;
 /// Offset of `RequestHeader::client_submit_ns`, patched into an already-staged
 /// header by `commit()`. See `Client::commit`.
 const REQUEST_SUBMIT_NS_AT: usize = 40;
+/// Largest single response frame: header plus a full read payload.
+const MAX_FRAME: usize = RESPONSE_LEN + BLOCK_SIZE as usize;
+/// Receive buffer, sized so one `read(2)` can deliver many completions.
+///
+/// The reap loop used to cost THREE syscalls per completion — `poll`, then
+/// `read_exact` for the 96-byte header, then `read_exact` for the 4 KiB
+/// payload — and each fio job is a single thread doing that serially for every
+/// response it has outstanding. That showed up in the protocol's own ledger as
+/// `egress_ns` (server `write` -> client finished reading) becoming the largest
+/// segment of the round trip once the server side stopped being the wall.
+/// Reading into a buffer this size amortises the syscalls over up to 64
+/// completions at the cost of one 4 KiB memcpy each, which is ~150 ns against
+/// ~2 us for a syscall.
+const RX_CAPACITY: usize = 64 * MAX_FRAME;
 const BLOCK_SIZE: u32 = 4096;
 const MAX_DEPTH: usize = 256;
 const OP_HELLO: u16 = 1;
@@ -289,6 +303,16 @@ struct Client {
     getevents_calls: u64,
     getevents_wall_ns: u64,
     lifetime_start: Option<Instant>,
+    /// Responses read from the socket but not yet handed to fio. Persists
+    /// ACROSS `getevents` calls, which is what lets a `read` that lands a
+    /// partial frame simply return instead of blocking mid-frame.
+    rx: Vec<u8>,
+    rx_head: usize,
+    rx_tail: usize,
+    /// How many complete responses each `read(2)` delivered — the direct
+    /// read-out of whether the buffering is doing anything.
+    fills: u64,
+    filled_frames: u64,
 }
 
 fn request(opcode: u16, payload_len: u32, id: u64, offset: u64, len: u32) -> [u8; REQUEST_LEN] {
@@ -337,6 +361,11 @@ impl Client {
             getevents_calls: 0,
             getevents_wall_ns: 0,
             lifetime_start: Some(Instant::now()),
+            rx: vec![0; RX_CAPACITY],
+            rx_head: 0,
+            rx_tail: 0,
+            fills: 0,
+            filled_frames: 0,
         })
     }
 
@@ -424,8 +453,56 @@ impl Client {
         result
     }
 
-    fn collect_one(&mut self) -> Result<(), c_int> {
-        let response = Self::read_header(&mut self.stream).map_err(|e| errno(&e))?;
+    /// Bytes read from the socket but not yet consumed.
+    fn rx_len(&self) -> usize {
+        self.rx_tail - self.rx_head
+    }
+
+    /// Total length of the response at the head of the buffer, once enough of
+    /// it has arrived to know. `None` means "read more first".
+    fn framed_len(&self) -> Option<usize> {
+        if self.rx_len() < RESPONSE_LEN {
+            return None;
+        }
+        let payload_len = u32_at(&self.rx[self.rx_head..], 28) as usize;
+        let total = RESPONSE_LEN + payload_len;
+        (self.rx_len() >= total).then_some(total)
+    }
+
+    /// One `read(2)` into the tail of the buffer. `Ok(false)` is EOF.
+    ///
+    /// Compaction keeps at least one whole frame of room at the tail, so a
+    /// single read can never be starved into making no progress.
+    fn fill(&mut self) -> Result<bool, c_int> {
+        if self.rx_head == self.rx_tail {
+            self.rx_head = 0;
+            self.rx_tail = 0;
+        } else if self.rx.len() - self.rx_tail < MAX_FRAME {
+            self.rx.copy_within(self.rx_head..self.rx_tail, 0);
+            self.rx_tail -= self.rx_head;
+            self.rx_head = 0;
+        }
+        let read = self
+            .stream
+            .read(&mut self.rx[self.rx_tail..])
+            .map_err(|e| errno(&e))?;
+        if read == 0 {
+            return Ok(false);
+        }
+        self.rx_tail += read;
+        self.fills += 1;
+        Ok(true)
+    }
+
+    /// Consumes exactly one complete response of `total` bytes from the head
+    /// of the buffer.
+    fn collect_framed(&mut self, total: usize) -> Result<(), c_int> {
+        let at = self.rx_head;
+        let mut response = [0u8; RESPONSE_LEN];
+        response.copy_from_slice(&self.rx[at..at + RESPONSE_LEN]);
+        if &response[0..4] != MAGIC || u16_at(&response, 4) != VERSION {
+            return Err(libc_errno::EPROTO);
+        }
         let id = u64_at(&response, 16);
         let index = id as usize % self.depth;
         let slot = self.slots[index];
@@ -434,14 +511,23 @@ impl Client {
         }
         let status = i32::from_le_bytes(response[8..12].try_into().unwrap());
         let bytes = u32_at(&response, 24);
-        let payload_len = u32_at(&response, 28);
-        if status < 0 || bytes != slot.len { return Err(if status < 0 { -status } else { libc_errno::EIO }); }
-        if payload_len != 0 {
-            if slot.opcode != OP_READ || payload_len != slot.len { return Err(libc_errno::EPROTO); }
-            let payload = unsafe { std::slice::from_raw_parts_mut(slot.buffer, payload_len as usize) };
-            self.stream.read_exact(payload).map_err(|e| errno(&e))?;
+        let payload_len = u32_at(&response, 28) as usize;
+        if status < 0 || bytes != slot.len {
+            return Err(if status < 0 { -status } else { libc_errno::EIO });
         }
-        // Taken AFTER the payload read so `egress_ns` covers the whole return
+        if payload_len != 0 {
+            if slot.opcode != OP_READ || payload_len != slot.len as usize {
+                return Err(libc_errno::EPROTO);
+            }
+            // SAFETY: `slot.buffer` is fio's io_u buffer for this request and
+            // is `slot.len` bytes, checked equal to `payload_len` above.
+            let target = unsafe { std::slice::from_raw_parts_mut(slot.buffer, payload_len) };
+            target.copy_from_slice(&self.rx[at + RESPONSE_LEN..at + total]);
+        }
+        self.rx_head += total;
+        self.filled_frames += 1;
+
+        // Taken AFTER the payload copy so `egress_ns` covers the whole return
         // trip the client actually waited on, header and body alike.
         let server_send_ns = u64_at(&response, 88);
         let sample = StageSample {
@@ -508,32 +594,51 @@ pub unsafe extern "C" fn onyx_rs_getevents(client: *mut c_void, min: u32, max: u
     client.completed.clear();
     let fd = client.stream.as_raw_fd();
     let block_ms = timeout_ms(timeout);
+    let mut failed = None;
     while client.completed.len() < max as usize {
+        // Drain whatever is already buffered before touching the socket: one
+        // `read` typically lands several completions, and paying `poll` per
+        // completion is what made the reap loop the wall.
+        if let Some(total) = client.framed_len() {
+            if let Err(code) = client.collect_framed(total) {
+                failed = Some(code);
+                break;
+            }
+            continue;
+        }
         // Below `min` we may wait out fio's timeout; at or above it we may only
-        // reap what has already arrived and must never block.
+        // reap what has already arrived and must never block. A partial frame
+        // left in the buffer here is fine — it survives to the next call.
         let wait = if client.completed.len() >= min as usize { 0 } else { block_ms };
         match wait_readable(fd, wait) {
             Ok(true) => {}
             Ok(false) => break,
             Err(code) => {
-                client.getevents_calls += 1;
-                client.getevents_wall_ns += call_started.elapsed().as_nanos() as u64;
-                return -code;
+                failed = Some(code);
+                break;
             }
         }
-        match client.collect_one() {
-            Ok(()) => {}
+        match client.fill() {
+            Ok(true) => {}
+            Ok(false) => {
+                failed = Some(libc_errno::EIO);
+                break;
+            }
             Err(code) if code == libc_errno::EAGAIN || code == libc_errno::EWOULDBLOCK => break,
             Err(code) => {
-                client.getevents_calls += 1;
-                client.getevents_wall_ns += call_started.elapsed().as_nanos() as u64;
-                return -code;
+                failed = Some(code);
+                break;
             }
         }
     }
     client.getevents_calls += 1;
     client.getevents_wall_ns += call_started.elapsed().as_nanos() as u64;
-    client.completed.len() as c_int
+    match failed {
+        // Completions already reaped in this call must still be reported;
+        // dropping them on the way out is how fio loses io_us.
+        Some(code) if client.completed.is_empty() => -code,
+        _ => client.completed.len() as c_int,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -567,6 +672,14 @@ pub unsafe extern "C" fn onyx_rs_cleanup(client: *mut c_void) {
             client.depth_max,
         );
     }
+    if client.fills > 0 {
+        eprintln!(
+            "onyx-stage reap fills={} frames={} frames_per_read={:.2}",
+            client.fills,
+            client.filled_frames,
+            client.filled_frames as f64 / client.fills as f64,
+        );
+    }
     if let Some(start) = client.lifetime_start {
         let lifetime_ns = start.elapsed().as_nanos() as u64;
         let pct = if lifetime_ns > 0 {
@@ -595,6 +708,43 @@ mod libc_errno {
 mod tests {
     use super::*;
 
+    fn test_client(stream: UnixStream, depth: usize) -> Client {
+        Client {
+            stream,
+            next_id: 2,
+            depth,
+            slots: [Slot::default(); MAX_DEPTH],
+            completed: Vec::new(),
+            pending: Vec::new(),
+            read_stats: LatencyAccum::default(),
+            write_stats: LatencyAccum::default(),
+            depth_sum: 0,
+            depth_samples: 0,
+            depth_max: 0,
+            staged: Vec::new(),
+            getevents_calls: 0,
+            getevents_wall_ns: 0,
+            lifetime_start: None,
+            rx: vec![0; RX_CAPACITY],
+            rx_head: 0,
+            rx_tail: 0,
+            fills: 0,
+            filled_frames: 0,
+        }
+    }
+
+    /// Minimal well-formed response frame, matching the server's encoding.
+    fn response_frame(opcode: u16, id: u64, bytes: u32, payload_len: u32) -> Vec<u8> {
+        let mut frame = vec![0u8; RESPONSE_LEN + payload_len as usize];
+        frame[0..4].copy_from_slice(MAGIC);
+        frame[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        frame[6..8].copy_from_slice(&opcode.to_le_bytes());
+        frame[16..24].copy_from_slice(&id.to_le_bytes());
+        frame[24..28].copy_from_slice(&bytes.to_le_bytes());
+        frame[28..32].copy_from_slice(&payload_len.to_le_bytes());
+        frame
+    }
+
     /// `poll(2)` semantics, and the reason `set_read_timeout` could not be used:
     /// Rust rejects a zero `Duration` outright, so the old "don't block" path
     /// errored and discarded already-collected events.
@@ -620,23 +770,7 @@ mod tests {
     #[test]
     fn queue_stages_header_then_payload_and_commit_drains() {
         let (a, mut b) = UnixStream::pair().unwrap();
-        let mut client = Client {
-            stream: a,
-            next_id: 2,
-            depth: 4,
-            slots: [Slot::default(); MAX_DEPTH],
-            completed: Vec::new(),
-            pending: Vec::new(),
-            read_stats: LatencyAccum::default(),
-            write_stats: LatencyAccum::default(),
-            depth_sum: 0,
-            depth_samples: 0,
-            depth_max: 0,
-            staged: Vec::new(),
-            getevents_calls: 0,
-            getevents_wall_ns: 0,
-            lifetime_start: None,
-        };
+        let mut client = test_client(a, 4);
         let mut payload = [0xABu8; BLOCK_SIZE as usize];
         payload[0] = 0x5A;
         let io_u = 0x1000usize as *mut c_void;
@@ -700,6 +834,74 @@ mod tests {
         assert_eq!(u32_at(&encoded, 32), 4096);
         assert_eq!(&encoded[36..40], &[0; 4], "reserved must stay zero");
         assert_eq!(u64_at(&encoded, REQUEST_SUBMIT_NS_AT), 0);
+    }
+
+    /// The point of the receive buffer: ONE `read(2)` must be able to deliver
+    /// several completions. The old loop paid `poll` + two `read_exact` calls
+    /// per completion, and with each fio job reaping serially for every request
+    /// it has outstanding that cost showed up as `egress_ns`.
+    #[test]
+    fn one_read_reaps_every_response_the_server_batched() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut client = test_client(a, 8);
+
+        // Three write completions the server wrote back to back.
+        let mut wire = Vec::new();
+        for id in 2u64..5 {
+            let index = id as usize % client.depth;
+            client.slots[index] = Slot {
+                id,
+                io_u: (0x1000 + id as usize) as *mut c_void,
+                buffer: ptr::null_mut(),
+                len: BLOCK_SIZE,
+                opcode: OP_WRITE,
+                queued_at: Some(Instant::now()),
+                stage_delay_ns: 0,
+            };
+            wire.extend_from_slice(&response_frame(OP_WRITE, id, BLOCK_SIZE, 0));
+        }
+        b.write_all(&wire).unwrap();
+
+        assert!(client.fill().unwrap(), "one read takes all three frames");
+        assert_eq!(client.fills, 1);
+        for _ in 0..3 {
+            let total = client.framed_len().expect("a whole frame is buffered");
+            client.collect_framed(total).unwrap();
+        }
+        assert_eq!(client.filled_frames, 3, "three completions from ONE read");
+        assert_eq!(client.completed.len(), 3);
+        assert_eq!(client.framed_len(), None, "buffer fully consumed");
+        assert_eq!(client.rx_len(), 0);
+    }
+
+    /// A frame split across two reads must not be mistaken for a whole one,
+    /// and the partial must survive to the next read.
+    #[test]
+    fn a_partial_frame_waits_for_the_rest() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut client = test_client(a, 8);
+        let id = 2u64;
+        client.slots[id as usize % client.depth] = Slot {
+            id,
+            io_u: 0x2000usize as *mut c_void,
+            buffer: ptr::null_mut(),
+            len: BLOCK_SIZE,
+            opcode: OP_WRITE,
+            queued_at: Some(Instant::now()),
+            stage_delay_ns: 0,
+        };
+        let frame = response_frame(OP_WRITE, id, BLOCK_SIZE, 0);
+
+        b.write_all(&frame[..RESPONSE_LEN - 8]).unwrap();
+        client.fill().unwrap();
+        assert_eq!(client.framed_len(), None, "a short header is not a frame");
+
+        b.write_all(&frame[RESPONSE_LEN - 8..]).unwrap();
+        client.fill().unwrap();
+        let total = client.framed_len().expect("the rest arrived");
+        assert_eq!(total, RESPONSE_LEN);
+        client.collect_framed(total).unwrap();
+        assert_eq!(client.completed.len(), 1);
     }
 
     /// The stamp is only comparable against the server's because both read the
