@@ -35,3 +35,4 @@ pub mod ffi;
 pub mod service;
 pub mod signal;
 pub mod volume;
+pub mod worker_queue;

@@ -27,7 +27,7 @@ fio --name=onyx-randwrite \
 
 `onyx_socket` is the control-socket path; the plugin appends `.io`. `size` is
 required because this is a diskless engine and fio cannot discover the volume
-size through protocol version 1.
+size through protocol version 2.
 
 Current protocol constraints:
 
@@ -37,3 +37,34 @@ Current protocol constraints:
 - `iodepth` is limited to 256 per job by the server protocol.
 - `numjobs` creates one independent Direct IO session per job (server maximum:
   64 sessions).
+- The plugin and the engine must be built from the same tree. Protocol version
+  2 changed both header sizes, so a stale `.so` against a new engine (or the
+  reverse) fails at `HELLO` with `EPROTO` rather than reporting wrong numbers.
+
+## The `onyx-stage` latency ledger
+
+At job cleanup each session prints one line per direction to stderr:
+
+```
+onyx-stage write n=… accounted=…% rtt_ns … stage_ns … intake_ns … total_ns …
+  resp_queue_ns … egress_ns … [within total] queue_ns … engine_ns … durable_ns … dispatch_ns …
+```
+
+`stage` / `intake` / `total` / `resp_queue` / `egress` are disjoint and span
+the whole round trip, in the order an IO walks them:
+
+| segment | window | measured by |
+|---|---|---|
+| `stage` | `queue()` staged it -> `commit()` wrote it | client `Instant` |
+| `intake` | client `write` -> server finished reading the request | client stamp vs server `CLOCK_MONOTONIC` |
+| `total` | request read -> response built | server `Instant` |
+| `resp_queue` | response built -> writer thread's `write` | server `Instant` |
+| `egress` | server `write` -> client finished reading the response | server stamp vs client `CLOCK_MONOTONIC` |
+
+`accounted` is their sum over `rtt`, and it is the number to read first: the
+breakdown is only trustworthy at ~100%. `queue` / `engine` / `durable` /
+`dispatch` subdivide `total` and must not be added on top of it.
+
+`intake` and `egress` need both processes on one machine, since they difference
+two `CLOCK_MONOTONIC` readings taken in different processes. They report 0
+rather than a fabricated value when that does not hold.

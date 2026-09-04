@@ -3,11 +3,15 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::ptr;
+use std::time::Instant;
 
 const MAGIC: &[u8; 4] = b"ONIO";
-const VERSION: u16 = 1;
-const REQUEST_LEN: usize = 40;
-const RESPONSE_LEN: usize = 72;
+const VERSION: u16 = 2;
+const REQUEST_LEN: usize = 48;
+const RESPONSE_LEN: usize = 96;
+/// Offset of `RequestHeader::client_submit_ns`, patched into an already-staged
+/// header by `commit()`. See `Client::commit`.
+const REQUEST_SUBMIT_NS_AT: usize = 40;
 const BLOCK_SIZE: u32 = 4096;
 const MAX_DEPTH: usize = 256;
 const OP_HELLO: u16 = 1;
@@ -35,8 +39,29 @@ struct PollFd {
     revents: i16,
 }
 
+const CLOCK_MONOTONIC: c_int = 1;
+
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: std::ffi::c_ulong, timeout: c_int) -> c_int;
+    fn clock_gettime(clk_id: c_int, tp: *mut Timespec) -> c_int;
+}
+
+/// Raw `CLOCK_MONOTONIC` nanoseconds — must match the server's
+/// `onyx_storage::direct_io::monotonic_ns` bit for bit, because the whole
+/// point is to difference a stamp taken here against one taken there.
+///
+/// `Instant` cannot do this: it is opaque and process-local. `CLOCK_MONOTONIC`
+/// is system-wide on Linux, so the two processes share one timeline. This is
+/// what turns the two socket-transit windows from "eliminated by proxy" into
+/// "measured" — the previous round could rule out six hypotheses for the
+/// ~10.6 ms unaccounted at QD1024 but could not see into either transit.
+fn monotonic_ns() -> u64 {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a live, exclusively borrowed timespec.
+    if unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
 }
 
 /// Block until the socket is readable. `timeout_ms` follows `poll(2)`: negative
@@ -90,69 +115,138 @@ struct Slot {
     buffer: *mut u8,
     len: u32,
     opcode: u16,
+    /// Set by `queue()`, read by `collect_one()` — the FULL client-observed
+    /// round trip, to compare against `server_total_ns` (which only starts
+    /// once the server has finished reading the request off the socket).
+    /// Whatever gap remains is spent either staged in `pending` before a
+    /// `commit()`, in transit, or after the response arrived but before
+    /// `collect_one` got around to it.
+    queued_at: Option<Instant>,
+    /// Set by `commit()` — how long this request sat staged in `pending`
+    /// before the client wrote it, i.e. `T(write) - T(queue)`. Carried per
+    /// slot rather than only globally so the round-trip ledger can be closed
+    /// per opcode; see `LatencyAccum::log`'s `accounted`.
+    stage_delay_ns: u64,
 }
 
-/// Per-opcode accumulation of the server-side stage timings every response
-/// already carries (`ResponseHeader`'s last five fields) — computed once per
-/// IO on the engine side and otherwise thrown away by `collect_one`. Mean +
-/// max only (no percentiles): enough to see which stage dominates without a
-/// histogram allocation per response.
+/// One request staged in `pending` but not yet written: which slot owns it and
+/// where its header sits in the staging buffer, so `commit()` can patch the
+/// submit stamp in at the last possible moment.
+#[derive(Clone, Copy)]
+struct Staged {
+    slot: usize,
+    header_at: usize,
+}
+
+/// One IO's timings, laid out in the order the IO walks them.
+///
+/// `stage` / `intake` / `total` / `resp_queue` / `egress` are DISJOINT and
+/// together span the whole round trip, so their sum is directly comparable
+/// against `rtt` — that residual is the self-check (`accounted` below), the
+/// same discipline `tools/lv2_epoch_delta.py` applies to the LV2 ledger.
+/// `queue` / `engine` / `durable` / `dispatch` are breakdowns WITHIN `total`
+/// and must not be added to the total again.
 #[derive(Clone, Copy, Default)]
-struct LatencyAccum {
-    count: u64,
+struct StageSample {
+    client_rtt_ns: u64,
+    stage_delay_ns: u64,
+    intake_ns: u64,
     server_total_ns: u64,
     submit_queue_ns: u64,
     engine_submit_ns: u64,
     durable_wait_ns: u64,
     completion_dispatch_ns: u64,
-    server_total_max: u64,
-    submit_queue_max: u64,
-    engine_submit_max: u64,
-    durable_wait_max: u64,
-    completion_dispatch_max: u64,
+    response_queue_ns: u64,
+    egress_ns: u64,
+}
+
+/// Per-opcode accumulation of `StageSample`. Mean + max only (no
+/// percentiles): enough to see which segment dominates without a histogram
+/// allocation per response.
+#[derive(Clone, Copy, Default)]
+struct LatencyAccum {
+    count: u64,
+    sum: StageSample,
+    max: StageSample,
 }
 
 impl LatencyAccum {
-    fn record(
-        &mut self,
-        server_total: u64,
-        submit_queue: u64,
-        engine_submit: u64,
-        durable_wait: u64,
-        completion_dispatch: u64,
-    ) {
+    fn record(&mut self, sample: StageSample) {
         self.count += 1;
-        self.server_total_ns += server_total;
-        self.submit_queue_ns += submit_queue;
-        self.engine_submit_ns += engine_submit;
-        self.durable_wait_ns += durable_wait;
-        self.completion_dispatch_ns += completion_dispatch;
-        self.server_total_max = self.server_total_max.max(server_total);
-        self.submit_queue_max = self.submit_queue_max.max(submit_queue);
-        self.engine_submit_max = self.engine_submit_max.max(engine_submit);
-        self.durable_wait_max = self.durable_wait_max.max(durable_wait);
-        self.completion_dispatch_max = self.completion_dispatch_max.max(completion_dispatch);
+        let s = &mut self.sum;
+        let m = &mut self.max;
+        s.client_rtt_ns += sample.client_rtt_ns;
+        s.stage_delay_ns += sample.stage_delay_ns;
+        s.intake_ns += sample.intake_ns;
+        s.server_total_ns += sample.server_total_ns;
+        s.submit_queue_ns += sample.submit_queue_ns;
+        s.engine_submit_ns += sample.engine_submit_ns;
+        s.durable_wait_ns += sample.durable_wait_ns;
+        s.completion_dispatch_ns += sample.completion_dispatch_ns;
+        s.response_queue_ns += sample.response_queue_ns;
+        s.egress_ns += sample.egress_ns;
+        m.client_rtt_ns = m.client_rtt_ns.max(sample.client_rtt_ns);
+        m.stage_delay_ns = m.stage_delay_ns.max(sample.stage_delay_ns);
+        m.intake_ns = m.intake_ns.max(sample.intake_ns);
+        m.server_total_ns = m.server_total_ns.max(sample.server_total_ns);
+        m.submit_queue_ns = m.submit_queue_ns.max(sample.submit_queue_ns);
+        m.engine_submit_ns = m.engine_submit_ns.max(sample.engine_submit_ns);
+        m.durable_wait_ns = m.durable_wait_ns.max(sample.durable_wait_ns);
+        m.completion_dispatch_ns = m.completion_dispatch_ns.max(sample.completion_dispatch_ns);
+        m.response_queue_ns = m.response_queue_ns.max(sample.response_queue_ns);
+        m.egress_ns = m.egress_ns.max(sample.egress_ns);
     }
 
+    /// `accounted` is the load-bearing number: it is the fraction of the
+    /// client-observed round trip that the five disjoint segments explain.
+    /// A previous round of work could account for only ~2-4% of an 11 ms
+    /// round trip at QD1024, which is what motivated putting a client stamp
+    /// on the wire in the first place. If this prints well under 100%, there
+    /// is STILL a window with no instrument in it — do not attribute the
+    /// remainder to whichever segment happens to be largest.
     fn log(&self, label: &str) {
         if self.count == 0 {
             return;
         }
         let n = self.count as f64;
+        let s = &self.sum;
+        let accounted = s.stage_delay_ns
+            + s.intake_ns
+            + s.server_total_ns
+            + s.response_queue_ns
+            + s.egress_ns;
+        let pct = if s.client_rtt_ns > 0 {
+            accounted as f64 / s.client_rtt_ns as f64 * 100.0
+        } else {
+            0.0
+        };
         eprintln!(
-            "onyx-stage {label} n={} total_ns avg={:.0} max={} queue_ns avg={:.0} max={} \
-             engine_ns avg={:.0} max={} durable_ns avg={:.0} max={} dispatch_ns avg={:.0} max={}",
+            "onyx-stage {label} n={} accounted={pct:.1}% \
+             rtt_ns avg={:.0} max={} stage_ns avg={:.0} max={} intake_ns avg={:.0} max={} \
+             total_ns avg={:.0} max={} resp_queue_ns avg={:.0} max={} egress_ns avg={:.0} max={} \
+             [within total] queue_ns avg={:.0} max={} engine_ns avg={:.0} max={} \
+             durable_ns avg={:.0} max={} dispatch_ns avg={:.0} max={}",
             self.count,
-            self.server_total_ns as f64 / n,
-            self.server_total_max,
-            self.submit_queue_ns as f64 / n,
-            self.submit_queue_max,
-            self.engine_submit_ns as f64 / n,
-            self.engine_submit_max,
-            self.durable_wait_ns as f64 / n,
-            self.durable_wait_max,
-            self.completion_dispatch_ns as f64 / n,
-            self.completion_dispatch_max,
+            s.client_rtt_ns as f64 / n,
+            self.max.client_rtt_ns,
+            s.stage_delay_ns as f64 / n,
+            self.max.stage_delay_ns,
+            s.intake_ns as f64 / n,
+            self.max.intake_ns,
+            s.server_total_ns as f64 / n,
+            self.max.server_total_ns,
+            s.response_queue_ns as f64 / n,
+            self.max.response_queue_ns,
+            s.egress_ns as f64 / n,
+            self.max.egress_ns,
+            s.submit_queue_ns as f64 / n,
+            self.max.submit_queue_ns,
+            s.engine_submit_ns as f64 / n,
+            self.max.engine_submit_ns,
+            s.durable_wait_ns as f64 / n,
+            self.max.durable_wait_ns,
+            s.completion_dispatch_ns as f64 / n,
+            self.max.completion_dispatch_ns,
         );
     }
 }
@@ -176,6 +270,25 @@ struct Client {
     pending: Vec<u8>,
     read_stats: LatencyAccum,
     write_stats: LatencyAccum,
+    /// How many slots are actually occupied (queued-or-in-flight) each time
+    /// `queue()` succeeds — diagnostic for whether fio is genuinely holding
+    /// `iodepth` requests outstanding or something is quietly capping it far
+    /// below the configured depth.
+    depth_sum: u64,
+    depth_samples: u64,
+    depth_max: usize,
+    /// Requests staged since the last `commit()` — stamped with the actual
+    /// `write_all` time when `commit()` runs, so `stage_delay_ns` can isolate
+    /// "sat in `pending` waiting for fio to call commit()" from everything
+    /// downstream of the bytes actually leaving the client.
+    staged: Vec<Staged>,
+    /// Wall time spent inside `onyx_rs_getevents` (mostly blocked in
+    /// `wait_readable`) vs the total lifetime of the client — splits "fio is
+    /// genuinely blocked waiting for the socket to become readable" from
+    /// "fio is off doing something else and hasn't called getevents yet".
+    getevents_calls: u64,
+    getevents_wall_ns: u64,
+    lifetime_start: Option<Instant>,
 }
 
 fn request(opcode: u16, payload_len: u32, id: u64, offset: u64, len: u32) -> [u8; REQUEST_LEN] {
@@ -217,6 +330,13 @@ impl Client {
             pending: Vec::with_capacity(depth * (REQUEST_LEN + BLOCK_SIZE as usize)),
             read_stats: LatencyAccum::default(),
             write_stats: LatencyAccum::default(),
+            depth_sum: 0,
+            depth_samples: 0,
+            depth_max: 0,
+            staged: Vec::with_capacity(depth),
+            getevents_calls: 0,
+            getevents_wall_ns: 0,
+            lifetime_start: Some(Instant::now()),
         })
     }
 
@@ -246,21 +366,56 @@ impl Client {
         // depth * (REQUEST_LEN + BLOCK_SIZE).
         if !self.slots[index].io_u.is_null() { return Ok(FIO_Q_BUSY); }
         let header = request(opcode, if opcode == OP_WRITE { len } else { 0 }, id, offset, len);
+        let header_at = self.pending.len();
         self.pending.extend_from_slice(&header);
         if opcode == OP_WRITE {
             let payload = unsafe { std::slice::from_raw_parts(buffer, len as usize) };
             self.pending.extend_from_slice(payload);
         }
         self.next_id = self.next_id.wrapping_add(1);
-        self.slots[index] = Slot { id, io_u, buffer, len, opcode };
+        self.slots[index] = Slot {
+            id,
+            io_u,
+            buffer,
+            len,
+            opcode,
+            queued_at: Some(Instant::now()),
+            stage_delay_ns: 0,
+        };
+        self.staged.push(Staged { slot: index, header_at });
+        let outstanding = self.slots[..self.depth].iter().filter(|s| !s.io_u.is_null()).count();
+        self.depth_sum += outstanding as u64;
+        self.depth_samples += 1;
+        self.depth_max = self.depth_max.max(outstanding);
         Ok(FIO_Q_QUEUED)
     }
 
     /// Flush every request staged since the last commit in ONE write.
+    ///
+    /// This is also where each staged header gets its `client_submit_ns`
+    /// patched in — deliberately here and not in `queue()`, so the stamp
+    /// measures transit rather than transit plus this client's own staging
+    /// delay. One clock read serves the whole batch because a batch leaves in
+    /// one `write_all`; if that `write_all` ever blocks on socket
+    /// backpressure, the later requests in the batch absorb the block as
+    /// `intake_ns`, which is signal (the socket is full) rather than noise.
     fn commit(&mut self) -> Result<(), c_int> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let sent_at = Instant::now();
+        let submit_ns = monotonic_ns().to_le_bytes();
+        for i in 0..self.staged.len() {
+            let staged = self.staged[i];
+            let slot = &mut self.slots[staged.slot];
+            if let Some(queued_at) = slot.queued_at {
+                slot.stage_delay_ns =
+                    sent_at.saturating_duration_since(queued_at).as_nanos() as u64;
+            }
+            let at = staged.header_at + REQUEST_SUBMIT_NS_AT;
+            self.pending[at..at + 8].copy_from_slice(&submit_ns);
+        }
+        self.staged.clear();
         let result = self.stream.write_all(&self.pending).map_err(|e| errno(&e));
         // Clear either way: a short/failed write leaves the session
         // unrecoverable, and fio aborts the job on a commit error, so retrying
@@ -286,18 +441,34 @@ impl Client {
             let payload = unsafe { std::slice::from_raw_parts_mut(slot.buffer, payload_len as usize) };
             self.stream.read_exact(payload).map_err(|e| errno(&e))?;
         }
+        // Taken AFTER the payload read so `egress_ns` covers the whole return
+        // trip the client actually waited on, header and body alike.
+        let server_send_ns = u64_at(&response, 88);
+        let sample = StageSample {
+            client_rtt_ns: slot
+                .queued_at
+                .map(|start| start.elapsed().as_nanos() as u64)
+                .unwrap_or(0),
+            stage_delay_ns: slot.stage_delay_ns,
+            intake_ns: u64_at(&response, 72),
+            server_total_ns: u64_at(&response, 32),
+            submit_queue_ns: u64_at(&response, 40),
+            engine_submit_ns: u64_at(&response, 48),
+            durable_wait_ns: u64_at(&response, 56),
+            completion_dispatch_ns: u64_at(&response, 64),
+            response_queue_ns: u64_at(&response, 80),
+            egress_ns: if server_send_ns == 0 {
+                0
+            } else {
+                monotonic_ns().saturating_sub(server_send_ns)
+            },
+        };
         let accum = match slot.opcode {
             OP_READ => &mut self.read_stats,
             OP_WRITE => &mut self.write_stats,
             _ => unreachable!("only read/write slots are tracked"),
         };
-        accum.record(
-            u64_at(&response, 32),
-            u64_at(&response, 40),
-            u64_at(&response, 48),
-            u64_at(&response, 56),
-            u64_at(&response, 64),
-        );
+        accum.record(sample);
         self.slots[index] = Slot::default();
         self.completed.push(slot.io_u);
         Ok(())
@@ -333,6 +504,7 @@ pub unsafe extern "C" fn onyx_rs_queue(client: *mut c_void, io_u: *mut c_void,
 pub unsafe extern "C" fn onyx_rs_getevents(client: *mut c_void, min: u32, max: u32,
                                             timeout: *const Timespec) -> c_int {
     let client = unsafe { &mut *client.cast::<Client>() };
+    let call_started = Instant::now();
     client.completed.clear();
     let fd = client.stream.as_raw_fd();
     let block_ms = timeout_ms(timeout);
@@ -343,14 +515,24 @@ pub unsafe extern "C" fn onyx_rs_getevents(client: *mut c_void, min: u32, max: u
         match wait_readable(fd, wait) {
             Ok(true) => {}
             Ok(false) => break,
-            Err(code) => return -code,
+            Err(code) => {
+                client.getevents_calls += 1;
+                client.getevents_wall_ns += call_started.elapsed().as_nanos() as u64;
+                return -code;
+            }
         }
         match client.collect_one() {
             Ok(()) => {}
             Err(code) if code == libc_errno::EAGAIN || code == libc_errno::EWOULDBLOCK => break,
-            Err(code) => return -code,
+            Err(code) => {
+                client.getevents_calls += 1;
+                client.getevents_wall_ns += call_started.elapsed().as_nanos() as u64;
+                return -code;
+            }
         }
     }
+    client.getevents_calls += 1;
+    client.getevents_wall_ns += call_started.elapsed().as_nanos() as u64;
     client.completed.len() as c_int
 }
 
@@ -377,6 +559,26 @@ pub unsafe extern "C" fn onyx_rs_cleanup(client: *mut c_void) {
     let _ = client.stream.write_all(&close);
     client.read_stats.log("read");
     client.write_stats.log("write");
+    if client.depth_samples > 0 {
+        eprintln!(
+            "onyx-stage depth samples={} avg={:.2} max={}",
+            client.depth_samples,
+            client.depth_sum as f64 / client.depth_samples as f64,
+            client.depth_max,
+        );
+    }
+    if let Some(start) = client.lifetime_start {
+        let lifetime_ns = start.elapsed().as_nanos() as u64;
+        let pct = if lifetime_ns > 0 {
+            client.getevents_wall_ns as f64 / lifetime_ns as f64 * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "onyx-stage getevents calls={} wall_ns={} lifetime_ns={} pct_blocked_in_getevents={:.1}%",
+            client.getevents_calls, client.getevents_wall_ns, lifetime_ns, pct,
+        );
+    }
 }
 
 mod libc_errno {
@@ -427,6 +629,13 @@ mod tests {
             pending: Vec::new(),
             read_stats: LatencyAccum::default(),
             write_stats: LatencyAccum::default(),
+            depth_sum: 0,
+            depth_samples: 0,
+            depth_max: 0,
+            staged: Vec::new(),
+            getevents_calls: 0,
+            getevents_wall_ns: 0,
+            lifetime_start: None,
         };
         let mut payload = [0xABu8; BLOCK_SIZE as usize];
         payload[0] = 0x5A;
@@ -444,13 +653,24 @@ mod tests {
         assert_eq!(&client.pending[0..4], MAGIC);
         assert_eq!(u64_at(&client.pending, 24), 8192, "offset survives staging");
         assert_eq!(client.pending[REQUEST_LEN], 0x5A, "payload follows the header");
+        assert_eq!(
+            u64_at(&client.pending, REQUEST_SUBMIT_NS_AT), 0,
+            "queue() must NOT stamp — a staged stamp would measure this client's \
+             own staging delay as transit",
+        );
 
+        let before = monotonic_ns();
         client.commit().unwrap();
         assert!(client.pending.is_empty(), "commit drains the staging buffer");
         let mut got = vec![0u8; REQUEST_LEN + BLOCK_SIZE as usize];
         b.read_exact(&mut got).unwrap();
         assert_eq!(u16_at(&got, 6), OP_WRITE);
         assert_eq!(got[REQUEST_LEN], 0x5A);
+        let stamp = u64_at(&got, REQUEST_SUBMIT_NS_AT);
+        assert!(
+            stamp >= before && stamp <= monotonic_ns(),
+            "commit() stamps the wire with CLOCK_MONOTONIC: {stamp} outside [{before}, now]",
+        );
 
         // A full slot ring is fio's cue to commit, not an error.
         for i in 0..3 {
@@ -472,11 +692,31 @@ mod tests {
     fn request_encoding_matches_protocol() {
         let encoded = request(OP_WRITE, 4096, 0x1122, 8192, 4096);
         assert_eq!(&encoded[0..4], b"ONIO");
+        assert_eq!(u16_at(&encoded, 4), VERSION);
         assert_eq!(u16_at(&encoded, 6), OP_WRITE);
         assert_eq!(u32_at(&encoded, 12), 4096);
         assert_eq!(u64_at(&encoded, 16), 0x1122);
         assert_eq!(u64_at(&encoded, 24), 8192);
         assert_eq!(u32_at(&encoded, 32), 4096);
-        assert_eq!(&encoded[36..40], &[0; 4]);
+        assert_eq!(&encoded[36..40], &[0; 4], "reserved must stay zero");
+        assert_eq!(u64_at(&encoded, REQUEST_SUBMIT_NS_AT), 0);
+    }
+
+    /// The stamp is only comparable against the server's because both read the
+    /// same system-wide clock. A wrong `clk_id` would still produce plausible
+    /// nanoseconds, so pin it against the one clock `Instant` also uses.
+    #[test]
+    fn monotonic_ns_tracks_the_same_clock_as_instant() {
+        let start_instant = Instant::now();
+        let start = monotonic_ns();
+        assert!(start > 0, "CLOCK_MONOTONIC must be readable");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let elapsed_raw = monotonic_ns() - start;
+        let elapsed_instant = start_instant.elapsed().as_nanos() as u64;
+        assert!(elapsed_raw >= 20_000_000, "raw clock advanced {elapsed_raw} ns");
+        assert!(
+            elapsed_raw.abs_diff(elapsed_instant) < 5_000_000,
+            "raw {elapsed_raw} ns and Instant {elapsed_instant} ns must be the same clock",
+        );
     }
 }

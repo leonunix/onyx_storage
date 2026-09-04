@@ -24,11 +24,12 @@ use crate::engine::OnyxEngine;
 use crate::error::OnyxError;
 use crate::types::BLOCK_SIZE;
 use crate::volume::{OnyxVolume, VolumeWriteTicket};
+use crate::worker_queue::WorkerQueue;
 
 pub const DIRECT_IO_MAGIC: [u8; 4] = *b"ONIO";
-pub const DIRECT_IO_VERSION: u16 = 1;
-pub const REQUEST_HEADER_LEN: usize = 40;
-pub const RESPONSE_HEADER_LEN: usize = 72;
+pub const DIRECT_IO_VERSION: u16 = 2;
+pub const REQUEST_HEADER_LEN: usize = 48;
+pub const RESPONSE_HEADER_LEN: usize = 96;
 pub const MAX_DIRECT_IO_BYTES: usize = BLOCK_SIZE as usize;
 pub const MAX_DIRECT_IO_OUTSTANDING: usize = 256;
 pub const MAX_VOLUME_NAME_BYTES: usize = 255;
@@ -76,6 +77,46 @@ impl ShutdownState {
     }
 }
 
+/// Raw `CLOCK_MONOTONIC` nanoseconds.
+///
+/// `Instant` cannot cross a process boundary, but `CLOCK_MONOTONIC` is
+/// system-wide on Linux, so a stamp taken by the client and one taken by the
+/// server are directly comparable as long as both run on this machine.  That
+/// is the only way to measure the two windows the protocol's own `Instant`
+/// timings structurally cannot see — the transit from the client's `write`
+/// into the session reader, and the transit from the writer thread's `write`
+/// back into the client's reap loop.  Everything else was already covered,
+/// which is why the previous round of work could only eliminate hypotheses
+/// (see memory `direct_io_qd1024_gap_elimination_chain`) instead of naming
+/// where the missing ~10.6 ms at QD1024 actually goes.
+pub fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live, exclusively borrowed `timespec`.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+/// Nanoseconds a request spent between leaving the client and being fully
+/// read by its session thread.
+///
+/// A `client_submit_ns` of 0 means the client did not stamp, and a stamp from
+/// the future means the two readings raced a clock adjustment (or the client
+/// is not on this machine).  Both report 0 rather than a fabricated number,
+/// so a zero here always reads as "unmeasured", never as "instant".
+fn measure_intake_ns(client_submit_ns: u64, received_ns: u64) -> u64 {
+    if client_submit_ns == 0 {
+        return 0;
+    }
+    received_ns.saturating_sub(client_submit_ns)
+}
+
 /// Fixed-size little-endian request header.
 ///
 /// `payload_len` is the number of bytes following the header.  `io_len` is
@@ -88,6 +129,11 @@ pub struct RequestHeader {
     pub request_id: u64,
     pub offset: u64,
     pub io_len: u32,
+    /// `monotonic_ns` at the moment the client handed these bytes to `write`,
+    /// or 0 when the client does not stamp.  Clients must stamp as late as
+    /// possible — a stamp taken when the request was *staged* would fold the
+    /// client's own staging delay into the measured transit.
+    pub client_submit_ns: u64,
 }
 
 impl RequestHeader {
@@ -101,6 +147,7 @@ impl RequestHeader {
         out[16..24].copy_from_slice(&self.request_id.to_le_bytes());
         out[24..32].copy_from_slice(&self.offset.to_le_bytes());
         out[32..36].copy_from_slice(&self.io_len.to_le_bytes());
+        out[40..48].copy_from_slice(&self.client_submit_ns.to_le_bytes());
         out
     }
 
@@ -119,6 +166,7 @@ impl RequestHeader {
             request_id: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
             offset: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
             io_len: u32::from_le_bytes(buf[32..36].try_into().unwrap()),
+            client_submit_ns: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
         })
     }
 }
@@ -137,6 +185,26 @@ pub struct ResponseHeader {
     pub engine_submit_ns: u64,
     pub durable_wait_ns: u64,
     pub completion_dispatch_ns: u64,
+    /// Client `write` -> session thread finished reading the request.  See
+    /// `measure_intake_ns`; 0 means unmeasured.
+    ///
+    /// The boundary is "the request is fully read", so a write's intake
+    /// covers header AND payload while a read's covers only the header.  A
+    /// write reading higher than a read is therefore expected, and comparing
+    /// the two directly measures nothing.
+    pub intake_ns: u64,
+    /// Response built -> `write_response` about to hit the socket.  This is
+    /// the third window nothing measured: a completion is handed to the
+    /// per-session writer thread through a channel, and `server_total_ns`
+    /// stops when the response is *constructed*, not when it is sent.  With
+    /// ~550 threads on ~44 pinned cores (memory
+    /// `cpu_oversubscription_is_the_real_wake_floor`) a descheduled writer
+    /// thread is exactly the kind of delay that would be invisible today.
+    pub response_queue_ns: u64,
+    /// `monotonic_ns` immediately before the response bytes hit the socket,
+    /// so the client can measure the return transit the same way the server
+    /// measures `intake_ns`.
+    pub server_send_ns: u64,
 }
 
 impl ResponseHeader {
@@ -154,6 +222,9 @@ impl ResponseHeader {
         out[48..56].copy_from_slice(&self.engine_submit_ns.to_le_bytes());
         out[56..64].copy_from_slice(&self.durable_wait_ns.to_le_bytes());
         out[64..72].copy_from_slice(&self.completion_dispatch_ns.to_le_bytes());
+        out[72..80].copy_from_slice(&self.intake_ns.to_le_bytes());
+        out[80..88].copy_from_slice(&self.response_queue_ns.to_le_bytes());
+        out[88..96].copy_from_slice(&self.server_send_ns.to_le_bytes());
         out
     }
 
@@ -176,8 +247,23 @@ impl ResponseHeader {
             engine_submit_ns: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
             durable_wait_ns: u64::from_le_bytes(buf[56..64].try_into().unwrap()),
             completion_dispatch_ns: u64::from_le_bytes(buf[64..72].try_into().unwrap()),
+            intake_ns: u64::from_le_bytes(buf[72..80].try_into().unwrap()),
+            response_queue_ns: u64::from_le_bytes(buf[80..88].try_into().unwrap()),
+            server_send_ns: u64::from_le_bytes(buf[88..96].try_into().unwrap()),
         })
     }
+}
+
+/// Every server-side stage timing a response carries, so the helpers that
+/// build responses take one value instead of a growing positional tail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StageTimings {
+    server_total_ns: u64,
+    submit_queue_ns: u64,
+    engine_submit_ns: u64,
+    durable_wait_ns: u64,
+    completion_dispatch_ns: u64,
+    intake_ns: u64,
 }
 
 fn validate_header_prefix(buf: &[u8], expected_len: usize) -> io::Result<()> {
@@ -223,9 +309,10 @@ fn bind_direct_io_thread(cpus: &[usize], ordinal: usize) {
 }
 
 struct SubmitLanes {
-    senders: Arc<Vec<Sender<SubmitTask>>>,
+    lanes: Arc<Vec<WorkerQueue<SubmitTask>>>,
     worker_handles: Vec<JoinHandle<()>>,
     workers_per_lane: usize,
+    groups_per_lane: usize,
 }
 
 impl SubmitLanes {
@@ -236,6 +323,10 @@ impl SubmitLanes {
     /// partition that bounded the ublk frontend at 3-4 queues' worth of workers
     /// (see `UblkConfig::shared_io_workers`). Keeping the harness's own
     /// concurrency unbounded is what makes it usable as an instrument.
+    ///
+    /// "ONE queue" is now one queue *logically*: see
+    /// `worker_queue::MAX_RECEIVERS_PER_CHANNEL` for why the lane is physically
+    /// several channels with a per-request rotor over them.
     fn start(
         nr_queues: usize,
         queue_workers: usize,
@@ -255,31 +346,32 @@ impl SubmitLanes {
             (true, None) => nr_queues.saturating_mul(queue_workers),
             (false, _) => queue_workers,
         };
-        let mut senders = Vec::with_capacity(lanes);
+        let mut built_lanes = Vec::with_capacity(lanes);
         let mut worker_handles = Vec::with_capacity(lanes.saturating_mul(workers_per_lane));
+        let mut groups_per_lane = 0;
 
         for lane_id in 0..lanes {
-            let (tx, rx) = crossbeam_channel::bounded::<SubmitTask>(lane_capacity);
-            senders.push(tx);
-            for worker_id in 0..workers_per_lane {
-                let worker_rx = rx.clone();
+            // `lane_capacity` is the TOTAL across the lane's groups, so this
+            // keeps exactly the admission capacity one shared channel had.
+            let (queue, receivers) =
+                WorkerQueue::<SubmitTask>::build(workers_per_lane, Some(lane_capacity));
+            groups_per_lane = queue.groups();
+            for (worker_id, worker_rx) in receivers.into_iter().enumerate() {
                 let worker_cpus = direct_io_cpus.clone();
+                let ordinal = lane_id
+                    .saturating_mul(workers_per_lane)
+                    .saturating_add(worker_id);
                 let handle = thread::Builder::new()
                     .name(format!("direct-io-submit-q{lane_id}-w{worker_id}"))
                     .spawn(move || {
-                        bind_direct_io_thread(
-                            &worker_cpus,
-                            lane_id
-                                .saturating_mul(workers_per_lane)
-                                .saturating_add(worker_id),
-                        );
+                        bind_direct_io_thread(&worker_cpus, ordinal);
                         submit_worker_loop(worker_rx);
                     });
                 match handle {
                     Ok(handle) => worker_handles.push(handle),
                     Err(error) => {
-                        drop(rx);
-                        drop(senders);
+                        drop(queue);
+                        drop(built_lanes);
                         for handle in worker_handles {
                             let _ = handle.join();
                         }
@@ -287,17 +379,19 @@ impl SubmitLanes {
                     }
                 }
             }
+            built_lanes.push(queue);
         }
 
         Ok(Self {
-            senders: Arc::new(senders),
+            lanes: Arc::new(built_lanes),
             worker_handles,
             workers_per_lane,
+            groups_per_lane,
         })
     }
 
     fn shutdown_and_join(self) {
-        drop(self.senders);
+        drop(self.lanes);
         for handle in self.worker_handles {
             if let Err(error) = handle.join() {
                 tracing::error!(?error, "direct IO submit worker panicked");
@@ -347,7 +441,7 @@ impl DirectIoServer {
             submit_workers_override,
             direct_io_cpus.clone(),
         )?;
-        let lane_senders = submit_lanes.senders.clone();
+        let lane_handles = submit_lanes.lanes.clone();
         let shutdown = Arc::new(ShutdownState::new());
         let thread_shutdown = shutdown.clone();
         let listener_handle = thread::Builder::new()
@@ -357,7 +451,7 @@ impl DirectIoServer {
                 listener_loop(
                     listener,
                     engine,
-                    lane_senders,
+                    lane_handles,
                     queue_workers,
                     direct_io_cpus,
                     thread_shutdown,
@@ -374,7 +468,9 @@ impl DirectIoServer {
 
         tracing::info!(
             path = %socket_path.display(),
-            submit_lanes = submit_lanes.senders.len(),
+            submit_lanes = submit_lanes.lanes.len(),
+            groups_per_lane = submit_lanes.groups_per_lane,
+            receivers_per_group = crate::worker_queue::MAX_RECEIVERS_PER_CHANNEL,
             workers_per_lane = submit_lanes.workers_per_lane,
             direct_io_cpus = ?logged_direct_io_cpus,
             "direct IO socket listening"
@@ -414,7 +510,7 @@ impl Drop for DirectIoServer {
 fn listener_loop(
     listener: UnixListener,
     engine: Arc<ArcSwap<Option<OnyxEngine>>>,
-    submit_lanes: Arc<Vec<Sender<SubmitTask>>>,
+    submit_lanes: Arc<Vec<WorkerQueue<SubmitTask>>>,
     queue_workers: usize,
     direct_io_cpus: Arc<Vec<usize>>,
     shutdown: Arc<ShutdownState>,
@@ -438,7 +534,7 @@ fn listener_loop(
                 let session_engine = engine.clone();
                 let session_shutdown = shutdown.clone();
                 let lane_id = session_id % submit_lanes.len();
-                let lane_tx = submit_lanes[lane_id].clone();
+                let lane = submit_lanes.clone();
                 let session_cpus = direct_io_cpus.clone();
                 match thread::Builder::new()
                     .name(format!("direct-io-session-{session_id}"))
@@ -448,7 +544,8 @@ fn listener_loop(
                             session_engine,
                             session_shutdown,
                             session_id,
-                            lane_tx,
+                            lane,
+                            lane_id,
                             queue_workers,
                             session_cpus,
                         )
@@ -496,6 +593,7 @@ struct PendingWrite {
     submitted_at: Instant,
     submit_queue_ns: u64,
     engine_submit_ns: u64,
+    intake_ns: u64,
     bytes: u32,
 }
 
@@ -503,6 +601,24 @@ struct Outbound {
     header: ResponseHeader,
     payload: Vec<u8>,
     clear_active_id: bool,
+    /// When this response was handed to the writer thread — turned into
+    /// `ResponseHeader::response_queue_ns` by `write_response`.
+    queued_at: Instant,
+}
+
+impl Outbound {
+    fn new(header: ResponseHeader, payload: Vec<u8>, clear_active_id: bool) -> Self {
+        Self {
+            header,
+            payload,
+            clear_active_id,
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn header_only(header: ResponseHeader, clear_active_id: bool) -> Self {
+        Self::new(header, Vec::new(), clear_active_id)
+    }
 }
 
 struct SubmitTask {
@@ -511,6 +627,7 @@ struct SubmitTask {
     payload: Vec<u8>,
     server_started: Instant,
     queued_at: Instant,
+    intake_ns: u64,
     pending_tx: Sender<PendingWrite>,
     /// Header-only responses (write acks, errors, close) — the fast lane.
     ack_tx: Sender<Outbound>,
@@ -525,7 +642,8 @@ fn handle_session(
     engine: Arc<ArcSwap<Option<OnyxEngine>>>,
     shutdown: Arc<ShutdownState>,
     session_id: usize,
-    submit_tx: Sender<SubmitTask>,
+    submit_lane: Arc<Vec<WorkerQueue<SubmitTask>>>,
+    lane_id: usize,
     lane_worker_count: usize,
     direct_io_cpus: Arc<Vec<usize>>,
 ) {
@@ -539,11 +657,16 @@ fn handle_session(
         Err((header, status)) => {
             let _ = write_response(
                 &mut stream,
-                &Outbound {
-                    header: response(header.opcode, header.request_id, status, 0, 0, 0, 0, 0),
-                    payload: Vec::new(),
-                    clear_active_id: false,
-                },
+                &mut Outbound::header_only(
+                    response(
+                        header.opcode,
+                        header.request_id,
+                        status,
+                        0,
+                        StageTimings::default(),
+                    ),
+                    false,
+                ),
             );
             return;
         }
@@ -556,20 +679,16 @@ fn handle_session(
             Err(error) => {
                 let _ = write_response(
                     &mut stream,
-                    &Outbound {
-                        header: response(
+                    &mut Outbound::header_only(
+                        response(
                             OP_HELLO,
                             hello.request_id,
                             status_from_error(&error),
                             0,
-                            0,
-                            0,
-                            0,
-                            0,
+                            StageTimings::default(),
                         ),
-                        payload: Vec::new(),
-                        clear_active_id: false,
-                    },
+                        false,
+                    ),
                 );
                 return;
             }
@@ -577,11 +696,16 @@ fn handle_session(
         Some(_) | None => {
             let _ = write_response(
                 &mut stream,
-                &Outbound {
-                    header: response(OP_HELLO, hello.request_id, -libc::ENODEV, 0, 0, 0, 0, 0),
-                    payload: Vec::new(),
-                    clear_active_id: false,
-                },
+                &mut Outbound::header_only(
+                    response(
+                        OP_HELLO,
+                        hello.request_id,
+                        -libc::ENODEV,
+                        0,
+                        StageTimings::default(),
+                    ),
+                    false,
+                ),
             );
             return;
         }
@@ -590,20 +714,16 @@ fn handle_session(
 
     if write_response(
         &mut stream,
-        &Outbound {
-            header: response(
+        &mut Outbound::header_only(
+            response(
                 OP_HELLO,
                 hello.request_id,
                 0,
                 lane_worker_count as u32,
-                0,
-                0,
-                0,
-                0,
+                StageTimings::default(),
             ),
-            payload: Vec::new(),
-            clear_active_id: false,
-        },
+            false,
+        ),
     )
     .is_err()
     {
@@ -693,10 +813,25 @@ fn handle_session(
             Ok(true) => {}
             Ok(false) | Err(_) => break,
         }
+        // Both stamps mark the same instant — the request is fully read.  The
+        // `Instant` drives every relative stage timing; the raw monotonic
+        // reading is what can be differenced against the client's stamp.
+        let received_ns = monotonic_ns();
         let server_started = Instant::now();
+        let stages = StageTimings {
+            intake_ns: measure_intake_ns(header.client_submit_ns, received_ns),
+            ..StageTimings::default()
+        };
 
         if header.flags != 0 {
-            send_immediate_error(&ack_tx, &header, -libc::EINVAL, server_started, false);
+            send_error(
+                &ack_tx,
+                &header,
+                -libc::EINVAL,
+                server_started,
+                stages,
+                false,
+            );
             continue;
         }
         match header.opcode {
@@ -704,11 +839,12 @@ fn handle_session(
                 if header.io_len as usize > MAX_DIRECT_IO_BYTES
                     || header.offset.checked_add(header.io_len as u64).is_none()
                 {
-                    send_immediate_error(
+                    send_error(
                         &ack_tx,
                         &header,
                         -libc::EINVAL,
                         server_started,
+                        stages,
                         false,
                     );
                     continue;
@@ -717,22 +853,24 @@ fn handle_session(
                 let mut ids = active_ids.lock().unwrap();
                 if ids.contains(&header.request_id) {
                     drop(ids);
-                    send_immediate_error(
+                    send_error(
                         &ack_tx,
                         &header,
                         -libc::EALREADY,
                         server_started,
+                        stages,
                         false,
                     );
                     continue;
                 }
                 if ids.len() >= MAX_DIRECT_IO_OUTSTANDING {
                     drop(ids);
-                    send_immediate_error(
+                    send_error(
                         &ack_tx,
                         &header,
                         -libc::EAGAIN,
                         server_started,
+                        stages,
                         false,
                     );
                     continue;
@@ -741,30 +879,39 @@ fn handle_session(
             }
             OP_CLOSE => {
                 if header.payload_len != 0 || header.io_len != 0 || header.offset != 0 {
-                    send_immediate_error(
+                    send_error(
                         &ack_tx,
                         &header,
                         -libc::EINVAL,
                         server_started,
+                        stages,
                         false,
                     );
                     continue;
                 }
                 if active_ids.lock().unwrap().contains(&header.request_id) {
-                    send_immediate_error(
+                    send_error(
                         &ack_tx,
                         &header,
                         -libc::EALREADY,
                         server_started,
+                        stages,
                         false,
                     );
                     continue;
                 }
-                close_request = Some((header.request_id, server_started));
+                close_request = Some((header.request_id, server_started, stages));
                 break;
             }
             _ => {
-                send_immediate_error(&ack_tx, &header, -libc::EPROTO, server_started, false);
+                send_error(
+                    &ack_tx,
+                    &header,
+                    -libc::EPROTO,
+                    server_started,
+                    stages,
+                    false,
+                );
                 break;
             }
         }
@@ -775,20 +922,25 @@ fn handle_session(
             payload,
             server_started,
             queued_at: Instant::now(),
+            intake_ns: stages.intake_ns,
             pending_tx: pending_tx.clone(),
             ack_tx: ack_tx.clone(),
             payload_tx: payload_tx.clone(),
             recycle_tx: recycle_tx.clone(),
         };
-        if let Err(error) = submit_tx.send(task) {
+        if let Err(error) = submit_lane[lane_id].send(task) {
             let mut task = error.0;
             let payload = std::mem::take(&mut task.payload);
             let _ = task.recycle_tx.try_send(payload);
-            send_immediate_error(
+            send_error(
                 &task.ack_tx,
                 &task.header,
                 -libc::ESHUTDOWN,
                 task.server_started,
+                StageTimings {
+                    intake_ns: task.intake_ns,
+                    ..StageTimings::default()
+                },
                 true,
             );
         }
@@ -800,21 +952,12 @@ fn handle_session(
         tracing::error!(?error, "direct IO durability dispatcher panicked");
     }
 
-    if let Some((request_id, started)) = close_request {
-        let _ = ack_tx.send(Outbound {
-            header: response(
-                OP_CLOSE,
-                request_id,
-                0,
-                0,
-                started.elapsed().as_nanos() as u64,
-                0,
-                0,
-                0,
-            ),
-            payload: Vec::new(),
-            clear_active_id: false,
-        });
+    if let Some((request_id, started, mut stages)) = close_request {
+        stages.server_total_ns = started.elapsed().as_nanos() as u64;
+        let _ = ack_tx.send(Outbound::header_only(
+            response(OP_CLOSE, request_id, 0, 0, stages),
+            false,
+        ));
     }
     drop(ack_tx);
     drop(payload_tx);
@@ -855,16 +998,20 @@ fn read_hello(
 
 fn submit_worker_loop(input: Receiver<SubmitTask>) {
     while let Ok(task) = input.recv() {
-        let submit_queue_ns = task.queued_at.elapsed().as_nanos() as u64;
+        let stages = StageTimings {
+            submit_queue_ns: task.queued_at.elapsed().as_nanos() as u64,
+            intake_ns: task.intake_ns,
+            ..StageTimings::default()
+        };
         match task.header.opcode {
-            OP_WRITE => handle_submit_write(task, submit_queue_ns),
-            OP_READ => handle_submit_read(task, submit_queue_ns),
+            OP_WRITE => handle_submit_write(task, stages),
+            OP_READ => handle_submit_read(task, stages),
             _ => unreachable!("only IO requests enter direct IO submit lanes"),
         }
     }
 }
 
-fn handle_submit_write(mut task: SubmitTask, submit_queue_ns: u64) {
+fn handle_submit_write(mut task: SubmitTask, mut stages: StageTimings) {
     let header = task.header;
     if header.io_len == 0
         || header.payload_len != header.io_len
@@ -874,13 +1021,12 @@ fn handle_submit_write(mut task: SubmitTask, submit_queue_ns: u64) {
     {
         let payload = std::mem::take(&mut task.payload);
         let _ = task.recycle_tx.try_send(payload);
-        send_timed_error(
+        send_error(
             &task.ack_tx,
             &header,
             -libc::EINVAL,
             task.server_started,
-            submit_queue_ns,
-            0,
+            stages,
             true,
         );
         return;
@@ -891,7 +1037,7 @@ fn handle_submit_write(mut task: SubmitTask, submit_queue_ns: u64) {
         .volume
         .write_aligned_deferred(header.offset, &task.payload);
     let submitted_at = Instant::now();
-    let engine_submit_ns = submitted_at
+    stages.engine_submit_ns = submitted_at
         .saturating_duration_since(submit_started)
         .as_nanos() as u64;
     let payload = std::mem::take(&mut task.payload);
@@ -904,36 +1050,35 @@ fn handle_submit_write(mut task: SubmitTask, submit_queue_ns: u64) {
                 ticket,
                 server_started: task.server_started,
                 submitted_at,
-                submit_queue_ns,
-                engine_submit_ns,
+                submit_queue_ns: stages.submit_queue_ns,
+                engine_submit_ns: stages.engine_submit_ns,
+                intake_ns: stages.intake_ns,
                 bytes: header.io_len,
             };
             if let Err(error) = task.pending_tx.send(pending) {
                 error.0.ticket.abandon();
-                send_timed_error(
+                send_error(
                     &task.ack_tx,
                     &header,
                     -libc::ESHUTDOWN,
                     task.server_started,
-                    submit_queue_ns,
-                    engine_submit_ns,
+                    stages,
                     true,
                 );
             }
         }
-        Err(error) => send_timed_error(
+        Err(error) => send_error(
             &task.ack_tx,
             &header,
             status_from_error(&error),
             task.server_started,
-            submit_queue_ns,
-            engine_submit_ns,
+            stages,
             true,
         ),
     }
 }
 
-fn handle_submit_read(mut task: SubmitTask, submit_queue_ns: u64) {
+fn handle_submit_read(mut task: SubmitTask, mut stages: StageTimings) {
     let header = task.header;
     if header.payload_len != 0
         || !task.payload.is_empty()
@@ -944,13 +1089,12 @@ fn handle_submit_read(mut task: SubmitTask, submit_queue_ns: u64) {
     {
         let payload = std::mem::take(&mut task.payload);
         let _ = task.recycle_tx.try_send(payload);
-        send_timed_error(
+        send_error(
             &task.ack_tx,
             &header,
             -libc::EINVAL,
             task.server_started,
-            submit_queue_ns,
-            0,
+            stages,
             true,
         );
         return;
@@ -960,36 +1104,25 @@ fn handle_submit_read(mut task: SubmitTask, submit_queue_ns: u64) {
     let _ = task.recycle_tx.try_send(request_payload);
     let mut data = vec![0u8; header.io_len as usize];
     let submit_started = Instant::now();
-    match task.volume.read_into(header.offset, &mut data) {
+    let result = task.volume.read_into(header.offset, &mut data);
+    stages.engine_submit_ns = submit_started.elapsed().as_nanos() as u64;
+    match result {
         Ok(()) => {
-            let engine_submit_ns = submit_started.elapsed().as_nanos() as u64;
-            let _ = task.payload_tx.send(Outbound {
-                header: response(
-                    OP_READ,
-                    header.request_id,
-                    0,
-                    header.io_len,
-                    task.server_started.elapsed().as_nanos() as u64,
-                    submit_queue_ns,
-                    engine_submit_ns,
-                    0,
-                ),
-                payload: data,
-                clear_active_id: true,
-            });
-        }
-        Err(error) => {
-            let engine_submit_ns = submit_started.elapsed().as_nanos() as u64;
-            send_timed_error(
-                &task.ack_tx,
-                &header,
-                status_from_error(&error),
-                task.server_started,
-                submit_queue_ns,
-                engine_submit_ns,
+            stages.server_total_ns = task.server_started.elapsed().as_nanos() as u64;
+            let _ = task.payload_tx.send(Outbound::new(
+                response(OP_READ, header.request_id, 0, header.io_len, stages),
+                data,
                 true,
-            )
+            ));
         }
+        Err(error) => send_error(
+            &task.ack_tx,
+            &header,
+            status_from_error(&error),
+            task.server_started,
+            stages,
+            true,
+        ),
     }
 }
 
@@ -1060,20 +1193,22 @@ fn abort_undurable_writes(
         }
 
         item.ticket.abandon();
-        let outbound = Outbound {
-            header: response(
+        let outbound = Outbound::header_only(
+            response(
                 OP_WRITE,
                 item.request_id,
                 -libc::ESHUTDOWN,
                 0,
-                item.server_started.elapsed().as_nanos() as u64,
-                item.submit_queue_ns,
-                item.engine_submit_ns,
-                0,
+                StageTimings {
+                    server_total_ns: item.server_started.elapsed().as_nanos() as u64,
+                    submit_queue_ns: item.submit_queue_ns,
+                    engine_submit_ns: item.engine_submit_ns,
+                    intake_ns: item.intake_ns,
+                    ..StageTimings::default()
+                },
             ),
-            payload: Vec::new(),
-            clear_active_id: true,
-        };
+            true,
+        );
         if output.try_send(outbound).is_err() {
             alive.store(false, Ordering::Release);
         }
@@ -1097,22 +1232,23 @@ fn complete_durable_write(
         .min(observed_wait_ns);
     let durable_wait_ns = observed_wait_ns.saturating_sub(completion_dispatch_ns);
     item.ticket.finish();
-    let mut header = response(
-        OP_WRITE,
-        item.request_id,
-        0,
-        item.bytes,
-        item.server_started.elapsed().as_nanos() as u64,
-        item.submit_queue_ns,
-        item.engine_submit_ns,
-        durable_wait_ns,
+    let outbound = Outbound::header_only(
+        response(
+            OP_WRITE,
+            item.request_id,
+            0,
+            item.bytes,
+            StageTimings {
+                server_total_ns: item.server_started.elapsed().as_nanos() as u64,
+                submit_queue_ns: item.submit_queue_ns,
+                engine_submit_ns: item.engine_submit_ns,
+                durable_wait_ns,
+                completion_dispatch_ns,
+                intake_ns: item.intake_ns,
+            },
+        ),
+        true,
     );
-    header.completion_dispatch_ns = completion_dispatch_ns;
-    let outbound = Outbound {
-        header,
-        payload: Vec::new(),
-        clear_active_id: true,
-    };
     let sent = if nonblocking {
         output.try_send(outbound).is_ok()
     } else {
@@ -1133,13 +1269,13 @@ fn arm_pending(item: PendingWrite, wake_tx: &Sender<()>, pending: &mut Vec<Pendi
 /// being torn down).
 fn write_and_clear(
     stream: &mut UnixStream,
-    outbound: Outbound,
+    mut outbound: Outbound,
     alive: &AtomicBool,
     active_ids: &Mutex<HashSet<u64>>,
 ) -> bool {
     let request_id = outbound.header.request_id;
     let clear_active_id = outbound.clear_active_id;
-    if write_response(stream, &outbound).is_err() {
+    if write_response(stream, &mut outbound).is_err() {
         alive.store(false, Ordering::Release);
         let _ = stream.shutdown(std::net::Shutdown::Both);
         return false;
@@ -1234,39 +1370,21 @@ fn writer_loop(
     }
 }
 
-fn send_immediate_error(
+/// Fails a request, filling in `server_total_ns` from `started` and keeping
+/// whatever stages the caller had already measured.
+fn send_error(
     output: &Sender<Outbound>,
     header: &RequestHeader,
     status: i32,
     started: Instant,
+    mut stages: StageTimings,
     clear_active_id: bool,
 ) {
-    send_timed_error(output, header, status, started, 0, 0, clear_active_id);
-}
-
-fn send_timed_error(
-    output: &Sender<Outbound>,
-    header: &RequestHeader,
-    status: i32,
-    started: Instant,
-    submit_queue_ns: u64,
-    engine_submit_ns: u64,
-    clear_active_id: bool,
-) {
-    let _ = output.send(Outbound {
-        header: response(
-            header.opcode,
-            header.request_id,
-            status,
-            0,
-            started.elapsed().as_nanos() as u64,
-            submit_queue_ns,
-            engine_submit_ns,
-            0,
-        ),
-        payload: Vec::new(),
+    stages.server_total_ns = started.elapsed().as_nanos() as u64;
+    let _ = output.send(Outbound::header_only(
+        response(header.opcode, header.request_id, status, 0, stages),
         clear_active_id,
-    });
+    ));
 }
 
 fn response(
@@ -1274,10 +1392,7 @@ fn response(
     request_id: u64,
     status: i32,
     bytes: u32,
-    server_total_ns: u64,
-    submit_queue_ns: u64,
-    engine_submit_ns: u64,
-    durable_wait_ns: u64,
+    stages: StageTimings,
 ) -> ResponseHeader {
     ResponseHeader {
         opcode,
@@ -1289,21 +1404,28 @@ fn response(
         } else {
             0
         },
-        server_total_ns,
-        submit_queue_ns,
-        engine_submit_ns,
-        durable_wait_ns,
-        completion_dispatch_ns: 0,
+        server_total_ns: stages.server_total_ns,
+        submit_queue_ns: stages.submit_queue_ns,
+        engine_submit_ns: stages.engine_submit_ns,
+        durable_wait_ns: stages.durable_wait_ns,
+        completion_dispatch_ns: stages.completion_dispatch_ns,
+        intake_ns: stages.intake_ns,
+        // Both are stamped by `write_response`, the single funnel every
+        // response goes through on its way to the socket.
+        response_queue_ns: 0,
+        server_send_ns: 0,
     }
 }
 
-fn write_response(stream: &mut UnixStream, outbound: &Outbound) -> io::Result<()> {
+fn write_response(stream: &mut UnixStream, outbound: &mut Outbound) -> io::Result<()> {
     if outbound.header.payload_len as usize != outbound.payload.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "direct IO response payload length mismatch",
         ));
     }
+    outbound.header.response_queue_ns = outbound.queued_at.elapsed().as_nanos() as u64;
+    outbound.header.server_send_ns = monotonic_ns();
     stream.write_all(&outbound.header.encode())?;
     stream.write_all(&outbound.payload)?;
     Ok(())
@@ -1338,7 +1460,7 @@ fn read_exact_interruptible(
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "direct IO frame ended early",
-                ))
+                ));
             }
             Ok(read) => offset += read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1348,7 +1470,7 @@ fn read_exact_interruptible(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                continue
+                continue;
             }
             Err(error) => return Err(error),
         }
@@ -1384,9 +1506,11 @@ mod tests {
             request_id: 0x0102_0304_0506_0708,
             offset: 0x1112_1314_1516_1718,
             io_len: 4096,
+            client_submit_ns: 0x2122_2324_2526_2728,
         };
         let encoded = header.encode();
-        assert_eq!(&encoded[0..8], b"ONIO\x01\x00\x02\x00");
+        assert_eq!(&encoded[0..8], b"ONIO\x02\x00\x02\x00");
+        assert_eq!(&encoded[36..40], &[0; 4], "reserved stays zero");
         assert_eq!(RequestHeader::decode(&encoded).unwrap(), header);
     }
 
@@ -1403,8 +1527,91 @@ mod tests {
             engine_submit_ns: 30,
             durable_wait_ns: 40,
             completion_dispatch_ns: 50,
+            intake_ns: 60,
+            response_queue_ns: 70,
+            server_send_ns: 80,
         };
         assert_eq!(ResponseHeader::decode(&header.encode()).unwrap(), header);
+    }
+
+    /// A zero stamp means "the client does not stamp", and a stamp from the
+    /// future means the two readings raced a clock adjustment.  Neither may
+    /// turn into a fabricated latency — the whole point of this field is that
+    /// a number in it can be trusted.
+    #[test]
+    fn intake_is_unmeasured_rather_than_fabricated() {
+        assert_eq!(measure_intake_ns(0, 10_000), 0, "unstamped client");
+        assert_eq!(measure_intake_ns(10_000, 5_000), 0, "stamp from the future");
+        assert_eq!(measure_intake_ns(5_000, 12_000), 7_000);
+    }
+
+    /// A stage measured but dropped by one of the several response builders
+    /// is indistinguishable from a stage that is genuinely zero, and every
+    /// builder now funnels through `response`.  Pin the whole set across the
+    /// wire so a new field cannot be added to `StageTimings` and quietly go
+    /// nowhere.
+    #[test]
+    fn error_responses_carry_every_measured_stage() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let request = RequestHeader {
+            opcode: OP_WRITE,
+            flags: 0,
+            payload_len: 4096,
+            request_id: 11,
+            offset: 0,
+            io_len: 4096,
+            client_submit_ns: 1,
+        };
+        send_error(
+            &tx,
+            &request,
+            -libc::ENOSPC,
+            Instant::now(),
+            StageTimings {
+                server_total_ns: 0,
+                submit_queue_ns: 2,
+                engine_submit_ns: 3,
+                durable_wait_ns: 4,
+                completion_dispatch_ns: 5,
+                intake_ns: 6,
+            },
+            true,
+        );
+
+        let outbound = rx.try_recv().expect("error response was queued");
+        let header = ResponseHeader::decode(&outbound.header.encode()).unwrap();
+        assert_eq!(header.status, -libc::ENOSPC);
+        assert_eq!(header.submit_queue_ns, 2);
+        assert_eq!(header.engine_submit_ns, 3);
+        assert_eq!(header.durable_wait_ns, 4);
+        assert_eq!(header.completion_dispatch_ns, 5);
+        assert_eq!(header.intake_ns, 6, "intake must survive the error path");
+        assert!(outbound.clear_active_id);
+    }
+
+    /// `server_total_ns` stops when a response is *built*; the per-session
+    /// writer thread then has to be scheduled before the bytes leave.  That
+    /// gap was invisible until now, so assert the funnel actually stamps it.
+    #[test]
+    fn write_response_stamps_the_writer_queue_delay() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let mut outbound = Outbound::header_only(
+            response(OP_WRITE, 7, 0, 4096, StageTimings::default()),
+            false,
+        );
+        thread::sleep(Duration::from_millis(2));
+        let before = monotonic_ns();
+        write_response(&mut server, &mut outbound).unwrap();
+
+        let mut buf = [0u8; RESPONSE_HEADER_LEN];
+        client.read_exact(&mut buf).unwrap();
+        let decoded = ResponseHeader::decode(&buf).unwrap();
+        assert!(
+            decoded.response_queue_ns >= 2_000_000,
+            "queue delay {} ns should cover the 2 ms the response waited",
+            decoded.response_queue_ns
+        );
+        assert!(decoded.server_send_ns >= before);
     }
 
     #[test]
@@ -1432,6 +1639,7 @@ mod tests {
             request_id: 7,
             offset: 0,
             io_len: 0,
+            client_submit_ns: monotonic_ns(),
         };
         client.write_all(&hello.encode()).unwrap();
         client.write_all(volume).unwrap();

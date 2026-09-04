@@ -16,8 +16,8 @@ use crossbeam_channel::{Receiver, Sender};
 
 use onyx_storage::config::OnyxConfig;
 use onyx_storage::direct_io::{
-    RequestHeader, ResponseHeader, MAX_DIRECT_IO_OUTSTANDING, MAX_VOLUME_NAME_BYTES, OP_CLOSE,
-    OP_HELLO, OP_WRITE, REQUEST_HEADER_LEN, RESPONSE_HEADER_LEN,
+    monotonic_ns, RequestHeader, ResponseHeader, MAX_DIRECT_IO_OUTSTANDING, MAX_VOLUME_NAME_BYTES,
+    OP_CLOSE, OP_HELLO, OP_WRITE, REQUEST_HEADER_LEN, RESPONSE_HEADER_LEN,
 };
 use onyx_storage::engine::OnyxEngine;
 use onyx_storage::metrics::{EngineMetricsSnapshot, EngineStatusSnapshot, MetaMemorySnapshot};
@@ -414,6 +414,7 @@ impl DirectApiClient {
                 request_id: 0,
                 offset: 0,
                 io_len: 0,
+                client_submit_ns: 0,
             },
             volume.as_bytes(),
         )?;
@@ -437,6 +438,7 @@ impl DirectApiClient {
                 request_id,
                 offset,
                 io_len: payload.len() as u32,
+                client_submit_ns: 0,
             },
             payload,
         )?;
@@ -474,6 +476,7 @@ impl DirectApiClient {
                 request_id,
                 offset: 0,
                 io_len: 0,
+                client_submit_ns: 0,
             },
             &[],
         )?;
@@ -491,7 +494,12 @@ impl DirectApiClient {
         Ok(request_id)
     }
 
-    fn write_request(&mut self, header: RequestHeader, payload: &[u8]) -> Result<()> {
+    fn write_request(&mut self, mut header: RequestHeader, payload: &[u8]) -> Result<()> {
+        // Stamped here, not at the call sites, so the value is always the
+        // last thing measured before the bytes leave — that is what makes the
+        // server's `intake_ns` a transit measurement rather than one that has
+        // this client's own bookkeeping folded into it.
+        header.client_submit_ns = monotonic_ns();
         if payload.len() != header.payload_len as usize {
             return Err(anyhow!(
                 "request {} payload length mismatch: header={}, actual={}",
@@ -3909,6 +3917,9 @@ mod tests {
                     engine_submit_ns: 0,
                     durable_wait_ns: 0,
                     completion_dispatch_ns: 0,
+                    intake_ns: 0,
+                    response_queue_ns: 0,
+                    server_send_ns: 0,
                 },
             );
 
@@ -3932,6 +3943,9 @@ mod tests {
                         engine_submit_ns: 10,
                         durable_wait_ns: 15,
                         completion_dispatch_ns: 5,
+                        intake_ns: 3,
+                        response_queue_ns: 4,
+                        server_send_ns: 0,
                     },
                 );
             }
@@ -3952,6 +3966,9 @@ mod tests {
                     engine_submit_ns: 0,
                     durable_wait_ns: 0,
                     completion_dispatch_ns: 0,
+                    intake_ns: 0,
+                    response_queue_ns: 0,
+                    server_send_ns: 0,
                 },
             );
         });
