@@ -264,6 +264,25 @@ impl BufferFlusher {
         } else {
             8
         };
+        // These three pools are still ONE channel with N receivers. N is 8 / 4 / 8
+        // by default, i.e. at or under the bound, so routing them through
+        // `WorkerQueue` would change nothing today — but the sizes are config
+        // knobs, so make crossing the bound loud rather than silent.
+        if shared_compress_pool {
+            crate::worker_queue::warn_if_over_receiver_bound(
+                "flusher-compress",
+                compress_pool_workers,
+            );
+        }
+        if shared_cleanup_pool {
+            crate::worker_queue::warn_if_over_receiver_bound(
+                "flusher-cleanup",
+                cleanup_pool_workers,
+            );
+        }
+        if shared_dedup_pool {
+            crate::worker_queue::warn_if_over_receiver_bound("flusher-dedup", dedup_pool_workers);
+        }
         let shared_compress_channel = shared_compress_pool.then(|| {
             bounded::<CoalesceUnit>(
                 Self::WRITER_BATCH_SIZE

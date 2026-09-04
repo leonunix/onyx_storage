@@ -22,6 +22,7 @@ use crate::buffer::pool::BufferAppendTicket;
 use crate::config::UblkConfig;
 use crate::error::{OnyxError, OnyxResult};
 use crate::types::{Lba, VolumeConfig, BLOCK_SIZE, SECTOR_SIZE};
+use crate::worker_queue::WorkerQueue;
 use crate::zone::manager::ZoneManager;
 
 /// ublk target that routes IO through the ZoneManager
@@ -62,7 +63,10 @@ struct QueuedIo {
 /// wakes the queue thread so it drains them.
 struct QueueSinks {
     completion_tx: Sender<CompletedIo>,
-    durability_tx: Sender<PendingDurableIo>,
+    /// Routed through `WorkerQueue` even when this queue owns its single
+    /// private dispatcher, so both paths have one type and the receiver bound
+    /// applies no matter which is configured.
+    durability_tx: Arc<WorkerQueue<PendingDurableIo>>,
     event_fd: RawFd,
 }
 
@@ -463,16 +467,20 @@ fn record_completed_io_metrics(
 ///   `qid * workers + i` (decodable back to qid for NUMA pod routing);
 /// * shared pool — one call for the device, `ublk-io-worker-<i>`, affinity index
 ///   `i`, and every worker can serve every queue.
+/// `receivers` comes from `WorkerQueue::build`: one entry per worker, so no
+/// more than `worker_queue::MAX_RECEIVERS_PER_CHANNEL` of them share a channel.
+/// Cloning ONE receiver per worker here is what made this pool's wake path
+/// O(pool size) under a single mutex — see that constant.
 fn spawn_io_workers(
     name_prefix: String,
-    workers: usize,
     affinity_base: usize,
     ctx: IoWorkerContext,
-    request_rx: Receiver<QueuedIo>,
+    receivers: Vec<Receiver<QueuedIo>>,
 ) -> Vec<JoinHandle<()>> {
-    (0..workers)
-        .map(|worker_idx| {
-            let rx = request_rx.clone();
+    receivers
+        .into_iter()
+        .enumerate()
+        .map(|(worker_idx, rx)| {
             let ctx = ctx.clone();
             let name = format!("{name_prefix}{worker_idx}");
             thread::Builder::new()
@@ -734,18 +742,26 @@ impl OnyxUblkTarget {
             } else {
                 queue_workers * nr_queues as usize
             };
-            let (tx, rx) = crossbeam_channel::unbounded::<QueuedIo>();
-            let handles = spawn_io_workers("ublk-io-worker-".to_string(), total, 0, worker_ctx.clone(), rx);
+            let (queue, receivers) = WorkerQueue::<QueuedIo>::build(total, None);
+            let groups = queue.groups();
+            let handles = spawn_io_workers(
+                "ublk-io-worker-".to_string(),
+                0,
+                worker_ctx.clone(),
+                receivers,
+            );
             tracing::info!(
                 workers = total,
+                groups,
+                receivers_per_group = crate::worker_queue::MAX_RECEIVERS_PER_CHANNEL,
                 nr_queues,
                 "ublk shared io worker pool started (every queue served by every worker)"
             );
-            Some((tx, handles))
+            Some((Arc::new(queue), handles))
         } else {
             None
         };
-        let shared_tx = shared_pool.as_ref().map(|(tx, _)| tx.clone());
+        let shared_tx = shared_pool.as_ref().map(|(queue, _)| queue.clone());
 
         // Same shared-vs-private split as the IO worker pool above, for the
         // durability dispatcher: see UblkConfig::durability_dispatchers.
@@ -755,20 +771,27 @@ impl OnyxUblkTarget {
             } else {
                 8
             };
-            let (tx, rx) = crossbeam_channel::unbounded::<PendingDurableIo>();
-            let handles = (0..total)
-                .map(|i| spawn_durability_dispatcher(format!("ublk-durable-{i}"), i, rx.clone()))
+            let (queue, receivers) = WorkerQueue::<PendingDurableIo>::build(total, None);
+            let groups = queue.groups();
+            let handles = receivers
+                .into_iter()
+                .enumerate()
+                .map(|(i, rx)| spawn_durability_dispatcher(format!("ublk-durable-{i}"), i, rx))
                 .collect::<Vec<_>>();
             tracing::info!(
                 dispatchers = total,
+                groups,
+                receivers_per_group = crate::worker_queue::MAX_RECEIVERS_PER_CHANNEL,
                 nr_queues,
                 "ublk shared durability dispatcher pool started (every queue served by every dispatcher)"
             );
-            Some((tx, handles))
+            Some((Arc::new(queue), handles))
         } else {
             None
         };
-        let shared_durability_tx = shared_durability_pool.as_ref().map(|(tx, _)| tx.clone());
+        let shared_durability_tx = shared_durability_pool
+            .as_ref()
+            .map(|(queue, _)| queue.clone());
 
         let q_handler = move |qid: u16, dev: &UblkDev| {
             crate::affinity::bind_current(
@@ -795,10 +818,13 @@ impl OnyxUblkTarget {
             let (durability_tx, private_durability_handle) = match shared_durability_tx.as_ref() {
                 Some(tx) => (tx.clone(), None),
                 None => {
-                    let (tx, rx) = crossbeam_channel::unbounded::<PendingDurableIo>();
-                    let handle =
-                        spawn_durability_dispatcher(format!("ublk-q{qid}-durable"), qid as usize, rx);
-                    (tx, Some(handle))
+                    let (queue, mut receivers) = WorkerQueue::<PendingDurableIo>::build(1, None);
+                    let handle = spawn_durability_dispatcher(
+                        format!("ublk-q{qid}-durable"),
+                        qid as usize,
+                        receivers.remove(0),
+                    );
+                    (Arc::new(queue), Some(handle))
                 }
             };
             let sinks = Arc::new(QueueSinks {
@@ -813,20 +839,19 @@ impl OnyxUblkTarget {
             let (private_tx, worker_handles) = match shared_tx.as_ref() {
                 Some(_) => (None, Vec::new()),
                 None => {
-                    let (tx, rx) = crossbeam_channel::unbounded::<QueuedIo>();
+                    let (queue, receivers) = WorkerQueue::<QueuedIo>::build(queue_workers, None);
                     let handles = spawn_io_workers(
                         format!("ublk-q{qid}-worker-"),
-                        queue_workers,
                         qid as usize * queue_workers,
                         worker_ctx.clone(),
-                        rx,
+                        receivers,
                     );
-                    (Some(tx), handles)
+                    (Some(Arc::new(queue)), handles)
                 }
             };
             let submit_tx = match (&private_tx, shared_tx.as_ref()) {
-                (Some(tx), _) => tx.clone(),
-                (None, Some(tx)) => tx.clone(),
+                (Some(queue), _) => queue.clone(),
+                (None, Some(queue)) => queue.clone(),
                 (None, None) => unreachable!("one of the two pools is always present"),
             };
             let sinks_for_io = sinks.clone();
