@@ -8,6 +8,7 @@ use onyx_storage::types::*;
 
 fn make_unit(vol_id: &str, start_lba: u64, lba_count: u32, data_size: usize) -> CompressedUnit {
     CompressedUnit {
+        shard_idx: 0,
         vol_id: vol_id.to_string(),
         start_lba: Lba(start_lba),
         lba_count,
