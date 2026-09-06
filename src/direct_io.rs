@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -673,6 +673,66 @@ struct PendingWrite {
     bytes: u32,
 }
 
+/// Per-session request IDs that have not completed their response write.
+///
+/// A legal depth-256 client can receive one completion and immediately submit
+/// its replacement before the writer thread removes the completed ID. Waiting
+/// for that transient slot closes the race without holding this mutex across a
+/// socket write or weakening duplicate-ID detection.
+struct ActiveIds {
+    ids: Mutex<HashSet<u64>>,
+    slot_available: Condvar,
+}
+
+impl ActiveIds {
+    fn new() -> Self {
+        Self {
+            ids: Mutex::new(HashSet::new()),
+            slot_available: Condvar::new(),
+        }
+    }
+
+    fn reserve(
+        &self,
+        request_id: u64,
+        alive: &AtomicBool,
+        shutdown: &ShutdownState,
+    ) -> Result<(), i32> {
+        let mut ids = self.ids.lock().unwrap();
+        loop {
+            if ids.contains(&request_id) {
+                return Err(-libc::EALREADY);
+            }
+            if ids.len() < MAX_DIRECT_IO_OUTSTANDING {
+                ids.insert(request_id);
+                return Ok(());
+            }
+            if !alive.load(Ordering::Acquire) || shutdown.is_requested() {
+                return Err(-libc::ESHUTDOWN);
+            }
+            let (next, _) = self
+                .slot_available
+                .wait_timeout(ids, IO_POLL_TIMEOUT)
+                .unwrap();
+            ids = next;
+        }
+    }
+
+    fn contains(&self, request_id: u64) -> bool {
+        self.ids.lock().unwrap().contains(&request_id)
+    }
+
+    fn release(&self, request_id: u64) {
+        if self.ids.lock().unwrap().remove(&request_id) {
+            self.slot_available.notify_one();
+        }
+    }
+
+    fn wake_all(&self) {
+        self.slot_available.notify_all();
+    }
+}
+
 struct Outbound {
     header: ResponseHeader,
     payload: Vec<u8>,
@@ -807,7 +867,7 @@ fn handle_session(
     }
 
     let alive = Arc::new(AtomicBool::new(true));
-    let active_ids = Arc::new(Mutex::new(HashSet::<u64>::new()));
+    let active_ids = Arc::new(ActiveIds::new());
     // Two lanes so a large read payload in flight can't strand a pending
     // write ack behind it — see `writer_loop`'s doc comment.
     let (ack_tx, ack_rx) = crossbeam_channel::bounded(MAX_DIRECT_IO_OUTSTANDING);
@@ -926,32 +986,17 @@ fn handle_session(
                     continue;
                 }
 
-                let mut ids = active_ids.lock().unwrap();
-                if ids.contains(&header.request_id) {
-                    drop(ids);
+                if let Err(status) = active_ids.reserve(header.request_id, &alive, &shutdown) {
                     send_error(
                         &ack_tx,
                         &header,
-                        -libc::EALREADY,
+                        status,
                         server_started,
                         stages,
                         false,
                     );
                     continue;
                 }
-                if ids.len() >= MAX_DIRECT_IO_OUTSTANDING {
-                    drop(ids);
-                    send_error(
-                        &ack_tx,
-                        &header,
-                        -libc::EAGAIN,
-                        server_started,
-                        stages,
-                        false,
-                    );
-                    continue;
-                }
-                ids.insert(header.request_id);
             }
             OP_CLOSE => {
                 if header.payload_len != 0 || header.io_len != 0 || header.offset != 0 {
@@ -965,7 +1010,7 @@ fn handle_session(
                     );
                     continue;
                 }
-                if active_ids.lock().unwrap().contains(&header.request_id) {
+                if active_ids.contains(header.request_id) {
                     send_error(
                         &ack_tx,
                         &header,
@@ -1344,17 +1389,18 @@ fn write_and_clear(
     stream: &mut UnixStream,
     mut outbound: Outbound,
     alive: &AtomicBool,
-    active_ids: &Mutex<HashSet<u64>>,
+    active_ids: &ActiveIds,
 ) -> bool {
     let request_id = outbound.header.request_id;
     let clear_active_id = outbound.clear_active_id;
     if write_response(stream, &mut outbound).is_err() {
         alive.store(false, Ordering::Release);
+        active_ids.wake_all();
         let _ = stream.shutdown(std::net::Shutdown::Both);
         return false;
     }
     if clear_active_id {
-        active_ids.lock().unwrap().remove(&request_id);
+        active_ids.release(request_id);
     }
     true
 }
@@ -1377,7 +1423,7 @@ fn writer_loop(
     ack_rx: Receiver<Outbound>,
     payload_rx: Receiver<Outbound>,
     alive: Arc<AtomicBool>,
-    active_ids: Arc<Mutex<HashSet<u64>>>,
+    active_ids: Arc<ActiveIds>,
 ) {
     let _ = stream.set_write_timeout(Some(IO_WRITE_TIMEOUT));
     let mut ack_open = true;
@@ -1616,6 +1662,51 @@ mod tests {
         assert_eq!(measure_intake_ns(0, 10_000), 0, "unstamped client");
         assert_eq!(measure_intake_ns(10_000, 5_000), 0, "stamp from the future");
         assert_eq!(measure_intake_ns(5_000, 12_000), 7_000);
+    }
+
+    #[test]
+    fn active_id_limit_waits_for_completion_slot_instead_of_returning_eagain() {
+        let active_ids = Arc::new(ActiveIds::new());
+        let alive = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(ShutdownState::new());
+        for request_id in 0..MAX_DIRECT_IO_OUTSTANDING as u64 {
+            active_ids
+                .reserve(request_id, &alive, &shutdown)
+                .unwrap();
+        }
+        assert_eq!(
+            active_ids.reserve(0, &alive, &shutdown),
+            Err(-libc::EALREADY),
+            "duplicate IDs must still fail immediately at full depth"
+        );
+
+        let waiter_ids = active_ids.clone();
+        let waiter_alive = alive.clone();
+        let waiter_shutdown = shutdown.clone();
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let waiter = thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let result = waiter_ids.reserve(
+                MAX_DIRECT_IO_OUTSTANDING as u64,
+                &waiter_alive,
+                &waiter_shutdown,
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(10)).is_err(),
+            "a full legal-depth session must apply backpressure"
+        );
+        active_ids.release(0);
+        assert_eq!(
+            done_rx.recv_timeout(IO_POLL_TIMEOUT * 5).unwrap(),
+            Ok(())
+        );
+        assert!(active_ids.contains(MAX_DIRECT_IO_OUTSTANDING as u64));
+        waiter.join().unwrap();
     }
 
     /// A stage measured but dropped by one of the several response builders
