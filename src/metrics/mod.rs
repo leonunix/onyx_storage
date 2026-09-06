@@ -14,6 +14,7 @@ const FINE_LATENCY_BUCKETS: usize = FINE_LATENCY_DIRECT_BUCKETS
     + (FINE_LATENCY_LAST_EXPONENT - FINE_LATENCY_FIRST_EXPONENT + 1) * FINE_LATENCY_SUB_BUCKETS;
 const MAX_READ_POOL_WORKERS: usize = 128;
 
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 fn latency_bucket(ns: u64) -> usize {
     if ns == 0 {
         0
@@ -22,6 +23,7 @@ fn latency_bucket(ns: u64) -> usize {
     }
 }
 
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 fn record_latency_bucket(buckets: &[AtomicU64; LATENCY_BUCKETS], ns: u64) {
     buckets[latency_bucket(ns)].fetch_add(1, Ordering::Relaxed);
 }
@@ -1202,6 +1204,10 @@ impl Drop for ForegroundIoLease {
     }
 }
 
+#[cfg_attr(
+    not(any(test, feature = "diagnostic-metrics")),
+    allow(unused_variables)
+)]
 impl EngineMetrics {
     /// Mark one logical foreground IO active until the last holder drops.
     ///
@@ -1222,12 +1228,14 @@ impl EngineMetrics {
         worker_ns: u64,
         completion_wait_ns: u64,
     ) {
-        record_latency_bucket(&self.ublk_write_queue_wait_latency_buckets, queue_wait_ns);
-        record_latency_bucket(&self.ublk_write_worker_latency_buckets, worker_ns);
-        record_latency_bucket(
-            &self.ublk_write_completion_wait_latency_buckets,
-            completion_wait_ns,
-        );
+        crate::diagnostic_metrics! {
+            record_latency_bucket(&self.ublk_write_queue_wait_latency_buckets, queue_wait_ns);
+            record_latency_bucket(&self.ublk_write_worker_latency_buckets, worker_ns);
+            record_latency_bucket(
+                &self.ublk_write_completion_wait_latency_buckets,
+                completion_wait_ns,
+            );
+        }
     }
 
     /// Records one call to the ublk completion drain loop. `items` is how
@@ -1256,30 +1264,34 @@ impl EngineMetrics {
     }
 
     pub fn record_buffer_append_prepare_ns(&self, ns: u64) {
-        self.buffer_append_prepare_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        record_latency_bucket(&self.buffer_append_prepare_latency_buckets, ns);
+        crate::diagnostic_metrics! {
+            self.buffer_append_prepare_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&self.buffer_append_prepare_latency_buckets, ns);
+        }
     }
 
     pub fn record_buffer_append_order_wait_ns(&self, ns: u64) {
-        self.buffer_append_order_wait_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        record_counter_max(&self.buffer_append_order_wait_max_ns, ns);
-        record_latency_bucket(&self.buffer_append_order_wait_latency_buckets, ns);
+        crate::diagnostic_metrics! {
+            self.buffer_append_order_wait_ns.fetch_add(ns, Ordering::Relaxed);
+            record_counter_max(&self.buffer_append_order_wait_max_ns, ns);
+            record_latency_bucket(&self.buffer_append_order_wait_latency_buckets, ns);
+        }
     }
 
     pub fn record_buffer_append_order_hold_ns(&self, ns: u64) {
-        self.buffer_append_order_hold_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        record_counter_max(&self.buffer_append_order_hold_max_ns, ns);
-        record_latency_bucket(&self.buffer_append_order_hold_latency_buckets, ns);
+        crate::diagnostic_metrics! {
+            self.buffer_append_order_hold_ns.fetch_add(ns, Ordering::Relaxed);
+            record_counter_max(&self.buffer_append_order_hold_max_ns, ns);
+            record_latency_bucket(&self.buffer_append_order_hold_latency_buckets, ns);
+        }
     }
 
     pub fn record_buffer_append_wait_durable_ns(&self, ns: u64) {
-        self.buffer_append_wait_durable_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        record_latency_bucket(&self.buffer_append_wait_durable_latency_buckets, ns);
-        self.buffer_append_wait_durable_fine_latency.record(ns);
+        crate::diagnostic_metrics! {
+            self.buffer_append_wait_durable_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&self.buffer_append_wait_durable_latency_buckets, ns);
+            self.buffer_append_wait_durable_fine_latency.record(ns);
+        }
     }
 
     pub(crate) fn record_buffer_append_wait_durable_foreground_ns(&self, ns: u64) {
@@ -1315,69 +1327,80 @@ impl EngineMetrics {
             .snapshot()
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_staging_queue_ns(&self, ns: u64) {
-        self.buffer_lv2_staging_queue_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_staging_queue_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_prepared_queue_ns(&self, ns: u64) {
-        self.buffer_lv2_prepared_queue_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_prepared_queue_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_group_collect_ns(&self, ns: u64) {
-        self.buffer_lv2_group_collect_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_group_collect_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_payload_write_ns(&self, ns: u64) {
-        self.buffer_lv2_payload_write_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_payload_write_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_payload_profile(&self, wall_ns: u64, cpu_ns: u64) {
-        let cpu_ns = cpu_ns.min(wall_ns);
-        let offcpu_ns = wall_ns.saturating_sub(cpu_ns);
-        self.buffer_lv2_payload_profile_samples
-            .fetch_add(1, Ordering::Relaxed);
-        self.buffer_lv2_payload_profile_wall_ns
-            .fetch_add(wall_ns, Ordering::Relaxed);
-        self.buffer_lv2_payload_profile_cpu_ns
-            .fetch_add(cpu_ns, Ordering::Relaxed);
-        self.buffer_lv2_payload_profile_offcpu_ns
-            .fetch_add(offcpu_ns, Ordering::Relaxed);
-        record_counter_max(&self.buffer_lv2_payload_profile_wall_max_ns, wall_ns);
-        record_counter_max(&self.buffer_lv2_payload_profile_cpu_max_ns, cpu_ns);
-        record_counter_max(&self.buffer_lv2_payload_profile_offcpu_max_ns, offcpu_ns);
+        crate::diagnostic_metrics! {
+            let cpu_ns = cpu_ns.min(wall_ns);
+            let offcpu_ns = wall_ns.saturating_sub(cpu_ns);
+            self.buffer_lv2_payload_profile_samples.fetch_add(1, Ordering::Relaxed);
+            self.buffer_lv2_payload_profile_wall_ns.fetch_add(wall_ns, Ordering::Relaxed);
+            self.buffer_lv2_payload_profile_cpu_ns.fetch_add(cpu_ns, Ordering::Relaxed);
+            self.buffer_lv2_payload_profile_offcpu_ns.fetch_add(offcpu_ns, Ordering::Relaxed);
+            record_counter_max(&self.buffer_lv2_payload_profile_wall_max_ns, wall_ns);
+            record_counter_max(&self.buffer_lv2_payload_profile_cpu_max_ns, cpu_ns);
+            record_counter_max(&self.buffer_lv2_payload_profile_offcpu_max_ns, offcpu_ns);
+        }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_checkpoint_write_ns(&self, ns: u64) {
-        self.buffer_lv2_checkpoint_write_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_checkpoint_write_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_root_flush_ns(&self, ns: u64) {
-        self.buffer_lv2_root_flush_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_root_flush_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_entry_write_ns(&self, ns: u64) {
-        self.buffer_lv2_entry_write_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_entry_write_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_staged_to_durable_ns(&self, ns: u64) {
-        self.buffer_lv2_staged_to_durable_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_staged_to_durable_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_written_queue_ns(&self, ns: u64) {
-        self.buffer_lv2_written_queue_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_written_queue_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_written_to_durable_ns(&self, ns: u64) {
-        self.buffer_lv2_written_to_durable_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_written_to_durable_latency.record(ns); }
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_watermark_dispatch_ns(&self, ns: u64) {
-        self.buffer_lv2_watermark_dispatch_latency.record(ns);
+        crate::diagnostic_metrics! { self.buffer_lv2_watermark_dispatch_latency.record(ns); }
     }
 
     /// One completed coordinator epoch. `idle` is the time blocked waiting for
     /// a written batch; the rest is the serial critical section that every
     /// acknowledged append waits behind.
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn record_buffer_lv2_coord_epoch(
         &self,
         idle_ns: u64,
@@ -1386,22 +1409,19 @@ impl EngineMetrics {
         flush_ns: u64,
         publish_ns: u64,
     ) {
-        self.buffer_lv2_coord_idle_ns
-            .fetch_add(idle_ns, Ordering::Relaxed);
-        self.buffer_lv2_coord_ckpt_encode_ns
-            .fetch_add(ckpt_encode_ns, Ordering::Relaxed);
-        self.buffer_lv2_coord_ckpt_write_ns
-            .fetch_add(ckpt_write_ns, Ordering::Relaxed);
-        self.buffer_lv2_coord_flush_ns
-            .fetch_add(flush_ns, Ordering::Relaxed);
-        self.buffer_lv2_coord_publish_ns
-            .fetch_add(publish_ns, Ordering::Relaxed);
-        self.buffer_lv2_coord_epochs.fetch_add(1, Ordering::Relaxed);
-        let busy = ckpt_encode_ns
-            .saturating_add(ckpt_write_ns)
-            .saturating_add(flush_ns)
-            .saturating_add(publish_ns);
-        record_counter_max(&self.buffer_lv2_coord_busy_max_ns, busy);
+        crate::diagnostic_metrics! {
+            self.buffer_lv2_coord_idle_ns.fetch_add(idle_ns, Ordering::Relaxed);
+            self.buffer_lv2_coord_ckpt_encode_ns.fetch_add(ckpt_encode_ns, Ordering::Relaxed);
+            self.buffer_lv2_coord_ckpt_write_ns.fetch_add(ckpt_write_ns, Ordering::Relaxed);
+            self.buffer_lv2_coord_flush_ns.fetch_add(flush_ns, Ordering::Relaxed);
+            self.buffer_lv2_coord_publish_ns.fetch_add(publish_ns, Ordering::Relaxed);
+            self.buffer_lv2_coord_epochs.fetch_add(1, Ordering::Relaxed);
+            let busy = ckpt_encode_ns
+                .saturating_add(ckpt_write_ns)
+                .saturating_add(flush_ns)
+                .saturating_add(publish_ns);
+            record_counter_max(&self.buffer_lv2_coord_busy_max_ns, busy);
+        }
     }
 
     /// Get or create per-volume metrics counters.
@@ -1450,9 +1470,10 @@ impl EngineMetrics {
     }
 
     pub fn record_read_pool_queue_wait_ns(&self, ns: u64) {
-        self.read_pool_queue_wait_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        record_latency_bucket(&self.read_pool_queue_wait_latency_buckets, ns);
+        crate::diagnostic_metrics! {
+            self.read_pool_queue_wait_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&self.read_pool_queue_wait_latency_buckets, ns);
+        }
     }
 
     pub fn record_read_pool_worker_queue_wait_ns(
@@ -1461,13 +1482,23 @@ impl EngineMetrics {
         class: ReadPoolClass,
         ns: u64,
     ) {
-        if let Some(counter) = self.read_pool_worker_queue_wait_ns.get(worker_idx) {
-            counter.fetch_add(ns, Ordering::Relaxed);
+        let class_metrics = self.read_pool_class(class);
+        crate::diagnostic_metrics! {
+            if let Some(counter) = self.read_pool_worker_queue_wait_ns.get(worker_idx) {
+                counter.fetch_add(ns, Ordering::Relaxed);
+            }
+            class_metrics.queue_wait_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&class_metrics.queue_wait_latency_buckets, ns);
         }
+        self.record_read_pool_worker_dequeued(class);
+        self.record_read_pool_queue_wait_ns(ns);
+    }
+
+    /// Maintain request/depth accounting even when diagnostic timing is not
+    /// compiled into the engine.
+    pub fn record_read_pool_worker_dequeued(&self, class: ReadPoolClass) {
         let class_metrics = self.read_pool_class(class);
         class_metrics.requests.fetch_add(1, Ordering::Relaxed);
-        class_metrics.queue_wait_ns.fetch_add(ns, Ordering::Relaxed);
-        record_latency_bucket(&class_metrics.queue_wait_latency_buckets, ns);
         // Paired with the `record_read_pool_enqueued` bump; the request has left
         // the channel and is now the worker's.
         let _ = class_metrics
@@ -1475,7 +1506,6 @@ impl EngineMetrics {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
                 Some(depth.saturating_sub(1))
             });
-        self.record_read_pool_queue_wait_ns(ns);
     }
 
     pub fn record_read_pool_submit_wait_ns(
@@ -1484,24 +1514,25 @@ impl EngineMetrics {
         class: ReadPoolClass,
         ns: u64,
     ) {
-        self.read_pool_submit_wait_ns
-            .fetch_add(ns, Ordering::Relaxed);
-        record_latency_bucket(&self.read_pool_submit_wait_latency_buckets, ns);
-        if let Some(counter) = self.read_pool_worker_submit_wait_ns.get(worker_idx) {
-            counter.fetch_add(ns, Ordering::Relaxed);
-        }
         let class_metrics = self.read_pool_class(class);
-        class_metrics.submit_wait_ns.fetch_add(ns, Ordering::Relaxed);
         class_metrics.submit_batches.fetch_add(1, Ordering::Relaxed);
-        record_latency_bucket(&class_metrics.submit_wait_latency_buckets, ns);
+        crate::diagnostic_metrics! {
+            self.read_pool_submit_wait_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&self.read_pool_submit_wait_latency_buckets, ns);
+            if let Some(counter) = self.read_pool_worker_submit_wait_ns.get(worker_idx) {
+                counter.fetch_add(ns, Ordering::Relaxed);
+            }
+            class_metrics.submit_wait_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&class_metrics.submit_wait_latency_buckets, ns);
+        }
     }
 
     pub fn record_read_pool_decode_ns(&self, class: ReadPoolClass, ns: u64) {
-        self.read_pool_decode_ns.fetch_add(ns, Ordering::Relaxed);
-        record_latency_bucket(&self.read_pool_decode_latency_buckets, ns);
-        self.read_pool_class(class)
-            .decode_ns
-            .fetch_add(ns, Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            self.read_pool_decode_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&self.read_pool_decode_latency_buckets, ns);
+            self.read_pool_class(class).decode_ns.fetch_add(ns, Ordering::Relaxed);
+        }
     }
 
     /// One coalesced batch is about to be issued for `class`.
@@ -1512,15 +1543,15 @@ impl EngineMetrics {
     }
 
     pub fn record_read_pool_class_coalesce_wait_ns(&self, class: ReadPoolClass, ns: u64) {
-        self.read_pool_class(class)
-            .coalesce_wait_ns
-            .fetch_add(ns, Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            self.read_pool_class(class).coalesce_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        }
     }
 
     pub fn record_read_pool_worker_busy_ns(&self, class: ReadPoolClass, ns: u64) {
-        self.read_pool_class(class)
-            .worker_busy_ns
-            .fetch_add(ns, Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            self.read_pool_class(class).worker_busy_ns.fetch_add(ns, Ordering::Relaxed);
+        }
     }
 
     pub fn record_read_pool_worker_batch(&self, worker_idx: usize, requests: u64) {
@@ -1533,8 +1564,10 @@ impl EngineMetrics {
     }
 
     pub fn record_read_submit_unit_io_ns(&self, ns: u64) {
-        self.read_submit_unit_io_ns.fetch_add(ns, Ordering::Relaxed);
-        record_latency_bucket(&self.read_submit_unit_io_latency_buckets, ns);
+        crate::diagnostic_metrics! {
+            self.read_submit_unit_io_ns.fetch_add(ns, Ordering::Relaxed);
+            record_latency_bucket(&self.read_submit_unit_io_latency_buckets, ns);
+        }
     }
 }
 

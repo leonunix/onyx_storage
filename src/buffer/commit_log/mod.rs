@@ -1279,8 +1279,10 @@ pub struct WriteBufferPool {
 /// request worker while preserving ack-after-fdatasync semantics.
 pub struct BufferAppendTicket {
     shard: Arc<BufferShard>,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pending: Arc<PendingEntry>,
     seq: u64,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     append_started: Instant,
     durability_wait_started: Instant,
     /// Shared by every LV2 shard ticket belonging to one foreground request.
@@ -1300,6 +1302,7 @@ impl BufferAppendTicket {
     /// Time from the LV2 watermark advance that made this append durable until
     /// an asynchronous frontend observed it. `None` means the watermark has not
     /// advanced yet (or the entry came from recovery without a live timestamp).
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn completion_dispatch_delay_ns(&self, observed_at: Instant) -> Option<u64> {
         let advanced_at = self
             .pending
@@ -1330,7 +1333,7 @@ impl BufferAppendTicket {
         self.finish_at(Instant::now(), true)
     }
 
-    fn finish_at(self, finished_at: Instant, dispatched: bool) -> u64 {
+    fn finish_at(self, finished_at: Instant, _dispatched: bool) -> u64 {
         debug_assert!(self.is_durable());
         let durable_wait_ns = finished_at
             .saturating_duration_since(self.durability_wait_started)
@@ -1338,23 +1341,25 @@ impl BufferAppendTicket {
         if let Some(lease) = &self.foreground_io_lease {
             lease.record_buffer_append_wait_durable_ns(durable_wait_ns);
         }
-        if let Some(metrics) = self.shard.metrics.get() {
-            metrics.record_buffer_append_wait_durable_ns(durable_wait_ns);
-            metrics.buffer_append_total_ns.fetch_add(
-                finished_at
-                    .saturating_duration_since(self.append_started)
-                    .as_nanos() as u64,
-                Ordering::Relaxed,
-            );
-            if dispatched {
-                let advanced_at = self
-                    .pending
-                    .durability_advanced_at_ns
-                    .load(Ordering::Acquire);
-                if advanced_at != 0 {
-                    metrics.record_buffer_lv2_watermark_dispatch_ns(
-                        lv2_metric_timestamp_ns(finished_at).saturating_sub(advanced_at),
-                    );
+        crate::diagnostic_metrics! {
+            if let Some(metrics) = self.shard.metrics.get() {
+                metrics.record_buffer_append_wait_durable_ns(durable_wait_ns);
+                metrics.buffer_append_total_ns.fetch_add(
+                    finished_at
+                        .saturating_duration_since(self.append_started)
+                        .as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                if _dispatched {
+                    let advanced_at = self
+                        .pending
+                        .durability_advanced_at_ns
+                        .load(Ordering::Acquire);
+                    if advanced_at != 0 {
+                        metrics.record_buffer_lv2_watermark_dispatch_ns(
+                            lv2_metric_timestamp_ns(finished_at).saturating_sub(advanced_at),
+                        );
+                    }
                 }
             }
         }
@@ -1495,6 +1500,7 @@ struct BufferShardHandle {
 struct StagedEntry {
     pending: Arc<PendingEntry>,
     payload: Arc<[u8]>,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     staged_at: Instant,
 }
 

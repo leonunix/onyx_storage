@@ -1,5 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := all
+CARGO_FEATURES ?=
+CARGO_FEATURE_ARGS := $(if $(strip $(CARGO_FEATURES)),--features $(CARGO_FEATURES))
 
 .PHONY: all dev engine-build engine-test engine-release fio-engine dashboard-backend dashboard-frontend dashboard-build dashboard-backend-build dashboard-frontend-build dashboard-release
 
@@ -18,16 +20,16 @@ dev:
 	wait
 
 engine-build:
-	cargo build
+	cargo build $(CARGO_FEATURE_ARGS)
 
 engine-test:
 	cargo test
 
 engine-release:
-	cargo build --release
+	cargo build --release $(CARGO_FEATURE_ARGS)
 
 fio-engine:
-	$(MAKE) -C fio FIO_SOURCE_DIR="$(FIO_SOURCE_DIR)"
+	$(MAKE) -C fio FIO_SOURCE_DIR="$(FIO_SOURCE_DIR)" CARGO_FEATURES="$(CARGO_FEATURES)"
 
 dashboard-backend:
 	cd dashboard/backend && go run ./cmd/dashboardd

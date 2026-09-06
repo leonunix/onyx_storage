@@ -122,6 +122,7 @@ impl ReadPurpose {
 struct ReadRequest {
     mapping: BlockmapValue,
     reply: Sender<OnyxResult<Vec<u8>>>,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     enqueued_at: Instant,
     purpose: ReadPurpose,
     /// `false` → worker returns one 4 KB LBA at `mapping.offset_in_unit`
@@ -418,6 +419,7 @@ impl ReadPool {
             .send(ReadRequest {
                 mapping,
                 reply: reply_tx,
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 enqueued_at: Instant::now(),
                 purpose,
                 return_unit,
@@ -446,6 +448,7 @@ impl ReadPool {
             .send(ReadRequest {
                 mapping: first,
                 reply: reply_tx,
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 enqueued_at: Instant::now(),
                 purpose: ReadPurpose::Foreground,
                 return_unit: true,
@@ -596,7 +599,9 @@ fn worker_loop(
         // The worker is unavailable to any other batch from here until the last
         // reply goes out, coalescing included — that whole span is what
         // "mean busy workers" has to count.
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let busy_start = Instant::now();
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let coalesce_start = Instant::now();
         let deadline = Instant::now() + BATCH_COALESCE_WINDOW;
         loop {
@@ -624,15 +629,15 @@ fn worker_loop(
                 Err(_) => break,
             }
         }
-        let coalesce_ns = elapsed_ns(coalesce_start);
-        ctx.metrics
-            .read_pool_coalesce_wait_ns
-            .fetch_add(coalesce_ns, Ordering::Relaxed);
-        ctx.metrics
-            .record_read_pool_class_coalesce_wait_ns(class, coalesce_ns);
+        crate::diagnostic_metrics! {
+            let coalesce_ns = elapsed_ns(coalesce_start);
+            ctx.metrics.read_pool_coalesce_wait_ns.fetch_add(coalesce_ns, Ordering::Relaxed);
+            ctx.metrics.record_read_pool_class_coalesce_wait_ns(class, coalesce_ns);
+        }
         process_batch(&ctx, &mut scratch, &mut batch, class);
-        ctx.metrics
-            .record_read_pool_worker_busy_ns(class, elapsed_ns(busy_start));
+        crate::diagnostic_metrics! {
+            ctx.metrics.record_read_pool_worker_busy_ns(class, elapsed_ns(busy_start));
+        }
     }
 }
 
@@ -719,14 +724,15 @@ fn process_batch(
         let offset = ctx.base_offset() + (pba.0 + ctx.pba_offset) * ctx.block_size as u64;
 
         let slot = scratch.requests.len();
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let alloc_start = Instant::now();
         if let Err(e) = scratch.prepare_buffer(slot, read_size, ctx.use_hugepages) {
             let _ = req.reply.send(Err(e));
             continue;
         }
-        ctx.metrics
-            .read_pool_alloc_ns
-            .fetch_add(elapsed_ns(alloc_start), Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            ctx.metrics.read_pool_alloc_ns.fetch_add(elapsed_ns(alloc_start), Ordering::Relaxed);
+        }
         scratch.expected.push(read_size as u32);
         scratch.offsets.push(offset);
         scratch.requests.push(req);
@@ -764,15 +770,18 @@ fn process_uring_submit(
         });
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     let submit_start = Instant::now();
     let cqes = match unsafe { ring.submit_batch(&scratch.ops) } {
         Ok(c) => c,
         Err(e) => {
-            ctx.metrics.record_read_pool_submit_wait_ns(
-                ctx.worker_idx,
-                class,
-                elapsed_ns(submit_start),
-            );
+            crate::diagnostic_metrics! {
+                ctx.metrics.record_read_pool_submit_wait_ns(
+                    ctx.worker_idx,
+                    class,
+                    elapsed_ns(submit_start),
+                );
+            }
             for req in &scratch.requests {
                 let _ = req
                     .reply
@@ -783,8 +792,13 @@ fn process_uring_submit(
             return;
         }
     };
-    ctx.metrics
-        .record_read_pool_submit_wait_ns(ctx.worker_idx, class, elapsed_ns(submit_start));
+    crate::diagnostic_metrics! {
+        ctx.metrics.record_read_pool_submit_wait_ns(
+            ctx.worker_idx,
+            class,
+            elapsed_ns(submit_start),
+        );
+    }
 
     for i in 0..scratch.requests.len() {
         let exp_bytes = scratch.expected[i];
@@ -830,6 +844,7 @@ fn process_backend_submit(
     let offsets: Vec<u64> = scratch.offsets[..n].to_vec();
     let expected: Vec<u32> = scratch.expected[..n].to_vec();
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     let submit_start = Instant::now();
     let res = {
         let mut ops: Vec<(u64, &mut [u8])> = scratch.bufs[..n]
@@ -844,8 +859,13 @@ fn process_backend_submit(
             .collect();
         backend.read_many_at(&mut ops)
     };
-    ctx.metrics
-        .record_read_pool_submit_wait_ns(ctx.worker_idx, class, elapsed_ns(submit_start));
+    crate::diagnostic_metrics! {
+        ctx.metrics.record_read_pool_submit_wait_ns(
+            ctx.worker_idx,
+            class,
+            elapsed_ns(submit_start),
+        );
+    }
 
     if let Err(e) = res {
         for req in &scratch.requests {
@@ -875,7 +895,7 @@ fn finish_request(
     req: &ReadRequest,
     buf: &[u8],
     exp_bytes: u32,
-    class: ReadPoolClass,
+    _class: ReadPoolClass,
 ) {
     ctx.metrics.lv3_read_ops.fetch_add(1, Ordering::Relaxed);
     ctx.metrics
@@ -886,6 +906,7 @@ fn finish_request(
     //   return_unit=false: slice out a single 4 KB LBA (legacy).
     //   return_unit=true:  hand back the full decoded unit so the caller can
     //                      fan out multiple LBAs from one IO.
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     let decode_start = Instant::now();
     let count_crc_error = counts_as_crc_error(req.purpose);
     let result = if let Some(mappings) = req.raw_extent.as_ref() {
@@ -941,8 +962,9 @@ fn finish_request(
             dump_crc_victim_forensics(&req.mapping, req.raw_extent.as_deref());
         }
     }
-    ctx.metrics
-        .record_read_pool_decode_ns(class, elapsed_ns(decode_start));
+    crate::diagnostic_metrics! {
+        ctx.metrics.record_read_pool_decode_ns(_class, elapsed_ns(decode_start));
+    }
     let _ = req.reply.send(result);
 }
 
@@ -987,18 +1009,23 @@ fn dump_crc_victim_forensics(mapping: &BlockmapValue, raw_extent: Option<&[Block
     }
 }
 
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
-fn record_queue_wait(metrics: &EngineMetrics, worker_idx: usize, req: &ReadRequest) {
-    metrics.record_read_pool_worker_queue_wait_ns(
-        worker_idx,
-        req.purpose.class(),
-        Instant::now()
-            .saturating_duration_since(req.enqueued_at)
-            .as_nanos() as u64,
-    );
+fn record_queue_wait(metrics: &EngineMetrics, _worker_idx: usize, req: &ReadRequest) {
+    crate::diagnostic_metrics! {
+        metrics.record_read_pool_worker_queue_wait_ns(
+            _worker_idx,
+            req.purpose.class(),
+            Instant::now()
+                .saturating_duration_since(req.enqueued_at)
+                .as_nanos() as u64,
+        );
+    }
+    #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+    metrics.record_read_pool_worker_dequeued(req.purpose.class());
 }
 
 fn counts_as_crc_error(purpose: ReadPurpose) -> bool {

@@ -7,14 +7,19 @@ const POST_WRITE_VERIFY: bool = false;
 /// Profiling every root write would add two clock syscalls to the LV2 hot path.
 /// One sample per 64 calls is frequent enough for one-second metrics deltas while
 /// keeping the measurement overhead negligible.
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 const LV2_PAYLOAD_PROFILE_SAMPLE_MASK: u64 = 63;
 
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 fn should_sample_lv2_payload_write(sequence: &mut u64) -> bool {
     *sequence = sequence.wrapping_add(1);
     *sequence & LV2_PAYLOAD_PROFILE_SAMPLE_MASK == 0
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(test, feature = "diagnostic-metrics")
+))]
 fn thread_cpu_time() -> Option<Duration> {
     let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) };
@@ -25,7 +30,10 @@ fn thread_cpu_time() -> Option<Duration> {
     Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    any(test, feature = "diagnostic-metrics")
+))]
 fn thread_cpu_time() -> Option<Duration> {
     None
 }
@@ -176,6 +184,10 @@ impl WriteBufferPool {
         Duration::from_millis((1u64 << shift).min(16))
     }
 
+    #[cfg_attr(
+        not(any(test, feature = "diagnostic-metrics")),
+        allow(unused_variables)
+    )]
     fn write_batch(
         device: &dyn BlockBackend,
         io_lock: &parking_lot::Mutex<()>,
@@ -188,6 +200,7 @@ impl WriteBufferPool {
 
         let spans = Self::encode_entries_into_spans(entries)?;
 
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let write_start = Instant::now();
         let _guard = io_lock.lock();
         // One batched submit for the whole coalesced run. On a chunklet LD this
@@ -200,8 +213,10 @@ impl WriteBufferPool {
             .map(|s| (s.offset, &s.buf.as_slice()[..s.len as usize]))
             .collect();
         device.write_many_at(&ops)?;
-        if let Some(metrics) = metrics.get() {
-            BufferShard::record_metric(&metrics.buffer_append_log_write_ns, write_start);
+        crate::diagnostic_metrics! {
+            if let Some(metrics) = metrics.get() {
+                BufferShard::record_metric(&metrics.buffer_append_log_write_ns, write_start);
+            }
         }
 
         // Post-write verification: read back the first block of each entry
@@ -253,6 +268,10 @@ impl WriteBufferPool {
     /// The failpoint-driven test injection from `sync_device_impl` is checked
     /// after CQE harvest so existing recovery tests still cover this path.
 
+    #[cfg_attr(
+        not(any(test, feature = "diagnostic-metrics")),
+        allow(unused_variables)
+    )]
     pub(in crate::buffer::commit_log) fn write_batch_and_sync_uring(
         device: &dyn BlockBackend,
         shard: &BufferShard,
@@ -319,6 +338,7 @@ impl WriteBufferPool {
 
         // Fast path SQE budget: N data writes + 1 fsync + optional checkpoint.
         let fast_path_ops = span_count + 1 + usize::from(has_ckpt);
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let write_start = Instant::now();
 
         if fast_path_ops as u32 <= ring.sq_entries() {
@@ -430,8 +450,10 @@ impl WriteBufferPool {
             }
         }
 
-        if let Some(metrics) = metrics.get() {
-            BufferShard::record_metric(&metrics.buffer_append_log_write_ns, write_start);
+        crate::diagnostic_metrics! {
+            if let Some(metrics) = metrics.get() {
+                BufferShard::record_metric(&metrics.buffer_append_log_write_ns, write_start);
+            }
         }
 
         // 7. Honour the test failpoint AFTER successful CQE harvest so existing
@@ -686,8 +708,10 @@ impl WriteBufferPool {
             crate::metrics::record_counter_max(&m.buffer_sync_bytes_max, batch_bytes);
             m.buffer_sync_epochs_committed
                 .fetch_add(batch_entries, Ordering::Relaxed);
-            BufferShard::record_metric(&m.buffer_append_log_write_ns, batch.write_start);
-            BufferShard::record_metric(&m.buffer_sync_batch_ns, batch.write_start);
+            crate::diagnostic_metrics! {
+                BufferShard::record_metric(&m.buffer_append_log_write_ns, batch.write_start);
+                BufferShard::record_metric(&m.buffer_sync_batch_ns, batch.write_start);
+            }
         }
     }
 
@@ -1047,6 +1071,7 @@ impl WriteBufferPool {
             spans: Vec<CoalescedSpan>,
             checkpoint: ShardCheckpoint,
             started: Instant,
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             prepared_at: Instant,
         }
 
@@ -1062,6 +1087,7 @@ impl WriteBufferPool {
             /// are where 40% of it hid (box 2026-08-25: 2.80 ms of a 7.02 ms
             /// mean unaccounted, measured with UPPER-BOUND means for every other
             /// stage).
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             written_at: Instant,
         }
 
@@ -1101,13 +1127,16 @@ impl WriteBufferPool {
                     );
                     loop {
                         if shard.staging_rx.is_empty() {
+                            #[cfg(any(test, feature = "diagnostic-metrics"))]
                             let idle_started = Instant::now();
                             let woken = wake_rx.recv_timeout(Duration::from_millis(50));
-                            if let Some(metrics) = metrics.get() {
-                                metrics.buffer_lv2_prepare_idle_ns.fetch_add(
-                                    idle_started.elapsed().as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                );
+                            crate::diagnostic_metrics! {
+                                if let Some(metrics) = metrics.get() {
+                                    metrics.buffer_lv2_prepare_idle_ns.fetch_add(
+                                        idle_started.elapsed().as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
                             }
                             match woken {
                                 Ok(()) => {}
@@ -1129,17 +1158,20 @@ impl WriteBufferPool {
                         // path the same window three times.
                         let started = Instant::now();
                         let all = shard.drain_staged_limited();
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
                         let drained_at = Instant::now();
                         if all.is_empty() {
                             continue;
                         }
-                        if let Some(metrics) = metrics.get() {
-                            for entry in &all {
-                                metrics.record_buffer_lv2_staging_queue_ns(
-                                    drained_at
-                                        .saturating_duration_since(entry.staged_at)
-                                        .as_nanos() as u64,
-                                );
+                        crate::diagnostic_metrics! {
+                            if let Some(metrics) = metrics.get() {
+                                for entry in &all {
+                                    metrics.record_buffer_lv2_staging_queue_ns(
+                                        drained_at
+                                            .saturating_duration_since(entry.staged_at)
+                                            .as_nanos() as u64,
+                                    );
+                                }
                             }
                         }
                         let persist = {
@@ -1168,6 +1200,7 @@ impl WriteBufferPool {
                         // `built_at` closes the build segment and opens the send
                         // segment: a full lane queue blocks here, which is the
                         // signal that the write lanes are the constraint.
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
                         let built_at = Instant::now();
                         let sent = tx.send(PreparedBatch {
                             member_idx,
@@ -1175,17 +1208,20 @@ impl WriteBufferPool {
                             spans,
                             checkpoint,
                             started,
+                            #[cfg(any(test, feature = "diagnostic-metrics"))]
                             prepared_at: built_at,
                         });
                         if let Some(metrics) = metrics.get() {
-                            metrics.buffer_lv2_prepare_build_ns.fetch_add(
-                                built_at.saturating_duration_since(started).as_nanos() as u64,
-                                Ordering::Relaxed,
-                            );
-                            metrics.buffer_lv2_prepare_send_block_ns.fetch_add(
-                                built_at.elapsed().as_nanos() as u64,
-                                Ordering::Relaxed,
-                            );
+                            crate::diagnostic_metrics! {
+                                metrics.buffer_lv2_prepare_build_ns.fetch_add(
+                                    built_at.saturating_duration_since(started).as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                metrics.buffer_lv2_prepare_send_block_ns.fetch_add(
+                                    built_at.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                             metrics
                                 .buffer_lv2_prepare_batches
                                 .fetch_add(1, Ordering::Relaxed);
@@ -1210,22 +1246,24 @@ impl WriteBufferPool {
                         crate::affinity::ThreadRole::BufferSync,
                         lane_idx,
                     );
+                    #[cfg(any(test, feature = "diagnostic-metrics"))]
                     let mut payload_profile_sequence = 0u64;
                     loop {
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
                         let idle_started = Instant::now();
                         let Ok(first) = lane_rx.recv() else {
                             return;
                         };
-                        if let Some(metrics) = metrics.get() {
-                            metrics.buffer_lv2_lane_idle_ns.fetch_add(
-                                idle_started.elapsed().as_nanos() as u64,
-                                Ordering::Relaxed,
-                            );
-                        }
-                        if let Some(metrics) = metrics.get() {
-                            metrics.record_buffer_lv2_prepared_queue_ns(
-                                first.prepared_at.elapsed().as_nanos() as u64,
-                            );
+                        crate::diagnostic_metrics! {
+                            if let Some(metrics) = metrics.get() {
+                                metrics.buffer_lv2_lane_idle_ns.fetch_add(
+                                    idle_started.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                metrics.record_buffer_lv2_prepared_queue_ns(
+                                    first.prepared_at.elapsed().as_nanos() as u64,
+                                );
+                            }
                         }
                         let mut prepared = vec![first];
                         let collect_started = Instant::now();
@@ -1238,10 +1276,12 @@ impl WriteBufferPool {
                                 }
                                 match lane_rx.recv_timeout(deadline - now) {
                                     Ok(batch) => {
-                                        if let Some(metrics) = metrics.get() {
-                                            metrics.record_buffer_lv2_prepared_queue_ns(
-                                                batch.prepared_at.elapsed().as_nanos() as u64,
-                                            );
+                                        crate::diagnostic_metrics! {
+                                            if let Some(metrics) = metrics.get() {
+                                                metrics.record_buffer_lv2_prepared_queue_ns(
+                                                    batch.prepared_at.elapsed().as_nanos() as u64,
+                                                );
+                                            }
                                         }
                                         prepared.push(batch);
                                     }
@@ -1250,30 +1290,36 @@ impl WriteBufferPool {
                                 }
                             }
                         }
-                        if let Some(metrics) = metrics.get() {
-                            BufferShard::record_metric(
-                                &metrics.buffer_sync_sleep_ns,
-                                collect_started,
-                            );
+                        crate::diagnostic_metrics! {
+                            if let Some(metrics) = metrics.get() {
+                                BufferShard::record_metric(
+                                    &metrics.buffer_sync_sleep_ns,
+                                    collect_started,
+                                );
+                            }
                         }
                         while let Ok(batch) = lane_rx.try_recv() {
-                            if let Some(metrics) = metrics.get() {
-                                metrics.record_buffer_lv2_prepared_queue_ns(
-                                    batch.prepared_at.elapsed().as_nanos() as u64,
-                                );
+                            crate::diagnostic_metrics! {
+                                if let Some(metrics) = metrics.get() {
+                                    metrics.record_buffer_lv2_prepared_queue_ns(
+                                        batch.prepared_at.elapsed().as_nanos() as u64,
+                                    );
+                                }
                             }
                             prepared.push(batch);
                         }
-                        if let Some(metrics) = metrics.get() {
-                            let collect_ns = collect_started.elapsed().as_nanos() as u64;
-                            metrics.record_buffer_lv2_group_collect_ns(collect_ns);
-                            metrics
-                                .buffer_lv2_lane_collect_ns
-                                .fetch_add(collect_ns, Ordering::Relaxed);
+                        crate::diagnostic_metrics! {
+                            if let Some(metrics) = metrics.get() {
+                                let collect_ns = collect_started.elapsed().as_nanos() as u64;
+                                metrics.record_buffer_lv2_group_collect_ns(collect_ns);
+                                metrics.buffer_lv2_lane_collect_ns
+                                    .fetch_add(collect_ns, Ordering::Relaxed);
+                            }
                         }
 
                         let mut consecutive_failures = 0u32;
                         loop {
+                            #[cfg(any(test, feature = "diagnostic-metrics"))]
                             let opsbuild_started = Instant::now();
                             let mut ops = Vec::new();
                             for batch in &prepared {
@@ -1286,16 +1332,20 @@ impl WriteBufferPool {
                                 }));
                             }
                             let write_started = Instant::now();
-                            if let Some(metrics) = metrics.get() {
-                                metrics.buffer_lv2_lane_opsbuild_ns.fetch_add(
-                                    write_started
-                                        .saturating_duration_since(opsbuild_started)
-                                        .as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                );
+                            crate::diagnostic_metrics! {
+                                if let Some(metrics) = metrics.get() {
+                                    metrics.buffer_lv2_lane_opsbuild_ns.fetch_add(
+                                        write_started
+                                            .saturating_duration_since(opsbuild_started)
+                                            .as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
                             }
+                            #[cfg(any(test, feature = "diagnostic-metrics"))]
                             let profile_this_write =
                                 should_sample_lv2_payload_write(&mut payload_profile_sequence);
+                            #[cfg(any(test, feature = "diagnostic-metrics"))]
                             let cpu_started = profile_this_write.then(thread_cpu_time).flatten();
                             match root_device.write_many_at(&ops) {
                                 Ok(()) => {
@@ -1309,14 +1359,15 @@ impl WriteBufferPool {
                                             "slow LV2 global root write"
                                         );
                                     }
-                                    if let Some(metrics) = metrics.get() {
-                                        BufferShard::record_metric(
-                                            &metrics.buffer_append_log_write_ns,
-                                            write_started,
-                                        );
-                                        metrics.record_buffer_lv2_payload_write_ns(
-                                            write_elapsed.as_nanos() as u64,
-                                        );
+                                    crate::diagnostic_metrics! {
+                                        if let Some(metrics) = metrics.get() {
+                                            BufferShard::record_metric(
+                                                &metrics.buffer_append_log_write_ns,
+                                                write_started,
+                                            );
+                                            metrics.record_buffer_lv2_payload_write_ns(
+                                                write_elapsed.as_nanos() as u64,
+                                            );
                                         // Failed attempts and their retry backoff
                                         // are excluded; both are zero on a healthy
                                         // device, so the lane ledger still closes.
@@ -1334,20 +1385,23 @@ impl WriteBufferPool {
                                         // pays. That inspection bias is what
                                         // left 37% of `append_wait_durable`
                                         // looking unaccounted.
-                                        let epoch_entries: usize =
-                                            prepared.iter().map(|b| b.all.len()).sum();
-                                        for _ in 0..epoch_entries {
-                                            metrics.record_buffer_lv2_entry_write_ns(
-                                                write_elapsed.as_nanos() as u64,
-                                            );
+                                        crate::diagnostic_metrics! {
+                                            let epoch_entries: usize =
+                                                prepared.iter().map(|b| b.all.len()).sum();
+                                            for _ in 0..epoch_entries {
+                                                metrics.record_buffer_lv2_entry_write_ns(
+                                                    write_elapsed.as_nanos() as u64,
+                                                );
+                                            }
                                         }
-                                        if let Some(cpu_elapsed) = cpu_started.and_then(|started| {
-                                            thread_cpu_time().map(|now| now.saturating_sub(started))
-                                        }) {
-                                            metrics.record_buffer_lv2_payload_profile(
-                                                write_elapsed.as_nanos() as u64,
-                                                cpu_elapsed.as_nanos() as u64,
-                                            );
+                                            if let Some(cpu_elapsed) = cpu_started.and_then(|started| {
+                                                thread_cpu_time().map(|now| now.saturating_sub(started))
+                                            }) {
+                                                metrics.record_buffer_lv2_payload_profile(
+                                                    write_elapsed.as_nanos() as u64,
+                                                    cpu_elapsed.as_nanos() as u64,
+                                                );
+                                            }
                                         }
                                     }
                                     break;
@@ -1365,6 +1419,7 @@ impl WriteBufferPool {
                             }
                         }
 
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
                         let written_at = Instant::now();
                         let written = prepared
                             .into_iter()
@@ -1381,19 +1436,23 @@ impl WriteBufferPool {
                                     max_seq,
                                     checkpoint: batch.checkpoint,
                                     started: batch.started,
+                                    #[cfg(any(test, feature = "diagnostic-metrics"))]
                                     written_at,
                                 }
                             })
                             .collect();
                         // A full `written` queue means the single durability
                         // coordinator is the constraint, not this lane.
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
                         let send_started = Instant::now();
                         let sent = written_tx.send(written);
                         if let Some(metrics) = metrics.get() {
-                            metrics.buffer_lv2_lane_send_block_ns.fetch_add(
-                                send_started.elapsed().as_nanos() as u64,
-                                Ordering::Relaxed,
-                            );
+                            crate::diagnostic_metrics! {
+                                metrics.buffer_lv2_lane_send_block_ns.fetch_add(
+                                    send_started.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                             metrics
                                 .buffer_lv2_lane_epochs
                                 .fetch_add(1, Ordering::Relaxed);
@@ -1414,11 +1473,14 @@ impl WriteBufferPool {
                 // Everything from here to `publish` is serial and single
                 // threaded: every acknowledged append waits behind it, so
                 // `1 - idle/interval` is the ceiling this stage can sustain.
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 let idle_started = Instant::now();
                 let Ok(mut batches) = written_rx.recv() else {
                     break;
                 };
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 let recv_at = Instant::now();
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 let idle_ns = recv_at.saturating_duration_since(idle_started).as_nanos() as u64;
                 if let Some(metrics) = metrics.get() {
                     metrics
@@ -1431,21 +1493,25 @@ impl WriteBufferPool {
                 // A lane already formed the complete durability epoch for its
                 // root write. Drain any sibling epochs that finished in the
                 // meantime, then publish the shared barrier immediately.
-                if let Some(metrics) = metrics.get() {
-                    for batch in &batches {
-                        metrics.record_buffer_lv2_written_queue_ns(
-                            recv_at.saturating_duration_since(batch.written_at).as_nanos() as u64,
-                        );
+                crate::diagnostic_metrics! {
+                    if let Some(metrics) = metrics.get() {
+                        for batch in &batches {
+                            metrics.record_buffer_lv2_written_queue_ns(
+                                recv_at.saturating_duration_since(batch.written_at).as_nanos() as u64,
+                            );
+                        }
                     }
                 }
                 while let Ok(epoch) = written_rx.try_recv() {
-                    if let Some(metrics) = metrics.get() {
-                        let drained_at = Instant::now();
-                        for batch in &epoch {
-                            metrics.record_buffer_lv2_written_queue_ns(
-                                drained_at.saturating_duration_since(batch.written_at).as_nanos()
-                                    as u64,
-                            );
+                    crate::diagnostic_metrics! {
+                        if let Some(metrics) = metrics.get() {
+                            let drained_at = Instant::now();
+                            for batch in &epoch {
+                                metrics.record_buffer_lv2_written_queue_ns(
+                                    drained_at.saturating_duration_since(batch.written_at).as_nanos()
+                                        as u64,
+                                );
+                            }
                         }
                     }
                     batches.extend(epoch);
@@ -1521,11 +1587,15 @@ impl WriteBufferPool {
                 // Covers everything between the first written batch arriving and
                 // the checkpoint page write: the sibling-epoch drain, the packed
                 // checkpoint mutex, `begin_next`, and `encode_pending`.
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 let ckpt_encode_ns = recv_at.elapsed().as_nanos() as u64;
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 let mut ckpt_write_ns = 0u64;
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 let mut flush_ns = 0u64;
 
                 loop {
+                    #[cfg(any(test, feature = "diagnostic-metrics"))]
                     let checkpoint_started = Instant::now();
                     let checkpoint_result = match pending_generation {
                         Some(generation) => Self::write_packed_checkpoint_page(
@@ -1539,9 +1609,12 @@ impl WriteBufferPool {
                         ),
                         None => Ok(()),
                     };
+                    #[cfg(any(test, feature = "diagnostic-metrics"))]
                     let checkpoint_elapsed = checkpoint_started.elapsed();
-                    ckpt_write_ns =
-                        ckpt_write_ns.saturating_add(checkpoint_elapsed.as_nanos() as u64);
+                    crate::diagnostic_metrics! {
+                        ckpt_write_ns =
+                            ckpt_write_ns.saturating_add(checkpoint_elapsed.as_nanos() as u64);
+                    }
                     if let Err(err) = checkpoint_result {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         tracing::warn!(
@@ -1553,15 +1626,17 @@ impl WriteBufferPool {
                         thread::sleep(Self::sync_retry_backoff(consecutive_failures));
                         continue;
                     }
-                    if let Some(metrics) = metrics.get() {
-                        BufferShard::record_metric(
-                            &metrics.buffer_append_log_write_ns,
-                            checkpoint_started,
-                        );
-                        if pending_generation.is_some() {
-                            metrics.record_buffer_lv2_checkpoint_write_ns(
-                                checkpoint_elapsed.as_nanos() as u64,
+                    crate::diagnostic_metrics! {
+                        if let Some(metrics) = metrics.get() {
+                            BufferShard::record_metric(
+                                &metrics.buffer_append_log_write_ns,
+                                checkpoint_started,
                             );
+                            if pending_generation.is_some() {
+                                metrics.record_buffer_lv2_checkpoint_write_ns(
+                                    checkpoint_elapsed.as_nanos() as u64,
+                                );
+                            }
                         }
                     }
 
@@ -1572,7 +1647,9 @@ impl WriteBufferPool {
                     let flush_started = Instant::now();
                     let result = Self::sync_device_impl(root_device.as_ref());
                     let flush_elapsed = flush_started.elapsed();
-                    flush_ns = flush_ns.saturating_add(flush_elapsed.as_nanos() as u64);
+                    crate::diagnostic_metrics! {
+                        flush_ns = flush_ns.saturating_add(flush_elapsed.as_nanos() as u64);
+                    }
                     match result {
                         Ok(()) => {
                             consecutive_failures = 0;
@@ -1583,9 +1660,11 @@ impl WriteBufferPool {
                             }
                             if let Some(metrics) = metrics.get() {
                                 metrics.buffer_sync_flushes.fetch_add(1, Ordering::Relaxed);
-                                metrics.record_buffer_lv2_root_flush_ns(
-                                    flush_elapsed.as_nanos() as u64
-                                );
+                                crate::diagnostic_metrics! {
+                                    metrics.record_buffer_lv2_root_flush_ns(
+                                        flush_elapsed.as_nanos() as u64
+                                    );
+                                }
                             }
                             let epoch_elapsed = epoch_started.elapsed();
                             if flush_elapsed >= Duration::from_millis(10)
@@ -1616,6 +1695,7 @@ impl WriteBufferPool {
 
                 // Per-entry watermark advance and ready-publish, still on the
                 // single coordinator thread and still ahead of the next epoch.
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 let publish_started = Instant::now();
                 for batch in batches {
                     let shard = &members[batch.member_idx].1;
@@ -1637,35 +1717,37 @@ impl WriteBufferPool {
                         .map(|entry| entry.pending.seq)
                         .max()
                         .unwrap_or(0);
-                    let advance_at = Instant::now();
-                    let advanced_at_ns = lv2_metric_timestamp_ns(advance_at);
-                    for entry in &batch.all {
-                        entry
-                            .pending
-                            .durability_advanced_at_ns
-                            .store(advanced_at_ns, Ordering::Release);
-                    }
-                    if let Some(metrics) = metrics.get() {
-                        // The whole in-pipeline span, per entry: staged until
-                        // this entry's watermark advance. `append_wait_durable`
-                        // minus `watermark_dispatch` must equal this, so it is
-                        // the anchor the per-stage ledger has to add up to.
+                    crate::diagnostic_metrics! {
+                        let advance_at = Instant::now();
+                        let advanced_at_ns = lv2_metric_timestamp_ns(advance_at);
                         for entry in &batch.all {
-                            metrics.record_buffer_lv2_staged_to_durable_ns(
-                                advance_at.saturating_duration_since(entry.staged_at).as_nanos()
-                                    as u64,
-                            );
+                            entry.pending.durability_advanced_at_ns
+                                .store(advanced_at_ns, Ordering::Release);
+                        }
+                        if let Some(metrics) = metrics.get() {
+                            // The whole in-pipeline span, per entry: staged until
+                            // this entry's watermark advance. `append_wait_durable`
+                            // minus `watermark_dispatch` must equal this, so it is
+                            // the anchor the per-stage ledger has to add up to.
+                            for entry in &batch.all {
+                                metrics.record_buffer_lv2_staged_to_durable_ns(
+                                    advance_at.saturating_duration_since(entry.staged_at).as_nanos()
+                                        as u64,
+                                );
+                            }
                         }
                     }
                     shard.lv2_durability.advance(max_seq);
-                    if let Some(metrics) = metrics.get() {
-                        // Lane write done -> this batch's watermark advance.
-                        // Together with `written_queue` this splits the
-                        // coordinator's contribution into "waiting for the
-                        // coordinator" and "the coordinator's own serial work".
-                        metrics.record_buffer_lv2_written_to_durable_ns(
-                            batch.written_at.elapsed().as_nanos() as u64,
-                        );
+                    crate::diagnostic_metrics! {
+                        if let Some(metrics) = metrics.get() {
+                            // Lane write done -> this batch's watermark advance.
+                            // Together with `written_queue` this splits the
+                            // coordinator's contribution into "waiting for the
+                            // coordinator" and "the coordinator's own serial work".
+                            metrics.record_buffer_lv2_written_to_durable_ns(
+                                batch.written_at.elapsed().as_nanos() as u64,
+                            );
+                        }
                     }
                     for entry in &batch.all {
                         shard.publish_ready(entry.pending.seq);
@@ -1692,17 +1774,21 @@ impl WriteBufferPool {
                         metrics
                             .buffer_sync_epochs_committed
                             .fetch_add(entries, Ordering::Relaxed);
-                        BufferShard::record_metric(&metrics.buffer_sync_batch_ns, batch.started);
+                        crate::diagnostic_metrics! {
+                            BufferShard::record_metric(&metrics.buffer_sync_batch_ns, batch.started);
+                        }
                     }
                 }
-                if let Some(metrics) = metrics.get() {
-                    metrics.record_buffer_lv2_coord_epoch(
-                        idle_ns,
-                        ckpt_encode_ns,
-                        ckpt_write_ns,
-                        flush_ns,
-                        publish_started.elapsed().as_nanos() as u64,
-                    );
+                crate::diagnostic_metrics! {
+                    if let Some(metrics) = metrics.get() {
+                        metrics.record_buffer_lv2_coord_epoch(
+                            idle_ns,
+                            ckpt_encode_ns,
+                            ckpt_write_ns,
+                            flush_ns,
+                            publish_started.elapsed().as_nanos() as u64,
+                        );
+                    }
                 }
             }
         });
@@ -1779,10 +1865,16 @@ impl WriteBufferPool {
                     }
                     while wake_rx.try_recv().is_ok() {}
                     if !batch_wait.is_zero() {
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
                         let sleep_start = Instant::now();
                         thread::sleep(batch_wait);
-                        if let Some(metrics) = metrics.get() {
-                            BufferShard::record_metric(&metrics.buffer_sync_sleep_ns, sleep_start);
+                        crate::diagnostic_metrics! {
+                            if let Some(metrics) = metrics.get() {
+                                BufferShard::record_metric(
+                                    &metrics.buffer_sync_sleep_ns,
+                                    sleep_start,
+                                );
+                            }
                         }
                         while wake_rx.try_recv().is_ok() {}
                     }
@@ -1807,6 +1899,7 @@ impl WriteBufferPool {
                 }
             }
 
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             let batch_start = Instant::now();
             if !writes_applied {
                 let (writes_to_persist, cancelled_in_batch): (Vec<StagedEntry>, Vec<u64>) = {
@@ -2009,8 +2102,10 @@ impl WriteBufferPool {
                 }
             }
 
-            if let Some(metrics) = metrics.get() {
-                BufferShard::record_metric(&metrics.buffer_sync_batch_ns, batch_start);
+            crate::diagnostic_metrics! {
+                if let Some(metrics) = metrics.get() {
+                    BufferShard::record_metric(&metrics.buffer_sync_batch_ns, batch_start);
+                }
             }
         }
     }

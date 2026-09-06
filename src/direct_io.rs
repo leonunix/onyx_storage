@@ -117,6 +117,18 @@ fn measure_intake_ns(client_submit_ns: u64, received_ns: u64) -> u64 {
     received_ns.saturating_sub(client_submit_ns)
 }
 
+#[inline(always)]
+fn stage_monotonic_ns() -> u64 {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    {
+        return monotonic_ns();
+    }
+    #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+    {
+        0
+    }
+}
+
 /// Fixed-size little-endian request header.
 ///
 /// `payload_len` is the number of bytes following the header.  `io_len` is
@@ -264,6 +276,70 @@ struct StageTimings {
     durable_wait_ns: u64,
     completion_dispatch_ns: u64,
     intake_ns: u64,
+}
+
+/// A zero-sized clock in normal builds. This preserves the Direct IO wire
+/// layout while compiling all server-side stage clock reads out of production.
+#[derive(Debug, Clone, Copy)]
+struct StageInstant {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    inner: Instant,
+}
+
+impl StageInstant {
+    #[inline(always)]
+    fn now() -> Self {
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        {
+            return Self {
+                inner: Instant::now(),
+            };
+        }
+        #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+        {
+            Self {}
+        }
+    }
+
+    #[inline(always)]
+    fn elapsed(self) -> Duration {
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        {
+            return self.inner.elapsed();
+        }
+        #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+        {
+            Duration::ZERO
+        }
+    }
+
+    #[inline(always)]
+    fn saturating_duration_since(self, earlier: Self) -> Duration {
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        {
+            return self.inner.saturating_duration_since(earlier.inner);
+        }
+        #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+        {
+            let _ = earlier;
+            Duration::ZERO
+        }
+    }
+}
+
+#[inline(always)]
+fn completion_dispatch_delay_ns(ticket: &VolumeWriteTicket, completed_at: StageInstant) -> u64 {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    {
+        return ticket
+            .completion_dispatch_delay_ns(completed_at.inner)
+            .unwrap_or(0);
+    }
+    #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+    {
+        let _ = (ticket, completed_at);
+        0
+    }
 }
 
 fn validate_header_prefix(buf: &[u8], expected_len: usize) -> io::Result<()> {
@@ -589,8 +665,8 @@ fn reap_finished_sessions(sessions: &mut Vec<JoinHandle<()>>) {
 struct PendingWrite {
     request_id: u64,
     ticket: VolumeWriteTicket,
-    server_started: Instant,
-    submitted_at: Instant,
+    server_started: StageInstant,
+    submitted_at: StageInstant,
     submit_queue_ns: u64,
     engine_submit_ns: u64,
     intake_ns: u64,
@@ -603,7 +679,7 @@ struct Outbound {
     clear_active_id: bool,
     /// When this response was handed to the writer thread — turned into
     /// `ResponseHeader::response_queue_ns` by `write_response`.
-    queued_at: Instant,
+    queued_at: StageInstant,
 }
 
 impl Outbound {
@@ -612,7 +688,7 @@ impl Outbound {
             header,
             payload,
             clear_active_id,
-            queued_at: Instant::now(),
+            queued_at: StageInstant::now(),
         }
     }
 
@@ -625,8 +701,8 @@ struct SubmitTask {
     volume: Arc<OnyxVolume>,
     header: RequestHeader,
     payload: Vec<u8>,
-    server_started: Instant,
-    queued_at: Instant,
+    server_started: StageInstant,
+    queued_at: StageInstant,
     intake_ns: u64,
     pending_tx: Sender<PendingWrite>,
     /// Header-only responses (write acks, errors, close) — the fast lane.
@@ -816,8 +892,8 @@ fn handle_session(
         // Both stamps mark the same instant — the request is fully read.  The
         // `Instant` drives every relative stage timing; the raw monotonic
         // reading is what can be differenced against the client's stamp.
-        let received_ns = monotonic_ns();
-        let server_started = Instant::now();
+        let received_ns = stage_monotonic_ns();
+        let server_started = StageInstant::now();
         let stages = StageTimings {
             intake_ns: measure_intake_ns(header.client_submit_ns, received_ns),
             ..StageTimings::default()
@@ -921,7 +997,7 @@ fn handle_session(
             header,
             payload,
             server_started,
-            queued_at: Instant::now(),
+            queued_at: StageInstant::now(),
             intake_ns: stages.intake_ns,
             pending_tx: pending_tx.clone(),
             ack_tx: ack_tx.clone(),
@@ -1032,11 +1108,11 @@ fn handle_submit_write(mut task: SubmitTask, mut stages: StageTimings) {
         return;
     }
 
-    let submit_started = Instant::now();
+    let submit_started = StageInstant::now();
     let result = task
         .volume
         .write_aligned_deferred(header.offset, &task.payload);
-    let submitted_at = Instant::now();
+    let submitted_at = StageInstant::now();
     stages.engine_submit_ns = submitted_at
         .saturating_duration_since(submit_started)
         .as_nanos() as u64;
@@ -1103,7 +1179,7 @@ fn handle_submit_read(mut task: SubmitTask, mut stages: StageTimings) {
     let request_payload = std::mem::take(&mut task.payload);
     let _ = task.recycle_tx.try_send(request_payload);
     let mut data = vec![0u8; header.io_len as usize];
-    let submit_started = Instant::now();
+    let submit_started = StageInstant::now();
     let result = task.volume.read_into(header.offset, &mut data);
     stages.engine_submit_ns = submit_started.elapsed().as_nanos() as u64;
     match result {
@@ -1221,14 +1297,11 @@ fn complete_durable_write(
     alive: &AtomicBool,
     nonblocking: bool,
 ) {
-    let completed_at = Instant::now();
+    let completed_at = StageInstant::now();
     let observed_wait_ns = completed_at
         .saturating_duration_since(item.submitted_at)
         .as_nanos() as u64;
-    let completion_dispatch_ns = item
-        .ticket
-        .completion_dispatch_delay_ns(completed_at)
-        .unwrap_or(0)
+    let completion_dispatch_ns = completion_dispatch_delay_ns(&item.ticket, completed_at)
         .min(observed_wait_ns);
     let durable_wait_ns = observed_wait_ns.saturating_sub(completion_dispatch_ns);
     item.ticket.finish();
@@ -1376,7 +1449,7 @@ fn send_error(
     output: &Sender<Outbound>,
     header: &RequestHeader,
     status: i32,
-    started: Instant,
+    started: StageInstant,
     mut stages: StageTimings,
     clear_active_id: bool,
 ) {
@@ -1425,7 +1498,7 @@ fn write_response(stream: &mut UnixStream, outbound: &mut Outbound) -> io::Resul
         ));
     }
     outbound.header.response_queue_ns = outbound.queued_at.elapsed().as_nanos() as u64;
-    outbound.header.server_send_ns = monotonic_ns();
+    outbound.header.server_send_ns = stage_monotonic_ns();
     stream.write_all(&outbound.header.encode())?;
     stream.write_all(&outbound.payload)?;
     Ok(())
@@ -1566,7 +1639,7 @@ mod tests {
             &tx,
             &request,
             -libc::ENOSPC,
-            Instant::now(),
+            StageInstant::now(),
             StageTimings {
                 server_total_ns: 0,
                 submit_queue_ns: 2,

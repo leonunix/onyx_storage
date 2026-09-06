@@ -1,15 +1,17 @@
 FIO_SOURCE_DIR ?=
+CARGO_FEATURES ?=
+CARGO_FEATURE_ARGS := $(if $(strip $(CARGO_FEATURES)),--features $(CARGO_FEATURES))
 TARGET := onyx_fio_engine.so
 
-.PHONY: all clean
+.PHONY: all clean FORCE
 
 all: $(TARGET)
 
-$(TARGET): Cargo.toml build.rs src/lib.rs src/fio_bridge.c
+$(TARGET): Cargo.toml build.rs src/lib.rs src/fio_bridge.c FORCE
 	@test -n "$(FIO_SOURCE_DIR)" || { echo "FIO_SOURCE_DIR must point to the fio source tree" >&2; exit 2; }
 	@test -f "$(FIO_SOURCE_DIR)/fio.h" || { echo "$(FIO_SOURCE_DIR)/fio.h not found" >&2; exit 2; }
 	@test -f "$(FIO_SOURCE_DIR)/config-host.h" || { echo "run ./configure in $(FIO_SOURCE_DIR) first" >&2; exit 2; }
-	FIO_SOURCE_DIR="$(FIO_SOURCE_DIR)" cargo build --release --offline
+	FIO_SOURCE_DIR="$(FIO_SOURCE_DIR)" cargo build --release --offline $(CARGO_FEATURE_ARGS)
 	$(CC) -O2 -fPIC -shared -std=gnu11 -Wno-unused-parameter \
 		-D_GNU_SOURCE -DFIO_EXTERNAL_ENGINE \
 		-include "$(FIO_SOURCE_DIR)/config-host.h" -I"$(FIO_SOURCE_DIR)" \
@@ -19,3 +21,5 @@ $(TARGET): Cargo.toml build.rs src/lib.rs src/fio_bridge.c
 clean:
 	rm -f $(TARGET)
 	cargo clean
+
+FORCE:

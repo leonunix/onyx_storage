@@ -80,6 +80,9 @@ crossbeam-channel = "0.5"
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
+# Expensive per-IO timing, latency histograms, and lock diagnostics. Production
+# builds leave this off so the instrumentation is absent from hot paths.
+diagnostic-metrics = []
 
 [[bin]]
 name = "onyx-engine-bench"

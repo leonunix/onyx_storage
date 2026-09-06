@@ -6,16 +6,20 @@ mod sync;
 
 struct AppendOrderGuardSet<'a> {
     _guards: Vec<parking_lot::MutexGuard<'a, ()>>,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     metrics: Option<&'a EngineMetrics>,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     hold_started: Instant,
 }
 
 impl Drop for AppendOrderGuardSet<'_> {
     fn drop(&mut self) {
-        if let Some(metrics) = self.metrics {
-            metrics.record_buffer_append_order_hold_ns(
-                self.hold_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            );
+        crate::diagnostic_metrics! {
+            if let Some(metrics) = self.metrics {
+                metrics.record_buffer_append_order_hold_ns(
+                    self.hold_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+            }
         }
     }
 }
@@ -75,15 +79,20 @@ impl WriteBufferPool {
             };
             guards.push(guard);
         }
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let metrics = self.metrics.get().map(Arc::as_ref);
-        if let Some(metrics) = metrics {
-            metrics.record_buffer_append_order_wait_ns(
-                wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            );
+        crate::diagnostic_metrics! {
+            if let Some(metrics) = metrics {
+                metrics.record_buffer_append_order_wait_ns(
+                    wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+            }
         }
         Some(AppendOrderGuardSet {
             _guards: guards,
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             metrics,
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             hold_started: Instant::now(),
         })
     }
@@ -130,20 +139,26 @@ impl WriteBufferPool {
         indices.sort_unstable();
         indices.dedup();
 
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let wait_started = Instant::now();
         let guards = indices
             .into_iter()
             .map(|index| self.append_order_stripes[index].lock.lock())
             .collect();
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let metrics = self.metrics.get().map(Arc::as_ref);
-        if let Some(metrics) = metrics {
-            metrics.record_buffer_append_order_wait_ns(
-                wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            );
+        crate::diagnostic_metrics! {
+            if let Some(metrics) = metrics {
+                metrics.record_buffer_append_order_wait_ns(
+                    wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+            }
         }
         AppendOrderGuardSet {
             _guards: guards,
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             metrics,
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             hold_started: Instant::now(),
         }
     }
@@ -446,6 +461,7 @@ impl WriteBufferPool {
         if relocation_source.is_some() && self.relocation_appends_cancelled() {
             return Err(OnyxError::RelocationCancelled);
         }
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let total_start = Instant::now();
         let shard_idx = self.shard_for_lba(start_lba);
         if relocation_source.is_some()
@@ -529,10 +545,12 @@ impl WriteBufferPool {
         if append_result.as_ref().is_ok_and(|result| result.is_some()) {
             shard.shard.maintain_payload_cache_after_append();
         }
-        if let Some(metrics) = self.metrics.get() {
-            metrics.record_buffer_append_prepare_ns(total_start.elapsed().as_nanos() as u64);
+        crate::diagnostic_metrics! {
+            if let Some(metrics) = self.metrics.get() {
+                metrics.record_buffer_append_prepare_ns(total_start.elapsed().as_nanos() as u64);
+            }
         }
-        let Some((seq, pending)) = append_result? else {
+        let Some((seq, _pending)) = append_result? else {
             return Ok(None);
         };
         // Wake the per-shard sync thread so it drains the staging channel
@@ -542,8 +560,10 @@ impl WriteBufferPool {
         let _ = shard.sync_wake_tx.send(());
         Ok(Some(BufferAppendTicket {
             shard: shard.shard.clone(),
-            pending,
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
+            pending: _pending,
             seq,
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             append_started: total_start,
             durability_wait_started: Instant::now(),
             foreground_io_lease: None,

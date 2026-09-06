@@ -14,6 +14,19 @@ cd /path/to/matching/fio/source && ./configure
 make -C fio FIO_SOURCE_DIR=/path/to/matching/fio/source
 ```
 
+Normal release builds compile expensive per-IO stage timing out of both the
+engine and plugin. Build an instrumented pair only while diagnosing latency:
+
+```bash
+make engine-release CARGO_FEATURES=diagnostic-metrics
+make fio-engine FIO_SOURCE_DIR=/path/to/matching/fio/source \
+  CARGO_FEATURES=diagnostic-metrics
+```
+
+The response wire format remains version 2 in either mode. Without the feature,
+stage latency fields are zero (unmeasured), while correctness, error, capacity,
+and engine control-loop metrics remain enabled.
+
 Run a 4 KiB random-write workload against an already-running Onyx service:
 
 ```bash

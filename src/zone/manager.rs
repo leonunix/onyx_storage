@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 use std::time::Instant;
 
 use crate::buffer::flush::BufferFlusher;
@@ -156,6 +157,7 @@ pub struct ZoneManager {
 }
 
 #[inline]
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
@@ -169,17 +171,20 @@ fn with_foreground_io<T>(metrics: &Arc<EngineMetrics>, f: impl FnOnce() -> T) ->
 /// charges the total ns counter once on every exit (early-return paths and
 /// the success path) without having to thread the bookkeeping through each
 /// branch.
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 struct ReadSubmitTimer<'a> {
     counter: &'a std::sync::atomic::AtomicU64,
     start: Instant,
 }
 
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 impl<'a> ReadSubmitTimer<'a> {
     fn new(counter: &'a std::sync::atomic::AtomicU64, start: Instant) -> Self {
         Self { counter, start }
     }
 }
 
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 impl Drop for ReadSubmitTimer<'_> {
     fn drop(&mut self) {
         self.counter
@@ -290,16 +295,19 @@ impl ZoneManager {
         data: &[u8],
         vol_created_at: u64,
     ) -> OnyxResult<()> {
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let total_start = Instant::now();
         let tickets =
             self.submit_write_deferred(vol_id, start_lba, lba_count, data, vol_created_at)?;
         for ticket in tickets {
             ticket.wait();
         }
-        self.metrics.zone_submit_write_ns.fetch_add(
-            total_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        crate::diagnostic_metrics! {
+            self.metrics.zone_submit_write_ns.fetch_add(
+                total_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(())
     }
 
@@ -487,11 +495,14 @@ impl ZoneManager {
         self.metrics
             .read_submit_calls
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let total_start = Instant::now();
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let _scope_total = ReadSubmitTimer::new(&self.metrics.read_submit_total_ns, total_start);
 
         // Pass 1: buffer lookups. Hits write directly into `out_buf`; misses
         // queue up for a single blockmap batch.
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let pass1_start = Instant::now();
         let mut pending_lbas: Vec<u64> = Vec::new();
         let mut pending_slots: Vec<u32> = Vec::new();
@@ -523,9 +534,10 @@ impl ZoneManager {
                 pending_slots.push(i as u32);
             }
         }
-        self.metrics
-            .read_submit_buffer_lookup_ns
-            .fetch_add(elapsed_ns(pass1_start), Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            self.metrics.read_submit_buffer_lookup_ns
+                .fetch_add(elapsed_ns(pass1_start), Ordering::Relaxed);
+        }
 
         if pending_lbas.is_empty() {
             return Ok(ReadBatchOutcome::Complete);
@@ -550,7 +562,9 @@ impl ZoneManager {
         // span. A range scan returns only mapped entries, which avoids paying
         // one point lookup per hole when the volume is still sparse. Small
         // reads stay on multi_get to keep the one-block path minimal.
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let pass2_start = Instant::now();
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let meta_query_ns;
         if count >= RANGE_META_LOOKUP_MIN_LBAS {
             for &slot in &pending_slots {
@@ -559,6 +573,7 @@ impl ZoneManager {
             }
 
             let end_lba = Lba(start_lba.0 + count as u64);
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             let query_start = Instant::now();
             let mapped = if let Some(ord) = vol_ord {
                 self.meta
@@ -567,7 +582,10 @@ impl ZoneManager {
                 self.meta
                     .get_mappings_range_unordered_str(vol_id, start_lba, end_lba)?
             };
-            meta_query_ns = elapsed_ns(query_start);
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
+            {
+                meta_query_ns = elapsed_ns(query_start);
+            }
             let mut mapped_slot = vec![false; count as usize];
             if pending_lbas.len() == count as usize {
                 for (lba, mapping) in mapped {
@@ -619,6 +637,7 @@ impl ZoneManager {
                 self.metrics.read_unmapped.fetch_add(1, Ordering::Relaxed);
             }
         } else {
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
             let query_start = Instant::now();
             let mappings = if let Some(ord) = vol_ord {
                 self.meta.multi_get_mappings_raw_ord(ord, &pending_lbas)?
@@ -626,7 +645,10 @@ impl ZoneManager {
                 let pending_lbas: Vec<Lba> = pending_lbas.iter().copied().map(Lba).collect();
                 self.meta.multi_get_mappings_str(vol_id, &pending_lbas)?
             };
-            meta_query_ns = elapsed_ns(query_start);
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
+            {
+                meta_query_ns = elapsed_ns(query_start);
+            }
             for (idx, mapping_opt) in mappings.into_iter().enumerate() {
                 let slot = pending_slots[idx] as usize;
                 match mapping_opt {
@@ -659,16 +681,16 @@ impl ZoneManager {
                 }
             }
         }
-        self.metrics
-            .read_submit_meta_get_ns
-            .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
-        self.metrics
-            .read_submit_meta_query_ns
-            .fetch_add(meta_query_ns, Ordering::Relaxed);
-        self.metrics.read_submit_meta_route_ns.fetch_add(
-            elapsed_ns(pass2_start).saturating_sub(meta_query_ns),
-            Ordering::Relaxed,
-        );
+        crate::diagnostic_metrics! {
+            self.metrics.read_submit_meta_get_ns
+                .fetch_add(elapsed_ns(pass2_start), Ordering::Relaxed);
+            self.metrics.read_submit_meta_query_ns
+                .fetch_add(meta_query_ns, Ordering::Relaxed);
+            self.metrics.read_submit_meta_route_ns.fetch_add(
+                elapsed_ns(pass2_start).saturating_sub(meta_query_ns),
+                Ordering::Relaxed,
+            );
+        }
 
         if mapped_units.is_empty() {
             return Ok(ReadBatchOutcome::Complete);
@@ -754,6 +776,7 @@ impl ZoneManager {
         // Pass 4: fan out unit reads. Send all first, then drain — the
         // ReadPool worker coalesces same-worker requests into one io_uring
         // submit, and other workers run in parallel.
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
         let pass4_start = Instant::now();
         let pass4_result = if let Some(pool) = self.read_pool.as_deref() {
             let mut raw_receivers = Vec::with_capacity(raw_extents.len());
@@ -877,8 +900,9 @@ impl ZoneManager {
             }
             result
         };
-        self.metrics
-            .record_read_submit_unit_io_ns(elapsed_ns(pass4_start));
+        crate::diagnostic_metrics! {
+            self.metrics.record_read_submit_unit_io_ns(elapsed_ns(pass4_start));
+        }
         pass4_result.map(|_| ReadBatchOutcome::Complete)
     }
 

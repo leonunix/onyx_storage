@@ -27,6 +27,7 @@ impl BufferShard {
         start.elapsed().as_nanos().min(u64::MAX as u128) as u64
     }
 
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(super) fn record_metric(counter: &std::sync::atomic::AtomicU64, start: Instant) {
         counter.fetch_add(Self::elapsed_ns(start), Ordering::Relaxed);
     }
@@ -997,6 +998,7 @@ impl BufferShard {
             let staged = StagedEntry {
                 pending: pending.clone(),
                 payload,
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
                 staged_at: Instant::now(),
             };
             #[cfg(test)]

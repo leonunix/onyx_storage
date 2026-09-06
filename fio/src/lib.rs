@@ -3,7 +3,19 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::ptr;
+use std::time::Duration;
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 use std::time::Instant;
+
+#[cfg(any(test, feature = "diagnostic-metrics"))]
+macro_rules! diagnostic_metrics {
+    ($($body:tt)*) => {{ $($body)* }};
+}
+
+#[cfg(not(any(test, feature = "diagnostic-metrics")))]
+macro_rules! diagnostic_metrics {
+    ($($body:tt)*) => {{}};
+}
 
 const MAGIC: &[u8; 4] = b"ONIO";
 const VERSION: u16 = 2;
@@ -53,10 +65,12 @@ struct PollFd {
     revents: i16,
 }
 
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 const CLOCK_MONOTONIC: c_int = 1;
 
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: std::ffi::c_ulong, timeout: c_int) -> c_int;
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     fn clock_gettime(clk_id: c_int, tp: *mut Timespec) -> c_int;
 }
 
@@ -69,6 +83,7 @@ unsafe extern "C" {
 /// what turns the two socket-transit windows from "eliminated by proxy" into
 /// "measured" — the previous round could rule out six hypotheses for the
 /// ~10.6 ms unaccounted at QD1024 but could not see into either transit.
+#[cfg(any(test, feature = "diagnostic-metrics"))]
 fn monotonic_ns() -> u64 {
     let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `ts` is a live, exclusively borrowed timespec.
@@ -76,6 +91,63 @@ fn monotonic_ns() -> u64 {
         return 0;
     }
     (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
+}
+
+#[cfg(any(test, feature = "diagnostic-metrics"))]
+type MetricInstant = Instant;
+
+#[cfg(not(any(test, feature = "diagnostic-metrics")))]
+#[derive(Clone, Copy)]
+struct MetricInstant;
+
+#[inline(always)]
+fn metric_now() -> MetricInstant {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    {
+        return Instant::now();
+    }
+    #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+    {
+        MetricInstant
+    }
+}
+
+#[inline(always)]
+fn metric_elapsed(start: MetricInstant) -> Duration {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    {
+        return start.elapsed();
+    }
+    #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+    {
+        let _ = start;
+        Duration::ZERO
+    }
+}
+
+#[inline(always)]
+fn metric_duration_since(later: MetricInstant, earlier: MetricInstant) -> Duration {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    {
+        return later.saturating_duration_since(earlier);
+    }
+    #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+    {
+        let _ = (later, earlier);
+        Duration::ZERO
+    }
+}
+
+#[inline(always)]
+fn diagnostic_monotonic_ns() -> u64 {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    {
+        return monotonic_ns();
+    }
+    #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+    {
+        0
+    }
 }
 
 /// Block until the socket is readable. `timeout_ms` follows `poll(2)`: negative
@@ -135,7 +207,7 @@ struct Slot {
     /// Whatever gap remains is spent either staged in `pending` before a
     /// `commit()`, in transit, or after the response arrived but before
     /// `collect_one` got around to it.
-    queued_at: Option<Instant>,
+    queued_at: Option<MetricInstant>,
     /// Set by `commit()` — how long this request sat staged in `pending`
     /// before the client wrote it, i.e. `T(write) - T(queue)`. Carried per
     /// slot rather than only globally so the round-trip ledger can be closed
@@ -185,6 +257,7 @@ struct LatencyAccum {
 }
 
 impl LatencyAccum {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     fn record(&mut self, sample: StageSample) {
         self.count += 1;
         let s = &mut self.sum;
@@ -302,7 +375,7 @@ struct Client {
     /// "fio is off doing something else and hasn't called getevents yet".
     getevents_calls: u64,
     getevents_wall_ns: u64,
-    lifetime_start: Option<Instant>,
+    lifetime_start: Option<MetricInstant>,
     /// Responses read from the socket but not yet handed to fio. Persists
     /// ACROSS `getevents` calls, which is what lets a `read` that lands a
     /// partial frame simply return instead of blocking mid-frame.
@@ -360,7 +433,7 @@ impl Client {
             staged: Vec::with_capacity(depth),
             getevents_calls: 0,
             getevents_wall_ns: 0,
-            lifetime_start: Some(Instant::now()),
+            lifetime_start: Some(metric_now()),
             rx: vec![0; RX_CAPACITY],
             rx_head: 0,
             rx_tail: 0,
@@ -408,7 +481,7 @@ impl Client {
             buffer,
             len,
             opcode,
-            queued_at: Some(Instant::now()),
+            queued_at: Some(metric_now()),
             stage_delay_ns: 0,
         };
         self.staged.push(Staged { slot: index, header_at });
@@ -432,14 +505,13 @@ impl Client {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let sent_at = Instant::now();
-        let submit_ns = monotonic_ns().to_le_bytes();
+        let sent_at = metric_now();
+        let submit_ns = diagnostic_monotonic_ns().to_le_bytes();
         for i in 0..self.staged.len() {
             let staged = self.staged[i];
             let slot = &mut self.slots[staged.slot];
             if let Some(queued_at) = slot.queued_at {
-                slot.stage_delay_ns =
-                    sent_at.saturating_duration_since(queued_at).as_nanos() as u64;
+                slot.stage_delay_ns = metric_duration_since(sent_at, queued_at).as_nanos() as u64;
             }
             let at = staged.header_at + REQUEST_SUBMIT_NS_AT;
             self.pending[at..at + 8].copy_from_slice(&submit_ns);
@@ -529,32 +601,34 @@ impl Client {
 
         // Taken AFTER the payload copy so `egress_ns` covers the whole return
         // trip the client actually waited on, header and body alike.
-        let server_send_ns = u64_at(&response, 88);
-        let sample = StageSample {
-            client_rtt_ns: slot
-                .queued_at
-                .map(|start| start.elapsed().as_nanos() as u64)
-                .unwrap_or(0),
-            stage_delay_ns: slot.stage_delay_ns,
-            intake_ns: u64_at(&response, 72),
-            server_total_ns: u64_at(&response, 32),
-            submit_queue_ns: u64_at(&response, 40),
-            engine_submit_ns: u64_at(&response, 48),
-            durable_wait_ns: u64_at(&response, 56),
-            completion_dispatch_ns: u64_at(&response, 64),
-            response_queue_ns: u64_at(&response, 80),
-            egress_ns: if server_send_ns == 0 {
-                0
-            } else {
-                monotonic_ns().saturating_sub(server_send_ns)
-            },
-        };
-        let accum = match slot.opcode {
-            OP_READ => &mut self.read_stats,
-            OP_WRITE => &mut self.write_stats,
-            _ => unreachable!("only read/write slots are tracked"),
-        };
-        accum.record(sample);
+        diagnostic_metrics! {
+            let server_send_ns = u64_at(&response, 88);
+            let sample = StageSample {
+                client_rtt_ns: slot
+                    .queued_at
+                    .map(|start| metric_elapsed(start).as_nanos() as u64)
+                    .unwrap_or(0),
+                stage_delay_ns: slot.stage_delay_ns,
+                intake_ns: u64_at(&response, 72),
+                server_total_ns: u64_at(&response, 32),
+                submit_queue_ns: u64_at(&response, 40),
+                engine_submit_ns: u64_at(&response, 48),
+                durable_wait_ns: u64_at(&response, 56),
+                completion_dispatch_ns: u64_at(&response, 64),
+                response_queue_ns: u64_at(&response, 80),
+                egress_ns: if server_send_ns == 0 {
+                    0
+                } else {
+                    monotonic_ns().saturating_sub(server_send_ns)
+                },
+            };
+            let accum = match slot.opcode {
+                OP_READ => &mut self.read_stats,
+                OP_WRITE => &mut self.write_stats,
+                _ => unreachable!("only read/write slots are tracked"),
+            };
+            accum.record(sample);
+        }
         self.slots[index] = Slot::default();
         self.completed.push(slot.io_u);
         Ok(())
@@ -590,7 +664,7 @@ pub unsafe extern "C" fn onyx_rs_queue(client: *mut c_void, io_u: *mut c_void,
 pub unsafe extern "C" fn onyx_rs_getevents(client: *mut c_void, min: u32, max: u32,
                                             timeout: *const Timespec) -> c_int {
     let client = unsafe { &mut *client.cast::<Client>() };
-    let call_started = Instant::now();
+    let _call_started = metric_now();
     client.completed.clear();
     let fd = client.stream.as_raw_fd();
     let block_ms = timeout_ms(timeout);
@@ -631,8 +705,10 @@ pub unsafe extern "C" fn onyx_rs_getevents(client: *mut c_void, min: u32, max: u
             }
         }
     }
-    client.getevents_calls += 1;
-    client.getevents_wall_ns += call_started.elapsed().as_nanos() as u64;
+    diagnostic_metrics! {
+        client.getevents_calls += 1;
+        client.getevents_wall_ns += metric_elapsed(_call_started).as_nanos() as u64;
+    }
     match failed {
         // Completions already reaped in this call must still be reported;
         // dropping them on the way out is how fio loses io_us.
@@ -681,7 +757,7 @@ pub unsafe extern "C" fn onyx_rs_cleanup(client: *mut c_void) {
         );
     }
     if let Some(start) = client.lifetime_start {
-        let lifetime_ns = start.elapsed().as_nanos() as u64;
+        let lifetime_ns = metric_elapsed(start).as_nanos() as u64;
         let pct = if lifetime_ns > 0 {
             client.getevents_wall_ns as f64 / lifetime_ns as f64 * 100.0
         } else {

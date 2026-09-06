@@ -7,3 +7,7 @@ publish = false
 
 [lib]
 crate-type = ["staticlib"]
+
+[features]
+default = []
+diagnostic-metrics = []

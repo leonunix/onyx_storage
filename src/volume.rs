@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+#[cfg(any(test, feature = "diagnostic-metrics"))]
+use std::time::{Duration, Instant};
 
 use crate::buffer::commit_log::BufferAppendTicket;
 use crate::engine::VolumeAliveFlag;
@@ -35,6 +36,41 @@ pub struct OnyxVolume {
     vol_metrics: Arc<VolumeMetrics>,
 }
 
+#[derive(Clone, Copy)]
+struct VolumeMetricInstant {
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    inner: Instant,
+}
+
+impl VolumeMetricInstant {
+    #[inline(always)]
+    fn now() -> Self {
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        {
+            return Self {
+                inner: Instant::now(),
+            };
+        }
+        #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+        {
+            Self {}
+        }
+    }
+
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    #[inline(always)]
+    fn elapsed(self) -> Duration {
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        {
+            return self.inner.elapsed();
+        }
+        #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+        {
+            Duration::ZERO
+        }
+    }
+}
+
 /// An aligned volume write that has entered LV2 but is not necessarily durable.
 /// Waiting preserves the normal acknowledgement boundary: all covered buffer
 /// shards must advance their fdatasync watermark before the write completes.
@@ -46,8 +82,8 @@ pub struct VolumeWriteTicket {
     metrics: Arc<EngineMetrics>,
     vol_metrics: Arc<VolumeMetrics>,
     bytes: u64,
-    volume_started: Instant,
-    zone_started: Instant,
+    volume_started: VolumeMetricInstant,
+    zone_started: VolumeMetricInstant,
 }
 
 impl VolumeWriteTicket {
@@ -65,6 +101,7 @@ impl VolumeWriteTicket {
 
     /// Delay between the last covered shard becoming durable and an async
     /// frontend observing the completed volume write.
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn completion_dispatch_delay_ns(&self, observed_at: Instant) -> Option<u64> {
         if self.tickets.is_empty() || !self.is_durable() {
             return None;
@@ -128,21 +165,19 @@ impl VolumeWriteTicket {
         metrics: &EngineMetrics,
         vol_metrics: &VolumeMetrics,
         bytes: u64,
-        volume_started: Instant,
-        zone_started: Instant,
+        _volume_started: VolumeMetricInstant,
+        _zone_started: VolumeMetricInstant,
     ) {
-        let volume_elapsed_ns = volume_started.elapsed().as_nanos() as u64;
-        let zone_elapsed_ns = zone_started.elapsed().as_nanos() as u64;
         metrics.volume_write_ops.fetch_add(1, Ordering::Relaxed);
         metrics
             .volume_write_bytes
             .fetch_add(bytes, Ordering::Relaxed);
-        metrics
-            .volume_write_total_ns
-            .fetch_add(volume_elapsed_ns, Ordering::Relaxed);
-        metrics
-            .zone_submit_write_ns
-            .fetch_add(zone_elapsed_ns, Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            let volume_elapsed_ns = _volume_started.elapsed().as_nanos() as u64;
+            let zone_elapsed_ns = _zone_started.elapsed().as_nanos() as u64;
+            metrics.volume_write_total_ns.fetch_add(volume_elapsed_ns, Ordering::Relaxed);
+            metrics.zone_submit_write_ns.fetch_add(zone_elapsed_ns, Ordering::Relaxed);
+        }
         vol_metrics.write_ops.fetch_add(1, Ordering::Relaxed);
         vol_metrics.write_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -254,20 +289,21 @@ impl OnyxVolume {
             });
         }
 
-        let start = Instant::now();
+        let _start = VolumeMetricInstant::now();
         let bs = BLOCK_SIZE as u64;
         if offset_bytes % bs == 0 && len % bs == 0 {
-            self.write_aligned_deferred_started(offset_bytes, data, start)?
+            self.write_aligned_deferred_started(offset_bytes, data, _start)?
                 .wait();
             return Ok(());
         }
 
         let _guard = self.vol_lock.read().unwrap();
         let result = self.write_locked(offset_bytes, data);
-        if result.is_ok() {
-            self.metrics
-                .volume_write_total_ns
-                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            if result.is_ok() {
+                self.metrics.volume_write_total_ns
+                    .fetch_add(_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         result
     }
@@ -281,14 +317,14 @@ impl OnyxVolume {
         offset_bytes: u64,
         data: &[u8],
     ) -> OnyxResult<VolumeWriteTicket> {
-        self.write_aligned_deferred_started(offset_bytes, data, Instant::now())
+        self.write_aligned_deferred_started(offset_bytes, data, VolumeMetricInstant::now())
     }
 
     fn write_aligned_deferred_started(
         &self,
         offset_bytes: u64,
         data: &[u8],
-        volume_started: Instant,
+        volume_started: VolumeMetricInstant,
     ) -> OnyxResult<VolumeWriteTicket> {
         if data.is_empty() {
             return Err(OnyxError::Config(
@@ -311,7 +347,7 @@ impl OnyxVolume {
         }
 
         self.check_alive()?;
-        let zone_started = Instant::now();
+        let zone_started = VolumeMetricInstant::now();
         let tickets = self.zone_manager.submit_write_deferred(
             &self.vol_id,
             Lba(offset_bytes / bs),
@@ -331,13 +367,14 @@ impl OnyxVolume {
 
     /// Read `len` bytes from a byte offset. Unmapped blocks return zeros.
     pub fn read(&self, offset_bytes: u64, len: usize) -> OnyxResult<Vec<u8>> {
-        let start = Instant::now();
+        let _start = VolumeMetricInstant::now();
         let _guard = self.vol_lock.read().unwrap();
         let result = self.read_locked(offset_bytes, len);
-        if result.is_ok() {
-            self.metrics
-                .volume_read_total_ns
-                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            if result.is_ok() {
+                self.metrics.volume_read_total_ns
+                    .fetch_add(_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         result
     }
@@ -347,13 +384,14 @@ impl OnyxVolume {
     /// This avoids one allocation per read for benchmark/protocol-front-end
     /// paths that already own an IO buffer.
     pub fn read_into(&self, offset_bytes: u64, out: &mut [u8]) -> OnyxResult<()> {
-        let start = Instant::now();
+        let _start = VolumeMetricInstant::now();
         let _guard = self.vol_lock.read().unwrap();
         let result = self.read_locked_into(offset_bytes, out);
-        if result.is_ok() {
-            self.metrics
-                .volume_read_total_ns
-                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::diagnostic_metrics! {
+            if result.is_ok() {
+                self.metrics.volume_read_total_ns
+                    .fetch_add(_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         result
     }

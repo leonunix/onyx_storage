@@ -5,6 +5,21 @@ compile_error!("onyx-storage only supports Linux");
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Compile a diagnostic metrics block only for tests or an explicitly
+/// instrumented build. Keep correctness counters and control-loop inputs out
+/// of this macro: the default production build erases its body completely.
+#[cfg(any(test, feature = "diagnostic-metrics"))]
+macro_rules! diagnostic_metrics {
+    ($($body:tt)*) => {{ $($body)* }};
+}
+
+#[cfg(not(any(test, feature = "diagnostic-metrics")))]
+macro_rules! diagnostic_metrics {
+    ($($body:tt)*) => {{}};
+}
+
+pub(crate) use diagnostic_metrics;
+
 pub mod config;
 pub mod error;
 pub mod types;
