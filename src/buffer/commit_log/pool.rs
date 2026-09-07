@@ -509,6 +509,13 @@ impl WriteBufferPool {
             }
             None => self.lock_append_order(vol_id, start_lba, lba_count),
         };
+        // Random fio LBAs make this a uniform 1/1024 sample without another
+        // shared counter in the critical path. The entire probe is absent from
+        // normal builds; it exists only to split `append_order_hold` reliably.
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        let profile_append_detail = start_lba.0 & 1023 == 0;
+        #[cfg(not(any(test, feature = "diagnostic-metrics")))]
+        let profile_append_detail = false;
         // The fence may trip while this producer was throttled or queued behind
         // another append. Do not enter LV2 after fail-stop has been published.
         let append_result = (|| {
@@ -518,16 +525,54 @@ impl WriteBufferPool {
             if !validate()? {
                 return Ok(None);
             }
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
+            let reserve_started = profile_append_detail.then(Instant::now);
             let (reservation, frontier_guard) = shard.shard.reserve_append(
                 &self.next_seq,
                 &self.frontier_gate,
                 prepared.slot_count,
                 relocation_cancel,
+                profile_append_detail,
             )?;
+            #[cfg(any(test, feature = "diagnostic-metrics"))]
+            let profile_append_detail = if profile_append_detail && reservation.backpressured {
+                if let Some(metrics) = self.metrics.get() {
+                    metrics
+                        .buffer_append_detail_backpressure_skips
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                false
+            } else {
+                profile_append_detail
+            };
+            crate::diagnostic_metrics! {
+                if profile_append_detail {
+                    if let (Some(started), Some(metrics)) = (reserve_started, self.metrics.get()) {
+                        metrics.buffer_append_reserve_ns.fetch_add(
+                            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                            Ordering::Relaxed,
+                        );
+                        metrics
+                            .buffer_append_reserve_ring_lock_ns
+                            .fetch_add(reservation.ring_lock_ns, Ordering::Relaxed);
+                        metrics
+                            .buffer_append_reserve_frontier_lock_ns
+                            .fetch_add(reservation.frontier_lock_ns, Ordering::Relaxed);
+                        metrics
+                            .buffer_append_reserve_ring_relock_ns
+                            .fetch_add(reservation.ring_relock_ns, Ordering::Relaxed);
+                    }
+                }
+            }
             let seq = reservation.seq;
             let pending = shard
                 .shard
-                .publish_prepared(reservation, prepared, relocation_source)?;
+                .publish_prepared(
+                    reservation,
+                    prepared,
+                    relocation_source,
+                    profile_append_detail,
+                )?;
             // The seq is now either visible in `pending_seqs`, or the append
             // failed and no acknowledged write exists for this seq. Do not hold
             // the gate across fdatasync / ready publication.

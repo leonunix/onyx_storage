@@ -64,6 +64,24 @@ impl EngineMetrics {
             buffer_append_order_hold_ns: load(&self.buffer_append_order_hold_ns),
             buffer_append_order_wait_max_ns: load(&self.buffer_append_order_wait_max_ns),
             buffer_append_order_hold_max_ns: load(&self.buffer_append_order_hold_max_ns),
+            buffer_append_detail_samples: load(&self.buffer_append_detail_samples),
+            buffer_append_detail_backpressure_skips: load(
+                &self.buffer_append_detail_backpressure_skips,
+            ),
+            buffer_append_reserve_ns: load(&self.buffer_append_reserve_ns),
+            buffer_append_reserve_ring_lock_ns: load(&self.buffer_append_reserve_ring_lock_ns),
+            buffer_append_reserve_frontier_lock_ns: load(
+                &self.buffer_append_reserve_frontier_lock_ns,
+            ),
+            buffer_append_reserve_ring_relock_ns: load(
+                &self.buffer_append_reserve_ring_relock_ns,
+            ),
+            buffer_append_supersede_scan_ns: load(&self.buffer_append_supersede_scan_ns),
+            buffer_append_index_publish_ns: load(&self.buffer_append_index_publish_ns),
+            buffer_append_ring_publish_ns: load(&self.buffer_append_ring_publish_ns),
+            buffer_append_cache_publish_ns: load(&self.buffer_append_cache_publish_ns),
+            buffer_append_stage_turn_wait_ns: load(&self.buffer_append_stage_turn_wait_ns),
+            buffer_append_stage_send_ns: load(&self.buffer_append_stage_send_ns),
             buffer_append_log_write_ns: load(&self.buffer_append_log_write_ns),
             buffer_append_wait_durable_ns: load(&self.buffer_append_wait_durable_ns),
             buffer_append_prepare_latency_buckets: load_latency_buckets(
@@ -712,6 +730,30 @@ pub struct EngineMetricsSnapshot {
     pub buffer_append_order_wait_max_ns: u64,
     #[serde(default)]
     pub buffer_append_order_hold_max_ns: u64,
+    #[serde(default)]
+    pub buffer_append_detail_samples: u64,
+    #[serde(default)]
+    pub buffer_append_detail_backpressure_skips: u64,
+    #[serde(default)]
+    pub buffer_append_reserve_ns: u64,
+    #[serde(default)]
+    pub buffer_append_reserve_ring_lock_ns: u64,
+    #[serde(default)]
+    pub buffer_append_reserve_frontier_lock_ns: u64,
+    #[serde(default)]
+    pub buffer_append_reserve_ring_relock_ns: u64,
+    #[serde(default)]
+    pub buffer_append_supersede_scan_ns: u64,
+    #[serde(default)]
+    pub buffer_append_index_publish_ns: u64,
+    #[serde(default)]
+    pub buffer_append_ring_publish_ns: u64,
+    #[serde(default)]
+    pub buffer_append_cache_publish_ns: u64,
+    #[serde(default)]
+    pub buffer_append_stage_turn_wait_ns: u64,
+    #[serde(default)]
+    pub buffer_append_stage_send_ns: u64,
     pub buffer_append_log_write_ns: u64,
     pub buffer_append_wait_durable_ns: u64,
     pub buffer_append_prepare_latency_buckets: Vec<u64>,
@@ -1410,6 +1452,18 @@ impl EngineMetricsSnapshot {
             buffer_append_order_hold_ns,
             buffer_append_order_wait_max_ns,
             buffer_append_order_hold_max_ns,
+            buffer_append_detail_samples,
+            buffer_append_detail_backpressure_skips,
+            buffer_append_reserve_ns,
+            buffer_append_reserve_ring_lock_ns,
+            buffer_append_reserve_frontier_lock_ns,
+            buffer_append_reserve_ring_relock_ns,
+            buffer_append_supersede_scan_ns,
+            buffer_append_index_publish_ns,
+            buffer_append_ring_publish_ns,
+            buffer_append_cache_publish_ns,
+            buffer_append_stage_turn_wait_ns,
+            buffer_append_stage_send_ns,
             buffer_append_log_write_ns,
             buffer_append_wait_durable_ns,
             buffer_sync_batches,

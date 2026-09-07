@@ -1503,6 +1503,22 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "append_order_detail: samples={} backpressure_skips={} reserve_ns={} reserve_ring_lock_ns={} reserve_frontier_lock_ns={} reserve_ring_relock_ns={} supersede_scan_ns={} index_publish_ns={} ring_publish_ns={} cache_publish_ns={} stage_turn_wait_ns={} stage_send_ns={}",
+            self.metrics.buffer_append_detail_samples,
+            self.metrics.buffer_append_detail_backpressure_skips,
+            self.metrics.buffer_append_reserve_ns,
+            self.metrics.buffer_append_reserve_ring_lock_ns,
+            self.metrics.buffer_append_reserve_frontier_lock_ns,
+            self.metrics.buffer_append_reserve_ring_relock_ns,
+            self.metrics.buffer_append_supersede_scan_ns,
+            self.metrics.buffer_append_index_publish_ns,
+            self.metrics.buffer_append_ring_publish_ns,
+            self.metrics.buffer_append_cache_publish_ns,
+            self.metrics.buffer_append_stage_turn_wait_ns,
+            self.metrics.buffer_append_stage_send_ns,
+        );
+        let _ = writeln!(
+            out,
             "buffer_sync_batch: entries={} bytes={} entries_max={} bytes_max={}",
             self.metrics.buffer_sync_entries,
             self.metrics.buffer_sync_bytes,

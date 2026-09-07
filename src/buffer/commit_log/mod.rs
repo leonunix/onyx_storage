@@ -579,6 +579,14 @@ struct AppendReservation {
     seq: u64,
     write_offset: u64,
     stage_order: u64,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    backpressured: bool,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    ring_lock_ns: u64,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    frontier_lock_ns: u64,
+    #[cfg(any(test, feature = "diagnostic-metrics"))]
+    ring_relock_ns: u64,
 }
 
 #[derive(Default)]

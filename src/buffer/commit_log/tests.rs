@@ -231,6 +231,14 @@ fn global_sync_loop_coalesces_shards_and_recovers_acked_entries() {
     let stage_metrics = metrics.snapshot();
     assert!(stage_metrics.buffer_append_order_wait_ns > 0);
     assert!(stage_metrics.buffer_append_order_hold_ns > 0);
+    assert_eq!(stage_metrics.buffer_append_detail_samples, 1);
+    assert!(stage_metrics.buffer_append_reserve_ns > 0);
+    assert!(stage_metrics.buffer_append_supersede_scan_ns > 0);
+    assert!(stage_metrics.buffer_append_index_publish_ns > 0);
+    assert!(stage_metrics.buffer_append_ring_publish_ns > 0);
+    assert!(stage_metrics.buffer_append_cache_publish_ns > 0);
+    assert!(stage_metrics.buffer_append_stage_turn_wait_ns > 0);
+    assert!(stage_metrics.buffer_append_stage_send_ns > 0);
     assert_eq!(
         stage_metrics
             .buffer_append_order_wait_latency_buckets

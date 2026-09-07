@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Per-stage LV2 latency percentiles from two metrics-json samples."""
-import json, socket, sys, time
+import json, os, socket, sys, time
 
-SOCK = "/tmp/onyx-storage-nvme.sock"
+SOCK = os.environ.get("ONYX_SOCKET", "/tmp/onyx-storage-nvme.sock")
 STAGES = [
     ("staging_queue", "buffer_lv2_staging_queue_latency_buckets"),
     ("prepared_queue", "buffer_lv2_prepared_queue_latency_buckets"),

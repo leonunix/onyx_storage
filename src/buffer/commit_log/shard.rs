@@ -810,6 +810,7 @@ impl BufferShard {
         frontier_gate: &'a parking_lot::RwLock<()>,
         slot_count: u32,
         relocation_cancel: Option<&AtomicBool>,
+        _profile_detail: bool,
     ) -> OnyxResult<(AppendReservation, parking_lot::RwLockReadGuard<'a, ()>)> {
         // ── Ring lock: reserve space, wait if shard is temporarily full ──
         // The flush lane will drain entries and notify ring_space_cv.
@@ -831,7 +832,17 @@ impl BufferShard {
             Some(_) => self.backpressure_timeout.min(RELOCATION_BACKPRESSURE_BUDGET),
             None => self.backpressure_timeout,
         };
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        let ring_lock_started = _profile_detail.then(Instant::now);
         let mut ring = self.ring.lock();
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        let ring_lock_ns = ring_lock_started
+            .map(Self::elapsed_ns)
+            .unwrap_or_default();
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        let mut frontier_lock_ns = 0u64;
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        let mut ring_relock_ns = 0u64;
         let mut wait_start: Option<Instant> = None;
         loop {
             if Self::log_space_offset(&ring, slot_count).is_some() {
@@ -840,8 +851,20 @@ impl BufferShard {
                 // that same order. This keeps a full-ring waiter from blocking
                 // the durability path that must release its space.
                 drop(ring);
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
+                let frontier_started = _profile_detail.then(Instant::now);
                 let frontier_guard = frontier_gate.read();
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
+                if let Some(started) = frontier_started {
+                    frontier_lock_ns = frontier_lock_ns.saturating_add(Self::elapsed_ns(started));
+                }
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
+                let ring_relock_started = _profile_detail.then(Instant::now);
                 ring = self.ring.lock();
+                #[cfg(any(test, feature = "diagnostic-metrics"))]
+                if let Some(started) = ring_relock_started {
+                    ring_relock_ns = ring_relock_ns.saturating_add(Self::elapsed_ns(started));
+                }
                 if Self::log_space_offset(&ring, slot_count).is_some() {
                     let seq = next_seq.fetch_add(1, Ordering::Relaxed);
                     let write_offset = Self::reserve_log_space(&mut ring, seq, slot_count)
@@ -851,6 +874,14 @@ impl BufferShard {
                         seq,
                         write_offset,
                         stage_order,
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
+                        backpressured: wait_start.is_some(),
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
+                        ring_lock_ns,
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
+                        frontier_lock_ns,
+                        #[cfg(any(test, feature = "diagnostic-metrics"))]
+                        ring_relock_ns,
                     };
                     self.record_reserve_wait(wait_start);
                     drop(ring);
@@ -908,7 +939,33 @@ impl BufferShard {
         reservation: AppendReservation,
         prepared: PreparedAppend,
         relocation_source: Option<crate::space::extent::Extent>,
+        _profile_detail: bool,
     ) -> OnyxResult<Arc<PendingEntry>> {
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        let mut detail_started = _profile_detail.then(Instant::now);
+        #[cfg(any(test, feature = "diagnostic-metrics"))]
+        if _profile_detail {
+            if let Some(metrics) = self.metrics.get() {
+                metrics
+                    .buffer_append_detail_samples
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        macro_rules! detail_lap {
+            ($field:ident) => {
+                crate::diagnostic_metrics! {
+                    if let Some(started) = detail_started {
+                        if let Some(metrics) = self.metrics.get() {
+                            metrics.$field.fetch_add(
+                                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        detail_started = Some(Instant::now());
+                    }
+                }
+            };
+        }
         let PreparedAppend {
             vol_id,
             vid,
@@ -934,6 +991,7 @@ impl BufferShard {
             let previous_latest = self.latest_lba_seq.get(key).map(|entry| *entry.value());
             replaced_indices.push((key.clone(), previous, previous_latest));
         }
+        detail_lap!(buffer_append_supersede_scan_ns);
 
         // Build PendingEntry with payload populated eagerly. This is the
         // post-volatile design: payload lives in the in-memory cache from
@@ -976,6 +1034,7 @@ impl BufferShard {
             self.pending_bytes
                 .fetch_add(disk_len as u64, Ordering::Relaxed);
         }
+        detail_lap!(buffer_append_index_publish_ns);
         // Publish to the bounded coalescer index only AFTER pending_entries is
         // visible. If reserve_log_space inserts first, oldest_pending_arcs can
         // observe the seq in this window, fail its DashMap lookup, and prune it
@@ -983,6 +1042,7 @@ impl BufferShard {
         // bounded retry can ever find. Removal remains paired with
         // note_applied; release_below does not need to touch this set.
         self.ring.lock().pending_seqs.insert(reservation.seq);
+        detail_lap!(buffer_append_ring_publish_ns);
 
         // Account payload bytes toward the in-memory cache budget. LRU
         // eviction (`evict_payload_cache_to_budget`) will strip oldest
@@ -990,11 +1050,13 @@ impl BufferShard {
         self.payload_bytes_in_memory
             .fetch_add(payload_len, Ordering::Relaxed);
         self.cached_payload_order.lock().push_back(reservation.seq);
+        detail_lap!(buffer_append_cache_publish_ns);
 
         // Different LBA stripes may reach this point out of order. Serialize
         // only the final channel handoff so the scalar durability watermark and
         // checkpoint-guided recovery retain their increasing-seq invariant.
         let send_result = self.stage_turn.run(reservation.stage_order, || {
+            detail_lap!(buffer_append_stage_turn_wait_ns);
             let staged = StagedEntry {
                 pending: pending.clone(),
                 payload,
@@ -1005,7 +1067,9 @@ impl BufferShard {
             if self.fail_next_staging_send.swap(false, Ordering::Relaxed) {
                 return Err(());
             }
-            self.staging_tx.send(staged).map_err(|_| ())
+            let result = self.staging_tx.send(staged).map_err(|_| ());
+            detail_lap!(buffer_append_stage_send_ns);
+            result
         });
         if send_result.is_err() {
             // Back out the new entry and restore the successfully published
