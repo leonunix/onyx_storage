@@ -86,9 +86,29 @@ pub struct VolumeWriteTicket {
     zone_started: VolumeMetricInstant,
 }
 
+fn aggregate_durability(polls: impl IntoIterator<Item = OnyxResult<bool>>) -> OnyxResult<bool> {
+    let mut all_durable = true;
+    for poll in polls {
+        all_durable &= poll?;
+    }
+    Ok(all_durable)
+}
+
+fn complete_tickets_then_record<T>(
+    tickets: impl IntoIterator<Item = T>,
+    mut complete: impl FnMut(T) -> OnyxResult<u64>,
+    record: impl FnOnce(),
+) -> OnyxResult<()> {
+    for ticket in tickets {
+        complete(ticket)?;
+    }
+    record();
+    Ok(())
+}
+
 impl VolumeWriteTicket {
-    pub fn is_durable(&self) -> bool {
-        self.tickets.iter().all(BufferAppendTicket::is_durable)
+    pub fn poll_durability(&self) -> OnyxResult<bool> {
+        aggregate_durability(self.tickets.iter().map(BufferAppendTicket::poll_durability))
     }
 
     /// Abandon frontend acknowledgement without waiting for durability.
@@ -103,7 +123,7 @@ impl VolumeWriteTicket {
     /// frontend observing the completed volume write.
     #[cfg(any(test, feature = "diagnostic-metrics"))]
     pub(crate) fn completion_dispatch_delay_ns(&self, observed_at: Instant) -> Option<u64> {
-        if self.tickets.is_empty() || !self.is_durable() {
+        if self.tickets.is_empty() || self.poll_durability().ok() != Some(true) {
             return None;
         }
         let mut min_delay = u64::MAX;
@@ -113,17 +133,17 @@ impl VolumeWriteTicket {
         Some(min_delay)
     }
 
-    /// Register an edge-coalesced completion wakeup. The return value is true
-    /// when all shard tickets are already durable; otherwise at least one
-    /// future watermark advance will notify `tx`.
-    pub fn arm_wakeup(&self, tx: &crossbeam_channel::Sender<()>) -> bool {
+    /// Register an edge-coalesced completion wakeup. `Ok(true)` means every
+    /// shard ticket is already durable, `Ok(false)` means a future watermark
+    /// advance will notify `tx`, and `Err` is a terminal persistence fault.
+    pub fn arm_wakeup(&self, tx: &crossbeam_channel::Sender<()>) -> OnyxResult<bool> {
         for ticket in &self.tickets {
-            ticket.arm_wakeup(tx);
+            ticket.arm_wakeup(tx)?;
         }
-        self.is_durable()
+        self.poll_durability()
     }
 
-    pub fn wait(self) {
+    pub fn wait(self) -> OnyxResult<()> {
         let Self {
             tickets,
             metrics,
@@ -132,20 +152,18 @@ impl VolumeWriteTicket {
             volume_started,
             zone_started,
         } = self;
-        for ticket in tickets {
-            ticket.wait();
-        }
-        Self::record_completion(&metrics, &vol_metrics, bytes, volume_started, zone_started);
+        complete_tickets_then_record(tickets, BufferAppendTicket::wait, || {
+            Self::record_completion(&metrics, &vol_metrics, bytes, volume_started, zone_started);
+        })
     }
 
     /// Complete a ticket that has already reached its durability watermark.
     /// This is the non-blocking reap path used by asynchronous frontends. A
     /// premature caller falls back to the normal durable wait rather than
     /// acknowledging an unsynced write.
-    pub fn finish(self) {
-        if !self.is_durable() {
-            self.wait();
-            return;
+    pub fn finish(self) -> OnyxResult<()> {
+        if !self.poll_durability()? {
+            return self.wait();
         }
         let Self {
             tickets,
@@ -155,10 +173,9 @@ impl VolumeWriteTicket {
             volume_started,
             zone_started,
         } = self;
-        for ticket in tickets {
-            ticket.finish_dispatched();
-        }
-        Self::record_completion(&metrics, &vol_metrics, bytes, volume_started, zone_started);
+        complete_tickets_then_record(tickets, BufferAppendTicket::finish_dispatched, || {
+            Self::record_completion(&metrics, &vol_metrics, bytes, volume_started, zone_started);
+        })
     }
 
     fn record_completion(
@@ -293,7 +310,7 @@ impl OnyxVolume {
         let bs = BLOCK_SIZE as u64;
         if offset_bytes % bs == 0 && len % bs == 0 {
             self.write_aligned_deferred_started(offset_bytes, data, _start)?
-                .wait();
+                .wait()?;
             return Ok(());
         }
 
@@ -587,5 +604,55 @@ impl OnyxVolume {
             .fetch_add(len as u64, Ordering::Relaxed);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn durability_aggregation_never_hides_a_terminal_fault_behind_pending() {
+        assert!(!aggregate_durability([Ok(true), Ok(false)]).unwrap());
+        assert!(aggregate_durability([Ok(true), Ok(true)]).unwrap());
+
+        assert!(matches!(
+            aggregate_durability([
+                Ok(false),
+                Err(OnyxError::MetaFenced("injected stage gap".into())),
+            ]),
+            Err(OnyxError::MetaFenced(reason)) if reason.contains("injected stage gap")
+        ));
+    }
+
+    #[test]
+    fn ticket_completion_error_does_not_record_write_success() {
+        let attempted = Cell::new(0usize);
+        let success_records = Cell::new(0usize);
+        let result = complete_tickets_then_record(
+            [
+                Ok(1),
+                Err(OnyxError::MetaFenced("injected stage gap".into())),
+                Ok(3),
+            ],
+            |result| {
+                attempted.set(attempted.get() + 1);
+                result
+            },
+            || success_records.set(success_records.get() + 1),
+        );
+
+        assert!(matches!(result, Err(OnyxError::MetaFenced(_))));
+        assert_eq!(attempted.get(), 2, "completion must stop at the fault");
+        assert_eq!(success_records.get(), 0, "a failed wait is not a success");
+
+        complete_tickets_then_record(
+            [Ok(4), Ok(5)],
+            |result| result,
+            || success_records.set(success_records.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(success_records.get(), 1, "success is recorded exactly once");
     }
 }

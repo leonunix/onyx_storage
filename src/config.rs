@@ -1786,6 +1786,11 @@ pub struct BufferConfig {
     /// 0 = engine default.
     #[serde(default)]
     pub staging_queue_entries: usize,
+    /// Allow append producers to enqueue in publication order and restore the
+    /// physical reservation order in the single per-shard sync consumer.
+    /// Enabled by default; set false to restore producer-side serialization.
+    #[serde(default = "default_stage_reorder_enabled")]
+    pub stage_reorder_enabled: bool,
     /// Max entries one sync thread drains into a single fdatasync epoch.
     /// 0 = engine default.
     #[serde(default)]
@@ -1894,6 +1899,7 @@ impl Default for BufferConfig {
             max_memory_mb: 0,
             volatile_memory_mb: 0,
             staging_queue_entries: 0,
+            stage_reorder_enabled: default_stage_reorder_enabled(),
             sync_batch_max_entries: 0,
             sync_batch_max_bytes_mb: 0,
             lv2_prepared_queue_depth_per_lane: 0,
@@ -2542,6 +2548,9 @@ fn default_group_commit_wait_us() -> u64 {
 fn default_buffer_shards() -> usize {
     4
 }
+fn default_stage_reorder_enabled() -> bool {
+    true
+}
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceConfig {
     /// Unix socket path for IPC (stop command, status queries)
@@ -2820,6 +2829,30 @@ mod service_config_tests {
         )
         .unwrap();
         assert_eq!(configured.buffer.lv2_prepared_queue_depth_per_lane, 4);
+    }
+
+    #[test]
+    fn stage_reorder_defaults_on_and_accepts_explicit_disable() {
+        let default_config: OnyxConfig = toml::from_str("").unwrap();
+        assert!(default_config.buffer.stage_reorder_enabled);
+
+        let existing_buffer_config: OnyxConfig = toml::from_str(
+            r#"
+                [buffer]
+                shards = 16
+            "#,
+        )
+        .unwrap();
+        assert!(existing_buffer_config.buffer.stage_reorder_enabled);
+
+        let configured: OnyxConfig = toml::from_str(
+            r#"
+                [buffer]
+                stage_reorder_enabled = false
+            "#,
+        )
+        .unwrap();
+        assert!(!configured.buffer.stage_reorder_enabled);
     }
 
     /// The three LV3 batcher knobs have to be sweepable together: the window and

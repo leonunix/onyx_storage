@@ -57,6 +57,16 @@ pub struct LinkedOp {
     pub link_next: bool,
 }
 
+/// Ownership result for a nowait chain. `QueuedAfterSubmitError` means the SQEs
+/// are visible through the shared SQ tail even though `io_uring_enter` failed;
+/// callers must retain every referenced buffer and retry via `harvest`.
+#[derive(Debug)]
+pub enum LinkedSubmitOutcome {
+    Full,
+    Submitted,
+    QueuedAfterSubmitError(OnyxError),
+}
+
 /// Build the SQE for one op, tagging it with `user_data` (so CQEs map back even
 /// if the kernel reorders completions) and the submission flags implied by the
 /// op kind plus `link_next`. Shared by `submit_batch` (always `link_next=false`)
@@ -352,8 +362,8 @@ impl IoUringSession {
     /// `(batch_id, op_index)` from the harvested CQE.
     ///
     /// Whole-chain-or-nothing: if the SQ ring lacks room for the full group, it
-    /// pushes NOTHING and returns `Ok(false)` so the caller can `harvest` to free
-    /// CQ/SQ space and retry. A half-pushed chain would dangle the last
+    /// pushes NOTHING and returns [`LinkedSubmitOutcome::Full`] so the caller can
+    /// `harvest` to free CQ/SQ space and retry. A half-pushed chain would dangle the last
     /// `IOSQE_IO_LINK`, so partial submission is never allowed.
     ///
     /// SAFETY: identical to `submit_batch` — pointers in `ops` must stay valid
@@ -363,9 +373,9 @@ impl IoUringSession {
         &self,
         ops: &[LinkedOp],
         base_user_data: u64,
-    ) -> OnyxResult<bool> {
+    ) -> OnyxResult<LinkedSubmitOutcome> {
         if ops.is_empty() {
-            return Ok(true);
+            return Ok(LinkedSubmitOutcome::Submitted);
         }
         if ops.len() as u32 > self.sq_entries {
             return Err(OnyxError::Io(std::io::Error::new(
@@ -382,33 +392,37 @@ impl IoUringSession {
         debug_assert!(ops.len() < (1usize << 32));
 
         let mut ring = self.ring.lock();
-        {
-            let sub = ring.submission();
-            if sub.capacity() - sub.len() < ops.len() {
-                return Ok(false);
-            }
+        let mut sub = ring.submission();
+        if sub.capacity() - sub.len() < ops.len() {
+            return Ok(LinkedSubmitOutcome::Full);
         }
         for (idx, lop) in ops.iter().enumerate() {
             let entry = build_sqe(&lop.op, base_user_data | idx as u64, lop.link_next);
             // SAFETY: see submit_batch — pointers outlive the CQE harvest.
-            let mut sub = ring.submission();
             if sub.push(&entry).is_err() {
                 // Capacity was checked above under the same lock, so this is
-                // unreachable; bail without leaving a dangling LINK undriven.
-                drop(sub);
+                // unreachable. Do not drop the SQ handle here: its Drop would
+                // publish the partial chain to the shared tail.
+                std::mem::forget(sub);
                 return Err(OnyxError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("io_uring SQ push failed mid-chain at op {idx}"),
                 )));
             }
         }
-        ring.submit().map_err(|e| {
-            OnyxError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("io_uring submit() failed: {e}"),
-            ))
-        })?;
-        Ok(true)
+        // Publish the complete chain to the shared SQ tail as one group before
+        // entering the kernel. A later submit error cannot roll these SQEs back;
+        // callers must retain their buffers and retry through `harvest`.
+        drop(sub);
+        match ring.submit() {
+            Ok(_) => Ok(LinkedSubmitOutcome::Submitted),
+            Err(error) => Ok(LinkedSubmitOutcome::QueuedAfterSubmitError(OnyxError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("io_uring submit() failed: {error}"),
+                ),
+            ))),
+        }
     }
 
     /// Drain completions for in-flight ops submitted via `submit_linked_nowait`.
@@ -691,7 +705,10 @@ mod tests {
                 link_next: false,
             },
         ];
-        assert!(unsafe { session.submit_linked_nowait(&ops0, 0u64 << 32).unwrap() });
+        assert!(matches!(
+            unsafe { session.submit_linked_nowait(&ops0, 0u64 << 32).unwrap() },
+            LinkedSubmitOutcome::Submitted
+        ));
 
         // Chain for batch_id 1: write@4096 (LINK) → fsync.
         let ops1 = vec![
@@ -709,7 +726,10 @@ mod tests {
                 link_next: false,
             },
         ];
-        assert!(unsafe { session.submit_linked_nowait(&ops1, 1u64 << 32).unwrap() });
+        assert!(matches!(
+            unsafe { session.submit_linked_nowait(&ops1, 1u64 << 32).unwrap() },
+            LinkedSubmitOutcome::Submitted
+        ));
 
         // Harvest all 4 CQEs (2 per chain).
         let mut got: Vec<(u64, i32)> = Vec::new();
@@ -742,9 +762,8 @@ mod tests {
     }
 
     /// `submit_linked_nowait` is whole-chain-or-nothing: if the SQ ring lacks
-    /// room for the full chain it pushes nothing and returns `Ok(false)` rather
-    /// than dangling a trailing IO_LINK. A chain longer than the ring is a hard
-    /// error.
+    /// room for the full chain it pushes nothing and returns `Full` rather than
+    /// dangling a trailing IO_LINK. A chain longer than the ring is a hard error.
     #[test]
     fn nowait_chain_larger_than_ring_errors() {
         let session = IoUringSession::new(4).unwrap();

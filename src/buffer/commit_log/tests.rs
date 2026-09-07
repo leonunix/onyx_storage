@@ -655,7 +655,7 @@ fn global_packed_checkpoint_failure_does_not_advance_durability() {
     }
     thread::sleep(Duration::from_millis(5));
     assert!(
-        !ticket.is_durable(),
+        !ticket.poll_durability().unwrap(),
         "checkpoint write failure must not advance the LV2 watermark"
     );
     assert_eq!(
@@ -665,7 +665,7 @@ fn global_packed_checkpoint_failure_does_not_advance_durability() {
     );
 
     backend.fail_packed_writes.store(false, Ordering::Release);
-    assert_eq!(ticket.wait(), 1);
+    assert_eq!(ticket.wait().unwrap(), 1);
     assert!(backend.flushes.load(Ordering::Relaxed) >= 1);
 }
 
@@ -1430,13 +1430,13 @@ fn global_sync_records_watermark_to_dispatcher_latency() {
         .append_deferred("vol", Lba(0), 1, &[0x5a; BLOCK_SIZE as usize], 1)
         .unwrap();
     let (wake_tx, wake_rx) = bounded(1);
-    if !ticket.arm_wakeup(&wake_tx) {
+    if !ticket.arm_wakeup(&wake_tx).unwrap() {
         wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
     assert!(ticket
         .completion_dispatch_delay_ns(Instant::now())
         .is_some());
-    ticket.finish_dispatched();
+    ticket.finish_dispatched().unwrap();
 
     let snapshot = metrics.snapshot();
     assert_eq!(
@@ -1456,6 +1456,337 @@ fn create_pool(size: u64, group_commit_wait: Duration) -> (WriteBufferPool, Name
         WriteBufferPool::open_with_group_commit_wait(dev, group_commit_wait).unwrap(),
         tmp,
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReorderConsumerPath {
+    Serial,
+    Global,
+    UringPipeline,
+}
+
+fn open_reorder_test_pool(
+    path: ReorderConsumerPath,
+    device_path: &std::path::Path,
+    size: u64,
+) -> OnyxResult<WriteBufferPool> {
+    let backend: Arc<dyn BlockBackend> = match path {
+        ReorderConsumerPath::Global => Arc::new(NoUringCountingBackend::open(device_path, size, 0)),
+        ReorderConsumerPath::Serial | ReorderConsumerPath::UringPipeline => {
+            Arc::new(RawDevice::open_or_create(device_path, size).unwrap())
+        }
+    };
+    let shard_count = match path {
+        ReorderConsumerPath::Global => 4,
+        ReorderConsumerPath::Serial | ReorderConsumerPath::UringPipeline => 1,
+    };
+    let uring_sq_entries = match path {
+        ReorderConsumerPath::UringPipeline => Some(64),
+        ReorderConsumerPath::Serial | ReorderConsumerPath::Global => None,
+    };
+    let mut limits = BufferRuntimeLimits::default().with_stage_reorder(true);
+    limits.staging_channel_capacity = 2;
+    // Force the restored prefix to cross consumer batches. This catches an
+    // implementation that sorts only one channel drain instead of retaining
+    // per-shard reorder state between drains.
+    limits.sync_batch_max_entries = 1;
+
+    WriteBufferPool::open_with_options_full_and_limits(
+        backend,
+        Duration::from_millis(1),
+        shard_count,
+        1,
+        Duration::from_secs(1),
+        0,
+        uring_sq_entries,
+        limits,
+    )
+}
+
+fn distinct_lbas_on_first_shard(pool: &WriteBufferPool, count: usize) -> Vec<Lba> {
+    use std::hash::{Hash, Hasher};
+
+    let mut volume_hasher = std::collections::hash_map::DefaultHasher::new();
+    "stage-reorder".hash(&mut volume_hasher);
+    let volume_hash = volume_hasher.finish();
+    let mut lbas = Vec::with_capacity(count);
+    let mut stripes = std::collections::HashSet::new();
+    for raw_lba in 0..100_000u64 {
+        let lba = Lba(raw_lba);
+        if raw_lba % pool.shards.len() as u64 != 0 {
+            continue;
+        }
+        let mut mixed = volume_hash ^ raw_lba.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        let stripe = (mixed as usize) & (APPEND_ORDER_STRIPES - 1);
+        if stripes.insert(stripe) {
+            lbas.push(lba);
+            if lbas.len() == count {
+                return lbas;
+            }
+        }
+    }
+    panic!("could not find {count} distinct append-order stripes on shard 0");
+}
+
+fn run_stage_reorder_inversion(path: ReorderConsumerPath) {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 128 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool = match open_reorder_test_pool(path, tmp.path(), size) {
+        Ok(pool) => Arc::new(pool),
+        Err(error)
+            if matches!(path, ReorderConsumerPath::UringPipeline)
+                && error.to_string().contains("io_uring setup failed")
+                && (error.to_string().contains("Operation not permitted")
+                    || error.to_string().contains("Permission denied")
+                    || error.to_string().contains("Function not implemented")) =>
+        {
+            eprintln!("skipping io_uring reorder test: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to open {path:?} reorder test pool: {error}"),
+    };
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+    let lbas = distinct_lbas_on_first_shard(&pool, 2);
+    let low_lba = lbas[0];
+    let high_lba = lbas[1];
+
+    let (_paused_order, hit_rx, release_tx) = pool.shards[0].shard.pause_next_stage_for_test();
+    let low_pool = pool.clone();
+    let low = std::thread::spawn(move || -> OnyxResult<u64> {
+        low_pool
+            .append_deferred("stage-reorder", low_lba, 1, &[0x11; BLOCK_SIZE as usize], 1)?
+            .wait()
+    });
+    hit_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("low stage order did not reach the pause hook");
+
+    // The later producer must complete publication while the predecessor is
+    // paused. Under AppendStageTurn this receive times out; under consumer-side
+    // reorder it returns a still-pending ticket.
+    let (ticket_tx, ticket_rx) = bounded(1);
+    let high_pool = pool.clone();
+    let high_producer = std::thread::spawn(move || {
+        let result = high_pool.append_deferred(
+            "stage-reorder",
+            high_lba,
+            1,
+            &[0x22; BLOCK_SIZE as usize],
+            1,
+        );
+        ticket_tx.send(result).unwrap();
+    });
+    let high_ticket = ticket_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("later producer remained serialized behind the low stage order")
+        .unwrap();
+    high_producer.join().unwrap();
+    let high_seq = high_ticket.seq();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while metrics.buffer_stage_reorder_current.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{path:?} consumer never buffered the future stage order"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(high_ticket.poll_durability().unwrap(), false);
+    assert!(matches!(
+        pool.recv_ready_timeout(Duration::from_millis(50)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(
+        pool.shards[0]
+            .shard
+            .lv2_durability
+            .synced_seq
+            .load(Ordering::Acquire)
+            < high_seq,
+        "{path:?} advanced durability across a missing stage order"
+    );
+
+    release_tx.send(()).unwrap();
+    let low_seq = low.join().unwrap().unwrap();
+    assert_eq!(high_ticket.wait().unwrap(), high_seq);
+    assert!(low_seq < high_seq);
+    assert_eq!(
+        metrics.buffer_stage_reorder_current.load(Ordering::Acquire),
+        0
+    );
+
+    drop(pool);
+    let reopened = open_reorder_test_pool(path, tmp.path(), size).unwrap();
+    assert_eq!(reopened.pending_count(), 2);
+    assert_eq!(
+        reopened
+            .lookup("stage-reorder", low_lba)
+            .unwrap()
+            .unwrap()
+            .payload
+            .unwrap()[0],
+        0x11
+    );
+    assert_eq!(
+        reopened
+            .lookup("stage-reorder", high_lba)
+            .unwrap()
+            .unwrap()
+            .payload
+            .unwrap()[0],
+        0x22
+    );
+}
+
+#[test]
+fn serial_consumer_reorders_a_forced_producer_inversion() {
+    run_stage_reorder_inversion(ReorderConsumerPath::Serial);
+}
+
+#[test]
+fn global_consumer_reorders_a_forced_producer_inversion() {
+    run_stage_reorder_inversion(ReorderConsumerPath::Global);
+}
+
+#[test]
+fn uring_pipeline_consumer_reorders_a_forced_producer_inversion() {
+    run_stage_reorder_inversion(ReorderConsumerPath::UringPipeline);
+}
+
+#[test]
+fn stage_gap_poison_fails_successor_and_shutdown_reopens_at_durable_prefix() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size = 32 * 1024 * 1024;
+    tmp.as_file().set_len(size).unwrap();
+    let pool =
+        Arc::new(open_reorder_test_pool(ReorderConsumerPath::Serial, tmp.path(), size).unwrap());
+    let metrics = Arc::new(EngineMetrics::default());
+    pool.attach_metrics(metrics.clone());
+    let lbas = distinct_lbas_on_first_shard(&pool, 2);
+    let failed_lba = lbas[0];
+    let successor_lba = lbas[1];
+
+    let durable_seq = pool
+        .append(
+            "stage-reorder",
+            failed_lba,
+            1,
+            &[0x31; BLOCK_SIZE as usize],
+            1,
+        )
+        .unwrap();
+    while pool.try_recv_ready().is_ok() {}
+
+    let (_paused_order, hit_rx, release_tx) = pool.shards[0].shard.pause_next_stage_for_test();
+    let failed_pool = pool.clone();
+    let failed = std::thread::spawn(move || {
+        failed_pool.append_deferred(
+            "stage-reorder",
+            failed_lba,
+            1,
+            &[0x41; BLOCK_SIZE as usize],
+            1,
+        )
+    });
+    hit_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("failed predecessor did not reach the pause hook");
+
+    let (ticket_tx, ticket_rx) = bounded(1);
+    let successor_pool = pool.clone();
+    let successor_producer = std::thread::spawn(move || {
+        ticket_tx
+            .send(successor_pool.append_deferred(
+                "stage-reorder",
+                successor_lba,
+                1,
+                &[0x51; BLOCK_SIZE as usize],
+                1,
+            ))
+            .unwrap();
+    });
+    let successor_ticket = ticket_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("successor did not stage ahead of the paused predecessor")
+        .unwrap();
+    successor_producer.join().unwrap();
+    assert_eq!(successor_ticket.poll_durability().unwrap(), false);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while metrics.buffer_stage_reorder_current.load(Ordering::Acquire) == 0 {
+        assert!(Instant::now() < deadline, "successor never entered reorder");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let (wait_started_tx, wait_started_rx) = bounded(1);
+    let successor_wait = std::thread::spawn(move || {
+        wait_started_tx.send(()).unwrap();
+        successor_ticket.wait()
+    });
+    wait_started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+
+    pool.shards[0].shard.fail_next_staging_send_for_test();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        failed.join().unwrap(),
+        Err(OnyxError::MetaFenced(_))
+    ));
+    assert!(matches!(
+        successor_wait.join().unwrap(),
+        Err(OnyxError::MetaFenced(_))
+    ));
+    assert_eq!(
+        pool.shards[0]
+            .shard
+            .lv2_durability
+            .synced_seq
+            .load(Ordering::Acquire),
+        durable_seq,
+        "stage fault must freeze the watermark at the durable prefix"
+    );
+    assert!(pool.is_meta_fenced());
+    assert!(matches!(
+        pool.append(
+            "stage-reorder",
+            Lba(99_999),
+            1,
+            &[0x61; BLOCK_SIZE as usize],
+            1,
+        ),
+        Err(OnyxError::MetaFenced(_))
+    ));
+
+    let (dropped_tx, dropped_rx) = bounded(1);
+    let dropper = std::thread::spawn(move || {
+        drop(pool);
+        dropped_tx.send(()).unwrap();
+    });
+    dropped_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("stage-gap shutdown did not terminate its sync consumer");
+    dropper.join().unwrap();
+
+    let reopened = open_reorder_test_pool(ReorderConsumerPath::Serial, tmp.path(), size).unwrap();
+    assert_eq!(
+        reopened
+            .lookup("stage-reorder", failed_lba)
+            .unwrap()
+            .unwrap()
+            .payload
+            .unwrap()[0],
+        0x31
+    );
+    assert!(reopened
+        .lookup("stage-reorder", successor_lba)
+        .unwrap()
+        .is_none());
+    assert_eq!(reopened.pending_count(), 1);
 }
 
 #[test]
@@ -1498,7 +1829,7 @@ fn relocation_source_is_live_only_and_cleared_on_recovery() {
         )
         .unwrap()
         .unwrap();
-    let seq = ticket.wait();
+    let seq = ticket.wait().unwrap();
 
     assert_eq!(
         pool.pending_entry_arc(seq).unwrap().relocation_source,
@@ -1561,7 +1892,7 @@ fn foreground_append_cannot_be_overtaken_after_relocation_validation() {
     );
 
     release_tx.send(()).unwrap();
-    let gc_seq = gc.join().unwrap();
+    let gc_seq = gc.join().unwrap().unwrap();
     let foreground_seq = foreground.join().unwrap();
     assert!(foreground_seq > gc_seq);
     let latest = pool.lookup("test-vol", Lba(77)).unwrap().unwrap();
@@ -1690,13 +2021,13 @@ fn foreground_lease_spans_split_tickets_and_gc_stays_untracked() {
     drop(lease);
 
     assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 1);
-    first.wait();
+    first.wait().unwrap();
     assert_eq!(
         metrics.foreground_io_outstanding.load(Ordering::Relaxed),
         1,
         "one logical request remains outstanding until its final split ticket"
     );
-    second.wait();
+    second.wait().unwrap();
     assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 0);
 
     let foreground_samples = metrics
@@ -1709,7 +2040,8 @@ fn foreground_lease_spans_split_tickets_and_gc_stays_untracked() {
     // a foreground lease. They stay in aggregate durability telemetry only.
     pool.append_deferred("test-vol", Lba(102), 1, &[0x33; BLOCK_SIZE as usize], 7)
         .unwrap()
-        .wait();
+        .wait()
+        .unwrap();
     assert_eq!(metrics.foreground_io_outstanding.load(Ordering::Relaxed), 0);
     assert_eq!(
         metrics
@@ -3445,8 +3777,8 @@ fn durability_waiter_fast_path_when_already_synced() {
     let w = Lv2DurabilityWaiter::new(0);
     w.advance(10);
     // seq <= synced returns immediately with zero registration.
-    assert_eq!(w.wait_for(5), Duration::ZERO);
-    assert_eq!(w.wait_for(10), Duration::ZERO);
+    assert_eq!(w.wait_for(5).unwrap(), Duration::ZERO);
+    assert_eq!(w.wait_for(10).unwrap(), Duration::ZERO);
 }
 
 #[test]
@@ -3455,7 +3787,7 @@ fn durability_waiter_channel_fast_path_when_already_synced() {
     let (tx, rx) = bounded(1);
     w.advance(10);
 
-    assert!(w.arm_channel(10, &tx));
+    assert!(w.arm_channel(10, &tx).unwrap());
     assert!(
         rx.try_recv().is_err(),
         "fast path must not queue a stale wake"
@@ -3467,7 +3799,7 @@ fn durability_waiter_channel_wakes_dispatcher() {
     let w = Lv2DurabilityWaiter::new(0);
     let (tx, rx) = bounded(1);
 
-    assert!(!w.arm_channel(7, &tx));
+    assert!(!w.arm_channel(7, &tx).unwrap());
     w.advance(7);
 
     rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -3479,7 +3811,7 @@ fn durability_waiter_wakes_parked_appender() {
     let w = Arc::new(Lv2DurabilityWaiter::new(0));
     let w2 = w.clone();
     let h = std::thread::spawn(move || {
-        w2.wait_for(5);
+        w2.wait_for(5).unwrap();
     });
     // Give the waiter time to park, then advance past it.
     std::thread::sleep(Duration::from_millis(20));
@@ -3496,12 +3828,12 @@ fn durability_waiter_selective_wake_leaves_later_seq_parked() {
 
     let (we, ee) = (w.clone(), early_done.clone());
     let early = std::thread::spawn(move || {
-        we.wait_for(5);
+        we.wait_for(5).unwrap();
         ee.store(true, Ordering::Release);
     });
     let (wl, el) = (w.clone(), late_done.clone());
     let late = std::thread::spawn(move || {
-        wl.wait_for(10);
+        wl.wait_for(10).unwrap();
         el.store(true, Ordering::Release);
     });
 
@@ -3539,7 +3871,7 @@ fn durability_waiter_advance_over_gap_wakes_lower_seqs() {
     // max_seq=11 matches no waiter exactly but covers all three.
     w.advance(11);
     for h in handles {
-        h.join().unwrap();
+        h.join().unwrap().unwrap();
     }
 }
 
@@ -3555,7 +3887,7 @@ fn durability_waiter_no_lost_wakeup_under_race() {
         let waiter = std::thread::spawn(move || wc.wait_for(seq));
         let wa = w.clone();
         let advancer = std::thread::spawn(move || wa.advance(seq));
-        waiter.join().unwrap();
+        waiter.join().unwrap().unwrap();
         advancer.join().unwrap();
         assert!(w.synced_seq.load(Ordering::Acquire) >= seq);
     }
@@ -3571,7 +3903,7 @@ fn durability_waiter_channel_has_no_lost_wakeup_under_race() {
         let wa = w.clone();
         let advance = std::thread::spawn(move || wa.advance(1));
 
-        let already_durable = register.join().unwrap();
+        let already_durable = register.join().unwrap().unwrap();
         advance.join().unwrap();
         if !already_durable {
             rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -3590,7 +3922,7 @@ fn durability_waiter_many_appenders_all_wake() {
         let wc = w.clone();
         let woke = woke.clone();
         handles.push(std::thread::spawn(move || {
-            wc.wait_for(seq);
+            wc.wait_for(seq).unwrap();
             woke.fetch_add(1, Ordering::Relaxed);
         }));
     }
@@ -3600,6 +3932,51 @@ fn durability_waiter_many_appenders_all_wake() {
         h.join().unwrap();
     }
     assert_eq!(woke.load(Ordering::Relaxed), 64);
+}
+
+#[test]
+fn durability_waiter_poison_wakes_thread_and_channel_waiters() {
+    let waiter = Arc::new(Lv2DurabilityWaiter::new(0));
+    let (wake_tx, wake_rx) = bounded(1);
+    assert!(!waiter.arm_channel(7, &wake_tx).unwrap());
+
+    let thread_waiter = waiter.clone();
+    let (started_tx, started_rx) = bounded(1);
+    let parked = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        thread_waiter.wait_for(8)
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+
+    waiter.poison("injected stage gap");
+
+    wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        parked.join().unwrap(),
+        Err(OnyxError::MetaFenced(reason)) if reason.contains("injected stage gap")
+    ));
+    assert!(matches!(
+        waiter.wait_for(9),
+        Err(OnyxError::MetaFenced(reason)) if reason.contains("injected stage gap")
+    ));
+    assert!(matches!(
+        waiter.arm_channel(9, &wake_tx),
+        Err(OnyxError::MetaFenced(reason)) if reason.contains("injected stage gap")
+    ));
+}
+
+#[test]
+fn durability_waiter_poison_freezes_watermark_but_preserves_prior_durability() {
+    let waiter = Lv2DurabilityWaiter::new(0);
+    assert!(waiter.advance(5));
+    waiter.poison("stage stream aborted");
+
+    assert_eq!(waiter.poll(5).unwrap(), true);
+    assert_eq!(waiter.wait_for(5).unwrap(), Duration::ZERO);
+    assert!(!waiter.advance(10));
+    assert_eq!(waiter.synced_seq.load(Ordering::Acquire), 5);
+    assert!(matches!(waiter.poll(6), Err(OnyxError::MetaFenced(_))));
 }
 
 #[test]
@@ -3616,6 +3993,14 @@ fn global_prepared_queue_depth_preserves_auto_default_and_explicit_override() {
         WriteBufferPool::resolve_global_prepared_queue_depth(0, 0),
         1
     );
+}
+
+#[test]
+fn stage_reorder_runtime_default_is_enabled_and_can_be_disabled() {
+    assert!(BufferRuntimeLimits::default().stage_reorder_enabled);
+    assert!(!BufferRuntimeLimits::default()
+        .with_stage_reorder(false)
+        .stage_reorder_enabled);
 }
 
 #[test]

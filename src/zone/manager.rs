@@ -300,7 +300,7 @@ impl ZoneManager {
         let tickets =
             self.submit_write_deferred(vol_id, start_lba, lba_count, data, vol_created_at)?;
         for ticket in tickets {
-            ticket.wait();
+            ticket.wait()?;
         }
         crate::diagnostic_metrics! {
             self.metrics.zone_submit_write_ns.fetch_add(

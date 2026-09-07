@@ -28,14 +28,18 @@ fn relocation_run_end(ready_lbas: &[(crate::types::Lba, usize)], run_start: usiz
 fn finish_relocation_submissions<T, E>(
     submissions: Vec<(T, u32)>,
     append_error: Option<E>,
-    mut wait: impl FnMut(T),
+    mut wait: impl FnMut(T) -> Result<(), E>,
 ) -> Result<u32, E> {
     let mut rewritten = 0u32;
+    let mut wait_error = None;
     for (ticket, lba_count) in submissions {
-        wait(ticket);
-        rewritten = rewritten.saturating_add(lba_count);
+        match wait(ticket) {
+            Ok(()) => rewritten = rewritten.saturating_add(lba_count),
+            Err(error) if wait_error.is_none() => wait_error = Some(error),
+            Err(_) => {}
+        }
     }
-    match append_error {
+    match wait_error.or(append_error) {
         Some(error) => Err(error),
         None => Ok(rewritten),
     }
@@ -321,9 +325,8 @@ pub fn rewrite_candidate(
     // A later run can fail after earlier deferred appends were accepted. Drain
     // those durability tickets before surfacing the error so the caller never
     // drops accepted relocation work with ambiguous LV2 durability.
-    let rewritten = finish_relocation_submissions(tickets, append_error, |ticket| {
-        ticket.wait();
-    })?;
+    let rewritten =
+        finish_relocation_submissions(tickets, append_error, |ticket| ticket.wait().map(|_| ()))?;
 
     tracing::debug!(
         pba = candidate.pba.0,
@@ -366,10 +369,33 @@ mod tests {
         let result = finish_relocation_submissions(
             vec![(11u64, 2), (22u64, 3)],
             Some("later append failed"),
-            |ticket| waited.push(ticket),
+            |ticket| {
+                waited.push(ticket);
+                Ok(())
+            },
         );
 
         assert_eq!(waited, vec![11, 22]);
         assert_eq!(result, Err("later append failed"));
+    }
+
+    #[test]
+    fn durability_failure_takes_precedence_after_all_tickets_are_drained() {
+        let mut waited = Vec::new();
+        let result = finish_relocation_submissions(
+            vec![(11u64, 2), (22u64, 3)],
+            Some("later append failed"),
+            |ticket| {
+                waited.push(ticket);
+                if ticket == 11 {
+                    Err("staging durability failed")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(waited, vec![11, 22]);
+        assert_eq!(result, Err("staging durability failed"));
     }
 }

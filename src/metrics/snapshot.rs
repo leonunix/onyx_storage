@@ -80,8 +80,21 @@ impl EngineMetrics {
             buffer_append_index_publish_ns: load(&self.buffer_append_index_publish_ns),
             buffer_append_ring_publish_ns: load(&self.buffer_append_ring_publish_ns),
             buffer_append_cache_publish_ns: load(&self.buffer_append_cache_publish_ns),
+            buffer_append_stage_window_wait_ns: load(&self.buffer_append_stage_window_wait_ns),
+            buffer_append_stage_window_wait_events: load(
+                &self.buffer_append_stage_window_wait_events,
+            ),
             buffer_append_stage_turn_wait_ns: load(&self.buffer_append_stage_turn_wait_ns),
             buffer_append_stage_send_ns: load(&self.buffer_append_stage_send_ns),
+            buffer_stage_reorder_out_of_order: load(&self.buffer_stage_reorder_out_of_order),
+            buffer_stage_reorder_current: load(&self.buffer_stage_reorder_current),
+            buffer_stage_reorder_max: load(&self.buffer_stage_reorder_max),
+            buffer_stage_reorder_max_distance: load(&self.buffer_stage_reorder_max_distance),
+            buffer_stage_reorder_gap_events: load(&self.buffer_stage_reorder_gap_events),
+            buffer_stage_reorder_gap_wait_ns: load(&self.buffer_stage_reorder_gap_wait_ns),
+            buffer_stage_reorder_duplicate: load(&self.buffer_stage_reorder_duplicate),
+            buffer_stage_reorder_stale: load(&self.buffer_stage_reorder_stale),
+            buffer_stage_reorder_faults: load(&self.buffer_stage_reorder_faults),
             buffer_append_log_write_ns: load(&self.buffer_append_log_write_ns),
             buffer_append_wait_durable_ns: load(&self.buffer_append_wait_durable_ns),
             buffer_append_prepare_latency_buckets: load_latency_buckets(
@@ -751,9 +764,31 @@ pub struct EngineMetricsSnapshot {
     #[serde(default)]
     pub buffer_append_cache_publish_ns: u64,
     #[serde(default)]
+    pub buffer_append_stage_window_wait_ns: u64,
+    #[serde(default)]
+    pub buffer_append_stage_window_wait_events: u64,
+    #[serde(default)]
     pub buffer_append_stage_turn_wait_ns: u64,
     #[serde(default)]
     pub buffer_append_stage_send_ns: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_out_of_order: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_current: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_max: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_max_distance: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_gap_events: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_gap_wait_ns: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_duplicate: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_stale: u64,
+    #[serde(default)]
+    pub buffer_stage_reorder_faults: u64,
     pub buffer_append_log_write_ns: u64,
     pub buffer_append_wait_durable_ns: u64,
     pub buffer_append_prepare_latency_buckets: Vec<u64>,
@@ -1329,6 +1364,9 @@ impl EngineMetricsSnapshot {
                     flush_qos_waiters: self.flush_qos_waiters,
                     flush_qos_waiters_max: self.flush_qos_waiters_max,
                     foreground_io_outstanding: self.foreground_io_outstanding,
+                    buffer_stage_reorder_current: self.buffer_stage_reorder_current,
+                    buffer_stage_reorder_max: self.buffer_stage_reorder_max,
+                    buffer_stage_reorder_max_distance: self.buffer_stage_reorder_max_distance,
                     flush_commit_executor_queue_depth: self.flush_commit_executor_queue_depth,
                     flush_commit_worker_executor_queue_wait_max_ns: self.flush_commit_worker_executor_queue_wait_max_ns,
                     flush_commit_executor_queue_depth_max: self.flush_commit_executor_queue_depth_max,
@@ -1462,8 +1500,18 @@ impl EngineMetricsSnapshot {
             buffer_append_index_publish_ns,
             buffer_append_ring_publish_ns,
             buffer_append_cache_publish_ns,
+            buffer_append_stage_window_wait_ns,
+            buffer_append_stage_window_wait_events,
             buffer_append_stage_turn_wait_ns,
             buffer_append_stage_send_ns,
+            buffer_stage_reorder_out_of_order,
+            // buffer_stage_reorder_{current,max,max_distance} are live/HWM gauges
+            // preserved above.
+            buffer_stage_reorder_gap_events,
+            buffer_stage_reorder_gap_wait_ns,
+            buffer_stage_reorder_duplicate,
+            buffer_stage_reorder_stale,
+            buffer_stage_reorder_faults,
             buffer_append_log_write_ns,
             buffer_append_wait_durable_ns,
             buffer_sync_batches,
@@ -1942,6 +1990,10 @@ mod compatibility_tests {
         earlier.flush_commit_executors_limit = 8;
         earlier.flush_commit_executors_active = 8;
         earlier.foreground_io_outstanding = 9;
+        earlier.buffer_stage_reorder_out_of_order = 10;
+        earlier.buffer_stage_reorder_current = 9;
+        earlier.buffer_stage_reorder_max = 12;
+        earlier.buffer_stage_reorder_max_distance = 8;
         earlier.flush_commit_worker_executor_queue_wait_max_ns = 12;
         earlier.flush_commit_executor_queue_depth_max = 12;
         earlier.flush_commit_executors_active_max = 12;
@@ -1958,6 +2010,10 @@ mod compatibility_tests {
         current.flush_commit_executors_limit = 8;
         current.flush_commit_executors_active = 1;
         current.foreground_io_outstanding = 3;
+        current.buffer_stage_reorder_out_of_order = 25;
+        current.buffer_stage_reorder_current = 2;
+        current.buffer_stage_reorder_max = 16;
+        current.buffer_stage_reorder_max_distance = 11;
         current.flush_commit_worker_executor_queue_wait_max_ns = 12;
         current.flush_commit_executor_queue_depth_max = 12;
         current.flush_commit_executors_active_max = 12;
@@ -1974,6 +2030,10 @@ mod compatibility_tests {
         assert_eq!(delta.flush_commit_executors_limit, 8);
         assert_eq!(delta.flush_commit_executors_active, 1);
         assert_eq!(delta.foreground_io_outstanding, 3);
+        assert_eq!(delta.buffer_stage_reorder_out_of_order, 15);
+        assert_eq!(delta.buffer_stage_reorder_current, 2);
+        assert_eq!(delta.buffer_stage_reorder_max, 16);
+        assert_eq!(delta.buffer_stage_reorder_max_distance, 11);
         assert_eq!(delta.flush_commit_worker_executor_queue_wait_max_ns, 12);
         assert_eq!(delta.flush_commit_executor_queue_depth_max, 12);
         assert_eq!(delta.flush_commit_executors_active_max, 12);

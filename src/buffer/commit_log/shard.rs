@@ -348,6 +348,7 @@ impl BufferShard {
         max_flushed_seq: Arc<AtomicU64>,
         durable_seq: Arc<AtomicU64>,
         lv2_durability: Arc<Lv2DurabilityWaiter>,
+        persistence_fence: Arc<OnceLock<String>>,
         ready_tx: Sender<u64>,
         shard_ready_tx: Sender<u64>,
     ) -> OnyxResult<(Self, u64)> {
@@ -415,7 +416,8 @@ impl BufferShard {
             scan.max_seq = scan.max_seq.max(ckpt.max_seq);
         }
 
-        let (staging_tx, staging_rx) = bounded(runtime_limits.staging_channel_capacity.max(1));
+        let staging_capacity = runtime_limits.staging_channel_capacity.max(1);
+        let (staging_tx, staging_rx) = bounded(staging_capacity);
         let had_head = !scan.log_order.is_empty();
         let mut log_order = VecDeque::with_capacity(scan.log_order.len());
         log_order.extend(scan.log_order);
@@ -474,8 +476,14 @@ impl BufferShard {
                 staging_rx,
                 next_reservation_order: AtomicU64::new(0),
                 stage_turn: AppendStageTurn::default(),
+                stage_window: StageWindow::new(staging_capacity),
+                stage_reorder_enabled: runtime_limits.stage_reorder_enabled,
+                stage_fault: OnceLock::new(),
+                persistence_fence,
                 #[cfg(test)]
                 fail_next_staging_send: AtomicBool::new(false),
+                #[cfg(test)]
+                stage_pause: parking_lot::Mutex::new(None),
                 sync_batch_max_entries: runtime_limits.sync_batch_max_entries.max(1),
                 sync_batch_max_bytes: runtime_limits.sync_batch_max_bytes.max(BLOCK_SIZE as usize),
                 cached_payload_order: parking_lot::Mutex::new(VecDeque::with_capacity(1024)),
@@ -761,6 +769,7 @@ impl BufferShard {
     pub(super) fn wake_ring_waiters(&self) {
         let _guard = self.ring.lock();
         self.ring_space_cv.notify_all();
+        self.stage_window.wake_all();
     }
 
     pub(super) fn wait_for_ring_space(&self, slot_count: u32) {
@@ -939,6 +948,7 @@ impl BufferShard {
         reservation: AppendReservation,
         prepared: PreparedAppend,
         relocation_source: Option<crate::space::extent::Extent>,
+        stage_permit: StagePermit,
         _profile_detail: bool,
     ) -> OnyxResult<Arc<PendingEntry>> {
         #[cfg(any(test, feature = "diagnostic-metrics"))]
@@ -1052,10 +1062,11 @@ impl BufferShard {
         self.cached_payload_order.lock().push_back(reservation.seq);
         detail_lap!(buffer_append_cache_publish_ns);
 
-        // Different LBA stripes may reach this point out of order. Serialize
-        // only the final channel handoff so the scalar durability watermark and
-        // checkpoint-guided recovery retain their increasing-seq invariant.
-        let send_result = self.stage_turn.run(reservation.stage_order, || {
+        // Different LBA stripes may reach this point out of order. The legacy
+        // arm orders the final handoff here; the consumer-reorder arm sends
+        // immediately and restores the dense stage-order prefix in the shard's
+        // single sync consumer.
+        let send = || {
             detail_lap!(buffer_append_stage_turn_wait_ns);
             let staged = StagedEntry {
                 pending: pending.clone(),
@@ -1064,12 +1075,80 @@ impl BufferShard {
                 staged_at: Instant::now(),
             };
             #[cfg(test)]
+            self.pause_stage_for_test(reservation.stage_order);
+            #[cfg(test)]
             if self.fail_next_staging_send.swap(false, Ordering::Relaxed) {
+                self.fence_stage(format!(
+                    "injected LV2 staging failure at order {} seq {}",
+                    reservation.stage_order, reservation.seq
+                ));
                 return Err(());
             }
-            let result = self.staging_tx.send(staged).map_err(|_| ());
+            let envelope = StageEnvelope::new(reservation.stage_order, staged, stage_permit);
+            let result = if self.stage_reorder_enabled {
+                self.staging_tx.try_send(envelope).map_err(|error| {
+                    let (reason, envelope) = match error {
+                        TrySendError::Full(envelope) => (
+                            format!(
+                                "LV2 staging channel full despite permit: order={} seq={}",
+                                reservation.stage_order, reservation.seq
+                            ),
+                            envelope,
+                        ),
+                        TrySendError::Disconnected(envelope) => (
+                            format!(
+                                "LV2 staging consumer disconnected: order={} seq={}",
+                                reservation.stage_order, reservation.seq
+                            ),
+                            envelope,
+                        ),
+                    };
+                    self.fence_stage(reason);
+                    drop(envelope);
+                })
+            } else {
+                let mut envelope = envelope;
+                loop {
+                    match self
+                        .staging_tx
+                        .send_timeout(envelope, BACKPRESSURE_POLL_INTERVAL)
+                    {
+                        Ok(()) => break Ok(()),
+                        Err(SendTimeoutError::Timeout(returned)) => {
+                            envelope = returned;
+                            if self.stage_fault.get().is_some() {
+                                break Err(());
+                            }
+                        }
+                        Err(SendTimeoutError::Disconnected(returned)) => {
+                            self.fence_stage(format!(
+                                "LV2 staging consumer disconnected: order={} seq={}",
+                                reservation.stage_order, reservation.seq
+                            ));
+                            drop(returned);
+                            break Err(());
+                        }
+                    }
+                }
+            };
             detail_lap!(buffer_append_stage_send_ns);
             result
+        };
+        let send_result = if self.stage_reorder_enabled {
+            send()
+        } else {
+            self.stage_turn.run(reservation.stage_order, send)
+        };
+        // A sibling producer can poison this shard after our pre-reservation
+        // fence check but before this handoff completes. Convert that race into
+        // the normal rollback path instead of returning a ticket for a consumer
+        // that has already stopped.
+        let send_result = send_result.and_then(|()| {
+            if self.stage_fault.get().is_some() {
+                Err(())
+            } else {
+                Ok(())
+            }
         });
         if send_result.is_err() {
             // Back out the new entry and restore the successfully published
@@ -1086,7 +1165,7 @@ impl BufferShard {
                 }
             }
             return Err(OnyxError::MetaFenced(
-                "buffer sync staging channel closed".into(),
+                "buffer sync staging handoff failed".into(),
             ));
         }
 
@@ -1118,13 +1197,116 @@ impl BufferShard {
         self.fail_next_staging_send.store(true, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(super) fn pause_next_stage_for_test(&self) -> (u64, Receiver<()>, Sender<()>) {
+        let order = self.next_reservation_order.load(Ordering::Acquire);
+        let (hit_tx, hit_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let previous = self.stage_pause.lock().replace(TestStagePause {
+            order,
+            hit_tx,
+            release_rx,
+        });
+        assert!(previous.is_none(), "only one LV2 stage pause may be armed");
+        (order, hit_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn pause_stage_for_test(&self, order: u64) {
+        let pause = {
+            let mut armed = self.stage_pause.lock();
+            if armed.as_ref().is_some_and(|pause| pause.order == order) {
+                armed.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.hit_tx.send(());
+            let _ = pause.release_rx.recv();
+        }
+    }
+
+    pub(super) fn acquire_stage_permit(
+        &self,
+        relocation_cancel: Option<&AtomicBool>,
+    ) -> OnyxResult<StagePermit> {
+        if !self.stage_reorder_enabled {
+            return Ok(StagePermit::unbounded());
+        }
+        if let Some(reason) = self.persistence_fence.get() {
+            return Err(OnyxError::MetaFenced(reason.clone()));
+        }
+        if let Some(reason) = self.stage_fault.get() {
+            return Err(OnyxError::MetaFenced(reason.clone()));
+        }
+        let (permit, waited) = self
+            .stage_window
+            .acquire(relocation_cancel, self.persistence_fence.as_ref())?;
+        if let Some(waited) = waited {
+            if let Some(metrics) = self.metrics.get() {
+                metrics
+                    .buffer_append_stage_window_wait_events
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics.buffer_append_stage_window_wait_ns.fetch_add(
+                    waited.as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        Ok(permit)
+    }
+
+    pub(super) fn stage_fault_reason(&self) -> Option<&str> {
+        self.stage_fault.get().map(String::as_str)
+    }
+
+    pub(super) fn fence_stage(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if self.stage_fault.set(reason.clone()).is_ok() {
+            let _ = self.persistence_fence.set(reason.clone());
+            self.lv2_durability.poison(reason.clone());
+            if let Some(metrics) = self.metrics.get() {
+                metrics
+                    .buffer_stage_reorder_faults
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.stage_window.wake_all();
+            tracing::error!(reason = %reason, "LV2 staging pipeline fenced");
+        }
+    }
+
+    pub(super) fn stage_input_ready(&self, reorder: &StageReorder) -> bool {
+        reorder.has_ready() || !self.staging_rx.is_empty()
+    }
+
+    /// A clean stop has consumed every assigned stage order. A non-empty
+    /// future map or an assigned-but-unsent order is a permanent gap once the
+    /// pool owns no live appenders, so fail-stop instead of skipping it.
+    pub(super) fn stage_shutdown_complete(&self, reorder: &StageReorder) -> bool {
+        if self.stage_input_ready(reorder) {
+            return false;
+        }
+        let issued = self.next_reservation_order.load(Ordering::Acquire);
+        if reorder.is_empty() && reorder.next_order() == issued {
+            return true;
+        }
+        self.fence_stage(format!(
+            "LV2 staging shutdown gap: next_order={} issued_order={} buffered={}",
+            reorder.next_order(),
+            issued,
+            reorder.buffered_len()
+        ));
+        true
+    }
+
     /// Block until the LV2 fdatasync watermark covers `seq`. The sync
     /// thread advances `lv2_durability.synced_seq` after each successful
     /// io_uring fdatasync barrier; `notify_all` then releases every parked
     /// appender whose seq is now durable. Called by `WriteBufferPool::append`
     /// before returning the ack to the caller.
-    pub(super) fn wait_for_durable(&self, seq: u64) {
-        self.lv2_durability.wait_for(seq);
+    pub(super) fn wait_for_durable(&self, seq: u64) -> OnyxResult<()> {
+        self.lv2_durability.wait_for(seq).map(|_| ())
     }
 
     /// Wake the flusher after this seq becomes durable. These bounded channels
@@ -1136,8 +1318,7 @@ impl BufferShard {
     }
 
     /// Drop the indices + cache state for an entry that was inserted but
-    /// then failed to publish to the sync thread (staging channel closed
-    /// during shutdown). Idempotent.
+    /// then failed to publish to the sync thread. Idempotent.
     fn evict_pending_entry(&self, seq: u64, pending: &Arc<PendingEntry>) {
         let vid = self.intern_vol_id(&pending.vol_id);
         for i in 0..pending.lba_count {
@@ -1171,8 +1352,11 @@ impl BufferShard {
         }
     }
 
-    pub(super) fn drain_staged_limited(&self) -> Vec<StagedEntry> {
-        self.drain_staged_capped(self.sync_batch_max_entries)
+    pub(super) fn drain_staged_limited(
+        &self,
+        reorder: &mut StageReorder,
+    ) -> OnyxResult<Vec<StagedEntry>> {
+        self.drain_staged_capped(reorder, self.sync_batch_max_entries)
     }
 
     /// Like `drain_staged_limited` but also bounds the entry count at
@@ -1180,18 +1364,22 @@ impl BufferShard {
     /// pipelined uring sync path uses this to keep one batch's IO_LINK chain
     /// (≤ `entries + 2` SQEs) within the ring's SQ depth — a chain cannot be
     /// split across submits without dangling the trailing LINK.
-    pub(super) fn drain_staged_capped(&self, max_entries: usize) -> Vec<StagedEntry> {
-        let cap = max_entries.min(self.sync_batch_max_entries).max(1);
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0usize;
-        while let Ok(entry) = self.staging_rx.try_recv() {
-            batch_bytes = batch_bytes.saturating_add(entry.payload.len());
-            batch.push(entry);
-            if batch.len() >= cap || batch_bytes >= self.sync_batch_max_bytes {
-                break;
-            }
+    pub(super) fn drain_staged_capped(
+        &self,
+        reorder: &mut StageReorder,
+        max_entries: usize,
+    ) -> OnyxResult<Vec<StagedEntry>> {
+        if let Some(reason) = self.stage_fault.get() {
+            return Err(OnyxError::MetaFenced(reason.clone()));
         }
-        batch
+        let cap = max_entries.min(self.sync_batch_max_entries).max(1);
+        let result = reorder
+            .drain(&self.staging_rx, cap, self.sync_batch_max_bytes)
+            .map_err(|reason| {
+                self.fence_stage(reason.clone());
+                OnyxError::MetaFenced(reason)
+            });
+        result
     }
 
     pub(super) fn used_bytes(&self) -> u64 {

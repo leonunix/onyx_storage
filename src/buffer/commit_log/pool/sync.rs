@@ -543,16 +543,20 @@ impl WriteBufferPool {
         data_fd: RawFd,
         data_base: u64,
         ckpt_target: Option<(RawFd, u64)>,
-    ) -> bool {
+    ) -> OnyxResult<bool> {
         let base_ud = batch.batch_id << 32;
         let ops = Self::chain_ops(batch, data_fd, data_base, ckpt_target);
         unsafe {
             let _g = shard.io_lock.lock();
-            match ring.submit_linked_nowait(&ops, base_ud) {
-                Ok(ok) => ok,
-                Err(e) => {
-                    tracing::warn!(error = %e, "uring pipeline submit errored; will retry");
-                    false
+            match ring.submit_linked_nowait(&ops, base_ud)? {
+                LinkedSubmitOutcome::Full => Ok(false),
+                LinkedSubmitOutcome::Submitted => Ok(true),
+                LinkedSubmitOutcome::QueuedAfterSubmitError(error) => {
+                    // The complete chain was already published to the shared SQ
+                    // before io_uring_enter failed. Track the batch as in-flight
+                    // so its buffers remain alive; `harvest` submits it again.
+                    tracing::warn!(error = %error, "uring pipeline submit errored; queued chain retained");
+                    Ok(true)
                 }
             }
         }
@@ -660,6 +664,28 @@ impl WriteBufferPool {
         }
     }
 
+    /// A stage-order fault freezes the watermark immediately, but submitted SQEs
+    /// still borrow the batch buffers through raw pointers. Harvest every CQE
+    /// before dropping those buffers; none of these batches are published.
+    fn quiesce_uring_fifo_after_stage_fault(
+        ring: &IoUringSession,
+        fifo: &mut VecDeque<InflightUringBatch>,
+    ) {
+        while fifo
+            .iter()
+            .any(|batch| batch.seen_cqes < batch.expected_cqes)
+        {
+            match ring.harvest(1) {
+                Ok(completions) => Self::apply_completions(fifo, completions),
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to quiesce poisoned LV2 io_uring");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        fifo.clear();
+    }
+
     /// Post-fsync work for a successfully-durable batch, in FIFO (seq) order:
     /// retire superseded ranges, strip stale cancellation flags, advance the LV2
     /// durability watermark (covers cancelled seqs too), record metrics. Mirrors
@@ -669,6 +695,16 @@ impl WriteBufferPool {
         batch: &InflightUringBatch,
         metrics: &Arc<OnceLock<Arc<EngineMetrics>>>,
     ) {
+        let advanced_at_ns = lv2_metric_timestamp_ns(Instant::now());
+        for entry in &batch.inflight_all {
+            entry
+                .pending
+                .durability_advanced_at_ns
+                .store(advanced_at_ns, Ordering::Release);
+        }
+        if !shard.lv2_durability.advance(batch.max_seq) {
+            return;
+        }
         let pendings: Vec<Arc<PendingEntry>> = batch
             .inflight_all
             .iter()
@@ -681,14 +717,6 @@ impl WriteBufferPool {
                 lc.cancelled.remove(&e.pending.seq);
             }
         }
-        let advanced_at_ns = lv2_metric_timestamp_ns(Instant::now());
-        for entry in &batch.inflight_all {
-            entry
-                .pending
-                .durability_advanced_at_ns
-                .store(advanced_at_ns, Ordering::Release);
-        }
-        shard.lv2_durability.advance(batch.max_seq);
         for entry in &batch.inflight_all {
             shard.publish_ready(entry.pending.seq);
         }
@@ -760,7 +788,30 @@ impl WriteBufferPool {
                 let ops = Self::chain_ops(fifo.front().unwrap(), data_fd, data_base, ckpt_target);
                 unsafe {
                     let _g = shard.io_lock.lock();
-                    ring.submit_linked_nowait(&ops, base_ud)?
+                    match ring.submit_linked_nowait(&ops, base_ud) {
+                        Ok(LinkedSubmitOutcome::Full) => Ok(false),
+                        Ok(LinkedSubmitOutcome::Submitted) => Ok(true),
+                        Ok(LinkedSubmitOutcome::QueuedAfterSubmitError(error)) => {
+                            tracing::warn!(
+                                error = %error,
+                                "uring recovery submit errored; queued chain retained"
+                            );
+                            Ok(true)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            let submitted = match submitted {
+                Ok(submitted) => submitted,
+                Err(error) => {
+                    let front = fifo.front_mut().unwrap();
+                    front.failed = true;
+                    front.seen_cqes = front.expected_cqes;
+                    shard.fence_stage(format!(
+                        "LV2 io_uring recovery failed before queueing: {error}"
+                    ));
+                    return Err(error);
                 }
             };
             if !submitted {
@@ -836,13 +887,18 @@ impl WriteBufferPool {
         let mut open: Option<OpenBatch> = None;
         let mut next_batch_id: u64 = 1;
         let mut ema_write = Duration::ZERO;
+        let mut reorder = StageReorder::new(metrics.clone());
 
         loop {
+            if shard.stage_fault_reason().is_some() {
+                Self::quiesce_uring_fifo_after_stage_fault(&ring, &mut fifo);
+                return;
+            }
             // 1. Submit a held-back batch (SQ was full) once a FIFO slot frees.
             if let Some(mut batch) = pending_submit.take() {
                 if fifo.len() < depth {
                     batch.write_start = Instant::now();
-                    if Self::submit_batch_nowait(
+                    match Self::submit_batch_nowait(
                         &ring,
                         &shard,
                         &batch,
@@ -850,9 +906,13 @@ impl WriteBufferPool {
                         data_base,
                         ckpt_target,
                     ) {
-                        fifo.push_back(batch);
-                    } else {
-                        pending_submit = Some(batch);
+                        Ok(true) => fifo.push_back(batch),
+                        Ok(false) => pending_submit = Some(batch),
+                        Err(error) => {
+                            shard.fence_stage(format!(
+                                "LV2 io_uring batch submission failed before queueing: {error}"
+                            ));
+                        }
                     }
                 } else {
                     pending_submit = Some(batch);
@@ -870,7 +930,13 @@ impl WriteBufferPool {
                 });
                 let room = entry_cap.saturating_sub(ob.entries.len());
                 if room > 0 && ob.bytes < byte_cap {
-                    let more = shard.drain_staged_capped(room);
+                    let more = match shard.drain_staged_capped(&mut reorder, room) {
+                        Ok(entries) => entries,
+                        Err(error) => {
+                            tracing::error!(error = %error, "LV2 staging reorder failed");
+                            continue;
+                        }
+                    };
                     if !more.is_empty() {
                         if ob.entries.is_empty() {
                             ob.opened_at = Instant::now();
@@ -901,7 +967,7 @@ impl WriteBufferPool {
                     let mut batch =
                         Self::seal_uring_batch(&shard, ckpt_target, ob.entries, &mut next_batch_id);
                     batch.write_start = Instant::now();
-                    if Self::submit_batch_nowait(
+                    match Self::submit_batch_nowait(
                         &ring,
                         &shard,
                         &batch,
@@ -909,9 +975,13 @@ impl WriteBufferPool {
                         data_base,
                         ckpt_target,
                     ) {
-                        fifo.push_back(batch);
-                    } else {
-                        pending_submit = Some(batch);
+                        Ok(true) => fifo.push_back(batch),
+                        Ok(false) => pending_submit = Some(batch),
+                        Err(error) => {
+                            shard.fence_stage(format!(
+                                "LV2 io_uring batch submission failed before queueing: {error}"
+                            ));
+                        }
                     }
                 }
             }
@@ -930,7 +1000,7 @@ impl WriteBufferPool {
                 let _ = wake_rx.recv_timeout(wait);
                 while wake_rx.try_recv().is_ok() {}
             } else {
-                let can_accumulate = !shard.staging_rx.is_empty()
+                let can_accumulate = shard.stage_input_ready(&reorder)
                     && pending_submit.is_none()
                     && open
                         .as_ref()
@@ -990,7 +1060,7 @@ impl WriteBufferPool {
                 && fifo.is_empty()
                 && pending_submit.is_none()
                 && open.is_none()
-                && shard.staging_rx.is_empty()
+                && shard.stage_shutdown_complete(&reorder)
             {
                 return;
             }
@@ -1125,8 +1195,12 @@ impl WriteBufferPool {
                         crate::affinity::ThreadRole::BufferSync,
                         member_idx,
                     );
+                    let mut reorder = StageReorder::new(metrics.clone());
                     loop {
-                        if shard.staging_rx.is_empty() {
+                        if shard.stage_fault_reason().is_some() {
+                            return;
+                        }
+                        if !shard.stage_input_ready(&reorder) {
                             #[cfg(any(test, feature = "diagnostic-metrics"))]
                             let idle_started = Instant::now();
                             let woken = wake_rx.recv_timeout(Duration::from_millis(50));
@@ -1142,7 +1216,7 @@ impl WriteBufferPool {
                                 Ok(()) => {}
                                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
                                     if shutdown.load(Ordering::Relaxed)
-                                        && shard.staging_rx.is_empty()
+                                        && shard.stage_shutdown_complete(&reorder)
                                     {
                                         return;
                                     }
@@ -1157,7 +1231,17 @@ impl WriteBufferPool {
                         // write, and flush used to charge the foreground ack
                         // path the same window three times.
                         let started = Instant::now();
-                        let all = shard.drain_staged_limited();
+                        let all = match shard.drain_staged_limited(&mut reorder) {
+                            Ok(entries) => entries,
+                            Err(error) => {
+                                tracing::error!(
+                                    member_idx,
+                                    error = %error,
+                                    "global LV2 staging reorder failed"
+                                );
+                                return;
+                            }
+                        };
                         #[cfg(any(test, feature = "diagnostic-metrics"))]
                         let drained_at = Instant::now();
                         if all.is_empty() {
@@ -1229,7 +1313,9 @@ impl WriteBufferPool {
                         if sent.is_err() {
                             return;
                         }
-                        if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                        if shutdown.load(Ordering::Relaxed)
+                            && shard.stage_shutdown_complete(&reorder)
+                        {
                             return;
                         }
                     }
@@ -1699,18 +1785,6 @@ impl WriteBufferPool {
                 let publish_started = Instant::now();
                 for batch in batches {
                     let shard = &members[batch.member_idx].1;
-                    let pendings: Vec<Arc<PendingEntry>> = batch
-                        .all
-                        .iter()
-                        .map(|entry| entry.pending.clone())
-                        .collect();
-                    shard.retire_superseded_by_durable_entries(&pendings);
-                    {
-                        let mut lifecycle = shard.lifecycle.lock();
-                        for entry in &batch.all {
-                            lifecycle.cancelled.remove(&entry.pending.seq);
-                        }
-                    }
                     let max_seq = batch
                         .all
                         .iter()
@@ -1737,7 +1811,21 @@ impl WriteBufferPool {
                             }
                         }
                     }
-                    shard.lv2_durability.advance(max_seq);
+                    if !shard.lv2_durability.advance(max_seq) {
+                        continue;
+                    }
+                    let pendings: Vec<Arc<PendingEntry>> = batch
+                        .all
+                        .iter()
+                        .map(|entry| entry.pending.clone())
+                        .collect();
+                    shard.retire_superseded_by_durable_entries(&pendings);
+                    {
+                        let mut lifecycle = shard.lifecycle.lock();
+                        for entry in &batch.all {
+                            lifecycle.cancelled.remove(&entry.pending.seq);
+                        }
+                    }
                     crate::diagnostic_metrics! {
                         if let Some(metrics) = metrics.get() {
                             // Lane write done -> this batch's watermark advance.
@@ -1839,6 +1927,7 @@ impl WriteBufferPool {
         let mut retry_after: Option<Instant> = None;
         let mut inflight: Vec<StagedEntry> = Vec::new();
         let mut writes_applied = false;
+        let mut reorder = StageReorder::new(metrics.clone());
         let batch_wait = if group_commit_wait.is_zero() {
             Duration::from_millis(1)
         } else {
@@ -1846,18 +1935,25 @@ impl WriteBufferPool {
         };
 
         loop {
+            if shard.stage_fault_reason().is_some() {
+                return;
+            }
             if inflight.is_empty() {
-                if shard.staging_rx.is_empty() {
+                if !shard.stage_input_ready(&reorder) {
                     match wake_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(()) => {}
                         Err(RecvTimeoutError::Timeout) => {
-                            if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                            if shutdown.load(Ordering::Relaxed)
+                                && shard.stage_shutdown_complete(&reorder)
+                            {
                                 return;
                             }
                             continue;
                         }
                         Err(RecvTimeoutError::Disconnected) => {
-                            if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                            if shutdown.load(Ordering::Relaxed)
+                                && shard.stage_shutdown_complete(&reorder)
+                            {
                                 return;
                             }
                             continue;
@@ -1880,9 +1976,15 @@ impl WriteBufferPool {
                     }
                 }
 
-                inflight = shard.drain_staged_limited();
+                inflight = match shard.drain_staged_limited(&mut reorder) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        tracing::error!(error = %error, "LV2 staging reorder failed");
+                        return;
+                    }
+                };
                 if inflight.is_empty() {
-                    if shutdown.load(Ordering::Relaxed) && shard.staging_rx.is_empty() {
+                    if shutdown.load(Ordering::Relaxed) && shard.stage_shutdown_complete(&reorder) {
                         return;
                     }
                     continue;
@@ -2005,19 +2107,6 @@ impl WriteBufferPool {
                 Ok(()) => {
                     consecutive_failures = 0;
                     retry_after = None;
-                    let inflight_pending: Vec<Arc<PendingEntry>> =
-                        inflight.iter().map(|entry| entry.pending.clone()).collect();
-                    shard.retire_superseded_by_durable_entries(&inflight_pending);
-                    // Strip cancellation flags for this batch — appenders
-                    // already returned errors and the indices were rolled
-                    // back via `evict_pending_entry`, so any leftover
-                    // cancellation markers are stale.
-                    {
-                        let mut lc = shard.lifecycle.lock();
-                        for entry in &inflight {
-                            lc.cancelled.remove(&entry.pending.seq);
-                        }
-                    }
                     // Advance the LV2 fdatasync watermark, then publish every
                     // durable entry. Sync owns this publication so a dropped
                     // deferred ticket cannot strand an entry outside flusher.
@@ -2033,7 +2122,22 @@ impl WriteBufferPool {
                             .durability_advanced_at_ns
                             .store(advanced_at_ns, Ordering::Release);
                     }
-                    shard.lv2_durability.advance(batch_max_durable);
+                    if !shard.lv2_durability.advance(batch_max_durable) {
+                        return;
+                    }
+                    let inflight_pending: Vec<Arc<PendingEntry>> =
+                        inflight.iter().map(|entry| entry.pending.clone()).collect();
+                    shard.retire_superseded_by_durable_entries(&inflight_pending);
+                    // Strip cancellation flags for this batch — appenders
+                    // already returned errors and the indices were rolled
+                    // back via `evict_pending_entry`, so any leftover
+                    // cancellation markers are stale.
+                    {
+                        let mut lc = shard.lifecycle.lock();
+                        for entry in &inflight {
+                            lc.cancelled.remove(&entry.pending.seq);
+                        }
+                    }
                     for entry in &inflight {
                         shard.publish_ready(entry.pending.seq);
                     }

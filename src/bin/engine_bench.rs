@@ -211,32 +211,35 @@ struct PendingWrite {
 }
 
 impl PendingWrite {
-    fn arm_wakeup(&self, tx: &Sender<()>) {
+    fn arm_wakeup(&self, tx: &Sender<()>) -> Result<()> {
         self.ticket
             .as_ref()
             .expect("pending write ticket already completed")
-            .arm_wakeup(tx);
+            .arm_wakeup(tx)?;
+        Ok(())
     }
 
-    fn is_durable(&self) -> bool {
-        self.ticket
+    fn poll_durability(&self) -> Result<bool> {
+        Ok(self
+            .ticket
             .as_ref()
             .expect("pending write ticket already completed")
-            .is_durable()
+            .poll_durability()?)
     }
 
-    fn wait(mut self) {
+    fn wait(mut self) -> Result<()> {
         if let Some(ticket) = self.ticket.take() {
-            ticket.wait();
+            ticket.wait()?;
         }
+        Ok(())
     }
 
-    fn finish_durable(mut self) -> CompletedWrite {
+    fn finish_durable(mut self) -> Result<CompletedWrite> {
         self.ticket
             .take()
             .expect("pending write ticket already completed")
-            .finish();
-        CompletedWrite {
+            .finish()?;
+        Ok(CompletedWrite {
             buffer: self
                 .buffer
                 .take()
@@ -248,14 +251,14 @@ impl PendingWrite {
             append_worker_ns: self.append_worker_ns,
             bytes: self.bytes,
             measured: self.measured,
-        }
+        })
     }
 }
 
 impl Drop for PendingWrite {
     fn drop(&mut self) {
         if let Some(ticket) = self.ticket.take() {
-            ticket.wait();
+            let _ = ticket.wait();
         }
     }
 }
@@ -1808,7 +1811,7 @@ fn run_mixed(engine: &OnyxEngine, cli: &Cli) -> Result<TimedRun> {
                         };
                         if let Err(error) = worker_result_tx.send(submit_result) {
                             if let SubmitResult::Pending(pending) = error.0 {
-                                pending.wait();
+                                let _ = pending.wait();
                             }
                             return;
                         }
@@ -2225,7 +2228,7 @@ fn accept_dispatch_result(
 ) -> Result<()> {
     match result {
         SubmitResult::Pending(write) => {
-            write.arm_wakeup(wake_tx);
+            write.arm_wakeup(wake_tx)?;
             pending.push(write);
         }
         SubmitResult::Failed { job, buffer, error } => {
@@ -2241,13 +2244,34 @@ fn dispatch_durable_writes(
 ) -> Result<()> {
     let mut idx = 0;
     while idx < pending.len() {
-        if !pending[idx].is_durable() {
-            idx += 1;
-            continue;
+        match pending[idx].poll_durability() {
+            Ok(false) => {
+                idx += 1;
+                continue;
+            }
+            Err(error) => {
+                let mut write = pending.swap_remove(idx);
+                let job = write.job;
+                write.ticket.take();
+                let buffer = write
+                    .buffer
+                    .take()
+                    .expect("pending write buffer already returned");
+                route_job_event(
+                    event_txs,
+                    job,
+                    JobEvent::Failed {
+                        buffer,
+                        error: error.to_string(),
+                    },
+                )?;
+                continue;
+            }
+            Ok(true) => {}
         }
         let write = pending.swap_remove(idx);
         let job = write.job;
-        let completed = write.finish_durable();
+        let completed = write.finish_durable()?;
         route_job_event(event_txs, job, JobEvent::Complete(completed))?;
     }
     Ok(())

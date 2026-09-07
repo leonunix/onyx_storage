@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{
+    bounded, unbounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError,
+    TrySendError,
+};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
@@ -13,10 +16,12 @@ use crate::error::{OnyxError, OnyxResult};
 use crate::io::aligned::{round_up, AlignedBuf};
 use crate::io::block_backend::{slice_backend, BlockBackend};
 use crate::io::device::RawDevice;
-use crate::io::uring::{IoUringSession, LinkedOp, UringOp, UringOpResult};
+use crate::io::uring::{IoUringSession, LinkedOp, LinkedSubmitOutcome, UringOp, UringOpResult};
 use crate::meta::schema::MAX_VOLUME_ID_BYTES;
 use crate::metrics::{BufferShardSnapshot, EngineMetrics, ForegroundIoLease};
 use crate::types::{Lba, BLOCK_SIZE};
+
+use self::staging::{StageEnvelope, StagePermit, StageReorder, StageWindow};
 
 const COMMIT_LOG_MAGIC: u32 = 0x4F43_4C47; // "OCLG"
 const COMMIT_LOG_VERSION: u32 = 3;
@@ -103,6 +108,9 @@ const LV2_COMMIT_TIMEOUT_PCT: u64 = 10;
 #[derive(Debug, Clone, Copy)]
 pub struct BufferRuntimeLimits {
     pub staging_channel_capacity: usize,
+    /// Let producers enqueue after publication and restore physical reservation
+    /// order in the single per-shard sync consumer.
+    pub stage_reorder_enabled: bool,
     pub sync_batch_max_entries: usize,
     pub sync_batch_max_bytes: usize,
     /// Prepared-batch channel depth for each global root-write lane. Zero keeps
@@ -238,6 +246,7 @@ impl BufferRuntimeLimits {
             } else {
                 staging_channel_capacity
             },
+            stage_reorder_enabled: defaults.stage_reorder_enabled,
             sync_batch_max_entries: if sync_batch_max_entries == 0 {
                 defaults.sync_batch_max_entries
             } else {
@@ -282,6 +291,11 @@ impl BufferRuntimeLimits {
         self
     }
 
+    pub fn with_stage_reorder(mut self, enabled: bool) -> Self {
+        self.stage_reorder_enabled = enabled;
+        self
+    }
+
     /// `0` keeps the compiled `min(shards, 8)` lane count.
     pub fn with_write_lanes(mut self, lanes: usize) -> Self {
         self.lv2_write_lanes = lanes;
@@ -299,6 +313,7 @@ impl Default for BufferRuntimeLimits {
     fn default() -> Self {
         Self {
             staging_channel_capacity: STAGING_CHANNEL_CAPACITY,
+            stage_reorder_enabled: true,
             sync_batch_max_entries: SYNC_BATCH_MAX_ENTRIES,
             sync_batch_max_bytes: SYNC_BATCH_MAX_BYTES,
             lv2_prepared_queue_depth_per_lane: 0,
@@ -314,7 +329,8 @@ impl Default for BufferRuntimeLimits {
 }
 
 /// LV2 fdatasync watermark + targeted wakeup registry. Producers (`append`)
-/// park here until the sync thread fdatasync's their seq.
+/// park here until the sync thread fdatasync's their seq or the shard's stage
+/// stream is poisoned.
 ///
 /// `advance` wakes ONLY the appenders whose seq is now durable; the ones still
 /// waiting on a later (in-flight or still-OPEN) batch stay parked and
@@ -330,9 +346,15 @@ impl Default for BufferRuntimeLimits {
 pub(crate) struct Lv2DurabilityWaiter {
     /// Monotonic max seq whose payload is fdatasync'd on LV2 for this shard.
     pub(crate) synced_seq: AtomicU64,
-    /// Parked appenders, each tagged with the seq it waits for. Locked only for
-    /// the brief register / drain critical sections, never across a `park()`.
-    waiters: parking_lot::Mutex<Vec<SeqWaiter>>,
+    /// Parked appenders plus the terminal stage fault. Locked only for brief
+    /// register / drain / advance critical sections, never across a `park()`.
+    state: parking_lot::Mutex<DurabilityState>,
+}
+
+#[derive(Default)]
+struct DurabilityState {
+    waiters: Vec<SeqWaiter>,
+    poisoned: Option<String>,
 }
 
 /// One parked appender, tagged with the seq it is waiting for.
@@ -358,69 +380,12 @@ impl Lv2DurabilityWaiter {
     pub(crate) fn new(initial: u64) -> Self {
         Self {
             synced_seq: AtomicU64::new(initial),
-            waiters: parking_lot::Mutex::new(Vec::new()),
+            state: parking_lot::Mutex::new(DurabilityState::default()),
         }
     }
 
-    /// Block until `synced_seq >= seq`. Returns the wait duration so the
-    /// caller can attribute it to `buffer_append_wait_durable_ns`.
-    pub(crate) fn wait_for(&self, seq: u64) -> Duration {
-        // Fast path: already durable — no registration, no lock, no park.
-        if self.synced_seq.load(Ordering::Acquire) >= seq {
-            return Duration::ZERO;
-        }
-        let start = Instant::now();
-        let parker = Arc::new(DurabilityParker {
-            done: AtomicBool::new(false),
-            thread: thread::current(),
-        });
-        {
-            let mut waiters = self.waiters.lock();
-            // Re-check under the lock: `advance` takes this same lock to drain,
-            // so if it advanced past `seq` before we registered we observe the
-            // new watermark here and skip parking. Closes the lost-wakeup race.
-            if self.synced_seq.load(Ordering::Acquire) >= seq {
-                return start.elapsed();
-            }
-            waiters.push(SeqWaiter {
-                seq,
-                wake: DurabilityWake::Thread(parker.clone()),
-            });
-        }
-        // Park until `advance` unparks us. The re-check defends against a
-        // spurious `park()` return, which leaves us registered so we re-park.
-        loop {
-            thread::park();
-            if parker.done.load(Ordering::Acquire) || self.synced_seq.load(Ordering::Acquire) >= seq
-            {
-                break;
-            }
-        }
-        start.elapsed()
-    }
-
-    /// Advance the watermark and wake exactly the appenders whose seq is now
-    /// durable. Called by the sync thread after fdatasync covers the batch.
-    pub(crate) fn advance(&self, max_seq: u64) {
-        let prev = self.synced_seq.fetch_max(max_seq, Ordering::Release);
-        if prev >= max_seq {
-            return;
-        }
-        // Collect the now-durable waiters under the lock; unpark AFTER releasing
-        // it so woken appenders never touch this lock on their way out.
-        let mut wake = Vec::new();
-        {
-            let mut waiters = self.waiters.lock();
-            let mut i = 0;
-            while i < waiters.len() {
-                if waiters[i].seq <= max_seq {
-                    wake.push(waiters.swap_remove(i).wake);
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        for waiter in wake {
+    fn wake(waiters: Vec<DurabilityWake>) {
+        for waiter in waiters {
             match waiter {
                 DurabilityWake::Thread(parker) => {
                     parker.done.store(true, Ordering::Release);
@@ -433,19 +398,119 @@ impl Lv2DurabilityWaiter {
         }
     }
 
-    fn arm_channel(&self, seq: u64, tx: &Sender<()>) -> bool {
+    pub(crate) fn poll(&self, seq: u64) -> OnyxResult<bool> {
         if self.synced_seq.load(Ordering::Acquire) >= seq {
-            return true;
+            return Ok(true);
         }
-        let mut waiters = self.waiters.lock();
+        let state = self.state.lock();
         if self.synced_seq.load(Ordering::Acquire) >= seq {
-            return true;
+            return Ok(true);
         }
-        waiters.push(SeqWaiter {
+        if let Some(reason) = &state.poisoned {
+            return Err(OnyxError::MetaFenced(reason.clone()));
+        }
+        Ok(false)
+    }
+
+    /// Block until `synced_seq >= seq`. Returns the wait duration so the
+    /// caller can attribute it to `buffer_append_wait_durable_ns`.
+    pub(crate) fn wait_for(&self, seq: u64) -> OnyxResult<Duration> {
+        // Fast path: already durable — no registration, no lock, no park.
+        if self.synced_seq.load(Ordering::Acquire) >= seq {
+            return Ok(Duration::ZERO);
+        }
+        let start = Instant::now();
+        let parker = Arc::new(DurabilityParker {
+            done: AtomicBool::new(false),
+            thread: thread::current(),
+        });
+        {
+            let mut state = self.state.lock();
+            // Re-check under the lock: `advance` takes this same lock to drain,
+            // so if it advanced past `seq` before we registered we observe the
+            // new watermark here and skip parking. Closes the lost-wakeup race.
+            if self.synced_seq.load(Ordering::Acquire) >= seq {
+                return Ok(start.elapsed());
+            }
+            if let Some(reason) = &state.poisoned {
+                return Err(OnyxError::MetaFenced(reason.clone()));
+            }
+            state.waiters.push(SeqWaiter {
+                seq,
+                wake: DurabilityWake::Thread(parker.clone()),
+            });
+        }
+        // Park until `advance` unparks us. The re-check defends against a
+        // spurious `park()` return, which leaves us registered so we re-park.
+        loop {
+            thread::park();
+            match self.poll(seq)? {
+                true => break,
+                false => {
+                    parker.done.store(false, Ordering::Release);
+                }
+            }
+        }
+        Ok(start.elapsed())
+    }
+
+    /// Advance the watermark and wake exactly the appenders whose seq is now
+    /// durable. Called by the sync thread after fdatasync covers the batch.
+    pub(crate) fn advance(&self, max_seq: u64) -> bool {
+        // Collect the now-durable waiters under the lock; unpark AFTER releasing
+        // it so woken appenders never touch this lock on their way out.
+        let wake = {
+            let mut state = self.state.lock();
+            if state.poisoned.is_some() {
+                return false;
+            }
+            let prev = self.synced_seq.fetch_max(max_seq, Ordering::Release);
+            if prev >= max_seq {
+                return true;
+            }
+            let mut wake = Vec::new();
+            let mut i = 0;
+            while i < state.waiters.len() {
+                if state.waiters[i].seq <= max_seq {
+                    wake.push(state.waiters.swap_remove(i).wake);
+                } else {
+                    i += 1;
+                }
+            }
+            wake
+        };
+        Self::wake(wake);
+        true
+    }
+
+    pub(crate) fn poison(&self, reason: impl Into<String>) {
+        let wake = {
+            let mut state = self.state.lock();
+            if state.poisoned.is_some() {
+                return;
+            }
+            state.poisoned = Some(reason.into());
+            state.waiters.drain(..).map(|waiter| waiter.wake).collect()
+        };
+        Self::wake(wake);
+    }
+
+    fn arm_channel(&self, seq: u64, tx: &Sender<()>) -> OnyxResult<bool> {
+        if self.synced_seq.load(Ordering::Acquire) >= seq {
+            return Ok(true);
+        }
+        let mut state = self.state.lock();
+        if self.synced_seq.load(Ordering::Acquire) >= seq {
+            return Ok(true);
+        }
+        if let Some(reason) = &state.poisoned {
+            return Err(OnyxError::MetaFenced(reason.clone()));
+        }
+        state.waiters.push(SeqWaiter {
             seq,
             wake: DurabilityWake::Channel(tx.clone()),
         });
-        false
+        Ok(false)
     }
 }
 
@@ -593,6 +658,13 @@ struct AppendReservation {
 struct AppendStageTurn {
     next: parking_lot::Mutex<u64>,
     changed: parking_lot::Condvar,
+}
+
+#[cfg(test)]
+struct TestStagePause {
+    order: u64,
+    hit_tx: Sender<()>,
+    release_rx: Receiver<()>,
 }
 
 #[repr(align(64))]
@@ -1141,18 +1213,23 @@ struct BufferShard {
     /// load and starve those heuristics.
     pending_bytes: AtomicU64,
     flush_progress: DashMap<u64, HashSet<u16>>,
-    staging_tx: Sender<StagedEntry>,
-    staging_rx: Receiver<StagedEntry>,
+    staging_tx: Sender<StageEnvelope>,
+    staging_rx: Receiver<StageEnvelope>,
     /// Reservation order is allocated while holding `ring`, so it has the same
     /// order as physical ring records and per-shard global seqs.
     next_reservation_order: AtomicU64,
-    /// Multiple non-overlapping appenders may publish indices concurrently, but
-    /// the sync channel must retain physical reservation order because
-    /// `synced_seq` is a scalar watermark and guided recovery expects increasing
-    /// seqs after the checkpoint head.
+    /// Legacy A/B arm for producer-side ordering. The consumer-reorder arm
+    /// bypasses this turn and restores the physical reservation prefix in the
+    /// shard's single sync consumer.
     stage_turn: AppendStageTurn,
+    stage_window: Arc<StageWindow>,
+    stage_reorder_enabled: bool,
+    stage_fault: OnceLock<String>,
+    persistence_fence: Arc<OnceLock<String>>,
     #[cfg(test)]
     fail_next_staging_send: AtomicBool,
+    #[cfg(test)]
+    stage_pause: parking_lot::Mutex<Option<TestStagePause>>,
     sync_batch_max_entries: usize,
     sync_batch_max_bytes: usize,
     /// FIFO tracking eviction order for the in-memory payload cache. Payloads
@@ -1261,7 +1338,7 @@ pub struct WriteBufferPool {
     /// the recorded reason instead of silently acking into a ring that can no
     /// longer be drained — the ENOSPC "ack is a lie" hole. Reads are never
     /// fenced. The fence only clears on process restart.
-    meta_fence: OnceLock<String>,
+    meta_fence: Arc<OnceLock<String>>,
     /// Cancels RELOCATION appends (GC rewrites) that are parked on ring space.
     ///
     /// Production runs the ring in wait-forever backpressure mode
@@ -1303,8 +1380,8 @@ impl BufferAppendTicket {
         self.seq
     }
 
-    pub fn is_durable(&self) -> bool {
-        self.shard.lv2_durability.synced_seq.load(Ordering::Acquire) >= self.seq
+    pub fn poll_durability(&self) -> OnyxResult<bool> {
+        self.shard.lv2_durability.poll(self.seq)
     }
 
     /// Time from the LV2 watermark advance that made this append durable until
@@ -1316,10 +1393,11 @@ impl BufferAppendTicket {
             .pending
             .durability_advanced_at_ns
             .load(Ordering::Acquire);
-        (advanced_at != 0).then(|| lv2_metric_timestamp_ns(observed_at).saturating_sub(advanced_at))
+        (advanced_at != 0 && self.poll_durability().ok() == Some(true))
+            .then(|| lv2_metric_timestamp_ns(observed_at).saturating_sub(advanced_at))
     }
 
-    pub(crate) fn arm_wakeup(&self, tx: &Sender<()>) -> bool {
+    pub(crate) fn arm_wakeup(&self, tx: &Sender<()>) -> OnyxResult<bool> {
         self.shard.lv2_durability.arm_channel(self.seq, tx)
     }
 
@@ -1328,21 +1406,26 @@ impl BufferAppendTicket {
         self.foreground_io_lease = Some(lease);
     }
 
-    pub fn wait(self) -> u64 {
-        self.shard.wait_for_durable(self.seq);
+    pub fn wait(self) -> OnyxResult<u64> {
+        self.shard.wait_for_durable(self.seq)?;
         self.finish_at(Instant::now(), false)
     }
 
-    pub fn finish(self) -> u64 {
+    pub fn finish(self) -> OnyxResult<u64> {
         self.finish_at(Instant::now(), false)
     }
 
-    pub(crate) fn finish_dispatched(self) -> u64 {
+    pub(crate) fn finish_dispatched(self) -> OnyxResult<u64> {
         self.finish_at(Instant::now(), true)
     }
 
-    fn finish_at(self, finished_at: Instant, _dispatched: bool) -> u64 {
-        debug_assert!(self.is_durable());
+    fn finish_at(self, finished_at: Instant, _dispatched: bool) -> OnyxResult<u64> {
+        if !self.poll_durability()? {
+            return Err(OnyxError::MetaFenced(format!(
+                "buffer append seq {} completed before LV2 durability",
+                self.seq
+            )));
+        }
         let durable_wait_ns = finished_at
             .saturating_duration_since(self.durability_wait_started)
             .as_nanos() as u64;
@@ -1371,7 +1454,7 @@ impl BufferAppendTicket {
                 }
             }
         }
-        self.seq
+        Ok(self.seq)
     }
 }
 
@@ -1514,6 +1597,7 @@ struct StagedEntry {
 
 mod pool;
 mod shard;
+mod staging;
 
 #[cfg(test)]
 mod tests;

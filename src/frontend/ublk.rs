@@ -584,7 +584,7 @@ fn spawn_durability_dispatcher(
                     match rx.recv() {
                         Ok(item) => {
                             for ticket in &item.tickets {
-                                ticket.arm_wakeup(&wake_tx);
+                                let _ = ticket.arm_wakeup(&wake_tx);
                             }
                             pending.push(item);
                         }
@@ -595,7 +595,7 @@ fn spawn_durability_dispatcher(
                         recv(rx) -> result => match result {
                             Ok(item) => {
                                 for ticket in &item.tickets {
-                                    ticket.arm_wakeup(&wake_tx);
+                                    let _ = ticket.arm_wakeup(&wake_tx);
                                 }
                                 pending.push(item);
                             }
@@ -608,7 +608,7 @@ fn spawn_durability_dispatcher(
                 }
                 while let Ok(item) = rx.try_recv() {
                     for ticket in &item.tickets {
-                        ticket.arm_wakeup(&wake_tx);
+                        let _ = ticket.arm_wakeup(&wake_tx);
                     }
                     pending.push(item);
                 }
@@ -616,19 +616,38 @@ fn spawn_durability_dispatcher(
 
                 let mut idx = 0;
                 while idx < pending.len() {
-                    if pending[idx]
-                        .tickets
-                        .iter()
-                        .all(BufferAppendTicket::is_durable)
-                    {
+                    let durability = ublk_durability_action(
+                        pending[idx]
+                            .tickets
+                            .iter()
+                            .map(BufferAppendTicket::poll_durability),
+                    );
+                    if !matches!(&durability, UblkDurabilityAction::Pending) {
                         let item = pending.swap_remove(idx);
-                        for ticket in item.tickets {
-                            ticket.finish_dispatched();
-                        }
+                        let res = match durability {
+                            UblkDurabilityAction::Ready => {
+                                let mut res = item.res;
+                                for ticket in item.tickets {
+                                    if let Err(error) = ticket.finish_dispatched() {
+                                        tracing::error!(
+                                            error = %error,
+                                            "ublk durability completion raced a stage fault"
+                                        );
+                                        res = -libc::EIO;
+                                    }
+                                }
+                                res
+                            }
+                            UblkDurabilityAction::Failed { error, res } => {
+                                tracing::error!(error = %error, "ublk durable write failed");
+                                res
+                            }
+                            UblkDurabilityAction::Pending => unreachable!(),
+                        };
                         let completed = CompletedIo {
                             tag: item.tag,
                             op: item.op,
-                            res: item.res,
+                            res,
                             elapsed_ns: item.queued_at.elapsed().as_nanos() as u64,
                             queue_wait_ns: item.queue_wait_ns,
                             worker_ns: item.worker_ns,
@@ -646,6 +665,34 @@ fn spawn_durability_dispatcher(
             }
         })
         .unwrap_or_else(|err| panic!("failed to spawn ublk durability dispatcher: {err}"))
+}
+
+enum UblkDurabilityAction {
+    Pending,
+    Ready,
+    Failed { error: OnyxError, res: i32 },
+}
+
+fn ublk_durability_action(
+    polls: impl IntoIterator<Item = OnyxResult<bool>>,
+) -> UblkDurabilityAction {
+    let mut all_durable = true;
+    for poll in polls {
+        match poll {
+            Ok(durable) => all_durable &= durable,
+            Err(error) => {
+                return UblkDurabilityAction::Failed {
+                    error,
+                    res: -libc::EIO,
+                };
+            }
+        }
+    }
+    if all_durable {
+        UblkDurabilityAction::Ready
+    } else {
+        UblkDurabilityAction::Pending
+    }
 }
 
 impl OnyxUblkTarget {
@@ -1056,5 +1103,34 @@ impl OnyxUblkTarget {
         run_result?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_durability_fault_becomes_failed_io_completion() {
+        assert!(matches!(
+            ublk_durability_action([Ok(true), Ok(false)]),
+            UblkDurabilityAction::Pending
+        ));
+        assert!(matches!(
+            ublk_durability_action([Ok(true), Ok(true)]),
+            UblkDurabilityAction::Ready
+        ));
+
+        let action = ublk_durability_action([
+            Ok(false),
+            Err(OnyxError::MetaFenced("injected stage gap".into())),
+        ]);
+        assert!(matches!(
+            action,
+            UblkDurabilityAction::Failed {
+                error: OnyxError::MetaFenced(_),
+                res
+            } if res == -libc::EIO
+        ));
     }
 }

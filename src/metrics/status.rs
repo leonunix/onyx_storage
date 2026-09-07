@@ -1519,6 +1519,21 @@ impl EngineStatusSnapshot {
         );
         let _ = writeln!(
             out,
+            "stage_reorder: stage_window_wait_events={} stage_window_wait_ns={} out_of_order={} current={} max={} max_distance={} gap_events={} gap_wait_ns={} duplicate={} stale={} faults={}",
+            self.metrics.buffer_append_stage_window_wait_events,
+            self.metrics.buffer_append_stage_window_wait_ns,
+            self.metrics.buffer_stage_reorder_out_of_order,
+            self.metrics.buffer_stage_reorder_current,
+            self.metrics.buffer_stage_reorder_max,
+            self.metrics.buffer_stage_reorder_max_distance,
+            self.metrics.buffer_stage_reorder_gap_events,
+            self.metrics.buffer_stage_reorder_gap_wait_ns,
+            self.metrics.buffer_stage_reorder_duplicate,
+            self.metrics.buffer_stage_reorder_stale,
+            self.metrics.buffer_stage_reorder_faults,
+        );
+        let _ = writeln!(
+            out,
             "buffer_sync_batch: entries={} bytes={} entries_max={} bytes_max={}",
             self.metrics.buffer_sync_entries,
             self.metrics.buffer_sync_bytes,
@@ -2015,6 +2030,34 @@ mod tests {
         assert!(text.contains("buffer_applied_frontier: 42"));
         assert!(text.contains("buffer_durable_seq: 41"));
         assert!(text.contains("metadb_durable_buffer_seq: 41"));
+    }
+
+    #[test]
+    fn stage_reorder_metrics_reach_status_text() {
+        let status = EngineStatusSnapshot {
+            metrics: EngineMetricsSnapshot {
+                buffer_append_stage_window_wait_ns: 101,
+                buffer_append_stage_window_wait_events: 2,
+                buffer_stage_reorder_out_of_order: 3,
+                buffer_stage_reorder_current: 4,
+                buffer_stage_reorder_max: 5,
+                buffer_stage_reorder_max_distance: 6,
+                buffer_stage_reorder_gap_events: 7,
+                buffer_stage_reorder_gap_wait_ns: 8,
+                buffer_stage_reorder_duplicate: 9,
+                buffer_stage_reorder_stale: 10,
+                buffer_stage_reorder_faults: 11,
+                ..EngineMetricsSnapshot::default()
+            },
+            ..EngineStatusSnapshot::default()
+        };
+
+        let text = status.render_text();
+        assert!(text.contains(
+            "stage_reorder: stage_window_wait_events=2 stage_window_wait_ns=101 \
+             out_of_order=3 current=4 max=5 \
+             max_distance=6 gap_events=7 gap_wait_ns=8 duplicate=9 stale=10 faults=11"
+        ));
     }
 
     #[test]

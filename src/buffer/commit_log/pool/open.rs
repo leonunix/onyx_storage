@@ -273,6 +273,7 @@ impl WriteBufferPool {
 
         // ── Parallel shard recovery ──────────────────────────────────
         let metrics = Arc::new(OnceLock::new());
+        let persistence_fence = Arc::new(OnceLock::new());
         let payload_bytes_in_memory = Arc::new(AtomicU64::new(0));
         // Durability-watermark atomics shared with every shard. `max_flushed_seq`
         // is bumped in free_seq_allocation; `durable_seq` is advanced by the
@@ -313,6 +314,7 @@ impl WriteBufferPool {
                         let mfs = max_flushed_seq.clone();
                         let ds = durable_seq.clone();
                         let lv2 = lv2_durability_per_shard[idx].clone();
+                        let fence = persistence_fence.clone();
                         let rtx = ready_tx.clone();
                         let srtx = shard_ready_txs_for_open[idx].clone();
                         s.spawn(move || {
@@ -329,6 +331,7 @@ impl WriteBufferPool {
                                 mfs,
                                 ds,
                                 lv2,
+                                fence,
                                 rtx,
                                 srtx,
                             )
@@ -359,6 +362,7 @@ impl WriteBufferPool {
                         max_flushed_seq.clone(),
                         durable_seq.clone(),
                         lv2_durability_per_shard[idx].clone(),
+                        persistence_fence.clone(),
                         ready_tx.clone(),
                         shard_ready_txs_for_open[idx].clone(),
                     )
@@ -561,7 +565,7 @@ impl WriteBufferPool {
             backend_debt_throttle_enabled: runtime_limits.throttle_backend_debt,
             prewait_ring_space: runtime_limits.prewait_ring_space_outside_order,
             backend_throttle_control: BackendThrottleControl::default(),
-            meta_fence: OnceLock::new(),
+            meta_fence: persistence_fence,
             relocation_cancelled: AtomicBool::new(false),
         };
 

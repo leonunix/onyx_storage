@@ -21,7 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::affinity::{self, ThreadRole};
 use crate::engine::OnyxEngine;
-use crate::error::OnyxError;
+use crate::error::{OnyxError, OnyxResult};
 use crate::types::BLOCK_SIZE;
 use crate::volume::{OnyxVolume, VolumeWriteTicket};
 use crate::worker_queue::WorkerQueue;
@@ -1292,11 +1292,20 @@ fn durability_loop(
 
         let mut idx = 0;
         while idx < pending.len() {
-            if pending[idx].ticket.is_durable() {
-                let item = pending.swap_remove(idx);
-                complete_durable_write(item, &output, &alive, false);
-            } else {
-                idx += 1;
+            let durability = pending[idx].ticket.poll_durability();
+            match direct_io_durability_action(&durability) {
+                DirectIoDurabilityAction::Ready => {
+                    let item = pending.swap_remove(idx);
+                    complete_durable_write(item, &output, &alive, false);
+                }
+                DirectIoDurabilityAction::Pending => idx += 1,
+                DirectIoDurabilityAction::Failed(status) => {
+                    let item = pending.swap_remove(idx);
+                    let error =
+                        durability.expect_err("failed durability action must carry an error");
+                    tracing::error!(error = %error, "Direct IO durable write failed");
+                    complete_failed_write(item, status, &output, &alive, false);
+                }
             }
         }
     }
@@ -1308,31 +1317,70 @@ fn abort_undurable_writes(
     alive: &AtomicBool,
 ) {
     for item in pending {
-        if item.ticket.is_durable() {
-            complete_durable_write(item, output, alive, true);
-            continue;
+        let durability = item.ticket.poll_durability();
+        match direct_io_durability_action(&durability) {
+            DirectIoDurabilityAction::Ready => {
+                complete_durable_write(item, output, alive, true);
+                continue;
+            }
+            DirectIoDurabilityAction::Failed(status) => {
+                let error = durability.expect_err("failed durability action must carry an error");
+                tracing::error!(error = %error, "Direct IO durable write failed during shutdown");
+                complete_failed_write(item, status, output, alive, true);
+                continue;
+            }
+            DirectIoDurabilityAction::Pending => {}
         }
+        complete_failed_write(item, -libc::ESHUTDOWN, output, alive, true);
+    }
+}
 
-        item.ticket.abandon();
-        let outbound = Outbound::header_only(
-            response(
-                OP_WRITE,
-                item.request_id,
-                -libc::ESHUTDOWN,
-                0,
-                StageTimings {
-                    server_total_ns: item.server_started.elapsed().as_nanos() as u64,
-                    submit_queue_ns: item.submit_queue_ns,
-                    engine_submit_ns: item.engine_submit_ns,
-                    intake_ns: item.intake_ns,
-                    ..StageTimings::default()
-                },
-            ),
-            true,
-        );
-        if output.try_send(outbound).is_err() {
-            alive.store(false, Ordering::Release);
-        }
+#[derive(Debug, Eq, PartialEq)]
+enum DirectIoDurabilityAction {
+    Pending,
+    Ready,
+    Failed(i32),
+}
+
+fn direct_io_durability_action(result: &OnyxResult<bool>) -> DirectIoDurabilityAction {
+    match result {
+        Ok(false) => DirectIoDurabilityAction::Pending,
+        Ok(true) => DirectIoDurabilityAction::Ready,
+        Err(error) => DirectIoDurabilityAction::Failed(status_from_error(error)),
+    }
+}
+
+fn complete_failed_write(
+    item: PendingWrite,
+    status: i32,
+    output: &Sender<Outbound>,
+    alive: &AtomicBool,
+    nonblocking: bool,
+) {
+    item.ticket.abandon();
+    let outbound = Outbound::header_only(
+        response(
+            OP_WRITE,
+            item.request_id,
+            status,
+            0,
+            StageTimings {
+                server_total_ns: item.server_started.elapsed().as_nanos() as u64,
+                submit_queue_ns: item.submit_queue_ns,
+                engine_submit_ns: item.engine_submit_ns,
+                intake_ns: item.intake_ns,
+                ..StageTimings::default()
+            },
+        ),
+        true,
+    );
+    let sent = if nonblocking {
+        output.try_send(outbound).is_ok()
+    } else {
+        output.send(outbound).is_ok()
+    };
+    if !sent {
+        alive.store(false, Ordering::Release);
     }
 }
 
@@ -1349,13 +1397,20 @@ fn complete_durable_write(
     let completion_dispatch_ns = completion_dispatch_delay_ns(&item.ticket, completed_at)
         .min(observed_wait_ns);
     let durable_wait_ns = observed_wait_ns.saturating_sub(completion_dispatch_ns);
-    item.ticket.finish();
+    let completion = item.ticket.finish();
+    if let Err(error) = &completion {
+        tracing::error!(error = %error, "Direct IO durability completion raced a stage fault");
+    }
+    let (status, bytes) = match completion {
+        Ok(()) => (0, item.bytes),
+        Err(error) => (status_from_error(&error), 0),
+    };
     let outbound = Outbound::header_only(
         response(
             OP_WRITE,
             item.request_id,
-            0,
-            item.bytes,
+            status,
+            bytes,
             StageTimings {
                 server_total_ns: item.server_started.elapsed().as_nanos() as u64,
                 submit_queue_ns: item.submit_queue_ns,
@@ -1378,7 +1433,7 @@ fn complete_durable_write(
 }
 
 fn arm_pending(item: PendingWrite, wake_tx: &Sender<()>, pending: &mut Vec<PendingWrite>) {
-    item.ticket.arm_wakeup(wake_tx);
+    let _ = item.ticket.arm_wakeup(wake_tx);
     pending.push(item);
 }
 
@@ -1651,6 +1706,28 @@ mod tests {
             server_send_ns: 80,
         };
         assert_eq!(ResponseHeader::decode(&header.encode()).unwrap(), header);
+    }
+
+    #[test]
+    fn terminal_durability_fault_is_a_failed_completion_with_protocol_errno() {
+        assert_eq!(
+            direct_io_durability_action(&Ok(false)),
+            DirectIoDurabilityAction::Pending
+        );
+        assert_eq!(
+            direct_io_durability_action(&Ok(true)),
+            DirectIoDurabilityAction::Ready
+        );
+
+        let fault = Err(OnyxError::MetaFenced("injected stage gap".into()));
+        assert_eq!(
+            direct_io_durability_action(&fault),
+            DirectIoDurabilityAction::Failed(-libc::EROFS)
+        );
+        assert_eq!(
+            direct_io_durability_action(&fault),
+            DirectIoDurabilityAction::Failed(status_from_error(fault.as_ref().unwrap_err()))
+        );
     }
 
     /// A zero stamp means "the client does not stamp", and a stamp from the

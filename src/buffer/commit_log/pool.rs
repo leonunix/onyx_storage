@@ -338,11 +338,19 @@ impl WriteBufferPool {
     /// True once the metadb persistence fence has tripped.
     pub fn is_meta_fenced(&self) -> bool {
         self.meta_fence.get().is_some()
+            || self
+                .shards
+                .iter()
+                .any(|shard| shard.shard.stage_fault_reason().is_some())
     }
 
     /// The fence reason if tripped, else `None`. Surfaced by `onyx status`.
     pub fn meta_fence_reason(&self) -> Option<&str> {
-        self.meta_fence.get().map(String::as_str)
+        self.meta_fence.get().map(String::as_str).or_else(|| {
+            self.shards
+                .iter()
+                .find_map(|shard| shard.shard.stage_fault_reason())
+        })
     }
 
     /// Stop relocation (GC rewrite) appends from parking on ring space, and wake
@@ -376,7 +384,7 @@ impl WriteBufferPool {
     ) -> OnyxResult<u64> {
         Ok(self
             .append_deferred(vol_id, start_lba, lba_count, payload, vol_created_at)?
-            .wait())
+            .wait()?)
     }
 
     pub fn append_deferred(
@@ -473,6 +481,9 @@ impl WriteBufferPool {
         }
         self.apply_write_throttle(shard_idx, relocation_source.is_none());
         let shard = &self.shards[shard_idx];
+        if let Some(reason) = shard.shard.stage_fault_reason() {
+            return Err(OnyxError::MetaFenced(reason.to_string()));
+        }
         let prepared =
             shard
                 .shard
@@ -489,8 +500,13 @@ impl WriteBufferPool {
         }
         // The pre-wait is bounded, so a cancel that landed during it is picked up
         // here rather than after the stripe locks are taken.
-        let relocation_cancel =
-            relocation_source.is_some().then_some(&self.relocation_cancelled);
+        let relocation_cancel = relocation_source
+            .is_some()
+            .then_some(&self.relocation_cancelled);
+        // This wait is outside the LBA stripes. Once acquired, the permit stays
+        // with the assigned stage order until the consumer emits it, bounding
+        // channel + reorder + assigned-but-unsent work as one window.
+        let stage_permit = shard.shard.acquire_stage_permit(relocation_cancel)?;
         // Relocation appends must not block indefinitely on the stripe locks
         // either — see `try_lock_append_order`.
         let append_order = match relocation_cancel {
@@ -521,6 +537,9 @@ impl WriteBufferPool {
         let append_result = (|| {
             if let Some(reason) = self.meta_fence.get() {
                 return Err(OnyxError::MetaFenced(reason.clone()));
+            }
+            if let Some(reason) = shard.shard.stage_fault_reason() {
+                return Err(OnyxError::MetaFenced(reason.to_string()));
             }
             if !validate()? {
                 return Ok(None);
@@ -565,14 +584,13 @@ impl WriteBufferPool {
                 }
             }
             let seq = reservation.seq;
-            let pending = shard
-                .shard
-                .publish_prepared(
-                    reservation,
-                    prepared,
-                    relocation_source,
-                    profile_append_detail,
-                )?;
+            let pending = shard.shard.publish_prepared(
+                reservation,
+                prepared,
+                relocation_source,
+                stage_permit,
+                profile_append_detail,
+            )?;
             // The seq is now either visible in `pending_seqs`, or the append
             // failed and no acknowledged write exists for this seq. Do not hold
             // the gate across fdatasync / ready publication.
@@ -1380,7 +1398,11 @@ impl WriteBufferPool {
                     released_entries: s.released_entries.load(Ordering::Relaxed),
                     released_bytes: s.released_bytes.load(Ordering::Relaxed),
                     last_release_cap: s.last_release_cap.load(Ordering::Relaxed),
-                    staged_entries: s.staging_rx.len(),
+                    staged_entries: if s.stage_reorder_enabled {
+                        s.stage_window.outstanding()
+                    } else {
+                        s.staging_rx.len()
+                    },
                     volatile_payloads: 0,
                 }
             })
