@@ -6,7 +6,7 @@
 
 ## 总体判断
 
-当前代码已经从 AGENTS.md 里的 RocksDB 设计演进成 `onyx_metadb` 设计：L2P、refcount、dedup index 都由 metadb 承担，写入热路径不再按每个 LBA 直接维护传统 refcount。PBA 回收主线分成两套语义，并有一个 lineage 专用例外：
+当前代码使用 `onyx_metadb`：L2P、refcount、dedup index 都由 metadb 承担，写入热路径不再按每个 LBA 直接维护传统 refcount。PBA 回收主线分成两套语义，并有一个 lineage 专用例外：
 
 - **事务失败/未提交新 PBA**：直接 `allocator.free_one/free_extent`。
 - **已经进入元数据可见集的 PBA**：应先 `retire`，再由 GC 的 Gate 1/Gate 2 确认后 `reclaim`。
@@ -191,6 +191,6 @@ dirty startup 分支打印 rebuilding refcount，但 `MetaStore::rebuild_refcoun
 
 1. 先把 lineage direct-free 改成显式 proof API/命名，并让它先清 candidate-cache、处理 duplicate surface。
 2. 给 dedup + no ReadPool 加启动拒绝。
-3. 更新 AGENTS.md 和架构文档，删除 RocksDB/dedup_reverse/SHA-256 的旧描述，并写清楚 lineage FreePbas 例外。
+3. 架构与开发约定统一参见 CLAUDE.md，包含当前 dedup 布局与 lineage FreePbas 回收边界。
 4. 把 `DedupScanner` 拆职责，不急着改行为，先改命名和指标归属。
 5. 统一 PBA lifecycle API，再收紧 allocator 直接 free 的调用点。

@@ -168,7 +168,7 @@ Per-volume blockmap（每个 volume 一个命名空间）：
 - [x] 去重：工作线程池、dedup_index、分级跳过策略、DEDUP_SKIPPED 补扫、RAM 候选缓存 + LV3 字节验证 promote、candidate-before-retire cleanup、scrub/orphan 维护、cold-tail blockmap 扫描、cuckoo-filter L0
 - [x] 高性能前台：staging channel + write thread batch、jemalloc、DashMap 256 分片索引、ring 背压
 - [x] 高性能后台：batch writer（drain 32 units → 1 metadb tx）、multi_get 旧 mapping、批量 dedup cleanup、sharded dedup apply lane
-- [x] 换元数据引擎：用 in-tree onyx-metadb 替换 RocksDB（paged COW radix L2P、paged-array refcount + delta、cuckoo dedup_index、group commit；LV2 缓冲即持久日志）
+- [x] 元数据引擎：使用 in-tree onyx-metadb（paged COW radix L2P、paged-array refcount + delta、cuckoo dedup_index、group commit；LV2 缓冲即持久日志）
 - [x] 服务模式：多卷启动、Unix socket IPC（stop/create/delete/list）、信号处理（SIGTERM/SIGINT）
 - [x] RAID 感知：full-stripe（strip 对齐）写出 + strip 粒度分配，经仓库内 onyx-chunklet 用户态 RAID 后端落地
 - [x] chunklet 集成：LV3(RAID6)、LV2(RAID10)、metadb(RAID10 meta LD) 全在一个 chunklet 池上（裸 NVMe）——消除文件系统元数据 SPOF；满盘 fencing + 崩溃恢复已在 NVMe 真机验收

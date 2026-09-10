@@ -257,7 +257,7 @@ Onyx's logical "tables" map onto four purpose-built structures inside [onyx-meta
 | refcount        | global paged-array + per-shard delta                 | `Pba(u64 BE)`                | `u32` count         | Physical block reference counts (no snapshots) |
 | dedup_index     | global cuckoo (4 slots/bucket, 28 buckets/page) + cuckoo-filter L0 + L1 hot cache | `Hash8` (xxh3_64) | 27 B `DedupValue`   | Content hash &rarr; PBA fast lookup       |
 
-Cross-table atomicity comes from metadb transactions: writer commits publish L2P remaps, and verified candidate promotes add `DedupPut` in the same transaction as their LBA remap (`atomic_batch_dedup_hits_with_promote`). First-occurrence misses live in the RAM `CandidateCache` and never touch the persistent dedup table. There is no RocksDB, no column families, and no `WriteBatch` &mdash; the engine no longer has a `rocksdb` dependency at all.
+Cross-table atomicity comes from metadb transactions: writer commits publish L2P remaps, and verified candidate promotes add `DedupPut` in the same transaction as their LBA remap (`atomic_batch_dedup_hits_with_promote`). First-occurrence misses live in the RAM `CandidateCache` and never touch the persistent dedup table.
 
 Committed PBA reclamation is intentionally two-stage. Remap/delete/dedup demote paths retire dead physical space after removing candidate-cache references; `GcRunner::reclaim_retired_extents` later releases it only after refcount, hazard, and an exact fold-consistent blockmap/l2p-buffer check plus a reclaim-age grace. Volume deletion follows the same retired-PBA model. metadb Lineage GC `FreePbas` surfaces exclusive `rc == 0` candidates, but Onyx retires them through this same reclaim path rather than direct-freeing &mdash; the `rc == 0` proof does not cover rc-untracked packed/multi-LBA L2P sharing &mdash; with candidate-cache invalidation, hazard wait, fold-consistent reference scan, and duplicate-surface idempotency.
 
@@ -268,7 +268,7 @@ Committed PBA reclamation is intentionally two-stage. Remap/delete/dedup demote 
 - [x] Dedup: worker pool, dedup_index, tiered skip strategy, DEDUP_SKIPPED rescan, RAM candidate cache + LV3 byte-verified promote on duplicate sighting, candidate-before-retire cleanup, scrub/orphan maintenance, cold-tail blockmap rescan, cuckoo-filter L0
 - [x] Performance (frontend): staging buffer, write thread batch, jemalloc, DashMap 256-shard indices, ring backpressure
 - [x] Performance (backend): batched writer (drain 32 units per metadb tx), multi_get for old mappings, batched dedup cleanup, sharded dedup apply lanes, balanced read pool dispatch
-- [x] Metadata engine swap: replaced RocksDB with in-tree onyx-metadb (paged COW radix L2P, paged-array refcount + delta, cuckoo dedup_index, group commit; LV2 buffer as the durable journal)
+- [x] Metadata engine: in-tree onyx-metadb (paged COW radix L2P, paged-array refcount + delta, cuckoo dedup_index, group commit; LV2 buffer as the durable journal)
 - [x] Service mode: multi-volume start, Unix socket IPC (stop/create/delete/list), signal handling (SIGTERM/SIGINT)
 - [x] RAID-aware: full-stripe (strip-aligned) writes + strip-granularity allocation, via the in-tree onyx-chunklet userspace RAID backend
 - [x] Chunklet integration: LV3 (RAID6), LV2 (RAID10), and metadb (RAID10 meta LD) all on one chunklet pool over the raw NVMe &mdash; retires the filesystem metadata SPOF; capacity-exhaustion fencing + crash-recovery validated on NVMe hardware

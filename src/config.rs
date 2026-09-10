@@ -315,7 +315,7 @@ pub struct MetaConfig {
     /// Bloom-filter budget for metadb's dedup LSM SSTs. Higher values
     /// reduce false positives on all-miss foreground dedup lookups at the
     /// cost of more metadata pages. Large-memory NVMe deployments should
-    /// prefer 16-20 bits/entry; the default stays RocksDB-like.
+    /// prefer 16-20 bits/entry; the default is 10 bits/entry.
     #[serde(default = "default_lsm_bloom_bits_per_entry")]
     pub lsm_bloom_bits_per_entry: u32,
     /// Minimum interval between background metadb checkpoints, in
