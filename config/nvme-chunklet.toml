@@ -106,9 +106,9 @@ lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0
 # taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
-lv3_ld_id = "9a912452-e9e8-49f6-9683-5ec93643ff1a"
-lv2_ld_id = "e57dc0c2-33c9-47b0-8491-b2e1a8b3666d"
-meta_ld_id = "d163e445-8671-4f5b-9aee-85cd9660d181"
+lv3_ld_id = "07fba5a1-c97a-41d5-bcab-333f3f804521"
+lv2_ld_id = "da834635-9584-44f4-a1cf-b3f1169e9638"
+meta_ld_id = "d8a25477-877a-475e-8c70-71554246d3c7"
 # Stripe-lock key grouping for the LV2 LD ONLY: chunklet hashes `key >> shift`,
 # so 10 collapses 1024 contiguous 4 KiB keys (4 MiB) onto one lock bucket, and
 # a ~512-key mirror write stops holding ~512 of the 65536 buckets for the whole
@@ -204,6 +204,32 @@ rc_segment_overlay_max_entries = 4000000
 # whose fio full-run averages DO overlap. Left at the default until a wider
 # repeat; set 200 to reproduce the arm above.
 lv3_batch_coalesce_us = 0
+# ⭐ DEVICE CONCURRENCY — the open lever, left at the shipped default pending the
+# box A/B (`tools/lv3_concurrency_ab.sh`, report `tools/lv3_concurrency_report.sh`).
+#
+# `lv3_batch_target_bytes` both ends an aggregation window AND cuts a writer
+# request into chunks, and all of one request's chunks are submitted before any
+# is waited on — so LOWERING it converts one lane's batch into several
+# independent device calls without shrinking the writer's batch (or its metadb
+# commit). Measured baseline at RWMIX=0 (/root/lv3run/dsr_r1, three clean B
+# segments): the aggregator holds 1.98 requests of ~3.4 MB per 4 MiB batch, so
+# device concurrency is 2.00-2.07 of SIX executors and the drives sit at
+# aqu-sz 1.05-1.48. The same LD does 1738 MiB/s at 6 concurrent callers.
+#
+# `lv3_batch_min_dispatch_bytes` (0 = derive from the byte target) is the floor
+# under early dispatch. It is what the 2026-08-14 `lv3_batch_idle_dispatch` arm
+# lacked: with a zero floor the aggregator releases a fragment the moment an
+# executor frees up, which raised concurrency 0.97 -> 1.35 and lost 1007 -> 771
+# MiB/s because the writer's own cycle shrank with it (chunklet 68.4 -> 2.4
+# stripes/call, metadb commits 583 -> 2949/s).
+#
+# The arm to reproduce (over IPC, so it stays inside one process at one pool age):
+#   onyx-storage -c <cfg> lv3-batch 1048576 1048576
+# and if concurrency pins at ~6, the follow-on needs a RESTART because the
+# executor count sizes a thread pool at open:
+#   lv3_batch_executors = 12
+lv3_batch_target_bytes = 0
+lv3_batch_min_dispatch_bytes = 0
 # data_device omitted: LV3 comes from the chunklet pool.
 block_size = 4096
 use_hugepages = false
@@ -391,6 +417,25 @@ packed_meta_batch_max_lbas = 1024
 # against the arena's default 64; over IPC alone the bundles fall back to the heap
 # and bump mem_arena.overflow). Driver: tools/stripe_run_ab.sh.
 stripe_run_max_stripes = 1
+# ⚠ The writer lane's read-active batch targets — what a MIXED workload actually
+# runs on. `read_active` is derived from the GLOBAL read counter (any read in the
+# engine bumps it), so at 70/30 every lane is read-active on essentially every
+# cycle and its 32-unit target makes each LV3 request 128 KiB — which is why the
+# aggregator has to fold ~9 lanes to build one device call. Confirm with
+# `flush_writer_batch: read_active_cycles / cycles` in `status` (it reads 0.0 at
+# RWMIX=0 and is expected near 1.0 at 70/30) BEFORE tuning these.
+#
+# Note the drain-size half of that path caps nothing: writer_read_active_batch_size
+# has equalled flush.writer_batch_size (1024) since 2026-05. Foreground reads are
+# separately protected by the coalescer's flush_admission_qos.
+#
+# Left at the compiled defaults pending the box A/B. The arm to reproduce, over
+# IPC so it stays inside one process (raise the deadline WITH the target or the
+# lane just times out at the old size):
+#   onyx-storage -c <cfg> writer-batch 256 2000 0
+writer_read_active_batch_target_units = 0
+writer_read_active_batch_coalesce_us = 0
+writer_batch_target_bytes = 0
 # Flush QoS OFF. The 100 ms default arms a foreground admission ladder that
 # measured as a net negative on this box: A/B over interleaved arms gave
 # OFF 233/233 MiB/s with p99 22.5 ms, ON 198 or 63.9 MiB/s with the collapsed
