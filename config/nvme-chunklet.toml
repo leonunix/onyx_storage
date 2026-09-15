@@ -106,9 +106,9 @@ lv2 = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 6, strip_kib = 0
 # taking metadb down (the SPOF that /mnt/onyx-meta XFS used to be).
 meta = { raid = "raid10", set_size = 2, row_size = 2, num_rows = 32, strip_kib = 0 }
 # Filled in after `chunklet-init --force` (Phase 3f re-init, 10 PDs, meta LD 64GiB):
-lv3_ld_id = "07fba5a1-c97a-41d5-bcab-333f3f804521"
-lv2_ld_id = "da834635-9584-44f4-a1cf-b3f1169e9638"
-meta_ld_id = "d8a25477-877a-475e-8c70-71554246d3c7"
+lv3_ld_id = "3c569e4d-7f28-40f7-94d4-81b6be237078"
+lv2_ld_id = "ec0ac362-1321-41f8-a761-d12f1fcfb49b"
+meta_ld_id = "e7c1cfd9-9a8c-4027-8097-2770e9605eee"
 # Stripe-lock key grouping for the LV2 LD ONLY: chunklet hashes `key >> shift`,
 # so 10 collapses 1024 contiguous 4 KiB keys (4 MiB) onto one lock bucket, and
 # a ~512-key mirror write stops holding ~512 of the 65536 buckets for the whole
@@ -236,7 +236,33 @@ use_hugepages = false
 default_compression = "Lz4"
 io_backend = "uring"
 uring_sq_entries = 1024
-read_pool_workers = 32
+# 12, not 32 (box 2026-09-15, memory `thread_budget_io_readpool_ab`). The pool
+# splits in half (`reserved_foreground_workers`), so this is 6 foreground + 6
+# background.
+#
+# WHY. The engine ran 622 OS threads with mean RUNNABLE 117 against 44
+# NUMA-confined cores (2.66x oversubscribed, 187k involuntary context
+# switches/s — memory `thread_starvation_confirmed_census`), and a per-group
+# census found this pool absurdly over budget: 32 threads produced 18.1 mean
+# runnable, MORE than the entire 112-thread flusher pipeline (15.1), and
+# `read-pool-fg` was the single most-preempted group in the engine at 1311
+# involuntary switches/s/thread with 65% of its threads runnable.
+#
+# Measured, 4 arms with a baseline bracket (420 s burn each, QD256 j16d16
+# randrw 70/30, aged 256 GiB volume): 32 -> 12 alongside `ublk.io_workers` 32
+# took total threads 622 -> 498, mean runnable 117 -> 71, involuntary switches
+# 187k -> 106k/s (-43%), and `lv3-batch-exec-` preemption 205.9 -> 78.0
+# switches/s/thread — that last one is the group carrying the 9.65x `compute`
+# inflation of memory `chunklet_call_slowdown_is_cpu_starvation`.
+#
+# ⛔ Throughput is FLAT, and proving that needed the bracket: the identical
+# config re-run last came back -14.3%, so the arms must be judged against the
+# bracket MEAN (873.6 MiB/s), where they land at -3.2% and -0.4%. Judging
+# against the first arm alone reports a bogus -10.1%.
+#
+# ⚠ Do not take this to 0: `dedup.enabled` with `read_pool_workers == 0`
+# disables the LV3 byte verification that makes dedup CORRECT, not faster.
+read_pool_workers = 12
 # Roadmap ③: allocate + write LV3 units that are a whole number of RAID6
 # stripes on a stripe-aligned PBA so chunklet takes its zero-RMW full-stripe
 # path. Pairs with the stripe-multiple coalesce below — a unit only qualifies
@@ -394,6 +420,28 @@ queue_workers = 4
 # concurrency tracks the number of SUBMITTER CPUS, which is the signature of
 # this funnel and of nothing else.
 shared_io_workers = true
+# 32 explicit, NOT the 0 default (0 = nr_queues * queue_workers = 128).
+#
+# WHY. The per-group census (memory `thread_starvation_confirmed_census`) found
+# this pool to be the engine's single biggest CPU contender: 128 threads
+# producing 37.3 mean RUNNABLE and 73k of the engine's 187k involuntary context
+# switches/s, against 44 NUMA-confined cores. Cutting it to 32 dropped total
+# mean runnable 117 -> 68 and gave every OTHER group relief too — the flusher
+# stages roughly halved their runnable counts, i.e. they started getting CPU
+# when they asked for it. Full 4-arm table in memory
+# `thread_budget_io_readpool_ab`; throughput is flat (see the bracket warning
+# on `storage.read_pool_workers`).
+#
+# ⚠⚠ 32 is the FLOOR at QD256, and this is NOT a CPU pool — it is a
+# CONCURRENCY pool. The worker BLOCKS: writes park in `append()` until the LV2
+# fdatasync (~85% `durable_wait_ns`) and reads park on the read pool. A blocked
+# worker serves nothing, so this number caps how many host IOs can be in
+# flight. At this load 46k reads/s x ~1.5 ms mean ≈ 70 worker-seconds/s, so 128
+# was not arbitrary; at 32 the LV2 ring emptied (`buffer_physical_fill_pct`
+# 86 -> 2, pending 2507 -> 449), which is INTAKE concurrency falling, not the
+# drain speeding up. Wanting it smaller means making the worker stop blocking
+# (async completion), not picking a smaller number.
+io_workers = 32
 
 [flush]
 compress_workers = 2
